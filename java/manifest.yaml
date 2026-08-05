@@ -1,8 +1,33 @@
 schemaVersion: 1
 id: java
-displayName: "Java"
+displayName: Java
 rank: 3
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Java HTTP client and experimental pinned-profile WebSocket client. Capability badges remain empty pending shared evidence.
+toolchain:
+  name: Eclipse Temurin JDK
+  version: 21.0.8+9
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication is deferred.
+  - Live values support only the JSON-safe subset used by this experiment.
+  - WebSocket mutations/actions, chunks, optimistic updates, journals, and replay are deferred.
+  - Each Live subscription buffers only its newest 16 updates.
 capabilities: []
