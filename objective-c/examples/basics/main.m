@@ -1,23 +1,3 @@
-# Convex from Objective-C
-
-A native Objective-C client that calls Convex functions over HTTP and follows a query through the pinned `/api/sync` WebSocket profile.
-
-This is educational and unofficial, not a production Convex SDK.
-
-## Start here
-
-[`examples/basics/main.m`](examples/basics/main.m) follows the shared counter from 0 to 1. It performs an HTTP query, begins Live before the mutation, uses an idempotency key, and verifies the reactive update.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP queries, mutations, actions, token changes, and structured errors | Implemented, awaiting root-owned shared evidence |
-| Live initial values and updates through `/api/sync` | Implemented, awaiting root-owned shared evidence |
-| Remove, reconnect, query-error recovery, and bounded delivery | Implemented, awaiting root-owned shared evidence |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.m -->
-```text
 #import "ConvexClient.h"
 #include <limits.h>
 #include <math.h>
@@ -129,21 +109,3 @@ int main(int argc, char **argv) {
   [pool drain];
   return 0;
 }
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-`./run test objective-c` formats, compiles, and runs deterministic Objective-C client and Live fixtures inside Docker. `./run build objective-c` produces the non-root amd64 adapter runtime. Root-owned `verify-example` and conformance commands remain the capability-evidence gates.
-
-## Protocol notes
-
-The public API is made of real Objective-C classes and Foundation values: `CVXClient`, `CVXSubscription`, `NSDictionary`, `NSArray`, and `NSError`. It runs on GNUstep Base and libobjc on Linux. The canonical example and a deterministic local fixture both exercise that API. A private C boundary exists only so the black-box adapter can inspect exact protocol events without exposing json-c types to application code.
-
-The adapter speaks NDJSON protocol v1 on stdin/stdout or a single `ADAPTER_LISTEN` TCP connection. Checksum-pinned libcurl 8.21.0 supplies HTTP, TLS, and WebSocket transport, while json-c 0.16 supplies the internal JSON parser. Convex-specific protocol and ownership logic remains here. One worker alone owns the socket, query-set changes, and reconnects. It resubscribes active queries after reconnect, suppresses unchanged hydration, resets backoff after a healthy connection, and reports structured function, protocol, and transport errors without stranding valid subscriptions.
-
-The final images keep the root filesystem read-only. Their `/tmp` points at Docker's bounded `/dev/shm` runtime tmpfs because GNUstep startup under amd64 emulation needs temporary lock storage; neither client writes persistent application state there.
-
-Live delivery keeps the newest 16 updates per subscription and also enforces a conservative shared 8 MiB encoded-byte budget. The adapter caps active subscriptions at 16. Controller output has one owner and a 500 ms write deadline, so a stopped stdin or TCP reader cannot leave generation invalidation, unsubscribe, replacement, EOF cleanup, or close blocked behind output.
-
-Live authentication, optimistic updates, tagged Convex values, WebSocket mutations/actions, and `TransitionChunk` assembly are intentionally deferred. The sync endpoint is an undocumented pinned profile and may drift. Capability badges remain empty until the root integration task runs the shared local and hosted evidence gates from the reviewed commit.

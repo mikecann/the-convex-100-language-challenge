@@ -4,5 +4,30 @@ displayName: "Objective-C"
 rank: 18
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.2.0
+  notes: Native Objective-C Foundation API and ownership on GNUstep/libobjc. A single private owner implements Convex HTTP and pinned Live state, using checksum-pinned libcurl 8.21.0 for HTTP/TLS/WebSocket transport and json-c 0.16 for JSON. The read-only runtime maps /tmp to Docker's bounded /dev/shm tmpfs for GNUstep startup lock storage.
+toolchain:
+  name: Clang Objective-C with GNUstep Base
+  version: 14.0.6 / GNUstep Base 1.28.0
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, optimistic updates, WebSocket mutations, and WebSocket actions are deferred.
+  - The undocumented pinned sync profile can drift independently of the documented HTTP API.
+  - Delivery holds at most the newest 16 updates per subscription, rejects a single encoded Live message above 2 MiB, and shares a conservative 8 MiB encoded-byte budget across all subscriptions.
+  - The adapter accepts at most 16 subscriptions and abandons a controller output stream when a write remains blocked for 500 ms.
 capabilities: []
