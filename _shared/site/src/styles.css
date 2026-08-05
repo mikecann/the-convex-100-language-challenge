@@ -167,6 +167,17 @@ dialog dt { color: var(--muted); }
 dialog dd { margin: 0; overflow-wrap: anywhere; }
 pre { overflow: auto; padding: 1rem; border: 1px solid var(--border); background: #070b13; }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.example-code .shiki {
+  overflow: auto;
+  margin: 0;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.35rem;
+  background: #070b13 !important;
+  font-size: 0.86rem;
+  line-height: 1.6;
+}
+.example-code .shiki code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .test-list { padding: 0; list-style: none; font-family: ui-monospace, monospace; }
 .test-list li { margin: 0.35rem 0; padding: 0.55rem; border-left: 4px solid var(--border); background: #0b1020; }
 .test-list li[data-status="pass"] { border-color: var(--live); }

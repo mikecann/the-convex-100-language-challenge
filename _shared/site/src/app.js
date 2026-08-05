@@ -169,6 +169,26 @@ function showLanguage(language) {
     ["Hosted drift", language.hostedResult?.earnedCapabilities?.join(", ")],
   ]);
 
+  if (language.example) {
+    const heading = document.createElement("h3");
+    heading.textContent = language.example.path;
+    const highlighted = document.createElement("div");
+    highlighted.className = "example-code";
+
+    // highlightedHtml is generated from repository-owned source by Shiki. Keep
+    // a text-only fallback so an older result file still renders safely.
+    if (language.example.highlightedHtml) {
+      highlighted.innerHTML = language.example.highlightedHtml;
+    } else {
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      code.textContent = language.example.code;
+      pre.append(code);
+      highlighted.append(pre);
+    }
+    dialogContent.append(heading, highlighted);
+  }
+
   if (language.result?.tests) {
     const heading = document.createElement("h3");
     heading.textContent = "Conformance evidence";
@@ -181,16 +201,6 @@ function showLanguage(language) {
       tests.append(item);
     }
     dialogContent.append(heading, tests);
-  }
-
-  if (language.example) {
-    const heading = document.createElement("h3");
-    heading.textContent = language.example.path;
-    const pre = document.createElement("pre");
-    const code = document.createElement("code");
-    code.textContent = language.example.code;
-    pre.append(code);
-    dialogContent.append(heading, pre);
   }
 
   dialog.showModal();

@@ -3,6 +3,7 @@ import path from "node:path";
 import process from "node:process";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
+import { bundledLanguages, codeToHtml } from "shiki";
 import { parse } from "yaml";
 
 const root = process.env.REPO_ROOT ?? "/repo";
@@ -106,7 +107,38 @@ function readOptionalResult(directory, languageId) {
   );
 }
 
-function firstExample(languageId) {
+const syntaxAliases = {
+  "c-sharp": "csharp",
+  "f-sharp": "fsharp",
+  "objective-c": "objective-c",
+  "visual-basic-net": "vb",
+};
+
+const extensionAliases = {
+  cs: "csharp",
+  fs: "fsharp",
+  fsx: "fsharp",
+  h: "c",
+  hpp: "cpp",
+  kts: "kotlin",
+  m: "objective-c",
+  ml: "ocaml",
+  mli: "ocaml",
+  ps1: "powershell",
+  py: "python",
+  rb: "ruby",
+  rs: "rust",
+  sh: "bash",
+  ts: "typescript",
+};
+
+function syntaxFor(languageId, file) {
+  const extension = path.extname(file).slice(1).toLowerCase();
+  const candidates = [syntaxAliases[languageId], languageId, extensionAliases[extension], extension];
+  return candidates.find((candidate) => candidate && candidate in bundledLanguages) ?? "text";
+}
+
+async function firstExample(languageId) {
   const directory = path.join(root, languageId, "example");
   if (!fs.existsSync(directory)) return null;
   const files = fs
@@ -116,13 +148,20 @@ function firstExample(languageId) {
     .sort();
   const file = files[0];
   if (!file) return null;
+  const code = fs.readFileSync(file, "utf8");
+  const language = syntaxFor(languageId, file);
   return {
     path: path.relative(path.join(root, languageId), file),
-    code: fs.readFileSync(file, "utf8"),
+    code,
+    language,
+    highlightedHtml: await codeToHtml(code, {
+      lang: language,
+      theme: "github-dark-default",
+    }),
   };
 }
 
-const languages = roster.languages.map((entry) => {
+const languages = await Promise.all(roster.languages.map(async (entry) => {
   const manifest = parse(
     fs.readFileSync(path.join(root, entry.id, "manifest.yaml"), "utf8"),
   );
@@ -141,9 +180,9 @@ const languages = roster.languages.map((entry) => {
     result: trustedResult ?? localResult,
     evidenceTrust: trustedResult ? "trusted-main" : localResult ? evidenceChannel : null,
     hostedResult,
-    example: firstExample(entry.id),
+    example: await firstExample(entry.id),
   };
-});
+}));
 
 fs.mkdirSync(output, { recursive: true });
 for (const filename of ["index.html", "app.js", "styles.css"]) {
