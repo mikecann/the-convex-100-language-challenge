@@ -11,13 +11,23 @@ COPY README.md ./README.md
 
 # Maven resolves Scala and Jackson only in this build stage.
 RUN cd client && mvn -q -DskipTests package
-RUN java -cp client/target/scala-client-0.1.0-all.jar convex.LocalTests && \
-    mkdir -p /work/out && \
+RUN cd client && \
+    mvn -q dependency:build-classpath -Dmdep.outputFile=/tmp/scalafmt-classpath && \
+    format_status=0 && \
+    java -cp "$(cat /tmp/scalafmt-classpath)" org.scalafmt.cli.Cli --test scala tests ../examples/basics > /tmp/scalafmt-output 2>&1 || format_status=$?; \
+    sed -n '1,240p' /tmp/scalafmt-output; \
+    test "$format_status" -eq 0; \
+    ! grep -Eq 'error:|ParseError' /tmp/scalafmt-output
+RUN java -cp client/target/classes:client/target/scala-client-0.1.0-all.jar convex.LiveAcceptanceTests && \
+    mkdir -p /work/out/adapter /work/out/example && \
     cp examples/basics/Main.scala /work/out/canonical-example.scala && \
     sed -n '/^```text$/,/^```$/p' README.md | sed '1d;$d' > /tmp/readme-example.scala && \
     cmp examples/basics/Main.scala /tmp/readme-example.scala && \
-    jar cfe /work/out/adapter.jar convex.Adapter -C client/target/classes . && \
-    jar cfe /work/out/example.jar convex.example.Main -C client/target/classes .
+    cd client/target/classes && \
+    find convex -maxdepth 1 -type f -name 'Adapter*.class' -exec cp --parents '{}' /work/out/adapter ';' && \
+    find convex/example -maxdepth 1 -type f -name 'Main*.class' -exec cp --parents '{}' /work/out/example ';' && \
+    jar cfe /work/out/adapter.jar convex.Adapter -C /work/out/adapter . && \
+    jar cfe /work/out/example.jar convex.example.Main -C /work/out/example .
 CMD ["/bin/sh", "-c", "uname -m | grep -qx x86_64 && test \"$(java -XshowSettings:properties -version 2>&1 | sed -n 's/.*os.arch = //p')\" = amd64"]
 
 FROM test AS runtime-rootfs
