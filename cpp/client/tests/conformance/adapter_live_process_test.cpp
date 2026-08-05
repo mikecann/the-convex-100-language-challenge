@@ -19,9 +19,8 @@ using Json = convex::Json;
 
 static std::string timestamp(std::uint64_t value) {
   std::array<unsigned char, 8> decoded{};
-  for (int index = 7; index >= 0; --index) {
-    decoded.at(static_cast<std::size_t>(index)) =
-        static_cast<unsigned char>(value & 0xff);
+  for (std::size_t index = 0; index < decoded.size(); ++index) {
+    decoded.at(index) = static_cast<unsigned char>(value & 0xff);
     value >>= 8;
   }
   std::array<unsigned char, 13> encoded{};

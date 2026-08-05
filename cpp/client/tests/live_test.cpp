@@ -28,9 +28,8 @@ struct SubscriptionTestAccess {
 
 static std::string timestamp(std::uint64_t value) {
   std::array<unsigned char, 8> decoded{};
-  for (int index = 7; index >= 0; --index) {
-    decoded.at(static_cast<std::size_t>(index)) =
-        static_cast<unsigned char>(value & 0xff);
+  for (std::size_t index = 0; index < decoded.size(); ++index) {
+    decoded.at(index) = static_cast<unsigned char>(value & 0xff);
     value >>= 8;
   }
   std::array<unsigned char, 13> encoded{};
@@ -86,7 +85,7 @@ int main() {
     auto add = read_json(websocket);
     assert(connect.at("connectionCount") == 0);
     assert(add.at("modifications").at(0).at("type") == "Add");
-    send_transition(websocket, 0, 1,
+    send_transition(websocket, 0, 255,
                     {{"type", "QueryFailed"},
                      {"queryId", 0},
                      {"errorMessage", "empty room"},
@@ -95,7 +94,9 @@ int main() {
     while (!error_consumed)
       std::this_thread::yield();
     for (int value = 0; value < 20; ++value) {
-      send_transition(websocket, value + 1, value + 2,
+      // Cross 255 -> 256 immediately so the test proves timestamps are
+      // compared as little-endian uint64 values, not raw byte arrays.
+      send_transition(websocket, value + 255, value + 256,
                       {{"type", "QueryUpdated"},
                        {"queryId", 0},
                        {"value", {{"count", value}}},
@@ -164,7 +165,7 @@ int main() {
       // The client must suppress it, then deliver only the later external
       // change.
       const int rehydrated_count = connection == 0 ? 0 : connection - 1;
-      send_transition(websocket, 0, 1,
+      send_transition(websocket, 0, 255,
                       {{"type", "QueryUpdated"},
                        {"queryId", 0},
                        {"value", {{"count", rehydrated_count}}},
@@ -172,7 +173,7 @@ int main() {
       if (connection > 0) {
         rehydrated.at(connection - 1).set_value();
         send_changed.at(connection - 1).get_future().wait();
-        send_transition(websocket, 1, 2,
+        send_transition(websocket, 255, 256,
                         {{"type", "QueryUpdated"},
                          {"queryId", 0},
                          {"value", {{"count", connection}}},
@@ -180,7 +181,7 @@ int main() {
         if (connection == 5) {
           // Deduplication applies only to the first reconnect rehydration. A
           // later same-value transition is still a real server event.
-          send_transition(websocket, 2, 3,
+          send_transition(websocket, 256, 257,
                           {{"type", "QueryUpdated"},
                            {"queryId", 0},
                            {"value", {{"count", connection}}},
@@ -223,10 +224,10 @@ int main() {
       close_reasons.begin() + 1, close_reasons.end(),
       [](const auto &reason) { return reason == "DebugDisconnect"; }));
   assert(observed_timestamps.front().empty());
-  assert(observed_timestamps.at(1) == timestamp(1));
+  assert(observed_timestamps.at(1) == timestamp(255));
   assert(std::all_of(
       observed_timestamps.begin() + 2, observed_timestamps.end(),
-      [](const auto &observed) { return observed == timestamp(2); }));
+      [](const auto &observed) { return observed == timestamp(256); }));
   reconnect_client.close();
 
   // A peer can stop midway through a WebSocket frame. Closing must cancel that
@@ -307,8 +308,8 @@ int main() {
   assert(handshake_peer_closed);
   handshake_client.close();
 
-  // Successful handshakes reset transient-failure backoff. Six peers that
-  // accept the WebSocket and then vanish should reconnect at the base delay.
+  // A successful WebSocket handshake alone must not reset transient-failure
+  // backoff. Six peers accept the upgrade but never send valid Convex traffic.
   constexpr unsigned short backoff_port = 32129;
   std::promise<void> backoff_ready;
   std::vector<std::chrono::steady_clock::time_point> accepted_at;

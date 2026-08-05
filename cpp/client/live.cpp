@@ -43,12 +43,12 @@ struct StateVersion {
   std::uint32_t query_set;
   std::uint32_t identity;
   std::string timestamp;
-  std::array<unsigned char, 8> decoded_timestamp;
+  std::uint64_t decoded_timestamp;
 
   bool operator==(const StateVersion &) const = default;
 };
 
-std::array<unsigned char, 8> decode_timestamp(const std::string &timestamp) {
+std::uint64_t decode_timestamp(const std::string &timestamp) {
   // Convex timestamps are canonical base64 encodings of exactly eight bytes.
   // Decode and re-encode them before they can become reconnect metadata.
   if (timestamp.size() != 12) {
@@ -82,8 +82,12 @@ std::array<unsigned char, 8> decode_timestamp(const std::string &timestamp) {
     throw ProtocolError("Live timestamp is not canonical base64");
   }
 
-  std::array<unsigned char, 8> result{};
-  std::copy_n(decoded.begin(), result.size(), result.begin());
+  // Convex serializes its uint64 timestamp least-significant byte first. Raw
+  // byte comparison would therefore claim that 256 moved backwards from 255.
+  std::uint64_t result = 0;
+  for (std::size_t index = 0; index < 8; ++index) {
+    result |= static_cast<std::uint64_t>(decoded.at(index)) << (index * 8);
+  }
   return result;
 }
 
@@ -117,9 +121,7 @@ StateVersion parse_state_version(const Json &version, const char *label) {
           decode_timestamp(timestamp)};
 }
 
-StateVersion zero_state_version() {
-  return {0, 0, zero_timestamp, {0, 0, 0, 0, 0, 0, 0, 0}};
-}
+StateVersion zero_state_version() { return {0, 0, zero_timestamp, 0}; }
 
 LiveParts parse_live_url(std::string url) {
   const auto scheme_end = url.find("://");
@@ -220,7 +222,7 @@ struct Subscription::State : std::enable_shared_from_this<Subscription::State> {
   std::uint64_t connection_count = 0;
   std::string last_close_reason = "InitialConnect";
   std::string max_observed_timestamp;
-  std::optional<std::array<unsigned char, 8>> max_observed_timestamp_bytes;
+  std::optional<std::uint64_t> max_observed_timestamp_value;
   bool have_last_value = false;
   bool last_delivery_was_error = false;
   Json last_value;
@@ -386,10 +388,10 @@ struct Subscription::State : std::enable_shared_from_this<Subscription::State> {
 
       // Commit the complete transition before publishing any part of it.
       version = end_version;
-      if (!max_observed_timestamp_bytes ||
-          end_version.decoded_timestamp > *max_observed_timestamp_bytes) {
+      if (!max_observed_timestamp_value ||
+          end_version.decoded_timestamp > *max_observed_timestamp_value) {
         max_observed_timestamp = end_version.timestamp;
-        max_observed_timestamp_bytes = end_version.decoded_timestamp;
+        max_observed_timestamp_value = end_version.decoded_timestamp;
       }
       attempts = 0;
 
