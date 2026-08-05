@@ -1,7 +1,7 @@
 schemaVersion: 1
 id: javascript
 displayName: JavaScript
-rank: 7
+rank: 2
 selectionTier: ranked
 implementation:
   status: attempting

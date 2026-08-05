@@ -6,6 +6,7 @@ FROM ${NODE_IMAGE} AS test
 WORKDIR /opt/convex
 COPY client/package.json client/package-lock.json ./client/
 RUN cd client && npm ci --ignore-scripts
+RUN ln -s client/node_modules node_modules
 COPY client ./client
 COPY examples ./examples
 # Assert that this is a real amd64 runtime, then parse and test both the client
@@ -16,12 +17,17 @@ RUN node --test examples/basics/main.test.js
 RUN printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | node client/tests/conformance/adapter.js >/tmp/adapter.ndjson && grep -Fq '"language":"javascript"' /tmp/adapter.ndjson && grep -Fq '"type":"closed"' /tmp/adapter.ndjson
 CMD ["node", "-e", "process.exit(0)"]
 
+FROM ${NODE_IMAGE} AS production-dependencies
+WORKDIR /opt/convex/client
+COPY client/package.json client/package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts
+
 FROM ${NODE_IMAGE} AS runtime-base
 # Node is the declared target runtime. Remove package managers and development
 # frontends before publishing either minimal runtime image.
 RUN rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack
 WORKDIR /opt/convex
-COPY --from=test /opt/convex/client/node_modules ./client/node_modules
+COPY --from=production-dependencies /opt/convex/client/node_modules ./client/node_modules
 COPY client/convex.js ./client/convex.js
 RUN test "$(node -p 'process.arch')" = x64 && ! command -v npm && ! command -v npx && ! command -v corepack
 USER 65532:65532
