@@ -9,7 +9,7 @@ import (
 	"os"
 	"time"
 
-	convex "github.com/mikecann/100-convex-clients/go"
+	convex "github.com/mikecann/100-convex-clients/go/client"
 )
 
 func main() {

@@ -15,7 +15,7 @@ This repository tests how many programming languages can support useful Convex c
 
 ## Implementation honesty
 
-- Every language lives at `<language-id>/` in the repository root and owns its implementation, Dockerfile, test adapter, example, and manifest.
+- Every language lives at `<language-id>/` in the repository root and owns its implementation, Dockerfile, test adapter, examples, and manifest.
 - Declare whether an implementation is `native`, `binding`, `generated`, `transpiled`, or `bridge`.
 - A native client may use normal HTTP, TLS, JSON, and WebSocket libraries for its language, but it must implement Convex-specific behavior in the target language.
 - Do not shell out to another Convex client, Node.js, Python, `curl`, or the Convex CLI and present the result as a native client.
@@ -25,12 +25,20 @@ This repository tests how many programming languages can support useful Convex c
 
 ## Example code
 
-- Treat every runnable file under `<language-id>/example/` as teaching material, not just a smoke test.
+- Treat every runnable file under `<language-id>/examples/` as teaching material, not just a smoke test.
 - Comment each meaningful Convex step in plain language: configuration, client creation, authentication when used, cleanup, the HTTP query, decoding into an idiomatic value, starting Live before the mutation, the initial Live value, the mutation and its idempotency key, and the resulting Live update.
 - Comment non-obvious helper functions too, including what failure they handle and why the example needs them.
 - Explain intent, sequencing, and Convex behaviour. Do not merely translate the target language's syntax into prose or comment routine error handling.
 - Keep comments close to the code they explain and concise enough that the example still reads naturally.
-- The runnable `example/` file is the canonical source. Generate the README and website from it so all three surfaces always show the same commented code.
+- The runnable `examples/basics/` file is the canonical source. Generate the README and website from it so all three surfaces always show the same commented code.
+
+## Language layout
+
+- Put client library code under `<language-id>/client/` and its unit tests beside it, using the ecosystem's normal test convention.
+- Put the canonical introductory example under `<language-id>/examples/basics/`. Keep tests there only when they exercise example-specific behaviour.
+- Put the conformance adapter under `<language-id>/adapter/` and keep adapter-specific tests with it.
+- Do not create repository-level `<language-id>/src/` or `<language-id>/tests/` buckets. A client may still use paths such as `client/src/` or `client/src/test/` when its package ecosystem requires them.
+- Keep cross-client black-box conformance tests under `_shared/harness/`; they do not belong to an individual client package.
 
 ## Convex safety
 

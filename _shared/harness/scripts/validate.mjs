@@ -89,13 +89,7 @@ for (const language of roster.languages) {
     if (projection.markerCount === 0) {
       errors.push(`${language.id}: implemented client README needs a generated example block`);
     }
-    for (const required of [
-      "Dockerfile",
-      "src",
-      "example",
-      "adapter",
-      "tests",
-    ]) {
+    for (const required of ["Dockerfile", "client", "examples/basics", "adapter"]) {
       if (!fs.existsSync(path.join(directory, required))) {
         errors.push(`${language.id}: implemented client missing ${required}`);
       }

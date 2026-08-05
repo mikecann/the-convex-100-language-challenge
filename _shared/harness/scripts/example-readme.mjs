@@ -42,6 +42,7 @@ export function projectReadmeExamples(readmePath) {
   const beginCount = original.split(beginPrefix).length - 1;
   const endCount = original.split(endMarker).length - 1;
   const errors = [];
+  const sources = [];
   let markerCount = 0;
 
   if (beginCount !== endCount) {
@@ -52,7 +53,9 @@ export function projectReadmeExamples(readmePath) {
   try {
     projected = original.replace(blockPattern, (_block, relativeSource) => {
       markerCount += 1;
-      return renderExampleBlock(languageDirectory, relativeSource.trim());
+      const source = relativeSource.trim();
+      sources.push(source);
+      return renderExampleBlock(languageDirectory, source);
     });
   } catch (error) {
     errors.push(error.message);
@@ -62,5 +65,5 @@ export function projectReadmeExamples(readmePath) {
     errors.push("generated example marker is malformed");
   }
 
-  return { original, projected, markerCount, errors };
+  return { original, projected, markerCount, sources, errors };
 }

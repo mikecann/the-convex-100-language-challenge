@@ -1,4 +1,4 @@
-package tests
+package convex_test
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
-	convex "github.com/mikecann/100-convex-clients/go"
+	convex "github.com/mikecann/100-convex-clients/go/client"
 )
 
 type testWireMessage struct {

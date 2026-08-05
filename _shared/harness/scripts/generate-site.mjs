@@ -5,6 +5,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { bundledLanguages, codeToHtml } from "shiki";
 import { parse } from "yaml";
+import { projectReadmeExamples } from "./example-readme.mjs";
 
 const root = process.env.REPO_ROOT ?? "/repo";
 const output = path.join(root, "_shared/site/dist");
@@ -139,19 +140,20 @@ function syntaxFor(languageId, file) {
 }
 
 async function firstExample(languageId) {
-  const directory = path.join(root, languageId, "example");
-  if (!fs.existsSync(directory)) return null;
-  const files = fs
-    .readdirSync(directory, { recursive: true, withFileTypes: true })
-    .filter((entry) => entry.isFile())
-    .map((entry) => path.join(entry.parentPath, entry.name))
-    .sort();
-  const file = files[0];
-  if (!file) return null;
+  const languageDirectory = path.join(root, languageId);
+  const readmePath = path.join(languageDirectory, "README.md");
+  if (!fs.existsSync(readmePath)) return null;
+  const projection = projectReadmeExamples(readmePath);
+  if (projection.errors.length > 0) {
+    throw new Error(`${languageId}: ${projection.errors.join("; ")}`);
+  }
+  const relativeSource = projection.sources[0];
+  if (!relativeSource) return null;
+  const file = path.resolve(languageDirectory, relativeSource);
   const code = fs.readFileSync(file, "utf8");
   const language = syntaxFor(languageId, file);
   return {
-    path: path.relative(path.join(root, languageId), file),
+    path: relativeSource,
     code,
     language,
     highlightedHtml: await codeToHtml(code, {

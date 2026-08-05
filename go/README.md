@@ -37,7 +37,7 @@ third-party sync protocol.
 
 ## Usage
 
-<!-- BEGIN GENERATED EXAMPLE: example/main.go -->
+<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.go -->
 ```go
 package main
 
@@ -50,7 +50,7 @@ import (
 	"os"
 	"time"
 
-	convex "github.com/mikecann/100-convex-clients/go"
+	convex "github.com/mikecann/100-convex-clients/go/client"
 )
 
 func main() {
@@ -160,7 +160,7 @@ func randomID() string {
 ```
 <!-- END GENERATED EXAMPLE -->
 
-This block is generated from `example/main.go`, which is also the source shown
+This block is generated from `examples/basics/main.go`, which is also the source shown
 on the evidence website. Edit and run the source file, then use
 `./run sync-examples` to refresh this README projection.
 

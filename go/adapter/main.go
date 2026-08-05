@@ -14,7 +14,7 @@ import (
 	"runtime"
 	"sync"
 
-	convex "github.com/mikecann/100-convex-clients/go"
+	convex "github.com/mikecann/100-convex-clients/go/client"
 )
 
 const adapterProtocolVersion = 1

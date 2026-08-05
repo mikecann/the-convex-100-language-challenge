@@ -14,10 +14,9 @@
 <id>/
   manifest.yaml          declared intent, toolchain, and provenance
   Dockerfile             pinned multi-stage build
-  src/                   client library
-  example/               shared counter-room example
+  client/                client library and its unit tests
+  examples/basics/       shared counter-room example and example-only tests
   adapter/               thin NDJSON conformance adapter
-  tests/                 language-local unit tests
   README.md              idiomatic usage and limitations
 
 _shared/
@@ -35,7 +34,7 @@ run                      root Docker-only orchestration entrypoint
 
 ### Example comments
 
-Every language example must read like a short guided tour of the client API,
+Every language's `examples/basics/` program must read like a short guided tour of the client API,
 not an uncommented smoke test. The canonical runnable source should comment all
 of these steps when they are present:
 
@@ -55,10 +54,23 @@ library. Do not narrate obvious target-language syntax or routine error checks.
 If a client has not earned Live, omit those operations and explain the verified
 HTTP-only scope instead of including pretend code.
 
-The runnable file under `example/` is the canonical source. The evidence site
+The runnable file under `examples/basics/` is the canonical source. The evidence site
 reads that file directly, and README code blocks are generated projections
 checked by `./run validate`. Use `./run sync-examples` after editing an example;
 never maintain a second handwritten copy.
+
+### Language-owned code
+
+The repository standardises ownership boundaries, not each ecosystem's internal
+package layout. Client code and its unit tests live under `client/`.
+Example-specific tests live with the example under `examples/basics/`, and
+adapter-specific tests live under `adapter/`. Cross-client black-box tests stay
+under `_shared/harness/`.
+
+Do not add generic `<id>/src/` or `<id>/tests/` buckets. Ecosystem conventions
+still apply inside each boundary, so Rust can use `client/src/lib.rs`, Maven can
+use `client/src/main/java` and `client/src/test/java`, and Go can keep package
+files and `_test.go` files directly under `client/`.
 
 Client pull requests may modify only their own `<id>/` directory. Changes under `_shared/`, `docs/`, or `roster/` belong in separate reviewed pull requests. CI path policy must enforce that split before language work is parallelized.
 

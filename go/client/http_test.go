@@ -1,4 +1,4 @@
-package tests
+package convex_test
 
 import (
 	"context"
@@ -8,7 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	convex "github.com/mikecann/100-convex-clients/go"
+	convex "github.com/mikecann/100-convex-clients/go/client"
 )
 
 func TestDocumentedHTTPQuery(t *testing.T) {
