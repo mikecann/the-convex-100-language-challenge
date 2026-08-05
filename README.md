@@ -33,15 +33,29 @@ The capability badges are cumulative. Implementation provenance is a separate la
 - Results are attached to a source commit, container digest, runtime version, protocol revision, and conformance-suite version.
 - Experimental clients stay in this monorepo. Passing a test does not make a package officially supported by Convex.
 
-## Planned repository shape
+## Repository shape
 
 ```text
-clients/<language-id>/     source, Dockerfile, adapter, and manifest
-conformance/               black-box controller, fixtures, and fault injection
-convex/                    approved test backend
-docs/                      selection method, architecture, and protocol notes
-schemas/                   machine-readable manifest and result schemas
-site/                      live capability wall and per-language reports
+<language-id>/             one top-level directory per roster language
+  manifest.yaml            declared intent, toolchain, and provenance
+  Dockerfile               pinned build and runtime image
+  src/                     idiomatic client library
+  example/                 the shared counter-room example
+  adapter/                 native NDJSON conformance adapter
+  tests/                   language-local tests
+  README.md                usage, evidence, and limitations
+_shared/                   trusted backend, harness, schemas, site, and results
+run                         Docker-only orchestration entrypoint
+roster/                    sourced language selection and feasibility audit
 ```
+
+The repository root is intentionally visual: the accepted roster appears as 100
+peer language directories. Popularity rank lives in metadata, so a ranking
+change never renames a directory. Shared infrastructure is kept under
+`_shared/` and is protected separately from language implementation changes.
+
+Build status and verified platforms are recorded as evidence. They are not
+capability badges. A successful build alone does not mean a client can talk to
+Convex.
 
 See the [roster methodology](roster/methodology.md), [exact proposed roster](roster/languages.yaml), [conformance contract](docs/conformance.md), and [implementation architecture](docs/architecture.md).

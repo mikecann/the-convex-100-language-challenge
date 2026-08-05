@@ -123,6 +123,11 @@ Every client image contains the library and a thin language-native adapter. The 
 
 The adapter emits timestamped NDJSON responses containing request or subscription IDs. The controller owns fixture reset, randomized nonces, external reference mutations, the fault proxy, assertions, timeouts, and badge calculation.
 
+The first command is always `hello` and includes `protocolVersion: 1`. The
+adapter rejects unsupported protocol versions. Every later command carries a
+request ID, and every subscription event carries a subscription ID. Stdout is
+reserved for NDJSON protocol events; human diagnostics go to stderr.
+
 Every result records at least:
 
 - Source commit and client tree hash.
@@ -134,4 +139,16 @@ Every result records at least:
 - Per-test status, duration, and evidence hash.
 - Earned badges and failure reason.
 
-The proposed Convex test schema and auth fixture remain approval-gated. No schema may be created or applied until Michael approves the exact fields and indexes.
+The official JavaScript client is a semantic oracle for results, errors,
+subscriptions, and lifecycle behaviour. It is not a byte-for-byte oracle for
+Yellow HTTP because its current HTTP client uses the undocumented
+`convex_encoded_json` format while Yellow deliberately uses the documented
+`json` format.
+
+Build success and platform verification are evidence fields, not capability
+badges. Capability remains HTTP, Live, or Hardened.
+
+The exact counter-room schema and indexes are frozen in
+`docs/backend-contract.md`. Michael approved the dedicated schema and pilot
+implementation on 5 August 2026. Any change to that schema requires fresh
+approval before it is applied.

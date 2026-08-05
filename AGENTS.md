@@ -15,11 +15,12 @@ This repository tests how many programming languages can support useful Convex c
 
 ## Implementation honesty
 
-- Every language lives under `clients/<language-id>/` and owns its implementation, Dockerfile, test adapter, and manifest.
-- Declare whether an implementation is `native`, `binding`, or `transpiled`.
+- Every language lives at `<language-id>/` in the repository root and owns its implementation, Dockerfile, test adapter, example, and manifest.
+- Declare whether an implementation is `native`, `binding`, `generated`, `transpiled`, or `bridge`.
 - A native client may use normal HTTP, TLS, JSON, and WebSocket libraries for its language, but it must implement Convex-specific behavior in the target language.
 - Do not shell out to another Convex client, Node.js, Python, `curl`, or the Convex CLI and present the result as a native client.
 - Shared-core FFI can be useful, but it earns the binding badge rather than the native badge.
+- Bridges are retained as evidence but do not count as native client libraries.
 - Preserve failed attempts and their evidence. Do not mark a capability passing based only on compilation or a mocked test.
 
 ## Convex safety
@@ -31,9 +32,9 @@ This repository tests how many programming languages can support useful Convex c
 
 ## Parallel agents
 
-- Use one branch and one worktree per language implementation.
+- Use one branch and one worktree per language implementation after the pilot.
 - Agents may edit only their assigned client directory unless their task explicitly includes shared infrastructure.
-- Shared harness, schema, manifest schema, and architecture changes must be handled separately from language batches.
+- Shared harness, schema, manifest schema, architecture, results, and site changes under `_shared/` must be handled separately from language batches.
 - Build and test the assigned client in Docker before handing it back.
 
 ## Pull requests
