@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><OptionStrict>On</OptionStrict></PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="conformance/**;**/obj/**;**/bin/**" />
+    <ProjectReference Include="../Convex.vbproj" />
+    <ProjectReference Include="conformance/Adapter.vbproj" />
+  </ItemGroup>
+</Project>

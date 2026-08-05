@@ -1,26 +1,3 @@
-# Convex from Visual Basic .NET
-
-This is a native Visual Basic .NET demonstration of Convex JSON HTTP functions
-and the experimental pinned Live sync profile. It is educational, unofficial,
-and not a production SDK.
-
-## Start here
-
-[The canonical basic example](examples/basics/Program.vb) reads a counter,
-starts Live before changing it, performs an idempotent mutation, and verifies
-the resulting Live update. This exact commented source becomes the example
-image.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| JSON HTTP queries, mutations, and actions | Implemented, awaiting root-owned shared evidence |
-| Live query subscriptions | Experimental pinned profile, awaiting root-owned shared evidence |
-| Authentication | HTTP bearer tokens only |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/Program.vb -->
-```text
 Imports System.Text.Json.Nodes
 Imports ConvexVisualBasic
 
@@ -72,37 +49,3 @@ Module Program
         End Using
     End Function
 End Module
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-```sh
-./run test visual-basic-dotnet
-./run build visual-basic-dotnet
-```
-
-`test` runs formatting-equivalent compilation and deterministic language-local
-tests inside the pinned SDK image. `build` produces the minimal amd64 adapter
-runtime. Shared verification is deliberately owned by the root integrator.
-
-## Protocol notes
-
-Live uses the pinned `convex-rs-0.10.4-unversioned-sync` profile at `/api/sync`.
-The test-only adapter speaks NDJSON v1 on stdin/stdout or `ADAPTER_LISTEN`, and
-offers `debugDisconnect` so the shared harness can prove reconnects. One
-owner loop serializes the socket, query-set versions, and reconnects. The
-delivery buffer retains the deterministic newest 16 events and bounds their
-pessimistically encoded value, error, data, and log output to one MiB per
-subscription. The adapter limits a process to eight subscriptions so stopped
-near-limit queues remain below the shared 128 MiB process ceiling.
-
-## Limitations
-
-The sync profile is not a documented stable API. Live authentication,
-optimistic updates, transition chunks, journals, and replay are intentionally
-deferred. No capability badge is claimed until shared local and hosted evidence
-is run from a reviewed commit. The final image keeps the .NET 8 runtime, TLS
-libraries and CA roots, `/bin/sh`, and the verifier's basic POSIX text tools. It
-contains no SDK, compiler, package manager, Perl, Node.js, Python, curl, Convex
-CLI, or delegated client runtime.
