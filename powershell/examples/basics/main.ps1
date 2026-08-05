@@ -1,23 +1,3 @@
-# Convex from PowerShell
-
-This small PowerShell client calls a Convex function over HTTP, then follows the same counter through the experimental Live sync profile.
-
-It is educational and unofficial, not a production SDK or a supported Convex package.
-
-## Start here
-
-The [canonical basic example](examples/basics/main.ps1) makes the counter's `0 -> 1` journey: HTTP query, initial Live value, idempotent mutation, and the Live update caused by that mutation.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| JSON HTTP queries, mutations, and actions | Implemented, pending shared evidence |
-| Pinned `/api/sync` Live reads | Implemented, pending shared evidence |
-| Capability badges | None earned yet |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.ps1 -->
-```text
 #!/usr/bin/pwsh
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot '../../client/Convex.ps1')
@@ -65,22 +45,3 @@ try {
     Write-Output "verified count: $current -> $expected"
   } finally { Remove-ConvexSubscription $live 'basic-counter' }
 } finally { if ($live) { Close-ConvexLive $live }; Close-ConvexClient $client }
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-```sh
-./run test powershell
-./run build powershell
-```
-
-The first command formats/parses and runs deterministic client and adapter checks in an amd64 PowerShell container. The second builds the final non-root runtime image. Root-owned verification separately runs the canonical example and shared local and hosted conformance.
-
-## Conformance and protocol notes
-
-`/usr/local/bin/convex-adapter` implements NDJSON protocol v1 through stdin/stdout or `ADAPTER_LISTEN`. Its one owner runspace alone reads, writes, reconnects, and advances `/api/sync` versions. Subscription relays check the active generation under a lock, and each queue retains at most its newest 16 events and one MiB of encoded data.
-
-## Limitations
-
-Live authentication, optimistic updates, WebSocket mutations/actions, tagged Convex values, query journals, and transition chunks are deliberately out of scope. `/api/sync` is pinned experimental protocol behaviour, not a stability promise.
