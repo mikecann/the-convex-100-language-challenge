@@ -85,9 +85,10 @@ test, package operation, and generated artifact.
 ```
 
 `verify-example` compiles and runs the canonical basic example inside Docker,
-then requires its query, mutation, and Live subscription to observe the expected
-counter change. The last two commands generate a clearly labelled local
-evidence preview and serve it at `http://127.0.0.1:4173`. `./run site` is
+then requires its complete stdout to match the universal ordered happy-path
+transcript in `_shared/examples/basics.expected.txt`. The last two commands
+generate a clearly labelled local evidence preview and serve it at
+`http://127.0.0.1:4173`. `./run site` is
 stricter: it ignores local results and renders only the trusted-main result
 index.
 
