@@ -23,6 +23,15 @@ This repository tests how many programming languages can support useful Convex c
 - Bridges are retained as evidence but do not count as native client libraries.
 - Preserve failed attempts and their evidence. Do not mark a capability passing based only on compilation or a mocked test.
 
+## Example code
+
+- Treat every runnable file under `<language-id>/example/` as teaching material, not just a smoke test.
+- Comment each meaningful Convex step in plain language: configuration, client creation, authentication when used, cleanup, the HTTP query, decoding into an idiomatic value, starting Live before the mutation, the initial Live value, the mutation and its idempotency key, and the resulting Live update.
+- Comment non-obvious helper functions too, including what failure they handle and why the example needs them.
+- Explain intent, sequencing, and Convex behaviour. Do not merely translate the target language's syntax into prose or comment routine error handling.
+- Keep comments close to the code they explain and concise enough that the example still reads naturally.
+- The runnable `example/` file is the canonical source. Generate the README and website from it so all three surfaces always show the same commented code.
+
 ## Convex safety
 
 - Any Convex schema change requires Michael's explicit approval before it is applied.

@@ -35,12 +35,25 @@ run                      root Docker-only orchestration entrypoint
 
 ### Example comments
 
-Examples should read like a short guided tour of the client API. Put comments
-next to each meaningful Convex step, such as creating the client, running a
-query, decoding its result, starting a Live subscription, and cleaning up the
-client or subscription. Explain the operation in terms useful to someone
-learning the library, while avoiding comments on ordinary error checks or other
-obvious target-language syntax.
+Every language example must read like a short guided tour of the client API,
+not an uncommented smoke test. The canonical runnable source should comment all
+of these steps when they are present:
+
+1. Reading deployment configuration and authentication.
+2. Creating the client and cleaning up its resources.
+3. Running the initial query over HTTP.
+4. Decoding the result into an idiomatic value for that language.
+5. Starting a Live subscription before making a change.
+6. Receiving the subscription's initial value.
+7. Running the mutation and explaining its idempotency key.
+8. Receiving the resulting Live update without polling again.
+9. Any non-obvious helper, including the failure it handles and why it exists.
+
+Put comments immediately beside the code they explain. Explain intent,
+sequencing, and Convex behaviour in terms useful to someone learning the
+library. Do not narrate obvious target-language syntax or routine error checks.
+If a client has not earned Live, omit those operations and explain the verified
+HTTP-only scope instead of including pretend code.
 
 The runnable file under `example/` is the canonical source. The evidence site
 reads that file directly, and README code blocks are generated projections

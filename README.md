@@ -31,6 +31,7 @@ Live includes HTTP. Implementation provenance is a separate label:
 - One source language, one audited entry in the roster.
 - Every build and test runs in Docker. Language toolchains are never installed on the host.
 - HTTP is the minimum useful target. Realtime and resilience are separate earned capabilities.
+- Every runnable example is a commented guided tour of the verified client API, and that same source is shown in its README and on the website.
 - A native implementation may use ordinary transport libraries, but Convex-specific behavior must be written in the target language.
 - Shared-core and transpiled clients are labelled rather than hidden.
 - Results are attached to a source commit, container digest, runtime version, protocol revision, and conformance-suite version.
