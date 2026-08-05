@@ -2,8 +2,48 @@
 
 ARG DART_IMAGE=dart:3.7.2-sdk@sha256:ede9f598a82f87ba0d6cd9fe327c02a1c7aac69ac64528b8d1ac192b3bc4c1b2
 ARG BUSYBOX_IMAGE=busybox:1.37.0-musl@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23
+ARG ALPINE_IMAGE=alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 
 FROM --platform=linux/amd64 ${BUSYBOX_IMAGE} AS busybox
+
+FROM --platform=linux/amd64 ${ALPINE_IMAGE} AS busybox-builder
+RUN apk add --no-cache \
+      build-base=0.5-r3 \
+      linux-headers=6.14.2-r0
+ADD --checksum=sha256:3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4 \
+    https://busybox.net/downloads/busybox-1.37.0.tar.bz2 /tmp/busybox.tar.bz2
+WORKDIR /src
+RUN tar -xjf /tmp/busybox.tar.bz2 && \
+    cd busybox-1.37.0 && \
+    printf '%s\n' \
+      'CONFIG_STATIC=y' \
+      'CONFIG_BUSYBOX=y' \
+      'CONFIG_ASH=y' \
+      'CONFIG_ASH_TEST=y' \
+      'CONFIG_ASH_CMDCMD=y' \
+      'CONFIG_SH_IS_ASH=y' \
+      'CONFIG_TEST=y' \
+      'CONFIG_TEST1=y' \
+      'CONFIG_TEST2=y' \
+      'CONFIG_ID=y' \
+      'CONFIG_GREP=y' \
+      > /tmp/minimal.config && \
+    make allnoconfig >/dev/null && \
+    while IFS= read -r setting; do \
+      name="${setting%%=*}"; \
+      sed -i "s/^# $name is not set$/$setting/" .config; \
+    done < /tmp/minimal.config && \
+    make oldconfig </dev/null >/dev/null && \
+    make -j2 busybox && \
+    mkdir -p /out && \
+    cp busybox /out/busybox
+RUN cd busybox-1.37.0 && \
+    ./busybox --list && \
+    file ./busybox | grep -q 'statically linked' && \
+    test "$(./busybox --list)" = "$(printf '%s\n' '[' '[[' ash grep id sh test)" && \
+    for tool in apk apt apt-get apt-key curl dpkg nc rpm wget; do \
+      test "$(./busybox "$tool" 2>/dev/null; printf '%s' "$?")" = 127; \
+    done
 
 FROM --platform=linux/amd64 ${DART_IMAGE} AS test
 WORKDIR /work
@@ -46,10 +86,13 @@ RUN set -eu; \
 
 FROM busybox AS runtime-base
 USER 0:0
-# BusyBox is the pinned non-scratch policy base, but its stock image exposes
-# hundreds of unrelated applet links. Retain only the verifier's shell, id and
-# grep surface before overlaying the exact Dart AOT runtime closure.
-RUN set -eu; \
+# Build a shell/text-tool surface containing only the applets the shared
+# verifier needs. The stock image is still the pinned non-scratch ancestry, but
+# its general-purpose multicall binary is replaced rather than hidden off PATH.
+COPY --from=busybox-builder /out/busybox /restricted-busybox
+RUN /bin/busybox sh -c 'set -eu; \
+    /bin/busybox mkdir /policy; \
+    cp /bin/busybox /policy/busybox; \
     /bin/busybox rm -rf \
       /etc/group /etc/localtime /etc/mtab /etc/network /etc/passwd /etc/shadow \
       /.cache /home /root /sbin /tmp /usr /var /lib; \
@@ -57,16 +100,51 @@ RUN set -eu; \
     /bin/busybox mkdir -p /usr/bin /usr/local/bin; \
     /bin/busybox ln -s busybox /bin/sh; \
     /bin/busybox ln -s ../../bin/busybox /usr/bin/id; \
-    /bin/busybox ln -s ../../bin/busybox /usr/bin/grep
+    /bin/busybox ln -s ../../bin/busybox /usr/bin/grep; \
+    /bin/busybox mv /restricted-busybox /bin/busybox; \
+    test "$(/bin/busybox --list | /bin/busybox grep -c "^")" = 7; \
+    for applet in "[" "[[" ash grep id sh test; do \
+      /bin/busybox --list | /bin/busybox grep -Fqx "$applet"; \
+    done; \
+    for tool in apk apt apt-get apt-key curl dpkg nc rpm wget; do \
+      if /bin/busybox "$tool" >/dev/null 2>&1; then exit 1; \
+      else status=$?; test "$status" = 127; fi; \
+    done; \
+    forbidden="$(/policy/busybox find / -xdev \( -type f -o -type l \) \
+      \( -name apk -o -name apt -o -name apt-get -o -name apt-key \
+      -o -name curl -o -name dpkg -o -name nc -o -name rpm -o -name wget \) \
+      -print)"; \
+    test -z "$forbidden"; \
+    /policy/busybox rm -rf /policy; \
+    test ! -e /policy'
 COPY --from=runtime-rootfs /runtime /
 RUN set -eu; \
     test -x /bin/sh && test -x /usr/bin/id && test -x /usr/bin/grep; \
-    test "$(/bin/busybox find /bin -mindepth 1 -maxdepth 1 | /bin/busybox wc -l)" = 2; \
-    test "$(/bin/busybox find /usr/bin -mindepth 1 -maxdepth 1 | /bin/busybox wc -l)" = 2; \
+    test "$(/bin/busybox --list | /bin/busybox grep -c '^')" = 7; \
+    for applet in '[' '[[' ash grep id sh test; do \
+      /bin/busybox --list | /bin/busybox grep -Fqx "$applet"; \
+    done; \
+    for tool in apk apt apt-get apt-key curl dpkg nc rpm wget; do \
+      if /bin/busybox "$tool" >/dev/null 2>&1; then exit 1; \
+      else status=$?; test "$status" = 127; fi; \
+    done; \
     test -r /etc/ssl/certs/ca-certificates.crt; \
     for tool in dart dartaotruntime node python python3 npm npx apt apt-get apt-key dpkg rpm debconf perl openssl curl wget nc convex gcc cc make; do \
       ! command -v "$tool"; \
-    done
+    done; \
+    scan_tree() { \
+      for path in "$1"/* "$1"/.[!.]* "$1"/..?*; do \
+        test -e "$path" || test -L "$path" || continue; \
+        case "$path" in /dev|/proc|/sys) continue;; esac; \
+        name="${path##*/}"; \
+        case "$name" in \
+          apk|apt|apt-get|apt-key|cc|convex|curl|dart|dartaotruntime|debconf|dpkg|gcc|make|nc|node|npm|npx|openssl|perl|python|python3|rpm|wget) \
+            exit 1;; \
+        esac; \
+        if test -d "$path" && test ! -L "$path"; then scan_tree "$path"; fi; \
+      done; \
+    }; \
+    scan_tree ""
 USER 65532:65532
 
 FROM runtime-base AS example-runtime
