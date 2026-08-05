@@ -20,7 +20,6 @@ increments with an idempotency key, and proves the update arrived reactively.
 | Bearer authentication | Implemented |
 | UTF-8 and nested JSON | Implemented via jq |
 | Live Add, Remove, reconnect, and query-error recovery | Implemented, pending shared evidence |
-| Canonical example against local Convex | Passes |
 
 ## Basic example
 

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 ARG ALPINE=alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 FROM ${ALPINE} AS test
-RUN apk add --no-cache bash=5.2.37-r0 jq=1.8.1-r0 openssl=3.5.7-r0 socat=1.8.1.3-r0
+RUN apk add --no-cache bash=5.2.37-r0 jq=1.8.1-r0 openssl=3.5.7-r0 socat=1.8.1.3-r0 ca-certificates=20260611-r0
 WORKDIR /opt/convex
 COPY client ./client
 COPY examples ./examples

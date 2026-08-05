@@ -14,10 +14,14 @@ queue_live_error() {
   for query in "${!LIVE_SUB[@]}"; do live_queue_push "$query" "$(jq -cn --arg name "$name" --arg message "$message" '{error:{name:$name,message:$message}}')"; done
 }
 drain_live() {
-  local raw query sub update read_status
+  local raw query sub update read_status frames=0 delivered=0
   [[ -n ${LIVE_IN:-} ]] || return 0
-  while :; do
-    read_status=0; raw=$(live_read 0.01) || read_status=$?
+  # One frame per controller turn keeps a hot subscription from starving close
+  # and unsubscribe commands. The per-subscription queue remains bounded at 16.
+  while ((frames < 1)); do
+    # Keep each frame read bounded, but leave enough room for the small timeout
+    # helper processes used by this deliberately dependency-light Bash client.
+    read_status=0; live_read 0.1 >/dev/null || read_status=$?; raw=$LIVE_READ
     if ((read_status)); then
       if ((read_status == 2)); then queue_live_error ProtocolError 'invalid RFC6455 or Convex Live frame'; live_disconnect
       elif ((read_status == 3)); then live_disconnect; live_reconnect || queue_live_error TransportError 'Live transport closed and reconnect failed'
@@ -25,6 +29,7 @@ drain_live() {
       break
     fi
     if ! jq -e '.type == "Transition" or .type == "Ping"' >/dev/null 2>&1 <<<"$raw"; then queue_live_error ProtocolError 'unsupported or malformed Convex Live message'; live_disconnect; break; fi
+    ((frames++)) || true
     while IFS=$'\t' read -r query update; do
       sub=${LIVE_SUB[$query]:-}; [[ -z $sub ]] && continue
       live_queue_push "$query" "$update"
@@ -32,7 +37,8 @@ drain_live() {
   done
   for query in "${!LIVE_QUEUE[@]}"; do
     sub=${LIVE_SUB[$query]:-}; [[ -z $sub ]] && continue
-    while live_queue_shift "$query"; do update=$LIVE_SHIFTED; jq -cn --arg s "$sub" --argjson u "$update" '{type:"subscription",subscriptionId:$s} + $u'; done
+    delivered=0
+    while ((delivered < 16)) && live_queue_shift "$query"; do update=$LIVE_SHIFTED; jq -cn --arg s "$sub" --argjson u "$update" '{type:"subscription",subscriptionId:$s} + $u'; ((delivered++)) || true; done
   done
 }
 while :; do
@@ -51,7 +57,7 @@ while :; do
       if result=$(_convex_call "$op" "$path" "$args" 2>&1); then send --arg id "$id" --argjson result "$result" '{id:$id,type:"result",value:$result.value} + (if ($result.logs|length)>0 then {logs:$result.logs} else {} end)';
       elif jq -e '.name' >/dev/null 2>&1 <<<"$result"; then send --arg id "$id" --argjson error "$result" '{id:$id,type:"error",error:($error|del(.logs))} + (if ($error.logs|length)>0 then {logs:$error.logs} else {} end)';
       else jq -cn --arg id "$id" --arg message "$result" '{id:$id,type:"error",error:{name:"TransportError",message:$message}}'; fi ;;
-    close) live_disconnect; send --arg id "$id" '{id:$id,type:"closed"}'; exit 0 ;;
+    close) live_close; send --arg id "$id" '{id:$id,type:"closed"}'; exit 0 ;;
     subscribe)
       [[ -n ${LIVE_FD:-} ]] || live_connect
       path=$(jq -r .path <<<"$line"); args=$(jq -c .args <<<"$line"); sub=$(jq -r .subscriptionId <<<"$line")
