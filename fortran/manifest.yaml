@@ -4,5 +4,31 @@ displayName: "Fortran"
 rank: 29
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Convex HTTP and pinned sync behavior are implemented in Fortran. A small generic ISO_C_BINDING transport uses libcurl for HTTP, c-ares for bounded DNS, and OpenSSL/socket primitives for TLS and RFC6455; it contains no Convex-specific logic.
+toolchain:
+  name: GNU Fortran
+  version: 14.2.0
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication is deferred.
+  - Values are exposed as JSON text rather than a richer Fortran value tree.
+  - WebSocket mutations, actions, optimistic updates, journals, replay, and TransitionChunk assembly are deferred.
+  - Live and adapter delivery are globally bounded to the newest 16 encoded events and 32 MiB with conservative overhead; the adapter coalesces queued updates per subscription.
+  - Capabilities remain unearned until the root-owned shared local and hosted conformance evidence passes.
 capabilities: []
