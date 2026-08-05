@@ -1,114 +1,430 @@
-package Convex::Subscription;
-use strict;
-use warnings;
-use threads;
-use Thread::Queue;
-use IO::Select;
-use Time::HiRes qw(time);
-use Convex::Errors;
-
-# Each subscription owns a bounded newest-16 mailbox. It deliberately drops
-# the oldest value so a slow reader eventually catches up with reactive state.
-sub new { bless { manager => $_[1], id => $_[2], queue => Thread::Queue->new, closed => 0 }, $_[0] }
-sub next_update {
-  my ($self, $timeout) = @_; my $item = defined $timeout ? $self->{queue}->dequeue_timed(time + $timeout) : $self->{queue}->dequeue;
-  die Convex::Errors::transport_error('timed out waiting for Live update', 'live') unless defined $item;
-  die Convex::Errors::closed_error('Live subscription is closed') if $item->{closed}; return $item;
-}
-sub deliver { my ($self, $update) = @_; return if $self->{closed}; $self->{queue}->dequeue_nb while $self->{queue}->pending >= 16; $self->{queue}->enqueue($update); }
-sub finish { my ($self) = @_; return if $self->{closed}++; $self->{queue}->dequeue_nb while $self->{queue}->pending; $self->{queue}->enqueue({ closed => 1 }); }
-sub close { my ($self) = @_; return if $self->{closed}; $self->{manager}->request('unsubscribe', { query_id => $self->{id} }); }
-
 package Convex::Live;
+
 use strict;
 use warnings;
+
+use threads;
+use IO::Select;
+use JSON::PP;
 use Thread::Queue;
-use JSON::PP qw(encode_json decode_json);
-use Time::HiRes qw(time sleep);
-use URI;
-use Convex::WebSocket;
+use Time::HiRes qw(sleep time);
+
 use Convex::Errors;
+use Convex::Subscription;
+use Convex::WebSocket;
+
+use constant INITIAL_BACKOFF_SECONDS => 0.1;
+use constant MAX_BACKOFF_SECONDS     => 15;
+use constant INACTIVITY_SECONDS      => 30;
+
+my $CANONICAL_JSON = JSON::PP->new->canonical->allow_nonref;
 
 sub new {
-  my ($class, $deployment_url, $client_version) = @_;
-  my $uri = URI->new($deployment_url); $uri->scheme($uri->scheme eq 'https' ? 'wss' : 'ws'); $uri->path(($uri->path || '') . '/api/sync'); $uri->query(undef); $uri->fragment(undef);
-  my $self = bless { url => $uri->as_string, client_version => $client_version, commands => Thread::Queue->new, next_id => 0, stopped => 0 }, $class;
-  $self->{worker} = threads->create(sub { $self->_run }); return $self;
+    my ( $class, $deployment_url, $client_version ) = @_;
+    my $self = bless {
+        url            => _live_url($deployment_url),
+        client_version => $client_version,
+        commands       => Thread::Queue->new,
+        next_id        => 0,
+        stopped        => 0,
+    }, $class;
+    $self->{worker} = threads->create( sub { $self->_run } );
+    return $self;
 }
+
 sub request {
-  my ($self, $type, $data) = @_; die Convex::Errors::closed_error('Convex Live manager is closed') if $self->{stopped}; my $reply = Thread::Queue->new;
-  $self->{commands}->enqueue({ type => $type, data => $data || {}, reply => $reply }); my $out = $reply->dequeue; die $out->{error} if $out->{error}; return $out->{value};
+    my ( $self, $type, $data ) = @_;
+    die Convex::Errors::closed_error('Convex Live manager is closed')
+      if $self->{stopped};
+    my $reply = Thread::Queue->new;
+    $self->{commands}->enqueue(
+        {
+            type  => $type,
+            data  => $data // {},
+            reply => $reply,
+        }
+    );
+    my $out = $reply->dequeue;
+    die $out->{error} if $out->{error};
+    return $out->{value};
 }
-sub subscribe { $_[0]->request('subscribe', { path => $_[1], args => $_[2] }) }
-sub debug_disconnect { $_[0]->request('debug_disconnect') }
-sub close { my ($self) = @_; return if $self->{stopped}++; eval { $self->request('close') }; $self->{worker}->join if $self->{worker} && !$self->{worker}->is_joinable; }
+
+sub subscribe {
+    my ( $self, $path, $args ) = @_;
+    die Convex::Errors::closed_error('Convex Live manager is closed')
+      if $self->{stopped};
+    my $id           = $self->{next_id}++;
+    my $subscription = Convex::Subscription->new( $self, $id );
+    $self->request(
+        'subscribe',
+        {
+            query_id => $id,
+            path     => $path,
+            args     => $args,
+            queue    => $subscription->{queue},
+        }
+    );
+    return $subscription;
+}
+
+sub debug_disconnect {
+    my ($self) = @_;
+    return $self->request('debug_disconnect');
+}
+
+sub close {
+    my ($self) = @_;
+    return if $self->{stopped};
+
+    # Queue shutdown while requests are still accepted. Marking stopped first
+    # would reject our own command and leave the sole worker running forever.
+    my $reply = Thread::Queue->new;
+    $self->{commands}
+      ->enqueue( { type => 'close', data => {}, reply => $reply } );
+    my $out = $reply->dequeue;
+    $self->{stopped} = 1;
+    $self->{worker}->join if $self->{worker};
+    die $out->{error}     if $out->{error};
+    return;
+}
 
 sub _run {
-  my ($self) = @_; my (%subs, %results); my ($socket, $query_version, $remote, $connections, $reason, $max_ts, $backoff, $retry_at) = (undef, 0, _zero(), 0, 'InitialConnect', undef, 0.1, 0);
-  my $closed = 0;
-  while (!$closed) {
-    # The worker alone changes socket or query-set state. Callers only enqueue commands.
-    while (my $command = $self->{commands}->dequeue_nb) {
-      my ($type, $data, $reply) = @{$command}{qw(type data reply)};
-      eval {
-        if ($type eq 'subscribe') {
-          my $id = $self->{next_id}++; my $sub = Convex::Subscription->new($self, $id); $subs{$id} = { %$data, subscription => $sub };
-          $reply->enqueue({ value => $sub });
-          _modify($socket, \$query_version, [_add($id, $subs{$id})]) if $socket; $retry_at = time unless $socket;
-        } elsif ($type eq 'unsubscribe') {
-          my $state = delete $subs{$data->{query_id}}; delete $results{$data->{query_id}};
-          if ($state) { $state->{subscription}->finish; _modify($socket, \$query_version, [{ type => 'Remove', queryId => $data->{query_id} }]) if $socket; }
-          $reply->enqueue({ value => undef });
-        } elsif ($type eq 'debug_disconnect') {
-          die Convex::Errors::transport_error('Live WebSocket is not connected', 'live') unless $socket;
-          $socket->close_now; $socket = undef; ++$connections; $reason = 'DebugDisconnect'; $retry_at = time; $reply->enqueue({ value => undef });
-        } elsif ($type eq 'close') {
-          $closed = 1; $socket->close_now if $socket; $reply->enqueue({ value => undef });
-        } else { die Convex::Errors::protocol_error("unknown Live command $type"); }
-        1;
-      } or do { $reply->enqueue({ error => $@ }); };
-    }
-    last if $closed;
-    if (!$socket && %subs && time >= $retry_at) {
-      eval {
-        $socket = Convex::WebSocket->connect($self->{url}, $self->{client_version}); $query_version = 0; $remote = _zero(); %results = ();
-        my $connect = { type => 'Connect', sessionId => _uuid(), connectionCount => $connections, lastCloseReason => $reason, clientTs => 0 }; $connect->{maxObservedTimestamp} = $max_ts if defined $max_ts;
-        $socket->write_json($connect); _modify($socket, \$query_version, [ map { _add($_, $subs{$_}) } sort { $a <=> $b } keys %subs ]) if %subs;
-        $backoff = 0.1; 1;
-      } or do { $reason = "$@"; ++$connections; $retry_at = time + $backoff; $backoff = $backoff * 2 > 15 ? 15 : $backoff * 2; $socket = undef; };
-    }
-    if ($socket) {
-      my $ready = IO::Select->new($socket->io)->can_read(0.05);
-      if (@$ready || $socket->pending) {
-        eval {
-          my $raw = $socket->read_message; die Convex::Errors::transport_error('server closed', 'live') unless defined $raw;
-          my $message = decode_json($raw); $backoff = 0.1;
-          if (($message->{type} || '') eq 'Transition') {
-            die Convex::Errors::protocol_error('Transition version mismatch') unless encode_json($message->{startVersion}) eq encode_json($remote);
-            my %changed;
-            for my $m (@{$message->{modifications} || []}) {
-              my $id = $m->{queryId};
-              if ($m->{type} eq 'QueryUpdated') { $changed{$id} = { value => $m->{value}, logs => $m->{logLines} || [] }; $results{$id} = $changed{$id}; }
-              elsif ($m->{type} eq 'QueryFailed') { $changed{$id} = { error => Convex::Errors::function_error($m->{errorMessage} || 'query failed', $m->{errorData}, $m->{logLines} || []) }; $results{$id} = $changed{$id}; }
-              elsif ($m->{type} eq 'QueryRemoved') { delete $results{$id}; }
-              else { die Convex::Errors::protocol_error('unknown Transition modification'); }
+    my ($self) = @_;
+    my %subscriptions;
+    my %last_results;
+    my $socket;
+    my $query_version     = 0;
+    my $remote_version    = _zero_version();
+    my $connection_count  = 0;
+    my $last_close_reason = 'InitialConnect';
+    my $max_observed_ts;
+    my $backoff              = INITIAL_BACKOFF_SECONDS;
+    my $retry_at             = 0;
+    my $last_server_response = time;
+    my $closed               = 0;
+
+    while ( !$closed ) {
+        while ( my $command = $self->{commands}->dequeue_nb ) {
+            my ( $type, $data, $reply ) =
+              @{$command}{qw(type data reply)};
+            my $ok = eval {
+                if ( $type eq 'subscribe' ) {
+                    my $id = $data->{query_id};
+                    $subscriptions{$id} = { %{$data}, finished => 0, };
+                    $reply->enqueue( { value => undef } );
+                    if ($socket) {
+                        _modify_query_set( $socket, \$query_version,
+                            [ _add_modification( $id, $subscriptions{$id} ) ],
+                        );
+                    }
+                    else {
+                        $retry_at = time;
+                    }
+                }
+                elsif ( $type eq 'unsubscribe' ) {
+                    my $id    = $data->{query_id};
+                    my $state = delete $subscriptions{$id};
+                    delete $last_results{$id};
+                    if ($state) {
+
+                        # Invalidate and wake the relay before publishing the
+                        # acknowledgement through the adapter.
+                        _finish_state($state);
+                        _modify_query_set( $socket, \$query_version,
+                            [ { type => 'Remove', queryId => 0 + $id } ],
+                        ) if $socket;
+                    }
+                    $retry_at = 0 unless %subscriptions;
+                    $reply->enqueue( { value => undef } );
+                }
+                elsif ( $type eq 'debug_disconnect' ) {
+                    die Convex::Errors::transport_error(
+                        'Live WebSocket is not connected', 'live' )
+                      unless $socket;
+                    $socket->close_now;
+                    $socket = undef;
+                    $connection_count += 1;
+                    $last_close_reason = 'DebugDisconnect';
+                    $query_version     = 0;
+                    $remote_version    = _zero_version();
+                    $retry_at          = time;
+
+                    # The old connection is gone and reconnect work is now
+                    # scheduled, so the adapter may safely publish its ACK.
+                    $reply->enqueue( { value => undef } );
+                }
+                elsif ( $type eq 'close' ) {
+                    $closed = 1;
+                    $socket->close_now if $socket;
+                    $socket = undef;
+                    $reply->enqueue( { value => undef } );
+                }
+                else {
+                    die Convex::Errors::protocol_error(
+                        "unknown Live command $type");
+                }
+                1;
+            };
+            $reply->enqueue( { error => $@ } ) unless $ok;
+        }
+        last if $closed;
+
+        if ( !$socket && %subscriptions && time >= $retry_at ) {
+            my $connected = eval {
+                $socket = Convex::WebSocket->connect( $self->{url},
+                    $self->{client_version} );
+                $query_version        = 0;
+                $remote_version       = _zero_version();
+                $last_server_response = time;
+                my $connect = {
+                    type            => 'Connect',
+                    sessionId       => _uuid(),
+                    connectionCount => $connection_count,
+                    lastCloseReason => $last_close_reason,
+                    clientTs        => 0,
+                };
+                $connect->{maxObservedTimestamp} = $max_observed_ts
+                  if defined $max_observed_ts;
+                $socket->write_json($connect);
+                _modify_query_set(
+                    $socket,
+                    \$query_version,
+                    [
+                        map  { _add_modification( $_, $subscriptions{$_} ) }
+                        sort { $a <=> $b } keys %subscriptions
+                    ],
+                );
+
+                # A successful handshake resets transport backoff.
+                $backoff = INITIAL_BACKOFF_SECONDS;
+                1;
+            };
+            if ( !$connected ) {
+                _publish_error( \%subscriptions, $@ );
+                $socket->close_now if $socket;
+                $socket            = undef;
+                $last_close_reason = "$@";
+                $connection_count += 1;
+                $retry_at = time + $backoff;
+                $backoff  = _next_backoff($backoff);
             }
-            $remote = $message->{endVersion}; $max_ts = $remote->{ts};
-            # Commit the complete transition, then relay only still-current subscriptions.
-            for my $id (sort { $a <=> $b } keys %changed) {
-              $subs{$id}{subscription}->deliver($changed{$id}) if $subs{$id};
+        }
+
+        if ($socket) {
+            my @ready = IO::Select->new( $socket->io )->can_read(0.05);
+            if ( @ready || $socket->pending ) {
+                my $read_ok = eval {
+                    my $raw = $socket->read_message;
+                    die Convex::Errors::transport_error( 'server closed',
+                        'live' )
+                      unless defined $raw;
+                    $last_server_response = time;
+                    my $message = JSON::PP::decode_json($raw);
+                    if ( ( $message->{type} // q{} ) eq 'Transition' ) {
+                        _handle_transition(
+                            $message,          \$remote_version,
+                            \$max_observed_ts, \%last_results,
+                            \%subscriptions,
+                        );
+
+                        # A valid transition proves a healthy connection too.
+                        $backoff = INITIAL_BACKOFF_SECONDS;
+                    }
+                    elsif ( ( $message->{type} // q{} ) =~
+                        /\A(?:Ping|MutationResponse|ActionResponse)\z/ )
+                    {
+                        $backoff = INITIAL_BACKOFF_SECONDS;
+                    }
+                    elsif ( ( $message->{type} // q{} ) eq 'TransitionChunk' ) {
+                        die Convex::Errors::protocol_error(
+                            'TransitionChunk assembly is not implemented');
+                    }
+                    else {
+                        die Convex::Errors::protocol_error(
+                            'unknown Live message');
+                    }
+                    1;
+                };
+                if ( !$read_ok ) {
+                    _publish_error( \%subscriptions, $@ );
+                    $socket->close_now if $socket;
+                    $socket = undef;
+                    $connection_count += 1;
+                    $last_close_reason = "$@";
+                    $query_version     = 0;
+                    $remote_version    = _zero_version();
+                    $retry_at          = time + $backoff;
+                    $backoff           = _next_backoff($backoff);
+                }
             }
-          } elsif (($message->{type} || '') =~ /^(Ping|MutationResponse|ActionResponse)$/) { }
-          else { die Convex::Errors::protocol_error('unknown Live message'); }
-          1;
-        } or do { my $error = $@; $_->{subscription}->deliver({ error => $error }) for values %subs; $socket->close_now; $socket = undef; ++$connections; $reason = "$error"; $retry_at = time + $backoff; $backoff = $backoff * 2 > 15 ? 15 : $backoff * 2; };
-      }
-    } else { sleep 0.02; }
-  }
-  $_->{subscription}->finish for values %subs;
+            elsif ( time - $last_server_response > INACTIVITY_SECONDS ) {
+                my $error =
+                  Convex::Errors::transport_error( 'InactiveServer', 'live' );
+                _publish_error( \%subscriptions, $error );
+                $socket->close_now;
+                $socket = undef;
+                $connection_count += 1;
+                $last_close_reason = 'InactiveServer';
+                $query_version     = 0;
+                $remote_version    = _zero_version();
+                $retry_at          = time + $backoff;
+                $backoff           = _next_backoff($backoff);
+            }
+        }
+        else {
+            sleep 0.02;
+        }
+    }
+
+    _finish_state($_) for values %subscriptions;
+    return;
 }
-sub _modify { my ($socket, $version, $mods) = @_; return unless @$mods; $socket->write_json({ type => 'ModifyQuerySet', baseVersion => $$version, newVersion => $$version + 1, modifications => $mods }); ++$$version; }
-sub _add { my ($id, $state) = @_; return { type => 'Add', queryId => 0 + $id, udfPath => $state->{path}, args => [ $state->{args} ] }; }
-sub _zero { { querySet => 0, identity => 0, ts => 'AAAAAAAAAAA=' } }
-sub _uuid { sprintf('%08x-%04x-%04x-%04x-%012x', rand(2**32), rand(2**16), rand(2**16), rand(2**16), rand(2**48)); }
+
+sub _handle_transition {
+    my ( $message, $remote_ref, $max_ts_ref,
+        $last_results_ref, $subscriptions_ref )
+      = @_;
+    die Convex::Errors::protocol_error('Transition version mismatch')
+      unless _versions_equal( $message->{startVersion}, ${$remote_ref} );
+
+    my %changed;
+    for my $modification ( @{ $message->{modifications} // [] } ) {
+        my $id = $modification->{queryId};
+        if ( ( $modification->{type} // q{} ) eq 'QueryUpdated' ) {
+            my $update = {
+                value => $modification->{value},
+                logs  => $modification->{logLines} // [],
+            };
+            my $previous = $last_results_ref->{$id};
+
+            # Reconnect hydration is not a new application value. Keep the
+            # previous result through disconnect and suppress only equality.
+            if (  !$previous
+                || $previous->{error}
+                || !_json_equal( $previous->{value}, $update->{value} ) )
+            {
+                $changed{$id} = $update;
+            }
+            $last_results_ref->{$id} = $update;
+        }
+        elsif ( ( $modification->{type} // q{} ) eq 'QueryFailed' ) {
+            my $error = Convex::Errors::function_error(
+                $modification->{errorMessage} // 'query failed',
+                $modification->{errorData},
+                $modification->{logLines} // [],
+            );
+            my $update = { error => $error };
+            $last_results_ref->{$id} = $update;
+            $changed{$id} = $update;
+        }
+        elsif ( ( $modification->{type} // q{} ) eq 'QueryRemoved' ) {
+            delete $last_results_ref->{$id};
+        }
+        else {
+            die Convex::Errors::protocol_error(
+                'unknown Transition modification');
+        }
+    }
+
+    # Commit the complete transition before any subscriber observes it.
+    ${$remote_ref} = $message->{endVersion};
+    ${$max_ts_ref} = ${$remote_ref}->{ts};
+    for my $id ( sort { $a <=> $b } keys %changed ) {
+        _deliver_state( $subscriptions_ref->{$id}, $changed{$id} )
+          if $subscriptions_ref->{$id};
+    }
+    return;
+}
+
+sub _publish_error {
+    my ( $subscriptions, $error ) = @_;
+    _deliver_state( $_, { error => $error } )
+      for values %{$subscriptions};
+    return;
+}
+
+sub _modify_query_set {
+    my ( $socket, $version_ref, $modifications ) = @_;
+    return unless @{$modifications};
+    $socket->write_json(
+        {
+            type          => 'ModifyQuerySet',
+            baseVersion   => ${$version_ref},
+            newVersion    => ${$version_ref} + 1,
+            modifications => $modifications,
+        }
+    );
+    ${$version_ref} += 1;
+    return;
+}
+
+sub _deliver_state {
+    my ( $state, $update ) = @_;
+    return if $state->{finished};
+    $state->{queue}->dequeue_nb
+      while $state->{queue}->pending >=
+      Convex::Subscription::MAX_BUFFERED_UPDATES();
+    $state->{queue}->enqueue( Convex::Subscription::_encode_update($update) );
+    return;
+}
+
+sub _finish_state {
+    my ($state) = @_;
+    return if $state->{finished}++;
+    $state->{queue}->dequeue_nb while $state->{queue}->pending;
+    $state->{queue}->enqueue( JSON::PP::encode_json( { kind => 'closed' } ) );
+    return;
+}
+
+sub _add_modification {
+    my ( $id, $state ) = @_;
+    return {
+        type    => 'Add',
+        queryId => 0 + $id,
+        udfPath => $state->{path},
+        args    => [ $state->{args} ],
+    };
+}
+
+sub _versions_equal {
+    my ( $left, $right ) = @_;
+    return 0 unless ref($left) eq 'HASH' && ref($right) eq 'HASH';
+    return
+         ( $left->{querySet} // -1 ) == ( $right->{querySet} // -2 )
+      && ( $left->{identity} // -1 ) == ( $right->{identity} // -2 )
+      && ( $left->{ts} // q{} ) eq ( $right->{ts} // q{missing} );
+}
+
+sub _json_equal {
+    my ( $left, $right ) = @_;
+    return $CANONICAL_JSON->encode($left) eq $CANONICAL_JSON->encode($right);
+}
+
+sub _zero_version {
+    return { querySet => 0, identity => 0, ts => 'AAAAAAAAAAA=' };
+}
+
+sub _next_backoff {
+    my ($current) = @_;
+    return $current * 2 > MAX_BACKOFF_SECONDS
+      ? MAX_BACKOFF_SECONDS
+      : $current * 2;
+}
+
+sub _live_url {
+    my ($url) = @_;
+    die Convex::Errors::protocol_error('invalid deployment URL for Live')
+      unless $url =~ m{\A(https?)://([^/?#]+)(/[^?#]*)?\z};
+    my ( $scheme, $authority, $path ) = ( $1, $2, $3 // q{} );
+    $scheme = $scheme eq 'https' ? 'wss' : 'ws';
+    $path =~ s{/+\z}{};
+    return "$scheme://$authority$path/api/sync";
+}
+
+sub _uuid {
+    return sprintf '%08x-%04x-%04x-%04x-%012x',
+      rand( 2**32 ), rand( 2**16 ), rand( 2**16 ),
+      rand( 2**16 ), rand( 2**48 );
+}
+
 1;
