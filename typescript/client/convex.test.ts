@@ -168,8 +168,8 @@ test("Live recovers after a query error and bounds a slow consumer to the newest
     if (!add) return;
     let start = remoteVersions.get(socket) ?? zeroVersion;
     if (add.udfPath === "demo:fail") {
-      const end = version(1);
-      sendTransition(socket, start, end, [
+      const failedVersion = version(1);
+      sendTransition(socket, start, failedVersion, [
         {
           type: "QueryFailed",
           queryId: add.queryId,
@@ -178,11 +178,23 @@ test("Live recovers after a query error and bounds a slow consumer to the newest
           logLines: ["live log"],
         },
       ]);
-      remoteVersions.set(socket, end);
+      remoteVersions.set(socket, failedVersion);
+      setTimeout(() => {
+        const recoveredVersion = version(2);
+        sendTransition(socket, failedVersion, recoveredVersion, [
+          {
+            type: "QueryUpdated",
+            queryId: add.queryId,
+            value: { recovered: true },
+            logLines: ["recovery log"],
+          },
+        ]);
+        remoteVersions.set(socket, recoveredVersion);
+      }, 10);
       return;
     }
     for (let count = 0; count < 18; count++) {
-      const end = version(count + 2);
+      const end = version(count + 3);
       sendTransition(socket, start, end, [
         { type: "QueryUpdated", queryId: add.queryId, value: count },
       ]);
@@ -199,6 +211,11 @@ test("Live recovers after a query error and bounds a slow consumer to the newest
     assert.equal(failure.name, "FunctionError");
     assert.deepEqual(failure.data, { code: "LIVE_FAIL" });
     assert.deepEqual(failure.logs, ["live log"]);
+    const recovered = await nextValue(failed);
+    assert.deepEqual(recovered, {
+      value: { recovered: true },
+      logs: ["recovery log"],
+    });
     await failed.close();
     const slow = client.subscribe("demo:many", {});
     await new Promise((resolve) => setTimeout(resolve, 40));

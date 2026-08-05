@@ -108,6 +108,25 @@ test("adapter serialises subscription errors without an id and acknowledges unsu
           ],
         }),
       );
+      setTimeout(
+        () =>
+          socket.send(
+            JSON.stringify({
+              type: "Transition",
+              startVersion: { querySet: 1, identity: 0, ts: "MQ==" },
+              endVersion: { querySet: 1, identity: 0, ts: "Mg==" },
+              modifications: [
+                {
+                  type: "QueryUpdated",
+                  queryId: add.queryId,
+                  value: { recovered: true },
+                  logLines: ["adapter recovery log"],
+                },
+              ],
+            }),
+          ),
+        10,
+      );
     }),
   );
   const adapter = streamAdapter({ CONVEX_URL: await listen(server) });
@@ -119,22 +138,28 @@ test("adapter serialises subscription errors without an id and acknowledges unsu
       path: "demo:fail",
       args: {},
     });
-    const first = await adapter.events(2);
+    const first = await adapter.events(3);
     assert.deepEqual(first[0], { id: "subscribe", type: "ack" });
     assert.equal(first[1].type, "subscription");
     assert.equal(first[1].subscriptionId, "room");
     assert.equal(Object.hasOwn(first[1], "id"), false);
     assert.equal(first[1].error.name, "FunctionError");
     assert.equal(first[1].error.data.code, "LIVE_ADAPTER_FAIL");
+    assert.deepEqual(first[2], {
+      type: "subscription",
+      subscriptionId: "room",
+      value: { recovered: true },
+      logs: ["adapter recovery log"],
+    });
     adapter.send({
       id: "unsubscribe",
       op: "unsubscribe",
       subscriptionId: "room",
     });
     adapter.send({ id: "close", op: "close" });
-    const all = await adapter.events(4);
-    assert.deepEqual(all[2], { id: "unsubscribe", type: "ack" });
-    assert.deepEqual(all[3], { id: "close", type: "closed" });
+    const all = await adapter.events(5);
+    assert.deepEqual(all[3], { id: "unsubscribe", type: "ack" });
+    assert.deepEqual(all[4], { id: "close", type: "closed" });
   } finally {
     adapter.input.destroy();
     adapter.output.destroy();
