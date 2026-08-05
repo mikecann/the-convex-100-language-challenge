@@ -20,7 +20,8 @@ int convex_call(convex_client *client, const char *operation, const char *path,
  * thread that touches libcurl's WebSocket handle. */
 convex_subscription *convex_subscribe(convex_client *client, const char *path,
                                       json_object *args, convex_error *error);
-/* Returns 1 for an update, 0 for timeout, and -1 after close. */
+/* Returns 1 for an update, 0 for timeout, and -1 after close. Subscription
+ * handles remain valid until convex_free(client), even after convex_close. */
 int convex_subscription_next(convex_subscription *subscription, convex_update *update,
                              int timeout_ms);
 int convex_unsubscribe(convex_subscription *subscription, convex_error *error);

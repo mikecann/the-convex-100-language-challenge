@@ -7,11 +7,12 @@ COPY examples ./examples
 RUN gcc -D_POSIX_C_SOURCE=200809L -std=c17 -Wall -Wextra -Werror -pthread -Iclient client/convex.c client/tests/conformance/main.c -lcurl -ljson-c -o /out-adapter && \
     gcc -DCONVEX_ADAPTER_TESTING -D_POSIX_C_SOURCE=200809L -std=c17 -Wall -Wextra -Werror -pthread -Iclient client/convex.c client/tests/conformance/main.c -lcurl -ljson-c -o /out-adapter-test && \
     gcc -D_POSIX_C_SOURCE=200809L -std=c17 -Wall -Wextra -Werror -pthread -Iclient client/convex.c examples/basics/main.c -lcurl -ljson-c -o /out-example && \
-    gcc -D_POSIX_C_SOURCE=200809L -std=c17 -Wall -Wextra -Werror -pthread -Iclient client/convex.c client/tests/live_test.c -lcurl -ljson-c -lcrypto -o /out-live-test && \
+    gcc -DCONVEX_CLIENT_TESTING -D_POSIX_C_SOURCE=200809L -std=c17 -Wall -Wextra -Werror -pthread -Iclient client/convex.c client/tests/live_test.c -lcurl -ljson-c -lcrypto -o /out-live-test && \
     file /out-adapter | grep 'x86-64'
 FROM build AS test
 RUN <<'EOF'
 set -eu
+test "$(uname -m)" = x86_64
 actual=$(/out-adapter <<'COMMANDS'
 {malformed
 {"id":"hello","protocolVersion":1,"op":"hello"}

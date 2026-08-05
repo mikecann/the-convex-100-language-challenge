@@ -67,7 +67,8 @@ int main(int argc, char **argv) {
   /* Start Live before the mutation so no reactive update can be missed. */
   convex_subscription *subscription = convex_subscribe(client, "demo:state", query_args, &error);
   convex_update update = {0};
-  if (!subscription || convex_subscription_next(subscription, &update, 10000) != 1 ||
+  if (!subscription) die(client, &error, "could not subscribe");
+  if (convex_subscription_next(subscription, &update, 10000) != 1 ||
       update.error.name || count_of(update.value) != 0)
     die(client, &update.error, "unexpected initial Live value");
   printf("live initial count: 0\n");

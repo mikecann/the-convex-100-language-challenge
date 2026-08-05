@@ -65,6 +65,21 @@ static int send_frame(int fd, int opcode, int final, const char *data, size_t le
   return send(fd,header,h,MSG_NOSIGNAL)==(ssize_t)h && send(fd,data,length,MSG_NOSIGNAL)==(ssize_t)length;
 }
 
+static int send_all(int fd, const char *data, size_t length) {
+  while(length){ssize_t sent=send(fd,data,length,MSG_NOSIGNAL);if(sent<=0)return 0;data+=sent;length-=(size_t)sent;}
+  return 1;
+}
+
+static int complete_fixture_auth(const char *request) {
+  static const char prefix[]="Authorization: Bearer ";
+  const char *header=strstr(request,prefix);
+  if(!header)return 0;
+  const char *token=header+sizeof(prefix)-1,*end=strstr(token,"\r\n");
+  if(!end||end-token!=4096||token[4095]!='Z')return 0;
+  for(size_t n=0;n<4095;n++)if(token[n]!='a')return 0;
+  return 1;
+}
+
 static void base64(const unsigned char *source, size_t length, char *output) {
   static const char table[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";size_t at=0;
   for(size_t n=0;n<length;n+=3){uint32_t value=(uint32_t)source[n]<<16;if(n+1<length)value|=(uint32_t)source[n+1]<<8;if(n+2<length)value|=source[n+2];output[at++]=table[(value>>18)&63];output[at++]=table[(value>>12)&63];output[at++]=n+1<length?table[(value>>6)&63]:'=';output[at++]=n+2<length?table[value&63]:'=';}output[at]=0;
@@ -78,9 +93,19 @@ static int accept_request(int fd) {
   if(!strstr(request,"Upgrade: websocket")&&!strstr(request,"Upgrade: WebSocket")){
     size_t header_length=(size_t)(headers_end+4-request),content_length=0;char *length_header=strstr(request,"Content-Length:");if(length_header)content_length=(size_t)strtoul(length_header+15,NULL,10);
     while(used<header_length+content_length&&used+1<sizeof(request)){ssize_t got=recv(fd,request+used,sizeof(request)-used-1,0);if(got<=0)return 0;used+=(size_t)got;request[used]=0;}
-    const char *body=headers_end+4;const char *payload;
+    const char *body=headers_end+4;
+    if(strstr(body,"\"path\":\"demo:oversize\"")){
+      const size_t body_length=2097153;
+      char header[256];int header_length=snprintf(header,sizeof(header),"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",body_length);
+      if(!send_all(fd,header,(size_t)header_length))return 0;
+      char chunk[16384];memset(chunk,'x',sizeof(chunk));size_t remaining=body_length;
+      while(remaining){size_t amount=remaining<sizeof(chunk)?remaining:sizeof(chunk);if(!send_all(fd,chunk,amount))break;remaining-=amount;}
+      return 2;
+    }
+    const char *payload;
     if(strstr(body,"\"path\":\"demo:null\""))payload="{\"status\":\"success\",\"value\":null,\"logLines\":[\"null fixture\"]}";
     else if(strstr(body,"\"path\":\"demo:fail\""))payload="{\"status\":\"error\",\"errorMessage\":\"expected fixture failure\",\"errorData\":{\"code\":\"EXPECTED\"},\"logLines\":[\"failure fixture\"]}";
+    else if(strstr(body,"\"path\":\"demo:auth\""))payload=complete_fixture_auth(request)?"{\"status\":\"success\",\"value\":{\"auth\":true}}":"{\"status\":\"error\",\"errorMessage\":\"truncated auth header\"}";
     else payload="{\"status\":\"success\",\"value\":{\"unicode\":\"世界\",\"nested\":{\"nil\":null}},\"logLines\":[\"success fixture\"]}";
     char response[1024];int response_length=snprintf(response,sizeof(response),"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",strlen(payload),payload);return send(fd,response,(size_t)response_length,0)==response_length?2:0;
   }
@@ -105,14 +130,24 @@ static int send_transition(int fd,int query_id,int start_query_set,int end_query
   json_object_put(root);return okay;
 }
 
+static int send_malformed_version(int fd,int query_set,const char *start_ts,int kind) {
+  json_object *root=json_object_new_object(),*start=json_object_new_object(),*end=json_object_new_object(),*mods=json_object_new_array();
+  json_object_object_add(root,"type",json_object_new_string("Transition"));
+  json_object_object_add(start,"querySet",json_object_new_int(query_set));json_object_object_add(start,"identity",json_object_new_int(0));
+  json_object_object_add(start,"ts",kind==2?NULL:json_object_new_int(42));
+  json_object_object_add(end,"querySet",json_object_new_int(query_set));json_object_object_add(end,"identity",json_object_new_int(0));json_object_object_add(end,"ts",json_object_new_string(start_ts));
+  json_object_object_add(root,"startVersion",start);json_object_object_add(root,"endVersion",end);json_object_object_add(root,"modifications",mods);
+  const char *text=json_object_to_json_string_ext(root,JSON_C_TO_STRING_PLAIN);int okay=send_frame(fd,1,1,text,strlen(text));json_object_put(root);return okay;
+}
+
 static void *fixture_thread(void *opaque) {
   fixture *server=opaque;int serial=0;
   while(!server->stop){int fd=accept(server->listener,NULL,NULL);if(fd<0){if(server->stop)break;continue;}int request_kind=accept_request(fd);if(request_kind==2){close(fd);continue;}if(request_kind!=1){close(fd);fixture_fail(server,"request handshake failed");continue;}
     char *text=NULL;if(!read_frame(fd,&text)){close(fd);continue;}json_object *connect=json_tokener_parse(text);free(text);int connection_count=-1;if(!connect||!integer_field(connect,"connectionCount",&connection_count)){if(connect)json_object_put(connect);close(fd);fixture_fail(server,"invalid Connect");continue;}pthread_mutex_lock(&server->mutex);int base=server->connection_base,expected=server->connections-base;server->connections++;pthread_cond_broadcast(&server->changed);pthread_mutex_unlock(&server->mutex);if(connection_count!=expected){json_object_put(connect);close(fd);fixture_fail(server,"connectionCount did not advance exactly");continue;}if(base==0&&expected>=1&&expected<=5){json_object *reason=NULL,*timestamp=NULL;char expected_timestamp[64];snprintf(expected_timestamp,sizeof(expected_timestamp),"%010d=",serial);if(!json_object_object_get_ex(connect,"lastCloseReason",&reason)||strcmp(json_object_get_string(reason),"DebugDisconnect")||!json_object_object_get_ex(connect,"maxObservedTimestamp",&timestamp)||strcmp(json_object_get_string(timestamp),expected_timestamp)){json_object_put(connect);close(fd);fixture_fail(server,"debug reconnect metadata was not preserved");continue;}}json_object_put(connect);
     if(!read_frame(fd,&text)){close(fd);continue;}json_object *add=json_tokener_parse(text);free(text);json_object *mods=NULL,*mod=NULL,*field=NULL;int query_id=-1,query_set=0;if(!add||!json_object_object_get_ex(add,"modifications",&mods)||(mod=json_object_array_get_idx(mods,0))==NULL||!json_object_object_get_ex(mod,"type",&field)||strcmp(json_object_get_string(field),"Add")||!integer_field(mod,"queryId",&query_id)||!integer_field(add,"newVersion",&query_set)){if(add)json_object_put(add);close(fd);fixture_fail(server,"invalid Add");continue;}json_object_put(add);
     serial++;char current_ts[64];snprintf(current_ts,sizeof(current_ts),"%010d=",serial);pthread_mutex_lock(&server->mutex);int generation=server->generation,count=server->desired_count,failure=server->desired_failure,fragment=server->desired_fragment;server->sent_generation=generation;pthread_cond_broadcast(&server->changed);pthread_mutex_unlock(&server->mutex);if(!send_transition(fd,query_id,0,query_set,"AAAAAAAAAAA=",serial,count,failure,fragment)){close(fd);continue;}
-    for(;;){pthread_mutex_lock(&server->mutex);int stop=server->stop,new_generation=server->generation,malformed=server->desired_malformed;count=server->desired_count;failure=server->desired_failure;fragment=server->desired_fragment;pthread_mutex_unlock(&server->mutex);if(stop)break;if(new_generation!=generation){generation=new_generation;if(malformed){send_frame(fd,1,1,"{not-json",9);}else{serial++;if(!send_transition(fd,query_id,query_set,query_set,current_ts,serial,count,failure,fragment))break;snprintf(current_ts,sizeof(current_ts),"%010d=",serial);}pthread_mutex_lock(&server->mutex);server->sent_generation=generation;pthread_cond_broadcast(&server->changed);pthread_mutex_unlock(&server->mutex);}
-      struct pollfd poller={.fd=fd,.events=POLLIN};int ready=poll(&poller,1,5);if(ready>0){if(!read_frame(fd,&text))break;json_object *message=json_tokener_parse(text);free(text);json_object *type=NULL;if(message&&json_object_object_get_ex(message,"type",&type)&&!strcmp(json_object_get_string(type),"ModifyQuerySet")){json_object *items=NULL;json_object_object_get_ex(message,"modifications",&items);json_object *item=items?json_object_array_get_idx(items,0):NULL;json_object *kind=NULL;if(item&&json_object_object_get_ex(item,"type",&kind)&&!strcmp(json_object_get_string(kind),"Remove")){pthread_mutex_lock(&server->mutex);server->remove_seen++;pthread_cond_broadcast(&server->changed);pthread_mutex_unlock(&server->mutex);json_object_put(message);break;}}if(message)json_object_put(message);}}
+    for(;;){pthread_mutex_lock(&server->mutex);int stop=server->stop,new_generation=server->generation,malformed=server->desired_malformed;count=server->desired_count;failure=server->desired_failure;fragment=server->desired_fragment;pthread_mutex_unlock(&server->mutex);if(stop)break;if(new_generation!=generation){generation=new_generation;if(malformed==1){send_frame(fd,1,1,"{not-json",9);}else if(malformed==2||malformed==3){send_malformed_version(fd,query_set,current_ts,malformed);}else{serial++;if(!send_transition(fd,query_id,query_set,query_set,current_ts,serial,count,failure,fragment))break;snprintf(current_ts,sizeof(current_ts),"%010d=",serial);}pthread_mutex_lock(&server->mutex);server->sent_generation=generation;pthread_cond_broadcast(&server->changed);pthread_mutex_unlock(&server->mutex);}
+      struct pollfd poller={.fd=fd,.events=POLLIN};int ready=poll(&poller,1,5);if(ready>0){if(!read_frame(fd,&text))break;json_object *message=json_tokener_parse(text);free(text);json_object *type=NULL;if(message&&json_object_object_get_ex(message,"type",&type)&&!strcmp(json_object_get_string(type),"ModifyQuerySet")){json_object *items=NULL,*new_version=NULL;json_object_object_get_ex(message,"modifications",&items);json_object *item=items?json_object_array_get_idx(items,0):NULL;json_object *kind=NULL;if(item&&json_object_object_get_ex(item,"type",&kind)&&!strcmp(json_object_get_string(kind),"Remove")){pthread_mutex_lock(&server->mutex);server->remove_seen++;pthread_cond_broadcast(&server->changed);pthread_mutex_unlock(&server->mutex);json_object_put(message);break;}if(item&&kind&&!strcmp(json_object_get_string(kind),"Add")&&integer_field(item,"queryId",&query_id)&&json_object_object_get_ex(message,"newVersion",&new_version)){int next_query_set=json_object_get_int(new_version);serial++;if(!send_transition(fd,query_id,query_set,next_query_set,current_ts,serial,count,failure,fragment)){json_object_put(message);break;}query_set=next_query_set;snprintf(current_ts,sizeof(current_ts),"%010d=",serial);}}if(message)json_object_put(message);}}
     close(fd);
   }return NULL;
 }
@@ -123,6 +158,7 @@ static void fixture_change(fixture *server,int count,int failure,int malformed,i
 static void fixture_configure(fixture *server,int count,int failure,int malformed,int fragmented){pthread_mutex_lock(&server->mutex);server->desired_count=count;server->desired_failure=failure;server->desired_malformed=malformed;server->desired_fragment=fragmented;server->generation++;pthread_mutex_unlock(&server->mutex);}
 static void wait_connections(fixture *server,int count){pthread_mutex_lock(&server->mutex);while(server->connections<count&&!server->failed)pthread_cond_wait(&server->changed,&server->mutex);pthread_mutex_unlock(&server->mutex);}
 static void wait_removes(fixture *server,int count){pthread_mutex_lock(&server->mutex);while(server->remove_seen<count&&!server->failed)pthread_cond_wait(&server->changed,&server->mutex);pthread_mutex_unlock(&server->mutex);}
+static int fixture_connections(fixture *server){pthread_mutex_lock(&server->mutex);int count=server->connections;pthread_mutex_unlock(&server->mutex);return count;}
 
 static int update_count(convex_subscription *sub,int expected,int expect_error){convex_update update={0};int got=convex_subscription_next(sub,&update,5000);if(got!=1){fprintf(stderr,"update wait returned %d\n",got);return 0;}int okay;if(expect_error==1)okay=update.error.name&&update.error.data;else if(expect_error==2)okay=update.error.name&&!strcmp(update.error.name,"ProtocolError");else{json_object *count=NULL,*text=NULL;okay=!update.error.name&&update.value&&json_object_object_get_ex(update.value,"count",&count)&&json_object_get_int(count)==expected&&json_object_object_get_ex(update.value,"text",&text)&&!strcmp(json_object_get_string(text),"Hello, 世界 👋");}if(!okay)fprintf(stderr,"unexpected update error=%s message=%s value=%s\n",update.error.name?update.error.name:"",update.error.message?update.error.message:"",update.value?json_object_to_json_string(update.value):"null");convex_update_free(&update);return okay;}
 
@@ -149,6 +185,33 @@ static void relay_byte(int fd){char byte;check(read(fd,&byte,1)==1,"relay barrie
 static void relay_resume(relay_control *control){char byte='x';check(write(control->resume[1],&byte,1)==1,"relay resume");}
 static void require_no_adapter_event(adapter_process *process){struct pollfd descriptor={.fd=fileno(process->output),.events=POLLIN};check(poll(&descriptor,1,100)==0,"stale adapter subscription event");}
 
+static void test_http_guards(const char *url) {
+  convex_error error={0};convex_result result={0};json_object *args=json_object_new_object();
+  convex_client *client=convex_new(url,"c-http-fixture",&error);check(client!=NULL,"HTTP fixture client");
+  char *token=malloc(4097);check(token!=NULL,"long auth token allocation");memset(token,'a',4095);token[4095]='Z';token[4096]=0;
+  check(convex_set_auth(client,token,&error),"long bearer token accepted");free(token);
+  check(convex_call(client,"query","demo:auth",args,&result,&error),"long bearer token transmitted without truncation");
+  json_object *auth=NULL;check(result.value&&json_object_object_get_ex(result.value,"auth",&auth)&&json_object_get_boolean(auth),"fixture observed complete bearer token");convex_result_free(&result);
+  check(!convex_call(client,"query","demo:oversize",args,&result,&error),"oversized HTTP response rejected");
+  check(error.name&&!strcmp(error.name,"TransportError"),"oversized HTTP response reports transport error");convex_error_free(&error);
+  check(convex_close(client,5000,&error),"HTTP-only client closes");
+  check(!convex_call(client,"query","demo:echo",args,&result,&error)&&error.message&&!strcmp(error.message,"client is closed"),"HTTP call rejects closed client");convex_error_free(&error);
+  check(!convex_set_auth(client,"replacement",&error)&&error.message&&!strcmp(error.message,"client is closed"),"auth replacement rejects closed client");convex_error_free(&error);
+  convex_free(client);json_object_put(args);
+}
+
+static void test_snapshot_add_race(fixture *server,const char *url) {
+  int ready[2],resume[2];check(!pipe(ready)&&!pipe(resume),"snapshot race pipes");
+  char value[32];snprintf(value,sizeof(value),"%d",ready[1]);setenv("CONVEX_TEST_SNAPSHOT_READY_FD",value,1);snprintf(value,sizeof(value),"%d",resume[0]);setenv("CONVEX_TEST_SNAPSHOT_RESUME_FD",value,1);
+  pthread_mutex_lock(&server->mutex);server->connection_base=server->connections;pthread_mutex_unlock(&server->mutex);fixture_configure(server,30,0,0,0);
+  convex_error error={0};convex_client *client=convex_new(url,"c-snapshot-race",&error);json_object *args=json_object_new_object();json_object_object_add(args,"room",json_object_new_string("snapshot-race"));
+  convex_subscription *first=convex_subscribe(client,"demo:state",args,&error);check(first!=NULL,"first snapshot subscription");char byte;check(read(ready[0],&byte,1)==1,"initial Add snapshot captured");
+  convex_subscription *second=convex_subscribe(client,"demo:state",args,&error);check(second!=NULL,"concurrent snapshot subscription");unsetenv("CONVEX_TEST_SNAPSHOT_READY_FD");unsetenv("CONVEX_TEST_SNAPSHOT_RESUME_FD");byte='x';check(write(resume[1],&byte,1)==1,"release initial Add snapshot");
+  check(update_count(first,30,0),"snapshot subscription receives initial value");check(update_count(second,30,0),"concurrent Add remains pending and receives initial value");
+  check(convex_close(client,5000,&error),"snapshot client closes");convex_update after_close={0};check(convex_subscription_next(first,&after_close,0)==-1,"first subscription handle survives close");check(convex_subscription_next(second,&after_close,0)==-1,"second subscription handle survives close");
+  convex_free(client);json_object_put(args);close(ready[0]);close(ready[1]);close(resume[0]);close(resume[1]);
+}
+
 static void test_adapter_events(fixture *server,const char *url) {
   pthread_mutex_lock(&server->mutex);server->connection_base=server->connections;pthread_mutex_unlock(&server->mutex);
   adapter_process adapter=start_adapter(url);json_object *event,*field=NULL;fprintf(stderr,"adapter fixture: HTTP result\n");
@@ -173,6 +236,7 @@ static void test_adapter_relay_races(fixture *server,const char *url) {
 
 int main(void) {
   fixture server;fixture_start(&server);char url[128];snprintf(url,sizeof(url),"http://127.0.0.1:%d",server.port);convex_error error={0};convex_client *client=convex_new(url,"c-live-fixture",&error);json_object *args=json_object_new_object();json_object_object_add(args,"room",json_object_new_string("fixture"));
+  test_http_guards(url);
   convex_subscription *sub=convex_subscribe(client,"demo:state",args,&error);check(sub&&update_count(sub,0,0),"initial fragmented Live update");
   fixture_change(&server,1,0,0,1);check(update_count(sub,1,0),"fragmented UTF-8 update");
   for(int n=1;n<=5;n++){check(convex_debug_disconnect(client,&error),"debug disconnect ack");wait_connections(&server,n+1);check(update_count(sub,1,0),"reconnect update");}
@@ -182,6 +246,6 @@ int main(void) {
   struct timespec settle={.tv_sec=0,.tv_nsec=100000000L};nanosleep(&settle,NULL);
   check(update_count(sub,6,0),"bounded newest-16 queue drops oldest");
   for(int n=7;n<=21;n++)check(update_count(sub,n,0),"bounded queue preserves newest order");
-  fixture_change(&server,1,0,1,0);check(update_count(sub,0,2),"malformed server message becomes protocol error");wait_connections(&server,8);
-  check(convex_unsubscribe(sub,&error),"final unsubscribe");check(convex_close(client,5000,&error),"blocked close completes");convex_free(client);json_object_put(args);test_adapter_events(&server,url);test_adapter_relay_races(&server,url);fixture_stop(&server);puts("PASS native C Live and adapter fixtures");return 0;
+  for(int malformed=1;malformed<=3;malformed++){int before=fixture_connections(&server);fixture_change(&server,1,0,malformed,0);check(update_count(sub,0,2),malformed==1?"invalid JSON becomes protocol error":malformed==2?"null version timestamp becomes protocol error":"non-string version timestamp becomes protocol error");wait_connections(&server,before+1);check(update_count(sub,1,0),"Live query recovers after malformed Transition");}
+  check(convex_unsubscribe(sub,&error),"final unsubscribe");check(convex_close(client,5000,&error),"blocked close completes");convex_free(client);json_object_put(args);test_snapshot_add_race(&server,url);test_adapter_events(&server,url);test_adapter_relay_races(&server,url);fixture_stop(&server);puts("PASS native C Live and adapter fixtures");return 0;
 }

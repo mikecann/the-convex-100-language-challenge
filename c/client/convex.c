@@ -16,6 +16,7 @@ struct convex_client { char *url; char *version; char *token; live_manager *live
 struct bytes { char *data; size_t length; };
 
 #define LIVE_QUEUE_CAPACITY 16
+#define HTTP_MAX_RESPONSE 2097152
 #define LIVE_MAX_MESSAGE 2097152
 #define LIVE_INITIAL_TS "AAAAAAAAAAA="
 
@@ -28,6 +29,7 @@ struct convex_subscription {
   int add_pending;
   int remove_pending;
   int remove_done;
+  uint64_t add_sequence;
   convex_update queue[LIVE_QUEUE_CAPACITY];
   size_t queue_start;
   size_t queue_count;
@@ -42,6 +44,7 @@ struct live_manager {
   pthread_cond_t updates;
   convex_subscription *subscriptions;
   uint32_t next_query_id;
+  uint64_t next_add_sequence;
   uint32_t query_set_version;
   uint32_t remote_query_set;
   uint32_t remote_identity;
@@ -53,10 +56,13 @@ struct live_manager {
   int stopped;
   int debug_requested;
   int connected;
+  int worker_joined;
   unsigned long debug_generation;
   unsigned long debug_completed;
   CURL *socket;
 };
+
+static void destroy_live(live_manager *manager);
 
 static char *duplicate(const char *s) { size_t n = strlen(s) + 1; char *p = malloc(n); if (p) memcpy(p, s, n); return p; }
 static void fail(convex_error *e, const char *name, const char *message, json_object *data) {
@@ -66,7 +72,13 @@ static void fail(convex_error *e, const char *name, const char *message, json_ob
 void convex_error_free(convex_error *e) { if (!e) return; free(e->name); free(e->message); if(e->data) json_object_put(e->data); if(e->logs) json_object_put(e->logs); memset(e,0,sizeof(*e)); }
 void convex_result_free(convex_result *r) { if (!r) return; if(r->value) json_object_put(r->value); if(r->logs) json_object_put(r->logs); memset(r,0,sizeof(*r)); }
 static size_t receive(void *contents, size_t size, size_t nmemb, void *opaque) {
-  struct bytes *b=opaque; size_t add=size*nmemb; char *next=realloc(b->data,b->length+add+1); if(!next || b->length+add > 2097152) return 0;
+  struct bytes *b=opaque;
+  if (size && nmemb > SIZE_MAX / size) return 0;
+  size_t add=size*nmemb;
+  /* Reject the chunk while b still owns its original allocation. Reallocating
+   * first can move that allocation and leave the caller with a stale pointer. */
+  if (b->length > HTTP_MAX_RESPONSE || add > HTTP_MAX_RESPONSE - b->length) return 0;
+  char *next=realloc(b->data,b->length+add+1); if(!next) return 0;
   b->data=next; memcpy(b->data+b->length,contents,add); b->length+=add; b->data[b->length]=0; return add;
 }
 convex_client *convex_new(const char *url, const char *version, convex_error *e) {
@@ -75,14 +87,26 @@ convex_client *convex_new(const char *url, const char *version, convex_error *e)
   c->url=duplicate(url); while(strlen(c->url)>0 && c->url[strlen(c->url)-1]=='/') c->url[strlen(c->url)-1]=0;
   c->version=duplicate(version ? version : "c-0.1.0"); return c;
 }
-void convex_free(convex_client *c) { if(c){convex_error ignored={0};convex_close(c,-1,&ignored);convex_error_free(&ignored);free(c->url);free(c->version);free(c->token);free(c);} }
-int convex_set_auth(convex_client *c,const char *token,convex_error *e) { if(!c){fail(e,"Error","client is closed",NULL);return 0;} free(c->token); c->token=token&&*token?duplicate(token):NULL; return 1; }
+void convex_free(convex_client *c) { if(c){convex_error ignored={0};convex_close(c,-1,&ignored);convex_error_free(&ignored);destroy_live(c->live);free(c->url);free(c->version);free(c->token);free(c);} }
+int convex_set_auth(convex_client *c,const char *token,convex_error *e) { if(!c||c->closed){fail(e,"Error","client is closed",NULL);return 0;}char *next=token&&*token?duplicate(token):NULL;if(token&&*token&&!next){fail(e,"Error","out of memory",NULL);return 0;}free(c->token);c->token=next;return 1; }
 int convex_call(convex_client *c,const char *operation,const char *path,json_object *args,convex_result *r,convex_error *e) {
-  if(!c || !path || !*path || !args || json_object_get_type(args)!=json_type_object){ fail(e,"ProtocolError","Convex arguments must be a JSON object",NULL); return 0; }
+  if(!c || c->closed){ fail(e,"Error","client is closed",NULL); return 0; }
+  if(!path || !*path || !args || json_object_get_type(args)!=json_type_object){ fail(e,"ProtocolError","Convex arguments must be a JSON object",NULL); return 0; }
   json_object *request=json_object_new_object(); json_object_object_add(request,"path",json_object_new_string(path)); json_object_object_add(request,"args",json_object_get(args)); json_object_object_add(request,"format",json_object_new_string("json"));
   char endpoint[2048]; snprintf(endpoint,sizeof(endpoint),"%s/api/%s",c->url,operation);
   CURL *curl=curl_easy_init(); struct bytes body={0}; if(!curl){json_object_put(request);fail(e,"TransportError","could not create HTTP client",NULL);return 0;}
-  struct curl_slist *headers=NULL; headers=curl_slist_append(headers,"Content-Type: application/json"); headers=curl_slist_append(headers,"Accept: application/json"); char client_header[256]; snprintf(client_header,sizeof(client_header),"Convex-Client: %s",c->version); headers=curl_slist_append(headers,client_header); char auth[2048]; if(c->token){snprintf(auth,sizeof(auth),"Authorization: Bearer %s",c->token);headers=curl_slist_append(headers,auth);}
+  struct curl_slist *headers=NULL; headers=curl_slist_append(headers,"Content-Type: application/json"); headers=curl_slist_append(headers,"Accept: application/json"); char client_header[256]; snprintf(client_header,sizeof(client_header),"Convex-Client: %s",c->version); headers=curl_slist_append(headers,client_header);
+  if(c->token){
+    static const char prefix[]="Authorization: Bearer ";
+    size_t token_length=strlen(c->token);
+    if(token_length>SIZE_MAX-sizeof(prefix)){curl_slist_free_all(headers);curl_easy_cleanup(curl);json_object_put(request);fail(e,"Error","authentication token is too large",NULL);return 0;}
+    char *auth=malloc(sizeof(prefix)+token_length);
+    if(!auth){curl_slist_free_all(headers);curl_easy_cleanup(curl);json_object_put(request);fail(e,"Error","out of memory",NULL);return 0;}
+    memcpy(auth,prefix,sizeof(prefix)-1);memcpy(auth+sizeof(prefix)-1,c->token,token_length+1);
+    struct curl_slist *with_auth=curl_slist_append(headers,auth);free(auth);
+    if(!with_auth){curl_slist_free_all(headers);curl_easy_cleanup(curl);json_object_put(request);fail(e,"Error","out of memory",NULL);return 0;}
+    headers=with_auth;
+  }
   curl_easy_setopt(curl,CURLOPT_URL,endpoint); curl_easy_setopt(curl,CURLOPT_POST,1L); curl_easy_setopt(curl,CURLOPT_POSTFIELDS,json_object_to_json_string_ext(request,JSON_C_TO_STRING_PLAIN)); curl_easy_setopt(curl,CURLOPT_HTTPHEADER,headers); curl_easy_setopt(curl,CURLOPT_WRITEFUNCTION,receive); curl_easy_setopt(curl,CURLOPT_WRITEDATA,&body); curl_easy_setopt(curl,CURLOPT_TIMEOUT,30L);
   CURLcode code=curl_easy_perform(curl); curl_slist_free_all(headers); curl_easy_cleanup(curl); json_object_put(request);
   if(code!=CURLE_OK){free(body.data);fail(e,"TransportError",curl_easy_strerror(code),NULL);return 0;}
@@ -279,15 +303,25 @@ static int connect_socket(live_manager *manager, char *reason, size_t reason_siz
   json_object *connect = connect_message(manager);
   int okay = ws_send_json(socket, connect, reason, reason_size); json_object_put(connect);
   if (!okay) { curl_easy_cleanup(manager->socket);manager->socket=NULL; return 0; }
+  uint64_t snapshot_sequence = 0;
   pthread_mutex_lock(&manager->mutex);
   if (active_count_locked(manager)) {
+    snapshot_sequence = manager->next_add_sequence;
     json_object *modify = modify_message_locked(manager, NULL, 0);
     pthread_mutex_unlock(&manager->mutex);
+#ifdef CONVEX_CLIENT_TESTING
+    /* A test-only barrier makes the Add-snapshot race deterministic without
+     * changing normal client behavior or exposing a public testing API. */
+    const char *ready_value=getenv("CONVEX_TEST_SNAPSHOT_READY_FD");
+    const char *resume_value=getenv("CONVEX_TEST_SNAPSHOT_RESUME_FD");
+    if(ready_value&&*ready_value&&resume_value&&*resume_value){char byte='x';int ready_fd=atoi(ready_value),resume_fd=atoi(resume_value);(void)write(ready_fd,&byte,1);(void)read(resume_fd,&byte,1);}
+#endif
     okay = ws_send_json(socket, modify, reason, reason_size); json_object_put(modify);
     pthread_mutex_lock(&manager->mutex);
     if (okay) {
       manager->query_set_version = 1;
-      for (convex_subscription *sub=manager->subscriptions;sub;sub=sub->next) sub->add_pending=0;
+      for (convex_subscription *sub=manager->subscriptions;sub;sub=sub->next)
+        if(sub->add_sequence<=snapshot_sequence)sub->add_pending=0;
     }
   }
   pthread_mutex_unlock(&manager->mutex);
@@ -299,11 +333,21 @@ static int connect_socket(live_manager *manager, char *reason, size_t reason_siz
 static int state_version(json_object *root, const char *name, uint32_t *query_set,
                          uint32_t *identity, const char **timestamp) {
   json_object *version=NULL,*q=NULL,*i=NULL,*ts=NULL;
-  return json_object_object_get_ex(root,name,&version) &&
-    json_object_object_get_ex(version,"querySet",&q) &&
-    json_object_object_get_ex(version,"identity",&i) &&
-    json_object_object_get_ex(version,"ts",&ts) &&
-    ((*query_set=(uint32_t)json_object_get_int64(q)),(*identity=(uint32_t)json_object_get_int64(i)),(*timestamp=json_object_get_string(ts)),1);
+  if(!root||json_object_get_type(root)!=json_type_object ||
+    !json_object_object_get_ex(root,name,&version) || !version ||
+    json_object_get_type(version)!=json_type_object ||
+    !json_object_object_get_ex(version,"querySet",&q) || !q ||
+    json_object_get_type(q)!=json_type_int ||
+    !json_object_object_get_ex(version,"identity",&i) || !i ||
+    json_object_get_type(i)!=json_type_int ||
+    !json_object_object_get_ex(version,"ts",&ts)) return 0;
+  int64_t q_value=json_object_get_int64(q),i_value=json_object_get_int64(i);
+  if(!ts||json_object_get_type(ts)!=json_type_string || q_value<0 ||
+    q_value>UINT32_MAX || i_value<0 || i_value>UINT32_MAX) return 0;
+  const char *ts_value=json_object_get_string(ts);
+  if(!ts_value||strlen(ts_value)>=128) return 0;
+  *query_set=(uint32_t)q_value;*identity=(uint32_t)i_value;*timestamp=ts_value;
+  return 1;
 }
 
 static int handle_transition(live_manager *manager, json_object *message,
@@ -389,7 +433,7 @@ static live_manager *ensure_live(convex_client *client, convex_error *error) {
 }
 
 convex_subscription *convex_subscribe(convex_client *client,const char *path,json_object *args,convex_error *error){
-  if(!client||!path||!*path||!args||json_object_get_type(args)!=json_type_object){fail(error,"ProtocolError","Live query path and object arguments are required",NULL);return NULL;}live_manager *manager=ensure_live(client,error);if(!manager)return NULL;convex_subscription *sub=calloc(1,sizeof(*sub));if(!sub){fail(error,"Error","out of memory",NULL);return NULL;}sub->manager=manager;sub->path=duplicate(path);sub->args=json_object_get(args);sub->active=1;sub->add_pending=1;pthread_mutex_lock(&manager->mutex);sub->query_id=manager->next_query_id++;sub->next=manager->subscriptions;manager->subscriptions=sub;pthread_cond_broadcast(&manager->changed);pthread_mutex_unlock(&manager->mutex);return sub;
+  if(!client||!path||!*path||!args||json_object_get_type(args)!=json_type_object){fail(error,"ProtocolError","Live query path and object arguments are required",NULL);return NULL;}live_manager *manager=ensure_live(client,error);if(!manager)return NULL;convex_subscription *sub=calloc(1,sizeof(*sub));if(!sub){fail(error,"Error","out of memory",NULL);return NULL;}sub->manager=manager;sub->path=duplicate(path);sub->args=json_object_get(args);sub->active=1;sub->add_pending=1;pthread_mutex_lock(&manager->mutex);sub->query_id=manager->next_query_id++;sub->add_sequence=++manager->next_add_sequence;sub->next=manager->subscriptions;manager->subscriptions=sub;pthread_cond_broadcast(&manager->changed);pthread_mutex_unlock(&manager->mutex);return sub;
 }
 
 int convex_subscription_next(convex_subscription *sub,convex_update *update,int timeout_ms){if(!sub||!update)return -1;memset(update,0,sizeof(*update));live_manager *manager=sub->manager;pthread_mutex_lock(&manager->mutex);struct timespec deadline={0};if(timeout_ms>=0)deadline=realtime_after_ms(timeout_ms);while(!sub->queue_count&&sub->active&&!manager->stopped){int result=timeout_ms<0?pthread_cond_wait(&manager->updates,&manager->mutex):pthread_cond_timedwait(&manager->updates,&manager->mutex,&deadline);if(result==ETIMEDOUT){pthread_mutex_unlock(&manager->mutex);return 0;}}if(!sub->queue_count){pthread_mutex_unlock(&manager->mutex);return -1;}*update=sub->queue[sub->queue_start];memset(&sub->queue[sub->queue_start],0,sizeof(*update));sub->queue_start=(sub->queue_start+1)%LIVE_QUEUE_CAPACITY;sub->queue_count--;pthread_mutex_unlock(&manager->mutex);return 1;}
@@ -398,4 +442,6 @@ int convex_unsubscribe(convex_subscription *sub,convex_error *error){if(!sub)ret
 
 int convex_debug_disconnect(convex_client *client,convex_error *error){if(!client||!client->live){fail(error,"TransportError","Live WebSocket is not connected",NULL);return 0;}live_manager *manager=client->live;pthread_mutex_lock(&manager->mutex);if(!manager->connected){pthread_mutex_unlock(&manager->mutex);fail(error,"TransportError","Live WebSocket is not connected",NULL);return 0;}unsigned long generation=++manager->debug_generation;manager->debug_requested=1;pthread_cond_broadcast(&manager->changed);while(manager->debug_completed<generation&&!manager->stopped)pthread_cond_wait(&manager->changed,&manager->mutex);int okay=manager->debug_completed>=generation;pthread_mutex_unlock(&manager->mutex);if(!okay)fail(error,"TransportError","client closed during debug disconnect",NULL);return okay;}
 
-int convex_close(convex_client *client,int timeout_ms,convex_error *error){if(!client)return 1;if(client->closed&&!client->live)return 1;client->closed=1;live_manager *manager=client->live;if(!manager)return 1;pthread_mutex_lock(&manager->mutex);manager->closing=1;pthread_cond_broadcast(&manager->changed);struct timespec deadline={0};if(timeout_ms>=0)deadline=realtime_after_ms(timeout_ms);while(!manager->stopped){int result=timeout_ms<0?pthread_cond_wait(&manager->changed,&manager->mutex):pthread_cond_timedwait(&manager->changed,&manager->mutex,&deadline);if(result==ETIMEDOUT){pthread_mutex_unlock(&manager->mutex);fail(error,"TransportError","timed out waiting for Live worker to close",NULL);return 0;}}pthread_mutex_unlock(&manager->mutex);pthread_join(manager->worker,NULL);convex_subscription *sub=manager->subscriptions;while(sub){convex_subscription *next=sub->next;for(size_t n=0;n<sub->queue_count;n++)convex_update_free(&sub->queue[(sub->queue_start+n)%LIVE_QUEUE_CAPACITY]);free(sub->path);json_object_put(sub->args);free(sub);sub=next;}pthread_mutex_destroy(&manager->mutex);pthread_cond_destroy(&manager->changed);pthread_cond_destroy(&manager->updates);free(manager);client->live=NULL;return 1;}
+int convex_close(convex_client *client,int timeout_ms,convex_error *error){if(!client)return 1;client->closed=1;live_manager *manager=client->live;if(!manager)return 1;pthread_mutex_lock(&manager->mutex);manager->closing=1;pthread_cond_broadcast(&manager->changed);struct timespec deadline={0};if(timeout_ms>=0)deadline=realtime_after_ms(timeout_ms);while(!manager->stopped){int result=timeout_ms<0?pthread_cond_wait(&manager->changed,&manager->mutex):pthread_cond_timedwait(&manager->changed,&manager->mutex,&deadline);if(result==ETIMEDOUT){pthread_mutex_unlock(&manager->mutex);fail(error,"TransportError","timed out waiting for Live worker to close",NULL);return 0;}}int join_worker=!manager->worker_joined;manager->worker_joined=1;pthread_mutex_unlock(&manager->mutex);if(join_worker)pthread_join(manager->worker,NULL);pthread_mutex_lock(&manager->mutex);for(convex_subscription *sub=manager->subscriptions;sub;sub=sub->next){for(size_t n=0;n<sub->queue_count;n++)convex_update_free(&sub->queue[(sub->queue_start+n)%LIVE_QUEUE_CAPACITY]);sub->queue_start=0;sub->queue_count=0;}pthread_mutex_unlock(&manager->mutex);return 1;}
+
+static void destroy_live(live_manager *manager){if(!manager)return;convex_subscription *sub=manager->subscriptions;while(sub){convex_subscription *next=sub->next;for(size_t n=0;n<sub->queue_count;n++)convex_update_free(&sub->queue[(sub->queue_start+n)%LIVE_QUEUE_CAPACITY]);free(sub->path);json_object_put(sub->args);free(sub);sub=next;}pthread_mutex_destroy(&manager->mutex);pthread_cond_destroy(&manager->changed);pthread_cond_destroy(&manager->updates);free(manager);}
