@@ -118,6 +118,8 @@ func main() {
 	printJSON("live update", nextUpdate(subscription))
 }
 
+// nextUpdate waits for one value from a Live subscription. It turns a closed
+// stream, query error, or stalled connection into a clear example failure.
 func nextUpdate(subscription *convex.Subscription) json.RawMessage {
 	select {
 	case update, ok := <-subscription.Updates():
@@ -133,7 +135,10 @@ func nextUpdate(subscription *convex.Subscription) json.RawMessage {
 	}
 }
 
+// printJSON makes a raw Convex result readable in the terminal. Application
+// code would normally decode the value into a typed struct instead.
 func printJSON(label string, raw json.RawMessage) {
+	// Decode only so MarshalIndent can add whitespace without changing the data.
 	var indented any
 	if err := json.Unmarshal(raw, &indented); err != nil {
 		panic(err)
@@ -142,7 +147,10 @@ func printJSON(label string, raw json.RawMessage) {
 	fmt.Printf("%s: %s\n", label, formatted)
 }
 
+// randomID gives this mutation its idempotency key. Reusing the same ID for
+// the same room returns the existing result instead of incrementing twice.
 func randomID() string {
+	// Cryptographic randomness avoids collisions between concurrent example runs.
 	var value [8]byte
 	if _, err := rand.Read(value[:]); err != nil {
 		panic(err)
