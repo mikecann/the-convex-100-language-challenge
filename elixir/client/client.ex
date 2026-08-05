@@ -39,6 +39,10 @@ defmodule Convex.Client do
   @spec subscribe(pid(), String.t(), map(), keyword()) ::
           {:ok, Convex.Subscription.t()} | {:error, Exception.t()}
   def subscribe(client, path, args, options \\ []) do
+    # Capture the calling process before delegating to the Client GenServer.
+    # Otherwise Live would default to that internal GenServer as the owner and
+    # reactive updates would never reach the process that requested them.
+    options = Keyword.put_new(options, :owner, self())
     GenServer.call(client, {:subscribe, path, args, options}, 15_000)
   end
 

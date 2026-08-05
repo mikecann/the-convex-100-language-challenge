@@ -90,6 +90,27 @@ defmodule Convex.ClientTest do
     refute Keyword.has_key?(Client.http_options("http://backend:3210/api/query"), :ssl)
   end
 
+  test "a Live subscription defaults ownership to its calling process" do
+    caller = self()
+
+    # Stand in for the Client GenServer and inspect the exact request produced
+    # by the public API without opening a network connection in this unit test.
+    fake_client =
+      spawn(fn ->
+        receive do
+          {:"$gen_call", {reply_to, reference}, {:subscribe, path, args, options}} ->
+            send(caller, {:subscription_request, path, args, options})
+            send(reply_to, {reference, {:error, :expected_test_reply}})
+        end
+      end)
+
+    assert {:error, :expected_test_reply} =
+             Client.subscribe(fake_client, "demo:state", %{"room" => "owner-test"})
+
+    assert_receive {:subscription_request, "demo:state", %{"room" => "owner-test"}, options}
+    assert options[:owner] == caller
+  end
+
   defp start_http_server(response_fun, request_count \\ 1) do
     {:ok, listener} = :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
     {:ok, {_address, port}} = :inet.sockname(listener)
