@@ -5,55 +5,220 @@ open System.Collections.Generic
 open System.IO
 open System.Net
 open System.Net.Sockets
+open System.Text
 open System.Text.Json.Nodes
 open System.Threading
 open System.Threading.Tasks
 open Convex
 
+[<Literal>]
+let MaximumNdjsonBytes = 4 * 1024 * 1024
+
+[<Literal>]
+let MaximumControllerLineBytes = 8 * 1024 * 1024
+
+[<Literal>]
+let MaximumQueuedControllerBytes = 16 * 1024 * 1024
+
 type ActiveSubscription =
     { Generation: int64
       Subscription: Subscription }
 
+type private ReadOutcome =
+    | Line of string
+    | Rejected of exn
+    | EndOfInput
+
+type private WriteRequest =
+    { Bytes: byte array
+      Predicate: unit -> bool
+      Completion: TaskCompletionSource<unit>
+      IsClose: bool }
+
 // Language-local tests pause exactly after dequeue to prove acknowledgement is a relay barrier.
 let mutable relayBeforePublish: (unit -> Task) option = None
 
-type LockedWriter(target: TextWriter) =
-    let gate = new SemaphoreSlim(1, 1)
-    let mutable closed = false
+/// Incremental byte reader for real stdin and TCP mode. It never allocates an
+/// arbitrarily large line, and it discards the rest of an oversized record so a
+/// later valid NDJSON command still starts at an actual newline boundary.
+type private BoundedStreamNdjsonReader(stream: Stream) =
+    let readBuffer = Array.zeroCreate<byte> 8192
+    let line = new MemoryStream()
+    let strictUtf8 = UTF8Encoding(false, true)
+    let mutable offset = 0
+    let mutable available = 0
+    let mutable discarding = false
+    let mutable reachedEnd = false
 
-    member _.Write(value: JsonObject) =
+    let decodeLine () =
+        let bytes = line.ToArray()
+        line.SetLength 0
+
+        let count =
+            if bytes.Length > 0 && bytes[bytes.Length - 1] = 13uy then
+                bytes.Length - 1
+            else
+                bytes.Length
+
+        try
+            Line(strictUtf8.GetString(bytes, 0, count))
+        with :? DecoderFallbackException as error ->
+            Rejected(ProtocolError("adapter input was not valid UTF-8: " + error.Message))
+
+    member _.Read() =
         task {
-            do! gate.WaitAsync()
+            let mutable result: ReadOutcome option = None
 
-            try
-                if not closed then
-                    do! target.WriteLineAsync(value.ToJsonString())
-            finally
-                gate.Release() |> ignore
+            while result.IsNone do
+                if offset = available && not reachedEnd then
+                    let! count = stream.ReadAsync(readBuffer.AsMemory())
+                    offset <- 0
+                    available <- count
+
+                    if count = 0 then
+                        reachedEnd <- true
+
+                if offset < available then
+                    let value = readBuffer[offset]
+                    offset <- offset + 1
+
+                    if value = 10uy then
+                        if discarding then
+                            discarding <- false
+
+                            result <-
+                                Some(
+                                    Rejected(
+                                        ProtocolError(sprintf "adapter command exceeded %d bytes" MaximumNdjsonBytes)
+                                    )
+                                )
+                        else
+                            result <- Some(decodeLine ())
+                    elif not discarding then
+                        line.WriteByte value
+
+                        if line.Length > int64 MaximumNdjsonBytes then
+                            line.SetLength 0
+                            discarding <- true
+                elif reachedEnd then
+                    if discarding then
+                        discarding <- false
+
+                        result <-
+                            Some(
+                                Rejected(ProtocolError(sprintf "adapter command exceeded %d bytes" MaximumNdjsonBytes))
+                            )
+                    elif line.Length > 0L then
+                        result <- Some(decodeLine ())
+                    else
+                        result <- Some EndOfInput
+
+            return result.Value
         }
 
-    member _.WriteIf(predicate: unit -> bool, value: JsonObject) =
-        task {
-            do! gate.WaitAsync()
+/// One bounded pump serializes controller writes. Registry locks are used only
+/// by the predicate immediately before a write, never while output backpressure
+/// is awaited. Every write has a deadline and the pending queue has count and
+/// encoded-byte ceilings.
+type BoundedWriter(writeBytes: byte array -> CancellationToken -> Task<unit>) =
+    let sync = obj ()
+    let signal = new SemaphoreSlim(0)
+    let requests = Queue<WriteRequest>()
+    let mutable queuedBytes = 0
+    let mutable accepting = true
+    let mutable terminalError: exn option = None
 
-            try
-                if not closed && predicate () then
-                    do! target.WriteLineAsync(value.ToJsonString())
-            finally
-                gate.Release() |> ignore
+    let failPending error =
+        lock sync (fun () ->
+            terminalError <- Some error
+            accepting <- false
+
+            while requests.Count > 0 do
+                let request = requests.Dequeue()
+                queuedBytes <- queuedBytes - request.Bytes.Length
+                request.Completion.TrySetException error |> ignore)
+
+    let pump =
+        task {
+            let mutable running = true
+
+            while running do
+                do! signal.WaitAsync()
+
+                let request =
+                    lock sync (fun () ->
+                        if requests.Count = 0 then
+                            None
+                        else
+                            let value = requests.Dequeue()
+                            queuedBytes <- queuedBytes - value.Bytes.Length
+                            Some value)
+
+                match request with
+                | None -> ()
+                | Some current ->
+                    try
+                        if current.Predicate() then
+                            use timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds 1500.)
+                            do! writeBytes current.Bytes timeout.Token
+
+                        current.Completion.TrySetResult() |> ignore
+
+                        if current.IsClose then
+                            running <- false
+                    with error ->
+                        let transport = TransportError("adapter write", error.Message)
+                        current.Completion.TrySetException transport |> ignore
+                        failPending transport
+                        running <- false
         }
 
-    member _.Close(value: JsonObject) =
-        task {
-            do! gate.WaitAsync()
+    do pump |> ignore
 
-            try
-                if not closed then
-                    closed <- true
-                    do! target.WriteLineAsync(value.ToJsonString())
-            finally
-                gate.Release() |> ignore
-        }
+    member private _.Queue(predicate: unit -> bool, value: JsonObject, isClose: bool) =
+        let bytes = Encoding.UTF8.GetBytes(value.ToJsonString() + "\n")
+
+        let completion =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        lock sync (fun () ->
+            match terminalError with
+            | Some error -> completion.TrySetException error |> ignore
+            | None when not accepting -> completion.TrySetException(ObjectDisposedException "adapter writer") |> ignore
+            | None when bytes.Length > MaximumControllerLineBytes ->
+                completion.TrySetException(
+                    ProtocolError(sprintf "adapter event exceeded %d bytes" MaximumControllerLineBytes)
+                )
+                |> ignore
+            | None when
+                requests.Count >= 32
+                || queuedBytes + bytes.Length > MaximumQueuedControllerBytes
+                ->
+                completion.TrySetException(TransportError("adapter write", "controller output queue is full"))
+                |> ignore
+            | None ->
+                if isClose then
+                    accepting <- false
+
+                let request =
+                    { Bytes = bytes
+                      Predicate = predicate
+                      Completion = completion
+                      IsClose = isClose }
+
+                requests.Enqueue request
+                queuedBytes <- queuedBytes + bytes.Length
+                signal.Release() |> ignore)
+
+        completion.Task
+
+    member this.Write(value: JsonObject) =
+        this.Queue((fun () -> true), value, false)
+
+    member this.WriteIf(predicate, value: JsonObject) = this.Queue(predicate, value, false)
+
+    member this.Close(value: JsonObject) =
+        this.Queue((fun () -> true), value, true)
 
 let makeEvent (kind: string) (id: string option) =
     let value = JsonObject()
@@ -122,9 +287,32 @@ let subscriptionEvent (id: string) (update: Update) =
     addLogs value update.Logs
     value
 
-let runAdapter (input: TextReader) (output: TextWriter) (deployment: string option) =
+let private textReader (input: TextReader) () =
     task {
-        let writer = LockedWriter(output)
+        let! line = input.ReadLineAsync()
+
+        if isNull line then
+            return EndOfInput
+        elif Encoding.UTF8.GetByteCount line > MaximumNdjsonBytes then
+            return Rejected(ProtocolError(sprintf "adapter command exceeded %d bytes" MaximumNdjsonBytes))
+        else
+            return Line line
+    }
+
+let private textWriter (output: TextWriter) (bytes: byte array) (cancellation: CancellationToken) =
+    task {
+        let text = Encoding.UTF8.GetString(bytes, 0, bytes.Length - 1)
+        do! output.WriteLineAsync(text).WaitAsync(cancellation)
+    }
+
+let private streamWriter (output: Stream) (bytes: byte array) (cancellation: CancellationToken) =
+    task {
+        do! output.WriteAsync(bytes.AsMemory(), cancellation)
+        do! output.FlushAsync cancellation
+    }
+
+let private runAdapterCore (readLine: unit -> Task<ReadOutcome>) (writer: BoundedWriter) (deployment: string option) =
+    task {
         let registryLock = obj ()
         let subscriptions = Dictionary<string, ActiveSubscription>()
         let mutable generation = 0L
@@ -160,6 +348,20 @@ let runAdapter (input: TextReader) (output: TextWriter) (deployment: string opti
                     && Object.ReferenceEquals(current.Subscription, active.Subscription)
                 | _ -> false)
 
+        let removeOne id =
+            lock registryLock (fun () ->
+                match subscriptions.TryGetValue id with
+                | true, current ->
+                    subscriptions.Remove id |> ignore
+                    Some current
+                | _ -> None)
+
+        let removeAll () =
+            lock registryLock (fun () ->
+                let values = subscriptions.Values |> Seq.toArray
+                subscriptions.Clear()
+                values)
+
         let relay id active =
             task {
                 let mutable running = true
@@ -181,7 +383,11 @@ let runAdapter (input: TextReader) (output: TextWriter) (deployment: string opti
                     with
                     | :? ObjectDisposedException -> running <- false
                     | error ->
-                        do! writer.WriteIf((fun () -> isCurrent id active), failure None (Some id) error)
+                        try
+                            do! writer.WriteIf((fun () -> isCurrent id active), failure None (Some id) error)
+                        with _ ->
+                            ()
+
                         running <- false
             }
 
@@ -189,11 +395,14 @@ let runAdapter (input: TextReader) (output: TextWriter) (deployment: string opti
             let mutable finished = false
 
             while not finished do
-                let! line = input.ReadLineAsync()
-
-                if isNull line then
-                    finished <- true
-                else
+                match! readLine () with
+                | EndOfInput -> finished <- true
+                | Rejected error ->
+                    try
+                        do! writer.Write(failure None None error)
+                    with _ ->
+                        finished <- true
+                | Line line ->
                     let mutable id: string option = None
 
                     try
@@ -226,11 +435,10 @@ let runAdapter (input: TextReader) (output: TextWriter) (deployment: string opti
                             value["runtime"] <- JsonValue.Create(Environment.Version.ToString())
                             do! writer.Write value
                         | "close" ->
-                            lock registryLock (fun () ->
-                                for entry in subscriptions.Values do
-                                    (entry.Subscription :> IDisposable).Dispose()
+                            let remaining = removeAll ()
 
-                                subscriptions.Clear())
+                            for entry in remaining do
+                                (entry.Subscription :> IDisposable).Dispose()
 
                             match live with
                             | Some value -> (value :> IDisposable).Dispose()
@@ -240,8 +448,10 @@ let runAdapter (input: TextReader) (output: TextWriter) (deployment: string opti
                             | Some value -> (value :> IDisposable).Dispose()
                             | None -> ()
 
-                            do! writer.Close(makeEvent "closed" id)
-                            finished <- true
+                            try
+                                do! writer.Close(makeEvent "closed" id)
+                            finally
+                                finished <- true
                         | "setAuth" ->
                             (getClient ())
                                 .SetAuth(
@@ -271,15 +481,7 @@ let runAdapter (input: TextReader) (output: TextWriter) (deployment: string opti
                         | "subscribe" ->
                             let subscriptionId = command["subscriptionId"].GetValue<string>()
 
-                            let previous =
-                                lock registryLock (fun () ->
-                                    match subscriptions.TryGetValue subscriptionId with
-                                    | true, current ->
-                                        subscriptions.Remove subscriptionId |> ignore
-                                        Some current
-                                    | _ -> None)
-                            // Dispose completes the old relay generation before the replacement acknowledgement.
-                            match previous with
+                            match removeOne subscriptionId with
                             | Some old -> (old.Subscription :> IDisposable).Dispose()
                             | None -> ()
 
@@ -303,15 +505,7 @@ let runAdapter (input: TextReader) (output: TextWriter) (deployment: string opti
                         | "unsubscribe" ->
                             let subscriptionId = command["subscriptionId"].GetValue<string>()
 
-                            let previous =
-                                lock registryLock (fun () ->
-                                    match subscriptions.TryGetValue subscriptionId with
-                                    | true, current ->
-                                        subscriptions.Remove subscriptionId |> ignore
-                                        Some current
-                                    | _ -> None)
-
-                            match previous with
+                            match removeOne subscriptionId with
                             | Some old -> (old.Subscription :> IDisposable).Dispose()
                             | None -> ()
 
@@ -324,19 +518,25 @@ let runAdapter (input: TextReader) (output: TextWriter) (deployment: string opti
                             do! writer.Write(makeEvent "ack" id)
                         | other -> invalidArg "op" ("unknown operation: " + other)
                     with error ->
-                        do! writer.Write(failure id None error)
+                        try
+                            do! writer.Write(failure id None error)
+                        with _ ->
+                            finished <- true
         finally
-            let remaining =
-                lock registryLock (fun () ->
-                    let values = subscriptions.Values |> Seq.toArray
-                    subscriptions.Clear()
-                    values)
+            let remaining = removeAll ()
 
             for active in remaining do
-                (active.Subscription :> IDisposable).Dispose()
+                try
+                    (active.Subscription :> IDisposable).Dispose()
+                with _ ->
+                    ()
 
             match live with
-            | Some value -> (value :> IDisposable).Dispose()
+            | Some value ->
+                try
+                    (value :> IDisposable).Dispose()
+                with _ ->
+                    ()
             | None -> ()
 
             match client with
@@ -344,13 +544,25 @@ let runAdapter (input: TextReader) (output: TextWriter) (deployment: string opti
             | None -> ()
     }
 
+let runAdapter (input: TextReader) (output: TextWriter) (deployment: string option) =
+    let writer = BoundedWriter(textWriter output)
+    runAdapterCore (textReader input) writer deployment
+
+let runAdapterStreams (input: Stream) (output: Stream) (deployment: string option) =
+    let reader = BoundedStreamNdjsonReader(input)
+    let writer = BoundedWriter(streamWriter output)
+    runAdapterCore reader.Read writer deployment
+
 [<EntryPoint>]
 let main _ =
     let listen = Environment.GetEnvironmentVariable "ADAPTER_LISTEN"
     let deployment = Environment.GetEnvironmentVariable "CONVEX_URL" |> Option.ofObj
 
     if String.IsNullOrWhiteSpace listen then
-        runAdapter Console.In Console.Out deployment
+        use input = Console.OpenStandardInput()
+        use output = Console.OpenStandardOutput()
+
+        runAdapterStreams input output deployment
         |> fun work -> work.GetAwaiter().GetResult()
     else
         let separator = listen.LastIndexOf ':'
@@ -367,9 +579,10 @@ let main _ =
         server.Start()
         use connection = server.AcceptTcpClient()
         use stream = connection.GetStream()
-        use input = new StreamReader(stream)
-        use output = new StreamWriter(stream, AutoFlush = true)
-        runAdapter input output deployment |> fun work -> work.GetAwaiter().GetResult()
+
+        runAdapterStreams stream stream deployment
+        |> fun work -> work.GetAwaiter().GetResult()
+
         server.Stop()
 
     0

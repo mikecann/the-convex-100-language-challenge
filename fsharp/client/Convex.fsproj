@@ -1,4 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><TargetFramework>net8.0</TargetFramework><LangVersion>latest</LangVersion><Nullable>enable</Nullable><NoWarn>3511</NoWarn></PropertyGroup>
   <ItemGroup><Compile Include="Convex.fs" /><Compile Include="OwnerLive.fs" /></ItemGroup>
+  <ItemGroup><AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute"><_Parameter1>FsharpTests</_Parameter1></AssemblyAttribute></ItemGroup>
 </Project>

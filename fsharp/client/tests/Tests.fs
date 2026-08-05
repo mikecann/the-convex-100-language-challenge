@@ -1,4 +1,5 @@
 open System
+open System.Buffers.Binary
 open System.Diagnostics
 open System.IO
 open System.Net
@@ -47,14 +48,19 @@ let freePort () =
     listener.Start()
     (listener.LocalEndpoint :?> IPEndPoint).Port
 
-let version (querySet: int) (timestamp: string) =
+let timestamp (value: uint64) =
+    let bytes = Array.zeroCreate<byte> 8
+    BinaryPrimitives.WriteUInt64LittleEndian(bytes, value)
+    Convert.ToBase64String bytes
+
+let version (querySet: int) (timestampValue: uint64) =
     let value = JsonObject()
     value["querySet"] <- JsonValue.Create querySet
     value["identity"] <- JsonValue.Create 0
-    value["ts"] <- JsonValue.Create timestamp
+    value["ts"] <- JsonValue.Create(timestamp timestampValue)
     value
 
-let zero () = version 0 "AAAAAAAAAAA="
+let zero () = version 0 0UL
 
 let transition (startVersion: JsonObject) (endVersion: JsonObject) (modification: JsonNode) =
     let value = JsonObject()
@@ -63,6 +69,33 @@ let transition (startVersion: JsonObject) (endVersion: JsonObject) (modification
     value["endVersion"] <- endVersion
     value["modifications"] <- JsonArray([| modification |])
     value.ToJsonString()
+
+let transitionMany (startVersion: JsonObject) (endVersion: JsonNode) (modifications: JsonNode array) =
+    let value = JsonObject()
+    value["type"] <- JsonValue.Create "Transition"
+    value["startVersion"] <- startVersion
+    value["endVersion"] <- endVersion
+    value["modifications"] <- JsonArray modifications
+    value.ToJsonString()
+
+let queryUpdatedValue (id: int) (result: JsonNode) =
+    let value = JsonObject()
+    value["type"] <- JsonValue.Create "QueryUpdated"
+    value["queryId"] <- JsonValue.Create id
+    value["value"] <- if isNull result then null else result.DeepClone()
+    value["logLines"] <- JsonArray()
+    value :> JsonNode
+
+let queryRemoved (id: int) =
+    let value = JsonObject()
+    value["type"] <- JsonValue.Create "QueryRemoved"
+    value["queryId"] <- JsonValue.Create id
+    value :> JsonNode
+
+let firstModificationId (message: JsonNode) =
+    let modifications = message["modifications"].AsArray()
+    let first = modifications[0]
+    first["queryId"].GetValue<int>()
 
 let queryUpdated (id: int) (count: int) (text: string) =
     let value = JsonObject()
@@ -254,8 +287,7 @@ let controlFrameFixture () =
                 let id = modification["queryId"].GetValue<int>()
                 do! sendRawFrame stream 0x9uy (Encoding.UTF8.GetBytes "ping")
 
-                let update =
-                    transition (zero ()) (version 1 "control") (queryUpdated id 0 "control")
+                let update = transition (zero ()) (version 1 1UL) (queryUpdated id 0 "control")
 
                 do! sendRawFrame stream 0x1uy (Encoding.UTF8.GetBytes update)
             }
@@ -286,15 +318,15 @@ let liveFixture () =
                 let firstAdd = JsonNode.Parse(firstAddText)
                 let firstModification = (firstAdd["modifications"].AsArray())[0]
                 let id = firstModification["queryId"].GetValue<int>()
-                let v1 = version 1 "AAAAAAAAAAE="
-                let v2 = version 1 "AAAAAAAAAAI="
-                let v3 = version 1 "AAAAAAAAAAM="
+                let v1 = version 1 1UL
+                let v2 = version 1 2UL
+                let v3 = version 1 3UL
                 do! sendText first (transition (zero ()) v1 (queryUpdated id 0 "雪")) true
                 do! sendText first (transition (v1.DeepClone().AsObject()) v2 (queryFailed id)) false
                 do! sendText first (transition (v2.DeepClone().AsObject()) v3 (queryUpdated id 1 "recovered")) false
                 let mutable currentCount = 1
                 let mutable currentText = "recovered"
-                let mutable expectedTimestamp = "AAAAAAAAAAM="
+                let mutable expectedTimestamp = timestamp 3UL
 
                 for reconnectNumber in 1..5 do
                     let! nextContext = listener.GetContextAsync()
@@ -313,8 +345,8 @@ let liveFixture () =
                     let nextAdd = JsonNode.Parse(nextAddText)
                     let nextModification = (nextAdd["modifications"].AsArray())[0]
                     check (nextModification["type"].GetValue<string>() = "Add") "rehydration did not resend Add"
-                    let hydrationTimestamp = sprintf "hydration-%d" reconnectNumber
-                    let updateTimestamp = sprintf "update-%d" reconnectNumber
+                    let hydrationTimestamp = uint64 (reconnectNumber * 2 + 2)
+                    let updateTimestamp = hydrationTimestamp + 1UL
                     let hydrated = version 1 hydrationTimestamp
                     let updated = version 1 updateTimestamp
 
@@ -336,7 +368,7 @@ let liveFixture () =
                                 (queryUpdated id currentCount currentText))
                             false
 
-                    expectedTimestamp <- updateTimestamp
+                    expectedTimestamp <- timestamp updateTimestamp
             }
 
         use live = new LiveClient(sprintf "http://127.0.0.1:%d" port)
@@ -365,6 +397,520 @@ let liveFixture () =
             check (reconnected["count"].GetValue<int>() = reconnectNumber + 1) "unchanged hydration was not suppressed"
 
         do! server.WaitAsync(TimeSpan.FromSeconds 5.)
+    }
+
+let atomicTransitionFixture () =
+    task {
+        let port = freePort ()
+        use listener = new HttpListener()
+        listener.Prefixes.Add(sprintf "http://127.0.0.1:%d/" port)
+        listener.Start()
+
+        let invalidVersions =
+            [| JsonNode.Parse(sprintf "{\"querySet\":1,\"ts\":\"%s\"}" (timestamp 1UL))
+               JsonNode.Parse(sprintf "{\"querySet\":1.0,\"identity\":0,\"ts\":\"%s\"}" (timestamp 1UL))
+               JsonNode.Parse(sprintf "{\"querySet\":1,\"identity\":4294967296,\"ts\":\"%s\"}" (timestamp 1UL))
+               JsonNode.Parse("{\"querySet\":1,\"identity\":0,\"ts\":\"not-base64\"}")
+               JsonNode.Parse(sprintf "{\"querySet\":2,\"identity\":0,\"ts\":\"%s\"}" (timestamp 1UL)) |]
+
+        let server =
+            task {
+                for invalid in invalidVersions do
+                    let! context = listener.GetContextAsync()
+                    let! upgrade = context.AcceptWebSocketAsync(null)
+                    use socket = upgrade.WebSocket
+                    let! _ = receiveText socket
+                    let! addText = receiveText socket
+                    let add = JsonNode.Parse addText
+                    let id = firstModificationId add
+
+                    do!
+                        sendText
+                            socket
+                            (transitionMany (zero ()) invalid [| queryUpdated id 999 "must-not-publish" |])
+                            false
+
+                let! context = listener.GetContextAsync()
+                let! upgrade = context.AcceptWebSocketAsync(null)
+                use socket = upgrade.WebSocket
+                let! _ = receiveText socket
+                let! addText = receiveText socket
+                let add = JsonNode.Parse addText
+                let id = firstModificationId add
+                let one = version 1 1UL
+                let two = version 1 2UL
+
+                do!
+                    sendText
+                        socket
+                        (transitionMany (zero ()) one [| queryUpdated id 100 "superseded"; queryRemoved id |])
+                        false
+
+                do!
+                    sendText
+                        socket
+                        (transitionMany
+                            (one.DeepClone().AsObject())
+                            two
+                            [| queryUpdated id 1 "intermediate"; queryUpdated id 2 "final" |])
+                        false
+            }
+
+        use live = new LiveClient(sprintf "http://127.0.0.1:%d" port)
+        use! subscription = live.Subscribe("demo:state", JsonObject())
+
+        for _ in invalidVersions do
+            let update = subscription.NextUpdate(TimeSpan.FromSeconds 5.)
+
+            check
+                (update.Error
+                 |> Option.exists (function
+                     | ProtocolError _ -> true
+                     | _ -> false))
+                "malformed endVersion leaked a partial update"
+
+        let final = subscription.Next(TimeSpan.FromSeconds 5.)
+        check (final["count"].GetValue<int>() = 2) "transition changes were not coalesced"
+        do! server.WaitAsync(TimeSpan.FromSeconds 5.)
+    }
+
+let timestampFixture () =
+    task {
+        let port = freePort ()
+        use listener = new HttpListener()
+        listener.Prefixes.Add(sprintf "http://127.0.0.1:%d/" port)
+        listener.Start()
+
+        let thirdConnected =
+            TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let server =
+            task {
+                let! firstContext = listener.GetContextAsync()
+                let! firstUpgrade = firstContext.AcceptWebSocketAsync(null)
+                use first = firstUpgrade.WebSocket
+                let! _ = receiveText first
+                let! addText = receiveText first
+                let add = JsonNode.Parse addText
+                let id = firstModificationId add
+                let twoFiftyFive = version 1 255UL
+                let twoFiftySix = version 1 256UL
+                do! sendText first (transition (zero ()) twoFiftyFive (queryUpdated id 0 "255")) false
+
+                do!
+                    sendText
+                        first
+                        (transition (twoFiftyFive.DeepClone().AsObject()) twoFiftySix (queryUpdated id 1 "256"))
+                        false
+
+                do!
+                    sendText
+                        first
+                        (transition
+                            (twoFiftySix.DeepClone().AsObject())
+                            (version 1 255UL)
+                            (queryUpdated id 999 "backwards"))
+                        false
+
+                let! secondContext = listener.GetContextAsync()
+                let! secondUpgrade = secondContext.AcceptWebSocketAsync(null)
+                use second = secondUpgrade.WebSocket
+                let! secondConnectText = receiveText second
+                let secondConnect = JsonNode.Parse secondConnectText
+
+                check
+                    (secondConnect["maxObservedTimestamp"].GetValue<string>() = timestamp 256UL)
+                    "little-endian max timestamp after 255 to 256"
+
+                let! _ = receiveText second
+                do! sendText second (transition (zero ()) (version 1 200UL) (queryUpdated id 1 "recovered")) false
+
+                let! thirdContext = listener.GetContextAsync()
+                let! thirdUpgrade = thirdContext.AcceptWebSocketAsync(null)
+                use third = thirdUpgrade.WebSocket
+                let! thirdConnectText = receiveText third
+                let thirdConnect = JsonNode.Parse thirdConnectText
+
+                check
+                    (thirdConnect["maxObservedTimestamp"].GetValue<string>() = timestamp 256UL)
+                    "max timestamp moved backwards across reconnect"
+
+                let! _ = receiveText third
+                thirdConnected.TrySetResult() |> ignore
+                do! Task.Delay 100
+            }
+
+        use live = new LiveClient(sprintf "http://127.0.0.1:%d" port)
+        use! subscription = live.Subscribe("demo:state", JsonObject())
+        check (((subscription.Next(TimeSpan.FromSeconds 5.))["count"]).GetValue<int>() = 0) "timestamp 255"
+        check (((subscription.Next(TimeSpan.FromSeconds 5.))["count"]).GetValue<int>() = 1) "timestamp 256"
+        let backwards = subscription.NextUpdate(TimeSpan.FromSeconds 5.)
+
+        check
+            (backwards.Error
+             |> Option.exists (function
+                 | ProtocolError _ -> true
+                 | _ -> false))
+            "backwards timestamp was accepted"
+
+        check
+            (((subscription.Next(TimeSpan.FromSeconds 5.))["count"]).GetValue<int>() = 1)
+            "same-value recovery after protocol failure was suppressed"
+
+        check (live.MaxObservedTimestamp = Some(timestamp 256UL)) "numeric timestamp maximum"
+        do! live.DebugDisconnect()
+        do! thirdConnected.Task.WaitAsync(TimeSpan.FromSeconds 5.)
+        do! server.WaitAsync(TimeSpan.FromSeconds 5.)
+    }
+
+let semanticHydrationFixture () =
+    task {
+        let port = freePort ()
+        use listener = new HttpListener()
+        listener.Prefixes.Add(sprintf "http://127.0.0.1:%d/" port)
+        listener.Start()
+
+        let objectValue first =
+            let value = JsonObject()
+
+            if first then
+                value["a"] <- JsonValue.Create 1
+                value["b"] <- null
+            else
+                value["b"] <- null
+                value["a"] <- JsonValue.Create 1
+
+            value :> JsonNode
+
+        let server =
+            task {
+                let! firstContext = listener.GetContextAsync()
+                let! firstUpgrade = firstContext.AcceptWebSocketAsync(null)
+                use first = firstUpgrade.WebSocket
+                let! _ = receiveText first
+                let! addText = receiveText first
+                let add = JsonNode.Parse addText
+                let id = firstModificationId add
+                let one = version 1 1UL
+                let two = version 1 2UL
+                let three = version 1 3UL
+                do! sendText first (transition (zero ()) one (queryUpdatedValue id (objectValue true))) false
+                do! sendText first (transition (one.DeepClone().AsObject()) two (queryFailed id)) false
+
+                do!
+                    sendText
+                        first
+                        (transition (two.DeepClone().AsObject()) three (queryUpdatedValue id (objectValue false)))
+                        false
+
+                let! secondContext = listener.GetContextAsync()
+                let! secondUpgrade = secondContext.AcceptWebSocketAsync(null)
+                use second = secondUpgrade.WebSocket
+                let! _ = receiveText second
+                let! _ = receiveText second
+                let four = version 1 4UL
+                let five = version 1 5UL
+                do! sendText second (transition (zero ()) four (queryUpdatedValue id (objectValue true))) false
+
+                do! sendText second (transition (four.DeepClone().AsObject()) five (queryUpdatedValue id null)) false
+
+                let! thirdContext = listener.GetContextAsync()
+                let! thirdUpgrade = thirdContext.AcceptWebSocketAsync(null)
+                use third = thirdUpgrade.WebSocket
+                let! _ = receiveText third
+                let! _ = receiveText third
+                let six = version 1 6UL
+                let seven = version 1 7UL
+                do! sendText third (transition (zero ()) six (queryUpdatedValue id null)) false
+                let changed = JsonObject()
+                changed["a"] <- JsonValue.Create 2
+
+                do! sendText third (transition (six.DeepClone().AsObject()) seven (queryUpdatedValue id changed)) false
+            }
+
+        use live = new LiveClient(sprintf "http://127.0.0.1:%d" port)
+        use! subscription = live.Subscribe("demo:state", JsonObject())
+        let initial = subscription.Next(TimeSpan.FromSeconds 5.)
+        check (initial["a"].GetValue<int>() = 1) "semantic initial value"
+        let failed = subscription.NextUpdate(TimeSpan.FromSeconds 5.)
+        check failed.Error.IsSome "QueryFailed missing from semantic fixture"
+        let recovered = subscription.Next(TimeSpan.FromSeconds 5.)
+        check (recovered["a"].GetValue<int>() = 1) "same semantic value did not recover QueryFailed"
+        do! live.DebugDisconnect()
+        check (isNull (subscription.Next(TimeSpan.FromSeconds 5.))) "reordered hydration was not suppressed"
+        do! live.DebugDisconnect()
+        let changed = subscription.Next(TimeSpan.FromSeconds 5.)
+        check (changed["a"].GetValue<int>() = 2) "null hydration was not suppressed"
+        do! server.WaitAsync(TimeSpan.FromSeconds 5.)
+    }
+
+let socketOwnershipFixture () =
+    task {
+        let port = freePort ()
+        use listener = new HttpListener()
+        listener.Prefixes.Add(sprintf "http://127.0.0.1:%d/" port)
+        listener.Start()
+        let operations = ResizeArray<int64 * string>()
+        LiveTestHooks.SocketOperation <- fun operation -> lock operations (fun () -> operations.Add operation)
+
+        try
+            let server =
+                task {
+                    let! context = listener.GetContextAsync()
+                    let! upgrade = context.AcceptWebSocketAsync(null)
+                    use socket = upgrade.WebSocket
+                    let! _ = receiveText socket
+                    let! addText = receiveText socket
+                    let add = JsonNode.Parse addText
+                    let id = firstModificationId add
+                    do! sendText socket (transition (zero ()) (version 1 1UL) (queryUpdated id 0 "owner")) false
+                    let! _ = receiveText socket
+                    do! Task.Delay 50
+                }
+
+            let live = new LiveClient(sprintf "http://127.0.0.1:%d" port)
+            let! subscription = live.Subscribe("demo:state", JsonObject())
+            subscription.Next(TimeSpan.FromSeconds 5.) |> ignore
+            (subscription :> IDisposable).Dispose()
+            (live :> IDisposable).Dispose()
+            do! server.WaitAsync(TimeSpan.FromSeconds 5.)
+
+            let observed = lock operations (fun () -> operations |> Seq.toArray)
+            check (observed |> Array.map fst |> Array.distinct |> Array.length = 1) "socket had multiple logical owners"
+
+            for operation in [ "Connect"; "Receive"; "Send"; "Abort"; "Dispose" ] do
+                check
+                    (observed |> Array.exists (fun (_, current) -> current = operation))
+                    ("missing owner operation " + operation)
+        finally
+            LiveTestHooks.SocketOperation <- fun _ -> ()
+    }
+
+let globalDeliveryBudgetFixture () =
+    task {
+        let port = freePort ()
+        use listener = new HttpListener()
+        listener.Prefixes.Add(sprintf "http://127.0.0.1:%d/" port)
+        listener.Start()
+        let sent = TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let server =
+            task {
+                let! context = listener.GetContextAsync()
+                let! upgrade = context.AcceptWebSocketAsync(null)
+                use socket = upgrade.WebSocket
+                let! _ = receiveText socket
+                let ids = ResizeArray<int>()
+
+                for _ in 1..8 do
+                    let! addText = receiveText socket
+                    let add = JsonNode.Parse addText
+                    ids.Add(firstModificationId add)
+
+                let mutable current = zero ()
+                let payload = String('g', 600000)
+
+                for index in 1..20 do
+                    let next = version 1 (uint64 index)
+                    let id = ids[(index - 1) % ids.Count]
+
+                    do!
+                        sendText
+                            socket
+                            (transition (current.DeepClone().AsObject()) next (queryUpdated id index payload))
+                            false
+
+                    current <- next
+
+                sent.TrySetResult() |> ignore
+                do! Task.Delay 1000
+            }
+
+        use live = new LiveClient(sprintf "http://127.0.0.1:%d" port)
+        let subscriptions = ResizeArray<Subscription>()
+
+        for index in 1..8 do
+            let args = JsonObject()
+            args["room"] <- JsonValue.Create index
+            let! subscription = live.Subscribe("demo:state", args)
+            subscriptions.Add subscription
+
+        do! sent.Task.WaitAsync(TimeSpan.FromSeconds 15.)
+        do! Task.Delay 500
+        let count, bytes = live.DeliverySnapshot
+        check (count <= 16) "global delivery count exceeded 16"
+        check (bytes <= 8 * 1024 * 1024) "global encoded delivery bytes exceeded budget"
+        check (bytes < 128 * 1024 * 1024) "global delivery memory exceeded container budget"
+
+        let oversizedArgs = JsonObject()
+        oversizedArgs["payload"] <- JsonValue.Create(String('a', 300000))
+
+        try
+            let! _ = live.Subscribe("demo:state", oversizedArgs)
+            failwith "oversized subscription arguments were accepted"
+        with :? ArgumentException ->
+            ()
+
+        do! server.WaitAsync(TimeSpan.FromSeconds 5.)
+    }
+
+let subscriptionAndCommandBudgetFixture () =
+    task {
+        let port = freePort ()
+        use listener = new HttpListener()
+        listener.Prefixes.Add(sprintf "http://127.0.0.1:%d/" port)
+        listener.Start()
+
+        let server =
+            task {
+                let! context = listener.GetContextAsync()
+                let! upgrade = context.AcceptWebSocketAsync(null)
+                use socket = upgrade.WebSocket
+                let! _ = receiveText socket
+
+                for _ in 1..64 do
+                    let! _ = receiveText socket
+                    ()
+
+                do! Task.Delay 500
+            }
+
+        let live = new LiveClient(sprintf "http://127.0.0.1:%d" port)
+
+        for index in 1..64 do
+            let args = JsonObject()
+            args["room"] <- JsonValue.Create index
+            let! _ = live.Subscribe("demo:state", args)
+            ()
+
+        try
+            let! _ = live.Subscribe("demo:state", JsonObject())
+            failwith "65th Live subscription was accepted"
+        with :? InvalidOperationException ->
+            ()
+
+        (live :> IDisposable).Dispose()
+        do! server.WaitAsync(TimeSpan.FromSeconds 5.)
+
+        use paused = new LiveClient("http://127.0.0.1:1")
+        let release = paused.PauseOwnerForTest()
+
+        let oversizedArgs = JsonObject()
+        oversizedArgs["payload"] <- JsonValue.Create(String('x', 300000))
+
+        try
+            paused.Subscribe("demo:state", oversizedArgs) |> ignore
+            failwith "paused owner retained oversized subscription arguments"
+        with :? ArgumentException ->
+            ()
+
+        let queued = ResizeArray<Task<int * int>>()
+        let mutable rejected = 0
+
+        for _ in 1..300 do
+            try
+                queued.Add(paused.DeliverySnapshotAsyncForTest())
+            with :? InvalidOperationException ->
+                rejected <- rejected + 1
+
+        check (rejected > 0 && queued.Count <= 256) "Live command ingress was not bounded"
+        release.TrySetResult() |> ignore
+        let! _ = Task.WhenAll(queued).WaitAsync(TimeSpan.FromSeconds 5.)
+
+        let bytePort = freePort ()
+        use byteListener = new HttpListener()
+        byteListener.Prefixes.Add(sprintf "http://127.0.0.1:%d/" bytePort)
+        byteListener.Start()
+
+        let expectedAdds =
+            TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let byteServer =
+            task {
+                let! context = byteListener.GetContextAsync()
+                let! upgrade = context.AcceptWebSocketAsync(null)
+                use socket = upgrade.WebSocket
+                let! _ = receiveText socket
+                let! expected = expectedAdds.Task
+
+                for _ in 1..expected do
+                    let! _ = receiveText socket
+                    ()
+            }
+
+        let aggregate = new LiveClient(sprintf "http://127.0.0.1:%d" bytePort)
+        let aggregateRelease = aggregate.PauseOwnerForTest()
+        let subscriptions = ResizeArray<Task<Subscription>>()
+        let aggregateArgs = JsonObject()
+        aggregateArgs["payload"] <- JsonValue.Create(String('a', 120000))
+        let mutable aggregateRejected = 0
+
+        for _ in 1..64 do
+            try
+                subscriptions.Add(aggregate.Subscribe("demo:state", aggregateArgs))
+            with :? InvalidOperationException ->
+                aggregateRejected <- aggregateRejected + 1
+
+        let reservedCount, reservedBytes = aggregate.PendingSubscriptionBudgetForTest
+
+        check
+            (aggregateRejected > 0
+             && reservedCount = subscriptions.Count
+             && reservedCount < 64)
+            "pending subscription count was not reserved globally"
+
+        check (reservedBytes <= 4 * 1024 * 1024) "pending subscription bytes exceeded global budget"
+        expectedAdds.TrySetResult(subscriptions.Count) |> ignore
+        aggregateRelease.TrySetResult() |> ignore
+        let! _ = Task.WhenAll(subscriptions).WaitAsync(TimeSpan.FromSeconds 15.)
+        (aggregate :> IDisposable).Dispose()
+        do! byteServer.WaitAsync(TimeSpan.FromSeconds 5.)
+    }
+
+let httpBodyBudgetFixture () =
+    task {
+        let port = freePort ()
+        use listener = new HttpListener()
+        listener.Prefixes.Add(sprintf "http://127.0.0.1:%d/" port)
+        listener.Start()
+
+        let server =
+            task {
+                let! context = listener.GetContextAsync()
+
+                let body =
+                    Encoding.UTF8.GetBytes(
+                        "{\"status\":\"success\",\"value\":\"" + String('h', 9 * 1024 * 1024) + "\"}"
+                    )
+
+                context.Response.ContentLength64 <- int64 body.Length
+
+                try
+                    do! context.Response.OutputStream.WriteAsync body
+                with _ ->
+                    ()
+
+                context.Response.Close()
+            }
+
+        use client = new Client(sprintf "http://127.0.0.1:%d" port)
+
+        try
+            let! _ = client.Query("demo:state", JsonObject())
+            failwith "oversized HTTP response was accepted"
+        with TransportError(_, message) ->
+            check (message.Contains "exceeded") "oversized HTTP response error"
+
+        do! server.WaitAsync(TimeSpan.FromSeconds 5.)
+
+        let args = JsonObject()
+        args["payload"] <- JsonValue.Create(String('r', 9 * 1024 * 1024))
+
+        try
+            let! _ = client.Query("demo:state", args)
+            failwith "oversized HTTP request was accepted"
+        with :? ArgumentException ->
+            ()
     }
 
 let boundedDeliveryFixture () =
@@ -403,12 +949,12 @@ let boundedDeliveryFixture () =
                 let addModification = (add["modifications"].AsArray())[0]
                 let id = addModification["queryId"].GetValue<int>()
                 let mutable current = zero ()
-                let initialVersion = version 1 "bounded-initial"
+                let initialVersion = version 1 1UL
                 do! sendText socket (transition current initialVersion (queryUpdated id 0 "initial")) false
                 current <- initialVersion
 
                 for count in 1..20 do
-                    let next = version 1 (sprintf "small-%d" count)
+                    let next = version 1 (uint64 (count + 1))
 
                     do!
                         sendText
@@ -423,7 +969,7 @@ let boundedDeliveryFixture () =
                 let payload = String('x', 100000)
 
                 for count in 200..209 do
-                    let next = version 1 (sprintf "large-%d" count)
+                    let next = version 1 (uint64 (count - 178))
 
                     do!
                         sendText
@@ -436,8 +982,8 @@ let boundedDeliveryFixture () =
                 largeSent.TrySetResult() |> ignore
                 do! largeDrained.Task
 
-                for marker in [ "error-1"; "error-2"; "error-3" ] do
-                    let next = version 1 marker
+                for index, marker in [ "error-1"; "error-2"; "error-3" ] |> List.indexed do
+                    let next = version 1 (uint64 (index + 32))
 
                     do!
                         sendText
@@ -481,7 +1027,7 @@ let boundedDeliveryFixture () =
             with :? TimeoutException ->
                 draining <- false
 
-        check (large.Count = 2 && large[0] = 208 && large[1] = 209) "encoded-byte delivery bound"
+        check (large.Count = 10 && large[0] = 200 && large[9] = 209) "encoded-byte delivery retention"
         largeDrained.TrySetResult() |> ignore
         do! errorsSent.Task.WaitAsync(TimeSpan.FromSeconds 5.)
         do! Task.Delay 250
@@ -505,7 +1051,7 @@ let boundedDeliveryFixture () =
             with :? TimeoutException ->
                 draining <- false
 
-        check (Seq.toList errors = [ "error-2"; "error-3" ]) "structured-error encoded-byte bound"
+        check (Seq.toList errors = [ "error-1"; "error-2"; "error-3" ]) "structured-error encoded-byte retention"
         errorsDrained.TrySetResult() |> ignore
         do! server.WaitAsync(TimeSpan.FromSeconds 5.)
     }
@@ -538,7 +1084,7 @@ let relayBarrierFixture () =
                 let add = JsonNode.Parse addText
                 let modification = (add["modifications"].AsArray())[0]
                 let id = modification["queryId"].GetValue<int>()
-                do! sendText socket (transition (zero ()) (version 1 "relay") (queryUpdated id 0 "paused")) false
+                do! sendText socket (transition (zero ()) (version 1 1UL) (queryUpdated id 0 "paused")) false
                 let! removeText = receiveText socket
                 let remove = JsonNode.Parse removeText
                 let removeModification = (remove["modifications"].AsArray())[0]
@@ -606,7 +1152,7 @@ let replacementBarrierFixture () =
                 let oldAdd = JsonNode.Parse oldAddText
                 let oldModification = (oldAdd["modifications"].AsArray())[0]
                 let oldId = oldModification["queryId"].GetValue<int>()
-                do! sendText socket (transition (zero ()) (version 1 "old") (queryUpdated oldId 99 "stale")) false
+                do! sendText socket (transition (zero ()) (version 1 1UL) (queryUpdated oldId 99 "stale")) false
                 let! removeText = receiveText socket
                 let remove = JsonNode.Parse removeText
                 let removeModification = (remove["modifications"].AsArray())[0]
@@ -616,11 +1162,7 @@ let replacementBarrierFixture () =
                 let newModification = (newAdd["modifications"].AsArray())[0]
                 let newId = newModification["queryId"].GetValue<int>()
 
-                do!
-                    sendText
-                        socket
-                        (transition (version 1 "old") (version 3 "new") (queryUpdated newId 2 "current"))
-                        false
+                do! sendText socket (transition (version 1 1UL) (version 3 2UL) (queryUpdated newId 2 "current")) false
             }
 
         let input = new AsyncLineReader()
@@ -704,7 +1246,7 @@ let failedReconnectFixture () =
                 let add = JsonNode.Parse addText
                 let modification = (add["modifications"].AsArray())[0]
                 let id = modification["queryId"].GetValue<int>()
-                do! sendText first (transition (zero ()) (version 1 "initial") (queryUpdated id 0 "initial")) false
+                do! sendText first (transition (zero ()) (version 1 1UL) (queryUpdated id 0 "initial")) false
                 do! detached.Task
                 // 100 + 200 + 400 + 800 + 1600 ms produces five refused reconnects.
                 do! Task.Delay 3500
@@ -719,16 +1261,13 @@ let failedReconnectFixture () =
                 let nextAdd = JsonNode.Parse nextAddText
                 let nextModification = (nextAdd["modifications"].AsArray())[0]
                 let nextId = nextModification["queryId"].GetValue<int>()
-                let hydrated = version 1 "hydrated"
+                let hydrated = version 1 2UL
                 do! sendText next (transition (zero ()) hydrated (queryUpdated nextId 0 "initial")) false
 
                 do!
                     sendText
                         next
-                        (transition
-                            (hydrated.DeepClone().AsObject())
-                            (version 1 "updated")
-                            (queryUpdated nextId 1 "updated"))
+                        (transition (hydrated.DeepClone().AsObject()) (version 1 3UL) (queryUpdated nextId 1 "updated"))
                         false
             }
 
@@ -769,11 +1308,7 @@ let protocolTransportRecoveryFixture () =
                 let secondModification = (secondAdd["modifications"].AsArray())[0]
                 let secondId = secondModification["queryId"].GetValue<int>()
 
-                do!
-                    sendText
-                        second
-                        (transition (zero ()) (version 1 "recovered-protocol") (queryUpdated secondId 1 "protocol"))
-                        false
+                do! sendText second (transition (zero ()) (version 1 1UL) (queryUpdated secondId 1 "protocol")) false
 
                 do! Task.Delay 100
 
@@ -792,7 +1327,7 @@ let protocolTransportRecoveryFixture () =
                 let thirdAdd = JsonNode.Parse thirdAddText
                 let thirdModification = (thirdAdd["modifications"].AsArray())[0]
                 let thirdId = thirdModification["queryId"].GetValue<int>()
-                let hydrated = version 1 "hydrated-transport"
+                let hydrated = version 1 2UL
                 do! sendText third (transition (zero ()) hydrated (queryUpdated thirdId 1 "protocol")) false
 
                 do!
@@ -800,7 +1335,7 @@ let protocolTransportRecoveryFixture () =
                         third
                         (transition
                             (hydrated.DeepClone().AsObject())
-                            (version 1 "recovered-transport")
+                            (version 1 3UL)
                             (queryUpdated thirdId 2 "transport"))
                         false
             }
@@ -827,6 +1362,8 @@ let protocolTransportRecoveryFixture () =
                  | _ -> false))
             "real TransportError event"
 
+        let hydratedAfterTransport = subscription.Next(TimeSpan.FromSeconds 5.)
+        check (hydratedAfterTransport["count"].GetValue<int>() = 1) "transport error same-value recovery"
         let afterTransport = subscription.Next(TimeSpan.FromSeconds 5.)
         check (afterTransport["count"].GetValue<int>() = 2) "transport recovery"
         do! server.WaitAsync(TimeSpan.FromSeconds 5.)
@@ -1006,6 +1543,79 @@ let boundedCloseFixture continuous =
         do! server.WaitAsync(TimeSpan.FromSeconds 5.)
     }
 
+let closeUnsubscribeRaceFixture closeFirst =
+    task {
+        let port = freePort ()
+        use listener = new HttpListener()
+        listener.Prefixes.Add(sprintf "http://127.0.0.1:%d/" port)
+        listener.Start()
+
+        let active =
+            TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let server =
+            task {
+                let! context = listener.GetContextAsync()
+                let! upgrade = context.AcceptWebSocketAsync(null)
+                use socket = upgrade.WebSocket
+                let! _ = receiveText socket
+                let! _ = receiveText socket
+                active.TrySetResult() |> ignore
+
+                if closeFirst then
+                    let buffer = Array.zeroCreate<byte> 1
+
+                    try
+                        let! _ = socket.ReceiveAsync(ArraySegment<byte> buffer, CancellationToken.None)
+                        ()
+                    with _ ->
+                        ()
+                else
+                    let! removeText = receiveText socket
+                    let remove = JsonNode.Parse removeText
+                    let modification = (remove["modifications"].AsArray())[0]
+
+                    check
+                        (modification["type"].GetValue<string>() = "Remove")
+                        "unsubscribe was not ordered before close"
+            }
+
+        let live = new LiveClient(sprintf "http://127.0.0.1:%d" port)
+        let! subscription = live.Subscribe("demo:state", JsonObject())
+        do! active.Task.WaitAsync(TimeSpan.FromSeconds 5.)
+        let release = live.PauseOwnerForTest()
+
+        if closeFirst then
+            let close = Task.Run(fun () -> (live :> IDisposable).Dispose())
+
+            check
+                (SpinWait.SpinUntil((fun () -> live.IsDisposedForTest), TimeSpan.FromSeconds 1.))
+                "close did not enter the dispose barrier"
+
+            let unsubscribe = Task.Run(fun () -> (subscription :> IDisposable).Dispose())
+            do! unsubscribe.WaitAsync(TimeSpan.FromSeconds 1.)
+            release.TrySetResult() |> ignore
+            do! close.WaitAsync(TimeSpan.FromSeconds 1.)
+        else
+            let unsubscribe = Task.Run(fun () -> (subscription :> IDisposable).Dispose())
+
+            check
+                (SpinWait.SpinUntil((fun () -> live.PendingCommandsForTest = 1), TimeSpan.FromSeconds 1.))
+                "unsubscribe did not enter the owner queue barrier"
+
+            let close = Task.Run(fun () -> (live :> IDisposable).Dispose())
+
+            check
+                (SpinWait.SpinUntil((fun () -> live.IsDisposedForTest), TimeSpan.FromSeconds 1.))
+                "close did not queue behind unsubscribe"
+
+            release.TrySetResult() |> ignore
+            do! unsubscribe.WaitAsync(TimeSpan.FromSeconds 4.)
+            do! close.WaitAsync(TimeSpan.FromSeconds 4.)
+
+        do! server.WaitAsync(TimeSpan.FromSeconds 5.)
+    }
+
 let adapterTcpFixture () =
     task {
         let port = freePort ()
@@ -1029,6 +1639,17 @@ let adapterTcpFixture () =
         check connected "adapter TCP listener did not start"
         use stream = controller.GetStream()
         use reader = new StreamReader(stream)
+
+        let oversized =
+            Encoding.UTF8.GetBytes(String('雪', ConvexAdapter.MaximumNdjsonBytes / 3 + 1) + "\n")
+
+        do! stream.WriteAsync oversized
+        let! oversizedError = reader.ReadLineAsync()
+        let oversizedEvent = JsonNode.Parse oversizedError
+
+        check
+            ((oversizedEvent["error"]["name"]).GetValue<string>() = "ProtocolError")
+            "oversized TCP NDJSON was not rejected"
 
         let hello =
             Encoding.UTF8.GetBytes "{\"protocolVersion\":1,\"id\":\"h\",\"op\":\"hello\"}\n"
@@ -1066,10 +1687,62 @@ let adapterStdinEofFixture () =
         check (adapterProcess.ExitCode = 0) "stdin EOF did not cleanly stop adapter"
     }
 
+let adapterStdinOversizedEofFixture () =
+    task {
+        use adapterProcess = new Process()
+        adapterProcess.StartInfo.FileName <- "dotnet"
+        adapterProcess.StartInfo.ArgumentList.Add("client/tests/conformance/bin/Release/net8.0/Adapter.dll")
+        adapterProcess.StartInfo.UseShellExecute <- false
+        adapterProcess.StartInfo.RedirectStandardInput <- true
+        adapterProcess.StartInfo.RedirectStandardOutput <- true
+        check (adapterProcess.Start()) "oversized stdin adapter process did not start"
+        let oversized = String('雪', ConvexAdapter.MaximumNdjsonBytes / 3 + 1)
+        do! adapterProcess.StandardInput.WriteAsync oversized
+        adapterProcess.StandardInput.Close()
+        let! errorLine = adapterProcess.StandardOutput.ReadLineAsync()
+        let error = JsonNode.Parse errorLine
+
+        check
+            ((error["error"]["name"]).GetValue<string>() = "ProtocolError")
+            "unterminated oversized stdin NDJSON was not rejected"
+
+        do! adapterProcess.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds 5.)
+        check (adapterProcess.ExitCode = 0) "oversized stdin EOF did not cleanly stop adapter"
+    }
+
+let stalledControllerWriterFixture () =
+    task {
+        let stalled (_: byte array) (cancellation: CancellationToken) =
+            task { do! Task.Delay(Timeout.Infinite, cancellation) }
+
+        let writer = ConvexAdapter.BoundedWriter stalled
+        let watch = Stopwatch.StartNew()
+        let blocked = writer.Write(ConvexAdapter.makeEvent "ack" (Some "blocked"))
+        let closing = writer.Close(ConvexAdapter.makeEvent "closed" (Some "close"))
+
+        for pending in [ blocked; closing ] do
+            try
+                do! pending
+                failwith "stalled controller write unexpectedly completed"
+            with TransportError _ ->
+                ()
+
+        watch.Stop()
+        check (watch.Elapsed < TimeSpan.FromSeconds 3.) "controller backpressure held close indefinitely"
+    }
+
 [<EntryPoint>]
 let main _ =
+    ExampleCountTests.run ()
     controlFrameFixture().GetAwaiter().GetResult()
     liveFixture().GetAwaiter().GetResult()
+    atomicTransitionFixture().GetAwaiter().GetResult()
+    timestampFixture().GetAwaiter().GetResult()
+    semanticHydrationFixture().GetAwaiter().GetResult()
+    socketOwnershipFixture().GetAwaiter().GetResult()
+    globalDeliveryBudgetFixture().GetAwaiter().GetResult()
+    subscriptionAndCommandBudgetFixture().GetAwaiter().GetResult()
+    httpBodyBudgetFixture().GetAwaiter().GetResult()
     boundedDeliveryFixture().GetAwaiter().GetResult()
     relayBarrierFixture().GetAwaiter().GetResult()
     replacementBarrierFixture().GetAwaiter().GetResult()
@@ -1082,7 +1755,11 @@ let main _ =
     stalledHandshakeFixture().GetAwaiter().GetResult()
     boundedCloseFixture false |> fun work -> work.GetAwaiter().GetResult()
     boundedCloseFixture true |> fun work -> work.GetAwaiter().GetResult()
+    closeUnsubscribeRaceFixture true |> fun work -> work.GetAwaiter().GetResult()
+    closeUnsubscribeRaceFixture false |> fun work -> work.GetAwaiter().GetResult()
     adapterStdinEofFixture().GetAwaiter().GetResult()
+    adapterStdinOversizedEofFixture().GetAwaiter().GetResult()
     adapterTcpFixture().GetAwaiter().GetResult()
+    stalledControllerWriterFixture().GetAwaiter().GetResult()
     printfn "F# client tests passed"
     0

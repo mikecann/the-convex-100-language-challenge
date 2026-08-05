@@ -2,6 +2,8 @@ namespace Convex
 
 open System
 open System.Collections.Generic
+open System.Buffers.Binary
+open System.Globalization
 open System.Net.Http
 open System.Net.WebSockets
 open System.Text
@@ -18,20 +20,124 @@ type Result =
       Logs: string list }
 
 module private Json =
+    [<Literal>]
+    let MaximumHttpBytes = 8 * 1024 * 1024
+
+    type StateVersion =
+        { QuerySet: uint32
+          Identity: uint32
+          Timestamp: string
+          TimestampValue: uint64 }
+
     let strings (node: JsonNode) =
         match node with
         | :? JsonArray as values ->
             [ for value in values do
-                  if not (isNull value) then
-                      value.GetValue<string>() ]
-        | _ -> []
+                  if isNull value then
+                      raise (ProtocolError "Live logLines contained null")
+
+                  try
+                      yield value.GetValue<string>()
+                  with _ ->
+                      raise (ProtocolError "Live logLines must contain only strings") ]
+        | _ -> raise (ProtocolError "Live logLines must be an array")
+
+    let private versionCounter (version: JsonObject) field label =
+        if not (version.ContainsKey field) || isNull version[field] then
+            raise (ProtocolError(sprintf "%s omitted integer %s" label field))
+
+        let encoded = version[field].ToJsonString()
+
+        match UInt32.TryParse(encoded, NumberStyles.None, CultureInfo.InvariantCulture) with
+        | true, value -> value
+        | _ -> raise (ProtocolError(sprintf "%s has invalid %s" label field))
+
+    let private timestamp (value: JsonNode) label =
+        if isNull value then
+            raise (ProtocolError(sprintf "%s omitted string ts" label))
+
+        let encoded =
+            try
+                value.GetValue<string>()
+            with _ ->
+                raise (ProtocolError(sprintf "%s omitted string ts" label))
+
+        let decoded =
+            try
+                Convert.FromBase64String encoded
+            with :? FormatException ->
+                raise (ProtocolError(sprintf "%s ts is not valid base64" label))
+
+        if decoded.Length <> 8 then
+            raise (ProtocolError(sprintf "%s ts must encode exactly eight bytes" label))
+
+        if Convert.ToBase64String(decoded) <> encoded then
+            raise (ProtocolError(sprintf "%s ts is not canonical base64" label))
+
+        encoded, BinaryPrimitives.ReadUInt64LittleEndian decoded
+
+    let stateVersion (node: JsonNode) label =
+        let version =
+            match node with
+            | :? JsonObject as value -> value
+            | _ -> raise (ProtocolError(sprintf "%s must be an object" label))
+
+        let encodedTimestamp, timestampValue = timestamp version["ts"] label
+
+        { QuerySet = versionCounter version "querySet" label
+          Identity = versionCounter version "identity" label
+          Timestamp = encodedTimestamp
+          TimestampValue = timestampValue }
 
     let zeroVersion () =
-        let value = JsonObject()
-        value["querySet"] <- JsonValue.Create 0
-        value["identity"] <- JsonValue.Create 0
-        value["ts"] <- JsonValue.Create "AAAAAAAAAAA="
-        value
+        { QuerySet = 0u
+          Identity = 0u
+          Timestamp = "AAAAAAAAAAA="
+          TimestampValue = 0UL }
+
+    let rec semanticallyEqual (left: JsonNode) (right: JsonNode) =
+        if isNull left || isNull right then
+            isNull left && isNull right
+        else
+            match left, right with
+            | (:? JsonObject as leftObject), (:? JsonObject as rightObject) ->
+                leftObject.Count = rightObject.Count
+                && (leftObject
+                    |> Seq.forall (fun pair ->
+                        rightObject.ContainsKey pair.Key
+                        && semanticallyEqual pair.Value rightObject[pair.Key]))
+            | (:? JsonArray as leftArray), (:? JsonArray as rightArray) ->
+                leftArray.Count = rightArray.Count
+                && Seq.forall2 semanticallyEqual leftArray rightArray
+            | _ -> JsonNode.DeepEquals(left, right)
+
+    let successfulValuesEqual (left: JsonNode option) (right: JsonNode option) =
+        match left, right with
+        | None, None -> true
+        | Some leftValue, Some rightValue -> semanticallyEqual leftValue rightValue
+        | _ -> false
+
+    let readBoundedUtf8 operation (stream: IO.Stream) =
+        task {
+            let buffer = Array.zeroCreate<byte> 8192
+            use collected = new IO.MemoryStream()
+            let mutable finished = false
+
+            while not finished do
+                let! count = stream.ReadAsync(buffer.AsMemory())
+
+                if count = 0 then
+                    finished <- true
+                elif collected.Length + int64 count > int64 MaximumHttpBytes then
+                    raise (TransportError(operation, sprintf "HTTP response exceeded %d bytes" MaximumHttpBytes))
+                else
+                    collected.Write(buffer, 0, count)
+
+            try
+                return UTF8Encoding(false, true).GetString(collected.ToArray())
+            with :? DecoderFallbackException as error ->
+                return raise (TransportError(operation, "HTTP response was not valid UTF-8: " + error.Message))
+        }
 
 /// Native F# implementation of Convex's JSON HTTP function endpoint.
 type Client(deployment: string) =
@@ -72,7 +178,12 @@ type Client(deployment: string) =
             use request =
                 new HttpRequestMessage(HttpMethod.Post, Uri(baseUri, "/api/" + operation))
 
-            request.Content <- new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json")
+            let encodedPayload = payload.ToJsonString()
+
+            if Encoding.UTF8.GetByteCount encodedPayload > Json.MaximumHttpBytes then
+                invalidArg "args" (sprintf "Convex request exceeded %d bytes" Json.MaximumHttpBytes)
+
+            request.Content <- new StringContent(encodedPayload, Encoding.UTF8, "application/json")
 
             request.Headers.TryAddWithoutValidation("Convex-Client", "fsharp-0.1.0")
             |> ignore
@@ -84,12 +195,13 @@ type Client(deployment: string) =
             let! response =
                 task {
                     try
-                        return! http.SendAsync request
+                        return! http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead)
                     with error ->
                         return raise (TransportError(operation, error.Message))
                 }
 
-            let! body = response.Content.ReadAsStringAsync()
+            use! responseStream = response.Content.ReadAsStreamAsync()
+            let! body = Json.readBoundedUtf8 operation responseStream
 
             let decoded =
                 try
@@ -148,14 +260,59 @@ type Update =
       Error: exn option
       Logs: string list }
 
-/// A subscription owns a count-and-byte bounded newest-value buffer.
-type Subscription internal (queryId: int, path: string, args: JsonObject, unsubscribe: int -> Task<unit>) =
+type internal DeliveryEntry(update: Update, size: int, local: LinkedList<DeliveryEntry>) =
+    member _.Update = update
+    member _.Size = size
+    member _.Local = local
+    member val GlobalNode: LinkedListNode<DeliveryEntry> = null with get, set
+    member val LocalNode: LinkedListNode<DeliveryEntry> = null with get, set
+
+/// All subscriptions on one Live client share this budget. A slow collection of
+/// subscriptions therefore cannot multiply the memory ceiling per query.
+type internal DeliveryBudget(maximumCount: int, maximumBytes: int) =
     let sync = obj ()
-    let updates = Queue<Update * int>()
+    let entries = LinkedList<DeliveryEntry>()
     let mutable encodedBytes = 0
+
+    let remove (entry: DeliveryEntry) =
+        if not (isNull entry.GlobalNode) then
+            entries.Remove entry.GlobalNode
+            entry.Local.Remove entry.LocalNode
+            encodedBytes <- encodedBytes - entry.Size
+            entry.GlobalNode <- null
+            entry.LocalNode <- null
+
+    member _.Sync = sync
+
+    member _.Add(local: LinkedList<DeliveryEntry>, update: Update, size: int) =
+        while entries.Count > 0
+              && (entries.Count >= maximumCount || encodedBytes + size > maximumBytes) do
+            remove entries.First.Value
+
+        if size > maximumBytes then
+            raise (ProtocolError(sprintf "Live delivery exceeded the global %d-byte budget" maximumBytes))
+
+        let entry = DeliveryEntry(update, size, local)
+        entry.GlobalNode <- entries.AddLast entry
+        entry.LocalNode <- local.AddLast entry
+        encodedBytes <- encodedBytes + size
+
+    member _.Remove(entry: DeliveryEntry) = remove entry
+
+    member _.Clear(local: LinkedList<DeliveryEntry>) =
+        while local.Count > 0 do
+            remove local.First.Value
+
+    member _.Snapshot = entries.Count, encodedBytes
+
+/// A subscription reads from the one global count-and-byte bounded newest buffer.
+type Subscription
+    internal (queryId: int, path: string, args: JsonObject, budget: DeliveryBudget, unsubscribe: int -> Task<unit>) =
+    let updates = LinkedList<DeliveryEntry>()
     let mutable closed = false
-    let mutable suppressEqual: string option = None
-    let mutable lastValue: string option = None
+    let mutable suppressEqual: JsonNode option option = None
+    let mutable lastValue: JsonNode option option = None
+    let mutable lastDeliveryWasError = false
 
     let encodedSize (update: Update) =
         // Size the complete delivery shape. Function errors can carry large JSON data and
@@ -207,55 +364,61 @@ type Subscription internal (queryId: int, path: string, args: JsonObject, unsubs
     member _.Args = args
 
     member internal _.PrepareHydrationDedup() =
-        lock sync (fun () -> suppressEqual <- lastValue)
+        lock budget.Sync (fun () ->
+            suppressEqual <-
+                if lastDeliveryWasError then
+                    None
+                else
+                    lastValue |> Option.map (Option.map _.DeepClone()))
 
     member internal _.Offer(update: Update) =
-        lock sync (fun () ->
+        lock budget.Sync (fun () ->
             if not closed then
-                let serialized = update.Value |> Option.map (fun value -> value.ToJsonString())
-                let duplicateHydration = suppressEqual.IsSome && serialized = suppressEqual
+                let successfulValue = update.Value |> Option.map _.DeepClone()
+
+                let duplicateHydration =
+                    match suppressEqual with
+                    | Some previous when update.Error.IsNone -> Json.successfulValuesEqual previous successfulValue
+                    | _ -> false
+
                 suppressEqual <- None
 
                 if not duplicateHydration then
                     let size = encodedSize update
 
-                    while updates.Count > 0 && (updates.Count >= 16 || encodedBytes + size > 262144) do
-                        let _, removed = updates.Dequeue()
-                        encodedBytes <- encodedBytes - removed
-                    // A single oversized value is still delivered. It cannot grow the buffer beyond one item.
-                    updates.Enqueue(update, size)
-                    encodedBytes <- encodedBytes + size
+                    budget.Add(updates, update, size)
 
-                    // Errors are deliveries, not remote values. Keep the last successful
-                    // value so reconnect hydration can still suppress an unchanged replay.
                     if update.Error.IsNone then
-                        lastValue <- serialized
+                        lastValue <- Some successfulValue
+                        lastDeliveryWasError <- false
+                    else
+                        // An unchanged value after QueryFailed is recovery, not duplicate hydration.
+                        lastDeliveryWasError <- true
 
-                    Monitor.PulseAll sync)
+                    Monitor.PulseAll budget.Sync)
 
     member internal _.Finish() =
-        lock sync (fun () ->
+        lock budget.Sync (fun () ->
             closed <- true
-            updates.Clear()
-            encodedBytes <- 0
-            Monitor.PulseAll sync)
+            budget.Clear updates
+            Monitor.PulseAll budget.Sync)
 
     member _.NextUpdate(timeout: TimeSpan) =
-        lock sync (fun () ->
+        lock budget.Sync (fun () ->
             let deadline = DateTime.UtcNow + timeout
 
             while updates.Count = 0 && not closed do
                 let remaining = deadline - DateTime.UtcNow
 
-                if remaining <= TimeSpan.Zero || not (Monitor.Wait(sync, remaining)) then
+                if remaining <= TimeSpan.Zero || not (Monitor.Wait(budget.Sync, remaining)) then
                     raise (TimeoutException "timed out waiting for Live update")
 
             if updates.Count = 0 then
                 raise (ObjectDisposedException "Subscription")
 
-            let update, size = updates.Dequeue()
-            encodedBytes <- encodedBytes - size
-            update)
+            let entry = updates.First.Value
+            budget.Remove entry
+            entry.Update)
 
     member this.Next(timeout: TimeSpan) =
         let update = this.NextUpdate timeout
@@ -267,7 +430,19 @@ type Subscription internal (queryId: int, path: string, args: JsonObject, unsubs
 
     interface IDisposable with
         member _.Dispose() =
-            if not closed then
+            let shouldUnsubscribe =
+                lock budget.Sync (fun () ->
+                    if closed then
+                        false
+                    else
+                        // Invalidate delivery before asking the owner to remove the query.
+                        // This is the unsubscribe acknowledgement's local generation barrier.
+                        closed <- true
+                        budget.Clear updates
+                        Monitor.PulseAll budget.Sync
+                        true)
+
+            if shouldUnsubscribe then
                 unsubscribe queryId |> fun work -> work.GetAwaiter().GetResult()
 
 #if LEGACY_LIVE

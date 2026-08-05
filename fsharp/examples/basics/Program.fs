@@ -1,24 +1,7 @@
 open System
-open System.Globalization
 open System.Text.Json.Nodes
 open Convex
-
-let count (value: JsonNode) place =
-    match value with
-    | :? JsonObject as objectValue when not (isNull objectValue["count"]) ->
-        // Convex may encode a whole counter as either 0 or 0.0. Normalize only finite Int32 values.
-        let raw = objectValue["count"].ToJsonString()
-
-        match Double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture) with
-        | true, number when
-            Double.IsFinite number
-            && number = Math.Truncate number
-            && number >= float Int32.MinValue
-            && number <= float Int32.MaxValue
-            ->
-            int number
-        | _ -> invalidOp (place + " did not return a whole Int32 count")
-    | _ -> invalidOp (place + " did not return a counter value")
+open ExampleCount
 
 [<EntryPoint>]
 let main argv =

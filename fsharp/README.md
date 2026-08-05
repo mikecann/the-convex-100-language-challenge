@@ -6,7 +6,7 @@ It is unofficial teaching code, not a production SDK.
 
 ## Start here
 
-[The canonical basic example](examples/basics/Program.fs) reads a room's counter over HTTP, starts Live, applies one idempotent mutation, and checks the Live update.
+[The canonical basic example](examples/basics/Program.fs) reads a room's counter over HTTP, starts Live, applies one idempotent mutation, and checks the Live update. Its small [exact JSON count decoder](examples/basics/Count.fs) accepts decimal forms such as `0.0` without rounding through floating point.
 
 ## What works
 
@@ -20,26 +20,9 @@ It is unofficial teaching code, not a production SDK.
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Program.fs -->
 ```fsharp
 open System
-open System.Globalization
 open System.Text.Json.Nodes
 open Convex
-
-let count (value: JsonNode) place =
-    match value with
-    | :? JsonObject as objectValue when not (isNull objectValue["count"]) ->
-        // Convex may encode a whole counter as either 0 or 0.0. Normalize only finite Int32 values.
-        let raw = objectValue["count"].ToJsonString()
-
-        match Double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture) with
-        | true, number when
-            Double.IsFinite number
-            && number = Math.Truncate number
-            && number >= float Int32.MinValue
-            && number <= float Int32.MaxValue
-            ->
-            int number
-        | _ -> invalidOp (place + " did not return a whole Int32 count")
-    | _ -> invalidOp (place + " did not return a counter value")
+open ExampleCount
 
 [<EntryPoint>]
 let main argv =
@@ -116,14 +99,14 @@ The repository coordinator owns `verify-example`, `verify`, and `verify-hosted`.
 
 ## Protocol notes
 
-The implementation sends Convex JSON HTTP requests directly and speaks the pinned `/api/sync` WebSocket protocol in F#. One mailbox owner controls socket generations, query-set versions, writes, metadata, and reconnect scheduling. Its single reader reassembles one frame at a time and waits for owner acknowledgement before reading again. Subscription replacement and unsubscribe invalidate the old relay before acknowledgement.
+The implementation sends Convex JSON HTTP requests directly and speaks the pinned `/api/sync` WebSocket protocol in F#. One mailbox owner is the sole caller of every WebSocket connect, receive, send, abort, and dispose operation. It validates and coalesces a complete transition, commits the strict state version, and only then publishes changes in query-ID order. Subscription replacement and unsubscribe invalidate the old relay before acknowledgement.
 
-Each subscription keeps the newest 16 deliveries and at most 262144 encoded bytes. If one delivery alone exceeds the byte budget, it is retained so callers can still observe its value or structured error. Valid protocol traffic resets reconnect backoff. Reconnect metadata carries the connection count, last close reason, and the maximum observed Convex timestamp.
+All subscriptions share one newest-16 delivery budget capped at 8 MiB of complete encoded values and structured errors. Subscription count, argument bytes, command ingress, Live frames, and HTTP bodies have separate global ceilings, so adding subscriptions cannot multiply an unbounded per-query allowance. Convex timestamps must be canonical base64 encodings of exactly one little-endian `uint64`; reconnect metadata retains the numeric maximum rather than the most recently received string.
 
-The adapter implements NDJSON protocol v1 over stdin/stdout or one TCP controller connection. It reserves stdout for protocol events and exposes `debugDisconnect` only for conformance testing.
+The adapter implements NDJSON protocol v1 over stdin/stdout or one TCP controller connection. It incrementally caps input at 4 MiB per encoded record, caps queued controller output at 16 MiB, and gives each write a 1.5-second deadline. It reserves stdout for protocol events and exposes `debugDisconnect` only for conformance testing.
 
 ## Limitations
 
 This is pinned to an undocumented protocol profile, so it is evidence for this experiment rather than a stable SDK contract. Live authentication, optimistic updates, transition chunks, journals, and WebSocket mutation or action calls are not implemented. HTTP supports bearer authentication and remains the path for mutations and actions.
 
-The language-local fixtures cover fragmented multibyte UTF-8, partial frames, idle and continuously sending peers, stalled handshakes, structured protocol/transport/function errors, QueryFailed recovery, five refused reconnect attempts followed by success, five debug reconnects, hydration suppression, stale relay races, both delivery bounds, and partial NDJSON plus EOF. Shared local and hosted conformance evidence is deliberately left to the repository coordinator.
+The language-local fixtures also cover atomic transition rejection, repeated-query coalescing, strict state versions, 255 to 256 little-endian timestamp ordering, semantic object and null hydration, same-value recovery after errors, cross-subscription memory pressure, command and subscription ceilings, bounded HTTP bodies, oversized partial NDJSON, controller backpressure, and sole-owner socket instrumentation. Shared local and hosted conformance evidence is deliberately left to the repository coordinator.

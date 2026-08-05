@@ -28,5 +28,5 @@ adapter:
 limitations:
   - Live authentication, optimistic updates, transition chunks, journals, and WebSocket mutation or action calls are not implemented; HTTP bearer authentication is supported.
   - Live follows a pinned, undocumented protocol profile and is educational rather than a compatibility promise.
-  - The per-subscription queue retains the newest 16 deliveries and at most 262144 encoded bytes; a single oversized delivery is retained so its structured outcome remains observable.
+  - All subscriptions share one newest-16 queue capped at 8388608 encoded bytes; subscription count, argument bytes, command ingress, frames, HTTP bodies, and adapter I/O have separate global bounds.
 capabilities: []
