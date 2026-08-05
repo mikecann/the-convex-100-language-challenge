@@ -1,23 +1,3 @@
-# Convex from Groovy
-
-This small Groovy client makes a normal Convex HTTP query and mutation, then keeps the same query live over `/api/sync` to show the counter changing from `0` to `1`.
-
-It is an educational, unofficial protocol demonstration, not a production SDK or a package intended for publication.
-
-## Start here
-
-[`examples/basics/Main.groovy`](examples/basics/Main.groovy) is the canonical example. It creates one unique room, reads it through HTTP, starts Live before the mutation, applies an idempotent mutation, and proves the resulting Live update agrees.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| JSON HTTP query, mutation, action, bearer auth, logs, and structured errors | Implemented, pending root-owned conformance evidence |
-| `/api/sync` live queries with reconnect and error recovery | Implemented, pending root-owned conformance evidence |
-| Live auth, optimistic mutations, and `TransitionChunk` | Deliberately deferred |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.groovy -->
-```text
 package examples.basics
 
 import convex.ConvexClient
@@ -73,24 +53,3 @@ final class Main {
     number.intValueExact()
   }
 }
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker checks
-
-```sh
-./run test groovy       # Formats, compiles, and runs Groovy-local deterministic tests in Docker.
-./run build groovy      # Builds the linux/amd64 non-root conformance runtime image.
-./run verify-example groovy  # Root-owned: runs this exact example against the approved local deployment.
-./run verify-all groovy      # Root-owned: runs local and hosted black-box conformance serially.
-```
-
-The final images run compiled bytecode on the Temurin JRE. They contain no Groovy compiler, build tool, package manager, Node, Python, curl, or Convex CLI.
-
-## Protocol notes
-
-The client uses the pinned `convex-rs-0.10.4-unversioned-sync` `/api/sync` profile. One single-threaded owner performs every socket read transition, write, reconnect, and query-set mutation. Relays consume a bounded newest-16 queue with a 2 MiB encoded-value budget. The test-only adapter supports NDJSON on stdin/stdout or one `ADAPTER_LISTEN` TCP connection, and exposes `debugDisconnect` only for the shared controller.
-
-## Limitations
-
-This is intentionally narrow: it has no persistence, offline replay, optimistic state, package metadata, or claim of protocol stability. A `QueryFailed` is delivered as a structured subscription error; a later valid `QueryUpdated` on the same subscription recovers it.
