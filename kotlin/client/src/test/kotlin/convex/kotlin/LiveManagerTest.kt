@@ -28,6 +28,7 @@ class LiveManagerTest {
     @Test
     fun `one owner serializes Connect Add Remove and delivers fragmented updates and recovery`() {
         val sent = CountDownLatch(1)
+        val sendThreads = Collections.synchronizedList(mutableListOf<String>())
         RawWebSocketFixture { connection, _ ->
             val connect = connection.readMessage()
             assertEquals("Connect", connect.type)
@@ -51,6 +52,7 @@ class LiveManagerTest {
             connection.awaitClientClose()
         }.use { fixture ->
             LiveManager(fixture.url, "test").use { manager ->
+                manager.sendInitiatedThreadObserver = { sendThreads += it }
                 val first = manager.subscribe("demo:state", JsonObject(emptyMap()))
                 val initialUpdate = first.next() ?: error("initial update timed out")
                 assertEquals(0, initialUpdate.value.countValue())
@@ -64,6 +66,8 @@ class LiveManagerTest {
                 val second = manager.subscribe("demo:other", JsonObject(emptyMap()))
                 assertEquals(9, second.nextValue())
                 second.close()
+                awaitCondition { sendThreads.size >= 4 }
+                assertTrue(sendThreads.all { it == "convex-kotlin-live" }, sendThreads.toString())
             }
         }
     }
@@ -222,6 +226,35 @@ class LiveManagerTest {
         }
     }
 
+    @Test
+    fun `subscription close is bounded for idle continuous partial frame and pending handshake peers`() {
+        assertBoundedUnsubscribe(PeerMode.IDLE)
+        assertBoundedUnsubscribe(PeerMode.CONTINUOUS)
+        assertBoundedUnsubscribe(PeerMode.PARTIAL)
+
+        ServerSocket(0).use { server ->
+            val accepted = CountDownLatch(1)
+            val peer =
+                Thread {
+                    server.accept().use {
+                        accepted.countDown()
+                        CountDownLatch(1).await()
+                    }
+                }.apply {
+                    isDaemon = true
+                    start()
+                }
+            LiveManager("http://127.0.0.1:${server.localPort}", "test").use { manager ->
+                val subscription = manager.subscribe("demo:state", JsonObject(emptyMap()))
+                assertTrue(accepted.await(8, TimeUnit.SECONDS))
+                val elapsed = measureTimeMillis { subscription.close() }
+                assertTrue(elapsed < 2_000, "pending handshake unsubscribe took ${elapsed}ms")
+            }
+            server.close()
+            peer.interrupt()
+        }
+    }
+
     private fun assertBoundedClose(mode: PeerMode) {
         val ready = CountDownLatch(1)
         RawWebSocketFixture { connection, _ ->
@@ -244,6 +277,32 @@ class LiveManagerTest {
             assertTrue(ready.await(8, TimeUnit.SECONDS), "$mode peer did not become ready")
             val elapsed = measureTimeMillis { manager.close() }
             assertTrue(elapsed < 2_000, "$mode close took ${elapsed}ms")
+        }
+    }
+
+    private fun assertBoundedUnsubscribe(mode: PeerMode) {
+        val ready = CountDownLatch(1)
+        RawWebSocketFixture { connection, _ ->
+            connection.readMessage()
+            connection.readMessage()
+            ready.countDown()
+            when (mode) {
+                PeerMode.IDLE -> CountDownLatch(1).await()
+                PeerMode.PARTIAL -> {
+                    connection.sendPartialText(20, "{\"type\":".toByteArray())
+                    CountDownLatch(1).await()
+                }
+                PeerMode.CONTINUOUS -> {
+                    while (true) connection.sendPing("busy")
+                }
+            }
+        }.use { fixture ->
+            LiveManager(fixture.url, "test").use { manager ->
+                val subscription = manager.subscribe("demo:state", JsonObject(emptyMap()))
+                assertTrue(ready.await(8, TimeUnit.SECONDS), "$mode peer did not become ready")
+                val elapsed = measureTimeMillis { subscription.close() }
+                assertTrue(elapsed < 2_000, "$mode unsubscribe took ${elapsed}ms")
+            }
         }
     }
 

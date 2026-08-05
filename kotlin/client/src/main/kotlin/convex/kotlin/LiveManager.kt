@@ -17,9 +17,9 @@ import java.net.http.HttpClient
 import java.net.http.WebSocket
 import java.nio.ByteBuffer
 import java.time.Duration
+import java.util.ArrayDeque
 import java.util.UUID
 import java.util.concurrent.ArrayBlockingQueue
-import java.util.concurrent.CancellationException
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CompletionException
 import java.util.concurrent.Executors
@@ -81,6 +81,13 @@ private data class State(
     var last: Update? = null,
 )
 
+private data class PendingSend(
+    val operation: String,
+    val socket: WebSocket,
+    val generation: Long,
+    val action: (WebSocket) -> CompletableFuture<*>,
+)
+
 /**
  * One actor owns socket state, outgoing frames, reconnects, and query versions.
  * JDK callbacks only copy transport data and enqueue it back to that actor.
@@ -113,7 +120,8 @@ internal class LiveManager(
     private var socket: WebSocket? = null
     private var pendingHandshake: CompletableFuture<WebSocket>? = null
     private var pendingReconnect: ScheduledFuture<*>? = null
-    private var sendTail: CompletableFuture<Void> = CompletableFuture.completedFuture(null)
+    private val pendingSends = ArrayDeque<PendingSend>()
+    private var inFlightSend: CompletableFuture<*>? = null
     private var closed = false
     private var nextQueryId = 0
     private var querySet = 0
@@ -125,6 +133,7 @@ internal class LiveManager(
     private var generation = 0L
 
     internal var reconnectDelayObserver: ((Long) -> Unit)? = null
+    internal var sendInitiatedThreadObserver: ((String) -> Unit)? = null
 
     fun subscribe(
         path: String,
@@ -152,7 +161,16 @@ internal class LiveManager(
             val state = states.remove(queryId) ?: return@onOwner
             state.subscription.deactivate()
             if (socket != null) modify(listOf(remove(queryId)))
-            if (states.isEmpty()) cancelReconnect()
+            if (states.isEmpty()) {
+                cancelReconnect()
+                if (socket == null) {
+                    // A last-subscription unsubscribe must not leave a stalled
+                    // handshake alive until its transport timeout.
+                    generation++
+                    pendingHandshake?.cancel(true)
+                    pendingHandshake = null
+                }
+            }
         }
 
     fun debugDisconnect() =
@@ -214,7 +232,8 @@ internal class LiveManager(
                 socket = connected
                 querySet = 0
                 remoteVersion = RemoteVersion.zero()
-                sendTail = CompletableFuture.completedFuture(null)
+                pendingSends.clear()
+                inFlightSend = null
                 reconnectDelayMillis = INITIAL_RECONNECT_DELAY_MILLIS
 
                 enqueueJson(
@@ -227,8 +246,8 @@ internal class LiveManager(
                         put("clientTs", 0)
                     },
                 )
-                // enqueueJson chains each JDK send future. The Add cannot start
-                // until the Connect future has completed successfully.
+                // The actor queue starts Add only after Connect's completion has
+                // dispatched back here from the JDK transport thread.
                 if (states.isNotEmpty()) {
                     modify(states.map { (id, state) -> add(id, state.path, state.args) })
                 }
@@ -239,44 +258,72 @@ internal class LiveManager(
     private fun enqueueJson(value: JsonObject) {
         val payload = ConvexClient.json.encodeToString(JsonObject.serializer(), value)
         enqueueSend("live write") { webSocket ->
-            webSocket.sendText(payload, true).thenApply { null }
+            webSocket.sendText(payload, true)
         }
     }
 
     private fun enqueuePong(payload: ByteBuffer) {
         enqueueSend("live pong") { webSocket ->
-            webSocket.sendPong(payload).thenApply { null }
+            webSocket.sendPong(payload)
         }
     }
 
     private fun enqueueSend(
         operation: String,
-        action: (WebSocket) -> CompletableFuture<Void>,
+        action: (WebSocket) -> CompletableFuture<*>,
     ) {
         val expectedSocket = socket ?: return
-        val expectedGeneration = generation
-        val next =
-            sendTail
-                .handle { _, priorFailure ->
-                    if (priorFailure != null) throw CompletionException(unwrap(priorFailure))
-                    if (closed || socket !== expectedSocket || generation != expectedGeneration) {
-                        throw CancellationException("Live connection generation retired")
-                    }
-                    expectedSocket
-                }.thenCompose(action)
-        sendTail = next
-        next.whenComplete { _, error ->
-            if (error == null) return@whenComplete
-            dispatch {
-                if (!closed && socket === expectedSocket && generation == expectedGeneration) {
-                    val cause = unwrap(error)
-                    if (cause !is CancellationException) {
-                        publishTransportFailure(operation, cause)
-                    }
-                    retire("$operation: ${cause.message}", reconnect = true)
+        pendingSends.addLast(PendingSend(operation, expectedSocket, generation, action))
+        startNextSend()
+    }
+
+    /**
+     * Starts writes only on the owner. A JDK completion callback does nothing
+     * except dispatch [completeSend] back to this actor first.
+     */
+    private fun startNextSend() {
+        if (inFlightSend != null) return
+        while (pendingSends.isNotEmpty()) {
+            val pending = pendingSends.removeFirst()
+            if (closed || socket !== pending.socket || generation != pending.generation) continue
+            sendInitiatedThreadObserver?.invoke(Thread.currentThread().name)
+            val future =
+                try {
+                    pending.action(pending.socket)
+                } catch (error: Throwable) {
+                    publishTransportFailure(pending.operation, error)
+                    retire("${pending.operation}: ${error.message}", reconnect = true)
+                    return
                 }
+            inFlightSend = future
+            future.whenComplete { _, error ->
+                // Do not inspect actor state or start the next send on the JDK
+                // completion thread. Even a synchronously completed future is
+                // routed through the owner's executor.
+                dispatch { completeSend(pending, future, error) }
             }
+            return
         }
+    }
+
+    private fun completeSend(
+        pending: PendingSend,
+        future: CompletableFuture<*>,
+        error: Throwable?,
+    ) {
+        if (inFlightSend !== future) return
+        inFlightSend = null
+        if (closed || socket !== pending.socket || generation != pending.generation) {
+            startNextSend()
+            return
+        }
+        if (error != null) {
+            val cause = unwrap(error)
+            publishTransportFailure(pending.operation, cause)
+            retire("${pending.operation}: ${cause.message}", reconnect = true)
+            return
+        }
+        startNextSend()
     }
 
     private fun modify(modifications: List<JsonObject>) {
@@ -464,8 +511,9 @@ internal class LiveManager(
         val oldSocket = socket
         socket = null
         generation++
-        sendTail.cancel(true)
-        sendTail = CompletableFuture.completedFuture(null)
+        pendingSends.clear()
+        inFlightSend?.cancel(true)
+        inFlightSend = null
         oldSocket?.abort()
         if (oldSocket != null) connectionCount++
         lastCloseReason = reason
@@ -486,7 +534,9 @@ internal class LiveManager(
                 cancelReconnect()
                 pendingHandshake?.cancel(true)
                 pendingHandshake = null
-                sendTail.cancel(true)
+                pendingSends.clear()
+                inFlightSend?.cancel(true)
+                inFlightSend = null
                 socket?.abort()
                 socket = null
                 states.values.forEach { it.subscription.deactivate() }
