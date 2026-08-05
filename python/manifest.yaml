@@ -4,5 +4,30 @@ displayName: "Python"
 rank: 1
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Python documented JSON HTTP client and a stdlib RFC 6455 WebSocket attempt for the pinned Live profile. Capability badges remain empty until shared local and hosted conformance pass.
+toolchain:
+  name: Python
+  version: 3.13.5
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication is deferred.
+  - The WebSocket implementation supports only unfragmented text frames used by the pinned profile.
+  - TransitionChunk assembly, mutation replay, optimistic updates, journals, and full Convex values are deferred.
+  - Live compatibility has not yet been demonstrated against either shared deployment profile.
 capabilities: []
