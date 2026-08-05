@@ -1,32 +1,3 @@
-# Convex from Tcl
-
-This demonstration uses Tcl to call Convex's documented JSON HTTP endpoints and
-to keep a reactive query current through a native Tcl WebSocket connection.
-
-It is an educational, unofficial experiment. It is not a production SDK, an
-officially sanctioned Convex client, or a package intended for publication.
-
-## Start here
-
-[`examples/basics/main.tcl`](examples/basics/main.tcl) is the canonical example.
-It reads a new counter room over HTTP, starts Live before changing it, applies
-an idempotent mutation, and proves the same `0 -> 1` journey arrived through
-the subscription. The block below is generated from that exact runnable file.
-
-## What works
-
-| Capability | Current state | What that means |
-| --- | --- | --- |
-| HTTP | Awaiting shared verification | Native Tcl HTTP query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented. |
-| Live | Awaiting shared verification | Native Tcl RFC 6455 subscriptions, unsubscribe, reconnect, reactive errors, and clean close target the pinned sync profile. |
-
-No capability badge is earned until root-owned local and hosted black-box
-conformance passes. A Docker build or a language-local test does not earn one.
-
-## The basic example
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.tcl -->
-```tcl
 #!/usr/local/bin/tclsh
 # The canonical teaching example intentionally uses the same Tcl client source
 # as the conformance adapter, so readers run precisely what the README shows.
@@ -107,41 +78,3 @@ try {
     if {[info exists subscription]} { ::convex::unsubscribe $client $subscription }
     ::convex::close $client
 }
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Verify it in Docker
-
-```sh
-./run test tcl
-./run verify-example tcl
-./run verify tcl
-./run verify-hosted tcl
-./run verify-all tcl
-```
-
-`test` runs Tcl parsing and focused language-local checks inside Docker.
-`verify-example` executes the canonical source above and compares its stdout
-with the universal transcript. The remaining commands are root-owned shared
-gates for the approved local and hosted deployments.
-
-## Conformance and protocol notes
-
-The test-only adapter under `client/tests/conformance/` speaks NDJSON protocol
-v1 on stdin/stdout and TCP. It calls the real Tcl client for every operation.
-Its adapter-only `debugDisconnect` command lets the shared harness prove five
-real reconnects.
-
-HTTP uses Convex's documented `format: "json"` endpoints. Live pins
-`convex-rs-0.10.4-unversioned-sync` at
-`6f1df8a8ba1665084ec001e307ca841ca17074d7` and `/api/sync`. That realtime
-protocol is not documented as stable, so hosted verification remains required.
-
-## Limitations
-
-- Live authentication and `TransitionChunk` assembly are intentionally not yet
-  implemented. A chunk is treated as recoverable protocol drift.
-- Values are limited to this experiment's JSON-safe subset. Tagged Convex
-  Int64, bytes, special floats, and negative zero are outside scope.
-- Mutations and actions use HTTP. Optimistic updates, journals, mutation replay,
-  and WebSocket writes are deferred.
