@@ -1,5 +1,11 @@
 -module(main).
 -export([main/0]).
+-ifdef(TEST).
+-export([count/1]).
+-endif.
+
+-define(MIN_COUNT, -9223372036854775808).
+-define(MAX_COUNT, 9223372036854775807).
 
 main() ->
     Room =
@@ -66,12 +72,19 @@ next_count(Id) ->
         erlang:error(live_timeout)
     end.
 
-%% JSX follows JavaScript's number model, so Convex's integer counter can
-%% arrive as a whole float. Reject fractions rather than silently truncating.
+%% JSX may decode Convex's counter as either an integer or a whole float.
+%% Accept both spellings within a signed 64-bit teaching value, but reject
+%% fractions, strings, non-finite stand-ins, and values that would overflow.
 count(Value) ->
     case maps:get(<<"count">>, Value) of
-        N when is_integer(N) -> N;
-        N when is_float(N), trunc(N) == N -> trunc(N)
+        N when is_integer(N), N >= ?MIN_COUNT, N =< ?MAX_COUNT -> N;
+        N when is_float(N) ->
+            Whole = trunc(N),
+            case N == Whole andalso Whole >= ?MIN_COUNT andalso Whole =< ?MAX_COUNT of
+                true -> Whole;
+                false -> erlang:error({invalid_count, N})
+            end;
+        Invalid -> erlang:error({invalid_count, Invalid})
     end.
 
 env(Name, Default) ->
