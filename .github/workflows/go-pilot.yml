@@ -1,10 +1,8 @@
 name: Go pilot
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
+  # Keep hosted CI opt-in while the language clients are being explored.
+  # We will restore automatic trusted runs when we are ready to publish evidence.
   workflow_dispatch:
 
 permissions:
