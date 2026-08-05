@@ -2,12 +2,13 @@
   "Educational native Clojure Convex HTTP and pinned Live sync-profile client."
   (:require [clojure.data.json :as json]
             [clojure.string :as string])
-  (:import [java.net URI]
+  (:import [java.math BigInteger]
+           [java.net URI]
            [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers WebSocket WebSocket$Listener]
            [java.nio ByteBuffer]
            [java.nio.charset StandardCharsets]
            [java.time Duration]
-           [java.util ArrayDeque LinkedHashMap UUID]
+           [java.util ArrayDeque Base64 LinkedHashMap UUID]
            [java.util.concurrent ArrayBlockingQueue Callable CompletableFuture CompletionException ExecutionException Executors RejectedExecutionException ScheduledExecutorService ThreadFactory ThreadPoolExecutor ThreadPoolExecutor$AbortPolicy TimeUnit TimeoutException]
            [java.util.function BiConsumer]))
 
@@ -329,16 +330,35 @@
       completion)
     (completed-future)))
 
+(defn- decode-timestamp [timestamp]
+  ;; Convex timestamps are canonical base64 encodings of one little-endian
+  ;; uint64. Decode numerically: lexical or raw-byte ordering gets 255 -> 256
+  ;; wrong because the least-significant byte comes first.
+  (when-not (and (string? timestamp) (= 12 (count timestamp)))
+    (throw (failure :protocol "Live timestamp must canonically encode eight bytes")))
+  (let [decoded (try
+                  (.decode (Base64/getDecoder) ^String timestamp)
+                  (catch IllegalArgumentException _ nil))]
+    (when-not (and decoded
+                   (= 8 (alength ^bytes decoded))
+                   (= timestamp (.encodeToString (Base64/getEncoder) ^bytes decoded)))
+      (throw (failure :protocol "Live timestamp is not canonical eight-byte base64")))
+    (reduce (fn [^BigInteger result index]
+              (.or result
+                   (.shiftLeft (BigInteger/valueOf (bit-and 0xff (aget ^bytes decoded index)))
+                               (* 8 index))))
+            BigInteger/ZERO
+            (range 8))))
+
 (defn- valid-version [value]
   (when-not (and (map? value)
                  (contains? value "querySet") (integer? (get value "querySet"))
                  (not (neg? (get value "querySet")))
                  (contains? value "identity") (integer? (get value "identity"))
                  (not (neg? (get value "identity")))
-                 (contains? value "ts") (string? (get value "ts"))
-                 (seq (get value "ts")))
+                 (contains? value "ts") (string? (get value "ts")))
     (throw (failure :protocol "Live state version is malformed")))
-  value)
+  [value (decode-timestamp (get value "ts"))])
 
 (defn- modification-logs [item]
   (if (contains? item "logLines")
@@ -382,13 +402,17 @@
 
 (defn- apply-transition! [live message]
   (let [state @(:state live)
-        start (valid-version (get message "startVersion"))
+        [start start-timestamp] (valid-version (get message "startVersion"))
         _ (when-not (= start (:remote-version state))
             (throw (failure :protocol "Transition start version does not match local version")))
         modifications (get message "modifications")
         _ (when-not (vector? modifications)
             (throw (failure :protocol "Transition modifications must be an array")))
-        end (valid-version (get message "endVersion"))
+        [end end-timestamp] (valid-version (get message "endVersion"))
+        _ (when (or (< (get end "querySet") (get start "querySet"))
+                    (< (get end "identity") (get start "identity"))
+                    (neg? (.compareTo ^BigInteger end-timestamp ^BigInteger start-timestamp)))
+            (throw (failure :protocol "Transition end version moved backwards")))
         parsed (mapv parse-modification modifications)
         ;; A transaction may update one query more than once. Commit only its
         ;; final state so observers never see an intermediate value that was not
@@ -407,11 +431,15 @@
                     result))
                 {:subscriptions (:subscriptions state) :deliveries []}
                 parsed-by-id)
-        committed (assoc state
-                         :remote-version end
-                         :max-ts (get end "ts")
-                         :backoff initial-backoff-ms
-                         :subscriptions (:subscriptions staged))]
+        newer-maximum? (or (nil? (:max-ts-value state))
+                           (pos? (.compareTo ^BigInteger end-timestamp
+                                             ^BigInteger (:max-ts-value state))))
+        committed (cond-> (assoc state
+                                 :remote-version end
+                                 :backoff initial-backoff-ms
+                                 :subscriptions (:subscriptions staged))
+                    newer-maximum?
+                    (assoc :max-ts (get end "ts") :max-ts-value end-timestamp))]
     ;; Validate and stage the entire transaction before one state commit. Relays
     ;; cannot observe a half-applied multi-query transition.
     (reset! (:state live) committed)
@@ -621,7 +649,7 @@
                   (atom {:socket nil :handshake nil :reconnect nil :pending-sends (ArrayDeque.)
                          :in-flight nil :closed false :next-id 0 :query-version 0
                          :remote-version (version-zero) :connection-count 0
-                         :last-close-reason "InitialConnect" :max-ts nil
+                         :last-close-reason "InitialConnect" :max-ts nil :max-ts-value nil
                          :backoff initial-backoff-ms :generation 0
                          :delivery-budget (delivery-budget)
                          :subscriptions (sorted-map)}))))

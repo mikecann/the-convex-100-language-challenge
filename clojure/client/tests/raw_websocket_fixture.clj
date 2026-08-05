@@ -8,6 +8,7 @@
            [java.nio.charset StandardCharsets]
            [java.security MessageDigest]
            [java.time Duration]
+           [java.nio ByteBuffer ByteOrder]
            [java.util Base64]
            [java.util.concurrent ConcurrentHashMap Executors TimeUnit]
            [java.util.concurrent.atomic AtomicBoolean AtomicInteger]))
@@ -193,9 +194,16 @@
 
 (defn url [fixture] (str "http://127.0.0.1:" (.getLocalPort ^ServerSocket (:server fixture))))
 
-(defn version [query-set timestamp]
+(defn timestamp [value]
+  (let [bytes (-> (ByteBuffer/allocate 8)
+                  (.order ByteOrder/LITTLE_ENDIAN)
+                  (.putLong (long value))
+                  (.array))]
+    (.encodeToString (Base64/getEncoder) bytes)))
+
+(defn version [query-set timestamp-value]
   {"querySet" query-set "identity" 0
-   "ts" (if (zero? timestamp) "AAAAAAAAAAA=" (str "fixture-ts-" timestamp))})
+   "ts" (timestamp timestamp-value)})
 
 (defn updated [query-id value & [logs]]
   (cond-> {"type" "QueryUpdated" "queryId" query-id "value" value}

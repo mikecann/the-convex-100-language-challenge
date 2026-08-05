@@ -214,6 +214,26 @@
         (is (every? #(not-any? nil? (vals %)) events)))
       (finally (.stop ^HttpServer (:server fixture) 0)))))
 
+(deftest malformed-command-shapes-never-serialize-null-optional-fields
+  (let [events (run-string
+                [{"op" "hello" "protocolVersion" 1}
+                 {"id" nil "op" "hello" "protocolVersion" 1}
+                 {"id" 7 "op" "hello" "protocolVersion" 1}
+                 {"id" "" "op" "hello" "protocolVersion" 1}
+                 {"id" "extra" "op" "hello" "protocolVersion" 1 "extra" true}
+                 {"id" "call" "op" "query" "path" "demo:state"}
+                 (command "hello" "hello" {"protocolVersion" 1})
+                 (command "close" "close")]
+                nil)]
+    (is (= ["error" "error" "error" "error" "error" "error" "ready" "closed"]
+           (mapv #(get % "type") events)))
+    (is (every? #(= "ProtocolError" (get-in % ["error" "name"]))
+                (take 6 events)))
+    (is (every? #(not (contains? % "id")) (take 4 events)))
+    (is (= ["extra" "call"] (mapv #(get % "id") (subvec events 4 6))))
+    (is (= "hello" (get-in events [6 "id"])))
+    (is (every? #(not-any? nil? (vals %)) events))))
+
 (deftest partial-stdin-lines-flush-before-eof-and-clean-eof-stops
   (let [controller (PipedOutputStream.)
         adapter-input (PipedInputStream. controller)

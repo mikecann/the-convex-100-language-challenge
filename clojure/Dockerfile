@@ -13,7 +13,7 @@ RUN set -eu; \
     make allnoconfig >/dev/null; \
     for symbol in \
         STATIC BUSYBOX ASH SH_IS_ASH ASH_ECHO ASH_PRINTF ASH_TEST ASH_GETOPTS ASH_CMDCMD \
-        AWK BASENAME CAT CMP CUT FIND GREP HEAD ID LS SED SORT TAIL TR UNIQ UNAME WC; do \
+        AWK BASENAME CAT CMP CUT FIND FEATURE_FIND_TYPE GREP HEAD ID LS SED SORT TAIL TR UNIQ UNAME WC; do \
         sed -i "s/# CONFIG_${symbol} is not set/CONFIG_${symbol}=y/" .config; \
     done; \
     make oldconfig </dev/null >/dev/null; \
@@ -109,10 +109,17 @@ RUN test -x /bin/sh \
     && test "$(java -XX:+PerfDisableSharedMem -XshowSettings:properties -version 2>&1 | awk '/os.arch =/ { print $3 }')" = amd64 \
     && test -x /bin/busybox \
     && test "$(/bin/busybox --list | sort | tr '\n' ' ')" = "ash awk basename cat cmp cut find grep head id ls sed sh sort tail tr uname uniq wc " \
+    && test "$(find /opt/clojure-jre/bin -type f | wc -l)" = 1 \
+    && test "$(find /opt/clojure-jre/bin -type f)" = /opt/clojure-jre/bin/java \
     && ! /bin/busybox wget 2>/dev/null \
     && ! /bin/busybox nc 2>/dev/null \
     && ! /bin/sh -c 'exec -a wget /bin/busybox' 2>/dev/null \
     && ! /bin/sh -c 'exec -a nc /bin/busybox' 2>/dev/null \
+    && ! /bin/sh -c 'exec -a curl /bin/busybox' 2>/dev/null \
+    && ! /bin/sh -c 'exec -a apt /bin/busybox' 2>/dev/null \
+    && ! /bin/sh -c 'exec -a javac /bin/busybox' 2>/dev/null \
+    && ! /bin/sh -c 'exec -a node /bin/busybox' 2>/dev/null \
+    && ! /bin/sh -c 'exec -a python /bin/busybox' 2>/dev/null \
     && ! command -v javac \
     && ! command -v jar \
     && ! command -v clojure \
@@ -128,4 +135,16 @@ ENTRYPOINT ["/usr/local/bin/convex-example"]
 FROM runtime-base AS runtime
 COPY --from=test /work/adapter-classes/ /opt/convex/adapter-classes/
 COPY --from=runtime-rootfs /launchers/convex-adapter /usr/local/bin/convex-adapter
+RUN output="$(printf '%s\n' \
+      '{"op":"hello","protocolVersion":1}' \
+      '{"id":"hello","op":"hello","protocolVersion":1}' \
+      '{"id":"close","op":"close"}' \
+      | /usr/local/bin/convex-adapter)" \
+    && test "$(printf '%s\n' "$output" | wc -l)" = 3 \
+    && printf '%s\n' "$output" | head -n 1 | grep -Fq '"type":"error"' \
+    && printf '%s\n' "$output" | head -n 1 | grep -Fq '"name":"ProtocolError"' \
+    && ! printf '%s\n' "$output" | head -n 1 | grep -Fq '"id"' \
+    && ! printf '%s\n' "$output" | grep -Fq '"id":null' \
+    && printf '%s\n' "$output" | tail -n 2 | head -n 1 | grep -Fq '"type":"ready"' \
+    && printf '%s\n' "$output" | tail -n 1 | grep -Fq '"type":"closed"'
 ENTRYPOINT ["/usr/local/bin/convex-adapter"]

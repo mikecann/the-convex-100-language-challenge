@@ -24,6 +24,66 @@
   (reset! before-publish-hook nil)
   (reset! inside-publication-lock-hook nil))
 
+(defn- valid-id? [value]
+  (and (string? value) (<= 1 (count value) 128)))
+
+(defn- protocol-error [message]
+  (ex-info message {:kind :protocol}))
+
+(defn- exact-keys? [command required optional]
+  (let [present (set (keys command))]
+    (and (every? #(contains? present %) required)
+         (every? #(or (contains? required %) (contains? optional %)) present))))
+
+(defn- validate-command! [command]
+  ;; Validate the controller boundary before constructing any response. In
+  ;; particular, an absent id must never become a schema-invalid `"id":null`.
+  (when-not (map? command)
+    (throw (protocol-error "adapter command must be an object")))
+  (let [id (get command "id")
+        operation (get command "op")]
+    (when-not (valid-id? id)
+      (throw (protocol-error "adapter command id must be a non-empty string of at most 128 characters")))
+    (when-not (string? operation)
+      (throw (protocol-error "adapter command op must be a string")))
+    (case operation
+      "hello"
+      (when-not (and (exact-keys? command #{"id" "op" "protocolVersion"} #{})
+                     (= 1 (get command "protocolVersion")))
+        (throw (protocol-error "hello command is malformed")))
+
+      ("query" "mutation" "action")
+      (when-not (and (exact-keys? command #{"id" "op" "path" "args"} #{})
+                     (string? (get command "path"))
+                     (<= 3 (count (get command "path")))
+                     (map? (get command "args")))
+        (throw (protocol-error (str operation " command is malformed"))))
+
+      "subscribe"
+      (when-not (and (exact-keys? command #{"id" "op" "subscriptionId"} #{"path" "args"})
+                     (valid-id? (get command "subscriptionId"))
+                     (string? (get command "path"))
+                     (seq (get command "path"))
+                     (map? (get command "args")))
+        (throw (protocol-error "subscribe command is malformed")))
+
+      "unsubscribe"
+      (when-not (and (exact-keys? command #{"id" "op" "subscriptionId"} #{})
+                     (valid-id? (get command "subscriptionId")))
+        (throw (protocol-error "unsubscribe command is malformed")))
+
+      "setAuth"
+      (when-not (and (exact-keys? command #{"id" "op" "token"} #{})
+                     (string? (get command "token")))
+        (throw (protocol-error "setAuth command is malformed")))
+
+      ("close" "debugDisconnect")
+      (when-not (exact-keys? command #{"id" "op"} #{})
+        (throw (protocol-error (str operation " command is malformed"))))
+
+      (throw (protocol-error (str "unknown operation " operation))))
+    command))
+
 (defn- error-name [error]
   (case (:kind (ex-data error))
     :function "FunctionError"
@@ -39,8 +99,8 @@
                  (contains? data :data) (assoc "data" (:data data)))]
     (cond-> {"type" (if subscription-id "subscription" "error")
              "error" detail}
-      (and (nil? subscription-id) (seq id)) (assoc "id" id)
-      (seq subscription-id) (assoc "subscriptionId" subscription-id)
+      (and (nil? subscription-id) (valid-id? id)) (assoc "id" id)
+      (valid-id? subscription-id) (assoc "subscriptionId" subscription-id)
       (seq (:logs data)) (assoc "logs" (vec (:logs data))))))
 
 (defrecord OutputEnvelope [bytes current? before-check droppable? writing completion terminal?])
@@ -335,7 +395,7 @@
                                 nil))
                     stop? (if command
                             (try
-                              (process! command)
+                              (process! (validate-command! command))
                               (catch Throwable error
                                 ;; Per-command failures retain correlation and the stream continues.
                                 (write-event! out (error-event (get command "id") nil error))

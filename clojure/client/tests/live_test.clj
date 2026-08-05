@@ -163,6 +163,103 @@
                   (is (= {"count" 1} (:value update)))))))))
       (finally (.close fixture)))))
 
+(deftest timestamps-are-canonical-little-endian-uint64-values
+  (is (neg? (.compareTo ^java.math.BigInteger
+             (#'convex/decode-timestamp (ws/timestamp 255))
+                        (#'convex/decode-timestamp (ws/timestamp 256)))))
+  (is (= (biginteger "18446744073709551615")
+         (#'convex/decode-timestamp "//////////8=")))
+  (doseq [timestamp [nil "" "fixture-ts-1" "AAAAAAAAAAA" "AAAAAAAAAA=="
+                     "//////////8-"]]
+    (is (= :protocol
+           (try
+             (#'convex/decode-timestamp timestamp)
+             :accepted
+             (catch clojure.lang.ExceptionInfo error (:kind (ex-data error))))))))
+
+(deftest malformed-wire-timestamps-fail-structurally-and-live-recovers
+  (let [malformed ["fixture-ts-1" "AAAAAAAAAA=="]
+        fixture (ws/fixture
+                 (fn [connection index]
+                   (ws/read-message! connection)
+                   (ws/read-message! connection)
+                   (if (< index (count malformed))
+                     (ws/send-text! connection
+                                    (assoc-in
+                                     (ws/transition (ws/version 0 0) (ws/version 1 1)
+                                                    (ws/updated 0 {"count" 99}))
+                                     ["endVersion" "ts"] (nth malformed index)))
+                     (do
+                       (ws/send-text! connection
+                                      (ws/transition (ws/version 0 0) (ws/version 1 2)
+                                                     (ws/updated 0 {"count" 1})))
+                       (Thread/sleep 3000)))))]
+    (try
+      (with-open [live (convex/live-client (ws/url fixture))]
+        (let [subscription (convex/subscribe live "demo:state" {})]
+          (dotimes [_ (count malformed)]
+            (is (= :protocol
+                   (get-in (convex/next-update subscription 5000) [:error :kind]))))
+          (is (= {"count" 1} (:value (convex/next-update subscription 5000))))))
+      (finally (.close fixture)))))
+
+(deftest a-transition-cannot-move-its-timestamp-backwards
+  (let [fixture (ws/fixture
+                 (fn [connection index]
+                   (ws/read-message! connection)
+                   (ws/read-message! connection)
+                   (if (zero? index)
+                     (do
+                       (ws/send-text! connection
+                                      (ws/transition (ws/version 0 0) (ws/version 1 256)
+                                                     (ws/updated 0 {"count" 0})))
+                       (ws/send-text! connection
+                                      (ws/transition (ws/version 1 256) (ws/version 1 255)
+                                                     (ws/updated 0 {"count" 99}))))
+                     (do
+                       (ws/send-text! connection
+                                      (ws/transition (ws/version 0 0) (ws/version 1 257)
+                                                     (ws/updated 0 {"count" 1})))
+                       (Thread/sleep 3000)))))]
+    (try
+      (with-open [live (convex/live-client (ws/url fixture))]
+        (let [subscription (convex/subscribe live "demo:state" {})]
+          (is (= {"count" 0} (:value (convex/next-update subscription 5000))))
+          (let [failure (convex/next-update subscription 5000)]
+            (is (= :protocol (get-in failure [:error :kind]))))
+          (is (= {"count" 1} (:value (convex/next-update subscription 5000))))))
+      (finally (.close fixture)))))
+
+(deftest reconnect-retains-the-numeric-maximum-observed-timestamp
+  (let [observed (atom [])
+        fixture (ws/fixture
+                 (fn [connection index]
+                   (let [connect (ws/read-message! connection)]
+                     (swap! observed conj (get connect "maxObservedTimestamp")))
+                   (ws/read-message! connection)
+                   (case index
+                     0 (ws/send-text! connection
+                                      (ws/transition (ws/version 0 0) (ws/version 1 256)
+                                                     (ws/updated 0 {"count" 0})))
+                     1 (ws/send-text! connection
+                                      (ws/transition (ws/version 0 0) (ws/version 1 255)
+                                                     (ws/updated 0 {"count" 1})))
+                     (do
+                       (ws/send-text! connection
+                                      (ws/transition (ws/version 0 0) (ws/version 1 257)
+                                                     (ws/updated 0 {"count" 2})))
+                       (Thread/sleep 3000)))))]
+    (try
+      (with-open [live (convex/live-client (ws/url fixture))]
+        (let [subscription (convex/subscribe live "demo:state" {})]
+          (is (= {"count" 0} (:value (convex/next-update subscription 5000))))
+          (convex/debug-disconnect! live)
+          (is (= {"count" 1} (:value (convex/next-update subscription 5000))))
+          (convex/debug-disconnect! live)
+          (is (= {"count" 2} (:value (convex/next-update subscription 5000))))))
+      (is (= [nil (ws/timestamp 256) (ws/timestamp 256)] @observed))
+      (finally (.close fixture)))))
+
 (deftest repeated-query-updates-in-one-transition-publish-only-the-committed-value
   (let [fixture (ws/fixture
                  (fn [connection _]
@@ -200,7 +297,7 @@
                                 ;; changed transition. If a very slow CI host lets
                                 ;; the fixture's transport close first, the next
                                 ;; automatic reconnect must carry that newer value.
-                                (str "fixture-ts-" (if (>= index 6) (max index 7) index))
+                                (ws/timestamp (if (>= index 6) (max index 7) index))
                                 (get connect "maxObservedTimestamp"))))
                    (ws/read-message! connection)
                    (ws/send-text! connection
@@ -225,8 +322,8 @@
                                        [:generation :connection-count :max-ts :remote-version
                                         :last-close-reason :socket :handshake]))
                     #(contains? (if (= attempt 4)
-                                  #{"fixture-ts-6" "fixture-ts-7"}
-                                  #{(str "fixture-ts-" (+ attempt 2))})
+                                  #{(ws/timestamp 6) (ws/timestamp 7)}
+                                  #{(ws/timestamp (+ attempt 2))})
                                 (:max-ts @(:state live)))))
           ;; Five unchanged rehydrations stay suppressed. Only the changed value crosses.
           (is (= {"count" 1} (:value (convex/next-update subscription 8000))))))
