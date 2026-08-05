@@ -1,23 +1,3 @@
-# Convex from Haskell
-
-This small client calls Convex functions over HTTPS and follows a reactive query through the pinned `/api/sync` WebSocket profile.
-
-It is an educational, unofficial experiment, not a production SDK or a package intended for publication.
-
-## Start here
-
-[`examples/basics/Main.hs`](examples/basics/Main.hs) is the canonical example. It reads a counter over HTTP, starts Live before the write, applies one idempotent mutation, and verifies the Live update.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| JSON HTTP queries, mutations, and actions | Implemented locally, unearned pending shared evidence |
-| Pinned Live query protocol | Implemented locally, unearned pending shared evidence |
-| Production SDK compatibility | Not claimed |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.hs -->
-```haskell
 {-# LANGUAGE OverloadedStrings #-}
 
 module Main (main) where
@@ -101,26 +81,3 @@ main = do
     awaitLive label subscription = do
         received <- timeout (10 * 1000000) (nextUpdate subscription)
         maybe (fail (label <> " timed out")) pure received
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-```sh
-./run sync-examples
-./run validate
-./run test haskell
-./run build haskell
-```
-
-The test target checks Fourmolu formatting, compiles the exact example and adapter for `linux/amd64`, and runs real loopback HTTP, WebSocket, stdin, and TCP fixtures. The build target creates the non-root conformance image. Root runs `verify-example`, `verify`, and `verify-hosted` serially because they share the backend and evidence store.
-
-## Protocol notes
-
-The client owns Convex-specific HTTP envelopes and the pinned unversioned sync messages. `http-client-tls` 0.3.6.4 supplies ordinary HTTPS/TLS transport; `wuss` 2.0.2.5 and `websockets` 0.13.0.0 supply ordinary WSS and frame handling. The Live owner serializes reconnects and `Add`/`Remove` query-set changes. It validates canonical little-endian Convex timestamps, keeps their numeric maximum across reconnects, and publishes the final modification for each query in query-ID order. Each subscription retains the newest 16 updates, dropping older intermediate states when a consumer is slow.
-
-The build uses GHC 9.10.1, Fourmolu 0.16.2.0, a Cabal index state of 2025-08-01, exact direct dependency constraints in `client/cabal.project`, and digest-pinned Haskell 9.10.1 and Debian Bookworm images. The final images contain the compiled Haskell executable and runtime library closure, CA certificates, `/bin/sh`, and the basic POSIX tools required by the shared verifier. They do not contain GHC, Cabal, Fourmolu, another language runtime, or the Convex CLI.
-
-## Limitations
-
-The implementation deliberately limits values to JSON, does not offer Live authentication or optimistic updates, and reconnects on protocol shapes outside the pinned profile. WebSocket mutations, WebSocket actions, and `TransitionChunk` assembly are deferred. The shared evaluator, not this README, awards HTTP or Live badges.
