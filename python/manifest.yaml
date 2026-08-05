@@ -11,6 +11,7 @@ implementation:
 toolchain:
   name: Python
   version: 3.13.5
+targetRuntimeCommand: python3
 syncProfile:
   id: convex-rs-0.10.4-unversioned-sync
   sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
