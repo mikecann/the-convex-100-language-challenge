@@ -80,7 +80,8 @@ final class WebSocket {
   public function wait(float $seconds):void{$r=[$this->io];$w=$e=[];@stream_select($r,$w,$e,(int)$seconds,(int)(($seconds-(int)$seconds)*1000000));}
   public function send(array $v):void{$this->frame(1,json_encode($v,JSON_THROW_ON_ERROR|JSON_INVALID_UTF8_SUBSTITUTE));}
   public function read():string|false|null {
-    $this->buffer.=stream_get_contents($this->io)?:'';
+    $chunk=stream_get_contents($this->io);$this->buffer.=$chunk?:'';
+    if($this->buffer==='' && feof($this->io)) return null;
     while(true) {
       if(strlen($this->buffer)<2)return false;[$a,$b]=array_values(unpack('C2',substr($this->buffer,0,2)));$fin=(bool)($a&128);$len=$b&127;$at=2;
       if($b&128)throw new ProtocolError('server WebSocket frames must not be masked');

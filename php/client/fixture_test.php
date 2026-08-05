@@ -12,6 +12,13 @@ $hp=port();[$p,$pipes]=peer('http',$hp);$client=new Client("http://127.0.0.1:$hp
 // RFC6455 peer records Connect/Add/Remove and sends fragmented UTF-8
 // QueryFailed, followed by QueryUpdated for the exact same query id.
 $wp=port();[$p,$pipes]=peer('websocket',$wp);$live=new Client("http://127.0.0.1:$wp");$sub=$live->subscribe('demo:requiresNonzero',['room'=>'r']);$first=$sub->nextUpdate(3);ok($first->error instanceof FunctionError&&$first->error->data['code']==='ROOM_EMPTY','QueryFailed');$second=$sub->nextUpdate(3);ok($second->value['count']===1&&$second->value['word']==='é','same-subscription recovery');$sub->close();$live->close();proc_close($p);
+// Six successive sockets are intentionally closed by the server. Each fresh
+// transport must report connectionCount 0..5 and re-send Add. The peer checks
+// those bytes and the final Remove version transition before exiting cleanly.
+$wp=port();[$p,$pipes]=peer('reconnect',$wp);$live=new Client("http://127.0.0.1:$wp");$sub=$live->subscribe('demo:state',['room'=>'r']);for($i=0;$i<6;$i++){ $u=$sub->nextUpdate(4);ok($u->error===null&&$u->value['count']===$i,"reconnect value $i"); }$sub->close();$live->close();ok(proc_close($p)===0,'five reconnect Connect/Add/Remove assertions');
+// No server bytes arrive after Add. Closing must tear down that blocked live
+// transport immediately, rather than waiting for a read timeout or worker.
+$wp=port();[$p,$pipes]=peer('blocked',$wp);$live=new Client("http://127.0.0.1:$wp");$sub=$live->subscribe('demo:state',['room'=>'blocked']);$start=microtime(true);$sub->close();$live->close();ok(microtime(true)-$start<.25,'blocked read close bounded');proc_close($p);
 // The intentionally bounded queue keeps only the newest sixteen values.
 $manager=(new ReflectionClass(Convex\LiveManager::class))->newInstanceWithoutConstructor();$s=new Subscription($manager,99);for($i=0;$i<20;$i++)$s->deliver(new Update($i));for($i=4;$i<20;$i++)ok($s->nextUpdate(.01)->value===$i,'newest-16 overflow');
 echo "php socket fixtures passed\n";
