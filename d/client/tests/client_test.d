@@ -17,6 +17,32 @@ unittest
 
 unittest
 {
+    bool explicitNull;
+    try
+    {
+        decodeResponse("query", `{"status":"error","errorMessage":"null payload","errorData":null}`);
+    }
+    catch (ConvexError error)
+    {
+        explicitNull = error.kind == "FunctionError" && error.hasData
+            && error.data.type == JSONType.null_;
+    }
+    assert(explicitNull);
+
+    bool absent;
+    try
+    {
+        decodeResponse("query", `{"status":"error","errorMessage":"no payload"}`);
+    }
+    catch (ConvexError error)
+    {
+        absent = error.kind == "FunctionError" && !error.hasData;
+    }
+    assert(absent);
+}
+
+unittest
+{
     bool failed;
     try
     {

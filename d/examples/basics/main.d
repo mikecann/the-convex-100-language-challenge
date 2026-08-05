@@ -2,6 +2,7 @@ module basics_main;
 
 import convex : ConvexClient;
 import std.json : JSONType, JSONValue;
+import std.math : isFinite;
 import std.process : environment;
 import std.stdio : writeln;
 
@@ -10,18 +11,33 @@ import std.stdio : writeln;
 long wholeCounter(JSONValue value, string operation)
 {
     if (value.type == JSONType.integer)
-        return value.integer;
+    {
+        if (value.integer >= 0)
+            return value.integer;
+    }
     if (value.type == JSONType.float_)
     {
         auto number = value.floating;
-        auto integer = cast(long) number;
-        if (number == integer && integer >= 0)
-            return integer;
+        /* long.max rounds up when converted to double, so compare against the
+         * first unrepresentable integer instead of casting before the guard. */
+        if (number.isFinite && number >= 0 && number < 9_223_372_036_854_775_808.0)
+        {
+            auto integer = cast(long) number;
+            if (number == integer)
+                return integer;
+        }
     }
     throw new Exception(operation ~ " count is not a whole nonnegative integer");
 }
 
-void main(string[] arguments)
+version (ExampleUnitTest)
+{
+    void main()
+    {
+    }
+}
+else
+    void main(string[] arguments)
 {
     // Read the dedicated verification deployment and unique room supplied by
     // the shared example runner.
@@ -80,4 +96,23 @@ void main(string[] arguments)
 
     // Print verification only after HTTP and Live agree on the 0 -> 1 journey.
     writeln("verified count: 0 -> 1");
+}
+
+unittest
+{
+    assert(wholeCounter(JSONValue(0.0), "zero") == 0);
+    assert(wholeCounter(JSONValue(1.0), "one") == 1);
+    foreach (invalid; [
+        JSONValue(0.5), JSONValue("1"), JSONValue(double.nan),
+        JSONValue(double.infinity), JSONValue(9_223_372_036_854_775_808.0),
+        JSONValue(-1L)
+    ])
+    {
+        bool rejected;
+        try
+            wholeCounter(invalid, "invalid");
+        catch (Exception)
+            rejected = true;
+        assert(rejected);
+    }
 }

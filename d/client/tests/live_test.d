@@ -7,8 +7,9 @@ import core.thread : Thread;
 import core.time : msecs;
 import std.base64 : Base64;
 import std.conv : to;
+import std.datetime.stopwatch : StopWatch;
 import std.digest.sha : sha1Of;
-import std.json : JSONValue, parseJSON;
+import std.json : JSONType, JSONValue, parseJSON;
 import std.socket : InternetAddress, Socket, TcpSocket;
 import std.string : indexOf, splitLines, startsWith, strip;
 
@@ -26,6 +27,30 @@ private void sendAll(Socket peer, const(ubyte)[] bytes)
 private void sendAll(Socket peer, string text)
 {
     sendAll(peer, cast(const(ubyte)[]) text);
+}
+
+private Socket acceptWithin(TcpSocket listener, int timeoutMs)
+{
+    listener.blocking = false;
+    StopWatch timer;
+    timer.start();
+    while (timer.peek.total!"msecs" < timeoutMs)
+    {
+        try
+        {
+            auto peer = listener.accept();
+            if (peer !is null)
+            {
+                peer.blocking = true;
+                return peer;
+            }
+        }
+        catch (Exception)
+        {
+        }
+        Thread.sleep(5.msecs);
+    }
+    return null;
 }
 
 private ubyte[] receiveExact(Socket peer, size_t length)
@@ -69,6 +94,7 @@ private struct RawFrame
 {
     ubyte opcode;
     ubyte[] payload;
+    ubyte[] mask;
 }
 
 private RawFrame receiveFrame(Socket peer)
@@ -92,13 +118,21 @@ private RawFrame receiveFrame(Socket peer)
     auto payload = receiveExact(peer, cast(size_t) length);
     foreach (index, ref octet; payload)
         octet ^= mask[index % 4];
-    return RawFrame(opcode, payload);
+    return RawFrame(opcode, payload, mask);
 }
 
 private string receiveText(Socket peer)
 {
     auto frame = receiveFrame(peer);
     assert(frame.opcode == 1);
+    return cast(string) frame.payload;
+}
+
+private string receiveText(Socket peer, ref ubyte[] mask)
+{
+    auto frame = receiveFrame(peer);
+    assert(frame.opcode == 1);
+    mask = frame.mask;
     return cast(string) frame.payload;
 }
 
@@ -159,11 +193,14 @@ unittest
         scope (exit)
             peer.close();
         handshake(peer);
-        auto connect = parseJSON(receiveText(peer));
+        ubyte[] connectMask;
+        ubyte[] addMask;
+        ubyte[] removeMask;
+        auto connect = parseJSON(receiveText(peer, connectMask));
         assert(connect.object["type"].str == "Connect");
         assert(connect.object["connectionCount"].integer == 0);
         assert("maxObservedTimestamp" !in connect.object);
-        auto add = parseJSON(receiveText(peer));
+        auto add = parseJSON(receiveText(peer, addMask));
         assert(add.object["type"].str == "ModifyQuerySet");
         assert(add.object["baseVersion"].integer == 0);
         assert(add.object["newVersion"].integer == 1);
@@ -173,7 +210,9 @@ unittest
             `[{"type":"QueryUpdated","queryId":0,"value":{"count":99}},`
             ~ `{"type":"QueryUpdated","queryId":0,"value":{"count":0},"logLines":["initial"]}]`));
         sendText(peer, transition(1, 1, 1, 2, `[{"type":"QueryFailed","queryId":0,"errorMessage":"expected","errorData":{"code":"BROKEN"},"logLines":["failed"]}]`));
-        auto recovery = transition(1, 2, 1, 256,
+        sendText(peer, transition(1, 2, 1, 3,
+            `[{"type":"QueryFailed","queryId":0,"errorMessage":"explicit null","errorData":null}]`));
+        auto recovery = transition(1, 3, 1, 256,
             `[{"type":"QueryUpdated","queryId":0,"value":{"count":1},"logLines":["recovered ☃"]}]`);
         size_t split;
         foreach (index, octet; cast(const(ubyte)[]) recovery)
@@ -188,10 +227,11 @@ unittest
         sendFrame(peer, true, 0, cast(const(ubyte)[]) recovery[split .. $]);
         auto pong = receiveFrame(peer);
         assert(pong.opcode == 10 && cast(string) pong.payload == "ping");
-        auto remove = parseJSON(receiveText(peer));
+        auto remove = parseJSON(receiveText(peer, removeMask));
         assert(remove.object["baseVersion"].integer == 1);
         assert(remove.object["newVersion"].integer == 2);
         assert(remove.object["modifications"].array[0].object["type"].str == "Remove");
+        assert(connectMask != addMask && connectMask != removeMask && addMask != removeMask);
     });
     server.start();
 
@@ -210,6 +250,9 @@ unittest
             && failed.error.data.object["code"].str == "BROKEN" && failed.logs == [
                 "failed"
     ]);
+    auto explicitNull = subscription.next(2_000);
+    assert(explicitNull !is null && explicitNull.error !is null
+            && explicitNull.error.hasData && explicitNull.error.data.type == JSONType.null_);
     auto recovered = subscription.next(2_000);
     assert(recovered !is null && recovered.hasValue
             && recovered.value.object["count"].integer == 1 && recovered.logs == [
@@ -217,6 +260,162 @@ unittest
     ]);
     subscription.close();
     client.close();
+    server.join();
+}
+
+unittest
+{
+    /* Five refused attempts build a multi-second retry delay. A completed
+     * handshake, even one closed before a transition, must reset it. */
+    enum port = 18152;
+    auto server = new Thread({
+        Thread.sleep(1_800.msecs);
+        auto listener = new TcpSocket();
+        scope (exit)
+            listener.close();
+        listener.bind(new InternetAddress("127.0.0.1", port));
+        listener.listen(2);
+
+        auto first = acceptWithin(listener, 2_000);
+        assert(first !is null);
+        handshake(first);
+        auto firstConnect = parseJSON(receiveText(first));
+        assert(firstConnect.object["connectionCount"].integer >= 4);
+        receiveText(first);
+        first.close();
+
+        /* amd64 emulation can delay libcurl teardown, but this remains well
+         * below the 3.2 second accumulated backoff that must be discarded. */
+        auto second = acceptWithin(listener, 2_000);
+        assert(second !is null);
+        scope (exit)
+            second.close();
+        handshake(second);
+        auto secondConnect = parseJSON(receiveText(second));
+        assert(
+            secondConnect.object["connectionCount"].integer
+            == firstConnect.object["connectionCount"].integer + 1);
+        receiveText(second);
+        sendText(second, transition(0, 0, 1, 1,
+            `[{"type":"QueryUpdated","queryId":0,"value":{"count":12}}]`));
+        Thread.sleep(100.msecs);
+    });
+    server.start();
+
+    auto client = new ConvexClient("http://127.0.0.1:" ~ port.to!string);
+    auto subscription = client.subscribe("demo:state",
+            JSONValue(["room": JSONValue("backoff-reset")]));
+    server.join();
+    client.close();
+}
+
+unittest
+{
+    /* The owner must process lifecycle commands between socket reads, even
+     * when the peer is idle, chatty, or has stopped inside a frame header. */
+    foreach (mode; 0 .. 3)
+    {
+        auto port = cast(ushort)(18147 + mode);
+        auto listener = new TcpSocket();
+        listener.bind(new InternetAddress("127.0.0.1", port));
+        listener.listen(1);
+        auto server = new Thread({
+            scope (exit)
+                listener.close();
+            auto peer = listener.accept();
+            scope (exit)
+                peer.close();
+            handshake(peer);
+            parseJSON(receiveText(peer));
+            parseJSON(receiveText(peer));
+
+            if (mode == 2)
+                sendAll(peer, cast(const(ubyte)[])[0x81, 126, 0]);
+
+            bool removed;
+            while (!removed)
+            {
+                if (mode == 1)
+                    sendFrame(peer, true, 9, cast(const(ubyte)[]) "busy");
+                auto incoming = receiveFrame(peer);
+                if (incoming.opcode == 1)
+                {
+                    auto message = parseJSON(cast(string) incoming.payload);
+                    removed = message.object["modifications"].array[0].object["type"].str
+                        == "Remove";
+                }
+                else
+                {
+                    assert(mode == 1 && incoming.opcode == 10
+                        && cast(string) incoming.payload == "busy");
+                }
+            }
+            for (;;)
+            {
+                auto closing = receiveFrame(peer);
+                if (closing.opcode == 8)
+                    break;
+                assert(mode == 1 && closing.opcode == 10 && cast(string) closing.payload == "busy");
+            }
+        });
+        server.start();
+
+        auto client = new ConvexClient("http://127.0.0.1:" ~ port.to!string);
+        auto subscription = client.subscribe("demo:state",
+                JSONValue(["room": JSONValue("lifecycle")]));
+        StopWatch timer;
+        timer.start();
+        subscription.close();
+        assert(timer.peek.total!"msecs" < 1_500);
+        timer.reset();
+        timer.start();
+        client.close();
+        assert(timer.peek.total!"msecs" < 1_500);
+        server.join();
+    }
+}
+
+unittest
+{
+    /* libcurl's progress callback must make a WebSocket upgrade cancellable.
+     * This peer accepts TCP but deliberately never returns HTTP 101. */
+    enum port = 18150;
+    auto listener = new TcpSocket();
+    listener.bind(new InternetAddress("127.0.0.1", port));
+    listener.listen(1);
+    auto server = new Thread({
+        scope (exit)
+            listener.close();
+        auto peer = listener.accept();
+        scope (exit)
+            peer.close();
+        ubyte[4096] request;
+        assert(peer.receive(request) > 0);
+        ubyte[32] untilClosed;
+        while (peer.receive(untilClosed) > 0)
+        {
+        }
+    });
+    server.start();
+
+    auto client = new ConvexClient("http://127.0.0.1:" ~ port.to!string);
+    bool subscribeFailed;
+    auto pending = new Thread({
+        try
+            client.subscribe("demo:state", JSONValue([
+            "room": JSONValue("stall")
+        ]));
+        catch (ConvexError)
+            subscribeFailed = true;
+    });
+    pending.start();
+    Thread.sleep(200.msecs);
+    StopWatch timer;
+    timer.start();
+    client.close();
+    assert(timer.peek.total!"msecs" < 1_500);
+    pending.join();
+    assert(subscribeFailed);
     server.join();
 }
 

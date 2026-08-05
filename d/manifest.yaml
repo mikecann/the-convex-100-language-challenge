@@ -29,6 +29,6 @@ limitations:
   - Live authentication, optimistic updates, mutations over WebSocket, and TransitionChunk assembly are deferred.
   - Values are limited to the JSON-safe value set covered by the documented HTTP format.
   - Each subscription retains the newest 16 updates. All subscriptions share an 8 MiB encoded-byte budget and evict the globally oldest intermediate update under pressure.
-  - The adapter caps active subscriptions at 16 and gives its single encoded in-flight NDJSON write a 500 ms deadline, closing a stalled controller instead of retaining output indefinitely.
+  - The adapter caps active subscriptions at 16, buffers at most 32 commands or 4 MiB of decoded input, and gives its single encoded in-flight NDJSON write a 500 ms deadline, closing a stalled controller instead of retaining output indefinitely.
   - Capability badges are intentionally empty until shared local and hosted conformance pass.
 capabilities: []

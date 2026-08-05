@@ -12,9 +12,9 @@ import core.sync.mutex : Mutex;
 import core.sys.posix.poll : POLLIN, POLLOUT, poll, pollfd;
 import core.thread : Thread;
 import core.time : msecs;
-import etc.c.curl : CURL, CURLcode, CURL_SOCKET_BAD, CurlError,
-    CurlOption, curl_easy_cleanup, curl_easy_getinfo,
-    curl_easy_init, curl_easy_perform, curl_easy_recv, curl_easy_send, curl_easy_setopt, curl_easy_strerror,
+import etc.c.curl : CURL, CURLcode, CURL_SOCKET_BAD, CurlError, CurlOption,
+    curl_easy_cleanup, curl_easy_getinfo, curl_easy_init,
+    curl_easy_perform, curl_easy_recv, curl_easy_send, curl_easy_setopt, curl_easy_strerror,
     curl_slist, curl_slist_append, curl_slist_free_all, curl_socket_t;
 import std.algorithm.searching : startsWith;
 import std.algorithm.sorting : sort;
@@ -24,7 +24,6 @@ import std.conv : to;
 import std.datetime.stopwatch : StopWatch;
 import std.json : JSONType, JSONValue, parseJSON;
 import std.net.curl : HTTP;
-import std.random : unpredictableSeed;
 import std.string : indexOf, stripRight;
 import std.string : fromStringz, toStringz;
 import std.uuid : randomUUID;
@@ -39,6 +38,8 @@ enum liveSendTimeoutMs = 500;
 enum liveCommandTimeoutMs = 12_000;
 enum initialTimestamp = "AAAAAAAAAAA=";
 
+private extern (C) int RAND_bytes(ubyte* buffer, int length);
+
 struct ConvexResult
 {
     JSONValue value;
@@ -48,14 +49,16 @@ struct ConvexResult
 class ConvexError : Exception
 {
     string kind;
+    bool hasData;
     JSONValue data;
     string[] logs;
 
-    this(string kind, string message, JSONValue data = JSONValue.init, string[] logs = [
-    ])
+    this(string kind, string message, JSONValue data = JSONValue.init,
+            string[] logs = [], bool hasData = false)
     {
         super(message);
         this.kind = kind;
+        this.hasData = hasData;
         this.data = data;
         this.logs = logs;
     }
@@ -71,6 +74,7 @@ class LiveUpdate
 
     private ulong serial;
     private size_t retainedBytes;
+    private bool retainedByAdapter;
 }
 
 /** Keep the public API compact while preserving the error details supplied by
@@ -231,11 +235,11 @@ ConvexResult decodeResponse(string operation, string responseBody)
     }
     if (status.str == "error")
     {
-        JSONValue data = "errorData" in response.object
-            ? response.object["errorData"] : JSONValue.init;
+        bool hasData = ("errorData" in response.object) !is null;
+        JSONValue data = hasData ? response.object["errorData"] : JSONValue.init;
         string message = "errorMessage" in response.object && response.object["errorMessage"].type == JSONType.string
             ? response.object["errorMessage"].str : "Convex function failed";
-        throw new ConvexError("FunctionError", message, data, logs);
+        throw new ConvexError("FunctionError", message, data, logs, hasData);
     }
     throw new ConvexError("ProtocolError", "HTTP response had an unknown status");
 }
@@ -288,6 +292,16 @@ class ConvexSubscription
     LiveUpdate next(int timeoutMs = -1)
     {
         return manager.next(state, timeoutMs);
+    }
+
+    version (ConvexAdapter) LiveUpdate nextRetained(int timeoutMs = -1)
+    {
+        return manager.next(state, timeoutMs, true);
+    }
+
+    version (ConvexAdapter) void releaseRetained(LiveUpdate update)
+    {
+        manager.releaseRetained(update);
     }
 
     void close(int timeoutMs = 2_000)
@@ -358,7 +372,6 @@ private class LiveManager
     private size_t queuedBytes;
     private bool fragmentedText;
     private ubyte[] fragmentedPayload;
-    private uint maskState;
 
     this(string deployment, string versionHeader)
     {
@@ -366,7 +379,6 @@ private class LiveManager
         this.versionHeader = versionHeader;
         mutex = new Mutex();
         remoteVersion = StateVersion(0, 0, 0, initialTimestamp);
-        maskState = unpredictableSeed;
         worker = new Thread(&ownerLoop);
         worker.name = "convex-d-live-owner";
         worker.start();
@@ -400,7 +412,7 @@ private class LiveManager
         return new ConvexSubscription(this, state);
     }
 
-    LiveUpdate next(SubscriptionState state, int timeoutMs)
+    LiveUpdate next(SubscriptionState state, int timeoutMs, bool retainForAdapter = false)
     {
         StopWatch clock;
         clock.start();
@@ -412,7 +424,9 @@ private class LiveManager
                 {
                     auto update = state.queue[0];
                     state.queue = state.queue[1 .. $];
-                    queuedBytes -= update.retainedBytes;
+                    update.retainedByAdapter = retainForAdapter;
+                    if (!retainForAdapter)
+                        queuedBytes -= update.retainedBytes;
                     return update;
                 }
                 if (!state.active || stopped)
@@ -421,6 +435,20 @@ private class LiveManager
             if (timeoutMs >= 0 && clock.peek.total!"msecs" >= timeoutMs)
                 return null;
             Thread.sleep(5.msecs);
+        }
+    }
+
+    version (ConvexAdapter) void releaseRetained(LiveUpdate update)
+    {
+        if (update is null)
+            return;
+        synchronized (mutex)
+        {
+            if (update.retainedByAdapter)
+            {
+                update.retainedByAdapter = false;
+                queuedBytes -= update.retainedBytes;
+            }
         }
     }
 
@@ -578,7 +606,7 @@ private class LiveManager
         if (update.error !is null)
         {
             size += update.error.msg.length + update.error.kind.length;
-            if (update.error.data.type != JSONType.null_)
+            if (update.error.hasData)
                 size += update.error.data.toString().length;
         }
         foreach (line; update.logs)
@@ -704,8 +732,9 @@ private class LiveManager
             {
                 if (connectSocket(reason))
                 {
-                    /* A handshake alone does not reset an accumulated retry
-                     * delay. Valid server traffic below does. */
+                    /* A completed RFC6455 handshake is a healthy connection
+                     * boundary, so later failures restart at the initial delay. */
+                    backoff = 100;
                 }
                 else
                 {
@@ -784,6 +813,9 @@ private class LiveManager
         curl_easy_setopt(nextSocket, CurlOption.httpheader, headers);
         curl_easy_setopt(nextSocket, CurlOption.connect_only, cast(c_long) 2);
         curl_easy_setopt(nextSocket, CurlOption.timeout_ms, cast(c_long) 10_000);
+        curl_easy_setopt(nextSocket, CurlOption.noprogress, cast(c_long) 0);
+        curl_easy_setopt(nextSocket, CurlOption.progressfunction, &liveDialProgress);
+        curl_easy_setopt(nextSocket, CurlOption.progressdata, cast(void*) this);
         curl_easy_setopt(nextSocket, cast(CurlOption) curlOptionWsOptions,
                 cast(c_long) curlWsRawMode);
         auto code = curl_easy_perform(nextSocket);
@@ -829,6 +861,12 @@ private class LiveManager
             connected = true;
         }
         return true;
+    }
+
+    private bool shouldCancelDial()
+    {
+        synchronized (mutex)
+            return closing;
     }
 
     private JSONValue connectMessage()
@@ -908,16 +946,14 @@ private class LiveManager
             foreach_reverse (index; 0 .. 8)
                 frame ~= cast(ubyte)(cast(ulong) payload.length >> (index * 8));
         }
-        /* Each client frame needs a fresh unpredictable masking key. A local
-         * xorshift expands the process random seed without sharing an RNG
-         * across threads; only the Live owner calls this method. */
-        maskState ^= maskState << 13;
-        maskState ^= maskState >> 17;
-        maskState ^= maskState << 5;
-        ubyte[4] mask = [
-            cast(ubyte) maskState, cast(ubyte)(maskState >> 8),
-            cast(ubyte)(maskState >> 16), cast(ubyte)(maskState >> 24)
-        ];
+        /* RFC6455 requires a fresh unpredictable key for every client frame.
+         * OpenSSL is already the pinned TLS provider behind libcurl. */
+        ubyte[4] mask;
+        if (RAND_bytes(mask.ptr, cast(int) mask.length) != 1)
+        {
+            reason = "could not obtain a WebSocket masking key";
+            return false;
+        }
         frame ~= mask[];
         auto payloadStart = frame.length;
         frame.length += payload.length;
@@ -930,7 +966,7 @@ private class LiveManager
         {
             synchronized (mutex)
             {
-                if (closing || (state !is null && !removing && state.removePending))
+                if ((closing && opcode != 8) || (state !is null && !removing && state.removePending))
                 {
                     reason = "live write cancelled";
                     return false;
@@ -989,6 +1025,11 @@ private class LiveManager
         if (code != CurlError.ok)
         {
             reason = "live read: " ~ curlError(code);
+            return -1;
+        }
+        if (received == 0)
+        {
+            reason = "WebSocket peer closed the transport";
             return -1;
         }
         receiveBuffer ~= chunk[0 .. received];
@@ -1272,8 +1313,8 @@ private class LiveManager
                     state.hasLastValue = false;
                     state.rehydrating = false;
                     auto data = modification.hasData ? modification.data : JSONValue.init;
-                    update.error = new ConvexError("FunctionError",
-                            modification.message, data, modification.logs);
+                    update.error = new ConvexError("FunctionError", modification.message,
+                            data, modification.logs, modification.hasData);
                 }
                 enqueueLocked(state, update);
             }
@@ -1473,6 +1514,12 @@ private string curlError(CURLcode code)
     return text is null ? "libcurl error " ~ code.to!string : text.fromStringz.idup;
 }
 
+private extern (C) int liveDialProgress(void* context, double, double, double, double)
+{
+    auto manager = cast(LiveManager) context;
+    return manager is null || manager.shouldCancelDial() ? 1 : 0;
+}
+
 version (ConvexAdapter)
 {
     /** Test-adapter-only fault injection. This is deliberately absent from a
@@ -1532,6 +1579,20 @@ unittest
             manager.enqueueLocked(number % 2 == 0 ? first : second, update);
         }
         assert(manager.queuedBytes <= liveQueueBudgetBytes);
+    }
+    version (ConvexAdapter)
+    {
+        size_t before;
+        synchronized (manager.mutex)
+            before = manager.queuedBytes;
+        auto subscription = new ConvexSubscription(manager, first);
+        auto retained = subscription.nextRetained(0);
+        assert(retained !is null);
+        synchronized (manager.mutex)
+            assert(manager.queuedBytes == before);
+        subscription.releaseRetained(retained);
+        synchronized (manager.mutex)
+            assert(manager.queuedBytes == before - retained.retainedBytes);
     }
     manager.close(1_000);
 }

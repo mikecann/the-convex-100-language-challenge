@@ -22,13 +22,223 @@ import std.conv : to;
 import std.json : JSONType, JSONValue, parseJSON;
 import std.socket : InternetAddress, Socket, TcpSocket;
 import std.stdio : stderr;
-import std.string : lastIndexOf;
+import std.string : indexOf, lastIndexOf;
 
 enum runtimeName = "ldc-1.40.0";
 enum maxInputLineBytes = 2 * 1024 * 1024;
+enum maxInputQueueBytes = 4 * 1024 * 1024;
+enum maxInputQueueLines = 32;
 enum maxOutputLineBytes = 3 * 1024 * 1024;
 enum outputDeadlineMs = 500;
 enum maxSubscriptions = 16;
+
+/** The reader may see close while the command owner is waiting for a Live Add
+ * barrier. Recording it here lets that reader cancel a stalled WebSocket dial
+ * without executing any other adapter command out of order. */
+private class AdapterSession
+{
+    private Mutex mutex;
+    private ConvexClient client;
+    private bool closeRequested;
+    private ConvexError closeError;
+
+    this()
+    {
+        mutex = new Mutex();
+    }
+
+    ConvexClient ensureClient()
+    {
+        import std.process : environment;
+
+        synchronized (mutex)
+        {
+            if (closeRequested)
+                throw new ConvexError("Error", "Convex client is closed");
+            if (client is null)
+            {
+                auto url = environment.get("CONVEX_URL", "");
+                if (url.length == 0)
+                    throw new ConvexError("ProtocolError", "CONVEX_URL is required");
+                client = new ConvexClient(url);
+            }
+            return client;
+        }
+    }
+
+    void requestClose()
+    {
+        ConvexClient current;
+        synchronized (mutex)
+        {
+            closeRequested = true;
+            current = client;
+        }
+        if (current !is null)
+        {
+            try
+                current.close();
+            catch (ConvexError error)
+                synchronized (mutex)
+                    closeError = error;
+        }
+    }
+
+    ConvexError closeFailure()
+    {
+        synchronized (mutex)
+            return closeError;
+    }
+}
+
+/** Read and frame NDJSON independently of command execution. Only close has an
+ * early side effect, and that side effect is limited to cancelling transport. */
+private class CommandReader
+{
+    private int descriptor;
+    private AdapterSession session;
+    private Mutex mutex;
+    private Thread worker;
+    private string[] lines;
+    private size_t queuedBytes;
+    private bool stopped;
+    private bool finished;
+    private bool oversized;
+
+    this(int descriptor, AdapterSession session)
+    {
+        this.descriptor = descriptor;
+        this.session = session;
+        mutex = new Mutex();
+        worker = new Thread(&readLoop);
+        worker.name = "convex-d-adapter-input";
+        worker.start();
+    }
+
+    bool next(ref string line, int timeoutMs)
+    {
+        auto deadline = monotonicMilliseconds() + timeoutMs;
+        for (;;)
+        {
+            synchronized (mutex)
+            {
+                if (lines.length > 0)
+                {
+                    line = lines[0];
+                    lines = lines[1 .. $];
+                    queuedBytes -= line.length + 1;
+                    return true;
+                }
+                if (finished)
+                    return false;
+            }
+            if (monotonicMilliseconds() >= deadline)
+                return false;
+            Thread.sleep(5.msecs);
+        }
+    }
+
+    bool isFinished()
+    {
+        synchronized (mutex)
+            return finished && lines.length == 0;
+    }
+
+    bool inputWasOversized()
+    {
+        synchronized (mutex)
+            return oversized;
+    }
+
+    void stop()
+    {
+        synchronized (mutex)
+            stopped = true;
+        worker.join();
+    }
+
+    private void readLoop()
+    {
+        string pending;
+        ubyte[16_384] bytes;
+        readMore: for (;;)
+        {
+            synchronized (mutex)
+                if (stopped)
+                    break;
+            pollfd entry;
+            entry.fd = descriptor;
+            entry.events = POLLIN;
+            auto ready = poll(&entry, 1, 50);
+            if (ready < 0 && errno == EINTR)
+                continue;
+            if (ready < 0)
+                break;
+            if (ready == 0)
+                continue;
+            auto received = read(descriptor, bytes.ptr, bytes.length);
+            if (received < 0 && (errno == EAGAIN || errno == EINTR))
+                continue;
+            if (received <= 0)
+                break;
+            pending ~= cast(string) bytes[0 .. received].idup;
+            for (;;)
+            {
+                long newline = -1;
+                foreach (index, octet; pending)
+                    if (octet == '\n')
+                    {
+                        newline = cast(long) index;
+                        break;
+                    }
+                if (newline < 0)
+                    break;
+                auto line = pending[0 .. newline];
+                if (line.length > 0 && line[$ - 1] == '\r')
+                    line = line[0 .. $ - 1];
+                pending = pending[newline + 1 .. $];
+                if (line.length > maxInputLineBytes)
+                {
+                    synchronized (mutex)
+                        oversized = true;
+                    break readMore;
+                }
+                if (isCloseCommand(line))
+                    session.requestClose();
+                if (!enqueue(line.idup))
+                    break readMore;
+            }
+            if (pending.length > maxInputLineBytes)
+            {
+                synchronized (mutex)
+                    oversized = true;
+                break;
+            }
+        }
+        synchronized (mutex)
+            finished = true;
+    }
+
+    private bool enqueue(string line)
+    {
+        for (;;)
+        {
+            synchronized (mutex)
+            {
+                if (stopped)
+                    return false;
+                if (lines.length < maxInputQueueLines
+                        && queuedBytes + line.length + 1 <= maxInputQueueBytes)
+                {
+                    lines ~= line;
+                    queuedBytes += line.length + 1;
+                    return true;
+                }
+            }
+            Thread.sleep(5.msecs);
+        }
+    }
+}
 
 private class Output
 {
@@ -182,32 +392,64 @@ private class Output
 
 private class Relay
 {
-    ConvexSubscription subscription;
     Thread worker;
     string subscriptionId;
     ulong generation;
+    private LiveUpdate delegate(int) nextUpdate;
+    private void delegate(LiveUpdate) releaseUpdate;
+    private void delegate() closeSource;
+    private void delegate() afterDequeue;
 
     this(ConvexSubscription subscription, string subscriptionId, ulong generation,
             Output output, int delayMs)
     {
-        this.subscription = subscription;
+        nextUpdate = (int timeoutMs) => subscription.nextRetained(timeoutMs);
+        releaseUpdate = (LiveUpdate update) => subscription.releaseRetained(update);
+        closeSource = () => subscription.close();
+        start(subscriptionId, generation, output, delayMs);
+    }
+
+    version (AdapterUnitTest) this(LiveUpdate delegate(int) nextUpdate, void delegate(LiveUpdate) releaseUpdate,
+            void delegate() closeSource, void delegate() afterDequeue,
+            string subscriptionId, ulong generation, Output output)
+    {
+        this.nextUpdate = nextUpdate;
+        this.releaseUpdate = releaseUpdate;
+        this.closeSource = closeSource;
+        this.afterDequeue = afterDequeue;
+        start(subscriptionId, generation, output, 0);
+    }
+
+    private void start(string subscriptionId, ulong generation, Output output, int delayMs)
+    {
         this.subscriptionId = subscriptionId;
         this.generation = generation;
         worker = new Thread({
             for (;;)
             {
-                auto update = subscription.next(100);
+                auto update = nextUpdate(100);
                 if (update is null)
                 {
                     if (!output.isActive(subscriptionId, generation))
                         return;
                     continue;
                 }
-                if (delayMs > 0)
-                    Thread.sleep(delayMs.msecs);
-                if (!output.relay(subscriptionId, generation,
-                    subscriptionEvent(subscriptionId, update)))
-                    return;
+                try
+                {
+                    if (afterDequeue !is null)
+                        afterDequeue();
+                    if (delayMs > 0)
+                        Thread.sleep(delayMs.msecs);
+                    if (!output.relay(subscriptionId, generation,
+                        subscriptionEvent(subscriptionId, update)))
+                        return;
+                }
+                finally
+                {
+                    /* The Live owner keeps this value charged while it waits
+                     * for the physical NDJSON write or is rejected as stale. */
+                    releaseUpdate(update);
+                }
             }
         });
         worker.name = "convex-d-adapter-relay";
@@ -217,7 +459,7 @@ private class Relay
     void stop()
     {
         try
-            subscription.close();
+            closeSource();
         catch (ConvexError)
         {
         }
@@ -265,69 +507,34 @@ else
 
 private void serve(int input, Output output)
 {
-    auto client = cast(ConvexClient) null;
+    auto session = new AdapterSession();
+    auto reader = new CommandReader(input, session);
     Relay[string] relays;
-    string pending;
     bool done;
     import std.process : environment;
 
     auto relayDelay = environment.get("ADAPTER_TEST_RELAY_DELAY_MS", "0").to!int;
-    ubyte[16_384] bytes;
     while (!done && !output.isClosed())
     {
-        pollfd entry;
-        entry.fd = input;
-        entry.events = POLLIN;
-        auto ready = poll(&entry, 1, 50);
-        if (ready < 0 && errno == EINTR)
-            continue;
-        if (ready < 0)
-            break;
-        if (ready == 0)
-            continue;
-        auto received = read(input, bytes.ptr, bytes.length);
-        if (received < 0 && (errno == EAGAIN || errno == EINTR))
-            continue;
-        if (received <= 0)
-            break;
-        pending ~= cast(string) bytes[0 .. received].idup;
-        for (;;)
+        string line;
+        if (reader.next(line, 50))
         {
-            long newline = -1;
-            foreach (index, octet; pending)
-                if (octet == '\n')
-                {
-                    newline = cast(long) index;
-                    break;
-                }
-            if (newline < 0)
-                break;
-            auto line = pending[0 .. newline];
-            if (line.length > 0 && line[$ - 1] == '\r')
-                line = line[0 .. $ - 1];
-            pending = pending[newline + 1 .. $];
-            handle(client, relays, line, output, relayDelay, done);
-            if (done || output.isClosed())
-                break;
+            handle(session, relays, line, output, relayDelay, done);
+            continue;
         }
-        if (pending.length > maxInputLineBytes)
-        {
-            output.send(errorEvent("", "ProtocolError", "adapter input line exceeds 2 MiB"));
+        if (reader.isFinished())
             break;
-        }
     }
+    if (reader.inputWasOversized() && !output.isClosed())
+        output.send(errorEvent("", "ProtocolError", "adapter input line exceeds 2 MiB"));
     output.invalidateAll();
     foreach (relay; relays.byValue())
         relay.stop();
-    if (client !is null)
-        try
-            client.close();
-        catch (ConvexError)
-        {
-        }
+    session.requestClose();
+    reader.stop();
 }
 
-private void handle(ref ConvexClient client, ref Relay[string] relays, string line,
+private void handle(AdapterSession session, ref Relay[string] relays, string line,
         Output output, int relayDelay, ref bool done)
 {
     JSONValue command;
@@ -374,15 +581,14 @@ private void handle(ref ConvexClient client, ref Relay[string] relays, string li
         foreach (relay; relays.byValue())
             relay.stop();
         relays.clear();
-        if (client !is null)
-            try
-                client.close();
-            catch (ConvexError error)
-            {
-                output.send(convexErrorEvent(id, error));
-                done = true;
-                return;
-            }
+        session.requestClose();
+        auto closeError = session.closeFailure();
+        if (closeError !is null)
+        {
+            output.send(convexErrorEvent(id, closeError));
+            done = true;
+            return;
+        }
         output.finish(id);
         done = true;
         return;
@@ -391,7 +597,7 @@ private void handle(ref ConvexClient client, ref Relay[string] relays, string li
     {
         try
         {
-            client = ensureClient(client);
+            auto client = session.ensureClient();
             if (!hasString(command, "token"))
                 throw new ConvexError("ProtocolError", "setAuth needs token");
             client.setAuth(fieldString(command, "token"));
@@ -409,7 +615,7 @@ private void handle(ref ConvexClient client, ref Relay[string] relays, string li
         {
             if (!hasString(command, "path") || !("args" in command.object))
                 throw new ConvexError("ProtocolError", "adapter call needs path and args");
-            client = ensureClient(client);
+            auto client = session.ensureClient();
             ConvexResult result;
             if (op == "query")
                 result = client.query(fieldString(command, "path"), command.object["args"]);
@@ -448,7 +654,7 @@ private void handle(ref ConvexClient client, ref Relay[string] relays, string li
                         "subscribe needs subscriptionId, path, and args");
             if (relays.length >= maxSubscriptions)
                 throw new ConvexError("ProtocolError", "adapter supports at most 16 subscriptions");
-            client = ensureClient(client);
+            auto client = session.ensureClient();
             auto subscription = client.subscribe(fieldString(command, "path"),
                     command.object["args"]);
             auto generation = output.activateAndAck(subscriptionId, id);
@@ -477,7 +683,7 @@ private void handle(ref ConvexClient client, ref Relay[string] relays, string li
     {
         try
         {
-            client = ensureClient(client);
+            auto client = session.ensureClient();
             adapterDebugDisconnect(client);
             output.acknowledge(id);
         }
@@ -490,16 +696,18 @@ private void handle(ref ConvexClient client, ref Relay[string] relays, string li
     output.send(errorEvent(id, "ProtocolError", "unknown adapter operation"));
 }
 
-private ConvexClient ensureClient(ConvexClient client)
+private bool isCloseCommand(string line)
 {
-    if (client !is null)
-        return client;
-    import std.process : environment;
-
-    auto url = environment.get("CONVEX_URL", "");
-    if (url.length == 0)
-        throw new ConvexError("ProtocolError", "CONVEX_URL is required");
-    return new ConvexClient(url);
+    try
+    {
+        auto command = parseJSON(line);
+        return command.type == JSONType.object && hasString(command, "op")
+            && command.object["op"].str == "close";
+    }
+    catch (Exception)
+    {
+        return false;
+    }
 }
 
 private JSONValue subscriptionEvent(string subscriptionId, LiveUpdate update)
@@ -512,7 +720,7 @@ private JSONValue subscriptionEvent(string subscriptionId, LiveUpdate update)
         JSONValue[string] detail;
         detail["name"] = JSONValue(update.error.kind);
         detail["message"] = JSONValue(update.error.msg);
-        if (update.error.data.type != JSONType.null_)
+        if (update.error.hasData)
             detail["data"] = update.error.data;
         event["error"] = JSONValue(detail);
     }
@@ -568,20 +776,21 @@ private JSONValue simpleEvent(string id, string kind)
 
 private JSONValue errorEvent(string id, string kind, string message)
 {
-    return errorEvent(id, kind, message, JSONValue.init, []);
+    return errorEvent(id, kind, message, JSONValue.init, [], false);
 }
 
 private JSONValue convexErrorEvent(string id, ConvexError error)
 {
-    return errorEvent(id, error.kind, error.msg, error.data, error.logs);
+    return errorEvent(id, error.kind, error.msg, error.data, error.logs, error.hasData);
 }
 
-private JSONValue errorEvent(string id, string kind, string message, JSONValue data, string[] logs)
+private JSONValue errorEvent(string id, string kind, string message,
+        JSONValue data, string[] logs, bool hasData)
 {
     JSONValue[string] detail;
     detail["name"] = JSONValue(kind);
     detail["message"] = JSONValue(message);
-    if (data.type != JSONType.null_)
+    if (hasData)
         detail["data"] = data;
     JSONValue[string] event;
     if (id.length > 0)
@@ -642,4 +851,170 @@ version (AdapterUnitTest) unittest
     assert(!output.send(JSONValue(event)));
     assert(output.isClosed());
     assert(monotonicMilliseconds() - started < 1_500);
+}
+
+version (AdapterUnitTest) unittest
+{
+    auto explicitNull = new ConvexError("FunctionError", "null payload",
+            JSONValue(null), [], true);
+    auto encoded = convexErrorEvent("http", explicitNull);
+    assert("data" in encoded.object["error"].object);
+    assert(encoded.object["error"].object["data"].type == JSONType.null_);
+
+    auto absent = convexErrorEvent("http", new ConvexError("FunctionError", "absent"));
+    assert("data" !in absent.object["error"].object);
+
+    auto update = new LiveUpdate();
+    update.error = explicitNull;
+    auto subscription = subscriptionEvent("live", update);
+    assert("data" in subscription.object["error"].object);
+    assert(subscription.object["error"].object["data"].type == JSONType.null_);
+}
+
+version (AdapterUnitTest) unittest
+{
+    import core.time : msecs;
+    import std.process : environment;
+    import std.socket : InternetAddress, TcpSocket;
+    import std.string : indexOf;
+
+    enum port = 18151;
+    auto listener = new TcpSocket();
+    listener.bind(new InternetAddress("127.0.0.1", port));
+    listener.listen(1);
+    auto stalled = new Thread({
+        scope (exit)
+            listener.close();
+        auto peer = listener.accept();
+        scope (exit)
+            peer.close();
+        ubyte[4096] request;
+        assert(peer.receive(request) > 0);
+        ubyte[32] untilClosed;
+        try
+            while (peer.receive(untilClosed) > 0)
+            {
+            }
+                catch (Exception)
+                {
+                }
+    });
+    stalled.start();
+
+    auto previousUrl = environment.get("CONVEX_URL", "");
+    environment["CONVEX_URL"] = "http://127.0.0.1:" ~ port.to!string;
+    scope (exit)
+    {
+        if (previousUrl.length > 0)
+            environment["CONVEX_URL"] = previousUrl;
+        else
+            environment.remove("CONVEX_URL");
+    }
+
+    int[2] input;
+    int[2] result;
+    assert(pipe(input) == 0 && pipe(result) == 0);
+    setNonblocking(input[0]);
+    auto output = new Output(result[1], false);
+    auto adapter = new Thread({ serve(input[0], output); });
+    adapter.start();
+
+    auto subscribe = `{"id":"subscribe","op":"subscribe","subscriptionId":"s","path":"demo:state","args":{}}`
+        ~ "\n";
+    assert(write(input[1], subscribe.ptr, subscribe.length) == subscribe.length);
+    Thread.sleep(250.msecs);
+    auto started = monotonicMilliseconds();
+    auto closeCommand = `{"id":"close","op":"close"}` ~ "\n";
+    assert(write(input[1], closeCommand.ptr, closeCommand.length) == closeCommand.length);
+    close(input[1]);
+    adapter.join();
+    assert(monotonicMilliseconds() - started < 1_500);
+    close(input[0]);
+    close(result[1]);
+
+    string response;
+    ubyte[4096] chunk;
+    for (;;)
+    {
+        auto received = read(result[0], chunk.ptr, chunk.length);
+        if (received <= 0)
+            break;
+        response ~= cast(string) chunk[0 .. received].idup;
+    }
+    close(result[0]);
+    assert(response.indexOf(`"id":"subscribe"`) >= 0);
+    assert(response.indexOf(`"id":"close","type":"closed"`) >= 0);
+    stalled.join();
+}
+
+version (AdapterUnitTest) unittest
+{
+    foreach (replacement; [false, true])
+    {
+        int[2] descriptors;
+        assert(pipe(descriptors) == 0);
+        auto output = new Output(descriptors[1], false);
+        auto oldGeneration = output.activateAndAck("same", "first");
+
+        auto gate = new Mutex();
+        bool dequeued;
+        bool resume;
+        bool supplied;
+        size_t releases;
+        auto update = new LiveUpdate();
+        update.hasValue = true;
+        update.value = JSONValue(["count": JSONValue(1L)]);
+        auto relay = new Relay((int) {
+            if (!supplied)
+            {
+                supplied = true;
+                return update;
+            }
+            return null;
+        }, (LiveUpdate released) { releases++; }, () {}, () {
+            synchronized (gate)
+                dequeued = true;
+            for (;;)
+            {
+                synchronized (gate)
+                    if (resume)
+                        break;
+                Thread.sleep(5.msecs);
+            }
+        }, "same", oldGeneration, output);
+
+        auto deadline = monotonicMilliseconds() + 1_000;
+        for (;;)
+        {
+            synchronized (gate)
+                if (dequeued)
+                    break;
+            assert(monotonicMilliseconds() < deadline);
+            Thread.sleep(5.msecs);
+        }
+        output.invalidate("same");
+        if (replacement)
+            output.activateAndAck("same", "replacement");
+        else
+            output.acknowledge("unsubscribe");
+        synchronized (gate)
+            resume = true;
+        relay.stop();
+        assert(releases == 1);
+
+        close(descriptors[1]);
+        string response;
+        ubyte[4096] bytes;
+        for (;;)
+        {
+            auto received = read(descriptors[0], bytes.ptr, bytes.length);
+            if (received <= 0)
+                break;
+            response ~= cast(string) bytes[0 .. received].idup;
+        }
+        close(descriptors[0]);
+        assert(response.indexOf(`"id":"first"`) >= 0);
+        assert(response.indexOf(replacement ? `"id":"replacement"` : `"id":"unsubscribe"`) >= 0);
+        assert(response.indexOf(`"subscriptionId":"same"`) < 0);
+    }
 }
