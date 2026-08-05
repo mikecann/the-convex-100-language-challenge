@@ -26,7 +26,7 @@ The manifest intentionally awards no badges yet. Only the shared local and
 hosted black-box controller may turn either row into a passing capability.
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.erl -->
-```text
+```erlang
 -module(main).
 -export([main/0]).
 
