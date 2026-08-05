@@ -102,6 +102,9 @@ namespace Convex {
     private HashMap<uint, Subscription> active = new HashMap<uint, Subscription> ();
     private uint next_query_id = 1;
     private uint query_set_version = 0;
+    // Each callback captures this number.  A late close/error from a retired
+    // socket must never be allowed to change the replacement connection.
+    private uint socket_generation = 0;
     private uint remote_query_set = 0;
     private uint remote_identity = 0;
     private string remote_timestamp = "AAAAAAAAAAA=";
@@ -109,6 +112,7 @@ namespace Convex {
     private string last_close_reason = "InitialConnect";
     private string max_timestamp = "AAAAAAAAAAA=";
     private uint64 max_timestamp_number = 0;
+    private bool saw_timestamp = false;
     private bool connecting = false;
     private bool closing = false;
     private uint reconnect_backoff_ms = 100;
@@ -136,7 +140,8 @@ namespace Convex {
     internal bool debug_disconnect () {
       if (socket == null) return false;
       last_close_reason = "debugDisconnect";
-      socket.close (4000, "conformance disconnect");
+      // retire_and_reconnect invalidates callbacks and schedules the next
+      // connection before this method returns, which is the adapter ACK barrier.
       retire_and_reconnect ("debugDisconnect");
       return true;
     }
@@ -167,19 +172,28 @@ namespace Convex {
       try {
         var message = new Message ("GET", websocket_url ());
         message.request_headers.append ("Convex-Client", "vala-0.1.0");
+        if (client.auth_token != null) message.request_headers.append ("Authorization", "Bearer " + client.auth_token);
         var next = yield session.websocket_connect_async (message, null, null, Priority.DEFAULT, null);
         if (closing) { next.close (1000, "client closed"); return; }
         socket = next;
+        uint generation = ++socket_generation;
         query_set_version = 0;
         remote_query_set = 0; remote_identity = 0; remote_timestamp = "AAAAAAAAAAA=";
         reconnect_backoff_ms = 100;
         socket.set_max_incoming_payload_size (2 * 1024 * 1024);
-        socket.message.connect (on_message);
-        socket.error.connect ((error) => { retire_and_reconnect (error.message); });
-        socket.closed.connect (() => { retire_and_reconnect ("socket closed"); });
+        socket.message.connect ((type, payload) => {
+          if (socket == next && socket_generation == generation) on_message (type, payload);
+        });
+        socket.error.connect ((error) => {
+          if (socket == next && socket_generation == generation) retire_and_reconnect (error.message);
+        });
+        socket.closed.connect (() => {
+          if (socket == next && socket_generation == generation) retire_and_reconnect ("socket closed");
+        });
+        string observed_timestamp = saw_timestamp ? ",\"maxObservedTimestamp\":" + json_string (max_timestamp) : "";
         send_text ("{\"type\":\"Connect\",\"sessionId\":" + json_string (Uuid.string_random ()) +
           ",\"connectionCount\":" + connection_count.to_string () + ",\"lastCloseReason\":" +
-          json_string (last_close_reason) + ",\"maxObservedTimestamp\":" + json_string (max_timestamp) + ",\"clientTs\":0}");
+          json_string (last_close_reason) + observed_timestamp + ",\"clientTs\":0}");
         var all = new ArrayList<Subscription> ();
         foreach (var sub in active.values) all.add (sub);
         if (all.size > 0) {
@@ -214,9 +228,12 @@ namespace Convex {
 
     private void retire_and_reconnect (string reason) {
       if (socket == null && !connecting) return;
+      var retired = socket;
       socket = null; connecting = false; query_set_version = 0;
+      socket_generation++;
       remote_query_set = 0; remote_identity = 0; remote_timestamp = "AAAAAAAAAAA=";
       connection_count++; last_close_reason = reason;
+      if (retired != null && retired.state == WebsocketState.OPEN) retired.close (4000, reason);
       if (closing || active.size == 0 || reconnect_source != 0) return;
       uint delay = reconnect_backoff_ms;
       reconnect_backoff_ms = uint.min (reconnect_backoff_ms * 2, 15000);
@@ -258,6 +275,7 @@ namespace Convex {
       uint64 end_number = timestamp_value (end_timestamp);
       if (end_number < max_timestamp_number) throw new ClientError.PROTOCOL ("timestamp moved backwards");
       max_timestamp = end_timestamp; max_timestamp_number = end_number;
+      saw_timestamp = true;
       remote_timestamp = end_timestamp; remote_query_set = (uint) end.get_int_member ("querySet"); remote_identity = (uint) end.get_int_member ("identity");
       // All state is committed before any callback can observe the transition.
       foreach (var update in pending) update.subscription.publish (update.value, update.error);
@@ -281,6 +299,7 @@ namespace Convex {
     private LiveOwner? live;
     private bool closed = false;
     public FunctionError? last_function_error { get; private set; }
+    internal string? auth_token { get { return token; } }
     public Client (string url) throws ClientError {
       if (!url.has_prefix ("http://") && !url.has_prefix ("https://")) throw new ClientError.PROTOCOL ("Convex deployment URL must use http or https");
       this.url = url.has_suffix ("/") ? url.substring (0, url.length - 1) : url;

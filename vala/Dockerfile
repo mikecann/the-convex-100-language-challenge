@@ -22,10 +22,20 @@ RUN valac --pkg gee-0.8 --pkg gio-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
 RUN valac --pkg gee-0.8 --pkg gio-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
     --target-glib=2.74 \
     -o /out/convex-example client/convex.vala examples/basics/main.vala
+RUN valac --pkg gee-0.8 --pkg gio-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
+    --target-glib=2.74 \
+    -o /out/convex-client-tests client/convex.vala client/tests/client_tests.vala \
+    && /out/convex-client-tests
 RUN printf '%s\n' \
     '{"protocolVersion":1,"id":"hello","op":"hello"}' \
     '{"id":"close","op":"close"}' | /out/convex-adapter > /tmp/events \
     && grep -Fq '"language":"vala"' /tmp/events && grep -Fq '"type":"closed"' /tmp/events
+RUN invalid="$(printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello","unexpected":true}' '{"id":"","op":"close"}' '{"id":"missing-token","op":"setAuth"}' '{"id":"missing-subscription","op":"unsubscribe"}' '{"id":"final-close","op":"close"}' | /out/convex-adapter)"; \
+    echo "$invalid" | grep -Fq '"type":"error"'; \
+    ! echo "$invalid" | grep -Fq '"type":"ready"'; \
+    ! echo "$invalid" | grep -Fq '"id":"missing-token","type":"ack"'; \
+    ! echo "$invalid" | grep -Fq '"id":"missing-subscription","type":"ack"'; \
+    echo "$invalid" | grep -Fq '"id":"final-close","type":"closed"'
 RUN ADAPTER_LISTEN=127.0.0.1:18080 /out/convex-adapter >/tmp/tcp.out 2>/tmp/tcp.err & \
     pid=$!; sleep 1; actual="$(printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | busybox nc 127.0.0.1 18080)"; \
     echo "$actual" | grep -Fq '"language":"vala"'; echo "$actual" | grep -Fq '"type":"closed"'; wait "$pid"

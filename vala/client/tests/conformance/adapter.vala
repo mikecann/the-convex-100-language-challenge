@@ -24,13 +24,14 @@ class Adapter : GLib.Object {
     } catch (Error error) { stderr.printf ("adapter output failed: %s\n", error.message); }
   }
 
-  private void error (string id, string name, string message, Json.Node? data = null, string? subscription_id = null) {
+  private void error (string id, string name, string message, Json.Node? data = null, string? subscription_id = null, string[] logs = {}) {
     var body = "{\"name\":" + Convex.json_string (name) + ",\"message\":" + Convex.json_string (message);
     if (data != null) body += ",\"data\":" + Convex.node_text (data);
     body += "}";
-    if (subscription_id != null) emit ("{\"type\":\"subscription\",\"subscriptionId\":" + Convex.json_string (subscription_id) + ",\"error\":" + body + "}");
-    else if (id.length > 0) emit ("{\"id\":" + Convex.json_string (id) + ",\"type\":\"error\",\"error\":" + body + "}");
-    else emit ("{\"type\":\"error\",\"error\":" + body + "}");
+    var logs_field = logs.length > 0 ? ",\"logs\":" + logs_json (logs) : "";
+    if (subscription_id != null) emit ("{\"type\":\"subscription\",\"subscriptionId\":" + Convex.json_string (subscription_id) + ",\"error\":" + body + logs_field + "}");
+    else if (id.length > 0) emit ("{\"id\":" + Convex.json_string (id) + ",\"type\":\"error\",\"error\":" + body + logs_field + "}");
+    else emit ("{\"type\":\"error\",\"error\":" + body + logs_field + "}");
   }
 
   private string logs_json (string[] logs) {
@@ -51,7 +52,7 @@ class Adapter : GLib.Object {
 
   private void on_subscription (string subscription_id, Json.Node? value, FunctionError? failure) {
     if (!subscriptions.contains (subscription_id)) return;
-    if (failure != null) { error ("", failure.name, failure.message, failure.data, subscription_id); return; }
+    if (failure != null) { error ("", failure.name, failure.message, failure.data, subscription_id, failure.logs); return; }
     if (value != null) emit ("{\"type\":\"subscription\",\"subscriptionId\":" + Convex.json_string (subscription_id) + ",\"value\":" + Convex.node_text (value) + "}");
   }
 
@@ -61,9 +62,11 @@ class Adapter : GLib.Object {
     catch (Error parse_error) { error ("", "ProtocolError", "malformed adapter command"); return; }
     if (command.get_node_type () != NodeType.OBJECT) { error ("", "ProtocolError", "malformed adapter command"); return; }
     var object = command.get_object ();
-    var id = object.has_member ("id") ? object.get_string_member ("id") : "";
-    var op = object.has_member ("op") ? object.get_string_member ("op") : "";
+    var id = "";
     try {
+      validate_envelope (object);
+      id = object.get_string_member ("id");
+      var op = object.get_string_member ("op");
       if (op == "hello") {
         if (!object.has_member ("protocolVersion") || object.get_int_member ("protocolVersion") != 1) throw new ClientError.PROTOCOL ("unsupported adapter protocol version");
         emit ("{\"protocolVersion\":1,\"id\":" + Convex.json_string (id) + ",\"type\":\"ready\",\"language\":\"vala\",\"implementation\":\"native-vala-libsoup3\",\"runtime\":" + Convex.json_string (Environment.get_variable ("VALA_RUNTIME") ?? "glib") + "}");
@@ -102,10 +105,48 @@ class Adapter : GLib.Object {
     } catch (Error command_error) {
       if (client != null && client.last_function_error != null) {
         var failure = client.last_function_error;
-        error (id, failure.name, failure.message, failure.data);
+        error (id, failure.name, failure.message, failure.data, null, failure.logs);
       } else {
         error (id, "ProtocolError", command_error.message);
       }
+    }
+  }
+
+  // The harness relies on a strict protocol. Rejecting unknown fields makes
+  // client-side typos visible instead of silently treating them as success.
+  private void validate_envelope (Json.Object object) throws ClientError {
+    if (!object.has_member ("id") || !object.has_member ("op")) throw new ClientError.PROTOCOL ("adapter command needs id and op");
+    var id = object.get_string_member ("id");
+    var op = object.get_string_member ("op");
+    if (id.length == 0 || op.length == 0) throw new ClientError.PROTOCOL ("adapter command id and op must be non-empty strings");
+    string[] permitted;
+    if (op == "hello") permitted = { "id", "op", "protocolVersion" };
+    else if (op == "query" || op == "mutation" || op == "action") permitted = { "id", "op", "path", "args" };
+    else if (op == "setAuth") permitted = { "id", "op", "token" };
+    else if (op == "subscribe") permitted = { "id", "op", "subscriptionId", "path", "args" };
+    else if (op == "unsubscribe") permitted = { "id", "op", "subscriptionId" };
+    else if (op == "debugDisconnect" || op == "close") permitted = { "id", "op" };
+    else throw new ClientError.PROTOCOL ("unknown adapter operation");
+    foreach (unowned string member in object.get_members ()) {
+      bool allowed = false;
+      foreach (var name in permitted) if (member == name) { allowed = true; break; }
+      if (!allowed) throw new ClientError.PROTOCOL ("unknown adapter field " + member);
+    }
+    if (op == "hello" && !object.has_member ("protocolVersion")) {
+      throw new ClientError.PROTOCOL ("hello requires protocolVersion");
+    }
+    if ((op == "query" || op == "mutation" || op == "action") &&
+        (!object.has_member ("path") || !object.has_member ("args"))) {
+      throw new ClientError.PROTOCOL ("call requires path and args");
+    }
+    if (op == "setAuth" && !object.has_member ("token")) {
+      throw new ClientError.PROTOCOL ("setAuth requires token");
+    }
+    if (op == "subscribe" && (!object.has_member ("subscriptionId") || !object.has_member ("path") || !object.has_member ("args"))) {
+      throw new ClientError.PROTOCOL ("subscribe requires subscriptionId, path, and args");
+    }
+    if (op == "unsubscribe" && !object.has_member ("subscriptionId")) {
+      throw new ClientError.PROTOCOL ("unsubscribe requires subscriptionId");
     }
   }
 
