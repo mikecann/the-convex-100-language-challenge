@@ -1,31 +1,3 @@
-# Convex from Python
-
-This demonstration uses native Python to query and mutate Convex through its
-documented JSON HTTP API, plus a small RFC 6455 WebSocket implementation that
-targets the pinned Convex Live profile.
-
-It is an educational, unofficial experiment. It is not a production SDK, an
-officially sanctioned Convex client, or a package intended for publication.
-
-## Start here
-
-[`examples/basics/main.py`](examples/basics/main.py) is the canonical example.
-It reads one unique counter room over HTTP, starts Live before changing it,
-performs one idempotent mutation, and checks the resulting `0 -> 1` journey.
-
-## What works
-
-| Capability | Current state | What that means |
-| --- | --- | --- |
-| HTTP | Awaiting shared verification | Native stdlib JSON HTTP query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented. |
-| Live | Awaiting shared verification | Native stdlib WebSocket subscription, bounded update delivery, reconnect attempt, unsubscribe, and clean close target the pinned profile. |
-
-No capability badge is earned until shared local and hosted black-box tests pass.
-
-## The basic example
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.py -->
-```python
 #!/usr/local/bin/python3
 import math, os, secrets, sys
 sys.path.insert(0, os.environ.get('CONVEX_CLIENT_PATH', os.path.abspath(os.path.join(os.path.dirname(__file__), '../../client'))))
@@ -68,34 +40,3 @@ def main():
         # when a teaching assertion above exposes unexpected server behaviour.
         client.close()
 if __name__ == '__main__': main()
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Verify it in Docker
-
-```sh
-./run test python
-./run verify-example python
-./run verify python
-./run verify-hosted python
-./run verify-all python
-```
-
-`test` runs compilation and Python-local tests inside Docker. `verify-example`
-executes the exact source above and requires its universal six-line transcript.
-The remaining commands are root-owned shared local and hosted evidence runs.
-
-## Conformance and protocol notes
-
-The test-only adapter under `client/tests/conformance/` speaks NDJSON adapter
-protocol v1 over stdin/stdout or TCP. `debugDisconnect` is adapter-only and
-exists for reconnect testing. HTTP uses `format: "json"`; Live targets
-`convex-rs-0.10.4-unversioned-sync` at commit
-`6f1df8a8ba1665084ec001e307ca841ca17074d7` and `/api/sync`.
-
-## Limitations
-
-- Live authentication and `TransitionChunk` assembly are deferred.
-- Live only supports unfragmented text WebSocket frames and JSON-safe values.
-- Mutations/actions use HTTP. Replay, optimistic updates, journals, and full
-  Convex value encoding are outside this teaching client.

@@ -1,0 +1,265 @@
+"""A deliberately small, native Python Convex demonstration client."""
+import base64
+import hashlib
+import json
+import os
+import queue
+import secrets
+import socket
+import ssl
+import struct
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+
+
+class ConvexError(Exception): pass
+class ClosedError(ConvexError): pass
+class ProtocolError(ConvexError): pass
+class TransportError(ConvexError): pass
+
+
+class FunctionError(ConvexError):
+    def __init__(self, message, *, data=None, logs=None):
+        super().__init__(message); self.data = data; self.logs = logs or []
+
+
+@dataclass
+class Result:
+    value: object
+    logs: list
+
+
+@dataclass
+class Update:
+    value: object = None
+    error: Exception | None = None
+    logs: list | None = None
+
+
+class _WebSocket:
+    # RFC 6455 framing is kept here instead of hiding Convex behaviour behind a
+    # third-party SDK. It supports the text frames used by the pinned profile.
+    def __init__(self, url, client_version):
+        parsed = urllib.parse.urlparse(url)
+        raw = socket.create_connection((parsed.hostname, parsed.port or (443 if parsed.scheme == "wss" else 80)), 10)
+        self.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=parsed.hostname) if parsed.scheme == "wss" else raw
+        key = base64.b64encode(os.urandom(16)).decode()
+        path = (parsed.path or "/") + (("?" + parsed.query) if parsed.query else "")
+        self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {parsed.netloc}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nConvex-Client: {client_version}\r\n\r\n").encode())
+        self._buffer = b""
+        response = self._read_until(b"\r\n\r\n")
+        header_end = response.index(b"\r\n\r\n") + 4
+        self._buffer = response[header_end:]
+        header_lines = response[:header_end - 4].decode("iso-8859-1").split("\r\n")
+        status = header_lines.pop(0).split(" ", 2)
+        headers = {}
+        for line in header_lines:
+            if ":" not in line: self.close(); raise TransportError("malformed WebSocket upgrade header")
+            name, value = line.split(":", 1)
+            key_name = name.strip().lower()
+            headers[key_name] = headers.get(key_name, "") + (("," if key_name in headers else "") + value.strip())
+        expected_accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
+        connection_tokens = {token.strip().lower() for token in headers.get("connection", "").split(",")}
+        if (len(status) < 2 or status[0] != "HTTP/1.1" or status[1] != "101"
+                or headers.get("upgrade", "").lower() != "websocket"
+                or "upgrade" not in connection_tokens
+                or headers.get("sec-websocket-accept", "").encode("ascii", "ignore") != expected_accept):
+            self.close(); raise TransportError("WebSocket upgrade was rejected")
+
+    def _read_until(self, marker):
+        data = b""
+        while marker not in data:
+            chunk = self.sock.recv(4096)
+            if not chunk: raise TransportError("WebSocket closed during upgrade")
+            data += chunk
+        return data
+
+    def _exact(self, length):
+        data, self._buffer = self._buffer[:length], self._buffer[length:]
+        while len(data) < length:
+            chunk = self.sock.recv(length - len(data))
+            if not chunk: raise EOFError
+            data += chunk
+        return data
+
+    def send_json(self, value):
+        payload = json.dumps(value, separators=(",", ":")).encode(); mask = os.urandom(4)
+        size = len(payload)
+        head = bytes([0x81, 0x80 | (size if size < 126 else 126 if size < 65536 else 127)])
+        if size >= 65536: head += struct.pack("!Q", size)
+        elif size >= 126: head += struct.pack("!H", size)
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        self.sock.sendall(head + mask + masked)
+
+    def _send_control(self, opcode, payload=b""):
+        if len(payload) > 125: raise ProtocolError("oversized WebSocket control frame")
+        mask = os.urandom(4)
+        self.sock.sendall(bytes([0x80 | opcode, 0x80 | len(payload)]) + mask + bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload)))
+
+    def receive_json(self):
+        first, second = self._exact(2); fin = bool(first & 0x80); opcode = first & 15; size = second & 127
+        if first & 0x70: raise ProtocolError("WebSocket RSV bits require an unnegotiated extension")
+        if second & 0x80: raise ProtocolError("server WebSocket frames must not be masked")
+        if size == 126: size = struct.unpack("!H", self._exact(2))[0]
+        elif size == 127:
+            size = struct.unpack("!Q", self._exact(8))[0]
+            if size & (1 << 63): raise ProtocolError("invalid 64-bit WebSocket payload length")
+        if opcode >= 8 and (not fin or size > 125): raise ProtocolError("invalid WebSocket control frame")
+        data = self._exact(size)
+        if opcode == 8:
+            if len(data) == 1: raise ProtocolError("invalid WebSocket close payload")
+            self._send_control(8, data)
+            raise EOFError
+        if opcode == 9: self._send_control(10, data); return self.receive_json()
+        if opcode == 10: return self.receive_json()
+        if not fin: raise ProtocolError("fragmented WebSocket messages are not supported")
+        if opcode != 1: raise ProtocolError(f"unsupported WebSocket opcode {opcode}")
+        try: return json.loads(data.decode("utf-8"))
+        except UnicodeDecodeError as error: raise ProtocolError("WebSocket text was not UTF-8") from error
+
+    def close(self):
+        try: self.sock.close()
+        except Exception: pass
+
+
+class Subscription:
+    MAX_BUFFERED_UPDATES = 16
+    def __init__(self, manager, query_id): self.manager, self.query_id, self.updates, self.closed = manager, query_id, queue.Queue(self.MAX_BUFFERED_UPDATES), False
+    def next_update(self, timeout=None):
+        try: update = self.updates.get(timeout=timeout)
+        except queue.Empty: raise TransportError("timed out waiting for Live update")
+        if isinstance(update, ClosedError): raise update
+        return update
+    def deliver(self, update):
+        if not self.closed:
+            try: self.updates.put_nowait(update)
+            except queue.Full:
+                try: self.updates.get_nowait()
+                except queue.Empty: pass
+                self.updates.put_nowait(update)
+    def close(self):
+        if not self.closed: self.closed = True; self.manager.unsubscribe(self.query_id)
+
+
+class _LiveManager:
+    INITIAL_VERSION = {"querySet": 0, "identity": 0, "ts": "AAAAAAAAAAA="}
+    def __init__(self, url, version, websocket_factory=_WebSocket):
+        p = urllib.parse.urlparse(url); self.url = urllib.parse.urlunparse(("wss" if p.scheme == "https" else "ws", p.netloc, p.path.rstrip("/") + "/api/sync", "", "", "")); self.version = version
+        self.subs, self.socket, self.lock, self.closed, self.connection_count = {}, None, threading.RLock(), False, 0
+        self.websocket_factory = websocket_factory
+        self.expected_disconnects = set()
+        self.last_close_reason = "InitialConnect"
+        self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
+    def subscribe(self, path, args):
+        with self.lock:
+            ident = max(self.subs, default=-1) + 1; sub = Subscription(self, ident); self.subs[ident] = (path, args, sub)
+            if self.socket: self._modify([self._add(ident, path, args)])
+            return sub
+    def unsubscribe(self, ident):
+        with self.lock:
+            if self.subs.pop(ident, None) and self.socket:
+                self._modify([{ "type": "Remove", "queryId": ident }])
+                if not self.subs:
+                    self._disconnect_locked("NoSubscriptions")
+    def _add(self, ident, path, args): return {"type":"Add", "queryId":ident, "udfPath":path, "args":[args]}
+    def _connect(self):
+        self.socket = self.websocket_factory(self.url, self.version); self.query_version = 0; self.remote_version = dict(self.INITIAL_VERSION)
+        self.socket.send_json({"type":"Connect", "sessionId":secrets.token_hex(16), "connectionCount":self.connection_count, "lastCloseReason":self.last_close_reason, "clientTs":0})
+        self._modify([self._add(i, p, a) for i, (p,a,_) in self.subs.items()])
+    def _modify(self, mods):
+        if not mods: return
+        self.socket.send_json({"type":"ModifyQuerySet", "baseVersion":self.query_version, "newVersion":self.query_version + 1, "modifications":mods}); self.query_version += 1
+    def _run(self):
+        while not self.closed:
+            active_socket = None
+            try:
+                with self.lock:
+                    has_subscriptions = bool(self.subs)
+                    if has_subscriptions and not self.socket: self._connect()
+                    active_socket = self.socket
+                if not has_subscriptions:
+                    time.sleep(.05); continue
+                # Never hold the lifecycle lock during blocking network I/O.
+                # Unsubscribe, close, and debugDisconnect must be able to close
+                # the socket and wake this receive immediately.
+                message = active_socket.receive_json()
+                if message.get("type") == "Transition": self._transition(message)
+                elif message.get("type") in ("Ping", "MutationResponse", "ActionResponse"): pass
+                elif message.get("type") == "TransitionChunk": raise ProtocolError("TransitionChunk assembly is deferred")
+                else: raise ProtocolError(f"unexpected Live message {message.get('type')!r}")
+            except Exception as error:
+                with self.lock:
+                    expected = active_socket in self.expected_disconnects
+                    self.expected_disconnects.discard(active_socket)
+                    if self.socket is active_socket:
+                        self.socket.close(); self.socket = None; self.connection_count += 1
+                        self.last_close_reason = type(error).__name__
+                    current_subscriptions = list(self.subs.values())
+                # Transport loss is an internal reconnect concern. Only protocol
+                # drift is observable; query failures arrive in Transition data.
+                if not expected and isinstance(error, ProtocolError):
+                    for _,_,sub in current_subscriptions: sub.deliver(Update(error=error, logs=[]))
+                time.sleep(.1)
+    def _transition(self, message):
+        if message.get("startVersion") != self.remote_version: raise ProtocolError("Transition start version does not match local version")
+        changed=[]
+        for mod in message.get("modifications", []):
+            ident=mod["queryId"]
+            if mod["type"] == "QueryUpdated": changed.append((ident, Update(mod.get("value"), logs=mod.get("logLines", []))))
+            elif mod["type"] == "QueryFailed": changed.append((ident, Update(error=FunctionError(mod.get("errorMessage", "query failed"), data=mod.get("errorData"), logs=mod.get("logLines", [])), logs=mod.get("logLines", []))))
+            elif mod["type"] != "QueryRemoved": raise ProtocolError(f"unknown Transition modification {mod['type']!r}")
+        self.remote_version=message["endVersion"]
+        with self.lock:
+            for ident,update in changed:
+                if ident in self.subs: self.subs[ident][2].deliver(update)
+    def disconnect_for_adapter(self):
+        with self.lock:
+            if not self.socket: raise TransportError("Live WebSocket is not connected")
+            self._disconnect_locked("DebugDisconnect")
+    def _disconnect_locked(self, reason):
+        active_socket = self.socket
+        if not active_socket: return
+        self.socket = None
+        self.connection_count += 1
+        self.last_close_reason = reason
+        self.expected_disconnects.add(active_socket)
+        active_socket.close()
+    def close(self):
+        self.closed=True
+        with self.lock:
+            self._disconnect_locked("ClientClosed")
+            for _,_,sub in self.subs.values(): sub.deliver(ClosedError("Live subscription is closed"))
+        self.thread.join(timeout=2)
+
+
+class Client:
+    VERSION = "python-0.1.0"
+    def __init__(self, deployment_url, bearer_token=None):
+        p=urllib.parse.urlparse(deployment_url)
+        if p.scheme not in ("http", "https") or not p.hostname or p.username: raise ValueError("Convex deployment URL must be an http(s) URL with a host")
+        self.url=deployment_url.rstrip("/"); self.token=bearer_token or ""; self.closed=False; self.live=None
+    def set_auth(self, token): self._check(); self.token=token or ""
+    def _check(self):
+        if self.closed: raise ClosedError("Convex client is closed")
+    def _call(self, operation, path, args):
+        self._check()
+        if not isinstance(args, dict) or not path: raise ValueError("Convex path and named object arguments are required")
+        request=urllib.request.Request(self.url + "/api/" + operation, data=json.dumps({"path":path,"args":args,"format":"json"}).encode(), headers={"Content-Type":"application/json", "Accept":"application/json", "Convex-Client":self.VERSION, **({"Authorization":"Bearer " + self.token} if self.token else {})}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response: decoded=json.load(response)
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as error: raise TransportError(str(error)) from error
+        if decoded.get("status") == "success" and "value" in decoded: return Result(decoded["value"], decoded.get("logLines", []))
+        if decoded.get("status") == "error": raise FunctionError(decoded.get("errorMessage", "Convex function failed"), data=decoded.get("errorData"), logs=decoded.get("logLines", []))
+        raise ProtocolError("unknown Convex HTTP response")
+    def query(self,path,args=None): return self._call("query",path,args or {})
+    def mutation(self,path,args=None): return self._call("mutation",path,args or {})
+    def action(self,path,args=None): return self._call("action",path,args or {})
+    def subscribe(self,path,args=None):
+        self._check(); self.live=self.live or _LiveManager(self.url,self.VERSION); return self.live.subscribe(path,args or {})
+    def debug_disconnect_for_adapter(self): self._check(); self.live.disconnect_for_adapter() if self.live else (_ for _ in ()).throw(TransportError("Live WebSocket is not connected"))
+    def close(self):
+        if not self.closed: self.closed=True; self.live and self.live.close()
