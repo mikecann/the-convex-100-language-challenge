@@ -25,11 +25,37 @@ RUN npm ci --omit=dev --ignore-scripts
 FROM ${NODE_IMAGE} AS runtime-base
 # Node is the declared target runtime. Remove package managers and development
 # frontends before publishing either minimal runtime image.
-RUN rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack
+RUN rm -f \
+      /usr/local/bin/npm \
+      /usr/local/bin/npx \
+      /usr/local/bin/corepack \
+      /usr/bin/apt \
+      /usr/bin/apt-* \
+      /usr/bin/dpkg \
+      /usr/bin/dpkg-* \
+      /usr/bin/debconf* \
+      /usr/bin/update-alternatives \
+      /usr/sbin/dpkg-* \
+      /usr/sbin/invoke-rc.d \
+      /usr/sbin/update-rc.d && \
+    rm -rf \
+      /usr/local/lib/node_modules/npm \
+      /usr/local/lib/node_modules/corepack \
+      /etc/apt \
+      /var/lib/apt \
+      /var/cache/apt \
+      /var/lib/dpkg \
+      /var/cache/debconf \
+      /usr/lib/apt \
+      /usr/lib/dpkg \
+      /usr/share/dpkg
 WORKDIR /opt/convex
 COPY --from=production-dependencies /opt/convex/client/node_modules ./client/node_modules
 COPY client/convex.js ./client/convex.js
-RUN test "$(node -p 'process.arch')" = x64 && ! command -v npm && ! command -v npx && ! command -v corepack
+RUN test "$(node -p 'process.arch')" = x64 && \
+    for command_name in apt apt-get dpkg npm npx corepack; do \
+      ! command -v "$command_name"; \
+    done
 USER 65532:65532
 
 FROM runtime-base AS example-runtime
