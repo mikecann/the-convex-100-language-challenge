@@ -14,7 +14,7 @@ queue_live_error() {
   for query in "${!LIVE_SUB[@]}"; do live_queue_push "$query" "$(jq -cn --arg name "$name" --arg message "$message" '{error:{name:$name,message:$message}}')"; done
 }
 drain_live() {
-  local raw query sub update read_status frames=0 delivered=0
+  local raw query sub update expected read_status frames=0 delivered=0
   [[ -n ${LIVE_IN:-} ]] || return 0
   # One frame per controller turn keeps a hot subscription from starving close
   # and unsubscribe commands. The per-subscription queue remains bounded at 16.
@@ -32,13 +32,19 @@ drain_live() {
     ((frames++)) || true
     while IFS=$'\t' read -r query update; do
       sub=${LIVE_SUB[$query]:-}; [[ -z $sub ]] && continue
+      if [[ -v 'LIVE_REHYDRATE[$query]' ]]; then
+        expected=${LIVE_REHYDRATE[$query]}; unset 'LIVE_REHYDRATE[$query]'
+        # A reconnect replays current query state. Suppress only an exact
+        # rehydration of the last delivered result; changed state still emits.
+        jq -ne --argjson current "$update" --argjson prior "$expected" '$current.value == $prior.value and $current.error == $prior.error' >/dev/null && continue
+      fi
       live_queue_push "$query" "$update"
     done < <(jq -r '.modifications[]? | select(.type == "QueryUpdated" or .type == "QueryFailed") | [.queryId, (if .type == "QueryFailed" then {error:{name:"FunctionError",message:(.errorMessage // "Live query failed"),data:.errorData},logs:(.logLines // [])} else {value:.value,logs:(.logLines // [])} end | tojson)] | @tsv' <<<"$raw")
   done
   for query in "${!LIVE_QUEUE[@]}"; do
     sub=${LIVE_SUB[$query]:-}; [[ -z $sub ]] && continue
     delivered=0
-    while ((delivered < 16)) && live_queue_shift "$query"; do update=$LIVE_SHIFTED; jq -cn --arg s "$sub" --argjson u "$update" '{type:"subscription",subscriptionId:$s} + $u'; ((delivered++)) || true; done
+    while ((delivered < 16)) && live_queue_shift "$query"; do update=$LIVE_SHIFTED; LIVE_LAST[$query]=$update; jq -cn --arg s "$sub" --argjson u "$update" '{type:"subscription",subscriptionId:$s} + $u'; ((delivered++)) || true; done
   done
 }
 while :; do

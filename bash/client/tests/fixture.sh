@@ -58,6 +58,7 @@ if [[ $request = GET\ /api/sync* ]]; then
   case ${BASH_FIXTURE_HANDSHAKE:-ok} in
     bad_accept) accept=definitely-wrong ;;
     bad_upgrade) printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: not-websocket\r\nConnection: keep-alive\r\nSec-WebSocket-Accept: %s\r\n\r\n' "$accept"; sleep 1; exit 0 ;;
+    no_terminator) printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n' "$accept"; exit 0 ;;
   esac
   printf 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n' "$accept"
   [[ ${BASH_FIXTURE_HANDSHAKE:-ok} = bad_accept ]] && { sleep 1; exit 0; }
@@ -76,9 +77,15 @@ if [[ $request = GET\ /api/sync* ]]; then
       if [[ $path = demo:requiresNonzero && $count = 0 ]]; then
         transition=$(jq -cn --argjson q "$q" '{type:"Transition",startVersion:{querySet:0,identity:0,ts:"AAAAAAAAAAA="},endVersion:{querySet:1,identity:0,ts:"AQAAAAAAAAA="},modifications:[{type:"QueryFailed",queryId:$q,errorMessage:"room is empty",errorData:{code:"ROOM_EMPTY"},logLines:["query demo:requiresNonzero"]}]}')
       else
-        transition=$(jq -cn --argjson q "$q" --arg room "$room" --argjson count "$count" '{type:"Transition",startVersion:{querySet:0,identity:0,ts:"AAAAAAAAAAA="},endVersion:{querySet:1,identity:0,ts:"AQAAAAAAAAA="},modifications:[{type:"QueryUpdated",queryId:$q,value:{room:$room,count:$count,lastLanguage:null,latestRunId:null,updatedAt:null},logLines:["query demo:state 世界 👋"]}]}')
+        transition=$(jq -cn --argjson q "$q" --arg room "$room" --argjson count "$count" '{type:"Transition",startVersion:{querySet:0,identity:0,ts:"AAAAAAAAAAA="},endVersion:{querySet:1,identity:0,ts:"AQAAAAAAAAA="},modifications:[{type:"QueryUpdated",queryId:$q,value:{room:$room,count:$count,lastLanguage:(if $count > 0 then "Bash" else null end),latestRunId:(if $count > 0 then "fixture" else null end),updatedAt:(if $count > 0 then 1 else null end)},logLines:["query demo:state 世界 👋"]}]}')
       fi
-      if [[ $path = fixture:partial ]]; then write_byte 129; sleep 5; exit 0; fi
+      if [[ $path = fixture:partial && ! -f $state_dir/partial-sent ]]; then
+        : >"$state_dir/partial-sent"
+        # Resume the abandoned frame after the client's read deadline. The
+        # client must reconnect before treating any later byte as a new header.
+        write_byte 129; sleep 0.4; write_byte 1; printf x; exit 0
+      fi
+      if [[ $path = fixture:stall ]]; then write_byte 129; sleep 5; exit 0; fi
       if [[ $path = fixture:close ]]; then server_frame "$(printf '\003\350')" 8 1; client_frame >/dev/null || test $? = 8; exit 0; fi
       # A real control ping must receive a masked pong with the same payload.
       server_frame 'fixture-ping' 9 1
