@@ -16,21 +16,27 @@ using tcp = asio::ip::tcp;
 using Json = convex::Json;
 
 static Json version(int timestamp, int query_set = 1) {
-  return {{"querySet",query_set},{"identity",0},{"ts",timestamp == 0 ? "AAAAAAAAAAA=" : std::to_string(timestamp)}};
+  return {{"querySet", query_set},
+          {"identity", 0},
+          {"ts", timestamp == 0 ? "AAAAAAAAAAA=" : std::to_string(timestamp)}};
 }
 
-static Json read_websocket_json(websocket::stream<tcp::socket>& websocket) {
+static Json read_websocket_json(websocket::stream<tcp::socket> &websocket) {
   beast::flat_buffer buffer;
   websocket.read(buffer);
   return Json::parse(beast::buffers_to_string(buffer.data()));
 }
 
-static void send_transition(websocket::stream<tcp::socket>& websocket, int start, int end, Json modification) {
-  Json message{{"type","Transition"},{"startVersion",version(start, start == 0 ? 0 : 1)},{"endVersion",version(end)},{"modifications",Json::array({std::move(modification)})}};
+static void send_transition(websocket::stream<tcp::socket> &websocket,
+                            int start, int end, Json modification) {
+  Json message{{"type", "Transition"},
+               {"startVersion", version(start, start == 0 ? 0 : 1)},
+               {"endVersion", version(end)},
+               {"modifications", Json::array({std::move(modification)})}};
   websocket.write(asio::buffer(message.dump()));
 }
 
-static Json read_controller_line(tcp::socket& socket, asio::streambuf& buffer) {
+static Json read_controller_line(tcp::socket &socket, asio::streambuf &buffer) {
   asio::read_until(socket, buffer, '\n');
   std::istream input(&buffer);
   std::string text;
@@ -38,7 +44,7 @@ static Json read_controller_line(tcp::socket& socket, asio::streambuf& buffer) {
   return Json::parse(text);
 }
 
-static void send_controller_line(tcp::socket& socket, Json command) {
+static void send_controller_line(tcp::socket &socket, Json command) {
   auto text = command.dump() + "\n";
   asio::write(socket, asio::buffer(text));
 }
@@ -56,7 +62,8 @@ int main() {
 
   std::thread fixture([&] {
     asio::io_context io;
-    tcp::acceptor acceptor(io, {asio::ip::make_address("127.0.0.1"), websocket_port});
+    tcp::acceptor acceptor(
+        io, {asio::ip::make_address("127.0.0.1"), websocket_port});
     fixture_ready.set_value();
     for (int connection = 0; connection < 3; ++connection) {
       tcp::socket socket(io);
@@ -68,15 +75,32 @@ int main() {
       assert(connect.at("connectionCount") == connection);
       assert(add.at("modifications").at(0).at("type") == "Add");
 
-      send_transition(websocket, 0, 1, {{"type","QueryUpdated"},{"queryId",0},{"value",{{"count",connection}}},{"logLines",Json::array()}});
+      send_transition(websocket, 0, 1,
+                      {{"type", "QueryUpdated"},
+                       {"queryId", 0},
+                       {"value", {{"count", connection}}},
+                       {"logLines", Json::array()}});
       if (connection == 0) {
         failure_signal.wait();
-        send_transition(websocket, 1, 2, {{"type","QueryFailed"},{"queryId",0},{"errorMessage","empty"},{"errorData",{{"code","ROOM_EMPTY"}}},{"logLines",Json::array({"failed"})}});
+        send_transition(websocket, 1, 2,
+                        {{"type", "QueryFailed"},
+                         {"queryId", 0},
+                         {"errorMessage", "empty"},
+                         {"errorData", {{"code", "ROOM_EMPTY"}}},
+                         {"logLines", Json::array({"failed"})}});
         recovery_signal.wait();
-        send_transition(websocket, 2, 3, {{"type","QueryUpdated"},{"queryId",0},{"value",{{"count",10}}},{"logLines",Json::array({"recovered"})}});
+        send_transition(websocket, 2, 3,
+                        {{"type", "QueryUpdated"},
+                         {"queryId", 0},
+                         {"value", {{"count", 10}}},
+                         {"logLines", Json::array({"recovered"})}});
       } else if (connection == 1) {
         malformed_signal.wait();
-        Json malformed{{"type","Bogus"}};
+        // A Transition with a missing endVersion exercises schema validation,
+        // not merely the explicit unknown-message branch.
+        Json malformed{{"type", "Transition"},
+                       {"startVersion", version(1)},
+                       {"modifications", Json::array()}};
         websocket.write(asio::buffer(malformed.dump()));
       }
 
@@ -106,7 +130,8 @@ int main() {
   bool connected = false;
   for (int attempt = 0; attempt < 100; ++attempt) {
     beast::error_code error;
-    controller.connect({asio::ip::make_address("127.0.0.1"), controller_port}, error);
+    controller.connect({asio::ip::make_address("127.0.0.1"), controller_port},
+                       error);
     if (!error) {
       connected = true;
       break;
@@ -117,9 +142,14 @@ int main() {
   assert(connected);
 
   asio::streambuf buffer;
-  send_controller_line(controller, {{"protocolVersion",1},{"id","hello"},{"op","hello"}});
+  send_controller_line(
+      controller, {{"protocolVersion", 1}, {"id", "hello"}, {"op", "hello"}});
   assert(read_controller_line(controller, buffer).at("type") == "ready");
-  send_controller_line(controller, {{"id","subscribe"},{"op","subscribe"},{"subscriptionId","room"},{"path","demo:state"},{"args",Json::object()}});
+  send_controller_line(controller, {{"id", "subscribe"},
+                                    {"op", "subscribe"},
+                                    {"subscriptionId", "room"},
+                                    {"path", "demo:state"},
+                                    {"args", Json::object()}});
   assert(read_controller_line(controller, buffer).at("type") == "ack");
 
   auto initial = read_controller_line(controller, buffer);
@@ -137,7 +167,8 @@ int main() {
   assert(recovered.at("value").at("count") == 10);
   assert(recovered.at("logs") == Json::array({"recovered"}));
 
-  send_controller_line(controller, {{"id","disconnect"},{"op","debugDisconnect"}});
+  send_controller_line(controller,
+                       {{"id", "disconnect"}, {"op", "debugDisconnect"}});
   auto disconnect = read_controller_line(controller, buffer);
   assert(disconnect.at("id") == "disconnect" && disconnect.at("type") == "ack");
   auto reconnected = read_controller_line(controller, buffer);
@@ -148,14 +179,18 @@ int main() {
   auto protocol_recovery = read_controller_line(controller, buffer);
   assert(protocol_recovery.at("value").at("count") == 2);
 
-  send_controller_line(controller, {{"id","unsubscribe"},{"op","unsubscribe"},{"subscriptionId","room"}});
+  send_controller_line(controller, {{"id", "unsubscribe"},
+                                    {"op", "unsubscribe"},
+                                    {"subscriptionId", "room"}});
   auto unsubscribe = read_controller_line(controller, buffer);
-  assert(unsubscribe.at("id") == "unsubscribe" && unsubscribe.at("type") == "ack");
+  assert(unsubscribe.at("id") == "unsubscribe" &&
+         unsubscribe.at("type") == "ack");
   auto close_started = std::chrono::steady_clock::now();
-  send_controller_line(controller, {{"id","close"},{"op","close"}});
+  send_controller_line(controller, {{"id", "close"}, {"op", "close"}});
   auto closed = read_controller_line(controller, buffer);
   assert(closed.at("id") == "close" && closed.at("type") == "closed");
-  assert(std::chrono::steady_clock::now() - close_started < std::chrono::seconds(2));
+  assert(std::chrono::steady_clock::now() - close_started <
+         std::chrono::seconds(2));
 
   fixture.join();
   int status;

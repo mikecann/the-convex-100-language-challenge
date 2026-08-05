@@ -1,17 +1,17 @@
 #include "convex.hpp"
 
 template <typename T>
-concept HasSubscriptionDisconnect = requires(T& value) {
+concept HasSubscriptionDisconnect = requires(T &value) {
   value.debug_disconnect();
 };
 
 template <typename T>
-concept HasAdapterDisconnect = requires(T& value) {
+concept HasAdapterDisconnect = requires(T &value) {
   value.debug_disconnect_for_adapter();
 };
 
 template <typename T>
-concept HasPendingUpdatesTestHook = requires(T& value) {
+concept HasPendingUpdatesTestHook = requires(T &value) {
   value.pending_updates_for_test();
 };
 

@@ -1,22 +1,3 @@
-# Convex from C++
-
-This is a small C++ demonstration of Convex's JSON HTTP API and an experimental pinned Live protocol profile.
-
-It is educational, unofficial, and not a production SDK.
-
-## Start here
-
-[`examples/basics/main.cc`](examples/basics/main.cc) walks through a counter query, a subscription started before the write, an idempotent mutation, and the resulting Live update.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP query, mutation, and action | Pending shared conformance |
-| Live subscription and reconnect | Pending shared conformance |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.cc -->
-```cpp
 #include "convex.hpp"
 
 #include <cstdlib>
@@ -97,17 +78,3 @@ int main(int argc, char **argv) {
     return 1;
   }
 }
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-`./run test cpp` builds and tests the client wholly inside Docker. `./run verify-example cpp`, `./run verify cpp`, and `./run verify-hosted cpp` are root-owned evidence gates and have not yet awarded a capability.
-
-## Protocol notes
-
-The client uses ordinary Boost.Beast/OpenSSL transport code. Live is constrained to the reviewed `convex-rs-0.10.4-unversioned-sync` profile at `/api/sync`; `debugDisconnect` is adapter-only. Each subscription has a bounded 16-update delivery queue. If its consumer falls behind, the oldest update is dropped so the queue retains the newest 16 updates.
-
-## Limitations
-
-This experiment does not promise protocol compatibility. Authentication for Live, transition chunk assembly, optimistic updates, replay, and the full Convex value space are deferred.
