@@ -127,10 +127,13 @@ Partial handshake and frame reads or writes abandon the connection after a
 two-second deadline. A partial write force-retires the uncertain stream before
 active Add operations are rehydrated on a new connection. Adapter EOF performs
 the same subscription, relay, client, and socket cleanup as an explicit close,
-without writing to the disconnected controller. Deterministic fixtures cover
-Add/Remove, QueryFailed recovery, five reconnects and metadata, unchanged
-hydration suppression, stale relay races, fragmented UTF-8 and control frames,
-structured recovery, partial and blocked writes, EOF, and hostile shutdown.
+without writing to the disconnected controller. Adapter NDJSON writes have a
+one-second complete-write deadline and force-retire a partial controller stream
+so EOF cleanup cannot wait forever behind output backpressure. Deterministic
+fixtures cover Add/Remove, QueryFailed recovery, five reconnects and metadata,
+unchanged hydration suppression, stale relay races, fragmented UTF-8 and
+control frames, structured recovery, partial and blocked writes, EOF, and
+hostile shutdown.
 `debugDisconnect` is adapter-only.
 
 Runtime transport modules are supplied by the digest-pinned Perl 5.42.0 image:

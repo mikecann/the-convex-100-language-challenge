@@ -6,8 +6,11 @@ use Thread::Queue;
 use FindBin;
 use IO::Handle;
 use IO::Select;
+use IO::Socket::INET;
 use JSON::PP qw(decode_json encode_json);
-use Socket   qw(AF_UNIX PF_UNSPEC SHUT_WR SOCK_STREAM);
+use Socket   qw(
+  AF_UNIX PF_UNSPEC SHUT_WR SOCK_STREAM SOL_SOCKET SO_RCVBUF SO_SNDBUF
+);
 use Test::More;
 use Time::HiRes qw(sleep time);
 
@@ -38,6 +41,154 @@ sub is_event {
     my ( $actual, $expected, $label ) = @_;
     is( $CANONICAL_JSON->encode($actual),
         $CANONICAL_JSON->encode($expected), $label );
+    return;
+}
+
+sub constrain_output_buffers {
+    my ( $writer, $reader ) = @_;
+    setsockopt $writer, SOL_SOCKET, SO_SNDBUF, pack( 'i', 4_096 )
+      or die "set adapter send buffer: $!";
+    setsockopt $reader, SOL_SOCKET, SO_RCVBUF, pack( 'i', 4_096 )
+      or die "set controller receive buffer: $!";
+    return;
+}
+
+sub read_prefix {
+    my ( $socket, $length, $timeout ) = @_;
+    my $deadline = time + $timeout;
+    my $prefix   = q{};
+    while ( length($prefix) < $length ) {
+        my $remaining = $deadline - time;
+        die 'timed out waiting for partial adapter event' if $remaining <= 0;
+        my @ready = IO::Select->new($socket)->can_read($remaining);
+        die 'timed out waiting for partial adapter event' unless @ready;
+        my $count = sysread $socket, my $chunk, $length - length($prefix);
+        die "read adapter event prefix: $!" unless defined $count;
+        die 'adapter closed before partial event prefix' if $count == 0;
+        $prefix .= $chunk;
+    }
+    return $prefix;
+}
+
+sub wait_for_thread {
+    my ( $thread, $timeout ) = @_;
+    my $deadline = time + $timeout;
+    sleep 0.01 while !$thread->is_joinable && time < $deadline;
+    return $thread->is_joinable;
+}
+
+sub run_stalled_output_eof_fixture {
+    my ($mode)              = @_;
+    my $subscription_closed = Thread::Queue->new;
+    my $client_closed       = Thread::Queue->new;
+    my @queues              = ( Thread::Queue->new );
+    my $client              = AdapterFixtureClient->new(
+        \@queues,
+        {
+            subscription_closed => $subscription_closed,
+            client_closed       => $client_closed,
+        }
+    );
+
+    my ( $command_controller, $event_controller, $adapter_input,
+        $adapter_output, $server );
+    if ( $mode eq 'stdio' ) {
+
+        # Separate duplex pairs model stdin and stdout. Backpressure on output
+        # must not prevent the input side from delivering EOF.
+        socketpair( $command_controller, $adapter_input,
+            AF_UNIX, SOCK_STREAM, PF_UNSPEC )
+          or die "stdio input socketpair: $!";
+        socketpair( $event_controller, $adapter_output,
+            AF_UNIX, SOCK_STREAM, PF_UNSPEC )
+          or die "stdio output socketpair: $!";
+    }
+    else {
+        $server = IO::Socket::INET->new(
+            LocalAddr => '127.0.0.1',
+            LocalPort => 0,
+            Listen    => 1,
+            ReuseAddr => 1,
+        ) or die "TCP fixture listen: $!";
+        $command_controller = IO::Socket::INET->new(
+            PeerAddr => '127.0.0.1',
+            PeerPort => $server->sockport,
+            Proto    => 'tcp',
+        ) or die "TCP fixture connect: $!";
+        $adapter_input    = $server->accept;
+        $adapter_output   = $adapter_input;
+        $event_controller = $command_controller;
+        close $server or die "TCP fixture listener close: $!";
+    }
+    $command_controller->autoflush(1);
+    constrain_output_buffers( $adapter_output, $event_controller );
+
+    my $thread = threads->create(
+        sub {
+            Adapter::run_adapter( $adapter_input, $adapter_output,
+                { client => $client },
+            );
+            close $adapter_input if defined fileno $adapter_input;
+            close $adapter_output
+              if $mode eq 'stdio' && defined fileno $adapter_output;
+            return;
+        }
+    );
+    send_command(
+        $command_controller,
+        {
+            id             => "$mode-stall-subscribe",
+            op             => 'subscribe',
+            subscriptionId => "$mode-stall-id",
+            path           => 'fixture:stalled-output',
+            args           => {},
+        }
+    );
+    is_event(
+        read_event( $event_controller, 0.5 ),
+        { id => "$mode-stall-subscribe", type => 'ack' },
+        "$mode stalled-output fixture subscribes",
+    );
+
+    # Read one real prefix, then stop draining output. The relay now owns a
+    # partial NDJSON publication while EOF begins lifecycle cleanup.
+    $queues[0]->enqueue(
+        encode_json(
+            {
+                kind  => 'value',
+                value => { payload => 'x' x ( 512 * 1_024 ) },
+            }
+        )
+    );
+    my $prefix = read_prefix( $event_controller, 4_096, 1 );
+    is( length($prefix), 4_096, "$mode reads a partial event prefix" );
+    shutdown $command_controller, SHUT_WR
+      or die "$mode controller EOF: $!";
+
+    my $finished = wait_for_thread( $thread, 2 );
+    ok( $finished, "$mode EOF is bounded behind stalled event output" );
+    if ( !$finished ) {
+
+        # Keep a failing fixture bounded too, so a regression reports normally
+        # rather than leaving the Docker test target hung.
+        close $event_controller if defined fileno $event_controller;
+        $finished = wait_for_thread( $thread, 1 );
+    }
+    if ($finished) {
+        $thread->join;
+    }
+    else {
+        $thread->detach;
+    }
+    is( $subscription_closed->pending,
+        1, "$mode EOF closes the active subscription" );
+    is( $client_closed->pending, 1, "$mode EOF closes the client" );
+    is( scalar threads->list(threads::running),
+        0, "$mode EOF leaves no running or unjoined threads" );
+
+    close $command_controller if defined fileno $command_controller;
+    close $event_controller
+      if $mode eq 'stdio' && defined fileno $event_controller;
     return;
 }
 
@@ -327,5 +478,8 @@ is( scalar threads->list(threads::running),
     0, 'EOF cleanup leaves no running or unjoined threads' );
 close $controller;
 close $adapter;
+
+run_stalled_output_eof_fixture('stdio');
+run_stalled_output_eof_fixture('tcp');
 
 done_testing;
