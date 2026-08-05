@@ -1,33 +1,3 @@
-# Convex from JavaScript
-
-This folder shows a small JavaScript program talking directly to Convex. It
-calls queries, mutations, and actions over HTTP, then follows a query over a
-WebSocket.
-
-This is an educational, unofficial demonstration for the 100-language project.
-It is not a production SDK or a package intended for publication.
-
-## Start here
-
-Read the [basic example](examples/basics/main.js). It queries a counter room,
-starts Live, applies one idempotent mutation, and checks that Live observes the
-same `0 -> 1` change. The native implementation is in [client](client/).
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP queries, mutations, and actions | Implemented, pending shared evidence |
-| HTTP bearer token | Implemented, pending shared evidence |
-| Initial and updated Live values | Implemented, pending shared evidence |
-| Live reconnection test hook | Implemented, pending shared evidence |
-| Capability badges | Not claimed until root evidence |
-| Live authentication and WebSocket writes | Deferred |
-
-## Basic example
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.js -->
-```javascript
 #!/usr/local/bin/node
 import { randomUUID } from "node:crypto";
 import { Client } from "../../client/convex.js";
@@ -105,38 +75,3 @@ async function nextUpdate(subscription, name) {
     clearTimeout(timer);
   }
 }
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker-only verification
-
-```sh
-./run test javascript
-./run build javascript
-```
-
-`test` parses the client, adapter, and exact canonical example, then runs its
-local tests inside a pinned linux/amd64 Node image. `build` produces the
-non-root conformance image and the matching example-runtime target. Root-owned
-`verify-example`, `verify`, and `verify-hosted` are the only commands that can
-award HTTP or Live capability badges.
-
-## Conformance and protocol notes
-
-The test-only adapter at `client/tests/conformance/adapter.js` accepts NDJSON
-protocol v1 over stdin/stdout or `ADAPTER_LISTEN` TCP. Its `debugDisconnect`
-command is deliberately adapter-only, so the shared controller can exercise
-real reconnects without any Docker or host-network privilege.
-
-HTTP uses the documented JSON `/api/query`, `/api/mutation`, and `/api/action`
-endpoints. Live uses `ws` solely for WebSocket transport; JavaScript implements
-the Convex query-set, transition, and reconnect behaviour itself against the
-experimental `convex-rs-0.10.4-unversioned-sync` `/api/sync` profile.
-
-## Limitations
-
-Live authentication, WebSocket mutations/actions, optimistic updates, journal
-replay, TransitionChunk assembly, and tagged Convex value encodings are
-deferred. Each subscription keeps at most 16 pending updates and discards the
-oldest value for a slow consumer, because reactive queries represent current
-state rather than an event log.
