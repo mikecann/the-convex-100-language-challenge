@@ -63,6 +63,20 @@ assert.equal(
   }),
   null,
 );
+assert.equal(
+  targetRuntimeError("php", {
+    implementation: { status: "attempting" },
+    targetRuntimeCommand: "php",
+  }),
+  null,
+);
+assert.match(
+  targetRuntimeError("php", {
+    implementation: { status: "attempting" },
+    targetRuntimeCommand: "composer",
+  }),
+  /must declare/,
+);
 assert.match(
   targetRuntimeError("typescript", {
     implementation: { status: "attempting" },
