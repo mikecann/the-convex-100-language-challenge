@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
-ARG PYTHON_IMAGE=python:3.13.5-slim-bookworm
+ARG PYTHON_IMAGE=python:3.13.5-slim-bookworm@sha256:4c2cf9917bd1cbacc5e9b07320025bdb7cdf2df7b0ceaccb55e9dd7e30987419
 
 FROM --platform=linux/amd64 ${PYTHON_IMAGE} AS test
 WORKDIR /work
@@ -38,5 +38,6 @@ COPY --chmod=0555 examples/basics/main.py /usr/local/bin/convex-example
 ENTRYPOINT ["/usr/local/bin/python3", "/usr/local/bin/convex-example"]
 
 FROM runtime-base AS runtime
-COPY --chmod=0555 client/tests/conformance/adapter.py /usr/local/bin/convex-adapter
-ENTRYPOINT ["/usr/local/bin/python3", "/usr/local/bin/convex-adapter"]
+COPY --chmod=0444 client/tests/conformance/adapter.py /opt/convex/adapter.py
+COPY --chmod=0555 client/tests/conformance/entrypoint.sh /usr/local/bin/convex-adapter
+ENTRYPOINT ["/usr/local/bin/convex-adapter"]

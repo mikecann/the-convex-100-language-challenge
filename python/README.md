@@ -60,7 +60,10 @@ def main():
             if whole(changed.value['count'],'updated Live value') != expected: raise RuntimeError('updated Live count disagreed')
             print(f'live updated count: {expected}'); print(f'verified count: {current} -> {expected}')
         finally: subscription.close()
-    finally: client.close()
+    finally:
+        # Always stop the Live worker and release HTTP/WebSocket resources, even
+        # when a teaching assertion above exposes unexpected server behaviour.
+        client.close()
 if __name__ == '__main__': main()
 ```
 <!-- END GENERATED EXAMPLE -->

@@ -50,8 +50,13 @@ class _WebSocket:
         key = base64.b64encode(os.urandom(16)).decode()
         path = (parsed.path or "/") + (("?" + parsed.query) if parsed.query else "")
         self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {parsed.netloc}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nConvex-Client: {client_version}\r\n\r\n").encode())
+        self._buffer = b""
         response = self._read_until(b"\r\n\r\n")
-        if not response.startswith(b"HTTP/1.1 101") or base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()) not in response:
+        header_end = response.index(b"\r\n\r\n") + 4
+        self._buffer = response[header_end:]
+        headers = response[:header_end]
+        expected_accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
+        if not headers.startswith(b"HTTP/1.1 101") or expected_accept not in headers:
             self.close(); raise TransportError("WebSocket upgrade was rejected")
 
     def _read_until(self, marker):
@@ -63,7 +68,7 @@ class _WebSocket:
         return data
 
     def _exact(self, length):
-        data = b""
+        data, self._buffer = self._buffer[:length], self._buffer[length:]
         while len(data) < length:
             chunk = self.sock.recv(length - len(data))
             if not chunk: raise EOFError
@@ -79,16 +84,31 @@ class _WebSocket:
         masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
         self.sock.sendall(head + mask + masked)
 
+    def _send_control(self, opcode, payload=b""):
+        if len(payload) > 125: raise ProtocolError("oversized WebSocket control frame")
+        mask = os.urandom(4)
+        self.sock.sendall(bytes([0x80 | opcode, 0x80 | len(payload)]) + mask + bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload)))
+
     def receive_json(self):
-        first, second = self._exact(2); opcode = first & 15; size = second & 127
+        first, second = self._exact(2); fin = bool(first & 0x80); opcode = first & 15; size = second & 127
+        if first & 0x70: raise ProtocolError("WebSocket RSV bits require an unnegotiated extension")
+        if second & 0x80: raise ProtocolError("server WebSocket frames must not be masked")
         if size == 126: size = struct.unpack("!H", self._exact(2))[0]
-        elif size == 127: size = struct.unpack("!Q", self._exact(8))[0]
-        mask = self._exact(4) if second & 128 else None; data = self._exact(size)
-        if mask: data = bytes(byte ^ mask[index % 4] for index, byte in enumerate(data))
-        if opcode == 8: raise EOFError
-        if opcode == 9: self.sock.sendall(b"\x8a\x00"); return self.receive_json()
+        elif size == 127:
+            size = struct.unpack("!Q", self._exact(8))[0]
+            if size & (1 << 63): raise ProtocolError("invalid 64-bit WebSocket payload length")
+        if opcode >= 8 and (not fin or size > 125): raise ProtocolError("invalid WebSocket control frame")
+        data = self._exact(size)
+        if opcode == 8:
+            if len(data) == 1: raise ProtocolError("invalid WebSocket close payload")
+            self._send_control(8, data)
+            raise EOFError
+        if opcode == 9: self._send_control(10, data); return self.receive_json()
+        if opcode == 10: return self.receive_json()
+        if not fin: raise ProtocolError("fragmented WebSocket messages are not supported")
         if opcode != 1: raise ProtocolError(f"unsupported WebSocket opcode {opcode}")
-        return json.loads(data)
+        try: return json.loads(data.decode("utf-8"))
+        except UnicodeDecodeError as error: raise ProtocolError("WebSocket text was not UTF-8") from error
 
     def close(self):
         try: self.sock.close()
@@ -116,9 +136,10 @@ class Subscription:
 
 class _LiveManager:
     INITIAL_VERSION = {"querySet": 0, "identity": 0, "ts": "AAAAAAAAAAA="}
-    def __init__(self, url, version):
+    def __init__(self, url, version, websocket_factory=_WebSocket):
         p = urllib.parse.urlparse(url); self.url = urllib.parse.urlunparse(("wss" if p.scheme == "https" else "ws", p.netloc, p.path.rstrip("/") + "/api/sync", "", "", "")); self.version = version
         self.subs, self.socket, self.lock, self.closed, self.connection_count = {}, None, threading.RLock(), False, 0
+        self.websocket_factory = websocket_factory
         self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
     def subscribe(self, path, args):
         with self.lock:
@@ -127,10 +148,14 @@ class _LiveManager:
             return sub
     def unsubscribe(self, ident):
         with self.lock:
-            if self.subs.pop(ident, None) and self.socket: self._modify([{ "type": "Remove", "queryId": ident }])
+            if self.subs.pop(ident, None) and self.socket:
+                self._modify([{ "type": "Remove", "queryId": ident }])
+                if not self.subs:
+                    self.socket.close()
+                    self.socket = None
     def _add(self, ident, path, args): return {"type":"Add", "queryId":ident, "udfPath":path, "args":[args]}
     def _connect(self):
-        self.socket = _WebSocket(self.url, self.version); self.query_version = 0; self.remote_version = dict(self.INITIAL_VERSION)
+        self.socket = self.websocket_factory(self.url, self.version); self.query_version = 0; self.remote_version = dict(self.INITIAL_VERSION)
         self.socket.send_json({"type":"Connect", "sessionId":secrets.token_hex(16), "connectionCount":self.connection_count, "lastCloseReason":"InitialConnect", "clientTs":0})
         self._modify([self._add(i, p, a) for i, (p,a,_) in self.subs.items()])
     def _modify(self, mods):
@@ -138,19 +163,28 @@ class _LiveManager:
         self.socket.send_json({"type":"ModifyQuerySet", "baseVersion":self.query_version, "newVersion":self.query_version + 1, "modifications":mods}); self.query_version += 1
     def _run(self):
         while not self.closed:
+            active_socket = None
             try:
                 with self.lock:
-                    if not self.subs: time.sleep(.05); continue
-                    if not self.socket: self._connect()
-                    message = self.socket.receive_json()
+                    has_subscriptions = bool(self.subs)
+                    if has_subscriptions and not self.socket: self._connect()
+                    active_socket = self.socket
+                if not has_subscriptions:
+                    time.sleep(.05); continue
+                # Never hold the lifecycle lock during blocking network I/O.
+                # Unsubscribe, close, and debugDisconnect must be able to close
+                # the socket and wake this receive immediately.
+                message = active_socket.receive_json()
                 if message.get("type") == "Transition": self._transition(message)
                 elif message.get("type") in ("Ping", "MutationResponse", "ActionResponse"): pass
                 elif message.get("type") == "TransitionChunk": raise ProtocolError("TransitionChunk assembly is deferred")
                 else: raise ProtocolError(f"unexpected Live message {message.get('type')!r}")
             except Exception as error:
                 with self.lock:
-                    if self.socket: self.socket.close(); self.socket = None; self.connection_count += 1
-                    for _,_,sub in self.subs.values(): sub.deliver(Update(error=error, logs=[]))
+                    if self.socket is active_socket:
+                        self.socket.close(); self.socket = None; self.connection_count += 1
+                    current_subscriptions = list(self.subs.values())
+                for _,_,sub in current_subscriptions: sub.deliver(Update(error=error, logs=[]))
                 time.sleep(.1)
     def _transition(self, message):
         if message.get("startVersion") != self.remote_version: raise ProtocolError("Transition start version does not match local version")
@@ -173,6 +207,7 @@ class _LiveManager:
         with self.lock:
             if self.socket: self.socket.close()
             for _,_,sub in self.subs.values(): sub.deliver(ClosedError("Live subscription is closed"))
+        self.thread.join(timeout=2)
 
 
 class Client:
