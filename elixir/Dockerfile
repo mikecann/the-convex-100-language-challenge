@@ -54,6 +54,11 @@ RUN apk add --no-cache \
     libstdc++=14.2.0-r6 \
     ncurses-libs=6.5_p20250503-r0 \
     openssl=3.5.7-r0
+# The installed shared libraries are immutable runtime inputs. Remove Alpine's
+# installer and its database, repositories, keys, cache, and helper data so the
+# unprivileged final process cannot treat this image as a package environment.
+RUN rm -f /sbin/apk && \
+    rm -rf /etc/apk /lib/apk /var/cache/apk /var/lib/apk /usr/share/apk
 # Copy only the target-platform Erlang runtime, not Mix, Elixir's compiler
 # executable, Hex, Rebar, or the rest of the language build image.
 COPY --from=target-erlang-runtime /usr/local/lib/erlang/erts-14.2.5.15 /usr/local/lib/erlang/erts-14.2.5.15
@@ -73,6 +78,20 @@ COPY --from=target-erlang-runtime /usr/local/lib/erlang/lib/stdlib-5.2.3.6 /usr/
 COPY --from=release-build /app/_build/prod/rel/convex_client /opt/convex
 ENV ERL_FLAGS="+S 2:2 +SDcpu 1 +SDio 1"
 USER 65532:65532
+# Prove the final runtime keeps the POSIX tools used by shared verification,
+# exposes no package/build frontends, and can boot the real adapter release to
+# a clean EOF-driven shutdown as the same unprivileged user used in production.
+RUN set -eu; \
+    for required in sh id grep erl; do command -v "$required" >/dev/null; done; \
+    for forbidden in apk elixir elixirc iex mix hex rebar rebar3 erlc cc gcc clang make node npm python python3 curl convex; do \
+      if command -v "$forbidden" >/dev/null 2>&1; then exit 1; fi; \
+    done; \
+    test ! -e /sbin/apk; \
+    test ! -e /etc/apk; \
+    test ! -e /lib/apk; \
+    test ! -e /var/cache/apk; \
+    test ! -e /usr/share/apk; \
+    CONVEX_ENTRYPOINT=adapter CONVEX_URL=http://127.0.0.1 /opt/convex/bin/convex_client start </dev/null
 
 FROM runtime-base AS example-runtime
 COPY --chmod=0555 examples/basics/entrypoint.sh /usr/local/bin/convex-example
