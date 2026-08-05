@@ -8,13 +8,18 @@ namespace Convex;
 /// <summary>Pinned convex-rs 0.10.4 unversioned /api/sync profile, with bounded newest-16 delivery.</summary>
 public sealed class LiveClient(string deployment) : IDisposable
 {
+    internal static Action? DebugPumpStopped;
+    internal static Action? ReconnectAttempting;
     private readonly Uri _endpoint = ToWebSocket(deployment);
     private readonly ConcurrentDictionary<int, Subscription> _subscriptions = [];
     private readonly SemaphoreSlim _gate = new(1, 1);
     private ClientWebSocket? _socket;
+    private Task? _receiveTask;
     private int _nextId, _querySet, _connections;
     private bool _closed, _reconnecting;
+    private volatile bool _intentionalRecovery;
     private string _lastClose = "InitialConnect";
+    private string? _maxObservedTimestamp;
     private JsonObject _version = ZeroVersion();
     private readonly CancellationTokenSource _lifetime = new();
     private static readonly System.Text.UTF8Encoding StrictUtf8 = new(false, true);
@@ -32,10 +37,11 @@ public sealed class LiveClient(string deployment) : IDisposable
     {
         ThrowIfClosed(); var socket = new ClientWebSocket(); socket.Options.SetRequestHeader("Convex-Client", "csharp-0.1.0");
         await socket.ConnectAsync(_endpoint, _lifetime.Token); _socket = socket; _querySet = 0; _version = ZeroVersion();
-        _ = Receive(socket);
-        await Send(new JsonObject { ["type"]="Connect", ["sessionId"]=Guid.NewGuid().ToString(), ["connectionCount"]=_connections, ["lastCloseReason"]=_lastClose, ["clientTs"]=0 });
+        _receiveTask = Receive(socket);
+        var connect=new JsonObject { ["type"]="Connect", ["sessionId"]=Guid.NewGuid().ToString(), ["connectionCount"]=_connections, ["lastCloseReason"]=_lastClose, ["clientTs"]=0 };
+        if(_maxObservedTimestamp is not null)connect["maxObservedTimestamp"]=_maxObservedTimestamp;
+        await Send(connect);
         if (_subscriptions.Count > 0) await Modify(_subscriptions.Values.Select(Add).ToArray());
-        _reconnecting = false;
     }
     private JsonObject Add(Subscription s) => new() { ["type"]="Add", ["queryId"]=s.QueryId, ["udfPath"]=s.Path, ["args"]=new JsonArray((JsonNode)s.Args.DeepClone()) };
     private async Task Modify(IEnumerable<JsonObject> modifications) { await Send(new JsonObject { ["type"]="ModifyQuerySet", ["baseVersion"]=_querySet, ["newVersion"]=_querySet+1, ["modifications"]=new JsonArray(modifications.Select(x => (JsonNode)x).ToArray()) }); _querySet++; }
@@ -76,7 +82,7 @@ public sealed class LiveClient(string deployment) : IDisposable
         // A deliberate debug disconnect detaches the old socket before aborting it.
         // Its receive task must not turn that expected cancellation into a user error.
         if (!ReferenceEquals(_socket, socket)) return;
-        if (failure is not null) DeliverFailure(failure);
+        if (failure is not null && !_intentionalRecovery) DeliverFailure(failure);
         await Disconnect(socket, failure is ConvexClient.ProtocolException ? "ProtocolError" : "TransportError", true);
     }
     private void Handle(JsonObject message)
@@ -84,6 +90,7 @@ public sealed class LiveClient(string deployment) : IDisposable
         var type = message["type"]?.GetValue<string>(); if (type is "Ping" or "MutationResponse" or "ActionResponse") return;
         if (type is not "Transition") throw new ConvexClient.ProtocolException("unsupported Live message: " + type);
         if (!JsonNode.DeepEquals(message["startVersion"], _version)) throw new ConvexClient.ProtocolException("Live transition version mismatch");
+        var restoredActiveQuery=false;
         foreach (var n in message["modifications"]?.AsArray() ?? [])
         {
             var m = n?.AsObject() ?? throw new ConvexClient.ProtocolException("Live transition contained an invalid modification");
@@ -96,12 +103,17 @@ public sealed class LiveClient(string deployment) : IDisposable
             {
                 if (!m.ContainsKey("value")) throw new ConvexClient.ProtocolException("QueryUpdated omitted value");
                 subscription.Offer(new Update(m["value"]?.DeepClone(), null, logs));
+                restoredActiveQuery=true;
             }
-            else if (modificationType == "QueryFailed")
+            else if (modificationType == "QueryFailed") {
                 subscription.Offer(new Update(null, new ConvexClient.FunctionException("query", m["errorMessage"]?.GetValue<string>() ?? "query failed", m["errorData"]?.DeepClone(), logs), logs));
+                restoredActiveQuery=true;
+            }
             else throw new ConvexClient.ProtocolException("unsupported Live transition modification: " + modificationType);
         }
         _version = (JsonObject)message["endVersion"]!.DeepClone();
+        _maxObservedTimestamp=_version["ts"]?.GetValue<string>();
+        if(restoredActiveQuery)_intentionalRecovery = false;
     }
     private void DeliverFailure(Exception failure)
     {
@@ -118,12 +130,31 @@ public sealed class LiveClient(string deployment) : IDisposable
             if (reconnect && _subscriptions.Count>0 && !_closed && !_reconnecting) { _reconnecting=true; _=Reconnect(); }
         } finally { _gate.Release(); }
     }
-    private async Task Reconnect() { var delay=100; while (!_closed) { try { await Task.Delay(delay,_lifetime.Token); await _gate.WaitAsync(_lifetime.Token); try { if (_socket is null) await Connect(); return; } finally {_gate.Release();} } catch (OperationCanceledException) { return; } catch { delay=Math.Min(delay*2,15000); } } }
-    public async Task DebugDisconnect() { await Disconnect(null, "DebugDisconnect", true); }
+    private async Task Reconnect() { var delay=100; while (!_closed) { try { await Task.Delay(delay,_lifetime.Token);ReconnectAttempting?.Invoke();await _gate.WaitAsync(_lifetime.Token); try { if (_socket is null) await Connect(); _reconnecting=false; return; } finally {_gate.Release();} } catch (OperationCanceledException) { return; } catch { delay=Math.Min(delay*2,15000); } } }
+    public async Task DebugDisconnect()
+    {
+        Task? stoppedPump;
+        await _gate.WaitAsync();
+        try {
+            ThrowIfClosed();
+            var previous=_socket??throw new InvalidOperationException("Live WebSocket is not connected");
+            _socket=null;stoppedPump=_receiveTask;_receiveTask=null;previous.Abort();previous.Dispose();_connections++;
+            _lastClose="DebugDisconnect";_querySet=0;_version=ZeroVersion();_intentionalRecovery=true;
+        } finally { _gate.Release(); }
+
+        if(stoppedPump is not null)await stoppedPump.WaitAsync(TimeSpan.FromSeconds(3));
+        DebugPumpStopped?.Invoke();
+
+        // Start the ordinary backoff only after the old receive pump has stopped.
+        // The adapter can now acknowledge debugDisconnect before the 100 ms delay expires.
+        await _gate.WaitAsync();
+        try { if(!_closed&&_subscriptions.Count>0&&_socket is null&&!_reconnecting){_reconnecting=true;_=Reconnect();} }
+        finally { _gate.Release(); }
+    }
     internal async Task Unsubscribe(Subscription s) { await _gate.WaitAsync(); try { if (_subscriptions.TryRemove(s.QueryId, out _)) { s.Finish(); if (_socket is not null) await Modify([new JsonObject { ["type"]="Remove", ["queryId"]=s.QueryId }]); } } finally { _gate.Release(); } }
     private static JsonObject ZeroVersion() => new() { ["querySet"]=0,["identity"]=0,["ts"]="AAAAAAAAAAA=" };
     private void ThrowIfClosed() { if (_closed) throw new ObjectDisposedException(nameof(LiveClient)); }
-    public void Dispose() { if (_closed) return; _closed=true; _lifetime.Cancel(); var socket=_socket;_socket=null;socket?.Abort();socket?.Dispose();foreach(var s in _subscriptions.Values)s.Finish();_subscriptions.Clear(); }
+    public void Dispose() { if (_closed) return; _closed=true;_intentionalRecovery=false;_lifetime.Cancel();var socket=_socket;_socket=null;_receiveTask=null;socket?.Abort();socket?.Dispose();foreach(var s in _subscriptions.Values)s.Finish();_subscriptions.Clear(); }
     public record Update(JsonNode? Value, Exception? Error, IReadOnlyList<string> Logs);
     public sealed class Subscription(LiveClient owner, int queryId, string path, JsonObject args) : IDisposable
     { internal int QueryId {get;}=queryId; internal string Path {get;}=path; internal JsonObject Args {get;}=args; private readonly BlockingCollection<Update> _updates=new(16); private readonly object _deliveryLock=new();private bool _closed;internal Action? OfferInsideLock;internal Action? FinishBeforeLock;

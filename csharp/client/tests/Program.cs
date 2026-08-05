@@ -16,6 +16,7 @@ static class Tests
         await TestAdapterHttpOperations();
         await TestAdapterTcp();
         await TestAdapterLiveControllerLifecycle();
+        await TestAdapterDebugRecoverySuppressesTransientClose();
         await TestAdapterSuppressesStaleRelayAfterUnsubscribe();
         await TestAdapterSuppressesStaleRelayAfterReplacement();
         TestBoundedDelivery();
@@ -180,6 +181,49 @@ static class Tests
         Environment.SetEnvironmentVariable("ADAPTER_LISTEN",null);Environment.SetEnvironmentVariable("CONVEX_URL",null);
     }
 
+    private static async Task TestAdapterDebugRecoverySuppressesTransientClose()
+    {
+        using var syncListener=Listen();
+        var pumpStopped=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reconnectStarted=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        LiveClient.DebugPumpStopped=()=>pumpStopped.TrySetResult();
+        LiveClient.ReconnectAttempting=()=>reconnectStarted.TrySetResult();
+        var syncServer=Task.Run(async()=>{
+            using(var socket=await syncListener.AcceptTcpClientAsync()){
+                var stream=socket.GetStream();await Handshake(stream);await ReadClientText(stream);var add=JsonNode.Parse(await ReadClientText(stream))!;var id=add["modifications"]![0]!["queryId"]!.GetValue<int>();
+                await WriteServerText(stream,Transition(Zero(),Version(1),new JsonObject{{"type","QueryUpdated"},{"queryId",id},{"value",new JsonObject{{"count",0}}},{"logLines",new JsonArray()}}).ToJsonString());
+                // Try to race a late old-socket frame with the deliberate abort.
+                await pumpStopped.Task.WaitAsync(Timeout);try{await WriteServerText(stream,"{\"type\":\"not-a-transition\"}");}catch(IOException){}
+                await WaitForEof(stream);
+            }
+            using(var socket=await syncListener.AcceptTcpClientAsync()){
+                var stream=socket.GetStream();await Handshake(stream);await ReadClientText(stream);await ReadClientText(stream);
+                // Hosted-like transient: the first restored socket dies after Add,
+                // before it can establish a valid transition.
+                await Task.Delay(75);socket.Client.LingerState=new LingerOption(true,0);
+            }
+            using(var socket=await syncListener.AcceptTcpClientAsync()){
+                var stream=socket.GetStream();await Handshake(stream);await ReadClientText(stream);var add=JsonNode.Parse(await ReadClientText(stream))!;var id=add["modifications"]![0]!["queryId"]!.GetValue<int>();
+                await WriteServerText(stream,Transition(Zero(),Version(3),new JsonObject{{"type","QueryUpdated"},{"queryId",id},{"value",new JsonObject{{"count",1}}},{"logLines",new JsonArray()}}).ToJsonString());
+                await WaitForEof(stream);
+            }
+        });
+        using var reserved=Listen();var adapterPort=((IPEndPoint)reserved.LocalEndpoint).Port;reserved.Stop();
+        Environment.SetEnvironmentVariable("CONVEX_URL",Url(syncListener));Environment.SetEnvironmentVariable("ADAPTER_LISTEN","127.0.0.1:"+adapterPort);
+        var adapter=Task.Run(Adapter.Main);TcpClient? controller=null;
+        for(var attempt=0;attempt<50&&controller is null;attempt++){try{controller=new TcpClient();await controller.ConnectAsync(IPAddress.Loopback,adapterPort);}catch{controller?.Dispose();controller=null;await Task.Delay(20);}}
+        var connected=controller??throw new Exception("hosted-like adapter did not listen");
+        try{
+            using(connected)using(var stream=connected.GetStream())using(var reader=new StreamReader(stream))using(var writer=new StreamWriter(stream){AutoFlush=true}){
+                await writer.WriteLineAsync("{\"id\":\"subscribe\",\"op\":\"subscribe\",\"subscriptionId\":\"hosted\",\"path\":\"demo:state\",\"args\":{}}");Equal("ack",(await ReadEvent(reader))["type"]!.GetValue<string>(),"hosted-like subscribe ack");Equal(0,(await ReadEvent(reader))["value"]!["count"]!.GetValue<int>(),"hosted-like initial");
+                await writer.WriteLineAsync("{\"id\":\"debug\",\"op\":\"debugDisconnect\"}");var ack=await ReadEvent(reader);Equal("ack",ack["type"]!.GetValue<string>(),"hosted-like debug ack");Check(pumpStopped.Task.IsCompleted,"debug ack preceded old pump closure");Check(!reconnectStarted.Task.IsCompleted,"debug ack followed reconnect attempt instead of preceding backoff");
+                var recovered=await ReadEvent(reader);Check(!recovered.AsObject().ContainsKey("error"),"intentional recovery emitted transient error");Equal(1,recovered["value"]!["count"]!.GetValue<int>(),"hosted-like recovered value");
+                await writer.WriteLineAsync("{\"id\":\"close\",\"op\":\"close\"}");Equal("closed",(await ReadEvent(reader))["type"]!.GetValue<string>(),"hosted-like close");
+            }
+            await adapter.WaitAsync(Timeout);await syncServer.WaitAsync(Timeout);
+        }finally{LiveClient.DebugPumpStopped=null;LiveClient.ReconnectAttempting=null;Environment.SetEnvironmentVariable("ADAPTER_LISTEN",null);Environment.SetEnvironmentVariable("CONVEX_URL",null);}
+    }
+
     private static void TestBoundedDelivery()
     {
         var subscription = new LiveClient.Subscription(null!, 7, "demo:state", new JsonObject());
@@ -269,7 +313,7 @@ static class Tests
     private static async Task TestReconnectAndResubscribe()
     {
         using var listener=Listen();
-        var server=Task.Run(async()=>{for(var connection=0;connection<2;connection++){using var socket=await listener.AcceptTcpClientAsync();var stream=socket.GetStream();await Handshake(stream);var connect=JsonNode.Parse(await ReadClientText(stream))!.AsObject();Equal(connection,connect["connectionCount"]!.GetValue<int>(),"connection count");var add=JsonNode.Parse(await ReadClientText(stream))!.AsObject();Equal("Add",add["modifications"]![0]!["type"]!.GetValue<string>(),"reconnect did not resubscribe");var id=add["modifications"]![0]!["queryId"]!.GetValue<int>();await WriteServerText(stream,Transition(Zero(),Version(connection+1),new JsonObject{{"type","QueryUpdated"},{"queryId",id},{"value",new JsonObject{{"count",connection}}},{"logLines",new JsonArray()}}).ToJsonString());if(connection==0)await WaitForEof(stream);else Equal("Remove",JsonNode.Parse(await ReadClientText(stream))!["modifications"]![0]!["type"]!.GetValue<string>(),"reconnect unsubscribe");}});
+        var server=Task.Run(async()=>{for(var connection=0;connection<2;connection++){using var socket=await listener.AcceptTcpClientAsync();var stream=socket.GetStream();await Handshake(stream);var connect=JsonNode.Parse(await ReadClientText(stream))!.AsObject();Equal(connection,connect["connectionCount"]!.GetValue<int>(),"connection count");if(connection>0)Equal(Version(1)["ts"]!.GetValue<string>(),connect["maxObservedTimestamp"]!.GetValue<string>(),"reconnect max observed timestamp");var add=JsonNode.Parse(await ReadClientText(stream))!.AsObject();Equal("Add",add["modifications"]![0]!["type"]!.GetValue<string>(),"reconnect did not resubscribe");var id=add["modifications"]![0]!["queryId"]!.GetValue<int>();await WriteServerText(stream,Transition(Zero(),Version(connection+1),new JsonObject{{"type","QueryUpdated"},{"queryId",id},{"value",new JsonObject{{"count",connection}}},{"logLines",new JsonArray()}}).ToJsonString());if(connection==0)await WaitForEof(stream);else Equal("Remove",JsonNode.Parse(await ReadClientText(stream))!["modifications"]![0]!["type"]!.GetValue<string>(),"reconnect unsubscribe");}});
         using var live=new LiveClient(Url(listener));var subscription=await live.Subscribe("demo:state",new JsonObject());Equal(0,subscription.Next(Timeout)["count"]!.GetValue<int>(),"initial reconnect value");await live.DebugDisconnect();Equal(1,subscription.Next(Timeout)["count"]!.GetValue<int>(),"post-reconnect value");subscription.Dispose();await server.WaitAsync(Timeout);
     }
 
