@@ -87,8 +87,10 @@ int convex_call(convex_client *c,const char *operation,const char *path,json_obj
   CURLcode code=curl_easy_perform(curl); curl_slist_free_all(headers); curl_easy_cleanup(curl); json_object_put(request);
   if(code!=CURLE_OK){free(body.data);fail(e,"TransportError",curl_easy_strerror(code),NULL);return 0;}
   json_object *response=json_tokener_parse(body.data ? body.data : ""); free(body.data); if(!response){fail(e,"ProtocolError","HTTP response was not valid Convex JSON",NULL);return 0;}
-  json_object *status=NULL,*value=NULL,*message=NULL,*data=NULL,*logs=NULL; json_object_object_get_ex(response,"status",&status); json_object_object_get_ex(response,"value",&value); json_object_object_get_ex(response,"errorMessage",&message); json_object_object_get_ex(response,"errorData",&data); json_object_object_get_ex(response,"logLines",&logs);
-  if(status && !strcmp(json_object_get_string(status),"success") && value){r->value=json_object_get(value); r->logs=logs?json_object_get(logs):NULL; json_object_put(response); return 1;}
+  json_object *status=NULL,*value=NULL,*message=NULL,*data=NULL,*logs=NULL; json_object_object_get_ex(response,"status",&status); int has_value=json_object_object_get_ex(response,"value",&value); json_object_object_get_ex(response,"errorMessage",&message); json_object_object_get_ex(response,"errorData",&data); json_object_object_get_ex(response,"logLines",&logs);
+  /* json-c represents a JSON null member with a NULL pointer. Key presence is
+   * therefore separate from pointer truthiness for a successful null result. */
+  if(status && !strcmp(json_object_get_string(status),"success") && has_value){r->value=value?json_object_get(value):NULL; r->logs=logs?json_object_get(logs):NULL; json_object_put(response); return 1;}
   if(status && !strcmp(json_object_get_string(status),"error")){ fail(e,"FunctionError",message?json_object_get_string(message):"Convex function failed",data); if(logs)e->logs=json_object_get(logs); json_object_put(response); return 0; }
   json_object_put(response);fail(e,"ProtocolError","HTTP response had an unknown status",NULL);return 0;
 }
@@ -362,10 +364,10 @@ static void *live_worker(void *opaque) {
     if(manager->closing){pthread_mutex_unlock(&manager->mutex);break;}
     int active=active_count_locked(manager),debug=manager->debug_requested;
     if(debug){manager->debug_requested=0;disconnect_socket_locked(manager,"DebugDisconnect");manager->debug_completed=manager->debug_generation;reconnect_at=monotonic_ms()+100;pthread_cond_broadcast(&manager->changed);}
-    if(!manager->socket){for(convex_subscription *sub=manager->subscriptions;sub;sub=sub->next)if(sub->remove_pending&&!sub->remove_done){sub->active=0;sub->remove_done=1;pthread_cond_broadcast(&manager->changed);}}
+    if(!manager->socket){for(convex_subscription *sub=manager->subscriptions;sub;sub=sub->next)if(sub->remove_pending&&!sub->remove_done){sub->active=0;sub->remove_done=1;pthread_cond_broadcast(&manager->changed);pthread_cond_broadcast(&manager->updates);}}
     if(manager->socket){
       for(convex_subscription *sub=manager->subscriptions;sub;sub=sub->next)if(sub->active&&sub->add_pending&&!sub->remove_pending){json_object *add=modify_message_locked(manager,sub,0);pthread_mutex_unlock(&manager->mutex);int sent=ws_send_json(manager->socket,add,reason,sizeof(reason));json_object_put(add);pthread_mutex_lock(&manager->mutex);if(sent){manager->query_set_version++;sub->add_pending=0;}else{disconnect_socket_locked(manager,reason);reconnect_at=monotonic_ms()+backoff;backoff=backoff<7500?backoff*2:15000;}break;}
-      for(convex_subscription *sub=manager->subscriptions;sub;sub=sub->next)if(sub->remove_pending&&!sub->remove_done){json_object *remove=modify_message_locked(manager,sub,1);pthread_mutex_unlock(&manager->mutex);int sent=ws_send_json(manager->socket,remove,reason,sizeof(reason));json_object_put(remove);pthread_mutex_lock(&manager->mutex);if(sent){manager->query_set_version++;sub->active=0;sub->remove_done=1;pthread_cond_broadcast(&manager->changed);}else{disconnect_socket_locked(manager,reason);reconnect_at=monotonic_ms()+backoff;backoff=backoff<7500?backoff*2:15000;}break;}
+      for(convex_subscription *sub=manager->subscriptions;sub;sub=sub->next)if(sub->remove_pending&&!sub->remove_done){json_object *remove=modify_message_locked(manager,sub,1);pthread_mutex_unlock(&manager->mutex);int sent=ws_send_json(manager->socket,remove,reason,sizeof(reason));json_object_put(remove);pthread_mutex_lock(&manager->mutex);if(sent){manager->query_set_version++;sub->active=0;sub->remove_done=1;pthread_cond_broadcast(&manager->changed);pthread_cond_broadcast(&manager->updates);}else{disconnect_socket_locked(manager,reason);reconnect_at=monotonic_ms()+backoff;backoff=backoff<7500?backoff*2:15000;}break;}
     }
     active=active_count_locked(manager);
     pthread_mutex_unlock(&manager->mutex);

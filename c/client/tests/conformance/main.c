@@ -5,6 +5,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -166,9 +167,14 @@ int main(void) {
   curl_global_init(CURL_GLOBAL_DEFAULT);
   const char *address = getenv("ADAPTER_LISTEN");
   if (!address || !*address) { serve(stdin, stdout); return 0; }
-  char *copy=copy_string(address),*colon=strrchr(copy,':');int port=colon?atoi(colon+1):0;
+  char *copy=copy_string(address),*colon=strrchr(copy,':');
+  if(!colon||colon==copy||!colon[1]){fprintf(stderr,"ADAPTER_LISTEN must be host:port\n");free(copy);return 1;}
+  *colon=0;char *port_end=NULL;long parsed_port=strtol(colon+1,&port_end,10);
+  if(!port_end||*port_end||parsed_port<1||parsed_port>65535){fprintf(stderr,"ADAPTER_LISTEN has invalid port\n");free(copy);return 1;}
+  int port=(int)parsed_port;
   int listener=socket(AF_INET,SOCK_STREAM,0),yes=1;setsockopt(listener,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));
-  struct sockaddr_in local={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_ANY),.sin_port=htons(port)};
+  struct sockaddr_in local={.sin_family=AF_INET,.sin_port=htons((uint16_t)port)};
+  if(inet_pton(AF_INET,copy,&local.sin_addr)!=1){fprintf(stderr,"ADAPTER_LISTEN host must be an IPv4 address\n");close(listener);free(copy);return 1;}
   if(bind(listener,(struct sockaddr*)&local,sizeof(local))||listen(listener,1)){perror("adapter listen");free(copy);return 1;}
   int peer=accept(listener,NULL,NULL);FILE *input=fdopen(dup(peer),"r"),*output=fdopen(peer,"w");
   serve(input,output);fclose(input);fclose(output);close(listener);free(copy);return 0;

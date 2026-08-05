@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -23,6 +24,7 @@ typedef struct {
   int port;
   int stop;
   int connections;
+  int connection_base;
   int remove_seen;
   int generation;
   int sent_generation;
@@ -68,12 +70,23 @@ static void base64(const unsigned char *source, size_t length, char *output) {
   for(size_t n=0;n<length;n+=3){uint32_t value=(uint32_t)source[n]<<16;if(n+1<length)value|=(uint32_t)source[n+1]<<8;if(n+2<length)value|=source[n+2];output[at++]=table[(value>>18)&63];output[at++]=table[(value>>12)&63];output[at++]=n+1<length?table[(value>>6)&63]:'=';output[at++]=n+2<length?table[value&63]:'=';}output[at]=0;
 }
 
-static int handshake(int fd) {
+/* Returns 1 for an upgraded WebSocket, 2 for a completed HTTP fixture call. */
+static int accept_request(int fd) {
   char request[8192]={0};size_t used=0;
   while(used+1<sizeof(request)&&!strstr(request,"\r\n\r\n")){ssize_t got=recv(fd,request+used,sizeof(request)-used-1,0);if(got<=0)return 0;used+=(size_t)got;request[used]=0;}
+  char *headers_end=strstr(request,"\r\n\r\n");
+  if(!strstr(request,"Upgrade: websocket")&&!strstr(request,"Upgrade: WebSocket")){
+    size_t header_length=(size_t)(headers_end+4-request),content_length=0;char *length_header=strstr(request,"Content-Length:");if(length_header)content_length=(size_t)strtoul(length_header+15,NULL,10);
+    while(used<header_length+content_length&&used+1<sizeof(request)){ssize_t got=recv(fd,request+used,sizeof(request)-used-1,0);if(got<=0)return 0;used+=(size_t)got;request[used]=0;}
+    const char *body=headers_end+4;const char *payload;
+    if(strstr(body,"\"path\":\"demo:null\""))payload="{\"status\":\"success\",\"value\":null,\"logLines\":[\"null fixture\"]}";
+    else if(strstr(body,"\"path\":\"demo:fail\""))payload="{\"status\":\"error\",\"errorMessage\":\"expected fixture failure\",\"errorData\":{\"code\":\"EXPECTED\"},\"logLines\":[\"failure fixture\"]}";
+    else payload="{\"status\":\"success\",\"value\":{\"unicode\":\"世界\",\"nested\":{\"nil\":null}},\"logLines\":[\"success fixture\"]}";
+    char response[1024];int response_length=snprintf(response,sizeof(response),"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s",strlen(payload),payload);return send(fd,response,(size_t)response_length,0)==response_length?2:0;
+  }
   char *key=strstr(request,"Sec-WebSocket-Key:");if(!key)return 0;key+=18;while(*key==' ')key++;char *end=strstr(key,"\r\n");if(!end)return 0;*end=0;
   char joined[256];snprintf(joined,sizeof(joined),"%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11",key);unsigned char digest[SHA_DIGEST_LENGTH];SHA1((unsigned char*)joined,strlen(joined),digest);char accept[64];base64(digest,sizeof(digest),accept);
-  char response[512];int length=snprintf(response,sizeof(response),"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n",accept);return send(fd,response,(size_t)length,0)==length;
+  char response[512];int length=snprintf(response,sizeof(response),"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n",accept);return send(fd,response,(size_t)length,0)==length?1:0;
 }
 
 static void fixture_fail(fixture *server, const char *message) { pthread_mutex_lock(&server->mutex);server->failed=1;snprintf(server->failure,sizeof(server->failure),"%s",message);pthread_cond_broadcast(&server->changed);pthread_mutex_unlock(&server->mutex); }
@@ -94,8 +107,8 @@ static int send_transition(int fd,int query_id,int start_query_set,int end_query
 
 static void *fixture_thread(void *opaque) {
   fixture *server=opaque;int serial=0;
-  while(!server->stop){int fd=accept(server->listener,NULL,NULL);if(fd<0){if(server->stop)break;continue;}if(!handshake(fd)){close(fd);fixture_fail(server,"WebSocket handshake failed");continue;}
-    char *text=NULL;if(!read_frame(fd,&text)){close(fd);continue;}json_object *connect=json_tokener_parse(text);free(text);int connection_count=-1;if(!connect||!integer_field(connect,"connectionCount",&connection_count)){if(connect)json_object_put(connect);close(fd);fixture_fail(server,"invalid Connect");continue;}pthread_mutex_lock(&server->mutex);int expected=server->connections++;pthread_cond_broadcast(&server->changed);pthread_mutex_unlock(&server->mutex);if(connection_count!=expected){json_object_put(connect);close(fd);fixture_fail(server,"connectionCount did not advance exactly");continue;}json_object_put(connect);
+  while(!server->stop){int fd=accept(server->listener,NULL,NULL);if(fd<0){if(server->stop)break;continue;}int request_kind=accept_request(fd);if(request_kind==2){close(fd);continue;}if(request_kind!=1){close(fd);fixture_fail(server,"request handshake failed");continue;}
+    char *text=NULL;if(!read_frame(fd,&text)){close(fd);continue;}json_object *connect=json_tokener_parse(text);free(text);int connection_count=-1;if(!connect||!integer_field(connect,"connectionCount",&connection_count)){if(connect)json_object_put(connect);close(fd);fixture_fail(server,"invalid Connect");continue;}pthread_mutex_lock(&server->mutex);int base=server->connection_base,expected=server->connections-base;server->connections++;pthread_cond_broadcast(&server->changed);pthread_mutex_unlock(&server->mutex);if(connection_count!=expected){json_object_put(connect);close(fd);fixture_fail(server,"connectionCount did not advance exactly");continue;}if(base==0&&expected>=1&&expected<=5){json_object *reason=NULL,*timestamp=NULL;char expected_timestamp[64];snprintf(expected_timestamp,sizeof(expected_timestamp),"%010d=",serial);if(!json_object_object_get_ex(connect,"lastCloseReason",&reason)||strcmp(json_object_get_string(reason),"DebugDisconnect")||!json_object_object_get_ex(connect,"maxObservedTimestamp",&timestamp)||strcmp(json_object_get_string(timestamp),expected_timestamp)){json_object_put(connect);close(fd);fixture_fail(server,"debug reconnect metadata was not preserved");continue;}}json_object_put(connect);
     if(!read_frame(fd,&text)){close(fd);continue;}json_object *add=json_tokener_parse(text);free(text);json_object *mods=NULL,*mod=NULL,*field=NULL;int query_id=-1,query_set=0;if(!add||!json_object_object_get_ex(add,"modifications",&mods)||(mod=json_object_array_get_idx(mods,0))==NULL||!json_object_object_get_ex(mod,"type",&field)||strcmp(json_object_get_string(field),"Add")||!integer_field(mod,"queryId",&query_id)||!integer_field(add,"newVersion",&query_set)){if(add)json_object_put(add);close(fd);fixture_fail(server,"invalid Add");continue;}json_object_put(add);
     serial++;char current_ts[64];snprintf(current_ts,sizeof(current_ts),"%010d=",serial);pthread_mutex_lock(&server->mutex);int generation=server->generation,count=server->desired_count,failure=server->desired_failure,fragment=server->desired_fragment;server->sent_generation=generation;pthread_cond_broadcast(&server->changed);pthread_mutex_unlock(&server->mutex);if(!send_transition(fd,query_id,0,query_set,"AAAAAAAAAAA=",serial,count,failure,fragment)){close(fd);continue;}
     for(;;){pthread_mutex_lock(&server->mutex);int stop=server->stop,new_generation=server->generation,malformed=server->desired_malformed;count=server->desired_count;failure=server->desired_failure;fragment=server->desired_fragment;pthread_mutex_unlock(&server->mutex);if(stop)break;if(new_generation!=generation){generation=new_generation;if(malformed){send_frame(fd,1,1,"{not-json",9);}else{serial++;if(!send_transition(fd,query_id,query_set,query_set,current_ts,serial,count,failure,fragment))break;snprintf(current_ts,sizeof(current_ts),"%010d=",serial);}pthread_mutex_lock(&server->mutex);server->sent_generation=generation;pthread_cond_broadcast(&server->changed);pthread_mutex_unlock(&server->mutex);}
@@ -113,17 +126,42 @@ static void wait_removes(fixture *server,int count){pthread_mutex_lock(&server->
 
 static int update_count(convex_subscription *sub,int expected,int expect_error){convex_update update={0};int got=convex_subscription_next(sub,&update,5000);if(got!=1){fprintf(stderr,"update wait returned %d\n",got);return 0;}int okay;if(expect_error==1)okay=update.error.name&&update.error.data;else if(expect_error==2)okay=update.error.name&&!strcmp(update.error.name,"ProtocolError");else{json_object *count=NULL,*text=NULL;okay=!update.error.name&&update.value&&json_object_object_get_ex(update.value,"count",&count)&&json_object_get_int(count)==expected&&json_object_object_get_ex(update.value,"text",&text)&&!strcmp(json_object_get_string(text),"Hello, 世界 👋");}if(!okay)fprintf(stderr,"unexpected update error=%s message=%s value=%s\n",update.error.name?update.error.name:"",update.error.message?update.error.message:"",update.value?json_object_to_json_string(update.value):"null");convex_update_free(&update);return okay;}
 
+typedef struct { pid_t pid; FILE *input; FILE *output; } adapter_process;
+
+static adapter_process start_adapter(const char *url) {
+  int commands[2],events[2];check(!pipe(commands)&&!pipe(events),"adapter pipes");pid_t pid=fork();check(pid>=0,"fork adapter");
+  if(pid==0){dup2(commands[0],STDIN_FILENO);dup2(events[1],STDOUT_FILENO);close(commands[0]);close(commands[1]);close(events[0]);close(events[1]);setenv("CONVEX_URL",url,1);unsetenv("ADAPTER_LISTEN");execl("/out-adapter","/out-adapter",(char*)NULL);_exit(127);}
+  close(commands[0]);close(events[1]);adapter_process process={.pid=pid,.input=fdopen(commands[1],"w"),.output=fdopen(events[0],"r")};setvbuf(process.input,NULL,_IOLBF,0);return process;
+}
+
+static void adapter_send(adapter_process *process,const char *command){fprintf(process->input,"%s\n",command);fflush(process->input);}
+static json_object *adapter_read(adapter_process *process){char line[8192];check(fgets(line,sizeof(line),process->output)!=NULL,"adapter event");json_object *event=json_tokener_parse(line);check(event!=NULL,"adapter event JSON");return event;}
+static const char *event_type(json_object *event){json_object *type=NULL;return json_object_object_get_ex(event,"type",&type)?json_object_get_string(type):"";}
+static void require_absent(json_object *event,const char *name){json_object *ignored=NULL;check(!json_object_object_get_ex(event,name,&ignored),name);}
+
+static void test_adapter_events(fixture *server,const char *url) {
+  pthread_mutex_lock(&server->mutex);server->connection_base=server->connections;pthread_mutex_unlock(&server->mutex);
+  adapter_process adapter=start_adapter(url);json_object *event,*field=NULL;fprintf(stderr,"adapter fixture: HTTP result\n");
+  adapter_send(&adapter,"{\"id\":\"result\",\"op\":\"query\",\"path\":\"demo:echo\",\"args\":{}}");event=adapter_read(&adapter);check(!strcmp(event_type(event),"result"),"adapter result event");check(json_object_object_get_ex(event,"value",&field)&&field,"result value present");check(json_object_object_get_ex(event,"logs",&field),"result logs present");require_absent(event,"error");require_absent(event,"subscriptionId");json_object_put(event);
+  fprintf(stderr,"adapter fixture: HTTP null\n");adapter_send(&adapter,"{\"id\":\"null\",\"op\":\"query\",\"path\":\"demo:null\",\"args\":{}}");event=adapter_read(&adapter);field=(json_object*)1;check(!strcmp(event_type(event),"result")&&json_object_object_get_ex(event,"value",&field)&&field==NULL,"JSON null result is successful");require_absent(event,"error");json_object_put(event);
+  fprintf(stderr,"adapter fixture: HTTP error\n");adapter_send(&adapter,"{\"id\":\"failure\",\"op\":\"query\",\"path\":\"demo:fail\",\"args\":{}}");event=adapter_read(&adapter);check(!strcmp(event_type(event),"error"),"adapter FunctionError event");json_object *error=NULL,*data=NULL,*code=NULL;check(json_object_object_get_ex(event,"error",&error)&&json_object_object_get_ex(error,"data",&data)&&json_object_object_get_ex(data,"code",&code)&&!strcmp(json_object_get_string(code),"EXPECTED"),"structured FunctionError data");check(json_object_object_get_ex(event,"logs",&field),"FunctionError logs");require_absent(event,"value");require_absent(event,"subscriptionId");json_object_put(event);
+  fprintf(stderr,"adapter fixture: Live result\n");fixture_configure(server,2,0,0,0);adapter_send(&adapter,"{\"id\":\"subscribe\",\"op\":\"subscribe\",\"subscriptionId\":\"fixture-live\",\"path\":\"demo:state\",\"args\":{\"room\":\"adapter\"}}");json_object *ack=NULL,*update=NULL;for(int n=0;n<2;n++){event=adapter_read(&adapter);if(!strcmp(event_type(event),"ack"))ack=event;else update=event;}check(ack&&update,"subscribe ack and value");require_absent(update,"id");require_absent(update,"error");check(json_object_object_get_ex(update,"subscriptionId",&field)&&!strcmp(json_object_get_string(field),"fixture-live")&&json_object_object_get_ex(update,"value",&field),"subscription value shape");json_object_put(ack);json_object_put(update);
+  fprintf(stderr,"adapter fixture: Live error\n");fixture_change(server,2,1,0,0);event=adapter_read(&adapter);check(!strcmp(event_type(event),"subscription"),"subscription error event");require_absent(event,"id");require_absent(event,"value");check(json_object_object_get_ex(event,"error",&error)&&json_object_object_get_ex(error,"data",&data),"subscription structured error");json_object_put(event);
+  fprintf(stderr,"adapter fixture: close\n");adapter_send(&adapter,"{\"id\":\"unsubscribe\",\"op\":\"unsubscribe\",\"subscriptionId\":\"fixture-live\"}");event=adapter_read(&adapter);check(!strcmp(event_type(event),"ack"),"unsubscribe ack");json_object_put(event);
+  adapter_send(&adapter,"{\"id\":\"close\",\"op\":\"close\"}");event=adapter_read(&adapter);check(!strcmp(event_type(event),"closed"),"adapter close");json_object_put(event);fclose(adapter.input);fclose(adapter.output);int status=0;waitpid(adapter.pid,&status,0);check(WIFEXITED(status)&&WEXITSTATUS(status)==0,"adapter process exit");
+}
+
 int main(void) {
   fixture server;fixture_start(&server);char url[128];snprintf(url,sizeof(url),"http://127.0.0.1:%d",server.port);convex_error error={0};convex_client *client=convex_new(url,"c-live-fixture",&error);json_object *args=json_object_new_object();json_object_object_add(args,"room",json_object_new_string("fixture"));
   convex_subscription *sub=convex_subscribe(client,"demo:state",args,&error);check(sub&&update_count(sub,0,0),"initial fragmented Live update");
   fixture_change(&server,1,0,0,1);check(update_count(sub,1,0),"fragmented UTF-8 update");
   for(int n=1;n<=5;n++){check(convex_debug_disconnect(client,&error),"debug disconnect ack");wait_connections(&server,n+1);check(update_count(sub,1,0),"reconnect update");}
   check(convex_unsubscribe(sub,&error),"unsubscribe");wait_removes(&server,1);pthread_mutex_lock(&server.mutex);int remove_seen=server.remove_seen;pthread_mutex_unlock(&server.mutex);check(remove_seen==1,"exactly one Remove");
-  fixture_configure(&server,0,1,0,0);sub=convex_subscribe(client,"demo:requiresNonzero",args,&error);check(update_count(sub,0,1),"QueryFailed");fixture_change(&server,1,0,0,0);check(update_count(sub,1,0),"same subscription recovery");
+  convex_subscription *removed=sub;fixture_configure(&server,0,1,0,0);sub=convex_subscribe(client,"demo:requiresNonzero",args,&error);check(update_count(sub,0,1),"QueryFailed");fixture_change(&server,1,0,0,0);check(update_count(sub,1,0),"same subscription recovery");convex_update stale={0};check(convex_subscription_next(removed,&stale,50)==-1,"removed subscription never receives replacement updates");
   for(int n=2;n<=21;n++)fixture_change(&server,n,0,0,0);
   struct timespec settle={.tv_sec=0,.tv_nsec=100000000L};nanosleep(&settle,NULL);
   check(update_count(sub,6,0),"bounded newest-16 queue drops oldest");
   for(int n=7;n<=21;n++)check(update_count(sub,n,0),"bounded queue preserves newest order");
   fixture_change(&server,1,0,1,0);check(update_count(sub,0,2),"malformed server message becomes protocol error");wait_connections(&server,8);
-  check(convex_unsubscribe(sub,&error),"final unsubscribe");check(convex_close(client,5000,&error),"blocked close completes");convex_free(client);json_object_put(args);fixture_stop(&server);puts("PASS native C Live fixtures");return 0;
+  check(convex_unsubscribe(sub,&error),"final unsubscribe");check(convex_close(client,5000,&error),"blocked close completes");convex_free(client);json_object_put(args);test_adapter_events(&server,url);fixture_stop(&server);puts("PASS native C Live and adapter fixtures");return 0;
 }

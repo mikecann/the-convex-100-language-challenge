@@ -29,6 +29,14 @@ set -eu
 ADAPTER_LISTEN=127.0.0.1:18080 /out-adapter &
 adapter_pid=$!
 sleep 0.1
+container_address=$(ip -4 addr show eth0 | awk '/inet / {sub("/.*", "", $2); print $2; exit}')
+non_loopback=$(printf '%s\n' \
+  '{"id":"wrong-host","protocolVersion":1,"op":"hello"}' \
+  '{"id":"wrong-close","op":"close"}' | nc -w 1 "$container_address" 18080 2>/dev/null || true)
+if test -n "$non_loopback"; then
+  printf '%s\n' 'loopback adapter unexpectedly accepted a non-loopback connection' >&2
+  exit 1
+fi
 actual=$(printf '%s\n' \
   '{"id":"tcp-hello","protocolVersion":1,"op":"hello"}' \
   '{"id":"tcp-close","op":"close"}' | nc 127.0.0.1 18080)
