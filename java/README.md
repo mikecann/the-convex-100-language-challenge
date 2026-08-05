@@ -18,7 +18,10 @@ the Live update. It is the exact program included below and run by the image.
 | Live query subscriptions | Experimental pinned profile, awaiting shared evidence |
 | Authentication | HTTP bearer tokens only |
 
-```java
+## The basic example
+
+<!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.java -->
+```text
 package convex.example;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -90,6 +93,7 @@ public final class Main {
   }
 }
 ```
+<!-- END GENERATED EXAMPLE -->
 
 ## Docker verification
 
