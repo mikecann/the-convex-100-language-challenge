@@ -7,7 +7,7 @@ implementation:
   status: attempting
   provenance: native
   version: 0.1.0
-  notes: Native R client. Convex HTTP and Sync protocol state are implemented in R; curl, jsonlite, and websocket provide ordinary transport and JSON primitives only.
+  notes: Native R client. Convex HTTP and Sync protocol state are implemented in R; curl, jsonlite, later, and websocket provide ordinary transport, JSON, and event-loop primitives only.
 toolchain:
   name: R
   version: 4.5.1
