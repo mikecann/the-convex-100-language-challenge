@@ -1,4 +1,5 @@
 #import "ConvexClient.h"
+#include "ConvexClientInternal.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -7,6 +8,7 @@
 #include <openssl/sha.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +19,11 @@
 #include <unistd.h>
 
 void convex_test_fail_duplicate_after(int successful_calls);
+size_t convex_test_queued_bytes(convex_client *client);
+size_t convex_test_queue_budget(void);
+int convex_test_enqueue_payload(convex_subscription *subscription,
+                                size_t payload_size);
+static long long test_monotonic_ms(void);
 
 typedef struct {
   pthread_mutex_t mutex;
@@ -34,6 +41,7 @@ typedef struct {
   int desired_failure;
   int desired_malformed;
   int desired_fragment;
+  size_t desired_blob_size;
   int failed;
   char failure[256];
 } fixture;
@@ -113,10 +121,14 @@ static size_t frame_header(unsigned char header[10], int opcode, int final,
   header[h++] = (unsigned char)((final ? 128 : 0) | opcode);
   if (length < 126)
     header[h++] = (unsigned char)length;
-  else {
+  else if (length <= UINT16_MAX) {
     header[h++] = 126;
     header[h++] = (unsigned char)(length >> 8);
     header[h++] = (unsigned char)length;
+  } else {
+    header[h++] = 127;
+    for (int shift = 56; shift >= 0; shift -= 8)
+      header[h++] = (unsigned char)((uint64_t)length >> shift);
   }
   return h;
 }
@@ -230,6 +242,33 @@ static int accept_request(int fd) {
         remaining -= amount;
       }
       return 2;
+    }
+    if (strstr(body, "\"path\":\"demo:large\"")) {
+      const size_t blob_length = 1400000;
+      static const char prefix[] =
+          "{\"status\":\"success\",\"value\":{\"blob\":\"";
+      static const char suffix[] = "\"},\"logLines\":[]}";
+      size_t payload_length =
+          sizeof(prefix) - 1 + blob_length + sizeof(suffix) - 1;
+      char header[256];
+      int header_length = snprintf(header, sizeof(header),
+                                   "HTTP/1.1 200 OK\r\nContent-Type: "
+                                   "application/json\r\nContent-Length: "
+                                   "%zu\r\nConnection: close\r\n\r\n",
+                                   payload_length);
+      if (!send_all(fd, header, (size_t)header_length) ||
+          !send_all(fd, prefix, sizeof(prefix) - 1))
+        return 0;
+      char chunk[16384];
+      memset(chunk, 'x', sizeof(chunk));
+      size_t remaining = blob_length;
+      while (remaining) {
+        size_t amount = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
+        if (!send_all(fd, chunk, amount))
+          return 0;
+        remaining -= amount;
+      }
+      return send_all(fd, suffix, sizeof(suffix) - 1) ? 2 : 0;
     }
     const char *payload;
     if (strstr(body, "\"path\":\"demo:null\""))
@@ -352,6 +391,51 @@ static void stalled_fixture_stop(stalled_fixture *server) {
   pthread_cond_destroy(&server->changed);
 }
 
+static void *stalled_handshake_thread(void *opaque) {
+  stalled_fixture *server = opaque;
+  int fd = accept(server->listener, NULL, NULL);
+  if (fd < 0)
+    return NULL;
+  char request[4096] = {0};
+  size_t used = 0;
+  while (used + 1 < sizeof(request) && !strstr(request, "\r\n\r\n")) {
+    ssize_t got = recv(fd, request + used, sizeof(request) - used - 1, 0);
+    if (got <= 0)
+      break;
+    used += (size_t)got;
+    request[used] = 0;
+  }
+  pthread_mutex_lock(&server->mutex);
+  server->ready = strstr(request, "Upgrade: websocket") != NULL ||
+                  strstr(request, "Upgrade: WebSocket") != NULL;
+  server->failed = !server->ready;
+  pthread_cond_broadcast(&server->changed);
+  while (!server->stop)
+    pthread_cond_wait(&server->changed, &server->mutex);
+  pthread_mutex_unlock(&server->mutex);
+  close(fd);
+  return NULL;
+}
+
+static void stalled_handshake_start(stalled_fixture *server) {
+  memset(server, 0, sizeof(*server));
+  pthread_mutex_init(&server->mutex, NULL);
+  pthread_cond_init(&server->changed, NULL);
+  server->listener = socket(AF_INET, SOCK_STREAM, 0);
+  int yes = 1;
+  setsockopt(server->listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  struct sockaddr_in address = {.sin_family = AF_INET,
+                                .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+                                .sin_port = 0};
+  check(!bind(server->listener, (struct sockaddr *)&address, sizeof(address)) &&
+            !listen(server->listener, 1),
+        "stalled handshake fixture listen");
+  socklen_t size = sizeof(address);
+  getsockname(server->listener, (struct sockaddr *)&address, &size);
+  server->port = ntohs(address.sin_port);
+  pthread_create(&server->thread, NULL, stalled_handshake_thread, server);
+}
+
 static void fixture_fail(fixture *server, const char *message) {
   pthread_mutex_lock(&server->mutex);
   server->failed = 1;
@@ -370,7 +454,8 @@ static int integer_field(json_object *object, const char *name, int *value) {
 
 static int send_transition(int fd, int query_id, int start_query_set,
                            int end_query_set, const char *start_ts, int serial,
-                           int count, int failure, int fragmented) {
+                           int count, int failure, int fragmented,
+                           size_t blob_size) {
   char end_ts[64];
   snprintf(end_ts, sizeof(end_ts), "%010d=", serial);
   json_object *root = json_object_new_object(),
@@ -404,6 +489,17 @@ static int send_transition(int fd, int query_id, int start_query_set,
                            json_object_new_double((double)count));
     json_object_object_add(value, "text",
                            json_object_new_string("Hello, 世界 👋"));
+    if (blob_size) {
+      char *blob = malloc(blob_size);
+      if (!blob) {
+        json_object_put(root);
+        return 0;
+      }
+      memset(blob, 'x', blob_size);
+      json_object_object_add(value, "blob",
+                             json_object_new_string_len(blob, (int)blob_size));
+      free(blob);
+    }
     json_object_object_add(mod, "value", value);
   }
   json_object_array_add(mods, mod);
@@ -572,11 +668,12 @@ static void *fixture_thread(void *opaque) {
     pthread_mutex_lock(&server->mutex);
     int generation = server->generation, count = server->desired_count,
         failure = server->desired_failure, fragment = server->desired_fragment;
+    size_t blob_size = server->desired_blob_size;
     server->sent_generation = generation;
     pthread_cond_broadcast(&server->changed);
     pthread_mutex_unlock(&server->mutex);
     if (!send_transition(fd, query_id, 0, query_set, "AAAAAAAAAAA=", serial,
-                         count, failure, fragment)) {
+                         count, failure, fragment, blob_size)) {
       close(fd);
       continue;
     }
@@ -587,6 +684,7 @@ static void *fixture_thread(void *opaque) {
       count = server->desired_count;
       failure = server->desired_failure;
       fragment = server->desired_fragment;
+      blob_size = server->desired_blob_size;
       pthread_mutex_unlock(&server->mutex);
       if (stop)
         break;
@@ -608,7 +706,7 @@ static void *fixture_thread(void *opaque) {
         } else {
           serial++;
           if (!send_transition(fd, query_id, query_set, query_set, current_ts,
-                               serial, count, failure, fragment))
+                               serial, count, failure, fragment, blob_size))
             break;
           snprintf(current_ts, sizeof(current_ts), "%010d=", serial);
         }
@@ -649,8 +747,8 @@ static void *fixture_thread(void *opaque) {
             int next_query_set = json_object_get_int(new_version);
             serial++;
             if (!send_transition(fd, query_id, query_set, next_query_set,
-                                 current_ts, serial, count, failure,
-                                 fragment)) {
+                                 current_ts, serial, count, failure, fragment,
+                                 blob_size)) {
               json_object_put(message);
               break;
             }
@@ -703,6 +801,7 @@ static void fixture_change(fixture *server, int count, int failure,
   server->desired_failure = failure;
   server->desired_malformed = malformed;
   server->desired_fragment = fragmented;
+  server->desired_blob_size = 0;
   int generation = ++server->generation;
   while (server->sent_generation < generation && !server->failed)
     pthread_cond_wait(&server->changed, &server->mutex);
@@ -715,6 +814,7 @@ static void fixture_configure(fixture *server, int count, int failure,
   server->desired_failure = failure;
   server->desired_malformed = malformed;
   server->desired_fragment = fragmented;
+  server->desired_blob_size = 0;
   server->generation++;
   pthread_mutex_unlock(&server->mutex);
 }
@@ -884,6 +984,76 @@ static void require_no_adapter_event(adapter_process *process) {
   check(poll(&descriptor, 1, 100) == 0, "stale adapter subscription event");
 }
 
+static void wait_child_bounded(pid_t pid, const char *message) {
+  long long deadline = test_monotonic_ms() + 2500;
+  int status = 0;
+  while (test_monotonic_ms() < deadline) {
+    pid_t result = waitpid(pid, &status, WNOHANG);
+    if (result == pid) {
+      check(WIFEXITED(status) && WEXITSTATUS(status) == 0, message);
+      return;
+    }
+    struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
+    nanosleep(&pause, NULL);
+  }
+  kill(pid, SIGKILL);
+  waitpid(pid, &status, 0);
+  check(0, message);
+}
+
+static const char stopped_reader_commands[] =
+    "{\"id\":\"large\",\"op\":\"query\",\"path\":\"demo:large\",\"args\":{}}\n"
+    "{\"id\":\"close\",\"op\":\"close\"}\n";
+
+static void test_stdin_stopped_reader(const char *url) {
+  adapter_process adapter = start_adapter(url);
+  check(fwrite(stopped_reader_commands, 1, sizeof(stopped_reader_commands) - 1,
+               adapter.input) == sizeof(stopped_reader_commands) - 1 &&
+            !fflush(adapter.input),
+        "stdin stopped-reader commands");
+  fclose(adapter.input);
+  wait_child_bounded(adapter.pid,
+                     "stdin adapter exits under stopped-reader backpressure");
+  fclose(adapter.output);
+}
+
+static void test_tcp_stopped_reader(const char *url) {
+  int port = 20000 + (int)(getpid() % 20000);
+  pid_t pid = fork();
+  check(pid >= 0, "fork TCP stopped-reader adapter");
+  if (pid == 0) {
+    char address[64];
+    snprintf(address, sizeof(address), "127.0.0.1:%d", port);
+    setenv("CONVEX_URL", url, 1);
+    setenv("ADAPTER_LISTEN", address, 1);
+    execl("/out-adapter", "/out-adapter", (char *)NULL);
+    _exit(127);
+  }
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in address = {.sin_family = AF_INET,
+                                .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+                                .sin_port = htons((uint16_t)port)};
+  int connected = 0;
+  for (int attempt = 0; attempt < 100 && !connected; attempt++) {
+    connected = connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0;
+    if (!connected) {
+      struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
+      nanosleep(&pause, NULL);
+    }
+  }
+  check(connected, "TCP stopped-reader adapter listens");
+  int receive_buffer = 1024;
+  setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer,
+             sizeof(receive_buffer));
+  check(send_all(fd, stopped_reader_commands,
+                 sizeof(stopped_reader_commands) - 1),
+        "TCP stopped-reader commands");
+  shutdown(fd, SHUT_WR);
+  wait_child_bounded(pid,
+                     "TCP adapter exits under stopped-reader backpressure");
+  close(fd);
+}
+
 static void test_http_guards(const char *url) {
   convex_error error = {0};
   convex_result result = {0};
@@ -976,6 +1146,7 @@ static convex_subscription *
 start_stalled_send(stalled_fixture *server, convex_client **client,
                    json_object **args, int started_pipe[2], int timeout_pipe[2],
                    int watch_timeout) {
+  fprintf(stderr, "stalled frame: start peer\n");
   stalled_fixture_start(server);
   char url[128], value[32];
   snprintf(url, sizeof(url), "http://127.0.0.1:%d", server->port);
@@ -994,12 +1165,16 @@ start_stalled_send(stalled_fixture *server, convex_client **client,
   convex_error error = {0};
   *client = convex_new(url, "c-stalled-send", &error);
   check(*client != NULL, "stalled send client");
+  fprintf(stderr, "stalled frame: subscribe\n");
   *args = large_live_args();
   convex_subscription *sub =
       convex_subscribe(*client, "demo:state", *args, &error);
   check(sub != NULL, "stalled send subscription");
+  fprintf(stderr, "stalled frame: wait handshake\n");
   stalled_fixture_wait_ready(server);
+  fprintf(stderr, "stalled frame: wait large send\n");
   wait_for_signal(started_pipe[0], 3000, "large WebSocket send started");
+  fprintf(stderr, "stalled frame: large send active\n");
   return sub;
 }
 
@@ -1026,12 +1201,14 @@ static void test_stalled_peer_deadlines(void) {
   int started[2], timed_out[2];
   convex_error error = {0};
 
+  fprintf(stderr, "stalled frame: natural timeout case\n");
   start_stalled_send(&server, &client, &args, started, timed_out, 1);
   wait_for_signal(timed_out[0], 2000, "stalled WebSocket send deadline");
   check(convex_close(client, 2000, &error),
         "client closes after stalled send deadline");
   finish_stalled_send(&server, client, args, started, timed_out);
 
+  fprintf(stderr, "stalled frame: unsubscribe case\n");
   convex_subscription *sub =
       start_stalled_send(&server, &client, &args, started, timed_out, 0);
   long long before = test_monotonic_ms();
@@ -1043,6 +1220,7 @@ static void test_stalled_peer_deadlines(void) {
         "client closes after stalled unsubscribe");
   finish_stalled_send(&server, client, args, started, timed_out);
 
+  fprintf(stderr, "stalled frame: close case\n");
   start_stalled_send(&server, &client, &args, started, timed_out, 0);
   before = test_monotonic_ms();
   check(convex_close(client, 2000, &error),
@@ -1050,6 +1228,29 @@ static void test_stalled_peer_deadlines(void) {
   check(test_monotonic_ms() - before < 1500,
         "stalled close respects its deadline");
   finish_stalled_send(&server, client, args, started, timed_out);
+}
+
+static void test_stalled_handshake_deadline(void) {
+  stalled_fixture server;
+  stalled_handshake_start(&server);
+  char url[128];
+  snprintf(url, sizeof(url), "http://127.0.0.1:%d", server.port);
+  convex_error error = {0};
+  convex_client *client =
+      convex_new(url, "objective-c-stalled-handshake", &error);
+  json_object *args = json_object_new_object();
+  convex_subscription *subscription =
+      convex_subscribe(client, "demo:state", args, &error);
+  check(subscription != NULL, "stalled handshake subscription starts");
+  stalled_fixture_wait_ready(&server);
+  long long before = test_monotonic_ms();
+  check(convex_close(client, 2000, &error),
+        "close completes during stalled WebSocket handshake");
+  check(test_monotonic_ms() - before < 1500,
+        "stalled WebSocket handshake close respects its deadline");
+  convex_free(client);
+  json_object_put(args);
+  stalled_fixture_stop(&server);
 }
 
 static void expect_no_update(convex_subscription *sub, int timeout_ms,
@@ -1102,6 +1303,31 @@ static void test_snapshot_add_race(fixture *server, const char *url) {
   close(ready[1]);
   close(resume[0]);
   close(resume[1]);
+}
+
+static void test_aggregate_queue_budget(fixture *server, const char *url) {
+  pthread_mutex_lock(&server->mutex);
+  server->connection_base = server->connections;
+  pthread_mutex_unlock(&server->mutex);
+  convex_error error = {0};
+  convex_client *client = convex_new(url, "objective-c-byte-budget", &error);
+  json_object *args = json_object_new_object();
+  convex_subscription *subscriptions[4];
+  for (int n = 0; n < 4; n++) {
+    subscriptions[n] = convex_subscribe(client, "demo:state", args, &error);
+    check(subscriptions[n] != NULL, "byte-budget subscription");
+  }
+  for (int round = 0; round < 16; round++)
+    for (int n = 0; n < 4; n++)
+      check(convex_test_enqueue_payload(subscriptions[n], 1400000),
+            "near-maximum queue payload");
+  size_t queued = convex_test_queued_bytes(client);
+  check(queued <= convex_test_queue_budget(),
+        "aggregate queue remains within encoded-byte budget");
+  check(queued > 0, "aggregate queue retains bounded newest payloads");
+  check(convex_close(client, 3000, &error), "byte-budget client closes");
+  convex_free(client);
+  json_object_put(args);
 }
 
 static void test_adapter_events(fixture *server, const char *url) {
@@ -1268,7 +1494,55 @@ static void test_adapter_relay_races(fixture *server, const char *url) {
   check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "race adapter exit");
 }
 
+static void test_objective_c_api(fixture *server, const char *url) {
+  pthread_mutex_lock(&server->mutex);
+  server->connection_base = server->connections;
+  int remove_base = server->remove_seen;
+  pthread_mutex_unlock(&server->mutex);
+  fixture_configure(server, 80, 0, 0, 0);
+
+  NSError *error = nil;
+  CVXClient *client = [[CVXClient alloc]
+      initWithDeploymentURL:[NSURL URLWithString:[NSString
+                                                     stringWithUTF8String:url]]
+              clientVersion:@"objective-c-foundation-fixture"
+                      error:&error];
+  check(client != nil && error == nil, "Foundation client construction");
+  CVXResult *result = [client query:@"demo:echo" args:@{} error:&error];
+  check(result != nil && [[[result.value objectForKey:@"nested"]
+                             objectForKey:@"nil"] isEqual:[NSNull null]],
+        "Foundation HTTP value decoding");
+
+  CVXSubscription *subscription =
+      [client subscribe:@"demo:state"
+                   args:@{@"room" : @"foundation-fixture"}
+                  error:&error];
+  check(subscription != nil, "Foundation Live subscription");
+  CVXLiveUpdate *update =
+      [subscription nextUpdateWithTimeoutMilliseconds:3000 error:&error];
+  check(update != nil && update.error == nil &&
+            [[[update value] objectForKey:@"count"] intValue] == 80,
+        "Foundation Live value decoding");
+  check([subscription unsubscribe:&error], "Foundation unsubscribe");
+  wait_removes(server, remove_base + 1);
+  pthread_mutex_lock(&server->mutex);
+  int remove_seen = server->remove_seen;
+  pthread_mutex_unlock(&server->mutex);
+  check(remove_seen == remove_base + 1,
+        "Foundation unsubscribe sends exactly one Remove");
+  check([client closeWithTimeoutMilliseconds:3000 error:&error],
+        "Foundation close");
+  [client release];
+
+  pthread_mutex_lock(&server->mutex);
+  server->connection_base = server->connections;
+  pthread_mutex_unlock(&server->mutex);
+  fixture_configure(server, 0, 0, 0, 0);
+}
+
 int main(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  fprintf(stderr, "fixture: start\n");
   fixture server;
   fixture_start(&server);
   char url[128];
@@ -1277,9 +1551,17 @@ int main(void) {
   convex_client *client = convex_new(url, "c-live-fixture", &error);
   json_object *args = json_object_new_object();
   json_object_object_add(args, "room", json_object_new_string("fixture"));
+  fprintf(stderr, "fixture: HTTP guards\n");
   test_http_guards(url);
+  fprintf(stderr, "fixture: owned strings\n");
   test_owned_string_failures(url);
+  fprintf(stderr, "fixture: stalled frames\n");
   test_stalled_peer_deadlines();
+  fprintf(stderr, "fixture: stalled handshake\n");
+  test_stalled_handshake_deadline();
+  fprintf(stderr, "fixture: Foundation API\n");
+  test_objective_c_api(&server, url);
+  fprintf(stderr, "fixture: Live state machine\n");
   convex_subscription *sub =
       convex_subscribe(client, "demo:state", args, &error);
   check(sub && update_count(sub, 0, 0), "initial Live update");
@@ -1298,12 +1580,15 @@ int main(void) {
     check(update_count(sub, n + 3, 0),
           "changed value is delivered after reconnect");
   }
+  pthread_mutex_lock(&server.mutex);
+  int remove_base = server.remove_seen;
+  pthread_mutex_unlock(&server.mutex);
   check(convex_unsubscribe(sub, &error), "unsubscribe");
-  wait_removes(&server, 1);
+  wait_removes(&server, remove_base + 1);
   pthread_mutex_lock(&server.mutex);
   int remove_seen = server.remove_seen;
   pthread_mutex_unlock(&server.mutex);
-  check(remove_seen == 1, "exactly one Remove");
+  check(remove_seen == remove_base + 1, "exactly one Remove");
   convex_subscription *removed = sub;
   fixture_configure(&server, 0, 1, 0, 0);
   sub = convex_subscribe(client, "demo:requiresNonzero", args, &error);
@@ -1348,10 +1633,20 @@ int main(void) {
   check(convex_close(client, 5000, &error), "blocked close completes");
   convex_free(client);
   json_object_put(args);
+  fprintf(stderr, "fixture: snapshot Add race\n");
   test_snapshot_add_race(&server, url);
+  fprintf(stderr, "fixture: aggregate queue budget\n");
+  test_aggregate_queue_budget(&server, url);
+  fprintf(stderr, "fixture: adapter events\n");
   test_adapter_events(&server, url);
+  fprintf(stderr, "fixture: relay barriers\n");
   test_adapter_relay_races(&server, url);
+  fprintf(stderr, "fixture: stopped stdin reader\n");
+  test_stdin_stopped_reader(url);
+  fprintf(stderr, "fixture: stopped TCP reader\n");
+  test_tcp_stopped_reader(url);
   fixture_stop(&server);
   puts("PASS native Objective-C Live and adapter fixtures");
+  [pool drain];
   return 0;
 }

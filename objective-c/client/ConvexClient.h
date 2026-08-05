@@ -1,49 +1,64 @@
-#ifndef CONVEX_H
-#define CONVEX_H
+#import <Foundation/Foundation.h>
 
-#include <json-c/json.h>
-#include <stddef.h>
+NS_ASSUME_NONNULL_BEGIN
 
-/* A deliberately small, native Objective-C client for Convex's documented
- * HTTP API and its pinned Live profile. */
-typedef struct convex_client convex_client;
-typedef struct convex_subscription convex_subscription;
-typedef struct {
-  json_object *value;
-  json_object *logs;
-} convex_result;
-typedef struct {
-  char *name;
-  char *message;
-  json_object *data;
-  json_object *logs;
-} convex_error;
-typedef struct {
-  json_object *value;
-  json_object *logs;
-  convex_error error;
-} convex_update;
+FOUNDATION_EXPORT NSString *const CVXErrorDomain;
 
-convex_client *convex_new(const char *deployment_url,
-                          const char *client_version, convex_error *error);
-void convex_free(convex_client *client);
-int convex_set_auth(convex_client *client, const char *token,
-                    convex_error *error);
-int convex_call(convex_client *client, const char *operation, const char *path,
-                json_object *args, convex_result *result, convex_error *error);
-/* Live subscriptions run on one client-owned worker. The worker is the only
- * thread that touches libcurl's WebSocket handle. */
-convex_subscription *convex_subscribe(convex_client *client, const char *path,
-                                      json_object *args, convex_error *error);
-/* Returns 1 for an update, 0 for timeout, and -1 after close. Subscription
- * handles remain valid until convex_free(client), even after convex_close. */
-int convex_subscription_next(convex_subscription *subscription,
-                             convex_update *update, int timeout_ms);
-int convex_unsubscribe(convex_subscription *subscription, convex_error *error);
-int convex_debug_disconnect(convex_client *client, convex_error *error);
-int convex_close(convex_client *client, int timeout_ms, convex_error *error);
-void convex_update_free(convex_update *update);
-void convex_result_free(convex_result *result);
-void convex_error_free(convex_error *error);
+@interface CVXResult : NSObject {
+@private
+  id _value;
+  NSArray *_logs;
+}
+@property(nonatomic, retain) id value;
+@property(nonatomic, retain) NSArray *logs;
+@end
 
-#endif
+@interface CVXLiveUpdate : NSObject {
+@private
+  id _value;
+  NSArray *_logs;
+  NSError *_error;
+}
+@property(nonatomic, retain, nullable) id value;
+@property(nonatomic, retain) NSArray *logs;
+@property(nonatomic, retain, nullable) NSError *error;
+@end
+
+@class CVXClient;
+
+@interface CVXSubscription : NSObject {
+@private
+  void *_core;
+  CVXClient *_owner;
+}
+- (nullable CVXLiveUpdate *)nextUpdateWithTimeoutMilliseconds:(NSInteger)timeout
+                                                        error:(NSError **)error;
+- (BOOL)unsubscribe:(NSError **)error;
+@end
+
+@interface CVXClient : NSObject {
+@private
+  void *_core;
+}
+- (nullable instancetype)initWithDeploymentURL:(NSURL *)deploymentURL
+                                 clientVersion:(NSString *)clientVersion
+                                         error:(NSError **)error
+    NS_DESIGNATED_INITIALIZER;
+- (nullable instancetype)init NS_UNAVAILABLE;
+- (BOOL)setAuthToken:(nullable NSString *)token error:(NSError **)error;
+- (nullable CVXResult *)query:(NSString *)path
+                         args:(NSDictionary *)args
+                        error:(NSError **)error;
+- (nullable CVXResult *)mutation:(NSString *)path
+                            args:(NSDictionary *)args
+                           error:(NSError **)error;
+- (nullable CVXResult *)action:(NSString *)path
+                          args:(NSDictionary *)args
+                         error:(NSError **)error;
+- (nullable CVXSubscription *)subscribe:(NSString *)path
+                                   args:(NSDictionary *)args
+                                  error:(NSError **)error;
+- (BOOL)closeWithTimeoutMilliseconds:(NSInteger)timeout error:(NSError **)error;
+@end
+
+NS_ASSUME_NONNULL_END

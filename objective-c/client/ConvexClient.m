@@ -1,4 +1,5 @@
 #import "ConvexClient.h"
+#include "ConvexClientInternal.h"
 #include <curl/curl.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -33,7 +34,10 @@ struct ws_receive_state {
 #define HTTP_MAX_RESPONSE 2097152
 #define LIVE_MAX_MESSAGE 2097152
 #define LIVE_SEND_TIMEOUT_MS 500
+#define LIVE_HANDSHAKE_TIMEOUT_MS 750
+#define LIVE_QUEUE_TOTAL_BUDGET (8 * 1024 * 1024)
 #define LIVE_INITIAL_TS "AAAAAAAAAAA="
+#define SYSTEM_CA_BUNDLE "/etc/ssl/certs/ca-certificates.crt"
 
 struct convex_subscription {
   live_manager *manager;
@@ -49,6 +53,8 @@ struct convex_subscription {
   uint64_t add_sequence;
   json_object *last_value;
   convex_update queue[LIVE_QUEUE_CAPACITY];
+  size_t queue_bytes[LIVE_QUEUE_CAPACITY];
+  uint64_t queue_sequences[LIVE_QUEUE_CAPACITY];
   size_t queue_start;
   size_t queue_count;
   struct convex_subscription *next;
@@ -69,6 +75,8 @@ struct live_manager {
   char remote_ts[128];
   char max_observed_ts[128];
   uint32_t connection_count;
+  size_t queued_bytes;
+  uint64_t next_queue_sequence;
   char last_close_reason[256];
   int closing;
   int stopped;
@@ -81,6 +89,8 @@ struct live_manager {
 };
 
 static void destroy_live(live_manager *manager);
+static void enqueue_update_locked(convex_subscription *subscription,
+                                  const convex_update *source);
 
 #ifdef CONVEX_CLIENT_TESTING
 static pthread_mutex_t duplicate_test_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -90,6 +100,40 @@ void convex_test_fail_duplicate_after(int successful_calls) {
   pthread_mutex_lock(&duplicate_test_mutex);
   duplicate_fail_after = successful_calls;
   pthread_mutex_unlock(&duplicate_test_mutex);
+}
+
+size_t convex_test_queued_bytes(convex_client *client) {
+  if (!client || !client->live)
+    return 0;
+  live_manager *manager = client->live;
+  pthread_mutex_lock(&manager->mutex);
+  size_t bytes = manager->queued_bytes;
+  pthread_mutex_unlock(&manager->mutex);
+  return bytes;
+}
+
+size_t convex_test_queue_budget(void) { return LIVE_QUEUE_TOTAL_BUDGET; }
+
+int convex_test_enqueue_payload(convex_subscription *subscription,
+                                size_t payload_size) {
+  if (!subscription || payload_size > LIVE_MAX_MESSAGE)
+    return 0;
+  char *payload = malloc(payload_size);
+  if (!payload)
+    return 0;
+  memset(payload, 'q', payload_size);
+  convex_update update = {0};
+  update.value = json_object_new_object();
+  json_object_object_add(
+      update.value, "blob",
+      json_object_new_string_len(payload, (int)payload_size));
+  free(payload);
+  live_manager *manager = subscription->manager;
+  pthread_mutex_lock(&manager->mutex);
+  enqueue_update_locked(subscription, &update);
+  pthread_mutex_unlock(&manager->mutex);
+  json_object_put(update.value);
+  return 1;
 }
 
 static int should_fail_duplicate(void) {
@@ -190,7 +234,7 @@ convex_client *convex_new(const char *url, const char *version,
   }
   while (strlen(c->url) > 0 && c->url[strlen(c->url) - 1] == '/')
     c->url[strlen(c->url) - 1] = 0;
-  c->version = duplicate(version ? version : "objective-c-0.1.0");
+  c->version = duplicate(version ? version : "objective-c-0.2.0");
   if (!c->version) {
     free(c->url);
     free(c);
@@ -288,6 +332,7 @@ int convex_call(convex_client *c, const char *operation, const char *path,
     headers = with_auth;
   }
   curl_easy_setopt(curl, CURLOPT_URL, endpoint);
+  curl_easy_setopt(curl, CURLOPT_CAINFO, SYSTEM_CA_BUNDLE);
   curl_easy_setopt(curl, CURLOPT_POST, 1L);
   curl_easy_setopt(
       curl, CURLOPT_POSTFIELDS,
@@ -381,9 +426,52 @@ void convex_update_free(convex_update *update) {
 
 static void enqueue_update_locked(convex_subscription *sub,
                                   const convex_update *source) {
+  live_manager *manager = sub->manager;
+  size_t encoded = 128;
+  if (source->value)
+    encoded += strlen(
+        json_object_to_json_string_ext(source->value, JSON_C_TO_STRING_PLAIN));
+  if (source->logs)
+    encoded += strlen(
+        json_object_to_json_string_ext(source->logs, JSON_C_TO_STRING_PLAIN));
+  if (source->error.name)
+    encoded +=
+        strlen(source->error.name) +
+        strlen(source->error.message ? source->error.message : "") +
+        (source->error.data ? strlen(json_object_to_json_string_ext(
+                                  source->error.data, JSON_C_TO_STRING_PLAIN))
+                            : 0);
+  /* Account conservatively for both the retained json-c tree and the encoded
+   * adapter event that may exist at the same time. */
+  size_t cost = encoded > (SIZE_MAX - 4096) / 2 ? SIZE_MAX : encoded * 2 + 4096;
+
+  while (manager->queued_bytes > LIVE_QUEUE_TOTAL_BUDGET - cost) {
+    convex_subscription *oldest = NULL;
+    uint64_t oldest_sequence = UINT64_MAX;
+    for (convex_subscription *candidate = manager->subscriptions; candidate;
+         candidate = candidate->next) {
+      if (candidate->queue_count &&
+          candidate->queue_sequences[candidate->queue_start] <
+              oldest_sequence) {
+        oldest = candidate;
+        oldest_sequence = candidate->queue_sequences[candidate->queue_start];
+      }
+    }
+    if (!oldest)
+      return;
+    manager->queued_bytes -= oldest->queue_bytes[oldest->queue_start];
+    convex_update_free(&oldest->queue[oldest->queue_start]);
+    oldest->queue_bytes[oldest->queue_start] = 0;
+    oldest->queue_sequences[oldest->queue_start] = 0;
+    oldest->queue_start = (oldest->queue_start + 1) % LIVE_QUEUE_CAPACITY;
+    oldest->queue_count--;
+  }
   size_t index;
   if (sub->queue_count == LIVE_QUEUE_CAPACITY) {
+    manager->queued_bytes -= sub->queue_bytes[sub->queue_start];
     convex_update_free(&sub->queue[sub->queue_start]);
+    sub->queue_bytes[sub->queue_start] = 0;
+    sub->queue_sequences[sub->queue_start] = 0;
     sub->queue_start = (sub->queue_start + 1) % LIVE_QUEUE_CAPACITY;
     sub->queue_count--;
   }
@@ -394,6 +482,9 @@ static void enqueue_update_locked(convex_subscription *sub,
   sub->queue[index].logs = source->logs ? json_object_get(source->logs) : NULL;
   if (source->error.name)
     copy_error(&sub->queue[index].error, &source->error);
+  sub->queue_bytes[index] = cost;
+  sub->queue_sequences[index] = ++manager->next_queue_sequence;
+  manager->queued_bytes += cost;
   sub->queue_count++;
 }
 
@@ -591,6 +682,20 @@ static void disconnect_socket_locked(live_manager *manager,
       sub->rehydrating = 1;
 }
 
+static int handshake_progress(void *opaque, curl_off_t download_total,
+                              curl_off_t download_now, curl_off_t upload_total,
+                              curl_off_t upload_now) {
+  (void)download_total;
+  (void)download_now;
+  (void)upload_total;
+  (void)upload_now;
+  live_manager *manager = opaque;
+  pthread_mutex_lock(&manager->mutex);
+  int closing = manager->closing;
+  pthread_mutex_unlock(&manager->mutex);
+  return closing;
+}
+
 static int connect_socket(live_manager *manager, char *reason,
                           size_t reason_size) {
   size_t url_length = strlen(manager->client->url) + 16;
@@ -610,14 +715,31 @@ static int connect_socket(live_manager *manager, char *reason,
            manager->client->version);
   headers = curl_slist_append(headers, client_header);
   curl_easy_setopt(socket, CURLOPT_URL, url);
+  curl_easy_setopt(socket, CURLOPT_CAINFO, SYSTEM_CA_BUNDLE);
   curl_easy_setopt(socket, CURLOPT_HTTPHEADER, headers);
   curl_easy_setopt(socket, CURLOPT_CONNECT_ONLY, 2L);
-  curl_easy_setopt(socket, CURLOPT_TIMEOUT, 10L);
+  curl_easy_setopt(socket, CURLOPT_CONNECTTIMEOUT_MS, 500L);
+  curl_easy_setopt(socket, CURLOPT_TIMEOUT_MS, (long)LIVE_HANDSHAKE_TIMEOUT_MS);
+  curl_easy_setopt(socket, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(socket, CURLOPT_XFERINFOFUNCTION, handshake_progress);
+  curl_easy_setopt(socket, CURLOPT_XFERINFODATA, manager);
   CURLcode code = curl_easy_perform(socket);
   curl_slist_free_all(headers);
   free(url);
   if (code != CURLE_OK) {
     snprintf(reason, reason_size, "live dial: %s", curl_easy_strerror(code));
+    curl_easy_cleanup(socket);
+    return 0;
+  }
+  curl_socket_t active_socket = CURL_SOCKET_BAD;
+  int socket_flags = -1;
+  if (curl_easy_getinfo(socket, CURLINFO_ACTIVESOCKET, &active_socket) !=
+          CURLE_OK ||
+      active_socket == CURL_SOCKET_BAD ||
+      (socket_flags = fcntl(active_socket, F_GETFL, 0)) < 0 ||
+      fcntl(active_socket, F_SETFL, socket_flags | O_NONBLOCK) < 0) {
+    snprintf(reason, reason_size,
+             "live dial: could not make socket nonblocking");
     curl_easy_cleanup(socket);
     return 0;
   }
@@ -860,7 +982,11 @@ static int receive_message(live_manager *manager,
                            size_t reason_size) {
   char chunk[16384];
   size_t received = 0;
+#if LIBCURL_VERSION_NUM < 0x080000
+  struct curl_ws_frame *meta = NULL;
+#else
   const struct curl_ws_frame *meta = NULL;
+#endif
   CURLcode code =
       curl_ws_recv(manager->socket, chunk, sizeof(chunk), &received, &meta);
   if (code == CURLE_AGAIN)
@@ -1178,7 +1304,10 @@ int convex_subscription_next(convex_subscription *sub, convex_update *update,
     return -1;
   }
   *update = sub->queue[sub->queue_start];
+  manager->queued_bytes -= sub->queue_bytes[sub->queue_start];
   memset(&sub->queue[sub->queue_start], 0, sizeof(*update));
+  sub->queue_bytes[sub->queue_start] = 0;
+  sub->queue_sequences[sub->queue_start] = 0;
   sub->queue_start = (sub->queue_start + 1) % LIVE_QUEUE_CAPACITY;
   sub->queue_count--;
   pthread_mutex_unlock(&manager->mutex);
@@ -1266,9 +1395,13 @@ int convex_close(convex_client *client, int timeout_ms, convex_error *error) {
   pthread_mutex_lock(&manager->mutex);
   for (convex_subscription *sub = manager->subscriptions; sub;
        sub = sub->next) {
-    for (size_t n = 0; n < sub->queue_count; n++)
-      convex_update_free(
-          &sub->queue[(sub->queue_start + n) % LIVE_QUEUE_CAPACITY]);
+    for (size_t n = 0; n < sub->queue_count; n++) {
+      size_t index = (sub->queue_start + n) % LIVE_QUEUE_CAPACITY;
+      manager->queued_bytes -= sub->queue_bytes[index];
+      convex_update_free(&sub->queue[index]);
+      sub->queue_bytes[index] = 0;
+      sub->queue_sequences[index] = 0;
+    }
     sub->queue_start = 0;
     sub->queue_count = 0;
   }
@@ -1297,3 +1430,250 @@ static void destroy_live(live_manager *manager) {
   pthread_cond_destroy(&manager->updates);
   free(manager);
 }
+
+NSString *const CVXErrorDomain =
+    @"dev.letsbuildit.100-convex-clients.objective-c";
+
+static id foundation_value(json_object *object) {
+  if (!object)
+    return [NSNull null];
+  const char *encoded =
+      json_object_to_json_string_ext(object, JSON_C_TO_STRING_PLAIN);
+  NSData *data = [NSData dataWithBytes:encoded length:strlen(encoded)];
+  NSError *error = nil;
+  id value = [NSJSONSerialization JSONObjectWithData:data
+                                             options:0
+                                               error:&error];
+  return value ? value : [NSNull null];
+}
+
+static json_object *json_value(id value, NSError **error) {
+  if (![NSJSONSerialization isValidJSONObject:value]) {
+    if (error)
+      *error = [NSError errorWithDomain:CVXErrorDomain
+                                   code:1
+                               userInfo:@{
+                                 NSLocalizedDescriptionKey :
+                                     @"Convex arguments must be a JSON object",
+                                 @"name" : @"ProtocolError"
+                               }];
+    return NULL;
+  }
+  NSData *data = [NSJSONSerialization dataWithJSONObject:value
+                                                 options:0
+                                                   error:error];
+  if (!data)
+    return NULL;
+  json_tokener *tokener = json_tokener_new();
+  if (!tokener)
+    return NULL;
+  json_object *object =
+      json_tokener_parse_ex(tokener, [data bytes], (int)[data length]);
+  json_tokener_free(tokener);
+  return object;
+}
+
+static NSError *foundation_error(convex_error *error) {
+  NSString *name =
+      error->name ? [NSString stringWithUTF8String:error->name] : @"Error";
+  NSString *message = error->message
+                          ? [NSString stringWithUTF8String:error->message]
+                          : @"unknown Convex error";
+  NSMutableDictionary *info = [NSMutableDictionary
+      dictionaryWithObjectsAndKeys:message, NSLocalizedDescriptionKey, name,
+                                   @"name", nil];
+  if (error->data)
+    [info setObject:foundation_value(error->data) forKey:@"data"];
+  if (error->logs)
+    [info setObject:foundation_value(error->logs) forKey:@"logs"];
+  return [NSError errorWithDomain:CVXErrorDomain code:2 userInfo:info];
+}
+
+@implementation CVXResult
+@synthesize value = _value;
+@synthesize logs = _logs;
+- (void)dealloc {
+  [_value release];
+  [_logs release];
+  [super dealloc];
+}
+@end
+
+@implementation CVXLiveUpdate
+@synthesize value = _value;
+@synthesize logs = _logs;
+@synthesize error = _error;
+- (void)dealloc {
+  [_value release];
+  [_logs release];
+  [_error release];
+  [super dealloc];
+}
+@end
+
+@interface CVXSubscription (Private)
+- (instancetype)initWithCore:(convex_subscription *)core
+                       owner:(CVXClient *)owner;
+@end
+
+@implementation CVXSubscription
+- (instancetype)initWithCore:(convex_subscription *)core
+                       owner:(CVXClient *)owner {
+  self = [super init];
+  if (self) {
+    _core = core;
+    _owner = [owner retain];
+  }
+  return self;
+}
+- (CVXLiveUpdate *)nextUpdateWithTimeoutMilliseconds:(NSInteger)timeout
+                                               error:(NSError **)error {
+  convex_update update = {0};
+  int result = convex_subscription_next((convex_subscription *)_core, &update,
+                                        (int)timeout);
+  if (result <= 0) {
+    if (result < 0 && error)
+      *error = [NSError
+          errorWithDomain:CVXErrorDomain
+                     code:3
+                 userInfo:@{
+                   NSLocalizedDescriptionKey : @"Live subscription is closed",
+                   @"name" : @"TransportError"
+                 }];
+    return nil;
+  }
+  CVXLiveUpdate *value = [[[CVXLiveUpdate alloc] init] autorelease];
+  value.logs = update.logs ? foundation_value(update.logs) : @[];
+  if (update.error.name)
+    value.error = foundation_error(&update.error);
+  else
+    value.value = foundation_value(update.value);
+  convex_update_free(&update);
+  return value;
+}
+- (BOOL)unsubscribe:(NSError **)error {
+  convex_error core_error = {0};
+  int okay = convex_unsubscribe((convex_subscription *)_core, &core_error);
+  if (!okay && error)
+    *error = foundation_error(&core_error);
+  convex_error_free(&core_error);
+  return okay;
+}
+- (void)dealloc {
+  [_owner release];
+  [super dealloc];
+}
+@end
+
+@implementation CVXClient
+- (instancetype)init {
+  return [self
+      initWithDeploymentURL:[NSURL URLWithString:@"http://invalid.invalid"]
+              clientVersion:@"objective-c-init-unavailable"
+                      error:NULL];
+}
+
+- (instancetype)initWithDeploymentURL:(NSURL *)deploymentURL
+                        clientVersion:(NSString *)clientVersion
+                                error:(NSError **)error {
+  self = [super init];
+  if (!self)
+    return nil;
+  convex_error core_error = {0};
+  _core = convex_new([[deploymentURL absoluteString] UTF8String],
+                     [clientVersion UTF8String], &core_error);
+  if (!_core) {
+    if (error)
+      *error = foundation_error(&core_error);
+    convex_error_free(&core_error);
+    [self release];
+    return nil;
+  }
+  return self;
+}
+- (BOOL)setAuthToken:(NSString *)token error:(NSError **)error {
+  convex_error core_error = {0};
+  int okay = convex_set_auth((convex_client *)_core,
+                             token ? [token UTF8String] : NULL, &core_error);
+  if (!okay && error)
+    *error = foundation_error(&core_error);
+  convex_error_free(&core_error);
+  return okay;
+}
+- (CVXResult *)call:(const char *)operation
+               path:(NSString *)path
+               args:(NSDictionary *)args
+              error:(NSError **)error {
+  json_object *arguments = json_value(args, error);
+  if (!arguments)
+    return nil;
+  convex_result result = {0};
+  convex_error core_error = {0};
+  int okay = convex_call((convex_client *)_core, operation, [path UTF8String],
+                         arguments, &result, &core_error);
+  json_object_put(arguments);
+  if (!okay) {
+    if (error)
+      *error = foundation_error(&core_error);
+    convex_error_free(&core_error);
+    return nil;
+  }
+  CVXResult *value = [[[CVXResult alloc] init] autorelease];
+  value.value = foundation_value(result.value);
+  value.logs = result.logs ? foundation_value(result.logs) : @[];
+  convex_result_free(&result);
+  return value;
+}
+- (CVXResult *)query:(NSString *)path
+                args:(NSDictionary *)args
+               error:(NSError **)error {
+  return [self call:"query" path:path args:args error:error];
+}
+- (CVXResult *)mutation:(NSString *)path
+                   args:(NSDictionary *)args
+                  error:(NSError **)error {
+  return [self call:"mutation" path:path args:args error:error];
+}
+- (CVXResult *)action:(NSString *)path
+                 args:(NSDictionary *)args
+                error:(NSError **)error {
+  return [self call:"action" path:path args:args error:error];
+}
+- (CVXSubscription *)subscribe:(NSString *)path
+                          args:(NSDictionary *)args
+                         error:(NSError **)error {
+  json_object *arguments = json_value(args, error);
+  if (!arguments)
+    return nil;
+  convex_error core_error = {0};
+  convex_subscription *subscription = convex_subscribe(
+      (convex_client *)_core, [path UTF8String], arguments, &core_error);
+  json_object_put(arguments);
+  if (!subscription) {
+    if (error)
+      *error = foundation_error(&core_error);
+    convex_error_free(&core_error);
+    return nil;
+  }
+  return [[[CVXSubscription alloc] initWithCore:subscription
+                                          owner:self] autorelease];
+}
+- (BOOL)closeWithTimeoutMilliseconds:(NSInteger)timeout
+                               error:(NSError **)error {
+  convex_error core_error = {0};
+  int okay = convex_close((convex_client *)_core, (int)timeout, &core_error);
+  if (!okay && error)
+    *error = foundation_error(&core_error);
+  convex_error_free(&core_error);
+  return okay;
+}
+- (void)dealloc {
+  if (_core) {
+    convex_error ignored = {0};
+    convex_close((convex_client *)_core, 2000, &ignored);
+    convex_error_free(&ignored);
+    convex_free((convex_client *)_core);
+  }
+  [super dealloc];
+}
+@end

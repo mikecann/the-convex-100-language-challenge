@@ -1,14 +1,59 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
-FROM --platform=linux/amd64 alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce AS build
-RUN apk add --no-cache build-base=0.5-r3 gcc-objc=14.2.0-r6 clang19=19.1.7-r6 clang19-extra-tools=19.1.7-r6 libobjc=14.2.0-r6 curl-dev=8.14.1-r3 json-c-dev=0.18-r1
+ARG DEBIAN_IMAGE=debian:12.11-slim@sha256:b1a741487078b369e78119849663d7f1a5341ef2768798f7b7406c4240f86aef
+
+FROM --platform=linux/amd64 ${DEBIAN_IMAGE} AS curl-build
+RUN apt-get update && apt-get install --yes --no-install-recommends \
+    build-essential=12.9 \
+    libssl-dev=3.0.20-1~deb12u2 \
+    pkg-config=1.8.1-1 && \
+    rm -rf /var/lib/apt/lists/*
+ADD --checksum=sha256:aa1b66a70eace83dc624508745646c08ae561de512ab403adffb93ac87fc72e6 \
+    https://curl.se/download/curl-8.21.0.tar.xz /tmp/curl.tar.xz
+RUN tar -xJf /tmp/curl.tar.xz -C /tmp && \
+    cd /tmp/curl-8.21.0 && \
+    ./configure --prefix=/opt/curl --disable-shared --enable-static \
+      --enable-websockets --with-openssl --without-zlib --without-libpsl \
+      --without-libidn2 --without-brotli --without-zstd --without-nghttp2 \
+      --without-nghttp3 --without-libssh2 --without-librtmp --disable-dict \
+      --disable-file --disable-ftp --disable-gopher --disable-imap \
+      --disable-ldap --disable-ldaps --disable-mqtt --disable-pop3 \
+      --disable-rtsp --disable-smb --disable-smtp --disable-telnet \
+      --disable-tftp --disable-manual && \
+    make -j2 && \
+    make install && \
+    /opt/curl/bin/curl-config --protocols | grep -Fx WS && \
+    /opt/curl/bin/curl-config --protocols | grep -Fx WSS
+
+FROM --platform=linux/amd64 ${DEBIAN_IMAGE} AS build
+RUN apt-get update && apt-get install --yes --no-install-recommends \
+    build-essential=12.9 \
+    clang-14=1:14.0.6-12 \
+    clang-format-14=1:14.0.6-12 \
+    gnustep-make=2.9.1-2 \
+    libgnustep-base-dev=1.28.1+really1.28.0-5 \
+    libobjc-12-dev=12.2.0-14+deb12u1 \
+    libjson-c-dev=0.16-2 \
+    libssl-dev=3.0.20-1~deb12u2 && \
+    rm -rf /var/lib/apt/lists/*
 WORKDIR /src
+COPY --from=curl-build /opt/curl /opt/curl
 COPY client ./client
 COPY examples ./examples
-RUN /usr/lib/llvm19/bin/clang-format --style=LLVM -i client/ConvexClient.m client/ConvexClient.h client/tests/conformance/main.m client/tests/live_test.m examples/basics/main.m && \
-    /usr/lib/llvm19/bin/clang -fobjc-runtime=gcc -I/usr/lib/gcc/x86_64-alpine-linux-musl/14.2.0/include -D_POSIX_C_SOURCE=200809L -std=c17 -Wall -Wextra -Werror -pthread -Iclient client/ConvexClient.m client/tests/conformance/main.m -lcurl -ljson-c -lobjc -o /out-adapter && \
-    /usr/lib/llvm19/bin/clang -fobjc-runtime=gcc -I/usr/lib/gcc/x86_64-alpine-linux-musl/14.2.0/include -DCONVEX_ADAPTER_TESTING -D_POSIX_C_SOURCE=200809L -std=c17 -Wall -Wextra -Werror -pthread -Iclient client/ConvexClient.m client/tests/conformance/main.m -lcurl -ljson-c -lobjc -o /out-adapter-test && \
-    /usr/lib/llvm19/bin/clang -fobjc-runtime=gcc -I/usr/lib/gcc/x86_64-alpine-linux-musl/14.2.0/include -D_POSIX_C_SOURCE=200809L -std=c17 -Wall -Wextra -Werror -pthread -Iclient client/ConvexClient.m examples/basics/main.m -lcurl -ljson-c -lobjc -o /out-example && \
-    /usr/lib/llvm19/bin/clang -fobjc-runtime=gcc -I/usr/lib/gcc/x86_64-alpine-linux-musl/14.2.0/include -DCONVEX_CLIENT_TESTING -D_POSIX_C_SOURCE=200809L -std=c17 -Wall -Wextra -Werror -pthread -Iclient client/ConvexClient.m client/tests/live_test.m -lcurl -ljson-c -lobjc -lcrypto -o /out-live-test && file /out-adapter | grep 'x86-64'
+RUN clang-format-14 --style=LLVM --dry-run --Werror \
+      client/ConvexClient.m client/ConvexClient.h client/ConvexClientInternal.h \
+      client/tests/conformance/main.m client/tests/live_test.m \
+      examples/basics/main.m && \
+    objc_flags="$(gnustep-config --objc-flags) -I/usr/lib/gcc/x86_64-linux-gnu/12/include" && \
+    base_libs="$(gnustep-config --base-libs)" && \
+    curl_libs="$(/opt/curl/bin/curl-config --static-libs)" && \
+    clang-14 $objc_flags -I/opt/curl/include -D_POSIX_C_SOURCE=200809L -std=gnu17 -Wall -Wextra -Werror -pthread -Iclient client/ConvexClient.m client/tests/conformance/main.m $curl_libs -ljson-c $base_libs -o /out-adapter && \
+    clang-14 $objc_flags -I/opt/curl/include -DCONVEX_ADAPTER_TESTING -D_POSIX_C_SOURCE=200809L -std=gnu17 -Wall -Wextra -Werror -pthread -Iclient client/ConvexClient.m client/tests/conformance/main.m $curl_libs -ljson-c $base_libs -o /out-adapter-test && \
+    clang-14 $objc_flags -I/opt/curl/include -D_POSIX_C_SOURCE=200809L -std=gnu17 -Wall -Wextra -Werror -pthread -Iclient client/ConvexClient.m examples/basics/main.m $curl_libs -ljson-c $base_libs -o /out-example && \
+    clang-14 $objc_flags -I/opt/curl/include -DCONVEX_CLIENT_TESTING -D_POSIX_C_SOURCE=200809L -std=gnu17 -Wall -Wextra -Werror -pthread -Iclient client/ConvexClient.m client/tests/live_test.m $curl_libs -ljson-c -lcrypto $base_libs -o /out-live-test && \
+    readelf -h /out-adapter | grep -q 'Advanced Micro Devices X86-64' && \
+    readelf -d /out-adapter | grep -q 'libgnustep-base' && \
+    nm -u /out-adapter | grep -q 'objc_msg'
+
 FROM build AS test
 RUN <<'EOF'
 set -eu
@@ -26,12 +71,35 @@ printf '%s\n' "$actual" | grep -Fx '{"type":"error","id":"unknown","error":{"nam
 printf '%s\n' "$actual" | grep -Fx '{"id":"close","type":"closed"}'
 EOF
 RUN /out-live-test
-FROM --platform=linux/amd64 alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce AS runtime-base
-RUN apk add --no-cache libcurl=8.14.1-r3 json-c=0.18-r1 libobjc=14.2.0-r6 ca-certificates=20260611-r0 && rm -f /sbin/apk
+
+FROM --platform=linux/amd64 ${DEBIAN_IMAGE} AS runtime-base
+RUN apt-get update && apt-get install --yes --no-install-recommends \
+    ca-certificates=20230311+deb12u1 \
+    libgnustep-base1.28=1.28.1+really1.28.0-5 \
+    libjson-c5=0.16-2 && \
+    rm -f /usr/bin/apt /usr/bin/apt-* /usr/bin/dpkg /usr/bin/dpkg-* \
+      /usr/bin/openssl \
+      /usr/bin/perl /usr/bin/perl[0-9]* /usr/bin/cpan* /usr/bin/corelist \
+      /usr/bin/instmodsh /usr/bin/json_pp /usr/bin/perlbug /usr/bin/perldoc \
+      /usr/bin/prove /usr/bin/ptar* /usr/bin/shasum /usr/bin/splain && \
+    rm -rf /etc/apt /etc/dpkg /var/lib/apt /var/cache/apt /var/log/apt \
+      /var/lib/dpkg /var/cache/debconf /usr/lib/apt /usr/lib/dpkg \
+      /usr/libexec/dpkg /usr/share/dpkg /usr/share/debconf \
+      /usr/lib/*/perl /usr/lib/perl /usr/lib/perl5 /usr/share/perl \
+      /usr/share/perl5 /usr/share/doc/apt /usr/share/doc/dpkg && \
+    rm -rf /tmp && ln -s /dev/shm /tmp && \
+    hash -r && \
+    test ! -e /bin/busybox && \
+    for required in sh id grep sed awk cat; do command -v "$required" >/dev/null; done && \
+    for forbidden in busybox wget nc netcat telnet ftp openssl apt apt-get apt-cache dpkg dpkg-query perl clang gcc make curl node npm npx python python3 pip pip3 convex; do \
+      if command -v "$forbidden" >/dev/null 2>&1; then exit 1; fi; \
+    done
 USER 65532:65532
+
 FROM runtime-base AS example-runtime
-COPY --from=build /out-example /usr/local/bin/convex-example
+COPY --from=build --chown=65532:65532 --chmod=0555 /out-example /usr/local/bin/convex-example
 ENTRYPOINT ["/usr/local/bin/convex-example"]
+
 FROM runtime-base AS runtime
-COPY --from=build /out-adapter /usr/local/bin/convex-adapter
+COPY --from=build --chown=65532:65532 --chmod=0555 /out-adapter /usr/local/bin/convex-adapter
 ENTRYPOINT ["/usr/local/bin/convex-adapter"]

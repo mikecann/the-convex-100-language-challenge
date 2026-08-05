@@ -19,103 +19,114 @@ This is educational and unofficial, not a production Convex SDK.
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.m -->
 ```text
 #import "ConvexClient.h"
-#include <curl/curl.h>
+#include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 
-/* Convex's JSON encoding can represent a whole count as 0 or 0.0. This check
- * accepts both without accidentally truncating a fractional value. */
-static int whole(json_object *value) {
-  return json_object_get_type(value) == json_type_int ||
-         (json_object_get_type(value) == json_type_double &&
-          json_object_get_double(value) ==
-              (double)json_object_get_int64(value));
+/* Convex JSON may represent a whole count as 0 or 0.0. NSNumber keeps both
+ * forms idiomatic while this check rejects fractions, infinities, and values
+ * outside the exact signed 64-bit range. */
+static BOOL wholeNumber(id value, long long *output) {
+  if (![value isKindOfClass:[NSNumber class]])
+    return NO;
+  double number = [(NSNumber *)value doubleValue];
+  if (!isfinite(number) || trunc(number) != number ||
+      number < (double)LLONG_MIN || number > (double)LLONG_MAX)
+    return NO;
+  *output = [(NSNumber *)value longLongValue];
+  return (double)*output == number;
 }
 
-static int count_of(json_object *value) {
-  json_object *count = NULL;
-  return json_object_object_get_ex(value, "count", &count) && whole(count)
-             ? json_object_get_int(count)
+static long long countOf(id value) {
+  if (![value isKindOfClass:[NSDictionary class]])
+    return -1;
+  long long count = -1;
+  return wholeNumber([(NSDictionary *)value objectForKey:@"count"], &count)
+             ? count
              : -1;
 }
 
-static void die(convex_client *client, convex_error *error,
-                const char *fallback) {
-  fprintf(stderr, "%s\n", error->message ? error->message : fallback);
-  convex_error_free(error);
-  convex_free(client);
+static void die(CVXClient *client, NSError *error, const char *fallback) {
+  NSString *message = error ? [error localizedDescription]
+                            : [NSString stringWithUTF8String:fallback];
+  fprintf(stderr, "%s\n", [message UTF8String]);
+  [client release];
   exit(1);
 }
 
 int main(int argc, char **argv) {
-  const char *url = getenv("CONVEX_URL");
-  const char *room = argc > 1 ? argv[1] : "objective-c-basic-example";
-  convex_error error = {0};
-  convex_result result = {0};
-  curl_global_init(CURL_GLOBAL_DEFAULT);
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  const char *deployment = getenv("CONVEX_URL");
+  NSString *room = argc > 1 ? [NSString stringWithUTF8String:argv[1]]
+                            : @"objective-c-basic-example";
+  NSError *error = nil;
 
-  /* Configure the deployment from the environment and create the client. */
-  convex_client *client = convex_new(url, "objective-c-0.1.0", &error);
+  /* Configure the deployment and let the Objective-C client own all HTTP and
+   * Live resources until its explicit release at the end of the journey. */
+  NSURL *url =
+      deployment
+          ? [NSURL URLWithString:[NSString stringWithUTF8String:deployment]]
+          : nil;
+  CVXClient *client =
+      [[CVXClient alloc] initWithDeploymentURL:url
+                                 clientVersion:@"objective-c-0.2.0"
+                                         error:&error];
   if (!client)
-    die(client, &error, "could not create client");
+    die(client, error, "could not create client");
 
-  /* Query the current counter over HTTP and decode its JSON object. */
-  json_object *query_args = json_object_new_object();
-  json_object_object_add(query_args, "room", json_object_new_string(room));
-  if (!convex_call(client, "query", "demo:state", query_args, &result,
-                   &error) ||
-      count_of(result.value) != 0)
-    die(client, &error, "unexpected initial query value");
+  /* Query the current counter over HTTP and decode its NSDictionary value. */
+  NSDictionary *queryArguments = @{@"room" : room};
+  CVXResult *query = [client query:@"demo:state"
+                              args:queryArguments
+                             error:&error];
+  if (!query || countOf(query.value) != 0)
+    die(client, error, "unexpected initial query value");
   printf("current count: 0\n");
-  convex_result_free(&result);
 
   /* Start Live before the mutation so no reactive update can be missed. */
-  convex_subscription *subscription =
-      convex_subscribe(client, "demo:state", query_args, &error);
-  convex_update update = {0};
-  if (!subscription)
-    die(client, &error, "could not subscribe");
-  if (convex_subscription_next(subscription, &update, 10000) != 1 ||
-      update.error.name || count_of(update.value) != 0)
-    die(client, &update.error, "unexpected initial Live value");
+  CVXSubscription *subscription = [client subscribe:@"demo:state"
+                                               args:queryArguments
+                                              error:&error];
+  CVXLiveUpdate *initial =
+      [subscription nextUpdateWithTimeoutMilliseconds:10000 error:&error];
+  if (!initial || initial.error || countOf(initial.value) != 0)
+    die(client, initial.error ? initial.error : error,
+        "unexpected initial Live value");
   printf("live initial count: 0\n");
-  convex_update_free(&update);
 
   /* The run ID makes the mutation safe to retry without incrementing twice. */
-  json_object *mutation_args = json_object_new_object();
-  json_object_object_add(mutation_args, "room", json_object_new_string(room));
-  json_object_object_add(mutation_args, "language",
-                         json_object_new_string("Objective-C"));
-  char run_id[1024];
-  snprintf(run_id, sizeof(run_id), "%s-once", room);
-  json_object_object_add(mutation_args, "runId",
-                         json_object_new_string(run_id));
-  if (!convex_call(client, "mutation", "demo:increment", mutation_args, &result,
-                   &error))
-    die(client, &error, "mutation failed");
-  json_object *applied = NULL, *state = NULL;
-  if (!json_object_object_get_ex(result.value, "applied", &applied) ||
-      !json_object_get_boolean(applied) ||
-      !json_object_object_get_ex(result.value, "state", &state) ||
-      count_of(state) != 1)
-    die(client, &error, "unexpected mutation result");
+  NSString *runID = [room stringByAppendingString:@"-once"];
+  NSDictionary *mutationArguments = @{
+    @"room" : room,
+    @"language" : @"Objective-C",
+    @"runId" : runID,
+  };
+  CVXResult *mutation = [client mutation:@"demo:increment"
+                                    args:mutationArguments
+                                   error:&error];
+  NSDictionary *mutationValue =
+      [mutation.value isKindOfClass:[NSDictionary class]] ? mutation.value
+                                                          : nil;
+  if (!mutation || ![[mutationValue objectForKey:@"applied"] boolValue] ||
+      countOf([mutationValue objectForKey:@"state"]) != 1)
+    die(client, error, "unexpected mutation result");
   printf("mutation applied: true\nmutation count: 1\n");
-  convex_result_free(&result);
 
   /* Decode the resulting Live update, then cleanly remove the subscription. */
-  if (convex_subscription_next(subscription, &update, 10000) != 1 ||
-      update.error.name || count_of(update.value) != 1)
-    die(client, &update.error, "unexpected updated Live value");
+  CVXLiveUpdate *updated =
+      [subscription nextUpdateWithTimeoutMilliseconds:10000 error:&error];
+  if (!updated || updated.error || countOf(updated.value) != 1)
+    die(client, updated.error ? updated.error : error,
+        "unexpected updated Live value");
   printf("live updated count: 1\n");
-  convex_update_free(&update);
-  if (!convex_unsubscribe(subscription, &error))
-    die(client, &error, "unsubscribe failed");
+  if (![subscription unsubscribe:&error])
+    die(client, error, "unsubscribe failed");
 
   /* Print verification only after HTTP and Live agree on the 0 -> 1 journey. */
   printf("verified count: 0 -> 1\n");
-  json_object_put(query_args);
-  json_object_put(mutation_args);
-  convex_free(client);
+  [client release];
+  [pool drain];
   return 0;
 }
 ```
@@ -127,6 +138,12 @@ int main(int argc, char **argv) {
 
 ## Protocol notes
 
-The adapter speaks NDJSON protocol v1 on stdin/stdout or a single `ADAPTER_LISTEN` TCP connection. The native Objective-C translation unit intentionally keeps explicit, direct client ownership so the teaching example stays transparent. `libcurl` supplies HTTP, TLS, and WebSocket transport, `json-c` supplies JSON, and Convex protocol state remains in this implementation. One worker alone owns the socket, query-set changes, and reconnects. It resubscribes active queries after reconnect, suppresses unchanged hydration, reports structured function/protocol/transport errors, and uses bounded newest-16 per-subscription queues. The queue also rejects encoded Live messages above 2 MiB.
+The public API is made of real Objective-C classes and Foundation values: `CVXClient`, `CVXSubscription`, `NSDictionary`, `NSArray`, and `NSError`. It runs on GNUstep Base and libobjc on Linux. The canonical example and a deterministic local fixture both exercise that API. A private C boundary exists only so the black-box adapter can inspect exact protocol events without exposing json-c types to application code.
 
-Live authentication, optimistic updates, tagged Convex values, WebSocket mutations/actions, and `TransitionChunk` assembly are intentionally deferred. The sync endpoint is an undocumented pinned profile and may drift.
+The adapter speaks NDJSON protocol v1 on stdin/stdout or a single `ADAPTER_LISTEN` TCP connection. Checksum-pinned libcurl 8.21.0 supplies HTTP, TLS, and WebSocket transport, while json-c 0.16 supplies the internal JSON parser. Convex-specific protocol and ownership logic remains here. One worker alone owns the socket, query-set changes, and reconnects. It resubscribes active queries after reconnect, suppresses unchanged hydration, resets backoff after a healthy connection, and reports structured function, protocol, and transport errors without stranding valid subscriptions.
+
+The final images keep the root filesystem read-only. Their `/tmp` points at Docker's bounded `/dev/shm` runtime tmpfs because GNUstep startup under amd64 emulation needs temporary lock storage; neither client writes persistent application state there.
+
+Live delivery keeps the newest 16 updates per subscription and also enforces a conservative shared 8 MiB encoded-byte budget. The adapter caps active subscriptions at 16. Controller output has one owner and a 500 ms write deadline, so a stopped stdin or TCP reader cannot leave generation invalidation, unsubscribe, replacement, EOF cleanup, or close blocked behind output.
+
+Live authentication, optimistic updates, tagged Convex values, WebSocket mutations/actions, and `TransitionChunk` assembly are intentionally deferred. The sync endpoint is an undocumented pinned profile and may drift. Capability badges remain empty until the root integration task runs the shared local and hosted evidence gates from the reviewed commit.

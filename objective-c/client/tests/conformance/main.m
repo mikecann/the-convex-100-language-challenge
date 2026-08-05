@@ -1,19 +1,25 @@
 #import "ConvexClient.h"
+#include "ConvexClientInternal.h"
 #include <arpa/inet.h>
 #include <curl/curl.h>
+#include <errno.h>
 #include <json-c/json.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct {
   FILE *stream;
   pthread_mutex_t mutex;
+  int socket_stream;
+  int failed;
 } adapter_output;
 
 typedef struct adapter_subscription {
@@ -29,6 +35,8 @@ typedef struct adapter_subscription {
 #endif
   struct adapter_subscription *next;
 } adapter_subscription;
+
+#define ADAPTER_MAX_SUBSCRIPTIONS 16
 
 #ifdef CONVEX_ADAPTER_TESTING
 static int test_fd(const char *name) {
@@ -61,12 +69,82 @@ static char *copy_string(const char *value) {
   return copy;
 }
 
+static int write_event_locked(adapter_output *output, json_object *event) {
+  const char *json =
+      json_object_to_json_string_ext(event, JSON_C_TO_STRING_PLAIN);
+  size_t length = strlen(json), offset = 0;
+  if (length > 2097152)
+    return 0;
+  char *line = malloc(length + 1);
+  if (!line)
+    return 0;
+  memcpy(line, json, length);
+  line[length++] = '\n';
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  long long deadline =
+      (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000 + 500;
+  int fd = fileno(output->stream);
+  while (offset < length) {
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long long remaining =
+        deadline - ((long long)now.tv_sec * 1000 + now.tv_nsec / 1000000);
+    if (remaining <= 0)
+      break;
+    size_t amount = length - offset;
+    if (!output->socket_stream) {
+      // Poll before each PIPE_BUF-sized write instead of changing stdout's
+      // descriptor flags. This keeps a stopped controller bounded without
+      // mutating a descriptor owned by the caller or its runtime.
+      if (amount > 4096)
+        amount = 4096;
+      struct pollfd descriptor = {.fd = fd, .events = POLLOUT};
+      int wait = remaining > 25 ? 25 : (int)remaining;
+      int ready = poll(&descriptor, 1, wait);
+      if (ready < 0 && errno == EINTR)
+        continue;
+      if (ready < 0 || (ready > 0 && !(descriptor.revents & POLLOUT)))
+        break;
+      if (ready == 0)
+        continue;
+    }
+    ssize_t written = output->socket_stream ? send(fd, line + offset, amount,
+                                                   MSG_DONTWAIT | MSG_NOSIGNAL)
+                                            : write(fd, line + offset, amount);
+    if (written > 0) {
+      offset += (size_t)written;
+      continue;
+    }
+    if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+        errno != EINTR)
+      break;
+    struct pollfd descriptor = {.fd = fd, .events = POLLOUT};
+    int wait = remaining > 25 ? 25 : (int)remaining;
+    (void)poll(&descriptor, 1, wait);
+  }
+  free(line);
+  if (offset != length)
+    output->failed = 1;
+  return offset == length;
+}
+
 static void emit(adapter_output *output, json_object *event) {
   pthread_mutex_lock(&output->mutex);
-  fputs(json_object_to_json_string_ext(event, JSON_C_TO_STRING_PLAIN),
-        output->stream);
-  fputc('\n', output->stream);
-  fflush(output->stream);
+  if (!output->failed)
+    (void)write_event_locked(output, event);
+  pthread_mutex_unlock(&output->mutex);
+  json_object_put(event);
+}
+
+static void emit_subscription(adapter_subscription *record,
+                              unsigned long generation, json_object *event) {
+  adapter_output *output = record->output;
+  pthread_mutex_lock(&output->mutex);
+  pthread_mutex_lock(&record->state_mutex);
+  int publish = record->active && record->generation == generation;
+  pthread_mutex_unlock(&record->state_mutex);
+  if (publish && !output->failed)
+    (void)write_event_locked(output, event);
   pthread_mutex_unlock(&output->mutex);
   json_object_put(event);
 }
@@ -122,20 +200,17 @@ static void *forward_updates(void *opaque) {
 #ifdef CONVEX_ADAPTER_TESTING
     test_pause_relay(record);
 #endif
-    /* Invalidation and publication share this lock. Once unsubscribe or a
-     * same-ID replacement advances generation, a dequeued old value cannot
-     * cross the relay boundary. */
-    pthread_mutex_lock(&record->state_mutex);
-    int publish = record->active && record->generation == generation;
-    if (!publish) {
-      pthread_mutex_unlock(&record->state_mutex);
-      convex_update_free(&update);
-      continue;
-    }
+    json_object *event = json_object_new_object();
     if (update.error.name) {
-      emit_error(record->output, "", record->id, &update.error);
+      json_object_object_add(event, "type",
+                             json_object_new_string("subscription"));
+      json_object_object_add(event, "subscriptionId",
+                             json_object_new_string(record->id));
+      json_object_object_add(event, "error", error_object(&update.error));
+      if (update.error.logs)
+        json_object_object_add(event, "logs",
+                               json_object_get(update.error.logs));
     } else {
-      json_object *event = json_object_new_object();
       json_object_object_add(event, "type",
                              json_object_new_string("subscription"));
       json_object_object_add(event, "subscriptionId",
@@ -146,9 +221,10 @@ static void *forward_updates(void *opaque) {
         json_object_object_add(event, "logs", update.logs);
         update.logs = NULL;
       }
-      emit(record->output, event);
     }
-    pthread_mutex_unlock(&record->state_mutex);
+    /* The output lock owns ordering; the generation lock is held only for the
+     * check, never while the bounded controller write is in progress. */
+    emit_subscription(record, generation, event);
     convex_update_free(&update);
   }
   return NULL;
@@ -161,14 +237,25 @@ static adapter_subscription **find_record(adapter_subscription **head,
   return head;
 }
 
+static size_t record_count(adapter_subscription *head) {
+  size_t count = 0;
+  while (head) {
+    count++;
+    head = head->next;
+  }
+  return count;
+}
+
 static int stop_record(adapter_subscription **slot, convex_error *error) {
   adapter_subscription *record = *slot;
   if (!record)
     return 1;
+  pthread_mutex_lock(&record->output->mutex);
   pthread_mutex_lock(&record->state_mutex);
   record->active = 0;
   record->generation++;
   pthread_mutex_unlock(&record->state_mutex);
+  pthread_mutex_unlock(&record->output->mutex);
 #ifdef CONVEX_ADAPTER_TESTING
   test_signal("ADAPTER_TEST_RELAY_INACTIVE_FD");
 #endif
@@ -192,14 +279,14 @@ static convex_client *ensure_client(convex_client **client,
     error->message = copy_string("CONVEX_URL is required");
     return NULL;
   }
-  *client = convex_new(url, "objective-c-0.1.0", error);
+  *client = convex_new(url, "objective-c-0.2.0", error);
   if (*client && getenv("CONVEX_AUTH_TOKEN"))
     convex_set_auth(*client, getenv("CONVEX_AUTH_TOKEN"), error);
   return *client;
 }
 
-static void serve(FILE *input, FILE *stream) {
-  adapter_output output = {.stream = stream};
+static void serve(FILE *input, FILE *stream, int socket_stream) {
+  adapter_output output = {.stream = stream, .socket_stream = socket_stream};
   pthread_mutex_init(&output.mutex, NULL);
   convex_client *client = NULL;
   adapter_subscription *subscriptions = NULL;
@@ -243,9 +330,11 @@ static void serve(FILE *input, FILE *stream) {
                                json_object_new_string("objective-c"));
         json_object_object_add(
             event, "implementation",
-            json_object_new_string("native-objective-c-libcurl-websocket-json-c"));
-        json_object_object_add(event, "runtime",
-                               json_object_new_string("Objective-C clang musl"));
+            json_object_new_string(
+                "native-objective-c-gnustep-libcurl-websocket-json-c"));
+        json_object_object_add(
+            event, "runtime",
+            json_object_new_string("GNUstep Base 1.28 / libobjc 12"));
         emit(&output, event);
       }
     } else if (!strcmp(op, "query") || !strcmp(op, "mutation") ||
@@ -295,6 +384,14 @@ static void serve(FILE *input, FILE *stream) {
       convex_client *active = ensure_client(&client, &error);
       adapter_subscription **old = find_record(&subscriptions, subscription_id);
       if (*old && !stop_record(old, &error)) {
+        emit_error(&output, id, "", &error);
+        convex_error_free(&error);
+        json_object_put(command);
+        continue;
+      }
+      if (record_count(subscriptions) >= ADAPTER_MAX_SUBSCRIPTIONS) {
+        error.name = copy_string("ProtocolError");
+        error.message = copy_string("adapter subscription limit reached");
         emit_error(&output, id, "", &error);
         convex_error_free(&error);
         json_object_put(command);
@@ -379,7 +476,7 @@ int main(void) {
   curl_global_init(CURL_GLOBAL_DEFAULT);
   const char *address = getenv("ADAPTER_LISTEN");
   if (!address || !*address) {
-    serve(stdin, stdout);
+    serve(stdin, stdout, 0);
     return 0;
   }
   char *copy = copy_string(address), *colon = strrchr(copy, ':');
@@ -415,7 +512,7 @@ int main(void) {
   }
   int peer = accept(listener, NULL, NULL);
   FILE *input = fdopen(dup(peer), "r"), *output = fdopen(peer, "w");
-  serve(input, output);
+  serve(input, output, 1);
   fclose(input);
   fclose(output);
   close(listener);
