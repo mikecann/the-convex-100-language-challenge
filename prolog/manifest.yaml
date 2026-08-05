@@ -4,5 +4,28 @@ displayName: "Prolog"
 rank: 30
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native SWI-Prolog HTTP and WebSocket implementation. Capability badges remain unearned until root-owned shared evidence passes.
+toolchain:
+  name: SWI-Prolog
+  version: 9.2.8
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, WebSocket mutations/actions, transition chunks, and optimistic updates are deferred.
+  - The Live queue retains the newest 16 updates per subscription and rejects a single update over 8 MiB.
 capabilities: []
