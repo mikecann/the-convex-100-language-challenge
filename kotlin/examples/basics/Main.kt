@@ -2,10 +2,10 @@ package convex.kotlin.example
 
 import convex.kotlin.ConvexClient
 import convex.kotlin.Update
+import convex.kotlin.integralIntOrNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
@@ -65,11 +65,11 @@ private fun next(
     return update.value ?: error("$operation omitted a value")
 }
 
-// Decode Convex JSON into the idiomatic value this example needs, while making
-// a missing or non-integer counter fail instead of silently choosing a default.
+// Convex JSON may spell an integral count as 0.0. Decode it exactly, without
+// rounding a fractional value or accepting a number outside Kotlin's Int range.
 private fun count(
     value: kotlinx.serialization.json.JsonElement,
     operation: String,
 ): Int =
-    value.jsonObject["count"]?.jsonPrimitive?.int
+    value.jsonObject["count"]?.integralIntOrNull()
         ?: error("$operation did not return an integer count")
