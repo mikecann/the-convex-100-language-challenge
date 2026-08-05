@@ -19,6 +19,8 @@ Module Program
     Private Async Function MainAsync() As Task
         TestBoundedDeliveryNullAndHydration()
         Await TestAdapterValidationNullErrorsAndByteLimit()
+        Await TestAdapterPublishedOutputJsonShapes()
+        Await TestPublishedAdapterOutputJsonShapes()
         Await TestAdapterStaleRelay(False)
         Await TestAdapterStaleRelay(True)
         Await TestAdapterReplacementAtCap()
@@ -265,6 +267,106 @@ Module Program
             Equal("ProtocolError", malformedEvent("error")("name").GetValue(Of String)(), "malformed or partial NDJSON EOF classification")
         Next
     End Function
+
+    ''' <summary>Exercises the adapter's emitted NDJSON instead of ConvexClient objects.</summary>
+    Private Async Function TestAdapterPublishedOutputJsonShapes() As Task
+        Using listener = Listen()
+            Dim server = Task.Run(Async Function()
+                                      Using first = Await listener.AcceptTcpClientAsync()
+                                          Await ReadHttpRequest(first.GetStream())
+                                          Await WriteHttpResponse(first.GetStream(), 200,
+                                              "{""status"":""success"",""value"":{""documentId"":""documents:é雪"",""nested"":{""items"":[1,{""name"":""café""}]}},""logLines"":[""nested log 雪""]}")
+                                      End Using
+                                      Using second = Await listener.AcceptTcpClientAsync()
+                                          Await ReadHttpRequest(second.GetStream())
+                                          Await WriteHttpResponse(second.GetStream(), 200,
+                                              "{""status"":""success"",""value"":{""documentId"":""documents:plain-id"",""text"":""emoji 😀""},""logLines"":[""utf8 café 雪""]}")
+                                      End Using
+                                      Return True
+                                  End Function)
+
+            Dim input = String.Join(ControlChars.Lf, {
+                "{""id"":""nested"",""op"":""query"",""path"":""demo:nested"",""args"":{}}",
+                "{""id"":""utf8"",""op"":""query"",""path"":""demo:utf8"",""args"":{}}",
+                "{""id"":""close"",""op"":""close""}"
+            }) & ControlChars.Lf
+            Dim output As New StringWriter()
+            Await AdapterProgram.Run(New StringReader(input), output, Url(listener))
+            Await server.WaitAsync(TestTimeout)
+
+            AssertAdapterOutputJsonShapes(ParseEvents(output.ToString()), "adapter")
+        End Using
+    End Function
+
+    ''' <summary>
+    ''' Runs the exact published Adapter.dll when Docker provides it. This guards
+    ''' the final runtime serialization path, where a resolver-less options object
+    ''' can otherwise fail only after deployment-specific HTTP responses arrive.
+    ''' </summary>
+    Private Async Function TestPublishedAdapterOutputJsonShapes() As Task
+        Dim adapterPath = Environment.GetEnvironmentVariable("PUBLISHED_ADAPTER")
+        If String.IsNullOrWhiteSpace(adapterPath) Then Return
+
+        Using listener = Listen()
+            Dim server = StartAdapterJsonShapeFixture(listener)
+            Dim start As New ProcessStartInfo("dotnet") With {
+                .UseShellExecute = False,
+                .RedirectStandardInput = True,
+                .RedirectStandardOutput = True,
+                .RedirectStandardError = True
+            }
+            start.ArgumentList.Add(adapterPath)
+            start.Environment("CONVEX_URL") = Url(listener)
+            Using adapter = Process.Start(start)
+                If adapter Is Nothing Then Throw New InvalidOperationException("published adapter did not start")
+                Await adapter.StandardInput.WriteAsync(AdapterJsonShapeCommands())
+                adapter.StandardInput.Close()
+                Dim output = Await adapter.StandardOutput.ReadToEndAsync()
+                Dim errors = Await adapter.StandardError.ReadToEndAsync()
+                Await adapter.WaitForExitAsync().WaitAsync(TestTimeout)
+                Equal(0, adapter.ExitCode, "published adapter exit: " & errors)
+                Check(String.IsNullOrWhiteSpace(errors), "published adapter stderr: " & errors)
+                Await server.WaitAsync(TestTimeout)
+                AssertAdapterOutputJsonShapes(ParseEvents(output), "published adapter")
+            End Using
+        End Using
+    End Function
+
+    Private Function StartAdapterJsonShapeFixture(listener As TcpListener) As Task(Of Boolean)
+        Return Task.Run(Async Function()
+                            Using first = Await listener.AcceptTcpClientAsync()
+                                Await ReadHttpRequest(first.GetStream())
+                                Await WriteHttpResponse(first.GetStream(), 200,
+                                    "{""status"":""success"",""value"":{""documentId"":""documents:é雪"",""nested"":{""items"":[1,{""name"":""café""}]}},""logLines"":[""nested log 雪""]}")
+                            End Using
+                            Using second = Await listener.AcceptTcpClientAsync()
+                                Await ReadHttpRequest(second.GetStream())
+                                Await WriteHttpResponse(second.GetStream(), 200,
+                                    "{""status"":""success"",""value"":{""documentId"":""documents:plain-id"",""text"":""emoji 😀""},""logLines"":[""utf8 café 雪""]}")
+                            End Using
+                            Return True
+                        End Function)
+    End Function
+
+    Private Function AdapterJsonShapeCommands() As String
+        Return String.Join(ControlChars.Lf, {
+            "{""id"":""nested"",""op"":""query"",""path"":""demo:nested"",""args"":{}}",
+            "{""id"":""utf8"",""op"":""query"",""path"":""demo:utf8"",""args"":{}}",
+            "{""id"":""close"",""op"":""close""}"
+        }) & ControlChars.Lf
+    End Function
+
+    Private Sub AssertAdapterOutputJsonShapes(events As JsonNode(), source As String)
+        Dim nested = events(0).AsObject()
+        Equal("documents:é雪", nested("value")("documentId").GetValue(Of String)(), source & " document ID string")
+        Equal("café", nested("value")("nested")("items")(1)("name").GetValue(Of String)(), source & " nested JSON")
+        Equal("nested log 雪", nested("logs")(0).GetValue(Of String)(), source & " nested logs")
+
+        Dim utf8 = events(1).AsObject()
+        Equal("emoji 😀", utf8("value")("text").GetValue(Of String)(), source & " UTF-8 value")
+        Equal("utf8 café 雪", utf8("logs")(0).GetValue(Of String)(), source & " UTF-8 log")
+        Equal("closed", events(2)("type").GetValue(Of String)(), source & " close")
+    End Sub
 
     Private Async Function TestAdapterReplacementAtCap() As Task
         Using listener = Listen()

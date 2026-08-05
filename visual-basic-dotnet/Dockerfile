@@ -17,10 +17,10 @@ RUN dotnet build client/Convex.vbproj -c Release -warnaserror && \
     dotnet format client/tests/VisualBasicDotNetTests.vbproj --verify-no-changes --no-restore && \
     dotnet format examples/basics/Example.vbproj --verify-no-changes --no-restore && \
     dotnet format examples/basics/tests/ExampleTests.vbproj --verify-no-changes --no-restore && \
-    dotnet run --project client/tests/VisualBasicDotNetTests.vbproj -c Release --no-build && \
     dotnet run --project examples/basics/tests/ExampleTests.vbproj -c Release --no-build && \
     dotnet publish client/tests/conformance/Adapter.vbproj -c Release -o /out/adapter --no-self-contained && \
     dotnet publish examples/basics/Example.vbproj -c Release -o /out/example --no-self-contained && \
+    PUBLISHED_ADAPTER=/out/adapter/Adapter.dll dotnet run --project client/tests/VisualBasicDotNetTests.vbproj -c Release --no-build && \
     printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | dotnet /out/adapter/Adapter.dll | grep -q '"language":"visual-basic-dotnet"' && \
     test "$(uname -m)" = x86_64 && dotnet --info | grep -q 'Architecture: *x64'
 CMD ["/bin/sh", "-ec", "dotnet --info >/dev/null; test \"$(uname -m)\" = x86_64"]

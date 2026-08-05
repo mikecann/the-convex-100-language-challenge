@@ -5,6 +5,7 @@ Imports System.Net.Sockets
 Imports System.Text
 Imports System.Text.Json
 Imports System.Text.Json.Nodes
+Imports System.Text.Json.Serialization.Metadata
 Imports System.Threading
 Imports ConvexVisualBasic
 
@@ -13,7 +14,12 @@ Public Module Program
     Private Const MaxCommandBytes As Integer = 1048576
     Private Const MaxSubscriptions As Integer = 8
     Private ReadOnly StrictUtf8 As New UTF8Encoding(False, True)
-    Private ReadOnly Serializer As New JsonSerializerOptions()
+    ' JsonNode serialization reaches the final adapter's stdout path. An empty
+    ' options instance is not safe once System.Text.Json freezes it in trimmed
+    ' runtime configurations, so give it an explicit metadata resolver.
+    Private ReadOnly Serializer As New JsonSerializerOptions() With {
+        .TypeInfoResolver = New DefaultJsonTypeInfoResolver()
+    }
     Public RelayBeforeWriter As Func(Of Task)
 
     Public Sub Main(args As String())
