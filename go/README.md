@@ -1,41 +1,37 @@
-# Go Convex client pilot
+# Convex from Go
 
-This directory contains a native Go implementation of Convex's documented HTTP
-Functions API plus a deliberately small Live WebSocket client.
+This folder shows a small Go program talking directly to Convex. It can call
+queries, mutations, and actions over HTTP, then keep a query updated in real
+time over a WebSocket.
 
-It does not wrap `convex-js`, `convex-rs`, the Convex CLI, `curl`, or another
-runtime. `github.com/coder/websocket` supplies ordinary WebSocket transport;
-all Convex-specific request, response, subscription, transition, reconnect,
-and lifecycle behaviour is implemented here in Go.
+This is an educational demonstration for the 100-language project. It is not
+an official Convex SDK or a package intended for production use.
 
-## Protocol scope
+## Start here
 
-HTTP uses the documented `/api/query`, `/api/mutation`, and `/api/action`
-endpoints with `format: "json"`. It supports an optional user bearer token and
-keeps success values, function logs, structured application error data, and
-transport errors distinct.
+The [basic example](examples/basics/main.go) is the best place to begin. It:
 
-The shared suite exercises absent, rejected, replaced, and cleared tokens. A
-race-enabled Go transport test proves exact bearer-header forwarding. The pilot
-does not claim a successful signed identity because the dedicated deployment
-has no configured identity provider; that integration is outside the current
-HTTP and Live scope.
+1. Connects to a Convex deployment.
+2. Queries the current state of a counter room.
+3. Starts a Live subscription to that same query.
+4. Runs a mutation which changes the counter.
+5. Receives the new value through Live without polling again.
 
-Live is pinned to the internal `convex-rs` 0.10.4 profile at commit
-`6f1df8a8ba1665084ec001e307ca841ca17074d7`. It uses the unversioned
-`/api/sync` endpoint and implements initial results, later transitions,
-unsubscribe, reconnect with active-query restoration, query failures, server
-inactivity detection, and deterministic close.
+The implementation behind it lives in [client](client/). Everything is built
+and tested inside Docker, so no Go toolchain is installed on the host.
 
-That source revision defines chunked transitions, but chunk assembly is
-deliberately deferred from this pilot. Receiving `TransitionChunk` is surfaced
-as protocol drift and causes a clean reconnect instead of silently corrupting
-the subscription state.
+## What works
 
-This pin is a compatibility target, not a claim that Convex supports a stable
-third-party sync protocol.
+| Capability | Status |
+| --- | --- |
+| Queries, mutations, and actions over HTTP | Works |
+| Bearer-token authentication for HTTP calls | Works |
+| Initial and updated Live query values | Works |
+| Unsubscribe, reconnect, timeouts, and clean shutdown | Works |
+| Authentication for Live subscriptions | Not yet |
+| Full tagged Convex value types | Not yet |
 
-## Usage
+## Basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.go -->
 ```go
@@ -160,8 +156,8 @@ func randomID() string {
 ```
 <!-- END GENERATED EXAMPLE -->
 
-This block is generated from `examples/basics/main.go`, which is also the source shown
-on the evidence website. Edit and run the source file, then use
+This block is generated from `examples/basics/main.go`, which is also the source
+shown on the evidence website. Edit and run the source file, then use
 `./run sync-examples` to refresh this README projection.
 
 ## Conformance tests
@@ -211,6 +207,23 @@ No Go tooling should run on the host.
 pinned local backend. `verify-hosted` repeats them over current HTTPS and WSS.
 Only those shared controller results can calculate HTTP or Live. Trusted-main
 CI alone publishes the badges shown by the official evidence site.
+
+## How it talks to Convex
+
+HTTP calls use Convex's documented `/api/query`, `/api/mutation`, and
+`/api/action` endpoints. The client keeps successful values, function logs,
+structured application errors, and transport failures distinct.
+
+Live uses an ordinary Go WebSocket library, but the Convex-specific subscription
+and reconnect behaviour is implemented in Go. It does not wrap `convex-js`,
+`convex-rs`, the Convex CLI, `curl`, or another runtime.
+
+The Live implementation is deliberately experimental. It targets the internal
+`convex-rs` 0.10.4 protocol profile at commit
+`6f1df8a8ba1665084ec001e307ca841ca17074d7` and the unversioned `/api/sync`
+endpoint. That is a tested compatibility target, not a claim that Convex offers
+a stable third-party sync protocol. See the
+[protocol notes](../docs/protocol-profiles.md) for the exact boundary.
 
 ## Outside the current HTTP and Live scope
 
