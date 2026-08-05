@@ -19,11 +19,11 @@ RUN npm ci --omit=dev --ignore-scripts
 FROM test AS compile
 RUN cd client && npm run build
 FROM ${NODE_IMAGE} AS runtime-base
-RUN rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /usr/bin/apt /usr/bin/apt-* /usr/bin/dpkg /usr/bin/dpkg-* /usr/bin/debconf* /usr/bin/update-alternatives /usr/sbin/dpkg-* /usr/sbin/invoke-rc.d /usr/sbin/update-rc.d && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /etc/apt /var/lib/apt /var/cache/apt /var/lib/dpkg /var/cache/debconf /usr/lib/apt /usr/lib/dpkg /usr/share/dpkg
+RUN rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /usr/local/bin/yarn /usr/local/bin/yarnpkg /usr/bin/apt /usr/bin/apt-* /usr/bin/dpkg /usr/bin/dpkg-* /usr/bin/debconf* /usr/bin/update-alternatives /usr/sbin/dpkg-* /usr/sbin/invoke-rc.d /usr/sbin/update-rc.d && rm -rf /opt/yarn-v1.22.22 /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /etc/apt /var/lib/apt /var/cache/apt /var/lib/dpkg /var/cache/debconf /usr/lib/apt /usr/lib/dpkg /usr/share/dpkg
 WORKDIR /opt/convex
 COPY --from=production-dependencies /opt/convex/client/node_modules ./client/node_modules
 COPY --from=compile /opt/convex/client/dist ./client/dist
-RUN test "$(node -p 'process.arch')" = x64 && for command_name in apt apt-get dpkg npm npx corepack; do ! command -v "$command_name"; done
+RUN test "$(node -p 'process.arch')" = x64 && test ! -e /opt/yarn-v1.22.22 && for command_name in apt apt-get dpkg npm npx corepack yarn yarnpkg; do ! command -v "$command_name"; done
 USER 65532:65532
 FROM runtime-base AS example-runtime
 USER root
