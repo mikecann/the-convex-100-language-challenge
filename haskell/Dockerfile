@@ -57,6 +57,8 @@ RUN mkdir -p /out && \
 FROM ${RUNTIME_IMAGE} AS runtime-base
 COPY --from=test /etc/ssl /etc/ssl
 RUN set -eu; \
+    /usr/bin/rm -f /usr/bin/awk; \
+    /usr/bin/ln -s mawk /usr/bin/awk; \
     find /usr/bin /usr/sbin -mindepth 1 -maxdepth 1 -print > /tmp/runtime-commands; \
     while IFS= read -r path; do \
       case "$path" in \
@@ -66,48 +68,66 @@ RUN set -eu; \
     done < /tmp/runtime-commands; \
     /usr/bin/rm -rf \
       /etc/apt \
-      /etc/cron.daily/apt-compat \
-      /etc/cron.daily/dpkg \
+      /etc/alternatives \
+      /etc/cron.d \
+      /etc/cron.daily \
+      /etc/cron.hourly \
+      /etc/cron.monthly \
+      /etc/cron.weekly \
+      /etc/crontab \
       /etc/debconf.conf \
       /etc/dpkg \
-      /etc/logrotate.d/apt \
-      /etc/logrotate.d/dpkg \
-      /etc/systemd/system/timers.target.wants/apt-daily-upgrade.timer \
-      /etc/systemd/system/timers.target.wants/apt-daily.timer \
-      /etc/systemd/system/timers.target.wants/dpkg-db-backup.timer \
+      /etc/init.d \
+      /etc/logrotate.conf \
+      /etc/logrotate.d \
+      /etc/rc0.d \
+      /etc/rc1.d \
+      /etc/rc2.d \
+      /etc/rc3.d \
+      /etc/rc4.d \
+      /etc/rc5.d \
+      /etc/rc6.d \
+      /etc/rcS.d \
+      /etc/systemd \
       /usr/lib/apt \
       /usr/lib/dpkg \
-      /usr/lib/systemd/system/apt-daily-upgrade.service \
-      /usr/lib/systemd/system/apt-daily-upgrade.timer \
-      /usr/lib/systemd/system/apt-daily.service \
-      /usr/lib/systemd/system/apt-daily.timer \
-      /usr/lib/systemd/system/dpkg-db-backup.service \
-      /usr/lib/systemd/system/dpkg-db-backup.timer \
-      /usr/libexec/dpkg \
-      /usr/share/bash-completion/completions/apt \
-      /usr/share/bash-completion/completions/debconf \
-      /usr/share/bash-completion/completions/debconf-show \
-      /usr/share/bug/apt \
-      /usr/share/bug/dpkg \
-      /usr/share/debconf \
-      /usr/share/doc/apt \
-      /usr/share/doc/debconf \
-      /usr/share/doc/dpkg \
-      /usr/share/dpkg \
-      /usr/share/lintian/profiles/dpkg \
-      /usr/share/polkit-1/actions/org.dpkg.pkexec.update-alternatives.policy \
-      /var/cache/apt \
-      /var/cache/debconf \
-      /var/lib/apt \
-      /var/lib/dpkg \
-      /var/lib/systemd/deb-systemd-helper-enabled/apt-daily-upgrade.timer.dsh-also \
-      /var/lib/systemd/deb-systemd-helper-enabled/apt-daily.timer.dsh-also \
-      /var/lib/systemd/deb-systemd-helper-enabled/dpkg-db-backup.timer.dsh-also \
-      /var/lib/systemd/deb-systemd-helper-enabled/timers.target.wants/apt-daily-upgrade.timer \
-      /var/lib/systemd/deb-systemd-helper-enabled/timers.target.wants/apt-daily.timer \
-      /var/lib/systemd/deb-systemd-helper-enabled/timers.target.wants/dpkg-db-backup.timer \
+      /usr/lib/systemd \
+      /usr/libexec \
+      /usr/games \
+      /usr/include \
+      /usr/share \
+      /usr/src \
+      /var/cache \
+      /var/backups \
+      /var/lib \
+      /var/local \
+      /var/mail \
+      /var/opt \
+      /var/spool \
+      /var/tmp \
       /var/log/* \
       /tmp/runtime-commands; \
+    /usr/bin/rm -f \
+      /usr/lib/*/libapt-pkg.so* \
+      /usr/lib/*/libapt-private.so* \
+      /usr/lib/*/libdebconfclient.so*; \
+    /usr/bin/find /etc -mindepth 1 -maxdepth 1 -print > /tmp/runtime-etc; \
+    while IFS= read -r path; do \
+      case "$path" in \
+        /etc/gai.conf|/etc/host.conf|/etc/hostname|/etc/hosts|/etc/ld.so.cache|/etc/ld.so.conf|/etc/ld.so.conf.d|/etc/localtime|/etc/nsswitch.conf|/etc/resolv.conf|/etc/ssl|/etc/timezone) ;; \
+        *) /usr/bin/rm -rf "$path" ;; \
+      esac; \
+    done < /tmp/runtime-etc; \
+    /usr/bin/rm -f /tmp/runtime-etc; \
+    /usr/bin/find /usr/lib -mindepth 1 -maxdepth 1 -print > /tmp/runtime-usr-lib; \
+    while IFS= read -r path; do \
+      case "$path" in \
+        /usr/lib/locale|/usr/lib/x86_64-linux-gnu) ;; \
+        *) /usr/bin/rm -rf "$path" ;; \
+      esac; \
+    done < /tmp/runtime-usr-lib; \
+    /usr/bin/rm -f /tmp/runtime-usr-lib; \
+    /usr/bin/rm -rf /usr/local/man; \
     if /usr/bin/find /etc /usr/lib /usr/libexec /usr/share /var -xdev -print 2>/dev/null | \
       /usr/bin/grep -Eq '(^|/)(apt|dpkg|debconf)([^/]*|/)|update-alternatives'; then \
       echo "forbidden runtime package-management residue:" >&2; \
@@ -115,13 +135,42 @@ RUN set -eu; \
         /usr/bin/grep -E '(^|/)(apt|dpkg|debconf)([^/]*|/)|update-alternatives' >&2; \
       exit 1; \
     fi; \
+    for path in \
+      /etc/alternatives /etc/apt /etc/cron.d /etc/cron.daily /etc/cron.hourly \
+      /etc/cron.monthly /etc/cron.weekly /etc/crontab /etc/debconf.conf \
+      /etc/dpkg /etc/init.d /etc/logrotate.conf /etc/logrotate.d \
+      /etc/systemd /usr/lib/apt /usr/lib/dpkg /usr/lib/systemd \
+      /usr/libexec /usr/games /usr/include /usr/share /usr/src \
+      /var/backups /var/cache /var/lib /var/local /var/mail /var/opt \
+      /var/spool /var/tmp; do \
+      if test -e "$path"; then echo "forbidden runtime artifact tree: $path" >&2; exit 1; fi; \
+    done; \
+    for path in /etc/*; do \
+      if test ! -e "$path" && test ! -L "$path"; then continue; fi; \
+      case "$path" in \
+        /etc/gai.conf|/etc/host.conf|/etc/hostname|/etc/hosts|/etc/ld.so.cache|/etc/ld.so.conf|/etc/ld.so.conf.d|/etc/localtime|/etc/nsswitch.conf|/etc/resolv.conf|/etc/ssl|/etc/timezone) ;; \
+        *) echo "unexpected runtime config: $path" >&2; exit 1 ;; \
+      esac; \
+    done; \
+    for path in /usr/lib/*; do \
+      if test ! -e "$path" && test ! -L "$path"; then continue; fi; \
+      case "$path" in \
+        /usr/lib/locale|/usr/lib/x86_64-linux-gnu) ;; \
+        *) echo "unexpected runtime library tree: $path" >&2; exit 1 ;; \
+      esac; \
+    done; \
+    if test -e /usr/local/man; then echo "forbidden runtime manual tree" >&2; exit 1; fi; \
+    if /usr/bin/find /usr/lib -xdev \
+      \( -name 'libapt-pkg.so*' -o -name 'libapt-private.so*' -o -name 'libdebconfclient.so*' \) \
+      -print -quit | /usr/bin/grep -q .; then \
+      echo "forbidden runtime package library remains" >&2; \
+      exit 1; \
+    fi; \
     /usr/bin/rm -f /usr/bin/rm; \
     for command in apt apt-get apt-cache dpkg dpkg-query getent hostname ping nc openssl curl wget ghc ghci ghc-pkg runghc runhaskell cabal stack gcc cc clang make ld as perl ruby go rustc cargo node npm npx python python3 pip pip3 convex; do \
       if command -v "$command" >/dev/null 2>&1; then echo "forbidden runtime command: $command" >&2; exit 1; fi; \
     done; \
-    for path in /etc/apt /etc/dpkg /var/lib/dpkg /usr/lib/apt /usr/lib/dpkg /usr/share/dpkg; do \
-      if test -e "$path"; then echo "forbidden runtime helper tree: $path" >&2; exit 1; fi; \
-    done
+    true
 USER 65532:65532
 
 FROM runtime-base AS example-runtime
