@@ -19,6 +19,7 @@ class Subscription {
   ~Subscription();
   std::optional<Update> next_update(int timeout_ms = 10000);
   void close();
+  void debug_disconnect();
  private:
   friend class Client;
   explicit Subscription(std::string url, std::string path, Json args);
@@ -41,6 +42,7 @@ class Client {
  private:
   Result call(const std::string& operation, const std::string& path, const Json& args);
   std::string url_, token_;
+  std::vector<std::weak_ptr<Subscription>> subscriptions_;
   bool closed_ = false;
 };
 }

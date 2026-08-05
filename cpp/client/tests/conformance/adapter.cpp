@@ -1,5 +1,8 @@
 #include "convex.hpp"
+#include <boost/asio.hpp>
 #include <cstdlib>
+#include <array>
+#include <sstream>
 #include <iostream>
 #include <memory>
 #include <map>
@@ -32,4 +35,19 @@ static void run(std::istream& in, std::ostream& out) {
     } catch (const std::exception& error) { write_event(out, error_event(command, error)); }
   }
 }
-int main() { run(std::cin, std::cout); }
+int main() {
+  const char* listen = std::getenv("ADAPTER_LISTEN");
+  if (!listen || !*listen) { run(std::cin, std::cout); return 0; }
+  try {
+    std::string address(listen); auto separator = address.rfind(':');
+    if (separator == std::string::npos) throw std::runtime_error("ADAPTER_LISTEN must be host:port");
+    boost::asio::io_context io; boost::asio::ip::tcp::acceptor acceptor(io, {boost::asio::ip::make_address(address.substr(0, separator)), static_cast<unsigned short>(std::stoi(address.substr(separator + 1)))});
+    std::cerr << "adapter listening on " << address << '\n'; boost::asio::ip::tcp::socket socket(io); acceptor.accept(socket);
+    // The controller sends a finite NDJSON command stream ending in `close`.
+    // Accumulate partial socket reads until that complete command arrives, then
+    // reuse the exact stdin handler and send its newline-delimited events back.
+    std::string commands; std::array<char, 4096> chunk{};
+    for (;;) { boost::system::error_code ec; auto count = socket.read_some(boost::asio::buffer(chunk), ec); if (count) commands.append(chunk.data(), count); if (commands.find("\"op\":\"close\"") != std::string::npos) break; if (ec == boost::asio::error::eof) break; if (ec) throw boost::system::system_error(ec); }
+    std::istringstream input(commands); std::ostringstream output; run(input, output); boost::asio::write(socket, boost::asio::buffer(output.str())); boost::system::error_code ignored; socket.shutdown(boost::asio::ip::tcp::socket::shutdown_send, ignored); return 0;
+  } catch (const std::exception& error) { std::cerr << "adapter TCP failure: " << error.what() << '\n'; return 1; }
+}

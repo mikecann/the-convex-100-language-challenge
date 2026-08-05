@@ -22,11 +22,11 @@ static Parts parse_url(const std::string& value) {
 Client::Client(std::string url, std::string token) : url_(std::move(url)), token_(std::move(token)) { parse_url(url_); }
 void Client::set_auth(std::string token) { if (closed_) throw Error("Convex client is closed"); token_ = std::move(token); }
 void Client::close() { closed_ = true; }
-void Client::debug_disconnect_for_adapter() { if (closed_) throw Error("Convex client is closed"); /* Adapter hook reserved for the Live transport worker. */ }
+void Client::debug_disconnect_for_adapter() { if (closed_) throw Error("Convex client is closed"); bool disconnected = false; for (auto it = subscriptions_.begin(); it != subscriptions_.end();) { if (auto subscription = it->lock()) { subscription->debug_disconnect(); disconnected = true; ++it; } else it = subscriptions_.erase(it); } if (!disconnected) throw Error("Live WebSocket is not connected"); }
 Result Client::query(const std::string& path, const Json& args) { return call("query", path, args); }
 Result Client::mutation(const std::string& path, const Json& args) { return call("mutation", path, args); }
 Result Client::action(const std::string& path, const Json& args) { return call("action", path, args); }
-std::shared_ptr<Subscription> Client::subscribe(const std::string& path, const Json& args) { if (closed_) throw Error("Convex client is closed"); if (path.empty() || !args.is_object()) throw Error("Live query requires a path and named JSON arguments"); return std::shared_ptr<Subscription>(new Subscription(url_, path, args)); }
+std::shared_ptr<Subscription> Client::subscribe(const std::string& path, const Json& args) { if (closed_) throw Error("Convex client is closed"); if (path.empty() || !args.is_object()) throw Error("Live query requires a path and named JSON arguments"); auto subscription = std::shared_ptr<Subscription>(new Subscription(url_, path, args)); subscriptions_.push_back(subscription); return subscription; }
 Result Client::call(const std::string& op, const std::string& path, const Json& args) {
   if (closed_) throw Error("Convex client is closed");
   if (path.empty()) throw Error("Convex function path is required");
