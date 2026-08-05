@@ -1,12 +1,14 @@
 #include "convex.hpp"
 #include <boost/asio.hpp>
 #include <cstdlib>
+#include <cerrno>
 #include <array>
 #include <sstream>
 #include <iostream>
 #include <memory>
 #include <map>
 #include <mutex>
+#include <system_error>
 #include <thread>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -40,11 +42,11 @@ class SocketStreamBuf final : public std::streambuf {
   explicit SocketStreamBuf(boost::asio::ip::tcp::socket& socket) : socket_(socket) { setg(input_.data(), input_.data(), input_.data()); setp(output_.data(), output_.data() + output_.size()); }
   ~SocketStreamBuf() override { sync(); }
  protected:
-  int_type underflow() override { boost::system::error_code error; auto count = socket_.read_some(boost::asio::buffer(input_), error); if (error == boost::asio::error::eof || count == 0) return traits_type::eof(); if (error) throw boost::system::system_error(error); setg(input_.data(), input_.data(), input_.data() + count); return traits_type::to_int_type(*gptr()); }
+  int_type underflow() override { ssize_t count; do { count = ::recv(socket_.native_handle(), input_.data(), input_.size(), 0); } while (count < 0 && errno == EINTR); if (count == 0) return traits_type::eof(); if (count < 0) throw std::system_error(errno, std::generic_category(), "adapter TCP read"); setg(input_.data(), input_.data(), input_.data() + count); return traits_type::to_int_type(*gptr()); }
   int_type overflow(int_type value) override { if (flush_output() != 0) return traits_type::eof(); if (!traits_type::eq_int_type(value, traits_type::eof())) { *pptr() = traits_type::to_char_type(value); pbump(1); } return value; }
   int sync() override { return flush_output(); }
  private:
-  int flush_output() { auto count = pptr() - pbase(); if (count) { boost::system::error_code error; boost::asio::write(socket_, boost::asio::buffer(pbase(), count), error); if (error) return -1; setp(output_.data(), output_.data() + output_.size()); } return 0; }
+  int flush_output() { auto count = pptr() - pbase(); char* next = pbase(); while (count > 0) { ssize_t sent; do { sent = ::send(socket_.native_handle(), next, static_cast<std::size_t>(count), MSG_NOSIGNAL); } while (sent < 0 && errno == EINTR); if (sent <= 0) return -1; next += sent; count -= sent; } setp(output_.data(), output_.data() + output_.size()); return 0; }
   boost::asio::ip::tcp::socket& socket_; std::array<char, 4096> input_{}; std::array<char, 4096> output_{};
 };
 int main() {
@@ -55,6 +57,8 @@ int main() {
     if (separator == std::string::npos) throw std::runtime_error("ADAPTER_LISTEN must be host:port");
     boost::asio::io_context io; boost::asio::ip::tcp::acceptor acceptor(io, {boost::asio::ip::make_address(address.substr(0, separator)), static_cast<unsigned short>(std::stoi(address.substr(separator + 1)))});
     std::cerr << "adapter listening on " << address << '\n'; boost::asio::ip::tcp::socket socket(io); acceptor.accept(socket);
-    SocketStreamBuf buffer(socket); std::iostream stream(&buffer); run(stream, stream); stream.flush(); boost::system::error_code ignored; socket.shutdown(boost::asio::ip::tcp::socket::shutdown_send, ignored); return 0;
+    // Keep both stream and buffer state separate. The controller read blocks on
+    // the main thread while subscription events are written by a worker thread.
+    SocketStreamBuf input_buffer(socket), output_buffer(socket); std::istream input(&input_buffer); std::ostream output(&output_buffer); run(input, output); output.flush(); boost::system::error_code ignored; socket.shutdown(boost::asio::ip::tcp::socket::shutdown_send, ignored); return 0;
   } catch (const std::exception& error) { std::cerr << "adapter TCP failure: " << error.what() << '\n'; return 1; }
 }
