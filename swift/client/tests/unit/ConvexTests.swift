@@ -259,11 +259,18 @@ final class ConvexTests: XCTestCase {
     factory.socket(0).sendDelayMilliseconds = 100
     let adding = Task { try await live.subscribe("demo:second", [:]) }
     try await eventually { factory.socket(0).activeSends == 1 }
-    for _ in 0..<100 { factory.socket(0).emit(["type": "Ping"]) }
+    let residentBefore = residentBytes()
+    let largeMessage = String(repeating: "x", count: 1_500_000)
+    for index in 0..<20 {
+      factory.socket(0).emitText("{\"type\":\"Ping\",\"padding\":\"\(largeMessage)\(index)\"}")
+    }
     _ = try await adding.value
     let overflow = try await next(&iterator)
     XCTAssertEqual(overflow.error?.kind, .protocolError)
     XCTAssertTrue(overflow.error?.message.contains("mailbox overflow") == true)
+    if let residentBefore, let residentAfter = residentBytes() {
+      XCTAssertLessThan(residentAfter - residentBefore, 64 * 1024 * 1024)
+    }
     try await eventually { factory.count == 2 }
     await live.close()
   }
@@ -343,56 +350,108 @@ final class ConvexTests: XCTestCase {
     await adapter.value
   }
 
-  func testReplacementAndRemovalWaitForRelayStopBarriers() async throws {
+  func testProductionRelayLeasePreventsPostAckWritesForReplacementAndRemoval() async throws {
+    var descriptors: [Int32] = [0, 0]
+    XCTAssertEqual(pipe(&descriptors), 0)
+    defer {
+      close(descriptors[0])
+      close(descriptors[1])
+    }
+    let connection = LineConnection(
+      input: descriptors[0], output: descriptors[1], ownsDescriptors: false)
+    let output = AdapterOutput(connection)
     let registry = SubscriptionRegistry()
-    let first = LiveClient.Subscription(1)
-    let second = LiveClient.Subscription(2)
-    _ = await registry.replace("same", with: first)
-    let replacementGate = AsyncStream<Void>.makeStream()
+
+    let replacementEntered = DispatchSemaphore(value: 0)
+    let replacementRelease = DispatchSemaphore(value: 0)
+    let replacementLease = RelayWriteLease {
+      replacementEntered.signal()
+      replacementRelease.wait()
+    }
+    let replacementRelayTask = Task {
+      await output.writeIf(
+        replacementLease,
+        boxed: UnsafeEvent(["type": "subscription", "subscriptionId": "same", "value": 1]))
+    }
+    let replacementRelay = SubscriptionRelay(
+      token: UUID(), subscription: LiveClient.Subscription(1), lease: replacementLease,
+      task: replacementRelayTask)
+    _ = await registry.replace("same", with: replacementRelay)
+    XCTAssertEqual(replacementEntered.wait(timeout: .now() + 1), .success)
+
     let replacementFinished = CompletionFlag()
     let replacing = Task {
-      let token = await replaceRelay(registry: registry, id: "same", with: second) { _ in
-        for await _ in replacementGate.stream { break }
+      let next = SubscriptionRelay(
+        token: UUID(), subscription: LiveClient.Subscription(2), lease: RelayWriteLease(),
+        task: Task {})
+      if let previous = await registry.replace("same", with: next) {
+        await stopRelay(previous, live: nil)
       }
+      await output.write(["type": "ack", "id": "replace"])
       replacementFinished.finish()
-      return token
     }
     try await Task.sleep(for: .milliseconds(20))
     XCTAssertFalse(replacementFinished.isFinished)
-    replacementGate.continuation.yield()
-    replacementGate.continuation.finish()
-    _ = await replacing.value
+    replacementRelease.signal()
+    await replacing.value
 
-    let removalGate = AsyncStream<Void>.makeStream()
+    let removalEntered = DispatchSemaphore(value: 0)
+    let removalRelease = DispatchSemaphore(value: 0)
+    let removalLease = RelayWriteLease {
+      removalEntered.signal()
+      removalRelease.wait()
+    }
+    let removalRelayTask = Task {
+      await output.writeIf(
+        removalLease,
+        boxed: UnsafeEvent(["type": "subscription", "subscriptionId": "same", "value": 2]))
+    }
+    let removalRelay = SubscriptionRelay(
+      token: UUID(), subscription: LiveClient.Subscription(3), lease: removalLease,
+      task: removalRelayTask)
+    _ = await registry.replace("same", with: removalRelay)
+    XCTAssertEqual(removalEntered.wait(timeout: .now() + 1), .success)
+
     let removalFinished = CompletionFlag()
     let removing = Task {
-      await removeRelay(registry: registry, id: "same") { _ in
-        for await _ in removalGate.stream { break }
+      if let removed = await registry.remove("same") {
+        await stopRelay(removed, live: nil)
       }
+      await output.write(["type": "ack", "id": "remove"])
       removalFinished.finish()
     }
     try await Task.sleep(for: .milliseconds(20))
     XCTAssertFalse(removalFinished.isFinished)
-    removalGate.continuation.yield()
-    removalGate.continuation.finish()
+    removalRelease.signal()
     await removing.value
+
+    var iterator = LineConnection(
+      input: descriptors[0], output: descriptors[0], ownsDescriptors: false
+    )
+    .lines().makeAsyncIterator()
+    let firstLine = await iterator.next()
+    let secondLine = await iterator.next()
+    let thirdLine = await iterator.next()
+    let fourthLine = await iterator.next()
+    let lines = [firstLine, secondLine, thirdLine, fourthLine]
+    XCTAssertTrue(lines[0]?.contains("\"value\":1") == true)
+    XCTAssertTrue(lines[1]?.contains("\"id\":\"replace\"") == true)
+    XCTAssertTrue(lines[2]?.contains("\"value\":2") == true)
+    XCTAssertTrue(lines[3]?.contains("\"id\":\"remove\"") == true)
   }
 
-  func testSubscriptionRegistryRejectsStaleReplacementAndUnsubscribeRelays() async {
-    let registry = SubscriptionRegistry()
-    let first = LiveClient.Subscription(1)
-    let second = LiveClient.Subscription(2)
-    let (firstToken, _) = await registry.replace("same", with: first)
-    let (secondToken, replaced) = await registry.replace("same", with: second)
-    XCTAssertTrue(replaced === first)
-    let firstIsCurrent = await registry.isCurrent("same", token: firstToken)
-    let secondIsCurrent = await registry.isCurrent("same", token: secondToken)
-    let removed = await registry.remove("same")
-    let remainsCurrent = await registry.isCurrent("same", token: secondToken)
-    XCTAssertFalse(firstIsCurrent)
-    XCTAssertTrue(secondIsCurrent)
-    XCTAssertTrue(removed === second)
-    XCTAssertFalse(remainsCurrent)
+  func testRelayStartGateKeepsUpdatesBehindSubscribeAck() async throws {
+    let gate = RelayStartGate()
+    let passed = CompletionFlag()
+    let relay = Task {
+      await gate.wait()
+      passed.finish()
+    }
+    try await Task.sleep(for: .milliseconds(20))
+    XCTAssertFalse(passed.isFinished)
+    await gate.release()
+    await relay.value
+    XCTAssertTrue(passed.isFinished)
   }
 
   func testNewest16DropsOldestForSlowConsumer() async throws {
@@ -444,6 +503,7 @@ final class ConvexTests: XCTestCase {
     var iterator = subscription.stream.makeAsyncIterator()
     let update = try await next(&iterator)
     XCTAssertEqual(count(update), 41)
+    XCTAssertEqual((update.value as? [String: Any])?["label"] as? String, "split-🙂-scalar")
     async let second = live.subscribe("demo:second", [:])
     async let third = live.subscribe("demo:third", [:])
     _ = try await (second, third)
@@ -519,6 +579,17 @@ final class ConvexTests: XCTestCase {
       let line = status.split(separator: "\n").first(where: { $0.hasPrefix("Threads:") })
     else { return nil }
     return Int(line.split(whereSeparator: \Character.isWhitespace).last ?? "")
+  }
+
+  private func residentBytes() -> Int? {
+    #if os(Linux)
+      guard let stat = try? String(contentsOfFile: "/proc/self/statm", encoding: .utf8),
+        let pages = Int(stat.split(separator: " ").dropFirst().first ?? "")
+      else { return nil }
+      return pages * Int(sysconf(Int32(_SC_PAGESIZE)))
+    #else
+      return nil
+    #endif
   }
 
 }

@@ -94,7 +94,7 @@ import Foundation
 
 ## Protocol notes
 
-The adapter speaks NDJSON protocol v1 on stdin/stdout or the single TCP controller specified by `ADAPTER_LISTEN`. `debugDisconnect` is adapter-only. A single actor owns the socket. Ordered transport callbacks use a bounded 64-event mailbox; overflow is reported as a protocol error and reconnects. Subscriptions use a newest-16 buffer, dropping old intermediate updates for a slow consumer.
+The adapter speaks NDJSON protocol v1 on stdin/stdout or the single TCP controller specified by `ADAPTER_LISTEN`. `debugDisconnect` is adapter-only. A single actor owns the socket. Ordered transport callbacks use a bounded 8-event mailbox; overflow is reported as a protocol error and reconnects. Subscriptions use a newest-16 buffer, dropping old intermediate updates for a slow consumer.
 
 ## Limitations
 

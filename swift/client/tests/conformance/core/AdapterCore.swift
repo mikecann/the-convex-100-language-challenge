@@ -173,50 +173,90 @@ public func acceptConnection(at address: ListenAddress) throws -> LineConnection
 }
 
 public actor SubscriptionRegistry {
-  private struct Active {
-    let token: UUID
-    let subscription: LiveClient.Subscription
-  }
-  private var values: [String: Active] = [:]
+  private var values: [String: SubscriptionRelay] = [:]
 
   public init() {}
 
-  public func replace(_ id: String, with subscription: LiveClient.Subscription) -> (
-    UUID, LiveClient.Subscription?
-  ) {
-    let token = UUID()
-    let previous = values.updateValue(Active(token: token, subscription: subscription), forKey: id)?
-      .subscription
-    return (token, previous)
+  public func replace(_ id: String, with relay: SubscriptionRelay) -> SubscriptionRelay? {
+    let previous = values.updateValue(relay, forKey: id)
+    previous?.lease.invalidate()
+    return previous
   }
 
-  public func remove(_ id: String) -> LiveClient.Subscription? {
-    values.removeValue(forKey: id)?.subscription
+  public func remove(_ id: String) -> SubscriptionRelay? {
+    let relay = values.removeValue(forKey: id)
+    relay?.lease.invalidate()
+    return relay
   }
-  public func isCurrent(_ id: String, token: UUID) -> Bool { values[id]?.token == token }
-  public func removeAll() -> [LiveClient.Subscription] {
+  public func removeAll() -> [SubscriptionRelay] {
     defer { values.removeAll() }
-    return values.values.map(\.subscription)
+    let relays = Array(values.values)
+    for relay in relays { relay.lease.invalidate() }
+    return relays
   }
 }
 
-/// Replacement and removal return only after the old relay has been stopped.
-/// The adapter writes its acknowledgement after these barriers complete, so a
-/// controller never observes an ack while a stale relay can still emit events.
-public func replaceRelay(
-  registry: SubscriptionRegistry, id: String, with subscription: LiveClient.Subscription,
-  stop: @Sendable (LiveClient.Subscription) async -> Void
-) async -> UUID {
-  let (token, previous) = await registry.replace(id, with: subscription)
-  if let previous { await stop(previous) }
-  return token
+public struct SubscriptionRelay: @unchecked Sendable {
+  public let token: UUID
+  public let subscription: LiveClient.Subscription
+  public let lease: RelayWriteLease
+  public let task: Task<Void, Never>
+
+  public init(
+    token: UUID, subscription: LiveClient.Subscription, lease: RelayWriteLease,
+    task: Task<Void, Never>
+  ) {
+    self.token = token
+    self.subscription = subscription
+    self.lease = lease
+    self.task = task
+  }
 }
 
-public func removeRelay(
-  registry: SubscriptionRegistry, id: String,
-  stop: @Sendable (LiveClient.Subscription) async -> Void
-) async {
-  if let subscription = await registry.remove(id) { await stop(subscription) }
+/// Validation and the corresponding write share this lock. Invalidation cannot
+/// return, and therefore no replacement ACK can be written, while an old relay
+/// is between its validity check and its output write.
+public final class RelayWriteLease: @unchecked Sendable {
+  private let lock = NSLock()
+  private var valid = true
+  private let afterValidation: (@Sendable () -> Void)?
+
+  public init(afterValidation: (@Sendable () -> Void)? = nil) {
+    self.afterValidation = afterValidation
+  }
+
+  public func invalidate() { lock.withLock { valid = false } }
+
+  fileprivate func writeIfValid(_ body: () throws -> Void) rethrows {
+    try lock.withLock {
+      guard valid else { return }
+      afterValidation?()
+      try body()
+    }
+  }
+}
+
+public actor RelayStartGate {
+  private var open = false
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+  public init() {}
+  public func wait() async {
+    guard !open else { return }
+    await withCheckedContinuation { waiters.append($0) }
+  }
+  public func release() {
+    open = true
+    let pending = waiters
+    waiters.removeAll()
+    for waiter in pending { waiter.resume() }
+  }
+}
+
+public func stopRelay(_ relay: SubscriptionRelay, live: LiveClient?) async {
+  relay.lease.invalidate()
+  if let live { await live.unsubscribe(relay.subscription) }
+  relay.task.cancel()
+  await relay.task.value
 }
 
 public actor AdapterOutput {
@@ -227,15 +267,9 @@ public actor AdapterOutput {
     guard !closed else { return }
     try? connection.write(event: event)
   }
-  public func writeIf(_ predicate: @Sendable () async -> Bool, _ event: [String: Any]) async {
-    guard !closed, await predicate() else { return }
-    try? connection.write(event: event)
-  }
-  public func writeIf(
-    _ predicate: @Sendable () async -> Bool, boxed event: UnsafeEvent
-  ) async {
-    guard !closed, await predicate() else { return }
-    try? connection.write(event: event.value)
+  public func writeIf(_ lease: RelayWriteLease, boxed event: UnsafeEvent) {
+    guard !closed else { return }
+    try? lease.writeIfValid { try connection.write(event: event.value) }
   }
   public func finish(id: String?) {
     guard !closed else { return }
@@ -278,7 +312,7 @@ public func runAdapter(connection: LineConnection, deploymentURL: String?) async
         continue
       }
       if operation == "close" {
-        for subscription in await registry.removeAll() { await live?.unsubscribe(subscription) }
+        for relay in await registry.removeAll() { await stopRelay(relay, live: live) }
         await live?.close()
         client?.close()
         await output.finish(id: id)
@@ -311,34 +345,41 @@ public func runAdapter(connection: LineConnection, deploymentURL: String?) async
         let activeLive = live!
         let subscription = try await activeLive.subscribe(
           command["path"] as? String ?? "", command["args"] as? [String: Any] ?? [:])
-        let token = await replaceRelay(registry: registry, id: subscriptionID, with: subscription) {
-          await activeLive.unsubscribe($0)
-        }
-        await output.write(["type": "ack", "id": id ?? ""])
-        Task {
+        let token = UUID()
+        let lease = RelayWriteLease()
+        let start = RelayStartGate()
+        let relayTask = Task {
+          await start.wait()
           for await update in subscription.stream {
-            let current = await registry.isCurrent(subscriptionID, token: token)
-            guard current else { return }
+            if Task.isCancelled { return }
+            let event: [String: Any]
             if let error = update.error {
-              await output.writeIf(
-                { await registry.isCurrent(subscriptionID, token: token) },
-                adapterErrorEvent(id: nil, subscriptionID: subscriptionID, error: error))
+              event = adapterErrorEvent(
+                id: nil, subscriptionID: subscriptionID, error: error)
             } else if let value = update.value {
-              var event: [String: Any] = [
+              var valueEvent: [String: Any] = [
                 "type": "subscription", "subscriptionId": subscriptionID, "value": value,
               ]
-              if !update.logs.isEmpty { event["logs"] = update.logs }
-              await output.writeIf(
-                { await registry.isCurrent(subscriptionID, token: token) },
-                boxed: UnsafeEvent(event))
+              if !update.logs.isEmpty { valueEvent["logs"] = update.logs }
+              event = valueEvent
+            } else {
+              continue
             }
+            await output.writeIf(lease, boxed: UnsafeEvent(event))
           }
         }
+        let relay = SubscriptionRelay(
+          token: token, subscription: subscription, lease: lease, task: relayTask)
+        if let previous = await registry.replace(subscriptionID, with: relay) {
+          await stopRelay(previous, live: activeLive)
+        }
+        await output.write(["type": "ack", "id": id ?? ""])
+        await start.release()
       case "unsubscribe":
-        if let subscriptionID = command["subscriptionId"] as? String, let activeLive = live {
-          await removeRelay(registry: registry, id: subscriptionID) {
-            await activeLive.unsubscribe($0)
-          }
+        if let subscriptionID = command["subscriptionId"] as? String,
+          let relay = await registry.remove(subscriptionID)
+        {
+          await stopRelay(relay, live: live)
         }
         await output.write(["type": "ack", "id": id ?? ""])
       case "debugDisconnect":
@@ -352,7 +393,7 @@ public func runAdapter(connection: LineConnection, deploymentURL: String?) async
       await output.write(adapterErrorEvent(id: id, error: error))
     }
   }
-  for subscription in await registry.removeAll() { await live?.unsubscribe(subscription) }
+  for relay in await registry.removeAll() { await stopRelay(relay, live: live) }
   await live?.close()
   client?.close()
 }

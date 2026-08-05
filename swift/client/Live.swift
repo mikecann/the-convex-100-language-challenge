@@ -181,7 +181,7 @@ private enum InboundEvent: @unchecked Sendable {
 /// WebSocket callbacks may arrive on different event loops. This mailbox gives
 /// the protocol actor one ordered input rather than creating one Task per event.
 private final class InboundMailbox: @unchecked Sendable {
-  private static let capacity = 64
+  private static let capacity = 8
   private let lock = NSLock()
   private var values: [InboundEvent] = []
   private var draining = false
