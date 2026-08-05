@@ -47,11 +47,12 @@ runtime dependencies such as CA certificates and the target language runtime
 declared by the manifest. Keep language-specific build layouts inside Docker
 stages rather than leaking them into the educational repository.
 
-The current runtime probe rejects Node.js and Python as delegated runtimes for
-the Elixir and Ruby batch. When the roster reaches JavaScript or Python, change
-that probe through a separate shared-infrastructure review with a narrow
-manifest-derived allowance for the target language. Do not weaken it inside a
-language branch.
+The runtime probe rejects Node.js and Python unless the manifest declares the
+one approved `targetRuntimeCommand` for JavaScript or Python. This exempts only
+the interpreter that genuinely executes that target-language client. Package
+tooling and every other delegated runtime remain forbidden. Extending the
+allowance to another language requires a separate shared-infrastructure review;
+do not weaken it inside a language branch.
 
 ## Implementation honesty
 

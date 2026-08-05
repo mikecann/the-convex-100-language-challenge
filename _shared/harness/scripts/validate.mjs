@@ -5,6 +5,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { parse } from "yaml";
 import { projectReadmeExamples } from "./example-readme.mjs";
+import { targetRuntimeError } from "./target-runtime-policy.mjs";
 
 const root = process.env.REPO_ROOT ?? "/repo";
 const roster = parse(fs.readFileSync(path.join(root, "roster/languages.yaml"), "utf8"));
@@ -133,12 +134,19 @@ for (const language of roster.languages) {
     if (!(manifest.intendedCapabilities ?? []).includes("http")) {
       errors.push(`${language.id}: implemented client must intend the HTTP baseline`);
     }
+    const runtimeError = targetRuntimeError(language.id, manifest);
+    if (runtimeError) errors.push(runtimeError);
     if (
       (manifest.intendedCapabilities ?? []).includes("live") &&
       !(manifest.adapter?.adapterOnlyCommands ?? []).includes("debugDisconnect")
     ) {
       errors.push(`${language.id}: Live intent requires adapter-only debugDisconnect`);
     }
+  }
+
+  if (manifest.implementation?.status === "planned") {
+    const runtimeError = targetRuntimeError(language.id, manifest);
+    if (runtimeError) errors.push(runtimeError);
   }
 }
 
