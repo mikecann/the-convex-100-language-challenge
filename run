@@ -20,6 +20,7 @@ usage() {
     "  backend-down        stop the local backend without deleting data" \
     "  build <language>    build a language image for linux/amd64" \
     "  test <language>     run a language image's unit-test target" \
+    "  verify-example <language>  build and run the basic example against local Convex" \
     "  verify <language>   run the shared conformance pilot" \
     "  verify-hosted <language>  run the compatibility pilot against hosted Convex" \
     "  verify-all <language>  build once, then run local and hosted pilots" \
@@ -132,6 +133,46 @@ build_client_image() {
     --provenance=false \
     --tag "100-convex-clients-$language:local" \
     "$repo_root/$language"
+}
+
+build_example_image() {
+  language=$1
+  docker buildx build \
+    --load \
+    --platform linux/amd64 \
+    --provenance=false \
+    --target example-runtime \
+    --tag "100-convex-clients-$language-example:local" \
+    "$repo_root/$language"
+}
+
+run_example_verification() {
+  deployment_url=$1
+  backend_kind=$2
+  example_room="go-example-$backend_kind-$(date +%s)-$$"
+
+  docker run --rm \
+    --platform linux/amd64 \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --pids-limit 32 \
+    --memory 64m \
+    --cpus 0.5 \
+    --network "$backend_network" \
+    --user 65532:65532 \
+    --env CONVEX_URL="$deployment_url" \
+    --env EXAMPLE_ROOM="$example_room" \
+    --entrypoint /bin/sh \
+    100-convex-clients-go-example:local \
+    -ec '
+      output=$(/usr/local/bin/convex-go-example "$EXAMPLE_ROOM")
+      printf "%s\n" "$output"
+      printf "%s\n" "$output" | grep -Fqx "current count: 0"
+      printf "%s\n" "$output" | grep -Fq "\"applied\": true"
+      printf "%s\n" "$output" | grep -Fqx "verified count: 0 -> 1"
+    '
+  printf '%s\n' "PASS go basic example returned the expected 0 -> 1 update against $backend_kind"
 }
 
 build_pilot_image() {
@@ -323,6 +364,21 @@ case "$command_name" in
       --platform linux/amd64 \
       "100-convex-clients-$language:test"
     ;;
+  verify-example)
+    require_docker
+    language=${2:-}
+    case "$language" in
+      go)
+        backend_deploy
+        build_example_image go
+        run_example_verification http://backend:3210 self-hosted
+        ;;
+      *)
+        printf '%s\n' "No basic example verification exists for: $language" >&2
+        exit 1
+        ;;
+    esac
+    ;;
   verify)
     require_docker
     language=${2:-}
@@ -332,6 +388,8 @@ case "$command_name" in
         "$repo_root/run" test go
         "$repo_root/run" build go
         image_policy go
+        build_example_image go
+        run_example_verification http://backend:3210 self-hosted
         client_digest=$(
           docker image inspect 100-convex-clients-go:local --format '{{.Id}}'
         )
@@ -364,6 +422,8 @@ case "$command_name" in
         "$repo_root/run" test go
         "$repo_root/run" build go
         image_policy go
+        build_example_image go
+        run_example_verification https://usable-reindeer-44.convex.cloud hosted
         client_digest=$(
           docker image inspect 100-convex-clients-go:local --format '{{.Id}}'
         )
@@ -396,6 +456,9 @@ case "$command_name" in
         "$repo_root/run" test go
         build_client_image go
         image_policy go
+        build_example_image go
+        run_example_verification http://backend:3210 self-hosted
+        run_example_verification https://usable-reindeer-44.convex.cloud hosted
         client_digest=$(
           docker image inspect 100-convex-clients-go:local --format '{{.Id}}'
         )

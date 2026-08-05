@@ -34,9 +34,9 @@ run                      root Docker-only orchestration entrypoint
 
 ### Example comments
 
-Every language's `examples/basics/` program must read like a short guided tour of the client API,
-not an uncommented smoke test. The canonical runnable source should comment all
-of these steps when they are present:
+Every language's `examples/basics/` program must read like a short guided tour
+of the client API, not an uncommented smoke test. The canonical runnable source
+should comment all of these steps when they are present:
 
 1. Reading deployment configuration and authentication.
 2. Creating the client and cleaning up its resources.
@@ -54,10 +54,17 @@ library. Do not narrate obvious target-language syntax or routine error checks.
 If a client has not earned Live, omit those operations and explain the verified
 HTTP-only scope instead of including pretend code.
 
-The runnable file under `examples/basics/` is the canonical source. The evidence site
-reads that file directly, and README code blocks are generated projections
-checked by `./run validate`. Use `./run sync-examples` after editing an example;
-never maintain a second handwritten copy.
+The runnable file under `examples/basics/` is the canonical source. The evidence
+site reads that file directly, and README code blocks are generated projections
+checked by `./run validate`. Use `./run sync-examples` after editing an
+example; never maintain a second handwritten copy.
+
+Each language's Docker verification must also build and execute that canonical
+file against a unique room on an approved test deployment. The example must
+exit unsuccessfully if any operation it demonstrates returns an unexpected
+value. Where Live is implemented, that includes the resulting subscription
+update. Merely compiling the example does not prove that the code shown to
+viewers works.
 
 ### Language-owned code
 
@@ -65,8 +72,8 @@ The repository standardises ownership boundaries for an educational project.
 Client code and its unit tests live under `client/`.
 Example-specific tests live with the example under `examples/basics/`, and
 the language-specific executable that exposes the shared adapter protocol lives
-under `client/tests/conformance/`. Cross-client black-box scenarios and assertions
-stay under `_shared/harness/`.
+under `client/tests/conformance/`. Cross-client black-box scenarios and
+assertions stay under `_shared/harness/`.
 
 Do not add generic `<id>/src/` or `<id>/tests/` buckets. An implemented language
 root contains only `README.md`, `Dockerfile`, `manifest.yaml`, `client/`, and

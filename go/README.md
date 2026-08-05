@@ -28,6 +28,7 @@ and tested inside Docker, so no Go toolchain is installed on the host.
 | Bearer-token authentication for HTTP calls | Works |
 | Initial and updated Live query values | Works |
 | Unsubscribe, reconnect, timeouts, and clean shutdown | Works |
+| Canonical basic example executed in Docker | Works |
 | Authentication for Live subscriptions | Not yet |
 | Full tagged Convex value types | Not yet |
 
@@ -48,6 +49,18 @@ import (
 
 	convex "github.com/mikecann/100-convex-clients/go/client"
 )
+
+// roomState is the part of the Convex query result used by this example.
+type roomState struct {
+	Count float64 `json:"count"`
+}
+
+// incrementResult mirrors the mutation response so the example can verify that
+// the write was applied and produced the expected next state.
+type incrementResult struct {
+	Applied bool      `json:"applied"`
+	State   roomState `json:"state"`
+}
 
 func main() {
 	ctx := context.Background()
@@ -77,13 +90,9 @@ func main() {
 		panic(err)
 	}
 
-	var state struct {
-		Count float64 `json:"count"`
-	}
+	var state roomState
 	// Decode the JSON result into a typed Go value the application can use.
-	if err := json.Unmarshal(result.Value, &state); err != nil {
-		panic(err)
-	}
+	decodeJSON("current query", result.Value, &state)
 	fmt.Printf("current count: %.0f\n", state.Count)
 
 	// Begin listening for changes to the same query over Convex Live.
@@ -97,7 +106,11 @@ func main() {
 
 	// A subscription first sends the current value. Read that snapshot before
 	// making a change so the following update is unambiguous.
-	printJSON("live initial", nextUpdate(subscription))
+	initialValue := nextUpdate(subscription)
+	var initialState roomState
+	decodeJSON("initial Live value", initialValue, &initialState)
+	expectCount("initial Live value", initialState.Count, state.Count)
+	printJSON("live initial", initialValue)
 
 	// Run a mutation over HTTP. The subscription above will observe this write.
 	mutation, err := client.Mutation(ctx, "demo:increment", map[string]any{
@@ -108,10 +121,25 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	var increment incrementResult
+	decodeJSON("mutation", mutation.Value, &increment)
+	if !increment.Applied {
+		panic("mutation was not applied")
+	}
+	expectedCount := state.Count + 1
+	expectCount("mutation", increment.State.Count, expectedCount)
 	printJSON("mutation", mutation.Value)
 
 	// Receive the changed room through Live without issuing another HTTP query.
-	printJSON("live update", nextUpdate(subscription))
+	updatedValue := nextUpdate(subscription)
+	var updatedState roomState
+	decodeJSON("updated Live value", updatedValue, &updatedState)
+	expectCount("updated Live value", updatedState.Count, expectedCount)
+	printJSON("live update", updatedValue)
+
+	// Reaching this line proves the query, mutation, and Live subscription all
+	// agreed on the same change.
+	fmt.Printf("verified count: %.0f -> %.0f\n", state.Count, updatedState.Count)
 }
 
 // nextUpdate waits for one value from a Live subscription. It turns a closed
@@ -128,6 +156,22 @@ func nextUpdate(subscription *convex.Subscription) json.RawMessage {
 		return update.Value
 	case <-time.After(10 * time.Second):
 		panic("timed out waiting for Live update")
+	}
+}
+
+// decodeJSON turns a raw Convex result into the typed value needed by the next
+// step and includes the operation name if decoding fails.
+func decodeJSON(operation string, raw json.RawMessage, destination any) {
+	if err := json.Unmarshal(raw, destination); err != nil {
+		panic(fmt.Errorf("decode %s: %w", operation, err))
+	}
+}
+
+// expectCount makes the example fail instead of merely printing an unexpected
+// value. Docker uses that failure to reject a broken example.
+func expectCount(operation string, actual float64, expected float64) {
+	if actual != expected {
+		panic(fmt.Sprintf("%s count was %.0f, expected %.0f", operation, actual, expected))
 	}
 }
 
@@ -198,15 +242,19 @@ No Go tooling should run on the host.
 
 ```sh
 ./run test go
+./run verify-example go
 ./run verify go
 ./run verify-hosted go
 ```
 
 `test` runs race-enabled unit tests against mock HTTP and WebSocket peers.
-`verify` runs the complete JavaScript-oracle and Go black-box suites against the
-pinned local backend. `verify-hosted` repeats them over current HTTPS and WSS.
-Only those shared controller results can calculate HTTP or Live. Trusted-main
-CI alone publishes the badges shown by the official evidence site.
+`verify-example` builds this exact basic example into a minimal container, runs
+it against a unique room, and requires the query, mutation, and Live subscription
+to agree on a `0 -> 1` change. `verify` runs that check plus the complete
+JavaScript-oracle and Go black-box suites against the pinned local backend.
+`verify-hosted` repeats them over current HTTPS and WSS. Only those shared
+controller results can calculate HTTP or Live. Trusted-main CI alone publishes
+the badges shown by the official evidence site.
 
 ## How it talks to Convex
 

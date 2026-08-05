@@ -76,6 +76,7 @@ test, package operation, and generated artifact.
 ```sh
 ./run doctor
 ./run validate
+./run verify-example go
 ./run verify go
 ./run verify-hosted go
 ./run verify-all go
@@ -83,8 +84,11 @@ test, package operation, and generated artifact.
 ./run site-serve
 ```
 
-The last two commands generate a clearly labelled local evidence preview and
-serve it at `http://127.0.0.1:4173`. `./run site` is stricter: it ignores local
-results and renders only the trusted-main result index.
+`verify-example` compiles and runs the canonical basic example inside Docker,
+then requires its query, mutation, and Live subscription to observe the expected
+counter change. The last two commands generate a clearly labelled local
+evidence preview and serve it at `http://127.0.0.1:4173`. `./run site` is
+stricter: it ignores local results and renders only the trusted-main result
+index.
 
 See the [roster methodology](roster/methodology.md), [exact proposed roster](roster/languages.yaml), [conformance contract](docs/conformance.md), and [implementation architecture](docs/architecture.md).

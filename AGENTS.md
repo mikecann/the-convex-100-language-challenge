@@ -37,6 +37,7 @@ or ecosystem scaffolding that exists only to make a client distributable.
 - Explain intent, sequencing, and Convex behaviour. Do not merely translate the target language's syntax into prose or comment routine error handling.
 - Keep comments close to the code they explain and concise enough that the example still reads naturally.
 - The runnable `examples/basics/` file is the canonical source. Generate the README and website from it so all three surfaces always show the same commented code.
+- Docker verification must compile and execute that exact canonical example against a unique room on the approved test deployment. The example must fail on an unexpected value from any operation it demonstrates; compilation alone is not enough.
 
 ## Language layout
 
