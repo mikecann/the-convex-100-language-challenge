@@ -4,5 +4,29 @@ displayName: "C#"
 rank: 5
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native .NET 8 HTTP and pinned experimental WebSocket sync client. Capability badges remain empty pending shared evidence.
+toolchain:
+  name: .NET SDK
+  version: 8.0.408
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication and WebSocket mutations/actions are deferred.
+  - Transition chunks, optimistic updates, journals, and replay are deferred.
+  - Each Live subscription retains its newest 16 updates; old intermediate updates are dropped for slow consumers.
 capabilities: []
