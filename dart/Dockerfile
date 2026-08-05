@@ -18,6 +18,7 @@ RUN dart format --set-exit-if-changed client examples && \
     dart analyze client examples && \
     dart run client/tests/client_test.dart && \
     dart run client/tests/live_matrix_test.dart && \
+    dart run client/tests/lifecycle_test.dart && \
     dart run client/tests/adapter_test.dart && \
     dart run client/tests/websocket_frame_test.dart && \
     mkdir -p /out && \

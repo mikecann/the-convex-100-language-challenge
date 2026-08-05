@@ -97,6 +97,8 @@ Future<void> main(List<String> arguments) async {
 }
 
 Future<Object?> _nextValue(StreamIterator<LiveUpdate> updates) async {
+  // Bound the wait so a broken Live connection fails the example instead of
+  // hanging forever, and turn a structured Live failure back into an error.
   final hasUpdate = await updates.moveNext().timeout(
     const Duration(seconds: 10),
   );
@@ -108,6 +110,8 @@ Future<Object?> _nextValue(StreamIterator<LiveUpdate> updates) async {
 }
 
 int _count(String operation, Object? value) {
+  // Decode the JSON object into the simple Dart value this example needs while
+  // rejecting a surprising server result rather than printing false success.
   if (value is! Map || value['count'] is! num) {
     throw FormatException(
       '$operation did not return a numeric count: ${jsonEncode(value)}',
@@ -117,6 +121,8 @@ int _count(String operation, Object? value) {
 }
 
 ({bool applied, int count}) _readMutation(Object? value) {
+  // The mutation returns both idempotency status and the new counter state, so
+  // validate both fields before trusting either one.
   if (value is! Map || value['applied'] is! bool || value['state'] is! Map) {
     throw FormatException(
       'mutation did not return the expected shape: ${jsonEncode(value)}',
@@ -129,11 +135,14 @@ int _count(String operation, Object? value) {
 }
 
 void _expect(String operation, int actual, int expected) {
+  // Each demonstrated step must agree with the expected 0 -> 1 journey.
   if (actual != expected)
     throw StateError('$operation count was $actual, expected $expected');
 }
 
 String _runId() =>
+    // A random key makes this run unique while still allowing Convex to dedupe
+    // a retry of the same mutation request.
     List<int>.generate(
       16,
       (_) => Random.secure().nextInt(256),

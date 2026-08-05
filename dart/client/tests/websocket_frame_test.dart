@@ -8,6 +8,7 @@ import '../convex_client.dart';
 Future<void> main() async {
   await _fragmentedUtf8WithControlFrame();
   await _boundedCloseDuringPartialFrame();
+  await _boundedUnsubscribeDuringPartialFrame();
   stdout.writeln('PASS Dart fragmented UTF-8/control and partial-frame close');
 }
 
@@ -71,6 +72,27 @@ Future<void> _boundedCloseDuringPartialFrame() async {
   final client = ConvexClient(fixture.url);
   await client.subscribe('demo:state', {'room': 'partial'});
   await fixture.handlerReached.future.timeout(const Duration(seconds: 2));
+  await client.close().timeout(const Duration(seconds: 1));
+  await fixture.close();
+}
+
+Future<void> _boundedUnsubscribeDuringPartialFrame() async {
+  final fixture = await _RawFixture.start((reader, socket) async {
+    await _upgrade(reader, socket);
+    await _readClientJson(reader); // Connect
+    await _readClientJson(reader); // Add
+    socket.add([
+      0x81,
+      100,
+      0x7b,
+    ]); // Begin a frame and then remain uncooperative.
+  });
+  final client = ConvexClient(fixture.url);
+  final subscription = await client.subscribe('demo:state', {
+    'room': 'partial-unsubscribe',
+  });
+  await fixture.handlerReached.future.timeout(const Duration(seconds: 2));
+  await subscription.close().timeout(const Duration(seconds: 1));
   await client.close().timeout(const Duration(seconds: 1));
   await fixture.close();
 }

@@ -56,10 +56,12 @@ class LiveClient {
   final Map<int, LiveUpdate> _remoteResults = {};
   Future<void> _tail = Future.value();
   WebSocket? _socket;
+  _ConnectAttempt? _connectAttempt;
   Timer? _reconnectTimer;
   int _nextQueryId = 0;
   int _querySetVersion = 0;
   int _generation = 0;
+  int _upgradeEpoch = 0;
   int _connectionCount = 0;
   String _lastCloseReason = 'InitialConnect';
   String _maxObservedTimestamp = '';
@@ -85,6 +87,9 @@ class LiveClient {
   }
 
   Future<void> unsubscribe(int queryId) {
+    // A pending HTTP upgrade is not an established Live socket. Interrupt it
+    // here so this control command can reach the serialized owner immediately.
+    _interruptUpgrade();
     final completer = Completer<void>();
     _enqueue(() async {
       final state = _active.remove(queryId);
@@ -97,13 +102,18 @@ class LiveClient {
           {'type': 'Remove', 'queryId': queryId},
         ], 'unsubscribe');
       }
-      if (_active.isEmpty) _cancelReconnect();
+      if (_active.isEmpty) {
+        _cancelReconnect();
+      } else if (_socket == null) {
+        _scheduleReconnect(Duration.zero);
+      }
       completer.complete();
     });
     return completer.future;
   }
 
   Future<void> debugDisconnect() {
+    _interruptUpgrade();
     final completer = Completer<void>();
     _enqueue(() async {
       if (_socket == null) {
@@ -120,6 +130,7 @@ class LiveClient {
   }
 
   Future<void> close() {
+    _interruptUpgrade();
     final completer = Completer<void>();
     _enqueue(() async {
       if (_closed) return completer.complete();
@@ -153,10 +164,16 @@ class LiveClient {
   void _scheduleReconnect(Duration delay) {
     if (_closed || _active.isEmpty) return;
     _cancelReconnect();
+    final upgradeEpoch = _upgradeEpoch;
     _reconnectTimer = Timer(delay, () {
       _enqueue(() async {
         _reconnectTimer = null;
-        if (_socket != null || _closed || _active.isEmpty) return;
+        if (_socket != null ||
+            _closed ||
+            _active.isEmpty ||
+            upgradeEpoch != _upgradeEpoch) {
+          return;
+        }
         await _connect();
       });
     });
@@ -167,12 +184,44 @@ class LiveClient {
     _reconnectTimer = null;
   }
 
+  void _interruptUpgrade() {
+    // Invalidate a reconnect task even if it was queued just before the caller
+    // could observe and cancel its concrete _ConnectAttempt.
+    _upgradeEpoch += 1;
+    _connectAttempt?.cancel();
+  }
+
   Future<void> _connect() async {
+    final attempt = _ConnectAttempt();
+    _connectAttempt = attempt;
+    final connect = WebSocket.connect(
+      _syncUri.toString(),
+      headers: {'Convex-Client': _clientVersion},
+      customClient: attempt.httpClient,
+    ).timeout(const Duration(seconds: 10));
+    // Future.any stops waiting after cancellation, so explicitly retire a
+    // socket if an upgrade wins the network race just after that cancellation.
+    connect.then((socket) {
+      if (attempt.cancelled) {
+        unawaited(
+          socket.close(WebSocketStatus.normalClosure, 'connect cancelled'),
+        );
+      }
+    }, onError: (Object _) {});
     try {
-      final socket = await WebSocket.connect(
-        _syncUri.toString(),
-        headers: {'Convex-Client': _clientVersion},
-      ).timeout(const Duration(seconds: 10));
+      final socket = await Future.any<WebSocket>([
+        connect,
+        attempt.cancelledFuture.then<WebSocket>(
+          (_) => throw const _ConnectCancelled(),
+        ),
+      ]);
+      if (attempt.cancelled || _closed || _active.isEmpty) {
+        unawaited(
+          socket.close(WebSocketStatus.normalClosure, 'connect cancelled'),
+        );
+        return;
+      }
+      attempt.release();
       _socket = socket;
       _generation += 1;
       final generation = _generation;
@@ -203,13 +252,19 @@ class LiveClient {
           .map((state) => state.addModification)
           .toList(growable: false);
       if (additions.isNotEmpty) await _modify(additions, 'connect');
+    } on _ConnectCancelled {
+      return;
     } catch (error) {
+      if (attempt.cancelled) return;
+      attempt.abort();
       final transport = TransportError('live connect', error.toString());
       _publishFailure(transport);
       _lastCloseReason = transport.message;
       _connectionCount += 1;
       _scheduleReconnect(_nextBackoff);
       _nextBackoff = _doubleBackoff(_nextBackoff);
+    } finally {
+      if (identical(_connectAttempt, attempt)) _connectAttempt = null;
     }
   }
 
@@ -366,6 +421,37 @@ class LiveClient {
       if (state.shouldDeliver(update)) state.add(update);
     }
   }
+}
+
+class _ConnectAttempt {
+  final HttpClient httpClient = HttpClient();
+  final Completer<void> _cancelled = Completer<void>();
+  bool cancelled = false;
+
+  Future<void> get cancelledFuture => _cancelled.future;
+
+  void cancel() {
+    if (cancelled) return;
+    cancelled = true;
+    // WebSocket.connect accepts this client specifically so force-close can
+    // abort an HTTP upgrade whose peer never completes the handshake.
+    httpClient.close(force: true);
+    _cancelled.complete();
+  }
+
+  void abort() {
+    httpClient.close(force: true);
+  }
+
+  void release() {
+    // The upgraded socket is detached from the HTTP pool and remains owned by
+    // LiveClient. Closing the now-unused pool does not close that WebSocket.
+    httpClient.close();
+  }
+}
+
+class _ConnectCancelled implements Exception {
+  const _ConnectCancelled();
 }
 
 class _SubscriptionState {

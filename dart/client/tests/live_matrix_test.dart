@@ -6,6 +6,12 @@ import '../convex_client.dart';
 import '../live_client.dart';
 
 Future<void> main() async {
+  await _reconnectAndErrorMatrix();
+  await _backoffAndTimestampMatrix();
+  stdout.writeln('PASS deterministic Dart Live reconnect and error matrix');
+}
+
+Future<void> _reconnectAndErrorMatrix() async {
   final fixture = await _LiveFixture.start();
   final client = ConvexClient(fixture.url);
   final subscription = await client.subscribe('demo:state', {'room': 'matrix'});
@@ -84,13 +90,83 @@ Future<void> main() async {
     await client.close().timeout(const Duration(seconds: 1));
     await fixture.close();
   }
-  stdout.writeln('PASS deterministic Dart Live reconnect and error matrix');
+}
+
+Future<void> _backoffAndTimestampMatrix() async {
+  final fixture = await _BackoffFixture.start();
+  final client = ConvexClient(fixture.url);
+  final subscription = await client.subscribe('demo:state', {
+    'room': 'backoff',
+  });
+  final updates = StreamIterator(subscription.updates);
+  try {
+    _expectValue(await _next(updates), 0, 'backoff initial value');
+    final firstTimestamp = fixture.lastSentTimestamp;
+    _check(firstTimestamp == 'AQAAAAAAAAA=', 'unexpected first timestamp');
+
+    fixture.rejectNextUpgrades(3);
+    await fixture.dropGenuinely();
+    await fixture.waitForAcceptedConnections(2);
+    _expectValue(
+      await _nextSuccessful(updates),
+      0,
+      'value after accumulated handshake failures',
+    );
+    _check(fixture.rejectedUpgrades == 3, 'did not reject three handshakes');
+    final afterFailures = fixture.connectMessages[1];
+    _check(
+      afterFailures['connectionCount'] == 4,
+      'three failed handshakes produced ${afterFailures['connectionCount']}, expected connectionCount 4',
+    );
+    _check(
+      afterFailures['maxObservedTimestamp'] == firstTimestamp,
+      'maxObservedTimestamp did not survive failed handshakes',
+    );
+
+    final secondTimestamp = fixture.lastSentTimestamp;
+    _check(secondTimestamp == 'AgAAAAAAAAA=', 'unexpected second timestamp');
+    final reconnectWatch = Stopwatch()..start();
+    await fixture.dropGenuinely();
+    await fixture.waitForAcceptedConnections(3);
+    reconnectWatch.stop();
+    _check(
+      reconnectWatch.elapsed < const Duration(milliseconds: 500),
+      'valid transition did not reset backoff: ${reconnectWatch.elapsed}',
+    );
+    final afterReset = fixture.connectMessages[2];
+    _check(
+      afterReset['connectionCount'] == 5,
+      'post-reset reconnect had ${afterReset['connectionCount']}, expected connectionCount 5',
+    );
+    _check(
+      afterReset['maxObservedTimestamp'] == secondTimestamp,
+      'post-reset Connect did not carry the exact latest timestamp',
+    );
+    _expectValue(
+      await _nextSuccessful(updates),
+      0,
+      'value after reset backoff reconnect',
+    );
+    await subscription.close().timeout(const Duration(seconds: 1));
+  } finally {
+    await updates.cancel();
+    await client.close().timeout(const Duration(seconds: 1));
+    await fixture.close();
+  }
 }
 
 Future<LiveUpdate> _next(StreamIterator<LiveUpdate> updates) async {
   final moved = await updates.moveNext().timeout(const Duration(seconds: 3));
   if (!moved) throw StateError('Live stream ended early');
   return updates.current;
+}
+
+Future<LiveUpdate> _nextSuccessful(StreamIterator<LiveUpdate> updates) async {
+  for (var attempt = 0; attempt < 10; attempt += 1) {
+    final update = await _next(updates);
+    if (update.error == null) return update;
+  }
+  throw StateError('Live stream did not recover after transport failures');
 }
 
 void _expectValue(LiveUpdate update, int expected, String label) {
@@ -239,6 +315,100 @@ class _LiveFixture {
     );
     _remoteQuerySet = nextQuerySet;
     _remoteTimestamp = nextTimestamp;
+  }
+}
+
+class _BackoffFixture {
+  _BackoffFixture._(this.server);
+
+  static Future<_BackoffFixture> start() async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final fixture = _BackoffFixture._(server);
+    unawaited(server.forEach(fixture._handle));
+    return fixture;
+  }
+
+  final HttpServer server;
+  final List<Map<String, dynamic>> connectMessages = [];
+  final StreamController<int> _acceptedEvents = StreamController<int>.broadcast(
+    sync: true,
+  );
+  final List<WebSocket> _sockets = [];
+  WebSocket? _active;
+  int _rejectRemaining = 0;
+  int rejectedUpgrades = 0;
+  int _timestamp = 0;
+  String lastSentTimestamp = '';
+
+  String get url => 'http://${server.address.address}:${server.port}';
+
+  void rejectNextUpgrades(int count) {
+    _rejectRemaining = count;
+  }
+
+  Future<void> waitForAcceptedConnections(int expected) async {
+    if (connectMessages.length >= expected) return;
+    await _acceptedEvents.stream
+        .firstWhere((count) => count >= expected)
+        .timeout(const Duration(seconds: 6));
+  }
+
+  Future<void> dropGenuinely() async {
+    final socket = _active;
+    if (socket == null) throw StateError('no active backoff fixture socket');
+    await socket.close(WebSocketStatus.internalServerError, 'backoff drop');
+  }
+
+  Future<void> close() async {
+    for (final socket in _sockets) {
+      await socket.close();
+    }
+    await server.close(force: true);
+    await _acceptedEvents.close();
+  }
+
+  Future<void> _handle(HttpRequest request) async {
+    if (_rejectRemaining > 0) {
+      _rejectRemaining -= 1;
+      rejectedUpgrades += 1;
+      request.response.statusCode = HttpStatus.serviceUnavailable;
+      await request.response.close();
+      return;
+    }
+    final socket = await WebSocketTransformer.upgrade(request);
+    _sockets.add(socket);
+    var connected = false;
+    await for (final raw in socket) {
+      final message = jsonDecode(raw as String) as Map<String, dynamic>;
+      if (!connected) {
+        _active = socket;
+        connectMessages.add(message);
+        connected = true;
+        continue;
+      }
+      if (message['type'] != 'ModifyQuerySet') continue;
+      final modification =
+          (message['modifications'] as List).first as Map<String, dynamic>;
+      if (modification['type'] != 'Add') continue;
+      final timestamp = _timestampValue(++_timestamp);
+      lastSentTimestamp = timestamp;
+      socket.add(
+        jsonEncode({
+          'type': 'Transition',
+          'startVersion': {'querySet': 0, 'identity': 0, 'ts': 'AAAAAAAAAAA='},
+          'endVersion': {'querySet': 1, 'identity': 0, 'ts': timestamp},
+          'modifications': [
+            {
+              'type': 'QueryUpdated',
+              'queryId': modification['queryId'],
+              'value': {'count': 0},
+              'logLines': <String>[],
+            },
+          ],
+        }),
+      );
+      _acceptedEvents.add(connectMessages.length);
+    }
   }
 }
 
