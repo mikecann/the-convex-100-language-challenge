@@ -1,6 +1,7 @@
 export const approvedTargetRuntimeCommands = new Map([
   ["javascript", new Set(["node"])],
   ["python", new Set(["python", "python3"])],
+  ["typescript", new Set(["node"])],
 ]);
 
 export function targetRuntimeError(languageId, manifest) {
