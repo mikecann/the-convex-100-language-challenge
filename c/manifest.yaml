@@ -4,5 +4,30 @@ displayName: "C"
 rank: 10
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native C implementation of documented HTTP functions and the pinned sync profile using libcurl for HTTP, TLS, and WebSocket transport plus json-c for JSON.
+toolchain:
+  name: GCC
+  version: 14.2.0
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, optimistic updates, WebSocket mutations, and WebSocket actions are deferred.
+  - Live values cover the JSON-safe subset; tagged Convex value types are deferred.
+  - TransitionChunk assembly is deferred and treated as protocol drift that reconnects.
+  - Each subscription retains the newest 16 updates and drops the oldest value when its consumer is slow.
 capabilities: []

@@ -1,24 +1,3 @@
-# Convex from C
-
-A compact native C client that calls Convex functions over HTTP and keeps queries current over the pinned Live WebSocket profile.
-
-This is educational and unofficial, not a production Convex SDK.
-
-## Start here
-
-[`examples/basics/main.c`](examples/basics/main.c) follows the shared counter from 0 to 1 using an HTTP query, a Live subscription started before the mutation, and an idempotent mutation.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP queries, mutations and actions | Implemented, awaiting shared evidence |
-| Bearer-token replacement and structured function errors | Implemented, awaiting shared evidence |
-| Live initial values and updates | Implemented, awaiting shared evidence |
-| Remove, reconnect, query-error recovery and bounded delivery | Implemented, awaiting shared evidence |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.c -->
-```text
 #include "convex.h"
 #include <curl/curl.h>
 #include <stdio.h>
@@ -119,13 +98,3 @@ int main(int argc, char **argv) {
   convex_free(client);
   return 0;
 }
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-`./run test c` compiles the client and its adapter in Docker. `./run verify-example c` exercises the exact example against the dedicated backend. `./run verify c` is the shared HTTP and Live conformance gate.
-
-## Protocol notes and limits
-
-The adapter speaks NDJSON protocol v1 on stdin/stdout or one `ADAPTER_LISTEN` TCP connection. libcurl supplies ordinary HTTP, TLS, and WebSocket transport and json-c supplies JSON parsing; Convex behavior and sync state are implemented here in C. One worker owns the WebSocket, reconnects with 100 ms to 15 s exponential backoff, and resubscribes with fresh Add messages. Subscription queues retain the newest 16 updates. Live authentication, optimistic updates, tagged values, cancellation, streaming HTTP responses, and `TransitionChunk` assembly are deferred.
