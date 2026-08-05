@@ -1,0 +1,17 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Local orchestration state and generated reports
+.worktrees/
+.cache/
+artifacts/
+results/local/
+
+# Common build outputs that must remain inside containers
+node_modules/
+dist/
+build/
+target/
+coverage/

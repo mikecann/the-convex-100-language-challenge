@@ -1,0 +1,43 @@
+# Project instructions
+
+## Purpose
+
+This repository tests how many programming languages can support useful Convex clients. The result must remain evidence-led: a language earns a capability only when its container passes the shared black-box conformance test for that capability.
+
+## Docker-only builds
+
+- Do not install compilers, interpreters, package managers, SDKs, or build dependencies on the host.
+- Run builds, tests, formatting, linting, code generation, and package installation inside Docker containers.
+- Host-side commands are limited to repository operations, Docker orchestration, and read-only inspection using tools already installed.
+- Pin base image versions. Pin production and verification images by digest once a client is working.
+- Treat `linux/amd64` as the initial reference platform. Additional platforms are separate verified capabilities.
+- Do not mount the Docker socket into a language client container.
+
+## Implementation honesty
+
+- Every language lives under `clients/<language-id>/` and owns its implementation, Dockerfile, test adapter, and manifest.
+- Declare whether an implementation is `native`, `binding`, or `transpiled`.
+- A native client may use normal HTTP, TLS, JSON, and WebSocket libraries for its language, but it must implement Convex-specific behavior in the target language.
+- Do not shell out to another Convex client, Node.js, Python, `curl`, or the Convex CLI and present the result as a native client.
+- Shared-core FFI can be useful, but it earns the binding badge rather than the native badge.
+- Preserve failed attempts and their evidence. Do not mark a capability passing based only on compilation or a mocked test.
+
+## Convex safety
+
+- Any Convex schema change requires Michael's explicit approval before it is applied.
+- Use a dedicated test deployment or an approved local self-hosted deployment. Never point conformance tests at an unrelated development or production deployment.
+- Never bake deploy keys, auth tokens, or other secrets into images, layers, fixtures, logs, or committed files.
+- Pin the tested protocol and backend revision in verification evidence. Do not imply that an undocumented protocol is stable or officially supported.
+
+## Parallel agents
+
+- Use one branch and one worktree per language implementation.
+- Agents may edit only their assigned client directory unless their task explicitly includes shared infrastructure.
+- Shared harness, schema, manifest schema, and architecture changes must be handled separately from language batches.
+- Build and test the assigned client in Docker before handing it back.
+
+## Pull requests
+
+- Start every PR body with a `## Why` section that explains what prompted the change and why it is worth making.
+- Include the exact Docker build and conformance commands run.
+- State the earned capability badges and any known failures without rounding up.
