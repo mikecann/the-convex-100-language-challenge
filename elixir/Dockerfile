@@ -25,6 +25,7 @@ COPY client/*.ex ./source/
 COPY client/tests/conformance/*.ex ./source/conformance/
 COPY examples/basics/main.ex ./source/example.ex
 COPY client/test ./test
+COPY client/tests/conformance/*_test.exs ./test/conformance/
 COPY examples/basics/main_test.exs ./test/example_test.exs
 COPY client/.formatter.exs ./
 
@@ -41,7 +42,7 @@ RUN mix compile --warnings-as-errors
 # compiler path is unreliable under amd64 QEMU on Apple Silicon, so compile the
 # exact test modules here and persist their portable BEAM bytecode plus a module
 # manifest for the target-platform runner below.
-RUN mix run --no-start -e 'ExUnit.start(autorun: false); output = "_build/test/lib/convex_client/ebin"; modules = Path.wildcard("test/*_test.exs") |> Enum.flat_map(fn path -> Code.compile_file(path) end) |> Enum.map(fn {module, bytecode} -> File.write!(Path.join(output, Atom.to_string(module) <> ".beam"), bytecode); module end); File.write!("_build/test/precompiled_test_modules", :erlang.term_to_binary(modules))'
+RUN mix run --no-start -e 'ExUnit.start(autorun: false); output = "_build/test/lib/convex_client/ebin"; modules = Path.wildcard("test/**/*_test.exs") |> Enum.flat_map(fn path -> Code.compile_file(path) end) |> Enum.map(fn {module, bytecode} -> File.write!(Path.join(output, Atom.to_string(module) <> ".beam"), bytecode); module end); File.write!("_build/test/precompiled_test_modules", :erlang.term_to_binary(modules))'
 
 # BEAM files produced above are architecture-independent. Execute the checks
 # and every ExUnit test again with the pinned target-platform Elixir and ERTS,

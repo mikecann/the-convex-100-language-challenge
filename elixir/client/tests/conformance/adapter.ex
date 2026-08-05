@@ -255,15 +255,34 @@ defmodule Convex.Conformance.Adapter do
         _ -> {"Error", nil, []}
       end
 
-    event = %{
-      "id" => id,
-      "type" => if(subscription_id, do: "subscription", else: "error"),
-      "subscriptionId" => subscription_id,
-      "logs" => logs,
-      "error" => %{"name" => name, "message" => Exception.message(error), "data" => data}
-    }
+    event =
+      %{
+        "type" => if(subscription_id, do: "subscription", else: "error"),
+        "logs" => logs,
+        "error" => %{"name" => name, "message" => Exception.message(error), "data" => data}
+      }
+      |> put_optional("id", id)
+      |> put_optional("subscriptionId", subscription_id)
 
     emit(writer, event)
+  end
+
+  defp put_optional(event, _key, nil), do: event
+  defp put_optional(event, key, value), do: Map.put(event, key, value)
+
+  # Exercise the real writer and JSON encoder from language-local tests without
+  # exposing a test hook in the production conformance release.
+  if Mix.env() == :test do
+    @doc false
+    def emit_error_for_test(id, subscription_id, error) do
+      writer = spawn(fn -> writer_loop(:stdio) end)
+
+      try do
+        emit_error(writer, id, subscription_id, error)
+      after
+        Process.exit(writer, :kill)
+      end
+    end
   end
 
   defp writer_loop(transport) do
