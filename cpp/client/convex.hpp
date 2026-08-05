@@ -20,9 +20,9 @@ class Subscription {
   ~Subscription();
   std::optional<Update> next_update(int timeout_ms = 10000);
   void close();
-  void debug_disconnect();
  private:
   friend class Client;
+  void debug_disconnect();
 #ifdef CONVEX_CLIENT_TESTING
   friend struct SubscriptionTestAccess;
   std::vector<Update> pending_updates_for_test();
@@ -43,7 +43,9 @@ class Client {
   std::shared_ptr<Subscription> subscribe(const std::string& path, const Json& args = Json::object());
   void set_auth(std::string token);
   void close();
+#ifdef CONVEX_ADAPTER_BUILD
   void debug_disconnect_for_adapter();
+#endif
  private:
   Result call(const std::string& operation, const std::string& path, const Json& args);
   std::string url_, token_;

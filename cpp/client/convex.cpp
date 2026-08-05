@@ -26,7 +26,9 @@ static Parts parse_url(const std::string& value) {
 Client::Client(std::string url, std::string token) : url_(std::move(url)), token_(std::move(token)) { parse_url(url_); }
 void Client::set_auth(std::string token) { if (closed_) throw Error("Convex client is closed"); token_ = std::move(token); }
 void Client::close() { closed_ = true; }
+#ifdef CONVEX_ADAPTER_BUILD
 void Client::debug_disconnect_for_adapter() { if (closed_) throw Error("Convex client is closed"); bool disconnected = false; for (auto it = subscriptions_.begin(); it != subscriptions_.end();) { if (auto subscription = it->lock()) { subscription->debug_disconnect(); disconnected = true; ++it; } else it = subscriptions_.erase(it); } if (!disconnected) throw Error("Live WebSocket is not connected"); }
+#endif
 Result Client::query(const std::string& path, const Json& args) { return call("query", path, args); }
 Result Client::mutation(const std::string& path, const Json& args) { return call("mutation", path, args); }
 Result Client::action(const std::string& path, const Json& args) { return call("action", path, args); }
