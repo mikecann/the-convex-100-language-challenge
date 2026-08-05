@@ -88,8 +88,8 @@ public sealed class LiveClient(string deployment) : IDisposable
             var logs = m["logLines"]?.AsArray().Select(x => x?.GetValue<string>() ?? "").ToArray() ?? [];
             if (modificationType == "QueryUpdated")
             {
-                if (m["value"] is null) throw new ConvexClient.ProtocolException("QueryUpdated omitted value");
-                subscription.Offer(new Update(m["value"]!.DeepClone(), null, logs));
+                if (!m.ContainsKey("value")) throw new ConvexClient.ProtocolException("QueryUpdated omitted value");
+                subscription.Offer(new Update(m["value"]?.DeepClone(), null, logs));
             }
             else if (modificationType == "QueryFailed")
                 subscription.Offer(new Update(null, new ConvexClient.FunctionException("query", m["errorMessage"]?.GetValue<string>() ?? "query failed", m["errorData"]?.DeepClone(), logs), logs));

@@ -16,7 +16,7 @@ public static class Program
         if (string.IsNullOrWhiteSpace(listen)) await Run(Console.In, Console.Out, Environment.GetEnvironmentVariable("CONVEX_URL"));
         else { var parts=listen.Split(':'); var server=new TcpListener(IPAddress.Parse(parts[0]),int.Parse(parts[1])); server.Start(); using var tcp=await server.AcceptTcpClientAsync(); using var stream=tcp.GetStream(); using var input=new StreamReader(stream); using var output=new StreamWriter(stream){AutoFlush=true}; await Run(input,output,Environment.GetEnvironmentVariable("CONVEX_URL")); }
     }
-    private static async Task Run(TextReader input, TextWriter output, string? url)
+    internal static async Task Run(TextReader input, TextWriter output, string? url)
     {
         var writer = new LockedWriter(output); var subs = new Dictionary<string,LiveClient.Subscription>(); ConvexClient? client=null; LiveClient? live=null;
         try { for (string? line; (line=await input.ReadLineAsync()) is not null;) { JsonObject command; try { command=JsonNode.Parse(line)?.AsObject() ?? throw new Exception("command is not an object"); } catch(Exception e) { await writer.Write(Failure(null,null,e)); continue; }

@@ -13,6 +13,7 @@ static class Tests
     {
         TestAdapterSerialization();
         await TestHttp();
+        await TestAdapterHttpOperations();
         await TestAdapterTcp();
         TestBoundedDelivery();
         await TestLiveFlowAndUtf8Fragmentation();
@@ -29,6 +30,7 @@ static class Tests
         Check(logged.Contains("\"logs\":[\"hello\"]"), "result logs were omitted");
         var subscription = Adapter.Serialize(Adapter.SubscriptionEvent("s", new LiveClient.Update(new JsonObject { ["text"] = "雪" }, null, [])));
         Equal("{\"type\":\"subscription\",\"subscriptionId\":\"s\",\"value\":{\"text\":\"\\u96EA\"}}", subscription, "subscription optional fields");
+        Equal("{\"type\":\"subscription\",\"subscriptionId\":\"s\",\"value\":null}", Adapter.Serialize(Adapter.SubscriptionEvent("s", new LiveClient.Update(null, null, []))), "subscription JSON null shape");
         var plainError = Adapter.Serialize(Adapter.Failure("e", null, new InvalidOperationException("bad")));
         Check(!plainError.Contains("subscriptionId") && !plainError.Contains("logs") && !plainError.Contains("data"), "request error serialized absent fields");
         var functionError = Adapter.Serialize(Adapter.Failure(null, "s", new ConvexClient.FunctionException("query", "empty", new JsonObject { ["code"] = "EMPTY" }, ["checked"])));
@@ -39,30 +41,73 @@ static class Tests
     private static async Task TestHttp()
     {
         using var listener = Listen();
-        string? request = null, secondRequest = null;
+        var requests = new List<string>();
         var server = Task.Run(async () => {
-            using (var socket = await listener.AcceptTcpClientAsync()) {
-                request = await ReadHttpRequest(socket.GetStream());
-                await WriteHttpResponse(socket.GetStream(), 200, "{\"status\":\"success\",\"value\":{\"text\":\"雪\",\"nested\":{\"ok\":true}},\"logLines\":[\"ran\"]}");
-            }
-            using (var socket = await listener.AcceptTcpClientAsync()) {
-                secondRequest = await ReadHttpRequest(socket.GetStream());
-                await WriteHttpResponse(socket.GetStream(), 560, "{\"status\":\"error\",\"errorMessage\":\"empty\",\"errorData\":{\"code\":\"ROOM_EMPTY\"},\"logLines\":[\"checked\"]}");
+            for(var operation=0;operation<4;operation++) {
+                using var socket = await listener.AcceptTcpClientAsync();
+                requests.Add(await ReadHttpRequest(socket.GetStream()));
+                var response = operation < 3
+                    ? "{\"status\":\"success\",\"value\":{\"text\":\"雪\",\"nested\":{\"ok\":true}},\"logLines\":[\"ran\"]}"
+                    : "{\"status\":\"error\",\"errorMessage\":\"empty\",\"errorData\":{\"code\":\"ROOM_EMPTY\"},\"logLines\":[\"checked\"]}";
+                await WriteHttpResponse(socket.GetStream(), operation < 3 ? 200 : 560, response);
             }
         });
         using var client = new ConvexClient(Url(listener));
         client.SetAuth("secret-token");
-        var success = await client.Query("demo:echo", new JsonObject { ["text"] = "雪", ["nested"] = new JsonObject { ["value"] = 3 } });
+        var reusableArgs = new JsonObject { ["text"] = "雪", ["nested"] = new JsonObject { ["value"] = 3 } };
+        var success = await client.Query("demo:echo", reusableArgs);
+        await client.Mutation("demo:echo", reusableArgs);
+        await client.Action("demo:echo", reusableArgs);
         Equal("雪", success.Value!["text"]!.GetValue<string>(), "UTF-8 success value");
         Equal("ran", success.Logs[0], "success logs");
-        Check(request!.Contains("Authorization: Bearer secret-token", StringComparison.OrdinalIgnoreCase), "auth header missing");
+        Check(reusableArgs.Parent is null && reusableArgs["nested"]!.Parent == reusableArgs, "HTTP calls took ownership of reusable args");
+        var request = requests[0];
+        Check(request.Contains("Authorization: Bearer secret-token", StringComparison.OrdinalIgnoreCase), "auth header missing");
         var requestBody = JsonNode.Parse(request[(request.IndexOf("\r\n\r\n", StringComparison.Ordinal) + 4)..])!;
         Check(requestBody["path"]!.GetValue<string>() == "demo:echo" && requestBody["args"]!["text"]!.GetValue<string>() == "雪" && requestBody["args"]!["nested"]!["value"]!.GetValue<int>() == 3, "HTTP request formatting lost nested UTF-8 args");
         client.SetAuth(null);
         try { await client.Query("demo:error", new JsonObject()); throw new Exception("function error became success"); }
         catch (ConvexClient.FunctionException error) { Equal("ROOM_EMPTY", error.ErrorData!["code"]!.GetValue<string>(), "structured error data"); Equal("checked", error.Logs[0], "error logs"); }
-        Check(!secondRequest!.Contains("Authorization:", StringComparison.OrdinalIgnoreCase), "clearing auth retained bearer header");
+        Check(!requests[3].Contains("Authorization:", StringComparison.OrdinalIgnoreCase), "clearing auth retained bearer header");
         await server.WaitAsync(Timeout);
+    }
+
+    private static async Task TestAdapterHttpOperations()
+    {
+        using var listener = Listen();
+        var requests = new List<string>();
+        var responses = new[] {
+            "{\"status\":\"success\",\"value\":{\"text\":\"雪\",\"nested\":{\"ok\":true}},\"logLines\":[\"query log\"]}",
+            "{\"status\":\"success\",\"value\":{\"applied\":true},\"logLines\":[]}",
+            "{\"status\":\"success\",\"value\":{\"done\":true},\"logLines\":[\"action log\"]}",
+            "{\"status\":\"error\",\"errorMessage\":\"empty\",\"errorData\":{\"code\":\"ROOM_EMPTY\"},\"logLines\":[\"checked\"]}",
+            "{\"status\":\"success\",\"value\":null,\"logLines\":[]}"
+        };
+        var server = Task.Run(async () => {
+            for(var index=0;index<responses.Length;index++) {
+                using var socket=await listener.AcceptTcpClientAsync();requests.Add(await ReadHttpRequest(socket.GetStream()));
+                await WriteHttpResponse(socket.GetStream(),index==3?560:200,responses[index]);
+            }
+        });
+        var input = string.Join('\n', new[] {
+            "{\"id\":\"q\",\"op\":\"query\",\"path\":\"demo:query\",\"args\":{\"text\":\"雪\",\"nested\":{\"value\":3}}}",
+            "{\"id\":\"m\",\"op\":\"mutation\",\"path\":\"demo:mutation\",\"args\":{\"text\":\"雪\",\"nested\":{\"value\":3}}}",
+            "{\"id\":\"a\",\"op\":\"action\",\"path\":\"demo:action\",\"args\":{\"text\":\"雪\",\"nested\":{\"value\":3}}}",
+            "{\"id\":\"e\",\"op\":\"query\",\"path\":\"demo:error\",\"args\":{}}",
+            "{\"id\":\"n\",\"op\":\"action\",\"path\":\"demo:null\",\"args\":{}}",
+            "{\"id\":\"c\",\"op\":\"close\"}"
+        }) + "\n";
+        var output = new StringWriter();
+        await Adapter.Run(new StringReader(input),output,Url(listener));
+        await server.WaitAsync(Timeout);
+        var events=output.ToString().Split('\n',StringSplitOptions.RemoveEmptyEntries).Select(line => JsonNode.Parse(line)).ToArray();
+        Equal("雪",events[0]!["value"]!["text"]!.GetValue<string>(),"adapter query UTF-8 result");Equal("query log",events[0]!["logs"]![0]!.GetValue<string>(),"adapter query logs");
+        Check(events[1]!["value"]!["applied"]!.GetValue<bool>()&&!events[1]!.AsObject().ContainsKey("logs"),"adapter mutation empty logs were not omitted");
+        Check(events[2]!["value"]!["done"]!.GetValue<bool>()&&events[2]!["logs"]![0]!.GetValue<string>()=="action log","adapter action result/logs");
+        Equal("ROOM_EMPTY",events[3]!["error"]!["data"]!["code"]!.GetValue<string>(),"adapter structured error");Equal("checked",events[3]!["logs"]![0]!.GetValue<string>(),"adapter error logs");
+        Check(events[4]!.AsObject().ContainsKey("value")&&events[4]!["value"] is null&&!events[4]!.AsObject().ContainsKey("logs"),"adapter JSON null or empty logs shape");
+        Equal("closed",events[5]!["type"]!.GetValue<string>(),"adapter HTTP close");
+        foreach(var request in requests.Take(3)){var body=JsonNode.Parse(request[(request.IndexOf("\r\n\r\n",StringComparison.Ordinal)+4)..])!;Equal("雪",body["args"]!["text"]!.GetValue<string>(),"adapter nested UTF-8 args");Equal(3,body["args"]!["nested"]!["value"]!.GetValue<int>(),"adapter nested args");}
     }
 
     private static async Task TestAdapterTcp()
@@ -96,12 +141,13 @@ static class Tests
         using var listener=Listen();
         var server=Task.Run(async()=>{using var socket=await listener.AcceptTcpClientAsync();var stream=socket.GetStream();await Handshake(stream);await ReadClientText(stream);var add=JsonNode.Parse(await ReadClientText(stream))!.AsObject();var id=add["modifications"]![0]!["queryId"]!.GetValue<int>();
             var first=Transition(Zero(),Version(1),new JsonObject{{"type","QueryUpdated"},{"queryId",id},{"value",new JsonObject{{"count",0},{"text","雪"}}},{"logLines",new JsonArray()}}).ToJsonString().Replace("\\u96EA","雪",StringComparison.OrdinalIgnoreCase);await WriteFragmentedUtf8(stream,first,"雪");
-            await WriteServerText(stream,Transition(Version(1),Version(2),new JsonObject{{"type","QueryUpdated"},{"queryId",id},{"value",new JsonObject{{"count",1}}},{"logLines",new JsonArray("updated")}}).ToJsonString());
-            await WriteServerText(stream,Transition(Version(2),Version(3),new JsonObject{{"type","QueryFailed"},{"queryId",id},{"errorMessage","temporary"},{"errorData",new JsonObject{{"code","TEMP"}}},{"logLines",new JsonArray("failed")}}).ToJsonString());
-            await WriteServerText(stream,Transition(Version(3),Version(4),new JsonObject{{"type","QueryUpdated"},{"queryId",id},{"value",new JsonObject{{"count",2}}},{"logLines",new JsonArray()}}).ToJsonString());
+            await WriteServerText(stream,Transition(Version(1),Version(2),new JsonObject{{"type","QueryUpdated"},{"queryId",id},{"value",null},{"logLines",new JsonArray()}}).ToJsonString());
+            await WriteServerText(stream,Transition(Version(2),Version(3),new JsonObject{{"type","QueryUpdated"},{"queryId",id},{"value",new JsonObject{{"count",1}}},{"logLines",new JsonArray("updated")}}).ToJsonString());
+            await WriteServerText(stream,Transition(Version(3),Version(4),new JsonObject{{"type","QueryFailed"},{"queryId",id},{"errorMessage","temporary"},{"errorData",new JsonObject{{"code","TEMP"}}},{"logLines",new JsonArray("failed")}}).ToJsonString());
+            await WriteServerText(stream,Transition(Version(4),Version(5),new JsonObject{{"type","QueryUpdated"},{"queryId",id},{"value",new JsonObject{{"count",2}}},{"logLines",new JsonArray()}}).ToJsonString());
             var remove=JsonNode.Parse(await ReadClientText(stream))!.AsObject();Equal("Remove",remove["modifications"]![0]!["type"]!.GetValue<string>(),"unsubscribe Remove");});
         using var live=new LiveClient(Url(listener)); var subscription=await live.Subscribe("demo:state",new JsonObject());
-        Equal("雪",subscription.Next(Timeout)["text"]!.GetValue<string>(),"fragmented UTF-8 Live value");Equal(1,subscription.Next(Timeout)["count"]!.GetValue<int>(),"Live update");
+        Equal("雪",subscription.Next(Timeout)["text"]!.GetValue<string>(),"fragmented UTF-8 Live value");var nullUpdate=subscription.NextUpdate(Timeout);Check(nullUpdate.Error is null&&nullUpdate.Value is null,"Live JSON null was not delivered");Equal(1,subscription.Next(Timeout)["count"]!.GetValue<int>(),"Live update");
         var failed=subscription.NextUpdate(Timeout);Check(failed.Error is ConvexClient.FunctionException,"query error not delivered");Equal("TEMP",((ConvexClient.FunctionException)failed.Error!).ErrorData!["code"]!.GetValue<string>(),"query error data");
         Equal(2,subscription.Next(Timeout)["count"]!.GetValue<int>(),"query did not recover");subscription.Dispose();await server.WaitAsync(Timeout);
     }

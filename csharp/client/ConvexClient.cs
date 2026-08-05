@@ -26,8 +26,10 @@ public sealed class ConvexClient : IDisposable
     {
         EnsureOpen();
         if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("Convex function path is required");
+        // JsonNode values may have only one parent. Clone caller-owned arguments
+        // so the same object remains reusable across any number of calls.
         var request = new HttpRequestMessage(HttpMethod.Post, new Uri(_base, "/api/" + operation)) {
-            Content = JsonContent.Create(new JsonObject { ["path"] = path, ["args"] = args, ["format"] = "json" }) };
+            Content = JsonContent.Create(new JsonObject { ["path"] = path, ["args"] = args.DeepClone(), ["format"] = "json" }) };
         request.Headers.TryAddWithoutValidation("Convex-Client", "csharp-0.1.0");
         if (_token.Length != 0) request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + _token);
         HttpResponseMessage response;
