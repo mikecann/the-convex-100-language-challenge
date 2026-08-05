@@ -13,6 +13,7 @@
 -define(INITIAL_TS, <<"AAAAAAAAAAA=">>).
 -define(MAX_QUEUE_COUNT, 16).
 -define(MAX_QUEUE_BYTES, 262144).
+-define(MAX_U32, 16#FFFFFFFF).
 -define(INITIAL_BACKOFF, 100).
 -define(MAX_BACKOFF, 15000).
 -define(HANDSHAKE_TIMEOUT, 1000).
@@ -300,8 +301,7 @@ transition(#{<<"startVersion">> := Start, <<"endVersion">> := End,
 transition(_, State) -> protocol_reconnect(<<"malformed Transition">>, State).
 
 valid_version(#{<<"querySet">> := Q, <<"identity">> := I, <<"ts">> := Ts}) ->
-    is_integer(Q) andalso Q >= 0 andalso is_integer(I) andalso I >= 0 andalso
-    is_binary(Ts) andalso
+    is_u32(Q) andalso is_u32(I) andalso is_binary(Ts) andalso
     timestamp_number(Ts) =/= error;
 valid_version(_) -> false.
 
@@ -322,14 +322,19 @@ valid_modifications(Mods) -> lists:all(fun valid_modification/1, Mods).
 
 valid_modification(#{<<"type">> := <<"QueryUpdated">>, <<"queryId">> := Q,
                      <<"value">> := _} = Modification) ->
-    is_integer(Q) andalso valid_optional_log_lines(Modification);
+    is_u32(Q) andalso valid_optional_log_lines(Modification);
 valid_modification(#{<<"type">> := <<"QueryFailed">>, <<"queryId">> := Q,
                      <<"errorMessage">> := Message} = Modification) ->
-    is_integer(Q) andalso is_binary(Message) andalso
+    is_u32(Q) andalso is_binary(Message) andalso
     valid_optional_log_lines(Modification);
 valid_modification(#{<<"type">> := <<"QueryRemoved">>, <<"queryId">> := Q} = Modification) ->
-    is_integer(Q) andalso valid_optional_log_lines(Modification);
+    is_u32(Q) andalso valid_optional_log_lines(Modification);
 valid_modification(_) -> false.
+
+%% Query identifiers and both version counters are u32 values in the pinned
+%% convex-rs sync profile. Erlang integers do not overflow, so enforce the wire
+%% range explicitly before an otherwise atomic Transition can touch state.
+is_u32(Value) -> is_integer(Value) andalso Value >= 0 andalso Value =< ?MAX_U32.
 
 valid_optional_log_lines(Modification) ->
     case maps:find(<<"logLines">>, Modification) of

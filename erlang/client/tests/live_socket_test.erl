@@ -1,7 +1,7 @@
 %% Deterministic acceptance fixtures use real TCP WebSocket peers. They test
 %% Gun's framing path and the public owner calls, not internal state messages.
 -module(live_socket_test).
--export([main/0, pressure_main/0]).
+-export([main/0, pressure_main/0, u32_main/0]).
 
 -define(INITIAL_TS, <<"AAAAAAAAAAA=">>).
 
@@ -11,6 +11,7 @@ main() ->
     atomic_transition_and_query_removed(),
     five_reconnects_and_hydration_dedup(),
     protocol_error_reconnect(),
+    u32_wire_range_reconnect(),
     handshake_resets_accumulated_backoff(),
     five_failed_upgrades_then_success(),
     newest_sixteen_count_overflow(),
@@ -21,6 +22,13 @@ main() ->
     same_id_replacement_barrier(),
     tcp_partial_ndjson_and_eof_cleanup(),
     io:format("live socket tests passed~n").
+
+%% This separate entrypoint makes the review regression cheap to rerun while
+%% still exercising Gun and real TCP WebSocket peers.
+u32_main() ->
+    application:ensure_all_started(crypto),
+    u32_wire_range_reconnect(),
+    io:format("u32 wire range tests passed~n").
 
 %% Host-side adversarial.sh runs this fixture in the real test image while the
 %% final adapter has a 128 MiB cgroup limit. It stops reading controller output
@@ -281,6 +289,113 @@ protocol_recovery_peer(Listen, Parent) ->
     Parent ! {protocol_recovered, self()},
     receive finish -> ok after 2000 -> ok end,
     gen_tcp:close(Recovered).
+
+u32_wire_range_reconnect() ->
+    Parent = self(),
+    {Url, Server} = fixture(fun(Listen) -> u32_range_peer(Listen, Parent) end),
+    {ok, Client} = convex:new(Url),
+    {ok, _Live, Id} = convex:subscribe(Client, <<"demo:state">>, #{}, self()),
+    #{value := #{<<"count">> := 0}} = next_live(Id, 3000),
+    lists:foreach(
+      fun(Attempt) ->
+          %% Each bad Transition must report a protocol failure and retire its
+          %% connection. A good update placed before the bad field must not
+          %% leak from the rejected atomic transaction.
+          #{error := #{name := <<"ProtocolError">>}} = next_live(Id, 3000),
+          receive
+              {u32_reconnected, Server, Attempt, Connect} ->
+                  Attempt = maps:get(<<"connectionCount">>, Connect),
+                  %% Advancing the rejected timestamp would expose timestamp
+                  %% or version mutation in the following Connect metadata.
+                  true = timestamp(1) =:=
+                      maps:get(<<"maxObservedTimestamp">>, Connect)
+          after 3000 ->
+              erlang:error({u32_reconnect_timeout, Attempt})
+          end,
+          %% The fixture has completed a same-value rehydration and a Ping/Pong
+          %% barrier. No invalid result or queued value may arrive afterwards.
+          assert_no_live(Id, 100),
+          Server ! {continue_u32, Attempt}
+      end,
+      lists:seq(1, 6)),
+    #{value := #{<<"count">> := 1}} = next_live(Id, 3000),
+    receive {u32_recovered, Server} -> ok
+    after 1000 -> erlang:error(u32_recovery_timeout)
+    end,
+    Server ! finish,
+    ok = convex:close(Client),
+    flush_exits().
+
+u32_range_peer(Listen, Parent) ->
+    Socket = accept_ws(Listen),
+    {_Connect, QueryId} = read_connect_add(Socket),
+    V1 = version(1, timestamp(1)),
+    send_text(Socket,
+              transition(version(0, ?INITIAL_TS), V1,
+                         [updated(QueryId, #{<<"count">> => 0})])),
+    Cases = [negative_query_id, overflow_query_id,
+             negative_query_set, overflow_query_set,
+             negative_identity, overflow_identity],
+    u32_range_reconnects(Listen, Parent, Socket, QueryId, V1, Cases, 1).
+
+u32_range_reconnects(Listen, Parent, Socket, QueryId, V1,
+                     [Case | Rest], Attempt) ->
+    send_text(Socket, invalid_u32_transition(Case, QueryId, V1)),
+    wait_closed(Socket),
+    Reconnected = accept_ws(Listen),
+    {Connect, ReconnectedId} = read_connect_add(Reconnected),
+    Attempt = maps:get(<<"connectionCount">>, Connect),
+    true = timestamp(1) =:= maps:get(<<"maxObservedTimestamp">>, Connect),
+    %% Rehydrate the accepted state. The owner should deduplicate count 0,
+    %% proving the rejected Transition changed neither result nor delivery.
+    send_text(Reconnected,
+              transition(version(0, ?INITIAL_TS), V1,
+                         [updated(ReconnectedId, #{<<"count">> => 0})])),
+    send_frame(Reconnected, true, 9, <<"u32-hydrated">>),
+    {10, <<"u32-hydrated">>} = read_frame(Reconnected),
+    Parent ! {u32_reconnected, self(), Attempt, Connect},
+    receive {continue_u32, Attempt} -> ok end,
+    case Rest of
+        [] ->
+            %% The upper endpoint is valid for all three pinned u32 types.
+            %% Include an unknown max query ID beside the real subscription;
+            %% accepting the Transition and delivering count 1 proves the
+            %% guard did not accidentally narrow the range to signed u32.
+            MaxU32 = 4294967295,
+            V2 = #{<<"querySet">> => MaxU32, <<"identity">> => MaxU32,
+                   <<"ts">> => timestamp(2)},
+            send_text(Reconnected,
+                      transition(V1, V2,
+                                 [updated(ReconnectedId, #{<<"count">> => 1}),
+                                  updated(MaxU32, #{<<"count">> => 77})])),
+            Parent ! {u32_recovered, self()},
+            receive finish -> ok after 2000 -> ok end,
+            gen_tcp:close(Reconnected);
+        _ ->
+            u32_range_reconnects(Listen, Parent, Reconnected, ReconnectedId,
+                                 V1, Rest, Attempt + 1)
+    end.
+
+invalid_u32_transition(negative_query_id, QueryId, V1) ->
+    transition(V1, version(1, timestamp(2)),
+               [updated(QueryId, #{<<"count">> => 99}),
+                updated(-1, #{<<"count">> => 77})]);
+invalid_u32_transition(overflow_query_id, QueryId, V1) ->
+    transition(V1, version(1, timestamp(2)),
+               [updated(QueryId, #{<<"count">> => 99}),
+                updated(4294967296, #{<<"count">> => 77})]);
+invalid_u32_transition(negative_query_set, QueryId, V1) ->
+    End = (version(1, timestamp(2)))#{<<"querySet">> => -1},
+    transition(V1, End, [updated(QueryId, #{<<"count">> => 99})]);
+invalid_u32_transition(overflow_query_set, QueryId, V1) ->
+    End = (version(1, timestamp(2)))#{<<"querySet">> => 4294967296},
+    transition(V1, End, [updated(QueryId, #{<<"count">> => 99})]);
+invalid_u32_transition(negative_identity, QueryId, V1) ->
+    End = (version(1, timestamp(2)))#{<<"identity">> => -1},
+    transition(V1, End, [updated(QueryId, #{<<"count">> => 99})]);
+invalid_u32_transition(overflow_identity, QueryId, V1) ->
+    End = (version(1, timestamp(2)))#{<<"identity">> => 4294967296},
+    transition(V1, End, [updated(QueryId, #{<<"count">> => 99})]).
 
 handshake_resets_accumulated_backoff() ->
     Parent = self(),
