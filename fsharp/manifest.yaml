@@ -4,5 +4,29 @@ displayName: "F#"
 rank: 44
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native F#/.NET 8 implementation using built-in HttpClient, System.Text.Json, and ClientWebSocket. Badges remain empty until root-owned shared evidence passes.
+toolchain:
+  name: .NET SDK
+  version: 8.0.408
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, optimistic updates, transition chunks, journals, and WebSocket mutation or action calls are not implemented; HTTP bearer authentication is supported.
+  - Live follows a pinned, undocumented protocol profile and is educational rather than a compatibility promise.
+  - All subscriptions share one newest-16 queue capped at 8388608 encoded bytes; subscription count, argument bytes, command ingress, frames, HTTP bodies, and adapter I/O have separate global bounds.
 capabilities: []
