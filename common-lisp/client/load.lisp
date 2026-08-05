@@ -1,0 +1,6 @@
+(load "/project/client/package.lisp")
+(load "/project/client/json.lisp")
+(load "/project/client/transport.lisp")
+(load "/project/client/http.lisp")
+(load "/project/client/websocket.lisp")
+(load "/project/client/live.lisp")
