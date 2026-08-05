@@ -54,9 +54,20 @@ class _WebSocket:
         response = self._read_until(b"\r\n\r\n")
         header_end = response.index(b"\r\n\r\n") + 4
         self._buffer = response[header_end:]
-        headers = response[:header_end]
+        header_lines = response[:header_end - 4].decode("iso-8859-1").split("\r\n")
+        status = header_lines.pop(0).split(" ", 2)
+        headers = {}
+        for line in header_lines:
+            if ":" not in line: self.close(); raise TransportError("malformed WebSocket upgrade header")
+            name, value = line.split(":", 1)
+            key_name = name.strip().lower()
+            headers[key_name] = headers.get(key_name, "") + (("," if key_name in headers else "") + value.strip())
         expected_accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
-        if not headers.startswith(b"HTTP/1.1 101") or expected_accept not in headers:
+        connection_tokens = {token.strip().lower() for token in headers.get("connection", "").split(",")}
+        if (len(status) < 2 or status[0] != "HTTP/1.1" or status[1] != "101"
+                or headers.get("upgrade", "").lower() != "websocket"
+                or "upgrade" not in connection_tokens
+                or headers.get("sec-websocket-accept", "").encode("ascii", "ignore") != expected_accept):
             self.close(); raise TransportError("WebSocket upgrade was rejected")
 
     def _read_until(self, marker):
@@ -140,6 +151,8 @@ class _LiveManager:
         p = urllib.parse.urlparse(url); self.url = urllib.parse.urlunparse(("wss" if p.scheme == "https" else "ws", p.netloc, p.path.rstrip("/") + "/api/sync", "", "", "")); self.version = version
         self.subs, self.socket, self.lock, self.closed, self.connection_count = {}, None, threading.RLock(), False, 0
         self.websocket_factory = websocket_factory
+        self.expected_disconnects = set()
+        self.last_close_reason = "InitialConnect"
         self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
     def subscribe(self, path, args):
         with self.lock:
@@ -151,12 +164,11 @@ class _LiveManager:
             if self.subs.pop(ident, None) and self.socket:
                 self._modify([{ "type": "Remove", "queryId": ident }])
                 if not self.subs:
-                    self.socket.close()
-                    self.socket = None
+                    self._disconnect_locked("NoSubscriptions")
     def _add(self, ident, path, args): return {"type":"Add", "queryId":ident, "udfPath":path, "args":[args]}
     def _connect(self):
         self.socket = self.websocket_factory(self.url, self.version); self.query_version = 0; self.remote_version = dict(self.INITIAL_VERSION)
-        self.socket.send_json({"type":"Connect", "sessionId":secrets.token_hex(16), "connectionCount":self.connection_count, "lastCloseReason":"InitialConnect", "clientTs":0})
+        self.socket.send_json({"type":"Connect", "sessionId":secrets.token_hex(16), "connectionCount":self.connection_count, "lastCloseReason":self.last_close_reason, "clientTs":0})
         self._modify([self._add(i, p, a) for i, (p,a,_) in self.subs.items()])
     def _modify(self, mods):
         if not mods: return
@@ -181,10 +193,16 @@ class _LiveManager:
                 else: raise ProtocolError(f"unexpected Live message {message.get('type')!r}")
             except Exception as error:
                 with self.lock:
+                    expected = active_socket in self.expected_disconnects
+                    self.expected_disconnects.discard(active_socket)
                     if self.socket is active_socket:
                         self.socket.close(); self.socket = None; self.connection_count += 1
+                        self.last_close_reason = type(error).__name__
                     current_subscriptions = list(self.subs.values())
-                for _,_,sub in current_subscriptions: sub.deliver(Update(error=error, logs=[]))
+                # Transport loss is an internal reconnect concern. Only protocol
+                # drift is observable; query failures arrive in Transition data.
+                if not expected and isinstance(error, ProtocolError):
+                    for _,_,sub in current_subscriptions: sub.deliver(Update(error=error, logs=[]))
                 time.sleep(.1)
     def _transition(self, message):
         if message.get("startVersion") != self.remote_version: raise ProtocolError("Transition start version does not match local version")
@@ -201,11 +219,19 @@ class _LiveManager:
     def disconnect_for_adapter(self):
         with self.lock:
             if not self.socket: raise TransportError("Live WebSocket is not connected")
-            self.socket.close(); self.socket=None
+            self._disconnect_locked("DebugDisconnect")
+    def _disconnect_locked(self, reason):
+        active_socket = self.socket
+        if not active_socket: return
+        self.socket = None
+        self.connection_count += 1
+        self.last_close_reason = reason
+        self.expected_disconnects.add(active_socket)
+        active_socket.close()
     def close(self):
         self.closed=True
         with self.lock:
-            if self.socket: self.socket.close()
+            self._disconnect_locked("ClientClosed")
             for _,_,sub in self.subs.values(): sub.deliver(ClosedError("Live subscription is closed"))
         self.thread.join(timeout=2)
 
