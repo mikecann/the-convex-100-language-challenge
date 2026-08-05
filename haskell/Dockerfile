@@ -64,7 +64,57 @@ RUN set -eu; \
         *) /usr/bin/rm -f "$path" ;; \
       esac; \
     done < /tmp/runtime-commands; \
-    /usr/bin/rm -rf /etc/apt /etc/dpkg /var/lib/apt /var/cache/apt /var/lib/dpkg /usr/lib/apt /usr/lib/dpkg /usr/share/dpkg /var/log/* /tmp/runtime-commands; \
+    /usr/bin/rm -rf \
+      /etc/apt \
+      /etc/cron.daily/apt-compat \
+      /etc/cron.daily/dpkg \
+      /etc/debconf.conf \
+      /etc/dpkg \
+      /etc/logrotate.d/apt \
+      /etc/logrotate.d/dpkg \
+      /etc/systemd/system/timers.target.wants/apt-daily-upgrade.timer \
+      /etc/systemd/system/timers.target.wants/apt-daily.timer \
+      /etc/systemd/system/timers.target.wants/dpkg-db-backup.timer \
+      /usr/lib/apt \
+      /usr/lib/dpkg \
+      /usr/lib/systemd/system/apt-daily-upgrade.service \
+      /usr/lib/systemd/system/apt-daily-upgrade.timer \
+      /usr/lib/systemd/system/apt-daily.service \
+      /usr/lib/systemd/system/apt-daily.timer \
+      /usr/lib/systemd/system/dpkg-db-backup.service \
+      /usr/lib/systemd/system/dpkg-db-backup.timer \
+      /usr/libexec/dpkg \
+      /usr/share/bash-completion/completions/apt \
+      /usr/share/bash-completion/completions/debconf \
+      /usr/share/bash-completion/completions/debconf-show \
+      /usr/share/bug/apt \
+      /usr/share/bug/dpkg \
+      /usr/share/debconf \
+      /usr/share/doc/apt \
+      /usr/share/doc/debconf \
+      /usr/share/doc/dpkg \
+      /usr/share/dpkg \
+      /usr/share/lintian/profiles/dpkg \
+      /usr/share/polkit-1/actions/org.dpkg.pkexec.update-alternatives.policy \
+      /var/cache/apt \
+      /var/cache/debconf \
+      /var/lib/apt \
+      /var/lib/dpkg \
+      /var/lib/systemd/deb-systemd-helper-enabled/apt-daily-upgrade.timer.dsh-also \
+      /var/lib/systemd/deb-systemd-helper-enabled/apt-daily.timer.dsh-also \
+      /var/lib/systemd/deb-systemd-helper-enabled/dpkg-db-backup.timer.dsh-also \
+      /var/lib/systemd/deb-systemd-helper-enabled/timers.target.wants/apt-daily-upgrade.timer \
+      /var/lib/systemd/deb-systemd-helper-enabled/timers.target.wants/apt-daily.timer \
+      /var/lib/systemd/deb-systemd-helper-enabled/timers.target.wants/dpkg-db-backup.timer \
+      /var/log/* \
+      /tmp/runtime-commands; \
+    if /usr/bin/find /etc /usr/lib /usr/libexec /usr/share /var -xdev -print 2>/dev/null | \
+      /usr/bin/grep -Eq '(^|/)(apt|dpkg|debconf)([^/]*|/)|update-alternatives'; then \
+      echo "forbidden runtime package-management residue:" >&2; \
+      /usr/bin/find /etc /usr/lib /usr/libexec /usr/share /var -xdev -print 2>/dev/null | \
+        /usr/bin/grep -E '(^|/)(apt|dpkg|debconf)([^/]*|/)|update-alternatives' >&2; \
+      exit 1; \
+    fi; \
     /usr/bin/rm -f /usr/bin/rm; \
     for command in apt apt-get apt-cache dpkg dpkg-query getent hostname ping nc openssl curl wget ghc ghci ghc-pkg runghc runhaskell cabal stack gcc cc clang make ld as perl ruby go rustc cargo node npm npx python python3 pip pip3 convex; do \
       if command -v "$command" >/dev/null 2>&1; then echo "forbidden runtime command: $command" >&2; exit 1; fi; \
