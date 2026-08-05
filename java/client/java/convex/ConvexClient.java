@@ -61,7 +61,7 @@ public final class ConvexClient implements AutoCloseable {
   private void ensureOpen() { if (closed) throw new IllegalStateException("Convex client is closed"); }
   @Override public void close() { closed = true; }
   public record Result(JsonNode value, List<String> logs) {}
-  public static class TransportException extends Exception { public final String operation; TransportException(String op, Throwable cause) { super(cause.getMessage(), cause); operation = op; } }
-  public static class ProtocolException extends Exception { ProtocolException(String message) { super(message); } }
-  public static class FunctionException extends Exception { public final String operation; public final JsonNode data; public final List<String> logs; FunctionException(String op, String message, JsonNode data, List<String> logs) { super(message); operation=op; this.data=data; this.logs=logs; } }
+  public static class TransportException extends Exception { public final String operation; public TransportException(String op, Throwable cause) { super(cause.getMessage(), cause); operation = op; } }
+  public static class ProtocolException extends Exception { public ProtocolException(String message) { super(message); } }
+  public static class FunctionException extends Exception { public final String operation; public final JsonNode data; public final List<String> logs; public FunctionException(String op, String message, JsonNode data, List<String> logs) { super(message); operation=op; this.data=data; this.logs=logs; } }
 }
