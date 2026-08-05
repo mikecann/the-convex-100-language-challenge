@@ -30,5 +30,5 @@ limitations:
   - Live values expose the JSON-safe subset as raw JSON.
   - WebSocket mutations and actions are deferred.
   - TransitionChunk assembly is deferred; receiving one is treated as protocol drift and triggers reconnect.
-  - Hardened mutation ordering, replay, journals, and optimistic updates are deferred.
+  - Mutation ordering, replay, journals, and optimistic updates are deferred.
 capabilities: []

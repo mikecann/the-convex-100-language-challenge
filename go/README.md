@@ -18,7 +18,8 @@ transport errors distinct.
 The shared suite exercises absent, rejected, replaced, and cleared tokens. A
 race-enabled Go transport test proves exact bearer-header forwarding. The pilot
 does not claim a successful signed identity because the dedicated deployment
-has no configured identity provider; that integration remains Hardened scope.
+has no configured identity provider; that integration is outside the current
+HTTP and Live scope.
 
 Live is pinned to the internal `convex-rs` 0.10.4 profile at commit
 `6f1df8a8ba1665084ec001e307ca841ca17074d7`. It uses the unversioned
@@ -124,7 +125,7 @@ pinned local backend. `verify-hosted` repeats them over current HTTPS and WSS.
 Only those shared controller results can calculate HTTP or Live. Trusted-main
 CI alone publishes the badges shown by the official evidence site.
 
-## Deferred from Hardened
+## Outside the current HTTP and Live scope
 
 - Full tagged Convex value encoding and Go-native Int64/bytes/special-float mappings.
 - Live auth, auth rotation, and token refresh.

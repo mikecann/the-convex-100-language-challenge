@@ -8,7 +8,6 @@
   --muted: #b7c2d4;
   --http: #ffd43b;
   --live: #3ee89a;
-  --hardened: #5fa8ff;
   --failed: #ff6b78;
 }
 
@@ -136,7 +135,6 @@ main { padding: 0 clamp(1rem, 5vw, 5rem) 5rem; }
 .badge:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
 .badge.http { color: var(--http); }
 .badge.live { color: var(--live); }
-.badge.hardened { color: var(--hardened); }
 
 dialog {
   width: min(58rem, calc(100vw - 2rem));
@@ -183,9 +181,11 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .capability-cumulative {
   margin: 1.5rem 0 0;
   padding: 0.8rem 1rem;
-  border-left: 3px solid var(--hardened);
-  background: rgb(95 168 255 / 8%);
+  border-left: 3px solid var(--border);
+  background: rgb(255 255 255 / 5%);
 }
+.capability-dialog[data-capability="http"] .capability-cumulative { border-color: var(--http); }
+.capability-dialog[data-capability="live"] .capability-cumulative { border-color: var(--live); }
 
 @media (max-width: 700px) {
   .page-header { align-items: stretch; flex-direction: column; padding-top: 2rem; }

@@ -155,7 +155,6 @@ Clients cannot commit their own earned results. Only trusted-main CI may update 
 - Scope BuildKit caches per language and toolchain lock hash.
 - Run the full current suite nightly.
 - Perform a weekly no-cache rebuild to detect disappearing packages, images, licences, or toolchains.
-- Require 20 consecutive passes for hardened fault cases.
 - Weight future shards by observed p95 duration and memory rather than alphabetically.
 
 The initial images remain private in GHCR. No public language package is published until it has a maintainer and a separate release decision.

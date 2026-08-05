@@ -29,5 +29,5 @@ hosted drift comparison only.
 
 Authentication rotation, WebSocket mutations/actions, mutation replay,
 read-your-own-write commit timestamps, full Convex values, journals, optimistic
-updates, and large-transition chunk assembly belong to Hardened rather than the
-Go Live pilot.
+updates, and large-transition chunk assembly are outside the current HTTP and
+Live scope.

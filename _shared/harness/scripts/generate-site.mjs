@@ -68,9 +68,6 @@ function checkedResult(result, source, trusted) {
   if (!validateResult(result)) {
     throw new Error(`${source}: invalid result: ${ajv.errorsText(validateResult.errors)}`);
   }
-  if (result.earnedCapabilities.includes("hardened")) {
-    throw new Error(`${source}: Hardened publication is not implemented`);
-  }
   if (result.earnedCapabilities.includes("http") && !hasPassingTests(result, requiredHTTPTests)) {
     throw new Error(`${source}: HTTP capability lacks its exact required test set`);
   }

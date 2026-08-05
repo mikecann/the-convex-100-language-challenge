@@ -50,21 +50,6 @@ Relevant sources:
 - [Convex Rust sync types](https://github.com/get-convex/convex-rs/blob/6f1df8a8ba1665084ec001e307ca841ca17074d7/sync_types/README.md)
 - [Convex Rust sync endpoint](https://github.com/get-convex/convex-rs/blob/6f1df8a8ba1665084ec001e307ca841ca17074d7/src/client/mod.rs#L420-L429)
 
-## Blue: Hardened realtime
-
-The Hardened badge includes Live and additionally requires:
-
-- Complete Convex value encoding for the pinned profile.
-- Atomic application of every transition so subscriptions represent one logical timestamp.
-- Ordered mutations.
-- Reconnection of an interrupted mutation using the same session and request identity, with one database effect.
-- No automatic retry of an uncertain in-flight action.
-- Mutation success held until subscribed state advances through its commit timestamp.
-- Query journals and large transitions where the selected profile includes them.
-- Repeated auth rotation, disconnect, and lifecycle tests.
-
-The official request manager demonstrates the important distinction between reconnecting mutations and not replaying actions: [request manager source](https://github.com/get-convex/convex-js/blob/8acd427d94ffb2ce9816283d791e74745fc89906/src/browser/sync/request_manager.ts#L137-L225).
-
 ## Experimental full values
 
 The official JS HTTP client currently sends `format: "convex_encoded_json"` and tagged `$integer`, `$bytes`, and `$float` representations. That format is not listed as a supported public HTTP format, so it must not be silently folded into Yellow. Clients using it declare `experimentalFullValues: true` and pin the source revision they implement.
@@ -90,9 +75,9 @@ Raw HTTP does not document client-side mutation queuing, so ordering is not requ
 
 Yellow proves bearer-token transport, not successful identity-provider
 integration. A valid signed JWT and repeated auth rotation against an
-auth-enabled fixture remain part of Hardened. This keeps the pilot from
-claiming authentication semantics when its dedicated deployment has no
-configured identity provider.
+auth-enabled fixture are outside the current HTTP and Live suites. This keeps
+the experiment from claiming authentication semantics when its dedicated
+deployment has no configured identity provider.
 
 ### Live suite
 
@@ -102,21 +87,6 @@ configured identity provider.
 4. Drop the socket while idle, mutate state, reconnect, and observe current state.
 5. Recover a reactive query after its underlying error is repaired.
 6. Close without a reconnect, ghost callback, or hanging process.
-
-### Hardened suite
-
-1. Maintain an invariant across two subscriptions while a transaction repeatedly changes both values.
-2. After awaiting a mutation, expose subscribed state that already includes the write.
-3. Preserve server-observed order for mutations A, B, and C fired without awaiting between calls.
-4. Disconnect after the server receives a mutation but before its response, then settle once with one database effect.
-5. Disconnect an in-flight action and do not replay it.
-6. Round-trip Int64 boundaries, bytes, special floats, negative zero, Unicode, and nested values.
-7. Never regress to an older observed state after reconnect.
-8. Survive rapid subscribe, unsubscribe, and resubscribe churn.
-9. Recover protected subscriptions after replacing expired or invalid auth.
-10. Close cleanly without ghost callbacks or a hanging container.
-11. Exercise profile-specific query journals and large-transition chunks.
-12. Pass every fault case 20 consecutive times.
 
 ## Adapter protocol
 
@@ -158,7 +128,7 @@ Yellow HTTP because its current HTTP client uses the undocumented
 `json` format.
 
 Build success and platform verification are evidence fields, not capability
-badges. Capability remains HTTP, Live, or Hardened.
+badges. Capability remains HTTP or Live.
 
 The exact counter-room schema and indexes are frozen in
 `docs/backend-contract.md`. Michael approved the dedicated schema and pilot

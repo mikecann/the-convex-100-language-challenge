@@ -37,19 +37,6 @@ const capabilityDefinitions = {
     ],
     cumulative: "Live includes every HTTP requirement.",
   },
-  hardened: {
-    label: "Hardened",
-    summary:
-      "The realtime client passes the stricter correctness and failure tests expected for serious production use.",
-    requirements: [
-      "Applies realtime transitions atomically and never regresses to older state.",
-      "Orders mutations and reconnects an interrupted mutation with one database effect.",
-      "Does not replay an uncertain in-flight action.",
-      "Supports the full pinned Convex value profile and protected subscription auth rotation.",
-      "Survives lifecycle, churn, large-transition and repeated fault tests.",
-    ],
-    cumulative: "Hardened includes every HTTP and Live requirement.",
-  },
 };
 
 document.querySelector("#language-count").textContent = data.languages.length;
@@ -112,6 +99,7 @@ function showCapability(name) {
   cumulative.textContent = definition.cumulative;
 
   capabilityContent.append(title, summary, heading, requirements, cumulative);
+  capabilityDialog.dataset.capability = name;
   capabilityDialog.showModal();
 }
 

@@ -14,10 +14,9 @@ index.
 | --- | --- |
 | Yellow: HTTP | Queries, mutations, actions, JSON-safe values, bearer-token forwarding, and errors work over the documented HTTP API. |
 | Green: Live | The client additionally supports live query subscriptions over WebSockets. |
-| Blue: Hardened | The live client passes consistency, reconnection, auth rotation, mutation ordering, full-value, and lifecycle tests. |
 | Red: Failed | A clean Docker build, execution, or claimed capability test fails. |
 
-The capability badges are cumulative. Implementation provenance is a separate label:
+Live includes HTTP. Implementation provenance is a separate label:
 
 | Provenance | Meaning |
 | --- | --- |

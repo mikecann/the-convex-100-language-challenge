@@ -101,7 +101,7 @@
     "earnedCapabilities": {
       "type": "array",
       "uniqueItems": true,
-      "items": { "enum": ["http", "live", "hardened"] }
+      "items": { "enum": ["http", "live"] }
     }
   }
 }
