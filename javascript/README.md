@@ -1,9 +1,104 @@
-# JavaScript
+# Convex from JavaScript
 
-This language client is planned as roster entry 2.
+This folder shows a small JavaScript program talking directly to Convex. It
+calls queries, mutations, and actions over HTTP, then follows a query over a
+WebSocket.
 
-No implementation exists and no capabilities have been earned.
+This is an educational, unofficial demonstration for the 100-language project.
+It is not a production SDK or a package intended for publication.
 
-- Selection tier: `ranked`
-- Implementation status: `planned`
-- Earned capabilities: none
+## Start here
+
+Read the [basic example](examples/basics/main.js). It queries a counter room,
+starts Live, applies one idempotent mutation, and checks that Live observes the
+same `0 -> 1` change. The native implementation is in [client](client/).
+
+## What works
+
+| Capability | Status |
+| --- | --- |
+| HTTP queries, mutations, and actions | Implemented, pending shared evidence |
+| HTTP bearer token | Implemented, pending shared evidence |
+| Initial and updated Live values | Implemented, pending shared evidence |
+| Live reconnection test hook | Implemented, pending shared evidence |
+| Capability badges | Not claimed until root evidence |
+| Live authentication and WebSocket writes | Deferred |
+
+## Basic example
+
+<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.js -->
+```js
+#!/usr/local/bin/node
+import { randomUUID } from "node:crypto";
+import { Client } from "../../client/convex.js";
+
+const deploymentUrl = process.env.CONVEX_URL;
+if (!deploymentUrl) throw new Error("CONVEX_URL is required");
+const room = process.argv[2] ?? process.env.EXAMPLE_ROOM ?? "javascript-example";
+
+// Create a native JavaScript client for the deployment selected by the verifier.
+const client = new Client(deploymentUrl);
+try {
+  // Read the counter once over Convex's documented HTTP query endpoint.
+  const current = await client.query("demo:state", { room });
+  assertCount("current query", current.value.count, 0);
+  console.log(`current count: ${current.value.count}`);
+
+  // Start Live before the mutation so its first value proves the initial state.
+  const subscription = client.subscribe("demo:state", { room });
+  const initial = await nextUpdate(subscription, "initial Live value");
+  assertCount("initial Live value", initial.value.count, current.value.count);
+  console.log(`live initial count: ${initial.value.count}`);
+
+  // Send an idempotency key with the mutation, so retries cannot double-count.
+  const mutation = await client.mutation("demo:increment", { room, language: "javascript", runId: randomUUID() });
+  if (mutation.value.applied !== true) throw new Error("mutation was not applied");
+  console.log("mutation applied: true");
+  assertCount("mutation", mutation.value.state.count, 1);
+  console.log(`mutation count: ${mutation.value.state.count}`);
+
+  // The next Live value must be the write we just made, without another query.
+  const updated = await nextUpdate(subscription, "updated Live value");
+  assertCount("updated Live value", updated.value.count, 1);
+  console.log(`live updated count: ${updated.value.count}`);
+  await subscription.close();
+  console.log("verified count: 0 -> 1");
+} finally { await client.close(); }
+
+function assertCount(operation, actual, expected) { if (actual !== expected) throw new Error(`${operation} count was ${actual}, expected ${expected}`); }
+async function nextUpdate(subscription, name) { const timed = Promise.race([subscription.next(), new Promise((_, reject) => setTimeout(() => reject(new Error(`${name} timed out`)), 10000))]); const item = await timed; if (item.done) throw new Error(`${name} subscription closed`); if (item.value.error) throw item.value.error; return item.value; }
+```
+<!-- END GENERATED EXAMPLE -->
+
+## Docker-only verification
+
+```sh
+./run test javascript
+./run build javascript
+```
+
+`test` parses the client, adapter, and exact canonical example, then runs its
+local tests inside a pinned linux/amd64 Node image. `build` produces the
+non-root conformance image and the matching example-runtime target. Root-owned
+`verify-example`, `verify`, and `verify-hosted` are the only commands that can
+award HTTP or Live capability badges.
+
+## Conformance and protocol notes
+
+The test-only adapter at `client/tests/conformance/adapter.js` accepts NDJSON
+protocol v1 over stdin/stdout or `ADAPTER_LISTEN` TCP. Its `debugDisconnect`
+command is deliberately adapter-only, so the shared controller can exercise
+real reconnects without any Docker or host-network privilege.
+
+HTTP uses the documented JSON `/api/query`, `/api/mutation`, and `/api/action`
+endpoints. Live uses `ws` solely for WebSocket transport; JavaScript implements
+the Convex query-set, transition, and reconnect behaviour itself against the
+experimental `convex-rs-0.10.4-unversioned-sync` `/api/sync` profile.
+
+## Limitations
+
+Live authentication, WebSocket mutations/actions, optimistic updates, journal
+replay, TransitionChunk assembly, and tagged Convex value encodings are
+deferred. Each subscription keeps at most 16 pending updates and discards the
+oldest value for a slow consumer, because reactive queries represent current
+state rather than an event log.

@@ -1,8 +1,28 @@
 schemaVersion: 1
 id: javascript
-displayName: "JavaScript"
-rank: 2
+displayName: JavaScript
+rank: 7
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native JavaScript client using fetch and ws. Capability badges remain empty until root-owned local and hosted conformance evidence passes.
+toolchain:
+  name: Node.js
+  version: 22.16.0
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities: [http, live]
+platforms: [linux/amd64]
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands: [debugDisconnect]
+limitations:
+  - Live authentication, WebSocket mutations, actions, optimistic updates, and journals are deferred.
+  - TransitionChunk assembly and non-JSON Convex value encodings are treated as protocol drift.
+  - Live delivery uses a bounded newest-value queue of 16 updates per subscription.
 capabilities: []
