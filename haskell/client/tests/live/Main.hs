@@ -48,10 +48,14 @@ main = do
     testBoundedUnsubscribeAndClose
     putStrLn "live: concurrent close"
     testConcurrentClose
+    putStrLn "live: repeated close joins inactivity tickers"
+    testRepeatedClientClose
     putStrLn "live: stalled handshake and continuous peer"
     testStalledHandshakeAndContinuousPeer
     putStrLn "live: fragmented UTF-8 and half frame"
     testFragmentedUtf8AndHalfFrame
+    putStrLn "live: interrupted partial frame reconnect"
+    testInterruptedPartialFrameReconnect
     putStrLn "haskell Live WebSocket fixtures pass"
 
 testFailureRecoveryAndBoundedQueue :: IO ()
@@ -391,6 +395,15 @@ testConcurrentClose = withServer 19245 fixture $ do
         _ <- receiveObject connection
         forever (threadDelay 1000000)
 
+-- closeClient publishes its shared completion barrier only after the owned
+-- inactivity ticker has terminated and been joined. Repeating this lifecycle
+-- catches any regression that merely abandons one sleeping ticker per Client.
+testRepeatedClientClose :: IO ()
+testRepeatedClientClose =
+    forM_ [1 .. 64 :: Int] $ \_ -> do
+        client <- newClient "http://127.0.0.1:1"
+        assertCompletes "repeated client close" (closeClient client)
+
 testFiveFailedReconnectsThenSuccess :: IO ()
 testFiveFailedReconnectsThenSuccess = do
     stopServer <- newEmptyTMVarIO
@@ -535,6 +548,74 @@ testFragmentedUtf8AndHalfFrame = do
         SocketBytes.sendAll peer (BS.pack [0x81, 100, 0x7b])
         threadDelay 5000000
 
+-- A command wake that lands after a frame byte was consumed must retire this
+-- generation. The old peer deliberately resumes its half frame after the wake;
+-- no Add may be written there, and both subscriptions must hydrate on a fresh
+-- connection before either public handle can return a value.
+testInterruptedPartialFrameReconnect :: IO ()
+testInterruptedPartialFrameReconnect = do
+    partialConsumed <- newEmptyTMVarIO
+    startWake <- newEmptyTMVarIO
+    oldGenerationReused <- newEmptyTMVarIO
+    updatesConsumed <- newEmptyTMVarIO
+    withRawListener 19246 (fixture partialConsumed startWake oldGenerationReused updatesConsumed) $ do
+        client <- newClient "http://127.0.0.1:19246"
+        first <- subscribe client "counter:first" (object [])
+        atomically (takeTMVar partialConsumed)
+        secondTask <- async (subscribe client "counter:second" (object []))
+        atomically (putTMVar startWake ())
+        reused <- maybe (fail "timed out auditing the interrupted generation") pure =<< timeout 2000000 (atomically (takeTMVar oldGenerationReused))
+        assert (not reused) "owner wrote Add on a connection whose receive parser was interrupted"
+        secondResult <- maybe (fail "second subscription did not rehydrate") pure =<< timeout 3000000 (waitCatch secondTask)
+        second <- either (fail . show) pure secondResult
+        assertCount 70 =<< awaitValue first
+        assertCount 71 =<< awaitValue second
+        atomically (putTMVar updatesConsumed ())
+        closeClient client
+  where
+    fixture partialConsumed startWake oldGenerationReused updatesConsumed listener = do
+        (oldPeer, _) <- Socket.accept listener
+        rawHandshake oldPeer
+        _ <- receiveClientFrame oldPeer -- Connect
+        _ <- receiveClientFrame oldPeer -- first Add
+        -- Consume a text-frame header and one payload byte, then block inside
+        -- receiveData while the controller asks for a second subscription.
+        SocketBytes.sendAll oldPeer (BS.pack [0x81, 100, 0x7b])
+        -- The client has no other traffic to process, so this pause puts its
+        -- sole socket actor deterministically inside the partial frame read.
+        threadDelay 200000
+        atomically (putTMVar partialConsumed ())
+        _ <- atomically (takeTMVar startWake)
+        oldFrame <- timeout 1000000 (tryAny (receiveClientFrame oldPeer))
+        let reused = case oldFrame of
+                Just (Right (1, payload)) -> "ModifyQuerySet" `BS.isInfixOf` payload
+                _ -> False
+        atomically (putTMVar oldGenerationReused reused)
+        -- Resume the old half-frame and append another valid frame after the
+        -- wake. A correct client has already abandoned this socket, so these
+        -- bytes can never be parsed by a replacement receiveData call.
+        _ <- tryAny (SocketBytes.sendAll oldPeer (BS.replicate 99 0x20))
+        _ <- tryAny (sendRawFrame oldPeer True 1 "{\"type\":\"Ping\"}")
+        Socket.close oldPeer
+
+        (newPeer, _) <- Socket.accept listener
+        rawHandshake newPeer
+        _ <- receiveClientFrame newPeer -- reconnect Connect
+        _ <- receiveClientFrame newPeer -- both active Add operations
+        let transition =
+                encode
+                    ( object
+                        [ "type" .= ("Transition" :: Text)
+                        , "startVersion" .= version 0 "AAAAAAAAAAA="
+                        , "endVersion" .= version 1 "AQAAAAAAAAA="
+                        , "modifications" .= [updated 0 70, updated 1 71]
+                        ]
+                    )
+        sendRawFrame newPeer True 1 (LBS.toStrict transition)
+        _ <- atomically (takeTMVar updatesConsumed)
+        _ <- timeout 1000000 (tryAny (receiveClientFrame newPeer))
+        Socket.close newPeer
+
 withRawServer :: Int -> (Socket.Socket -> IO ()) -> IO a -> IO a
 withRawServer port handler test = Socket.withSocketsDo $ bracket open Socket.close $ \listener -> do
     worker <- async $ do
@@ -553,6 +634,19 @@ withRawServer port handler test = Socket.withSocketsDo $ bracket open Socket.clo
     finallyCancel task worker = task `finallyIO` cancel worker
     ignore :: SomeException -> IO ()
     ignore _ = pure ()
+
+withRawListener :: Int -> (Socket.Socket -> IO ()) -> IO a -> IO a
+withRawListener port handler test = Socket.withSocketsDo $ bracket open Socket.close $ \listener -> do
+    worker <- async (handler listener)
+    threadDelay 50000
+    test `finallyIO` cancel worker
+  where
+    open = do
+        listener <- Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol
+        Socket.setSocketOption listener Socket.ReuseAddr 1
+        Socket.bind listener (Socket.SockAddrInet (fromIntegral port) (Socket.tupleToHostAddress (127, 0, 0, 1)))
+        Socket.listen listener 2
+        pure listener
 
 finallyIO :: IO a -> IO b -> IO a
 finallyIO task cleanup = do

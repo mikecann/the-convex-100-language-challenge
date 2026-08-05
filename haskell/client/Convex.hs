@@ -28,8 +28,8 @@ where
 import Control.Concurrent (forkIO, threadDelay, throwTo)
 import Control.Concurrent.Async (Async, async, asyncThreadId, cancel, poll, waitCatch)
 import Control.Concurrent.STM
-import Control.Exception (Exception, SomeException, catch, displayException, finally, mask, throwIO, try)
-import Control.Monad (foldM, forM_, forever, unless, void, when)
+import Control.Exception (Exception, SomeException, displayException, finally, mask, throwIO, try)
+import Control.Monad (foldM, forM_, unless, void, when)
 import Crypto.Hash.SHA1 qualified as SHA1
 import Data.Aeson hiding (Result)
 import Data.Aeson.Key qualified as Key
@@ -386,17 +386,19 @@ liveWorker :: Address -> TBQueue Command -> TVar Bool -> QueueBudget -> IO ()
 liveWorker address commands closed budget = do
     events <- newTQueueIO
     inbound <- InboundQueue <$> newTBQueueIO 2 <*> newTVarIO 0
-    unsafeFork $ forever $ threadDelay 1000000 >> atomically (writeTQueue events InactivityTick)
-    owner events inbound initialState
+    ticker <- async (inactivityTicker closed events)
+    -- Stop publishes its completion barrier only after joining this ticker.
+    -- The finalizer also covers an unexpected owner exception before Stop.
+    owner events inbound ticker initialState `finally` void (stopTicker ticker)
   where
-    owner events inbound state = do
+    owner events inbound ticker state = do
         next <- atomically $ chooseInput commands events inbound
         case next of
-            OwnerCommand command -> handleCommand events inbound state command >>= maybe (pure ()) (owner events inbound)
-            OwnerEvent event -> handleEvent events inbound state event >>= owner events inbound
-            OwnerMessage generation bytes -> handleMessage events inbound state generation bytes >>= owner events inbound
+            OwnerCommand command -> handleCommand events inbound ticker state command >>= maybe (pure ()) (owner events inbound ticker)
+            OwnerEvent event -> handleEvent events inbound state event >>= owner events inbound ticker
+            OwnerMessage generation bytes -> handleMessage events inbound state generation bytes >>= owner events inbound ticker
 
-    handleCommand events inbound state (Add path args done)
+    handleCommand events inbound _ticker state (Add path args done)
         | length (liveSubscriptions state) >= maxSubscriptions = do
             atomically (putTMVar done (Left (ProtocolError "Live supports at most eight active subscriptions")))
             pure (Just state)
@@ -422,7 +424,7 @@ liveWorker address commands closed budget = do
             -- subscribe call cannot return until the socket owner has completed the
             -- Connect and hydration writes on a real connection.
             pure (Just connected)
-    handleCommand events inbound state (Remove ident done) = do
+    handleCommand events inbound _ticker state (Remove ident done) = do
         let removed = find ((== ident) . subscriptionId . stateSubscription) (liveSubscriptions state)
         case removed of
             Nothing -> atomically (putTMVar done (Right ())) >> pure (Just state)
@@ -448,7 +450,7 @@ liveWorker address commands closed budget = do
                 -- queue drain all precede this barrier.
                 forM_ reply (atomically . putTMVar done)
                 pure (Just afterSend)
-    handleCommand events _ state (DebugDisconnect done) = do
+    handleCommand events _ _ticker state (DebugDisconnect done) = do
         case liveSocket state of
             NoSocket -> do
                 scheduled <- ensureReconnectScheduled events state 0
@@ -469,12 +471,16 @@ liveWorker address commands closed budget = do
                         -- leave the client detached instead.
                         atomically (putTMVar done (Left (TransportError failure)))
                         pure (Just detached)
-    handleCommand _ _ state (Stop done) = do
+    handleCommand _ _ ticker state (Stop done) = do
         mapM_ (closeSubscription . stateSubscription) (liveSubscriptions state)
         forM_ (liveSubscriptions state) $ \entry ->
             forM_ (stateAddBarrier entry) (\barrier -> atomically (void (tryPutTMVar barrier (Left (ClosedError "Convex client is closed")))))
         (_, retirement) <- detachSocket state "ClientClosed"
-        atomically (writeTVar closed True >> putTMVar done (maybe (Right ()) (Left . TransportError) retirement))
+        tickerRetirement <- stopTicker ticker
+        let cleanupFailure = case retirement of
+                Just failure -> Just failure
+                Nothing -> tickerRetirement
+        atomically (writeTVar closed True >> putTMVar done (maybe (Right ()) (Left . TransportError) cleanupFailure))
         pure Nothing
 
     handleEvent events inbound state (SocketReady generation)
@@ -564,6 +570,34 @@ liveWorker address commands closed budget = do
 -- owner. It returns immediately and the resulting thread owns no client state.
 unsafeFork :: IO () -> IO ()
 unsafeFork task = void (forkIO task)
+
+-- The inactivity source belongs to the same lifecycle as the Live owner. It
+-- checks the close flag before publishing, and close still explicitly cancels
+-- and joins it so a sleeping ticker cannot outlive its Client.
+inactivityTicker :: TVar Bool -> TQueue SocketEvent -> IO ()
+inactivityTicker closed events = do
+    threadDelay 1000000
+    keepRunning <- atomically $ do
+        stopped <- readTVar closed
+        unless stopped (writeTQueue events InactivityTick)
+        pure (not stopped)
+    when keepRunning (inactivityTicker closed events)
+
+stopTicker :: Async () -> IO (Maybe Text)
+stopTicker ticker = do
+    finished <- poll ticker
+    case finished of
+        Just (Left failure) -> pure (Just ("Live inactivity ticker failed: " <> T.pack (displayException failure)))
+        Just (Right ()) -> pure Nothing
+        Nothing -> do
+            cancelled <- timeout 500000 (cancel ticker)
+            case cancelled of
+                Nothing -> pure (Just "timed out cancelling Live inactivity ticker")
+                Just () -> do
+                    joined <- timeout 500000 (waitCatch ticker)
+                    pure $ case joined of
+                        Nothing -> Just "timed out joining Live inactivity ticker"
+                        Just _ -> Nothing
 
 -- Socket cleanup is a command to the same actor that performs every read and
 -- write. No controller, state owner, timer, or detached cleanup thread ever
@@ -667,17 +701,16 @@ transportLoop restore connection inbound generation commandQueue sleeping = do
             _ <- timeout 500000 (try (WS.sendClose connection ("client disconnect" :: Text)) :: IO (Either SomeException ()))
             atomically (putTMVar done ())
         Nothing -> do
-            received <- ((Just <$> restore (WS.receiveData connection)) `catch` ownerWake) `finally` atomically (writeTVar sleeping False)
-            case received of
-                Nothing -> transportLoop restore connection inbound generation commandQueue sleeping
-                Just bytes -> do
-                    let size = fromIntegral (LBS.length bytes)
-                    when (size > maxLiveMessageBytes) (throwIO (ProtocolError "Live message exceeded 2 MiB"))
-                    publishInbound restore sleeping inbound (InboundMessage generation bytes size)
-                    transportLoop restore connection inbound generation commandQueue sleeping
-  where
-    ownerWake :: WakeSocketOwner -> IO (Maybe LBS.ByteString)
-    ownerWake _ = throwIO (TransportError "Live socket read was interrupted for an owner command")
+            -- An asynchronous wake can arrive after receiveData has consumed a
+            -- frame header or payload byte. Let it terminate this generation;
+            -- re-entering receiveData on the same socket could restart parsing
+            -- at a false frame boundary. The state owner will reconnect and
+            -- rehydrate any still-active subscriptions.
+            bytes <- restore (WS.receiveData connection) `finally` atomically (writeTVar sleeping False)
+            let size = fromIntegral (LBS.length bytes)
+            when (size > maxLiveMessageBytes) (throwIO (ProtocolError "Live message exceeded 2 MiB"))
+            publishInbound restore sleeping inbound (InboundMessage generation bytes size)
+            transportLoop restore connection inbound generation commandQueue sleeping
 
 publishInbound :: (forall a. IO a -> IO a) -> TVar Bool -> InboundQueue -> InboundMessage -> IO ()
 publishInbound restore sleeping inbound message@(InboundMessage _ _ size) =
