@@ -15,6 +15,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import scala.collection.mutable
 import scala.jdk.CollectionConverters.*
 
@@ -57,22 +59,48 @@ final class LiveClient(rawUrl: String) extends AutoCloseable, WebSocket.Listener
         "Live subscriptions require a function path and object args"
       )
     val answer = new CompletableFuture[Subscription]()
+    val abandoned = new AtomicBoolean(false)
+    val created = new AtomicReference[Subscription]()
     submit {
       try
         ensureOpen()
-        val subscription = new Subscription(this, nextId, path, args.deepCopy())
-        nextId += 1
-        subscriptions(subscription.queryId) = subscription
-        socket match
-          case Some(_) =>
-            modify(List(add(subscription)))
-            answer.complete(subscription)
-          case None =>
-            initialWaiters(subscription.queryId) = answer
-            if connecting.isEmpty then beginConnect(reconnecting = false)
-      catch case error: Exception => answer.completeExceptionally(error)
+        if abandoned.get() then
+          answer.completeExceptionally(new TimeoutException("timed out waiting for Live handshake"))
+        else
+          val subscription = new Subscription(this, nextId, path, args.deepCopy())
+          created.set(subscription)
+          nextId += 1
+          subscriptions(subscription.queryId) = subscription
+          socket match
+            case Some(_) =>
+              modify(List(add(subscription)))
+              answer.complete(subscription)
+            case None =>
+              initialWaiters(subscription.queryId) = answer
+              // A scheduled reconnect owns disconnected state. Starting a competing
+              // initial handshake here could consume its timer and strand every query.
+              if connecting.isEmpty && !reconnectScheduled then
+                beginConnect(reconnecting = connectionCount > 0)
+      catch
+        case error: Exception =>
+          Option(created.get()).foreach(discardSubscription(_, answer))
+          answer.completeExceptionally(error)
     }
-    await(answer, 5, "timed out waiting for Live handshake")
+    try awaitMillis(answer, subscribeTimeoutMillis, "timed out waiting for Live handshake")
+    catch
+      case error: Throwable =>
+        abandoned.set(true)
+        val cleanup = new CompletableFuture[Unit]()
+        val cleanupScheduled = submit {
+          try
+            Option(created.get()).foreach(discardSubscription(_, answer))
+            cleanup.complete(())
+          catch case cleanupError: Throwable => cleanup.completeExceptionally(cleanupError)
+        }
+        if cleanupScheduled then
+          try await(cleanup, 3, "timed out cancelling failed Live subscription")
+          catch case cleanupError: Throwable => error.addSuppressed(cleanupError)
+        throw error
 
   private[convex] def unsubscribe(subscription: Subscription): Unit =
     onOwner {
@@ -126,6 +154,7 @@ final class LiveClient(rawUrl: String) extends AutoCloseable, WebSocket.Listener
           else if failure != null then
             val error = unwrap(failure)
             if reconnecting then
+              connectionCount += 1
               lastCloseReason = "HandshakeError"
               scheduleNextReconnect(error)
             else failInitialWaiters(new TransportError("live", error))
@@ -185,11 +214,19 @@ final class LiveClient(rawUrl: String) extends AutoCloseable, WebSocket.Listener
     val active = socket.getOrElse(
       throw new IllegalStateException("Live WebSocket is not connected")
     )
-    await(
-      active.sendText(ConvexClient.json.writeValueAsString(message), true),
-      3,
-      "timed out writing Live message"
-    )
+    try
+      awaitMillis(
+        sendText(active, ConvexClient.json.writeValueAsString(message)),
+        writeTimeoutMillis,
+        "timed out writing Live message"
+      )
+    catch
+      case error: Throwable =>
+        val transport = new TransportError("live write", error)
+        // Once a write future fails or times out, the peer may have consumed any
+        // prefix. Retire that socket instead of guessing at its query-set version.
+        disconnect(active, "TransportError", reconnecting = true, Some(transport))
+        throw transport
 
   override def onOpen(webSocket: WebSocket): Unit = submit {
     webSocket.request(1)
@@ -368,12 +405,37 @@ final class LiveClient(rawUrl: String) extends AutoCloseable, WebSocket.Listener
     }
     initialWaiters.clear()
 
+  private def discardSubscription(
+      subscription: Subscription,
+      waiter: CompletableFuture[Subscription]
+  ): Unit =
+    initialWaiters.get(subscription.queryId).filter(_ eq waiter).foreach { _ =>
+      initialWaiters.remove(subscription.queryId)
+    }
+    if subscriptions.remove(subscription.queryId).nonEmpty then
+      subscription.finish()
+      if socket.nonEmpty then
+        try
+          modify(
+            List(
+              ConvexClient.json
+                .createObjectNode()
+                .put("type", "Remove")
+                .put("queryId", subscription.queryId)
+            )
+          )
+        catch
+          // send() already retired the uncertain socket and scheduled recovery.
+          case _: Exception => ()
+
   private def ensureOpen(): Unit =
     if closed then throw new IllegalStateException("Convex Live client is closed")
 
-  private def submit(action: => Unit): Unit =
-    try owner.execute(() => action)
-    catch case _: java.util.concurrent.RejectedExecutionException => ()
+  private def submit(action: => Unit): Boolean =
+    try
+      owner.execute(() => action)
+      true
+    catch case _: java.util.concurrent.RejectedExecutionException => false
 
   private def onOwner[T](action: => T): T =
     val answer = new CompletableFuture[T]()
@@ -405,12 +467,20 @@ object LiveClient:
   private val Closed = Update(null, new IllegalStateException("Live subscription is closed"), Nil)
   @volatile private[convex] var testInitialBackoffMillis = 100L
   @volatile private[convex] var testMaxBackoffMillis = 15_000L
+  @volatile private[convex] var testSubscribeTimeoutMillis = 5_000L
+  @volatile private[convex] var testWriteTimeoutMillis = 3_000L
   @volatile private[convex] var testReconnectScheduled: Long => Unit = _ => ()
   @volatile private[convex] var testOwnerEvent: (String, String) => Unit = (_, _) => ()
+  @volatile private[convex] var testSendText: (WebSocket, String) => CompletableFuture[WebSocket] =
+    (socket, text) => socket.sendText(text, true)
 
   private def initialBackoffMillis: Long = testInitialBackoffMillis
   private def maxBackoffMillis: Long = testMaxBackoffMillis
+  private def subscribeTimeoutMillis: Long = testSubscribeTimeoutMillis
+  private def writeTimeoutMillis: Long = testWriteTimeoutMillis
   private def reconnectAttemptScheduled(delay: Long): Unit = testReconnectScheduled(delay)
+  private def sendText(socket: WebSocket, text: String): CompletableFuture[WebSocket] =
+    testSendText(socket, text)
   private def ownerEvent(event: String): Unit =
     testOwnerEvent(event, Thread.currentThread().getName)
 
@@ -431,6 +501,17 @@ object LiveClient:
       timeoutMessage: String
   ): T =
     try future.get(seconds, TimeUnit.SECONDS)
+    catch
+      case timeout: TimeoutException =>
+        throw new TimeoutException(timeoutMessage)
+      case execution: ExecutionException => throw unwrap(execution)
+
+  private def awaitMillis[T](
+      future: java.util.concurrent.Future[T],
+      milliseconds: Long,
+      timeoutMessage: String
+  ): T =
+    try future.get(milliseconds, TimeUnit.MILLISECONDS)
     catch
       case timeout: TimeoutException =>
         throw new TimeoutException(timeoutMessage)

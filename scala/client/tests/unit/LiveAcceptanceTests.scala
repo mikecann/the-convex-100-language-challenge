@@ -9,13 +9,17 @@ import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
+import java.net.http.WebSocket
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.time.Duration
 import java.util.Base64
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import scala.collection.mutable
 import scala.jdk.CollectionConverters.*
@@ -31,6 +35,9 @@ object LiveAcceptanceTests:
     testRelayBarriers()
     testLiveFlowUtf8ControlAndQueryRecovery()
     testFiveReconnectFailuresMetadataDedupAndBackoffReset()
+    testSubscribeDuringReconnectBackoff()
+    testFailedSubscribeDoesNotLeaveGhost()
+    testHandshakeTimeoutDoesNotLeaveGhost()
     testProtocolAndTransportRecovery()
     testPartialFrameCloseIsBounded()
     testHandshakeCloseIsBounded()
@@ -349,7 +356,10 @@ object LiveAcceptanceTests:
       try
         handshake(restored)
         val connect = readClientJson(restored)
-        check(connect.path("connectionCount").asInt() == 1, "failed handshakes changed count")
+        check(
+          connect.path("connectionCount").asInt() == 6,
+          "failed reconnect handshakes were not counted"
+        )
         check(
           connect.path("lastCloseReason").asText().nonEmpty,
           "reconnect omitted lastCloseReason"
@@ -385,7 +395,7 @@ object LiveAcceptanceTests:
       try
         handshake(afterHealthy)
         val connect = readClientJson(afterHealthy)
-        check(connect.path("connectionCount").asInt() == 2, "healthy close count was wrong")
+        check(connect.path("connectionCount").asInt() == 7, "healthy close count was wrong")
         check(
           connect.path("lastCloseReason").asText() == "ServerClosed:1001",
           "healthy close reason was wrong"
@@ -435,6 +445,233 @@ object LiveAcceptanceTests:
       LiveClient.testInitialBackoffMillis = 100
       LiveClient.testMaxBackoffMillis = 15_000
       LiveClient.testReconnectScheduled = _ => ()
+      listener.close()
+
+  private def testSubscribeDuringReconnectBackoff(): Unit =
+    val listener = new ServerSocket(0)
+    val serverFailure = new AtomicReference[Throwable]()
+    val reconnectScheduled = new CountDownLatch(1)
+    LiveClient.testInitialBackoffMillis = 40
+    LiveClient.testMaxBackoffMillis = 80
+    LiveClient.testReconnectScheduled = _ => reconnectScheduled.countDown()
+    val server = startServer("scala-subscribe-during-backoff", serverFailure) {
+      val initial = listener.accept()
+      val originalQueryId =
+        try
+          handshake(initial)
+          readClientJson(initial)
+          val add = readClientJson(initial)
+          val queryId = add.path("modifications").path(0).path("queryId").asInt()
+          writeText(
+            initial,
+            transition(
+              zeroVersion,
+              version(1, 1),
+              updated(queryId, objectValue("count", 0))
+            ).toString
+          )
+          writeClose(initial, 1001, "reconnect for pending subscribe")
+          waitForEof(initial)
+          queryId
+        finally initial.close()
+
+      val rejected = listener.accept()
+      try
+        readHeaders(rejected.getInputStream)
+        rejected.getOutputStream.write(
+          "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
+            .getBytes(StandardCharsets.US_ASCII)
+        )
+        rejected.getOutputStream.flush()
+      finally rejected.close()
+
+      val recovered = listener.accept()
+      try
+        handshake(recovered)
+        val connect = readClientJson(recovered)
+        check(
+          connect.path("connectionCount").asInt() == 2,
+          "failed reconnect was not included in connectionCount"
+        )
+        val add = readClientJson(recovered)
+        val modifications = add.path("modifications")
+        check(modifications.size() == 2, "pending subscribe did not join reconnect Add")
+        val queryIds = modifications.elements().asScala.map(_.path("queryId").asInt()).toList
+        check(queryIds.contains(originalQueryId), "existing subscription vanished during reconnect")
+        writeText(
+          recovered,
+          transition(
+            zeroVersion,
+            version(1, 2),
+            updated(queryIds.head, objectValue("count", 1)),
+            updated(queryIds.last, objectValue("count", 2))
+          ).toString
+        )
+        waitForEof(recovered)
+      finally recovered.close()
+    }
+
+    try
+      val live = new LiveClient(url(listener))
+      try
+        val existing = live.subscribe("demo:state", ConvexClient.json.createObjectNode())
+        check(existing.next(Timeout).path("count").asInt() == 0, "initial value missing")
+        check(
+          existing.nextUpdate(Timeout).error.isInstanceOf[ConvexClient.TransportError],
+          "server close did not reach existing subscription"
+        )
+        check(reconnectScheduled.await(1, TimeUnit.SECONDS), "reconnect was not scheduled")
+        val replacement = new AtomicReference[LiveClient.Subscription]()
+        val subscribeFailure = new AtomicReference[Throwable]()
+        val subscribe = new Thread(() =>
+          try
+            replacement.set(
+              live.subscribe("demo:other", ConvexClient.json.createObjectNode())
+            )
+          catch case error: Throwable => subscribeFailure.set(error)
+        )
+        subscribe.start()
+        subscribe.join(Timeout.toMillis)
+        check(!subscribe.isAlive, "subscribe during reconnect never completed")
+        check(subscribeFailure.get() == null, "subscribe during reconnect failed")
+        val added = replacement.get()
+        check(added != null, "subscribe during reconnect returned no subscription")
+        check(existing.next(Timeout).path("count").asInt() == 1, "existing query was stranded")
+        check(added.next(Timeout).path("count").asInt() == 2, "pending query was stranded")
+        added.close()
+        existing.close()
+      finally live.close()
+      join(server, serverFailure)
+    finally
+      LiveClient.testInitialBackoffMillis = 100
+      LiveClient.testMaxBackoffMillis = 15_000
+      LiveClient.testReconnectScheduled = _ => ()
+      listener.close()
+
+  private def testFailedSubscribeDoesNotLeaveGhost(): Unit =
+    testFailedSubscribeDoesNotLeaveGhost(writeTimeout = false)
+    testFailedSubscribeDoesNotLeaveGhost(writeTimeout = true)
+
+  private def testFailedSubscribeDoesNotLeaveGhost(writeTimeout: Boolean): Unit =
+    val listener = new ServerSocket(0)
+    val serverFailure = new AtomicReference[Throwable]()
+    val retired = new CountDownLatch(1)
+    val server = startServer(
+      if writeTimeout then "scala-write-timeout" else "scala-write-failure",
+      serverFailure
+    ) {
+      val initial = listener.accept()
+      val originalQueryId =
+        try
+          handshake(initial)
+          readClientJson(initial)
+          val add = readClientJson(initial)
+          val queryId = add.path("modifications").path(0).path("queryId").asInt()
+          writeText(
+            initial,
+            transition(
+              zeroVersion,
+              version(1, 1),
+              updated(queryId, objectValue("count", 0))
+            ).toString
+          )
+          waitForEof(initial)
+          retired.countDown()
+          queryId
+        finally initial.close()
+
+      val recovered = listener.accept()
+      try
+        handshake(recovered)
+        val connect = readClientJson(recovered)
+        check(connect.path("connectionCount").asInt() == 1, "write failure was not counted")
+        val add = readClientJson(recovered)
+        val modifications = add.path("modifications")
+        check(modifications.size() == 1, "failed subscribe left a ghost Add")
+        val queryId = modifications.path(0).path("queryId").asInt()
+        check(queryId == originalQueryId, "reconnect retained the failed subscription")
+        writeText(
+          recovered,
+          transition(zeroVersion, version(1, 2), updated(queryId, objectValue("count", 1))).toString
+        )
+        waitForEof(recovered)
+      finally recovered.close()
+    }
+
+    val live = new LiveClient(url(listener))
+    try
+      val existing = live.subscribe("demo:state", ConvexClient.json.createObjectNode())
+      check(existing.next(Timeout).path("count").asInt() == 0, "initial value missing")
+      val failNextWrite = new AtomicBoolean(true)
+      if writeTimeout then LiveClient.testWriteTimeoutMillis = 30
+      LiveClient.testSendText = (socket, text) =>
+        if failNextWrite.compareAndSet(true, false) then
+          if writeTimeout then new CompletableFuture[WebSocket]()
+          else
+            CompletableFuture.failedFuture[WebSocket](
+              new IllegalStateException("injected sendText failure")
+            )
+        else socket.sendText(text, true)
+      try
+        live.subscribe("demo:ghost", ConvexClient.json.createObjectNode())
+        fail("failed sendText became a successful subscription")
+      catch
+        case error: ConvexClient.TransportError =>
+          check(error.operation == "live write", "write failure lost transport operation")
+      finally
+        LiveClient.testSendText = (socket, text) => socket.sendText(text, true)
+        LiveClient.testWriteTimeoutMillis = 3_000
+      check(retired.await(1, TimeUnit.SECONDS), "uncertain write socket was not retired")
+      check(
+        existing.nextUpdate(Timeout).error.isInstanceOf[ConvexClient.TransportError],
+        "write failure was not delivered to the existing subscription"
+      )
+      check(existing.next(Timeout).path("count").asInt() == 1, "existing query was stranded")
+      existing.close()
+    finally
+      LiveClient.testSendText = (socket, text) => socket.sendText(text, true)
+      LiveClient.testWriteTimeoutMillis = 3_000
+      live.close()
+    join(server, serverFailure)
+    listener.close()
+
+  private def testHandshakeTimeoutDoesNotLeaveGhost(): Unit =
+    val listener = new ServerSocket(0)
+    val serverFailure = new AtomicReference[Throwable]()
+    val requestSeen = new CountDownLatch(1)
+    val releaseHandshake = new CountDownLatch(1)
+    val server = startServer("scala-subscribe-handshake-timeout", serverFailure) {
+      val socket = listener.accept()
+      try
+        val headers = readHeaders(socket.getInputStream)
+        requestSeen.countDown()
+        releaseHandshake.await(Timeout.toMillis, TimeUnit.MILLISECONDS)
+        completeHandshake(socket, headers)
+        val connect = readClientJson(socket)
+        check(connect.path("type").asText() == "Connect", "late handshake omitted Connect")
+        socket.setSoTimeout(200)
+        try
+          val unexpected = readClientJson(socket)
+          fail(s"timed-out subscribe left a ghost frame: $unexpected")
+        catch case _: SocketTimeoutException => ()
+      finally socket.close()
+    }
+
+    val live = new LiveClient(url(listener))
+    LiveClient.testSubscribeTimeoutMillis = 40
+    try
+      check(!requestSeen.await(20, TimeUnit.MILLISECONDS), "handshake started before subscribe")
+      try
+        live.subscribe("demo:ghost", ConvexClient.json.createObjectNode())
+        fail("stalled handshake became a successful subscription")
+      catch case _: java.util.concurrent.TimeoutException => ()
+      check(requestSeen.await(1, TimeUnit.SECONDS), "handshake request was not observed")
+      releaseHandshake.countDown()
+      join(server, serverFailure)
+    finally
+      releaseHandshake.countDown()
+      LiveClient.testSubscribeTimeoutMillis = 5_000
+      live.close()
       listener.close()
 
   private def testProtocolAndTransportRecovery(): Unit =
@@ -593,6 +830,9 @@ object LiveAcceptanceTests:
 
   private def handshake(socket: Socket): Unit =
     val headers = readHeaders(socket.getInputStream)
+    completeHandshake(socket, headers)
+
+  private def completeHandshake(socket: Socket, headers: String): Unit =
     val key = headers
       .split("\r\n")
       .find(_.toLowerCase.startsWith("sec-websocket-key:"))
@@ -703,12 +943,13 @@ object LiveAcceptanceTests:
   private def transition(
       start: JsonNode,
       end: JsonNode,
-      modification: JsonNode
+      modifications: JsonNode*
   ): ObjectNode =
     val message = ConvexClient.json.createObjectNode().put("type", "Transition")
     message.set("startVersion", start)
     message.set("endVersion", end)
-    message.putArray("modifications").add(modification)
+    val array = message.putArray("modifications")
+    modifications.foreach(array.add)
     message
 
   private def updated(queryId: Int, value: JsonNode): ObjectNode =
