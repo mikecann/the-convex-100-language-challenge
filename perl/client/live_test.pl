@@ -65,16 +65,21 @@ sub read_client_json {
     return decode_json($decoded);
 }
 
-sub write_server_json {
-    my ( $socket, $value ) = @_;
-    my $payload = encode_json($value);
-    my $length  = length $payload;
-    my $header  = pack 'C', 0x81;
+sub write_server_text {
+    my ( $socket, $payload ) = @_;
+    my $length = length $payload;
+    my $header = pack 'C', 0x81;
     $header .=
       $length < 126
       ? pack( 'C', $length )
       : pack( 'Cn', 126, $length );
     print {$socket} $header . $payload;
+    return;
+}
+
+sub write_server_json {
+    my ( $socket, $value ) = @_;
+    write_server_text( $socket, encode_json($value) );
     return;
 }
 
@@ -340,7 +345,7 @@ sub finish_server {
                 )
             );
             $continue->dequeue;
-            write_server_json( $first, { type => 'UnknownServerMessage' } );
+            write_server_text( $first, '{malformed-json' );
             close $first;
 
             my $second = accept_websocket($listener);
@@ -354,6 +359,15 @@ sub finish_server {
                     version( 1, 'rehydrate-one' ),
                     updated( $id, 0 ),
                 )
+            );
+            write_server_json(
+                $second,
+                {
+                    type          => 'Transition',
+                    startVersion  => version( 1, 'rehydrate-one' ),
+                    endVersion    => version( 1, 'malformed-shape' ),
+                    modifications => {},
+                }
             );
             close $second;
 
@@ -369,17 +383,31 @@ sub finish_server {
                     updated( $id, 0 ),
                 )
             );
+            close $third;
+
+            my $fourth = accept_websocket($listener);
+            read_client_json($fourth);
+            $add = read_client_json($fourth);
+            $id  = $add->{modifications}[0]{queryId};
+            write_server_json(
+                $fourth,
+                transition(
+                    version( 0, 'AAAAAAAAAAA=' ),
+                    version( 1, 'rehydrate-three' ),
+                    updated( $id, 0 ),
+                )
+            );
             $continue->dequeue;
             write_server_json(
-                $third,
+                $fourth,
                 transition(
-                    version( 1, 'rehydrate-two' ),
+                    version( 1, 'rehydrate-three' ),
                     version( 1, 'recovered' ),
                     updated( $id, 1 ),
                 )
             );
-            read_exact( $third, 1 );
-            close $third;
+            read_exact( $fourth, 1 );
+            close $fourth;
             return;
         }
     );
@@ -389,7 +417,10 @@ sub finish_server {
         0, 'error fixture initial value' );
     $continue->enqueue(1);
     is( ref( $subscription->next_update(2)->{error} ),
-        'Convex::ProtocolError', 'protocol error is structured' );
+        'Convex::ProtocolError',
+        'malformed JSON is a structured protocol error' );
+    is( ref( $subscription->next_update(3)->{error} ),
+        'Convex::ProtocolError', 'malformed Transition is a protocol error' );
     is( ref( $subscription->next_update(3)->{error} ),
         'Convex::TransportError', 'transport error is structured' );
     $continue->enqueue(1);

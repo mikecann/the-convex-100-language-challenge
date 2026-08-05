@@ -219,7 +219,7 @@ sub _run {
                         'live' )
                       unless defined $raw;
                     $last_server_response = time;
-                    my $message = JSON::PP::decode_json($raw);
+                    my $message = _decode_server_message($raw);
                     if ( ( $message->{type} // q{} ) eq 'Transition' ) {
                         _handle_transition(
                             $message,          \$remote_version,
@@ -284,12 +284,24 @@ sub _handle_transition {
     my ( $message, $remote_ref, $max_ts_ref,
         $last_results_ref, $subscriptions_ref )
       = @_;
+    die Convex::Errors::protocol_error('Transition has malformed versions')
+      unless _valid_version( $message->{startVersion} )
+      && _valid_version( $message->{endVersion} );
+    die Convex::Errors::protocol_error(
+        'Transition modifications must be an array')
+      unless ref( $message->{modifications} ) eq 'ARRAY';
     die Convex::Errors::protocol_error('Transition version mismatch')
       unless _versions_equal( $message->{startVersion}, ${$remote_ref} );
 
     my %changed;
     for my $modification ( @{ $message->{modifications} // [] } ) {
+        die Convex::Errors::protocol_error(
+            'Transition modification must be an object')
+          unless ref($modification) eq 'HASH';
         my $id = $modification->{queryId};
+        die Convex::Errors::protocol_error(
+            'Transition modification requires queryId')
+          unless defined $id && !ref($id);
         if ( ( $modification->{type} // q{} ) eq 'QueryUpdated' ) {
             my $update = {
                 value => $modification->{value},
@@ -334,6 +346,17 @@ sub _handle_transition {
           if $subscriptions_ref->{$id};
     }
     return;
+}
+
+sub _decode_server_message {
+    my ($raw)        = @_;
+    my $message      = eval { JSON::PP::decode_json($raw) };
+    my $decode_error = $@;
+    die Convex::Errors::protocol_error("decode Live message: $decode_error")
+      if $decode_error;
+    die Convex::Errors::protocol_error('Live message must be an object')
+      unless ref($message) eq 'HASH';
+    return $message;
 }
 
 sub _publish_error {
@@ -393,6 +416,20 @@ sub _versions_equal {
          ( $left->{querySet} // -1 ) == ( $right->{querySet} // -2 )
       && ( $left->{identity} // -1 ) == ( $right->{identity} // -2 )
       && ( $left->{ts} // q{} ) eq ( $right->{ts} // q{missing} );
+}
+
+sub _valid_version {
+    my ($version) = @_;
+    return 0 unless ref($version) eq 'HASH';
+    return 0
+      unless defined $version->{querySet}
+      && defined $version->{identity}
+      && defined $version->{ts};
+    return 0
+      if ref( $version->{querySet} )
+      || ref( $version->{identity} )
+      || ref( $version->{ts} );
+    return 1;
 }
 
 sub _json_equal {

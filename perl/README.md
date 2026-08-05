@@ -25,6 +25,8 @@ use FindBin;
 use lib $ENV{CONVEX_CLIENT_PATH} || "$FindBin::Bin/../../client";
 use Convex;
 
+# Convex JSON numbers are decoded as scalars. This helper rejects a surprising
+# value before the example compares counts or prints a misleading success.
 sub whole_count {
     my ( $value, $operation ) = @_;
     die "$operation count was not a whole number"
@@ -35,7 +37,8 @@ sub whole_count {
 # Create a Convex client using the deployment selected by the verifier.
 my $client = Convex->new( $ENV{CONVEX_URL} );
 
-# A unique room lets concurrent example runs prove the same isolated 0 -> 1 journey.
+# A unique room lets concurrent example runs prove the same isolated
+# 0 -> 1 journey.
 my $room = $ARGV[0] || 'perl-example';
 eval {
     # Query the current room state through Convex's documented HTTP API.
@@ -44,7 +47,8 @@ eval {
       whole_count( $current->{value}{count}, 'current query' );
     print "current count: $current_count\n";
 
-# Start Live before changing state, so the reactive query cannot miss the mutation.
+    # Start Live before changing state, so the reactive query cannot miss the
+    # mutation.
     my $subscription = $client->subscribe( 'demo:state', { room => $room } );
     my $initial      = $subscription->next_update(10);
     die $initial->{error} if $initial->{error};
@@ -53,7 +57,8 @@ eval {
     die "initial Live count disagreed" unless $initial_count == $current_count;
     print "live initial count: $initial_count\n";
 
-   # The runId is an idempotency key, so retrying this logical mutation is safe.
+    # The runId is an idempotency key, so retrying this logical mutation is
+    # safe.
     my $mutation = $client->mutation(
         'demo:increment',
         {
@@ -69,7 +74,8 @@ eval {
     die 'mutation count disagreed' unless $mutation_count == $current_count + 1;
     print "mutation count: $mutation_count\n";
 
-# Receive the changed state from the existing Live query rather than polling HTTP.
+    # Receive the changed state from the existing Live query rather than
+    # polling HTTP.
     my $changed = $subscription->next_update(10);
     die $changed->{error} if $changed->{error};
     my $changed_count =
@@ -77,13 +83,20 @@ eval {
     die 'updated Live count disagreed' unless $changed_count == $mutation_count;
     print "live updated count: $changed_count\n";
     print "verified count: $current_count -> $changed_count\n";
+
+    # Unsubscribe explicitly so the Live worker removes this query before exit.
     $subscription->close;
     1;
 } or do {
     my $error = $@ || 'unknown example failure';
+
+    # Failure cleanup must also stop the Live worker instead of hiding it behind
+    # the original operation error or leaving the process running.
     $client->close;
     die $error;
 };
+
+# Close the shared client after the demonstrated HTTP and Live work is complete.
 $client->close;
 ```
 <!-- END GENERATED EXAMPLE -->
@@ -97,7 +110,11 @@ $client->close;
 
 The first checks every source against Perl::Tidy 20260705, runs Perl::Critic
 1.156 at severity 5, performs syntax checks, and executes the language-local
-fixture matrix. The second builds the minimal linux/amd64 adapter runtime.
+fixture matrix. All 37 build-only formatter and linter distributions are pinned
+by version, CPAN author path, and SHA-256 in
+[`client/tooling-cpan.lock`](client/tooling-cpan.lock); installation uses an
+empty local mirror so undeclared transitive downloads fail. The second builds
+the minimal linux/amd64 adapter runtime.
 Coordinator-owned `verify-example`, `verify`, and `verify-hosted` are required
 before either capability can be awarded.
 
@@ -114,8 +131,11 @@ fragmented UTF-8 and control frames, structured recovery, and hostile shutdown.
 
 Runtime transport modules are supplied by the digest-pinned Perl 5.42.0 image:
 HTTP::Tiny 0.090, JSON::PP 4.16, IO::Socket::SSL 2.091, MIME::Base64 3.16_01,
-and Net::SSLeay 1.94. The final scratch images contain their runtime closure but
-no compiler, linker, package manager, formatter, or linter commands.
+and Net::SSLeay 1.94. Final images use the pinned amd64 distroless Debian 12
+nonroot base, then add only the traced Perl and TLS runtime closure, the shell
+and text tools required by shared policy, and the client sources. CPAN and
+ExtUtils::MakeMaker modules are absent, as are compiler, linker, package
+manager, formatter, and linter commands.
 
 ## Limitations
 

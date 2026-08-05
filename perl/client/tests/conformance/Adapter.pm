@@ -1,0 +1,270 @@
+package Adapter;
+
+use strict;
+use warnings;
+
+use FindBin;
+use lib $ENV{CONVEX_CLIENT_PATH} || "$FindBin::Bin/../..";
+use lib join '/', ( $ENV{CONVEX_CLIENT_PATH} || "$FindBin::Bin/../.." ),
+  'tests', 'conformance';
+
+use IO::Handle;
+use IO::Socket::INET;
+use JSON::PP    qw(decode_json encode_json);
+use Time::HiRes qw(sleep time);
+use threads;
+
+use Convex;
+use RelayGuard;
+
+sub write_event {
+    my ( $output, $guard, $event ) = @_;
+    $guard->synchronized(
+        sub {
+            print {$output} encode_json($event) . "\n";
+            return;
+        }
+    );
+    return;
+}
+
+sub write_subscription_event {
+    my ( $output, $guard, $subscription_id, $generation, $event ) = @_;
+    return $guard->publish_if_current(
+        $subscription_id,
+        $generation,
+        sub {
+            print {$output} encode_json($event) . "\n";
+            return;
+        }
+    );
+}
+
+sub error_details {
+    my ($error) = @_;
+    my $kind    = ref($error) || 'TransportError';
+    my %details = (
+        name    => $kind =~ /([^:]+)\z/ ? $1 : $kind,
+        message => "$error",
+    );
+    $details{data} = $error->{data}
+      if ref($error) && exists $error->{data};
+    return \%details;
+}
+
+sub invalidate_relay {
+    my ( $subscription_id, $guard, $subscriptions, $relays, $retired_relays ) =
+      @_;
+
+    # Invalidation happens before the ACK and shares the publication lock.
+    # A relay paused after dequeue can resume later, but it cannot publish.
+    $guard->advance($subscription_id);
+    my $subscription = delete $subscriptions->{$subscription_id};
+    $subscription->close if $subscription;
+    my $relay = delete $relays->{$subscription_id};
+    push @{$retired_relays}, $relay if $relay;
+    return;
+}
+
+sub reap_relays {
+    my ( $retired_relays, $wait_seconds, $detach_remaining ) = @_;
+    my $deadline = time + $wait_seconds;
+    while ( @{$retired_relays} ) {
+        my @still_running;
+        for my $relay ( @{$retired_relays} ) {
+            if ( $relay->is_joinable ) {
+                $relay->join;
+            }
+            else {
+                push @still_running, $relay;
+            }
+        }
+        @{$retired_relays} = @still_running;
+        last if !@still_running || time >= $deadline;
+        sleep 0.01;
+    }
+    if ($detach_remaining) {
+        $_->detach for @{$retired_relays};
+        @{$retired_relays} = ();
+    }
+    return;
+}
+
+sub run_adapter {
+    my ( $input, $output, $options ) = @_;
+    $options //= {};
+    $output->autoflush(1);
+    my $guard  = RelayGuard->new;
+    my $client = $options->{client};
+    my %subscriptions;
+    my %relays;
+    my @retired_relays;
+    my $done = 0;
+
+    while ( my $line = <$input> ) {
+        my $command = eval { decode_json($line) };
+        if ($@) {
+            write_event(
+                $output, $guard,
+                {
+                    type  => 'error',
+                    error => {
+                        name    => 'ProtocolError',
+                        message => "decode command: $@",
+                    },
+                }
+            );
+            next;
+        }
+
+        my $id = $command->{id};
+        my $ok = eval {
+            if ( $command->{op} eq 'hello' ) {
+                die 'unsupported adapter protocol version'
+                  unless $command->{protocolVersion} == 1;
+                write_event(
+                    $output, $guard,
+                    {
+                        protocolVersion => 1,
+                        id              => $id,
+                        type            => 'ready',
+                        language        => 'perl',
+                        implementation  => "native-perl-$]",
+                        runtime         => "perl-$]",
+                    }
+                );
+            }
+            elsif ( $command->{op} =~ /\A(query|mutation|action)\z/ ) {
+                my $operation = $1;
+                $client //= Convex->new( $ENV{CONVEX_URL},
+                    bearer_token => $ENV{CONVEX_AUTH_TOKEN}, );
+                my $result = $client->$operation( $command->{path},
+                    $command->{args} || {} );
+                write_event(
+                    $output, $guard,
+                    {
+                        id    => $id,
+                        type  => 'result',
+                        value => $result->{value},
+                        logs  => $result->{logs},
+                    }
+                );
+            }
+            elsif ( $command->{op} eq 'setAuth' ) {
+                $client //= Convex->new( $ENV{CONVEX_URL} );
+                $client->set_auth( $command->{token} );
+                write_event( $output, $guard, { id => $id, type => 'ack' } );
+            }
+            elsif ( $command->{op} eq 'subscribe' ) {
+                $client //= Convex->new( $ENV{CONVEX_URL} );
+                my $subscription_id = $command->{subscriptionId};
+                invalidate_relay(
+                    $subscription_id, $guard, \%subscriptions,
+                    \%relays,         \@retired_relays,
+                );
+                my $generation   = $guard->advance($subscription_id);
+                my $subscription = $client->subscribe( $command->{path},
+                    $command->{args} || {} );
+                $subscriptions{$subscription_id} = $subscription;
+                write_event( $output, $guard, { id => $id, type => 'ack' } );
+
+                $relays{$subscription_id} = threads->create(
+                    sub {
+                        while (1) {
+                            my $update = eval { $subscription->next_update };
+                            my $error  = $@;
+                            last
+                              if $error
+                              && ref($error) eq 'Convex::ClosedError';
+                            $options->{relay_after_dequeue}->(
+                                $subscription_id, $generation, $update, $error,
+                            ) if $options->{relay_after_dequeue};
+                            my $event;
+                            if ( $error || $update->{error} ) {
+                                my $reported_error = $error || $update->{error};
+                                $event = {
+                                    type           => 'subscription',
+                                    subscriptionId => $subscription_id,
+                                    error => error_details($reported_error),
+                                };
+                                $event->{logs} = $reported_error->{logs}
+                                  if ref($reported_error) eq
+                                  'Convex::FunctionError';
+                            }
+                            else {
+                                $event = {
+                                    type           => 'subscription',
+                                    subscriptionId => $subscription_id,
+                                    value          => $update->{value},
+                                    logs           => $update->{logs} || [],
+                                };
+                            }
+                            write_subscription_event( $output, $guard,
+                                $subscription_id, $generation, $event );
+                        }
+                        return;
+                    }
+                );
+            }
+            elsif ( $command->{op} eq 'unsubscribe' ) {
+                invalidate_relay( $command->{subscriptionId},
+                    $guard, \%subscriptions, \%relays, \@retired_relays, );
+                write_event( $output, $guard, { id => $id, type => 'ack' } );
+            }
+            elsif ( $command->{op} eq 'debugDisconnect' ) {
+                $client->debug_disconnect_for_adapter;
+                write_event( $output, $guard, { id => $id, type => 'ack' } );
+            }
+            elsif ( $command->{op} eq 'close' ) {
+                invalidate_relay( $_, $guard, \%subscriptions, \%relays,
+                    \@retired_relays, )
+                  for keys %subscriptions;
+                $client->close if $client;
+                write_event( $output, $guard, { id => $id, type => 'closed' } );
+                $done = 1;
+            }
+            else {
+                die 'unknown adapter operation';
+            }
+            1;
+        };
+        if ( !$ok ) {
+            my $error = $@;
+            my $event = {
+                id    => $id,
+                type  => 'error',
+                error => error_details($error),
+            };
+            $event->{logs} = $error->{logs}
+              if ref($error) eq 'Convex::FunctionError';
+            write_event( $output, $guard, $event );
+        }
+        reap_relays( \@retired_relays, 0, 0 );
+        last if $done;
+    }
+
+    # The close event is already flushed. Reap cooperative relays briefly, then
+    # detach any hostile test relay so it cannot hold adapter shutdown forever.
+    reap_relays( \@retired_relays, 2, 1 );
+    return;
+}
+
+sub main {
+    if ( $ENV{ADAPTER_LISTEN} ) {
+        my ( $host, $port ) = split /:/, $ENV{ADAPTER_LISTEN}, 2;
+        my $server = IO::Socket::INET->new(
+            LocalAddr => $host,
+            LocalPort => $port,
+            Listen    => 1,
+            ReuseAddr => 1,
+        ) or die "listen: $!";
+        my $socket = $server->accept;
+        run_adapter( $socket, $socket );
+    }
+    else {
+        run_adapter( *STDIN, *STDOUT );
+    }
+    return;
+}
+
+1;
