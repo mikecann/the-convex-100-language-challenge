@@ -2,8 +2,6 @@ package convex.kotlin.example
 
 import convex.kotlin.ConvexClient
 import convex.kotlin.Update
-import java.time.Duration
-import java.util.UUID
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.buildJsonObject
@@ -11,6 +9,8 @@ import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import java.time.Duration
+import java.util.UUID
 
 fun main(args: Array<String>) {
     // Read the verifier-selected deployment instead of baking a URL into the image.
@@ -27,14 +27,16 @@ fun main(args: Array<String>) {
             val initial = count(next(subscription.next(), "initial Live value"), "initial Live value")
             check(initial == before) { "Live initial value disagreed with HTTP" }
             // The run ID is an idempotency key, preventing a retry from incrementing twice.
-            val mutation = client.mutation(
-                "demo:increment",
-                buildJsonObject {
-                    put("room", room)
-                    put("language", "kotlin")
-                    put("runId", UUID.randomUUID().toString())
-                },
-            ).value.jsonObject
+            val mutation =
+                client
+                    .mutation(
+                        "demo:increment",
+                        buildJsonObject {
+                            put("room", room)
+                            put("language", "kotlin")
+                            put("runId", UUID.randomUUID().toString())
+                        },
+                    ).value.jsonObject
             check(mutation["applied"]?.jsonPrimitive?.boolean == true) { "mutation was not applied" }
             val after = count(mutation["state"] ?: error("mutation omitted state"), "mutation")
             check(after == before + 1) { "mutation count was unexpected" }
@@ -52,11 +54,22 @@ fun main(args: Array<String>) {
     }
 }
 
-private fun next(update: Update?, operation: String): kotlinx.serialization.json.JsonElement {
+// Turn Live's three non-value outcomes into useful example failures: no event,
+// a structured query error, or a malformed update that omitted its value.
+private fun next(
+    update: Update?,
+    operation: String,
+): kotlinx.serialization.json.JsonElement {
     update ?: error("timed out waiting for $operation")
     update.error?.let { throw it }
     return update.value ?: error("$operation omitted a value")
 }
 
-private fun count(value: kotlinx.serialization.json.JsonElement, operation: String): Int =
-    value.jsonObject["count"]?.jsonPrimitive?.int ?: error("$operation did not return an integer count")
+// Decode Convex JSON into the idiomatic value this example needs, while making
+// a missing or non-integer counter fail instead of silently choosing a default.
+private fun count(
+    value: kotlinx.serialization.json.JsonElement,
+    operation: String,
+): Int =
+    value.jsonObject["count"]?.jsonPrimitive?.int
+        ?: error("$operation did not return an integer count")

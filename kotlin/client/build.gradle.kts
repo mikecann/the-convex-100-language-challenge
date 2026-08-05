@@ -1,6 +1,7 @@
 plugins {
     kotlin("jvm") version "2.2.21"
     kotlin("plugin.serialization") version "2.2.21"
+    id("org.jlleitschuh.gradle.ktlint") version "14.2.0"
     application
 }
 
@@ -10,24 +11,36 @@ repositories {
 
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1")
-    testImplementation(kotlin("test"))
+    testImplementation(kotlin("test-junit5"))
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.13.4")
 }
 
 kotlin {
     jvmToolchain(21)
 }
 
+val adapterSourceSet =
+    sourceSets.create("adapter") {
+        kotlin.setSrcDirs(listOf("src/main/kotlin", "tests/conformance"))
+        kotlin.exclude("**/*Test.kt")
+        compileClasspath += configurations.runtimeClasspath.get()
+        runtimeClasspath += output + compileClasspath
+    }
+
+val adapterTestSourceSet =
+    sourceSets.create("adapterTest") {
+        kotlin.setSrcDirs(listOf("tests/conformance", "tests/fixtures"))
+        kotlin.include("**/*Test.kt", "**/*Fixture.kt")
+        compileClasspath += adapterSourceSet.output + configurations.testRuntimeClasspath.get()
+        runtimeClasspath += output + compileClasspath
+    }
+
 sourceSets {
     main {
         kotlin.srcDir("src/main/kotlin")
     }
     test {
-        kotlin.srcDir("src/test/kotlin")
-    }
-    create("adapter") {
-        kotlin.srcDir("tests/conformance")
-        compileClasspath += sourceSets.main.get().output + configurations.runtimeClasspath.get()
-        runtimeClasspath += output + compileClasspath
+        kotlin.setSrcDirs(listOf("src/test/kotlin", "tests/fixtures"))
     }
     create("example") {
         kotlin.srcDir("../examples/basics")
@@ -37,7 +50,7 @@ sourceSets {
 }
 
 tasks.register<JavaExec>("runAdapter") {
-    classpath = sourceSets["adapter"].runtimeClasspath
+    classpath = adapterSourceSet.runtimeClasspath
     mainClass.set("convex.kotlin.adapter.AdapterMainKt")
 }
 
@@ -50,10 +63,14 @@ tasks.register<Jar>("adapterJar") {
     archiveFileName.set("convex-kotlin-adapter.jar")
     manifest { attributes["Main-Class"] = "convex.kotlin.adapter.AdapterMainKt" }
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-    from(sourceSets.main.get().output)
-    from(sourceSets["adapter"].output)
+    from(adapterSourceSet.output)
     dependsOn(configurations.runtimeClasspath)
-    from({ configurations.runtimeClasspath.get().filter { it.name.endsWith(".jar") }.map { zipTree(it) } })
+    from({
+        configurations.runtimeClasspath
+            .get()
+            .filter { it.name.endsWith(".jar") }
+            .map { zipTree(it) }
+    })
 }
 
 tasks.register<Jar>("exampleJar") {
@@ -63,9 +80,27 @@ tasks.register<Jar>("exampleJar") {
     from(sourceSets.main.get().output)
     from(sourceSets["example"].output)
     dependsOn(configurations.runtimeClasspath)
-    from({ configurations.runtimeClasspath.get().filter { it.name.endsWith(".jar") }.map { zipTree(it) } })
+    from({
+        configurations.runtimeClasspath
+            .get()
+            .filter { it.name.endsWith(".jar") }
+            .map { zipTree(it) }
+    })
 }
 
 tasks.check {
-    dependsOn("adapterJar", "exampleJar")
+    dependsOn("adapterJar", "adapterTest", "exampleJar")
+}
+
+tasks.withType<Test>().configureEach {
+    useJUnitPlatform()
+}
+
+tasks.register<Test>("adapterTest") {
+    testClassesDirs = adapterTestSourceSet.output.classesDirs
+    classpath = adapterTestSourceSet.runtimeClasspath
+}
+
+ktlint {
+    version.set("1.7.1")
 }
