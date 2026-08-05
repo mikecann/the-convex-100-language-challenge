@@ -40,4 +40,11 @@ function Json.array(value)
 	return value
 end
 
+-- dkjson applies this exact metatable while decoding JSON arrays. Checking its
+-- identity preserves the wire distinction between [] and {}, including when
+-- both are empty and Lua's table shape alone cannot tell them apart.
+function Json.is_array(value)
+	return type(value) == "table" and getmetatable(value) == Json.array_mt
+end
+
 return Json

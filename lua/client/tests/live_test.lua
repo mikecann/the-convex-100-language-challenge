@@ -3,6 +3,10 @@ local json = require("json")
 local errno = require("cqueues.errno")
 local Live = require("live")
 
+assert(json.is_array(assert(json.decode("[]"))), "decoded JSON array lost its identity")
+assert(not json.is_array(assert(json.decode("{}"))), "decoded JSON object passed the array predicate")
+assert(not json.is_array({}), "untagged Lua table passed the JSON array predicate")
+
 local function assert_equal(actual, expected, label)
 	assert(
 		actual == expected,
@@ -280,6 +284,86 @@ assert_equal(assert(subscription:next_update(1)).error.name, "TransportError", "
 assert_equal(assert(subscription:next_update(1)).error.name, "TransportError", "second connect failure")
 assert_equal(assert(subscription:next_update(2)).value.count, 0, "post-backoff hydration")
 assert_equal(manager.next_backoff, 0.1, "healthy handshake resets transport backoff")
+assert(manager:close())
+
+-- dkjson distinguishes JSON arrays and objects with metatables. Reject an
+-- object-shaped modifications field, object-shaped logLines, and non-string
+-- log entries before advancing any version, cached result, timestamp, backoff,
+-- or subscription delivery state.
+server = server_for_updates()
+manager = Live.Manager.new("http://unit.test", "lua-test", {
+	websocket_factory = function()
+		return server:new_socket()
+	end,
+})
+subscription = assert(manager:subscribe("demo:state", { room = "malformed-transition-shapes" }))
+assert_equal(assert(subscription:next_update(1)).value.count, 0)
+socket = server.connections[1]
+local initial_remote_results = manager.remote_results
+local initial_remote_result = manager.remote_results[subscription.query_id]
+local initial_last_delivered = manager.subscriptions[subscription.query_id].last_delivered
+local malformed_transitions = {
+	{
+		label = "object modifications",
+		message = {
+			type = "Transition",
+			startVersion = { querySet = 1, identity = 0, ts = "AQAAAAAAAAA=" },
+			endVersion = { querySet = 1, identity = 0, ts = "AgAAAAAAAAA=" },
+			modifications = json.object({}),
+		},
+		error_pattern = "modifications must be an array",
+	},
+	{
+		label = "object logLines",
+		message = transition(1, 1, "AQAAAAAAAAA=", "AgAAAAAAAAA=", {
+			type = "QueryUpdated",
+			queryId = subscription.query_id,
+			value = { count = 99 },
+			logLines = json.object({}),
+		}),
+		error_pattern = "logLines must be an array",
+	},
+	{
+		label = "missing logLines",
+		message = transition(1, 1, "AQAAAAAAAAA=", "AgAAAAAAAAA=", {
+			type = "QueryUpdated",
+			queryId = subscription.query_id,
+			value = { count = 99 },
+		}),
+		error_pattern = "logLines must be an array",
+	},
+	{
+		label = "non-string logLines entry",
+		message = transition(1, 1, "AQAAAAAAAAA=", "AgAAAAAAAAA=", {
+			type = "QueryUpdated",
+			queryId = subscription.query_id,
+			value = { count = 99 },
+			logLines = { "valid", 7 },
+		}),
+		error_pattern = "logLines entries must be strings",
+	},
+}
+for _, fixture in ipairs(malformed_transitions) do
+	manager.next_backoff = 7
+	socket.incoming[#socket.incoming + 1] = fixture.message
+	local accepted, protocol_error = manager:_receive()
+	assert(accepted == nil and protocol_error.name == "ProtocolError", fixture.label .. " was accepted")
+	assert(protocol_error.message:match(fixture.error_pattern), fixture.label .. " reported the wrong failure")
+	assert_equal(manager.remote_version.querySet, 1, fixture.label .. " changed query-set version")
+	assert_equal(manager.remote_version.ts, "AQAAAAAAAAA=", fixture.label .. " changed timestamp")
+	assert(manager.remote_results == initial_remote_results, fixture.label .. " replaced cached results")
+	assert(
+		manager.remote_results[subscription.query_id] == initial_remote_result,
+		fixture.label .. " changed cached query state"
+	)
+	assert_equal(manager.max_observed_timestamp, "AQAAAAAAAAA=", fixture.label .. " changed max timestamp")
+	assert(
+		manager.subscriptions[subscription.query_id].last_delivered == initial_last_delivered,
+		fixture.label .. " changed delivered state"
+	)
+	assert_equal(manager.next_backoff, 7, fixture.label .. " reset backoff before validation")
+	assert(subscription:try_next_update() == nil, fixture.label .. " emitted an invalid subscription event")
+end
 assert(manager:close())
 
 -- A protocol error is a typed subscription event, not a permanent strand.

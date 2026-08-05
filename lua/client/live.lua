@@ -468,7 +468,7 @@ function Manager:_transition(message)
 	if not versions_equal(message.startVersion, self.remote_version) then
 		return nil, failure("ProtocolError", "Transition start version does not match the local version")
 	end
-	if type(message.modifications) ~= "table" then
+	if not json.is_array(message.modifications) then
 		return nil, failure("ProtocolError", "Transition modifications must be an array")
 	end
 	for _, modification in ipairs(message.modifications) do
@@ -486,31 +486,43 @@ function Manager:_transition(message)
 		elseif modification.type ~= "QueryRemoved" then
 			return nil, failure("ProtocolError", "unknown Transition modification " .. tostring(modification.type))
 		end
-		if modification.logLines ~= nil and type(modification.logLines) ~= "table" then
+		if not json.is_array(modification.logLines) then
 			return nil, failure("ProtocolError", "Transition logLines must be an array")
 		end
-	end
-	local changed = {}
-	for _, modification in ipairs(message.modifications or {}) do
-		local query_id = modification.queryId
-		if modification.type == "QueryUpdated" then
-			changed[query_id] = { value = copy(modification.value), logs = modification.logLines or {} }
-			self.remote_results[query_id] = changed[query_id]
-		elseif modification.type == "QueryFailed" then
-			local err = failure(
-				"FunctionError",
-				modification.errorMessage or "Live query failed",
-				copy(modification.errorData),
-				modification.logLines or {}
-			)
-			changed[query_id] = { error = err, logs = err.logs }
-			self.remote_results[query_id] = changed[query_id]
-		elseif modification.type == "QueryRemoved" then
-			self.remote_results[query_id] = nil
+		for _, line in ipairs(modification.logLines) do
+			if type(line) ~= "string" then
+				return nil, failure("ProtocolError", "Transition logLines entries must be strings")
+			end
 		end
 	end
-	self.remote_version = copy(message.endVersion)
-	self.max_observed_timestamp = later_timestamp(self.max_observed_timestamp, self.remote_version.ts)
+
+	-- Build the complete next snapshot before touching manager state. A rejected
+	-- modification therefore cannot advance the remote version, alter cached
+	-- results, or move the observed timestamp partway through a Transition.
+	local changed = {}
+	local next_results = {}
+	for query_id, result in pairs(self.remote_results) do
+		next_results[query_id] = result
+	end
+	for _, modification in ipairs(message.modifications) do
+		local query_id = modification.queryId
+		local logs = copy(modification.logLines)
+		if modification.type == "QueryUpdated" then
+			changed[query_id] = { value = copy(modification.value), logs = logs }
+			next_results[query_id] = changed[query_id]
+		elseif modification.type == "QueryFailed" then
+			local err = failure("FunctionError", modification.errorMessage, copy(modification.errorData), logs)
+			changed[query_id] = { error = err, logs = err.logs }
+			next_results[query_id] = changed[query_id]
+		elseif modification.type == "QueryRemoved" then
+			next_results[query_id] = nil
+		end
+	end
+	local next_version = copy(message.endVersion)
+	local next_max_observed_timestamp = later_timestamp(self.max_observed_timestamp, next_version.ts)
+	self.remote_results = next_results
+	self.remote_version = next_version
+	self.max_observed_timestamp = next_max_observed_timestamp
 	for query_id, update in pairs(changed) do
 		local state = self.subscriptions[query_id]
 		if state then
@@ -539,11 +551,16 @@ function Manager:_receive()
 	if not message then
 		return nil, failure("ProtocolError", "decode Live message: " .. tostring(decode_error))
 	end
-	self.next_backoff = INITIAL_BACKOFF -- a valid server message proves health
 	if message.type == "Transition" then
-		return self:_transition(message)
+		local ok, err = self:_transition(message)
+		if not ok then
+			return nil, err
+		end
+		self.next_backoff = INITIAL_BACKOFF -- only a valid transition proves health
+		return true
 	end
 	if message.type == "Ping" or message.type == "MutationResponse" or message.type == "ActionResponse" then
+		self.next_backoff = INITIAL_BACKOFF
 		return true
 	end
 	if message.type == "FatalError" or message.type == "AuthError" then
