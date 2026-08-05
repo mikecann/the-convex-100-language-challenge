@@ -13,24 +13,38 @@ public static class CountValue
         // exact integer path, then accept 0.0-style encodings only when whole.
         if (value.TryGetValue<JsonElement>(out var element))
         {
-            if (element.ValueKind != JsonValueKind.Number) throw Invalid(operation);
-            if (element.TryGetInt32(out var integer)) return integer;
-            if (element.TryGetDouble(out var floating)) return Normalize(floating, operation);
+            if (element.ValueKind != JsonValueKind.Number)
+                throw Invalid(operation);
+            if (element.TryGetInt32(out var integer))
+                return integer;
+            if (element.TryGetDouble(out var floating))
+                return Normalize(floating, operation);
             throw Invalid(operation);
         }
 
         // These branches keep the helper useful for programmatically-created
         // JsonNodes in tests and for callers composing values without parsing.
-        if (value.TryGetValue<int>(out var directInteger)) return directInteger;
-        if (value.TryGetValue<long>(out var longInteger) && longInteger >= int.MinValue && longInteger <= int.MaxValue)
+        if (value.TryGetValue<int>(out var directInteger))
+            return directInteger;
+        if (
+            value.TryGetValue<long>(out var longInteger)
+            && longInteger >= int.MinValue
+            && longInteger <= int.MaxValue
+        )
             return (int)longInteger;
-        if (value.TryGetValue<double>(out var directDouble)) return Normalize(directDouble, operation);
+        if (value.TryGetValue<double>(out var directDouble))
+            return Normalize(directDouble, operation);
         throw Invalid(operation);
     }
 
     private static int Normalize(double value, string operation)
     {
-        if (!double.IsFinite(value) || value != Math.Truncate(value) || value < int.MinValue || value > int.MaxValue)
+        if (
+            !double.IsFinite(value)
+            || value != Math.Truncate(value)
+            || value < int.MinValue
+            || value > int.MaxValue
+        )
             throw Invalid(operation);
         return (int)value;
     }
