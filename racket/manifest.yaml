@@ -5,4 +5,5 @@ rank: 88
 selectionTier: curated_backfill
 implementation:
   status: planned
+  notes: Racket fails before completing version output under the required linux/amd64 Docker target in this worktree; no client source has been added without a runnable toolchain.
 capabilities: []
