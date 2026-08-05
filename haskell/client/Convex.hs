@@ -22,6 +22,7 @@ module Convex (
     unsubscribe,
     closeClient,
     debugDisconnectForAdapter,
+    debugTickerRunningForTests,
 )
 where
 
@@ -121,6 +122,7 @@ data Client = Client
     , clientWorker :: Async ()
     , clientClosed :: TVar Bool
     , clientCloseDone :: TMVar (Either ConvexError ())
+    , clientTickerRunning :: TVar Bool
     }
 
 newClient :: String -> IO Client
@@ -132,7 +134,8 @@ newClient url = do
     budget <- QueueBudget <$> newTVarIO 0 <*> newTVarIO 0
     closed <- newTVarIO False
     closeDone <- newEmptyTMVarIO
-    worker <- async (liveWorker address commands closed budget)
+    tickerRunning <- newTVarIO False
+    worker <- async (liveWorker address commands closed budget tickerRunning)
     pure
         Client
             { clientUrl = dropTrailing url
@@ -142,6 +145,7 @@ newClient url = do
             , clientWorker = worker
             , clientClosed = closed
             , clientCloseDone = closeDone
+            , clientTickerRunning = tickerRunning
             }
 
 {- | HTTP bearer authentication is mutable because the adapter exercises token
@@ -249,6 +253,11 @@ debugDisconnectForAdapter client = do
     reply <- newEmptyTMVarIO
     enqueueCommand client (DebugDisconnect reply)
     either throwIO pure =<< awaitReply "retiring the Live connection" 2000000 reply
+
+-- This test-only observation makes the ticker lifecycle visible without
+-- exposing its Async handle or allowing callers to influence production state.
+debugTickerRunningForTests :: Client -> IO Bool
+debugTickerRunningForTests = readTVarIO . clientTickerRunning
 
 closeClient :: Client -> IO ()
 closeClient client = do
@@ -382,11 +391,11 @@ initialState =
 -- generations, reconnect metadata, or subscription membership. The transport
 -- callback only performs reads and turns them into generation-tagged events;
 -- controller and relay threads can only enqueue commands.
-liveWorker :: Address -> TBQueue Command -> TVar Bool -> QueueBudget -> IO ()
-liveWorker address commands closed budget = do
+liveWorker :: Address -> TBQueue Command -> TVar Bool -> QueueBudget -> TVar Bool -> IO ()
+liveWorker address commands closed budget tickerRunning = do
     events <- newTQueueIO
     inbound <- InboundQueue <$> newTBQueueIO 2 <*> newTVarIO 0
-    ticker <- async (inactivityTicker closed events)
+    ticker <- async (tickerLifecycle tickerRunning (inactivityTicker closed events))
     -- Stop publishes its completion barrier only after joining this ticker.
     -- The finalizer also covers an unexpected owner exception before Stop.
     owner events inbound ticker initialState `finally` void (stopTicker ticker)
@@ -582,6 +591,11 @@ inactivityTicker closed events = do
         unless stopped (writeTQueue events InactivityTick)
         pure (not stopped)
     when keepRunning (inactivityTicker closed events)
+
+tickerLifecycle :: TVar Bool -> IO () -> IO ()
+tickerLifecycle running task = do
+    atomically (writeTVar running True)
+    task `finally` atomically (writeTVar running False)
 
 stopTicker :: Async () -> IO (Maybe Text)
 stopTicker ticker = do

@@ -8,7 +8,7 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, cancel, concurrently_, waitCatch)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, bracket, catch)
-import Control.Monad (foldM_, forM_, forever, replicateM)
+import Control.Monad (foldM_, forM_, forever, replicateM, unless)
 import Convex
 import Crypto.Hash.SHA1 qualified as SHA1
 import Data.Aeson
@@ -399,10 +399,20 @@ testConcurrentClose = withServer 19245 fixture $ do
 -- inactivity ticker has terminated and been joined. Repeating this lifecycle
 -- catches any regression that merely abandons one sleeping ticker per Client.
 testRepeatedClientClose :: IO ()
-testRepeatedClientClose =
-    forM_ [1 .. 64 :: Int] $ \_ -> do
-        client <- newClient "http://127.0.0.1:1"
+testRepeatedClientClose = do
+    clients <- mapM (const (newClient "http://127.0.0.1:1")) [1 .. 64 :: Int]
+    -- First prove every ticker really started. Otherwise a false default could
+    -- make the post-close assertion pass without exercising its lifecycle.
+    started <- timeout 1000000 (waitUntil (and <$> mapM debugTickerRunningForTests clients))
+    assert (started == Just ()) "not every inactivity ticker started"
+    forM_ clients $ \client -> do
         assertCompletes "repeated client close" (closeClient client)
+        running <- debugTickerRunningForTests client
+        assert (not running) "close returned before its inactivity ticker terminated"
+  where
+    waitUntil condition = do
+        ready <- condition
+        unless ready (threadDelay 1000 >> waitUntil condition)
 
 testFiveFailedReconnectsThenSuccess :: IO ()
 testFiveFailedReconnectsThenSuccess = do
