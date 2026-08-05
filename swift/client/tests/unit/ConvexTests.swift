@@ -39,6 +39,7 @@ final class FakeSocket: LiveSocket, @unchecked Sendable {
   var sendFailures = 0
   private(set) var activeSends = 0
   private(set) var maxActiveSends = 0
+  var sendDelayMilliseconds = 2
   init(
     text: @Sendable @escaping (String) -> Void, binary: @Sendable @escaping () -> Void,
     close: @Sendable @escaping () -> Void
@@ -60,7 +61,7 @@ final class FakeSocket: LiveSocket, @unchecked Sendable {
       return false
     }
     if shouldFail { throw TestFailure.message("send failed") }
-    try? await Task.sleep(for: .milliseconds(2))
+    try? await Task.sleep(for: .milliseconds(sendDelayMilliseconds))
     lock.withLock { activeSends -= 1 }
   }
   func close() { lock.withLock { isClosed = true } }
@@ -250,6 +251,133 @@ final class ConvexTests: XCTestCase {
     await live.close()
   }
 
+  func testInboundMailboxOverflowIsStructuredAndReconnects() async throws {
+    let factory = FakeFactory()
+    let live = try LiveClient("http://fixture", factory: factory)
+    let first = try await live.subscribe("demo:first", [:])
+    var iterator = first.stream.makeAsyncIterator()
+    factory.socket(0).sendDelayMilliseconds = 100
+    let adding = Task { try await live.subscribe("demo:second", [:]) }
+    try await eventually { factory.socket(0).activeSends == 1 }
+    for _ in 0..<100 { factory.socket(0).emit(["type": "Ping"]) }
+    _ = try await adding.value
+    let overflow = try await next(&iterator)
+    XCTAssertEqual(overflow.error?.kind, .protocolError)
+    XCTAssertTrue(overflow.error?.message.contains("mailbox overflow") == true)
+    try await eventually { factory.count == 2 }
+    await live.close()
+  }
+
+  func testNIOEventLoopGroupsRetireAcrossManyConnectionFailures() async throws {
+    let factory = NIOSocketFactory()
+    let threadsBefore = linuxThreadCount()
+    for _ in 0..<40 {
+      do {
+        _ = try await factory.connect(
+          url: URL(string: "ws://127.0.0.1:1/api/sync")!, onText: { _ in }, onBinary: {},
+          onClose: {})
+        XCTFail("expected connection failure")
+      } catch {}
+    }
+    try await eventually(timeout: 2_000) { factory.activeGroupCount == 0 }
+    await factory.shutdown()
+    if let threadsBefore {
+      try await eventually(timeout: 2_000) {
+        guard let current = self.linuxThreadCount() else { return false }
+        return current <= threadsBefore + 2
+      }
+    }
+  }
+
+  func testStalledUpgradeCanBeClosedWellInsideAdapterDeadline() async throws {
+    let server = try StalledHTTPServer()
+    let factory = NIOSocketFactory()
+    let live = try LiveClient("http://127.0.0.1:\(server.port)", factory: factory)
+    let subscribe = Task { try await live.subscribe("demo:state", [:]) }
+    try await server.waitUntilAccepted()
+    let clock = ContinuousClock()
+    let started = clock.now
+    await live.close()
+    XCTAssertLessThan(started.duration(to: clock.now), .seconds(2))
+    do {
+      _ = try await subscribe.value
+      XCTFail("expected cancelled upgrade")
+    } catch {}
+    try await eventually { factory.activeGroupCount == 0 }
+  }
+
+  func testAdapterCloseAfterStalledUpgradeBeatsControllerDeadlineAndEmitsClosed() async throws {
+    let server = try StalledHTTPServer()
+    var commands: [Int32] = [0, 0]
+    var events: [Int32] = [0, 0]
+    XCTAssertEqual(pipe(&commands), 0)
+    XCTAssertEqual(pipe(&events), 0)
+    defer {
+      close(commands[0])
+      close(commands[1])
+      close(events[0])
+      close(events[1])
+    }
+    let connection = LineConnection(input: commands[0], output: events[1], ownsDescriptors: false)
+    let adapter = Task {
+      await runAdapter(connection: connection, deploymentURL: "http://127.0.0.1:\(server.port)")
+    }
+    let input =
+      "{\"id\":\"sub\",\"op\":\"subscribe\",\"subscriptionId\":\"s\",\"path\":\"demo:state\",\"args\":{}}\n"
+      + "{\"id\":\"close\",\"op\":\"close\"}\n"
+    _ = input.withCString { write(commands[1], $0, input.utf8.count) }
+    let clock = ContinuousClock()
+    let started = clock.now
+    var iterator = LineConnection(input: events[0], output: events[0], ownsDescriptors: false)
+      .lines().makeAsyncIterator()
+    var sawClosed = false
+    for _ in 0..<3 {
+      guard let line = await iterator.next() else { break }
+      if line.contains("\"type\":\"closed\"") && line.contains("\"id\":\"close\"") {
+        sawClosed = true
+        break
+      }
+    }
+    XCTAssertTrue(sawClosed)
+    XCTAssertLessThan(started.duration(to: clock.now), .seconds(6))
+    await adapter.value
+  }
+
+  func testReplacementAndRemovalWaitForRelayStopBarriers() async throws {
+    let registry = SubscriptionRegistry()
+    let first = LiveClient.Subscription(1)
+    let second = LiveClient.Subscription(2)
+    _ = await registry.replace("same", with: first)
+    let replacementGate = AsyncStream<Void>.makeStream()
+    let replacementFinished = CompletionFlag()
+    let replacing = Task {
+      let token = await replaceRelay(registry: registry, id: "same", with: second) { _ in
+        for await _ in replacementGate.stream { break }
+      }
+      replacementFinished.finish()
+      return token
+    }
+    try await Task.sleep(for: .milliseconds(20))
+    XCTAssertFalse(replacementFinished.isFinished)
+    replacementGate.continuation.yield()
+    replacementGate.continuation.finish()
+    _ = await replacing.value
+
+    let removalGate = AsyncStream<Void>.makeStream()
+    let removalFinished = CompletionFlag()
+    let removing = Task {
+      await removeRelay(registry: registry, id: "same") { _ in
+        for await _ in removalGate.stream { break }
+      }
+      removalFinished.finish()
+    }
+    try await Task.sleep(for: .milliseconds(20))
+    XCTAssertFalse(removalFinished.isFinished)
+    removalGate.continuation.yield()
+    removalGate.continuation.finish()
+    await removing.value
+  }
+
   func testSubscriptionRegistryRejectsStaleReplacementAndUnsubscribeRelays() async {
     let registry = SubscriptionRegistry()
     let first = LiveClient.Subscription(1)
@@ -304,7 +432,9 @@ final class ConvexTests: XCTestCase {
   func testRealWebSocketTransportReassemblesFragmentsAcrossPingControlFrame() async throws {
     let transition = transition(
       start: version(0), end: version(1),
-      modifications: [["type": "QueryUpdated", "queryId": 0, "value": ["count": 41]]])
+      modifications: [
+        ["type": "QueryUpdated", "queryId": 0, "value": ["count": 41, "label": "split-🙂-scalar"]]
+      ])
     let payload = String(
       data: try JSONSerialization.data(withJSONObject: transition, options: [.sortedKeys]),
       encoding: .utf8)!
@@ -337,6 +467,8 @@ final class ConvexTests: XCTestCase {
       adapterErrorEvent(id: nil, subscriptionID: "s", error: function))
     XCTAssertFalse(subscription.contains("\"id\""))
     XCTAssertTrue(subscription.contains("\"subscriptionId\":\"s\""))
+    XCTAssertEqual(
+      try encodeEvent(["type": "closed", "id": "close"]), "{\"id\":\"close\",\"type\":\"closed\"}")
   }
 
   func testLineReaderBoundsPartialFrameAndCloses() async throws {
@@ -381,6 +513,14 @@ final class ConvexTests: XCTestCase {
     }
     throw TestFailure.message("condition not met")
   }
+
+  private func linuxThreadCount() -> Int? {
+    guard let status = try? String(contentsOfFile: "/proc/self/status", encoding: .utf8),
+      let line = status.split(separator: "\n").first(where: { $0.hasPrefix("Threads:") })
+    else { return nil }
+    return Int(line.split(whereSeparator: \Character.isWhitespace).last ?? "")
+  }
+
 }
 
 extension ListenAddress {
@@ -462,16 +602,21 @@ private final class RawWebSocketServer: @unchecked Sendable {
     let response =
       "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: \(acceptValue)\r\n\r\n"
     guard writeAll(client, Array(response.utf8)) else { return false }
-    guard readFrame(client) != nil, readFrame(client) != nil else { return false }
+    guard let connect = readFrame(client), let add = readFrame(client), connect.masked, add.masked
+    else { return false }
     let bytes = Array(text.utf8)
-    let split = bytes.count / 2
+    // Split after the first byte of a four-byte scalar. A correct WebSocket
+    // implementation reassembles bytes before asking Swift to decode UTF-8.
+    guard let scalarStart = bytes.firstIndex(where: { $0 >= 0xF0 }) else { return false }
+    let split = scalarStart + 1
     guard writeFrame(client, fin: false, opcode: 1, payload: Array(bytes[..<split])),
       writeFrame(client, fin: true, opcode: 9, payload: Array("probe".utf8)),
       writeFrame(client, fin: true, opcode: 0, payload: Array(bytes[split...]))
     else { return false }
-    guard readFrame(client)?.opcode == 10 else { return false }
+    guard let pong = readFrame(client), pong.opcode == 10, pong.masked else { return false }
     // Two concurrent subscriptions must still arrive as two complete frames.
-    return readFrame(client)?.opcode == 1 && readFrame(client)?.opcode == 1
+    guard let second = readFrame(client), let third = readFrame(client) else { return false }
+    return second.opcode == 1 && second.masked && third.opcode == 1 && third.masked
   }
 
   private static func readHTTP(_ descriptor: Int32) -> String? {
@@ -485,7 +630,9 @@ private final class RawWebSocketServer: @unchecked Sendable {
     return nil
   }
 
-  private static func readFrame(_ descriptor: Int32) -> (opcode: UInt8, payload: [UInt8])? {
+  private static func readFrame(_ descriptor: Int32) -> (
+    opcode: UInt8, payload: [UInt8], masked: Bool
+  )? {
     guard let header = readExact(descriptor, 2) else { return nil }
     let opcode = header[0] & 0x0f
     var count = Int(header[1] & 0x7f)
@@ -499,14 +646,22 @@ private final class RawWebSocketServer: @unchecked Sendable {
     if let mask, masked {
       for index in payload.indices { payload[index] ^= mask[index % 4] }
     }
-    return (opcode, payload)
+    return (opcode, payload, masked)
   }
 
   private static func writeFrame(
     _ descriptor: Int32, fin: Bool, opcode: UInt8, payload: [UInt8]
   ) -> Bool {
-    guard payload.count < 126 else { return false }
-    return writeAll(descriptor, [(fin ? 0x80 : 0) | opcode, UInt8(payload.count)] + payload)
+    let first = (fin ? 0x80 : 0) | opcode
+    let header: [UInt8]
+    if payload.count < 126 {
+      header = [first, UInt8(payload.count)]
+    } else if payload.count <= Int(UInt16.max) {
+      header = [first, 126, UInt8(payload.count >> 8), UInt8(payload.count & 0xff)]
+    } else {
+      return false
+    }
+    return writeAll(descriptor, header + payload)
   }
 
   private static func readExact(_ descriptor: Int32, _ count: Int) -> [UInt8]? {
@@ -535,9 +690,74 @@ private final class RawWebSocketServer: @unchecked Sendable {
   }
 }
 
+private final class StalledHTTPServer: @unchecked Sendable {
+  let port: UInt16
+  private let descriptor: Int32
+  private let accepted = CompletionFlag()
+
+  init() throws {
+    #if os(Linux)
+      let socketDescriptor = Glibc.socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+    #else
+      let socketDescriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+    #endif
+    guard socketDescriptor >= 0 else { throw TestFailure.message("socket failed") }
+    var address = sockaddr_in()
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = 0
+    address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+    let bound = withUnsafePointer(to: &address) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        bind(socketDescriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+    guard bound == 0, listen(socketDescriptor, 2) == 0 else {
+      close(socketDescriptor)
+      throw TestFailure.message("bind failed")
+    }
+    var actual = sockaddr_in()
+    var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+    _ = withUnsafeMutablePointer(to: &actual) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        getsockname(socketDescriptor, $0, &length)
+      }
+    }
+    descriptor = socketDescriptor
+    port = UInt16(bigEndian: actual.sin_port)
+    let signal = accepted
+    Thread.detachNewThread { [socketDescriptor, signal] in
+      while true {
+        let client = accept(socketDescriptor, nil, nil)
+        guard client >= 0 else { return }
+        signal.finish()
+        var byte: UInt8 = 0
+        while read(client, &byte, 1) > 0 {}
+        close(client)
+      }
+    }
+  }
+
+  deinit { close(descriptor) }
+
+  func waitUntilAccepted() async throws {
+    for _ in 0..<100 {
+      if accepted.isFinished { return }
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    throw TestFailure.message("stalled server did not accept")
+  }
+}
+
 private final class RawServerResult: @unchecked Sendable {
   private let lock = NSLock()
   private var stored: Bool?
   var value: Bool? { lock.withLock { stored } }
   func complete(_ value: Bool) { lock.withLock { stored = value } }
+}
+
+private final class CompletionFlag: @unchecked Sendable {
+  private let lock = NSLock()
+  private var finished = false
+  var isFinished: Bool { lock.withLock { finished } }
+  func finish() { lock.withLock { finished = true } }
 }

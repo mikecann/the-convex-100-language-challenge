@@ -20,7 +20,7 @@ RUN --mount=type=cache,id=swift-amd64-build-v2,target=/work/.build \
     cp .build/release/convex-adapter /out/convex-adapter && \
     cp .build/release/convex-example /out/convex-example
 
-FROM --platform=linux/amd64 swift:6.1.2-noble-slim@sha256:bf926ea857fa4e28a549bdc8ab2554d97e31bf323dce1d80594b6bce7acac19e AS runtime-base
+FROM --platform=linux/amd64 swift:6.1.2-noble-slim@sha256:bf926ea857fa4e28a549bdc8ab2554d97e31bf323dce1d80594b6bce7acac19e AS runtime-common
 # Keep the pinned glibc and Swift runtime distribution, but remove its package
 # environment and Perl interpreter completely. The final image remains a real
 # non-scratch OS image with the shell and text tools required by shared policy.
@@ -69,12 +69,12 @@ RUN set -eu; \
     test ! -e /usr/share/perl5; \
     test ! -e /usr/lib/x86_64-linux-gnu/perl-base; \
     test -z "$(find /etc /usr /var \( -iname 'apt' -o -iname 'apt-*' -o -iname 'dpkg' -o -iname 'dpkg-*' -o -iname 'perl' -o -iname 'perl-*' -o -iname 'libapt-*' \) 2>/dev/null)"
-COPY --from=test --chmod=0555 /out/convex-adapter /usr/local/bin/convex-adapter
-COPY --from=test --chmod=0555 /out/convex-example /usr/local/bin/convex-example
 USER 65532:65532
 
-FROM runtime-base AS example-runtime
+FROM runtime-common AS example-runtime
+COPY --from=test --chown=65532:65532 --chmod=0555 /out/convex-example /usr/local/bin/convex-example
 ENTRYPOINT ["/usr/local/bin/convex-example"]
 
-FROM runtime-base AS runtime
+FROM runtime-common AS runtime
+COPY --from=test --chown=65532:65532 --chmod=0555 /out/convex-adapter /usr/local/bin/convex-adapter
 ENTRYPOINT ["/usr/local/bin/convex-adapter"]

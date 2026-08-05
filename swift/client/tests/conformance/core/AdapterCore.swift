@@ -200,6 +200,25 @@ public actor SubscriptionRegistry {
   }
 }
 
+/// Replacement and removal return only after the old relay has been stopped.
+/// The adapter writes its acknowledgement after these barriers complete, so a
+/// controller never observes an ack while a stale relay can still emit events.
+public func replaceRelay(
+  registry: SubscriptionRegistry, id: String, with subscription: LiveClient.Subscription,
+  stop: @Sendable (LiveClient.Subscription) async -> Void
+) async -> UUID {
+  let (token, previous) = await registry.replace(id, with: subscription)
+  if let previous { await stop(previous) }
+  return token
+}
+
+public func removeRelay(
+  registry: SubscriptionRegistry, id: String,
+  stop: @Sendable (LiveClient.Subscription) async -> Void
+) async {
+  if let subscription = await registry.remove(id) { await stop(subscription) }
+}
+
 public actor AdapterOutput {
   private let connection: LineConnection
   private var closed = false
@@ -289,10 +308,12 @@ public func runAdapter(connection: LineConnection, deploymentURL: String?) async
         guard let subscriptionID = command["subscriptionId"] as? String, !subscriptionID.isEmpty
         else { throw AdapterIOError("subscriptionId is required") }
         if live == nil { live = try LiveClient(deploymentURL) }
-        let subscription = try await live!.subscribe(
+        let activeLive = live!
+        let subscription = try await activeLive.subscribe(
           command["path"] as? String ?? "", command["args"] as? [String: Any] ?? [:])
-        let (token, previous) = await registry.replace(subscriptionID, with: subscription)
-        if let previous { await live!.unsubscribe(previous) }
+        let token = await replaceRelay(registry: registry, id: subscriptionID, with: subscription) {
+          await activeLive.unsubscribe($0)
+        }
         await output.write(["type": "ack", "id": id ?? ""])
         Task {
           for await update in subscription.stream {
@@ -314,10 +335,10 @@ public func runAdapter(connection: LineConnection, deploymentURL: String?) async
           }
         }
       case "unsubscribe":
-        if let subscriptionID = command["subscriptionId"] as? String,
-          let subscription = await registry.remove(subscriptionID)
-        {
-          await live?.unsubscribe(subscription)
+        if let subscriptionID = command["subscriptionId"] as? String, let activeLive = live {
+          await removeRelay(registry: registry, id: subscriptionID) {
+            await activeLive.unsubscribe($0)
+          }
         }
         await output.write(["type": "ack", "id": id ?? ""])
       case "debugDisconnect":

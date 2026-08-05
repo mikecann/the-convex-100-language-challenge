@@ -23,15 +23,22 @@ protocol LiveSocketFactory: Sendable {
 
 private final class NIOSocket: LiveSocket, @unchecked Sendable {
   let socket: WebSocket
-  init(_ socket: WebSocket) { self.socket = socket }
+  private let retire: @Sendable () -> Void
+  init(_ socket: WebSocket, retire: @Sendable @escaping () -> Void) {
+    self.socket = socket
+    self.retire = retire
+  }
   var isClosed: Bool { socket.isClosed }
   func send(_ text: String) async throws { try await socket.send(text) }
-  func close() { socket.close(promise: nil) }
+  func close() {
+    socket.close(promise: nil)
+    retire()
+  }
 }
 
-private final class NIOSocketFactory: LiveSocketFactory, @unchecked Sendable {
+final class NIOSocketFactory: LiveSocketFactory, @unchecked Sendable {
   private let lock = NSLock()
-  private var groups: [ObjectIdentifier: MultiThreadedEventLoopGroup] = [:]
+  private var connections: [ObjectIdentifier: ActiveConnection] = [:]
 
   func connect(
     url: URL,
@@ -41,7 +48,6 @@ private final class NIOSocketFactory: LiveSocketFactory, @unchecked Sendable {
   ) async throws -> any LiveSocket {
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     let identifier = ObjectIdentifier(group)
-    lock.withLock { groups[identifier] = group }
     var configuration = WebSocketClient.Configuration(maxFrameSize: 64 * 1024)
     configuration.minNonFinalFragmentSize = 1
     configuration.maxAccumulatedFrameCount = 64
@@ -51,38 +57,78 @@ private final class NIOSocketFactory: LiveSocketFactory, @unchecked Sendable {
     return try await withCheckedThrowingContinuation {
       (continuation: CheckedContinuation<any LiveSocket, Error>) in
       let race = ConnectionRace(continuation)
+      let active = ActiveConnection(group: group, race: race)
+      lock.withLock { connections[identifier] = active }
       let future: EventLoopFuture<Void> = WebSocket.connect(
         to: url, headers: headers, configuration: configuration, on: group
-      ) { socket in
-        socket.onText { _, text in onText(text) }
-        socket.onBinary { _, _ in onBinary() }
-        socket.onClose.whenComplete { _ in onClose() }
-        guard race.resolve(.success(NIOSocket(socket))) else {
+      ) { [weak self] socket in
+        guard let self else {
           socket.close(promise: nil)
           return
         }
+        let retire: @Sendable () -> Void = { [weak self] in
+          self?.retire(identifier, group: group)
+        }
+        socket.onText { _, text in onText(text) }
+        socket.onBinary { _, _ in onBinary() }
+        socket.onClose.whenComplete { _ in
+          onClose()
+          retire()
+        }
+        guard race.resolve(.success(NIOSocket(socket, retire: retire))) else {
+          socket.close(promise: nil)
+          retire()
+          return
+        }
       }
-      future.whenFailure { error in _ = race.resolve(.failure(error)) }
+      future.whenFailure { [weak self] error in
+        _ = race.resolve(.failure(error))
+        self?.retire(identifier, group: group)
+      }
       Task {
-        try? await Task.sleep(for: .seconds(10))
+        try? await Task.sleep(for: .seconds(3))
         if race.resolve(.failure(transportError("Live HTTP upgrade timed out"))) {
-          group.shutdownGracefully { _ in }
+          self.retire(identifier, group: group)
         }
       }
     }
   }
 
   func cancelPendingConnects() {
-    let active = lock.withLock { Array(groups.values) }
-    for group in active { group.shutdownGracefully { _ in } }
+    let active = lock.withLock { Array(connections) }
+    for (identifier, connection) in active {
+      _ = connection.race.resolve(.failure(transportError("Live connect cancelled")))
+      retire(identifier, group: connection.group)
+    }
   }
 
   func shutdown() async {
     let active = lock.withLock { () -> [MultiThreadedEventLoopGroup] in
-      defer { groups.removeAll() }
-      return Array(groups.values)
+      defer { connections.removeAll() }
+      return connections.values.map(\.group)
     }
     for group in active { try? await group.shutdownGracefully() }
+  }
+
+  var activeGroupCount: Int { lock.withLock { connections.count } }
+
+  private func retire(
+    _ identifier: ObjectIdentifier, group expected: MultiThreadedEventLoopGroup
+  ) {
+    let removed = lock.withLock { () -> MultiThreadedEventLoopGroup? in
+      guard connections[identifier]?.group === expected else { return nil }
+      return connections.removeValue(forKey: identifier)?.group
+    }
+    removed?.shutdownGracefully { _ in }
+  }
+}
+
+private final class ActiveConnection: @unchecked Sendable {
+  let group: MultiThreadedEventLoopGroup
+  let race: ConnectionRace
+  init(group: MultiThreadedEventLoopGroup, race: ConnectionRace) {
+    self.group = group
+    self.race = race
   }
 }
 
@@ -121,18 +167,33 @@ private enum InboundEvent: @unchecked Sendable {
   case text(String, Int)
   case binary(Int)
   case closed(Int)
+  case overflow(Int)
+
+  var generation: Int {
+    switch self {
+    case .text(_, let generation), .binary(let generation), .closed(let generation),
+      .overflow(let generation):
+      return generation
+    }
+  }
 }
 
 /// WebSocket callbacks may arrive on different event loops. This mailbox gives
 /// the protocol actor one ordered input rather than creating one Task per event.
 private final class InboundMailbox: @unchecked Sendable {
+  private static let capacity = 64
   private let lock = NSLock()
   private var values: [InboundEvent] = []
   private var draining = false
 
   func enqueue(_ value: InboundEvent) -> Bool {
     lock.withLock {
-      values.append(value)
+      if values.count >= Self.capacity {
+        values.removeAll(keepingCapacity: true)
+        values.append(.overflow(value.generation))
+      } else {
+        values.append(value)
+      }
       guard !draining else { return false }
       draining = true
       return true
@@ -383,6 +444,8 @@ public actor LiveClient {
           await protocolFailure("Live server sent a binary message", generation: eventGeneration)
         case .closed(let eventGeneration):
           await socketClosed(generation: eventGeneration)
+        case .overflow(let eventGeneration):
+          await protocolFailure("Live inbound mailbox overflow", generation: eventGeneration)
         }
       }
     }
