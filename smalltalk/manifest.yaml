@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: smalltalk
+displayName: "Smalltalk"
+rank: 84
+selectionTier: curated_backfill
+implementation:
+  status: planned
+capabilities: []

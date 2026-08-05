@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: scheme
+displayName: "Scheme"
+rank: 72
+selectionTier: coverage
+implementation:
+  status: planned
+capabilities: []

@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: java
+displayName: "Java"
+rank: 3
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

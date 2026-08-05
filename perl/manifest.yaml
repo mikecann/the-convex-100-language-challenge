@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: perl
+displayName: "Perl"
+rank: 23
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

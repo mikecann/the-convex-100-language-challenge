@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: blitzmax
+displayName: "BlitzMax"
+rank: 61
+selectionTier: coverage
+implementation:
+  status: planned
+capabilities: []

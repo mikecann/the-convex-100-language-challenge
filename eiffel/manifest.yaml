@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: eiffel
+displayName: "Eiffel"
+rank: 99
+selectionTier: curated_backfill
+implementation:
+  status: planned
+capabilities: []

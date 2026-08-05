@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: clojure
+displayName: "Clojure"
+rank: 48
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

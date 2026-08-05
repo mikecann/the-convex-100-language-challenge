@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: swift
+displayName: "Swift"
+rank: 12
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

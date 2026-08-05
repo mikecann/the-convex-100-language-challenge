@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: idris
+displayName: "Idris"
+rank: 93
+selectionTier: curated_backfill
+implementation:
+  status: planned
+capabilities: []

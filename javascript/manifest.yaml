@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: javascript
+displayName: "JavaScript"
+rank: 2
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

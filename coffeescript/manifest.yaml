@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: coffeescript
+displayName: "CoffeeScript"
+rank: 62
+selectionTier: coverage
+implementation:
+  status: planned
+capabilities: []

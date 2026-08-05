@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: julia
+displayName: "Julia"
+rank: 32
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

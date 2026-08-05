@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: gleam
+displayName: "Gleam"
+rank: 50
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

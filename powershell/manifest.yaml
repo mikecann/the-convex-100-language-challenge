@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: powershell
+displayName: "PowerShell"
+rank: 20
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

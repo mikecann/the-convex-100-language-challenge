@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: typescript
+displayName: "TypeScript"
+rank: 6
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

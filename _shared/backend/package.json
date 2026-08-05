@@ -1,0 +1,15 @@
+{
+  "name": "@100-convex-clients/backend",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "deploy:once": "convex dev --once --typecheck enable --tail-logs disable",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "convex": "1.43.0"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

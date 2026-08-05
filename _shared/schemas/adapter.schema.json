@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://100-convex-clients.test/schemas/adapter-v1.json",
+  "title": "NDJSON adapter protocol v1 message",
+  "oneOf": [
+    { "$ref": "#/$defs/hello" },
+    { "$ref": "#/$defs/call" },
+    { "$ref": "#/$defs/subscribe" },
+    { "$ref": "#/$defs/auth" },
+    { "$ref": "#/$defs/control" },
+    { "$ref": "#/$defs/event" }
+  ],
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "hello": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocolVersion", "id", "op"],
+      "properties": {
+        "protocolVersion": { "const": 1 },
+        "id": { "$ref": "#/$defs/id" },
+        "op": { "const": "hello" }
+      }
+    },
+    "call": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "op", "path", "args"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "op": { "enum": ["query", "mutation", "action"] },
+        "path": { "type": "string", "minLength": 3 },
+        "args": { "type": "object" }
+      }
+    },
+    "subscribe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "op", "subscriptionId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "op": { "enum": ["subscribe", "unsubscribe"] },
+        "subscriptionId": { "$ref": "#/$defs/id" },
+        "path": { "type": "string" },
+        "args": { "type": "object" }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "op", "token"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "op": { "const": "setAuth" },
+        "token": { "type": "string" }
+      }
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "op"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "op": { "enum": ["close", "debugDisconnect"] }
+      }
+    },
+    "event": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "protocolVersion": { "const": 1 },
+        "id": { "$ref": "#/$defs/id" },
+        "subscriptionId": { "$ref": "#/$defs/id" },
+        "language": { "type": "string" },
+        "implementation": { "type": "string" },
+        "runtime": { "type": "string" },
+        "type": {
+          "enum": ["ready", "result", "error", "ack", "subscription", "closed"]
+        },
+        "value": true,
+        "logs": { "type": "array", "items": { "type": "string" } },
+        "error": { "type": "object" }
+      }
+    }
+  }
+}

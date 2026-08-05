@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: python
+displayName: "Python"
+rank: 1
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: assembly-x86-64
+displayName: "Assembly (x86-64 NASM)"
+rank: 24
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

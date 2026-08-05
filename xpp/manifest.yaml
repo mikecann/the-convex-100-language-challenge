@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: xpp
+displayName: "X++"
+rank: 55
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

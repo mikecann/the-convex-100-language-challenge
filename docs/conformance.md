@@ -10,7 +10,7 @@ The HTTP badge uses only Convex's documented public HTTP API:
 - It exposes idiomatic query, mutation, and action APIs.
 - It calls `/api/query`, `/api/mutation`, and `/api/action` directly.
 - It sends documented `format: "json"` requests.
-- It supports `Authorization: Bearer <JWT>`.
+- It supports setting, replacing, and clearing `Authorization: Bearer <JWT>`.
 - It preserves successful values, `errorMessage`, application `errorData`, and `logLines`.
 - It passes the JSON-safe value suite.
 
@@ -29,9 +29,10 @@ The Live badge includes Yellow and additionally requires:
 - A WebSocket subscription, not polling.
 - Initial and subsequent query values.
 - Unsubscribe.
-- Auth changes on the live connection.
 - Automatic reconnect and restoration of active subscriptions.
-- Distinct query, mutation, action, auth, and transport failures.
+- Reactive query failures remain typed subscription events, while transport
+  interruptions exercise reconnect and do not masquerade as query failures.
+- Clean client and subscription shutdown.
 
 Realtime is not a documented stable third-party wire API. Every implementation must pin one protocol profile and record its source revision. It must not combine convenient pieces from incompatible official clients.
 
@@ -39,7 +40,8 @@ Known profile differences already include:
 
 - Current Rust uses unversioned `/api/sync`.
 - Convex JS 1.43.0 uses `/api/1.43.0/sync`.
-- The JS profile supports `TransitionChunk`; the inspected Rust profile does not.
+- Both inspected schemas describe `TransitionChunk`, but Convex JS assembles it
+  while the inspected convex-rs 0.10.4 base client treats it as unexpected.
 
 Relevant sources:
 
@@ -47,21 +49,6 @@ Relevant sources:
 - [Convex JS sync endpoint](https://github.com/get-convex/convex-js/blob/8acd427d94ffb2ce9816283d791e74745fc89906/src/browser/sync/client.ts#L325-L340)
 - [Convex Rust sync types](https://github.com/get-convex/convex-rs/blob/6f1df8a8ba1665084ec001e307ca841ca17074d7/sync_types/README.md)
 - [Convex Rust sync endpoint](https://github.com/get-convex/convex-rs/blob/6f1df8a8ba1665084ec001e307ca841ca17074d7/src/client/mod.rs#L420-L429)
-
-## Blue: Hardened realtime
-
-The Hardened badge includes Live and additionally requires:
-
-- Complete Convex value encoding for the pinned profile.
-- Atomic application of every transition so subscriptions represent one logical timestamp.
-- Ordered mutations.
-- Reconnection of an interrupted mutation using the same session and request identity, with one database effect.
-- No automatic retry of an uncertain in-flight action.
-- Mutation success held until subscribed state advances through its commit timestamp.
-- Query journals and large transitions where the selected profile includes them.
-- Repeated auth rotation, disconnect, and lifecycle tests.
-
-The official request manager demonstrates the important distinction between reconnecting mutations and not replaying actions: [request manager source](https://github.com/get-convex/convex-js/blob/8acd427d94ffb2ce9816283d791e74745fc89906/src/browser/sync/request_manager.ts#L137-L225).
 
 ## Experimental full values
 
@@ -77,12 +64,20 @@ The official JS HTTP client currently sends `format: "convex_encoded_json"` and 
 1. Query with nested JSON arguments and verify the result.
 2. Mutate a counter and verify one database effect.
 3. Run an action and verify its result.
-4. Exercise valid, absent, invalid, replaced, and cleared bearer tokens.
+4. Exercise absent, invalid, replaced, and cleared bearer tokens against the
+   deployment. A language-local transport test must also prove that an opaque
+   configured token is sent exactly as `Authorization: Bearer <token>`.
 5. Preserve structured `ConvexError` data.
 6. Keep function logs distinct from return values.
 7. Pass null, booleans, finite Float64 values, UTF-8 strings, arrays, nested objects, and document IDs as strings.
 
 Raw HTTP does not document client-side mutation queuing, so ordering is not required for Yellow.
+
+Yellow proves bearer-token transport, not successful identity-provider
+integration. A valid signed JWT and repeated auth rotation against an
+auth-enabled fixture are outside the current HTTP and Live suites. This keeps
+the experiment from claiming authentication semantics when its dedicated
+deployment has no configured identity provider.
 
 ### Live suite
 
@@ -90,27 +85,19 @@ Raw HTTP does not document client-side mutation queuing, so ordering is not requ
 2. Observe a separate reference client's mutation without polling.
 3. Unsubscribe and receive no later callback.
 4. Drop the socket while idle, mutate state, reconnect, and observe current state.
-5. Rotate from user A to user B and re-evaluate protected subscriptions.
-6. Recover a reactive query after its underlying error is repaired.
-
-### Hardened suite
-
-1. Maintain an invariant across two subscriptions while a transaction repeatedly changes both values.
-2. After awaiting a mutation, expose subscribed state that already includes the write.
-3. Preserve server-observed order for mutations A, B, and C fired without awaiting between calls.
-4. Disconnect after the server receives a mutation but before its response, then settle once with one database effect.
-5. Disconnect an in-flight action and do not replay it.
-6. Round-trip Int64 boundaries, bytes, special floats, negative zero, Unicode, and nested values.
-7. Never regress to an older observed state after reconnect.
-8. Survive rapid subscribe, unsubscribe, and resubscribe churn.
-9. Recover protected subscriptions after replacing expired or invalid auth.
-10. Close cleanly without ghost callbacks or a hanging container.
-11. Exercise profile-specific query journals and large-transition chunks.
-12. Pass every fault case 20 consecutive times.
+5. Recover a reactive query after its underlying error is repaired.
+6. Close without a reconnect, ghost callback, or hanging process.
 
 ## Adapter protocol
 
-Every client image contains the library and a thin language-native adapter. The controller sends newline-delimited JSON commands over stdin:
+Every client image contains the library and a thin language-native adapter. The
+same NDJSON stream works in two transports. With no `ADAPTER_LISTEN`, the
+controller may use stdin and stdout. When `ADAPTER_LISTEN` is set, the adapter
+listens on that TCP address, accepts one controller connection, and carries the
+stream over that socket. The isolated Docker harness uses TCP so the controller
+and client can remain separate containers without mounting the Docker socket.
+
+The controller sends these commands:
 
 - `hello`
 - `query`
@@ -119,9 +106,24 @@ Every client image contains the library and a thin language-native adapter. The 
 - `subscribe`
 - `unsubscribe`
 - `setAuth`
+- `debugDisconnect` for a client attempting Live
 - `close`
 
-The adapter emits timestamped NDJSON responses containing request or subscription IDs. The controller owns fixture reset, randomized nonces, external reference mutations, the fault proxy, assertions, timeouts, and badge calculation.
+The adapter emits NDJSON responses containing request or subscription IDs. The
+controller owns randomized fixtures, external reference mutations, assertions,
+timeouts, fault injection, and capability calculation.
+
+The first command is always `hello` and includes `protocolVersion: 1`. Its
+`ready` response reports `protocolVersion`, the roster language ID,
+implementation provenance, and runtime version. The adapter rejects unsupported
+protocol versions. Every later command carries a request ID, and every
+subscription event carries a subscription ID. Stdout is reserved for NDJSON
+protocol events; human diagnostics go to stderr.
+
+`debugDisconnect` is test-only fault injection. It closes the active WebSocket
+without closing the client, allowing the controller to prove five real
+reconnects and restored subscriptions. It must not appear in the educational
+client API.
 
 Every result records at least:
 
@@ -134,4 +136,16 @@ Every result records at least:
 - Per-test status, duration, and evidence hash.
 - Earned badges and failure reason.
 
-The proposed Convex test schema and auth fixture remain approval-gated. No schema may be created or applied until Michael approves the exact fields and indexes.
+The official JavaScript client is a semantic oracle for results, errors,
+subscriptions, and lifecycle behaviour. It is not a byte-for-byte oracle for
+Yellow HTTP because its current HTTP client uses the undocumented
+`convex_encoded_json` format while Yellow deliberately uses the documented
+`json` format.
+
+Build success and platform verification are evidence fields, not capability
+badges. Capability remains HTTP or Live.
+
+The exact counter-room schema and indexes are frozen in
+`docs/backend-contract.md`. Michael approved the dedicated schema and pilot
+implementation on 5 August 2026. Any change to that schema requires fresh
+approval before it is applied.

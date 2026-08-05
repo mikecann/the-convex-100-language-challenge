@@ -3,6 +3,7 @@
 ## Goals
 
 - Attempt the sourced 100-language roster without installing language toolchains on the host.
+- Produce clear educational source and demonstrations for the website and video, not publishable SDK packages.
 - Award capabilities from repeatable black-box evidence rather than self-reported implementation status.
 - Preserve useful failures and implementation provenance.
 - Make it safe to add many clients concurrently without letting agents rewrite the test oracle.
@@ -11,32 +12,77 @@
 ## Repository boundaries
 
 ```text
-clients/<id>/
+<id>/
   manifest.yaml          declared intent, toolchain, and provenance
   Dockerfile             pinned multi-stage build
-  src/                   client library
-  adapter/               thin NDJSON conformance adapter
-  tests/                 language-local unit tests
+  client/                client, build metadata, unit tests, and conformance entrypoint
+  examples/basics/       shared counter-room example and example-only tests
   README.md              idiomatic usage and limitations
 
-conformance/
-  controller/            trusted black-box test controller
-  reference/             pinned official Convex reference clients
-  vectors/               versioned HTTP and value fixtures
-  scenarios/             HTTP, live, hardened, and lifecycle tests
-  fault-proxy/           deterministic disconnect and network fault control
-  protocol/              pinned realtime protocol profiles
+_shared/
+  backend/               approved Convex test backend
+  harness/               controller, reference client, vectors, and scenarios
+  protocol/              versioned adapter and pinned realtime profiles
+  schemas/               manifest, roster, result, and adapter schemas
+  site/                  static evidence wall and per-language evidence
+  results/               trusted summaries, never client-authored
 
-convex/                  approval-gated test backend
 docs/                    architecture, contracts, profiles, and decisions
 roster/                  sourced language selection and feasibility audit
-schemas/                 manifest, roster, result, and adapter schemas
-tooling/                 Dockerized orchestration and policy checks
-site/                    results wall and per-language evidence
-results/                 small trusted-main summaries, never client-authored
+run                      root Docker-only orchestration entrypoint
 ```
 
-Client pull requests may modify only their own `clients/<id>/` directory. Changes to the harness, schemas, vectors, protocol profiles, or generated results belong in separate reviewed pull requests.
+### Example comments
+
+Every language's `examples/basics/` program must read like a short guided tour
+of the client API, not an uncommented smoke test. The canonical runnable source
+should comment all of these steps when they are present:
+
+1. Reading deployment configuration and authentication.
+2. Creating the client and cleaning up its resources.
+3. Running the initial query over HTTP.
+4. Decoding the result into an idiomatic value for that language.
+5. Starting a Live subscription before making a change.
+6. Receiving the subscription's initial value.
+7. Running the mutation and explaining its idempotency key.
+8. Receiving the resulting Live update without polling again.
+9. Any non-obvious helper, including the failure it handles and why it exists.
+
+Put comments immediately beside the code they explain. Explain intent,
+sequencing, and Convex behaviour in terms useful to someone learning the
+library. Do not narrate obvious target-language syntax or routine error checks.
+If a client has not earned Live, omit those operations and explain the verified
+HTTP-only scope instead of including pretend code.
+
+The runnable file under `examples/basics/` is the canonical source. The evidence
+site reads that file directly, and README code blocks are generated projections
+checked by `./run validate`. Use `./run sync-examples` after editing an
+example; never maintain a second handwritten copy.
+
+Each language's Docker verification must also build and execute that canonical
+file against a unique room on an approved test deployment. The example must
+exit unsuccessfully if any operation it demonstrates returns an unexpected
+value. Where Live is implemented, that includes the resulting subscription
+update. Merely compiling the example does not prove that the code shown to
+viewers works.
+
+### Language-owned code
+
+The repository standardises ownership boundaries for an educational project.
+Client code and its unit tests live under `client/`.
+Example-specific tests live with the example under `examples/basics/`, and
+the language-specific executable that exposes the shared adapter protocol lives
+under `client/tests/conformance/`. Cross-client black-box scenarios and
+assertions stay under `_shared/harness/`.
+
+Do not add generic `<id>/src/` or `<id>/tests/` buckets. An implemented language
+root contains only `README.md`, `Dockerfile`, `manifest.yaml`, `client/`, and
+`examples/`. Keep source directly under `client/` where practical, together
+with the minimum build metadata needed by the container. When a toolchain
+expects paths such as Rust's `src/lib.rs` or Maven's `src/main/java`, the Docker
+build can copy the readable repository source into that temporary layout.
+
+Client pull requests may modify only their own `<id>/` directory. Changes under `_shared/`, `docs/`, or `roster/` belong in separate reviewed pull requests. CI path policy must enforce that split before language work is parallelized.
 
 ## Docker policy
 
@@ -58,6 +104,11 @@ Rules:
 - Do not download packages during conformance execution. Dependency restoration happens during the image build.
 - The language container never receives the Docker socket.
 
+The root `./run` command is the only supported host entrypoint. It may inspect
+repository metadata and invoke Docker, but compilers, package managers, code
+generation, formatting, builds, tests, and site generation all execute inside
+containers.
+
 The authoritative build shape will be equivalent to:
 
 ```text
@@ -65,25 +116,32 @@ docker buildx build \
   --platform linux/amd64 \
   --provenance=mode=max \
   --sbom=true \
-  clients/<id>
+  <id>
 ```
 
 Local development may use emulation, but an emulated pass does not replace the native amd64 CI result.
 
 ## Adapter and controller
 
-Each client image runs a language-native adapter that reads NDJSON commands from stdin and emits NDJSON events on stdout. The adapter provides a common control surface while exercising the actual public client API underneath it.
+Each client image runs a language-native adapter using the shared NDJSON
+protocol. It supports stdin/stdout for direct inspection and a one-connection
+TCP mode for the isolated Docker controller. The adapter provides a common
+control surface while exercising the actual public client API underneath it.
 
 The controller owns:
 
 - Random fixture values and per-run nonces.
 - State reset through an approved reference path.
 - External mutations using an official reference client.
-- Fault-proxy configuration.
+- Fault injection. The Go pilot currently uses an adapter-only socket break;
+  an external network fault proxy remains a later harness improvement.
 - Timeouts, clocks, assertions, repetition, and badge calculation.
 - Sanitized result and evidence generation.
 
-For local and trusted CI runs, the controller may receive a Docker socket so it can start clients and attach to their streams. It runs on a disposable worker or context. Client containers never receive that socket.
+For local and trusted CI runs, the root orchestrator starts the controller and
+clients. The controller and client containers do not receive the Docker socket.
+Client processes are attached through ordinary stdin, stdout, and a private
+Docker network.
 
 ## Runtime isolation
 
@@ -98,7 +156,11 @@ Client containers run with controls equivalent to:
 - No host mounts.
 - No access to the Docker socket.
 
-For hosted Convex tests, all HTTP and WebSocket traffic passes through an allowlist gateway restricted to the dedicated test deployment. A pinned self-hosted Convex backend can provide fast deterministic tests on the internal network, while a hosted smoke test checks HTTPS, WSS, and cloud compatibility.
+The deterministic suite targets a pinned local or self-hosted Convex backend in
+Docker. A dedicated hosted Convex development deployment is a compatibility
+smoke target for HTTPS, WSS, and current cloud behaviour. Random room IDs isolate
+fixture data, but they do not make shared hosted rate limits or credentials
+deterministic.
 
 Credentials are short-lived, supplied at runtime, redacted by the controller, and limited to the expendable test deployment.
 
@@ -120,6 +182,12 @@ Trusted CI records:
 
 Policy checks inspect source, manifests, image history, SBOMs, child processes, and outbound destinations. This detects obvious delegation to `curl`, Node, Python, the Convex CLI, or an undeclared shared core. Native provenance still requires review because automated checks are evidence, not proof.
 
+The Go pilot implements source and tree revisions, image and base digests,
+per-test and transcript hashes, final-image inspection, SBOM, and build
+provenance. Full outbound-destination inspection and a signed trusted-main
+index are not implemented yet, so pull-request and local website output stays
+visibly labelled as candidate evidence.
+
 Clients cannot commit their own earned results. Only trusted-main CI may update the small result index, and the website accepts only that signed index.
 
 ## CI strategy
@@ -139,7 +207,6 @@ Clients cannot commit their own earned results. Only trusted-main CI may update 
 - Scope BuildKit caches per language and toolchain lock hash.
 - Run the full current suite nightly.
 - Perform a weekly no-cache rebuild to detect disappearing packages, images, licences, or toolchains.
-- Require 20 consecutive passes for hardened fault cases.
 - Weight future shards by observed p95 duration and memory rather than alphabetically.
 
 The initial images remain private in GHCR. No public language package is published until it has a maintainer and a separate release decision.
@@ -176,37 +243,54 @@ The control plane performs any shared mutation. Visitors never receive deploymen
 
 ## Staged implementation
 
-### Stage 0: foundation
+### Stage 0: foundation and reconciliation
 
+- Reconcile this flat layout, CLI name, evidence vocabulary, and trust boundary.
 - Freeze roster and schemas.
-- Define the NDJSON adapter protocol.
+- Define NDJSON adapter protocol v1 and prove the harness rejects deliberately broken adapters.
 - Build the controller, official JavaScript reference, fault proxy, and one golden HTTP and Live scenario.
-- Propose the exact Convex test schema and auth fixture for Michael's approval.
+- Commit the exact approved Convex test schema and indexes.
 
-### Stage 1: official-client calibration
+### Stage 1: Go pilot
 
-Run adapters for official JavaScript, Rust, Python, Swift, and Kotlin clients. Their results calibrate the harness and correctly record native or binding provenance.
+Use the pinned official JavaScript client as a semantic oracle, then implement
+Go. JavaScript does not define the Yellow HTTP wire representation because the
+official client uses an undocumented richer encoding. Go earns HTTP only against
+the documented HTTP contract. Go may earn Live only against one explicitly
+pinned realtime profile and the hosted drift smoke test.
 
-### Stage 2: diverse pilot
+Stop for Michael's review before starting any second language.
+
+### Stage 2: official-client calibration debt
+
+Run adapters for official Rust, Python, Swift, and Kotlin clients. Their results
+broaden calibration and correctly record native or binding provenance.
+
+This remains explicit calibration debt while the first post-Go batch deliberately
+uses Ruby and Elixir to test whether the language-neutral harness works across
+an interpreted runtime and the BEAM. Complete the official-client calibration
+before treating the harness as mature enough for large batches.
+
+### Stage 3: diverse pilot
 
 Implement a small missing-client batch across different ecosystems, for example Go, Java, C#, Ruby, Elixir, Lua, C++, and Haskell. Do not scale until the tests have exposed and correctly diagnosed failures across multiple implementations.
 
-### Stage 3: HTTP expansion
+### Stage 4: HTTP expansion
 
 Prioritize practical `GGGG` roster entries. Establish Yellow before attempting realtime work. Generated OpenAPI clients may accelerate coverage but remain labelled `generated + HTTP`.
 
-### Stage 4: realtime expansion
+### Stage 5: realtime expansion
 
 Pin one protocol profile, initially proposed as the inspected `convex-rs` profile, and implement Live in clients with credible WebSocket ecosystems. Add hosted drift tests because the wire API is internal.
 
-### Stage 5: difficult and conditional languages
+### Stage 6: difficult and conditional languages
 
 Attempt FFI, transpiled, licensed, and legacy candidates under fixed budgets. Preserve blocked and failed results. Any backfill needed to reach 100 working languages lives in a separate implementation roster and never rewrites the sourced popularity roster.
 
 ## Approval gates
 
-- Exact Convex schema and indexes before any schema is created or applied.
-- Choice of self-hosted versus hosted test deployment and its credentials.
+- Any change to the approved Convex schema and indexes.
+- Hosted deployment credentials and any move away from deterministic local tests plus hosted smoke tests.
 - Any commercial runtime or licence acceptance.
 - Public package publication.
 - Public live runner and its spending limits.

@@ -8,6 +8,9 @@
 .cache/
 artifacts/
 results/local/
+_shared/results/local/
+_shared/results/hosted/
+_shared/site/dist/
 
 # Common build outputs that must remain inside containers
 node_modules/

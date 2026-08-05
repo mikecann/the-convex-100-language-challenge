@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Verified Convex clients across 100 programming languages." />
+    <title>100 Convex clients</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="page-header">
+      <div>
+        <h1>100 Convex clients</h1>
+        <p>One backend. One conformance test. No unearned badges.</p>
+      </div>
+      <div class="summary" aria-label="Project summary">
+        <strong id="working-count">0</strong>
+        <span>passing clients</span>
+        <strong id="language-count">100</strong>
+        <span>languages attempted</span>
+      </div>
+    </header>
+
+    <p id="evidence-notice" class="evidence-notice" hidden></p>
+
+    <main>
+      <section class="controls" aria-label="Language filters">
+        <label>
+          Search
+          <input id="search" type="search" placeholder="Go, Python, COBOL..." />
+        </label>
+        <label>
+          Status
+          <select id="status-filter">
+            <option value="all">All languages</option>
+            <option value="working">Working</option>
+            <option value="planned">Planned</option>
+            <option value="failed">Failed or blocked</option>
+          </select>
+        </label>
+        <div class="legend" aria-label="Capability legend">
+          <button class="badge http" type="button" data-capability="http">HTTP</button>
+          <button class="badge live" type="button" data-capability="live">Live</button>
+        </div>
+      </section>
+
+      <section id="language-grid" class="language-grid" aria-live="polite"></section>
+    </main>
+
+    <dialog id="language-dialog">
+      <button id="dialog-close" class="dialog-close" aria-label="Close">×</button>
+      <div id="dialog-content"></div>
+    </dialog>
+
+    <dialog id="capability-dialog" class="capability-dialog" aria-labelledby="capability-title">
+      <button id="capability-close" class="dialog-close" aria-label="Close capability explanation">×</button>
+      <div id="capability-content"></div>
+    </dialog>
+
+    <template id="language-card-template">
+      <article class="language-card">
+        <button class="language-card-open" type="button">
+          <span class="rank"></span>
+          <strong class="name"></strong>
+          <span class="state"></span>
+        </button>
+        <span class="badges"></span>
+      </article>
+    </template>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

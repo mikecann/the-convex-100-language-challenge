@@ -1,0 +1,65 @@
+name: Go pilot
+
+on:
+  # Keep hosted CI opt-in while the language clients are being explored.
+  # We will restore automatic trusted runs when we are ready to publish evidence.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-pilot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conformance:
+    name: Go on native linux/amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure Docker with the containerd image store
+        uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5.4.0
+        with:
+          version: v29.6.2
+          daemon-config: |
+            {
+              "features": {
+                "containerd-snapshotter": true
+              }
+            }
+
+      - name: Create an isolated BuildKit builder
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Verify the Docker environment
+        run: ./run doctor
+
+      - name: Validate the 100-language scaffold and harness self-test
+        run: ./run validate
+
+      - name: Build once, attest, and run local plus hosted conformance
+        env:
+          EVIDENCE_OCI_PATH: _shared/results/local/go-image.oci.tar
+        run: ./run verify-all go
+
+      - name: Generate the candidate evidence site
+        env:
+          EVIDENCE_CHANNEL: ci-candidate
+        run: ./run site-preview
+
+      - name: Upload results, attestations, and site preview
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: go-pilot-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            _shared/results/local/
+            _shared/results/hosted/
+            _shared/site/dist/

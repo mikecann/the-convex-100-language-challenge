@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: standard-ml
+displayName: "Standard ML"
+rank: 54
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

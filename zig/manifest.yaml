@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: zig
+displayName: "Zig"
+rank: 37
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

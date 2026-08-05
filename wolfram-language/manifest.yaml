@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: wolfram-language
+displayName: "Wolfram Language"
+rank: 45
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

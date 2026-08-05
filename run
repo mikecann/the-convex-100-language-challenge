@@ -1,0 +1,522 @@
+#!/bin/sh
+
+set -eu
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+backend_compose="$repo_root/_shared/backend/compose.yaml"
+backend_network="one-hundred-convex-clients_default"
+
+usage() {
+  printf '%s\n' \
+    "Usage: ./run <command> [language]" \
+    "" \
+    "Commands:" \
+    "  doctor              verify Docker and linux/amd64 emulation" \
+    "  validate            validate the roster and all manifests" \
+    "  backend-up          start the pinned local Convex backend" \
+    "  backend-deploy      push and typecheck the approved backend" \
+    "  hosted-deploy       push the backend to the dedicated hosted smoke target" \
+    "  hosted-smoke        run the JavaScript oracle against the hosted target" \
+    "  backend-down        stop the local backend without deleting data" \
+    "  build <language>    build a language image for linux/amd64" \
+    "  test <language>     run a language image's unit-test target" \
+    "  verify-example <language>  build and run the basic example against local Convex" \
+    "  verify <language>   run the shared conformance pilot" \
+    "  verify-hosted <language>  run the compatibility pilot against hosted Convex" \
+    "  verify-all <language>  build once, then run local and hosted pilots" \
+    "  sync-examples       project canonical example sources into READMEs" \
+    "  site                generate the trusted static evidence site" \
+    "  site-preview        generate a clearly labelled local-evidence preview" \
+    "  site-serve          serve the generated site at http://127.0.0.1:4173"
+}
+
+require_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    printf '%s\n' "Docker CLI not found. Install Docker Desktop first." >&2
+    exit 1
+  fi
+  docker info >/dev/null
+}
+
+require_implemented_language() {
+  language=${1:-}
+  if test -z "$language" || test ! -f "$repo_root/$language/Dockerfile"; then
+    printf '%s\n' "No implemented language exists for: ${language:-<missing>}" >&2
+    exit 1
+  fi
+}
+
+build_harness() {
+  docker build \
+    --file "$repo_root/_shared/harness/Dockerfile" \
+    --tag 100-convex-clients-harness:local \
+    "$repo_root"
+}
+
+backend_up() {
+  docker compose --file "$backend_compose" up --detach --wait backend
+}
+
+backend_deploy() {
+  backend_up
+  docker build \
+    --file "$repo_root/_shared/backend/Dockerfile" \
+    --tag 100-convex-clients-backend-deployer:local \
+    "$repo_root/_shared/backend"
+
+  admin_key=$(
+    docker compose --file "$backend_compose" exec -T backend ./generate_admin_key.sh |
+      awk 'NF { value = $0 } END { print value }'
+  )
+  case "$admin_key" in
+    *"|"*) ;;
+    *)
+      printf '%s\n' "The local backend did not return a valid admin key." >&2
+      exit 1
+      ;;
+  esac
+
+  docker run --rm \
+    --network "$backend_network" \
+    --env CONVEX_SELF_HOSTED_URL=http://backend:3210 \
+    --env CONVEX_SELF_HOSTED_ADMIN_KEY="$admin_key" \
+    100-convex-clients-backend-deployer:local
+}
+
+image_policy() {
+  language=$1
+  image="100-convex-clients-$language:local"
+
+  image_user=$(docker image inspect "$image" --format '{{.Config.User}}')
+  image_os=$(docker image inspect "$image" --format '{{.Os}}')
+  image_arch=$(docker image inspect "$image" --format '{{.Architecture}}')
+  image_entrypoint=$(docker image inspect "$image" --format '{{json .Config.Entrypoint}}')
+
+  test "$image_user" = "65532:65532"
+  test "$image_os/$image_arch" = "linux/amd64"
+  test "$image_entrypoint" = '["/usr/local/bin/convex-adapter"]'
+
+  docker run --rm \
+    --platform linux/amd64 \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --entrypoint /bin/sh \
+    "$image" \
+    -lc '
+      test "$(id -u)" != 0
+      for command_name in node npm python python3 curl convex; do
+        if command -v "$command_name" >/dev/null 2>&1; then
+          printf "%s\n" "Unexpected delegated runtime in final image: $command_name" >&2
+          exit 1
+        fi
+      done
+    '
+  printf '%s\n' "PASS $language final image policy"
+}
+
+build_client_image() {
+  language=$1
+  evidence_oci_path=${EVIDENCE_OCI_PATH:-}
+  if test -n "$evidence_oci_path"; then
+    case "$evidence_oci_path" in
+      /*) ;;
+      *) evidence_oci_path="$repo_root/$evidence_oci_path" ;;
+    esac
+    mkdir -p "$(dirname "$evidence_oci_path")"
+    docker buildx build \
+      --platform linux/amd64 \
+      --sbom=true \
+      --provenance=mode=max \
+      --tag "100-convex-clients-$language:local" \
+      --output type=docker \
+      --output "type=oci,dest=$evidence_oci_path" \
+      "$repo_root/$language"
+    return
+  fi
+
+  docker buildx build \
+    --load \
+    --platform linux/amd64 \
+    --provenance=false \
+    --tag "100-convex-clients-$language:local" \
+    "$repo_root/$language"
+}
+
+build_example_image() {
+  language=$1
+  docker buildx build \
+    --load \
+    --platform linux/amd64 \
+    --provenance=false \
+    --target example-runtime \
+    --tag "100-convex-clients-$language-example:local" \
+    "$repo_root/$language"
+}
+
+run_example_verification() {
+  language=$1
+  deployment_url=$2
+  backend_kind=$3
+  example_room="$language-example-$backend_kind-$(date +%s)-$$"
+
+  docker run --rm \
+    --platform linux/amd64 \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --pids-limit 32 \
+    --memory 128m \
+    --cpus 0.5 \
+    --network "$backend_network" \
+    --user 65532:65532 \
+    --env CONVEX_URL="$deployment_url" \
+    --env EXAMPLE_ROOM="$example_room" \
+    --entrypoint /bin/sh \
+    "100-convex-clients-$language-example:local" \
+    -ec '
+      output=$(/usr/local/bin/convex-example "$EXAMPLE_ROOM")
+      printf "%s\n" "$output"
+      printf "%s\n" "$output" | grep -Fqx "current count: 0"
+      printf "%s\n" "$output" | grep -Fq "\"applied\": true"
+      printf "%s\n" "$output" | grep -Fqx "verified count: 0 -> 1"
+    '
+  printf '%s\n' "PASS $language basic example returned the expected 0 -> 1 update against $backend_kind"
+}
+
+build_pilot_image() {
+  docker buildx build \
+    --load \
+    --platform linux/amd64 \
+    --file "$repo_root/_shared/harness/Dockerfile.pilot" \
+    --tag 100-convex-clients-pilot:local \
+    "$repo_root"
+}
+
+run_pilot_controller() {
+  language=$1
+  deployment_url=$2
+  backend_kind=$3
+  artifacts_dir=$4
+  client_digest=$5
+  source_commit=$6
+  source_dirty=$7
+  client_container="one-hundred-convex-clients-$language-$backend_kind-$$"
+  client_alias="$language-client"
+  client_tree_hash=$(git -C "$repo_root" rev-parse "$source_commit:$language")
+  harness_tree_hash=$(git -C "$repo_root" rev-parse "$source_commit:_shared/harness")
+  backend_tree_hash=$(git -C "$repo_root" rev-parse "$source_commit:_shared/backend")
+  backend_image_digest=
+  if test "$backend_kind" = "self-hosted"; then
+    backend_image_digest=sha256:467964cc6af57ba3e757e3e6cb1fa09a1c577803a19f03f0f42c9c4b134b070c
+  fi
+  evidence_channel=local
+  evidence_run_url=
+  if test "${GITHUB_ACTIONS:-}" = "true"; then
+    evidence_channel=github-actions
+    evidence_run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+  fi
+  evidence_oci_archive=
+  if test -n "${EVIDENCE_OCI_PATH:-}"; then
+    evidence_oci_archive=$(basename "$EVIDENCE_OCI_PATH")
+  fi
+
+  mkdir -p "$artifacts_dir"
+  docker run --detach \
+    --name "$client_container" \
+    --platform linux/amd64 \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --pids-limit 64 \
+    --memory 128m \
+    --cpus 0.5 \
+    --ulimit nofile=256:256 \
+    --network "$backend_network" \
+    --network-alias "$client_alias" \
+    --user 65532:65532 \
+    --env CONVEX_URL="$deployment_url" \
+    --env ADAPTER_LISTEN=0.0.0.0:8080 \
+    "100-convex-clients-$language:local" >/dev/null
+
+  trap 'docker rm --force "$client_container" >/dev/null 2>&1 || true' 0 1 2 15
+  controller_status=0
+  docker run --rm \
+    --platform linux/amd64 \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --pids-limit 128 \
+    --memory 1g \
+    --cpus 2 \
+    --ulimit nofile=1024:1024 \
+    --network "$backend_network" \
+    --user "$(id -u):$(id -g)" \
+    --env npm_config_cache=/tmp/npm-cache \
+    --env CONVEX_URL="$deployment_url" \
+    --env CLIENT_LANGUAGE="$language" \
+    --env CLIENT_ADAPTER_TCP="$client_alias:8080" \
+    --env BACKEND_KIND="$backend_kind" \
+    --env SOURCE_COMMIT="$source_commit" \
+    --env SOURCE_DIRTY="$source_dirty" \
+    --env CLIENT_IMAGE_DIGEST="$client_digest" \
+    --env CLIENT_TREE_HASH="$client_tree_hash" \
+    --env HARNESS_TREE_HASH="$harness_tree_hash" \
+    --env BACKEND_TREE_HASH="$backend_tree_hash" \
+    --env BACKEND_IMAGE_DIGEST="$backend_image_digest" \
+    --env EVIDENCE_CHANNEL="$evidence_channel" \
+    --env EVIDENCE_RUN_URL="$evidence_run_url" \
+    --env EVIDENCE_OCI_ARCHIVE="$evidence_oci_archive" \
+    --env TEST_PLATFORM=linux/amd64 \
+    --env REPO_ROOT=/repo \
+    --tmpfs /tmp \
+    --volume "$artifacts_dir:/artifacts" \
+    --volume "$repo_root:/repo:ro" \
+    100-convex-clients-pilot:local || controller_status=$?
+
+  if test "$controller_status" -ne 0; then
+    docker stop --time 2 "$client_container" >/dev/null 2>&1 || true
+  fi
+  client_status=$(docker wait "$client_container")
+  if test "$client_status" -ne 0; then
+    docker logs "$client_container" >&2 || true
+  fi
+  docker rm "$client_container" >/dev/null
+  trap - 0 1 2 15
+
+  test "$controller_status" -eq 0
+  test "$client_status" -eq 0
+}
+
+command_name=${1:-}
+
+case "$command_name" in
+  doctor)
+    require_docker
+    docker version
+    docker buildx inspect --bootstrap
+    docker run --rm --platform linux/amd64 alpine:3.22 uname -m
+    ;;
+  validate)
+    require_docker
+    build_harness
+    docker run --rm \
+      --read-only \
+      --cap-drop ALL \
+      --security-opt no-new-privileges \
+      --volume "$repo_root:/repo:ro" \
+      --env REPO_ROOT=/repo \
+      100-convex-clients-harness:local \
+      sh -lc 'npm run validate && npm run selftest'
+    ;;
+  sync-examples)
+    require_docker
+    build_harness
+    docker run --rm \
+      --user "$(id -u):$(id -g)" \
+      --read-only \
+      --cap-drop ALL \
+      --security-opt no-new-privileges \
+      --env REPO_ROOT=/repo \
+      --env npm_config_cache=/tmp/npm-cache \
+      --tmpfs /tmp \
+      --volume "$repo_root:/repo" \
+      100-convex-clients-harness:local npm run sync-examples
+    ;;
+  backend-up)
+    require_docker
+    backend_up
+    ;;
+  backend-deploy)
+    require_docker
+    backend_deploy
+    ;;
+  hosted-deploy)
+    require_docker
+    test -f "$HOME/.convex/config.json"
+    docker build \
+      --file "$repo_root/_shared/backend/Dockerfile" \
+      --tag 100-convex-clients-backend-deployer:local \
+      "$repo_root/_shared/backend"
+    docker run --rm \
+      --volume "$HOME/.convex:/root/.convex:ro" \
+      --env CONVEX_DEPLOYMENT=dev:usable-reindeer-44 \
+      --env CONVEX_URL=https://usable-reindeer-44.convex.cloud \
+      --env CONVEX_SITE_URL=https://usable-reindeer-44.convex.site \
+      100-convex-clients-backend-deployer:local
+    ;;
+  hosted-smoke)
+    require_docker
+    build_harness
+    docker run --rm \
+      --env CONVEX_URL=https://usable-reindeer-44.convex.cloud \
+      100-convex-clients-harness:local npm run oracle-smoke
+    ;;
+  backend-down)
+    require_docker
+    docker compose --file "$backend_compose" down
+    ;;
+  build)
+    require_docker
+    language=${2:-}
+    require_implemented_language "$language"
+    build_client_image "$language"
+    ;;
+  test)
+    require_docker
+    language=${2:-}
+    require_implemented_language "$language"
+    docker buildx build \
+      --load \
+      --platform linux/amd64 \
+      --target test \
+      --tag "100-convex-clients-$language:test" \
+      "$repo_root/$language"
+    docker run --rm \
+      --platform linux/amd64 \
+      "100-convex-clients-$language:test"
+    ;;
+  verify-example)
+    require_docker
+    language=${2:-}
+    require_implemented_language "$language"
+    backend_deploy
+    build_example_image "$language"
+    run_example_verification "$language" http://backend:3210 self-hosted
+    ;;
+  verify)
+    require_docker
+    language=${2:-}
+    require_implemented_language "$language"
+    backend_deploy
+    "$repo_root/run" test "$language"
+    "$repo_root/run" build "$language"
+    image_policy "$language"
+    build_example_image "$language"
+    run_example_verification "$language" http://backend:3210 self-hosted
+    client_digest=$(
+      docker image inspect "100-convex-clients-$language:local" --format '{{.Id}}'
+    )
+    source_commit=$(git -C "$repo_root" rev-parse HEAD)
+    source_dirty=false
+    if test -n "$(git -C "$repo_root" status --porcelain)"; then
+      source_dirty=true
+    fi
+    build_pilot_image
+    run_pilot_controller \
+      "$language" \
+      http://backend:3210 \
+      self-hosted \
+      "$repo_root/_shared/results/local" \
+      "$client_digest" \
+      "$source_commit" \
+      "$source_dirty"
+    ;;
+  verify-hosted)
+    require_docker
+    language=${2:-}
+    require_implemented_language "$language"
+    backend_up
+    "$repo_root/run" test "$language"
+    "$repo_root/run" build "$language"
+    image_policy "$language"
+    build_example_image "$language"
+    run_example_verification "$language" https://usable-reindeer-44.convex.cloud hosted
+    client_digest=$(
+      docker image inspect "100-convex-clients-$language:local" --format '{{.Id}}'
+    )
+    source_commit=$(git -C "$repo_root" rev-parse HEAD)
+    source_dirty=false
+    if test -n "$(git -C "$repo_root" status --porcelain)"; then
+      source_dirty=true
+    fi
+    build_pilot_image
+    run_pilot_controller \
+      "$language" \
+      https://usable-reindeer-44.convex.cloud \
+      hosted \
+      "$repo_root/_shared/results/hosted" \
+      "$client_digest" \
+      "$source_commit" \
+      "$source_dirty"
+    ;;
+  verify-all)
+    require_docker
+    language=${2:-}
+    require_implemented_language "$language"
+    backend_deploy
+    "$repo_root/run" test "$language"
+    build_client_image "$language"
+    image_policy "$language"
+    build_example_image "$language"
+    run_example_verification "$language" http://backend:3210 self-hosted
+    run_example_verification "$language" https://usable-reindeer-44.convex.cloud hosted
+    client_digest=$(
+      docker image inspect "100-convex-clients-$language:local" --format '{{.Id}}'
+    )
+    source_commit=$(git -C "$repo_root" rev-parse HEAD)
+    source_dirty=false
+    if test -n "$(git -C "$repo_root" status --porcelain)"; then
+      source_dirty=true
+    fi
+    build_pilot_image
+    run_pilot_controller \
+      "$language" \
+      http://backend:3210 \
+      self-hosted \
+      "$repo_root/_shared/results/local" \
+      "$client_digest" \
+      "$source_commit" \
+      "$source_dirty"
+    run_pilot_controller \
+      "$language" \
+      https://usable-reindeer-44.convex.cloud \
+      hosted \
+      "$repo_root/_shared/results/hosted" \
+      "$client_digest" \
+      "$source_commit" \
+      "$source_dirty"
+    ;;
+  site|site-preview)
+    require_docker
+    build_harness
+    include_local=false
+    evidence_channel=trusted-main
+    if test "$command_name" = "site-preview"; then
+      include_local=true
+      evidence_channel=${EVIDENCE_CHANNEL:-local-preview}
+    fi
+    docker run --rm \
+      --user "$(id -u):$(id -g)" \
+      --env npm_config_cache=/tmp/npm-cache \
+      --env INCLUDE_LOCAL_RESULTS="$include_local" \
+      --env EVIDENCE_CHANNEL="$evidence_channel" \
+      --tmpfs /tmp \
+      --volume "$repo_root:/repo" \
+      --env REPO_ROOT=/repo \
+      100-convex-clients-harness:local npm run site
+    ;;
+  site-serve)
+    require_docker
+    test -f "$repo_root/_shared/site/dist/index.html"
+    build_harness
+    docker run --rm --detach \
+      --name 100-convex-clients-site-preview \
+      --read-only \
+      --cap-drop ALL \
+      --security-opt no-new-privileges \
+      --pids-limit 64 \
+      --memory 128m \
+      --cpus 0.5 \
+      --user "$(id -u):$(id -g)" \
+      --publish 127.0.0.1:4173:4173 \
+      --env SITE_ROOT=/site \
+      --volume "$repo_root/_shared/site/dist:/site:ro" \
+      100-convex-clients-harness:local node scripts/serve-site.mjs
+    printf '%s\n' "Site preview: http://127.0.0.1:4173"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

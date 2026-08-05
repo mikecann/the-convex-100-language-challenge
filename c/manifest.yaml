@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: c
+displayName: "C"
+rank: 10
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

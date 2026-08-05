@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: lua
+displayName: "Lua"
+rank: 19
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

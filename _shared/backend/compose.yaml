@@ -1,0 +1,28 @@
+name: one-hundred-convex-clients
+
+services:
+  backend:
+    image: ghcr.io/get-convex/convex-backend@sha256:467964cc6af57ba3e757e3e6cb1fa09a1c577803a19f03f0f42c9c4b134b070c
+    stop_grace_period: 10s
+    stop_signal: SIGINT
+    ports:
+      - "3210:3210"
+      - "3211:3211"
+    volumes:
+      - backend-data:/convex/data
+    environment:
+      CONVEX_CLOUD_ORIGIN: http://127.0.0.1:3210
+      CONVEX_SITE_ORIGIN: http://127.0.0.1:3211
+      DISABLE_BEACON: "true"
+      DISABLE_METRICS_ENDPOINT: "true"
+      INSTANCE_NAME: 100-convex-clients
+      RUST_LOG: info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3210/version"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  backend-data:

@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: prolog
+displayName: "Prolog"
+rank: 30
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

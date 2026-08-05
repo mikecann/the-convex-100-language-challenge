@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: visual-basic-dotnet
+displayName: "Visual Basic .NET"
+rank: 22
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []
