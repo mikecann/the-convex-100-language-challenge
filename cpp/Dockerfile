@@ -13,7 +13,7 @@ RUN printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"clos
 CMD ["/bin/sh", "-c", "true"]
 
 FROM test AS runtime-rootfs
-RUN set -eu; root=/rootfs; mkdir -p "$root/bin" "$root/usr/bin" "$root/usr/local/bin" "$root/etc"; cp /bin/dash "$root/bin/sh"; cp /usr/bin/id "$root/usr/bin/id"; cp /usr/bin/grep "$root/usr/bin/grep"; cp /out/convex-example "$root/usr/local/bin/convex-example"; cp /out/convex-adapter "$root/usr/local/bin/convex-adapter"; { ldd /bin/dash /usr/bin/id /usr/bin/grep /out/convex-example /out/convex-adapter; } | awk '/=> \/ {print $3} $1 ~ /^\// {print $1}' | sort -u | xargs -r -I{} cp --parents {} "$root"; cp -a /etc/ssl "$root/etc/ssl"; cp /etc/nsswitch.conf "$root/etc/nsswitch.conf"; cp /etc/hosts "$root/etc/hosts"
+RUN set -eu; root=/rootfs; mkdir -p "$root/bin" "$root/usr/bin" "$root/usr/local/bin" "$root/etc"; cp /bin/dash "$root/bin/sh"; cp /usr/bin/id "$root/usr/bin/id"; cp /usr/bin/grep "$root/usr/bin/grep"; cp /out/convex-example "$root/usr/local/bin/convex-example"; cp /out/convex-adapter "$root/usr/local/bin/convex-adapter"; { ldd /bin/dash /usr/bin/id /usr/bin/grep /out/convex-example /out/convex-adapter; } | awk '$3 ~ /^\// {print $3} $1 ~ /^\// {name=$1; sub(/:$/, "", name); print name}' | sort -u | xargs -r -I{} cp --parents {} "$root"; cp -a /etc/ssl "$root/etc/ssl"; cp /etc/nsswitch.conf "$root/etc/nsswitch.conf"; cp /etc/hosts "$root/etc/hosts"
 FROM scratch AS runtime-base
 COPY --from=runtime-rootfs /rootfs /
 USER 65532:65532
