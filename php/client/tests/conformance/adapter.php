@@ -20,7 +20,7 @@ function adapter($input,$output):void {
       case 'close':foreach($subscriptions as $s)$s->close();$client?->close();emit($output,['id'=>$id,'type'=>'closed']);$alive=false;break;
       default:throw new \RuntimeException('unknown adapter operation');
     }}catch(\Throwable $x){emit($output,errorEvent($id??null,$x));}}
-    if($client){try{$client->pump(0.0);foreach($subscriptions as $sid=>$s){while(true){try{$u=$s->nextUpdate(0.0001);}catch(\Convex\TransportError){break;}catch(\Convex\ClosedError){break;}if($u->error)emit($output,errorEvent(null,$u->error,$sid));else emit($output,['type'=>'subscription','subscriptionId'=>$sid,'value'=>$u->value,'logs'=>$u->logs]);}}}catch(\Throwable $x){fwrite(STDERR,"live adapter: {$x->getMessage()}\n");}}
+    if($client){try{$client->pump(0.0);foreach($subscriptions as $sid=>$s){while(true){try{$u=$s->nextUpdate(0.0001);}catch(\Convex\TransportError){break;}catch(\Convex\ClosedError){break;}if($u->error)emit($output,errorEvent(null,$u->error,$sid));else emit($output,['type'=>'subscription','subscriptionId'=>$sid,'value'=>$u->value,'logs'=>$u->logs]);}}}catch(\Throwable $x){foreach(array_keys($subscriptions) as $sid)emit($output,errorEvent(null,$x,$sid));}}
   }
 }
 $listen=getenv('ADAPTER_LISTEN');if($listen){$server=stream_socket_server('tcp://'.$listen,$errno,$errstr);if(!$server)throw new RuntimeException($errstr);$conn=stream_socket_accept($server,-1);adapter($conn,$conn);fclose($conn);fclose($server);}else adapter(STDIN,STDOUT);
