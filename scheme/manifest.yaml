@@ -4,5 +4,21 @@ displayName: "Scheme"
 rank: 72
 selectionTier: coverage
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Guile Scheme implementation of Convex's documented JSON HTTP API. Live remains unimplemented while the direct RFC 6455 implementation is under construction.
+toolchain:
+  name: GNU Guile
+  version: 3.0.8-2
+intendedCapabilities:
+  - http
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+limitations:
+  - Live WebSocket subscriptions are not implemented, so no Live capability is claimed.
+  - JSON values are the documented HTTP JSON subset; tagged Convex value encodings are deferred.
 capabilities: []
