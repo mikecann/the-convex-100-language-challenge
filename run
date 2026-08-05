@@ -166,7 +166,7 @@ run_example_verification() {
     --cap-drop ALL \
     --security-opt no-new-privileges \
     --pids-limit 32 \
-    --memory 64m \
+    --memory 128m \
     --cpus 0.5 \
     --network "$backend_network" \
     --user 65532:65532 \
