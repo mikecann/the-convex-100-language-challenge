@@ -14,9 +14,21 @@ const contentTypes = {
 const server = http.createServer((request, response) => {
   const requestPath = new URL(request.url ?? "/", "http://localhost").pathname;
   const relativePath = requestPath === "/" ? "index.html" : requestPath.slice(1);
-  const filePath = path.resolve(root, relativePath);
+  let filePath = path.resolve(root, relativePath);
 
-  if (!filePath.startsWith(`${root}${path.sep}`) || !fs.existsSync(filePath)) {
+  if (!filePath.startsWith(`${root}${path.sep}`)) {
+    response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("Not found\n");
+    return;
+  }
+
+  // Language details are client-side routes. Serving the same index document
+  // here makes a direct visit or browser refresh behave like normal navigation.
+  if (!fs.existsSync(filePath) && /^\/languages\/[^/]+\/?$/.test(requestPath)) {
+    filePath = path.join(root, "index.html");
+  }
+
+  if (!fs.existsSync(filePath)) {
     response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
     response.end("Not found\n");
     return;

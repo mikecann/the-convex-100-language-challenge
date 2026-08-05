@@ -1,4 +1,4 @@
-const response = await fetch("data.json");
+const response = await fetch("/data.json");
 const data = await response.json();
 
 const grid = document.querySelector("#language-grid");
@@ -126,9 +126,49 @@ function render() {
     for (const capability of capabilities(language)) badges.append(badge(capability));
     const openButton = card.querySelector(".language-card-open");
     openButton.setAttribute("aria-label", `Open ${language.displayName} details`);
-    openButton.addEventListener("click", () => showLanguage(language));
+    openButton.addEventListener("click", () => openLanguage(language));
     grid.append(card);
   }
+}
+
+function languagePath(language) {
+  return `/languages/${encodeURIComponent(language.id)}`;
+}
+
+function routedLanguage() {
+  const match = window.location.pathname.match(/^\/languages\/([^/]+)\/?$/);
+  if (!match) return null;
+  let id;
+  try {
+    id = decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+  return data.languages.find((language) => language.id === id) ?? null;
+}
+
+function openLanguage(language, { updateHistory = true } = {}) {
+  if (updateHistory && window.location.pathname !== languagePath(language)) {
+    window.history.pushState({ languageId: language.id }, "", languagePath(language));
+  }
+  showLanguage(language);
+}
+
+function closeLanguage({ updateHistory = true } = {}) {
+  if (dialog.open) dialog.close();
+  if (updateHistory && routedLanguage()) {
+    window.history.pushState({}, "", "/");
+  }
+  document.title = "100 Convex clients";
+}
+
+function syncLanguageRoute() {
+  const language = routedLanguage();
+  if (language) {
+    openLanguage(language, { updateHistory: false });
+    return;
+  }
+  closeLanguage({ updateHistory: false });
 }
 
 function addDetailList(parent, entries) {
@@ -203,12 +243,13 @@ function showLanguage(language) {
     dialogContent.append(heading, tests);
   }
 
-  dialog.showModal();
+  document.title = `${language.displayName} · 100 Convex clients`;
+  if (!dialog.open) dialog.showModal();
 }
 
 search.addEventListener("input", render);
 statusFilter.addEventListener("change", render);
-document.querySelector("#dialog-close").addEventListener("click", () => dialog.close());
+document.querySelector("#dialog-close").addEventListener("click", () => closeLanguage());
 document.querySelector("#capability-close").addEventListener("click", () => capabilityDialog.close());
 for (const legendBadge of document.querySelectorAll(".legend [data-capability]")) {
   const name = legendBadge.dataset.capability;
@@ -218,10 +259,16 @@ for (const legendBadge of document.querySelectorAll(".legend [data-capability]")
   legendBadge.addEventListener("click", () => showCapability(name));
 }
 dialog.addEventListener("click", (event) => {
-  if (event.target === dialog) dialog.close();
+  if (event.target === dialog) closeLanguage();
+});
+dialog.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeLanguage();
 });
 capabilityDialog.addEventListener("click", (event) => {
   if (event.target === capabilityDialog) capabilityDialog.close();
 });
 
 render();
+window.addEventListener("popstate", syncLanguageRoute);
+syncLanguageRoute();
