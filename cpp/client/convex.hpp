@@ -21,9 +21,12 @@ class Subscription {
   std::optional<Update> next_update(int timeout_ms = 10000);
   void close();
   void debug_disconnect();
-  std::vector<Update> pending_updates_for_test();
  private:
   friend class Client;
+#ifdef CONVEX_CLIENT_TESTING
+  friend struct SubscriptionTestAccess;
+  std::vector<Update> pending_updates_for_test();
+#endif
   explicit Subscription(std::string url, std::string path, Json args);
   struct State;
   std::shared_ptr<State> state_;

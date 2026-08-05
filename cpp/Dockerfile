@@ -9,7 +9,7 @@ RUN test "$(uname -m)" = x86_64 && test "$(g++ -dumpmachine | cut -d- -f1)" = x8
 RUN mkdir -p /out && g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient client/convex.cpp client/live.cpp client/tests/conformance/adapter.cpp -lssl -lcrypto -lpthread -o /out/convex-adapter
 RUN g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient client/tests/conformance/adapter_live_process_test.cpp -lssl -lcrypto -lpthread -o /tmp/adapter-live-process-test && timeout 30s /tmp/adapter-live-process-test
 RUN g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient client/convex.cpp client/live.cpp client/tests/client_test.cpp -lssl -lcrypto -lpthread -o /tmp/client-test && /tmp/client-test
-RUN g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient client/convex.cpp client/live.cpp client/tests/live_test.cpp -lssl -lcrypto -lpthread -o /tmp/live-test && /tmp/live-test
+RUN g++ -std=c++20 -Wall -Wextra -Werror -pedantic -DCONVEX_CLIENT_TESTING -Iclient client/convex.cpp client/live.cpp client/tests/live_test.cpp -lssl -lcrypto -lpthread -o /tmp/live-test && /tmp/live-test
 RUN g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient client/convex.cpp client/live.cpp examples/basics/main.cpp -lssl -lcrypto -lpthread -o /out/convex-example
 RUN g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient -Iclient/tests/conformance client/convex.cpp client/live.cpp client/tests/conformance/adapter_integration_test.cpp -lssl -lcrypto -lpthread -o /tmp/adapter-integration-test && /tmp/adapter-integration-test
 RUN printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | /out/convex-adapter >/tmp/events && grep -Fq '"language":"cpp"' /tmp/events && grep -Fq '"type":"closed"' /tmp/events

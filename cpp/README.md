@@ -54,7 +54,7 @@ int main(int argc, char** argv) {
 
 ## Protocol notes
 
-The client uses ordinary Boost.Beast/OpenSSL transport code. Live is constrained to the reviewed `convex-rs-0.10.4-unversioned-sync` profile at `/api/sync`; `debugDisconnect` is adapter-only.
+The client uses ordinary Boost.Beast/OpenSSL transport code. Live is constrained to the reviewed `convex-rs-0.10.4-unversioned-sync` profile at `/api/sync`; `debugDisconnect` is adapter-only. Each subscription has a bounded 16-update delivery queue. If its consumer falls behind, the oldest update is dropped so the queue retains the newest 16 updates.
 
 ## Limitations
 

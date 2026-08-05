@@ -27,6 +27,7 @@ adapter:
     - debugDisconnect
 limitations:
   - Live is a pinned experimental protocol profile and remains pending black-box conformance.
+  - Each Live subscription buffers at most 16 updates and drops the oldest update when a slow consumer overflows that queue.
   - Live authentication, actions over WebSocket, transition chunks, optimistic updates, and mutation replay are deferred.
   - Values are limited to JSON values supported by nlohmann/json.
 capabilities: []

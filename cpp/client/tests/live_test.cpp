@@ -2,23 +2,196 @@
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 #include <boost/beast/websocket.hpp>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
 #include <future>
 #include <thread>
+#include <vector>
 
-namespace asio = boost::asio; namespace beast = boost::beast; namespace websocket = beast::websocket; using tcp = asio::ip::tcp; using Json = convex::Json;
-static Json version(int ts, int query_set = 1) { return {{"querySet",query_set},{"identity",0},{"ts",ts == 0 ? "AAAAAAAAAAA=" : std::to_string(ts)}}; }
-static void send_transition(websocket::stream<tcp::socket>& ws, int start, int end, Json modification) { Json message{{"type","Transition"},{"startVersion",version(start, start == 0 ? 0 : 1)},{"endVersion",version(end)},{"modifications",Json::array({std::move(modification)})}}; ws.write(asio::buffer(message.dump())); }
-static Json read_json(websocket::stream<tcp::socket>& ws) { beast::flat_buffer buffer; ws.read(buffer); return Json::parse(beast::buffers_to_string(buffer.data())); }
+namespace asio = boost::asio;
+namespace beast = boost::beast;
+namespace websocket = beast::websocket;
+using tcp = asio::ip::tcp;
+using Json = convex::Json;
+
+namespace convex {
+struct SubscriptionTestAccess {
+  static std::vector<Update> pending(Subscription& subscription) {
+    return subscription.pending_updates_for_test();
+  }
+};
+}
+
+static Json version(int timestamp, int query_set = 1) {
+  return {{"querySet",query_set},{"identity",0},{"ts",timestamp == 0 ? "AAAAAAAAAAA=" : std::to_string(timestamp)}};
+}
+
+static void send_transition(websocket::stream<tcp::socket>& websocket, int start, int end, Json modification) {
+  Json message{{"type","Transition"},{"startVersion",version(start, start == 0 ? 0 : 1)},{"endVersion",version(end)},{"modifications",Json::array({std::move(modification)})}};
+  websocket.write(asio::buffer(message.dump()));
+}
+
+static Json read_json(websocket::stream<tcp::socket>& websocket) {
+  beast::flat_buffer buffer;
+  websocket.read(buffer);
+  return Json::parse(beast::buffers_to_string(buffer.data()));
+}
 
 int main() {
-  constexpr unsigned short port = 32124; std::promise<void> ready; std::promise<void> updates_sent; std::atomic<bool> error_consumed = false; std::atomic<bool> remove_seen = false;
-  std::thread server([&] { asio::io_context io; tcp::acceptor acceptor(io, {asio::ip::make_address("127.0.0.1"), port}); ready.set_value(); tcp::socket socket(io); acceptor.accept(socket); websocket::stream<tcp::socket> ws(std::move(socket)); ws.accept(); auto connect = read_json(ws); auto add = read_json(ws); assert(connect.at("connectionCount") == 0); assert(add.at("modifications").at(0).at("type") == "Add"); send_transition(ws, 0, 1, {{"type","QueryFailed"},{"queryId",0},{"errorMessage","empty room"},{"errorData",{{"code","ROOM_EMPTY"}}},{"logLines",Json::array({"failed"})}}); while (!error_consumed) std::this_thread::yield(); for (int value = 0; value < 20; ++value) { send_transition(ws, value + 1, value + 2, {{"type","QueryUpdated"},{"queryId",0},{"value",{{"count",value}}},{"logLines",Json::array()}}); std::this_thread::sleep_for(std::chrono::milliseconds(2)); } updates_sent.set_value(); auto remove = read_json(ws); remove_seen = remove.at("baseVersion") == 1 && remove.at("newVersion") == 2 && remove.at("modifications").at(0).at("type") == "Remove"; });
-  ready.get_future().wait(); convex::Client client("http://127.0.0.1:" + std::to_string(port)); auto subscription = client.subscribe("demo:state", {{"room","test"}}); auto failed = subscription->next_update(); assert(failed && failed->error_data.at("code") == "ROOM_EMPTY" && failed->logs == std::vector<std::string>{"failed"}); error_consumed = true; updates_sent.get_future().wait(); for (;;) { auto pending = subscription->pending_updates_for_test(); if (pending.size() == 16 && pending.back().value.at("count") == 19) break; std::this_thread::yield(); } std::vector<int> values; while (auto update = subscription->next_update(20)) values.push_back(update->value.at("count")); assert(values.size() == 16 && values.front() == 4 && values.back() == 19); auto started = std::chrono::steady_clock::now(); subscription->close(); assert(std::chrono::steady_clock::now() - started < std::chrono::seconds(2)); server.join(); assert(remove_seen); client.close();
+  constexpr unsigned short overflow_port = 32124;
+  std::promise<void> overflow_ready;
+  std::promise<void> updates_sent;
+  std::atomic<bool> error_consumed = false;
+  std::atomic<bool> remove_seen = false;
+  std::thread overflow_server([&] {
+    asio::io_context io;
+    tcp::acceptor acceptor(io, {asio::ip::make_address("127.0.0.1"), overflow_port});
+    overflow_ready.set_value();
+    tcp::socket socket(io);
+    acceptor.accept(socket);
+    websocket::stream<tcp::socket> websocket(std::move(socket));
+    websocket.accept();
+    auto connect = read_json(websocket);
+    auto add = read_json(websocket);
+    assert(connect.at("connectionCount") == 0);
+    assert(add.at("modifications").at(0).at("type") == "Add");
+    send_transition(websocket, 0, 1, {{"type","QueryFailed"},{"queryId",0},{"errorMessage","empty room"},{"errorData",{{"code","ROOM_EMPTY"}}},{"logLines",Json::array({"failed"})}});
+    while (!error_consumed) std::this_thread::yield();
+    for (int value = 0; value < 20; ++value) {
+      send_transition(websocket, value + 1, value + 2, {{"type","QueryUpdated"},{"queryId",0},{"value",{{"count",value}}},{"logLines",Json::array()}});
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    updates_sent.set_value();
+    auto remove = read_json(websocket);
+    remove_seen = remove.at("baseVersion") == 1 && remove.at("newVersion") == 2 && remove.at("modifications").at(0).at("type") == "Remove";
+  });
+  overflow_ready.get_future().wait();
+  convex::Client overflow_client("http://127.0.0.1:" + std::to_string(overflow_port));
+  auto overflowing = overflow_client.subscribe("demo:state", {{"room","test"}});
+  auto failed = overflowing->next_update();
+  assert(failed && failed->error_data.at("code") == "ROOM_EMPTY" && failed->logs == std::vector<std::string>{"failed"});
+  error_consumed = true;
+  updates_sent.get_future().wait();
+  for (;;) {
+    auto pending = convex::SubscriptionTestAccess::pending(*overflowing);
+    if (pending.size() == 16 && pending.back().value.at("count") == 19) break;
+    std::this_thread::yield();
+  }
+  std::vector<int> values;
+  while (auto update = overflowing->next_update(20)) values.push_back(update->value.at("count"));
+  assert(values.size() == 16 && values.front() == 4 && values.back() == 19);
+  auto close_started = std::chrono::steady_clock::now();
+  overflowing->close();
+  assert(std::chrono::steady_clock::now() - close_started < std::chrono::seconds(2));
+  overflow_server.join();
+  assert(remove_seen);
+  overflow_client.close();
 
-  constexpr unsigned short reconnect_port = 32125; std::promise<void> reconnect_ready; std::vector<int> counts;
-  std::thread reconnect_server([&] { asio::io_context io; tcp::acceptor acceptor(io, {asio::ip::make_address("127.0.0.1"), reconnect_port}); reconnect_ready.set_value(); for (int connection = 0; connection < 6; ++connection) { tcp::socket socket(io); acceptor.accept(socket); websocket::stream<tcp::socket> ws(std::move(socket)); ws.accept(); auto connect = read_json(ws); auto add = read_json(ws); counts.push_back(connect.at("connectionCount")); assert(add.at("modifications").at(0).at("type") == "Add"); send_transition(ws, 0, 1, {{"type","QueryUpdated"},{"queryId",0},{"value",{{"count",connection}}},{"logLines",Json::array()}}); beast::flat_buffer buffer; beast::error_code ignored; ws.read(buffer, ignored); } });
-  reconnect_ready.get_future().wait(); convex::Client reconnect_client("http://127.0.0.1:" + std::to_string(reconnect_port)); auto reconnecting = reconnect_client.subscribe("demo:state", {{"room","reconnect"}}); for (int connection = 0; connection < 6; ++connection) { auto update = reconnecting->next_update(5000); assert(update && update->error.empty() && update->value.at("count") == connection); if (connection < 5) reconnect_client.debug_disconnect_for_adapter(); } reconnecting->close(); reconnect_server.join(); assert(counts == std::vector<int>({0,1,2,3,4,5})); reconnect_client.close();
+  constexpr unsigned short reconnect_port = 32125;
+  std::promise<void> reconnect_ready;
+  std::vector<int> counts;
+  std::thread reconnect_server([&] {
+    asio::io_context io;
+    tcp::acceptor acceptor(io, {asio::ip::make_address("127.0.0.1"), reconnect_port});
+    reconnect_ready.set_value();
+    for (int connection = 0; connection < 6; ++connection) {
+      tcp::socket socket(io);
+      acceptor.accept(socket);
+      websocket::stream<tcp::socket> websocket(std::move(socket));
+      websocket.accept();
+      auto connect = read_json(websocket);
+      auto add = read_json(websocket);
+      counts.push_back(connect.at("connectionCount"));
+      assert(add.at("modifications").at(0).at("type") == "Add");
+      send_transition(websocket, 0, 1, {{"type","QueryUpdated"},{"queryId",0},{"value",{{"count",connection}}},{"logLines",Json::array()}});
+      beast::flat_buffer buffer;
+      beast::error_code ignored;
+      websocket.read(buffer, ignored);
+    }
+  });
+  reconnect_ready.get_future().wait();
+  convex::Client reconnect_client("http://127.0.0.1:" + std::to_string(reconnect_port));
+  auto reconnecting = reconnect_client.subscribe("demo:state", {{"room","reconnect"}});
+  for (int connection = 0; connection < 6; ++connection) {
+    auto update = reconnecting->next_update(5000);
+    assert(update && update->error.empty() && update->value.at("count") == connection);
+    if (connection < 5) reconnect_client.debug_disconnect_for_adapter();
+  }
+  reconnecting->close();
+  reconnect_server.join();
+  assert(counts == std::vector<int>({0,1,2,3,4,5}));
+  reconnect_client.close();
+
+  // A peer can stop midway through a WebSocket frame. Closing must cancel that
+  // in-flight read instead of waiting forever for the rest of the payload.
+  constexpr unsigned short partial_port = 32126;
+  std::promise<void> partial_ready;
+  std::promise<void> partial_sent;
+  std::atomic<bool> partial_peer_closed = false;
+  std::thread partial_server([&] {
+    asio::io_context io;
+    tcp::acceptor acceptor(io, {asio::ip::make_address("127.0.0.1"), partial_port});
+    partial_ready.set_value();
+    tcp::socket socket(io);
+    acceptor.accept(socket);
+    websocket::stream<tcp::socket> websocket(std::move(socket));
+    websocket.accept();
+    read_json(websocket);
+    read_json(websocket);
+    const std::array<unsigned char, 3> partial_frame{0x81, 0x05, '{'};
+    asio::write(websocket.next_layer(), asio::buffer(partial_frame));
+    partial_sent.set_value();
+    std::array<char, 128> incoming{};
+    beast::error_code error;
+    while (websocket.next_layer().read_some(asio::buffer(incoming), error) > 0) {}
+    partial_peer_closed = error == asio::error::eof || error == asio::error::connection_reset;
+  });
+  partial_ready.get_future().wait();
+  convex::Client partial_client("http://127.0.0.1:" + std::to_string(partial_port));
+  auto partial = partial_client.subscribe("demo:state", {{"room","partial"}});
+  partial_sent.get_future().wait();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  close_started = std::chrono::steady_clock::now();
+  partial->close();
+  assert(std::chrono::steady_clock::now() - close_started < std::chrono::seconds(2));
+  partial_server.join();
+  assert(partial_peer_closed);
+  partial_client.close();
+
+  // Successful handshakes reset transient-failure backoff. Six peers that
+  // accept the WebSocket and then vanish should reconnect at the base delay.
+  constexpr unsigned short backoff_port = 32129;
+  std::promise<void> backoff_ready;
+  std::vector<std::chrono::steady_clock::time_point> accepted_at;
+  std::thread backoff_server([&] {
+    asio::io_context io;
+    tcp::acceptor acceptor(io, {asio::ip::make_address("127.0.0.1"), backoff_port});
+    backoff_ready.set_value();
+    for (int connection = 0; connection < 6; ++connection) {
+      tcp::socket socket(io);
+      acceptor.accept(socket);
+      websocket::stream<tcp::socket> websocket(std::move(socket));
+      websocket.accept();
+      read_json(websocket);
+      read_json(websocket);
+      accepted_at.push_back(std::chrono::steady_clock::now());
+      beast::error_code ignored;
+      websocket.next_layer().shutdown(tcp::socket::shutdown_both, ignored);
+      websocket.next_layer().close(ignored);
+    }
+  });
+  backoff_ready.get_future().wait();
+  convex::Client backoff_client("http://127.0.0.1:" + std::to_string(backoff_port));
+  auto backing_off = backoff_client.subscribe("demo:state", {{"room","backoff"}});
+  for (int failure = 0; failure < 6; ++failure) {
+    auto update = backing_off->next_update(5000);
+    assert(update && update->error_name == "TransportError");
+  }
+  backing_off->close();
+  backoff_server.join();
+  assert(accepted_at.size() == 6);
+  assert(accepted_at.back() - accepted_at.front() < std::chrono::seconds(2));
+  backoff_client.close();
 }
