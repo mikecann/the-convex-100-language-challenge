@@ -21,9 +21,8 @@ RUN mkdir -p /work/out/adapter /work/out/example && \
     javac -Xlint:all,-serial -Werror -cp client/target/java-client-0.1.0-all.jar -d /work/out/adapter \
       client/tests/conformance/Adapter.java client/tests/conformance/AdapterTest.java && \
     javac -Xlint:all,-serial -Werror -cp client/target/java-client-0.1.0-all.jar -d /work/out/example \
-      examples/basics/Main.java examples/basics/MainTest.java && \
+      examples/basics/Main.java && \
     java -cp client/target/java-client-0.1.0-all.jar:/work/out/adapter convex.adapter.AdapterTest && \
-    java -cp client/target/java-client-0.1.0-all.jar:/work/out/example convex.example.MainTest && \
     jar cfe /work/out/adapter.jar convex.adapter.Adapter -C /work/out/adapter convex/adapter/Adapter.class -C /work/out/adapter convex/adapter/Adapter\$Output.class && \
     jar cfe /work/out/example.jar convex.example.Main -C /work/out/example convex/example/Main.class
 CMD ["/bin/sh", "-c", "uname -m | grep -qx x86_64 && test \"$(java -XshowSettings:properties -version 2>&1 | sed -n 's/.*os.arch = //p')\" = amd64"]

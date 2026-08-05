@@ -88,9 +88,7 @@ public final class Adapter {
             case "mutation" -> client.mutation(command.path("path").asText(), args);
             default -> client.action(command.path("path").asText(), args);
           };
-          ObjectNode response = event("result", id).set("value", result.value());
-          if (!result.logs().isEmpty()) response.set("logs", ConvexClient.JSON.valueToTree(result.logs()));
-          output.write(response);
+          output.write(result(id, result));
         } else if ("subscribe".equals(operation)) {
           String subscriptionId = command.path("subscriptionId").asText("");
           if (subscriptionId.isBlank()) throw new IllegalArgumentException("subscriptionId is required");
@@ -158,6 +156,12 @@ public final class Adapter {
       if (function.data != null) detail.set("data", function.data);
       if (!function.logs.isEmpty()) response.set("logs", ConvexClient.JSON.valueToTree(function.logs));
     }
+    return response;
+  }
+
+  static ObjectNode result(String id, ConvexClient.Result result) {
+    ObjectNode response = event("result", id).set("value", result.value());
+    if (!result.logs().isEmpty()) response.set("logs", ConvexClient.JSON.valueToTree(result.logs()));
     return response;
   }
 

@@ -13,6 +13,15 @@ import java.util.List;
 /** Adapter TCP, optional-field, close, and structured-error serialization tests. */
 public final class AdapterTest {
   public static void main(String[] args) throws Exception {
+    JsonNode result = Adapter.result("query", new ConvexClient.Result(
+      ConvexClient.JSON.createObjectNode().put("count", 1), List.of("query log")));
+    check("result".equals(result.path("type").asText()), "wrong success event type");
+    check(result.path("value").path("count").asInt() == 1, "lost success value");
+    check("query log".equals(result.path("logs").path(0).asText()), "lost success logs");
+    JsonNode resultWithoutLogs = Adapter.result("query-empty", new ConvexClient.Result(
+      ConvexClient.JSON.createObjectNode().put("count", 0), List.of()));
+    check(!resultWithoutLogs.has("logs"), "serialized absent success logs");
+
     JsonNode failed = Adapter.failure("request", "", new ConvexClient.FunctionException(
       "query", "empty", ConvexClient.JSON.createObjectNode().put("code", "ROOM_EMPTY"), List.of("checked")));
     check("ROOM_EMPTY".equals(failed.path("error").path("data").path("code").asText()), "lost error.data");
