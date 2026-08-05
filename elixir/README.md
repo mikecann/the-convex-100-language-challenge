@@ -199,7 +199,11 @@ value extensions are deliberately outside this demonstration. Realtime is an
 internal protocol, so passing evidence for this pinned revision would not make
 it a supported third-party SDK contract.
 
-The pinned Gun 2.5.0 dependency currently resolves Cowlib 2.19.0, which Hex
-flags for response-header splitting. The example does not create response
-headers from untrusted input, but that unresolved advisory is another concrete
-reason not to treat this experiment as production-ready software.
+The pinned Gun 2.5.0 dependency currently resolves Cowlib 2.19.0. Hex flags
+both packages for the same request/response-splitting advisory
+(`GHSA-w4f7-4cxr-rv3c`) and separately flags Cowlib's cookie encoder for header
+injection (`GHSA-g2wm-735q-3f56`). This outbound client does not construct HTTP
+responses or call Cowlib's cookie encoder, but the vulnerable code remains in
+its dependency graph and no patched Hex release currently exists. Those
+unresolved advisories are another concrete reason not to treat this experiment
+as production-ready software.

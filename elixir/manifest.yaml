@@ -26,7 +26,7 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - Gun 2.5.0 currently resolves Cowlib 2.19.0, which Hex flags for response-header splitting; this reinforces that the demonstration is not production-ready.
+  - Gun 2.5.0 and Cowlib 2.19.0 are flagged for request/response splitting (GHSA-w4f7-4cxr-rv3c), and Cowlib's cookie encoder is separately flagged for header injection (GHSA-g2wm-735q-3f56). This outbound client does not construct responses or call that cookie encoder, but the vulnerable dependency code remains and no patched Hex release currently exists.
   - Live authentication is deferred.
   - Live values cover the JSON-safe subset used by the shared suite.
   - WebSocket mutations and actions are deferred.
