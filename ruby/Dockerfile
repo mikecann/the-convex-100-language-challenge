@@ -13,6 +13,7 @@ RUN find client examples -type f -name '*.rb' -exec ruby -w -c '{}' ';'
 RUN ruby -Iclient client/client_test.rb
 RUN ruby -Iclient client/web_socket_test.rb
 RUN ruby -Iclient client/live_test.rb
+RUN ruby -Iclient examples/basics/main_test.rb
 
 # Exercise the real conformance entrypoint without needing a deployment. The
 # hello and close commands prove its NDJSON lifecycle independently of HTTP.
