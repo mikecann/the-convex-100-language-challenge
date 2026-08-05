@@ -6,13 +6,13 @@ It is educational and unofficial. It is not a production SDK and is not intended
 
 ## Start here
 
-Read [`examples/basics/main.scm`](examples/basics/main.scm). It calls the counter's HTTP query and mutation endpoints and explains the parts that will become the full counter journey once Live is implemented.
+The future canonical counter example will be [`examples/basics/main.scm`](examples/basics/main.scm). It is an explicit failing placeholder, because the required direct Live WebSocket implementation is not ready yet.
 
 ## What works
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, actions, bearer auth, and structured errors | Implemented locally, awaiting root-owned shared evidence |
+| HTTP query/mutation/action envelope and adapter scaffolding | Attempting, with JSON and input-validation unit checks only |
 | Live subscriptions and the canonical 0 -> 1 example journey | Not implemented |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.scm -->
@@ -33,12 +33,12 @@ Read [`examples/basics/main.scm`](examples/basics/main.scm). It calls the counte
 ./run test scheme
 ```
 
-`test` runs the Scheme JSON and HTTP adapter checks inside the pinned linux/amd64 image. Root-owned `verify-example`, `verify`, and `verify-hosted` are deliberately not run from this language branch and cannot award a capability yet.
+`test` runs the Scheme JSON and adapter-lifecycle unit checks inside the pinned linux/amd64 image. It does not demonstrate a real Convex HTTP request yet. Root-owned `verify-example`, `verify`, and `verify-hosted` are deliberately not run from this language branch and cannot award a capability yet.
 
 ## Conformance and protocol notes
 
-The adapter speaks NDJSON protocol v1 on stdin/stdout and calls the same Guile implementation for queries, mutations, and actions. It does not invoke another Convex client, the Convex CLI, curl, Node.js, or Python. It currently returns a structured protocol error for subscription commands rather than pretending that polling is Live.
+The partial adapter speaks NDJSON protocol v1 on stdin/stdout and routes queries, mutations, and actions to the same Guile implementation. It does not invoke another Convex client, the Convex CLI, curl, Node.js, or Python. TCP adapter mode and all Live operations remain missing, so this is not yet an executable conformance client.
 
 ## Limitations
 
-Live is the blocking unfinished part of this implementation. The final Docker image is intentionally not presented as passing the canonical example or either capability badge until a direct Scheme RFC 6455 client, its ownership/reconnect tests, and root-owned shared evidence exist.
+This branch is preserved as an implementation attempt, not a usable client. The blockers are: a direct Scheme RFC 6455 client with owner/reconnect safety; a TCP adapter; deterministic real HTTP coverage; the six-line counter example; and hardened final runtime images. Until all of those exist and root-owned shared evidence passes, both capability arrays stay empty.
