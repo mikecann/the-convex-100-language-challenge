@@ -15,7 +15,7 @@
 using Json = nlohmann::json;
 static std::mutex output_lock;
 static void write_event(std::ostream& out, const Json& event) { std::lock_guard lock(output_lock); out << event.dump() << '\n' << std::flush; }
-static Json error_event(const Json& command, const std::exception& error) { Json body{{"name", "Error"}, {"message", error.what()}}; if (auto function = dynamic_cast<const convex::FunctionError*>(&error)) body["data"] = function->data; Json event{{"type", "error"}, {"error", body}}; if (command.contains("id")) event["id"] = command["id"]; return event; }
+static Json error_event(const Json& command, const std::exception& error) { Json body{{"name", "Error"}, {"message", error.what()}}; Json event{{"type", "error"}, {"error", body}}; if (auto function = dynamic_cast<const convex::FunctionError*>(&error)) { event["error"]["name"] = "FunctionError"; event["error"]["data"] = function->data; event["logs"] = function->logs; } if (command.contains("id")) event["id"] = command["id"]; return event; }
 static void run(std::istream& in, std::ostream& out) {
   std::unique_ptr<convex::Client> client;
   std::map<std::string, std::shared_ptr<convex::Subscription>> subscriptions;
