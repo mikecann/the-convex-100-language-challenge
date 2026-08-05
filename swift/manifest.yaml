@@ -4,5 +4,29 @@ displayName: "Swift"
 rank: 12
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Swift Foundation HTTP and URLSessionWebSocketTask client. Capability badges remain empty until root-owned conformance evidence passes.
+toolchain:
+  name: Swift
+  version: 6.1.2
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication and WebSocket mutations/actions are deferred.
+  - The undocumented sync profile is pinned and may drift.
+  - Each subscription holds its newest 16 updates; a slow consumer loses oldest intermediate updates.
 capabilities: []
