@@ -4,5 +4,30 @@ displayName: "Haskell"
 rank: 36
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Haskell HTTP and pinned Convex sync-profile client. Badges remain unearned until root-owned local and hosted conformance evidence succeeds.
+toolchain:
+  name: GHC
+  version: 9.10.1
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, optimistic updates, mutations over WebSocket, and TransitionChunk assembly are deferred.
+  - The educational client supports JSON-safe Convex values only.
+  - Each subscription retains at most the newest 16 updates. All subscriptions share a 16 MiB encoded-byte budget and drop the globally oldest intermediate states for a slow consumer.
+  - Capability badges are intentionally empty until shared local and hosted conformance pass.
 capabilities: []
