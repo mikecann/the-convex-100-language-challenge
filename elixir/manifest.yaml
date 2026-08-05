@@ -1,8 +1,35 @@
 schemaVersion: 1
 id: elixir
-displayName: "Elixir"
+displayName: Elixir
 rank: 34
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native documented JSON HTTP client and native OTP process targeting the pinned unversioned Convex Live profile. Capability badges remain empty until shared local and hosted evidence passes.
+toolchain:
+  name: Elixir / Erlang OTP
+  version: 1.17.3 / 26.2.5.15
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Gun 2.5.0 and Cowlib 2.19.0 are flagged for request/response splitting (GHSA-w4f7-4cxr-rv3c), and Cowlib's cookie encoder is separately flagged for header injection (GHSA-g2wm-735q-3f56). This outbound client does not construct responses or call that cookie encoder, but the vulnerable dependency code remains and no patched Hex release currently exists.
+  - Live authentication is deferred.
+  - Live values cover the JSON-safe subset used by the shared suite.
+  - WebSocket mutations and actions are deferred.
+  - TransitionChunk assembly is deferred; receiving one is reported as protocol drift.
+  - Mutation ordering, replay, journals, and optimistic updates are deferred.
 capabilities: []

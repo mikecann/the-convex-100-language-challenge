@@ -1,0 +1,6 @@
+%{
+  "castore": {:hex, :castore, "1.0.15", "8aa930c890fe18b6fe0a0cff27b27d0d4d231867897bd23ea772dee561f032a3", [:mix], [], "hexpm", "96ce4c69d7d5d7a0761420ef743e2f4096253931a3ba69e5ff8ef1844fe446d3"},
+  "cowlib": {:hex, :cowlib, "2.19.0", "c9d11c9d035472e27a740c9f327786c61ed209269b4be0260d59d3ec07b8949f", [:make, :rebar3], [], "hexpm", "6dc66e3135b229193ea4dcb14294e79520c923d391315c9c962ef0b4bea72356"},
+  "gun": {:hex, :gun, "2.5.0", "7be4c8d34a177f4213d48bb5fbffb03462ce871b4ec30b5aa3b08d2fd4fa424b", [:make, :rebar3], [{:cowlib, ">= 2.19.0 and < 3.0.0", [hex: :cowlib, repo: "hexpm", optional: false]}], "hexpm", "3839576181456f5553fc1be006fd95681576b916cc9ad68d422a287ed4a770dd"},
+  "jason": {:hex, :jason, "1.4.4", "b9226785a9aa77b6857ca22832cffa5d5011a667207eb2a0ad56adb5db443b8a", [:mix], [{:decimal, "~> 1.0 or ~> 2.0", [hex: :decimal, repo: "hexpm", optional: true]}], "hexpm", "c5eb0cab91f094599f94d55bc63409236a8ec69a21a67814529e8d5f6cc90b3b"},
+}
