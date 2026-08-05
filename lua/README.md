@@ -118,15 +118,18 @@ The adapter speaks NDJSON protocol v1 over stdin/stdout or `ADAPTER_LISTEN`
 TCP. HTTP and Live failures are serialized as `FunctionError`, `ProtocolError`,
 or `TransportError`. One cqueues owner controls WebSocket reads, writes,
 query-set versions, and reconnects. Each subscription keeps the newest 16
-updates. The adapter output FIFO holds at most 256 complete events, including
-the in-flight stdout write; a controller that stops reading causes a bounded
+updates. The adapter output FIFO holds at most 64 complete events and 8 MiB of
+encoded data, including the in-flight stdout write and a conservative per-entry
+overhead allowance. A controller that stops reading gets a structured, bounded
 adapter transport failure instead of blocking the Live owner. Lua-http supplies
 the low-level RFC 6455 framing, fragmented UTF-8,
 control-frame, and bounded-close implementation; Convex-specific transitions,
 metadata, hydration suppression, and query recovery stay in this Lua client.
 
-The image pins Debian bookworm-slim by digest, Lua 5.1.5, lua-http 0.4-1,
-cqueues 20200726-1+b1, dkjson 2.6-2, and StyLua 2.5.2. The Live
+The image pins Debian bookworm-slim and BusyBox 1.37.0-musl by digest, Lua
+5.1.5, lua-http 0.4-1, cqueues 20200726-1+b1, dkjson 2.6-2, and StyLua 2.5.2.
+The final shell is built from checksum-pinned BusyBox source with only the
+required shell and text applets compiled in. The Live
 wire profile is pinned to `convex-rs-0.10.4-unversioned-sync` at source commit
 `6f1df8a8ba1665084ec001e307ca841ca17074d7`.
 

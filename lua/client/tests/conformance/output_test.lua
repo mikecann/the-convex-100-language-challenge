@@ -51,7 +51,11 @@ assert(lines[1].type == "subscription" and lines[2].type == "ack", "ack overtook
 -- If invalidation wins before publication, the stale generation never enters
 -- the writer queue and only the acknowledgement is emitted.
 writer = Output.new({})
-assert(writer.max_pending == 256 and Output.MAX_PENDING == 256, "default stdout FIFO bound changed")
+assert(writer.max_pending == 64 and Output.MAX_PENDING == 64, "default stdout FIFO event bound changed")
+assert(
+	writer.max_pending_bytes == 8 * 1024 * 1024 and Output.MAX_PENDING_BYTES == 8 * 1024 * 1024,
+	"default stdout FIFO byte bound changed"
+)
 subscriptions.counter = entry
 subscriptions.counter = nil
 assert(
@@ -63,7 +67,7 @@ assert(
 	)
 )
 assert(writer:enqueue({ type = "ack", id = "replacement" }))
-assert(#writer.queue == 1 and assert(json.decode(writer.queue[1])).type == "ack")
+assert(#writer.queue == 1 and assert(json.decode(writer.queue[1].line)).type == "ack")
 
 -- A stopped stdout reader must not turn the FIFO into an unbounded mailbox or
 -- make the Live owner wait for queue space. The 5th pending event fails fast,
@@ -86,7 +90,7 @@ function blocked_stream:close()
 end
 
 cq = cqueues.new()
-writer = Output.new(blocked_stream, { max_pending = 4 })
+writer = Output.new(blocked_stream, { max_pending = 4, max_pending_bytes = 1024 * 1024 })
 local overflow_ok, overflow_error
 local watchdog_fired = false
 cq:wrap(function()
@@ -111,9 +115,12 @@ end)
 local loop_ok = cq:loop()
 assert(not loop_ok, "closed stdout writer unexpectedly completed")
 assert(not watchdog_fired, "stdout overflow waited on the lifecycle watchdog")
-assert(not overflow_ok and overflow_error:match("exceeded 4"), "stopped reader did not report bounded overflow")
+assert(not overflow_ok and type(overflow_error) == "table", "stopped reader did not report structured overflow")
+assert(overflow_error.name == "TransportError" and overflow_error.message:match("event limit"))
+assert(overflow_error.data.maxPendingEvents == 4 and overflow_error.data.pendingEvents == 4)
 assert(blocked_stream.closed, "overflow did not close the stalled stdout stream")
 assert(#writer.queue == 4, "stdout FIFO exceeded its configured pending-event bound")
+assert(writer.pending_bytes <= writer.max_pending_bytes, "stdout FIFO exceeded its configured byte bound")
 
 -- LuaSocket reports a partial last-byte index on nonblocking timeout. Resume
 -- from that exact byte until one complete NDJSON line reaches the peer.

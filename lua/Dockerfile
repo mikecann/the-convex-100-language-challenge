@@ -3,6 +3,28 @@
 ARG DEBIAN_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 ARG BUSYBOX_IMAGE=busybox:1.37.0-musl@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23
 
+FROM ${DEBIAN_IMAGE} AS busybox-builder
+ADD --checksum=sha256:3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4 \
+    https://busybox.net/downloads/busybox-1.37.0.tar.bz2 /tmp/busybox.tar.bz2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bzip2=1.0.8-5+b1 gcc=4:12.2.0-3 libc6-dev=2.36-9+deb12u14 \
+    make=4.3-4.1 musl-tools=1.2.3-1 \
+    && rm -rf /var/lib/apt/lists/*
+RUN tar -xjf /tmp/busybox.tar.bz2 -C /tmp
+WORKDIR /tmp/busybox-1.37.0
+# Build the runtime shell from source with only the 20 names below in its
+# compiled applet table. Renaming it to wget, nc, or another omitted applet
+# therefore cannot recover the full upstream BusyBox command set.
+RUN make allnoconfig >/dev/null && \
+    for option in STATIC BUSYBOX ASH ASH_ECHO ASH_PRINTF ASH_TEST AWK BASENAME CAT CMP CUT DIRNAME ENV GREP HEAD ID SED TAIL TEST TR TRUE FALSE UNAME WC; do \
+      sed -i "s/# CONFIG_${option} is not set/CONFIG_${option}=y/" .config; \
+    done && \
+    CC=musl-gcc make -j2 busybox >/dev/null && \
+    test "$(./busybox --list | wc -l)" -eq 20 && \
+    test "$(./busybox sh -c 'printf shell-ok')" = shell-ok && \
+    ! ./busybox --list | grep -E '^(wget|nc|telnet|ftp|ftpget|ftpput|httpd|tftp)$' && \
+    install -Dm0555 busybox /out/busybox
+
 FROM ${DEBIAN_IMAGE} AS formatter
 ADD --checksum=sha256:bcb0d855e91f102f28a370e850f8566b3b44b79e6274d806ea5246837c0fd5ab \
     https://github.com/JohnnyMorganz/StyLua/releases/download/v2.5.2/stylua-linux-x86_64.zip /tmp/stylua.zip
@@ -38,6 +60,7 @@ RUN lua5.1 client/tests/websocket_test.lua server & fixture_pid=$!; \
 	    wait "$fixture_pid"; server_status=$?; test "$client_status" -eq 0; test "$server_status" -eq 0
 RUN lua5.1 client/tests/conformance/events_test.lua
 RUN lua5.1 client/tests/conformance/output_test.lua
+RUN lua5.1 client/tests/conformance/output_memory_test.lua
 RUN printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | \
 	    LUA_PATH='./client/tests/conformance/?.lua;./client/?.lua;;' lua5.1 client/tests/conformance/adapter.lua >/tmp/adapter.ndjson && \
 	    grep -Fq '"language":"lua"' /tmp/adapter.ndjson && grep -Fq '"type":"closed"' /tmp/adapter.ndjson
@@ -105,18 +128,20 @@ RUN set -eu; root=/runtime-root; \
     test ! -e "$root/usr/lib/x86_64-linux-gnu/lua/5.1/socket/serial.so"; \
     test -z "$(find "$root" -type f \( -name 'libapt*' -o -name 'libpam*' -o -name 'libsystemd*' -o -name 'libext2fs*' \) -print -quit)"
 
-# BusyBox is a real, digest-pinned non-scratch runtime base. Keep only the
-# shell and basic POSIX text tools required by shared verification. Hard links
-# preserve one executable while removing package, network, and admin applets.
+# BusyBox is a real, digest-pinned non-scratch runtime base. Replace its full
+# multicall executable with the source-built restricted binary before exposing
+# the shell and basic POSIX text tools required by shared verification.
 FROM --platform=linux/amd64 ${BUSYBOX_IMAGE} AS runtime-os
+COPY --from=busybox-builder /out/busybox /tmp/restricted-busybox
 RUN set -eu; \
-    mkdir /runtime-tools; \
-    for tool in sh awk basename cat cmp cut dirname env grep head id sed tail test tr true false uname wc rm mv; do \
-      ln /bin/busybox "/runtime-tools/$tool"; \
+    mkdir /tmp/full; \
+    cp /bin/busybox /tmp/full/busybox; \
+    for path in /bin/*; do /tmp/full/busybox rm -f "$path"; done; \
+    for tool in sh awk basename cat cmp cut dirname env grep head id sed tail test tr true false uname wc; do \
+      /tmp/full/busybox ln /tmp/restricted-busybox "/bin/$tool"; \
     done; \
-    /runtime-tools/rm -rf /bin; \
-    /runtime-tools/mv /runtime-tools /bin; \
-    /bin/rm -f /bin/rm /bin/mv
+    /tmp/full/busybox rm -rf /sbin /usr/bin /usr/sbin; \
+    /tmp/full/busybox rm -rf /tmp/restricted-busybox /tmp/full
 
 FROM runtime-os AS runtime-base
 ENV CONVEX_CLIENT_PATH=/opt/convex/client
@@ -128,6 +153,10 @@ COPY client/tests/conformance/adapter_events.lua /opt/convex/client/adapter_even
 COPY client/tests/conformance/adapter_output.lua /opt/convex/client/adapter_output.lua
 RUN set -eu; \
     test "$(/usr/local/bin/lua -e 'io.write(_VERSION)')" = "Lua 5.1"; \
+    for applet in wget nc telnet ftp ftpget ftpput httpd tftp; do \
+      ! /bin/sh -c "exec -a $applet /bin/sh" >/dev/null 2>&1; \
+      ! /bin/sh -c "exec -a busybox /bin/sh $applet" >/dev/null 2>&1; \
+    done; \
     for command in busybox apk apt apt-get apt-cache dpkg luac lua5.1 gcc cc make node npm npx python python3 pip pip3 curl wget nc telnet ftpget ftpput convex; do \
       ! command -v "$command" >/dev/null 2>&1; \
     done

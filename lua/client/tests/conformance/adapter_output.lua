@@ -4,12 +4,16 @@ local json = require("json")
 
 local Output = {}
 Output.__index = Output
-Output.MAX_PENDING = 256
+Output.MAX_PENDING = 64
+Output.MAX_PENDING_BYTES = 8 * 1024 * 1024
+Output.ENTRY_OVERHEAD = 256
 
 function Output.new(stream, options)
 	options = options or {}
 	local max_pending = options.max_pending or Output.MAX_PENDING
+	local max_pending_bytes = options.max_pending_bytes or Output.MAX_PENDING_BYTES
 	assert(type(max_pending) == "number" and max_pending >= 1 and max_pending % 1 == 0)
+	assert(type(max_pending_bytes) == "number" and max_pending_bytes >= 1 and max_pending_bytes % 1 == 0)
 	return setmetatable({
 		stream = stream,
 		queue = {},
@@ -17,6 +21,8 @@ function Output.new(stream, options)
 		finished = false,
 		failed = nil,
 		max_pending = max_pending,
+		max_pending_bytes = max_pending_bytes,
+		pending_bytes = 0,
 		tcp_offset = 1,
 		now = options.now or socket.gettime,
 		wait_writable = options.wait_writable or function(peer, timeout)
@@ -29,8 +35,18 @@ function Output.new(stream, options)
 	}, Output)
 end
 
-function Output:_overflow()
-	self.failed = "adapter output queue exceeded " .. self.max_pending .. " pending events"
+function Output:_overflow(limit, attempted_bytes)
+	self.failed = {
+		name = "TransportError",
+		message = "adapter output queue exceeded its " .. limit,
+		data = {
+			maxPendingEvents = self.max_pending,
+			maxPendingBytes = self.max_pending_bytes,
+			pendingEvents = #self.queue,
+			pendingBytes = self.pending_bytes,
+			attemptedBytes = attempted_bytes,
+		},
+	}
 	self.finished = true
 	-- Enqueue never waits for capacity because the Live owner may be producing
 	-- the event that unblocks a controller lifecycle command. Closing the stalled
@@ -42,7 +58,7 @@ function Output:_overflow()
 		end)
 	end
 	self.changed:signal(1)
-	error(self.failed, 3)
+	error(self.failed, 0)
 end
 
 -- The generation check and JSON publication happen without yielding. Once a
@@ -52,13 +68,27 @@ function Output:enqueue(event, subscriptions, subscription_id, entry)
 		return false
 	end
 	if #self.queue >= self.max_pending then
-		self:_overflow()
+		self:_overflow("event limit")
 	end
 	local encoded, encode_error = json.encode(event)
 	assert(encoded, encode_error)
-	self.queue[#self.queue + 1] = encoded .. "\n"
+	-- Account the retained string, its newline, and a conservative allowance
+	-- for the Lua table slot and allocator metadata. Check before concatenating
+	-- the newline so a rejected event never creates another large retained copy.
+	local accounted_bytes = #encoded + 1 + Output.ENTRY_OVERHEAD
+	if self.pending_bytes + accounted_bytes > self.max_pending_bytes then
+		self:_overflow("byte limit", accounted_bytes)
+	end
+	self.queue[#self.queue + 1] = { line = encoded .. "\n", bytes = accounted_bytes }
+	self.pending_bytes = self.pending_bytes + accounted_bytes
 	self.changed:signal(1)
 	return true
+end
+
+function Output:_remove_first()
+	local queued = table.remove(self.queue, 1)
+	self.pending_bytes = self.pending_bytes - queued.bytes
+	return queued
 end
 
 function Output:finish()
@@ -73,13 +103,13 @@ function Output:run_stdio()
 		else
 			-- Keep the in-flight line in the queue so the bound includes a writer
 			-- blocked inside the kernel on a stopped stdout reader.
-			local line = self.queue[1]
-			local ok, write_error = self.stream:write(line)
+			local queued = self.queue[1]
+			local ok, write_error = self.stream:write(queued.line)
 			assert(ok, write_error)
 			if self.stream.flush then
 				assert(self.stream:flush())
 			end
-			table.remove(self.queue, 1)
+			self:_remove_first()
 		end
 	end
 end
@@ -87,10 +117,10 @@ end
 function Output:flush_tcp(timeout)
 	local deadline = self.now() + (timeout or 5)
 	while #self.queue > 0 do
-		local line = self.queue[1]
-		local sent, send_error, last_byte = self.stream:send(line, self.tcp_offset)
+		local queued = self.queue[1]
+		local sent, send_error, last_byte = self.stream:send(queued.line, self.tcp_offset)
 		if sent then
-			table.remove(self.queue, 1)
+			self:_remove_first()
 			self.tcp_offset = 1
 		else
 			if send_error ~= "timeout" then
