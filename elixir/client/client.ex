@@ -178,8 +178,10 @@ defmodule Convex.Client do
         {~c"convex-client", String.to_charlist(state.client_version)}
       ] ++ auth_header(state.token)
 
-    request =
-      {String.to_charlist(endpoint), headers, ~c"application/json", String.to_charlist(body)}
+    # Keep JSON as its encoded UTF-8 binary. Turning it into a Unicode charlist
+    # creates codepoints above 255 for values such as `世界` and `👋`; those are
+    # not valid iodata bytes and can leave `:httpc` waiting indefinitely.
+    request = {String.to_charlist(endpoint), headers, ~c"application/json", body}
 
     case :httpc.request(
            :post,

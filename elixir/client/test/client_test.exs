@@ -72,6 +72,46 @@ defmodule Convex.ClientTest do
     assert_receive {:server_done, ^server}
   end
 
+  test "a reusable client sends sequential Unicode JSON requests as UTF-8 bytes" do
+    parent = self()
+
+    {url, server} =
+      start_http_server(
+        fn request ->
+          send(parent, {:unicode_request, request})
+          {200, ~s({"status":"success","value":null})}
+        end,
+        2
+      )
+
+    {:ok, client} = Client.start_link(url)
+
+    # Match conformance ordering: an ASCII state query succeeds before the
+    # nested request introduces multibyte characters in the JSON body.
+    assert {:ok, _} = Client.query(client, "demo:state", %{"room" => "unicode-room"})
+
+    assert {:ok, _} =
+             Client.query(
+               client,
+               "demo:echo",
+               %{
+                 "value" => %{
+                   "unicode" => "Hello, 世界 👋",
+                   "nested" => %{"booleans" => [true, false], "number" => 42.5, "nil" => nil}
+                 }
+               },
+               2_000
+             )
+
+    assert_receive {:unicode_request, first_request}
+    assert_receive {:unicode_request, second_request}
+    assert first_request =~ "unicode-room"
+    assert second_request =~ "Hello, 世界 👋"
+
+    Client.close(client)
+    assert_receive {:server_done, ^server}
+  end
+
   test "arguments must be a named JSON object" do
     {:ok, client} = Client.start_link("https://example.convex.cloud")
     assert {:error, %ArgumentError{}} = Client.action(client, "demo:greet", ["elixir"])
