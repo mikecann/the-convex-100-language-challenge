@@ -54,6 +54,14 @@ tooling and every other delegated runtime remain forbidden. Extending the
 allowance to another language requires a separate shared-infrastructure review;
 do not weaken it inside a language branch.
 
+Do not infer that a minimal runtime works because the build or test stage works.
+Before handoff, execute the exact `/usr/local/bin/convex-example` and
+`/usr/local/bin/convex-adapter` entrypoints from their final images. Compiled
+clients must copy the complete runtime library closure. TLS clients must also
+carry the CA bundle, OpenSSL configuration, engines, and provider modules their
+runtime actually loads. Exercise TLS from the final image so hosted verification
+is not the first place a missing provider or certificate path is discovered.
+
 ## Implementation honesty
 
 - Every language lives at `<language-id>/` in the repository root and owns its implementation, Dockerfile, test adapter, examples, and manifest.
@@ -89,6 +97,9 @@ do not weaken it inside a language branch.
   do not duplicate the expected transcript or comparison logic in each language.
 - Never create a second test-only version of the example. Test the exact source
   file projected into the README and website.
+- Generate the site preview and inspect the canonical example before handoff.
+  Confirm that line breaks, comments, and syntax highlighting all come from the
+  real source file and remain readable in the rendered code panel.
 
 ## Language layout
 
@@ -168,6 +179,39 @@ Only the shared result evaluator may calculate HTTP or Live capability badges.
   runtime mailbox or a demand-driven stream, state that choice and test a slow
   consumer so future clients do not accidentally introduce an unbounded queue.
 
+## Live acceptance
+
+Live implementations need deterministic language-local coverage for the
+failure modes that ordinary happy-path tests miss:
+
+- Give one worker exclusive ownership of WebSocket reads, writes, reconnects,
+  and query-set version changes. Controller and subscription threads must send
+  commands to that owner rather than touching the socket concurrently.
+- Prove `Add` and `Remove`, an initial `QueryUpdated`, an external update, and
+  `QueryFailed` followed by recovery on the same subscription.
+- Make unsubscribe and same-ID replacement invalidate the old relay before the
+  acknowledgement is published. Pause a relay after dequeue in a deterministic
+  test and prove that no stale event can cross either acknowledgement.
+- For `debugDisconnect`, acknowledge only after the old connection is retired
+  and reconnect work is safely scheduled. Suppress an unchanged rehydration so
+  the exact sequence is initial `0`, disconnect acknowledgement, external
+  mutation, then `1`. Repeat this for five real reconnects and prove each
+  connection resends the active `Add` operations.
+- Carry `connectionCount`, `lastCloseReason`, and `maxObservedTimestamp`
+  correctly. Reset exponential transport backoff after a successful handshake
+  or valid server transition so healthy intervening connections do not inherit
+  an old maximum delay.
+- Decode fragmented UTF-8 messages and control frames correctly. Once any byte
+  of a frame has been consumed, a timeout must preserve parser state or abandon
+  that connection; it must never restart at a false frame boundary.
+- Make close and unsubscribe bounded even when the peer is idle, continuously
+  sending, or stalled halfway through a frame. Tests must assert the deadline,
+  not merely close a cooperative fixture peer.
+- Emit structured `FunctionError`, `ProtocolError`, and `TransportError` events
+  without permanently stranding otherwise valid subscriptions. After a
+  protocol or transport reconnect, prove that the subscription can deliver a
+  later valid value.
+
 ## README order
 
 Write each language README for a curious viewer, not as an audit log. Use this
@@ -209,6 +253,13 @@ them before discovering what the example does.
   `verify-hosted`, and `verify-all` serially on a shared host. Those commands
   deliberately share the backend, deployment, network, controller image, and
   evidence directories.
+- Keep at most three language implementations active inside one coordinator
+  task. When Michael explicitly requests greater throughput, separate top-level
+  Codex tasks may own additional language worktrees. Each task must still own
+  only its assigned language, may run only language-local Docker gates, and must
+  leave shared verification and shared-infrastructure edits to the coordinator.
+  Finish independent review and root-owned verification in bounded waves; a
+  large pile of compile-only branches is not useful progress.
 
 ## Language handoff checklist
 
@@ -222,6 +273,11 @@ Before a language implementation agent reports completion, it must provide:
   test-only hooks.
 - Confirmation that only the assigned language directory changed.
 
+If the assigned scope includes HTTP and Live, an HTTP-only build is an
+incomplete handoff, not completion. Say exactly what remains and leave all
+capabilities unearned. Do not stop at compilation or substitute a list of
+planned fixtures for tests that actually ran.
+
 After the implementation and independent code review are complete, the root
 integration agent must run the shared commands serially and add to the handoff:
 
@@ -231,6 +287,10 @@ integration agent must run the shared commands serially and add to the handoff:
 - Confirmation that the evidence records the reviewed source commit, a clean
   worktree, the expected runtime architecture, and the same built image for the
   deployment profiles.
+
+Run shared evidence after committing the reviewed source. A successful run
+with `dirty: true` or a `sourceCommit` that predates the reviewed tip must be
+rerun from the clean commit before a PR is opened.
 
 Generated, gitignored evidence under `_shared/results/local/` and
 `_shared/results/hosted/` is exempt from the directory-only handoff rule. It is
