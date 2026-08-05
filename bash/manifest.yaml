@@ -1,8 +1,22 @@
 schemaVersion: 1
 id: bash
-displayName: "Bash"
+displayName: Bash
 rank: 9
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Bash implementation of Convex's documented JSON HTTP API. It uses BusyBox wget as an ordinary HTTP/TLS transport and jq as the runtime JSON parser; it does not invoke another Convex client or runtime.
+toolchain:
+  name: GNU Bash
+  version: 5.2.37
+intendedCapabilities: [http]
+platforms: [linux/amd64]
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+limitations:
+  - Live is deferred. Bash has no standard WebSocket API and this HTTP client never presents polling as a Live subscription.
+  - The runtime deliberately includes jq for correct UTF-8 and nested JSON handling and BusyBox wget for HTTP/TLS.
 capabilities: []
