@@ -10,10 +10,12 @@ COPY examples ./examples
 # SWI's saved executables are native launchers.  The checked-in source remains
 # readable Prolog while the runtime receives neither swipl nor its compiler.
 RUN test "$(uname -m)" = x86_64 && \
+    swipl -q -g "current_prolog_flag(arch,Arch),sub_atom(Arch,0,6,_,x86_64),halt" && \
     swipl -q -g "[client/tests/client_test],run_tests,halt" && \
+    swipl -q -g "[client/tests/live_test],run_tests,halt" && \
     swipl -q -g "[client/tests/conformance/adapter_test],run_tests,halt" && \
     mkdir -p /out && \
-    swipl -q -g "consult('examples/basics/main.pl'),qsave_program('/out/convex-example',[stand_alone(true),goal(main),toplevel(halt)]),halt" && \
+    swipl -q -g "consult('examples/basics/main.prolog'),qsave_program('/out/convex-example',[stand_alone(true),goal(main),toplevel(halt)]),halt" && \
     swipl -q -g "consult('client/tests/conformance/adapter.pl'),qsave_program('/out/convex-adapter',[stand_alone(true),goal(convex_adapter:main),toplevel(halt)]),halt"
 
 # Copy the SWI engine and only the shared-object closure that the two saved
@@ -33,19 +35,37 @@ RUN set -eu; root=/rootfs; mkdir -p "$root"; \
 FROM build AS test
 # The `test` target is deliberately the toolchain image: it proves formatting
 # and language-local behaviour before the separate minimal runtime is made.
-CMD ["/bin/sh", "-ec", "swipl -q -g \"[client/tests/client_test],run_tests,halt\" && swipl -q -g \"[client/tests/conformance/adapter_test],run_tests,halt\""]
+CMD ["/bin/sh", "-ec", "test \"$(uname -m)\" = x86_64 && swipl -q -g \"current_prolog_flag(arch,Arch),sub_atom(Arch,0,6,_,x86_64),halt\" && swipl -q -g \"style_check([+singleton,+no_effect,+discontiguous,+charset]),[client/convex,client/tests/client_test,client/tests/live_test,client/tests/conformance/adapter_test],halt\" 2>/tmp/prolog-style.log && test ! -s /tmp/prolog-style.log && swipl -q -g \"[client/tests/client_test],run_tests,halt\" && swipl -q -g \"[client/tests/live_test],run_tests,halt\" && swipl -q -g \"[client/tests/conformance/adapter_test],run_tests,halt\""]
 
 FROM --platform=linux/amd64 ${RUNTIME_IMAGE} AS runtime-base
-# Debian supplies /bin/sh and the POSIX text tools required by the shared
-# verifier.  Remove its installer/database before copying the closed runtime.
-RUN rm -f /usr/bin/apt /usr/bin/apt-get /usr/bin/apt-cache /usr/bin/apt-config /usr/bin/apt-mark /usr/bin/dpkg /usr/bin/dpkg-query /usr/bin/dpkg-deb && \
-    rm -rf /etc/apt /var/lib/apt /var/lib/dpkg
+# Debian supplies separate POSIX executables, rather than a broad multicall
+# binary. Keep only the verifier's declared shell/text surface, then remove the
+# package, network, Perl, and administration surfaces wholesale.
+RUN set -eu; \
+    keep=/runtime-command-whitelist; \
+    mkdir -p "$keep/usr/bin"; \
+    for command_name in dash id grep sed mawk cat head tail wc cut tr sort uname find basename dirname env cp rm ln; do \
+      command_path=$(command -v "$command_name"); \
+      cp -L "$command_path" "$keep/usr/bin/$command_name"; \
+    done; \
+    "$keep/usr/bin/find" /usr/bin /usr/sbin -mindepth 1 -maxdepth 1 -exec "$keep/usr/bin/rm" -rf {} +; \
+    "$keep/usr/bin/cp" -a "$keep/usr/bin/." /usr/bin/; \
+    "$keep/usr/bin/ln" -s dash /usr/bin/sh; \
+    "$keep/usr/bin/ln" -s mawk /usr/bin/awk; \
+    /usr/bin/rm -rf "$keep" /etc/apt /var/lib/apt /var/lib/dpkg /usr/lib/apt /usr/lib/dpkg \
+      /usr/lib/*perl* /usr/share/perl /usr/share/perl5 /usr/share/debconf \
+      /usr/share/doc/perl* /usr/share/man/man1/perl* /usr/share/lintian; \
+    find /usr/local/bin /usr/local/sbin -mindepth 1 -maxdepth 1 -exec rm -rf {} +; \
+    /usr/bin/rm -f /usr/bin/cp /usr/bin/ln /usr/bin/rm /usr/bin/env
 COPY --from=build /rootfs /
 RUN set -eu; \
     test "$(uname -m)" = x86_64; \
-    for required in sh id grep; do command -v "$required" >/dev/null; done; \
-    for forbidden in swipl plld qsave_program apt apt-get dpkg gcc cc make node npm python python3 curl convex; do ! command -v "$forbidden" >/dev/null 2>&1; done; \
-    test ! -e /usr/lib/swipl/bin/x86_64-linux/swipl
+    for required in sh id grep sed awk cat head tail wc cut tr sort uname find basename dirname; do command -v "$required" >/dev/null; done; \
+    for forbidden in swipl plld qsave_program apt apt-get apt-cache dpkg dpkg-query perl cpan wget curl gcc cc make ld as node npm python python3 ruby php java git ssh nc socat convex; do ! command -v "$forbidden" >/dev/null 2>&1; done; \
+    test ! -e /usr/lib/swipl/bin/x86_64-linux/swipl; \
+    test ! -e /usr/bin/perl; \
+    test ! -d /usr/share/perl5; \
+    test ! -d /var/lib/dpkg
 USER 65532:65532
 
 FROM runtime-base AS example-runtime

@@ -6,7 +6,7 @@ selectionTier: ranked
 implementation:
   status: attempting
   provenance: native
-  version: 0.1.0
+  version: 0.2.0
   notes: Native SWI-Prolog HTTP and WebSocket implementation. Capability badges remain unearned until root-owned shared evidence passes.
 toolchain:
   name: SWI-Prolog
@@ -27,5 +27,6 @@ adapter:
     - debugDisconnect
 limitations:
   - Live authentication, WebSocket mutations/actions, transition chunks, and optimistic updates are deferred.
-  - The Live queue retains the newest 16 updates per subscription and rejects a single update over 8 MiB.
+  - The Live owner globally retains the newest 16 updates within a 16 MiB encoded-byte budget and rejects an event over 2 MiB.
+  - The adapter output queue is globally limited to 16 events and 8 MiB of encoded JSON.
 capabilities: []
