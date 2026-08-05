@@ -9,7 +9,7 @@
            [java.security MessageDigest]
            [java.time Duration]
            [java.util Base64]
-           [java.util.concurrent Executors TimeUnit]
+           [java.util.concurrent ConcurrentHashMap Executors TimeUnit]
            [java.util.concurrent.atomic AtomicBoolean AtomicInteger]))
 
 (def ^:private websocket-guid "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
@@ -125,47 +125,71 @@
 
 (defn close-transport! [connection] (.close ^Socket (:socket connection)))
 
-(defrecord Fixture [^ServerSocket server executor stopped connections failure handler]
+(defrecord Fixture [^ServerSocket server executor stopped connections sockets failure handler]
   java.lang.AutoCloseable
   (close [_]
     (.set ^AtomicBoolean stopped true)
     (.close server)
+    (doseq [socket sockets]
+      (try (.close ^Socket socket) (catch Throwable _ nil)))
     (.shutdownNow executor)
-    (.awaitTermination executor 2 TimeUnit/SECONDS)
+    (when-not (.awaitTermination executor 2 TimeUnit/SECONDS)
+      (throw (AssertionError. "WebSocket fixture threads did not stop")))
     (when-let [error @failure] (throw error))))
 
-(defn fixture [handler]
-  (let [server (ServerSocket. 0 20 (InetAddress/getLoopbackAddress))
-        executor (Executors/newCachedThreadPool)
-        stopped (AtomicBoolean. false)
-        connections (AtomicInteger. 0)
-        failure (atom nil)
-        result (->Fixture server executor stopped connections failure handler)]
-    (.execute executor
-              (reify Runnable
-                (run [_]
-                  (while (not (.get stopped))
-                    (try
-                      (let [socket (.accept server)
-                            index (.getAndIncrement connections)]
-                        (.setSoTimeout socket 10000)
-                        (.execute executor
-                                  (reify Runnable
-                                    (run [_]
-                                      (with-open [owned socket]
-                                        (try
-                                          (handshake! socket)
-                                          (handler {:socket socket
-                                                    :input (DataInputStream. (.getInputStream socket))
-                                                    :output (.getOutputStream socket)} index)
-                                          (catch SocketException _ nil)
-                                          (catch java.io.EOFException _ nil)
-                                          (catch InterruptedException _
-                                            (.interrupt (Thread/currentThread)))
-                                          (catch Throwable error
-                                            (compare-and-set! failure nil error))))))))
-                      (catch SocketException _ nil))))))
-    result))
+(defn fixture
+  ([handler] (fixture {} handler))
+  ([{:keys [drop-handshake? reject-handshake? allow-peer-close?]} handler]
+   (let [server (ServerSocket. 0 20 (InetAddress/getLoopbackAddress))
+         executor (Executors/newCachedThreadPool)
+         stopped (AtomicBoolean. false)
+         connections (AtomicInteger. 0)
+         sockets (ConcurrentHashMap/newKeySet)
+         failure (atom nil)
+         record-failure! (fn [error]
+                           (when-not (.get stopped)
+                             (compare-and-set! failure nil error)))
+         result (->Fixture server executor stopped connections sockets failure handler)]
+     (.execute executor
+               (reify Runnable
+                 (run [_]
+                   (while (not (.get stopped))
+                     (try
+                       (let [socket (.accept server)
+                             index (.getAndIncrement connections)]
+                         (.add sockets socket)
+                         (.setSoTimeout socket 10000)
+                         (.execute executor
+                                   (reify Runnable
+                                     (run [_]
+                                       (try
+                                         (with-open [owned socket]
+                                           (cond
+                                             (and drop-handshake? (drop-handshake? index)) nil
+                                             (and reject-handshake? (reject-handshake? index))
+                                             (let [output (.getOutputStream socket)]
+                                               (.write output
+                                                       (.getBytes
+                                                        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
+                                                        StandardCharsets/US_ASCII))
+                                               (.flush output))
+                                             :else
+                                             (do
+                                               (handshake! socket)
+                                               (handler {:socket socket
+                                                         :input (DataInputStream. (.getInputStream socket))
+                                                         :output (.getOutputStream socket)} index))))
+                                         (catch SocketException error
+                                           (when-not allow-peer-close? (record-failure! error)))
+                                         (catch java.io.EOFException error
+                                           (when-not allow-peer-close? (record-failure! error)))
+                                         (catch InterruptedException error
+                                           (.interrupt (Thread/currentThread))
+                                           (record-failure! error))
+                                         (catch Throwable error (record-failure! error))
+                                         (finally (.remove sockets socket)))))))
+                       (catch SocketException error (record-failure! error)))))))
+     result)))
 
 (defn url [fixture] (str "http://127.0.0.1:" (.getLocalPort ^ServerSocket (:server fixture))))
 

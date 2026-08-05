@@ -29,5 +29,6 @@ limitations:
   - Capability badges remain empty until root runs the serial shared conformance evidence.
   - Live authentication, optimistic updates, chunks, journals, and replay are deferred.
   - Each subscription retains only its newest 16 updates within a 256 KiB encoded delivery budget.
+  - Adapter command lines are limited to 1 MiB encoded, Live messages to 2 MiB encoded, and the Live owner queue to 64 events.
   - The runtime retains Clojure compiler classes because the Clojure runtime loads them while booting AOT-compiled namespaces; it exposes no compiler command, source tree, or package manager.
 capabilities: []

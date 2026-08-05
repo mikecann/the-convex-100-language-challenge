@@ -3,12 +3,14 @@
             [clojure.data.json :as json]
             [clojure.string :as string]
             [clojure.test :refer [deftest is]]
+            [convex.client :as convex]
             [raw-websocket-fixture :as ws])
   (:import [com.sun.net.httpserver HttpHandler HttpServer]
-           [java.io BufferedReader ByteArrayInputStream ByteArrayOutputStream InputStreamReader PipedInputStream PipedOutputStream]
+           [java.io BufferedReader ByteArrayInputStream ByteArrayOutputStream InputStream InputStreamReader PipedInputStream PipedOutputStream]
            [java.net InetAddress InetSocketAddress ServerSocket Socket]
            [java.nio.charset StandardCharsets]
-           [java.util.concurrent ArrayBlockingQueue CountDownLatch TimeUnit]))
+           [java.util.concurrent ArrayBlockingQueue CountDownLatch TimeUnit]
+           [java.util.concurrent.atomic AtomicInteger AtomicLong]))
 
 (defn- http-fixture []
   (let [server (HttpServer/create (InetSocketAddress. (InetAddress/getLoopbackAddress) 0) 0)]
@@ -87,6 +89,25 @@
   ;; carries a failed server-side expectation back into clojure.test.
   (when-not condition (throw (AssertionError. message))))
 
+(defn- repeating-input [total byte-value ^AtomicLong consumed]
+  (let [remaining (atom total)]
+    (proxy [InputStream] []
+      (read
+        ([]
+         (if (zero? @remaining)
+           -1
+           (do (swap! remaining dec)
+               (.incrementAndGet consumed)
+               byte-value)))
+        ([buffer offset length]
+         (if (zero? @remaining)
+           -1
+           (let [amount (int (min @remaining length))]
+             (java.util.Arrays/fill ^bytes buffer offset (+ offset amount) (byte byte-value))
+             (swap! remaining - amount)
+             (.addAndGet consumed amount)
+             amount)))))))
+
 (deftest command-errors-are-correlated-structured-and-stream-continues
   (let [fixture (http-fixture)]
     (try
@@ -128,6 +149,19 @@
     (is (not= ::timeout (deref running 2000 ::timeout)))
     (.close adapter-output)
     (.close controller-input)))
+
+(deftest seventy-megabyte-partial-line-is-rejected-before-allocation
+  (let [consumed (AtomicLong. 0)
+        input (repeating-input (* 70 1024 1024) (int \{) consumed)
+        output (ByteArrayOutputStream.)
+        running (future (adapter/run-adapter! input output nil))]
+    (is (not= ::timeout (deref running 3000 ::timeout)))
+    (let [event (json/read-str (string/trim (.toString output StandardCharsets/UTF_8)))]
+      (is (= "error" (get event "type")))
+      (is (= "ProtocolError" (get-in event ["error" "name"])))
+      (is (string/includes? (get-in event ["error" "message"]) "encoded bytes")))
+    ;; Buffered input may read one extra 8 KiB chunk, but never the 70 MiB attack.
+    (is (< (.get consumed) (* 2 1024 1024)))))
 
 (deftest tcp-stream-uses-the-same-partial-ndjson-and-flushes
   (is (= ["127.0.0.1" 3210] (adapter/parse-listen-address "127.0.0.1:3210")))
@@ -179,6 +213,13 @@
   (let [send-old (CountDownLatch. 1)
         send-new (CountDownLatch. 1)
         send-blocked (CountDownLatch. 1)
+        remove-complete (CountDownLatch. 1)
+        release-remove (CountDownLatch. 1)
+        add-complete (CountDownLatch. 1)
+        release-add (CountDownLatch. 1)
+        unsubscribe-complete (CountDownLatch. 1)
+        release-unsubscribe (CountDownLatch. 1)
+        completion-index (AtomicInteger. 0)
         fixture (ws/fixture
                  (fn [connection _]
                    (ws/read-message! connection)
@@ -218,8 +259,22 @@
         (is (= "ack" (get (next-event harness) "type")))
         (.countDown send-old)
         (is (.await old-dequeued 3 TimeUnit/SECONDS))
+        (reset! convex/send-completion-hook
+                (fn [operation]
+                  (when (= "modify query set" operation)
+                    (case (.incrementAndGet completion-index)
+                      1 (do (.countDown remove-complete) (.await release-remove))
+                      2 (do (.countDown add-complete) (.await release-add))
+                      3 (do (.countDown unsubscribe-complete) (.await release-unsubscribe))
+                      nil))))
         (send-command! harness (command "two" "subscribe"
                                         {"subscriptionId" "sub" "path" "demo:new" "args" {}}))
+        (is (.await remove-complete 3 TimeUnit/SECONDS))
+        (is (no-event? harness))
+        (.countDown release-remove)
+        (is (.await add-complete 3 TimeUnit/SECONDS))
+        (is (no-event? harness))
+        (.countDown release-add)
         (is (= "ack" (get (next-event harness) "type")))
         (.countDown release-old)
         (is (no-event? harness))
@@ -238,8 +293,13 @@
           (.countDown send-blocked)
           (is (.await inside-lock 3 TimeUnit/SECONDS))
           (send-command! harness (command "three" "unsubscribe" {"subscriptionId" "sub"}))
+          (is (.await unsubscribe-complete 3 TimeUnit/SECONDS))
           (is (no-event? harness))
           (.countDown release-lock)
+          ;; The relay lock is now free, but ack still waits for the real JDK
+          ;; send completion hook held on the Live owner.
+          (is (no-event? harness))
+          (.countDown release-unsubscribe)
           (is (= "ack" (get (next-event harness) "type")))
           (is (no-event? harness)))
 
@@ -247,5 +307,6 @@
         (is (= "closed" (get (next-event harness) "type"))))
       (finally
         (adapter/reset-test-hooks!)
+        (convex/reset-test-hooks!)
         (.close harness)
         (.close fixture)))))

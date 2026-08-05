@@ -6,7 +6,7 @@
             [raw-websocket-fixture :as ws])
   (:import [java.net InetAddress ServerSocket]
            [java.nio.charset StandardCharsets]
-           [java.util.concurrent CountDownLatch TimeUnit]
+           [java.util.concurrent ArrayBlockingQueue CountDownLatch ThreadPoolExecutor TimeUnit]
            [java.util.concurrent.atomic AtomicInteger]))
 
 (defn- await! [message predicate]
@@ -30,6 +30,19 @@
   (loop []
     (let [update (convex/next-update subscription 12000)]
       (if (:error update) update (:value update)))))
+
+(deftest fixture-thread-failures-return-to-the-test-thread
+  (let [fixture (ws/fixture (fn [_ _] (throw (AssertionError. "fixture failure propagated"))))
+        live (convex/live-client (ws/url fixture))]
+    (try
+      (convex/subscribe live "demo:state" {})
+      (await! "fixture did not record its worker failure" #(some? @(:failure fixture)))
+      (finally (.close live)))
+    (is (= "fixture failure propagated"
+           (try
+             (.close fixture)
+             "fixture close unexpectedly succeeded"
+             (catch AssertionError error (.getMessage error)))))))
 
 (deftest fragmented-multibyte-control-frames-query-failure-and-remove
   (let [remove-seen (CountDownLatch. 1)
@@ -67,64 +80,87 @@
           (is (.await remove-seen 3 TimeUnit/SECONDS))))
       (finally (.close fixture)))))
 
-(deftest five-failed-connections-backoff-and-metadata-then-recovery
+(deftest five-failed-handshakes-then-success-reset-backoff-and-metadata
   (let [connects (atom [])
+        handshake-ready (CountDownLatch. 1)
+        release-transition (CountDownLatch. 1)
         fixture (ws/fixture
+                 {:reject-handshake? #(< % 5)}
                  (fn [connection index]
+                   (ensure= "successful connection index" 5 index)
                    (let [connect (ws/read-message! connection)
                          add (ws/read-message! connection)]
                      (swap! connects conj connect)
                      (ensure= "reconnect subscription modification" "Add"
                               (get-in add ["modifications" 0 "type"]))
-                     (if (< index 5)
-                       (ws/close-transport! connection)
-                       (do
-                         (ws/send-text! connection
-                                        (ws/transition (ws/version 0 0) (ws/version 1 6)
-                                                       (ws/updated 0 {"count" 1})))
-                         (Thread/sleep 5000))))))]
+                     (.countDown handshake-ready)
+                     (ensure= "transition release timed out"
+                              true (.await release-transition 3 TimeUnit/SECONDS))
+                     (ws/send-text! connection
+                                    (ws/transition (ws/version 0 0) (ws/version 1 6)
+                                                   (ws/updated 0 {"count" 1})))
+                     (Thread/sleep 5000))))
+        fixture-url (ws/url fixture)]
     (try
-      (with-open [live (convex/live-client (ws/url fixture))]
+      (with-open [live (convex/live-client fixture-url)]
         (let [subscription (convex/subscribe live "demo:state" {})]
+          (is (.await handshake-ready 10 TimeUnit/SECONDS))
+          ;; No server message has been sent. The successful RFC 6455 handshake
+          ;; itself must clear the exponential delay inherited from five failures.
+          (is (= 100 (:backoff @(:state live))))
+          (.countDown release-transition)
           (loop [errors 0]
             (let [update (convex/next-update subscription 12000)]
               (if (:error update)
                 (recur (inc errors))
-                (do (is (= 5 errors))
-                    (is (= {"count" 1} (:value update)))
-                    ;; Backoff only resets when a valid protocol message arrives.
-                    (is (= 100 (:backoff @(:state live))))))))))
-      (is (= [0 1 2 3 4 5] (mapv #(get % "connectionCount") @connects)))
-      (is (= "InitialConnect" (get (first @connects) "lastCloseReason")))
-      (is (every? #(string/includes? (get % "lastCloseReason") "close") (rest @connects)))
+                (do
+                  (is (= 5 errors))
+                  (is (= {"count" 1} (:value update)))))))))
+      (is (= 5 (get (first @connects) "connectionCount")))
+      (is (string/includes? (get (first @connects) "lastCloseReason") "handshake"))
       (finally (.close fixture)))))
 
-(deftest invalid-transition-is-atomic-and-subscription-recovers
-  (let [fixture (ws/fixture
+(deftest every-modification-is-strictly-validated-before-atomic-commit
+  (let [invalid-items [["not-an-object"]
+                       {"queryId" 0}
+                       {"type" 7 "queryId" 0}
+                       {"type" "QueryUpdated"}
+                       {"type" "QueryUpdated" "queryId" -1 "value" nil}
+                       {"type" "QueryUpdated" "queryId" "0" "value" nil}
+                       {"type" "QueryUpdated" "queryId" 0}
+                       {"type" "QueryUpdated" "queryId" 0 "value" nil "logLines" "bad"}
+                       {"type" "QueryUpdated" "queryId" 0 "value" nil "logLines" ["ok" 7]}
+                       {"type" "QueryFailed" "queryId" 0}
+                       {"type" "QueryFailed" "queryId" 0 "errorMessage" 7}
+                       {"type" "Unknown" "queryId" 0}]
+        fixture (ws/fixture
                  (fn [connection index]
                    (ws/read-message! connection)
                    (ws/read-message! connection)
-                   (if (zero? index)
+                   (if (< index (count invalid-items))
+                     ;; The valid-looking first update must not leak from a
+                     ;; transaction whose later modification is malformed.
                      (ws/send-text! connection
-                                    {"type" "Transition"
-                                     "startVersion" (ws/version 0 0)
-                                     "endVersion" (ws/version 1 1)
-                                     "modifications" [(ws/updated 0 {"count" 99})
-                                                      {"type" "QueryUpdated" "value" {"count" 100}}]})
+                                    (ws/transition (ws/version 0 0) (ws/version 1 (inc index))
+                                                   (ws/updated 0 {"count" 99})
+                                                   (nth invalid-items index)))
                      (do
                        (ws/send-text! connection
-                                      (ws/transition (ws/version 0 0) (ws/version 1 2)
+                                      (ws/transition (ws/version 0 0) (ws/version 1 99)
                                                      (ws/updated 0 {"count" 1})))
                        (Thread/sleep 3000)))))]
     (try
       (with-open [live (convex/live-client (ws/url fixture))]
-        (let [subscription (convex/subscribe live "demo:state" {})
-              protocol (convex/next-update subscription 5000)
-              recovered (loop []
-                          (let [update (convex/next-update subscription 5000)]
-                            (if (:error update) (recur) update)))]
-          (is (= :protocol (get-in protocol [:error :kind])))
-          (is (= {"count" 1} (:value recovered)))))
+        (let [subscription (convex/subscribe live "demo:state" {})]
+          (loop [protocol-errors 0]
+            (let [update (convex/next-update subscription 20000)]
+              (if (:error update)
+                (do
+                  (is (= :protocol (get-in update [:error :kind])))
+                  (recur (inc protocol-errors)))
+                (do
+                  (is (= (count invalid-items) protocol-errors))
+                  (is (= {"count" 1} (:value update)))))))))
       (finally (.close fixture)))))
 
 (deftest debug-disconnect-is-a-generation-barrier-and-deduplicates-hydration
@@ -178,6 +214,9 @@
   (doseq [mode [:idle :continuous :partial]]
     (testing (name mode)
       (let [fixture (ws/fixture
+                     ;; The client deliberately closes each peer while its handler is
+                     ;; blocked or writing. EOF/SocketException is the expected outcome.
+                     {:allow-peer-close? true}
                      (fn [connection _]
                        (ws/read-message! connection)
                        (ws/read-message! connection)
@@ -240,6 +279,32 @@
             (is (pos? first-count))
             (is (= 19 (last remaining)))
             (is (<= (+ 1 (count remaining)) 16)))))
+      (finally (.close fixture)))))
+
+(deftest twenty-thousand-callbacks-use-demand-and-a-bounded-owner-queue
+  (let [callback-count 20000
+        fixture (ws/fixture
+                 (fn [connection _]
+                   (ws/read-message! connection)
+                   (ws/read-message! connection)
+                   ;; The peer writes without waiting for the client. JDK demand
+                   ;; must keep only one callback outstanding while owner catches up.
+                   ;; Reuse the encoded protocol message so this pressure test
+                   ;; measures callback/backpressure memory, not fixture JSON churn.
+                   (dotimes [_ callback-count]
+                     (ws/send-text! connection "{\"type\":\"Ping\"}"))
+                   (ws/send-text! connection
+                                  (ws/transition (ws/version 0 0) (ws/version 1 1)
+                                                 (ws/updated 0 {"count" callback-count})))
+                   (Thread/sleep 3000)))]
+    (try
+      (with-open [live (convex/live-client (ws/url fixture))]
+        (let [subscription (convex/subscribe live "demo:state" {})
+              update (convex/next-update subscription 30000)
+              queue (.getQueue ^ThreadPoolExecutor (:owner live))]
+          (is (= callback-count (get-in update [:value "count"])))
+          (is (instance? ArrayBlockingQueue queue))
+          (is (= 64 (+ (.size queue) (.remainingCapacity queue))))))
       (finally (.close fixture)))))
 
 (deftest failed-send-retires-generation-and-recovers

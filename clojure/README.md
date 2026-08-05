@@ -68,14 +68,14 @@ The [canonical basic example](examples/basics/main.clj) performs a unique room's
 
 ## Docker verification
 
-`./run test clojure` checks standard formatting, runs the language-local HTTP, raw WebSocket, lifecycle, and adapter tests, then AOT-compiles the exact example and adapter. `./run build clojure` creates the minimal non-root runtime. Root owns the serial shared example and conformance evidence.
+`./run test clojure` checks standard formatting, runs the language-local HTTP, raw WebSocket, lifecycle, and adapter tests, then AOT-compiles the exact example and adapter. `./run build clojure` creates the minimal non-root runtime. Its BusyBox is built from source with only the shell and inspection applets the verifier needs, so network and package-management applets are absent even when callers forge `argv[0]`. Root owns the serial shared example and conformance evidence.
 
 ## Protocol notes
 
-The client uses the documented JSON HTTP endpoints and the pinned `convex-rs-0.10.4-unversioned-sync` profile. One Clojure actor owns every WebSocket, query-set version, reconnect, and serialized write. JDK callbacks only send events back to that owner. Reconnect metadata survives generations, backoff resets after valid protocol traffic, and unchanged hydration is suppressed.
+The client uses the documented JSON HTTP endpoints and the pinned `convex-rs-0.10.4-unversioned-sync` profile. One Clojure actor owns every WebSocket, query-set version, reconnect, and serialized write. The JDK WebSocket is demand-driven: at most one callback is admitted at a time, and the owner's executor has a fixed 64-event queue as a second safety boundary. Reconnect metadata survives generations, backoff resets after a successful WebSocket handshake, and unchanged hydration is suppressed.
 
-The adapter supports partial NDJSON over stdin/stdout and `ADAPTER_LISTEN` TCP, flushes each correlated event, and continues after request errors. Its test-only `debugDisconnect` command retires the old generation before acknowledgement.
+The adapter supports partial NDJSON over stdin/stdout and `ADAPTER_LISTEN` TCP, flushes each correlated event, and continues after request errors. It rejects an encoded command line above 1 MiB before allocating the whole line. Replacement, unsubscribe, and the test-only `debugDisconnect` acknowledge only after their generation/relay barriers; replacement and unsubscribe also await the corresponding WebSocket send completion.
 
 ## Limitations
 
-The Live profile is experimental and deliberately earns no badge until the shared controller passes locally and against the hosted drift target. Authentication, optimistic updates, transition chunks, journals, and replay are deferred. Each subscription keeps the newest 16 snapshots within a 256 KiB encoded budget.
+The Live profile is experimental and deliberately earns no badge until the shared controller passes locally and against the hosted drift target. Authentication, optimistic updates, transition chunks, journals, and replay are deferred. Each subscription keeps the newest 16 snapshots within a 256 KiB encoded budget; each inbound WebSocket message is limited to 2 MiB.

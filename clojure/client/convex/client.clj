@@ -8,15 +8,24 @@
            [java.nio.charset StandardCharsets]
            [java.time Duration]
            [java.util ArrayDeque LinkedHashMap UUID]
-           [java.util.concurrent ArrayBlockingQueue Callable CompletableFuture CompletionException ExecutionException Executors RejectedExecutionException ScheduledExecutorService ThreadFactory TimeUnit TimeoutException]
+           [java.util.concurrent ArrayBlockingQueue Callable CompletableFuture CompletionException ExecutionException Executors RejectedExecutionException ScheduledExecutorService ThreadFactory ThreadPoolExecutor ThreadPoolExecutor$AbortPolicy TimeUnit TimeoutException]
            [java.util.function BiConsumer]))
 
 (def ^:private max-http-bytes (* 2 1024 1024))
 (def ^:private max-update-count 16)
 (def ^:private max-update-bytes (* 256 1024))
+(def ^:private max-owner-events 64)
+(def ^:private max-pending-sends 64)
+(def ^:private max-live-message-bytes (* 2 1024 1024))
 (def ^:private initial-timestamp "AAAAAAAAAAA=")
 (def ^:private initial-backoff-ms 100)
 (def ^:private max-backoff-ms 15000)
+
+;; Language-local barrier tests pause after a real JDK send future completes.
+;; Normal clients leave this nil; it never changes wire behavior.
+(def send-completion-hook (atom nil))
+
+(defn reset-test-hooks! [] (reset! send-completion-hook nil))
 
 (defn- failure [kind message & [fields]]
   (ex-info message (merge {:kind kind} fields)))
@@ -155,7 +164,8 @@
     (str (if (= "https" (.getScheme uri)) "wss" "ws") "://"
          (.getAuthority uri) (or (.getPath uri) "") "/api/sync")))
 
-(defrecord LiveClient [url ^HttpClient http owner ^ScheduledExecutorService scheduler state]
+(defrecord LiveClient [url ^HttpClient http ^ThreadPoolExecutor owner
+                       ^ScheduledExecutorService scheduler state]
   java.lang.AutoCloseable
   (close [this] (close-live! this)))
 
@@ -164,8 +174,10 @@
 (defn- bi-consumer [f] (reify BiConsumer (accept [_ value error] (f value error))))
 
 (defn- dispatch! [live f]
-  (try (.execute (:owner live) (runnable f))
-       (catch RejectedExecutionException _ nil)))
+  (try
+    (.execute ^ThreadPoolExecutor (:owner live) (runnable f))
+    true
+    (catch RejectedExecutionException _ false)))
 
 (defn- on-owner [live f]
   (if (= "convex-clojure-live" (.getName (Thread/currentThread)))
@@ -206,55 +218,134 @@
   {"type" "Add" "queryId" (:id subscription) "udfPath" (:path subscription)
    "args" [(:args subscription)]})
 
+(defn- completed-future []
+  (CompletableFuture/completedFuture nil))
+
+(defn- fail-completion! [pending error]
+  (.completeExceptionally ^CompletableFuture (:completion pending) error))
+
+(defn- send-failure [operation]
+  (failure :transport (str operation " was cancelled because the Live generation retired")))
+
+(defn- finish-send! [live in-flight pending error]
+  (when (identical? in-flight (:in-flight @(:state live)))
+    (swap! (:state live) assoc :in-flight nil)
+    (if error
+      (let [cause (unwrap-error error)]
+        (fail-completion! pending cause)
+        (publish-error! live :transport (:operation pending) cause)
+        (retire! live (str (:operation pending) " send failed") true))
+      (do
+        (when-let [hook @send-completion-hook]
+          (hook (:operation pending)))
+        (.complete ^CompletableFuture (:completion pending) nil)
+        (start-next-send! live)))))
+
 (defn- start-next-send! [live]
-  (let [state @(:state live)]
-    (when (nil? (:in-flight state))
-      (loop []
+  (when (nil? (:in-flight @(:state live)))
+    (loop []
+      (let [state @(:state live)]
         (when-let [pending (.pollFirst ^ArrayDeque (:pending-sends state))]
           (if (or (:closed state) (not (identical? (:socket pending) (:socket state)))
                   (not= (:generation pending) (:generation state)))
-            (recur)
+            (do
+              (fail-completion! pending (send-failure (:operation pending)))
+              (recur))
             (try
-              (let [future ((:action pending) (:socket pending))]
-                (swap! (:state live) assoc :in-flight future)
-                (.whenComplete ^CompletableFuture future
+              (let [transport ((:action pending) (:socket pending))
+                    in-flight {:transport transport :pending pending}]
+                (swap! (:state live) assoc :in-flight in-flight)
+                (.whenComplete ^CompletableFuture transport
                                (bi-consumer
                                 (fn [_ error]
-                                  (dispatch! live
-                                             (fn []
-                                               (when (identical? future (:in-flight @(:state live)))
-                                                 (swap! (:state live) assoc :in-flight nil)
-                                                 (if error
-                                                   (do (publish-error! live :transport (:operation pending) (unwrap-error error))
-                                                       (retire! live (str (:operation pending) " send failed") true))
-                                                   (start-next-send! live)))))))))
+                                  (when-not (dispatch! live #(finish-send! live in-flight pending error))
+                                    (fail-completion! pending
+                                                      (send-failure (:operation pending))))))))
               (catch Throwable error
+                (fail-completion! pending error)
                 (publish-error! live :transport (:operation pending) error)
                 (retire! live (str (:operation pending) " send failed") true)))))))))
 
 (defn- enqueue-send! [live operation action]
-  (let [state @(:state live)]
-    (when-let [socket (:socket state)]
-      (.addLast ^ArrayDeque (:pending-sends state)
-                {:operation operation :socket socket :generation (:generation state) :action action})
-      (start-next-send! live))))
+  (let [state @(:state live)
+        completion (CompletableFuture.)]
+    (if-let [socket (:socket state)]
+      (if (>= (.size ^ArrayDeque (:pending-sends state)) max-pending-sends)
+        (let [error (failure :transport "Live write queue is full")]
+          (.completeExceptionally completion error)
+          (publish-error! live :transport operation error)
+          (retire! live "Live write queue is full" true))
+        (do
+          (.addLast ^ArrayDeque (:pending-sends state)
+                    {:operation operation :socket socket :generation (:generation state)
+                     :action action :completion completion})
+          (start-next-send! live)))
+      (.complete completion nil))
+    completion))
 
-(defn- send-json! [live value]
-  (let [payload (json/write-str value)]
-    (enqueue-send! live "live write" #(.sendText ^WebSocket % payload true))))
+(defn- send-json!
+  ([live value] (send-json! live "live write" value))
+  ([live operation value]
+   (let [payload (json/write-str value)]
+     (enqueue-send! live operation #(.sendText ^WebSocket % payload true)))))
 
 (defn- modify! [live modifications]
-  (when (seq modifications)
-    (let [version (:query-version @(:state live))]
-      (send-json! live {"type" "ModifyQuerySet" "baseVersion" version
-                        "newVersion" (inc version) "modifications" (vec modifications)})
-      (swap! (:state live) update :query-version inc))))
+  (if (and (seq modifications) (:socket @(:state live)))
+    (let [version (:query-version @(:state live))
+          completion (send-json! live "modify query set"
+                                 {"type" "ModifyQuerySet" "baseVersion" version
+                                  "newVersion" (inc version)
+                                  "modifications" (vec modifications)})]
+      (swap! (:state live) update :query-version inc)
+      completion)
+    (completed-future)))
 
 (defn- valid-version [value]
-  (when-not (and (map? value) (integer? (get value "querySet"))
-                 (integer? (get value "identity")) (string? (get value "ts")))
+  (when-not (and (map? value)
+                 (contains? value "querySet") (integer? (get value "querySet"))
+                 (not (neg? (get value "querySet")))
+                 (contains? value "identity") (integer? (get value "identity"))
+                 (not (neg? (get value "identity")))
+                 (contains? value "ts") (string? (get value "ts"))
+                 (seq (get value "ts")))
     (throw (failure :protocol "Live state version is malformed")))
   value)
+
+(defn- modification-logs [item]
+  (if (contains? item "logLines")
+    (let [logs (get item "logLines")]
+      (when-not (and (vector? logs) (every? string? logs))
+        (throw (failure :protocol "Transition modification logLines must be an array of strings")))
+      logs)
+    []))
+
+(defn- parse-modification [item]
+  (when-not (map? item)
+    (throw (failure :protocol "Transition modification must be an object")))
+  (let [id (get item "queryId")
+        type (get item "type")
+        logs (modification-logs item)]
+    (when-not (and (contains? item "queryId") (integer? id) (not (neg? id)))
+      (throw (failure :protocol "Transition modification has invalid queryId")))
+    (when-not (and (contains? item "type") (string? type) (seq type))
+      (throw (failure :protocol "Transition modification omitted type")))
+    [id
+     (case type
+       "QueryUpdated"
+       (do
+         (when-not (contains? item "value")
+           (throw (failure :protocol "QueryUpdated omitted value")))
+         {:value (get item "value") :logs logs})
+
+       "QueryFailed"
+       (let [message (get item "errorMessage")]
+         (when-not (and (contains? item "errorMessage") (string? message))
+           (throw (failure :protocol "QueryFailed omitted string errorMessage")))
+         {:error {:kind :function :message message :data (get item "errorData")}
+          :logs logs})
+
+       "QueryRemoved" ::removed
+       (throw (failure :protocol (str "unknown Transition modification " type))))]))
 
 (defn- same-value? [previous update]
   (and previous (nil? (:error previous)) (nil? (:error update))
@@ -268,77 +359,114 @@
         modifications (get message "modifications")
         _ (when-not (vector? modifications)
             (throw (failure :protocol "Transition modifications must be an array")))
-        parsed (mapv (fn [item]
-                       (let [id (get item "queryId") type (get item "type")
-                             logs (vec (get item "logLines" []))]
-                         (when-not (integer? id)
-                           (throw (failure :protocol "Transition modification omitted queryId")))
-                         [id (case type
-                               "QueryUpdated" {:value (get item "value") :logs logs}
-                               "QueryFailed" {:error {:kind :function
-                                                      :message (get item "errorMessage" "query failed")
-                                                      :data (get item "errorData")}
-                                              :logs logs}
-                               "QueryRemoved" ::removed
-                               (throw (failure :protocol (str "unknown Transition modification " type))))]))
-                     modifications)
-        end (valid-version (get message "endVersion"))]
-    ;; Nothing is committed or delivered until the complete transition validates.
-    (swap! (:state live) assoc :remote-version end :max-ts (get end "ts")
-           :backoff initial-backoff-ms)
-    (doseq [[id update] (sort-by first parsed)]
-      (when-let [entry (get (:subscriptions @(:state live)) id)]
-        (if (= ::removed update)
-          (swap! (:state live) assoc-in [:subscriptions id :last] nil)
-          (when-not (same-value? (:last entry) update)
-            (swap! (:state live) assoc-in [:subscriptions id :last] update)
-            (deliver! (:subscription entry) update)))))))
+        end (valid-version (get message "endVersion"))
+        parsed (mapv parse-modification modifications)
+        staged (reduce
+                (fn [{:keys [subscriptions deliveries] :as result} [id update]]
+                  (if-let [entry (get subscriptions id)]
+                    (if (= ::removed update)
+                      (assoc result :subscriptions (assoc-in subscriptions [id :last] nil))
+                      (if (same-value? (:last entry) update)
+                        result
+                        {:subscriptions (assoc-in subscriptions [id :last] update)
+                         :deliveries (conj deliveries [(:subscription entry) update])}))
+                    result))
+                {:subscriptions (:subscriptions state) :deliveries []}
+                (sort-by first parsed))
+        committed (assoc state
+                         :remote-version end
+                         :max-ts (get end "ts")
+                         :backoff initial-backoff-ms
+                         :subscriptions (:subscriptions staged))]
+    ;; Validate and stage the entire transaction before one state commit. Relays
+    ;; cannot observe a half-applied multi-query transition.
+    (reset! (:state live) committed)
+    (doseq [[subscription update] (:deliveries staged)]
+      (deliver! subscription update))))
 
-(defn- receive-message! [live generation text]
-  (dispatch! live
-             (fn []
-               (let [state @(:state live)]
-                 (when (and (not (:closed state)) (= generation (:generation state)) (:socket state))
-                   (try
-                     (let [message (json/read-str text)]
-                       (case (get message "type")
-                         "Transition" (apply-transition! live message)
-                         "Ping" (swap! (:state live) assoc :backoff initial-backoff-ms)
-                         ("MutationResponse" "ActionResponse") (swap! (:state live) assoc :backoff initial-backoff-ms)
-                         (throw (failure :protocol (str "unsupported Live message " (get message "type"))))))
-                     (catch Throwable error
-                       (publish-error! live :protocol "live read" error)
-                       (retire! live (or (.getMessage error) "protocol failure") true))))))))
+(defn- receive-message! [live text]
+  (let [message (json/read-str text)
+        type (when (map? message) (get message "type"))]
+    (when-not (and (map? message) (string? type) (seq type))
+      (throw (failure :protocol "Live message omitted string type")))
+    (case type
+      "Transition" (apply-transition! live message)
+      "Ping" (swap! (:state live) assoc :backoff initial-backoff-ms)
+      ("MutationResponse" "ActionResponse")
+      (swap! (:state live) assoc :backoff initial-backoff-ms)
+      (throw (failure :protocol (str "unsupported Live message " type))))))
+
+(defn- current-socket? [live socket generation]
+  (let [state @(:state live)]
+    (and (not (:closed state))
+         (= generation (:generation state))
+         (identical? socket (:socket state)))))
+
+(defn- socket-event! [live socket generation request-next? f]
+  (when-not
+   (dispatch!
+    live
+    (fn []
+      (when (current-socket? live socket generation)
+        (try
+          (f)
+          (catch Throwable error
+            (publish-error! live :protocol "live read" error)
+            (retire! live (or (.getMessage error) "protocol failure") true)))
+        (when (and request-next? (current-socket? live socket generation))
+          (.request ^WebSocket socket 1)))))
+   ;; Rejection is only possible during shutdown or a violated owner bound.
+   ;; Aborting is safer than letting the JDK continue outside owner control.
+    (.abort ^WebSocket socket)))
 
 (defn- listener [live generation]
-  (let [text (StringBuilder.)]
+  (let [text (StringBuilder.)
+        encoded-bytes (long-array 1)]
     (proxy [WebSocket$Listener] []
-      (onOpen [socket] (.request socket 1))
+      (onOpen [_] nil)
       (onText [socket data last]
-        (.append text data)
-        (when last
-          (let [complete (.toString text)]
-            (.setLength text 0)
-            (receive-message! live generation complete)))
-        (.request socket 1)
+        (let [chunk (str data)]
+          (socket-event!
+           live socket generation true
+           (fn []
+             (let [next-size (+ (aget encoded-bytes 0)
+                                (alength (.getBytes chunk StandardCharsets/UTF_8)))]
+               (when (> next-size max-live-message-bytes)
+                 (throw (failure :protocol
+                                 (str "Live message exceeds " max-live-message-bytes " bytes"))))
+               (aset-long encoded-bytes 0 next-size)
+               (.append text chunk)
+               (when last
+                 (let [complete (.toString text)]
+                   (.setLength text 0)
+                   (aset-long encoded-bytes 0 0)
+                   (receive-message! live complete)))))))
         (CompletableFuture/completedFuture nil))
       (onBinary [socket _ _]
-        (dispatch! live #(when (= generation (:generation @(:state live)))
-                           (let [error (failure :protocol "binary Live messages are unsupported")]
-                             (publish-error! live :protocol "live read" error)
-                             (retire! live (.getMessage error) true))))
-        (.request socket 1)
+        (socket-event! live socket generation true
+                       #(throw (failure :protocol "binary Live messages are unsupported")))
         (CompletableFuture/completedFuture nil))
       (onPing [socket payload]
         (let [copy (byte-array (.remaining ^ByteBuffer payload))]
           (.get ^ByteBuffer payload copy)
-          (dispatch! live #(when (= generation (:generation @(:state live)))
-                             (enqueue-send! live "live pong"
-                                            (fn [active]
-                                              (.sendPong ^WebSocket active (ByteBuffer/wrap copy)))))))
-        (.request socket 1)
+          (socket-event!
+           live socket generation false
+           (fn []
+             (let [completion (enqueue-send! live "live pong"
+                                             (fn [active]
+                                               (.sendPong ^WebSocket active (ByteBuffer/wrap copy))))]
+               (.whenComplete
+                ^CompletableFuture completion
+                (bi-consumer
+                 (fn [_ error]
+                   (when-not error
+                     (when-not (dispatch! live #(when (current-socket? live socket generation)
+                                                  (.request ^WebSocket socket 1)))
+                       (.abort ^WebSocket socket))))))))))
         (CompletableFuture/completedFuture nil))
-      (onPong [socket _] (.request socket 1) (CompletableFuture/completedFuture nil))
+      (onPong [socket _]
+        (socket-event! live socket generation true (constantly nil))
+        (CompletableFuture/completedFuture nil))
       (onClose [socket code reason]
         (dispatch! live #(when (and (= generation (:generation @(:state live)))
                                     (identical? socket (:socket @(:state live))))
@@ -394,7 +522,11 @@
                                              (swap! (:state live) assoc
                                                     :socket socket
                                                     :query-version 0
-                                                    :remote-version (version-zero))
+                                                    :remote-version (version-zero)
+                                                    ;; A completed RFC 6455 handshake is healthy
+                                                    ;; transport traffic, so old failure delay must
+                                                    ;; not leak into this generation.
+                                                    :backoff initial-backoff-ms)
                                              (let [connected @(:state live)]
                                                (send-json!
                                                 live
@@ -407,14 +539,24 @@
                                                   (assoc "maxObservedTimestamp" (:max-ts connected)))))
                                              (modify! live
                                                       (mapv (comp add-message :subscription second)
-                                                            (:subscriptions @(:state live))))))))))))))))
+                                                            (:subscriptions @(:state live))))
+                                             ;; Demand begins only after owner has installed the
+                                             ;; generation and queued Connect/Add writes.
+                                             (.request ^WebSocket socket 1)))))))))))))
 
 (defn- retire! [live reason reconnect?]
-  (let [old (:socket @(:state live))]
+  (let [before @(:state live)
+        old (:socket before)
+        error (send-failure reason)]
+    (when-let [in-flight (:in-flight before)]
+      (.cancel ^CompletableFuture (:transport in-flight) true)
+      (fail-completion! (:pending in-flight) error))
+    (loop []
+      (when-let [pending (.pollFirst ^ArrayDeque (:pending-sends before))]
+        (fail-completion! pending error)
+        (recur)))
     (swap! (:state live)
            (fn [state]
-             (when-let [in-flight (:in-flight state)] (.cancel ^CompletableFuture in-flight true))
-             (.clear ^ArrayDeque (:pending-sends state))
              (-> state
                  (assoc :socket nil :in-flight nil :query-version 0 :remote-version (version-zero)
                         :last-close-reason reason)
@@ -426,10 +568,15 @@
       (increase-backoff! live))))
 
 (defn live-client [url]
-  (let [owner (Executors/newSingleThreadExecutor
-               (reify ThreadFactory
-                 (newThread [_ task]
-                   (doto (Thread. task "convex-clojure-live") (.setDaemon true)))))
+  (let [thread-factory (reify ThreadFactory
+                         (newThread [_ task]
+                           (doto (Thread. task "convex-clojure-live") (.setDaemon true))))
+        ;; Executors/newSingleThreadExecutor hides an unbounded LinkedBlockingQueue.
+        ;; Demand-gated callbacks should keep this queue near zero, while the hard
+        ;; capacity makes a future regression fail closed instead of growing memory.
+        owner (ThreadPoolExecutor. 1 1 0 TimeUnit/MILLISECONDS
+                                   (ArrayBlockingQueue. max-owner-events)
+                                   thread-factory (ThreadPoolExecutor$AbortPolicy.))
         scheduler (Executors/newSingleThreadScheduledExecutor
                    (reify ThreadFactory
                      (newThread [_ task]
@@ -443,41 +590,70 @@
                          :last-close-reason "InitialConnect" :max-ts nil
                          :backoff initial-backoff-ms :generation 0 :subscriptions (sorted-map)}))))
 
+(defn- await-send! [completion]
+  (try
+    (.get ^CompletableFuture completion 5 TimeUnit/SECONDS)
+    (catch ExecutionException error
+      (throw (unwrap-error error)))
+    (catch TimeoutException error
+      (throw (failure :transport "timed out waiting for Live write completion"
+                      {:cause error})))))
+
 (defn subscribe [live path args]
   (when-not (and (string? path) (seq path))
     (throw (failure :protocol "Convex function path is required")))
   (when-not (map? args)
     (throw (failure :protocol "Convex arguments must be a named JSON object")))
-  (on-owner live
-            (fn []
-              (when (:closed @(:state live)) (throw (failure :closed "Convex Live client is closed")))
-              (let [id (:next-id @(:state live))
-                    subscription (->Subscription live id path args (delivery-queue) (atom true))]
-                (swap! (:state live) (fn [state] (-> state
-                                                     (update :next-id inc)
-                                                     (assoc-in [:subscriptions id]
-                                                               {:subscription subscription :last nil}))))
-                (if (:socket @(:state live))
-                  (modify! live [(add-message subscription)])
-                  (schedule-reconnect! live 0))
-                subscription))))
+  (let [{:keys [subscription completion]}
+        (on-owner live
+                  (fn []
+                    (when (:closed @(:state live))
+                      (throw (failure :closed "Convex Live client is closed")))
+                    (let [id (:next-id @(:state live))
+                          subscription (->Subscription live id path args
+                                                       (delivery-queue) (atom true))
+                          _ (swap! (:state live)
+                                   (fn [state]
+                                     (-> state
+                                         (update :next-id inc)
+                                         (assoc-in [:subscriptions id]
+                                                   {:subscription subscription :last nil}))))
+                          completion (if (:socket @(:state live))
+                                       (modify! live [(add-message subscription)])
+                                       (do (schedule-reconnect! live 0) (completed-future)))]
+                      {:subscription subscription :completion completion})))]
+    (try
+      (await-send! completion)
+      subscription
+      (catch Throwable error
+        (reset! (:active subscription) false)
+        (on-owner live #(do
+                          (swap! (:state live) update :subscriptions dissoc (:id subscription))
+                          (.close ^DeliveryQueue (:delivery subscription))))
+        (throw error)))))
 
 (defn unsubscribe! [live subscription]
   (when (compare-and-set! (:active subscription) true false)
-    (on-owner live
-              (fn []
-                ;; The generation becomes inactive before this barrier returns.
-                (let [removed (get-in @(:state live) [:subscriptions (:id subscription)])]
-                  (swap! (:state live) update :subscriptions dissoc (:id subscription))
-                  (.close ^DeliveryQueue (:delivery subscription))
-                  (when (and removed (:socket @(:state live)))
-                    (modify! live [{"type" "Remove" "queryId" (:id subscription)}]))
-                  (when (empty? (:subscriptions @(:state live)))
-                    (cancel-reconnect! live)
-                    (when-let [handshake (:handshake @(:state live))]
-                      (swap! (:state live) update :generation inc)
-                      (.cancel ^CompletableFuture handshake true)
-                      (swap! (:state live) assoc :handshake nil)))))))
+    (let [completion
+          (on-owner live
+                    (fn []
+                      ;; Invalidation precedes both the relay barrier and the
+                      ;; transport completion returned to the controller.
+                      (let [removed (get-in @(:state live) [:subscriptions (:id subscription)])
+                            _ (swap! (:state live) update :subscriptions dissoc (:id subscription))
+                            _ (.close ^DeliveryQueue (:delivery subscription))
+                            completion (if (and removed (:socket @(:state live)))
+                                         (modify! live [{"type" "Remove"
+                                                         "queryId" (:id subscription)}])
+                                         (completed-future))]
+                        (when (empty? (:subscriptions @(:state live)))
+                          (cancel-reconnect! live)
+                          (when-let [handshake (:handshake @(:state live))]
+                            (swap! (:state live) update :generation inc)
+                            (.cancel ^CompletableFuture handshake true)
+                            (swap! (:state live) assoc :handshake nil)))
+                        completion)))]
+      (await-send! completion)))
   true)
 
 (defn debug-disconnect! [live]
@@ -497,11 +673,10 @@
                 (fn []
                   (when-not (:closed @(:state live))
                     (swap! (:state live) assoc :closed true)
-                    (swap! (:state live) update :generation inc)
                     (cancel-reconnect! live)
                     (when-let [handshake (:handshake @(:state live))]
                       (.cancel ^CompletableFuture handshake true))
-                    (when-let [socket (:socket @(:state live))] (.abort ^WebSocket socket))
+                    (retire! live "client closed" false)
                     (doseq [[_ entry] (:subscriptions @(:state live))]
                       (reset! (:active (:subscription entry)) false)
                       (.close ^DeliveryQueue (:delivery (:subscription entry))))

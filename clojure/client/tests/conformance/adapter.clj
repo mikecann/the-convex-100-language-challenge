@@ -4,11 +4,14 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as string]
             [convex.client :as convex])
-  (:import [java.io BufferedReader InputStreamReader OutputStreamWriter PrintWriter]
+  (:import [java.io BufferedInputStream ByteArrayOutputStream InputStream OutputStreamWriter PrintWriter]
            [java.net InetAddress InetSocketAddress ServerSocket]
-           [java.nio.charset StandardCharsets]
+           [java.nio ByteBuffer]
+           [java.nio.charset CodingErrorAction StandardCharsets]
            [java.util.concurrent ConcurrentHashMap TimeUnit]
            [java.util.concurrent.atomic AtomicLong]))
+
+(def ^:private max-command-bytes (* 1024 1024))
 
 (def before-publish-hook (atom nil))
 (def inside-publication-lock-hook (atom nil))
@@ -109,8 +112,36 @@
 
 (defn- ack [id] {"type" "ack" "id" id})
 
+(defn- decode-command-line [^ByteArrayOutputStream bytes]
+  (try
+    (let [decoder (doto (.newDecoder StandardCharsets/UTF_8)
+                    (.onMalformedInput CodingErrorAction/REPORT)
+                    (.onUnmappableCharacter CodingErrorAction/REPORT))
+          decoded (str (.decode decoder (ByteBuffer/wrap (.toByteArray bytes))))]
+      (if (.endsWith decoded "\r")
+        (subs decoded 0 (dec (count decoded)))
+        decoded))
+    (catch java.nio.charset.CharacterCodingException error
+      (throw (ex-info "adapter command is not valid UTF-8"
+                      {:kind :protocol :cause error})))))
+
+(defn- read-command-line! [^InputStream input]
+  ;; BufferedReader.readLine grows until newline. A hostile controller could
+  ;; therefore allocate tens of megabytes before JSON decoding gets a chance to
+  ;; reject anything. Count encoded bytes first and fail the connection at 1 MiB.
+  (let [bytes (ByteArrayOutputStream. 8192)]
+    (loop []
+      (let [byte (.read input)]
+        (cond
+          (= -1 byte) (when (pos? (.size bytes)) (decode-command-line bytes))
+          (= 10 byte) (decode-command-line bytes)
+          (>= (.size bytes) max-command-bytes)
+          (throw (ex-info (str "adapter command exceeds " max-command-bytes " encoded bytes")
+                          {:kind :protocol :fatal true}))
+          :else (do (.write bytes byte) (recur)))))))
+
 (defn run-adapter! [input output deployment]
-  (let [reader (BufferedReader. (InputStreamReader. input StandardCharsets/UTF_8))
+  (let [reader (BufferedInputStream. input 8192)
         out (writer output)
         client (atom nil)
         registrations (ConcurrentHashMap.)
@@ -188,9 +219,16 @@
                   (throw (ex-info (str "unknown operation " operation) {:kind :protocol})))))]
       (try
         (loop []
-          (when-let [line (.readLine reader)]
-            (if (string/blank? line)
-              (recur)
+          (let [line (try
+                       (read-command-line! reader)
+                       (catch clojure.lang.ExceptionInfo error
+                         (write-event! out (error-event nil nil error))
+                         ::fatal-input))]
+            (cond
+              (nil? line) nil
+              (= ::fatal-input line) nil
+              (string/blank? line) (recur)
+              :else
               (let [command (try
                               (json/read-str line)
                               (catch Exception error
@@ -198,16 +236,16 @@
                                               (error-event nil nil
                                                            (ex-info (str "decode command: " (.getMessage error))
                                                                     {:kind :protocol})))
-                                nil))]
-                (let [stop? (if command
-                              (try
-                                (process! command)
-                                (catch Throwable error
-                                  ;; Per-command failures retain correlation and the stream continues.
-                                  (write-event! out (error-event (get command "id") nil error))
-                                  false))
-                              false)]
-                  (when-not stop? (recur)))))))
+                                nil))
+                    stop? (if command
+                            (try
+                              (process! command)
+                              (catch Throwable error
+                                ;; Per-command failures retain correlation and the stream continues.
+                                (write-event! out (error-event (get command "id") nil error))
+                                false))
+                            false)]
+                (when-not stop? (recur))))))
         (finally
           (doseq [registration (iterator-seq (.iterator (.values registrations)))]
             (.close ^java.lang.AutoCloseable (:subscription registration)))
