@@ -7,7 +7,7 @@ implementation:
   status: attempting
   provenance: native
   version: 0.1.0
-  notes: Native Swift Foundation HTTP and URLSessionWebSocketTask client. Capability badges remain empty until root-owned conformance evidence passes.
+  notes: Native Swift Foundation HTTP and SwiftNIO WebSocket client through WebSocketKit 2.15.0. Capability badges remain empty until root-owned conformance evidence passes.
 toolchain:
   name: Swift
   version: 6.1.2
