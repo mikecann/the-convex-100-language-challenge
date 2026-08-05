@@ -1,21 +1,175 @@
 #include "convex.h"
-#include <curl/curl.h>
 #include <arpa/inet.h>
-#include <errno.h>
+#include <curl/curl.h>
 #include <json-c/json.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-static void emit(json_object *v, FILE *out) { fputs(json_object_to_json_string_ext(v,JSON_C_TO_STRING_PLAIN),out); fputc('\n',out); fflush(out); json_object_put(v); }
-static void error_event(FILE *out,const char *id,convex_error *e){ json_object *v=json_object_new_object(),*x=json_object_new_object(); json_object_object_add(v,"type",json_object_new_string("error")); if(id&&*id)json_object_object_add(v,"id",json_object_new_string(id)); json_object_object_add(x,"name",json_object_new_string(e->name?e->name:"Error"));json_object_object_add(x,"message",json_object_new_string(e->message?e->message:"unknown error")); if(e->data)json_object_object_add(x,"data",json_object_get(e->data));json_object_object_add(v,"error",x);emit(v,out); }
-static void serve(FILE *in,FILE *out){ char line[2097153]; convex_client *client=NULL; while(fgets(line,sizeof(line),in)){ json_object *cmd=json_tokener_parse(line),*field=NULL; const char *id="",*op=""; if(!cmd){convex_error e={0};e.name=strdup("ProtocolError");e.message=strdup("malformed adapter command");error_event(out,"",&e);convex_error_free(&e);continue;} if(json_object_object_get_ex(cmd,"id",&field))id=json_object_get_string(field); if(json_object_object_get_ex(cmd,"op",&field))op=json_object_get_string(field);
-    if(!strcmp(op,"hello")){json_object *v=json_object_new_object();json_object_object_add(v,"protocolVersion",json_object_new_int(1));json_object_object_add(v,"id",json_object_new_string(id));json_object_object_add(v,"type",json_object_new_string("ready"));json_object_object_add(v,"language",json_object_new_string("c"));json_object_object_add(v,"implementation",json_object_new_string("native-c-libcurl-json-c"));json_object_object_add(v,"runtime",json_object_new_string("C17"));emit(v,out);
-    } else if(!strcmp(op,"setAuth")){json_object *token=NULL;json_object_object_get_ex(cmd,"token",&token);convex_error e={0}; if(!client)client=convex_new(getenv("CONVEX_URL"),"c-0.1.0",&e); if(client&&convex_set_auth(client,token?json_object_get_string(token):"",&e)){json_object *v=json_object_new_object();json_object_object_add(v,"id",json_object_new_string(id));json_object_object_add(v,"type",json_object_new_string("ack"));emit(v,out);}else error_event(out,id,&e);convex_error_free(&e);
-    } else if(!strcmp(op,"query")||!strcmp(op,"mutation")||!strcmp(op,"action")){json_object *path=NULL,*args=NULL;json_object_object_get_ex(cmd,"path",&path);json_object_object_get_ex(cmd,"args",&args);convex_error e={0};convex_result r={0};if(!client)client=convex_new(getenv("CONVEX_URL"),"c-0.1.0",&e);if(client&&convex_call(client,op,path?json_object_get_string(path):"",args,&r,&e)){json_object *v=json_object_new_object();json_object_object_add(v,"id",json_object_new_string(id));json_object_object_add(v,"type",json_object_new_string("result"));json_object_object_add(v,"value",r.value);r.value=NULL;if(r.logs){json_object_object_add(v,"logs",r.logs);r.logs=NULL;}emit(v,out);}else error_event(out,id,&e);convex_result_free(&r);convex_error_free(&e);
-    } else if(!strcmp(op,"close")){json_object *v=json_object_new_object();json_object_object_add(v,"id",json_object_new_string(id));json_object_object_add(v,"type",json_object_new_string("closed"));emit(v,out);json_object_put(cmd);break;
-    } else {convex_error e={0};e.name=strdup("ProtocolError");e.message=strdup("unsupported adapter operation");error_event(out,id,&e);convex_error_free(&e);} json_object_put(cmd); } convex_free(client); }
-int main(void){curl_global_init(CURL_GLOBAL_DEFAULT); const char *address=getenv("ADAPTER_LISTEN"); if(!address||!*address){serve(stdin,stdout);return 0;} char *copy=strdup(address),*colon=strrchr(copy,':');int port=colon?atoi(colon+1):0;int fd=socket(AF_INET,SOCK_STREAM,0),yes=1;setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));struct sockaddr_in a={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_ANY),.sin_port=htons(port)};if(bind(fd,(struct sockaddr*)&a,sizeof(a))||listen(fd,1)){perror("adapter listen");return 1;}int peer=accept(fd,NULL,NULL);FILE *io=fdopen(peer,"r+");serve(io,io);fclose(io);close(fd);free(copy);return 0;}
+typedef struct {
+  FILE *stream;
+  pthread_mutex_t mutex;
+} adapter_output;
+
+typedef struct adapter_subscription {
+  char *id;
+  convex_subscription *subscription;
+  pthread_t thread;
+  adapter_output *output;
+  struct adapter_subscription *next;
+} adapter_subscription;
+
+static char *copy_string(const char *value) {
+  size_t length = strlen(value) + 1;
+  char *copy = malloc(length);
+  if (copy) memcpy(copy, value, length);
+  return copy;
+}
+
+static void emit(adapter_output *output, json_object *event) {
+  pthread_mutex_lock(&output->mutex);
+  fputs(json_object_to_json_string_ext(event, JSON_C_TO_STRING_PLAIN), output->stream);
+  fputc('\n', output->stream);
+  fflush(output->stream);
+  pthread_mutex_unlock(&output->mutex);
+  json_object_put(event);
+}
+
+static json_object *error_object(convex_error *error) {
+  json_object *object = json_object_new_object();
+  json_object_object_add(object, "name", json_object_new_string(error->name ? error->name : "Error"));
+  json_object_object_add(object, "message", json_object_new_string(error->message ? error->message : "unknown error"));
+  if (error->data) json_object_object_add(object, "data", json_object_get(error->data));
+  return object;
+}
+
+static void emit_error(adapter_output *output, const char *id,
+                       const char *subscription_id, convex_error *error) {
+  json_object *event = json_object_new_object();
+  if (subscription_id && *subscription_id) {
+    json_object_object_add(event, "type", json_object_new_string("subscription"));
+    json_object_object_add(event, "subscriptionId", json_object_new_string(subscription_id));
+  } else {
+    json_object_object_add(event, "type", json_object_new_string("error"));
+    if (id && *id) json_object_object_add(event, "id", json_object_new_string(id));
+  }
+  json_object_object_add(event, "error", error_object(error));
+  if (error->logs) json_object_object_add(event, "logs", json_object_get(error->logs));
+  emit(output, event);
+}
+
+static void simple_event(adapter_output *output, const char *id, const char *type) {
+  json_object *event = json_object_new_object();
+  json_object_object_add(event, "id", json_object_new_string(id));
+  json_object_object_add(event, "type", json_object_new_string(type));
+  emit(output, event);
+}
+
+static void *forward_updates(void *opaque) {
+  adapter_subscription *record = opaque;
+  convex_update update = {0};
+  while (convex_subscription_next(record->subscription, &update, -1) == 1) {
+    if (update.error.name) {
+      emit_error(record->output, "", record->id, &update.error);
+    } else {
+      json_object *event = json_object_new_object();
+      json_object_object_add(event, "type", json_object_new_string("subscription"));
+      json_object_object_add(event, "subscriptionId", json_object_new_string(record->id));
+      json_object_object_add(event, "value", update.value); update.value = NULL;
+      if (update.logs) { json_object_object_add(event, "logs", update.logs); update.logs = NULL; }
+      emit(record->output, event);
+    }
+    convex_update_free(&update);
+  }
+  return NULL;
+}
+
+static adapter_subscription **find_record(adapter_subscription **head, const char *id) {
+  while (*head && strcmp((*head)->id, id)) head = &(*head)->next;
+  return head;
+}
+
+static int stop_record(adapter_subscription **slot, convex_error *error) {
+  adapter_subscription *record = *slot;
+  if (!record) return 1;
+  if (!convex_unsubscribe(record->subscription, error)) return 0;
+  pthread_join(record->thread, NULL);
+  *slot = record->next;
+  free(record->id);
+  free(record);
+  return 1;
+}
+
+static convex_client *ensure_client(convex_client **client, convex_error *error) {
+  if (*client) return *client;
+  const char *url = getenv("CONVEX_URL");
+  if (!url || !*url) { error->name=copy_string("ProtocolError");error->message=copy_string("CONVEX_URL is required");return NULL; }
+  *client = convex_new(url, "c-0.1.0", error);
+  if (*client && getenv("CONVEX_AUTH_TOKEN")) convex_set_auth(*client, getenv("CONVEX_AUTH_TOKEN"), error);
+  return *client;
+}
+
+static void serve(FILE *input, FILE *stream) {
+  adapter_output output = {.stream = stream};
+  pthread_mutex_init(&output.mutex, NULL);
+  convex_client *client = NULL;
+  adapter_subscription *subscriptions = NULL;
+  char *line = malloc(2097153);
+  while (line && fgets(line, 2097153, input)) {
+    enum json_tokener_error parse_error = json_tokener_success;
+    json_object *command = json_tokener_parse_verbose(line, &parse_error);
+    if (!command || json_object_get_type(command) != json_type_object) {
+      convex_error error = {.name=copy_string("ProtocolError"),.message=copy_string("malformed adapter command")};
+      emit_error(&output, "", "", &error); convex_error_free(&error);
+      if (command) json_object_put(command);
+      continue;
+    }
+    json_object *field = NULL;
+    const char *id = json_object_object_get_ex(command,"id",&field) ? json_object_get_string(field) : "";
+    const char *op = json_object_object_get_ex(command,"op",&field) ? json_object_get_string(field) : "";
+    if (!strcmp(op, "hello")) {
+      json_object *version=NULL;
+      if (!json_object_object_get_ex(command,"protocolVersion",&version) || json_object_get_int(version)!=1) {
+        convex_error error={.name=copy_string("ProtocolError"),.message=copy_string("unsupported adapter protocol version")};emit_error(&output,id,"",&error);convex_error_free(&error);
+      } else {
+        json_object *event=json_object_new_object();json_object_object_add(event,"protocolVersion",json_object_new_int(1));json_object_object_add(event,"id",json_object_new_string(id));json_object_object_add(event,"type",json_object_new_string("ready"));json_object_object_add(event,"language",json_object_new_string("c"));json_object_object_add(event,"implementation",json_object_new_string("native-c17-libcurl-websocket-json-c"));json_object_object_add(event,"runtime",json_object_new_string("C17 musl"));emit(&output,event);
+      }
+    } else if (!strcmp(op,"query") || !strcmp(op,"mutation") || !strcmp(op,"action")) {
+      json_object *path=NULL,*args=NULL;json_object_object_get_ex(command,"path",&path);json_object_object_get_ex(command,"args",&args);convex_error error={0};convex_result result={0};convex_client *active=ensure_client(&client,&error);
+      if(active&&convex_call(active,op,path?json_object_get_string(path):"",args,&result,&error)){json_object *event=json_object_new_object();json_object_object_add(event,"id",json_object_new_string(id));json_object_object_add(event,"type",json_object_new_string("result"));json_object_object_add(event,"value",result.value);result.value=NULL;if(result.logs){json_object_object_add(event,"logs",result.logs);result.logs=NULL;}emit(&output,event);}else emit_error(&output,id,"",&error);convex_result_free(&result);convex_error_free(&error);
+    } else if (!strcmp(op,"setAuth")) {
+      json_object *token=NULL;json_object_object_get_ex(command,"token",&token);convex_error error={0};convex_client *active=ensure_client(&client,&error);if(active&&convex_set_auth(active,token?json_object_get_string(token):"",&error))simple_event(&output,id,"ack");else emit_error(&output,id,"",&error);convex_error_free(&error);
+    } else if (!strcmp(op,"subscribe")) {
+      json_object *sid=NULL,*path=NULL,*args=NULL;json_object_object_get_ex(command,"subscriptionId",&sid);json_object_object_get_ex(command,"path",&path);json_object_object_get_ex(command,"args",&args);const char *subscription_id=sid?json_object_get_string(sid):"";convex_error error={0};convex_client *active=ensure_client(&client,&error);adapter_subscription **old=find_record(&subscriptions,subscription_id);
+      if(*old&&!stop_record(old,&error)){emit_error(&output,id,"",&error);convex_error_free(&error);json_object_put(command);continue;}
+      convex_subscription *subscription=active?convex_subscribe(active,path?json_object_get_string(path):"",args,&error):NULL;
+      if(subscription){adapter_subscription *record=calloc(1,sizeof(*record));record->id=copy_string(subscription_id);record->subscription=subscription;record->output=&output;record->next=subscriptions;subscriptions=record;pthread_create(&record->thread,NULL,forward_updates,record);simple_event(&output,id,"ack");}else emit_error(&output,id,"",&error);convex_error_free(&error);
+    } else if (!strcmp(op,"unsubscribe")) {
+      json_object *sid=NULL;json_object_object_get_ex(command,"subscriptionId",&sid);const char *subscription_id=sid?json_object_get_string(sid):"";convex_error error={0};adapter_subscription **slot=find_record(&subscriptions,subscription_id);if(stop_record(slot,&error))simple_event(&output,id,"ack");else emit_error(&output,id,"",&error);convex_error_free(&error);
+    } else if (!strcmp(op,"debugDisconnect")) {
+      convex_error error={0};convex_client *active=ensure_client(&client,&error);if(active&&convex_debug_disconnect(active,&error))simple_event(&output,id,"ack");else emit_error(&output,id,"",&error);convex_error_free(&error);
+    } else if (!strcmp(op,"close")) {
+      convex_error error={0};while(subscriptions){if(!stop_record(&subscriptions,&error)){emit_error(&output,id,"",&error);convex_error_free(&error);break;}}if(client){convex_close(client,-1,&error);convex_free(client);client=NULL;}simple_event(&output,id,"closed");json_object_put(command);break;
+    } else {
+      convex_error error={.name=copy_string("ProtocolError"),.message=copy_string("unknown adapter operation")};emit_error(&output,id,"",&error);convex_error_free(&error);
+    }
+    json_object_put(command);
+  }
+  convex_error ignored={0};while(subscriptions)stop_record(&subscriptions,&ignored);convex_error_free(&ignored);convex_free(client);free(line);pthread_mutex_destroy(&output.mutex);
+}
+
+int main(void) {
+  curl_global_init(CURL_GLOBAL_DEFAULT);
+  const char *address = getenv("ADAPTER_LISTEN");
+  if (!address || !*address) { serve(stdin, stdout); return 0; }
+  char *copy=copy_string(address),*colon=strrchr(copy,':');int port=colon?atoi(colon+1):0;
+  int listener=socket(AF_INET,SOCK_STREAM,0),yes=1;setsockopt(listener,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));
+  struct sockaddr_in local={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_ANY),.sin_port=htons(port)};
+  if(bind(listener,(struct sockaddr*)&local,sizeof(local))||listen(listener,1)){perror("adapter listen");free(copy);return 1;}
+  int peer=accept(listener,NULL,NULL);FILE *input=fdopen(dup(peer),"r"),*output=fdopen(peer,"w");
+  serve(input,output);fclose(input);fclose(output);close(listener);free(copy);return 0;
+}

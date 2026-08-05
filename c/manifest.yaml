@@ -7,7 +7,7 @@ implementation:
   status: attempting
   provenance: native
   version: 0.1.0
-  notes: Native C implementation of the documented HTTP Functions API using libcurl for TLS and json-c for JSON.
+  notes: Native C implementation of documented HTTP functions and the pinned sync profile using libcurl for HTTP, TLS, and WebSocket transport plus json-c for JSON.
 toolchain:
   name: GCC
   version: 14.2.0
@@ -17,12 +17,17 @@ syncProfile:
   endpoint: /api/sync
 intendedCapabilities:
   - http
+  - live
 platforms:
   - linux/amd64
 adapter:
   protocolVersion: 1
   entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
 limitations:
-  - Live WebSocket synchronization is not implemented yet, so no Live capability is claimed.
-  - HTTP calls support JSON values and bearer-token replacement; cancellation and streaming responses are deferred.
+  - Live authentication, optimistic updates, WebSocket mutations, and WebSocket actions are deferred.
+  - Live values cover the JSON-safe subset; tagged Convex value types are deferred.
+  - TransitionChunk assembly is deferred and treated as protocol drift that reconnects.
+  - Each subscription retains the newest 16 updates and drops the oldest value when its consumer is slow.
 capabilities: []
