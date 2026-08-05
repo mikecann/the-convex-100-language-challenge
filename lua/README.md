@@ -26,7 +26,7 @@ client or CLI.
 ## Basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.lua -->
-```text
+```lua
 #!/usr/local/bin/lua
 package.path = (os.getenv("CONVEX_CLIENT_PATH") or "./client") .. "/?.lua;" .. package.path
 local Convex = require("convex")
