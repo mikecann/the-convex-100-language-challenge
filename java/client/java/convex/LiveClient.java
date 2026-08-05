@@ -199,7 +199,10 @@ public final class LiveClient implements AutoCloseable, WebSocket.Listener {
     connectionCount++;
     lastCloseReason = "DebugDisconnect";
     resetRemoteState();
-    scheduleReconnect(0);
+    // Give an in-flight external mutation a chance to commit before the restored
+    // query publishes its first value. This is the normal initial transport
+    // backoff, not a special retry loop that could hide a broken connection.
+    scheduleReconnect(reconnectBackoffMillis);
   }
 
   private void disconnect(String reason, boolean reconnect) {

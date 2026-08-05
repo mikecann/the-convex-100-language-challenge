@@ -12,6 +12,8 @@ import java.time.Duration;
 import java.util.Base64;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** Focused buffering and real WebSocket reconnect/resubscribe checks. */
 public final class LiveClientTest {
@@ -33,22 +35,34 @@ public final class LiveClientTest {
   private static void reconnectRestoresActiveQuery() throws Exception {
     try (ServerSocket listener = new ServerSocket(0)) {
       Throwable[] serverFailure = new Throwable[1];
+      AtomicLong disconnectNanos = new AtomicLong();
+      AtomicLong reconnectDelayMillis = new AtomicLong();
       Thread server = new Thread(() -> {
         try {
           serveConnection(listener.accept(), 0, 0);
-          serveConnection(listener.accept(), 1, 1);
+          Socket restored = listener.accept();
+          long delayMillis = TimeUnit.NANOSECONDS.toMillis(
+            System.nanoTime() - disconnectNanos.get());
+          reconnectDelayMillis.set(delayMillis);
+
+          // Model the harness race: the external mutation becomes visible after
+          // 75 ms. An immediate reconnect therefore restores stale count 0,
+          // while the normal 100 ms backoff restores the changed count 1.
+          serveConnection(restored, 1, delayMillis >= 75 ? 1 : 0);
         } catch (Throwable error) { serverFailure[0] = error; }
       }, "fake-convex-sync");
       server.start();
       try (LiveClient live = new LiveClient("http://127.0.0.1:" + listener.getLocalPort());
            LiveClient.Subscription subscription = live.subscribe("demo:state", ConvexClient.JSON.createObjectNode().put("room", "reconnect"))) {
         check(subscription.next(Duration.ofSeconds(3)).path("count").asInt() == 0, "missing initial transition");
+        disconnectNanos.set(System.nanoTime());
         live.debugDisconnect();
         check(subscription.next(Duration.ofSeconds(3)).path("count").asInt() == 1, "missing post-reconnect transition");
       }
       server.join(3_000);
       check(!server.isAlive(), "fake sync server did not finish");
       if (serverFailure[0] != null) throw new AssertionError("fake sync server failed", serverFailure[0]);
+      check(reconnectDelayMillis.get() >= 75, "debug disconnect bypassed normal reconnect backoff");
     }
   }
 
