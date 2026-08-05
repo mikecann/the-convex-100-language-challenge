@@ -155,7 +155,7 @@ defmodule Convex.Live do
 
   def handle_call(:debug_disconnect, _from, state) do
     :ok = :gun.close(state.connection)
-    {:reply, :ok, disconnected_state(state, "DebugDisconnect") |> schedule_reconnect(0)}
+    {:reply, :ok, debug_disconnected_state(state)}
   end
 
   def handle_call(:close, _from, state) do
@@ -417,6 +417,18 @@ defmodule Convex.Live do
         remote_version: @zero_version,
         websocket_ref: nil
     }
+  end
+
+  # The adapter acknowledges the forced transport break before its controller
+  # performs the external mutation. Use the same short backoff as a real Gun
+  # disconnect so a restored query does not race ahead and queue a stale value.
+  defp debug_disconnected_state(state) do
+    disconnected_state(state, "DebugDisconnect") |> schedule_reconnect()
+  end
+
+  if Mix.env() == :test do
+    @doc false
+    def debug_disconnected_state_for_test(state), do: debug_disconnected_state(state)
   end
 
   defp publish_protocol_error(state, error) do

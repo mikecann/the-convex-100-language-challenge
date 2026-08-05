@@ -62,6 +62,27 @@ defmodule Convex.LiveTest do
     assert tls_options[:server_name_indication] == ~c"example.convex.cloud"
   end
 
+  test "adapter-forced disconnect keeps the normal reconnect backoff" do
+    state =
+      live_state(make_ref())
+      |> Map.merge(%{
+        connection: self(),
+        reconnect_timer: nil,
+        websocket_ref: make_ref()
+      })
+
+    disconnected = Live.debug_disconnected_state_for_test(state)
+    remaining = Process.read_timer(disconnected.reconnect_timer)
+
+    assert is_integer(remaining)
+    assert remaining > 0
+    assert remaining <= 100
+    assert disconnected.connection == nil
+    assert disconnected.connection_count == 1
+
+    Process.cancel_timer(disconnected.reconnect_timer)
+  end
+
   defp live_state(reference) do
     %{
       active: %{
