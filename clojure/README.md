@@ -21,17 +21,23 @@ The [canonical basic example](examples/basics/main.clj) performs a unique room's
 (ns main
   (:gen-class)
   (:require [convex.client :as convex])
-  (:import [java.util UUID]))
+  (:import [java.math BigDecimal]
+           [java.util UUID]))
 
 (defn- count-of [state operation]
   (let [count (get state "count")]
     ;; Convex JSON may encode a whole count as 0 or 0.0. Validate before
     ;; normalising so a fractional or non-finite value cannot be hidden.
-    (when-not (and (number? count)
-                   (Double/isFinite (double count))
-                   (== (double count) (double (long count))))
-      (throw (ex-info (str operation " did not return a whole count") {})))
-    (long count)))
+    (when-not (number? count)
+      (throw (ex-info (str operation " did not return a numeric count") {})))
+    (let [decimal (try
+                    (bigdec count)
+                    (catch NumberFormatException _ nil))]
+      (when-not (and decimal
+                     (<= (.scale (.stripTrailingZeros ^BigDecimal decimal)) 0)
+                     (<= (bigdec Long/MIN_VALUE) decimal (bigdec Long/MAX_VALUE)))
+        (throw (ex-info (str operation " did not return an in-range whole count") {})))
+      (.longValueExact ^BigDecimal decimal))))
 
 (defn- print-transcript [before initial applied mutation updated]
   (println (str "current count: " before))
@@ -74,8 +80,8 @@ The [canonical basic example](examples/basics/main.clj) performs a unique room's
 
 The client uses the documented JSON HTTP endpoints and the pinned `convex-rs-0.10.4-unversioned-sync` profile. One Clojure actor owns every WebSocket, query-set version, reconnect, and serialized write. The JDK WebSocket is demand-driven: at most one callback is admitted at a time, and the owner's executor has a fixed 64-event queue as a second safety boundary. Reconnect metadata survives generations, backoff resets after a successful WebSocket handshake, and unchanged hydration is suppressed.
 
-The adapter supports partial NDJSON over stdin/stdout and `ADAPTER_LISTEN` TCP, flushes each correlated event, and continues after request errors. It rejects an encoded command line above 1 MiB before allocating the whole line. Replacement, unsubscribe, and the test-only `debugDisconnect` acknowledge only after their generation/relay barriers; replacement and unsubscribe also await the corresponding WebSocket send completion.
+The adapter supports partial NDJSON over stdin/stdout and `ADAPTER_LISTEN` TCP, flushes each correlated event, and continues after request errors. It rejects an encoded command line above 1 MiB before allocating the whole line. Its asynchronous writer has one newest-16, 4 MiB encoded budget across queued and in-flight output, so a stopped reader cannot block Live relays or grow memory without limit. Replacement, unsubscribe, and the test-only `debugDisconnect` acknowledge only after their generation/relay barriers; replacement and unsubscribe also await the corresponding WebSocket send completion.
 
 ## Limitations
 
-The Live profile is experimental and deliberately earns no badge until the shared controller passes locally and against the hosted drift target. Authentication, optimistic updates, transition chunks, journals, and replay are deferred. Each subscription keeps the newest 16 snapshots within a 256 KiB encoded budget; each inbound WebSocket message is limited to 2 MiB.
+The Live profile is experimental and deliberately earns no badge until the shared controller passes locally and against the hosted drift target. Authentication, optimistic updates, transition chunks, journals, and replay are deferred. All subscriptions share one newest-16, 4 MiB encoded delivery budget, and each inbound WebSocket message is limited to 2 MiB. The AOT runtime still includes Clojure's `clojure.lang.Compiler` classes because core namespace loading references them, but it exposes no Clojure or Java compiler command and contains no source or build metadata.

@@ -29,14 +29,14 @@ ADD --checksum=sha256:e864cafd01f4cfb428c79245196bb885a70688bbc15662501efc342b6b
     https://github.com/weavejester/cljfmt/releases/download/0.16.4/cljfmt-0.16.4-standalone.jar \
     /opt/cljfmt.jar
 WORKDIR /work
-COPY client ./client
-COPY examples ./examples
-
 # Maven only resolves the two pinned runtime libraries. Compilation, tests,
 # formatting verification, and entrypoint compilation all stay in this stage.
+COPY client/pom.xml ./client/pom.xml
 RUN cd client \
     && mvn -q dependency:build-classpath -Dmdep.outputFile=/work/classpath \
     && mvn -q dependency:copy-dependencies -DincludeScope=runtime -DoutputDirectory=/work/deps
+COPY client ./client
+COPY examples ./examples
 RUN test "$(uname -m)" = x86_64 \
     && test "$(java -XshowSettings:properties -version 2>&1 | awk '/os.arch =/ { print $3 }')" = amd64
 RUN CP="$(cat /work/classpath):/work/client:/work/client/tests:/work/client/tests/conformance:/work/examples/basics" \
@@ -65,7 +65,7 @@ RUN set -eu; \
         --strip-debug \
         --output /runtime/opt/clojure-jre; \
     rm -f /runtime/opt/clojure-jre/bin/keytool; \
-    mkdir -p /runtime/etc/ssl/certs /runtime/usr/local/lib /runtime/opt/convex/lib /launchers; \
+    mkdir -p /runtime/etc/ssl/certs /runtime/opt/convex/lib /launchers; \
     { \
         ldd /runtime/opt/clojure-jre/bin/java; \
         find /runtime/opt/clojure-jre -type f -name '*.so' -exec ldd '{}' ';'; \
@@ -84,10 +84,10 @@ RUN set -eu; \
         test ! -e "$config" || cp --parents "$config" /runtime; \
     done; \
     printf '%s\n' '#!/bin/sh' \
-      'exec /opt/clojure-jre/bin/java -XX:+PerfDisableSharedMem -cp /opt/convex/lib/*:/opt/convex/adapter-classes adapter "$@"' \
+      'exec /opt/clojure-jre/bin/java -XX:+PerfDisableSharedMem -XX:+UseSerialGC -XX:InitialRAMPercentage=10 -XX:MaxRAMPercentage=55 -cp /opt/convex/lib/*:/opt/convex/adapter-classes adapter "$@"' \
       > /launchers/convex-adapter; \
     printf '%s\n' '#!/bin/sh' \
-      'exec /opt/clojure-jre/bin/java -XX:+PerfDisableSharedMem -cp /opt/convex/lib/*:/opt/convex/example-classes main "$@"' \
+      'exec /opt/clojure-jre/bin/java -XX:+PerfDisableSharedMem -XX:+UseSerialGC -XX:InitialRAMPercentage=10 -XX:MaxRAMPercentage=55 -cp /opt/convex/lib/*:/opt/convex/example-classes main "$@"' \
       > /launchers/convex-example; \
     chmod 0555 /launchers/convex-adapter /launchers/convex-example
 
@@ -98,6 +98,8 @@ FROM --platform=linux/amd64 ${BUSYBOX_IMAGE} AS runtime-base
 RUN set -eu; \
     /bin/busybox find /bin -mindepth 1 ! -name busybox -delete; \
     /bin/busybox find /usr/bin -mindepth 1 -delete; \
+    /bin/busybox rm -rf /etc/network /etc/passwd /etc/group /etc/shadow \
+        /sbin /usr/sbin /usr/libexec /usr/share /usr/local /var /root /home /opt /lib /lib64; \
     /bin/busybox unlink /bin/busybox
 COPY --from=restricted-tools /out/bin/ /bin/
 COPY --from=runtime-rootfs /runtime /

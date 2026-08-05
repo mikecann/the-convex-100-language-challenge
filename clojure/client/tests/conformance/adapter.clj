@@ -4,14 +4,18 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as string]
             [convex.client :as convex])
-  (:import [java.io BufferedInputStream ByteArrayOutputStream InputStream OutputStreamWriter PrintWriter]
+  (:import [java.io BufferedInputStream ByteArrayOutputStream InputStream OutputStream]
            [java.net InetAddress InetSocketAddress ServerSocket]
            [java.nio ByteBuffer]
            [java.nio.charset CodingErrorAction StandardCharsets]
-           [java.util.concurrent ConcurrentHashMap TimeUnit]
+           [java.util ArrayDeque]
+           [java.util.concurrent CompletableFuture ConcurrentHashMap ExecutionException TimeUnit TimeoutException]
            [java.util.concurrent.atomic AtomicLong]))
 
 (def ^:private max-command-bytes (* 1024 1024))
+(def ^:private max-output-count 16)
+(def ^:private max-output-bytes (* 4 1024 1024))
+(def ^:private max-close-output-ms 1000)
 
 (def before-publish-hook (atom nil))
 (def inside-publication-lock-hook (atom nil))
@@ -39,32 +43,124 @@
       (seq subscription-id) (assoc "subscriptionId" subscription-id)
       (seq (:logs data)) (assoc "logs" (vec (:logs data))))))
 
-(defrecord LockedWriter [^PrintWriter output closed]
+(defrecord OutputEnvelope [bytes current? before-check droppable? writing completion terminal?])
+
+(defrecord BoundedWriter [^OutputStream output ^ArrayDeque queue bytes accepting worker]
   java.lang.AutoCloseable
-  (close [_] (reset! closed true)))
+  (close [_] (reset! accepting false)))
 
 (defn- writer [output]
-  (->LockedWriter (PrintWriter. (OutputStreamWriter. output StandardCharsets/UTF_8) true)
-                  (atom false)))
+  (let [writer (->BoundedWriter output (ArrayDeque.) (atom 0) (atom true) (atom nil))
+        worker (doto
+                (Thread.
+                 (fn []
+                   (loop []
+                     (let [envelope
+                           (locking writer
+                             (while (and (.isEmpty ^ArrayDeque (:queue writer)) @(:accepting writer))
+                               (.wait writer))
+                             (when-let [^OutputEnvelope next (.peekFirst ^ArrayDeque (:queue writer))]
+                               (reset! (:writing next) true)
+                               next))]
+                       (when envelope
+                         (try
+                           (.write ^OutputStream (:output writer) ^bytes (:bytes envelope))
+                           (.flush ^OutputStream (:output writer))
+                           (.complete ^CompletableFuture (:completion envelope) nil)
+                           (catch Throwable error
+                             (.completeExceptionally ^CompletableFuture (:completion envelope) error)
+                             (reset! (:accepting writer) false))
+                           (finally
+                             (locking writer
+                               (.removeFirstOccurrence ^ArrayDeque (:queue writer) envelope)
+                               (swap! (:bytes writer) - (alength ^bytes (:bytes envelope)))
+                               (.notifyAll writer))))
+                         (when-not (:terminal? envelope) (recur)))))))
+                 (.setName "convex-clojure-adapter-writer")
+                 (.setDaemon true)
+                 (.start))]
+    (reset! (:worker writer) worker)
+    writer))
+
+(defn- encoded-line [event]
+  (.getBytes (str (json/write-str event) "\n") StandardCharsets/UTF_8))
+
+(defn- remove-oldest-droppable! [writer]
+  (when-let [oldest
+             (first (filter #(and (:droppable? %) (not @(:writing %)))
+                            (iterator-seq (.iterator ^ArrayDeque (:queue writer)))))]
+    (.remove ^ArrayDeque (:queue writer) oldest)
+    (swap! (:bytes writer) - (alength ^bytes (:bytes oldest)))
+    (.complete ^CompletableFuture (:completion oldest) false)
+    true))
+
+(defn- enqueue-event! [writer event current? before-check droppable? terminal?]
+  (let [bytes (encoded-line event)
+        completion (CompletableFuture.)]
+    (locking writer
+      (when before-check (before-check))
+      (if-not (and @(:accepting writer) (current?))
+        (.complete completion false)
+        (do
+          (while (and (or (>= (.size ^ArrayDeque (:queue writer)) max-output-count)
+                          (> (+ @(:bytes writer) (alength bytes)) max-output-bytes))
+                      (remove-oldest-droppable! writer)))
+          (if (or (> (alength bytes) max-output-bytes)
+                  (>= (.size ^ArrayDeque (:queue writer)) max-output-count)
+                  (> (+ @(:bytes writer) (alength bytes)) max-output-bytes))
+            (if droppable?
+              (.complete completion false)
+              (do
+                (reset! (:accepting writer) false)
+                (.completeExceptionally completion
+                                        (ex-info "adapter output budget exhausted"
+                                                 {:kind :transport}))))
+            (let [envelope (->OutputEnvelope bytes current? before-check droppable?
+                                             (atom false) completion terminal?)]
+              (.addLast ^ArrayDeque (:queue writer) envelope)
+              (swap! (:bytes writer) + (alength bytes))
+              (when terminal? (reset! (:accepting writer) false))
+              (.notifyAll writer)))))
+      completion)))
 
 (defn- write-event! [writer event]
-  (locking writer
-    (when-not @(:closed writer)
-      (.println ^PrintWriter (:output writer) (json/write-str event))
-      (.flush ^PrintWriter (:output writer)))))
+  (enqueue-event! writer event (constantly true) nil false false))
 
 (defn- write-if-current! [writer current? before-check event]
-  (locking writer
-    (when before-check (before-check))
-    (when (and (not @(:closed writer)) (current?))
-      (.println ^PrintWriter (:output writer) (json/write-str event))
-      (.flush ^PrintWriter (:output writer)))))
+  (enqueue-event! writer event current? before-check true false))
 
 (defn- close-writer! [writer event]
-  (locking writer
-    (when (compare-and-set! (:closed writer) false true)
-      (.println ^PrintWriter (:output writer) (json/write-str event))
-      (.flush ^PrintWriter (:output writer)))))
+  (let [completion (enqueue-event! writer event (constantly true) nil false true)]
+    ;; Normal close waits for all prior output. A peer that stopped reading can
+    ;; still be released by closing its socket; no producer holds this monitor
+    ;; while the writer thread performs blocking I/O.
+    (try
+      (.get ^CompletableFuture completion max-close-output-ms TimeUnit/MILLISECONDS)
+      (catch TimeoutException _
+        (reset! (:accepting writer) false)
+        false)
+      (catch ExecutionException _ false))))
+
+(defn- await-output! [writer]
+  ;; EOF and fatal-input paths do not have a close event to wait on. Queue a
+  ;; zero-byte barrier so tests and pipe users never observe run-adapter!
+  ;; returning before its final protocol event reaches the stream.
+  (let [completion (CompletableFuture.)
+        barrier (->OutputEnvelope (byte-array 0) (constantly true) nil false
+                                  (atom false) completion false)]
+    (locking writer
+      (while (and (>= (.size ^ArrayDeque (:queue writer)) max-output-count)
+                  (remove-oldest-droppable! writer)))
+      (if (and @(:accepting writer)
+               (< (.size ^ArrayDeque (:queue writer)) max-output-count))
+        (do
+          (.addLast ^ArrayDeque (:queue writer) barrier)
+          (.notifyAll writer))
+        (.complete completion false)))
+    (try
+      (.get completion max-close-output-ms TimeUnit/MILLISECONDS)
+      (catch TimeoutException _ false)
+      (catch ExecutionException _ false))))
 
 (defn- relay! [subscription-id registration registrations writer]
   (doto
@@ -250,7 +346,8 @@
           (doseq [registration (iterator-seq (.iterator (.values registrations)))]
             (.close ^java.lang.AutoCloseable (:subscription registration)))
           (.clear registrations)
-          (when @client (.close ^java.lang.AutoCloseable @client)))))))
+          (when @client (.close ^java.lang.AutoCloseable @client))
+          (await-output! out))))))
 
 (defn parse-listen-address [address]
   (let [split (.lastIndexOf ^String address ":")]

@@ -108,6 +108,90 @@
              (.addAndGet consumed amount)
              amount)))))))
 
+(deftest asynchronous-output-has-one-global-count-and-encoded-byte-budget
+  (let [write-started (CountDownLatch. 1)
+        release-write (CountDownLatch. 1)
+        sink (proxy [java.io.OutputStream] []
+               (write
+                 ([byte-value]
+                  (.countDown write-started)
+                  (.await release-write 3 TimeUnit/SECONDS))
+                 ([buffer offset length]
+                  (.countDown write-started)
+                  (.await release-write 3 TimeUnit/SECONDS))))
+        writer (#'adapter/writer sink)
+        payload (apply str (repeat 250000 "x"))]
+    ;; Hold the real I/O worker after it takes the first event. Producers must
+    ;; remain asynchronous, and the in-flight bytes must still count.
+    (#'adapter/write-if-current! writer (constantly true) nil
+                                 {"type" "subscription" "subscriptionId" "sub"
+                                  "value" {"index" 0 "payload" payload}})
+    (is (.await write-started 3 TimeUnit/SECONDS))
+    (doseq [index (range 1 32)]
+      (#'adapter/write-if-current! writer (constantly true) nil
+                                   {"type" "subscription" "subscriptionId" "sub"
+                                    "value" {"index" index "payload" payload}}))
+    (locking writer
+      (is (= 16 (.size ^java.util.ArrayDeque (:queue writer))))
+      (is (<= @(:bytes writer) (* 4 1024 1024)))
+      ;; The in-flight item cannot be evicted, so the remaining slots contain
+      ;; the newest retained snapshots, including the final publication.
+      (is (string/includes?
+           (String. ^bytes (:bytes (.peekLast ^java.util.ArrayDeque (:queue writer)))
+                    StandardCharsets/UTF_8)
+           "\"index\":31")))
+    (.countDown release-write)
+    (#'adapter/close-writer! writer {"type" "closed" "id" "close"})))
+
+(deftest near-maximum-events-are-bounded-by-encoded-bytes-not-only-count
+  (let [write-started (CountDownLatch. 1)
+        release-write (CountDownLatch. 1)
+        sink (proxy [java.io.OutputStream] []
+               (write
+                 ([byte-value]
+                  (.countDown write-started)
+                  (.await release-write 5 TimeUnit/SECONDS))
+                 ([buffer offset length]
+                  (.countDown write-started)
+                  (.await release-write 5 TimeUnit/SECONDS))))
+        writer (#'adapter/writer sink)
+        payload (apply str (repeat 1900000 "x"))]
+    (doseq [index (range 6)]
+      (#'adapter/write-if-current! writer (constantly true) nil
+                                   {"type" "subscription" "subscriptionId" "sub"
+                                    "value" {"index" index "payload" payload}}))
+    (is (.await write-started 3 TimeUnit/SECONDS))
+    (locking writer
+      (is (= 2 (.size ^java.util.ArrayDeque (:queue writer))))
+      (is (<= @(:bytes writer) (* 4 1024 1024)))
+      (is (string/includes?
+           (String. ^bytes (:bytes (.peekLast ^java.util.ArrayDeque (:queue writer)))
+                    StandardCharsets/UTF_8)
+           "\"index\":5")))
+    (.countDown release-write)
+    (#'adapter/close-writer! writer {"type" "closed" "id" "close"})))
+
+(deftest close-remains-bounded-when-the-controller-stops-reading
+  (let [write-started (CountDownLatch. 1)
+        release-write (CountDownLatch. 1)
+        sink (proxy [java.io.OutputStream] []
+               (write
+                 ([byte-value]
+                  (.countDown write-started)
+                  (.await release-write 10 TimeUnit/SECONDS))
+                 ([buffer offset length]
+                  (.countDown write-started)
+                  (.await release-write 10 TimeUnit/SECONDS))))
+        writer (#'adapter/writer sink)]
+    (#'adapter/write-if-current! writer (constantly true) nil
+                                 {"type" "subscription" "subscriptionId" "sub"
+                                  "value" {"count" 1}})
+    (is (.await write-started 3 TimeUnit/SECONDS))
+    (let [started (System/nanoTime)]
+      (is (false? (#'adapter/close-writer! writer {"type" "closed" "id" "close"})))
+      (is (< (/ (- (System/nanoTime) started) 1000000.0) 1500.0)))
+    (.countDown release-write)))
+
 (deftest command-errors-are-correlated-structured-and-stream-continues
   (let [fixture (http-fixture)]
     (try

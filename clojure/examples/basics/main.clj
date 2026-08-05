@@ -1,17 +1,23 @@
 (ns main
   (:gen-class)
   (:require [convex.client :as convex])
-  (:import [java.util UUID]))
+  (:import [java.math BigDecimal]
+           [java.util UUID]))
 
 (defn- count-of [state operation]
   (let [count (get state "count")]
     ;; Convex JSON may encode a whole count as 0 or 0.0. Validate before
     ;; normalising so a fractional or non-finite value cannot be hidden.
-    (when-not (and (number? count)
-                   (Double/isFinite (double count))
-                   (== (double count) (double (long count))))
-      (throw (ex-info (str operation " did not return a whole count") {})))
-    (long count)))
+    (when-not (number? count)
+      (throw (ex-info (str operation " did not return a numeric count") {})))
+    (let [decimal (try
+                    (bigdec count)
+                    (catch NumberFormatException _ nil))]
+      (when-not (and decimal
+                     (<= (.scale (.stripTrailingZeros ^BigDecimal decimal)) 0)
+                     (<= (bigdec Long/MIN_VALUE) decimal (bigdec Long/MAX_VALUE)))
+        (throw (ex-info (str operation " did not return an in-range whole count") {})))
+      (.longValueExact ^BigDecimal decimal))))
 
 (defn- print-transcript [before initial applied mutation updated]
   (println (str "current count: " before))

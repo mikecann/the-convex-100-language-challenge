@@ -85,3 +85,19 @@
                            (catch clojure.lang.ExceptionInfo failure failure))]
             (is (= :transport (:kind (ex-data error))))))
         (finally (stop-http! fixture))))))
+
+(deftest http-log-lines-must-be-an-array-of-strings
+  (doseq [log-lines [nil "one line" ["ok" 7] {"line" "no"}]]
+    (let [fixture (http-fixture
+                   (fn [_ _]
+                     {:status 200
+                      :body (json/write-str {"status" "success"
+                                             "value" {"count" 1}
+                                             "logLines" log-lines})}))]
+      (try
+        (with-open [client (convex/client (:url fixture))]
+          (let [error (try
+                        (convex/query client "demo:state" {})
+                        (catch clojure.lang.ExceptionInfo failure failure))]
+            (is (= :protocol (:kind (ex-data error))))))
+        (finally (stop-http! fixture))))))

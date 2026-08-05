@@ -163,6 +163,28 @@
                   (is (= {"count" 1} (:value update)))))))))
       (finally (.close fixture)))))
 
+(deftest repeated-query-updates-in-one-transition-publish-only-the-committed-value
+  (let [fixture (ws/fixture
+                 (fn [connection _]
+                   (ws/read-message! connection)
+                   (ws/read-message! connection)
+                   (ws/send-text! connection
+                                  (ws/transition (ws/version 0 0) (ws/version 1 1)
+                                                 (ws/updated 0 {"count" 1})
+                                                 (ws/updated 0 {"count" 2})
+                                                 (ws/updated 0 {"count" 3})))
+                   (Thread/sleep 3000)))]
+    (try
+      (with-open [live (convex/live-client (ws/url fixture))]
+        (let [subscription (convex/subscribe live "demo:state" {})]
+          (is (= {"count" 3} (:value (convex/next-update subscription 3000))))
+          (is (= "timed out waiting for Live update"
+                 (try
+                   (convex/next-update subscription 100)
+                   "unexpected update"
+                   (catch clojure.lang.ExceptionInfo error (.getMessage error)))))))
+      (finally (.close fixture)))))
+
 (deftest debug-disconnect-is-a-generation-barrier-and-deduplicates-hydration
   (let [connections (AtomicInteger. 0)
         fixture (ws/fixture
@@ -257,19 +279,28 @@
 
 (deftest real-live-delivery-is-bounded-by-count-and-bytes
   (let [large (apply str (repeat 20000 "x"))
+        sent (CountDownLatch. 1)
         fixture (ws/fixture
                  (fn [connection _]
                    (ws/read-message! connection)
                    (ws/read-message! connection)
-                   (let [updates (mapv #(ws/updated 0 {"count" % "payload" large}) (range 20))]
+                   (doseq [index (range 20)]
                      (ws/send-text! connection
-                                    (apply ws/transition
-                                           (ws/version 0 0) (ws/version 1 1) updates)))
+                                    (ws/transition (ws/version (if (zero? index) 0 1) index)
+                                                   (ws/version 1 (inc index))
+                                                   (ws/updated 0 {"count" index
+                                                                  "payload" large}))))
+                   (.countDown sent)
                    (Thread/sleep 3000)))]
     (try
       (with-open [live (convex/live-client (ws/url fixture))]
         (let [subscription (convex/subscribe live "demo:state" {})]
-          (await! "bounded queue did not fill" #(>= (.size (:queue (:delivery subscription))) 10))
+          (is (.await sent 5 TimeUnit/SECONDS))
+          (let [budget (:delivery-budget @(:state live))]
+            (await! "bounded queue did not retain the final update"
+                    #(= 19 (get-in (:update
+                                    (.peekLast ^java.util.ArrayDeque (:entries budget)))
+                                   [:value "count"]))))
           (let [first-count (get-in (convex/next-update subscription 1000) [:value "count"])
                 remaining (loop [values []]
                             (if-let [update (try (convex/next-update subscription 50)
@@ -280,6 +311,57 @@
             (is (= 19 (last remaining)))
             (is (<= (+ 1 (count remaining)) 16)))))
       (finally (.close fixture)))))
+
+(deftest delivery-budget-is-global-across-subscriptions
+  (let [large (apply str (repeat 220000 "x"))
+        fixture (ws/fixture
+                 (fn [connection _]
+                   (ws/read-message! connection)
+                   (let [first-add (ws/read-message! connection)
+                         modifications (get first-add "modifications")
+                         all-adds (if (= 2 (count modifications))
+                                    modifications
+                                    (into modifications
+                                          (get (ws/read-message! connection) "modifications")))]
+                     (ensure= "both subscriptions reached the Live query set"
+                              2 (count all-adds)))
+                   (doseq [index (range 20)]
+                     (ws/send-text! connection
+                                    (ws/transition (ws/version (if (zero? index) 0 2) index)
+                                                   (ws/version 2 (inc index))
+                                                   (ws/updated 0 {"count" index "payload" large})
+                                                   (ws/updated 1 {"count" index "payload" large}))))
+                   (Thread/sleep 3000)))]
+    (try
+      (with-open [live (convex/live-client (ws/url fixture))]
+        (let [first-subscription (convex/subscribe live "demo:first" {})
+              second-subscription (convex/subscribe live "demo:second" {})
+              budget (:delivery-budget @(:state live))]
+          (await! "global delivery budget did not retain the newest values"
+                  #(= 19 (get-in (:update (.peekLast ^java.util.ArrayDeque (:entries budget)))
+                                 [:value "count"])))
+          (is (<= @(:count budget) 16))
+          (is (<= @(:bytes budget) (* 4 1024 1024)))
+          (let [drain-last (fn [subscription]
+                             (loop [last-value nil]
+                               (if-let [update (try
+                                                 (convex/next-update subscription 50)
+                                                 (catch clojure.lang.ExceptionInfo _ nil))]
+                                 (recur (get-in update [:value "count"]))
+                                 last-value)))]
+            (is (= 19 (drain-last first-subscription)))
+            (is (= 19 (drain-last second-subscription))))))
+      (finally (.close fixture)))))
+
+(deftest closed-delivery-queues-release-the-global-budget-index
+  (let [budget (#'convex/delivery-budget)]
+    (dotimes [index 100]
+      (let [delivery (#'convex/delivery-queue budget)]
+        (#'convex/offer-update! delivery {:value {"count" index}})
+        (.close ^java.lang.AutoCloseable delivery)))
+    (is (zero? @(:count budget)))
+    (is (zero? @(:bytes budget)))
+    (is (.isEmpty ^java.util.ArrayDeque (:entries budget)))))
 
 (deftest twenty-thousand-callbacks-use-demand-and-a-bounded-owner-queue
   (let [callback-count 20000

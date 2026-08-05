@@ -13,7 +13,7 @@
 
 (def ^:private max-http-bytes (* 2 1024 1024))
 (def ^:private max-update-count 16)
-(def ^:private max-update-bytes (* 256 1024))
+(def ^:private max-update-bytes (* 4 1024 1024))
 (def ^:private max-owner-events 64)
 (def ^:private max-pending-sends 64)
 (def ^:private max-live-message-bytes (* 2 1024 1024))
@@ -99,7 +99,11 @@
                       (throw (failure :transport
                                       (str "HTTP " (.statusCode response) " returned non-Convex JSON")
                                       {:operation operation :cause error}))))
-          logs (vec (get decoded "logLines" []))]
+          raw-logs (get decoded "logLines" [])
+          _ (when-not (and (vector? raw-logs) (every? string? raw-logs))
+              (throw (failure :protocol "HTTP response logLines must be an array of strings"
+                              {:operation operation})))
+          logs raw-logs]
       (case (get decoded "status")
         "success" (if (contains? decoded "value")
                     {:value (get decoded "value") :logs logs}
@@ -113,39 +117,64 @@
 (defn mutation [client path args] (call client "mutation" path args))
 (defn action [client path args] (call client "action" path args))
 
-;; A slow consumer gets recent snapshots, bounded by both count and encoded bytes.
-(defrecord DeliveryQueue [^ArrayBlockingQueue queue sizes bytes]
+;; Every subscription shares one budget. Otherwise many slow subscriptions can
+;; each retain their own allowance and defeat what looks like a bounded client.
+(defrecord DeliveryBudget [entries count bytes])
+(defrecord DeliveryItem [delivery update size active])
+(defrecord DeliveryQueue [^ArrayBlockingQueue queue budget]
   java.lang.AutoCloseable
-  (close [_] (.clear queue) (reset! sizes clojure.lang.PersistentQueue/EMPTY) (reset! bytes 0)))
+  (close [this]
+    (locking budget
+      (doseq [^DeliveryItem item (iterator-seq (.iterator queue))]
+        (when (compare-and-set! (:active item) true false)
+          (.remove ^ArrayDeque (:entries budget) item)
+          (swap! (:count budget) dec)
+          (swap! (:bytes budget) - (:size item))))
+      (.clear queue))))
 
-(defn- delivery-queue [] (->DeliveryQueue (ArrayBlockingQueue. max-update-count)
-                                          (atom clojure.lang.PersistentQueue/EMPTY)
-                                          (atom 0)))
+(defn- delivery-budget []
+  (->DeliveryBudget (ArrayDeque.) (atom 0) (atom 0)))
+
+(defn- delivery-queue [budget]
+  (->DeliveryQueue (ArrayBlockingQueue. max-update-count) budget))
 
 (defn- update-size [update]
   (alength (.getBytes (json/write-str update) StandardCharsets/UTF_8)))
 
 (defn- offer-update! [delivery update]
-  (let [size (update-size update)]
-    (locking delivery
+  (let [size (update-size update)
+        budget (:budget delivery)]
+    (locking budget
       (when (<= size max-update-bytes)
-        (while (or (= max-update-count (.size ^ArrayBlockingQueue (:queue delivery)))
-                   (> (+ @(:bytes delivery) size) max-update-bytes))
-          (.poll ^ArrayBlockingQueue (:queue delivery))
-          (let [removed (peek @(:sizes delivery))]
-            (swap! (:sizes delivery) pop)
-            (swap! (:bytes delivery) - removed)))
-        (.offer ^ArrayBlockingQueue (:queue delivery) update)
-        (swap! (:sizes delivery) conj size)
-        (swap! (:bytes delivery) + size)))))
+        (while (or (= max-update-count @(:count budget))
+                   (> (+ @(:bytes budget) size) max-update-bytes))
+          (when-let [^DeliveryItem oldest (.pollFirst ^ArrayDeque (:entries budget))]
+            (when (compare-and-set! (:active oldest) true false)
+              (.remove ^ArrayBlockingQueue (:queue (:delivery oldest)) oldest)
+              (swap! (:count budget) dec)
+              (swap! (:bytes budget) - (:size oldest)))))
+        (let [item (->DeliveryItem delivery update size (atom true))]
+          (.addLast ^ArrayDeque (:entries budget) item)
+          (.offer ^ArrayBlockingQueue (:queue delivery) item)
+          (swap! (:count budget) inc)
+          (swap! (:bytes budget) + size))))))
 
 (defn- poll-update! [delivery timeout-ms]
-  (when-let [update (.poll ^ArrayBlockingQueue (:queue delivery) timeout-ms TimeUnit/MILLISECONDS)]
-    (locking delivery
-      (when-let [size (peek @(:sizes delivery))]
-        (swap! (:sizes delivery) pop)
-        (swap! (:bytes delivery) - size)))
-    update))
+  (let [deadline (+ (System/nanoTime) (* timeout-ms 1000000))
+        budget (:budget delivery)]
+    (loop []
+      (let [remaining (max 0 (- deadline (System/nanoTime)))
+            ^DeliveryItem item (.poll ^ArrayBlockingQueue (:queue delivery)
+                                      remaining TimeUnit/NANOSECONDS)]
+        (when item
+          (if (compare-and-set! (:active item) true false)
+            (do
+              (locking budget
+                (.remove ^ArrayDeque (:entries budget) item)
+                (swap! (:count budget) dec)
+                (swap! (:bytes budget) - (:size item)))
+              (:update item))
+            (when (pos? (- deadline (System/nanoTime))) (recur))))))))
 
 (declare unsubscribe! close-live! debug-disconnect!)
 
@@ -361,6 +390,11 @@
             (throw (failure :protocol "Transition modifications must be an array")))
         end (valid-version (get message "endVersion"))
         parsed (mapv parse-modification modifications)
+        ;; A transaction may update one query more than once. Commit only its
+        ;; final state so observers never see an intermediate value that was not
+        ;; the transaction's result.
+        parsed-by-id (reduce (fn [latest [id update]] (assoc latest id update))
+                             (sorted-map) parsed)
         staged (reduce
                 (fn [{:keys [subscriptions deliveries] :as result} [id update]]
                   (if-let [entry (get subscriptions id)]
@@ -372,7 +406,7 @@
                          :deliveries (conj deliveries [(:subscription entry) update])}))
                     result))
                 {:subscriptions (:subscriptions state) :deliveries []}
-                (sort-by first parsed))
+                parsed-by-id)
         committed (assoc state
                          :remote-version end
                          :max-ts (get end "ts")
@@ -588,7 +622,9 @@
                          :in-flight nil :closed false :next-id 0 :query-version 0
                          :remote-version (version-zero) :connection-count 0
                          :last-close-reason "InitialConnect" :max-ts nil
-                         :backoff initial-backoff-ms :generation 0 :subscriptions (sorted-map)}))))
+                         :backoff initial-backoff-ms :generation 0
+                         :delivery-budget (delivery-budget)
+                         :subscriptions (sorted-map)}))))
 
 (defn- await-send! [completion]
   (try
@@ -611,7 +647,8 @@
                       (throw (failure :closed "Convex Live client is closed")))
                     (let [id (:next-id @(:state live))
                           subscription (->Subscription live id path args
-                                                       (delivery-queue) (atom true))
+                                                       (delivery-queue (:delivery-budget @(:state live)))
+                                                       (atom true))
                           _ (swap! (:state live)
                                    (fn [state]
                                      (-> state
