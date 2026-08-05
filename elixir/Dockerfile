@@ -29,7 +29,7 @@ COPY client/test ./test
 COPY examples/basics/main_test.exs ./test/example_test.exs
 COPY client/.formatter.exs ./
 
-FROM source AS test
+FROM source AS test-build
 ENV MIX_ENV=test
 RUN mix deps.get
 RUN mix deps.compile castore
@@ -38,7 +38,26 @@ RUN mix deps.compile gun
 RUN mix deps.compile jason
 RUN mix format --check-formatted
 RUN mix compile --warnings-as-errors
-RUN mix test
+# Mix normally compiles `.exs` tests while starting the test runner. That
+# compiler path is unreliable under amd64 QEMU on Apple Silicon, so compile the
+# exact test modules here and persist their portable BEAM bytecode plus a module
+# manifest for the target-platform runner below.
+RUN mix run --no-start -e 'ExUnit.start(autorun: false); output = "_build/test/lib/convex_client/ebin"; modules = Path.wildcard("test/*_test.exs") |> Enum.flat_map(fn path -> Code.compile_file(path) end) |> Enum.map(fn {module, bytecode} -> File.write!(Path.join(output, Atom.to_string(module) <> ".beam"), bytecode); module end); File.write!("_build/test/precompiled_test_modules", :erlang.term_to_binary(modules))'
+
+# BEAM files produced above are architecture-independent. Execute the checks
+# and every ExUnit test again with the pinned target-platform Elixir and ERTS,
+# so an amd64-labelled test image can never contain arm64 test evidence.
+FROM --platform=$TARGETPLATFORM ${ELIXIR_IMAGE} AS test
+WORKDIR /app
+ENV MIX_ENV=test
+ENV ERL_FLAGS="+S 1:1 +SDcpu 1 +SDio 1"
+COPY --from=test-build /app /app
+COPY --from=test-build /root/.mix /root/.mix
+RUN test "$(uname -m)" = "x86_64" && \
+    elixir -e 'architecture = :erlang.system_info(:system_architecture) |> List.to_string(); unless String.starts_with?(architecture, "x86_64"), do: raise("expected x86_64 ERTS, got #{architecture}")'
+RUN mix format --check-formatted
+RUN mix compile --warnings-as-errors
+RUN mix run --no-start --no-compile --no-deps-check -e 'ExUnit.start(autorun: false); modules = "_build/test/precompiled_test_modules" |> File.read!() |> :erlang.binary_to_term([:safe]); Enum.each(modules, &Code.ensure_loaded!/1); results = ExUnit.run(modules); System.halt(if results.failures == 0, do: 0, else: 1)'
 CMD ["/bin/true"]
 
 FROM source AS release-build
