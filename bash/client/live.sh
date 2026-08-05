@@ -17,7 +17,10 @@ LIVE_HANDSHAKE_MAX_BYTES=16384
 declare -Ag LIVE_PATH LIVE_ARGS LIVE_SUB LIVE_QUEUE LIVE_LAST LIVE_REHYDRATE
 
 _byte() { od -An -tu1 | tr -d ' \n'; }
-_write_byte() { printf '%b' "\\$(printf '%03o' "$1")" >&"$LIVE_FD"; }
+_write_byte() {
+	# shellcheck disable=SC2059 # The generated octal escape is the byte format.
+	printf "\\$(printf '%03o' "$1")" >&"$LIVE_FD"
+}
 _ws_url() {
 	local base=${CONVEX_URL%/}
 	printf '%s/api/sync' "${base/http:/ws:}" | sed 's#^https:#wss:#'
@@ -289,6 +292,13 @@ live_read() {
 			echo 'RFC6455 frame exceeds 2 MiB' >&2
 			return 2
 		}
+		if ((opcode == 2)); then
+			# Binary messages are outside the pinned Convex JSON profile, but consume
+			# their arbitrary bytes without ever storing NUL in a Bash string.
+			if ((n)); then _read_payload_hex_deadline "$n" "$timeout" || return $?; fi
+			echo 'unsupported RFC6455 opcode 2' >&2
+			return 2
+		fi
 		case $opcode in
 		1)
 			((expect_continuation == 0)) || {

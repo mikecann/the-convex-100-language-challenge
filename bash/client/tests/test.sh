@@ -195,7 +195,7 @@ test $((close_second & 128)) = 128
 
 # Control payloads are arbitrary bytes. Preserve NUL and trailing newline in a
 # Ping/Pong exchange, then reject the following binary data frame cleanly.
-printf '\211\002\000\012\202\000' >"$state/server-binary-control.bin"
+printf '\211\002\000\012\202\002\000\012' >"$state/server-binary-control.bin"
 exec {binary_in}<"$state/server-binary-control.bin"
 exec {binary_out}>"$state/client-binary-control.bin"
 LIVE_IN=$binary_in
@@ -271,7 +271,11 @@ exec {tcp_fd}<>/dev/tcp/127.0.0.1/19090
 send_command() { printf '%s\n' "$1" >&"$tcp_fd"; }
 next_event() {
 	local event
-	IFS= read -r -t 5 event <&"$tcp_fd"
+	if ! IFS= read -r -t 10 event <&"$tcp_fd"; then
+		printf 'adapter event timed out or reached EOF\n' >&2
+		[[ -s $state/adapter.err ]] && sed 's/^/adapter: /' "$state/adapter.err" >&2
+		return 1
+	fi
 	printf '%s\n' "$event"
 }
 next_for_id() {
