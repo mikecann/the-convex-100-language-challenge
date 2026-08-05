@@ -4,5 +4,29 @@ displayName: "Perl"
 rank: 23
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Perl HTTP client and RFC 6455 sync-profile implementation. Capability badges remain empty until coordinator-owned shared evidence passes.
+toolchain:
+  name: Perl
+  version: 5.42.0
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, WebSocket mutations, actions, transition chunk assembly, and full Convex values are deferred.
+  - The experimental sync protocol is pinned and undocumented; it is not a stable SDK contract.
+  - Live delivery uses a bounded newest-16 mailbox per subscription.
 capabilities: []
