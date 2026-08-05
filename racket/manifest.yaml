@@ -4,6 +4,31 @@ displayName: "Racket"
 rank: 88
 selectionTier: curated_backfill
 implementation:
-  status: planned
-  notes: Racket fails before completing version output under the required linux/amd64 Docker target in this worktree; no client source has been added without a runnable toolchain.
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Racket JSON HTTP and RFC 6455 Live client. Capability badges remain empty until root-owned local and hosted conformance pass.
+toolchain:
+  name: Racket BC conservative GC
+  version: "8.10"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Bearer-token replacement and clearing apply to HTTP; Live authentication is deferred.
+  - Live supports the JSON-safe value subset used by this experiment.
+  - WebSocket mutations and actions are deferred in favour of the documented HTTP API.
+  - TransitionChunk assembly is deferred and treated as protocol drift.
+  - Mutation replay, journals, optimistic updates, and lossless extended Convex values are deferred.
 capabilities: []
