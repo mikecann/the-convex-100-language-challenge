@@ -1,23 +1,3 @@
-# Convex from C
-
-A compact native C client that calls Convex functions over its documented JSON HTTP API.
-
-This is educational and unofficial, not a production Convex SDK.
-
-## Start here
-
-[`examples/basics/main.c`](examples/basics/main.c) follows the shared counter from 0 to 1 using a query and an idempotent mutation.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP queries, mutations and actions | Attempting verification |
-| Bearer-token replacement and structured function errors | Attempting verification |
-| Live queries | Not implemented |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.c -->
-```text
 #include "convex.h"
 #include <curl/curl.h>
 #include <stdio.h>
@@ -33,13 +13,3 @@ int main(int argc,char **argv){
   /* Apply one idempotent mutation, with a run key that makes retries safe. */ json_object_object_add(args,"language",json_object_new_string("C"));json_object_object_add(args,"runId",json_object_new_string("basic-example-once"));if(!convex_call(c,"mutation","demo:increment",args,&r,&e))return 1;json_object *applied=NULL,*state=NULL;if(!json_object_object_get_ex(r.value,"applied",&applied)||!json_object_get_boolean(applied)||!json_object_object_get_ex(r.value,"state",&state)||count_of(state)!=1)return 1;printf("mutation applied: true\nmutation count: 1\n");convex_result_free(&r);
   /* Read the resulting value and only print success once the whole journey is proven. */ if(!convex_call(c,"query","demo:state",args,&r,&e)||count_of(r.value)!=1)return 1;printf("live updated count: 1\nverified count: 0 -> 1\n");convex_result_free(&r);json_object_put(args);convex_free(c);return 0;
 }
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-`./run test c` compiles the client and its adapter in Docker. `./run verify-example c` exercises the exact example against the dedicated backend. `./run verify c` is the shared HTTP and Live conformance gate.
-
-## Protocol notes and limits
-
-The adapter speaks NDJSON protocol v1 on stdin/stdout or one `ADAPTER_LISTEN` TCP connection. libcurl supplies ordinary HTTP/TLS transport and json-c supplies JSON parsing; Convex function behavior is implemented here in C. Live synchronization, optimistic updates, cancellation and streaming are deferred.

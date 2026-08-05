@@ -1,0 +1,21 @@
+#include "convex.h"
+#include <curl/curl.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <json-c/json.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static void emit(json_object *v, FILE *out) { fputs(json_object_to_json_string_ext(v,JSON_C_TO_STRING_PLAIN),out); fputc('\n',out); fflush(out); json_object_put(v); }
+static void error_event(FILE *out,const char *id,convex_error *e){ json_object *v=json_object_new_object(),*x=json_object_new_object(); json_object_object_add(v,"type",json_object_new_string("error")); if(id&&*id)json_object_object_add(v,"id",json_object_new_string(id)); json_object_object_add(x,"name",json_object_new_string(e->name?e->name:"Error"));json_object_object_add(x,"message",json_object_new_string(e->message?e->message:"unknown error")); if(e->data)json_object_object_add(x,"data",json_object_get(e->data));json_object_object_add(v,"error",x);emit(v,out); }
+static void serve(FILE *in,FILE *out){ char line[2097153]; convex_client *client=NULL; while(fgets(line,sizeof(line),in)){ json_object *cmd=json_tokener_parse(line),*field=NULL; const char *id="",*op=""; if(!cmd){convex_error e={0};e.name=strdup("ProtocolError");e.message=strdup("malformed adapter command");error_event(out,"",&e);convex_error_free(&e);continue;} if(json_object_object_get_ex(cmd,"id",&field))id=json_object_get_string(field); if(json_object_object_get_ex(cmd,"op",&field))op=json_object_get_string(field);
+    if(!strcmp(op,"hello")){json_object *v=json_object_new_object();json_object_object_add(v,"protocolVersion",json_object_new_int(1));json_object_object_add(v,"id",json_object_new_string(id));json_object_object_add(v,"type",json_object_new_string("ready"));json_object_object_add(v,"language",json_object_new_string("c"));json_object_object_add(v,"implementation",json_object_new_string("native-c-libcurl-json-c"));json_object_object_add(v,"runtime",json_object_new_string("C17"));emit(v,out);
+    } else if(!strcmp(op,"setAuth")){json_object *token=NULL;json_object_object_get_ex(cmd,"token",&token);convex_error e={0}; if(!client)client=convex_new(getenv("CONVEX_URL"),"c-0.1.0",&e); if(client&&convex_set_auth(client,token?json_object_get_string(token):"",&e)){json_object *v=json_object_new_object();json_object_object_add(v,"id",json_object_new_string(id));json_object_object_add(v,"type",json_object_new_string("ack"));emit(v,out);}else error_event(out,id,&e);convex_error_free(&e);
+    } else if(!strcmp(op,"query")||!strcmp(op,"mutation")||!strcmp(op,"action")){json_object *path=NULL,*args=NULL;json_object_object_get_ex(cmd,"path",&path);json_object_object_get_ex(cmd,"args",&args);convex_error e={0};convex_result r={0};if(!client)client=convex_new(getenv("CONVEX_URL"),"c-0.1.0",&e);if(client&&convex_call(client,op,path?json_object_get_string(path):"",args,&r,&e)){json_object *v=json_object_new_object();json_object_object_add(v,"id",json_object_new_string(id));json_object_object_add(v,"type",json_object_new_string("result"));json_object_object_add(v,"value",r.value);r.value=NULL;if(r.logs){json_object_object_add(v,"logs",r.logs);r.logs=NULL;}emit(v,out);}else error_event(out,id,&e);convex_result_free(&r);convex_error_free(&e);
+    } else if(!strcmp(op,"close")){json_object *v=json_object_new_object();json_object_object_add(v,"id",json_object_new_string(id));json_object_object_add(v,"type",json_object_new_string("closed"));emit(v,out);json_object_put(cmd);break;
+    } else {convex_error e={0};e.name=strdup("ProtocolError");e.message=strdup("unsupported adapter operation");error_event(out,id,&e);convex_error_free(&e);} json_object_put(cmd); } convex_free(client); }
+int main(void){curl_global_init(CURL_GLOBAL_DEFAULT); const char *address=getenv("ADAPTER_LISTEN"); if(!address||!*address){serve(stdin,stdout);return 0;} char *copy=strdup(address),*colon=strrchr(copy,':');int port=colon?atoi(colon+1):0;int fd=socket(AF_INET,SOCK_STREAM,0),yes=1;setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));struct sockaddr_in a={.sin_family=AF_INET,.sin_addr.s_addr=htonl(INADDR_ANY),.sin_port=htons(port)};if(bind(fd,(struct sockaddr*)&a,sizeof(a))||listen(fd,1)){perror("adapter listen");return 1;}int peer=accept(fd,NULL,NULL);FILE *io=fdopen(peer,"r+");serve(io,io);fclose(io);close(fd);free(copy);return 0;}

@@ -4,5 +4,25 @@ displayName: "C"
 rank: 10
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native C implementation of the documented HTTP Functions API using libcurl for TLS and json-c for JSON.
+toolchain:
+  name: GCC
+  version: 14.2.0
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+limitations:
+  - Live WebSocket synchronization is not implemented yet, so no Live capability is claimed.
+  - HTTP calls support JSON values and bearer-token replacement; cancellation and streaming responses are deferred.
 capabilities: []
