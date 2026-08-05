@@ -190,4 +190,67 @@ class ConvexLiveManagerTest < Minitest::Test
     assert_equal 2, subscription.next_update(timeout: 3).value.fetch("count")
     subscription.close
   end
+
+  def test_bounded_subscription_queue_has_no_stale_timeout_signal
+    manager = Object.new
+    manager.define_singleton_method(:unsubscribe) { |_query_id| nil }
+    subscription = Convex::Subscription.new(manager, 7)
+
+    # Seventeen rapid values overflow the sixteen-value buffer. Reactive state
+    # keeps the newest sixteen values and drops only the oldest one.
+    17.times do |count|
+      subscription.deliver(Convex::Update.new({ "count" => count }, nil, []))
+    end
+    observed = 16.times.map { subscription.next_update(timeout: 0.1).value.fetch("count") }
+    assert_equal((1..16).to_a, observed)
+
+    started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    assert_raises(Convex::TransportError) { subscription.next_update(timeout: 0.05) }
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+    assert_operator elapsed, :<, 0.5
+  ensure
+    subscription&.close
+  end
+
+  def test_subscription_close_is_harmless_after_client_shutdown
+    @server = FakeSyncServer.new do |server|
+      socket = server.accept
+      server.read_json(socket)
+      add = server.read_json(socket)
+      query_id = add.dig("modifications", 0, "queryId")
+      server.write_json(
+        socket,
+        server.transition(
+          start_query_set: 0,
+          end_query_set: 1,
+          start_ts: "AAAAAAAAAAA=",
+          end_ts: "AQAAAAAAAAA=",
+          query_id: query_id,
+          count: 0
+        )
+      )
+      socket.read(2)
+      socket.close
+    rescue StandardError => error
+      server.record_error(error)
+    end
+
+    @client = Convex::Client.new(@server.url)
+    subscription = @client.subscribe("demo:state", "room" => "close-order")
+    assert_equal 0, subscription.next_update(timeout: 2).value.fetch("count")
+
+    @client.close
+    assert_nil subscription.close
+    assert_nil subscription.close
+  end
+
+  def test_dead_manager_rejects_new_work_with_typed_closed_error
+    manager = Convex::LiveManager.new("http://127.0.0.1:1", "ruby-test")
+    manager.close
+
+    error = assert_raises(Convex::ClosedError) do
+      manager.subscribe("demo:state", "room" => "closed")
+    end
+    assert_match(/closed/, error.message)
+  end
 end

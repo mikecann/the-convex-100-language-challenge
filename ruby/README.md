@@ -28,7 +28,7 @@ pass. A successful Docker build by itself does not count.
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.rb -->
 ```ruby
-#!/usr/bin/env ruby
+#!/usr/local/bin/ruby
 # frozen_string_literal: true
 
 require "json"

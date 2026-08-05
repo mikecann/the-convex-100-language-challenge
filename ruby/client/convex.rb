@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "json"
+require "rbconfig"
 require "net/http"
 require "thread"
 require "uri"

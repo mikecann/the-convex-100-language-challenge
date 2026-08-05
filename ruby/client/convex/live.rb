@@ -12,28 +12,36 @@ module Convex
   # A reactive query subscription. `next_update` blocks for the next current
   # value, while `close` removes the query from the shared Live connection.
   class Subscription
-    CLOSED = Object.new.freeze
+    MAX_BUFFERED_UPDATES = 16
 
     def initialize(manager, query_id)
       @manager = manager
       @query_id = query_id
-      @updates = SizedQueue.new(16)
+      @updates = []
       @mutex = Mutex.new
+      @condition = ConditionVariable.new
       @closed = false
+      @finished = false
     end
 
     def next_update(timeout: nil)
-      update = if timeout
-                 readable, = IO.select([queue_signal_reader], nil, nil, timeout)
-                 raise TransportError.new("timed out waiting for Live update", operation: "live") unless readable
+      deadline = monotonic + timeout if timeout
+      @mutex.synchronize do
+        while @updates.empty? && !@finished
+          if deadline
+            remaining = deadline - monotonic
+            if remaining <= 0
+              raise TransportError.new("timed out waiting for Live update", operation: "live")
+            end
+            @condition.wait(@mutex, remaining)
+          else
+            @condition.wait(@mutex)
+          end
+        end
+        raise ClosedError, "Live subscription is closed" if @finished && @updates.empty?
 
-                 queue_pop
-               else
-                 queue_pop
-               end
-      raise ClosedError, "Live subscription is closed" if update.equal?(CLOSED)
-
-      update
+        @updates.shift
+      end
     end
 
     def close
@@ -45,55 +53,40 @@ module Convex
       end
       @manager.unsubscribe(@query_id) if should_close
       nil
+    rescue ClosedError
+      # Client shutdown already removed this subscription. Close remains safe in
+      # an ensure block regardless of which resource was closed first.
+      nil
     end
 
     # LiveManager calls this only after an atomic transition is committed. A
     # slow consumer keeps the newest reactive value rather than blocking sync.
     def deliver(update)
-      @updates.push(update, true)
-      signal_queue
-    rescue ThreadError
-      @updates.pop(true) rescue nil
-      @updates.push(update, true) rescue nil
-      signal_queue
+      @mutex.synchronize do
+        return if @finished
+
+        @updates.shift if @updates.length == MAX_BUFFERED_UPDATES
+        @updates << update
+        @condition.signal
+      end
     end
 
     def finish
-      @updates.push(CLOSED, true)
-      signal_queue
-    rescue ThreadError
-      @updates.pop(true) rescue nil
-      retry
+      @mutex.synchronize do
+        return if @finished
+
+        @finished = true
+        # Once unsubscribe or client close completes, buffered callbacks must
+        # not leak out after the lifecycle acknowledgement.
+        @updates.clear
+        @condition.broadcast
+      end
     end
 
     private
 
-    # A pipe lets IO.select provide a timeout without using Ruby's asynchronous
-    # Timeout exceptions inside protocol code.
-    def queue_signal_reader
-      @signal_mutex ||= Mutex.new
-      @signal_mutex.synchronize do
-        unless @signal_reader
-          @signal_reader, @signal_writer = IO.pipe
-          @signal_writer.sync = true
-          signal_queue unless @updates.empty?
-        end
-      end
-      @signal_reader
-    end
-
-    def signal_queue
-      return unless @signal_writer
-
-      @signal_writer.write_nonblock(".")
-    rescue IO::WaitWritable, Errno::EPIPE
-      nil
-    end
-
-    def queue_pop
-      value = @updates.pop
-      @signal_reader&.read_nonblock(1) rescue nil
-      value
+    def monotonic
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end
   end
 
@@ -118,6 +111,9 @@ module Convex
       @commands = Queue.new
       @wake_reader, @wake_writer = IO.pipe
       @wake_writer.sync = true
+      @lifecycle_mutex = Mutex.new
+      @closing = false
+      @terminated = false
       @worker = Thread.new { run }
       @worker.name = "convex-live" if @worker.respond_to?(:name=)
     end
@@ -137,29 +133,57 @@ module Convex
     end
 
     def close
-      request(:close)
-      @worker.join
+      response = nil
+      @lifecycle_mutex.synchronize do
+        return nil if @terminated
+
+        unless @closing
+          @closing = true
+          response = enqueue_command(:close, {})
+        end
+      end
+      wait_for_response(response) if response
       nil
     rescue ClosedError
       nil
+    ensure
+      # Even an already-closed wake pipe must not leave a background worker
+      # behind after the public client reports that close has completed.
+      @worker.join unless @worker.equal?(Thread.current)
     end
 
     private
 
     def request(type, payload = {})
+      response = @lifecycle_mutex.synchronize do
+        raise ClosedError, "Convex Live manager is closed" if @closing || @terminated
+
+        enqueue_command(type, payload)
+      end
+      wait_for_response(response)
+    end
+
+    # The lifecycle lock makes queuing and waking one operation. The worker
+    # closes the pipe under the same lock, so a caller cannot enqueue after the
+    # last wakeup and wait forever on an unreachable command.
+    def enqueue_command(type, payload)
       response = Queue.new
       @commands << payload.merge(type: type, response: response)
-      wake
+      @wake_writer.write_nonblock(".")
+      response
+    rescue IO::WaitWritable
+      # A full wake pipe already means the worker has an unread notification.
+      response
+    rescue IOError, Errno::EPIPE => error
+      response << [:error, ClosedError.new("Convex Live manager wakeup failed: #{error.message}")]
+      response
+    end
+
+    def wait_for_response(response)
       outcome, value = response.pop
       raise value if outcome == :error
 
       value
-    end
-
-    def wake
-      @wake_writer.write_nonblock(".")
-    rescue IO::WaitWritable, Errno::EPIPE
-      nil
     end
 
     def run
@@ -184,8 +208,21 @@ module Convex
     ensure
       @socket&.close
       @subscriptions.each_value { |state| state[:subscription].finish }
-      @wake_reader.close rescue nil
-      @wake_writer.close rescue nil
+      pending = []
+      @lifecycle_mutex.synchronize do
+        @terminated = true
+        @closing = true
+        loop do
+          pending << @commands.pop(true)
+        rescue ThreadError
+          break
+        end
+        @wake_reader.close rescue nil
+        @wake_writer.close rescue nil
+      end
+      pending.each do |command|
+        command[:response] << [:error, ClosedError.new("Convex Live manager is closed")]
+      end
     end
 
     def reset_state

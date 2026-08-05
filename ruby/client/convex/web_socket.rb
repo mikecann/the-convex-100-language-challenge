@@ -1,6 +1,5 @@
 # frozen_string_literal: true
 
-require "base64"
 require "digest/sha1"
 require "openssl"
 require "securerandom"
@@ -38,7 +37,7 @@ module Convex
       @tcp.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
       @io = @uri.scheme == "wss" ? wrap_tls(@tcp) : @tcp
 
-      key = Base64.strict_encode64(SecureRandom.random_bytes(16))
+      key = strict_base64(SecureRandom.random_bytes(16))
       resource = @uri.request_uri.empty? ? "/" : @uri.request_uri
       host = @uri.host
       default_port = @uri.scheme == "wss" ? 443 : 80
@@ -64,7 +63,7 @@ module Convex
         name, value = line.split(":", 2)
         [name.downcase, value.strip] if name && value
       end.to_h
-      expected_accept = Base64.strict_encode64(Digest::SHA1.digest(key + WEBSOCKET_GUID))
+      expected_accept = strict_base64(Digest::SHA1.digest(key + WEBSOCKET_GUID))
       unless parsed_headers["sec-websocket-accept"] == expected_accept
         raise ProtocolError, "WebSocket upgrade returned an invalid accept key"
       end
@@ -136,6 +135,12 @@ module Convex
     end
 
     private
+
+    # Ruby's core pack directive provides RFC 4648 base64 without loading the
+    # RubyGems-packaged base64 helper into the minimal runtime.
+    def strict_base64(value)
+      [value].pack("m0")
+    end
 
     def wrap_tls(tcp)
       context = OpenSSL::SSL::SSLContext.new
