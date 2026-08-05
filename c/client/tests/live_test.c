@@ -127,6 +127,7 @@ static void wait_removes(fixture *server,int count){pthread_mutex_lock(&server->
 static int update_count(convex_subscription *sub,int expected,int expect_error){convex_update update={0};int got=convex_subscription_next(sub,&update,5000);if(got!=1){fprintf(stderr,"update wait returned %d\n",got);return 0;}int okay;if(expect_error==1)okay=update.error.name&&update.error.data;else if(expect_error==2)okay=update.error.name&&!strcmp(update.error.name,"ProtocolError");else{json_object *count=NULL,*text=NULL;okay=!update.error.name&&update.value&&json_object_object_get_ex(update.value,"count",&count)&&json_object_get_int(count)==expected&&json_object_object_get_ex(update.value,"text",&text)&&!strcmp(json_object_get_string(text),"Hello, 世界 👋");}if(!okay)fprintf(stderr,"unexpected update error=%s message=%s value=%s\n",update.error.name?update.error.name:"",update.error.message?update.error.message:"",update.value?json_object_to_json_string(update.value):"null");convex_update_free(&update);return okay;}
 
 typedef struct { pid_t pid; FILE *input; FILE *output; } adapter_process;
+typedef struct { int dequeued[2]; int resume[2]; int inactive[2]; } relay_control;
 
 static adapter_process start_adapter(const char *url) {
   int commands[2],events[2];check(!pipe(commands)&&!pipe(events),"adapter pipes");pid_t pid=fork();check(pid>=0,"fork adapter");
@@ -134,10 +135,19 @@ static adapter_process start_adapter(const char *url) {
   close(commands[0]);close(events[1]);adapter_process process={.pid=pid,.input=fdopen(commands[1],"w"),.output=fdopen(events[0],"r")};setvbuf(process.input,NULL,_IOLBF,0);return process;
 }
 
+static adapter_process start_paused_adapter(const char *url,relay_control *control) {
+  int commands[2],events[2];check(!pipe(commands)&&!pipe(events)&&!pipe(control->dequeued)&&!pipe(control->resume)&&!pipe(control->inactive),"paused adapter pipes");pid_t pid=fork();check(pid>=0,"fork paused adapter");
+  if(pid==0){dup2(commands[0],STDIN_FILENO);dup2(events[1],STDOUT_FILENO);close(commands[0]);close(commands[1]);close(events[0]);close(events[1]);close(control->dequeued[0]);close(control->resume[1]);close(control->inactive[0]);char value[32];snprintf(value,sizeof(value),"%d",control->dequeued[1]);setenv("ADAPTER_TEST_RELAY_DEQUEUED_FD",value,1);snprintf(value,sizeof(value),"%d",control->resume[0]);setenv("ADAPTER_TEST_RELAY_RESUME_FD",value,1);snprintf(value,sizeof(value),"%d",control->inactive[1]);setenv("ADAPTER_TEST_RELAY_INACTIVE_FD",value,1);setenv("CONVEX_URL",url,1);unsetenv("ADAPTER_LISTEN");execl("/out-adapter-test","/out-adapter-test",(char*)NULL);_exit(127);}
+  close(commands[0]);close(events[1]);close(control->dequeued[1]);close(control->resume[0]);close(control->inactive[1]);adapter_process process={.pid=pid,.input=fdopen(commands[1],"w"),.output=fdopen(events[0],"r")};setvbuf(process.input,NULL,_IOLBF,0);return process;
+}
+
 static void adapter_send(adapter_process *process,const char *command){fprintf(process->input,"%s\n",command);fflush(process->input);}
 static json_object *adapter_read(adapter_process *process){char line[8192];check(fgets(line,sizeof(line),process->output)!=NULL,"adapter event");json_object *event=json_tokener_parse(line);check(event!=NULL,"adapter event JSON");return event;}
 static const char *event_type(json_object *event){json_object *type=NULL;return json_object_object_get_ex(event,"type",&type)?json_object_get_string(type):"";}
 static void require_absent(json_object *event,const char *name){json_object *ignored=NULL;check(!json_object_object_get_ex(event,name,&ignored),name);}
+static void relay_byte(int fd){char byte;check(read(fd,&byte,1)==1,"relay barrier");}
+static void relay_resume(relay_control *control){char byte='x';check(write(control->resume[1],&byte,1)==1,"relay resume");}
+static void require_no_adapter_event(adapter_process *process){struct pollfd descriptor={.fd=fileno(process->output),.events=POLLIN};check(poll(&descriptor,1,100)==0,"stale adapter subscription event");}
 
 static void test_adapter_events(fixture *server,const char *url) {
   pthread_mutex_lock(&server->mutex);server->connection_base=server->connections;pthread_mutex_unlock(&server->mutex);
@@ -149,6 +159,16 @@ static void test_adapter_events(fixture *server,const char *url) {
   fprintf(stderr,"adapter fixture: Live error\n");fixture_change(server,2,1,0,0);event=adapter_read(&adapter);check(!strcmp(event_type(event),"subscription"),"subscription error event");require_absent(event,"id");require_absent(event,"value");check(json_object_object_get_ex(event,"error",&error)&&json_object_object_get_ex(error,"data",&data),"subscription structured error");json_object_put(event);
   fprintf(stderr,"adapter fixture: close\n");adapter_send(&adapter,"{\"id\":\"unsubscribe\",\"op\":\"unsubscribe\",\"subscriptionId\":\"fixture-live\"}");event=adapter_read(&adapter);check(!strcmp(event_type(event),"ack"),"unsubscribe ack");json_object_put(event);
   adapter_send(&adapter,"{\"id\":\"close\",\"op\":\"close\"}");event=adapter_read(&adapter);check(!strcmp(event_type(event),"closed"),"adapter close");json_object_put(event);fclose(adapter.input);fclose(adapter.output);int status=0;waitpid(adapter.pid,&status,0);check(WIFEXITED(status)&&WEXITSTATUS(status)==0,"adapter process exit");
+}
+
+static void test_adapter_relay_races(fixture *server,const char *url) {
+  pthread_mutex_lock(&server->mutex);server->connection_base=server->connections;pthread_mutex_unlock(&server->mutex);fixture_configure(server,10,0,0,0);relay_control control;adapter_process adapter=start_paused_adapter(url,&control);json_object *event,*value=NULL,*count=NULL;
+  adapter_send(&adapter,"{\"id\":\"subscribe-old\",\"op\":\"subscribe\",\"subscriptionId\":\"race\",\"path\":\"demo:state\",\"args\":{\"room\":\"unsubscribe-race\"}}");event=adapter_read(&adapter);check(!strcmp(event_type(event),"ack"),"race subscribe ack");json_object_put(event);relay_byte(control.dequeued[0]);
+  adapter_send(&adapter,"{\"id\":\"unsubscribe-race\",\"op\":\"unsubscribe\",\"subscriptionId\":\"race\"}");relay_byte(control.inactive[0]);relay_resume(&control);event=adapter_read(&adapter);check(!strcmp(event_type(event),"ack"),"race unsubscribe ack");json_object_put(event);require_no_adapter_event(&adapter);
+
+  fixture_configure(server,10,0,0,0);adapter_send(&adapter,"{\"id\":\"subscribe-replace-old\",\"op\":\"subscribe\",\"subscriptionId\":\"race\",\"path\":\"demo:state\",\"args\":{\"room\":\"old-room\"}}");event=adapter_read(&adapter);check(!strcmp(event_type(event),"ack"),"replacement old ack");json_object_put(event);relay_byte(control.dequeued[0]);fixture_change(server,20,0,0,0);
+  adapter_send(&adapter,"{\"id\":\"subscribe-replacement\",\"op\":\"subscribe\",\"subscriptionId\":\"race\",\"path\":\"demo:state\",\"args\":{\"room\":\"new-room\"}}");relay_byte(control.inactive[0]);relay_resume(&control);event=adapter_read(&adapter);check(!strcmp(event_type(event),"ack"),"replacement ack");json_object_put(event);relay_byte(control.dequeued[0]);require_no_adapter_event(&adapter);relay_resume(&control);event=adapter_read(&adapter);check(!strcmp(event_type(event),"subscription")&&json_object_object_get_ex(event,"value",&value)&&json_object_object_get_ex(value,"count",&count)&&json_object_get_int(count)==20,"only replacement value is relayed");json_object_put(event);
+  adapter_send(&adapter,"{\"id\":\"race-unsubscribe\",\"op\":\"unsubscribe\",\"subscriptionId\":\"race\"}");event=adapter_read(&adapter);check(!strcmp(event_type(event),"ack"),"replacement unsubscribe");json_object_put(event);adapter_send(&adapter,"{\"id\":\"race-close\",\"op\":\"close\"}");event=adapter_read(&adapter);check(!strcmp(event_type(event),"closed"),"race close");json_object_put(event);fclose(adapter.input);fclose(adapter.output);close(control.dequeued[0]);close(control.resume[1]);close(control.inactive[0]);int status=0;waitpid(adapter.pid,&status,0);check(WIFEXITED(status)&&WEXITSTATUS(status)==0,"race adapter exit");
 }
 
 int main(void) {
@@ -163,5 +183,5 @@ int main(void) {
   check(update_count(sub,6,0),"bounded newest-16 queue drops oldest");
   for(int n=7;n<=21;n++)check(update_count(sub,n,0),"bounded queue preserves newest order");
   fixture_change(&server,1,0,1,0);check(update_count(sub,0,2),"malformed server message becomes protocol error");wait_connections(&server,8);
-  check(convex_unsubscribe(sub,&error),"final unsubscribe");check(convex_close(client,5000,&error),"blocked close completes");convex_free(client);json_object_put(args);test_adapter_events(&server,url);fixture_stop(&server);puts("PASS native C Live and adapter fixtures");return 0;
+  check(convex_unsubscribe(sub,&error),"final unsubscribe");check(convex_close(client,5000,&error),"blocked close completes");convex_free(client);json_object_put(args);test_adapter_events(&server,url);test_adapter_relay_races(&server,url);fixture_stop(&server);puts("PASS native C Live and adapter fixtures");return 0;
 }

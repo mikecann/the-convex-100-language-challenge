@@ -21,8 +21,25 @@ typedef struct adapter_subscription {
   convex_subscription *subscription;
   pthread_t thread;
   adapter_output *output;
+  pthread_mutex_t state_mutex;
+  unsigned long generation;
+  int active;
+#ifdef CONVEX_ADAPTER_TESTING
+  int test_pause_used;
+#endif
   struct adapter_subscription *next;
 } adapter_subscription;
+
+#ifdef CONVEX_ADAPTER_TESTING
+static int test_fd(const char *name) { const char *value=getenv(name);return value&&*value?atoi(value):-1; }
+static void test_signal(const char *name) { int fd=test_fd(name);char byte='x';if(fd>=0)(void)write(fd,&byte,1); }
+static void test_pause_relay(adapter_subscription *record) {
+  if(record->test_pause_used)return;
+  record->test_pause_used=1;
+  test_signal("ADAPTER_TEST_RELAY_DEQUEUED_FD");
+  int fd=test_fd("ADAPTER_TEST_RELAY_RESUME_FD");char byte;if(fd>=0)(void)read(fd,&byte,1);
+}
+#endif
 
 static char *copy_string(const char *value) {
   size_t length = strlen(value) + 1;
@@ -72,8 +89,20 @@ static void simple_event(adapter_output *output, const char *id, const char *typ
 
 static void *forward_updates(void *opaque) {
   adapter_subscription *record = opaque;
+  pthread_mutex_lock(&record->state_mutex);
+  unsigned long generation=record->generation;
+  pthread_mutex_unlock(&record->state_mutex);
   convex_update update = {0};
   while (convex_subscription_next(record->subscription, &update, -1) == 1) {
+#ifdef CONVEX_ADAPTER_TESTING
+    test_pause_relay(record);
+#endif
+    /* Invalidation and publication share this lock. Once unsubscribe or a
+     * same-ID replacement advances generation, a dequeued old value cannot
+     * cross the relay boundary. */
+    pthread_mutex_lock(&record->state_mutex);
+    int publish=record->active&&record->generation==generation;
+    if (!publish) { pthread_mutex_unlock(&record->state_mutex);convex_update_free(&update);continue; }
     if (update.error.name) {
       emit_error(record->output, "", record->id, &update.error);
     } else {
@@ -84,6 +113,7 @@ static void *forward_updates(void *opaque) {
       if (update.logs) { json_object_object_add(event, "logs", update.logs); update.logs = NULL; }
       emit(record->output, event);
     }
+    pthread_mutex_unlock(&record->state_mutex);
     convex_update_free(&update);
   }
   return NULL;
@@ -97,9 +127,17 @@ static adapter_subscription **find_record(adapter_subscription **head, const cha
 static int stop_record(adapter_subscription **slot, convex_error *error) {
   adapter_subscription *record = *slot;
   if (!record) return 1;
+  pthread_mutex_lock(&record->state_mutex);
+  record->active=0;
+  record->generation++;
+  pthread_mutex_unlock(&record->state_mutex);
+#ifdef CONVEX_ADAPTER_TESTING
+  test_signal("ADAPTER_TEST_RELAY_INACTIVE_FD");
+#endif
   if (!convex_unsubscribe(record->subscription, error)) return 0;
   pthread_join(record->thread, NULL);
   *slot = record->next;
+  pthread_mutex_destroy(&record->state_mutex);
   free(record->id);
   free(record);
   return 1;
@@ -148,7 +186,7 @@ static void serve(FILE *input, FILE *stream) {
       json_object *sid=NULL,*path=NULL,*args=NULL;json_object_object_get_ex(command,"subscriptionId",&sid);json_object_object_get_ex(command,"path",&path);json_object_object_get_ex(command,"args",&args);const char *subscription_id=sid?json_object_get_string(sid):"";convex_error error={0};convex_client *active=ensure_client(&client,&error);adapter_subscription **old=find_record(&subscriptions,subscription_id);
       if(*old&&!stop_record(old,&error)){emit_error(&output,id,"",&error);convex_error_free(&error);json_object_put(command);continue;}
       convex_subscription *subscription=active?convex_subscribe(active,path?json_object_get_string(path):"",args,&error):NULL;
-      if(subscription){adapter_subscription *record=calloc(1,sizeof(*record));record->id=copy_string(subscription_id);record->subscription=subscription;record->output=&output;record->next=subscriptions;subscriptions=record;pthread_create(&record->thread,NULL,forward_updates,record);simple_event(&output,id,"ack");}else emit_error(&output,id,"",&error);convex_error_free(&error);
+      if(subscription){adapter_subscription *record=calloc(1,sizeof(*record));record->id=copy_string(subscription_id);record->subscription=subscription;record->output=&output;record->generation=1;record->active=1;pthread_mutex_init(&record->state_mutex,NULL);record->next=subscriptions;subscriptions=record;pthread_create(&record->thread,NULL,forward_updates,record);simple_event(&output,id,"ack");}else emit_error(&output,id,"",&error);convex_error_free(&error);
     } else if (!strcmp(op,"unsubscribe")) {
       json_object *sid=NULL;json_object_object_get_ex(command,"subscriptionId",&sid);const char *subscription_id=sid?json_object_get_string(sid):"";convex_error error={0};adapter_subscription **slot=find_record(&subscriptions,subscription_id);if(stop_record(slot,&error))simple_event(&output,id,"ack");else emit_error(&output,id,"",&error);convex_error_free(&error);
     } else if (!strcmp(op,"debugDisconnect")) {
