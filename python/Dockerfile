@@ -20,7 +20,7 @@ RUN set -eu; root=/runtime-root; mkdir -p "$root/bin" "$root/usr/bin" "$root/usr
     cp -a /usr/local/lib/python3.13 "$root/usr/local/lib/python3.13"; rm -rf "$root/usr/local/lib/python3.13/ensurepip" "$root/usr/local/lib/python3.13/site-packages/pip" "$root/usr/local/lib/python3.13/site-packages/pip-"*; \
     { ldd /usr/local/bin/python3 /bin/dash /usr/bin/id /usr/bin/grep; find /usr/local/lib/python3.13 -type f -name '*.so' -exec ldd '{}' ';'; } | awk '$3 ~ /^\// { print $3 } $1 ~ /^\// && $1 !~ /:$/ { print $1 }' | sort -u | while IFS= read -r library; do cp --parents "$library" "$root"; done; \
     for library in /lib/x86_64-linux-gnu/libnss_*.so.2; do test ! -e "$library" || cp --parents "$library" "$root"; done; \
-    cp -a /etc/ssl "$root/etc/ssl"; cp -a /usr/lib/ssl "$root/usr/lib/ssl"; for config in /etc/nsswitch.conf /etc/host.conf /etc/gai.conf; do test ! -e "$config" || cp --parents "$config" "$root"; done
+    cp -a /etc/ssl "$root/etc/ssl"; mkdir -p "$root/usr/lib/ssl"; ln -s /etc/ssl/certs/ca-certificates.crt "$root/usr/lib/ssl/cert.pem"; ln -s /etc/ssl/certs "$root/usr/lib/ssl/certs"; ln -s /etc/ssl/openssl.cnf "$root/usr/lib/ssl/openssl.cnf"; for config in /etc/nsswitch.conf /etc/host.conf /etc/gai.conf; do test ! -e "$config" || cp --parents "$config" "$root"; done
 
 FROM scratch AS runtime-base
 ENV PYTHONDONTWRITEBYTECODE=1
