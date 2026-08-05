@@ -4,5 +4,30 @@ displayName: "Dart"
 rank: 15
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Dart HTTP and WebSocket client. Capability badges remain empty until the coordinator's local and hosted black-box evidence passes.
+toolchain:
+  name: Dart SDK
+  version: 3.7.2
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication and token rotation are deferred.
+  - Full tagged Convex value types are deferred; this demonstration uses JSON-safe values.
+  - WebSocket mutations, actions, query journals, optimistic updates, and TransitionChunk assembly are deferred.
+  - No HTTP or Live capability is claimed until shared local and hosted conformance evidence is recorded.
 capabilities: []

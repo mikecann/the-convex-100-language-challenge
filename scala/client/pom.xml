@@ -1,0 +1,14 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion><groupId>test.convex</groupId><artifactId>scala-client</artifactId><version>0.1.0</version>
+  <properties><maven.compiler.release>21</maven.compiler.release><scala.version>3.3.5</scala.version><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding></properties>
+  <dependencies>
+    <dependency><groupId>org.scala-lang</groupId><artifactId>scala3-library_3</artifactId><version>${scala.version}</version></dependency>
+    <dependency><groupId>com.fasterxml.jackson.core</groupId><artifactId>jackson-databind</artifactId><version>2.18.2</version></dependency>
+    <dependency><groupId>org.scalameta</groupId><artifactId>scalafmt-cli_2.13</artifactId><version>3.8.4</version><scope>provided</scope></dependency>
+  </dependencies>
+  <build><sourceDirectory>${project.basedir}/scala</sourceDirectory><plugins>
+    <plugin><groupId>org.codehaus.mojo</groupId><artifactId>build-helper-maven-plugin</artifactId><version>3.6.0</version><executions><execution><id>educational-and-test-sources</id><phase>generate-sources</phase><goals><goal>add-source</goal></goals><configuration><sources><source>${project.basedir}/../examples/basics</source><source>${project.basedir}/tests/conformance</source><source>${project.basedir}/tests/unit</source></sources></configuration></execution></executions></plugin>
+    <plugin><groupId>net.alchim31.maven</groupId><artifactId>scala-maven-plugin</artifactId><version>4.9.2</version><executions><execution><goals><goal>compile</goal></goals></execution></executions><configuration><scalaVersion>${scala.version}</scalaVersion><args><arg>-deprecation</arg><arg>-feature</arg><arg>-unchecked</arg></args></configuration></plugin>
+    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-shade-plugin</artifactId><version>3.6.0</version><executions><execution><phase>package</phase><goals><goal>shade</goal></goals><configuration><createDependencyReducedPom>false</createDependencyReducedPom><shadedArtifactAttached>true</shadedArtifactAttached><shadedClassifierName>all</shadedClassifierName><filters><filter><artifact>*:*</artifact><excludes><exclude>convex/Adapter*</exclude><exclude>convex/LiveAcceptanceTests*</exclude><exclude>convex/example/**</exclude></excludes></filter></filters></configuration></execution></executions></plugin>
+  </plugins></build>
+</project>

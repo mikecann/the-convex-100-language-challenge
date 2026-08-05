@@ -47,6 +47,13 @@ runtime dependencies such as CA certificates and the target language runtime
 declared by the manifest. Keep language-specific build layouts inside Docker
 stages rather than leaking them into the educational repository.
 
+Treat multicall binaries as their complete compiled command surface. Removing
+BusyBox symlinks or hiding commands from `PATH` does not remove applets that can
+still be invoked through the multicall binary or a forged `argv[0]`. Inspect the
+final filesystem and applet table, then directly probe forbidden package,
+network, compiler, and delegated-runtime commands. Use a restricted build or
+separate binaries when the stock multicall surface is too broad.
+
 The runtime probe rejects Node.js and Python unless the manifest declares the
 one approved `targetRuntimeCommand` for JavaScript or Python. This exempts only
 the interpreter that genuinely executes that target-language client. Package
@@ -86,6 +93,11 @@ is not the first place a missing provider or certificate path is discovered.
   `0 -> 1` journey: initial HTTP query, initial Live value when supported,
   applied mutation, and resulting Live value when supported. Print a concise
   final verification line only after all included operations agree.
+- Convex JSON numbers may arrive in an integral decimal form such as `0.0` or
+  `1.0`. Example decoding must accept values that are mathematically integral
+  and in range, while rejecting fractional, quoted, non-finite, or overflowing
+  values. Add a focused regression instead of relying on mocked integer-only
+  fixtures.
 - The `/usr/local/bin/convex-example` entrypoint must accept the verifier's
   unique room ID as its first argument. A language may also provide a friendly
   default for someone running the image by hand.
@@ -178,6 +190,11 @@ Only the shared result evaluator may calculate HTTP or Live capability badges.
   an update queue, bound it and test its overflow behaviour. If it relies on a
   runtime mailbox or a demand-driven stream, state that choice and test a slow
   consumer so future clients do not accidentally introduce an unbounded queue.
+- An event-count limit is not a memory limit when one protocol value may be
+  close to the maximum frame size. Enforce a conservative byte budget as well
+  as any count bound, include encoded output and runtime overhead, and prove the
+  real final adapter remains comfortably below the shared 128 MiB limit with a
+  stopped reader and near-maximum messages.
 
 ## Live acceptance
 
