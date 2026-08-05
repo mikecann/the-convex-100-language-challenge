@@ -238,12 +238,19 @@
                      (swap! observed conj (get connect "maxObservedTimestamp")))
                    (ws/read-message! connection)
                    (case index
-                     0 (ws/send-text! connection
-                                      (ws/transition (ws/version 0 0) (ws/version 1 256)
-                                                     (ws/updated 0 {"count" 0})))
-                     1 (ws/send-text! connection
-                                      (ws/transition (ws/version 0 0) (ws/version 1 255)
-                                                     (ws/updated 0 {"count" 1})))
+                     0 (do
+                         (ws/send-text! connection
+                                        (ws/transition (ws/version 0 0) (ws/version 1 256)
+                                                       (ws/updated 0 {"count" 0})))
+                         ;; Keep the peer alive until debugDisconnect retires it.
+                         ;; Returning here would close the fixture socket and race
+                         ;; the explicit disconnect this regression is testing.
+                         (Thread/sleep 3000))
+                     1 (do
+                         (ws/send-text! connection
+                                        (ws/transition (ws/version 0 0) (ws/version 1 255)
+                                                       (ws/updated 0 {"count" 1})))
+                         (Thread/sleep 3000))
                      (do
                        (ws/send-text! connection
                                       (ws/transition (ws/version 0 0) (ws/version 1 257)
