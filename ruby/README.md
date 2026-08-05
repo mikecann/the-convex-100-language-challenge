@@ -80,7 +80,7 @@ def run_example
       unless initial_count == current_count
         raise "initial Live count was #{initial_count}, expected #{current_count}"
       end
-      puts "live initial: #{JSON.pretty_generate(initial_state)}"
+      puts "live initial count: #{initial_count}"
 
       # Run an HTTP mutation. The random runId is its idempotency key, so retrying
       # the same logical write would return the existing result instead of adding
@@ -93,13 +93,14 @@ def run_example
       )
       increment = mutation.value
       raise "mutation was not applied" unless increment["applied"] == true
+      puts "mutation applied: #{increment["applied"]}"
 
       expected_count = current_count + 1
       mutation_count = verified_whole_count(increment.dig("state", "count"), "mutation")
       unless mutation_count == expected_count
         raise "mutation count was #{mutation_count}, expected #{expected_count}"
       end
-      puts "mutation: #{JSON.pretty_generate(increment)}"
+      puts "mutation count: #{mutation_count}"
 
       # Receive the changed room through Live, without issuing another HTTP query.
       changed_update = subscription.next_update(timeout: 10)
@@ -110,7 +111,7 @@ def run_example
       unless changed_count == expected_count
         raise "updated Live count was #{changed_count}, expected #{expected_count}"
       end
-      puts "live update: #{JSON.pretty_generate(changed_state)}"
+      puts "live updated count: #{changed_count}"
 
       # Reaching this line proves HTTP query, HTTP mutation, and Live all agreed
       # on one 0 -> 1 state change.

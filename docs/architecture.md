@@ -66,6 +66,12 @@ value. Where Live is implemented, that includes the resulting subscription
 update. Merely compiling the example does not prove that the code shown to
 viewers works.
 
+All canonical basic examples share one universal happy-path stdout contract in
+`_shared/examples/basics.expected.txt`. The root verifier compares the complete
+ordered transcript rather than searching for a few success fragments. Keep
+runtime diagnostics on stderr so implementation details do not weaken or vary
+the cross-language test surface.
+
 ### Language-owned code
 
 The repository standardises ownership boundaries for an educational project.

@@ -72,7 +72,7 @@ func main() {
 	var initialState roomState
 	decodeJSON("initial Live value", initialValue, &initialState)
 	expectCount("initial Live value", initialState.Count, state.Count)
-	printJSON("live initial", initialValue)
+	fmt.Printf("live initial count: %.0f\n", initialState.Count)
 
 	// Run a mutation over HTTP. The subscription above will observe this write.
 	mutation, err := client.Mutation(ctx, "demo:increment", map[string]any{
@@ -88,16 +88,17 @@ func main() {
 	if !increment.Applied {
 		panic("mutation was not applied")
 	}
+	fmt.Printf("mutation applied: %t\n", increment.Applied)
 	expectedCount := state.Count + 1
 	expectCount("mutation", increment.State.Count, expectedCount)
-	printJSON("mutation", mutation.Value)
+	fmt.Printf("mutation count: %.0f\n", increment.State.Count)
 
 	// Receive the changed room through Live without issuing another HTTP query.
 	updatedValue := nextUpdate(subscription)
 	var updatedState roomState
 	decodeJSON("updated Live value", updatedValue, &updatedState)
 	expectCount("updated Live value", updatedState.Count, expectedCount)
-	printJSON("live update", updatedValue)
+	fmt.Printf("live updated count: %.0f\n", updatedState.Count)
 
 	// Reaching this line proves the query, mutation, and Live subscription all
 	// agreed on the same change.
@@ -135,18 +136,6 @@ func expectCount(operation string, actual float64, expected float64) {
 	if actual != expected {
 		panic(fmt.Sprintf("%s count was %.0f, expected %.0f", operation, actual, expected))
 	}
-}
-
-// printJSON makes a raw Convex result readable in the terminal. Application
-// code would normally decode the value into a typed struct instead.
-func printJSON(label string, raw json.RawMessage) {
-	// Decode only so MarshalIndent can add whitespace without changing the data.
-	var indented any
-	if err := json.Unmarshal(raw, &indented); err != nil {
-		panic(err)
-	}
-	formatted, _ := json.MarshalIndent(indented, "", "  ")
-	fmt.Printf("%s: %s\n", label, formatted)
 }
 
 // randomID gives this mutation its idempotency key. Reusing the same ID for
