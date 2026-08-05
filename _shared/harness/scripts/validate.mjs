@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import Ajv2020 from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
 import { parse } from "yaml";
 
 const root = process.env.REPO_ROOT ?? "/repo";
@@ -11,8 +12,25 @@ const manifestSchema = JSON.parse(
 );
 
 const ajv = new Ajv2020({ allErrors: true });
+addFormats(ajv);
 const validateManifest = ajv.compile(manifestSchema);
 const errors = [];
+
+for (const schemaName of ["adapter.schema.json", "result.schema.json"]) {
+  const schema = JSON.parse(
+    fs.readFileSync(path.join(root, "_shared/schemas", schemaName), "utf8"),
+  );
+  ajv.compile(schema);
+}
+
+const workflowPath = path.join(root, ".github/workflows/go-pilot.yml");
+const workflow = parse(fs.readFileSync(workflowPath, "utf8"));
+const workflowSteps = workflow.jobs?.conformance?.steps ?? [];
+for (const step of workflowSteps) {
+  if (step.uses && !/@[0-9a-f]{40}$/.test(step.uses)) {
+    errors.push(`GitHub Action is not pinned by full commit: ${step.uses}`);
+  }
+}
 
 if (roster.schemaVersion !== 1 || roster.languages.length !== 100) {
   errors.push("roster must contain exactly 100 schema-v1 languages");

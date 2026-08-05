@@ -34,20 +34,10 @@ jobs:
       - name: Validate the 100-language scaffold and harness self-test
         run: ./run validate
 
-      - name: Run deterministic Go conformance
-        run: ./run verify go
-
-      - name: Run hosted protocol-drift smoke test
-        run: ./run verify-hosted go
-
-      - name: Export the Go image with SBOM and build provenance
-        run: |
-          docker buildx build \
-            --platform linux/amd64 \
-            --sbom=true \
-            --provenance=mode=max \
-            --output type=oci,dest=_shared/results/local/go-image.oci.tar \
-            go
+      - name: Build once, attest, and run local plus hosted conformance
+        env:
+          EVIDENCE_OCI_PATH: _shared/results/local/go-image.oci.tar
+        run: ./run verify-all go
 
       - name: Generate the candidate evidence site
         env:

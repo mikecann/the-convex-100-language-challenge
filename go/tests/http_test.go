@@ -83,3 +83,40 @@ func TestArgumentsMustBeObject(t *testing.T) {
 		t.Fatal("expected argument validation error")
 	}
 }
+
+func TestBearerTokenCanBeReplacedAndCleared(t *testing.T) {
+	t.Parallel()
+	received := make(chan string, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","value":null}`))
+	}))
+	defer server.Close()
+
+	client, err := convex.New(server.URL, convex.WithBearerToken("first-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Query(context.Background(), "demo:state", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetAuth("replacement-token"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Query(context.Background(), "demo:state", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetAuth(""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Query(context.Background(), "demo:state", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+
+	for index, expected := range []string{"Bearer first-token", "Bearer replacement-token", ""} {
+		if actual := <-received; actual != expected {
+			t.Fatalf("request %d Authorization = %q, want %q", index+1, actual, expected)
+		}
+	}
+}

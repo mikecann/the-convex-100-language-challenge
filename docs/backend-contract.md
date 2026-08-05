@@ -70,6 +70,12 @@ The mutation checks `events.by_room_and_run_id`. A repeated `runId` returns the
 current room state with `applied: false`. A new `runId` atomically inserts one
 event, increments the room once, and returns `applied: true` with the new state.
 
+### `demo:roomId`
+
+Query arguments contain a room name. It returns the room's Convex document ID
+as a JSON string, or `null` when the room does not exist. The conformance suite
+round-trips that real ID through each client.
+
 ### `demo:greet`
 
 Action arguments:

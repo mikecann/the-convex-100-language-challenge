@@ -15,6 +15,11 @@ endpoints with `format: "json"`. It supports an optional user bearer token and
 keeps success values, function logs, structured application error data, and
 transport errors distinct.
 
+The shared suite exercises absent, rejected, replaced, and cleared tokens. A
+race-enabled Go transport test proves exact bearer-header forwarding. The pilot
+does not claim a successful signed identity because the dedicated deployment
+has no configured identity provider; that integration remains Hardened scope.
+
 Live is pinned to the internal `convex-rs` 0.10.4 profile at commit
 `6f1df8a8ba1665084ec001e307ca841ca17074d7`. It uses the unversioned
 `/api/sync` endpoint and implements initial results, later transitions,

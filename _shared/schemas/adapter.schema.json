@@ -6,6 +6,7 @@
     { "$ref": "#/$defs/hello" },
     { "$ref": "#/$defs/call" },
     { "$ref": "#/$defs/subscribe" },
+    { "$ref": "#/$defs/auth" },
     { "$ref": "#/$defs/control" },
     { "$ref": "#/$defs/event" }
   ],
@@ -42,6 +43,16 @@
         "subscriptionId": { "$ref": "#/$defs/id" },
         "path": { "type": "string" },
         "args": { "type": "object" }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "op", "token"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "op": { "const": "setAuth" },
+        "token": { "type": "string" }
       }
     },
     "control": {

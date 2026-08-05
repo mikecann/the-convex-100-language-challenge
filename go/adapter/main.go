@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"runtime"
 	"sync"
@@ -24,6 +26,7 @@ type command struct {
 	Path            string          `json:"path"`
 	Args            json.RawMessage `json:"args"`
 	SubscriptionID  string          `json:"subscriptionId"`
+	Token           string          `json:"token"`
 }
 
 type adapterError struct {
@@ -45,18 +48,44 @@ type event struct {
 	Error           *adapterError   `json:"error,omitempty"`
 }
 
-type output struct{ mu sync.Mutex }
+type output struct {
+	mu     sync.Mutex
+	writer io.Writer
+}
 
 func (o *output) write(value event) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if err := json.NewEncoder(os.Stdout).Encode(value); err != nil {
+	if err := json.NewEncoder(o.writer).Encode(value); err != nil {
 		fmt.Fprintln(os.Stderr, "encode adapter event:", err)
 	}
 }
 
 func main() {
-	out := &output{}
+	listenAddress := os.Getenv("ADAPTER_LISTEN")
+	if listenAddress == "" {
+		runAdapter(os.Stdin, os.Stdout)
+		return
+	}
+
+	listener, err := net.Listen("tcp", listenAddress)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "listen for conformance controller:", err)
+		os.Exit(1)
+	}
+	defer listener.Close()
+	fmt.Fprintln(os.Stderr, "adapter listening on", listenAddress)
+	connection, err := listener.Accept()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "accept conformance controller:", err)
+		os.Exit(1)
+	}
+	defer connection.Close()
+	runAdapter(connection, connection)
+}
+
+func runAdapter(reader io.Reader, writer io.Writer) {
+	out := &output{writer: writer}
 	var client *convex.Client
 	var clientMu sync.Mutex
 	subscriptions := make(map[string]*convex.Subscription)
@@ -122,7 +151,7 @@ func main() {
 		out.write(failure)
 	}
 
-	scanner := bufio.NewScanner(os.Stdin)
+	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 2<<20)
 	for scanner.Scan() {
 		var cmd command
@@ -176,6 +205,17 @@ func main() {
 				Value: result.Value,
 				Logs:  result.LogLines,
 			})
+
+		case "setAuth":
+			activeClient, err := ensureClient()
+			if err == nil {
+				err = activeClient.SetAuth(cmd.Token)
+			}
+			if err != nil {
+				writeFailure(cmd.ID, "", err)
+				continue
+			}
+			out.write(event{ID: cmd.ID, Type: "ack"})
 
 		case "subscribe":
 			if cmd.SubscriptionID == "" {

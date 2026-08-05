@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import Ajv2020 from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
 import { AdapterProcess } from "./adapter-process.mjs";
 
 const deploymentUrl = process.env.CONVEX_URL;
 if (!deploymentUrl) throw new Error("CONVEX_URL is required");
 
 const artifacts = process.env.ARTIFACTS_DIR ?? "/artifacts";
-const goAdapterPath = process.env.CLIENT_ADAPTER ?? "/client/convex-go-adapter";
+const goAdapterTCP = process.env.CLIENT_ADAPTER_TCP;
+if (!goAdapterTCP) throw new Error("CLIENT_ADAPTER_TCP is required");
 const referenceAdapterPath = fileURLToPath(
   new URL("../reference-js/adapter.mjs", import.meta.url),
 );
@@ -18,8 +22,12 @@ const testResults = [];
 let sequence = 0;
 let goRuntime = "unknown";
 
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
 const oracle = new AdapterProcess(process.execPath, [referenceAdapterPath]).start();
-const go = new AdapterProcess(goAdapterPath).start();
+const go = new AdapterProcess(null, [], { tcp: goAdapterTCP }).start();
 
 function nextId(prefix) {
   sequence += 1;
@@ -28,23 +36,34 @@ function nextId(prefix) {
 
 async function test(name, fn) {
   const start = performance.now();
+  const transcriptStart = {
+    oracle: oracle.transcript.length,
+    go: go.transcript.length,
+  };
+  let result;
   try {
     await fn();
-    testResults.push({
+    result = {
       name,
       status: "pass",
       durationMs: Math.round(performance.now() - start),
-    });
+    };
     console.log(`PASS ${name}`);
   } catch (error) {
-    testResults.push({
+    result = {
       name,
       status: "fail",
       durationMs: Math.round(performance.now() - start),
       detail: error.stack ?? error.message ?? String(error),
-    });
+    };
     console.error(`FAIL ${name}: ${error.stack ?? error}`);
   }
+  const evidence = {
+    oracle: oracle.transcript.slice(transcriptStart.oracle),
+    go: go.transcript.slice(transcriptStart.go),
+  };
+  result.evidenceHash = sha256(JSON.stringify(evidence));
+  testResults.push(result);
 }
 
 async function hello(adapter, label) {
@@ -84,6 +103,15 @@ async function unsubscribe(adapter, subscriptionId) {
     id: nextId("unsubscribe"),
     op: "unsubscribe",
     subscriptionId,
+  });
+  assert.equal(response.type, "ack", JSON.stringify(response));
+}
+
+async function setAuth(adapter, token) {
+  const response = await adapter.request({
+    id: nextId("set-auth"),
+    op: "setAuth",
+    token,
   });
   assert.equal(response.type, "ack", JSON.stringify(response));
 }
@@ -142,6 +170,16 @@ async function runHTTP(label, adapter, { expectLogs }) {
     assert.equal(response.value.state.count, 1);
   });
 
+  await test(`${label}/http/document-id-string`, async () => {
+    const idResponse = await call(adapter, "query", "demo:roomId", { room });
+    assert.equal(typeof idResponse.value, "string");
+    assert.ok(idResponse.value.length > 8);
+    const echoResponse = await call(adapter, "query", "demo:echo", {
+      value: idResponse.value,
+    });
+    assert.equal(echoResponse.value, idResponse.value);
+  });
+
   await test(`${label}/http/action`, async () => {
     const response = await call(adapter, "action", "demo:greet", {
       language: label === "go" ? "Go" : "JavaScript",
@@ -167,6 +205,34 @@ async function runHTTP(label, adapter, { expectLogs }) {
     });
     assert.equal(response.value[3], "🟨🟩🟦");
   });
+
+  if (label === "go") {
+    await test("go/http/bearer-token-lifecycle", async () => {
+      await setAuth(adapter, "invalid-token-one");
+      let response = await adapter.request({
+        id: nextId("invalid-auth"),
+        op: "query",
+        path: "demo:state",
+        args: { room: `${room}-invalid-auth` },
+      });
+      assert.equal(response.type, "error", JSON.stringify(response));
+
+      await setAuth(adapter, "invalid-token-two");
+      response = await adapter.request({
+        id: nextId("replaced-auth"),
+        op: "query",
+        path: "demo:state",
+        args: { room: `${room}-replaced-auth` },
+      });
+      assert.equal(response.type, "error", JSON.stringify(response));
+
+      await setAuth(adapter, "");
+      response = await call(adapter, "query", "demo:state", {
+        room: `${room}-cleared-auth`,
+      });
+      assert.equal(response.value.count, 0);
+    });
+  }
 }
 
 async function runLive(label, adapter) {
@@ -257,17 +323,54 @@ await test("oracle/live/clean-close", async () => {
   assert.equal((await oracle.exitPromise).code, 0);
 });
 
-const goHTTPPassed = testResults
-  .filter((entry) => entry.name.startsWith("go/http/"))
-  .every((entry) => entry.status === "pass");
-const goLivePassed =
-  goHTTPPassed &&
-  testResults
-    .filter((entry) => entry.name.startsWith("go/live/"))
-    .every((entry) => entry.status === "pass");
-const oraclePassed = testResults
-  .filter((entry) => entry.name.startsWith("oracle/"))
-  .every((entry) => entry.status === "pass");
+const requiredOracleTests = [
+  "oracle/adapter/hello",
+  "oracle/http/query",
+  "oracle/http/nested-json-and-logs",
+  "oracle/http/mutation",
+  "oracle/http/idempotent-mutation",
+  "oracle/http/document-id-string",
+  "oracle/http/action",
+  "oracle/http/structured-error",
+  "oracle/http/utf8-round-trip",
+  "oracle/live/initial-result",
+  "oracle/live/external-update",
+  "oracle/live/unsubscribe",
+  "oracle/live/reconnect-five-times",
+  "oracle/live/query-error-recovery",
+  "oracle/live/clean-close",
+];
+const requiredGoHTTPTests = [
+  "go/adapter/hello",
+  "go/http/query",
+  "go/http/nested-json-and-logs",
+  "go/http/mutation",
+  "go/http/idempotent-mutation",
+  "go/http/document-id-string",
+  "go/http/action",
+  "go/http/structured-error",
+  "go/http/utf8-round-trip",
+  "go/http/bearer-token-lifecycle",
+];
+const requiredGoLiveTests = [
+  "go/live/initial-result",
+  "go/live/external-update",
+  "go/live/unsubscribe",
+  "go/live/reconnect-five-times",
+  "go/live/query-error-recovery",
+  "go/live/clean-close",
+];
+
+function requiredTestsPassed(requiredNames) {
+  return requiredNames.every((name) => {
+    const matches = testResults.filter((entry) => entry.name === name);
+    return matches.length === 1 && matches[0].status === "pass";
+  });
+}
+
+const oraclePassed = requiredTestsPassed(requiredOracleTests);
+const goHTTPPassed = oraclePassed && requiredTestsPassed(requiredGoHTTPTests);
+const goLivePassed = goHTTPPassed && requiredTestsPassed(requiredGoLiveTests);
 
 const earnedCapabilities = [];
 if (oraclePassed && goHTTPPassed) earnedCapabilities.push("http");
@@ -281,6 +384,8 @@ try {
   // The individual calls already provide better failure evidence.
 }
 
+const transcript = { oracle: oracle.transcript, go: go.transcript };
+const transcriptJSON = `${JSON.stringify(transcript, null, 2)}\n`;
 const result = {
   schemaVersion: 1,
   language: "go",
@@ -290,12 +395,29 @@ const result = {
   runtimeVersion: goRuntime,
   platform: process.env.TEST_PLATFORM ?? "linux/amd64",
   imageDigest: process.env.CLIENT_IMAGE_DIGEST ?? "unknown",
+  clientTreeHash: process.env.CLIENT_TREE_HASH ?? "unknown",
+  baseImageDigests: [
+    "sha256:f4490d7b261d73af4543c46ac6597d7d101b6e1755bcdd8c5159fda7046b6b3e",
+    "sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce",
+  ],
   backend: {
     kind: process.env.BACKEND_KIND ?? "self-hosted",
     url: deploymentUrl,
     version: backendVersion.trim() || "unknown",
+    imageDigest: process.env.BACKEND_IMAGE_DIGEST || null,
   },
   protocol: "convex-rs-0.10.4-unversioned-sync",
+  revisions: {
+    harnessTreeHash: process.env.HARNESS_TREE_HASH ?? "unknown",
+    backendTreeHash: process.env.BACKEND_TREE_HASH ?? "unknown",
+    protocolSourceCommit: "6f1df8a8ba1665084ec001e307ca841ca17074d7",
+  },
+  evidence: {
+    channel: process.env.EVIDENCE_CHANNEL ?? "local",
+    runUrl: process.env.EVIDENCE_RUN_URL || null,
+    ociArchive: process.env.EVIDENCE_OCI_ARCHIVE || null,
+    transcriptSha256: sha256(transcriptJSON),
+  },
   startedAt: startedAt.toISOString(),
   finishedAt: new Date().toISOString(),
   tests: testResults,
@@ -303,11 +425,15 @@ const result = {
 };
 
 fs.mkdirSync(artifacts, { recursive: true });
+const resultSchema = JSON.parse(fs.readFileSync("/schemas/result.schema.json", "utf8"));
+const ajv = new Ajv2020({ allErrors: true });
+addFormats(ajv);
+const validateResult = ajv.compile(resultSchema);
+if (!validateResult(result)) {
+  throw new Error(`generated invalid result: ${ajv.errorsText(validateResult.errors)}`);
+}
+fs.writeFileSync(path.join(artifacts, "go-pilot-transcript.json"), transcriptJSON);
 fs.writeFileSync(path.join(artifacts, "go-pilot-result.json"), `${JSON.stringify(result, null, 2)}\n`);
-fs.writeFileSync(
-  path.join(artifacts, "go-pilot-transcript.json"),
-  `${JSON.stringify({ oracle: oracle.transcript, go: go.transcript }, null, 2)}\n`,
-);
 
 if (testResults.some((entry) => entry.status === "fail")) process.exitCode = 1;
 console.log(`Earned capabilities: ${earnedCapabilities.join(", ") || "none"}`);

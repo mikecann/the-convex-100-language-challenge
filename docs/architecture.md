@@ -81,7 +81,8 @@ The controller owns:
 - Random fixture values and per-run nonces.
 - State reset through an approved reference path.
 - External mutations using an official reference client.
-- Fault-proxy configuration.
+- Fault injection. The Go pilot currently uses an adapter-only socket break;
+  an external network fault proxy remains a later harness improvement.
 - Timeouts, clocks, assertions, repetition, and badge calculation.
 - Sanitized result and evidence generation.
 
@@ -128,6 +129,12 @@ Trusted CI records:
 - Earned capability badges.
 
 Policy checks inspect source, manifests, image history, SBOMs, child processes, and outbound destinations. This detects obvious delegation to `curl`, Node, Python, the Convex CLI, or an undeclared shared core. Native provenance still requires review because automated checks are evidence, not proof.
+
+The Go pilot implements source and tree revisions, image and base digests,
+per-test and transcript hashes, final-image inspection, SBOM, and build
+provenance. Full outbound-destination inspection and a signed trusted-main
+index are not implemented yet, so pull-request and local website output stays
+visibly labelled as candidate evidence.
 
 Clients cannot commit their own earned results. Only trusted-main CI may update the small result index, and the website accepts only that signed index.
 

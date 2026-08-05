@@ -5,6 +5,7 @@ COPY _shared/harness/package.json _shared/harness/package-lock.json ./
 RUN npm ci --ignore-scripts
 COPY _shared/harness/scripts ./scripts
 COPY _shared/harness/reference-js ./reference-js
+COPY _shared/schemas /schemas
 
 USER node
 CMD ["npm", "run", "validate"]

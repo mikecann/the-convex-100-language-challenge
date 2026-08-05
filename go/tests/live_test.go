@@ -175,6 +175,74 @@ func TestLiveReconnectRestoresSubscription(t *testing.T) {
 	}
 }
 
+func TestCancelledCloseStillInitiatesShutdown(t *testing.T) {
+	t.Parallel()
+	serverClosed := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.CloseNow()
+		ctx := r.Context()
+		var connect testWireMessage
+		if err := wsjson.Read(ctx, conn, &connect); err != nil {
+			t.Error(err)
+			return
+		}
+		var add testWireMessage
+		if err := wsjson.Read(ctx, conn, &add); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := sendTransition(
+			ctx,
+			conn,
+			0,
+			1,
+			"AAAAAAAAAAA=",
+			"AQAAAAAAAAA=",
+			add.Modifications[0].QueryID,
+			0,
+		); err != nil {
+			t.Error(err)
+			return
+		}
+		var ignored any
+		_ = wsjson.Read(ctx, conn, &ignored)
+		close(serverClosed)
+	}))
+	defer server.Close()
+
+	client, err := convex.New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := client.Subscribe(context.Background(), "demo:state", map[string]any{"room": "close"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertLiveCount(t, sub, 0)
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = client.Close(cancelled)
+	select {
+	case <-serverClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled Close did not initiate WebSocket shutdown")
+	}
+	select {
+	case _, ok := <-sub.Updates():
+		if ok {
+			t.Fatal("subscription remained open after cancelled Close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscription did not close after cancelled Close")
+	}
+}
+
 func sendTransition(
 	ctx context.Context,
 	conn *websocket.Conn,

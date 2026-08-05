@@ -85,10 +85,6 @@ func (c *Client) Subscribe(ctx context.Context, path string, args any) (*Subscri
 // Close shuts down Live networking and prevents future operations.
 func (c *Client) Close(ctx context.Context) error {
 	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return nil
-	}
 	c.closed = true
 	manager := c.live
 	c.mu.Unlock()
@@ -102,6 +98,8 @@ type liveManager struct {
 	wsURL         string
 	clientVersion string
 	commands      chan any
+	closeSignal   chan struct{}
+	closeOnce     sync.Once
 	done          chan struct{}
 }
 
@@ -127,10 +125,6 @@ type subscribeResponse struct {
 type unsubscribeCommand struct {
 	queryID uint32
 	resp    chan error
-}
-
-type closeCommand struct {
-	resp chan struct{}
 }
 
 type debugDisconnectCommand struct {
@@ -163,6 +157,7 @@ func newLiveManager(deploymentURL, clientVersion string) (*liveManager, error) {
 		wsURL:         u.String(),
 		clientVersion: clientVersion,
 		commands:      make(chan any),
+		closeSignal:   make(chan struct{}),
 		done:          make(chan struct{}),
 	}
 	go m.run()
@@ -205,20 +200,9 @@ func (m *liveManager) unsubscribe(queryID uint32) error {
 }
 
 func (m *liveManager) close(ctx context.Context) error {
-	resp := make(chan struct{}, 1)
-	select {
-	case m.commands <- closeCommand{resp: resp}:
-	case <-m.done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	select {
-	case <-resp:
-	case <-m.done:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	// Initiating shutdown must not depend on the caller's context. The context
+	// only bounds how long this caller waits for the manager to finish.
+	m.closeOnce.Do(func() { close(m.closeSignal) })
 	select {
 	case <-m.done:
 		return nil
@@ -481,6 +465,19 @@ func (m *liveManager) run() {
 
 	for {
 		select {
+		case <-m.closeSignal:
+			stopReconnect()
+			cancel()
+			if conn != nil {
+				_ = conn.Close(websocket.StatusNormalClosure, "client closed")
+				conn = nil
+			}
+			for id, sub := range active {
+				close(sub.updates)
+				delete(active, id)
+			}
+			return
+
 		case command := <-m.commands:
 			switch cmd := command.(type) {
 			case subscribeCommand:
@@ -561,22 +558,10 @@ func (m *liveManager) run() {
 					cmd.resp <- errors.New("Live WebSocket is not connected")
 					continue
 				}
-				closeConnection("AdapterDebugDisconnect", true)
-				cmd.resp <- nil
+				// Break only the transport. The reader must observe the failure and
+				// drive the same reconnect path as a real network disconnect.
+				cmd.resp <- conn.CloseNow()
 
-			case closeCommand:
-				stopReconnect()
-				cancel()
-				if conn != nil {
-					_ = conn.Close(websocket.StatusNormalClosure, "client closed")
-					conn = nil
-				}
-				for id, sub := range active {
-					close(sub.updates)
-					delete(active, id)
-				}
-				cmd.resp <- struct{}{}
-				return
 			}
 
 		case <-reconnect:

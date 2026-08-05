@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://100-convex-clients.test/schemas/result-v1.json",
-  "title": "Trusted conformance result v1",
+  "title": "Conformance result v1",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -13,8 +13,12 @@
     "runtimeVersion",
     "platform",
     "imageDigest",
+    "clientTreeHash",
+    "baseImageDigests",
     "backend",
     "protocol",
+    "revisions",
+    "evidence",
     "startedAt",
     "finishedAt",
     "tests",
@@ -23,36 +27,73 @@
   "properties": {
     "schemaVersion": { "const": 1 },
     "language": { "type": "string" },
-    "sourceCommit": { "type": "string" },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "dirty": { "type": "boolean" },
     "provenance": {
       "enum": ["native", "binding", "generated", "transpiled", "bridge"]
     },
     "runtimeVersion": { "type": "string" },
     "platform": { "type": "string" },
-    "imageDigest": { "type": "string" },
+    "imageDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "clientTreeHash": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "baseImageDigests": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+    },
     "backend": {
       "type": "object",
-      "required": ["kind", "url", "version"],
+      "additionalProperties": false,
+      "required": ["kind", "url", "version", "imageDigest"],
       "properties": {
         "kind": { "enum": ["self-hosted", "hosted"] },
         "url": { "type": "string" },
-        "version": { "type": "string" }
+        "version": { "type": "string" },
+        "imageDigest": {
+          "oneOf": [
+            { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            { "type": "null" }
+          ]
+        }
       }
     },
     "protocol": { "type": "string" },
+    "revisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["harnessTreeHash", "backendTreeHash", "protocolSourceCommit"],
+      "properties": {
+        "harnessTreeHash": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "backendTreeHash": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "protocolSourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel", "runUrl", "ociArchive", "transcriptSha256"],
+      "properties": {
+        "channel": { "enum": ["local", "github-actions"] },
+        "runUrl": { "type": ["string", "null"] },
+        "ociArchive": { "type": ["string", "null"] },
+        "transcriptSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
     "startedAt": { "type": "string", "format": "date-time" },
     "finishedAt": { "type": "string", "format": "date-time" },
     "tests": {
       "type": "array",
+      "minItems": 1,
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["name", "status", "durationMs"],
+        "required": ["name", "status", "durationMs", "evidenceHash"],
         "properties": {
           "name": { "type": "string" },
           "status": { "enum": ["pass", "fail", "skip"] },
           "durationMs": { "type": "integer", "minimum": 0 },
+          "evidenceHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
           "detail": { "type": "string" }
         }
       }

@@ -10,7 +10,7 @@ The HTTP badge uses only Convex's documented public HTTP API:
 - It exposes idiomatic query, mutation, and action APIs.
 - It calls `/api/query`, `/api/mutation`, and `/api/action` directly.
 - It sends documented `format: "json"` requests.
-- It supports `Authorization: Bearer <JWT>`.
+- It supports setting, replacing, and clearing `Authorization: Bearer <JWT>`.
 - It preserves successful values, `errorMessage`, application `errorData`, and `logLines`.
 - It passes the JSON-safe value suite.
 
@@ -30,7 +30,8 @@ The Live badge includes Yellow and additionally requires:
 - Initial and subsequent query values.
 - Unsubscribe.
 - Automatic reconnect and restoration of active subscriptions.
-- Distinct query and transport failures.
+- Reactive query failures remain typed subscription events, while transport
+  interruptions exercise reconnect and do not masquerade as query failures.
 - Clean client and subscription shutdown.
 
 Realtime is not a documented stable third-party wire API. Every implementation must pin one protocol profile and record its source revision. It must not combine convenient pieces from incompatible official clients.
@@ -78,12 +79,20 @@ The official JS HTTP client currently sends `format: "convex_encoded_json"` and 
 1. Query with nested JSON arguments and verify the result.
 2. Mutate a counter and verify one database effect.
 3. Run an action and verify its result.
-4. Exercise valid, absent, invalid, replaced, and cleared bearer tokens.
+4. Exercise absent, invalid, replaced, and cleared bearer tokens against the
+   deployment. A language-local transport test must also prove that an opaque
+   configured token is sent exactly as `Authorization: Bearer <token>`.
 5. Preserve structured `ConvexError` data.
 6. Keep function logs distinct from return values.
 7. Pass null, booleans, finite Float64 values, UTF-8 strings, arrays, nested objects, and document IDs as strings.
 
 Raw HTTP does not document client-side mutation queuing, so ordering is not required for Yellow.
+
+Yellow proves bearer-token transport, not successful identity-provider
+integration. A valid signed JWT and repeated auth rotation against an
+auth-enabled fixture remain part of Hardened. This keeps the pilot from
+claiming authentication semantics when its dedicated deployment has no
+configured identity provider.
 
 ### Live suite
 
@@ -122,7 +131,9 @@ Every client image contains the library and a thin language-native adapter. The 
 - `setAuth`
 - `close`
 
-The adapter emits timestamped NDJSON responses containing request or subscription IDs. The controller owns fixture reset, randomized nonces, external reference mutations, the fault proxy, assertions, timeouts, and badge calculation.
+The adapter emits NDJSON responses containing request or subscription IDs. The
+controller owns randomized fixtures, external reference mutations, assertions,
+timeouts, fault injection, and capability calculation.
 
 The first command is always `hello` and includes `protocolVersion: 1`. The
 adapter rejects unsupported protocol versions. Every later command carries a

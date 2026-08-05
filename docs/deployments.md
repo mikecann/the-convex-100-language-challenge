@@ -30,6 +30,12 @@ The hosted URL is public by design. Account credentials and deployment keys are
 not committed. Its purpose is current HTTPS/WSS compatibility smoke testing,
 not deterministic conformance or production traffic.
 
+The pilot mutation is intentionally unauthenticated and can create rooms and
+events. That is acceptable only while this remains a private, low-traffic
+experiment. Do not publicize the deployment URL or publish an interactive site
+until the backend has an approved abuse-control design. Random room IDs isolate
+tests; they are not rate limiting.
+
 The Go pilot passes the complete HTTP and Live suite on this deployment,
 including five forced reconnects and reactive query error recovery. The hosted
 run caught a stale certificate bundle in the first candidate runtime image; the

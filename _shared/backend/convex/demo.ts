@@ -66,6 +66,18 @@ export const requiresNonzero = query({
   },
 });
 
+export const roomId = query({
+  args: { room: v.string() },
+  returns: v.union(v.string(), v.null()),
+  handler: async (ctx, args) => {
+    const room = await ctx.db
+      .query("rooms")
+      .withIndex("by_name", (q) => q.eq("name", args.room))
+      .unique();
+    return room?._id ?? null;
+  },
+});
+
 export const increment = mutation({
   args: {
     room: v.string(),

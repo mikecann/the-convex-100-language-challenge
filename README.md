@@ -12,7 +12,7 @@ index.
 
 | Status | Meaning |
 | --- | --- |
-| Yellow: HTTP | Queries, mutations, actions, JSON-safe values, authentication, and errors work over the documented HTTP API. |
+| Yellow: HTTP | Queries, mutations, actions, JSON-safe values, bearer-token forwarding, and errors work over the documented HTTP API. |
 | Green: Live | The client additionally supports live query subscriptions over WebSockets. |
 | Blue: Hardened | The live client passes consistency, reconnection, auth rotation, mutation ordering, full-value, and lifecycle tests. |
 | Red: Failed | A clean Docker build, execution, or claimed capability test fails. |
@@ -72,6 +72,7 @@ test, package operation, and generated artifact.
 ./run validate
 ./run verify go
 ./run verify-hosted go
+./run verify-all go
 ./run site-preview
 ./run site-serve
 ```

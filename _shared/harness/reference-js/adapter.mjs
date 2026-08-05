@@ -56,6 +56,13 @@ async function handle(command) {
       return;
     }
 
+    if (command.op === "setAuth") {
+      if (command.token) http.setAuth(command.token);
+      else http.clearAuth();
+      send({ id: command.id, type: "ack" });
+      return;
+    }
+
     if (command.op === "subscribe") {
       const reference = makeFunctionReference(command.path);
       const unsubscribe = live.onUpdate(
