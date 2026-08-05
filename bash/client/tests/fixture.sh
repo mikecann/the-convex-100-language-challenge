@@ -11,7 +11,10 @@ if [[ ${BASH_FIXTURE_TRACE:-0} = 1 ]]; then
 	set -x
 fi
 
-write_byte() { printf '%b' "\\$(printf '%03o' "$1")"; }
+write_byte() {
+	# shellcheck disable=SC2059 # The generated octal escape is the byte format.
+	printf "\\$(printf '%03o' "$1")"
+}
 server_frame() {
 	local text=$1 opcode=${2:-1} final=${3:-1} n i length_code
 	n=$(printf %s "$text" | wc -c | tr -d ' ')
