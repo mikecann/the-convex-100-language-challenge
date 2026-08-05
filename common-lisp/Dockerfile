@@ -37,12 +37,13 @@ EOF
 
 # Start from the pinned non-scratch Debian image required by repository policy,
 # then remove its visible filesystem with a temporary static build helper. The
-# following COPY instructions reconstruct only the declared runtime closure.
-# The helper is deleted before any final-image layer is built.
+# helper is mounted only for that build step, so its bytes never enter a final
+# image layer. The following COPY instructions reconstruct only the declared
+# runtime closure.
 FROM --platform=linux/amd64 ${BUILD_IMAGE} AS runtime-base
-COPY --from=test /bin/busybox /tmp/busybox
-RUN set -eu; \
-    pruner=/tmp/busybox; \
+RUN --mount=type=bind,from=test,source=/bin/busybox,target=/busybox,readonly \
+    set -eu; \
+    pruner=/busybox; \
     for path in /bin /boot /home /lib /lib64 /media /mnt /opt /root \
                 /run /sbin /srv /usr /var; do \
       "$pruner" rm -rf "$path"; \
@@ -112,6 +113,7 @@ RUN test "$(id -u):$(id -g)" = 65532:65532 \
     && test ! -e /etc/dpkg \
     && test ! -e /etc/.pwd.lock \
     && test ! -e /etc/update-motd.d \
+    && test ! -e /busybox \
     && test ! -e /var \
     && test ! -e /usr/share \
     && test ! -e /usr/lib/x86_64-linux-gnu/gconv \
