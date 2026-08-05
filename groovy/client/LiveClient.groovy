@@ -6,22 +6,43 @@ import java.net.http.HttpClient
 import java.net.http.WebSocket
 import java.nio.charset.StandardCharsets
 import java.time.Duration
-import java.util.concurrent.*
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.Callable
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CompletionStage
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Native implementation of the pinned unversioned Convex sync profile.
- * State changes occur on owner only. The WebSocket listener merely queues work
- * there, so a controller thread can never concurrently write or alter a query set.
+ *
+ * The owner executor is the only code allowed to change socket, reconnect, or
+ * query-set state. JDK WebSocket callbacks place bounded immutable events into
+ * an inbox; they never run protocol logic or touch that state themselves.
  */
 final class LiveClient implements AutoCloseable {
   static final String INITIAL_TIMESTAMP = 'AAAAAAAAAAA='
   static final long INITIAL_BACKOFF_MS = 100L
   static final long MAX_BACKOFF_MS = 15_000L
+  static final int MAX_INCOMING_EVENTS = 32
+  static final int MAX_INCOMING_BYTES = 4 * 1024 * 1024
+  static final int MAX_MESSAGE_BYTES = 2 * 1024 * 1024
+
+  private static final Duration HANDSHAKE_TIMEOUT = Duration.ofSeconds(5)
+  private static final Duration WRITE_TIMEOUT = Duration.ofSeconds(2)
+  private static final Duration OWNER_TIMEOUT = Duration.ofSeconds(6)
+
   private final URI endpoint
-  private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
-  private final ScheduledExecutorService owner = Executors.newSingleThreadScheduledExecutor { r -> new Thread(r, 'convex-groovy-live') }
+  private final HttpClient http
+  private final ScheduledExecutorService owner
   private final LinkedHashMap<Integer, Subscription> subscriptions = [:]
+  private final IncomingBuffer incoming = new IncomingBuffer()
+
   private int nextId = 0
   private int querySetVersion = 0
   private int connectionCount = 0
@@ -30,183 +51,927 @@ final class LiveClient implements AutoCloseable {
   private String maxObservedTimestamp
   private Map remoteVersion = zeroVersion()
   private WebSocket socket
+  private CompletableFuture<WebSocket> pendingConnect
+  private ScheduledFuture<?> handshakeDeadline
   private boolean reconnectScheduled = false
   private boolean closed = false
   private long socketGeneration = 0
   private final StringBuilder fragments = new StringBuilder()
+  private int fragmentBytes = 0
 
   LiveClient(String deploymentUrl) {
     URI base = URI.create(deploymentUrl.replaceAll('/+$', ''))
     String scheme = base.scheme == 'https' ? 'wss' : base.scheme == 'http' ? 'ws' : null
-    if (!scheme || !base.host) throw new IllegalArgumentException('Convex deployment URL must be http(s)')
-    endpoint = URI.create("${scheme}://${base.rawAuthority ?: base.authority}${base.rawPath ?: ''}/api/sync")
+    if (!scheme || !base.host || base.userInfo) {
+      throw new IllegalArgumentException('Convex deployment URL must be http(s)')
+    }
+
+    endpoint = URI.create(
+      "${scheme}://${base.rawAuthority ?: base.authority}${base.rawPath ?: ''}/api/sync",
+    )
+    owner = Executors.newSingleThreadScheduledExecutor { Runnable task ->
+      Thread thread = new Thread(task, 'convex-groovy-live-owner')
+      thread.daemon = true
+      thread
+    }
+    http = HttpClient.newBuilder()
+      .connectTimeout(HANDSHAKE_TIMEOUT)
+      .build()
   }
 
   Subscription subscribe(String path, Map args) {
-    if (!path?.trim()) throw new IllegalArgumentException('Convex function path is required')
-    if (args == null) throw new IllegalArgumentException('Convex arguments must be a named JSON object')
+    if (!path?.trim()) {
+      throw new IllegalArgumentException('Convex function path is required')
+    }
+    if (args == null) {
+      throw new IllegalArgumentException('Convex arguments must be a named JSON object')
+    }
+
     onOwner {
       ensureOpen()
-      Subscription sub = new Subscription(this, nextId++, path, deepCopy(args))
-      subscriptions[sub.queryId] = sub
+      Subscription subscription = new Subscription(
+        this,
+        nextId++,
+        path,
+        deepCopy(args),
+      )
+      subscriptions[subscription.queryId] = subscription
+
       try {
-        if (socket == null) connect()
-        else modify([addModification(sub)])
-        return sub
+        if (socket != null) {
+          modify([addModification(subscription)])
+        } else if (pendingConnect == null && !reconnectScheduled) {
+          startConnect()
+        }
+        subscription
       } catch (Throwable error) {
-        subscriptions.remove(sub.queryId); sub.finish(); throw error
+        subscriptions.remove(subscription.queryId)
+        subscription.finish()
+        throw error
       }
     }
   }
 
-  void unsubscribe(Subscription sub) { onOwner {
-    if (subscriptions.remove(sub.queryId) == null) return
-    // This invalidates the relay before its caller receives an acknowledgement.
-    sub.finish()
-    if (socket != null) modify([[type: 'Remove', queryId: sub.queryId]])
-  } }
+  void unsubscribe(Subscription subscription) {
+    onOwner {
+      if (subscriptions.remove(subscription.queryId) == null) {
+        return
+      }
 
-  void debugDisconnect() { onOwner {
-    ensureOpen()
-    if (socket == null) throw new IllegalStateException('Live WebSocket is not connected')
-    retire('DebugDisconnect', true)
-  } }
-
-  private void connect() {
-    ensureOpen()
-    long generation = ++socketGeneration
-    WebSocket ws
-    try {
-      ws = http.newWebSocketBuilder().connectTimeout(Duration.ofSeconds(10)).header('Convex-Client', 'groovy-0.1.0')
-        .buildAsync(endpoint, new Listener(this, generation)).get(10, TimeUnit.SECONDS)
-    } catch (Exception error) { throw new ConvexClient.TransportException('live dial', error) }
-    socket = ws
-    querySetVersion = 0; remoteVersion = zeroVersion()
-    // A successful handshake resets exponential retry debt before server traffic arrives.
-    reconnectBackoffMs = INITIAL_BACKOFF_MS; reconnectScheduled = false
-    send([type: 'Connect', sessionId: UUID.randomUUID().toString(), connectionCount: connectionCount,
-          lastCloseReason: lastCloseReason, maxObservedTimestamp: maxObservedTimestamp, clientTs: 0].findAll { it.value != null })
-    if (!subscriptions.isEmpty()) modify(subscriptions.values().collect { addModification(it) })
+      subscription.finish()
+      if (socket != null) {
+        modify([[type: 'Remove', queryId: subscription.queryId]])
+      }
+      if (subscriptions.isEmpty()) {
+        cancelReconnect()
+      }
+    }
   }
 
-  private Map addModification(Subscription sub) { [type: 'Add', queryId: sub.queryId, udfPath: sub.path, args: [sub.args]] }
+  /** Adapter-only hook. It acknowledges only after retirement and retry scheduling. */
+  void debugDisconnect() {
+    onOwner {
+      ensureOpen()
+      if (socket == null) {
+        throw new IllegalStateException('Live WebSocket is not connected')
+      }
+      retireConnection('DebugDisconnect', true)
+    }
+  }
+
+  private void startConnect() {
+    ensureOpen()
+    if (pendingConnect != null || socket != null || subscriptions.isEmpty()) {
+      return
+    }
+
+    reconnectScheduled = false
+    long generation = ++socketGeneration
+    Listener listener = new Listener(this, generation)
+    CompletableFuture<WebSocket> candidate = http.newWebSocketBuilder()
+      .connectTimeout(HANDSHAKE_TIMEOUT)
+      .header('Convex-Client', 'groovy-0.2.0')
+      .buildAsync(endpoint, listener)
+    pendingConnect = candidate
+
+    handshakeDeadline = owner.schedule({
+      if (pendingConnect == candidate) {
+        candidate.cancel(true)
+        pendingConnect = null
+        connectionCount++
+        lastCloseReason = 'HandshakeTimeout'
+        scheduleReconnect()
+      }
+    } as Runnable, HANDSHAKE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+
+    candidate.whenComplete { WebSocket connected, Throwable error ->
+      enqueueOwner {
+        completeConnect(generation, candidate, connected, error)
+      }
+    }
+  }
+
+  private void completeConnect(
+    long generation,
+    CompletableFuture<WebSocket> candidate,
+    WebSocket connected,
+    Throwable error
+  ) {
+    if (pendingConnect != candidate) {
+      connected?.abort()
+      return
+    }
+
+    pendingConnect = null
+    handshakeDeadline?.cancel(false)
+    handshakeDeadline = null
+    if (closed || generation != socketGeneration || subscriptions.isEmpty()) {
+      connected?.abort()
+      return
+    }
+    if (error != null) {
+      connectionCount++
+      lastCloseReason = 'HandshakeFailed:' + concise(error)
+      scheduleReconnect()
+      return
+    }
+
+    socket = connected
+    querySetVersion = 0
+    remoteVersion = zeroVersion()
+    fragments.setLength(0)
+    fragmentBytes = 0
+    reconnectBackoffMs = INITIAL_BACKOFF_MS
+    subscriptions.values().each { it.beginHydration() }
+
+    try {
+      Map connect = [
+        type: 'Connect',
+        sessionId: UUID.randomUUID().toString(),
+        connectionCount: connectionCount,
+        lastCloseReason: lastCloseReason,
+        clientTs: 0,
+      ]
+      if (maxObservedTimestamp != null) {
+        connect.maxObservedTimestamp = maxObservedTimestamp
+      }
+      send(connect)
+      modify(subscriptions.values().collect { addModification(it) })
+    } catch (Throwable sendFailure) {
+      // A successful handshake followed by a failed initial write must not
+      // leave a candidate socket that prevents the scheduled retry.
+      retireConnection('InitialWriteFailed:' + concise(sendFailure), true)
+    }
+  }
+
+  private Map addModification(Subscription subscription) {
+    [
+      type: 'Add',
+      queryId: subscription.queryId,
+      udfPath: subscription.path,
+      args: [subscription.args],
+    ]
+  }
+
   private void modify(List<Map> modifications) {
-    send([type: 'ModifyQuerySet', baseVersion: querySetVersion, newVersion: querySetVersion + 1, modifications: modifications])
+    if (modifications.isEmpty()) {
+      return
+    }
+    send([
+      type: 'ModifyQuerySet',
+      baseVersion: querySetVersion,
+      newVersion: querySetVersion + 1,
+      modifications: modifications,
+    ])
     querySetVersion++
   }
+
   private void send(Map message) {
     WebSocket active = socket
-    if (active == null) throw new IllegalStateException('Live WebSocket is not connected')
-    try { active.sendText(JsonOutput.toJson(message), true).get(10, TimeUnit.SECONDS) }
-    catch (Exception error) { throw new ConvexClient.TransportException('live write', error) }
+    if (active == null) {
+      throw new IllegalStateException('Live WebSocket is not connected')
+    }
+
+    try {
+      active.sendText(JsonOutput.toJson(message), true)
+        .get(WRITE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+    } catch (Exception error) {
+      throw new ConvexClient.TransportException('live write', error)
+    }
   }
 
-  private void received(long generation, CharSequence data, boolean last) { onOwner {
-    if (closed || generation != socketGeneration || socket == null) return
-    fragments.append(data)
-    if (!last) return
-    String frame = fragments.toString(); fragments.setLength(0)
-    try { handle((Map) ConvexClient.JSON.parseText(frame)) }
-    catch (Throwable error) {
-      subscriptions.values().each { it.offer(new Update(null, asProtocol(error), [])) }
-      retire('ProtocolError', true)
+  private void acceptText(
+    WebSocket webSocket,
+    long generation,
+    CharSequence data,
+    boolean last
+  ) {
+    String immutable = data.toString()
+    int bytes = immutable.getBytes(StandardCharsets.UTF_8).length
+    if (!incoming.offer(new SocketEvent(generation, immutable, last, null, null), bytes)) {
+      incoming.forceError(
+        new SocketEvent(
+          generation,
+          '',
+          true,
+          new ConvexClient.TransportException(
+            'live read',
+            new IllegalStateException('Live callback inbox exceeded its byte budget'),
+          ),
+          null,
+        ),
+      )
     }
-  } }
+    scheduleDrain()
+  }
 
+  private void acceptFailure(long generation, Throwable error) {
+    incoming.forceError(new SocketEvent(generation, '', true, error, null))
+    scheduleDrain()
+  }
+
+  private void acceptPing(long generation, java.nio.ByteBuffer message) {
+    java.nio.ByteBuffer copy = message.asReadOnlyBuffer()
+    byte[] payload = new byte[copy.remaining()]
+    copy.get(payload)
+    if (!incoming.offer(new SocketEvent(generation, '', true, null, payload), payload.length + 64)) {
+      incoming.forceError(
+        new SocketEvent(
+          generation,
+          '',
+          true,
+          new ConvexClient.TransportException(
+            'live read',
+            new IllegalStateException('Live callback inbox exceeded its byte budget'),
+          ),
+          null,
+        ),
+      )
+    }
+    scheduleDrain()
+  }
+
+  private void scheduleDrain() {
+    if (incoming.markDrainScheduled()) {
+      enqueueOwner { drainIncoming() }
+    }
+  }
+
+  private void drainIncoming() {
+    SocketEvent event
+    while ((event = incoming.poll()) != null) {
+      if (closed || event.generation != socketGeneration) {
+        continue
+      }
+      if (event.error != null) {
+        if (socket == null) {
+          // buildAsync owns handshake failures and counts the attempt exactly
+          // once. Listener errors before a candidate becomes active are noise.
+          continue
+        }
+        subscriptions.values().each {
+          it.offerTransition(new Update(null, asTransport(event.error), []))
+        }
+        retireConnection('TransportError:' + concise(event.error), true)
+        continue
+      }
+      if (socket == null) {
+        continue
+      }
+      if (event.pong != null) {
+        try {
+          socket.sendPong(java.nio.ByteBuffer.wrap(event.pong))
+            .get(WRITE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+        } catch (Exception error) {
+          subscriptions.values().each {
+            it.offerTransition(new Update(null, asTransport(error), []))
+          }
+          retireConnection('TransportError:' + concise(error), true)
+        }
+        continue
+      }
+
+      fragmentBytes += event.encodedBytes()
+      if (fragmentBytes > MAX_MESSAGE_BYTES) {
+        protocolFailure('Live message exceeds 2 MiB')
+        continue
+      }
+      fragments.append(event.text)
+      if (!event.last) {
+        continue
+      }
+
+      String frame = fragments.toString()
+      fragments.setLength(0)
+      fragmentBytes = 0
+      try {
+        Object parsed = ConvexClient.JSON.parseText(frame)
+        if (!(parsed instanceof Map)) {
+          throw new ConvexClient.ProtocolException('Live message must be a JSON object')
+        }
+        handle((Map) parsed)
+      } catch (Throwable error) {
+        protocolFailure(error.message ?: error.class.simpleName)
+      }
+    }
+
+    incoming.finishDrain()
+    if (!incoming.isEmpty()) {
+      scheduleDrain()
+    }
+  }
+
+  private void protocolFailure(String message) {
+    ConvexClient.ProtocolException error = new ConvexClient.ProtocolException(message)
+    subscriptions.values().each {
+      it.offerTransition(new Update(null, error, []))
+    }
+    retireConnection('ProtocolError:' + message, true)
+  }
+
+  /** Validate the complete transition before changing any observable state. */
   private void handle(Map message) {
-    String type = message.type?.toString()
-    if (type in ['Ping', 'MutationResponse', 'ActionResponse']) return
-    if (type in ['TransitionChunk', 'FatalError', 'AuthError']) throw new ConvexClient.ProtocolException("${type}: ${message.error ?: 'unsupported'}")
-    if (type != 'Transition') throw new ConvexClient.ProtocolException("unknown Live message: ${type}")
-    if (message.startVersion != remoteVersion) throw new ConvexClient.ProtocolException('Live transition version mismatch')
-    Map<Integer, Update> changed = [:]
-    (message.modifications ?: []).each { Map mod ->
-      int id = (mod.queryId as Number).intValue(); List<String> logs = mod.logLines instanceof List ? mod.logLines.collect { it.toString() } : []
-      if (mod.type == 'QueryUpdated') changed[id] = new Update(mod.value, null, logs)
-      else if (mod.type == 'QueryFailed') changed[id] = new Update(null, new ConvexClient.FunctionException('query', mod.errorMessage?.toString() ?: 'query failed', mod.errorData, logs), logs)
-      else if (mod.type != 'QueryRemoved') throw new ConvexClient.ProtocolException("unknown Transition modification: ${mod.type}")
+    String type = requireString(message, 'type')
+    if (type in ['Ping', 'MutationResponse', 'ActionResponse']) {
+      return
     }
-    remoteVersion = deepCopy((Map) message.endVersion)
-    maxObservedTimestamp = remoteVersion.ts?.toString()
-    // Deterministic hydration: keep only new encoded values across reconnection.
-    changed.each { Integer id, Update update -> subscriptions[id]?.offerIfChanged(update) }
+    if (type in ['TransitionChunk', 'FatalError', 'AuthError']) {
+      throw new ConvexClient.ProtocolException(
+        "${type}: ${message.error ?: 'unsupported'}",
+      )
+    }
+    if (type != 'Transition') {
+      throw new ConvexClient.ProtocolException("unknown Live message: ${type}")
+    }
+    requireShape(
+      message,
+      ['type', 'startVersion', 'endVersion', 'modifications'] as Set,
+      ['clientClockSkew', 'serverTs'] as Set,
+      'Transition',
+    )
+    if (message.containsKey('clientClockSkew')) {
+      requireLongInteger(message.clientClockSkew, 'clientClockSkew', false)
+    }
+    if (message.containsKey('serverTs')) {
+      requireLongInteger(message.serverTs, 'serverTs', true)
+    }
+
+    Map startVersion = validateVersion(message.startVersion, 'startVersion')
+    Map endVersion = validateVersion(message.endVersion, 'endVersion')
+    if (startVersion != remoteVersion) {
+      throw new ConvexClient.ProtocolException('Live transition version mismatch')
+    }
+    if (!(message.modifications instanceof List)) {
+      throw new ConvexClient.ProtocolException('Transition modifications must be an array')
+    }
+
+    LinkedHashMap<Integer, Update> planned = [:]
+    Set<Integer> seen = [] as Set
+    message.modifications.each { Object candidate ->
+      if (!(candidate instanceof Map)) {
+        throw new ConvexClient.ProtocolException('Transition modification must be an object')
+      }
+      Map modification = (Map) candidate
+      int queryId = requireQueryId(modification.queryId)
+      if (!seen.add(queryId)) {
+        throw new ConvexClient.ProtocolException('Transition repeated a queryId')
+      }
+      String modificationType = requireString(modification, 'type')
+
+      if (modificationType == 'QueryUpdated') {
+        requireShape(
+          modification,
+          ['type', 'queryId', 'value'] as Set,
+          ['journal', 'logLines'] as Set,
+          'QueryUpdated',
+        )
+        if (modification.containsKey('journal') &&
+          modification.journal != null &&
+          !(modification.journal instanceof String)) {
+          throw new ConvexClient.ProtocolException(
+            'QueryUpdated journal must be a string or null',
+          )
+        }
+        if (!modification.containsKey('value')) {
+          throw new ConvexClient.ProtocolException('QueryUpdated omitted value')
+        }
+        List<String> logs = requireLogs(modification)
+        planned[queryId] = new Update(modification.value, null, logs)
+      } else if (modificationType == 'QueryFailed') {
+        requireShape(
+          modification,
+          ['type', 'queryId', 'errorMessage'] as Set,
+          ['errorData', 'logLines'] as Set,
+          'QueryFailed',
+        )
+        String errorMessage = requireString(modification, 'errorMessage')
+        List<String> logs = requireLogs(modification)
+        planned[queryId] = new Update(
+          null,
+          new ConvexClient.FunctionException(
+            'query',
+            errorMessage,
+            modification.errorData,
+            logs,
+          ),
+          logs,
+        )
+      } else if (modificationType == 'QueryRemoved') {
+        requireShape(
+          modification,
+          ['type', 'queryId'] as Set,
+          ['logLines'] as Set,
+          'QueryRemoved',
+        )
+        requireLogs(modification)
+      } else {
+        throw new ConvexClient.ProtocolException(
+          "unknown Transition modification: ${modificationType}",
+        )
+      }
+    }
+
+    // Commit only after every version and modification has passed validation.
+    remoteVersion = deepCopy(endVersion)
+    maxObservedTimestamp = endVersion.ts
     reconnectBackoffMs = INITIAL_BACKOFF_MS
+    planned.each { Integer queryId, Update update ->
+      subscriptions[queryId]?.offerTransition(update)
+    }
   }
 
-  private void closedByPeer(long generation, String reason) { onOwner { if (!closed && generation == socketGeneration && socket != null) retire(reason, true) } }
-  private void retire(String reason, boolean reconnect) {
-    WebSocket previous = socket; socket = null
-    if (previous != null) { previous.abort(); connectionCount++ }
-    lastCloseReason = reason; querySetVersion = 0; remoteVersion = zeroVersion(); fragments.setLength(0)
-    if (reconnect && !subscriptions.isEmpty()) scheduleReconnect(reconnectBackoffMs)
+  private static Map validateVersion(Object candidate, String field) {
+    if (!(candidate instanceof Map)) {
+      throw new ConvexClient.ProtocolException("${field} must be an object")
+    }
+    Map version = (Map) candidate
+    if (version.keySet() != ['querySet', 'identity', 'ts'] as Set) {
+      throw new ConvexClient.ProtocolException("${field} has an invalid shape")
+    }
+    int querySet = requireNonnegativeInteger(version.querySet, "${field}.querySet")
+    int identity = requireNonnegativeInteger(version.identity, "${field}.identity")
+    if (!(version.ts instanceof String) || !version.ts) {
+      throw new ConvexClient.ProtocolException("${field}.ts must be a non-empty string")
+    }
+    [querySet: querySet, identity: identity, ts: version.ts]
   }
-  private void scheduleReconnect(long delay) {
-    if (closed || reconnectScheduled || subscriptions.isEmpty()) return
+
+  private static int requireQueryId(Object candidate) {
+    requireNonnegativeInteger(candidate, 'queryId')
+  }
+
+  private static int requireNonnegativeInteger(Object candidate, String field) {
+    if (!(candidate instanceof Number)) {
+      throw new ConvexClient.ProtocolException("${field} must be an integer")
+    }
+    BigDecimal decimal
+    try {
+      decimal = new BigDecimal(candidate.toString())
+    } catch (NumberFormatException error) {
+      throw new ConvexClient.ProtocolException("${field} must be an integer")
+    }
+    if (decimal.stripTrailingZeros().scale() > 0 ||
+      decimal < 0 ||
+      decimal > Integer.MAX_VALUE) {
+      throw new ConvexClient.ProtocolException("${field} must be an in-range integer")
+    }
+    decimal.intValueExact()
+  }
+
+  private static long requireLongInteger(
+    Object candidate,
+    String field,
+    boolean nonnegative
+  ) {
+    if (!(candidate instanceof Number)) {
+      throw new ConvexClient.ProtocolException("${field} must be an integer")
+    }
+    BigDecimal decimal
+    try {
+      decimal = new BigDecimal(candidate.toString())
+    } catch (NumberFormatException error) {
+      throw new ConvexClient.ProtocolException("${field} must be an integer")
+    }
+    if (decimal.stripTrailingZeros().scale() > 0 ||
+      (nonnegative && decimal < 0) ||
+      decimal < Long.MIN_VALUE ||
+      decimal > Long.MAX_VALUE) {
+      throw new ConvexClient.ProtocolException("${field} must be an in-range integer")
+    }
+    decimal.longValueExact()
+  }
+
+  private static String requireString(Map source, String field) {
+    Object value = source[field]
+    if (!(value instanceof String) || !value) {
+      throw new ConvexClient.ProtocolException("${field} must be a non-empty string")
+    }
+    value
+  }
+
+  private static List<String> requireLogs(Map modification) {
+    if (!modification.containsKey('logLines')) {
+      return []
+    }
+    if (!(modification.logLines instanceof List) ||
+      !modification.logLines.every { it instanceof String }) {
+      throw new ConvexClient.ProtocolException('logLines must be an array of strings')
+    }
+    modification.logLines.collect { it.toString() }.asImmutable()
+  }
+
+  private static void requireShape(
+    Map source,
+    Set<String> required,
+    Set<String> optional,
+    String label
+  ) {
+    Set<String> keys = source.keySet() as Set<String>
+    if (!keys.containsAll(required) || !(keys - required - optional).isEmpty()) {
+      throw new ConvexClient.ProtocolException("${label} has an invalid shape")
+    }
+  }
+
+  private void peerClosed(long generation, int code, String reason) {
+    acceptFailure(
+      generation,
+      new ConvexClient.TransportException(
+        'live close',
+        new IOException("ServerClosed:${code}:${reason ?: ''}"),
+      ),
+    )
+  }
+
+  private void retireConnection(String reason, boolean reconnect) {
+    WebSocket previous = socket
+    socket = null
+    pendingConnect?.cancel(true)
+    pendingConnect = null
+    handshakeDeadline?.cancel(false)
+    handshakeDeadline = null
+    if (previous != null) {
+      previous.abort()
+      connectionCount++
+    }
+
+    lastCloseReason = reason
+    querySetVersion = 0
+    remoteVersion = zeroVersion()
+    fragments.setLength(0)
+    fragmentBytes = 0
+    incoming.clear()
+    if (reconnect && !subscriptions.isEmpty()) {
+      scheduleReconnect()
+    }
+  }
+
+  private void scheduleReconnect() {
+    if (closed || reconnectScheduled || subscriptions.isEmpty()) {
+      return
+    }
+    long delay = reconnectBackoffMs
+    reconnectBackoffMs = Math.min(MAX_BACKOFF_MS, reconnectBackoffMs * 2L)
     reconnectScheduled = true
     owner.schedule({
       reconnectScheduled = false
-      if (closed || socket != null || subscriptions.isEmpty()) return
-      try { connect() }
-      catch (Throwable error) {
-        lastCloseReason = error.message ?: 'TransportError'
-        long next = reconnectBackoffMs
-        reconnectBackoffMs = Math.min(MAX_BACKOFF_MS, reconnectBackoffMs * 2L)
-        scheduleReconnect(next)
+      if (!closed && socket == null && pendingConnect == null && !subscriptions.isEmpty()) {
+        startConnect()
       }
     } as Runnable, delay, TimeUnit.MILLISECONDS)
   }
 
-  private static Map zeroVersion() { [querySet: 0, identity: 0, ts: INITIAL_TIMESTAMP] }
-  private static Map deepCopy(Map value) { (Map) ConvexClient.JSON.parseText(JsonOutput.toJson(value)) }
-  private static Throwable asProtocol(Throwable error) { error instanceof ConvexClient.ProtocolException ? error : new ConvexClient.ProtocolException(error.message ?: error.class.simpleName) }
-  private void ensureOpen() { if (closed) throw new IllegalStateException('Convex Live client is closed') }
-  private <T> T onOwner(Closure<T> action) {
-    if (Thread.currentThread().name == 'convex-groovy-live') return action.call()
-    try { return owner.submit({ action.call() } as Callable<T>).get(15, TimeUnit.SECONDS) }
-    catch (ExecutionException error) { Throwable cause = error.cause; if (cause instanceof RuntimeException) throw (RuntimeException) cause; throw new RuntimeException(cause) }
+  private void cancelReconnect() {
+    reconnectScheduled = false
+    socketGeneration++
+    pendingConnect?.cancel(true)
+    pendingConnect = null
+    handshakeDeadline?.cancel(false)
+    handshakeDeadline = null
   }
-  @Override void close() { onOwner {
-    if (closed) return
-    closed = true; WebSocket previous = socket; socket = null
-    if (previous != null) { try { previous.sendClose(WebSocket.NORMAL_CLOSURE, 'closed').get(2, TimeUnit.SECONDS) } catch (Exception ignored) { previous.abort() } }
-    subscriptions.values().each { it.finish() }; subscriptions.clear()
-  }; owner.shutdownNow() }
+
+  private static Map zeroVersion() {
+    [querySet: 0, identity: 0, ts: INITIAL_TIMESTAMP]
+  }
+
+  private static Map deepCopy(Map value) {
+    (Map) ConvexClient.JSON.parseText(JsonOutput.toJson(value))
+  }
+
+  private static Throwable asTransport(Throwable error) {
+    error instanceof ConvexClient.TransportException
+      ? error
+      : new ConvexClient.TransportException('live read', error)
+  }
+
+  private static String concise(Throwable error) {
+    Throwable actual = error instanceof ExecutionException && error.cause
+      ? error.cause
+      : error
+    actual.message ?: actual.class.simpleName
+  }
+
+  private void ensureOpen() {
+    if (closed) {
+      throw new IllegalStateException('Convex Live client is closed')
+    }
+  }
+
+  private void enqueueOwner(Closure<?> action) {
+    try {
+      owner.execute { action.call() }
+    } catch (java.util.concurrent.RejectedExecutionException ignored) {
+      // Shutdown invalidates late listener callbacks.
+    }
+  }
+
+  private <T> T onOwner(Closure<T> action) {
+    if (Thread.currentThread().name == 'convex-groovy-live-owner') {
+      return action.call()
+    }
+    try {
+      owner.submit({ action.call() } as Callable<T>)
+        .get(OWNER_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+    } catch (ExecutionException error) {
+      Throwable cause = error.cause
+      if (cause instanceof RuntimeException) {
+        throw (RuntimeException) cause
+      }
+      throw new RuntimeException(cause)
+    }
+  }
+
+  @Override
+  void close() {
+    try {
+      onOwner {
+        if (closed) {
+          return
+        }
+        closed = true
+        reconnectScheduled = false
+        socketGeneration++
+        pendingConnect?.cancel(true)
+        pendingConnect = null
+        handshakeDeadline?.cancel(false)
+        handshakeDeadline = null
+
+        WebSocket previous = socket
+        socket = null
+        if (previous != null) {
+          try {
+            previous.sendClose(WebSocket.NORMAL_CLOSURE, 'closed')
+              .get(WRITE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+          } catch (Exception ignored) {
+            // The bounded abort below completes shutdown for an idle peer too.
+          } finally {
+            previous.abort()
+          }
+        }
+        subscriptions.values().each { it.finish() }
+        subscriptions.clear()
+        incoming.clear()
+      }
+    } finally {
+      owner.shutdownNow()
+      owner.awaitTermination(2, TimeUnit.SECONDS)
+    }
+  }
 
   static record Update(Object value, Throwable error, List<String> logs) {}
+
   static final class Subscription implements AutoCloseable {
-    static final int MAX_EVENTS = 16; static final int MAX_ENCODED_BYTES = 2 * 1024 * 1024
-    private final LiveClient manager; final int queryId; final String path; final Map args
-    private final ArrayDeque<Update> updates = new ArrayDeque<>(); private final ArrayDeque<Integer> sizes = new ArrayDeque<>()
-    private int bytes = 0; private boolean closed = false; private String lastValue
-    Subscription(LiveClient manager, int id, String path, Map args) { this.manager = manager; queryId = id; this.path = path; this.args = args }
-    synchronized void offerIfChanged(Update update) {
-      if (closed) return
-      String encoded = update.error == null ? JsonOutput.toJson(update.value) : null
-      if (encoded != null && encoded == lastValue) return
-      if (encoded != null) lastValue = encoded
-      int size = (encoded ?: (update.error?.message ?: 'error')).getBytes(StandardCharsets.UTF_8).length + 256
-      if (size > MAX_ENCODED_BYTES) { offer(new Update(null, new ConvexClient.ProtocolException('Live update exceeds queue byte budget'), update.logs)); return }
-      while (!updates.isEmpty() && (updates.size() >= MAX_EVENTS || bytes + size > MAX_ENCODED_BYTES)) { bytes -= sizes.removeFirst(); updates.removeFirst() }
-      updates.addLast(update); sizes.addLast(size); bytes += size; notifyAll()
+    static final int MAX_EVENTS = 16
+    static final int MAX_ENCODED_BYTES = 2 * 1024 * 1024
+
+    private final LiveClient manager
+    final int queryId
+    final String path
+    final Map args
+    private final ArrayDeque<Update> updates = new ArrayDeque<>()
+    private final ArrayDeque<Integer> sizes = new ArrayDeque<>()
+    private int bytes = 0
+    private boolean closed = false
+    private boolean hydrationPending = false
+    private String lastValue
+
+    Subscription(LiveClient manager, int queryId, String path, Map args) {
+      this.manager = manager
+      this.queryId = queryId
+      this.path = path
+      this.args = args
     }
-    synchronized void offer(Update update) { offerIfChanged(update) }
+
+    synchronized void beginHydration() {
+      hydrationPending = lastValue != null
+    }
+
+    synchronized void offerTransition(Update update) {
+      if (closed) {
+        return
+      }
+      if (update.error != null) {
+        // A valid recovery equal to the pre-error value must still be delivered.
+        lastValue = null
+        hydrationPending = false
+        enqueue(update)
+        return
+      }
+
+      String encoded = JsonOutput.toJson(update.value)
+      if (hydrationPending && encoded == lastValue) {
+        hydrationPending = false
+        return
+      }
+      hydrationPending = false
+      lastValue = encoded
+      enqueue(update)
+    }
+
+    synchronized void offer(Update update) {
+      offerTransition(update)
+    }
+
+    private void enqueue(Update update) {
+      String encoded = update.error == null
+        ? JsonOutput.toJson(update.value)
+        : (update.error.message ?: 'error')
+      int size = encoded.getBytes(StandardCharsets.UTF_8).length + 256
+      if (size > MAX_ENCODED_BYTES) {
+        Update replacement = new Update(
+          null,
+          new ConvexClient.ProtocolException('Live update exceeds queue byte budget'),
+          update.logs,
+        )
+        enqueueSized(replacement, 512)
+        return
+      }
+      enqueueSized(update, size)
+    }
+
+    private void enqueueSized(Update update, int size) {
+      while (!updates.isEmpty() &&
+        (updates.size() >= MAX_EVENTS || bytes + size > MAX_ENCODED_BYTES)) {
+        bytes -= sizes.removeFirst()
+        updates.removeFirst()
+      }
+      updates.addLast(update)
+      sizes.addLast(size)
+      bytes += size
+      notifyAll()
+    }
+
     synchronized Update nextUpdate(Duration timeout) {
       long deadline = System.nanoTime() + timeout.toNanos()
-      while (updates.isEmpty() && !closed) { long remaining = deadline - System.nanoTime(); if (remaining <= 0) throw new TimeoutException('timed out waiting for Live update'); wait(Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remaining))) }
-      if (updates.isEmpty()) throw new IllegalStateException('Live subscription is closed')
-      bytes -= sizes.removeFirst(); return updates.removeFirst()
+      while (updates.isEmpty() && !closed) {
+        long remaining = deadline - System.nanoTime()
+        if (remaining <= 0) {
+          throw new TimeoutException('timed out waiting for Live update')
+        }
+        wait(Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remaining)))
+      }
+      if (updates.isEmpty()) {
+        throw new IllegalStateException('Live subscription is closed')
+      }
+      bytes -= sizes.removeFirst()
+      updates.removeFirst()
     }
-    Object next(Duration timeout) { Update update = nextUpdate(timeout); if (update.error != null) throw update.error; return update.value }
-    synchronized void finish() { closed = true; updates.clear(); sizes.clear(); bytes = 0; notifyAll() }
-    @Override void close() { manager?.unsubscribe(this) ?: finish() }
+
+    Object next(Duration timeout) {
+      Update update = nextUpdate(timeout)
+      if (update.error != null) {
+        throw update.error
+      }
+      update.value
+    }
+
+    synchronized void finish() {
+      closed = true
+      updates.clear()
+      sizes.clear()
+      bytes = 0
+      notifyAll()
+    }
+
+    @Override
+    void close() {
+      manager?.unsubscribe(this) ?: finish()
+    }
+  }
+
+  private static record SocketEvent(
+    long generation,
+    String text,
+    boolean last,
+    Throwable error,
+    byte[] pong
+  ) {
+    int encodedBytes() {
+      pong == null
+        ? text.getBytes(StandardCharsets.UTF_8).length
+        : pong.length + 64
+    }
+  }
+
+  private static final class IncomingBuffer {
+    private final ArrayBlockingQueue<SocketEvent> events =
+      new ArrayBlockingQueue<>(MAX_INCOMING_EVENTS)
+    private final AtomicBoolean drainScheduled = new AtomicBoolean(false)
+    private int bytes = 0
+
+    synchronized boolean offer(SocketEvent event, int encodedBytes) {
+      if (encodedBytes > MAX_INCOMING_BYTES || bytes + encodedBytes > MAX_INCOMING_BYTES) {
+        return false
+      }
+      if (!events.offer(event)) {
+        return false
+      }
+      bytes += encodedBytes
+      true
+    }
+
+    synchronized void forceError(SocketEvent event) {
+      events.clear()
+      bytes = 0
+      events.offer(event)
+    }
+
+    synchronized SocketEvent poll() {
+      SocketEvent event = events.poll()
+      if (event != null) {
+        bytes -= event.encodedBytes()
+      }
+      event
+    }
+
+    boolean markDrainScheduled() {
+      drainScheduled.compareAndSet(false, true)
+    }
+
+    void finishDrain() {
+      drainScheduled.set(false)
+    }
+
+    boolean isEmpty() {
+      events.isEmpty()
+    }
+
+    synchronized void clear() {
+      events.clear()
+      bytes = 0
+    }
   }
 
   private static final class Listener implements WebSocket.Listener {
-    private final LiveClient client; private final long generation
-    Listener(LiveClient client, long generation) { this.client = client; this.generation = generation }
-    @Override void onOpen(WebSocket ws) { ws.request(1) }
-    @Override CompletionStage<?> onText(WebSocket ws, CharSequence data, boolean last) { client.received(generation, data, last); ws.request(1); CompletableFuture.completedFuture(null) }
-    @Override CompletionStage<?> onClose(WebSocket ws, int code, String reason) { client.closedByPeer(generation, "ServerClosed:${code}"); CompletableFuture.completedFuture(null) }
-    @Override void onError(WebSocket ws, Throwable error) { client.closedByPeer(generation, 'TransportError') }
+    private final LiveClient client
+    private final long generation
+
+    Listener(LiveClient client, long generation) {
+      this.client = client
+      this.generation = generation
+    }
+
+    @Override
+    void onOpen(WebSocket webSocket) {
+      webSocket.request(1)
+    }
+
+    @Override
+    CompletionStage<?> onText(
+      WebSocket webSocket,
+      CharSequence data,
+      boolean last
+    ) {
+      client.acceptText(webSocket, generation, data, last)
+      webSocket.request(1)
+      CompletableFuture.completedFuture(null)
+    }
+
+    @Override
+    CompletionStage<?> onPing(WebSocket webSocket, java.nio.ByteBuffer message) {
+      client.acceptPing(generation, message)
+      webSocket.request(1)
+      CompletableFuture.completedFuture(null)
+    }
+
+    @Override
+    CompletionStage<?> onPong(WebSocket webSocket, java.nio.ByteBuffer message) {
+      webSocket.request(1)
+      CompletableFuture.completedFuture(null)
+    }
+
+    @Override
+    CompletionStage<?> onClose(
+      WebSocket webSocket,
+      int statusCode,
+      String reason
+    ) {
+      client.peerClosed(generation, statusCode, reason)
+      CompletableFuture.completedFuture(null)
+    }
+
+    @Override
+    void onError(WebSocket webSocket, Throwable error) {
+      client.acceptFailure(generation, error)
+    }
   }
 }

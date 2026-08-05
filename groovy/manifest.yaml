@@ -6,7 +6,7 @@ selectionTier: ranked
 implementation:
   status: attempting
   provenance: native
-  version: 0.1.0
+  version: 0.2.0
   notes: Native Groovy implementation using the JDK HTTP/TLS/WebSocket APIs and Groovy's JSON parser. It is an educational protocol demonstration, not an SDK.
 toolchain:
   name: Groovy on Eclipse Temurin JDK

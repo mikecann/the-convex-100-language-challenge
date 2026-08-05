@@ -21,10 +21,22 @@ final class Main {
       if (initial != before) throw new IllegalStateException('Live initial value disagreed with HTTP')
 
       // The random runId is an idempotency key, so a transport retry cannot increment twice.
-      Map mutation = (Map) client.mutation('demo:increment', [room: room, language: 'groovy', runId: UUID.randomUUID().toString()]).value()
+      Map mutationArgs = [
+        room: room,
+        language: 'groovy',
+        runId: UUID.randomUUID().toString(),
+      ]
+      Map mutation = (Map) client.mutation(
+        'demo:increment',
+        mutationArgs,
+      ).value()
       boolean applied = mutation.applied == true
       int after = count(mutation.state, 'mutation result')
-      if (!applied || after != before + 1) throw new IllegalStateException('mutation did not produce the expected next count')
+      if (!applied || after != before + 1) {
+        throw new IllegalStateException(
+          'mutation did not produce the expected next count',
+        )
+      }
 
       // Decode the actual reactive update rather than issuing a second HTTP query.
       int updated = count(subscription.next(Duration.ofSeconds(10)), 'updated Live value')
@@ -49,7 +61,13 @@ final class Main {
       throw new IllegalStateException("${operation} returned a non-finite count")
     }
     BigDecimal number = new BigDecimal(value.toString())
-    if (number.stripTrailingZeros().scale() > 0 || number < Integer.MIN_VALUE || number > Integer.MAX_VALUE) throw new IllegalStateException("${operation} returned a non-integral or overflowing count")
+    if (number.stripTrailingZeros().scale() > 0 ||
+      number < Integer.MIN_VALUE ||
+      number > Integer.MAX_VALUE) {
+      throw new IllegalStateException(
+        "${operation} returned a non-integral or overflowing count",
+      )
+    }
     number.intValueExact()
   }
 }

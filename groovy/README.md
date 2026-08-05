@@ -41,10 +41,22 @@ final class Main {
       if (initial != before) throw new IllegalStateException('Live initial value disagreed with HTTP')
 
       // The random runId is an idempotency key, so a transport retry cannot increment twice.
-      Map mutation = (Map) client.mutation('demo:increment', [room: room, language: 'groovy', runId: UUID.randomUUID().toString()]).value()
+      Map mutationArgs = [
+        room: room,
+        language: 'groovy',
+        runId: UUID.randomUUID().toString(),
+      ]
+      Map mutation = (Map) client.mutation(
+        'demo:increment',
+        mutationArgs,
+      ).value()
       boolean applied = mutation.applied == true
       int after = count(mutation.state, 'mutation result')
-      if (!applied || after != before + 1) throw new IllegalStateException('mutation did not produce the expected next count')
+      if (!applied || after != before + 1) {
+        throw new IllegalStateException(
+          'mutation did not produce the expected next count',
+        )
+      }
 
       // Decode the actual reactive update rather than issuing a second HTTP query.
       int updated = count(subscription.next(Duration.ofSeconds(10)), 'updated Live value')
@@ -69,7 +81,13 @@ final class Main {
       throw new IllegalStateException("${operation} returned a non-finite count")
     }
     BigDecimal number = new BigDecimal(value.toString())
-    if (number.stripTrailingZeros().scale() > 0 || number < Integer.MIN_VALUE || number > Integer.MAX_VALUE) throw new IllegalStateException("${operation} returned a non-integral or overflowing count")
+    if (number.stripTrailingZeros().scale() > 0 ||
+      number < Integer.MIN_VALUE ||
+      number > Integer.MAX_VALUE) {
+      throw new IllegalStateException(
+        "${operation} returned a non-integral or overflowing count",
+      )
+    }
     number.intValueExact()
   }
 }
@@ -79,17 +97,17 @@ final class Main {
 ## Docker checks
 
 ```sh
-./run test groovy       # Formats, compiles, and runs Groovy-local deterministic tests in Docker.
+./run test groovy       # Lints, compiles, and runs Groovy-local deterministic tests in Docker.
 ./run build groovy      # Builds the linux/amd64 non-root conformance runtime image.
 ./run verify-example groovy  # Root-owned: runs this exact example against the approved local deployment.
 ./run verify-all groovy      # Root-owned: runs local and hosted black-box conformance serially.
 ```
 
-The final images run compiled bytecode on the Temurin JRE. They contain no Groovy compiler, build tool, package manager, Node, Python, curl, or Convex CLI.
+The final images run compiled bytecode on the Temurin JRE. They contain no Groovy compiler, build tool, package manager, Node, Python, curl, or Convex CLI. The adapter and example also use separate compiled classpaths, so neither image contains the other's program or the test suite.
 
 ## Protocol notes
 
-The client uses the pinned `convex-rs-0.10.4-unversioned-sync` `/api/sync` profile. One single-threaded owner performs every socket read transition, write, reconnect, and query-set mutation. Relays consume a bounded newest-16 queue with a 2 MiB encoded-value budget. The test-only adapter supports NDJSON on stdin/stdout or one `ADAPTER_LISTEN` TCP connection, and exposes `debugDisconnect` only for the shared controller.
+The client uses the pinned `convex-rs-0.10.4-unversioned-sync` `/api/sync` profile. JDK WebSocket callbacks copy fragments and control messages into a bounded inbox; one single-threaded owner performs protocol parsing, writes, reconnects, and query-set mutations. Each subscription keeps the newest 16 events within a 2 MiB encoded-value budget. The callback inbox is separately bounded to 32 events and 4 MiB. The test-only adapter supports strict, byte-bounded NDJSON on stdin/stdout or one `ADAPTER_LISTEN` TCP connection. Its output queue is bounded to 16 events and 4 MiB, and it exposes `debugDisconnect` only for the shared controller.
 
 ## Limitations
 
