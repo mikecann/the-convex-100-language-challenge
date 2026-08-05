@@ -24,7 +24,7 @@ cleans up its subscription and client.
 ## Basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.dart -->
-```text
+```dart
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
