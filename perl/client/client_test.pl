@@ -1,0 +1,12 @@
+use strict;
+use warnings;
+use Test::More;
+use FindBin;
+use lib "$FindBin::Bin";
+use Convex;
+ok(Convex->can('new'), 'native Perl client loads');
+my $client = Convex->new('http://example.test');
+eval { $client->query('demo:echo', []); }; like("$@", qr/named JSON object/, 'rejects positional Convex arguments');
+$client->close;
+eval { $client->query('demo:state', {}); }; like("$@", qr/closed/, 'rejects calls after close');
+done_testing;

@@ -1,23 +1,3 @@
-# Convex from Perl
-
-This is a small, native Perl demonstration of Convex HTTP calls and a pinned experimental Live protocol profile.
-
-It is educational and unofficial, not a production SDK or a package to install from CPAN.
-
-## Start here
-
-[`examples/basics/main.pl`](examples/basics/main.pl) queries a fresh counter room, begins Live, applies an idempotent mutation, then verifies the Live update.
-
-## What works
-
-| Behaviour | Status |
-| --- | --- |
-| Documented JSON HTTP queries, mutations, and actions | Implemented, pending shared evidence |
-| Pinned `/api/sync` Live query profile | Implemented, pending shared evidence |
-| Capability badges | None earned yet |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.pl -->
-```text
 #!/usr/local/bin/perl
 use strict;
 use warnings;
@@ -66,22 +46,3 @@ eval {
   1;
 } or do { my $error = $@ || 'unknown example failure'; $client->close; die $error; };
 $client->close;
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-```sh
-./run test perl
-./run build perl
-```
-
-The first runs Perl syntax checks and language-local tests in Docker. The second builds the linux/amd64 adapter runtime. Coordinator-owned `verify-example`, `verify`, and `verify-hosted` are required before either capability can be awarded.
-
-## Conformance notes
-
-The adapter speaks NDJSON protocol v1 over stdin/stdout or `ADAPTER_LISTEN` TCP. Live is implemented with one worker that owns WebSocket reads, writes, reconnects, and query-set versions; each subscriber gets a newest-16 mailbox. `debugDisconnect` is adapter-only.
-
-## Limitations
-
-Live authentication, WebSocket mutations/actions, transition-chunk assembly, journals, optimistic updates, and full Convex value support are deliberately deferred. The sync endpoint is pinned experimental compatibility work, not a stable public protocol.

@@ -1,0 +1,13 @@
+use strict;
+use warnings;
+use Test::More;
+use FindBin;
+use lib "$FindBin::Bin";
+use Convex::Live;
+my $manager = bless { request => sub {} }, 'FakeManager';
+my $sub = Convex::Subscription->new($manager, 1);
+$sub->deliver({ value => { count => $_ } }) for 0..16;
+my @counts = map { $sub->next_update(0.1)->{value}{count} } 1..16;
+is_deeply(\@counts, [1..16], 'slow consumers retain only the newest sixteen Live values');
+$sub->finish;
+done_testing;
