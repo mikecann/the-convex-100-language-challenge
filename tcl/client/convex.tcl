@@ -439,6 +439,9 @@ proc ::convex::ws_frame_received {id fin opcode payload} {
     set fragmentOpcode [dict get [state $id] wsFragmentOpcode]
     if {$opcode == 0} {
         if {$fragmentOpcode < 0} { error "unexpected WebSocket continuation" }
+        if {[string bytelength [dict get [state $id] wsFragments]] + [string bytelength $payload] > [expr {2 * 1024 * 1024}]} {
+            error "fragmented WebSocket message exceeds 2 MiB"
+        }
         put $id wsFragments "[dict get [state $id] wsFragments]$payload"
         if {!$fin} { return }
         set opcode $fragmentOpcode
@@ -447,7 +450,12 @@ proc ::convex::ws_frame_received {id fin opcode payload} {
         put $id wsFragmentOpcode -1
     } elseif {$opcode in {1 2}} {
         if {$fragmentOpcode >= 0} { error "new WebSocket data frame during fragment" }
-        if {!$fin} { put $id wsFragmentOpcode $opcode; put $id wsFragments $payload; return }
+        if {!$fin} {
+            if {[string bytelength $payload] > [expr {2 * 1024 * 1024}]} { error "fragmented WebSocket message exceeds 2 MiB" }
+            put $id wsFragmentOpcode $opcode
+            put $id wsFragments $payload
+            return
+        }
     } else { error "unsupported WebSocket opcode" }
     if {$opcode != 1} { error "binary WebSocket data is unsupported" }
     if {[catch {set text [encoding convertfrom utf-8 $payload]} error]} { error "invalid UTF-8 WebSocket text: $error" }
