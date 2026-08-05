@@ -58,7 +58,7 @@ defmodule Convex.Example do
         # agrees with the HTTP query before moving on to the mutation.
         initial = next_update(subscription, "initial Live value")
         expect_count("initial Live value", initial["count"], state["count"])
-        print_json("live initial", initial)
+        IO.puts("live initial count: #{initial["count"]}")
 
         # Increment the room over HTTP. The random run ID is an idempotency key,
         # so retrying this exact write would not increment the room twice.
@@ -74,12 +74,13 @@ defmodule Convex.Example do
 
         if increment["applied"] != true, do: raise("mutation was not applied")
         expect_count("mutation", increment["state"]["count"], expected_count)
-        print_json("mutation", increment)
+        IO.puts("mutation applied: #{increment["applied"]}")
+        IO.puts("mutation count: #{increment["state"]["count"]}")
 
         # Read the resulting state from Live without issuing another HTTP query.
         updated = next_update(subscription, "updated Live value")
         expect_count("updated Live value", updated["count"], expected_count)
-        print_json("live update", updated)
+        IO.puts("live updated count: #{updated["count"]}")
 
         # Reaching this line proves HTTP query, HTTP mutation, and Live all
         # agreed on the same 0 -> 1 change.
@@ -151,12 +152,6 @@ defmodule Convex.Example do
 
   def normalize_count!(operation, count) do
     raise "#{operation} count must be a finite whole number, got: #{inspect(count)}"
-  end
-
-  # Pretty JSON keeps nested Convex values readable in a terminal and provides
-  # the exact `"applied": true` evidence line consumed by the shared verifier.
-  defp print_json(label, value) do
-    IO.puts("#{label}: #{Jason.encode!(value, pretty: true)}")
   end
 
   # Cryptographic randomness makes the mutation idempotency key unique across
