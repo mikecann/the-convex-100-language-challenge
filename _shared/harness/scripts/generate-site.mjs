@@ -73,6 +73,7 @@ function readOptionalResult(directory, languageId) {
 const syntaxAliases = {
   "c-sharp": "csharp",
   "f-sharp": "fsharp",
+  fortran: "fortran-free-form",
   "objective-c": "objective-c",
   "visual-basic-net": "vb",
 };
@@ -84,6 +85,7 @@ const extensionAliases = {
   erl: "erlang",
   fs: "fsharp",
   fsx: "fsharp",
+  f90: "fortran-free-form",
   h: "c",
   hs: "haskell",
   hpp: "cpp",
