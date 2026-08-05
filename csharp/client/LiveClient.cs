@@ -9,7 +9,9 @@ namespace Convex;
 public sealed class LiveClient(string deployment) : IDisposable
 {
     internal static Action? DebugPumpStopped;
+    internal static Action? DebugSocketDetached;
     internal static Action? ReconnectAttempting;
+    internal static Func<Task>? TransitionBeforeCommit;
     private readonly Uri _endpoint = ToWebSocket(deployment);
     private readonly ConcurrentDictionary<int, Subscription> _subscriptions = [];
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -72,48 +74,58 @@ public sealed class LiveClient(string deployment) : IDisposable
                 if (!result.EndOfMessage) continue;
                 var json = StrictUtf8.GetString(frame.GetBuffer(), 0, checked((int)frame.Length));
                 frame.SetLength(0);
-                Handle(JsonNode.Parse(json)?.AsObject() ?? throw new ConvexClient.ProtocolException("empty Live frame"));
+                await Handle(socket, JsonNode.Parse(json)?.AsObject() ?? throw new ConvexClient.ProtocolException("empty Live frame"));
             }
         }
         catch (OperationCanceledException) when (_closed) { return; }
         catch (ConvexClient.ProtocolException error) { failure = error; }
         catch (Exception error) { failure = new ConvexClient.TransportException("live", error); }
 
-        // A deliberate debug disconnect detaches the old socket before aborting it.
-        // Its receive task must not turn that expected cancellation into a user error.
-        if (!ReferenceEquals(_socket, socket)) return;
-        if (failure is not null && !_intentionalRecovery) DeliverFailure(failure);
-        await Disconnect(socket, failure is ConvexClient.ProtocolException ? "ProtocolError" : "TransportError", true);
+        await Disconnect(socket, failure is ConvexClient.ProtocolException ? "ProtocolError" : "TransportError", true, failure);
     }
-    private void Handle(JsonObject message)
+    private async Task Handle(ClientWebSocket socket, JsonObject message)
     {
         var type = message["type"]?.GetValue<string>(); if (type is "Ping" or "MutationResponse" or "ActionResponse") return;
         if (type is not "Transition") throw new ConvexClient.ProtocolException("unsupported Live message: " + type);
-        if (!JsonNode.DeepEquals(message["startVersion"], _version)) throw new ConvexClient.ProtocolException("Live transition version mismatch");
-        var restoredActiveQuery=false;
+        var startVersion=message["startVersion"]?.AsObject()??throw new ConvexClient.ProtocolException("Live transition omitted startVersion");
+        var endVersion=message["endVersion"]?.AsObject()??throw new ConvexClient.ProtocolException("Live transition omitted endVersion");
+        var updates=new List<(int QueryId, Update Update)>();
         foreach (var n in message["modifications"]?.AsArray() ?? [])
         {
             var m = n?.AsObject() ?? throw new ConvexClient.ProtocolException("Live transition contained an invalid modification");
             var queryId = m["queryId"]?.GetValue<int>() ?? throw new ConvexClient.ProtocolException("Live modification omitted queryId");
             var modificationType = m["type"]?.GetValue<string>();
             if (modificationType == "QueryRemoved") continue;
-            if (!_subscriptions.TryGetValue(queryId, out var subscription)) continue;
             var logs = m["logLines"]?.AsArray().Select(x => x?.GetValue<string>() ?? "").ToArray() ?? [];
             if (modificationType == "QueryUpdated")
             {
                 if (!m.ContainsKey("value")) throw new ConvexClient.ProtocolException("QueryUpdated omitted value");
-                subscription.Offer(new Update(m["value"]?.DeepClone(), null, logs));
-                restoredActiveQuery=true;
+                updates.Add((queryId, new Update(m["value"]?.DeepClone(), null, logs)));
             }
             else if (modificationType == "QueryFailed") {
-                subscription.Offer(new Update(null, new ConvexClient.FunctionException("query", m["errorMessage"]?.GetValue<string>() ?? "query failed", m["errorData"]?.DeepClone(), logs), logs));
-                restoredActiveQuery=true;
+                updates.Add((queryId, new Update(null, new ConvexClient.FunctionException("query", m["errorMessage"]?.GetValue<string>() ?? "query failed", m["errorData"]?.DeepClone(), logs), logs)));
             }
             else throw new ConvexClient.ProtocolException("unsupported Live transition modification: " + modificationType);
         }
-        _version = (JsonObject)message["endVersion"]!.DeepClone();
-        _maxObservedTimestamp=_version["ts"]?.GetValue<string>();
-        if(restoredActiveQuery)_intentionalRecovery = false;
+
+        // Validation and commit are deliberately separate. Tests pause between
+        // them to prove a detached receive pump cannot publish or advance state.
+        await _gate.WaitAsync();
+        try {
+            if(!ReferenceEquals(_socket,socket))return;
+            if(!JsonNode.DeepEquals(startVersion,_version))throw new ConvexClient.ProtocolException("Live transition version mismatch");
+        } finally {_gate.Release();}
+        if(TransitionBeforeCommit is not null)await TransitionBeforeCommit();
+        await _gate.WaitAsync();
+        try {
+            if(!ReferenceEquals(_socket,socket))return;
+            if(!JsonNode.DeepEquals(startVersion,_version))throw new ConvexClient.ProtocolException("Live transition version mismatch");
+            var restoredActiveQuery=false;
+            foreach(var update in updates)if(_subscriptions.TryGetValue(update.QueryId,out var subscription)){subscription.Offer(update.Update);restoredActiveQuery=true;}
+            _version=(JsonObject)endVersion.DeepClone();
+            _maxObservedTimestamp=_version["ts"]?.GetValue<string>();
+            if(restoredActiveQuery)_intentionalRecovery=false;
+        } finally {_gate.Release();}
     }
     private void DeliverFailure(Exception failure)
     {
@@ -121,10 +133,11 @@ public sealed class LiveClient(string deployment) : IDisposable
         affected = _subscriptions.Values.ToArray();
         foreach (var subscription in affected) subscription.Offer(new Update(null, failure, []));
     }
-    private async Task Disconnect(ClientWebSocket? expected, string reason, bool reconnect)
+    private async Task Disconnect(ClientWebSocket? expected, string reason, bool reconnect, Exception? failure=null)
     {
         await _gate.WaitAsync(); try {
             if (expected is not null && !ReferenceEquals(_socket, expected)) return;
+            if(failure is not null&&!_intentionalRecovery)DeliverFailure(failure);
             if (_socket is not null) { _socket.Abort(); _socket.Dispose(); _socket=null; _connections++; }
             _lastClose=reason; _querySet=0; _version=ZeroVersion();
             if (reconnect && _subscriptions.Count>0 && !_closed && !_reconnecting) { _reconnecting=true; _=Reconnect(); }
@@ -141,6 +154,7 @@ public sealed class LiveClient(string deployment) : IDisposable
             _socket=null;stoppedPump=_receiveTask;_receiveTask=null;previous.Abort();previous.Dispose();_connections++;
             _lastClose="DebugDisconnect";_querySet=0;_version=ZeroVersion();_intentionalRecovery=true;
         } finally { _gate.Release(); }
+        DebugSocketDetached?.Invoke();
 
         if(stoppedPump is not null)await stoppedPump.WaitAsync(TimeSpan.FromSeconds(3));
         DebugPumpStopped?.Invoke();

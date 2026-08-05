@@ -185,25 +185,33 @@ static class Tests
     {
         using var syncListener=Listen();
         var pumpStopped=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var socketDetached=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var reconnectStarted=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var oldTransitionValidated=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseOldTransition=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var transitionCalls=0;
         LiveClient.DebugPumpStopped=()=>pumpStopped.TrySetResult();
+        LiveClient.DebugSocketDetached=()=>socketDetached.TrySetResult();
         LiveClient.ReconnectAttempting=()=>reconnectStarted.TrySetResult();
+        LiveClient.TransitionBeforeCommit=()=>Interlocked.Increment(ref transitionCalls)==2?PauseOldTransition():Task.CompletedTask;
+        async Task PauseOldTransition(){oldTransitionValidated.TrySetResult();await releaseOldTransition.Task;}
         var syncServer=Task.Run(async()=>{
             using(var socket=await syncListener.AcceptTcpClientAsync()){
                 var stream=socket.GetStream();await Handshake(stream);await ReadClientText(stream);var add=JsonNode.Parse(await ReadClientText(stream))!;var id=add["modifications"]![0]!["queryId"]!.GetValue<int>();
                 await WriteServerText(stream,Transition(Zero(),Version(1),new JsonObject{{"type","QueryUpdated"},{"queryId",id},{"value",new JsonObject{{"count",0}}},{"logLines",new JsonArray()}}).ToJsonString());
-                // Try to race a late old-socket frame with the deliberate abort.
-                await pumpStopped.Task.WaitAsync(Timeout);try{await WriteServerText(stream,"{\"type\":\"not-a-transition\"}");}catch(IOException){}
+                // This old-socket transition pauses after version validation but
+                // before delivery and commit while debugDisconnect detaches it.
+                await WriteServerText(stream,Transition(Version(1),Version(2),new JsonObject{{"type","QueryUpdated"},{"queryId",id},{"value",new JsonObject{{"count",99}}},{"logLines",new JsonArray()}}).ToJsonString());
                 await WaitForEof(stream);
             }
             using(var socket=await syncListener.AcceptTcpClientAsync()){
-                var stream=socket.GetStream();await Handshake(stream);await ReadClientText(stream);await ReadClientText(stream);
+                var stream=socket.GetStream();await Handshake(stream);var connect=JsonNode.Parse(await ReadClientText(stream))!;Equal(Version(1)["ts"]!.GetValue<string>(),connect["maxObservedTimestamp"]!.GetValue<string>(),"detached old transition advanced reconnect timestamp");await ReadClientText(stream);
                 // Hosted-like transient: the first restored socket dies after Add,
                 // before it can establish a valid transition.
                 await Task.Delay(75);socket.Client.LingerState=new LingerOption(true,0);
             }
             using(var socket=await syncListener.AcceptTcpClientAsync()){
-                var stream=socket.GetStream();await Handshake(stream);await ReadClientText(stream);var add=JsonNode.Parse(await ReadClientText(stream))!;var id=add["modifications"]![0]!["queryId"]!.GetValue<int>();
+                var stream=socket.GetStream();await Handshake(stream);var connect=JsonNode.Parse(await ReadClientText(stream))!;Equal(Version(1)["ts"]!.GetValue<string>(),connect["maxObservedTimestamp"]!.GetValue<string>(),"transient restored close changed reconnect timestamp");var add=JsonNode.Parse(await ReadClientText(stream))!;var id=add["modifications"]![0]!["queryId"]!.GetValue<int>();
                 await WriteServerText(stream,Transition(Zero(),Version(3),new JsonObject{{"type","QueryUpdated"},{"queryId",id},{"value",new JsonObject{{"count",1}}},{"logLines",new JsonArray()}}).ToJsonString());
                 await WaitForEof(stream);
             }
@@ -216,12 +224,14 @@ static class Tests
         try{
             using(connected)using(var stream=connected.GetStream())using(var reader=new StreamReader(stream))using(var writer=new StreamWriter(stream){AutoFlush=true}){
                 await writer.WriteLineAsync("{\"id\":\"subscribe\",\"op\":\"subscribe\",\"subscriptionId\":\"hosted\",\"path\":\"demo:state\",\"args\":{}}");Equal("ack",(await ReadEvent(reader))["type"]!.GetValue<string>(),"hosted-like subscribe ack");Equal(0,(await ReadEvent(reader))["value"]!["count"]!.GetValue<int>(),"hosted-like initial");
-                await writer.WriteLineAsync("{\"id\":\"debug\",\"op\":\"debugDisconnect\"}");var ack=await ReadEvent(reader);Equal("ack",ack["type"]!.GetValue<string>(),"hosted-like debug ack");Check(pumpStopped.Task.IsCompleted,"debug ack preceded old pump closure");Check(!reconnectStarted.Task.IsCompleted,"debug ack followed reconnect attempt instead of preceding backoff");
+                await oldTransitionValidated.Task.WaitAsync(Timeout);
+                await writer.WriteLineAsync("{\"id\":\"debug\",\"op\":\"debugDisconnect\"}");await socketDetached.Task.WaitAsync(Timeout);releaseOldTransition.TrySetResult();
+                var ack=await ReadEvent(reader);Equal("ack",ack["type"]!.GetValue<string>(),"hosted-like debug ack");Check(pumpStopped.Task.IsCompleted,"debug ack preceded old pump closure");Check(!reconnectStarted.Task.IsCompleted,"debug ack followed reconnect attempt instead of preceding backoff");
                 var recovered=await ReadEvent(reader);Check(!recovered.AsObject().ContainsKey("error"),"intentional recovery emitted transient error");Equal(1,recovered["value"]!["count"]!.GetValue<int>(),"hosted-like recovered value");
                 await writer.WriteLineAsync("{\"id\":\"close\",\"op\":\"close\"}");Equal("closed",(await ReadEvent(reader))["type"]!.GetValue<string>(),"hosted-like close");
             }
             await adapter.WaitAsync(Timeout);await syncServer.WaitAsync(Timeout);
-        }finally{LiveClient.DebugPumpStopped=null;LiveClient.ReconnectAttempting=null;Environment.SetEnvironmentVariable("ADAPTER_LISTEN",null);Environment.SetEnvironmentVariable("CONVEX_URL",null);}
+        }finally{releaseOldTransition.TrySetResult();LiveClient.DebugPumpStopped=null;LiveClient.DebugSocketDetached=null;LiveClient.ReconnectAttempting=null;LiveClient.TransitionBeforeCommit=null;Environment.SetEnvironmentVariable("ADAPTER_LISTEN",null);Environment.SetEnvironmentVariable("CONVEX_URL",null);}
     }
 
     private static void TestBoundedDelivery()
