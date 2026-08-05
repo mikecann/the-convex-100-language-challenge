@@ -1,22 +1,3 @@
-# Convex from Vala
-
-This native Vala client calls Convex over documented JSON HTTP endpoints and keeps a query current through the repository's pinned Live WebSocket profile.
-
-It is educational and unofficial. It is not a production SDK and is not intended for package publication.
-
-## Start here
-
-Read [`examples/basics/main.vala`](examples/basics/main.vala). It queries a fresh counter, starts Live before changing it, applies one idempotent mutation, and proves that HTTP and Live agree on `0 -> 1`.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP queries, mutations, actions, authentication, and structured errors | Implemented, awaiting shared evidence |
-| Live initial values, updates, reconnects, remove, and query-error recovery | Implemented, awaiting shared evidence |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.vala -->
-```vala
 using GLib;
 using Json;
 using Convex;
@@ -72,26 +53,3 @@ int main (string[] args) {
     loop.run (); return 0;
   } catch (Error error) { stderr.printf ("Vala example failed: %s\n", error.message); return 1; }
 }
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-```sh
-./run sync-examples
-./run validate
-./run test vala
-./run verify-example vala
-```
-
-`test` formats, compiles, and runs Vala's language-local adapter checks inside Docker. `verify-example` exercises the exact canonical example in its final runtime image. Root-owned shared conformance is still required before either capability can be earned.
-
-## Conformance and protocol notes
-
-The client implements Convex-specific HTTP envelopes and the pinned `/api/sync` query-set protocol in Vala. libsoup supplies ordinary TLS, HTTP, and RFC6455 transport only. One GLib-main-context Live owner exclusively opens, reads, writes, retires, and reconnects the socket. It commits a complete Transition before publishing updates, validates query-set versions, tracks the little-endian timestamp numerically, suppresses unchanged rehydration, and retains only the newest sixteen queued subscription updates.
-
-The test-only adapter accepts strict NDJSON v1 over stdin/stdout or one `ADAPTER_LISTEN` TCP controller. `debugDisconnect` is adapter-only and lets the shared harness prove real reconnections.
-
-## Limitations
-
-Live authentication, optimistic updates, mutation and action messages over WebSocket, journals, and TransitionChunk assembly are deferred. The manifest deliberately declares no earned badges until root-owned local and hosted evidence passes from a clean reviewed commit.

@@ -4,5 +4,29 @@ displayName: "Vala"
 rank: 74
 selectionTier: coverage
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Vala implementation using GLib, JSON-GLib, and libsoup for ordinary JSON, TLS, HTTP, and RFC6455 transport.
+toolchain:
+  name: Vala
+  version: 0.56.3
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, optimistic updates, WebSocket mutations, and WebSocket actions are deferred.
+  - TransitionChunk assembly is rejected as protocol drift and reconnects the shared Live owner.
+  - Values use Convex's JSON-safe subset and are exposed as JSON-GLib nodes.
 capabilities: []
