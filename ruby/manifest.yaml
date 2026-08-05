@@ -4,5 +4,31 @@ displayName: "Ruby"
 rank: 14
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Ruby documented JSON HTTP client and pinned-profile WebSocket client. Capability badges remain empty until shared local and hosted conformance pass.
+toolchain:
+  name: Ruby
+  version: 3.4.5
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication is deferred.
+  - Live supports the JSON-safe value subset used by this experiment.
+  - WebSocket mutations and actions are deferred in favour of the documented HTTP API.
+  - TransitionChunk assembly is deferred and treated as protocol drift.
+  - Mutation replay, journals, optimistic updates, and full Convex values are deferred.
 capabilities: []
