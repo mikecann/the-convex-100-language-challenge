@@ -25,7 +25,10 @@ Every implemented language Dockerfile must expose the same targets to the root
 `./run` command:
 
 - `test`: format or lint checks, language-local client tests, and compilation of
-  the canonical basic example and conformance executable.
+  the canonical basic example and conformance executable. The resulting image
+  must be a genuine `linux/amd64` image, not an amd64 label over host-platform
+  binaries. Assert both the container architecture and the target runtime's
+  architecture inside the image when cross-platform build stages are involved.
 - `example-runtime`: a minimal image whose entrypoint is the exact canonical
   `examples/basics/` program shown in the README and website, installed at
   `/usr/local/bin/convex-example`.
@@ -33,8 +36,11 @@ Every implemented language Dockerfile must expose the same targets to the root
   conformance executable, installed at `/usr/local/bin/convex-adapter`.
 
 Both runtime images must run as `65532:65532`, work with a read-only filesystem,
-drop all Linux capabilities, and contain no compiler, package manager, Convex
-CLI, or undeclared delegated client runtime. The shared policy and example
+drop all Linux capabilities, and expose no compiler or build frontend,
+package manager, Convex CLI, or undeclared delegated client runtime. A runtime
+may retain a language-runtime library named `compiler` only when the runtime
+itself requires it to boot; document why it is needed and prove that no compiler
+command is available. The shared policy and example
 verifier currently require `/bin/sh` and basic POSIX text tools in runtime
 images; do not use `scratch` until that verifier is redesigned. Install only
 runtime dependencies such as CA certificates and the target language runtime
@@ -135,6 +141,12 @@ Only the shared result evaluator may calculate HTTP or Live capability badges.
   accept one controller connection, and carry the same NDJSON stream over it.
 - The `hello` response must report protocol version, language ID,
   implementation provenance string, and runtime version.
+- The shared controller validates every emitted event strictly against
+  `_shared/schemas/adapter.schema.json`. Optional fields must be omitted when
+  absent; never serialize an absent `id`, `subscriptionId`, value, or error as
+  `null` unless the schema explicitly permits null. Add language-local coverage
+  for serialized success, structured HTTP error, subscription error, and close
+  events before relying on shared conformance to find a shape mismatch.
 - It must support clean shutdown and propagate structured function, protocol,
   and transport failures without flattening them into successful values.
 - Test-only fault injection may be compiled conditionally, but it must stay out
@@ -147,6 +159,10 @@ Only the shared result evaluator may calculate HTTP or Live capability badges.
 - The shared controller and result names must be parameterised by language ID.
   Never copy Go-specific test names, image paths, aliases, or entrypoint checks
   into a second client.
+- Choose and document Live delivery buffering deliberately. If the client owns
+  an update queue, bound it and test its overflow behaviour. If it relies on a
+  runtime mailbox or a demand-driven stream, state that choice and test a slow
+  consumer so future clients do not accidentally introduce an unbounded queue.
 
 ## README order
 
@@ -192,24 +208,35 @@ them before discovering what the example does.
 
 ## Language handoff checklist
 
-Before an agent reports completion, it must provide:
+Before a language implementation agent reports completion, it must provide:
 
 - The implementation provenance and any delegated libraries used for ordinary
   HTTP, TLS, JSON, or WebSocket transport.
 - Exact pinned toolchain, base image, and dependency versions.
 - Exact Docker commands run and their exit status.
+- Known failures, deferred protocol behaviour, buffering semantics, and any
+  test-only hooks.
+- Confirmation that only the assigned language directory changed.
+
+After the implementation and independent code review are complete, the root
+integration agent must run the shared commands serially and add to the handoff:
+
 - The canonical example's observed values and final verification line.
 - Local and hosted conformance results, with HTTP and Live claimed only when
   every required test passed.
-- Known failures, deferred protocol behaviour, and any test-only hooks.
-- Confirmation that only the assigned language directory changed.
+- Confirmation that the evidence records the reviewed source commit, a clean
+  worktree, the expected runtime architecture, and the same built image for the
+  deployment profiles.
 
 Generated, gitignored evidence under `_shared/results/local/` and
 `_shared/results/hosted/` is exempt from the directory-only handoff rule. It is
 local verification output, not source to commit.
 
-The reviewing agent must inspect the actual diff, rebuild the containers, run
-the example, and rerun conformance. A subagent summary is not verification.
+The independent language reviewer must inspect the actual diff and rebuild and
+exercise the Docker test/runtime images. The root integration reviewer must
+then run the canonical example and shared conformance serially. A subagent
+summary is not verification, and a language branch must not award itself a
+capability before those root-owned evidence runs pass.
 
 ## Pull requests
 
