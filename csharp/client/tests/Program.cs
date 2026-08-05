@@ -215,9 +215,12 @@ static class Tests
         using var syncListener=Listen();
         var relayEntered=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseRelay=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var oldPublishAttempted=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var barrierCalls=0;
-        Adapter.RelayBeforePublish=(_,_,_)=>Interlocked.Increment(ref barrierCalls)==1?BlockRelay():Task.CompletedTask;
-        async Task BlockRelay(){relayEntered.TrySetResult();await releaseRelay.Task;}
+        LiveClient.Subscription? oldSubscription=null;
+        Adapter.RelayBeforePublish=(_,subscription,_)=>Interlocked.Increment(ref barrierCalls)==1?BlockRelay(subscription):Task.CompletedTask;
+        Adapter.RelayAfterPublishAttempt=(_,subscription)=>{if(ReferenceEquals(subscription,oldSubscription))oldPublishAttempted.TrySetResult();};
+        async Task BlockRelay(LiveClient.Subscription subscription){oldSubscription=subscription;relayEntered.TrySetResult();await releaseRelay.Task;}
         var syncServer=Task.Run(async()=>{
             using var socket=await syncListener.AcceptTcpClientAsync();var stream=socket.GetStream();await Handshake(stream);await ReadClientText(stream);
             var oldAdd=JsonNode.Parse(await ReadClientText(stream))!;var oldId=oldAdd["modifications"]![0]!["queryId"]!.GetValue<int>();
@@ -240,11 +243,11 @@ static class Tests
                 await relayEntered.Task.WaitAsync(Timeout);
                 if(replace){await writer.WriteLineAsync("{\"id\":\"new\",\"op\":\"subscribe\",\"subscriptionId\":\"same\",\"path\":\"demo:state\",\"args\":{}}");Equal("new",(await ReadEvent(reader))["id"]!.GetValue<string>(),"replacement ack");Equal(2,(await ReadEvent(reader))["value"]!["count"]!.GetValue<int>(),"replacement update");}
                 else{await writer.WriteLineAsync("{\"id\":\"unsubscribe\",\"op\":\"unsubscribe\",\"subscriptionId\":\"same\"}");Equal("unsubscribe",(await ReadEvent(reader))["id"]!.GetValue<string>(),"unsubscribe ack");}
-                releaseRelay.TrySetResult();await Task.Delay(150);Check(!stream.DataAvailable,replace?"old replacement relay emitted stale error":"unsubscribed relay emitted stale value");
+                releaseRelay.TrySetResult();await oldPublishAttempted.Task.WaitAsync(Timeout);Check(!stream.DataAvailable,replace?"old replacement relay emitted stale error":"unsubscribed relay emitted stale value");
                 await writer.WriteLineAsync("{\"id\":\"close\",\"op\":\"close\"}");Equal("closed",(await ReadEvent(reader))["type"]!.GetValue<string>(),"stale relay close");
             }
             await adapter.WaitAsync(Timeout);await syncServer.WaitAsync(Timeout);
-        }finally{releaseRelay.TrySetResult();Adapter.RelayBeforePublish=null;Environment.SetEnvironmentVariable("ADAPTER_LISTEN",null);Environment.SetEnvironmentVariable("CONVEX_URL",null);}
+        }finally{releaseRelay.TrySetResult();Adapter.RelayBeforePublish=null;Adapter.RelayAfterPublishAttempt=null;Environment.SetEnvironmentVariable("ADAPTER_LISTEN",null);Environment.SetEnvironmentVariable("CONVEX_URL",null);}
     }
 
     private static async Task TestLiveFlowAndUtf8Fragmentation()

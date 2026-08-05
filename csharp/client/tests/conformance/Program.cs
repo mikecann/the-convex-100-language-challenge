@@ -12,6 +12,7 @@ public static class Program
 {
     private static readonly JsonSerializerOptions Json = new() { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull };
     internal static Func<string, LiveClient.Subscription, LiveClient.Update, Task>? RelayBeforePublish;
+    internal static Action<string, LiveClient.Subscription>? RelayAfterPublishAttempt;
     public static async Task Main()
     {
         var listen = Environment.GetEnvironmentVariable("ADAPTER_LISTEN");
@@ -43,6 +44,7 @@ public static class Program
                 if(RelayBeforePublish is { } barrier)await barrier(sid,s,update);
                 var value=update.Error is not null?Failure(null,sid,update.Error):SubscriptionEvent(sid,update);
                 await outp.WriteIf(()=>subs.TryGetValue(sid,out var active)&&ReferenceEquals(active,s),value);
+                RelayAfterPublishAttempt?.Invoke(sid,s);
             }
         } catch(Exception error) {
             await outp.WriteIf(()=>subs.TryGetValue(sid,out var active)&&ReferenceEquals(active,s),Failure(null,sid,error));
