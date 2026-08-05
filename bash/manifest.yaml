@@ -11,12 +11,17 @@ implementation:
 toolchain:
   name: GNU Bash
   version: 5.2.37
-intendedCapabilities: [http]
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities: [http, live]
 platforms: [linux/amd64]
 adapter:
   protocolVersion: 1
   entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands: [debugDisconnect]
 limitations:
-  - Live is deferred. Bash has no standard WebSocket API and this HTTP client never presents polling as a Live subscription.
+  - Live uses a direct Bash RFC6455 implementation. It supports the pinned sync profile only, with an intentionally bounded newest-16 delivery policy in the adapter.
   - The runtime deliberately includes jq for correct UTF-8 and nested JSON handling and BusyBox wget for HTTP/TLS.
 capabilities: []
