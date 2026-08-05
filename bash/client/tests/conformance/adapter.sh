@@ -14,7 +14,7 @@ queue_live_error() {
   for query in "${!LIVE_SUB[@]}"; do live_queue_push "$query" "$(jq -cn --arg name "$name" --arg message "$message" '{error:{name:$name,message:$message}}')"; done
 }
 drain_live() {
-  local raw query sub update expected read_status frames=0 delivered=0
+  local raw modification query sub update expected read_status frames=0 delivered=0
   [[ -n ${LIVE_IN:-} ]] || return 0
   # One frame per controller turn keeps a hot subscription from starving close
   # and unsubscribe commands. The per-subscription queue remains bounded at 16.
@@ -30,16 +30,18 @@ drain_live() {
     fi
     if ! jq -e '.type == "Transition" or .type == "Ping"' >/dev/null 2>&1 <<<"$raw"; then queue_live_error ProtocolError 'unsupported or malformed Convex Live message'; live_disconnect; break; fi
     ((frames++)) || true
-    while IFS=$'\t' read -r query update; do
+    while IFS= read -r modification; do
+      query=$(jq -r .queryId <<<"$modification")
+      update=$(jq -c 'if .type == "QueryFailed" then {error:{name:"FunctionError",message:(.errorMessage // "Live query failed"),data:.errorData},logs:(.logLines // [])} else {value:.value,logs:(.logLines // [])} end' <<<"$modification")
       sub=${LIVE_SUB[$query]:-}; [[ -z $sub ]] && continue
-      if [[ -v 'LIVE_REHYDRATE[$query]' ]]; then
-        expected=${LIVE_REHYDRATE[$query]}; unset 'LIVE_REHYDRATE[$query]'
+      if [[ -n ${LIVE_REHYDRATE["$query"]+present} ]]; then
+        expected=${LIVE_REHYDRATE["$query"]}; unset "LIVE_REHYDRATE[$query]"
         # A reconnect replays current query state. Suppress only an exact
         # rehydration of the last delivered result; changed state still emits.
-        jq -ne --argjson current "$update" --argjson prior "$expected" '$current.value == $prior.value and $current.error == $prior.error' >/dev/null && continue
+        if [[ -n $expected ]] && jq -ne --argjson current "$update" --argjson prior "$expected" '$current.value == $prior.value and $current.error == $prior.error' >/dev/null; then continue; fi
       fi
       live_queue_push "$query" "$update"
-    done < <(jq -r '.modifications[]? | select(.type == "QueryUpdated" or .type == "QueryFailed") | [.queryId, (if .type == "QueryFailed" then {error:{name:"FunctionError",message:(.errorMessage // "Live query failed"),data:.errorData},logs:(.logLines // [])} else {value:.value,logs:(.logLines // [])} end | tojson)] | @tsv' <<<"$raw")
+    done < <(jq -c '.modifications[]? | select(.type == "QueryUpdated" or .type == "QueryFailed")' <<<"$raw")
   done
   for query in "${!LIVE_QUEUE[@]}"; do
     sub=${LIVE_SUB[$query]:-}; [[ -z $sub ]] && continue

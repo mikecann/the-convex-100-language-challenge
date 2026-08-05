@@ -25,14 +25,27 @@ CONVEX_URL=http://127.0.0.1:18083; if live_connect; then exit 1; fi
 
 # WSS must validate both the issuing CA and the requested hostname.
 tls_state=/tmp/bash-convex-tls; tls_dir=$tls_state/tls; mkdir -p "$tls_dir"
+: >"$tls_state/large-sent"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=Bash Fixture CA' -keyout "$tls_dir/ca.key" -out "$tls_dir/ca.crt" >/dev/null 2>&1
 openssl req -newkey rsa:2048 -nodes -subj '/CN=localhost' -keyout "$tls_dir/server.key" -out "$tls_dir/server.csr" >/dev/null 2>&1
 openssl x509 -req -days 1 -in "$tls_dir/server.csr" -CA "$tls_dir/ca.crt" -CAkey "$tls_dir/ca.key" -CAcreateserial -extfile <(printf '%s\n' 'subjectAltName=DNS:localhost') -out "$tls_dir/server.crt" >/dev/null 2>&1
 BASH_FIXTURE_STATE=$tls_state socat OPENSSL-LISTEN:18443,reuseaddr,fork,cert="$tls_dir/server.crt",key="$tls_dir/server.key",verify=0 EXEC:"bash $root/client/tests/fixture.sh" & tls_pid=$!
 sleep 0.1
-CONVEX_URL=https://localhost:18443 CONVEX_CA_FILE=$tls_dir/ca.crt live_connect; live_disconnect
+CONVEX_URL=https://localhost:18443 CONVEX_CA_FILE=$tls_dir/ca.crt live_connect
+live_add 0 tls demo:state '{"room":"tls-room"}'
+tls_value=$(live_next_value 0); test "$(jq -r .count <<<"$tls_value")" = 0
+live_disconnect
 CONVEX_URL=https://127.0.0.1:18443 CONVEX_CA_FILE=$tls_dir/ca.crt; if live_connect; then exit 1; fi
 CONVEX_URL=https://localhost:18443 CONVEX_CA_FILE=/etc/ssl/certs/ca-certificates.crt; if live_connect; then exit 1; fi
+
+# Match the shared harness topology: TCP controller -> adapter -> WSS backend.
+ADAPTER_LISTEN=127.0.0.1:19096 CONVEX_URL=https://localhost:18443 CONVEX_CA_FILE=$tls_dir/ca.crt /usr/local/bin/convex-adapter & adapter_pid=$!
+sleep 0.2; exec {tls_adapter_fd}<>/dev/tcp/127.0.0.1/19096
+printf '%s\n' '{"id":"tls-sub","op":"subscribe","subscriptionId":"tls","path":"demo:state","args":{"room":"tls-adapter-room"}}' >&"$tls_adapter_fd"
+IFS= read -r -t 5 event <&"$tls_adapter_fd"; jq -e '.id=="tls-sub" and .type=="ack"' <<<"$event" >/dev/null
+IFS= read -r -t 5 event <&"$tls_adapter_fd"; jq -e '.type=="subscription" and .subscriptionId=="tls" and .value.count==0' <<<"$event" >/dev/null
+printf '%s\n' '{"id":"tls-close","op":"close"}' >&"$tls_adapter_fd"; IFS= read -r -t 5 event <&"$tls_adapter_fd"
+jq -e '.id=="tls-close" and .type=="closed"' <<<"$event" >/dev/null; wait "$adapter_pid"; unset adapter_pid
 reset_live
 export CONVEX_URL=http://127.0.0.1:18080
 
@@ -87,6 +100,9 @@ for i in $(seq 1 5); do
   event=$(next_event); jq -e --argjson count "$i" '.type=="subscription" and .value.count==$count and (has("error")|not)' <<<"$event" >/dev/null || { echo "unexpected reconnect update: $event" >&2; exit 1; }
 done
 send_command '{"id":"unsub","op":"unsubscribe","subscriptionId":"reconnect"}'; test "$(jq -r .type <<<"$(next_for_id unsub)")" = ack
+# The adapter ACKs after writing Remove; wait for the network fixture to record
+# that frame before closing the socket and asserting the transport transcript.
+for _ in $(seq 1 20); do [[ $(jq -s '[.[]|select(.type=="ModifyQuerySet")|.modifications[]|select(.type=="Remove")]|length' "$state/ws.log") -ge 2 ]] && break; sleep 0.05; done
 send_command '{"id":"close","op":"close"}'; test "$(jq -r .type <<<"$(next_for_id close)")" = closed
 wait "$adapter_pid"; unset adapter_pid
 test ! -s "$state/adapter.err"

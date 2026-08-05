@@ -12,6 +12,7 @@ _ws_url() { local base=${CONVEX_URL%/}; printf '%s/api/sync' "${base/http:/ws:}"
 
 live_connect() {
   local url hostport host port key line session_hex session_id expected_accept status_line
+  local tls_read tls_write tls_coproc_read tls_coproc_write
   local upgrade_header='' connection_header='' accept_header='' handshake_complete=0
   url=$(_ws_url); hostport=${url#ws://}; hostport=${hostport#wss://}; hostport=${hostport%%/*}
   host=${hostport%%:*}; port=${hostport#*:}; [[ $port = "$hostport" ]] && { [[ $url = wss:* ]] && port=443 || port=80; }
@@ -21,7 +22,13 @@ live_connect() {
         -verify_return_error -verify_hostname "$host" \
         -CAfile "${CONVEX_CA_FILE:-/etc/ssl/certs/ca-certificates.crt}" 2>/dev/null
     )
-    LIVE_FD=${LIVE_TLS[1]}; LIVE_IN=${LIVE_TLS[0]}; LIVE_PID=$LIVE_TLS_PID
+    # Bash marks the descriptors created for a coprocess as close-on-exec.
+    # Duplicate them onto ordinary descriptors because frame reads use dd under
+    # a deadline, and that child process must inherit the TLS input stream.
+    tls_coproc_write=${LIVE_TLS[1]}; tls_coproc_read=${LIVE_TLS[0]}; LIVE_PID=$LIVE_TLS_PID
+    exec {tls_write}>&"$tls_coproc_write"; exec {tls_read}<&"$tls_coproc_read"
+    eval "exec ${tls_coproc_write}>&-"; eval "exec ${tls_coproc_read}<&-"
+    LIVE_FD=$tls_write; LIVE_IN=$tls_read
   else
     exec {LIVE_FD}<>"/dev/tcp/$host/$port"; LIVE_IN=$LIVE_FD
   fi
@@ -123,7 +130,7 @@ live_read() {
 live_modify() { local modifications=$1 new=$((LIVE_QUERY_SET+1)); live_send "$(jq -cn --argjson base "$LIVE_QUERY_SET" --argjson new "$new" --argjson mods "$modifications" '{type:"ModifyQuerySet",baseVersion:$base,newVersion:$new,modifications:$mods}')"; LIVE_QUERY_SET=$new; }
 live_resubscribe() { local id mods='[]'; for id in "${!LIVE_PATH[@]}"; do mods=$(jq -cn --argjson old "$mods" --arg id "$id" --arg path "${LIVE_PATH[$id]}" --argjson args "${LIVE_ARGS[$id]}" '$old + [{type:"Add",queryId:($id|tonumber),udfPath:$path,args:[$args]}]'); done; if [[ $mods != '[]' ]]; then live_modify "$mods"; fi; return 0; }
 live_add() { local id=$1 sub=$2 path=$3 args=$4; LIVE_SUB[$id]=$sub; LIVE_PATH[$id]=$path; LIVE_ARGS[$id]=$args; live_modify "$(jq -cn --argjson id "$id" --arg p "$path" --argjson a "$args" '[{type:"Add",queryId:$id,udfPath:$p,args:[$a]}]')"; }
-live_remove() { local id=$1; unset 'LIVE_SUB[$id]' 'LIVE_PATH[$id]' 'LIVE_ARGS[$id]' 'LIVE_LAST[$id]' 'LIVE_REHYDRATE[$id]' 'LIVE_QUEUE[$id]'; live_modify "$(jq -cn --argjson id "$id" '[{type:"Remove",queryId:$id}]')"; }
+live_remove() { local id=$1; unset "LIVE_SUB[$id]" "LIVE_PATH[$id]" "LIVE_ARGS[$id]" "LIVE_LAST[$id]" "LIVE_REHYDRATE[$id]" "LIVE_QUEUE[$id]"; live_modify "$(jq -cn --argjson id "$id" '[{type:"Remove",queryId:$id}]')"; }
 live_disconnect() {
   local output_fd=${LIVE_FD:-} input_fd=${LIVE_IN:-}
   [[ -n $output_fd ]] && eval "exec ${output_fd}>&-" || true
@@ -134,7 +141,7 @@ live_disconnect() {
 live_close() { if [[ -n ${LIVE_FD:-} ]]; then live_send_frame 8 '' || true; fi; live_disconnect; }
 live_reconnect() {
   local attempts=0 delay_ms=100 id
-  for id in "${!LIVE_LAST[@]}"; do LIVE_REHYDRATE[$id]=${LIVE_LAST[$id]}; done
+  for id in "${!LIVE_LAST[@]}"; do LIVE_REHYDRATE["$id"]=${LIVE_LAST["$id"]}; done
   while ((attempts < 6)); do
     sleep "$(awk -v ms="$delay_ms" 'BEGIN { printf "%.3f", ms / 1000 }')"
     if live_connect; then return 0; fi
