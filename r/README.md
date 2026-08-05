@@ -44,6 +44,7 @@ run_example <- function() {
   client <- convex_client(Sys.getenv("CONVEX_URL"))
   # A unique room keeps concurrent examples isolated. The default is friendly by hand.
   room <- commandArgs(trailingOnly = TRUE)[1] %||% "r-example"
+  # Always close the client and its Live socket, including when a check fails.
   on.exit(client$close(), add = TRUE)
 
   # Query the current counter over Convex's HTTP endpoint.
@@ -53,6 +54,7 @@ run_example <- function() {
 
   # Start Live before the mutation, so the reactive value cannot miss the change.
   subscription <- client$subscribe("demo:state", list(room = room))
+  # Unsubscribe during cleanup so the server does not retain this query.
   on.exit(subscription$close(), add = TRUE)
 
   # Live first sends its current value. Decode it into a normal R list and

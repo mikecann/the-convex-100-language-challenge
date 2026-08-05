@@ -18,6 +18,8 @@ assert(result$id == "call" && isTRUE(result$value$ok), "result serialization los
 failure <- convex_error("convex_function_error", "expected failure", "query", list(code = "EXPECTED"), "before failure")
 error <- serialize(error_event("call", failure))
 assert(error$type == "error" && error$error$data$code == "EXPECTED", "structured HTTP error serialization lost data")
+assert(error$error$name == "FunctionError", "function error used a noncanonical name")
+assert(is.list(error$logs) && identical(error$logs, list("before failure")), "one error log was not serialized as an array")
 
 subscription_error <- serialize(error_event(NULL, failure, "subscription"))
 assert(subscription_error$type == "subscription", "subscription error used the wrong event type")
@@ -28,6 +30,9 @@ assert(closed$id == "close" && closed$type == "closed", "close serialization was
 
 plain_error <- serialize(error_event("protocol", convex_error("convex_protocol_error", "bad frame")))
 assert(!("data" %in% names(plain_error$error)), "absent structured error data was serialized as null")
+assert(plain_error$error$name == "ProtocolError", "protocol error used a noncanonical name")
+transport_error <- serialize(error_event("transport", convex_error("convex_transport_error", "socket closed")))
+assert(transport_error$error$name == "TransportError", "transport error used a noncanonical name")
 
 # Pause after dequeue, then model unsubscribe and same-ID replacement. Neither
 # stale relay may publish after the corresponding acknowledgement.

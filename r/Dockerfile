@@ -2,6 +2,7 @@
 # R's interpreter is the declared target runtime. The four ordinary packages
 # are pinned below and supply only TLS/HTTP, JSON, and WebSocket primitives.
 ARG R_IMAGE=rocker/r-ver:4.5.1@sha256:03b023fbf7b1b24ac1bb8b2ac5fd7e15a767e67b40ff50c155e328110981c2aa
+ARG RUNTIME_IMAGE=alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 FROM ${R_IMAGE} AS packages
 WORKDIR /work
 RUN apt-get update && apt-get install -y --no-install-recommends libcurl4-openssl-dev libssl-dev libz-dev make g++ ca-certificates && rm -rf /var/lib/apt/lists/*
@@ -46,8 +47,8 @@ RUN set -eu; \
     find "$root/usr/local/lib/R/bin" -mindepth 1 -maxdepth 1 ! -name exec ! -name R ! -name Rscript -exec rm -rf {} +; \
     sed -i '1s|/bin/bash|/bin/sh|' "$root/usr/local/lib/R/bin/R"; \
     { \
-      LD_LIBRARY_PATH=/usr/local/lib/R/lib ldd /usr/local/bin/Rscript /usr/local/lib/R/bin/exec/R /usr/local/lib/R/lib/libR.so /bin/dash /bin/rm /bin/mkdir /usr/bin/id /usr/bin/grep /usr/bin/sed /usr/bin/uname /usr/bin/which; \
-      find /usr/local/lib/R -type f -name '*.so' -exec ldd '{}' ';'; \
+      LD_LIBRARY_PATH=/usr/local/lib/R/lib ldd /usr/local/bin/Rscript /usr/local/lib/R/bin/exec/R /usr/local/lib/R/lib/libR.so /bin/dash /bin/rm /bin/mkdir /usr/bin/id /usr/bin/grep /usr/bin/sed /usr/bin/uname /usr/bin/which || true; \
+      LD_LIBRARY_PATH=/usr/local/lib/R/lib ldd /usr/local/lib/R/site-library/*/libs/*.so /usr/local/lib/R/library/*/libs/*.so || true; \
     } | awk '/=> \/.* \(0x/ { print $3 } $1 ~ /^\// && $1 !~ /:$/ { print $1 }' | sort -u | \
       while IFS= read -r library; do cp -L --parents "$library" "$root"; done; \
     for library in /lib/x86_64-linux-gnu/libnss_*.so.2; do \
@@ -55,10 +56,6 @@ RUN set -eu; \
     done; \
     for library in /lib/x86_64-linux-gnu/libcurl.so.4 /lib/x86_64-linux-gnu/liblapack.so.3 /lib/x86_64-linux-gnu/libblas.so.3 /lib/x86_64-linux-gnu/libopenblas.so.0 /lib/x86_64-linux-gnu/libgfortran.so.5 /lib/x86_64-linux-gnu/libgomp.so.1 /lib/x86_64-linux-gnu/libquadmath.so.0; do \
       test ! -e "$library" || cp -L --parents "$library" "$root"; \
-    done; \
-    cp -a /lib/x86_64-linux-gnu "$root/lib/"; \
-    for library in /lib/x86_64-linux-gnu/libcurl.so.4 /lib/x86_64-linux-gnu/liblapack.so.3 /lib/x86_64-linux-gnu/libblas.so.3 /lib/x86_64-linux-gnu/libopenblas.so.0 /lib/x86_64-linux-gnu/libgfortran.so.5 /lib/x86_64-linux-gnu/libgomp.so.1 /lib/x86_64-linux-gnu/libquadmath.so.0; do \
-      if test -e "$library"; then rm -f "$root$library"; cp -L "$library" "$root$library"; fi; \
     done; \
     cp -a /etc/ssl "$root/etc/ssl"; \
     cp -a /usr/lib/ssl "$root/usr/lib/ssl"; \
@@ -69,13 +66,24 @@ RUN set -eu; \
       test ! -e "$config" || cp --parents "$config" "$root"; \
     done
 
-FROM scratch AS runtime-base
+FROM ${RUNTIME_IMAGE} AS runtime-base
 ENV CONVEX_CLIENT_PATH=/opt/convex/client
 ENV TMPDIR=/dev/shm
 ENV LANG=C.UTF-8
 COPY --from=runtime-rootfs /runtime-root /
 COPY client/convex.R client/live.R /opt/convex/client/
 COPY --chmod=0555 client/tests/conformance/adapter.R /usr/local/bin/convex-adapter
+# Alpine supplies a pinned, non-scratch image history. Remove its package
+# manager and BusyBox frontend after installing the explicit glibc/R closure,
+# leaving only the individual POSIX tools copied by runtime-rootfs.
+RUN find /bin /sbin /usr/bin /usr/sbin -type l ! -path /bin/sh -delete && \
+    rm -f /bin/busybox /sbin/apk /usr/sbin/apk /usr/bin/apk /lib/ld-musl-x86_64.so.1 /lib/libc.musl-x86_64.so.1 && \
+    rm -rf /etc/apk /lib/apk /usr/lib/libapk* && \
+    for command_path in /bin/*; do case "$command_path" in /bin/dash|/bin/mkdir|/bin/rm|/bin/sh) ;; *) rm -f "$command_path" ;; esac; done && \
+    for command_path in /usr/bin/*; do case "$command_path" in /usr/bin/grep|/usr/bin/id|/usr/bin/sed|/usr/bin/uname|/usr/bin/which) ;; *) rm -f "$command_path" ;; esac; done && \
+    rm -f /sbin/* /usr/sbin/* && \
+    for command in R apk apt apt-get dpkg gcc g++ cc clang make node npm python python3 curl wget convex; do ! command -v "$command" >/dev/null 2>&1 || exit 1; done && \
+    test ! -e /usr/local/lib/R/bin/Rcmd && test ! -e /usr/local/lib/R/bin/INSTALL
 USER 65532:65532
 RUN expected='{"protocolVersion":1,"id":"hello","op":"hello"}\n{"id":"close","op":"close"}\n'; \
     actual=$(printf "$expected" | /usr/local/bin/convex-adapter); \

@@ -65,7 +65,18 @@ convex_live <- function(deployment_url, client_version, transport_factory = conv
 
   send_json <- function(value) {
     if (!state$connected || is.null(state$transport)) convex_stop("convex_transport_error", "Live WebSocket is not connected", "live")
-    state$transport$send(as.character(convex_json(value)))
+    tryCatch(
+      {
+        state$transport$send(as.character(convex_json(value)))
+        TRUE
+      },
+      error = function(error) {
+        typed <- convex_error("convex_transport_error", paste("WebSocket write failed:", conditionMessage(error)), "live")
+        publish_error(typed)
+        retire_transport(conditionMessage(typed), reconnect = TRUE, close_socket = TRUE)
+        FALSE
+      }
+    )
   }
 
   add_modification <- function(entry) {
@@ -74,13 +85,17 @@ convex_live <- function(deployment_url, client_version, transport_factory = conv
 
   modify_query_set <- function(modifications) {
     base_version <- state$query_set_version
-    send_json(list(
+    sent <- send_json(list(
       type = "ModifyQuerySet",
       baseVersion = base_version,
       newVersion = base_version + 1L,
       modifications = modifications
     ))
+    if (!sent) {
+      return(FALSE)
+    }
     state$query_set_version <- base_version + 1L
+    TRUE
   }
 
   deliver <- function(entry, update) {
@@ -223,7 +238,9 @@ convex_live <- function(deployment_url, client_version, transport_factory = conv
           clientTs = 0L
         )
         if (!is.null(state$max_observed_timestamp)) connect_message$maxObservedTimestamp <- state$max_observed_timestamp
-        send_json(connect_message)
+        if (!send_json(connect_message)) {
+          return(invisible(NULL))
+        }
         entries <- active_entries()
         if (length(entries)) modify_query_set(lapply(entries, add_modification))
       },

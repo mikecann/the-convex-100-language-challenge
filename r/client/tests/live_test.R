@@ -7,6 +7,7 @@ assert <- function(value, message) {
 
 fixture <- new.env(parent = emptyenv())
 fixture$connections <- list()
+fixture$fail_next_send <- FALSE
 fixture$factory <- function(url, client_version, handlers) {
   connection <- new.env(parent = emptyenv())
   connection$url <- url
@@ -16,7 +17,13 @@ fixture$factory <- function(url, client_version, handlers) {
   connection$closed <- FALSE
   transport <- list(
     connect = function() handlers$open(),
-    send = function(message) connection$sent <- c(connection$sent, list(jsonlite::fromJSON(message, simplifyVector = FALSE))),
+    send = function(message) {
+      if (isTRUE(fixture$fail_next_send)) {
+        fixture$fail_next_send <- FALSE
+        stop("fixture write failure")
+      }
+      connection$sent <- c(connection$sent, list(jsonlite::fromJSON(message, simplifyVector = FALSE)))
+    },
     close = function(code = 1000L, reason = "") connection$closed <- TRUE,
     ready_state = function() if (connection$closed) 3L else 1L
   )
@@ -174,5 +181,24 @@ fixture$connections[[2L]]$handlers$error("second failure")
 Sys.sleep(0.11)
 manager$pump(0)
 assert(length(fixture$connections) == 3L, "healthy handshake did not reset backoff")
+manager$close()
+
+# A synchronous socket write failure is a TransportError, retires the broken
+# connection, and resends every active Add after reconnect.
+fixture$connections <- list()
+manager <- convex_live("http://127.0.0.1:9999", "r-test", fixture$factory)
+first <- manager$subscribe("demo:state", list(room = "write-first"))
+fixture$fail_next_send <- TRUE
+second <- manager$subscribe("demo:state", list(room = "write-second"))
+failure <- second$next_update(0.1)
+assert(inherits(failure$error, "convex_transport_error"), "WebSocket write failure was not a TransportError")
+Sys.sleep(0.11)
+manager$pump(0)
+connection <- tail(fixture$connections, 1L)[[1L]]
+resent <- connection$sent[[2L]]$modifications
+assert(length(resent) == 2L && all(vapply(resent, function(item) item$type == "Add", logical(1))), "write recovery did not resend every Add")
+recovered <- version(1L, "write-recovered")
+emit(connection, transition(v0, recovered, list(list(type = "QueryUpdated", queryId = 1L, value = list(count = 7L), logLines = list()))))
+assert(second$next_update(0.1)$value$count == 7L, "subscription stayed stranded after a write failure")
 manager$close()
 cat("PASS R Live state-machine fixtures\n")

@@ -39,6 +39,10 @@ accept_websocket <- function(port) {
     blocking = TRUE,
     open = "r+b"
   )
+  finish_websocket_handshake(socket)
+}
+
+finish_websocket_handshake <- function(socket) {
   request <- readLines(socket, n = 1L, warn = FALSE)
   headers <- list()
   repeat {
@@ -57,6 +61,45 @@ accept_websocket <- function(port) {
   writeBin(charToRaw(response), socket)
   flush(socket)
   socket
+}
+
+read_exact <- function(socket, size) {
+  value <- raw()
+  while (length(value) < size) {
+    chunk <- readBin(socket, "raw", n = size - length(value))
+    if (!length(chunk)) stop("WebSocket peer closed mid-frame")
+    value <- c(value, chunk)
+  }
+  value
+}
+
+read_client_frame <- function(socket) {
+  header <- as.integer(read_exact(socket, 2L))
+  size <- bitwAnd(header[2L], 0x7fL)
+  if (size == 126L) {
+    extended <- as.integer(read_exact(socket, 2L))
+    size <- extended[1L] * 256L + extended[2L]
+  } else if (size == 127L) {
+    extended <- as.integer(read_exact(socket, 8L))
+    if (any(extended[1:4] != 0L)) stop("fixture frame is too large")
+    size <- sum(extended[5:8] * c(16777216, 65536, 256, 1))
+  }
+  masked <- bitwAnd(header[2L], 0x80L) != 0L
+  mask <- if (masked) as.integer(read_exact(socket, 4L)) else integer()
+  payload <- read_exact(socket, size)
+  if (masked && size) {
+    payload <- as.raw(bitwXor(as.integer(payload), mask[(seq_len(size) - 1L) %% 4L + 1L]))
+  }
+  list(opcode = bitwAnd(header[1L], 0x0fL), payload = payload)
+}
+
+read_client_json <- function(socket) {
+  repeat {
+    frame <- read_client_frame(socket)
+    if (frame$opcode == 0x1L) {
+      return(jsonlite::fromJSON(rawToChar(frame$payload), simplifyVector = FALSE))
+    }
+  }
 }
 
 port <- next_port()
@@ -95,6 +138,70 @@ update <- subscription$next_update(2)
 assert(update$value$text == "fragmented 🟨🟩🟦", "fragmented UTF-8 WebSocket message was corrupted")
 manager$close()
 invisible(suppressWarnings(parallel::mccollect(job, wait = TRUE)))
+
+# Drive five reconnects through six actual TCP/WebSocket handshakes. The peer
+# records every Connect and Add, rehydrates with an unchanged value, then sends
+# the changed value that should be the only post-disconnect delivery.
+port <- next_port()
+job <- parallel::mcparallel(
+  {
+    server <- serverSocket(port)
+    on.exit(close(server))
+    records <- list()
+    for (connection_index in 0:5) {
+      socket <- socketAccept(server, blocking = TRUE, open = "r+b")
+      socket <- finish_websocket_handshake(socket)
+      connect <- read_client_json(socket)
+      add <- read_client_json(socket)
+      records[[connection_index + 1L]] <- list(connect = connect, add = add)
+      start <- list(querySet = 0L, identity = 0L, ts = "AAAAAAAAAAA=")
+      hydrated <- list(querySet = 1L, identity = 0L, ts = paste0("real-hydrate-", connection_index))
+      hydrated_count <- max(0L, connection_index - 1L)
+      writeBin(server_frame(0x1L, as.character(convex_json(list(
+        type = "Transition",
+        startVersion = start,
+        endVersion = hydrated,
+        modifications = list(list(type = "QueryUpdated", queryId = 0L, value = list(count = hydrated_count), logLines = list()))
+      )))), socket)
+      if (connection_index > 0L) {
+        changed <- list(querySet = 1L, identity = 0L, ts = paste0("real-change-", connection_index))
+        writeBin(server_frame(0x1L, as.character(convex_json(list(
+          type = "Transition",
+          startVersion = hydrated,
+          endVersion = changed,
+          modifications = list(list(type = "QueryUpdated", queryId = 0L, value = list(count = connection_index), logLines = list()))
+        )))), socket)
+      }
+      flush(socket)
+      repeat {
+        frame <- read_client_frame(socket)
+        if (frame$opcode == 0x8L) break
+      }
+      writeBin(server_frame(0x8L, raw()), socket)
+      flush(socket)
+      close(socket)
+    }
+    records
+  },
+  silent = TRUE
+)
+Sys.sleep(0.08)
+manager <- convex_live(sprintf("http://127.0.0.1:%d", port), "r-real-reconnect-test")
+subscription <- manager$subscribe("demo:state", list(room = "real-reconnect"))
+assert(subscription$next_update(2)$value$count == 0L, "real reconnect fixture lost the initial value")
+for (attempt in 1:5) {
+  manager$debug_disconnect()
+  assert(subscription$next_update(2)$value$count == attempt, "real reconnect relayed hydration or lost the changed value")
+}
+manager$close()
+records <- parallel::mccollect(job, wait = TRUE)[[1L]]
+assert(length(records) == 6L, "real reconnect fixture did not open six sockets")
+for (connection_index in 0:5) {
+  record <- records[[connection_index + 1L]]
+  assert(record$connect$type == "Connect", "real reconnect did not send Connect first")
+  assert(record$connect$connectionCount == connection_index, "real reconnect lost connectionCount")
+  assert(record$add$modifications[[1L]]$type == "Add", "real reconnect did not resend the active Add")
+}
 
 # Unsubscribe and close must also remain bounded while the peer continuously
 # sends control frames. The library owns frame parsing, while this client keeps

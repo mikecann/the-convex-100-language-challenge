@@ -9,8 +9,15 @@ write_event <- function(io, event) {
 }
 
 adapter_error <- function(error) {
+  name <- switch(class(error)[1L],
+    convex_function_error = "FunctionError",
+    convex_protocol_error = "ProtocolError",
+    convex_transport_error = "TransportError",
+    convex_closed = "ClosedError",
+    class(error)[1L] %||% "Error"
+  )
   serialized <- list(
-    name = class(error)[1L] %||% "error",
+    name = name,
     message = conditionMessage(error)
   )
   if (inherits(error, "convex_error") && !is.null(error$data)) serialized$data <- error$data
@@ -24,7 +31,7 @@ error_event <- function(id, error, subscription_id = NULL) {
   )
   if (!is.null(id) && is.null(subscription_id)) event$id <- id
   if (!is.null(subscription_id)) event$subscriptionId <- subscription_id
-  if (inherits(error, "convex_error") && length(error$logs)) event$logs <- error$logs
+  if (inherits(error, "convex_error") && length(error$logs)) event$logs <- as.list(error$logs)
   event
 }
 
