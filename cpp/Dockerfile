@@ -12,7 +12,7 @@ RUN g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient client/convex.cpp cl
 RUN printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | /out/convex-adapter >/tmp/events && grep -Fq '"language":"cpp"' /tmp/events && grep -Fq '"type":"closed"' /tmp/events
 # The adapter accepts one TCP controller and runs exactly the same NDJSON
 # lifecycle over that socket as it does over stdin/stdout.
-RUN bash -ec '(ADAPTER_LISTEN=127.0.0.1:45678 /out/convex-adapter >/tmp/tcp.out 2>/tmp/tcp.err &) ; sleep 1; exec 3<>/dev/tcp/127.0.0.1/45678; printf "%s\\n" "{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}" "{\"id\":\"close\",\"op\":\"close\"}" >&3; cat <&3 >/tmp/tcp.events || true; cat /tmp/tcp.err; grep -Fq "\"language\":\"cpp\"" /tmp/tcp.events; grep -Fq "\"type\":\"closed\"" /tmp/tcp.events'
+RUN bash -ec '(ADAPTER_LISTEN=127.0.0.1:45678 /out/convex-adapter >/tmp/tcp.out 2>/tmp/tcp.err &) ; sleep 1; exec 3<>/dev/tcp/127.0.0.1/45678; printf "%s\\n" "{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}" >&3; IFS= read -r ready <&3; grep -Fq "\"language\":\"cpp\"" <<<"$ready"; printf "%s\\n" "{\"id\":\"close\",\"op\":\"close\"}" >&3; IFS= read -r closed <&3; grep -Fq "\"type\":\"closed\"" <<<"$closed"'
 CMD ["/bin/sh", "-c", "true"]
 
 FROM test AS runtime-rootfs

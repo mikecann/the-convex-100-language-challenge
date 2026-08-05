@@ -10,6 +10,10 @@
 namespace convex {
 namespace asio = boost::asio; namespace beast = boost::beast; namespace http = beast::http; namespace ssl = asio::ssl; using tcp = asio::ip::tcp;
 struct Parts { std::string host, port, base; bool secure; };
+template <typename Stream> static Result perform_http(Stream& stream, const Parts& p, const std::string& token, const std::string& op, const std::string& path, const Json& args) {
+  http::request<http::string_body> req{http::verb::post, p.base + "/api/" + op, 11}; req.set(http::field::host, p.host); req.set(http::field::content_type, "application/json"); req.set(http::field::accept, "application/json"); req.set("Convex-Client", "cpp-0.1.0"); if (!token.empty()) req.set(http::field::authorization, "Bearer " + token); req.body() = Json{{"path",path},{"args",args},{"format","json"}}.dump(); req.prepare_payload(); http::write(stream, req);
+  beast::flat_buffer buffer; http::response<http::string_body> response; http::read(stream, buffer, response); if (response.body().size() > 2 * 1024 * 1024) throw Error("response exceeds 2097152 bytes"); Json decoded; try { decoded = Json::parse(response.body()); } catch (...) { throw Error("HTTP response was not a Convex response"); } auto logs = decoded.value("logLines", std::vector<std::string>{}); if (decoded.value("status", "") == "success") { if (!decoded.contains("value")) throw Error("success response omitted value"); return {decoded["value"], logs}; } if (decoded.value("status", "") == "error") throw FunctionError(decoded.value("errorMessage", "Convex function failed"), decoded.value("errorData", Json()), logs); throw Error("HTTP response has unknown Convex status");
+}
 static Parts parse_url(const std::string& value) {
   auto scheme = value.find("://"); if (scheme == std::string::npos) throw Error("Convex deployment URL must use http or https");
   Parts p; auto name = value.substr(0, scheme); p.secure = name == "https"; if (!p.secure && name != "http") throw Error("Convex deployment URL must use http or https");
@@ -32,12 +36,13 @@ Result Client::call(const std::string& op, const std::string& path, const Json& 
   if (path.empty()) throw Error("Convex function path is required");
   if (!args.is_object()) throw Error("Convex arguments must be a named JSON object");
   auto p = parse_url(url_);
-  asio::io_context io; ssl::context ctx(ssl::context::tls_client); ctx.set_default_verify_paths(); ctx.set_verify_mode(ssl::verify_peer); tcp::resolver resolver(io); beast::ssl_stream<beast::tcp_stream> stream(io, ctx);
+  asio::io_context io; tcp::resolver resolver(io); auto endpoints = resolver.resolve(p.host, p.port);
+  if (!p.secure) { beast::tcp_stream stream(io); stream.connect(endpoints); return perform_http(stream, p, token_, op, path, args); }
+  ssl::context ctx(ssl::context::tls_client); ctx.set_default_verify_paths(); ctx.set_verify_mode(ssl::verify_peer); beast::ssl_stream<beast::tcp_stream> stream(io, ctx); stream.set_verify_callback(ssl::host_name_verification(p.host));
   if (!SSL_set_tlsext_host_name(stream.native_handle(), p.host.c_str())) throw Error("configure TLS server name");
-  beast::get_lowest_layer(stream).connect(resolver.resolve(p.host, p.port));
+  beast::get_lowest_layer(stream).connect(endpoints);
   stream.handshake(ssl::stream_base::client);
-  http::request<http::string_body> req{http::verb::post, p.base + "/api/" + op, 11}; req.set(http::field::host, p.host); req.set(http::field::content_type, "application/json"); req.set(http::field::accept, "application/json"); req.set("Convex-Client", "cpp-0.1.0"); if (!token_.empty()) req.set(http::field::authorization, "Bearer " + token_); req.body() = Json{{"path",path},{"args",args},{"format","json"}}.dump(); req.prepare_payload(); http::write(stream, req);
-  beast::flat_buffer buffer; http::response<http::string_body> response; http::read(stream, buffer, response); beast::error_code ec; stream.shutdown(ec); if (response.body().size() > 2 * 1024 * 1024) throw Error("response exceeds 2097152 bytes");
-  Json decoded; try { decoded = Json::parse(response.body()); } catch (...) { throw Error("HTTP response was not a Convex response"); } auto logs = decoded.value("logLines", std::vector<std::string>{}); if (decoded.value("status", "") == "success") { if (!decoded.contains("value")) throw Error("success response omitted value"); return {decoded["value"], logs}; } if (decoded.value("status", "") == "error") throw FunctionError(decoded.value("errorMessage", "Convex function failed"), decoded.value("errorData", Json()), logs); throw Error("HTTP response has unknown Convex status");
+  auto result = perform_http(stream, p, token_, op, path, args);
+  beast::error_code ignored; stream.shutdown(ignored); return result;
 }
 }

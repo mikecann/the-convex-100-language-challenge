@@ -13,7 +13,7 @@ using Json = nlohmann::json;
 struct Error : std::runtime_error { using std::runtime_error::runtime_error; };
 struct FunctionError : Error { Json data; std::vector<std::string> logs; FunctionError(std::string message, Json value, std::vector<std::string> lines) : Error(std::move(message)), data(std::move(value)), logs(std::move(lines)) {} };
 struct Result { Json value; std::vector<std::string> logs; };
-struct Update { Json value; std::vector<std::string> logs; std::string error; };
+struct Update { Json value; std::vector<std::string> logs; std::string error; Json error_data; };
 class Subscription {
  public:
   ~Subscription();
