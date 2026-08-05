@@ -145,3 +145,6 @@ protocol is not documented as stable, so hosted verification remains required.
   Int64, bytes, special floats, and negative zero are outside scope.
 - Mutations and actions use HTTP. Optimistic updates, journals, mutation replay,
   and WebSocket writes are deferred.
+- The current focused tests do not yet prove all required real-socket lifecycle
+  and backpressure cases. In particular, bytes accepted into Tcl's channel
+  buffer are not included in the adapter's queued-byte accounting.

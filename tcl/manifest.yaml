@@ -29,5 +29,6 @@ limitations:
   - Live authentication, optimistic updates, WebSocket mutations/actions, journals, and TransitionChunk assembly are deferred.
   - The educational API covers Convex's JSON-safe values. Full tagged Convex values, including Int64 and bytes, are deferred.
   - Capability badges remain empty until the root-owned local and hosted conformance gates pass.
-  - Adapter output retains the newest 16 subscription deliveries inside a 6 MiB encoded-byte budget; control responses are never silently dropped.
+  - Adapter output uses a newest-16 queue with a 6 MiB queued-byte limit, but its channel-buffer in-flight accounting and deterministic stalled-reader proof are incomplete.
+  - Deterministic real-socket coverage for reconnect barriers, QueryFailed recovery, fragmented/control frames, bounded shutdown, and backpressure remains to be added before capability verification.
 capabilities: []
