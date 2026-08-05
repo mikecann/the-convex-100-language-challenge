@@ -20,11 +20,13 @@ RUN bash -ec '(ADAPTER_LISTEN=127.0.0.1:45678 /out/convex-adapter >/tmp/tcp.out 
 CMD ["/bin/sh", "-c", "true"]
 
 FROM test AS runtime-rootfs
-RUN set -eu; root=/rootfs; mkdir -p "$root/bin" "$root/usr/bin" "$root/usr/local/bin" "$root/etc"; cp /bin/dash "$root/bin/sh"; cp /usr/bin/id "$root/usr/bin/id"; cp /usr/bin/grep "$root/usr/bin/grep"; cp /out/convex-example "$root/usr/local/bin/convex-example"; cp /out/convex-adapter "$root/usr/local/bin/convex-adapter"; { ldd /bin/dash /usr/bin/id /usr/bin/grep /out/convex-example /out/convex-adapter; } | awk '$3 ~ /^\// {print $3} $1 ~ /^\// {name=$1; sub(/:$/, "", name); print name}' | sort -u | xargs -r -I{} cp --parents {} "$root"; cp -a /etc/ssl "$root/etc/ssl"; cp /etc/nsswitch.conf "$root/etc/nsswitch.conf"; cp /etc/hosts "$root/etc/hosts"
+RUN set -eu; root=/rootfs; mkdir -p "$root/bin" "$root/usr/bin" "$root/usr/local/bin" "$root/usr/lib/x86_64-linux-gnu" "$root/etc"; cp /bin/dash "$root/bin/sh"; cp /usr/bin/id "$root/usr/bin/id"; cp /usr/bin/grep "$root/usr/bin/grep"; cp /out/convex-example "$root/usr/local/bin/convex-example"; cp /out/convex-adapter "$root/usr/local/bin/convex-adapter"; libraries="$({ ldd /bin/dash /usr/bin/id /usr/bin/grep /out/convex-example /out/convex-adapter; } | awk '$3 ~ /^\// {print $3} $1 ~ /^\// {name=$1; sub(/:$/, "", name); print name}' | sort -u)"; for library in $libraries; do cp --parents "$library" "$root"; cp -L "$library" "$root/usr/lib/x86_64-linux-gnu/$(basename "$library")"; done; cp -a /etc/ssl "$root/etc/ssl"; cp -a /usr/lib/ssl "$root/usr/lib/ssl"; cp -a /usr/lib/x86_64-linux-gnu/engines-3 /usr/lib/x86_64-linux-gnu/ossl-modules "$root/usr/lib/x86_64-linux-gnu/"; cp /etc/nsswitch.conf "$root/etc/nsswitch.conf"; cp /etc/hosts "$root/etc/hosts"
 FROM scratch AS runtime-base
 COPY --from=runtime-rootfs /rootfs /
 USER 65532:65532
-FROM runtime-base AS example-runtime
+FROM runtime-base AS runtime-checked
+RUN set -eu; message="$(/usr/local/bin/convex-example 2>&1 || true)"; test "$message" = "CONVEX_URL is required"; tls_message="$(CONVEX_URL=https://127.0.0.1:1 /usr/local/bin/convex-example 2>&1 || true)"; test "$tls_message" = "connect: Connection refused"; events="$(printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | /usr/local/bin/convex-adapter)"; echo "$events" | /usr/bin/grep -Fq '"language":"cpp"'; echo "$events" | /usr/bin/grep -Fq '"type":"closed"'
+FROM runtime-checked AS example-runtime
 ENTRYPOINT ["/usr/local/bin/convex-example"]
-FROM runtime-base AS runtime
+FROM runtime-checked AS runtime
 ENTRYPOINT ["/usr/local/bin/convex-adapter"]
