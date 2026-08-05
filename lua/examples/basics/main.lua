@@ -1,32 +1,3 @@
-# Convex from Lua
-
-This folder demonstrates a deliberately small native Lua client calling Convex
-queries, mutations, and actions through the documented JSON HTTP API.
-
-This is educational, unofficial, and not a production SDK. It is an honest
-work in progress: no capability badges are earned until the coordinator runs
-the shared local and hosted conformance suites.
-
-## Start here
-
-The [basic example](examples/basics/main.lua) reads a counter room and applies
-one idempotent increment. The client itself is in [client](client/). Its Docker
-images contain Lua, lua-cjson, lua-http, and cqueues, with no delegated Convex
-client or CLI.
-
-## What works
-
-| Surface | Repository state |
-| --- | --- |
-| JSON HTTP queries, mutations, actions, and bearer auth | Native candidate plus local fixtures; capability unearned |
-| Live query subscriptions and reconnects | Native candidate plus deterministic fixtures; capability unearned |
-| Canonical `0 -> 1` HTTP and Live journey | Exact runnable source is present; shared evidence pending |
-| Earned capabilities | None until the coordinator runs local and hosted conformance |
-
-## Basic example
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.lua -->
-```text
 #!/usr/local/bin/lua
 package.path = (os.getenv("CONVEX_CLIENT_PATH") or "./client") .. "/?.lua;" .. package.path
 local Convex = require("convex")
@@ -98,38 +69,3 @@ local function main()
 end
 
 main()
-```
-<!-- END GENERATED EXAMPLE -->
-
-The block is projected from the runnable source above. Run `./run sync-examples`
-after changing it so the README and website show the same code.
-
-## Docker checks
-
-`./run test lua` parses every Lua file, runs local tests, and exercises the
-stdin adapter lifecycle inside Docker. `./run build lua` produces the minimal
-amd64 adapter runtime image; the shared example verifier builds the separate
-`example-runtime` target. The coordinator alone runs shared verification
-against the approved test deployments.
-
-## Conformance notes
-
-The adapter speaks NDJSON protocol v1 over stdin/stdout or `ADAPTER_LISTEN`
-TCP. HTTP and Live failures are serialized as `FunctionError`, `ProtocolError`,
-or `TransportError`. One cqueues owner controls WebSocket reads, writes,
-query-set versions, and reconnects. Each subscription keeps the newest 16
-updates. Lua-http supplies the low-level RFC 6455 framing, fragmented UTF-8,
-control-frame, and bounded-close implementation; Convex-specific transitions,
-metadata, hydration suppression, and query recovery stay in this Lua client.
-
-The image pins Debian bookworm-slim by digest, Lua 5.1.5, lua-http 0.4-1,
-cqueues 20200726-1+b1, lua-cjson 2.1.0+dfsg-2.2, and StyLua 2.5.2. The Live
-wire profile is pinned to `convex-rs-0.10.4-unversioned-sync` at source commit
-`6f1df8a8ba1665084ec001e307ca841ca17074d7`.
-
-## Limitations
-
-Values currently cover Convex's JSON-safe subset. Live authentication,
-`TransitionChunk` assembly, optimistic updates, and WebSocket mutation replay
-are deliberately deferred. This demonstration is tied to the pinned,
-undocumented Live profile and should treat protocol drift as an error.

@@ -4,5 +4,28 @@ displayName: "Lua"
 rank: 19
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Lua HTTP client using lua-http and lua-cjson, with a single-owner lua-http and cqueues Live implementation. Capability badges remain empty until shared local and hosted conformance pass.
+toolchain:
+  name: Lua
+  version: 5.1.5
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - The educational client supports the JSON-safe Convex value subset only.
+  - Live authentication, TransitionChunk assembly, optimistic updates, and mutation replay are deferred.
 capabilities: []
