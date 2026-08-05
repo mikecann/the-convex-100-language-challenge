@@ -12,12 +12,17 @@ RUN cp -a client /tmp/client-before && cp -a examples /tmp/examples-before && \
     diff -ru /tmp/client-before client && diff -ru /tmp/examples-before examples
 
 FROM formatter AS test
+ENV DOTNET_GCHeapHardLimit=0x6000000
+ENV DOTNET_GCConserveMemory=9
 RUN test "$(dpkg --print-architecture)" = amd64 && test "$(uname -m)" = x86_64 && \
     pwsh -NoLogo -NoProfile -Command 'if ($PSVersionTable.Platform -ne "Unix" -or [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne "X64") { exit 1 }'
 RUN pwsh -NoLogo -NoProfile -Command '$bad=$false; Get-ChildItem client,examples -Recurse -Filter *.ps1 | ForEach-Object { $tokens=$null; $errors=$null; [Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$tokens,[ref]$errors) | Out-Null; if ($errors.Count) { $bad=$true; $errors | ForEach-Object { Write-Error $_.Message } } }; if ($bad) { exit 1 }'
 RUN pwsh -NoLogo -NoProfile -File client/tests/tests.ps1
 RUN pwsh -NoLogo -NoProfile -File client/tests/conformance/adapter-tests.ps1
 RUN pwsh -NoLogo -NoProfile -File client/tests/example-tests.ps1
+# The adversarial suite needs room for eight near-limit queues; the canonical
+# program is checked separately with the smaller final-runtime heap cap.
+RUN DOTNET_GCHeapHardLimit=0x4000000 pwsh -NoLogo -NoProfile -File client/tests/canonical-memory-tests.ps1
 RUN actual=$(printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | pwsh -NoLogo -NoProfile -File client/tests/conformance/adapter.ps1) && \
     printf '%s\n' "$actual" | grep -F '"type":"ready"' | grep -F '"language":"powershell"' && \
     printf '%s\n' "$actual" | grep -F '"id":"close"' | grep -F '"type":"closed"'
@@ -58,6 +63,12 @@ ENV TMPDIR=/dev/shm
 ENV HOME=/dev/shm
 ENV XDG_CACHE_HOME=/dev/shm
 ENV LANG=C.UTF-8
+# The example runs both its foreground script and the exclusive Live owner
+# runspace inside the shared 128 MiB verifier cgroup. Keep the CLR heap below
+# that cgroup ceiling so a transient JSON/WebSocket allocation triggers GC
+# instead of an OOM kill after the initial Live value.
+ENV DOTNET_GCHeapHardLimit=0x4000000
+ENV DOTNET_GCConserveMemory=9
 COPY --from=runtime-rootfs /runtime-root /
 COPY client/Convex.ps1 /opt/convex/client/Convex.ps1
 RUN mkdir -p /opt/convex/examples/basics /opt/convex/client/tests/conformance && \
