@@ -4,5 +4,30 @@ displayName: "Clojure"
 rank: 48
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Clojure code owns the Convex HTTP and pinned sync-profile messages. It uses only the JDK HTTP/TLS/WebSocket transport and clojure.data.json for JSON.
+toolchain:
+  name: Eclipse Temurin JDK with Clojure
+  version: 21.0.7+6 / 1.12.0
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Capability badges remain empty until root runs the serial shared conformance evidence.
+  - Live authentication, optimistic updates, chunks, journals, and replay are deferred.
+  - Each subscription retains only its newest 16 updates.
+  - The runtime retains Clojure compiler classes because Clojure evaluates checked-in source at startup; it exposes no compiler command or package manager.
 capabilities: []

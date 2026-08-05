@@ -1,22 +1,3 @@
-# Convex from Clojure
-
-This is a small Clojure client that calls Convex HTTP functions and follows the experimental pinned Live sync profile.
-
-It is educational, unofficial, and not a production Convex SDK.
-
-## Start here
-
-The [canonical basic example](examples/basics/main.clj) performs a unique room's `0 -> 1` counter journey: HTTP query, initial Live value, idempotent mutation, then its Live update.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP query, mutation, action | Implemented, awaiting shared evidence |
-| Live query | Implemented for the pinned profile, awaiting shared evidence |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.clj -->
-```text
 (ns convex.example.main
   (:require [convex.client :as convex])
   (:import [java.util UUID]))
@@ -57,17 +38,3 @@ The [canonical basic example](examples/basics/main.clj) performs a unique room's
                 updated (count-of (:value (convex/next-update subscription 10000)) "updated Live value")]
             (when-not (= after updated) (throw (ex-info "Live update disagreed" {})))
             (print-transcript before initial true after updated)))))))
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-`./run test clojure` runs formatting, unit tests, and adapter lifecycle checks inside Docker. `./run build clojure` creates the minimal non-root runtime images. Root runs `verify-example`, `verify`, and hosted evidence serially.
-
-## Protocol notes
-
-The client uses the documented JSON HTTP endpoint and the pinned `convex-rs-0.10.4-unversioned-sync` profile. The adapter supports stdin/stdout and `ADAPTER_LISTEN` TCP NDJSON plus the test-only `debugDisconnect` command.
-
-## Limitations
-
-The Live profile is experimental and deliberately does not earn a capability badge without the shared controller's local and hosted evidence. Its bounded queue keeps only the newest 16 values.
