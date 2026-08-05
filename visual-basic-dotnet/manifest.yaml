@@ -4,5 +4,29 @@ displayName: "Visual Basic .NET"
 rank: 22
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native VB.NET implementation using .NET HttpClient, System.Text.Json, and ClientWebSocket. Capability badges remain empty until root-owned shared evidence passes.
+toolchain:
+  name: .NET SDK
+  version: 8.0.408
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live is pinned to an undocumented experimental sync profile, not a stable public Convex protocol.
+  - HTTP bearer authentication is supported; Live authentication, transitions, optimistic updates, journals, and replay are deferred.
+  - Each subscription keeps at most its newest 16 values and one MiB of encoded value/error text; old intermediate values are deliberately evicted for slow consumers.
 capabilities: []
