@@ -4,5 +4,30 @@ displayName: "C++"
 rank: 4
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native C++ HTTP client using Boost.Beast and OpenSSL. The pinned Live protocol implementation is intentionally still under conformance review, so no capability is claimed.
+toolchain:
+  name: GCC
+  version: 14.2.0
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live is a pinned experimental protocol profile and remains pending black-box conformance.
+  - Each Live subscription buffers at most 16 updates and drops the oldest update when a slow consumer overflows that queue.
+  - Live authentication, actions over WebSocket, transition chunks, optimistic updates, and mutation replay are deferred.
+  - Values are limited to JSON values supported by nlohmann/json.
 capabilities: []
