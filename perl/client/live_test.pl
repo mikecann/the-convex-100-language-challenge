@@ -377,7 +377,10 @@ sub constrained_connector {
                     type          => 'Transition',
                     startVersion  => version( 1, 'rehydrate-one' ),
                     endVersion    => version( 1, 'malformed-shape' ),
-                    modifications => {},
+                    modifications => [
+                        updated( $id, 9 ),
+                        { type => 'Unknown', queryId => $id },
+                    ],
                 }
             );
             close $second;
@@ -391,7 +394,7 @@ sub constrained_connector {
                 transition(
                     version( 0, 'AAAAAAAAAAA=' ),
                     version( 1, 'rehydrate-two' ),
-                    updated( $id, 0 ),
+                    updated( $id, 9 ),
                 )
             );
             close $third;
@@ -405,7 +408,7 @@ sub constrained_connector {
                 transition(
                     version( 0, 'AAAAAAAAAAA=' ),
                     version( 1, 'rehydrate-three' ),
-                    updated( $id, 0 ),
+                    updated( $id, 9 ),
                 )
             );
             $continue->dequeue;
@@ -432,6 +435,8 @@ sub constrained_connector {
         'malformed JSON is a structured protocol error' );
     is( ref( $subscription->next_update(3)->{error} ),
         'Convex::ProtocolError', 'malformed Transition is a protocol error' );
+    is( $subscription->next_update(3)->{value}{count},
+        9, 'malformed Transition does not poison reconnect hydration' );
     is( ref( $subscription->next_update(3)->{error} ),
         'Convex::TransportError', 'transport error is structured' );
     $continue->enqueue(1);

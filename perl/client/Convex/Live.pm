@@ -341,6 +341,7 @@ sub _handle_transition {
     die Convex::Errors::protocol_error('Transition version mismatch')
       unless _versions_equal( $message->{startVersion}, ${$remote_ref} );
 
+    my %pending_results = %{$last_results_ref};
     my %changed;
     for my $modification ( @{ $message->{modifications} // [] } ) {
         die Convex::Errors::protocol_error(
@@ -355,7 +356,7 @@ sub _handle_transition {
                 value => $modification->{value},
                 logs  => $modification->{logLines} // [],
             };
-            my $previous = $last_results_ref->{$id};
+            my $previous = $pending_results{$id};
 
             # Reconnect hydration is not a new application value. Keep the
             # previous result through disconnect and suppress only equality.
@@ -365,7 +366,7 @@ sub _handle_transition {
             {
                 $changed{$id} = $update;
             }
-            $last_results_ref->{$id} = $update;
+            $pending_results{$id} = $update;
         }
         elsif ( ( $modification->{type} // q{} ) eq 'QueryFailed' ) {
             my $error = Convex::Errors::function_error(
@@ -374,11 +375,12 @@ sub _handle_transition {
                 $modification->{logLines} // [],
             );
             my $update = { error => $error };
-            $last_results_ref->{$id} = $update;
-            $changed{$id} = $update;
+            $pending_results{$id} = $update;
+            $changed{$id}         = $update;
         }
         elsif ( ( $modification->{type} // q{} ) eq 'QueryRemoved' ) {
-            delete $last_results_ref->{$id};
+            delete $pending_results{$id};
+            delete $changed{$id};
         }
         else {
             die Convex::Errors::protocol_error(
@@ -386,9 +388,11 @@ sub _handle_transition {
         }
     }
 
-    # Commit the complete transition before any subscriber observes it.
-    ${$remote_ref} = $message->{endVersion};
-    ${$max_ts_ref} = ${$remote_ref}->{ts};
+    # Validate every modification before committing either hydration state or
+    # the version. A malformed tail cannot suppress valid reconnect hydration.
+    %{$last_results_ref} = %pending_results;
+    ${$remote_ref}       = $message->{endVersion};
+    ${$max_ts_ref}       = ${$remote_ref}->{ts};
     for my $id ( sort { $a <=> $b } keys %changed ) {
         _deliver_state( $subscriptions_ref->{$id}, $changed{$id} )
           if $subscriptions_ref->{$id};
