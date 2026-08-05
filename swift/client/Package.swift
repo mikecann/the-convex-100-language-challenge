@@ -9,7 +9,8 @@ let package = Package(
     .executable(name: "convex-example", targets: ["ConvexExample"]),
   ],
   dependencies: [
-    .package(url: "https://github.com/vapor/websocket-kit.git", exact: "2.15.0")
+    .package(url: "https://github.com/apple/swift-crypto.git", exact: "4.5.1"),
+    .package(url: "https://github.com/vapor/websocket-kit.git", exact: "2.15.0"),
   ],
   targets: [
     .target(
@@ -23,6 +24,9 @@ let package = Package(
     .executableTarget(
       name: "ConvexAdapter", dependencies: ["AdapterCore"], path: "tests/conformance/main"),
     .executableTarget(name: "ConvexExample", dependencies: ["Convex"], path: "examples/basics"),
-    .testTarget(name: "ConvexTests", dependencies: ["Convex", "AdapterCore"], path: "tests/unit"),
+    .testTarget(
+      name: "ConvexTests",
+      dependencies: ["Convex", "AdapterCore", .product(name: "Crypto", package: "swift-crypto")],
+      path: "tests/unit"),
   ]
 )

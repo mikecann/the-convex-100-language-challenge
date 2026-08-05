@@ -1,5 +1,6 @@
 import AdapterCore
 @_spi(ConvexAdapter) @testable import Convex
+import Crypto
 import Foundation
 import XCTest
 
@@ -35,6 +36,9 @@ final class FakeSocket: LiveSocket, @unchecked Sendable {
   private let binary: @Sendable () -> Void
   private let closedCallback: @Sendable () -> Void
   private(set) var isClosed = false
+  var sendFailures = 0
+  private(set) var activeSends = 0
+  private(set) var maxActiveSends = 0
   init(
     text: @Sendable @escaping (String) -> Void, binary: @Sendable @escaping () -> Void,
     close: @Sendable @escaping () -> Void
@@ -43,7 +47,22 @@ final class FakeSocket: LiveSocket, @unchecked Sendable {
     self.binary = binary
     self.closedCallback = close
   }
-  func send(_ text: String) async throws { lock.withLock { sent.append(text) } }
+  func send(_ text: String) async throws {
+    let shouldFail = lock.withLock { () -> Bool in
+      activeSends += 1
+      maxActiveSends = max(maxActiveSends, activeSends)
+      if sendFailures > 0 {
+        sendFailures -= 1
+        activeSends -= 1
+        return true
+      }
+      sent.append(text)
+      return false
+    }
+    if shouldFail { throw TestFailure.message("send failed") }
+    try? await Task.sleep(for: .milliseconds(2))
+    lock.withLock { activeSends -= 1 }
+  }
   func close() { lock.withLock { isClosed = true } }
   func emit(_ object: [String: Any]) {
     text(String(data: try! JSONSerialization.data(withJSONObject: object), encoding: .utf8)!)
@@ -57,6 +76,7 @@ final class FakeFactory: LiveSocketFactory, @unchecked Sendable {
   private let lock = NSLock()
   private(set) var sockets: [FakeSocket] = []
   var failures = 0
+  var nextSocketSendFailures = 0
   func connect(
     url: URL, onText: @Sendable @escaping (String) -> Void,
     onBinary: @Sendable @escaping () -> Void, onClose: @Sendable @escaping () -> Void
@@ -71,9 +91,14 @@ final class FakeFactory: LiveSocketFactory, @unchecked Sendable {
       throw TestFailure.message("connect failed")
     }
     let socket = FakeSocket(text: onText, binary: onBinary, close: onClose)
+    socket.sendFailures = lock.withLock {
+      defer { nextSocketSendFailures = 0 }
+      return nextSocketSendFailures
+    }
     lock.withLock { sockets.append(socket) }
     return socket
   }
+  func cancelPendingConnects() {}
   func shutdown() async {}
   func socket(_ index: Int) -> FakeSocket { lock.withLock { sockets[index] } }
   var count: Int { lock.withLock { sockets.count } }
@@ -155,7 +180,7 @@ final class ConvexTests: XCTestCase {
     let recovered = try await next(&iterator)
     XCTAssertEqual(count(recovered), 1)
     try await live.debugDisconnectForAdapter()
-    XCTAssertEqual(factory.count, 2)
+    try await eventually { factory.count == 2 }
     factory.socket(1).emit(
       transition(
         start: version(0), end: version(1),
@@ -169,7 +194,7 @@ final class ConvexTests: XCTestCase {
     XCTAssertEqual(count(changed), 2)
     for expectedSocketCount in 3...6 {
       try await live.debugDisconnectForAdapter()
-      XCTAssertEqual(factory.count, expectedSocketCount)
+      try await eventually { factory.count == expectedSocketCount }
       factory.socket(expectedSocketCount - 1).emit(
         transition(
           start: version(0), end: version(1),
@@ -182,6 +207,46 @@ final class ConvexTests: XCTestCase {
         modifications: [["type": "QueryUpdated", "queryId": 0, "value": ["count": 3]]]))
     let afterFiveReconnects = try await next(&iterator)
     XCTAssertEqual(count(afterFiveReconnects), 3)
+    await live.close()
+  }
+
+  func testDebugDisconnectAcknowledgesBeforeFiveFailedOrdinaryRetries() async throws {
+    let factory = FakeFactory()
+    let live = try LiveClient("http://fixture", factory: factory)
+    _ = try await live.subscribe("demo:state", [:])
+    factory.failures = 5
+    let clock = ContinuousClock()
+    let started = clock.now
+    try await live.debugDisconnectForAdapter()
+    XCTAssertLessThan(started.duration(to: clock.now), .milliseconds(50))
+    try await eventually(timeout: 8_000) { factory.count == 2 }
+    await live.close()
+  }
+
+  func testFailedInitialSendClosesCandidateAndDoesNotPublishIt() async throws {
+    let factory = FakeFactory()
+    factory.nextSocketSendFailures = 1
+    let live = try LiveClient("http://fixture", factory: factory)
+    do {
+      _ = try await live.subscribe("demo:state", [:])
+      XCTFail("expected send failure")
+    } catch let error as ConvexError {
+      XCTAssertEqual(error.kind, .transport)
+    }
+    XCTAssertTrue(factory.socket(0).isClosed)
+    _ = try await live.subscribe("demo:state", [:])
+    XCTAssertEqual(factory.count, 2)
+    await live.close()
+  }
+
+  func testConcurrentSubscriptionsSerializeProtocolSends() async throws {
+    let factory = FakeFactory()
+    let live = try LiveClient("http://fixture", factory: factory)
+    _ = try await live.subscribe("demo:first", [:])
+    async let second = live.subscribe("demo:second", [:])
+    async let third = live.subscribe("demo:third", [:])
+    _ = try await (second, third)
+    XCTAssertEqual(factory.socket(0).maxActiveSends, 1)
     await live.close()
   }
 
@@ -233,6 +298,27 @@ final class ConvexTests: XCTestCase {
     factory.socket(1).emitBinary()
     let binary = try await next(&iterator)
     XCTAssertEqual(binary.error?.kind, .protocolError)
+    await live.close()
+  }
+
+  func testRealWebSocketTransportReassemblesFragmentsAcrossPingControlFrame() async throws {
+    let transition = transition(
+      start: version(0), end: version(1),
+      modifications: [["type": "QueryUpdated", "queryId": 0, "value": ["count": 41]]])
+    let payload = String(
+      data: try JSONSerialization.data(withJSONObject: transition, options: [.sortedKeys]),
+      encoding: .utf8)!
+    let server = try RawWebSocketServer(fragmentedText: payload)
+    let live = try LiveClient("http://127.0.0.1:\(server.port)")
+    let subscription = try await live.subscribe("demo:state", [:])
+    var iterator = subscription.stream.makeAsyncIterator()
+    let update = try await next(&iterator)
+    XCTAssertEqual(count(update), 41)
+    async let second = live.subscribe("demo:second", [:])
+    async let third = live.subscribe("demo:third", [:])
+    _ = try await (second, third)
+    let receivedPong = try await server.waitForPong()
+    XCTAssertTrue(receivedPong)
     await live.close()
   }
 
@@ -288,8 +374,8 @@ final class ConvexTests: XCTestCase {
     guard let value = await iterator.next() else { throw TestFailure.message("stream closed") }
     return value
   }
-  private func eventually(_ predicate: @escaping () -> Bool) async throws {
-    for _ in 0..<50 {
+  private func eventually(timeout: Int = 500, _ predicate: @escaping () -> Bool) async throws {
+    for _ in 0..<(timeout / 10) {
       if predicate() { return }
       try await Task.sleep(for: .milliseconds(10))
     }
@@ -301,4 +387,157 @@ extension ListenAddress {
   fileprivate init(host: String, port: UInt16) {
     self = try! ListenAddress("\(host.contains(":") ? "[\(host)]" : host):\(port)")
   }
+}
+
+/// A deliberately tiny RFC 6455 fixture. It exercises WebSocketKit itself,
+/// including masked client frames, fragmented server text and an interleaved ping.
+private final class RawWebSocketServer: @unchecked Sendable {
+  let port: UInt16
+  private let descriptor: Int32
+  private let result: RawServerResult
+
+  init(fragmentedText: String) throws {
+    #if os(Linux)
+      let socketDescriptor = Glibc.socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+    #else
+      let socketDescriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+    #endif
+    guard socketDescriptor >= 0 else { throw TestFailure.message("socket failed") }
+    var yes: Int32 = 1
+    let yesSize = socklen_t(MemoryLayout<Int32>.size)
+    _ = withUnsafePointer(to: &yes) {
+      setsockopt(socketDescriptor, SOL_SOCKET, SO_REUSEADDR, $0, yesSize)
+    }
+    var address = sockaddr_in()
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = 0
+    address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+    let bound = withUnsafePointer(to: &address) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        bind(socketDescriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+    guard bound == 0, listen(socketDescriptor, 1) == 0 else {
+      close(socketDescriptor)
+      throw TestFailure.message("bind failed")
+    }
+    var actual = sockaddr_in()
+    var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+    _ = withUnsafeMutablePointer(to: &actual) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        getsockname(socketDescriptor, $0, &length)
+      }
+    }
+    descriptor = socketDescriptor
+    port = UInt16(bigEndian: actual.sin_port)
+    result = RawServerResult()
+    let serverResult = result
+    Thread.detachNewThread { [socketDescriptor, serverResult] in
+      serverResult.complete(Self.serve(socketDescriptor, fragmentedText))
+    }
+  }
+
+  deinit { close(descriptor) }
+
+  func waitForPong() async throws -> Bool {
+    for _ in 0..<100 {
+      if let value = result.value { return value }
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    throw TestFailure.message("raw WebSocket fixture timed out")
+  }
+
+  private static func serve(_ listening: Int32, _ text: String) -> Bool {
+    let client = accept(listening, nil, nil)
+    guard client >= 0 else { return false }
+    defer { close(client) }
+    guard let request = readHTTP(client),
+      let keyLine = request.split(separator: "\r\n").first(where: {
+        $0.lowercased().hasPrefix("sec-websocket-key:")
+      })
+    else { return false }
+    let key = keyLine.split(separator: ":", maxSplits: 1)[1].trimmingCharacters(in: .whitespaces)
+    let digest = Insecure.SHA1.hash(data: Data((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").utf8))
+    let acceptValue = Data(digest).base64EncodedString()
+    let response =
+      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: \(acceptValue)\r\n\r\n"
+    guard writeAll(client, Array(response.utf8)) else { return false }
+    guard readFrame(client) != nil, readFrame(client) != nil else { return false }
+    let bytes = Array(text.utf8)
+    let split = bytes.count / 2
+    guard writeFrame(client, fin: false, opcode: 1, payload: Array(bytes[..<split])),
+      writeFrame(client, fin: true, opcode: 9, payload: Array("probe".utf8)),
+      writeFrame(client, fin: true, opcode: 0, payload: Array(bytes[split...]))
+    else { return false }
+    guard readFrame(client)?.opcode == 10 else { return false }
+    // Two concurrent subscriptions must still arrive as two complete frames.
+    return readFrame(client)?.opcode == 1 && readFrame(client)?.opcode == 1
+  }
+
+  private static func readHTTP(_ descriptor: Int32) -> String? {
+    var bytes: [UInt8] = []
+    while bytes.count < 16_384 {
+      var byte: UInt8 = 0
+      guard read(descriptor, &byte, 1) == 1 else { return nil }
+      bytes.append(byte)
+      if bytes.suffix(4) == [13, 10, 13, 10] { return String(bytes: bytes, encoding: .utf8) }
+    }
+    return nil
+  }
+
+  private static func readFrame(_ descriptor: Int32) -> (opcode: UInt8, payload: [UInt8])? {
+    guard let header = readExact(descriptor, 2) else { return nil }
+    let opcode = header[0] & 0x0f
+    var count = Int(header[1] & 0x7f)
+    if count == 126 {
+      guard let extended = readExact(descriptor, 2) else { return nil }
+      count = Int(extended[0]) << 8 | Int(extended[1])
+    }
+    let masked = header[1] & 0x80 != 0
+    let mask = masked ? readExact(descriptor, 4) : []
+    guard mask != nil, var payload = readExact(descriptor, count) else { return nil }
+    if let mask, masked {
+      for index in payload.indices { payload[index] ^= mask[index % 4] }
+    }
+    return (opcode, payload)
+  }
+
+  private static func writeFrame(
+    _ descriptor: Int32, fin: Bool, opcode: UInt8, payload: [UInt8]
+  ) -> Bool {
+    guard payload.count < 126 else { return false }
+    return writeAll(descriptor, [(fin ? 0x80 : 0) | opcode, UInt8(payload.count)] + payload)
+  }
+
+  private static func readExact(_ descriptor: Int32, _ count: Int) -> [UInt8]? {
+    var bytes = [UInt8](repeating: 0, count: count)
+    var offset = 0
+    while offset < count {
+      let amount = bytes.withUnsafeMutableBytes {
+        read(descriptor, $0.baseAddress!.advanced(by: offset), count - offset)
+      }
+      guard amount > 0 else { return nil }
+      offset += amount
+    }
+    return bytes
+  }
+
+  private static func writeAll(_ descriptor: Int32, _ bytes: [UInt8]) -> Bool {
+    var offset = 0
+    while offset < bytes.count {
+      let amount = bytes.withUnsafeBytes {
+        write(descriptor, $0.baseAddress!.advanced(by: offset), bytes.count - offset)
+      }
+      guard amount > 0 else { return false }
+      offset += amount
+    }
+    return true
+  }
+}
+
+private final class RawServerResult: @unchecked Sendable {
+  private let lock = NSLock()
+  private var stored: Bool?
+  var value: Bool? { lock.withLock { stored } }
+  func complete(_ value: Bool) { lock.withLock { stored = value } }
 }

@@ -28,18 +28,20 @@ import Foundation
       exit(2)
     }
     let room = CommandLine.arguments.dropFirst().first ?? "swift-example"
+    var live: LiveClient?
+    var client: ConvexClient?
     do {
-      // Create a native Swift client pointed at the dedicated Convex deployment.
-      let client = try ConvexClient(url)
-      defer { client.close() }
+      // CONVEX_URL selects the dedicated deployment used by both HTTP and Live.
+      let http = try ConvexClient(url)
+      client = http
       // Query the room over HTTP before beginning the Live journey.
-      let before = try await client.query("demo:state", ["room": room])
+      let before = try await http.query("demo:state", ["room": room])
       let current = count(before.value)
       print("current count: \(current)")
       // Start Live before mutating, so its first value is an independent snapshot.
-      let live = try LiveClient(url)
-      let sub = try await live.subscribe("demo:state", ["room": room])
-      defer { Task { await live.close() } }
+      let liveClient = try LiveClient(url)
+      live = liveClient
+      let sub = try await liveClient.subscribe("demo:state", ["room": room])
       var updates = sub.stream.makeAsyncIterator()
       guard let initial = await updates.next() else {
         throw ExampleError("Live closed before initial value")
@@ -49,7 +51,7 @@ import Foundation
       }
       print("live initial count: \(current)")
       // The random runId is an idempotency key: retrying this logical mutation will not double increment.
-      let mutation = try await client.mutation(
+      let mutation = try await http.mutation(
         "demo:increment", ["room": room, "language": "swift", "runId": UUID().uuidString])
       guard let object = mutation.value as? [String: Any], object["applied"] as? Bool == true else {
         throw ExampleError("mutation was not applied")
@@ -63,7 +65,12 @@ import Foundation
       else { throw ExampleError("unexpected Live update") }
       print("live updated count: \(after)")
       print("verified count: \(current) -> \(after)")
+      // Await Live shutdown so no socket or event-loop work escapes the example.
+      await live?.close()
+      client?.close()
     } catch {
+      await live?.close()
+      client?.close()
       FileHandle.standardError.write(Data("\(error)\n".utf8))
       exit(1)
     }

@@ -20,16 +20,30 @@ RUN --mount=type=cache,id=swift-amd64-build-v2,target=/work/.build \
     cp .build/release/convex-adapter /out/convex-adapter && \
     cp .build/release/convex-example /out/convex-example
 
-FROM --platform=linux/amd64 swift:6.1.2-noble-slim@sha256:bf926ea857fa4e28a549bdc8ab2554d97e31bf323dce1d80594b6bce7acac19e AS runtime-base
-RUN for command in swift swiftc swift-format swift-package clang gcc git npm npx node python python3 pip pip3 curl convex; do \
-      ! command -v "$command" >/dev/null 2>&1 || exit 1; \
-    done
+FROM test AS runtime-files
+RUN set -eu; \
+    mkdir -p /rootfs/bin /rootfs/usr/bin /rootfs/usr/local/bin /rootfs/etc/ssl/certs; \
+    cp -L /bin/dash /rootfs/bin/sh; \
+    cp -L /usr/bin/id /rootfs/usr/bin/id; \
+    cp /out/convex-adapter /rootfs/usr/local/bin/convex-adapter; \
+    cp /out/convex-example /rootfs/usr/local/bin/convex-example; \
+    cp /etc/ssl/certs/ca-certificates.crt /rootfs/etc/ssl/certs/ca-certificates.crt; \
+    for executable in /bin/dash /usr/bin/id /out/convex-adapter /out/convex-example; do ldd "$executable"; done | \
+      sed -n -e 's/.*=> \(\/[^ ]*\).*/\1/p' -e 's/^[[:space:]]*\(\/[^ ]*\).*/\1/p' | \
+      sort -u | xargs -r -I '{}' cp -L --parents '{}' /rootfs; \
+    chmod 0555 /rootfs/bin/sh /rootfs/usr/bin/id /rootfs/usr/local/bin/convex-*; \
+    test ! -e /rootfs/usr/bin/apt; \
+    test ! -e /rootfs/usr/bin/dpkg; \
+    test ! -e /rootfs/usr/bin/perl
+
+FROM scratch AS runtime-base
+COPY --from=runtime-files /rootfs /
+ENV PATH=/usr/local/bin:/usr/bin:/bin \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 USER 65532:65532
 
 FROM runtime-base AS example-runtime
-COPY --from=test /out/convex-example /usr/local/bin/convex-example
 ENTRYPOINT ["/usr/local/bin/convex-example"]
 
 FROM runtime-base AS runtime
-COPY --from=test /out/convex-adapter /usr/local/bin/convex-adapter
 ENTRYPOINT ["/usr/local/bin/convex-adapter"]
