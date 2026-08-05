@@ -4,5 +4,25 @@ displayName: "PHP"
 rank: 7
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native PHP streams implementation of documented JSON HTTP and the pinned Convex sync profile; no official Convex client is used.
+toolchain:
+  name: PHP
+  version: 8.4.8
+targetRuntimeCommand: php
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities: [http, live]
+platforms: [linux/amd64]
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands: [debugDisconnect]
+limitations:
+  - Live authentication, TransitionChunk assembly, optimistic writes, and non-JSON Convex values are deferred.
+  - A bounded newest-16 subscription queue protects the adapter from slow consumers.
 capabilities: []
