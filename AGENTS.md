@@ -71,6 +71,7 @@ do not weaken it inside a language branch.
 - Comment non-obvious helper functions too, including what failure they handle and why the example needs them.
 - Explain intent, sequencing, and Convex behaviour. Do not merely translate the target language's syntax into prose or comment routine error handling.
 - Keep comments close to the code they explain and concise enough that the example still reads naturally.
+- Format every checked-in source file with the language's standard formatter before review. Never compress multiple statements onto one line to reduce file length; the README and website display the canonical source verbatim.
 - The runnable `examples/basics/` file is the canonical source. Generate the README and website from it so all three surfaces always show the same commented code.
 - Docker verification must compile and execute that exact canonical example against a unique room on the approved test deployment. The example must fail on an unexpected value from any operation it demonstrates; compilation alone is not enough.
 - For the shared counter demonstration, use a unique room and prove the expected

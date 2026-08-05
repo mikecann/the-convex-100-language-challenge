@@ -21,7 +21,7 @@ the Live update. It is the exact program included below and run by the image.
 ## The basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.java -->
-```text
+```java
 package convex.example;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -51,7 +51,8 @@ public final class Main {
     ObjectNode roomArgs = ConvexClient.JSON.createObjectNode().put("room", room);
 
     // Create one native HTTP client and one Live connection, both cleaned up on every exit path.
-    try (ConvexClient client = new ConvexClient(url); LiveClient live = new LiveClient(url)) {
+    try (ConvexClient client = new ConvexClient(url);
+        LiveClient live = new LiveClient(url)) {
       // Ask the documented HTTP query API for the current state and decode its JSON count.
       int before = count(client.query("demo:state", roomArgs).value(), "current query");
 
@@ -60,10 +61,10 @@ public final class Main {
         int initial = count(subscription.next(Duration.ofSeconds(10)), "initial Live value");
         if (initial != before) throw new IllegalStateException("Live initial value disagreed");
 
-        // The random runId is the mutation's idempotency key, avoiding duplicate increments on a retry.
-        ObjectNode mutationArgs = roomArgs.deepCopy()
-          .put("language", "java")
-          .put("runId", UUID.randomUUID().toString());
+        // The random runId is the mutation's idempotency key, avoiding duplicate increments on a
+        // retry.
+        ObjectNode mutationArgs =
+            roomArgs.deepCopy().put("language", "java").put("runId", UUID.randomUUID().toString());
         JsonNode mutation = client.mutation("demo:increment", mutationArgs).value();
         boolean applied = mutation.path("applied").asBoolean();
         if (!applied) throw new IllegalStateException("mutation was not applied");
@@ -75,7 +76,8 @@ public final class Main {
         if (updated != after) throw new IllegalStateException("Live update disagreed");
 
         // Print only after HTTP and Live agree on the complete 0 to 1 journey.
-        writeTranscript(new PrintWriter(System.out, true), before, initial, applied, after, updated);
+        writeTranscript(
+            new PrintWriter(System.out, true), before, initial, applied, after, updated);
       }
     }
   }
