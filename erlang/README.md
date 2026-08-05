@@ -160,6 +160,10 @@ same 1 MiB newline parser and discard incomplete EOF fragments.
 The final image uses Dash plus individual POSIX text packages. It removes the
 BusyBox multicall binary and all of its links, so `wget` and `nc` cannot be
 recovered through command lookup, a different `argv[0]`, or a BusyBox applet.
+It also removes Alpine package-manager libraries, certificate update helpers,
+standalone network and ELF-inspection tools, and OTP's unused compile frontend
+modules. The remaining OTP bytecode is the runtime closure exercised by the
+HTTP, TLS, WebSocket, and JSON startup probe.
 The adapter exposes `debugDisconnect` only for conformance.
 
 ## Limitations

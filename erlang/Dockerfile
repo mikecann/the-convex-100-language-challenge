@@ -69,9 +69,16 @@ RUN set -eu; \
         fi; \
     done; \
     ln -sf /usr/bin/mawk /usr/bin/awk; \
-    rm -f /bin/busybox /sbin/apk /sbin/ldconfig /usr/sbin/chroot /usr/sbin/update-ca-certificates; \
+    rm -f \
+        /bin/busybox /sbin/apk /sbin/ldconfig \
+        /usr/sbin/chroot /usr/sbin/update-ca-certificates \
+        /usr/bin/c_rehash /usr/bin/scanelf /usr/bin/ssl_client \
+        /usr/lib/libapk.so* \
+        /usr/local/lib/erlang/lib/kernel-9.2.4.11/ebin/erl_compile_server.beam \
+        /usr/local/lib/erlang/lib/stdlib-5.2.3.6/ebin/erl_compile.beam; \
     rm -rf \
         /etc/apk /lib/apk /lib/sysctl.d \
+        /etc/ca-certificates/update.d \
         /etc/busybox-paths.d /etc/crontabs /etc/periodic \
         /etc/inittab /etc/logrotate.d /etc/profile /etc/profile.d \
         /etc/fstab /etc/issue /etc/modprobe.d /etc/modules \
@@ -82,7 +89,7 @@ RUN set -eu; \
         /usr/share /usr/local/share
 ENV ERL_FLAGS="+S 1:1 +SDcpu 1 +SDio 1" ERL_LIBS=/opt/convex/deps
 USER 65532:65532
-RUN set -eu; for command in sh id cat cmp cut grep head sed sort tail tr awk erl; do command -v "$command" >/dev/null; done; for command in busybox wget nc netcat apk elixir elixirc iex mix hex rebar rebar3 erlc cc gcc clang make node npm python python3 curl convex openssl; do ! command -v "$command" >/dev/null 2>&1 || exit 1; done; test ! -e /bin/busybox; test ! -e /usr/local/lib/erlang/erts-14.2.5.15/bin/erlc; erl -noshell -pa /opt/convex -eval '{ok, _} = application:ensure_all_started(inets), {ok, _} = application:ensure_all_started(ssl), {ok, _} = application:ensure_all_started(gun), <<_:8>> = crypto:strong_rand_bytes(1), halt().'
+RUN set -eu; for command in sh id cat cmp cut grep head sed sort tail tr awk erl; do command -v "$command" >/dev/null; done; for command in busybox wget nc netcat apk elixir elixirc iex mix hex rebar rebar3 erlc cc gcc clang make node npm python python3 curl convex openssl ssl_client c_rehash scanelf; do ! command -v "$command" >/dev/null 2>&1 || exit 1; done; test ! -e /bin/busybox; test ! -e /usr/lib/libapk.so.2.14.10; test ! -e /etc/ca-certificates/update.d; test ! -e /usr/local/lib/erlang/erts-14.2.5.15/bin/erlc; test ! -e /usr/local/lib/erlang/lib/stdlib-5.2.3.6/ebin/erl_compile.beam; test ! -e /usr/local/lib/erlang/lib/kernel-9.2.4.11/ebin/erl_compile_server.beam; erl -noshell -pa /opt/convex -eval '{non_existing, non_existing} = {code:which(erl_compile), code:which(erl_compile_server)}, {ok, _} = application:ensure_all_started(inets), {ok, _} = application:ensure_all_started(ssl), {ok, _} = application:ensure_all_started(gun), <<_:8>> = crypto:strong_rand_bytes(1), halt().'
 
 FROM runtime-base AS example-runtime
 COPY --from=build /app/example-ebin /opt/convex
