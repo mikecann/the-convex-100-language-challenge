@@ -1,32 +1,3 @@
-# Convex from Elixir
-
-This demonstration uses Elixir and OTP to query a Convex room, subscribe to it
-over Live, mutate it, and prove the reactive value changes from `0` to `1`.
-
-It is educational and unofficial. It is not a production SDK, an officially
-sanctioned Convex client, or a package intended for Hex.
-
-## Start here
-
-Read [`examples/basics/main.ex`](examples/basics/main.ex). It is the exact
-program Docker runs and the website displays. The comments walk through client
-creation, the initial HTTP query, subscribing before the write, idempotent
-mutation, and the resulting Live update.
-
-## What works
-
-| Capability | Current state | What that means |
-| --- | --- | --- |
-| HTTP | Awaiting shared evidence | Native query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented. |
-| Live | Awaiting shared evidence | Native WebSocket subscriptions, unsubscribe, typed query failures, and reconnect restoration are implemented against the pinned profile. |
-
-The manifest intentionally awards no badges yet. Only the shared local and
-hosted black-box controller may turn either row into a passing capability.
-
-## Basic example
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.ex -->
-```elixir
 defmodule Convex.Example do
   @moduledoc false
 
@@ -137,46 +108,3 @@ defmodule Convex.Example do
     :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
   end
 end
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Verify it in Docker
-
-```sh
-./run test elixir
-./run verify-example elixir
-./run verify elixir
-./run verify-hosted elixir
-./run verify-all elixir
-```
-
-`test` checks formatting, compiles all source and both executables, and runs
-language-local unit tests. `verify-example` runs the exact example above against
-a unique room. The two conformance commands separately test the approved local
-backend and dedicated hosted drift target. `verify-all` runs both from the same
-built source.
-
-## Conformance and protocol notes
-
-The public client calls `/api/query`, `/api/mutation`, and `/api/action` using
-the documented `format: "json"` HTTP contract. Its OTP Live process implements
-the `convex-rs-0.10.4-unversioned-sync` profile pinned at upstream commit
-`6f1df8a8ba1665084ec001e307ca841ca17074d7` and endpoint `/api/sync`.
-
-The test-only executable under `client/tests/conformance/` exposes NDJSON
-adapter protocol v1 over stdin/stdout or TCP. It includes `debugDisconnect`
-only so the shared controller can exercise real reconnection. That hook is not
-part of the educational client API.
-
-## Limitations
-
-Live authentication, WebSocket mutations and actions, transition chunks,
-mutation replay, optimistic updates, journals, and the non-JSON-safe Convex
-value extensions are deliberately outside this demonstration. Realtime is an
-internal protocol, so passing evidence for this pinned revision would not make
-it a supported third-party SDK contract.
-
-The pinned Gun 2.5.0 dependency currently resolves Cowlib 2.19.0, which Hex
-flags for response-header splitting. The example does not create response
-headers from untrusted input, but that unresolved advisory is another concrete
-reason not to treat this experiment as production-ready software.
