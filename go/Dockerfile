@@ -17,7 +17,7 @@ FROM test AS build
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -tags convexadapter -trimpath \
     -ldflags="-s -w -buildid=" \
-    -o /out/convex-go-adapter ./adapter
+    -o /out/convex-go-adapter ./tests/conformance
 
 FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce AS runtime
 RUN apk add --no-cache ca-certificates=20260611-r0

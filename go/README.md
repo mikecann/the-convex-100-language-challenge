@@ -164,10 +164,12 @@ This block is generated from `examples/basics/main.go`, which is also the source
 on the evidence website. Edit and run the source file, then use
 `./run sync-examples` to refresh this README projection.
 
-## Adapter
+## Conformance tests
 
-The final image runs a thin Go adapter which accepts NDJSON protocol v1 on
-stdin and reserves stdout for NDJSON events. It supports:
+The test-only source under `tests/conformance/` builds a thin Go executable
+which accepts NDJSON protocol v1 on stdin and reserves stdout for NDJSON
+events. It lets the shared harness exercise the real client and is not part of
+the educational client API. It supports:
 
 - `hello`
 - `query`

@@ -53,7 +53,7 @@ Live includes HTTP. Implementation provenance is a separate label:
   Dockerfile               pinned build and runtime image
   client/                  idiomatic client library and its unit tests
   examples/basics/         the shared counter-room example and its own tests
-  adapter/                 native NDJSON conformance adapter
+  tests/conformance/       test-only NDJSON conformance executable
   README.md                usage, evidence, and limitations
 _shared/                   trusted backend, harness, schemas, site, and results
 run                         Docker-only orchestration entrypoint
