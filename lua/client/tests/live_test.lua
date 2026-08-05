@@ -1,5 +1,5 @@
 package.path = "./client/?.lua;" .. package.path
-local cjson = require("cjson.safe")
+local json = require("json")
 local errno = require("cqueues.errno")
 local Live = require("live")
 
@@ -14,10 +14,18 @@ local FakeSocket = {}
 FakeSocket.__index = FakeSocket
 
 function FakeSocket.new(server)
-	return setmetatable(
+	local instance = setmetatable(
 		{ server = server, incoming = {}, closed = false, request = { headers = { append = function() end } } },
 		FakeSocket
 	)
+	instance.socket = {
+		shutdown = function() end,
+		close = function()
+			instance.closed = true
+			instance.forced_closed = true
+		end,
+	}
+	return instance
 end
 
 function FakeSocket:connect()
@@ -30,9 +38,14 @@ function FakeSocket:connect()
 end
 
 function FakeSocket:send(payload)
-	local message = assert(cjson.decode(payload))
+	local message = assert(json.decode(payload))
 	self.server.sent[#self.server.sent + 1] = message
 	if message.type == "ModifyQuerySet" then
+		local modification_type = message.modifications[1] and message.modifications[1].type
+		if self.server.fail_next_modify == modification_type then
+			self.server.fail_next_modify = nil
+			return nil, self.server.fail_message or "fixture query-set write failure"
+		end
 		self.server:on_modify(self, message)
 	end
 	return true
@@ -50,10 +63,16 @@ function FakeSocket:receive()
 		require("cqueues").sleep(0.001)
 		return nil, "timeout", errno.ETIMEDOUT
 	end
-	return cjson.encode(table.remove(self.incoming, 1)), "text"
+	return json.encode(table.remove(self.incoming, 1)), "text"
 end
 
-function FakeSocket:close()
+function FakeSocket:close(_, reason)
+	assert(#reason <= 123, "fixture rejected an oversized close reason")
+	self.close_reason = reason
+	if self.server.fail_next_close then
+		self.server.fail_next_close = false
+		error("fixture graceful close failure")
+	end
 	self.closed = true
 	return true
 end
@@ -74,7 +93,7 @@ local function server_for_updates()
 	end
 	function server:on_modify(socket, message)
 		local change = message.modifications[1]
-		if change.type == "Add" then
+		if change.type == "Add" and not self.suppress_add_update then
 			self.generation = self.generation + 1
 			socket.incoming[#socket.incoming + 1] = transition(0, message.newVersion, "AAAAAAAAAAA=", "AQAAAAAAAAA=", {
 				type = "QueryUpdated",
@@ -125,6 +144,67 @@ if not close_ok then
 	error(close_error.message or tostring(close_error))
 end
 assert_equal(server.sent[#server.sent].modifications[1].type, "Remove", "remove")
+assert(manager:close())
+
+-- A failed Add may already have reached the server. The client rejects that
+-- subscription, retires the uncertain socket, reports a structured failure to
+-- the remaining subscription, and replays only the still-active Add.
+server = server_for_updates()
+manager = Live.Manager.new("http://unit.test", "lua-test", {
+	websocket_factory = function()
+		return server:new_socket()
+	end,
+})
+local survivor = assert(manager:subscribe("demo:state", { room = "add-write-survivor" }))
+assert_equal(assert(survivor:next_update(1)).value.count, 0)
+local uncertain_socket = server.connections[1]
+server.fail_next_modify = "Add"
+server.fail_message = string.rep("long transport failure ", 12)
+server.fail_next_close = true
+local rejected, add_write_error = manager:subscribe("demo:state", { room = "failed-add" })
+assert(rejected == nil and add_write_error.name == "TransportError", "failed Add was not structured")
+assert(uncertain_socket.closed and manager.socket == nil, "failed Add retained the uncertain socket")
+assert(uncertain_socket.forced_closed, "failed graceful close did not force the transport closed")
+assert(#uncertain_socket.close_reason <= 123, "failed Add sent an oversized close reason")
+assert(#manager.last_close_reason > 123, "close-frame truncation also truncated connection metadata")
+assert_equal(assert(survivor:next_update(1)).error.name, "TransportError", "survivor missed Add failure")
+local deadline = require("cqueues").monotime() + 2
+while #server.connections < 2 and require("cqueues").monotime() < deadline do
+	manager.cq:step(0.2)
+end
+assert_equal(#server.connections, 2, "failed Add did not reconnect")
+local replay = server.sent[#server.sent]
+assert_equal(#replay.modifications, 1, "failed Add replayed a rejected query")
+assert_equal(replay.modifications[1].queryId, survivor.query_id, "failed Add omitted the survivor")
+assert(survivor:try_next_update() == nil, "replayed Add leaked unchanged hydration")
+
+-- A failed Remove follows the same rule. The removed query stays invalidated,
+-- while the surviving query is replayed on a fresh connection and recovers.
+server.suppress_add_update = true
+server.fail_message = nil
+local removed = assert(manager:subscribe("demo:state", { room = "failed-remove" }))
+server.fail_next_modify = "Remove"
+local remove_ok, remove_error = removed:close()
+assert(remove_ok == nil and remove_error.name == "TransportError", "failed Remove was not structured")
+assert(server.connections[2].closed and manager.socket == nil, "failed Remove retained the uncertain socket")
+assert_equal(assert(survivor:next_update(1)).error.name, "TransportError", "survivor missed Remove failure")
+server.suppress_add_update = false
+deadline = require("cqueues").monotime() + 2
+while #server.connections < 3 and require("cqueues").monotime() < deadline do
+	manager.cq:step(0.2)
+end
+assert_equal(#server.connections, 3, "failed Remove did not reconnect")
+replay = server.sent[#server.sent]
+assert_equal(#replay.modifications, 1, "failed Remove replayed an invalidated query")
+assert_equal(replay.modifications[1].queryId, survivor.query_id, "failed Remove omitted the survivor")
+server.connections[3].incoming[#server.connections[3].incoming + 1] = transition(
+	1,
+	1,
+	"AQAAAAAAAAA=",
+	"AgAAAAAAAAA=",
+	{ type = "QueryUpdated", queryId = survivor.query_id, value = { count = 1 }, logLines = {} }
+)
+assert_equal(assert(survivor:next_update(1)).value.count, 1, "Remove failure stranded the survivor")
 assert(manager:close())
 
 -- Reconnect five times. Each Connect carries monotonically increasing metadata,

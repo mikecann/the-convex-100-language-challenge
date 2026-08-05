@@ -11,7 +11,7 @@ the shared local and hosted conformance suites.
 
 The [basic example](examples/basics/main.lua) reads a counter room and applies
 one idempotent increment. The client itself is in [client](client/). Its Docker
-images contain Lua, lua-cjson, lua-http, and cqueues, with no delegated Convex
+images contain Lua, dkjson, lua-http, and cqueues, with no delegated Convex
 client or CLI.
 
 ## What works
@@ -123,7 +123,7 @@ control-frame, and bounded-close implementation; Convex-specific transitions,
 metadata, hydration suppression, and query recovery stay in this Lua client.
 
 The image pins Debian bookworm-slim by digest, Lua 5.1.5, lua-http 0.4-1,
-cqueues 20200726-1+b1, lua-cjson 2.1.0+dfsg-2.2, and StyLua 2.5.2. The Live
+cqueues 20200726-1+b1, dkjson 2.6-2, and StyLua 2.5.2. The Live
 wire profile is pinned to `convex-rs-0.10.4-unversioned-sync` at source commit
 `6f1df8a8ba1665084ec001e307ca841ca17074d7`.
 

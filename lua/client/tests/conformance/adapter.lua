@@ -1,24 +1,13 @@
 #!/usr/local/bin/lua
 package.path = os.getenv("CONVEX_CLIENT_PATH") and (os.getenv("CONVEX_CLIENT_PATH") .. "/?.lua;" .. package.path)
 	or ("./client/?.lua;" .. package.path)
-local json = require("cjson.safe")
+local json = require("json")
 local socket = require("socket")
 local cqueues = require("cqueues")
 local cqueue_socket = require("cqueues.socket")
 local Convex = require("convex")
 local Events = require("adapter_events")
-
-local function write(output, event)
-	local line = assert(json.encode(event)) .. "\n"
-	if output.write then
-		output:write(line)
-	else
-		assert(output:send(line))
-	end
-	if output.flush then
-		output:flush()
-	end
-end
+local Output = require("adapter_output")
 
 local function new_state(output)
 	return { output = output, client = nil, subscriptions = {}, closed = false }
@@ -42,21 +31,18 @@ local function ensure_client(state)
 end
 
 local function process_line(state, line)
-	local output = state.output
 	local command, decode_error = json.decode(line)
 	if not command then
-		write(
-			output,
+		state.output:enqueue(
 			Events.error(nil, { name = "ProtocolError", message = "decode command: " .. tostring(decode_error) })
 		)
 	elseif command.op == "hello" then
 		if command.protocolVersion ~= 1 then
-			write(
-				output,
+			state.output:enqueue(
 				Events.error(command.id, { name = "ProtocolError", message = "unsupported adapter protocol version" })
 			)
 		else
-			write(output, {
+			state.output:enqueue({
 				protocolVersion = 1,
 				id = command.id,
 				type = "ready",
@@ -74,17 +60,17 @@ local function process_line(state, line)
 		if state.client then
 			state.client:close()
 		end
-		write(output, { id = command.id, type = "closed" })
+		state.output:enqueue({ id = command.id, type = "closed" })
 		state.closed = true
+		state.output:finish()
 	elseif command.op == "subscribe" then
 		local client, client_error = ensure_client(state)
 		if not client then
-			write(output, Events.error(command.id, client_error))
+			state.output:enqueue(Events.error(command.id, client_error))
 		else
 			local subscription_id = command.subscriptionId
 			if not subscription_id or subscription_id == "" then
-				write(
-					output,
+				state.output:enqueue(
 					Events.error(command.id, { name = "ProtocolError", message = "subscriptionId is required" })
 				)
 			else
@@ -95,10 +81,10 @@ local function process_line(state, line)
 				end
 				local subscription, err = client:subscribe(command.path, command.args or {})
 				if not subscription then
-					write(output, Events.error(command.id, err))
+					state.output:enqueue(Events.error(command.id, err))
 				else
 					state.subscriptions[subscription_id] = { subscription = subscription }
-					write(output, { id = command.id, type = "ack" })
+					state.output:enqueue({ id = command.id, type = "ack" })
 				end
 			end
 		end
@@ -110,17 +96,17 @@ local function process_line(state, line)
 			ok, err = entry.subscription:close()
 		end
 		if ok then
-			write(output, { id = command.id, type = "ack" })
+			state.output:enqueue({ id = command.id, type = "ack" })
 		else
-			write(output, Events.error(command.id, err))
+			state.output:enqueue(Events.error(command.id, err))
 		end
 	elseif command.op == "debugDisconnect" then
 		local client, client_error = ensure_client(state)
 		local ok, err = client and client:debug_disconnect_for_adapter()
 		if ok then
-			write(output, { id = command.id, type = "ack" })
+			state.output:enqueue({ id = command.id, type = "ack" })
 		else
-			write(output, Events.error(command.id, err or client_error))
+			state.output:enqueue(Events.error(command.id, err or client_error))
 		end
 	else
 		if
@@ -129,20 +115,22 @@ local function process_line(state, line)
 			and command.op ~= "action"
 			and command.op ~= "setAuth"
 		then
-			write(output, Events.error(command.id, { name = "ProtocolError", message = "unknown adapter operation" }))
+			state.output:enqueue(
+				Events.error(command.id, { name = "ProtocolError", message = "unknown adapter operation" })
+			)
 		else
 			local client, client_error = ensure_client(state)
 			if not client then
-				write(output, Events.error(command.id, client_error))
+				state.output:enqueue(Events.error(command.id, client_error))
 			elseif command.op == "setAuth" then
 				client:set_auth(command.token or "")
-				write(output, { id = command.id, type = "ack" })
+				state.output:enqueue({ id = command.id, type = "ack" })
 			else
 				local result, err = client:call(command.op, command.path, command.args or {})
 				if result then
-					write(output, Events.result(command.id, result))
+					state.output:enqueue(Events.result(command.id, result))
 				else
-					write(output, Events.error(command.id, err))
+					state.output:enqueue(Events.error(command.id, err))
 				end
 			end
 		end
@@ -161,22 +149,15 @@ local function drain_live(state, step_owner)
 			if not update then
 				break
 			end
-			local delivered = Events.deliver_if_current(
-				state.subscriptions,
-				subscription_id,
-				entry,
-				update,
-				function(current_update)
-					if current_update.error then
-						local event = Events.error(nil, current_update.error)
-						event.type = "subscription"
-						event.subscriptionId = subscription_id
-						write(state.output, event)
-					else
-						write(state.output, Events.subscription(subscription_id, current_update))
-					end
-				end
-			)
+			local event
+			if update.error then
+				event = Events.error(nil, update.error)
+				event.type = "subscription"
+				event.subscriptionId = subscription_id
+			else
+				event = Events.subscription(subscription_id, update)
+			end
+			local delivered = state.output:enqueue(event, state.subscriptions, subscription_id, entry)
 			if not delivered then
 				break
 			end
@@ -186,9 +167,13 @@ end
 
 local function run_stdio()
 	local cq = cqueues.new()
-	local state = new_state(assert(cqueue_socket.fdopen(1)))
+	local output = Output.new(assert(cqueue_socket.fdopen(1)))
+	local state = new_state(output)
 	state.cq = cq
 	local input = assert(cqueue_socket.fdopen(0))
+	cq:wrap(function()
+		output:run_stdio()
+	end)
 	cq:wrap(function()
 		while not state.closed do
 			local line = input:read("*l")
@@ -202,6 +187,7 @@ local function run_stdio()
 					state.client:close()
 				end
 				state.closed = true
+				state.output:finish()
 				break
 			end
 			process_line(state, line)
@@ -225,7 +211,8 @@ if address and address ~= "" then
 	local server = assert(socket.bind(host, tonumber(port)))
 	local peer = assert(server:accept())
 	peer:settimeout(0)
-	local state = new_state(peer)
+	local output = Output.new(peer)
+	local state = new_state(output)
 	local partial = ""
 	while not state.closed do
 		local line, receive_error, fragment = peer:receive("*l", partial)
@@ -237,6 +224,8 @@ if address and address ~= "" then
 			break
 		end
 		drain_live(state, true)
+		local flushed, flush_error = output:flush_tcp(5)
+		assert(flushed, flush_error)
 		socket.sleep(0.005)
 	end
 	if state.client and not state.closed then

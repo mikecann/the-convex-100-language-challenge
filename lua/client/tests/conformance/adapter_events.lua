@@ -31,22 +31,4 @@ function Events.subscription(subscription_id, update)
 	return event
 end
 
--- Relays can yield while writing. Rechecking the exact entry after dequeue
--- prevents an old subscription from crossing an unsubscribe or replacement
--- acknowledgement if the controller changed that id in the meantime.
-function Events.relay_is_current(subscriptions, subscription_id, entry)
-	return subscriptions[subscription_id] == entry
-end
-
-function Events.deliver_if_current(subscriptions, subscription_id, entry, update, deliver, before_check)
-	if before_check then
-		before_check() -- deterministic fixture pause after dequeue
-	end
-	if not Events.relay_is_current(subscriptions, subscription_id, entry) then
-		return false
-	end
-	deliver(update)
-	return true
-end
-
 return Events

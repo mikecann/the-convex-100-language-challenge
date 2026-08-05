@@ -1,4 +1,4 @@
-local cjson = require("cjson.safe")
+local json = require("json")
 local cqueues = require("cqueues")
 local condition = require("cqueues.condition")
 local errno = require("cqueues.errno")
@@ -12,6 +12,13 @@ local INITIAL_BACKOFF = 0.1
 local MAX_BACKOFF = 15
 local MAX_BUFFERED_UPDATES = 16
 
+local function close_frame_reason(reason)
+	-- RFC 6455 leaves 123 bytes for a close reason. Keep the complete reason in
+	-- connection metadata, but send a bounded ASCII diagnostic on the wire so a
+	-- long or malformed transport error cannot prevent socket retirement.
+	return tostring(reason):gsub("[^ -~]", "?"):sub(1, 123)
+end
+
 local function failure(name, message, data, logs)
 	return { name = name, message = message, data = data, logs = logs or {} }
 end
@@ -20,16 +27,24 @@ local function copy(value)
 	if value == nil then
 		return nil
 	end
-	local encoded = assert(cjson.encode(value))
-	return assert(cjson.decode(encoded))
+	local encoded = assert(json.encode(value))
+	return assert(json.decode(encoded))
 end
 
 local function same_value(left, right)
+	if left == right then
+		return true
+	end
 	if type(left) ~= type(right) then
 		return false
 	end
 	if type(left) ~= "table" then
-		return left == right
+		return false
+	end
+	local left_kind = getmetatable(left) and getmetatable(left).__jsontype
+	local right_kind = getmetatable(right) and getmetatable(right).__jsontype
+	if left_kind ~= right_kind then
+		return false
 	end
 	for key, value in pairs(left) do
 		if not same_value(value, right[key]) then
@@ -234,7 +249,8 @@ function Manager:_respond(command, value, err)
 end
 
 function Manager:subscribe(path, args)
-	return self:_submit("subscribe", { path = path, args = copy(args or {}) })
+	args = json.object(args or {})
+	return self:_submit("subscribe", { path = path, args = copy(args) })
 end
 
 function Manager:unsubscribe(query_id)
@@ -260,7 +276,7 @@ function Manager:_add_modification(query_id, state)
 end
 
 function Manager:_send(value, timeout)
-	local encoded, encode_error = cjson.encode(value)
+	local encoded, encode_error = json.encode(value)
 	if not encoded then
 		return nil, failure("ProtocolError", "encode Live message: " .. tostring(encode_error))
 	end
@@ -286,6 +302,14 @@ function Manager:_modify(modifications, timeout)
 	return true
 end
 
+function Manager:_recover_query_set_write(err)
+	-- A failed WebSocket send is ambiguous: the server may have applied all,
+	-- part, or none of the frame. Retire that connection before publishing the
+	-- structured error, then replay only the still-active set on a new socket.
+	self:_disconnect("QuerySetWriteFailed: " .. err.message, true)
+	self:_publish_error(err)
+end
+
 function Manager:_process_commands()
 	while #self.commands > 0 do
 		local command = table.remove(self.commands, 1)
@@ -299,8 +323,10 @@ function Manager:_process_commands()
 			if self.socket then
 				local ok, err = self:_modify({ self:_add_modification(query_id, state) })
 				if not ok then
-					self:_respond(command, nil, err)
 					self.subscriptions[query_id] = nil
+					state.subscription:_finish()
+					self:_recover_query_set_write(err)
+					self:_respond(command, nil, err)
 				else
 					self:_respond(command, subscription)
 				end
@@ -317,6 +343,7 @@ function Manager:_process_commands()
 				if self.socket then
 					local ok, err = self:_modify({ { type = "Remove", queryId = command.query_id } }, 0.25)
 					if not ok then
+						self:_recover_query_set_write(err)
 						self:_respond(command, nil, err)
 					else
 						self:_respond(command, true)
@@ -399,9 +426,21 @@ end
 
 function Manager:_disconnect(reason, reconnect)
 	if self.socket then
-		pcall(function()
-			self.socket:close(1001, reason, 0.1)
+		local retired_socket = self.socket
+		local invoked, close_result = pcall(function()
+			return retired_socket:close(1001, close_frame_reason(reason), 0.1)
 		end)
+		local closed = invoked and close_result
+		if not closed and retired_socket.socket then
+			-- lua-http exposes the owned cqueues socket here. If its graceful
+			-- close path raises, force the transport closed before reconnecting.
+			pcall(function()
+				retired_socket.socket:shutdown()
+			end)
+			pcall(function()
+				retired_socket.socket:close()
+			end)
+		end
 		self.socket = nil
 		self.connection_count = self.connection_count + 1
 	end
@@ -495,7 +534,7 @@ function Manager:_receive()
 	if kind ~= "text" then
 		return nil, failure("ProtocolError", "Convex Live sent a non-text message")
 	end
-	local message, decode_error = cjson.decode(payload)
+	local message, decode_error = json.decode(payload)
 	if not message then
 		return nil, failure("ProtocolError", "decode Live message: " .. tostring(decode_error))
 	end

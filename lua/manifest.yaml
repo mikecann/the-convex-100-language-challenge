@@ -7,7 +7,7 @@ implementation:
   status: attempting
   provenance: native
   version: 0.1.0
-  notes: Native Lua HTTP client using lua-http and lua-cjson, with a single-owner lua-http and cqueues Live implementation. Capability badges remain empty until shared local and hosted conformance pass.
+  notes: Native Lua HTTP client using lua-http and dkjson, with a single-owner lua-http and cqueues Live implementation. Capability badges remain empty until shared local and hosted conformance pass.
 toolchain:
   name: Lua
   version: 5.1.5

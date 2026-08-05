@@ -1,5 +1,5 @@
-package.path = "./client/tests/conformance/?.lua;" .. package.path
-local json = require("cjson.safe")
+package.path = "./client/tests/conformance/?.lua;./client/?.lua;" .. package.path
+local json = require("json")
 local Events = require("adapter_events")
 
 local function round_trip(event)
@@ -39,23 +39,3 @@ assert(update.value.count == 2 and update.logs == nil)
 
 local closed = round_trip({ id = "close-1", type = "closed" })
 assert(closed.id == "close-1" and closed.type == "closed")
-
--- Model a relay paused after dequeue. Replacing and removing the id both make
--- the old entry ineligible before either acknowledgement can be published.
-local old_entry = { subscription = {} }
-local replacement = { subscription = {} }
-local subscriptions = { ["sub-1"] = old_entry }
-local dequeued_by_old_relay = { value = { count = 3 } }
-local delivered = 0
-assert(not Events.deliver_if_current(subscriptions, "sub-1", old_entry, dequeued_by_old_relay, function()
-	delivered = delivered + 1
-end, function()
-	subscriptions["sub-1"] = replacement
-end))
-assert(delivered == 0, "replacement acknowledgement allowed a stale relay")
-assert(not Events.deliver_if_current(subscriptions, "sub-1", replacement, dequeued_by_old_relay, function()
-	delivered = delivered + 1
-end, function()
-	subscriptions["sub-1"] = nil
-end))
-assert(delivered == 0, "unsubscribe acknowledgement allowed a stale relay")

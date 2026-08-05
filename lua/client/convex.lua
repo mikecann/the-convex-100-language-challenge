@@ -2,7 +2,7 @@
 -- the Convex request and response behaviour; the dependencies only provide
 -- ordinary TLS, HTTP framing, and JSON encoding.
 local http_request = require("http.request")
-local json = require("cjson.safe")
+local json = require("json")
 local Live = require("live")
 
 local Convex = {}
@@ -99,6 +99,7 @@ function Convex:call(operation, path, args)
 	if type(args) ~= "table" then
 		return fail("ProtocolError", "Convex arguments must be a named JSON object")
 	end
+	json.object(args)
 	local body, body_error = encode({ path = path, args = args, format = "json" }, "Convex request")
 	if not body then
 		return nil, body_error
@@ -165,5 +166,11 @@ end
 function Convex:action(path, args)
 	return self:call("action", path, args)
 end
+
+-- Lua has one table type, so these helpers let hand-written calls express the
+-- otherwise ambiguous empty JSON array and object without adapter-only tags.
+Convex.array = json.array
+Convex.object = json.object
+Convex.null = json.null
 
 return Convex

@@ -59,7 +59,7 @@ local function read_client_frame(peer)
 end
 
 local function begin_live_subscription(peer)
-	local json = require("cjson.safe")
+	local json = require("json")
 	local _, connect_payload = read_client_frame(peer)
 	assert(assert(json.decode(connect_payload)).type == "Connect", "Live client omitted Connect")
 	local _, modify_payload = read_client_frame(peer)
