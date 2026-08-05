@@ -4,5 +4,29 @@ displayName: "Objective-C"
 rank: 18
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Objective-C client. Its ownership handle and all Convex HTTP and pinned Live state run in Objective-C, using libcurl for HTTP/TLS/WebSocket transport and json-c for JSON.
+toolchain:
+  name: Clang Objective-C
+  version: 19.1.7
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, optimistic updates, WebSocket mutations, and WebSocket actions are deferred.
+  - The undocumented pinned sync profile can drift independently of the documented HTTP API.
+  - Delivery holds at most the newest 16 updates and rejects a single encoded Live message above 2 MiB.
 capabilities: []

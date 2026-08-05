@@ -1,23 +1,3 @@
-# Convex from Objective-C
-
-A native Objective-C client that calls Convex functions over HTTP and follows a query through the pinned `/api/sync` WebSocket profile.
-
-This is educational and unofficial, not a production Convex SDK.
-
-## Start here
-
-[`examples/basics/main.m`](examples/basics/main.m) follows the shared counter from 0 to 1. It performs an HTTP query, begins Live before the mutation, uses an idempotency key, and verifies the reactive update.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP queries, mutations, actions, token changes, and structured errors | Implemented, awaiting root-owned shared evidence |
-| Live initial values and updates through `/api/sync` | Implemented, awaiting root-owned shared evidence |
-| Remove, reconnect, query-error recovery, and bounded delivery | Implemented, awaiting root-owned shared evidence |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.m -->
-```text
 #import "ConvexClient.h"
 #include <curl/curl.h>
 #include <stdio.h>
@@ -118,15 +98,3 @@ int main(int argc, char **argv) {
   convex_free(client);
   return 0;
 }
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-`./run test objective-c` formats, compiles, and runs deterministic Objective-C client and Live fixtures inside Docker. `./run build objective-c` produces the non-root amd64 adapter runtime. Root-owned `verify-example` and conformance commands remain the capability-evidence gates.
-
-## Protocol notes
-
-The adapter speaks NDJSON protocol v1 on stdin/stdout or a single `ADAPTER_LISTEN` TCP connection. The native Objective-C translation unit intentionally keeps explicit, direct client ownership so the teaching example stays transparent. `libcurl` supplies HTTP, TLS, and WebSocket transport, `json-c` supplies JSON, and Convex protocol state remains in this implementation. One worker alone owns the socket, query-set changes, and reconnects. It resubscribes active queries after reconnect, suppresses unchanged hydration, reports structured function/protocol/transport errors, and uses bounded newest-16 per-subscription queues. The queue also rejects encoded Live messages above 2 MiB.
-
-Live authentication, optimistic updates, tagged Convex values, WebSocket mutations/actions, and `TransitionChunk` assembly are intentionally deferred. The sync endpoint is an undocumented pinned profile and may drift.
