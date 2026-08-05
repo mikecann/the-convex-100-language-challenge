@@ -10,7 +10,9 @@ RUN dotnet build client/Convex.csproj -c Release -warnaserror && \
     dotnet build client/tests/conformance/Adapter.csproj -c Release -warnaserror && \
     dotnet build client/tests/CsharpTests.csproj -c Release -warnaserror && \
     dotnet build examples/basics/Example.csproj -c Release -warnaserror && \
+    dotnet build examples/basics/tests/ExampleTests.csproj -c Release -warnaserror && \
     dotnet run --project client/tests/CsharpTests.csproj -c Release --no-build && \
+    dotnet run --project examples/basics/tests/ExampleTests.csproj -c Release --no-build && \
     dotnet publish client/tests/conformance/Adapter.csproj -c Release -o /out/adapter --no-self-contained && \
     dotnet publish examples/basics/Example.csproj -c Release -o /out/example --no-self-contained && \
     printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | dotnet /out/adapter/Adapter.dll | grep -q '"language":"csharp"' && \
