@@ -28,6 +28,9 @@ RUN expected='{"protocolVersion":1,"id":"hello","op":"hello"}\n{"id":"close","op
     actual=$(printf "$expected" | CONVEX_CLIENT_PATH=/work/client Rscript client/tests/conformance/adapter.R); \
     printf '%s\n' "$actual" | grep -Fx '{"protocolVersion":1,"id":"hello","type":"ready","language":"r","implementation":"native-r-4.5.1","runtime":"R-4.5.1"}'; \
     printf '%s\n' "$actual" | grep -Fx '{"id":"close","type":"closed"}'
+RUN actual=$({ printf '%s' '{"protocolVersion":1,"id":"hel'; sleep 0.02; printf '%s\n' 'lo","op":"hello"}'; } | \
+      timeout 2 env CONVEX_CLIENT_PATH=/work/client Rscript client/tests/conformance/adapter.R); \
+    printf '%s\n' "$actual" | grep -Fx '{"protocolVersion":1,"id":"hello","type":"ready","language":"r","implementation":"native-r-4.5.1","runtime":"R-4.5.1"}'
 CMD ["Rscript", "-e", "quit(status=0)"]
 
 FROM packages AS runtime-rootfs
@@ -89,6 +92,14 @@ RUN expected='{"protocolVersion":1,"id":"hello","op":"hello"}\n{"id":"close","op
     actual=$(printf "$expected" | /usr/local/bin/convex-adapter); \
     printf '%s\n' "$actual" | grep -Fx '{"protocolVersion":1,"id":"hello","type":"ready","language":"r","implementation":"native-r-4.5.1","runtime":"R-4.5.1"}'; \
     printf '%s\n' "$actual" | grep -Fx '{"id":"close","type":"closed"}'
+RUN actual=$(printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' | /usr/local/bin/convex-adapter); \
+    printf '%s\n' "$actual" | grep -Fx '{"protocolVersion":1,"id":"hello","type":"ready","language":"r","implementation":"native-r-4.5.1","runtime":"R-4.5.1"}'
+RUN set -eu; \
+    ADAPTER_LISTEN=127.0.0.1:43210 /usr/local/bin/convex-adapter & \
+    adapter_pid=$!; \
+    actual=$(/usr/local/bin/Rscript -e 'deadline <- Sys.time() + 2; socket <- NULL; while (is.null(socket) && Sys.time() < deadline) { socket <- tryCatch(socketConnection("127.0.0.1", 43210, blocking=TRUE, open="r+b"), error=function(error) NULL); if (is.null(socket)) Sys.sleep(0.01) }; stopifnot(!is.null(socket)); writeBin(charToRaw("{\"protocolVersion\":1,\"id\":\"hel"), socket); flush(socket); Sys.sleep(0.02); writeBin(charToRaw("lo\",\"op\":\"hello\"}\n"), socket); flush(socket); response <- readLines(socket, n=1L, warn=FALSE); close(socket); cat(response)'); \
+    wait "$adapter_pid"; \
+    printf '%s\n' "$actual" | grep -Fx '{"protocolVersion":1,"id":"hello","type":"ready","language":"r","implementation":"native-r-4.5.1","runtime":"R-4.5.1"}'
 
 FROM runtime-base AS example-runtime
 COPY --chmod=0555 examples/basics/main.R /usr/local/bin/convex-example
