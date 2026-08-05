@@ -1,61 +1,52 @@
 # Convex from Erlang
 
-This native Erlang attempt demonstrates Convex HTTP queries, mutations, and actions using OTP's HTTPS client and a small local JSON codec.
+This native Erlang client demonstrates Convex HTTP queries, mutations, actions, and Live queries using OTP plus Gun and JSX.
 
 It is educational and unofficial, not a production SDK.
 
 ## Start here
 
-[`examples/basics/main.erl`](examples/basics/main.erl) follows the shared counter from 0 to 1. It uses a clearly labelled polling helper to keep the teaching journey runnable while native WebSocket Live work remains unfinished.
+[`examples/basics/main.erl`](examples/basics/main.erl) follows the shared counter from 0 to 1 with an HTTP query, a real `/api/sync` WebSocket subscription started before the mutation, and the resulting Live update.
 
 ## What works
 
 | Capability | Status |
 | --- | --- |
 | HTTP queries, mutations, actions, auth replacement and structured errors | Implemented, awaiting shared HTTP conformance |
-| Real Convex Live WebSocket subscriptions | Not implemented, not claimed |
+| Live initial values, updates, Remove, error recovery and reconnect | Implemented, awaiting shared evidence |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.erl -->
 ```text
 -module(main).
 -export([main/0]).
+
 main() ->
-    Room = case init:get_plain_arguments() of
-        [R | _] -> R;
-        [] -> "erlang-basic-example"
-    end,
+    Room = case init:get_plain_arguments() of [R | _] -> R; [] -> "erlang-basic-example" end,
     {ok, Client} = convex:new(env("CONVEX_URL", "http://127.0.0.1:3210")),
-    Args = [{<<"room">>, unicode:characters_to_binary(Room)}],
-    %% Query the starting counter over Convex's documented HTTP endpoint.
+    Args = #{<<"room">> => unicode:characters_to_binary(Room)},
+    %% First read the durable counter through Convex's documented HTTP API.
     {ok, Initial, _} = convex:call(Client, query, <<"demo:state">>, Args),
     0 = count(Initial),
     io:format("current count: 0~n"),
-    %% Live should start before mutation. This temporary polling helper keeps
-    %% the sequence visible while the native WebSocket owner is unfinished.
-    {ok, Poll} = convex:poll_subscribe(Client, <<"demo:state">>, Args, self()),
-    {ok, Live0} = convex:poll_next(Poll, 10000),
-    0 = count(Live0),
+    %% Start the real /api/sync subscription before changing the counter.
+    {ok, Live, Subscription} = convex:subscribe(Client, <<"demo:state">>, Args, self()),
+    0 = next_count(Subscription),
     io:format("live initial count: 0~n"),
-    %% The run ID makes the mutation safe to retry without incrementing twice.
-    RunId = unicode:characters_to_binary(Room ++ "-once"),
-    MutationArgs = [
-        {<<"room">>, unicode:characters_to_binary(Room)},
-        {<<"language">>, <<"Erlang">>},
-        {<<"runId">>, RunId}
-    ],
+    %% Convex records this idempotency key so retrying cannot increment twice.
+    MutationArgs = #{<<"room">> => unicode:characters_to_binary(Room), <<"language">> => <<"Erlang">>, <<"runId">> => unicode:characters_to_binary(Room ++ "-once")},
     {ok, Mutation, _} = convex:call(Client, mutation, <<"demo:increment">>, MutationArgs),
-    true = proplists:get_value(<<"applied">>, Mutation),
-    1 = count(proplists:get_value(<<"state">>, Mutation)),
-    io:format("mutation applied: true~n"),
-    io:format("mutation count: 1~n"),
-    {ok, Live1} = convex:poll_next(Poll, 10000),
-    1 = count(Live1),
+    true = maps:get(<<"applied">>, Mutation),
+    1 = count(maps:get(<<"state">>, Mutation)),
+    io:format("mutation applied: true~nmutation count: 1~n"),
+    %% The owner decodes the resulting WebSocket Transition in order.
+    1 = next_count(Subscription),
     io:format("live updated count: 1~n"),
-    convex:close(Poll),
-    %% Only print verification after the HTTP and observed update agree.
+    convex:unsubscribe(Live, Subscription),
+    convex:close(#{live => Live}),
     io:format("verified count: 0 -> 1~n").
-count(V) -> proplists:get_value(<<"count">>,V).
-env(Name,Default) -> case os:getenv(Name) of false -> Default; Value -> Value end.
+next_count(Id) -> receive {convex_live, Id, #{value := Value}} -> count(Value); {convex_live, Id, #{error := Error}} -> erlang:error(Error) after 10000 -> erlang:error(live_timeout) end.
+count(Value) -> maps:get(<<"count">>, Value).
+env(Name, Default) -> case os:getenv(Name) of false -> Default; Value -> Value end.
 ```
 <!-- END GENERATED EXAMPLE -->
 
@@ -65,8 +56,8 @@ env(Name,Default) -> case os:getenv(Name) of false -> Default; Value -> Value en
 
 ## Protocol notes and limits
 
-OTP `httpc` and `ssl` provide ordinary HTTP/TLS transport. `convex.erl` owns the Convex request envelope, response decoding, bearer-token replacement, and structured errors. The present polling helper is deliberately separate from Live and never opens `/api/sync`.
+OTP `httpc` and `ssl` provide ordinary HTTP/TLS transport. Gun provides ordinary WebSocket framing, fragmentation and control handling. The Erlang `live` owner alone opens `/api/sync`, sends Connect/Add/Remove messages, maintains query-set/timestamp state, and publishes deduplicated updates.
 
 ## Limitations
 
-The remaining work is a single-owner native WebSocket sync worker with the pinned profile, TCP adapter mode, Live relay barriers, reconnect tests, and full Live protocol coverage. No HTTP or Live badge has been earned until root runs shared evidence.
+Live authentication, WebSocket mutations/actions, tagged Convex values, and TransitionChunk assembly are deferred. The adapter supports both stdin/stdout and one `ADAPTER_LISTEN` TCP controller. No HTTP or Live badge has been earned until root runs shared evidence.
