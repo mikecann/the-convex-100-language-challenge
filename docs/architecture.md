@@ -188,6 +188,13 @@ Trusted CI records:
 
 Policy checks inspect source, manifests, image history, SBOMs, child processes, and outbound destinations. This detects obvious delegation to `curl`, Node, Python, the Convex CLI, or an undeclared shared core. Native provenance still requires review because automated checks are evidence, not proof.
 
+JavaScript and Python are the narrow exception to the generic delegated-runtime
+probe: an implemented manifest must declare its approved
+`targetRuntimeCommand`, and the final image must contain that command. The probe
+continues to reject the other common delegated runtimes, package managers,
+`curl`, and the Convex CLI. Adding another exception is a shared policy change,
+not something a language implementation may do for itself.
+
 The Go pilot implements source and tree revisions, image and base digests,
 per-test and transcript hashes, final-image inspection, SBOM, and build
 provenance. Full outbound-destination inspection and a signed trusted-main
