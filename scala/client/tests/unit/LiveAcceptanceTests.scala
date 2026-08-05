@@ -11,6 +11,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.net.http.WebSocket
+import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.time.Duration
@@ -40,6 +41,7 @@ object LiveAcceptanceTests:
     testHandshakeTimeoutDoesNotLeaveGhost()
     testProtocolAndTransportRecovery()
     testPartialFrameCloseIsBounded()
+    testLateHandshakeSuccessIsAborted()
     testHandshakeCloseIsBounded()
     println("scala deterministic acceptance tests passed")
 
@@ -775,6 +777,15 @@ object LiveAcceptanceTests:
     val serverFailure = new AtomicReference[Throwable]()
     val requestSeen = new CountDownLatch(1)
     val releaseServer = new CountDownLatch(1)
+    val cleanupAccepted = new CountDownLatch(1)
+    val cleanupStarted = new CountDownLatch(1)
+    val releaseCleanup = new CountDownLatch(1)
+    LiveClient.testCleanupSubmitted = accepted => if accepted then cleanupAccepted.countDown()
+    LiveClient.testBeforeOwnerCloseReturns = () =>
+      cleanupAccepted.await(Timeout.toMillis, TimeUnit.MILLISECONDS)
+    LiveClient.testBeforeDiscardSubscription = () =>
+      cleanupStarted.countDown()
+      releaseCleanup.await(Timeout.toMillis, TimeUnit.MILLISECONDS)
     val server = startServer("scala-handshake-close", serverFailure) {
       val socket = listener.accept()
       try
@@ -794,18 +805,93 @@ object LiveAcceptanceTests:
     subscribe.start()
     try
       check(requestSeen.await(1, TimeUnit.SECONDS), "handshake request did not arrive")
+      val closeFailure = new AtomicReference[Throwable]()
+      val close = new Thread(() =>
+        try live.close()
+        catch case error: Throwable => closeFailure.set(error)
+      )
       val started = System.nanoTime()
-      live.close()
-      val elapsed = Duration.ofNanos(System.nanoTime() - started)
-      check(elapsed.compareTo(Duration.ofSeconds(1)) < 0, s"handshake close took $elapsed")
+      close.start()
+      check(cleanupStarted.await(1, TimeUnit.SECONDS), "accepted cleanup did not start")
+      check(close.isAlive, "close discarded its accepted cleanup task")
+      releaseCleanup.countDown()
+      close.join(1_000)
+      check(!close.isAlive, "close did not pass its owner drain barrier")
+      check(closeFailure.get() == null, "close failed while draining accepted cleanup")
       subscribe.join(1_000)
       check(!subscribe.isAlive, "pending subscribe survived close")
       check(subscribeFailure.get() != null, "pending subscribe did not fail")
+      val elapsed = Duration.ofNanos(System.nanoTime() - started)
+      check(elapsed.compareTo(Duration.ofSeconds(1)) < 0, s"handshake close took $elapsed")
     finally
+      releaseCleanup.countDown()
       releaseServer.countDown()
       live.close()
+      LiveClient.testBeforeDiscardSubscription = () => ()
+      LiveClient.testCleanupSubmitted = _ => ()
+      LiveClient.testBeforeOwnerCloseReturns = () => ()
     join(server, serverFailure)
     listener.close()
+
+  private def testLateHandshakeSuccessIsAborted(): Unit =
+    val future = new NonCancellingFuture[WebSocket]()
+    val connectStarted = new CountDownLatch(1)
+    val socket = new TrackingWebSocket()
+    LiveClient.testConnectWebSocket = (_, _, _) =>
+      connectStarted.countDown()
+      future
+    val live = new LiveClient("http://127.0.0.1:1")
+    val subscribeFailure = new AtomicReference[Throwable]()
+    val subscribe = new Thread(() =>
+      try
+        live.subscribe("demo:state", ConvexClient.json.createObjectNode())
+        ()
+      catch case error: Throwable => subscribeFailure.set(error)
+    )
+    subscribe.start()
+    try
+      check(connectStarted.await(1, TimeUnit.SECONDS), "controlled handshake did not start")
+      live.close()
+      subscribe.join(1_000)
+      check(!subscribe.isAlive, "controlled subscribe survived close")
+      check(subscribeFailure.get() != null, "controlled subscribe did not fail")
+      check(future.complete(socket), "controlled handshake did not complete successfully")
+      check(socket.aborted.await(1, TimeUnit.SECONDS), "late successful socket leaked after close")
+    finally
+      LiveClient.testConnectWebSocket = (http, endpoint, listener) =>
+        http
+          .newWebSocketBuilder()
+          .connectTimeout(Duration.ofSeconds(3))
+          .header("Convex-Client", "scala-0.1.0")
+          .buildAsync(endpoint, listener)
+      live.close()
+
+  private final class NonCancellingFuture[T] extends CompletableFuture[T]:
+    override def cancel(mayInterruptIfRunning: Boolean): Boolean = false
+
+  private final class TrackingWebSocket extends WebSocket:
+    val aborted = new CountDownLatch(1)
+
+    override def sendText(data: CharSequence, last: Boolean): CompletableFuture[WebSocket] =
+      CompletableFuture.completedFuture(this)
+
+    override def sendBinary(data: ByteBuffer, last: Boolean): CompletableFuture[WebSocket] =
+      CompletableFuture.completedFuture(this)
+
+    override def sendPing(message: ByteBuffer): CompletableFuture[WebSocket] =
+      CompletableFuture.completedFuture(this)
+
+    override def sendPong(message: ByteBuffer): CompletableFuture[WebSocket] =
+      CompletableFuture.completedFuture(this)
+
+    override def sendClose(statusCode: Int, reason: String): CompletableFuture[WebSocket] =
+      CompletableFuture.completedFuture(this)
+
+    override def request(n: Long): Unit = ()
+    override def getSubprotocol(): String = ""
+    override def isOutputClosed(): Boolean = aborted.getCount == 0
+    override def isInputClosed(): Boolean = aborted.getCount == 0
+    override def abort(): Unit = aborted.countDown()
 
   private def startServer(
       name: String,

@@ -30,6 +30,8 @@ final class LiveClient(rawUrl: String) extends AutoCloseable, WebSocket.Listener
     s"${if base.getScheme == "https" then "wss" else "ws"}://${base.getAuthority}${base.getPath}/api/sync"
   )
   private val http = HttpClient.newHttpClient()
+  private val lifecycle = new Object()
+  private var acceptingOwnerTasks = true
   private val owner: ScheduledExecutorService =
     Executors.newSingleThreadScheduledExecutor(runnable =>
       val thread = new Thread(runnable, "convex-scala-live-owner")
@@ -97,6 +99,7 @@ final class LiveClient(rawUrl: String) extends AutoCloseable, WebSocket.Listener
             cleanup.complete(())
           catch case cleanupError: Throwable => cleanup.completeExceptionally(cleanupError)
         }
+        cleanupSubmitted(cleanupScheduled)
         if cleanupScheduled then
           try await(cleanup, 3, "timed out cancelling failed Live subscription")
           catch case cleanupError: Throwable => error.addSuppressed(cleanupError)
@@ -138,14 +141,10 @@ final class LiveClient(rawUrl: String) extends AutoCloseable, WebSocket.Listener
   private def beginConnect(reconnecting: Boolean): Unit =
     ensureOpen()
     ownerEvent(if reconnecting then "reconnectBegin" else "initialConnectBegin")
-    val future = http
-      .newWebSocketBuilder()
-      .connectTimeout(Duration.ofSeconds(3))
-      .header("Convex-Client", "scala-0.1.0")
-      .buildAsync(endpoint, this)
+    val future = connectWebSocket(http, endpoint, this)
     connecting = Some(future)
-    future.whenComplete((connected, failure) =>
-      submit {
+    future.whenComplete((connected, failure) => {
+      val accepted = submit {
         if connecting.contains(future) then
           connecting = None
           if closed then
@@ -159,8 +158,12 @@ final class LiveClient(rawUrl: String) extends AutoCloseable, WebSocket.Listener
               scheduleNextReconnect(error)
             else failInitialWaiters(new TransportError("live", error))
           else finishConnect(connected, reconnecting)
+        else if connected != null then connected.abort()
       }
-    )
+      // Completion may race after close has drained and stopped the owner. A
+      // successful socket still belongs to us and must be retired on this thread.
+      if !accepted && connected != null then connected.abort()
+    })
 
   private def finishConnect(connected: WebSocket, reconnecting: Boolean): Unit =
     try
@@ -409,6 +412,7 @@ final class LiveClient(rawUrl: String) extends AutoCloseable, WebSocket.Listener
       subscription: Subscription,
       waiter: CompletableFuture[Subscription]
   ): Unit =
+    beforeDiscardSubscription()
     initialWaiters.get(subscription.queryId).filter(_ eq waiter).foreach { _ =>
       initialWaiters.remove(subscription.queryId)
     }
@@ -432,10 +436,14 @@ final class LiveClient(rawUrl: String) extends AutoCloseable, WebSocket.Listener
     if closed then throw new IllegalStateException("Convex Live client is closed")
 
   private def submit(action: => Unit): Boolean =
-    try
-      owner.execute(() => action)
-      true
-    catch case _: java.util.concurrent.RejectedExecutionException => false
+    lifecycle.synchronized {
+      if !acceptingOwnerTasks then false
+      else
+        try
+          owner.execute(() => action)
+          true
+        catch case _: java.util.concurrent.RejectedExecutionException => false
+    }
 
   private def onOwner[T](action: => T): T =
     val answer = new CompletableFuture[T]()
@@ -445,7 +453,7 @@ final class LiveClient(rawUrl: String) extends AutoCloseable, WebSocket.Listener
     }
     await(answer, 3, "timed out waiting for Live owner")
 
-  override def close(): Unit =
+  override def close(): Unit = synchronized {
     if closed then return
     onOwner {
       closed = true
@@ -458,8 +466,17 @@ final class LiveClient(rawUrl: String) extends AutoCloseable, WebSocket.Listener
       subscriptions.values.foreach(_.finish())
       subscriptions.clear()
       ownerEvent("closed")
+      beforeOwnerCloseReturns()
     }
-    owner.shutdownNow()
+    val drained = new CompletableFuture[Unit]()
+    lifecycle.synchronized {
+      acceptingOwnerTasks = false
+      try owner.execute(() => drained.complete(()))
+      catch case _: java.util.concurrent.RejectedExecutionException => drained.complete(())
+    }
+    try await(drained, 3, "timed out draining Live owner")
+    finally owner.shutdownNow()
+  }
 
 object LiveClient:
   final case class Update(value: JsonNode, error: Exception, logs: List[String])
@@ -471,16 +488,35 @@ object LiveClient:
   @volatile private[convex] var testWriteTimeoutMillis = 3_000L
   @volatile private[convex] var testReconnectScheduled: Long => Unit = _ => ()
   @volatile private[convex] var testOwnerEvent: (String, String) => Unit = (_, _) => ()
+  @volatile private[convex] var testBeforeDiscardSubscription: () => Unit = () => ()
+  @volatile private[convex] var testCleanupSubmitted: Boolean => Unit = _ => ()
+  @volatile private[convex] var testBeforeOwnerCloseReturns: () => Unit = () => ()
   @volatile private[convex] var testSendText: (WebSocket, String) => CompletableFuture[WebSocket] =
     (socket, text) => socket.sendText(text, true)
+  @volatile private[convex] var testConnectWebSocket
+      : (HttpClient, URI, WebSocket.Listener) => CompletableFuture[WebSocket] =
+    (http, endpoint, listener) =>
+      http
+        .newWebSocketBuilder()
+        .connectTimeout(Duration.ofSeconds(3))
+        .header("Convex-Client", "scala-0.1.0")
+        .buildAsync(endpoint, listener)
 
   private def initialBackoffMillis: Long = testInitialBackoffMillis
   private def maxBackoffMillis: Long = testMaxBackoffMillis
   private def subscribeTimeoutMillis: Long = testSubscribeTimeoutMillis
   private def writeTimeoutMillis: Long = testWriteTimeoutMillis
   private def reconnectAttemptScheduled(delay: Long): Unit = testReconnectScheduled(delay)
+  private def beforeDiscardSubscription(): Unit = testBeforeDiscardSubscription()
+  private def cleanupSubmitted(accepted: Boolean): Unit = testCleanupSubmitted(accepted)
+  private def beforeOwnerCloseReturns(): Unit = testBeforeOwnerCloseReturns()
   private def sendText(socket: WebSocket, text: String): CompletableFuture[WebSocket] =
     testSendText(socket, text)
+  private def connectWebSocket(
+      http: HttpClient,
+      endpoint: URI,
+      listener: WebSocket.Listener
+  ): CompletableFuture[WebSocket] = testConnectWebSocket(http, endpoint, listener)
   private def ownerEvent(event: String): Unit =
     testOwnerEvent(event, Thread.currentThread().getName)
 
