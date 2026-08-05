@@ -104,17 +104,20 @@ defmodule Convex.Example do
   end
 
   # Check the small state shape used by the lesson before reading its count.
-  # This keeps malformed protocol values from looking like a successful demo.
-  defp expect_state(_operation, %{"count" => count} = state) when is_number(count), do: state
+  # Convex JSON represents these schema numbers as Float64, so normalize whole
+  # values such as 0.0 to integers before comparing or printing them.
+  defp expect_state(operation, %{"count" => count} = state) do
+    Map.put(state, "count", normalize_count!(operation, count))
+  end
 
   defp expect_state(operation, value),
     do: raise("#{operation} returned an unexpected state: #{inspect(value)}")
 
   # Check the mutation fields used below instead of merely printing any JSON
   # object that happens to come back from the deployment.
-  defp expect_increment(%{"applied" => applied, "state" => %{"count" => count}} = result)
-       when is_boolean(applied) and is_number(count),
-       do: result
+  defp expect_increment(%{"applied" => applied, "state" => state} = result)
+       when is_boolean(applied),
+       do: Map.put(result, "state", expect_state("mutation", state))
 
   defp expect_increment(value),
     do: raise("mutation returned an unexpected value: #{inspect(value)}")
@@ -123,6 +126,31 @@ defmodule Convex.Example do
   # example if the shared backend returns a value other than the expected one.
   defp expect_count(operation, actual, expected) do
     if actual != expected, do: raise("#{operation} count was #{actual}, expected #{expected}")
+  end
+
+  # JSON numbers arrive as floats even though this counter is integral. Accept
+  # only finite whole numbers, then turn them into integers so the example's
+  # human output and the shared verifier both see exact `0` and `1` values.
+  @doc false
+  def normalize_count!(_operation, count) when is_integer(count), do: count
+
+  def normalize_count!(operation, count) when is_float(count) do
+    normalized =
+      try do
+        trunc(count)
+      rescue
+        ArithmeticError -> nil
+      end
+
+    if is_integer(normalized) and count == normalized do
+      normalized
+    else
+      raise "#{operation} count must be a finite whole number, got: #{inspect(count)}"
+    end
+  end
+
+  def normalize_count!(operation, count) do
+    raise "#{operation} count must be a finite whole number, got: #{inspect(count)}"
   end
 
   # Pretty JSON keeps nested Convex values readable in a terminal and provides

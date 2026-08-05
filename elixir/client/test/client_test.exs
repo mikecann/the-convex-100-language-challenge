@@ -78,6 +78,18 @@ defmodule Convex.ClientTest do
     Client.close(client)
   end
 
+  test "hosted HTTPS enables peer and hostname verification" do
+    options = Client.http_options("https://usable-reindeer-44.convex.cloud/api/query")
+    ssl_options = Keyword.fetch!(options, :ssl)
+
+    assert ssl_options[:verify] == :verify_peer
+    assert ssl_options[:server_name_indication] == ~c"usable-reindeer-44.convex.cloud"
+    assert File.regular?(List.to_string(ssl_options[:cacertfile]))
+    assert is_function(get_in(ssl_options, [:customize_hostname_check, :match_fun]), 2)
+
+    refute Keyword.has_key?(Client.http_options("http://backend:3210/api/query"), :ssl)
+  end
+
   defp start_http_server(response_fun, request_count \\ 1) do
     {:ok, listener} = :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true])
     {:ok, {_address, port}} = :inet.sockname(listener)

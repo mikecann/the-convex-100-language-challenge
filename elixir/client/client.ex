@@ -180,7 +180,7 @@ defmodule Convex.Client do
     case :httpc.request(
            :post,
            request,
-           [timeout: 30_000, connect_timeout: 10_000],
+           http_options(endpoint),
            body_format: :binary
          ) do
       {:ok, {{_version, status, _reason}, _headers, response_body}}
@@ -197,6 +197,30 @@ defmodule Convex.Client do
 
       {:error, reason} ->
         {:error, %TransportError{operation: operation, reason: reason}}
+    end
+  end
+
+  # `:httpc` does not make HTTPS verification intent obvious at a call site.
+  # Keep the security policy in one testable helper so hosted calls always use
+  # the pinned CA bundle, peer verification, SNI, and HTTPS hostname matching.
+  @doc false
+  def http_options(endpoint) do
+    uri = URI.parse(endpoint)
+    common = [timeout: 30_000, connect_timeout: 10_000]
+
+    if uri.scheme == "https" do
+      ssl_options = [
+        verify: :verify_peer,
+        cacertfile: String.to_charlist(CAStore.file_path()),
+        server_name_indication: String.to_charlist(uri.host),
+        customize_hostname_check: [
+          match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
+        ]
+      ]
+
+      Keyword.put(common, :ssl, ssl_options)
+    else
+      common
     end
   end
 

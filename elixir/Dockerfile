@@ -26,6 +26,7 @@ COPY client/*.ex ./source/
 COPY client/tests/conformance/*.ex ./source/conformance/
 COPY examples/basics/main.ex ./source/example.ex
 COPY client/test ./test
+COPY examples/basics/main_test.exs ./test/example_test.exs
 COPY client/.formatter.exs ./
 
 FROM source AS test
