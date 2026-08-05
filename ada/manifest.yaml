@@ -5,4 +5,5 @@ rank: 26
 selectionTier: ranked
 implementation:
   status: planned
+  notes: Blocked during native transport toolchain investigation. AWS 1f709a218bd9a6d20f055a94e56d5e72fb585477 exposes maintained Ada HTTPS and RFC6455 clients, but its pinned build requires gnatcoll_core, absent from Debian Bookworm's GNATCOLL package. Do not claim HTTP or Live until a pinned Docker-only GNATCOLL Core plus AWS build is reproducible and its final runtime passes policy.
 capabilities: []
