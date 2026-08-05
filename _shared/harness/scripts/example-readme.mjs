@@ -6,10 +6,12 @@ const endMarker = "<!-- END GENERATED EXAMPLE -->";
 const blockPattern = /<!-- BEGIN GENERATED EXAMPLE: ([^\r\n]+) -->\r?\n[\s\S]*?<!-- END GENERATED EXAMPLE -->/g;
 
 const fenceLanguages = {
+  ".adb": "ada",
   ".cc": "cpp",
   ".clj": "clojure",
   ".cs": "csharp",
   ".dart": "dart",
+  ".d": "d",
   ".erl": "erlang",
   ".ex": "elixir",
   ".exs": "elixir",
@@ -28,10 +30,14 @@ const fenceLanguages = {
   ".py": "python",
   ".r": "r",
   ".rb": "ruby",
+  ".rkt": "racket",
   ".rs": "rust",
   ".scala": "scala",
+  ".scm": "scheme",
+  ".tcl": "tcl",
   ".ts": "typescript",
   ".tsx": "tsx",
+  ".vala": "vala",
 };
 
 function renderExampleBlock(languageDirectory, relativeSource) {
