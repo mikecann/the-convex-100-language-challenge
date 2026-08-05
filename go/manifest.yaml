@@ -1,0 +1,34 @@
+schemaVersion: 1
+id: go
+displayName: Go
+rank: 8
+selectionTier: ranked
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native documented JSON HTTP client and pinned-profile WebSocket client. Local black-box evidence passes; trusted-main publication remains separate.
+toolchain:
+  name: Go
+  version: 1.25.6
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-go-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication is deferred.
+  - Live values expose the JSON-safe subset as raw JSON.
+  - WebSocket mutations and actions are deferred.
+  - TransitionChunk assembly is deferred; receiving one is treated as protocol drift and triggers reconnect.
+  - Hardened mutation ordering, replay, journals, and optimistic updates are deferred.
+capabilities: []
