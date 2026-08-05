@@ -4,5 +4,22 @@ displayName: "Erlang"
 rank: 38
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Erlang implementation of Convex HTTP envelopes using OTP inets, ssl, and a local JSON codec. The polling helper is deliberately not claimed as Live.
+toolchain:
+  name: Erlang/OTP
+  version: 26.2.5.15
+intendedCapabilities:
+  - http
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+limitations:
+  - Real Convex /api/sync WebSocket Live support is not implemented yet, so Live is not claimed.
+  - The local JSON codec supports the JSON-safe values used by this experiment, not every tagged Convex value.
+  - The adapter currently supports stdin/stdout NDJSON; ADAPTER_LISTEN TCP mode is deferred with Live work.
 capabilities: []

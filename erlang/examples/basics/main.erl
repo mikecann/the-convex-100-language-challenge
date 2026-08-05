@@ -1,22 +1,3 @@
-# Convex from Erlang
-
-This native Erlang attempt demonstrates Convex HTTP queries, mutations, and actions using OTP's HTTPS client and a small local JSON codec.
-
-It is educational and unofficial, not a production SDK.
-
-## Start here
-
-[`examples/basics/main.erl`](examples/basics/main.erl) follows the shared counter from 0 to 1. It uses a clearly labelled polling helper to keep the teaching journey runnable while native WebSocket Live work remains unfinished.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP queries, mutations, actions, auth replacement and structured errors | Implemented, awaiting shared HTTP conformance |
-| Real Convex Live WebSocket subscriptions | Not implemented, not claimed |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.erl -->
-```text
 -module(main).
 -export([main/0]).
 main() ->
@@ -56,17 +37,3 @@ main() ->
     io:format("verified count: 0 -> 1~n").
 count(V) -> proplists:get_value(<<"count">>,V).
 env(Name,Default) -> case os:getenv(Name) of false -> Default; Value -> Value end.
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-`./run test erlang` compiles the Erlang modules and runs the local codec and adapter lifecycle checks in a linux/amd64 container. `./run build erlang` builds the minimal non-root adapter image. Root owns `verify-example`, `verify`, and hosted conformance.
-
-## Protocol notes and limits
-
-OTP `httpc` and `ssl` provide ordinary HTTP/TLS transport. `convex.erl` owns the Convex request envelope, response decoding, bearer-token replacement, and structured errors. The present polling helper is deliberately separate from Live and never opens `/api/sync`.
-
-## Limitations
-
-The remaining work is a single-owner native WebSocket sync worker with the pinned profile, TCP adapter mode, Live relay barriers, reconnect tests, and full Live protocol coverage. No HTTP or Live badge has been earned until root runs shared evidence.
