@@ -5,15 +5,14 @@ ARG ELIXIR_IMAGE=elixir:1.17.3-otp-26-alpine@sha256:7d6fcd52aba8170560b39ca58527
 FROM --platform=$BUILDPLATFORM ${ELIXIR_IMAGE} AS dependencies
 WORKDIR /app
 ENV MIX_ENV=prod
-# A single scheduler avoids QEMU races in compiler protocol consolidation when
-# the required amd64 build runs on an Apple Silicon Docker host.
+# Keep native BUILDPLATFORM compilation deterministic and conservative. The
+# resulting dependency BEAM files are portable and run under target ERTS later.
 ENV ERL_FLAGS="+S 1:1 +SDcpu 1 +SDio 1"
 RUN mix local.hex --force && mix local.rebar --force
 COPY client/mix.exs client/mix.lock ./
 RUN mix deps.get --only prod
-# Compile each dependency in a fresh BEAM VM. Elixir's amd64 compiler can keep
-# a completed module marked read-only when several projects are compiled in one
-# emulated process on Apple Silicon.
+# Compile each dependency in a fresh native BEAM VM to avoid compiler-state
+# instability when several dependency projects share one compilation process.
 RUN mix deps.compile castore
 RUN mix deps.compile cowlib
 RUN mix deps.compile gun
