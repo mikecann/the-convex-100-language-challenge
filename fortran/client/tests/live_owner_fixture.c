@@ -168,6 +168,20 @@ static int send_transition(int fd, unsigned start, unsigned finish, int failed,
   return length > 0 && (size_t)length < sizeof(message) && send_text(fd, message);
 }
 
+static int send_invalid_logs_transition(int fd, unsigned start,
+                                        unsigned finish, int mixed) {
+  char start_ts[13], end_ts[13], message[2048];
+  timestamp_text(start, start_ts);
+  timestamp_text(finish, end_ts);
+  const char *logs = mixed ? "[\"valid\",7]" : "null";
+  int length = snprintf(message, sizeof(message),
+    "{\"type\":\"Transition\",\"startVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"%s\"},"
+    "\"endVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"%s\"},\"modifications\":["
+    "{\"type\":\"QueryUpdated\",\"queryId\":0,\"value\":{\"count\":%d},\"logLines\":%s}]}",
+    start_ts, end_ts, current_value, logs);
+  return length > 0 && (size_t)length < sizeof(message) && send_text(fd, message);
+}
+
 static void record_connection(int added) {
   pthread_mutex_lock(&fixture_mutex);
   connection_count++;
@@ -235,6 +249,10 @@ static void *serve(void *unused) {
         } else if (command == 'F') {
           if (!send_transition(peer, state, state + 1, 1, 0)) connected = 0;
           state++;
+        } else if (command == 'N' || command == 'M') {
+          if (!send_invalid_logs_transition(peer, state, state + 1,
+                                            command == 'M')) connected = 0;
+          state++;
         } else if (command == 'P') {
           send_text(peer, "{\"type\":\"UnknownFixtureMessage\"}");
           connected = 0;
@@ -288,6 +306,8 @@ static void command(char value) {
 
 void ft_live_fixture_update(void) { command('U'); }
 void ft_live_fixture_function_error(void) { command('F'); }
+void ft_live_fixture_null_logs(void) { command('N'); }
+void ft_live_fixture_mixed_logs(void) { command('M'); }
 void ft_live_fixture_protocol_error(void) { command('P'); }
 void ft_live_fixture_transport_error(void) { command('T'); }
 

@@ -24,12 +24,23 @@ struct http_fixture {
   pthread_t thread;
 };
 
+int ft_live_fixture_start(void);
+void ft_live_fixture_null_logs(void);
+void ft_live_fixture_mixed_logs(void);
+int ft_live_fixture_wait_adds(int expected, int timeout_ms);
+void ft_live_fixture_stop(void);
+
 static void *serve_http_errors(void *opaque) {
   struct http_fixture *fixture = opaque;
-  static const char body[] =
+  static const char *bodies[] = {
       "{\"status\":\"error\",\"errorMessage\":\"fixture failure\","
-      "\"errorData\":{\"code\":\"FIXTURE\"},\"logLines\":[\"fixture\"]}";
-  for (int request = 0; request < 2; request++) {
+      "\"errorData\":{\"code\":\"FIXTURE\"},\"logLines\":[\"fixture\"]}",
+      "{\"status\":\"error\",\"errorMessage\":\"fixture failure\","
+      "\"errorData\":{\"code\":\"FIXTURE\"},\"logLines\":[\"fixture\"]}",
+      "{\"status\":\"success\",\"value\":{\"count\":1},\"logLines\":null}",
+      "{\"status\":\"success\",\"value\":{\"count\":1},\"logLines\":[\"valid\",7]}",
+  };
+  for (int request = 0; request < 4; request++) {
     int peer = accept(fixture->listener, NULL, NULL);
     if (peer < 0) return NULL;
     char headers[8192];
@@ -40,6 +51,7 @@ static void *serve_http_errors(void *opaque) {
       used += (size_t)received;
       if (used >= 4 && !memcmp(headers + used - 4, "\r\n\r\n", 4)) break;
     }
+    const char *body = bodies[request];
     headers[used] = '\0';
     const char *content_length = strstr(headers, "Content-Length: ");
     size_t body_length = content_length ? (size_t)strtoul(content_length + 16, NULL, 10) : 0;
@@ -65,7 +77,7 @@ static unsigned start_http_fixture(struct http_fixture *fixture) {
   fixture->listener = socket(AF_INET, SOCK_STREAM, 0);
   struct sockaddr_in address = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
   if (fixture->listener < 0 || bind(fixture->listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-      listen(fixture->listener, 2) != 0) fail("HTTP fixture listen");
+      listen(fixture->listener, 4) != 0) fail("HTTP fixture listen");
   socklen_t length = sizeof(address);
   if (getsockname(fixture->listener, (struct sockaddr *)&address, &length) != 0 ||
       pthread_create(&fixture->thread, NULL, serve_http_errors, fixture) != 0)
@@ -121,6 +133,14 @@ static int read_line_bounded(int fd, char *line, size_t capacity, int timeout_ms
   }
   line[used] = '\0';
   return 1;
+}
+
+static int read_until(int fd, const char *needle, char *line, size_t capacity) {
+  for (int attempt = 0; attempt < 20; attempt++) {
+    if (!read_line_bounded(fd, line, capacity, 3000)) return 0;
+    if (strstr(line, needle)) return 1;
+  }
+  return 0;
 }
 
 static int connect_adapter(unsigned port) {
@@ -277,6 +297,8 @@ int main(void) {
   fd = connect_adapter(port);
   send_all(fd, "{\"id\":\"http-1\",\"op\":\"query\",\"path\":\"demo:state\",\"args\":{}}\n");
   send_all(fd, "{\"id\":\"http-2\",\"op\":\"query\",\"path\":\"demo:state\",\"args\":{}}\n");
+  send_all(fd, "{\"id\":\"http-null-logs\",\"op\":\"query\",\"path\":\"demo:state\",\"args\":{}}\n");
+  send_all(fd, "{\"id\":\"http-mixed-logs\",\"op\":\"query\",\"path\":\"demo:state\",\"args\":{}}\n");
   send_all(fd, "{\"id\":\"http-close\",\"op\":\"close\"}\n");
   shutdown(fd, SHUT_WR);
   read_to_eof(fd, output, sizeof(output));
@@ -284,8 +306,40 @@ int main(void) {
   wait_bounded(child);
   pthread_join(http_fixture.thread, NULL);
   if (!strstr(output, "{\"type\":\"error\",\"id\":\"http-1\",\"error\":{\"name\":\"FunctionError\",\"message\":\"fixture failure\",\"data\":{\"code\":\"FIXTURE\"}}}") ||
-      !strstr(output, "{\"type\":\"error\",\"id\":\"http-2\",\"error\":{\"name\":\"FunctionError\",\"message\":\"fixture failure\",\"data\":{\"code\":\"FIXTURE\"}}}"))
-    fail("real HTTP structured error serialization");
+      !strstr(output, "{\"type\":\"error\",\"id\":\"http-2\",\"error\":{\"name\":\"FunctionError\",\"message\":\"fixture failure\",\"data\":{\"code\":\"FIXTURE\"}}}") ||
+      !strstr(output, "{\"type\":\"error\",\"id\":\"http-null-logs\",\"error\":{\"name\":\"ProtocolError\",\"message\":\"HTTP logLines was not an array of strings\"}}") ||
+      !strstr(output, "{\"type\":\"error\",\"id\":\"http-mixed-logs\",\"error\":{\"name\":\"ProtocolError\",\"message\":\"HTTP logLines was not an array of strings\"}}") ||
+      strstr(output, "\"logs\":null"))
+    fail("real HTTP structured errors and log validation");
+
+  /* Drive malformed Live logs through the real final adapter. Each invalid
+   * transition is command-scoped, emits a structured ProtocolError, and then
+   * reconnects the still-active subscription without publishing bad logs. */
+  int live_port = ft_live_fixture_start();
+  if (live_port <= 0) fail("Live log fixture start");
+  snprintf(fixture_url, sizeof(fixture_url), "http://127.0.0.1:%d", live_port);
+  port = reserve_port();
+  child = start_adapter(port, "/out-adapter", fixture_url);
+  fd = connect_adapter(port);
+  send_all(fd, "{\"id\":\"live-subscribe\",\"op\":\"subscribe\",\"subscriptionId\":\"live-logs\",\"path\":\"demo:get\",\"args\":{}}\n");
+  if (!read_until(fd, "\"id\":\"live-subscribe\",\"type\":\"ack\"", line, sizeof(line)) ||
+      !read_until(fd, "\"subscriptionId\":\"live-logs\",\"value\":", line, sizeof(line)))
+    fail("Live log fixture initial subscription");
+  ft_live_fixture_null_logs();
+  if (!read_until(fd, "Transition logLines was not an array of strings", line, sizeof(line)) ||
+      strstr(line, "\"logs\":null") || !ft_live_fixture_wait_adds(2, 3000))
+    fail("null Live logLines validation and recovery");
+  ft_live_fixture_mixed_logs();
+  if (!read_until(fd, "Transition logLines was not an array of strings", line, sizeof(line)) ||
+      strstr(line, "\"logs\":[\"valid\",7]") || !ft_live_fixture_wait_adds(3, 3000))
+    fail("mixed Live logLines validation and recovery");
+  send_all(fd, "{\"id\":\"live-close\",\"op\":\"close\"}\n");
+  shutdown(fd, SHUT_WR);
+  if (!read_until(fd, "{\"id\":\"live-close\",\"type\":\"closed\"}", line, sizeof(line)))
+    fail("Live log fixture close");
+  close(fd);
+  wait_bounded(child);
+  ft_live_fixture_stop();
 
   port = reserve_port();
   child = start_adapter(port, "/out-adapter-test", NULL);

@@ -93,7 +93,8 @@ module convex_fortran
   public :: convex_new, convex_set_auth, convex_call
   public :: convex_live_start, convex_live_next, convex_live_unsubscribe
   public :: convex_live_debug_disconnect, convex_live_close, convex_live_metadata
-  public :: convex_json_member, convex_json_object_allowed, convex_count, json_string
+  public :: convex_json_member, convex_json_object_allowed, convex_json_string_array
+  public :: convex_count, json_string
 #ifdef FORTRAN_TESTING
   public :: convex_test_live_begin, convex_test_live_apply, convex_test_live_next
   public :: convex_test_live_stats, convex_test_live_end
@@ -437,12 +438,12 @@ contains
     character(:), allocatable, intent(out) :: value, error
     logical, intent(out) :: ok
     character(:), allocatable, intent(out), optional :: logs, error_data
-    character(:), allocatable :: endpoint, payload, response, status, message, encoded_message, data
+    character(:), allocatable :: endpoint, payload, response, status, message, encoded_message, data, encoded_logs
     character(kind=c_char), allocatable :: endpoint_c(:), payload_c(:), token_c(:)
     type(c_ptr) :: body, transport_error
     integer(c_size_t) :: body_length
     integer(c_int) :: transport_ok
-    logical :: found, decoded
+    logical :: found, decoded, logs_found
 
     value = ''
     error = ''
@@ -474,12 +475,18 @@ contains
     if (.not. found) then
       ok = .false.; error = 'ProtocolError: HTTP response was not valid Convex JSON'; return
     end if
+    encoded_logs = convex_json_member(response, 'logLines', logs_found)
+    if (logs_found) then
+      if (.not. convex_json_string_array(encoded_logs)) then
+        ok = .false.; error = 'ProtocolError: HTTP logLines was not an array of strings'; return
+      end if
+    end if
+    if (present(logs) .and. logs_found) logs = encoded_logs
     if (status == '"success"') then
       value = convex_json_member(response, 'value', found)
       if (.not. found) then
         ok = .false.; error = 'ProtocolError: successful Convex response omitted value'; return
       end if
-      if (present(logs)) logs = convex_json_member(response, 'logLines', found)
       ok = .true.
       return
     end if
@@ -495,7 +502,6 @@ contains
       end if
       data = convex_json_member(response, 'errorData', found)
       if (present(error_data) .and. found) error_data = data
-      if (present(logs)) logs = convex_json_member(response, 'logLines', found)
       error = 'FunctionError: ' // message
       ok = .false.
       return
@@ -1248,6 +1254,11 @@ contains
     call parse_nonnegative_integer(raw, modification%query_id, ok)
     if (.not. ok) then; reason = 'Transition modification queryId was invalid'; return; end if
     modification%logs = convex_json_member(object, 'logLines', found)
+    if (found) then
+      if (.not. convex_json_string_array(modification%logs)) then
+        ok = .false.; reason = 'Transition logLines was not an array of strings'; return
+      end if
+    end if
     if (modification%kind == 2) then
       modification%value = convex_json_member(object, 'value', found)
       if (.not. found) then; ok = .false.; reason = 'QueryUpdated omitted value'; return; end if
@@ -1658,6 +1669,40 @@ contains
     call parse_json_object(document, '', allowed_names, .true., ignored, found, valid)
     convex_json_object_allowed = valid
   end function convex_json_object_allowed
+
+  logical function convex_json_string_array(document)
+    character(*), intent(in) :: document
+    integer :: position
+    logical :: valid
+
+    convex_json_string_array = .false.
+    position = 1
+    call skip_json_space(document, position)
+    if (.not. json_at(document, position, '[')) return
+    position = position + 1
+    call skip_json_space(document, position)
+    if (json_at(document, position, ']')) then
+      position = position + 1
+      call skip_json_space(document, position)
+      convex_json_string_array = position > len(document)
+      return
+    end if
+    do
+      if (.not. json_at(document, position, '"')) return
+      call scan_json_string(document, position, valid)
+      if (.not. valid) return
+      call skip_json_space(document, position)
+      if (json_at(document, position, ']')) then
+        position = position + 1
+        call skip_json_space(document, position)
+        convex_json_string_array = position > len(document)
+        return
+      end if
+      if (.not. json_at(document, position, ',')) return
+      position = position + 1
+      call skip_json_space(document, position)
+    end do
+  end function convex_json_string_array
 
   subroutine parse_json_object(document, target, allowed_names, restrict_names, value, found, valid)
     character(*), intent(in) :: document, target, allowed_names

@@ -14,6 +14,9 @@ program test_client
   value = json_string('"Fortran \u03BB \uD83D\uDE80"', ok)
   if (.not. ok .or. value /= 'Fortran ' // char(206) // char(187) // ' ' // &
       char(240) // char(159) // char(154) // char(128)) error stop 'escaped Unicode was not decoded as UTF-8'
+  if (.not. convex_json_string_array('["first","second\\nline"]')) error stop 'valid logLines was rejected'
+  if (convex_json_string_array('null')) error stop 'null logLines was accepted'
+  if (convex_json_string_array('["first",7]')) error stop 'mixed logLines was accepted'
 
   count = convex_count('{"count":1.0}', ok)
   if (.not. ok .or. count /= 1) error stop 'integral decimal count was rejected'
@@ -55,7 +58,18 @@ program test_client
   call convex_test_live_next(value, ok, error, error_name)
   if (.not. ok .or. value /= '{"count":2}') error stop 'valid recovery after protocol error failed'
 
-  do sequence = 5, 24
+  ! Invalid logs reject the whole transition before either its version or
+  ! query value can change. The same valid transition must still apply.
+  call convex_test_live_apply(transition(4, 5, updated_with_logs('{"count":3}', 'null')), ok, error)
+  if (ok .or. index(error, 'logLines') == 0) error stop 'null Live logLines was accepted'
+  call convex_test_live_apply(transition(4, 5, updated_with_logs('{"count":3}', '["valid",7]')), ok, error)
+  if (ok .or. index(error, 'logLines') == 0) error stop 'mixed Live logLines was accepted'
+  call convex_test_live_apply(transition(4, 5, updated('{"count":3}')), ok, error)
+  if (.not. ok) error stop 'invalid Live logs mutated transition state'
+  call convex_test_live_next(value, ok, error, error_name)
+  if (.not. ok .or. value /= '{"count":3}') error stop 'valid recovery after invalid Live logs failed'
+
+  do sequence = 6, 24
     call convex_test_live_apply(transition(sequence - 1, sequence, updated('{"count":' // integer_text(sequence) // '}')), ok, error)
     if (.not. ok) error stop error
   end do
@@ -90,6 +104,12 @@ contains
     character(*), intent(in) :: json
     character(:), allocatable :: modification
     modification = '{"type":"QueryUpdated","queryId":0,"value":' // json // ',"logLines":[]}'
+  end function
+
+  function updated_with_logs(json, logs) result(modification)
+    character(*), intent(in) :: json, logs
+    character(:), allocatable :: modification
+    modification = '{"type":"QueryUpdated","queryId":0,"value":' // json // ',"logLines":' // logs // '}'
   end function
 
   function failed() result(modification)
