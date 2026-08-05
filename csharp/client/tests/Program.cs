@@ -15,6 +15,7 @@ static class Tests
         await TestHttp();
         await TestAdapterHttpOperations();
         await TestAdapterTcp();
+        await TestAdapterLiveControllerLifecycle();
         TestBoundedDelivery();
         await TestLiveFlowAndUtf8Fragmentation();
         await TestReconnectAndResubscribe();
@@ -128,6 +129,54 @@ static class Tests
         await adapter.WaitAsync(Timeout); Environment.SetEnvironmentVariable("ADAPTER_LISTEN", null);
     }
 
+    private static async Task TestAdapterLiveControllerLifecycle()
+    {
+        using var syncListener=Listen();
+        var syncServer=Task.Run(async()=>{
+            using(var socket=await syncListener.AcceptTcpClientAsync()) {
+                var stream=socket.GetStream();await Handshake(stream);await ReadClientText(stream);
+                var firstAdd=JsonNode.Parse(await ReadClientText(stream))!;var firstId=firstAdd["modifications"]![0]!["queryId"]!.GetValue<int>();
+                await WriteServerText(stream,Transition(Zero(),Version(1),new JsonObject{{"type","QueryUpdated"},{"queryId",firstId},{"value",new JsonObject{{"count",0}}},{"logLines",new JsonArray()}}).ToJsonString());
+                var remove=JsonNode.Parse(await ReadClientText(stream))!;Equal("Remove",remove["modifications"]![0]!["type"]!.GetValue<string>(),"adapter unsubscribe did not send Remove");
+                var secondAdd=JsonNode.Parse(await ReadClientText(stream))!;Equal("Add",secondAdd["modifications"]![0]!["type"]!.GetValue<string>(),"fresh adapter subscribe did not send Add");var secondId=secondAdd["modifications"]![0]!["queryId"]!.GetValue<int>();
+                await WriteServerText(stream,Transition(Version(1),Version(2),new JsonObject{{"type","QueryUpdated"},{"queryId",secondId},{"value",new JsonObject{{"count",1}}},{"logLines",new JsonArray()}}).ToJsonString());
+                await WaitForEof(stream);
+            }
+            for(var reconnect=1;reconnect<=5;reconnect++) {
+                using var socket=await syncListener.AcceptTcpClientAsync();var stream=socket.GetStream();await Handshake(stream);
+                var connect=JsonNode.Parse(await ReadClientText(stream))!;Equal(reconnect,connect["connectionCount"]!.GetValue<int>(),"adapter reconnect count");
+                var add=JsonNode.Parse(await ReadClientText(stream))!;Equal("Add",add["modifications"]![0]!["type"]!.GetValue<string>(),"adapter reconnect did not restore query");var id=add["modifications"]![0]!["queryId"]!.GetValue<int>();
+                await WriteServerText(stream,Transition(Zero(),Version(10+reconnect),new JsonObject{{"type","QueryUpdated"},{"queryId",id},{"value",new JsonObject{{"count",reconnect+1}}},{"logLines",new JsonArray()}}).ToJsonString());
+                await WaitForEof(stream);
+            }
+        });
+
+        using var reserved=Listen();var adapterPort=((IPEndPoint)reserved.LocalEndpoint).Port;reserved.Stop();
+        Environment.SetEnvironmentVariable("CONVEX_URL",Url(syncListener));
+        Environment.SetEnvironmentVariable("ADAPTER_LISTEN","127.0.0.1:"+adapterPort);
+        var adapter=Task.Run(Adapter.Main);
+        TcpClient? controller=null;
+        for(var attempt=0;attempt<50&&controller is null;attempt++){try{controller=new TcpClient();await controller.ConnectAsync(IPAddress.Loopback,adapterPort);}catch{controller?.Dispose();controller=null;await Task.Delay(20);}}
+        var connected=controller??throw new Exception("controller-shaped adapter did not listen");
+        using(connected) using(var stream=connected.GetStream()) using(var reader=new StreamReader(stream)) using(var writer=new StreamWriter(stream){AutoFlush=true}) {
+            await writer.WriteLineAsync("{\"id\":\"s1\",\"op\":\"subscribe\",\"subscriptionId\":\"first\",\"path\":\"demo:state\",\"args\":{}}");
+            Equal("ack",(await ReadEvent(reader))["type"]!.GetValue<string>(),"first subscribe ack");Equal(0,(await ReadEvent(reader))["value"]!["count"]!.GetValue<int>(),"first initial value");
+            await writer.WriteLineAsync("{\"id\":\"u1\",\"op\":\"unsubscribe\",\"subscriptionId\":\"first\"}");
+            var unsubscribe=await ReadEvent(reader);Equal("ack",unsubscribe["type"]!.GetValue<string>(),"unsubscribe ack while relay blocked");Equal("u1",unsubscribe["id"]!.GetValue<string>(),"unsubscribe ack id");
+            await writer.WriteLineAsync("{\"id\":\"s2\",\"op\":\"subscribe\",\"subscriptionId\":\"second\",\"path\":\"demo:state\",\"args\":{}}");
+            Equal("ack",(await ReadEvent(reader))["type"]!.GetValue<string>(),"fresh subscribe ack");Equal(1,(await ReadEvent(reader))["value"]!["count"]!.GetValue<int>(),"fresh initial value");
+            for(var reconnect=1;reconnect<=5;reconnect++) {
+                await writer.WriteLineAsync($"{{\"id\":\"d{reconnect}\",\"op\":\"debugDisconnect\"}}");
+                var ack=await ReadEvent(reader);Equal("ack",ack["type"]!.GetValue<string>(),"debugDisconnect ack");Equal("d"+reconnect,ack["id"]!.GetValue<string>(),"debugDisconnect ack id");
+                Equal(reconnect+1,(await ReadEvent(reader))["value"]!["count"]!.GetValue<int>(),"post-reconnect subscription value");
+            }
+            await writer.WriteLineAsync("{\"id\":\"client-close\",\"op\":\"close\"}");
+            var closed=await ReadEvent(reader);Equal("closed",closed["type"]!.GetValue<string>(),"client close event");Equal("client-close",closed["id"]!.GetValue<string>(),"client close id");
+        }
+        await adapter.WaitAsync(Timeout);await syncServer.WaitAsync(Timeout);
+        Environment.SetEnvironmentVariable("ADAPTER_LISTEN",null);Environment.SetEnvironmentVariable("CONVEX_URL",null);
+    }
+
     private static void TestBoundedDelivery()
     {
         var subscription = new LiveClient.Subscription(null!, 7, "demo:state", new JsonObject());
@@ -184,6 +233,7 @@ static class Tests
     private static async Task WriteFragmentedUtf8(NetworkStream stream,string text,string splitAt){var payload=Encoding.UTF8.GetBytes(text);var marker=Encoding.UTF8.GetBytes(splitAt);var index=payload.AsSpan().IndexOf(marker);Check(index>=0,"UTF-8 marker missing");await WriteFrame(stream,0x01,payload[..(index+1)]);await WriteFrame(stream,0x80,payload[(index+1)..]);}
     private static async Task WriteFrame(NetworkStream stream,int first,byte[] payload){var header=new List<byte>{(byte)first};if(payload.Length<126)header.Add((byte)payload.Length);else{header.Add(126);header.Add((byte)(payload.Length>>8));header.Add((byte)payload.Length);}await stream.WriteAsync(header.ToArray());await stream.WriteAsync(payload);}
     private static async Task WaitForEof(NetworkStream stream){var buffer=new byte[256];try{while(await stream.ReadAsync(buffer)>0){}}catch(IOException){}}
+    private static async Task<JsonNode> ReadEvent(StreamReader reader){var line=await reader.ReadLineAsync().WaitAsync(Timeout);return JsonNode.Parse(line??throw new EndOfStreamException("adapter event stream closed"))!;}
     private static string ReadAsciiLine(NetworkStream stream){var bytes=new List<byte>();while(true){var value=stream.ReadByte();if(value<0)throw new EndOfStreamException();if(value=='\r'){if(stream.ReadByte()!='\n')throw new IOException("invalid line ending");return Encoding.ASCII.GetString(bytes.ToArray());}bytes.Add((byte)value);}}
     private static void Check(bool condition,string message){if(!condition)throw new Exception(message);}
     private static void Equal<T>(T expected,T? actual,string message){if(!EqualityComparer<T>.Default.Equals(expected,actual))throw new Exception($"{message}: expected {expected}, got {actual}");}

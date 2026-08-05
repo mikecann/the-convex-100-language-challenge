@@ -39,7 +39,13 @@ public sealed class LiveClient(string deployment) : IDisposable
     }
     private JsonObject Add(Subscription s) => new() { ["type"]="Add", ["queryId"]=s.QueryId, ["udfPath"]=s.Path, ["args"]=new JsonArray((JsonNode)s.Args.DeepClone()) };
     private async Task Modify(IEnumerable<JsonObject> modifications) { await Send(new JsonObject { ["type"]="ModifyQuerySet", ["baseVersion"]=_querySet, ["newVersion"]=_querySet+1, ["modifications"]=new JsonArray(modifications.Select(x => (JsonNode)x).ToArray()) }); _querySet++; }
-    private async Task Send(JsonObject message) { var s = _socket ?? throw new InvalidOperationException("Live WebSocket is not connected"); await s.SendAsync(System.Text.Encoding.UTF8.GetBytes(message.ToJsonString()), WebSocketMessageType.Text, true, _lifetime.Token); }
+    private async Task Send(JsonObject message)
+    {
+        var socket = _socket ?? throw new InvalidOperationException("Live WebSocket is not connected");
+        using var bounded = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        bounded.CancelAfter(TimeSpan.FromSeconds(3));
+        await socket.SendAsync(System.Text.Encoding.UTF8.GetBytes(message.ToJsonString()), WebSocketMessageType.Text, true, bounded.Token);
+    }
     private async Task Receive(ClientWebSocket socket)
     {
         var buffer = new byte[4096];
@@ -117,7 +123,7 @@ public sealed class LiveClient(string deployment) : IDisposable
     internal async Task Unsubscribe(Subscription s) { await _gate.WaitAsync(); try { if (_subscriptions.TryRemove(s.QueryId, out _)) { s.Finish(); if (_socket is not null) await Modify([new JsonObject { ["type"]="Remove", ["queryId"]=s.QueryId }]); } } finally { _gate.Release(); } }
     private static JsonObject ZeroVersion() => new() { ["querySet"]=0,["identity"]=0,["ts"]="AAAAAAAAAAA=" };
     private void ThrowIfClosed() { if (_closed) throw new ObjectDisposedException(nameof(LiveClient)); }
-    public void Dispose() { if (_closed) return; _closed=true; _lifetime.Cancel(); _socket?.Abort(); foreach(var s in _subscriptions.Values)s.Finish(); _subscriptions.Clear(); }
+    public void Dispose() { if (_closed) return; _closed=true; _lifetime.Cancel(); var socket=_socket;_socket=null;socket?.Abort();socket?.Dispose();foreach(var s in _subscriptions.Values)s.Finish();_subscriptions.Clear(); }
     public record Update(JsonNode? Value, Exception? Error, IReadOnlyList<string> Logs);
     public sealed class Subscription(LiveClient owner, int queryId, string path, JsonObject args) : IDisposable
     { internal int QueryId {get;}=queryId; internal string Path {get;}=path; internal JsonObject Args {get;}=args; private readonly BlockingCollection<Update> _updates=new(16); private bool _closed;
