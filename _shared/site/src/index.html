@@ -39,9 +39,9 @@
           </select>
         </label>
         <div class="legend" aria-label="Capability legend">
-          <span class="badge http">HTTP</span>
-          <span class="badge live">Live</span>
-          <span class="badge hardened">Hardened</span>
+          <button class="badge http" type="button" data-capability="http">HTTP</button>
+          <button class="badge live" type="button" data-capability="live">Live</button>
+          <button class="badge hardened" type="button" data-capability="hardened">Hardened</button>
         </div>
       </section>
 
@@ -53,13 +53,20 @@
       <div id="dialog-content"></div>
     </dialog>
 
+    <dialog id="capability-dialog" class="capability-dialog" aria-labelledby="capability-title">
+      <button id="capability-close" class="dialog-close" aria-label="Close capability explanation">×</button>
+      <div id="capability-content"></div>
+    </dialog>
+
     <template id="language-card-template">
-      <button class="language-card">
-        <span class="rank"></span>
-        <strong class="name"></strong>
-        <span class="state"></span>
+      <article class="language-card">
+        <button class="language-card-open" type="button">
+          <span class="rank"></span>
+          <strong class="name"></strong>
+          <span class="state"></span>
+        </button>
         <span class="badges"></span>
-      </button>
+      </article>
     </template>
 
     <script type="module" src="app.js"></script>

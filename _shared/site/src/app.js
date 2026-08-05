@@ -7,6 +7,50 @@ const search = document.querySelector("#search");
 const statusFilter = document.querySelector("#status-filter");
 const dialog = document.querySelector("#language-dialog");
 const dialogContent = document.querySelector("#dialog-content");
+const capabilityDialog = document.querySelector("#capability-dialog");
+const capabilityContent = document.querySelector("#capability-content");
+
+// These descriptions are deliberately tied to the shared conformance contract.
+// A badge explains what the test suite proved, not what the implementation hopes
+// to support later.
+const capabilityDefinitions = {
+  http: {
+    label: "HTTP",
+    summary:
+      "The client can call Convex queries, mutations and actions through the documented HTTP API.",
+    requirements: [
+      "Round-trips JSON-safe values and document IDs.",
+      "Forwards, replaces and clears bearer tokens.",
+      "Preserves structured Convex errors and keeps function logs separate from results.",
+    ],
+    cumulative: "This is the foundation required by every higher capability.",
+  },
+  live: {
+    label: "Live",
+    summary:
+      "The client also maintains reactive query subscriptions over a WebSocket connection.",
+    requirements: [
+      "Receives initial and later query results without polling.",
+      "Unsubscribes without ghost updates.",
+      "Reconnects active subscriptions after an interrupted connection.",
+      "Recovers from query errors and closes cleanly.",
+    ],
+    cumulative: "Live includes every HTTP requirement.",
+  },
+  hardened: {
+    label: "Hardened",
+    summary:
+      "The realtime client passes the stricter correctness and failure tests expected for serious production use.",
+    requirements: [
+      "Applies realtime transitions atomically and never regresses to older state.",
+      "Orders mutations and reconnects an interrupted mutation with one database effect.",
+      "Does not replay an uncertain in-flight action.",
+      "Supports the full pinned Convex value profile and protected subscription auth rotation.",
+      "Survives lifecycle, churn, large-transition and repeated fault tests.",
+    ],
+    cumulative: "Hardened includes every HTTP and Live requirement.",
+  },
+};
 
 document.querySelector("#language-count").textContent = data.languages.length;
 document.querySelector("#working-count").textContent = data.languages.filter(
@@ -31,10 +75,44 @@ function status(language) {
 }
 
 function badge(name) {
-  const span = document.createElement("span");
-  span.className = `badge ${name}`;
-  span.textContent = name === "http" ? "HTTP" : name[0].toUpperCase() + name.slice(1);
-  return span;
+  const definition = capabilityDefinitions[name];
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `badge ${name}`;
+  button.textContent = definition?.label ?? name;
+  button.dataset.capability = name;
+  button.setAttribute("aria-haspopup", "dialog");
+  button.title = definition ? `${definition.label}: ${definition.summary}` : name;
+  button.addEventListener("click", () => showCapability(name));
+  return button;
+}
+
+function showCapability(name) {
+  const definition = capabilityDefinitions[name];
+  if (!definition) return;
+
+  capabilityContent.replaceChildren();
+  const title = document.createElement("h2");
+  title.id = "capability-title";
+  title.textContent = definition.label;
+  const summary = document.createElement("p");
+  summary.className = "capability-summary";
+  summary.textContent = definition.summary;
+  const heading = document.createElement("h3");
+  heading.textContent = "What it proves";
+  const requirements = document.createElement("ul");
+  requirements.className = "capability-requirements";
+  for (const requirement of definition.requirements) {
+    const item = document.createElement("li");
+    item.textContent = requirement;
+    requirements.append(item);
+  }
+  const cumulative = document.createElement("p");
+  cumulative.className = "capability-cumulative";
+  cumulative.textContent = definition.cumulative;
+
+  capabilityContent.append(title, summary, heading, requirements, cumulative);
+  capabilityDialog.showModal();
 }
 
 function render() {
@@ -58,7 +136,9 @@ function render() {
     card.querySelector(".state").textContent = languageStatus;
     const badges = card.querySelector(".badges");
     for (const capability of capabilities(language)) badges.append(badge(capability));
-    card.addEventListener("click", () => showLanguage(language));
+    const openButton = card.querySelector(".language-card-open");
+    openButton.setAttribute("aria-label", `Open ${language.displayName} details`);
+    openButton.addEventListener("click", () => showLanguage(language));
     grid.append(card);
   }
 }
@@ -131,8 +211,19 @@ function showLanguage(language) {
 search.addEventListener("input", render);
 statusFilter.addEventListener("change", render);
 document.querySelector("#dialog-close").addEventListener("click", () => dialog.close());
+document.querySelector("#capability-close").addEventListener("click", () => capabilityDialog.close());
+for (const legendBadge of document.querySelectorAll(".legend [data-capability]")) {
+  const name = legendBadge.dataset.capability;
+  const definition = capabilityDefinitions[name];
+  legendBadge.setAttribute("aria-haspopup", "dialog");
+  legendBadge.title = `${definition.label}: ${definition.summary}`;
+  legendBadge.addEventListener("click", () => showCapability(name));
+}
 dialog.addEventListener("click", (event) => {
   if (event.target === dialog) dialog.close();
+});
+capabilityDialog.addEventListener("click", (event) => {
+  if (event.target === capabilityDialog) capabilityDialog.close();
 });
 
 render();
