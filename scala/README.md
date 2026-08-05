@@ -22,7 +22,7 @@ image.
 ## The basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.scala -->
-```text
+```scala
 package convex.example
 
 import convex.{ConvexClient, LiveClient}
