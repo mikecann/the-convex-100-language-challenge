@@ -1,7 +1,7 @@
 %% Deterministic acceptance fixtures use real TCP WebSocket peers. They test
 %% Gun's framing path and the public owner calls, not internal state messages.
 -module(live_socket_test).
--export([main/0]).
+-export([main/0, pressure_main/0]).
 
 -define(INITIAL_TS, <<"AAAAAAAAAAA=">>).
 
@@ -21,6 +21,69 @@ main() ->
     same_id_replacement_barrier(),
     tcp_partial_ndjson_and_eof_cleanup(),
     io:format("live socket tests passed~n").
+
+%% Host-side adversarial.sh runs this fixture in the real test image while the
+%% final adapter has a 128 MiB cgroup limit. It stops reading controller output
+%% after the subscribe ACK and drives real 240 KiB WebSocket transitions until
+%% the adapter closes the stalled controller instead of accumulating memory.
+pressure_main() ->
+    application:ensure_all_started(crypto),
+    {ok, Listen} =
+        gen_tcp:listen(8081,
+                       [binary, {packet, raw}, {active, false}, {reuseaddr, true},
+                        {ip, {0, 0, 0, 0}}]),
+    Parent = self(),
+    _Server = spawn_link(fun() -> pressure_peer(Listen, Parent) end),
+    Host =
+        case os:getenv("ADAPTER_HOST") of
+            false -> "adapter";
+            Value -> Value
+        end,
+    Controller = pressure_connect(Host, 8080, 100),
+    send_ndjson(Controller,
+                #{<<"id">> => <<"pressure-subscribe">>, <<"op">> => <<"subscribe">>,
+                  <<"subscriptionId">> => <<"pressure">>,
+                  <<"path">> => <<"demo:state">>, <<"args">> => #{}}),
+    #{<<"id">> := <<"pressure-subscribe">>, <<"type">> := <<"ack">>} =
+        read_ndjson(Controller),
+    %% Intentionally do not call recv again on Controller.
+    receive
+        {pressure_closed, Count} when Count < 200 -> ok;
+        pressure_unbounded -> erlang:error(stopped_controller_was_not_bounded)
+    after 10000 -> erlang:error(stopped_controller_was_not_bounded)
+    end,
+    gen_tcp:close(Controller),
+    gen_tcp:close(Listen),
+    io:format("stopped controller bounded~n").
+
+pressure_peer(Listen, Parent) ->
+    Socket = accept_ws(Listen),
+    {_Connect, QueryId} = read_connect_add(Socket),
+    Blob = binary:copy(<<"x">>, 240000),
+    pressure_updates(Socket, Parent, QueryId, Blob, 0,
+                     version(0, ?INITIAL_TS)).
+
+pressure_updates(_Socket, Parent, _QueryId, _Blob, 200, _Start) ->
+    Parent ! pressure_unbounded;
+pressure_updates(Socket, Parent, QueryId, Blob, Count, Start) ->
+    End = version(1, timestamp(Count + 1)),
+    Payload =
+        transition(Start, End,
+                   [updated(QueryId,
+                            #{<<"count">> => Count, <<"blob">> => Blob})]),
+    case send_text(Socket, Payload) of
+        ok -> pressure_updates(Socket, Parent, QueryId, Blob, Count + 1, End);
+        {error, closed} -> Parent ! {pressure_closed, Count};
+        {error, epipe} -> Parent ! {pressure_closed, Count}
+    end.
+
+pressure_connect(_Host, _Port, 0) -> erlang:error(adapter_connect_timeout);
+pressure_connect(Host, Port, Attempts) ->
+    case gen_tcp:connect(Host, Port,
+                         [binary, {packet, line}, {active, false}], 100) of
+        {ok, Socket} -> Socket;
+        {error, _} -> timer:sleep(25), pressure_connect(Host, Port, Attempts - 1)
+    end.
 
 atomic_transition_and_query_removed() ->
     Parent = self(),
@@ -69,7 +132,7 @@ continuous_peer_close_is_bounded() ->
         {_Connect, _QueryId} = read_connect_add(Socket),
         Parent ! continuous_ready,
         spawn(fun() -> send_pings_until_closed(Socket, 0) end),
-        Remove = read_json(Socket),
+        Remove = read_json_skipping_control(Socket),
         <<"Remove">> = modification_type(Remove),
         Parent ! continuous_remove_seen,
         wait_closed(Socket)
@@ -107,9 +170,11 @@ fragmented_utf8_control_and_query_failed_recovery() ->
         send_frame(Socket, true, 0, Rest),
         {10, <<"fixture-ping">>} = read_frame(Socket),
         V2 = version(1, <<"AgAAAAAAAAA=">>),
-        send_text(Socket, transition(V1, V2, [failed(QueryId)])),
+        send_text(Socket, transition(V1, V2, [failed_without_data(QueryId)])),
         V3 = version(1, <<"AwAAAAAAAAA=">>),
-        send_text(Socket, transition(V2, V3, [updated(QueryId, #{<<"count">> => 1})])),
+        send_text(Socket, transition(V2, V3, [failed_with_null(QueryId)])),
+        V4 = version(1, <<"BAAAAAAAAAA=">>),
+        send_text(Socket, transition(V3, V4, [updated(QueryId, #{<<"count">> => 1})])),
         Parent ! {fixture_ready, self()},
         receive finish -> ok end,
         gen_tcp:close(Socket)
@@ -117,8 +182,11 @@ fragmented_utf8_control_and_query_failed_recovery() ->
     {ok, Client} = convex:new(Url),
     {ok, _Live, Id} = convex:subscribe(Client, <<"demo:state">>, #{}, self()),
     #{value := #{<<"word">> := <<"雪"/utf8>>}} = next_live(Id, 3000),
-    #{error := #{name := <<"FunctionError">>, data := #{<<"code">> := <<"EMPTY">>},
-                  logs := [<<"failed">>]}} = next_live(Id, 3000),
+    #{error := AbsentError} = next_live(Id, 3000),
+    #{name := <<"FunctionError">>, logs := [<<"absent">>]} = AbsentError,
+    false = maps:is_key(data, AbsentError),
+    #{error := #{name := <<"FunctionError">>, data := null,
+                 logs := [<<"explicit null">>]}} = next_live(Id, 3000),
     #{value := #{<<"count">> := 1}} = next_live(Id, 3000),
     receive {fixture_ready, Server} -> ok after 1000 -> erlang:error(fixture_timeout) end,
     Server ! finish,
@@ -153,6 +221,8 @@ protocol_error_reconnect() ->
     {ok, _Live, Id} = convex:subscribe(Client, <<"demo:state">>, #{}, self()),
     #{value := #{<<"count">> := 0}} = next_live(Id, 3000),
     #{error := #{name := <<"ProtocolError">>}} = next_live(Id, 3000),
+    #{error := #{name := <<"ProtocolError">>}} = next_live(Id, 3000),
+    #{error := #{name := <<"ProtocolError">>}} = next_live(Id, 3000),
     %% The next visible event proves recovery on the same subscription after
     %% the malformed connection is abandoned.
     #{value := #{<<"count">> := 1}} = next_live(Id, 3000),
@@ -166,14 +236,45 @@ protocol_recovery_peer(Listen, Parent) ->
     Socket = accept_ws(Listen),
     {Connect, QueryId} = read_connect_add(Socket),
     0 = maps:get(<<"connectionCount">>, Connect),
+    V1 = version(1, timestamp(1)),
     send_text(Socket,
-              transition(version(0, ?INITIAL_TS), version(1, timestamp(1)),
+              transition(version(0, ?INITIAL_TS), V1,
                          [updated(QueryId, #{<<"count">> => 0})])),
-    send_text(Socket, <<"not json">>),
+    %% A valid little-endian timestamp may not move backwards. The value in
+    %% this rejected transaction must never escape to the subscriber.
+    send_text(Socket,
+              transition(V1, version(1, timestamp(0)),
+                         [updated(QueryId, #{<<"count">> => 99})])),
     wait_closed(Socket),
+
+    Noncanonical = accept_ws(Listen),
+    {NoncanonicalConnect, NoncanonicalId} = read_connect_add(Noncanonical),
+    1 = maps:get(<<"connectionCount">>, NoncanonicalConnect),
+    true = timestamp(1) =:= maps:get(<<"maxObservedTimestamp">>, NoncanonicalConnect),
+    %% This is an alternate base64 spelling of eight zero bytes. Only the
+    %% canonical Convex spelling AAAAAAAAAAA= is accepted.
+    send_text(Noncanonical,
+              transition(version(0, ?INITIAL_TS),
+                         version(1, <<"AAAAAAAAAAB=">>),
+                         [updated(NoncanonicalId, #{<<"count">> => 88})])),
+    wait_closed(Noncanonical),
+
+    BadLogs = accept_ws(Listen),
+    {BadLogsConnect, BadLogsId} = read_connect_add(BadLogs),
+    2 = maps:get(<<"connectionCount">>, BadLogsConnect),
+    true = timestamp(1) =:= maps:get(<<"maxObservedTimestamp">>, BadLogsConnect),
+    InvalidLogs =
+        #{<<"type">> => <<"QueryUpdated">>, <<"queryId">> => BadLogsId,
+          <<"value">> => #{<<"count">> => 77}, <<"logLines">> => [7]},
+    send_text(BadLogs,
+              transition(version(0, ?INITIAL_TS), version(1, timestamp(2)),
+                         [updated(BadLogsId, #{<<"count">> => 66}), InvalidLogs])),
+    wait_closed(BadLogs),
+
     Recovered = accept_ws(Listen),
     {RecoveredConnect, RecoveredId} = read_connect_add(Recovered),
-    1 = maps:get(<<"connectionCount">>, RecoveredConnect),
+    3 = maps:get(<<"connectionCount">>, RecoveredConnect),
+    true = timestamp(1) =:= maps:get(<<"maxObservedTimestamp">>, RecoveredConnect),
     send_text(Recovered,
               transition(version(0, ?INITIAL_TS), version(1, timestamp(2)),
                          [updated(RecoveredId, #{<<"count">> => 1})])),
@@ -445,7 +546,17 @@ tcp_partial_ndjson_and_eof_cleanup() ->
                                    <<"errorMessage">> => <<"fixture failure">>,
                                    <<"errorData">> => #{<<"code">> => <<"FIXTURE">>},
                                    <<"logLines">> => []}),
-    {HttpUrl, _HttpServer} = http_fixture([Success, Failure]),
+    AbsentData = convex_json:encode(#{<<"status">> => <<"error">>,
+                                      <<"errorMessage">> => <<"absent data">>}),
+    NullData = convex_json:encode(#{<<"status">> => <<"error">>,
+                                    <<"errorMessage">> => <<"null data">>,
+                                    <<"errorData">> => null,
+                                    <<"logLines">> => []}),
+    BadLogs = convex_json:encode(#{<<"status">> => <<"success">>,
+                                   <<"value">> => #{<<"count">> => 8},
+                                   <<"logLines">> => [7]}),
+    {HttpUrl, _HttpServer} =
+        http_fixture([Success, Failure, AbsentData, NullData, BadLogs]),
     true = os:putenv("ADAPTER_LISTEN", Address),
     true = os:putenv("CONVEX_URL", HttpUrl),
     {Pid, Monitor} = spawn_monitor(fun adapter:main/0),
@@ -455,6 +566,24 @@ tcp_partial_ndjson_and_eof_cleanup() ->
     ok = gen_tcp:send(Socket, <<"lo\"}\n">>),
     {Line, <<>>} = read_line(Socket, <<>>),
     {ok, #{<<"type">> := <<"ready">>, <<"language">> := <<"erlang">>}} = convex_json:decode(Line),
+    %% Malformed commands are command-scoped ProtocolErrors. The reader stays
+    %% alive and includes a valid id only when the malformed command had one.
+    ok = gen_tcp:send(Socket, <<"{]\n">>),
+    #{<<"type">> := <<"error">>, <<"error">> := #{<<"name">> := <<"ProtocolError">>}} =
+        read_ndjson(Socket),
+    ok = gen_tcp:send(Socket, <<"{\"op\":\"close\"}\n">>),
+    MissingId = read_ndjson(Socket),
+    false = maps:is_key(<<"id">>, MissingId),
+    #{<<"type">> := <<"error">>} = MissingId,
+    ok = gen_tcp:send(Socket,
+                      <<"{\"id\":\"bad-query\",\"op\":\"query\",",
+                        "\"path\":\"demo:state\"}\n">>),
+    #{<<"id">> := <<"bad-query">>, <<"type">> := <<"error">>,
+      <<"error">> := #{<<"name">> := <<"ProtocolError">>}} = read_ndjson(Socket),
+    ok = gen_tcp:send(Socket, binary:copy(<<"x">>, 1048577)),
+    ok = gen_tcp:send(Socket, <<"\n">>),
+    #{<<"type">> := <<"error">>, <<"error">> := #{<<"name">> := <<"ProtocolError">>}} =
+        read_ndjson(Socket),
     ok = gen_tcp:send(Socket, <<"{\"id\":\"query\",\"op\":\"query\",\"path\":\"demo:state\",\"args\":{}}\n">>),
     {ResultLine, <<>>} = read_line(Socket, <<>>),
     {ok, #{<<"id">> := <<"query">>, <<"type">> := <<"result">>,
@@ -467,6 +596,25 @@ tcp_partial_ndjson_and_eof_cleanup() ->
                             <<"message">> := <<"fixture failure">>,
                             <<"data">> := #{<<"code">> := <<"FIXTURE">>}}}} =
         convex_json:decode(ErrorLine),
+    send_ndjson(Socket,
+                #{<<"id">> => <<"absent">>, <<"op">> => <<"query">>,
+                  <<"path">> => <<"demo:fail">>, <<"args">> => #{}}),
+    #{<<"id">> := <<"absent">>, <<"type">> := <<"error">>,
+      <<"error">> := AbsentError} = read_ndjson(Socket),
+    #{<<"name">> := <<"FunctionError">>, <<"message">> := <<"absent data">>} =
+        AbsentError,
+    false = maps:is_key(<<"data">>, AbsentError),
+    send_ndjson(Socket,
+                #{<<"id">> => <<"null">>, <<"op">> => <<"query">>,
+                  <<"path">> => <<"demo:fail">>, <<"args">> => #{}}),
+    #{<<"id">> := <<"null">>, <<"type">> := <<"error">>,
+      <<"error">> := #{<<"name">> := <<"FunctionError">>,
+                       <<"data">> := null}} = read_ndjson(Socket),
+    send_ndjson(Socket,
+                #{<<"id">> => <<"bad-logs">>, <<"op">> => <<"query">>,
+                  <<"path">> => <<"demo:state">>, <<"args">> => #{}}),
+    #{<<"id">> := <<"bad-logs">>, <<"type">> := <<"error">>,
+      <<"error">> := #{<<"name">> := <<"ProtocolError">>}} = read_ndjson(Socket),
     ok = gen_tcp:send(Socket, <<"{\"id\":\"unfinished\",\"op\":\"close\"}">>),
     gen_tcp:close(Socket),
     receive {'DOWN', Monitor, process, Pid, normal} -> ok after 2000 -> erlang:error(adapter_eof_timeout) end,
@@ -612,6 +760,15 @@ read_json(Socket) ->
     {ok, Value} = convex_json:decode(Payload),
     Value.
 
+read_json_skipping_control(Socket) ->
+    case read_frame(Socket) of
+        {1, Payload} ->
+            {ok, Value} = convex_json:decode(Payload),
+            Value;
+        {Opcode, _} when Opcode =:= 8; Opcode =:= 9; Opcode =:= 10 ->
+            read_json_skipping_control(Socket)
+    end.
+
 read_frame(Socket) ->
     <<Fin:1, _Reserved:3, Opcode:4, Masked:1, Length0:7>> = recv_exact(Socket, 2, <<>>),
     Length = case Length0 of
@@ -667,6 +824,15 @@ failed(QueryId) ->
       <<"errorMessage">> => <<"empty">>, <<"errorData">> => #{<<"code">> => <<"EMPTY">>},
       <<"logLines">> => [<<"failed">>]}.
 
+failed_without_data(QueryId) ->
+    #{<<"type">> => <<"QueryFailed">>, <<"queryId">> => QueryId,
+      <<"errorMessage">> => <<"absent data">>, <<"logLines">> => [<<"absent">>]}.
+
+failed_with_null(QueryId) ->
+    #{<<"type">> => <<"QueryFailed">>, <<"queryId">> => QueryId,
+      <<"errorMessage">> => <<"null data">>, <<"errorData">> => null,
+      <<"logLines">> => [<<"explicit null">>]}.
+
 removed(QueryId) ->
     #{<<"type">> => <<"QueryRemoved">>, <<"queryId">> => QueryId}.
 
@@ -679,7 +845,11 @@ next_live(Id, Timeout) ->
 
 next_dequeued(Id) ->
     receive
-        {relay_dequeued, Relay, Id, Event} -> {Relay, Event}
+        {relay_dequeued, Relay, Id, Event} ->
+            case is_process_alive(Relay) of
+                true -> {Relay, Event};
+                false -> next_dequeued(Id)
+            end
     after 3000 -> erlang:error({relay_dequeue_timeout, Id})
     end.
 

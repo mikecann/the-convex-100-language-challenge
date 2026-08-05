@@ -15,6 +15,7 @@ RUN mkdir -p core-ebin adapter-ebin example-ebin test-ebin && erlc -Werror -pa _
 RUN erl -noshell -pa test-ebin -pa _build/dev/lib/jsx/ebin -s codec_test main -s init stop
 RUN erl -noshell -pa test-ebin -pa _build/dev/lib/jsx/ebin -pa _build/dev/lib/gun/ebin -pa _build/dev/lib/cowlib/ebin -s live_socket_test main -s init stop
 RUN printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | erl -noshell -pa core-ebin -pa adapter-ebin -pa _build/dev/lib/jsx/ebin -pa _build/dev/lib/gun/ebin -pa _build/dev/lib/cowlib/ebin -s adapter main -s init stop >/tmp/adapter.ndjson && grep -Fq '"language":"erlang"' /tmp/adapter.ndjson && grep -Fq '"type":"closed"' /tmp/adapter.ndjson
+RUN set -eu; adapter() { erl -noshell -pa core-ebin -pa adapter-ebin -pa _build/dev/lib/jsx/ebin -pa _build/dev/lib/gun/ebin -pa _build/dev/lib/cowlib/ebin -s adapter main -s init stop; }; printf '%s' '{"id":"partial","op":"close"}' | adapter >/tmp/partial.ndjson; test ! -s /tmp/partial.ndjson; printf '%s\n' '{]' '{"op":"close"}' '{"id":"bad-query","op":"query","path":"demo:state"}' '{"id":"close","op":"close"}' | adapter >/tmp/malformed.ndjson; test "$(grep -c '"name":"ProtocolError"' /tmp/malformed.ndjson)" -eq 3; grep -Fq '"type":"closed"' /tmp/malformed.ndjson; (head -c 1048577 /dev/zero | tr '\000' x; printf '\n%s\n' '{"id":"close","op":"close"}') | adapter >/tmp/oversized.ndjson; grep -Fq '"name":"ProtocolError"' /tmp/oversized.ndjson; grep -Fq '"type":"closed"' /tmp/oversized.ndjson
 
 FROM build AS test
 CMD ["/bin/true"]
@@ -22,7 +23,7 @@ CMD ["/bin/true"]
 FROM --platform=$TARGETPLATFORM ${ELIXIR_IMAGE} AS target-erlang-runtime
 
 FROM alpine:3.22@sha256:7c8cb692ae09657cbc4a3f3cbd0e8d5a2690ba38386aaaf252dbb060bf5eb2e6 AS runtime-base
-RUN apk add --no-cache ca-certificates=20260611-r0 libcrypto3=3.5.7-r0 libssl3=3.5.7-r0 libstdc++=14.2.0-r6 ncurses-libs=6.5_p20250503-r0
+RUN apk add --no-cache ca-certificates=20260611-r0 libcrypto3=3.5.7-r0 libssl3=3.5.7-r0 libstdc++=14.2.0-r6 ncurses-libs=6.5_p20250503-r0 dash=0.5.12-r3 coreutils=9.7-r1 diffutils=3.12-r0 grep=3.12-r0 sed=4.9-r2 mawk=1.3.4-r11
 # The BEAM emulator and its two runtime helpers are sufficient for this
 # non-distributed client. Compiler commands, static libraries, headers,
 # dialyzer, epmd, escript, and the rest of the ERTS development tree stay out.
@@ -52,10 +53,14 @@ COPY --from=build /app/core-ebin /opt/convex
 COPY --from=build /app/_build/dev/lib/gun/ebin /opt/convex/deps/gun/ebin
 COPY --from=build /app/_build/dev/lib/cowlib/ebin /opt/convex/deps/cowlib/ebin
 COPY --from=build /app/_build/dev/lib/jsx/ebin /opt/convex/deps/jsx/ebin
-RUN rm -f /sbin/apk && rm -rf /etc/apk /lib/apk /var/cache/apk /var/lib/apk /usr/share/apk
+# Stock Alpine BusyBox contains wget and nc even when their symlinks are
+# removed, because callers can select applets through argv[0] or the multicall
+# command. Install a separate shell and text tools, then remove every BusyBox
+# link and the multicall binary itself from the final filesystem.
+RUN ln -sf /usr/bin/dash /bin/sh && for path in /bin/* /sbin/* /usr/bin/* /usr/sbin/*; do if test -L "$path"; then target=$(readlink "$path"); case "$target" in *busybox*) rm -f "$path" ;; esac; fi; done && ln -sf /usr/bin/mawk /usr/bin/awk && rm -f /bin/busybox /sbin/apk && rm -rf /etc/apk /lib/apk /var/cache/apk /var/lib/apk /usr/share/apk
 ENV ERL_FLAGS="+S 1:1 +SDcpu 1 +SDio 1" ERL_LIBS=/opt/convex/deps
 USER 65532:65532
-RUN set -eu; for command in sh id grep erl; do command -v "$command" >/dev/null; done; for command in apk elixir elixirc iex mix hex rebar rebar3 erlc cc gcc clang make node npm python python3 curl convex openssl; do ! command -v "$command" >/dev/null 2>&1 || exit 1; done; test ! -e /usr/local/lib/erlang/erts-14.2.5.15/bin/erlc; erl -noshell -pa /opt/convex -eval '{ok, _} = application:ensure_all_started(inets), {ok, _} = application:ensure_all_started(ssl), {ok, _} = application:ensure_all_started(gun), <<_:8>> = crypto:strong_rand_bytes(1), halt().'
+RUN set -eu; for command in sh id cat cmp cut grep head sed sort tail tr awk erl; do command -v "$command" >/dev/null; done; for command in busybox wget nc netcat apk elixir elixirc iex mix hex rebar rebar3 erlc cc gcc clang make node npm python python3 curl convex openssl; do ! command -v "$command" >/dev/null 2>&1 || exit 1; done; test ! -e /bin/busybox; test ! -e /usr/local/lib/erlang/erts-14.2.5.15/bin/erlc; erl -noshell -pa /opt/convex -eval '{ok, _} = application:ensure_all_started(inets), {ok, _} = application:ensure_all_started(ssl), {ok, _} = application:ensure_all_started(gun), <<_:8>> = crypto:strong_rand_bytes(1), halt().'
 
 FROM runtime-base AS example-runtime
 COPY --from=build /app/example-ebin /opt/convex

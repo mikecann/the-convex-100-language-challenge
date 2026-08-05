@@ -77,20 +77,44 @@ close(#{live := Pid}) ->
 decode_response(Body) ->
     case convex_json:decode(Body) of
         {ok, #{<<"status">> := <<"success">>, <<"value">> := Value} = Response} ->
-            {ok, Value, maps:get(<<"logLines">>, Response, [])};
-        {ok, #{<<"status">> := <<"error">>} = Response} ->
-            Base =
-                make_error(<<"FunctionError">>,
-                           maps:get(<<"errorMessage">>, Response,
-                                    <<"Convex function failed">>)),
-            {error,
-             maps:merge(Base,
-                        #{data => maps:get(<<"errorData">>, Response, null)})};
+            case response_logs(Response) of
+                {ok, Logs} -> {ok, Value, Logs};
+                error -> protocol_response_error()
+            end;
+        {ok, #{<<"status">> := <<"error">>, <<"errorMessage">> := Message} = Response}
+          when is_binary(Message) ->
+            case response_logs(Response) of
+                {ok, Logs} ->
+                    Base = (make_error(<<"FunctionError">>, Message))#{logs => Logs},
+                    %% Convex distinguishes no errorData field from an explicit
+                    %% JSON null. Preserve that distinction in the adapter.
+                    Error =
+                        case maps:find(<<"errorData">>, Response) of
+                            {ok, Data} -> Base#{data => Data};
+                            error -> Base
+                        end,
+                    {error, Error};
+                error -> protocol_response_error()
+            end;
         _ ->
-            {error,
-             make_error(<<"ProtocolError">>,
-                        <<"invalid Convex HTTP response">>)}
+            protocol_response_error()
     end.
+
+response_logs(Response) ->
+    case maps:find(<<"logLines">>, Response) of
+        error -> {ok, []};
+        {ok, Logs} when is_list(Logs) ->
+            case lists:all(fun erlang:is_binary/1, Logs) of
+                true -> {ok, Logs};
+                false -> error
+            end;
+        {ok, _} -> error
+    end.
+
+protocol_response_error() ->
+    {error,
+     make_error(<<"ProtocolError">>,
+                <<"invalid Convex HTTP response">>)}.
 
 make_error(Name, Message) ->
     #{name => Name, message => Message}.

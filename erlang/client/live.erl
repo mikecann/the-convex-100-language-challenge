@@ -46,7 +46,8 @@ handle_call({subscribe, Path, Args, Sink}, _From, State0) ->
     Gate = relay_gate(maps:get(client, State0)),
     Relay = spawn(fun() -> relay_loop(Owner, Gate) end),
     Sub = #{query_id => QueryId, path => Path, args => Args, sink => Sink,
-            generation => Generation, relay => Relay, last => undefined,
+            generation => Generation, relay => Relay, relay_owner => Owner,
+            relay_gate => Gate, last => undefined,
             queue => queue:new(), queue_count => 0, queue_bytes => 0,
             relay_busy => false, inflight => false,
             inflight_token => undefined, inflight_bytes => 0},
@@ -59,7 +60,7 @@ handle_call({unsubscribe, Id}, _From, State0) ->
         {Sub, Subs} ->
             %% Erase the generation before killing the relay and writing Remove.
             %% A dequeued event can no longer obtain delivery permission.
-            exit(maps:get(relay, Sub), kill),
+            retire_relay(maps:get(relay, Sub)),
             State1 = State0#{subscriptions => Subs},
             {reply, ok, maybe_send_modify(remove, Sub, State1)}
     end;
@@ -148,14 +149,18 @@ handle_info({relay_ready, Id, Generation, Token}, State0) ->
     case maps:find(Id, maps:get(subscriptions, State0)) of
         {ok, #{generation := Generation} = Sub0} ->
             %% relay_busy tracks the physical worker independently from the
-            %% logical delivery token, which overflow may already invalidate.
-            Sub1 = case maps:get(inflight_token, Sub0) of
-                Token -> Sub0#{relay_busy => false, inflight => false,
-                               inflight_token => undefined, inflight_bytes => 0};
-                _ -> Sub0#{relay_busy => false}
-            end,
-            {Sub2, State1} = dispatch_next(Id, Sub1, State0),
-            {noreply, put_sub(Id, Sub2, State1)};
+            %% delivery token. A ready message already queued by a retired
+            %% relay must not clear the replacement relay's physical charge.
+            case maps:get(inflight_token, Sub0) of
+                Token ->
+                    Sub1 =
+                        Sub0#{relay_busy => false, inflight => false,
+                              inflight_token => undefined, inflight_bytes => 0},
+                    {Sub2, State1} = dispatch_next(Id, Sub1, State0),
+                    {noreply, put_sub(Id, Sub2, State1)};
+                _ ->
+                    {noreply, State0}
+            end;
         _ -> {noreply, State0}
     end;
 handle_info(_, State) -> {noreply, State}.
@@ -277,7 +282,8 @@ handle_server(Message, State) ->
 
 transition(#{<<"startVersion">> := Start, <<"endVersion">> := End,
              <<"modifications">> := Mods}, State) when is_list(Mods) ->
-    case {version_matches(Start, State), valid_version(End), valid_modifications(Mods)} of
+    case {version_matches(Start, State), valid_transition_end(Start, End),
+          valid_modifications(Mods)} of
         {true, true, true} ->
             %% Collect the complete immutable Transition before touching
             %% subscriber state. Multiple modifications for one query collapse
@@ -294,9 +300,20 @@ transition(#{<<"startVersion">> := Start, <<"endVersion">> := End,
 transition(_, State) -> protocol_reconnect(<<"malformed Transition">>, State).
 
 valid_version(#{<<"querySet">> := Q, <<"identity">> := I, <<"ts">> := Ts}) ->
-    is_integer(Q) andalso is_integer(I) andalso is_binary(Ts) andalso
+    is_integer(Q) andalso Q >= 0 andalso is_integer(I) andalso I >= 0 andalso
+    is_binary(Ts) andalso
     timestamp_number(Ts) =/= error;
 valid_version(_) -> false.
+
+valid_transition_end(Start, End) ->
+    case {valid_version(Start), valid_version(End)} of
+        {true, true} ->
+            {ok, StartNumber} = timestamp_number(maps:get(<<"ts">>, Start)),
+            {ok, EndNumber} = timestamp_number(maps:get(<<"ts">>, End)),
+            EndNumber >= StartNumber;
+        _ ->
+            false
+    end.
 
 %% Validate every modification before applying any of them. A malformed tail
 %% must not leak an earlier value from the same Transition or advance version
@@ -304,13 +321,22 @@ valid_version(_) -> false.
 valid_modifications(Mods) -> lists:all(fun valid_modification/1, Mods).
 
 valid_modification(#{<<"type">> := <<"QueryUpdated">>, <<"queryId">> := Q,
-                     <<"value">> := _}) -> is_integer(Q);
+                     <<"value">> := _} = Modification) ->
+    is_integer(Q) andalso valid_optional_log_lines(Modification);
 valid_modification(#{<<"type">> := <<"QueryFailed">>, <<"queryId">> := Q,
-                     <<"errorMessage">> := Message}) ->
-    is_integer(Q) andalso is_binary(Message);
-valid_modification(#{<<"type">> := <<"QueryRemoved">>, <<"queryId">> := Q}) ->
-    is_integer(Q);
+                     <<"errorMessage">> := Message} = Modification) ->
+    is_integer(Q) andalso is_binary(Message) andalso
+    valid_optional_log_lines(Modification);
+valid_modification(#{<<"type">> := <<"QueryRemoved">>, <<"queryId">> := Q} = Modification) ->
+    is_integer(Q) andalso valid_optional_log_lines(Modification);
 valid_modification(_) -> false.
+
+valid_optional_log_lines(Modification) ->
+    case maps:find(<<"logLines">>, Modification) of
+        error -> true;
+        {ok, Logs} when is_list(Logs) -> lists:all(fun erlang:is_binary/1, Logs);
+        {ok, _} -> false
+    end.
 
 version_matches(#{<<"querySet">> := Q, <<"identity">> := I, <<"ts">> := Ts}, State) ->
     Q =:= maps:get(remote_query_set, State) andalso
@@ -322,10 +348,15 @@ collect_change(#{<<"type">> := <<"QueryUpdated">>, <<"queryId">> := Q,
                  <<"value">> := Value} = Mod, Changes) ->
     maps:put(Q, {value, Value, maps:get(<<"logLines">>, Mod, [])}, Changes);
 collect_change(#{<<"type">> := <<"QueryFailed">>, <<"queryId">> := Q} = Mod, Changes) ->
-    Error = #{name => <<"FunctionError">>,
-              message => maps:get(<<"errorMessage">>, Mod, <<"Live query failed">>),
-              data => maps:get(<<"errorData">>, Mod, null),
-              logs => maps:get(<<"logLines">>, Mod, [])},
+    Base = #{name => <<"FunctionError">>,
+             message => maps:get(<<"errorMessage">>, Mod),
+             logs => maps:get(<<"logLines">>, Mod, [])},
+    %% Absence and explicit JSON null have different Convex semantics.
+    Error =
+        case maps:find(<<"errorData">>, Mod) of
+            {ok, Data} -> Base#{data => Data};
+            error -> Base
+        end,
     maps:put(Q, {error, Error}, Changes);
 collect_change(#{<<"type">> := <<"QueryRemoved">>, <<"queryId">> := Q}, Changes) ->
     maps:put(Q, removed, Changes).
@@ -372,28 +403,50 @@ enqueue_bounded(Id, Event, Bytes,
     Relay ! {event, Id, Generation, Token, Event},
     Sub#{relay_busy => true, inflight => true,
          inflight_token => Token, inflight_bytes => Bytes};
-enqueue_bounded(_Id, Event, Bytes, Sub0) ->
-    trim_pipeline(queue:in({Event, Bytes}, maps:get(queue, Sub0)),
-                  maps:get(queue_count, Sub0) + 1,
-                  maps:get(queue_bytes, Sub0) + Bytes,
-                  Sub0).
+enqueue_bounded(Id, Event, Bytes, Sub0) ->
+    Sub1 =
+        trim_pipeline(Id, queue:in({Event, Bytes}, maps:get(queue, Sub0)),
+                      maps:get(queue_count, Sub0) + 1,
+                      maps:get(queue_bytes, Sub0) + Bytes,
+                      Sub0),
+    activate_pipeline(Id, Sub1).
 
-trim_pipeline(Queue, Count, Bytes, Sub = #{inflight := true})
+trim_pipeline(_Id, Queue, Count, Bytes, Sub = #{relay_busy := true})
   when Count + 1 =< ?MAX_QUEUE_COUNT,
        Bytes + map_get(inflight_bytes, Sub) =< ?MAX_QUEUE_BYTES ->
     Sub#{queue => Queue, queue_count => Count, queue_bytes => Bytes};
-trim_pipeline(Queue, Count, Bytes, Sub = #{inflight := false})
+trim_pipeline(_Id, Queue, Count, Bytes, Sub = #{relay_busy := false})
   when Count =< ?MAX_QUEUE_COUNT, Bytes =< ?MAX_QUEUE_BYTES ->
     Sub#{queue => Queue, queue_count => Count, queue_bytes => Bytes};
-trim_pipeline(Queue, Count, Bytes, Sub = #{inflight := true}) ->
+trim_pipeline(Id, Queue, Count, Bytes, Sub = #{inflight := true}) ->
     %% The held relay event is the oldest. Logically invalidate its delivery
-    %% token first so overflow really retains the newest events.
-    trim_pipeline(Queue, Count, Bytes,
-                  Sub#{inflight => false, inflight_token => undefined,
-                       inflight_bytes => 0});
-trim_pipeline(Queue0, Count, Bytes, Sub) ->
+    %% token first so overflow really retains the newest events. Retiring the
+    %% relay releases that physical binary before we remove its byte charge;
+    %% a replacement relay continues the same subscription generation.
+    retire_relay(maps:get(relay, Sub)),
+    Owner = maps:get(relay_owner, Sub),
+    Gate = maps:get(relay_gate, Sub),
+    Relay = spawn(fun() -> relay_loop(Owner, Gate) end),
+    trim_pipeline(Id, Queue, Count, Bytes,
+                  Sub#{relay => Relay, relay_busy => false, inflight => false,
+                       inflight_token => undefined, inflight_bytes => 0});
+trim_pipeline(Id, Queue0, Count, Bytes, Sub) ->
     {{value, {_Dropped, DroppedBytes}}, Queue1} = queue:out(Queue0),
-    trim_pipeline(Queue1, Count - 1, Bytes - DroppedBytes, Sub).
+    trim_pipeline(Id, Queue1, Count - 1, Bytes - DroppedBytes, Sub).
+
+activate_pipeline(Id, Sub = #{relay_busy := false}) ->
+    case queue:out(maps:get(queue, Sub)) of
+        {empty, _} -> Sub;
+        {{value, {Event, Bytes}}, Queue1} ->
+            Token = make_ref(),
+            maps:get(relay, Sub) !
+                {event, Id, maps:get(generation, Sub), Token, Event},
+            Sub#{queue => Queue1, queue_count => maps:get(queue_count, Sub) - 1,
+                 queue_bytes => maps:get(queue_bytes, Sub) - Bytes,
+                 relay_busy => true, inflight => true,
+                 inflight_token => Token, inflight_bytes => Bytes}
+    end;
+activate_pipeline(_Id, Sub) -> Sub.
 
 dispatch_next(Id, Sub0, State) ->
     case queue:out(maps:get(queue, Sub0)) of
@@ -459,8 +512,18 @@ cancel_timer(Ref) -> erlang:cancel_timer(Ref), ok.
 reason_binary(Reason) when is_binary(Reason) -> Reason;
 reason_binary(Reason) -> iolist_to_binary(io_lib:format("~p", [Reason])).
 
+retire_relay(Relay) ->
+    Monitor = erlang:monitor(process, Relay),
+    exit(Relay, kill),
+    receive
+        {'DOWN', Monitor, process, Relay, _} -> ok
+    after 1000 ->
+        erlang:demonitor(Monitor, [flush]),
+        exit({relay_retirement_timeout, Relay})
+    end.
+
 -ifdef(TEST).
-inflight_count(#{inflight := true}) -> 1;
+inflight_count(#{relay_busy := true}) -> 1;
 inflight_count(_) -> 0.
 -endif.
 
@@ -474,7 +537,11 @@ observed_max(Current, New) ->
 timestamp_number(Timestamp) ->
     try
         case base64:decode(Timestamp) of
-            <<Number:64/little-unsigned-integer>> -> {ok, Number};
+            <<Number:64/little-unsigned-integer>> = Bytes ->
+                case base64:encode(Bytes) of
+                    Timestamp -> {ok, Number};
+                    _ -> error
+                end;
             _ -> error
         end
     catch _:_ -> error

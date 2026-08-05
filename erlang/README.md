@@ -116,12 +116,15 @@ env(Name, Default) ->
 ```sh
 ./run test erlang
 ./run build erlang
+sh erlang/client/tests/conformance/adversarial.sh
 ```
 
 `test` checks the target architecture, treats Erlang compiler lint warnings as
 errors, compiles the client, example, and adapter, and runs deterministic
 codec, real-socket Live, and partial-NDJSON fixtures. `build` creates the
-minimal non-root conformance image. The root
+minimal non-root conformance image. The adversarial fixture stops reading the
+real final adapter's TCP output while 240 KiB Live updates arrive and proves
+the 128 MiB container closes cleanly instead of being OOM-killed. The root
 integration task separately owns the serialized `verify-example`, `verify`,
 `verify-hosted`, and `verify-all` evidence runs.
 
@@ -134,9 +137,17 @@ Connect/Add/Remove messages, maintains query-set and timestamp state, and
 publishes atomically deduplicated updates.
 
 Each subscription keeps the newest 16 undelivered events within a 256 KiB
-bound. Both limits include the event currently held by its relay. The test-only
-adapter supports NDJSON protocol v1 over stdin/stdout or one `ADAPTER_LISTEN`
-TCP controller and exposes `debugDisconnect` only for conformance.
+bound. Both limits include the event currently held by its relay, and an
+overflowed relay is confirmed dead before its physical payload leaves the byte
+budget. The adapter also owns one global 16-event, 256 KiB encoded-output
+budget, including the binary held by a blocked socket send; it closes a stalled
+controller when that budget fills. Stdin and `ADAPTER_LISTEN` TCP share the
+same 1 MiB newline parser and discard incomplete EOF fragments.
+
+The final image uses Dash plus individual POSIX text packages. It removes the
+BusyBox multicall binary and all of its links, so `wget` and `nc` cannot be
+recovered through command lookup, a different `argv[0]`, or a BusyBox applet.
+The adapter exposes `debugDisconnect` only for conformance.
 
 ## Limitations
 
