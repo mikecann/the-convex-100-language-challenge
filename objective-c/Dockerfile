@@ -78,7 +78,15 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
     libgnustep-base1.28=1.28.1+really1.28.0-5 \
     libjson-c5=0.16-2 && \
     rm -f /usr/bin/apt /usr/bin/apt-* /usr/bin/dpkg /usr/bin/dpkg-* \
-      /usr/bin/openssl \
+      /usr/sbin/dpkg-* \
+      /usr/bin/debconf /usr/bin/debconf-* /usr/bin/deb-systemd-* \
+      /usr/bin/update-alternatives \
+      /usr/sbin/invoke-rc.d /usr/sbin/policy-rc.d /usr/sbin/service \
+      /usr/sbin/start-stop-daemon /usr/sbin/update-rc.d \
+      /usr/sbin/installkernel /usr/sbin/pam-auth-update \
+      /usr/sbin/update-ca-certificates /usr/sbin/update-passwd \
+      /usr/sbin/add-shell /usr/sbin/remove-shell /usr/sbin/update-shells \
+      /usr/bin/openssl /usr/bin/c_rehash \
       /usr/bin/perl /usr/bin/perl[0-9]* /usr/bin/cpan* /usr/bin/corelist \
       /usr/bin/instmodsh /usr/bin/json_pp /usr/bin/perlbug /usr/bin/perldoc \
       /usr/bin/prove /usr/bin/ptar* /usr/bin/shasum /usr/bin/splain && \
@@ -91,9 +99,19 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
     hash -r && \
     test ! -e /bin/busybox && \
     for required in sh id grep sed awk cat; do command -v "$required" >/dev/null; done && \
-    for forbidden in busybox wget nc netcat telnet ftp openssl apt apt-get apt-cache dpkg dpkg-query perl clang gcc make curl node npm npx python python3 pip pip3 convex; do \
+    for forbidden in busybox wget nc netcat telnet ftp openssl c_rehash apt apt-get apt-cache dpkg dpkg-query dpkg-reconfigure dpkg-preconfigure debconf debconf-communicate update-alternatives invoke-rc.d service start-stop-daemon update-rc.d installkernel pam-auth-update update-ca-certificates update-passwd add-shell remove-shell update-shells perl clang gcc make curl node npm npx python python3 pip pip3 convex; do \
       if command -v "$forbidden" >/dev/null 2>&1; then exit 1; fi; \
-    done
+    done && \
+    test -z "$(find /usr/bin /usr/sbin -xdev -type f -perm /111 \
+      \( -name 'apt' -o -name 'apt-*' -o -name 'dpkg' -o -name 'dpkg-*' \
+      -o -name 'debconf' -o -name 'debconf-*' -o -name 'deb-systemd-*' \
+      -o -name 'update-alternatives' -o -name 'invoke-rc.d' \
+      -o -name 'policy-rc.d' -o -name 'service' \
+      -o -name 'start-stop-daemon' -o -name 'update-rc.d' \
+      -o -name 'installkernel' -o -name 'pam-auth-update' \
+      -o -name 'update-ca-certificates' -o -name 'update-passwd' \
+      -o -name 'add-shell' -o -name 'remove-shell' \
+      -o -name 'update-shells' -o -name 'c_rehash' \) -print)"
 USER 65532:65532
 
 FROM runtime-base AS example-runtime
