@@ -82,6 +82,25 @@ Returns a deterministic JSON object containing the language and greeting. It
 does not call an external service, so action conformance is not coupled to a
 third-party API.
 
+### `demo:echo`
+
+Query arguments contain a JSON-safe `value`. The function logs one deterministic
+line and returns the value unchanged. It exercises nested values and keeps
+function logs distinct from results.
+
+### `demo:fail`
+
+Query arguments contain a string `code`. The function throws a structured
+`ConvexError` with that code and a deterministic message. It exists only to
+verify application-error handling.
+
+### `demo:requiresNonzero`
+
+Reactive query arguments contain a room name. It throws a structured
+`ROOM_EMPTY` error while the room is absent or zero, then returns the room state
+after an increment. This verifies that a failed subscription stays active and
+can recover.
+
 ## Deployment topology
 
 - Deterministic conformance: pinned local Convex deployment in Docker.

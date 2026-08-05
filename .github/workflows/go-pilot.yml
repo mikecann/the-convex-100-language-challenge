@@ -1,0 +1,67 @@
+name: Go pilot
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - pilot/go
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-pilot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conformance:
+    name: Go on native linux/amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Create an isolated BuildKit builder
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Verify the Docker environment
+        run: ./run doctor
+
+      - name: Validate the 100-language scaffold and harness self-test
+        run: ./run validate
+
+      - name: Run deterministic Go conformance
+        run: ./run verify go
+
+      - name: Run hosted protocol-drift smoke test
+        run: ./run verify-hosted go
+
+      - name: Export the Go image with SBOM and build provenance
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --sbom=true \
+            --provenance=mode=max \
+            --output type=oci,dest=_shared/results/local/go-image.oci.tar \
+            go
+
+      - name: Generate the candidate evidence site
+        env:
+          EVIDENCE_CHANNEL: ci-candidate
+        run: ./run site-preview
+
+      - name: Upload results, attestations, and site preview
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: go-pilot-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            _shared/results/local/
+            _shared/results/hosted/
+            _shared/site/dist/

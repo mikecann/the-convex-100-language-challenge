@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://100-convex-clients.test/schemas/result-v1.json",
+  "title": "Trusted conformance result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "language",
+    "sourceCommit",
+    "dirty",
+    "provenance",
+    "runtimeVersion",
+    "platform",
+    "imageDigest",
+    "backend",
+    "protocol",
+    "startedAt",
+    "finishedAt",
+    "tests",
+    "earnedCapabilities"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "language": { "type": "string" },
+    "sourceCommit": { "type": "string" },
+    "dirty": { "type": "boolean" },
+    "provenance": {
+      "enum": ["native", "binding", "generated", "transpiled", "bridge"]
+    },
+    "runtimeVersion": { "type": "string" },
+    "platform": { "type": "string" },
+    "imageDigest": { "type": "string" },
+    "backend": {
+      "type": "object",
+      "required": ["kind", "url", "version"],
+      "properties": {
+        "kind": { "enum": ["self-hosted", "hosted"] },
+        "url": { "type": "string" },
+        "version": { "type": "string" }
+      }
+    },
+    "protocol": { "type": "string" },
+    "startedAt": { "type": "string", "format": "date-time" },
+    "finishedAt": { "type": "string", "format": "date-time" },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "status", "durationMs"],
+        "properties": {
+          "name": { "type": "string" },
+          "status": { "enum": ["pass", "fail", "skip"] },
+          "durationMs": { "type": "integer", "minimum": 0 },
+          "detail": { "type": "string" }
+        }
+      }
+    },
+    "earnedCapabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "enum": ["http", "live", "hardened"] }
+    }
+  }
+}

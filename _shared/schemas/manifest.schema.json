@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://100-convex-clients.test/schemas/manifest-v1.json",
+  "title": "Language client manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "displayName",
+    "rank",
+    "selectionTier",
+    "implementation",
+    "capabilities"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+    "displayName": { "type": "string", "minLength": 1 },
+    "rank": { "type": "integer", "minimum": 1, "maximum": 100 },
+    "selectionTier": {
+      "enum": ["ranked", "coverage", "curated_backfill"]
+    },
+    "implementation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "enum": ["planned", "attempting", "working", "failed", "blocked"]
+        },
+        "provenance": {
+          "enum": ["native", "binding", "generated", "transpiled", "bridge"]
+        },
+        "version": { "type": "string" },
+        "notes": { "type": "string" }
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" }
+      }
+    },
+    "syncProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sourceCommit", "endpoint"],
+      "properties": {
+        "id": { "type": "string" },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "endpoint": { "type": "string" }
+      }
+    },
+    "intendedCapabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "enum": ["http", "live", "hardened"] }
+    },
+    "platforms": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string" }
+    },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocolVersion", "entrypoint"],
+      "properties": {
+        "protocolVersion": { "const": 1 },
+        "entrypoint": { "type": "string" },
+        "adapterOnlyCommands": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "enum": ["http", "live", "hardened"] }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "implementation": {
+            "type": "object",
+            "properties": { "status": { "const": "planned" } },
+            "required": ["status"]
+          }
+        }
+      },
+      "then": {
+        "properties": { "capabilities": { "type": "array", "maxItems": 0 } }
+      }
+    }
+  ]
+}

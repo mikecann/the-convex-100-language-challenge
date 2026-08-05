@@ -2,7 +2,11 @@
 
 An experiment to make Convex usable from 100 programming languages and measure honestly how much of a client each language can support.
 
-The project is currently in the research and architecture phase. No language counts as working until its clean Docker image passes the shared conformance suite against the approved Convex test backend.
+The repository foundation and first native client pilot now exist. Go passes the
+shared HTTP and Live suites against both the pinned local backend and the
+dedicated hosted drift target. Its badges remain candidate evidence until the
+branch passes native `linux/amd64` CI and trusted-main publishes the result
+index.
 
 ## Capability badges
 
@@ -57,5 +61,23 @@ change never renames a directory. Shared infrastructure is kept under
 Build status and verified platforms are recorded as evidence. They are not
 capability badges. A successful build alone does not mean a client can talk to
 Convex.
+
+## Docker-only commands
+
+The root script is the supported entrypoint. It invokes Docker for every build,
+test, package operation, and generated artifact.
+
+```sh
+./run doctor
+./run validate
+./run verify go
+./run verify-hosted go
+./run site-preview
+./run site-serve
+```
+
+The last two commands generate a clearly labelled local evidence preview and
+serve it at `http://127.0.0.1:4173`. `./run site` is stricter: it ignores local
+results and renders only the trusted-main result index.
 
 See the [roster methodology](roster/methodology.md), [exact proposed roster](roster/languages.yaml), [conformance contract](docs/conformance.md), and [implementation architecture](docs/architecture.md).

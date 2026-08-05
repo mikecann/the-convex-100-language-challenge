@@ -1,0 +1,20 @@
+{
+  "name": "@100-convex-clients/harness",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "validate": "node scripts/validate.mjs",
+    "selftest": "node scripts/selftest.mjs",
+    "oracle-smoke": "node scripts/oracle-smoke.mjs",
+    "pilot": "node scripts/pilot.mjs",
+    "site": "node scripts/generate-site.mjs",
+    "site-serve": "node scripts/serve-site.mjs"
+  },
+  "dependencies": {
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "convex": "1.43.0",
+    "yaml": "2.9.0"
+  }
+}

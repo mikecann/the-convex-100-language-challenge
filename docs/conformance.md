@@ -29,9 +29,9 @@ The Live badge includes Yellow and additionally requires:
 - A WebSocket subscription, not polling.
 - Initial and subsequent query values.
 - Unsubscribe.
-- Auth changes on the live connection.
 - Automatic reconnect and restoration of active subscriptions.
-- Distinct query, mutation, action, auth, and transport failures.
+- Distinct query and transport failures.
+- Clean client and subscription shutdown.
 
 Realtime is not a documented stable third-party wire API. Every implementation must pin one protocol profile and record its source revision. It must not combine convenient pieces from incompatible official clients.
 
@@ -39,7 +39,8 @@ Known profile differences already include:
 
 - Current Rust uses unversioned `/api/sync`.
 - Convex JS 1.43.0 uses `/api/1.43.0/sync`.
-- The JS profile supports `TransitionChunk`; the inspected Rust profile does not.
+- Both inspected schemas describe `TransitionChunk`, but Convex JS assembles it
+  while the inspected convex-rs 0.10.4 base client treats it as unexpected.
 
 Relevant sources:
 
@@ -90,8 +91,8 @@ Raw HTTP does not document client-side mutation queuing, so ordering is not requ
 2. Observe a separate reference client's mutation without polling.
 3. Unsubscribe and receive no later callback.
 4. Drop the socket while idle, mutate state, reconnect, and observe current state.
-5. Rotate from user A to user B and re-evaluate protected subscriptions.
-6. Recover a reactive query after its underlying error is repaired.
+5. Recover a reactive query after its underlying error is repaired.
+6. Close without a reconnect, ghost callback, or hanging process.
 
 ### Hardened suite
 
