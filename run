@@ -23,6 +23,7 @@ usage() {
     "  verify <language>   run the shared conformance pilot" \
     "  verify-hosted <language>  run the compatibility pilot against hosted Convex" \
     "  verify-all <language>  build once, then run local and hosted pilots" \
+    "  sync-examples       project canonical example sources into READMEs" \
     "  site                generate the trusted static evidence site" \
     "  site-preview        generate a clearly labelled local-evidence preview" \
     "  site-serve          serve the generated site at http://127.0.0.1:4173"
@@ -252,6 +253,20 @@ case "$command_name" in
       --env REPO_ROOT=/repo \
       100-convex-clients-harness:local \
       sh -lc 'npm run validate && npm run selftest'
+    ;;
+  sync-examples)
+    require_docker
+    build_harness
+    docker run --rm \
+      --user "$(id -u):$(id -g)" \
+      --read-only \
+      --cap-drop ALL \
+      --security-opt no-new-privileges \
+      --env REPO_ROOT=/repo \
+      --env npm_config_cache=/tmp/npm-cache \
+      --tmpfs /tmp \
+      --volume "$repo_root:/repo" \
+      100-convex-clients-harness:local npm run sync-examples
     ;;
   backend-up)
     require_docker

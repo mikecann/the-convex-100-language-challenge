@@ -4,6 +4,7 @@ import process from "node:process";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { parse } from "yaml";
+import { projectReadmeExamples } from "./example-readme.mjs";
 
 const root = process.env.REPO_ROOT ?? "/repo";
 const roster = parse(fs.readFileSync(path.join(root, "roster/languages.yaml"), "utf8"));
@@ -59,6 +60,14 @@ for (const language of roster.languages) {
   }
   if (!fs.existsSync(readmePath)) {
     errors.push(`${language.id}: missing README.md`);
+  } else {
+    const projection = projectReadmeExamples(readmePath);
+    for (const error of projection.errors) {
+      errors.push(`${language.id}: ${error}`);
+    }
+    if (projection.original !== projection.projected) {
+      errors.push(`${language.id}: README example is stale; run ./run sync-examples`);
+    }
   }
 
   const manifest = parse(fs.readFileSync(manifestPath, "utf8"));
@@ -74,6 +83,12 @@ for (const language of roster.languages) {
   }
 
   if (manifest.implementation?.status !== "planned") {
+    const projection = fs.existsSync(readmePath)
+      ? projectReadmeExamples(readmePath)
+      : { markerCount: 0 };
+    if (projection.markerCount === 0) {
+      errors.push(`${language.id}: implemented client README needs a generated example block`);
+    }
     for (const required of [
       "Dockerfile",
       "src",

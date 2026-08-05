@@ -9,7 +9,8 @@
     "oracle-smoke": "node scripts/oracle-smoke.mjs",
     "pilot": "node scripts/pilot.mjs",
     "site": "node scripts/generate-site.mjs",
-    "site-serve": "node scripts/serve-site.mjs"
+    "site-serve": "node scripts/serve-site.mjs",
+    "sync-examples": "node scripts/sync-examples.mjs"
   },
   "dependencies": {
     "ajv": "8.20.0",

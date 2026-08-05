@@ -42,6 +42,11 @@ client or subscription. Explain the operation in terms useful to someone
 learning the library, while avoiding comments on ordinary error checks or other
 obvious target-language syntax.
 
+The runnable file under `example/` is the canonical source. The evidence site
+reads that file directly, and README code blocks are generated projections
+checked by `./run validate`. Use `./run sync-examples` after editing an example;
+never maintain a second handwritten copy.
+
 Client pull requests may modify only their own `<id>/` directory. Changes under `_shared/`, `docs/`, or `roster/` belong in separate reviewed pull requests. CI path policy must enforce that split before language work is parallelized.
 
 ## Docker policy
