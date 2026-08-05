@@ -6,8 +6,8 @@ selectionTier: ranked
 implementation:
   status: attempting
   provenance: native
-  version: 0.1.0
-  notes: Native VB.NET implementation using .NET HttpClient, System.Text.Json, and ClientWebSocket. Capability badges remain empty until root-owned shared evidence passes.
+  version: 0.2.0
+  notes: Native VB.NET implementation using only .NET HttpClient, System.Text.Json, and ClientWebSocket for ordinary transport and serialization. All Convex protocol behaviour is Visual Basic. Capability badges remain empty until root-owned shared evidence passes.
 toolchain:
   name: .NET SDK
   version: 8.0.408
@@ -27,6 +27,6 @@ adapter:
     - debugDisconnect
 limitations:
   - Live is pinned to an undocumented experimental sync profile, not a stable public Convex protocol.
-  - HTTP bearer authentication is supported; Live authentication, transitions, optimistic updates, journals, and replay are deferred.
-  - Each subscription keeps at most its newest 16 values and one MiB of encoded value/error text; old intermediate values are deliberately evicted for slow consumers.
+  - HTTP bearer authentication is supported; Live authentication, optimistic updates, transition chunks, journals, and replay are deferred.
+  - Each subscription keeps at most its newest 16 events and one MiB of pessimistically encoded value, error, data, and log output; old intermediate events are deliberately evicted for slow consumers. The adapter permits at most eight subscriptions so near-limit stopped queues remain below 128 MiB.
 capabilities: []

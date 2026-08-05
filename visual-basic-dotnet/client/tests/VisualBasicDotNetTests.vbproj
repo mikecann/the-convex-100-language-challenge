@@ -3,5 +3,6 @@
   <ItemGroup>
     <Compile Remove="conformance/**;**/obj/**;**/bin/**" />
     <ProjectReference Include="../Convex.vbproj" />
+    <ProjectReference Include="conformance/Adapter.vbproj" />
   </ItemGroup>
 </Project>

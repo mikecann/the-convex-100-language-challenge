@@ -12,6 +12,11 @@ RUN dotnet build client/Convex.vbproj -c Release -warnaserror && \
     dotnet build client/tests/VisualBasicDotNetTests.vbproj -c Release -warnaserror && \
     dotnet build examples/basics/Example.vbproj -c Release -warnaserror && \
     dotnet build examples/basics/tests/ExampleTests.vbproj -c Release -warnaserror && \
+    dotnet format client/Convex.vbproj --verify-no-changes --no-restore && \
+    dotnet format client/tests/conformance/Adapter.vbproj --verify-no-changes --no-restore && \
+    dotnet format client/tests/VisualBasicDotNetTests.vbproj --verify-no-changes --no-restore && \
+    dotnet format examples/basics/Example.vbproj --verify-no-changes --no-restore && \
+    dotnet format examples/basics/tests/ExampleTests.vbproj --verify-no-changes --no-restore && \
     dotnet run --project client/tests/VisualBasicDotNetTests.vbproj -c Release --no-build && \
     dotnet run --project examples/basics/tests/ExampleTests.vbproj -c Release --no-build && \
     dotnet publish client/tests/conformance/Adapter.vbproj -c Release -o /out/adapter --no-self-contained && \
@@ -22,7 +27,15 @@ CMD ["/bin/sh", "-ec", "dotnet --info >/dev/null; test \"$(uname -m)\" = x86_64"
 
 FROM --platform=linux/amd64 ${RUNTIME} AS runtime-base
 RUN mkdir -p /opt/convex /usr/local/bin && \
-    for command in dotnet-sdk msbuild vbc csc fsc nuget npm npx node python python3 pip pip3 curl convex; do ! command -v "$command" >/dev/null 2>&1 || exit 1; done && \
+    for candidate in /usr/bin/* /usr/sbin/*; do \
+      name="${candidate##*/}"; \
+      case "$name" in \
+        '['|arch|awk|basename|base64|cat|cmp|comm|cut|dash|date|dd|df|diff|dirname|dotnet|echo|env|expr|false|grep|head|id|ldd|ln|ls|mawk|mkdir|mktemp|mv|nawk|printf|pwd|readlink|realpath|rm|rmdir|sed|sh|sleep|sort|stat|tail|test|timeout|touch|tr|true|uname|uniq|wc|xargs) ;; \
+        *) if [ ! -d "$candidate" ]; then rm -f "$candidate"; fi ;; \
+      esac; \
+    done && \
+    rm -rf /etc/apt /usr/lib/apt /usr/share/doc /usr/share/man /usr/share/perl /var/cache/apt /var/lib/apt /var/lib/dpkg && \
+    for command in apt apt-get apt-cache dpkg dpkg-query perl bash openssl wget curl dotnet-sdk msbuild vbc csc fsc nuget npm npx node python python3 pip pip3 convex; do ! command -v "$command" >/dev/null 2>&1 || exit 1; done && \
     ! dotnet build --help >/dev/null 2>&1
 USER 65532:65532
 

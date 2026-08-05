@@ -1,5 +1,6 @@
 Imports System.Net.Http
 Imports System.Net.Http.Json
+Imports System.Text.Json
 Imports System.Text.Json.Nodes
 
 Namespace ConvexVisualBasic
@@ -47,7 +48,7 @@ Namespace ConvexVisualBasic
                 request.Content = JsonContent.Create(New JsonObject From {
                     {"path", path}, {"args", args.DeepClone()}, {"format", "json"}
                 })
-                request.Headers.TryAddWithoutValidation("Convex-Client", "visual-basic-dotnet-0.1.0")
+                request.Headers.TryAddWithoutValidation("Convex-Client", "visual-basic-dotnet-0.2.0")
                 If token.Length <> 0 Then request.Headers.TryAddWithoutValidation("Authorization", "Bearer " & token)
 
                 Dim response As HttpResponseMessage
@@ -58,21 +59,28 @@ Namespace ConvexVisualBasic
                 End Try
 
                 Using response
+                    Dim body As String
+                    Try
+                        body = Await response.Content.ReadAsStringAsync().ConfigureAwait(False)
+                    Catch ex As Exception
+                        Throw New TransportException(operation, ex)
+                    End Try
+
                     Dim decoded As JsonObject
                     Try
-                        decoded = Await response.Content.ReadFromJsonAsync(Of JsonObject)().ConfigureAwait(False)
-                        If decoded Is Nothing Then Throw New InvalidOperationException("empty response")
+                        decoded = TryCast(JsonNode.Parse(body), JsonObject)
+                        If decoded Is Nothing Then Throw New JsonException("response root must be an object")
                     Catch ex As Exception
-                        Throw New TransportException(operation, New InvalidOperationException("non-Convex HTTP response", ex))
+                        Throw New ProtocolException("HTTP response was not a Convex JSON object", ex)
                     End Try
                     Dim logs = DecodeLogs(decoded)
-                    Dim status = decoded("status")?.GetValue(Of String)()
+                    Dim status = RequiredString(decoded, "status")
                     If status = "success" Then
                         If Not decoded.ContainsKey("value") Then Throw New ProtocolException("success response omitted value")
                         Return New Result(If(decoded("value") Is Nothing, Nothing, decoded("value").DeepClone()), logs)
                     End If
                     If status = "error" Then
-                        Throw New FunctionException(operation, If(decoded("errorMessage")?.GetValue(Of String)(), "Convex function failed"), decoded("errorData"), logs)
+                        Throw New FunctionException(operation, RequiredString(decoded, "errorMessage"), decoded("errorData"), logs)
                     End If
                     Throw New ProtocolException("HTTP " & CStr(CInt(response.StatusCode)) & " response has unknown status")
                 End Using
@@ -80,9 +88,32 @@ Namespace ConvexVisualBasic
         End Function
 
         Friend Shared Function DecodeLogs(message As JsonObject) As IReadOnlyList(Of String)
-            Dim values = message("logLines")?.AsArray()
-            If values Is Nothing Then Return Array.Empty(Of String)()
-            Return values.Select(Function(value) If(value Is Nothing, "", value.GetValue(Of String)())).ToArray()
+            If Not message.ContainsKey("logLines") Then Return Array.Empty(Of String)()
+            Dim values = TryCast(message("logLines"), JsonArray)
+            If values Is Nothing Then Throw New ProtocolException("logLines must be an array")
+            Dim logs As New List(Of String)(values.Count)
+            For Each value In values
+                If value Is Nothing Then Throw New ProtocolException("logLines must contain strings")
+                Try
+                    logs.Add(value.GetValue(Of String)())
+                Catch ex As Exception
+                    Throw New ProtocolException("logLines must contain strings", ex)
+                End Try
+            Next
+            Return logs
+        End Function
+
+        Private Shared Function RequiredString(message As JsonObject, name As String) As String
+            If Not message.ContainsKey(name) OrElse message(name) Is Nothing Then Throw New ProtocolException(name & " is required")
+            Try
+                Dim value = message(name).GetValue(Of String)()
+                If String.IsNullOrEmpty(value) Then Throw New ProtocolException(name & " is required")
+                Return value
+            Catch ex As ProtocolException
+                Throw
+            Catch ex As Exception
+                Throw New ProtocolException(name & " must be a string", ex)
+            End Try
         End Function
 
         Private Sub EnsureOpen()
@@ -129,6 +160,9 @@ Namespace ConvexVisualBasic
             Inherits Exception
             Public Sub New(message As String)
                 MyBase.New(message)
+            End Sub
+            Public Sub New(message As String, inner As Exception)
+                MyBase.New(message, inner)
             End Sub
         End Class
     End Class

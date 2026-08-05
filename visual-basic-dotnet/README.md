@@ -40,35 +40,35 @@ Module Program
 
         ' The native HTTP and Live clients are both cleaned up if one observation fails.
         Using client As New ConvexClient(url)
-        Using live As New LiveClient(url)
-            ' HTTP is the initial source of truth before opening the reactive query.
-            Dim before = CountValue.Read((Await client.Query("demo:state", roomArgs)).Value, "current query")
+            Using live As New LiveClient(url)
+                ' HTTP is the initial source of truth before opening the reactive query.
+                Dim before = CountValue.Read((Await client.Query("demo:state", roomArgs)).Value, "current query")
 
-            ' Start Live before the mutation so its first value establishes the observation point.
-            Using subscription = Await live.Subscribe("demo:state", roomArgs)
-                Dim initial = CountValue.Read(subscription.Next(TimeSpan.FromSeconds(10)), "initial Live value")
-                If initial <> before Then Throw New InvalidOperationException("Live initial value disagreed")
+                ' Start Live before the mutation so its first value establishes the observation point.
+                Using subscription = Await live.Subscribe("demo:state", roomArgs)
+                    Dim initial = CountValue.Read(subscription.Next(TimeSpan.FromSeconds(10)), "initial Live value")
+                    If initial <> before Then Throw New InvalidOperationException("Live initial value disagreed")
 
-                ' runId makes retries idempotent and lets the backend report whether it applied this increment.
-                Dim mutation = Await client.Mutation("demo:increment", New JsonObject From {
-                    {"room", room}, {"language", "visual-basic-dotnet"}, {"runId", Guid.NewGuid().ToString()}
-                })
-                Dim mutationValue = mutation.Value?.AsObject()
-                If mutationValue Is Nothing OrElse Not mutationValue("applied").GetValue(Of Boolean)() Then Throw New InvalidOperationException("mutation was not applied")
-                Dim after = CountValue.Read(mutationValue("state"), "mutation")
-                If after <> before + 1 Then Throw New InvalidOperationException("mutation count was unexpected")
+                    ' runId makes retries idempotent and lets the backend report whether it applied this increment.
+                    Dim mutation = Await client.Mutation("demo:increment", New JsonObject From {
+                        {"room", room}, {"language", "visual-basic-dotnet"}, {"runId", Guid.NewGuid().ToString()}
+                    })
+                    Dim mutationValue = mutation.Value?.AsObject()
+                    If mutationValue Is Nothing OrElse Not mutationValue("applied").GetValue(Of Boolean)() Then Throw New InvalidOperationException("mutation was not applied")
+                    Dim after = CountValue.Read(mutationValue("state"), "mutation")
+                    If after <> before + 1 Then Throw New InvalidOperationException("mutation count was unexpected")
 
-                ' The second Live value must agree with the mutation before stdout records the universal transcript.
-                Dim updated = CountValue.Read(subscription.Next(TimeSpan.FromSeconds(10)), "updated Live value")
-                If updated <> after Then Throw New InvalidOperationException("Live update disagreed")
-                Console.WriteLine("current count: " & before)
-                Console.WriteLine("live initial count: " & initial)
-                Console.WriteLine("mutation applied: true")
-                Console.WriteLine("mutation count: " & after)
-                Console.WriteLine("live updated count: " & updated)
-                Console.WriteLine("verified count: " & before & " -> " & updated)
+                    ' The second Live value must agree with the mutation before stdout records the universal transcript.
+                    Dim updated = CountValue.Read(subscription.Next(TimeSpan.FromSeconds(10)), "updated Live value")
+                    If updated <> after Then Throw New InvalidOperationException("Live update disagreed")
+                    Console.WriteLine("current count: " & before)
+                    Console.WriteLine("live initial count: " & initial)
+                    Console.WriteLine("mutation applied: true")
+                    Console.WriteLine("mutation count: " & after)
+                    Console.WriteLine("live updated count: " & updated)
+                    Console.WriteLine("verified count: " & before & " -> " & updated)
+                End Using
             End Using
-        End Using
         End Using
     End Function
 End Module
@@ -92,11 +92,17 @@ Live uses the pinned `convex-rs-0.10.4-unversioned-sync` profile at `/api/sync`.
 The test-only adapter speaks NDJSON v1 on stdin/stdout or `ADAPTER_LISTEN`, and
 offers `debugDisconnect` so the shared harness can prove reconnects. One
 owner loop serializes the socket, query-set versions, and reconnects. The
-delivery buffer bounds both item count and encoded size.
+delivery buffer retains the deterministic newest 16 events and bounds their
+pessimistically encoded value, error, data, and log output to one MiB per
+subscription. The adapter limits a process to eight subscriptions so stopped
+near-limit queues remain below the shared 128 MiB process ceiling.
 
 ## Limitations
 
 The sync profile is not a documented stable API. Live authentication,
 optimistic updates, transition chunks, journals, and replay are intentionally
 deferred. No capability badge is claimed until shared local and hosted evidence
-is run from a reviewed commit.
+is run from a reviewed commit. The final image keeps the .NET 8 runtime, TLS
+libraries and CA roots, `/bin/sh`, and the verifier's basic POSIX text tools. It
+contains no SDK, compiler, package manager, Perl, Node.js, Python, curl, Convex
+CLI, or delegated client runtime.
