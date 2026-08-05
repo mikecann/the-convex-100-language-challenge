@@ -29,3 +29,9 @@ _convex_call() {
 convex_query() { _convex_call query "$@" | jq -c .value; }
 convex_mutation() { _convex_call mutation "$@" | jq -c .value; }
 convex_action() { _convex_call action "$@" | jq -c .value; }
+
+# Convex JSON numbers are represented as decimals. Teaching examples need a
+# stable whole-number transcript, including the valid 0.0 representation.
+convex_whole_number() {
+  jq -er 'if type == "number" and floor == . then tostring | sub("\\.0$"; "") else error("expected a whole JSON number") end' <<<"$1"
+}

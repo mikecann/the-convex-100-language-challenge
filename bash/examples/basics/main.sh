@@ -6,7 +6,7 @@ source "$(cd -- "$(dirname -- "$0")/../../client" && pwd)/convex.sh"
 source "$(cd -- "$(dirname -- "$0")/../../client" && pwd)/live.sh"
 room=${1:-bash-example}
 require_convex_url
-whole() { jq -er '.count | if floor == . then tostring | sub("\\.0$"; "") else error("count must be whole") end' <<<"$1"; }
+whole() { convex_whole_number "$(jq -c .count <<<"$1")"; }
 
 # First obtain the authoritative HTTP snapshot.
 before=$(convex_query demo:state "$(jq -cn --arg room "$room" '{room:$room}')")
