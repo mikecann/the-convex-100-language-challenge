@@ -483,15 +483,21 @@ function Manager:_transition(message)
 			if type(modification.errorMessage) ~= "string" then
 				return nil, failure("ProtocolError", "QueryFailed omitted errorMessage")
 			end
-		elseif modification.type ~= "QueryRemoved" then
+		elseif modification.type == "QueryRemoved" then
+			if modification.logLines ~= nil then
+				return nil, failure("ProtocolError", "QueryRemoved must not include logLines")
+			end
+		else
 			return nil, failure("ProtocolError", "unknown Transition modification " .. tostring(modification.type))
 		end
-		if not json.is_array(modification.logLines) then
-			return nil, failure("ProtocolError", "Transition logLines must be an array")
-		end
-		for _, line in ipairs(modification.logLines) do
-			if type(line) ~= "string" then
-				return nil, failure("ProtocolError", "Transition logLines entries must be strings")
+		if modification.type == "QueryUpdated" or modification.type == "QueryFailed" then
+			if not json.is_array(modification.logLines) then
+				return nil, failure("ProtocolError", "Transition logLines must be an array")
+			end
+			for _, line in ipairs(modification.logLines) do
+				if type(line) ~= "string" then
+					return nil, failure("ProtocolError", "Transition logLines entries must be strings")
+				end
 			end
 		end
 	end
@@ -506,11 +512,12 @@ function Manager:_transition(message)
 	end
 	for _, modification in ipairs(message.modifications) do
 		local query_id = modification.queryId
-		local logs = copy(modification.logLines)
 		if modification.type == "QueryUpdated" then
+			local logs = copy(modification.logLines)
 			changed[query_id] = { value = copy(modification.value), logs = logs }
 			next_results[query_id] = changed[query_id]
 		elseif modification.type == "QueryFailed" then
+			local logs = copy(modification.logLines)
 			local err = failure("FunctionError", modification.errorMessage, copy(modification.errorData), logs)
 			changed[query_id] = { error = err, logs = err.logs }
 			next_results[query_id] = changed[query_id]

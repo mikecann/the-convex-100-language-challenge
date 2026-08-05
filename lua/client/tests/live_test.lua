@@ -286,6 +286,30 @@ assert_equal(assert(subscription:next_update(2)).value.count, 0, "post-backoff h
 assert_equal(manager.next_backoff, 0.1, "healthy handshake resets transport backoff")
 assert(manager:close())
 
+-- Convex protocol 0.10.4 sends QueryRemoved with only its type and queryId.
+-- Accept that canonical shape without manufacturing a log array, advance the
+-- version atomically, and remove the cached result without a stale delivery.
+server = server_for_updates()
+manager = Live.Manager.new("http://unit.test", "lua-test", {
+	websocket_factory = function()
+		return server:new_socket()
+	end,
+})
+subscription = assert(manager:subscribe("demo:state", { room = "canonical-query-removed" }))
+assert_equal(assert(subscription:next_update(1)).value.count, 0)
+socket = server.connections[1]
+socket.incoming[#socket.incoming + 1] = transition(1, 1, "AQAAAAAAAAA=", "AgAAAAAAAAA=", {
+	type = "QueryRemoved",
+	queryId = subscription.query_id,
+})
+assert(manager:_receive())
+assert_equal(manager.remote_version.querySet, 1, "QueryRemoved changed query-set version")
+assert_equal(manager.remote_version.ts, "AgAAAAAAAAA=", "QueryRemoved did not advance timestamp")
+assert(manager.remote_results[subscription.query_id] == nil, "QueryRemoved retained the cached result")
+assert_equal(manager.max_observed_timestamp, "AgAAAAAAAAA=", "QueryRemoved did not advance max timestamp")
+assert(subscription:try_next_update() == nil, "QueryRemoved emitted a stale subscription value")
+assert(manager:close())
+
 -- dkjson distinguishes JSON arrays and objects with metatables. Reject an
 -- object-shaped modifications field, object-shaped logLines, and non-string
 -- log entries before advancing any version, cached result, timestamp, backoff,
@@ -341,6 +365,28 @@ local malformed_transitions = {
 			logLines = { "valid", 7 },
 		}),
 		error_pattern = "logLines entries must be strings",
+	},
+	{
+		label = "valid update before QueryRemoved with logLines",
+		message = {
+			type = "Transition",
+			startVersion = { querySet = 1, identity = 0, ts = "AQAAAAAAAAA=" },
+			endVersion = { querySet = 1, identity = 0, ts = "AgAAAAAAAAA=" },
+			modifications = {
+				{
+					type = "QueryUpdated",
+					queryId = subscription.query_id,
+					value = { count = 99 },
+					logLines = {},
+				},
+				{
+					type = "QueryRemoved",
+					queryId = subscription.query_id,
+					logLines = {},
+				},
+			},
+		},
+		error_pattern = "QueryRemoved must not include logLines",
 	},
 }
 for _, fixture in ipairs(malformed_transitions) do
