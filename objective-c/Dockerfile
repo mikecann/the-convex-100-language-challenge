@@ -98,16 +98,18 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
       /usr/libexec/dpkg /usr/share/dpkg /usr/share/debconf \
       /usr/lib/*/perl /usr/lib/perl /usr/lib/perl5 /usr/share/perl \
       /usr/share/perl5 /usr/share/doc/apt /usr/share/doc/dpkg \
-      /etc/alternatives /etc/cron.daily/apt-compat /etc/cron.daily/dpkg \
-      /etc/debconf.conf /etc/init.d /etc/logrotate.d/alternatives \
-      /etc/logrotate.d/apt /etc/logrotate.d/dpkg /etc/rc0.d /etc/rc1.d \
+      /etc/alternatives /etc/cron.d /etc/cron.daily /etc/cron.hourly \
+      /etc/cron.monthly /etc/cron.weekly /etc/crontab /etc/debconf.conf \
+      /etc/init.d /etc/logrotate.conf /etc/logrotate.d /etc/rc0.d /etc/rc1.d \
       /etc/rc2.d /etc/rc3.d /etc/rc4.d /etc/rc5.d /etc/rc6.d \
       /etc/rcS.d /etc/systemd /usr/lib/systemd /usr/share/systemd \
       /var/lib/systemd /usr/share/bash-completion /usr/share/bug \
       /usr/share/doc/debconf /usr/share/doc/libapt-pkg6.0 \
       /usr/share/doc/libdebconfclient0 /usr/share/lintian/profiles/dpkg \
       /usr/share/polkit-1/actions/org.dpkg.pkexec.update-alternatives.policy \
-      /var/cache/ldconfig /var/log/dpkg.log && \
+      /usr/share/doc/cron /usr/share/doc/cron-daemon-common \
+      /usr/share/doc/logrotate /var/cache/ldconfig /var/lib/logrotate \
+      /var/log/cron /var/log/dpkg.log /var/spool/cron && \
     rm -f /usr/lib/*/libapt-pkg.so* /usr/lib/*/libapt-private.so* \
       /usr/lib/*/libdebconfclient.so* && \
     ln -sf mawk /usr/bin/awk && \
@@ -130,6 +132,7 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
       -o -name 'update-shells' -o -name 'ischroot' -o -name 'run-parts' \
       -o -name 'savelog' -o -name 'tempfile' -o -name 'iconvconfig' \
       -o -name 'ldconfig' -o -name 'shadowconfig' -o -name 'c_rehash' \
+      -o -name 'cron*' -o -name 'crontab' -o -name 'logrotate*' \
       \) -print)" && \
     if test -n "$package_artifacts"; then \
       printf '%s\n' "$package_artifacts" >&2; \
