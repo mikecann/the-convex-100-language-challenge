@@ -36,6 +36,9 @@ RUN cd out/runtime \
       org.codehaus.groovy.tools.FileSystemCompiler --version
 
 FROM build AS test
+# Keep the adversarial stopped-reader and 130-subscription proof inside the
+# same 128 MiB JVM envelope as the final adapter and example images.
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAM=96m -Xms8m -Xmx24m -Xss256k -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -XX:MaxMetaspaceSize=24m -XX:CompressedClassSpaceSize=16m -XX:MaxDirectMemorySize=8m -XX:ReservedCodeCacheSize=4m"
 # This repository-local lint gate rejects compressed multi-statement teaching
 # source, tabs, trailing whitespace, and accidental overlong lines.
 RUN java -ea -cp 'out/tests:out/client:out/adapter:out/example:/opt/groovy/lib/*' \
@@ -52,6 +55,9 @@ COPY --from=jre /opt/java/openjdk /opt/java/openjdk
 COPY --from=jre /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ENV JAVA_HOME=/opt/java/openjdk
 ENV PATH=/opt/java/openjdk/bin:/usr/local/bin:/usr/bin:/bin
+# These are part of the runtime contract, not reviewer-only flags. They leave
+# room for TLS, direct buffers, threads, and native JVM bookkeeping at 128 MiB.
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAM=96m -Xms8m -Xmx24m -Xss256k -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -XX:MaxMetaspaceSize=24m -XX:CompressedClassSpaceSize=16m -XX:MaxDirectMemorySize=8m -XX:ReservedCodeCacheSize=4m"
 RUN set -eu; \
     mkdir /restricted-tools; \
     for tool in dash mawk basename cat cmp cut env grep head id sed sort tail tr uname wc; do \

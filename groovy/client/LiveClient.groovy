@@ -32,6 +32,11 @@ final class LiveClient implements AutoCloseable {
   static final int MAX_INCOMING_EVENTS = 32
   static final int MAX_INCOMING_BYTES = 4 * 1024 * 1024
   static final int MAX_MESSAGE_BYTES = 2 * 1024 * 1024
+  // This is deliberately a process-wide budget, not a per-subscription one.
+  // It includes callback events waiting for the owner and delivery events
+  // waiting for consumers, leaving generous JVM headroom below 128 MiB.
+  static final int MAX_BUFFERED_EVENTS = 128
+  static final int MAX_BUFFERED_BYTES = 12 * 1024 * 1024
 
   private static final Duration HANDSHAKE_TIMEOUT = Duration.ofSeconds(5)
   private static final Duration WRITE_TIMEOUT = Duration.ofSeconds(2)
@@ -41,7 +46,11 @@ final class LiveClient implements AutoCloseable {
   private final HttpClient http
   private final ScheduledExecutorService owner
   private final LinkedHashMap<Integer, Subscription> subscriptions = [:]
-  private final IncomingBuffer incoming = new IncomingBuffer()
+  private final DeliveryBudget deliveryBudget = new DeliveryBudget(
+    MAX_BUFFERED_EVENTS,
+    MAX_BUFFERED_BYTES,
+  )
+  private final IncomingBuffer incoming = new IncomingBuffer(deliveryBudget)
 
   private int nextId = 0
   private int querySetVersion = 0
@@ -256,6 +265,11 @@ final class LiveClient implements AutoCloseable {
       active.sendText(JsonOutput.toJson(message), true)
         .get(WRITE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
     } catch (Exception error) {
+      // A completed send future is the only proof that the JDK accepted this
+      // protocol write. Timeout or failure leaves the peer's query-set state
+      // ambiguous, so this owner immediately aborts that generation and
+      // reconnects from the subscriptions it still owns.
+      retireConnection('WriteFailed:' + concise(error), true)
       throw new ConvexClient.TransportException('live write', error)
     }
   }
@@ -605,6 +619,9 @@ final class LiveClient implements AutoCloseable {
   private void retireConnection(String reason, boolean reconnect) {
     WebSocket previous = socket
     socket = null
+    // Invalidate late callbacks before aborting. JDK may report onClose and
+    // onError after abort; neither may affect a replacement connection.
+    socketGeneration++
     pendingConnect?.cancel(true)
     pendingConnect = null
     handshakeDeadline?.cancel(false)
@@ -647,6 +664,14 @@ final class LiveClient implements AutoCloseable {
     pendingConnect = null
     handshakeDeadline?.cancel(false)
     handshakeDeadline = null
+  }
+
+  int bufferedDeliveryEvents() {
+    deliveryBudget.eventCount()
+  }
+
+  int bufferedDeliveryBytes() {
+    deliveryBudget.byteCount()
   }
 
   private static Map zeroVersion() {
@@ -749,6 +774,7 @@ final class LiveClient implements AutoCloseable {
     final Map args
     private final ArrayDeque<Update> updates = new ArrayDeque<>()
     private final ArrayDeque<Integer> sizes = new ArrayDeque<>()
+    private final DeliveryBudget budget
     private int bytes = 0
     private boolean closed = false
     private boolean hydrationPending = false
@@ -759,6 +785,10 @@ final class LiveClient implements AutoCloseable {
       this.queryId = queryId
       this.path = path
       this.args = args
+      budget = manager?.deliveryBudget ?: new DeliveryBudget(
+        MAX_EVENTS,
+        MAX_ENCODED_BYTES,
+      )
     }
 
     synchronized void beginHydration() {
@@ -811,8 +841,37 @@ final class LiveClient implements AutoCloseable {
     private void enqueueSized(Update update, int size) {
       while (!updates.isEmpty() &&
         (updates.size() >= MAX_EVENTS || bytes + size > MAX_ENCODED_BYTES)) {
-        bytes -= sizes.removeFirst()
+        int removed = sizes.removeFirst()
+        bytes -= removed
         updates.removeFirst()
+        budget.release(removed)
+      }
+      if (!budget.reserve(size)) {
+        // Never let many individually legal subscription queues accumulate
+        // into an unbounded process. The live owner keeps running and the
+        // consumer sees a precise failure once it drains its prior values.
+        Update overflow = new Update(
+          null,
+          new ConvexClient.ProtocolException('Live delivery budget exceeded'),
+          update.logs,
+        )
+        int overflowSize = 512
+        boolean reservedOverflow = budget.reserve(overflowSize)
+        while (!updates.isEmpty() && !reservedOverflow) {
+          int removed = sizes.removeFirst()
+          bytes -= removed
+          updates.removeFirst()
+          budget.release(removed)
+          reservedOverflow = budget.reserve(overflowSize)
+        }
+        if (!reservedOverflow) {
+          return
+        }
+        updates.addLast(overflow)
+        sizes.addLast(overflowSize)
+        bytes += overflowSize
+        notifyAll()
+        return
       }
       updates.addLast(update)
       sizes.addLast(size)
@@ -832,8 +891,11 @@ final class LiveClient implements AutoCloseable {
       if (updates.isEmpty()) {
         throw new IllegalStateException('Live subscription is closed')
       }
-      bytes -= sizes.removeFirst()
-      updates.removeFirst()
+      int removed = sizes.removeFirst()
+      bytes -= removed
+      Update update = updates.removeFirst()
+      budget.release(removed)
+      update
     }
 
     Object next(Duration timeout) {
@@ -846,6 +908,7 @@ final class LiveClient implements AutoCloseable {
 
     synchronized void finish() {
       closed = true
+      sizes.each { budget.release(it) }
       updates.clear()
       sizes.clear()
       bytes = 0
@@ -872,33 +935,78 @@ final class LiveClient implements AutoCloseable {
     }
   }
 
+  static final class DeliveryBudget {
+    private final int maxEvents
+    private final int maxBytes
+    private int events = 0
+    private int bytes = 0
+
+    DeliveryBudget(int maxEvents, int maxBytes) {
+      this.maxEvents = maxEvents
+      this.maxBytes = maxBytes
+    }
+
+    synchronized boolean reserve(int size) {
+      if (size < 0 || events >= maxEvents || bytes + size > maxBytes) {
+        return false
+      }
+      events++
+      bytes += size
+      true
+    }
+
+    synchronized void release(int size) {
+      events--
+      bytes -= size
+      assert events >= 0 && bytes >= 0: 'delivery budget accounting underflow'
+    }
+
+    synchronized int eventCount() { events }
+
+    synchronized int byteCount() { bytes }
+  }
+
   private static final class IncomingBuffer {
     private final ArrayBlockingQueue<SocketEvent> events =
       new ArrayBlockingQueue<>(MAX_INCOMING_EVENTS)
     private final AtomicBoolean drainScheduled = new AtomicBoolean(false)
+    private final DeliveryBudget budget
     private int bytes = 0
 
+    IncomingBuffer(DeliveryBudget budget) {
+      this.budget = budget
+    }
+
     synchronized boolean offer(SocketEvent event, int encodedBytes) {
-      if (encodedBytes > MAX_INCOMING_BYTES || bytes + encodedBytes > MAX_INCOMING_BYTES) {
+      int accounted = encodedBytes + 256
+      if (accounted > MAX_INCOMING_BYTES || bytes + accounted > MAX_INCOMING_BYTES ||
+        !budget.reserve(accounted)) {
         return false
       }
       if (!events.offer(event)) {
+        budget.release(accounted)
         return false
       }
-      bytes += encodedBytes
+      bytes += accounted
       true
     }
 
     synchronized void forceError(SocketEvent event) {
+      events.each { budget.release(it.encodedBytes() + 256) }
       events.clear()
       bytes = 0
-      events.offer(event)
+      if (budget.reserve(event.encodedBytes() + 256)) {
+        events.offer(event)
+        bytes = event.encodedBytes() + 256
+      }
     }
 
     synchronized SocketEvent poll() {
       SocketEvent event = events.poll()
       if (event != null) {
-        bytes -= event.encodedBytes()
+        int accounted = event.encodedBytes() + 256
+        bytes -= accounted
+        budget.release(accounted)
       }
       event
     }
@@ -916,6 +1024,7 @@ final class LiveClient implements AutoCloseable {
     }
 
     synchronized void clear() {
+      events.each { budget.release(it.encodedBytes() + 256) }
       events.clear()
       bytes = 0
     }

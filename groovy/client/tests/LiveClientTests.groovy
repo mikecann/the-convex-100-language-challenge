@@ -21,6 +21,7 @@ final class LiveClientTests {
     peerCloseReasonCarriesToReconnect()
     closeIsBoundedDuringStalledHandshake()
     closeIsBoundedWhilePeerContinuouslySends()
+    globalDeliveryBudgetCaps130StoppedSubscriptions()
   }
 
   private static void addInitialExternalAndRemove() {
@@ -410,6 +411,27 @@ final class LiveClientTests {
     long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
     assert elapsed < 3_000: "close was unbounded under continuous input: ${elapsed}ms"
     finish(listener, server, failure)
+  }
+
+  private static void globalDeliveryBudgetCaps130StoppedSubscriptions() {
+    LiveClient live = new LiveClient('http://127.0.0.1:1')
+    List<LiveClient.Subscription> subscriptions = (0..<130).collect { int id ->
+      new LiveClient.Subscription(live, id, 'demo:state', [room: "pressure-${id}"])
+    }
+    // Each update is legal on its own. A stopped consumer across 130 queues
+    // must still remain under one manager-wide byte and count envelope.
+    String nearLimit = 'x' * (96 * 1024 - 1024)
+    subscriptions.each {
+      it.offer(new LiveClient.Update([payload: nearLimit], null, []))
+    }
+    assert live.bufferedDeliveryEvents() <= LiveClient.MAX_BUFFERED_EVENTS
+    assert live.bufferedDeliveryBytes() <= LiveClient.MAX_BUFFERED_BYTES
+    assert live.bufferedDeliveryBytes() < 16 * 1024 * 1024
+
+    subscriptions.each { it.finish() }
+    assert live.bufferedDeliveryEvents() == 0
+    assert live.bufferedDeliveryBytes() == 0
+    live.close()
   }
 
   private static Map version(int querySet, String timestamp) {
