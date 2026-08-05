@@ -99,7 +99,7 @@ image_policy() {
   )
 
   case "$target_runtime" in
-    "" | node | python | python3) ;;
+    "" | node | php | python | python3) ;;
     *)
       printf '%s\n' "Unsupported target runtime command: $target_runtime" >&2
       exit 1
@@ -131,7 +131,7 @@ image_policy() {
           exit 1
         fi
       fi
-      for command_name in node python python3; do
+      for command_name in node php python python3; do
         if test "$command_name" = "$TARGET_RUNTIME_COMMAND"; then
           continue
         fi
@@ -140,7 +140,7 @@ image_policy() {
           exit 1
         fi
       done
-      for command_name in npm npx corepack pip pip3 pip3.13 curl convex; do
+      for command_name in npm npx corepack composer pear pecl phpize php-config pip pip3 pip3.13 curl convex; do
         if command -v "$command_name" >/dev/null 2>&1; then
           printf "%s\n" "Unexpected package or delegation tool in final image: $command_name" >&2
           exit 1
