@@ -86,6 +86,9 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
       /usr/sbin/installkernel /usr/sbin/pam-auth-update \
       /usr/sbin/update-ca-certificates /usr/sbin/update-passwd \
       /usr/sbin/add-shell /usr/sbin/remove-shell /usr/sbin/update-shells \
+      /usr/bin/ischroot /usr/bin/run-parts /usr/bin/savelog \
+      /usr/bin/tempfile /usr/sbin/iconvconfig /usr/sbin/ldconfig \
+      /usr/sbin/shadowconfig \
       /usr/bin/openssl /usr/bin/c_rehash \
       /usr/bin/perl /usr/bin/perl[0-9]* /usr/bin/cpan* /usr/bin/corelist \
       /usr/bin/instmodsh /usr/bin/json_pp /usr/bin/perlbug /usr/bin/perldoc \
@@ -94,15 +97,28 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
       /var/lib/dpkg /var/cache/debconf /usr/lib/apt /usr/lib/dpkg \
       /usr/libexec/dpkg /usr/share/dpkg /usr/share/debconf \
       /usr/lib/*/perl /usr/lib/perl /usr/lib/perl5 /usr/share/perl \
-      /usr/share/perl5 /usr/share/doc/apt /usr/share/doc/dpkg && \
+      /usr/share/perl5 /usr/share/doc/apt /usr/share/doc/dpkg \
+      /etc/alternatives /etc/cron.daily/apt-compat /etc/cron.daily/dpkg \
+      /etc/debconf.conf /etc/init.d /etc/logrotate.d/alternatives \
+      /etc/logrotate.d/apt /etc/logrotate.d/dpkg /etc/rc0.d /etc/rc1.d \
+      /etc/rc2.d /etc/rc3.d /etc/rc4.d /etc/rc5.d /etc/rc6.d \
+      /etc/rcS.d /etc/systemd /usr/lib/systemd /usr/share/systemd \
+      /var/lib/systemd /usr/share/bash-completion /usr/share/bug \
+      /usr/share/doc/debconf /usr/share/doc/libapt-pkg6.0 \
+      /usr/share/doc/libdebconfclient0 /usr/share/lintian/profiles/dpkg \
+      /usr/share/polkit-1/actions/org.dpkg.pkexec.update-alternatives.policy \
+      /var/cache/ldconfig /var/log/dpkg.log && \
+    rm -f /usr/lib/*/libapt-pkg.so* /usr/lib/*/libapt-private.so* \
+      /usr/lib/*/libdebconfclient.so* && \
+    ln -sf mawk /usr/bin/awk && \
     rm -rf /tmp && ln -s /dev/shm /tmp && \
     hash -r && \
     test ! -e /bin/busybox && \
-    for required in sh id grep sed awk cat; do command -v "$required" >/dev/null; done && \
-    for forbidden in busybox wget nc netcat telnet ftp openssl c_rehash apt apt-get apt-cache dpkg dpkg-query dpkg-reconfigure dpkg-preconfigure debconf debconf-communicate update-alternatives invoke-rc.d service start-stop-daemon update-rc.d installkernel pam-auth-update update-ca-certificates update-passwd add-shell remove-shell update-shells perl clang gcc make curl node npm npx python python3 pip pip3 convex; do \
+    for required in sh dash id grep sed awk mawk cat; do command -v "$required" >/dev/null; done && \
+    for forbidden in busybox wget nc netcat telnet ftp openssl c_rehash apt apt-get apt-cache apt-config apt-cdrom apt-key apt-mark dpkg dpkg-deb dpkg-divert dpkg-maintscript-helper dpkg-query dpkg-realpath dpkg-split dpkg-statoverride dpkg-trigger dpkg-reconfigure dpkg-preconfigure dpkg-fsys-usrunmess debconf debconf-apt-progress debconf-communicate debconf-copydb debconf-escape debconf-set-selections debconf-show deb-systemd-helper deb-systemd-invoke update-alternatives invoke-rc.d policy-rc.d service start-stop-daemon update-rc.d installkernel pam-auth-update update-ca-certificates update-passwd add-shell remove-shell update-shells ischroot run-parts savelog tempfile iconvconfig ldconfig shadowconfig perl clang gcc make curl node npm npx python python3 pip pip3 convex; do \
       if command -v "$forbidden" >/dev/null 2>&1; then exit 1; fi; \
     done && \
-    test -z "$(find /usr/bin /usr/sbin -xdev -type f -perm /111 \
+    package_artifacts="$(find /etc /usr /var -xdev \
       \( -name 'apt' -o -name 'apt-*' -o -name 'dpkg' -o -name 'dpkg-*' \
       -o -name 'debconf' -o -name 'debconf-*' -o -name 'deb-systemd-*' \
       -o -name 'update-alternatives' -o -name 'invoke-rc.d' \
@@ -111,7 +127,21 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
       -o -name 'installkernel' -o -name 'pam-auth-update' \
       -o -name 'update-ca-certificates' -o -name 'update-passwd' \
       -o -name 'add-shell' -o -name 'remove-shell' \
-      -o -name 'update-shells' -o -name 'c_rehash' \) -print)"
+      -o -name 'update-shells' -o -name 'ischroot' -o -name 'run-parts' \
+      -o -name 'savelog' -o -name 'tempfile' -o -name 'iconvconfig' \
+      -o -name 'ldconfig' -o -name 'shadowconfig' -o -name 'c_rehash' \
+      \) -print)" && \
+    if test -n "$package_artifacts"; then \
+      printf '%s\n' "$package_artifacts" >&2; \
+      exit 1; \
+    fi && \
+    find /usr/bin /usr/sbin -xdev \( -type f -o -type l \) \
+      ! -name sh ! -name dash ! -name id ! -name grep ! -name sed \
+      ! -name awk ! -name mawk ! -name cat -delete && \
+    for candidate in /usr/bin/* /usr/sbin/*; do \
+      if test ! -e "$candidate" && test ! -L "$candidate"; then continue; fi; \
+      case "${candidate##*/}" in sh|dash|id|grep|sed|awk|mawk|cat) ;; *) exit 1 ;; esac; \
+    done
 USER 65532:65532
 
 FROM runtime-base AS example-runtime
