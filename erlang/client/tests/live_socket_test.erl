@@ -20,6 +20,7 @@ main() ->
     stalled_handshake_and_partial_frame_are_bounded(),
     continuous_peer_close_is_bounded(),
     same_id_replacement_barrier(),
+    sequential_adapter_subscriptions_recreate_owner(),
     tcp_partial_ndjson_and_eof_cleanup(),
     io:format("live socket tests passed~n").
 
@@ -821,6 +822,68 @@ same_id_replacement_barrier() ->
     true = os:unsetenv("ADAPTER_LISTEN"),
     true = os:unsetenv("CONVEX_URL"),
     true = os:unsetenv("ADAPTER_TEST_RELAY_GATE").
+
+%% The shared controller keeps one TCP adapter alive across every Live case.
+%% When the final relay is removed, the next subscription must not inherit a
+%% socket that Gun is still closing. Exercise that exact two-room sequence.
+sequential_adapter_subscriptions_recreate_owner() ->
+    Parent = self(),
+    {Url, _} = fixture(fun(Listen) ->
+        FirstSocket = accept_ws(Listen),
+        {_Connect1, FirstId} = read_connect_add(FirstSocket),
+        send_text(FirstSocket,
+                  transition(version(0, ?INITIAL_TS), version(1, timestamp(1)),
+                             [updated(FirstId, #{<<"count">> => 0})])),
+        FirstRemove = read_json(FirstSocket),
+        <<"Remove">> = modification_type(FirstRemove),
+        wait_closed(FirstSocket),
+        Parent ! first_owner_retired,
+
+        SecondSocket = accept_ws(Listen),
+        {_Connect2, SecondId} = read_connect_add(SecondSocket),
+        send_text(SecondSocket,
+                  transition(version(0, ?INITIAL_TS), version(1, timestamp(1)),
+                             [updated(SecondId, #{<<"count">> => 0})])),
+        SecondRemove = read_json(SecondSocket),
+        <<"Remove">> = modification_type(SecondRemove),
+        wait_closed(SecondSocket)
+    end),
+    Port = free_port(),
+    Address = "127.0.0.1:" ++ integer_to_list(Port),
+    true = os:putenv("ADAPTER_LISTEN", Address),
+    true = os:putenv("CONVEX_URL", Url),
+    {Pid, Monitor} = spawn_monitor(fun adapter:main/0),
+    Controller = connect_line_retry(Port, 50),
+    send_ndjson(Controller,
+                #{<<"id">> => <<"first-subscribe">>, <<"op">> => <<"subscribe">>,
+                  <<"subscriptionId">> => <<"first">>, <<"path">> => <<"demo:state">>,
+                  <<"args">> => #{}}),
+    #{<<"id">> := <<"first-subscribe">>, <<"type">> := <<"ack">>} = read_ndjson(Controller),
+    #{<<"subscriptionId">> := <<"first">>,
+      <<"value">> := #{<<"count">> := 0}} = read_ndjson(Controller),
+    send_ndjson(Controller,
+                #{<<"id">> => <<"first-unsubscribe">>, <<"op">> => <<"unsubscribe">>,
+                  <<"subscriptionId">> => <<"first">>}),
+    #{<<"id">> := <<"first-unsubscribe">>, <<"type">> := <<"ack">>} = read_ndjson(Controller),
+    receive first_owner_retired -> ok after 2000 -> erlang:error(first_owner_retirement_timeout) end,
+
+    send_ndjson(Controller,
+                #{<<"id">> => <<"second-subscribe">>, <<"op">> => <<"subscribe">>,
+                  <<"subscriptionId">> => <<"second">>, <<"path">> => <<"demo:state">>,
+                  <<"args">> => #{}}),
+    #{<<"id">> := <<"second-subscribe">>, <<"type">> := <<"ack">>} = read_ndjson(Controller),
+    #{<<"subscriptionId">> := <<"second">>,
+      <<"value">> := #{<<"count">> := 0}} = read_ndjson(Controller),
+    send_ndjson(Controller,
+                #{<<"id">> => <<"second-unsubscribe">>, <<"op">> => <<"unsubscribe">>,
+                  <<"subscriptionId">> => <<"second">>}),
+    #{<<"id">> := <<"second-unsubscribe">>, <<"type">> := <<"ack">>} = read_ndjson(Controller),
+    send_ndjson(Controller, #{<<"id">> => <<"close">>, <<"op">> => <<"close">>}),
+    #{<<"type">> := <<"closed">>} = read_ndjson(Controller),
+    gen_tcp:close(Controller),
+    receive {'DOWN', Monitor, process, Pid, normal} -> ok after 2000 -> erlang:error(sequential_adapter_timeout) end,
+    true = os:unsetenv("ADAPTER_LISTEN"),
+    true = os:unsetenv("CONVEX_URL").
 
 fixture(Fun) ->
     {ok, Listen} = gen_tcp:listen(0, [binary, {packet, raw}, {active, false},

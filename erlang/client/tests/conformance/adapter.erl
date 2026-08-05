@@ -336,7 +336,14 @@ handle(C, Client, Live, Subs) ->
         <<"unsubscribe">> ->
             RequestedId = maps:get(<<"subscriptionId">>, C),
             unsubscribe_requested(Live, RequestedId, Subs),
-            {Client, Live, remove_requested(RequestedId, Subs), ack(Id), false};
+            Subs1 = remove_requested(RequestedId, Subs),
+            %% A conformance adapter is deliberately long-lived, but an idle
+            %% Live owner is not reusable evidence. Retire it once its last
+            %% relay is gone so the next subscription owns a fresh transport
+            %% rather than inheriting a closing Gun connection or timer.
+            %% Keep the HTTP/auth client state intact across that boundary.
+            {Client1, Live1} = reset_idle_live(Client, Live, Subs1),
+            {Client1, Live1, Subs1, ack(Id), false};
         <<"debugDisconnect">> ->
             disconnect_reply(Id, Client, Live, Subs);
         <<"close">> ->
@@ -359,6 +366,17 @@ unsubscribe_requested(Live, RequestedId, Subs) ->
 
 remove_requested(RequestedId, Subs) ->
     maps:filter(fun(_Real, Requested) -> Requested =/= RequestedId end, Subs).
+
+reset_idle_live(Client, Live, Subs) when map_size(Subs) =:= 0, Live =/= undefined ->
+    ok = convex:close(Client),
+    {ok, FreshClient0} = convex:new(maps:get(url, Client)),
+    FreshClient = restore_auth(FreshClient0, maps:get(token, Client)),
+    {FreshClient, maps:get(live, FreshClient)};
+reset_idle_live(Client, Live, _Subs) ->
+    {Client, Live}.
+
+restore_auth(Client, undefined) -> Client;
+restore_auth(Client, Token) -> convex:set_auth(Client, Token).
 
 ack(Id) ->
     #{<<"id">> => Id, <<"type">> => <<"ack">>}.
