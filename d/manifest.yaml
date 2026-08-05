@@ -4,5 +4,22 @@ displayName: "D"
 rank: 43
 selectionTier: ranked
 implementation:
-  status: planned
+  status: blocked
+  provenance: native
+  version: 0.1.0
+  notes: Native D implementation of Convex's documented JSON HTTP function envelopes, using Phobos std.net.curl for HTTP and TLS transport.
+toolchain:
+  name: LDC
+  version: 1.30.0
+intendedCapabilities:
+  - http
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+limitations:
+  - The universal canonical example requires a real Live 0 -> 1 journey, so this HTTP-only implementation cannot enter shared verification or earn an HTTP badge on its own.
+  - Live is deliberately unimplemented. The Debian LDC 1.30 Phobos curl binding exposes HTTP but not libcurl's WebSocket API; a real native WebSocket owner and its required socket-level tests are still needed before Live can be attempted honestly.
+  - Tagged Convex value encodings beyond ordinary JSON values are deferred.
 capabilities: []
