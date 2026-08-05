@@ -28,14 +28,9 @@ RUN dart format --set-exit-if-changed client examples && \
     test "$(od -An -t x1 -j 18 -N 2 /out/convex-dart-example | tr -d ' ')" = 3e00
 
 FROM test AS runtime-rootfs
-COPY --from=busybox /bin/busybox /busybox-static
 RUN set -eu; \
     rm -rf /runtime; \
-    mkdir -p /runtime/bin /runtime/usr/bin /runtime/etc/ssl/certs /runtime/usr/local/bin; \
-    cp /busybox-static /runtime/bin/busybox; \
-    ln -s busybox /runtime/bin/sh; \
-    ln -s ../../bin/busybox /runtime/usr/bin/id; \
-    ln -s ../../bin/busybox /runtime/usr/bin/grep; \
+    mkdir -p /runtime/etc/ssl/certs /runtime/usr/local/bin; \
     { \
       ldd /out/convex-dart-example; \
       ldd /out/convex-dart-adapter; \
@@ -49,14 +44,37 @@ RUN set -eu; \
       test ! -e "$config" || cp --parents "$config" /runtime; \
     done
 
-FROM scratch AS runtime-base
+FROM busybox AS runtime-base
+USER 0:0
+# BusyBox is the pinned non-scratch policy base, but its stock image exposes
+# hundreds of unrelated applet links. Retain only the verifier's shell, id and
+# grep surface before overlaying the exact Dart AOT runtime closure.
+RUN set -eu; \
+    /bin/busybox rm -rf \
+      /etc/group /etc/localtime /etc/mtab /etc/network /etc/passwd /etc/shadow \
+      /.cache /home /root /sbin /tmp /usr /var /lib; \
+    /bin/busybox find /bin -mindepth 1 -maxdepth 1 ! -name busybox -delete; \
+    /bin/busybox mkdir -p /usr/bin /usr/local/bin; \
+    /bin/busybox ln -s busybox /bin/sh; \
+    /bin/busybox ln -s ../../bin/busybox /usr/bin/id; \
+    /bin/busybox ln -s ../../bin/busybox /usr/bin/grep
 COPY --from=runtime-rootfs /runtime /
+RUN set -eu; \
+    test -x /bin/sh && test -x /usr/bin/id && test -x /usr/bin/grep; \
+    test "$(/bin/busybox find /bin -mindepth 1 -maxdepth 1 | /bin/busybox wc -l)" = 2; \
+    test "$(/bin/busybox find /usr/bin -mindepth 1 -maxdepth 1 | /bin/busybox wc -l)" = 2; \
+    test -r /etc/ssl/certs/ca-certificates.crt; \
+    for tool in dart dartaotruntime node python python3 npm npx apt apt-get apt-key dpkg rpm debconf perl openssl curl wget nc convex gcc cc make; do \
+      ! command -v "$tool"; \
+    done
 USER 65532:65532
 
 FROM runtime-base AS example-runtime
 COPY --from=test /out/convex-dart-example /usr/local/bin/convex-example
+RUN test -x /usr/local/bin/convex-example && test ! -e /usr/local/bin/convex-adapter
 ENTRYPOINT ["/usr/local/bin/convex-example"]
 
 FROM runtime-base AS runtime
 COPY --from=test /out/convex-dart-adapter /usr/local/bin/convex-adapter
+RUN test -x /usr/local/bin/convex-adapter && test ! -e /usr/local/bin/convex-example
 ENTRYPOINT ["/usr/local/bin/convex-adapter"]
