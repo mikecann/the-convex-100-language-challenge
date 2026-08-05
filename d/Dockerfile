@@ -57,7 +57,8 @@ RUN set -eu; \
     CONVEX_URL=http://127.0.0.1:18153 /out-adapter < /tmp/stopped-input > /tmp/stopped-output & adapter_pid=$!; \
     peak_kib=0; checks=0; \
     while kill -0 "$adapter_pid" 2>/dev/null; do \
-      rss_kib=$(awk '/VmRSS:/ { print $2 }' "/proc/$adapter_pid/status" 2>/dev/null || echo 0); \
+      rss_kib=$(awk '/VmRSS:/ { print $2 }' "/proc/$adapter_pid/status" 2>/dev/null || true); \
+      rss_kib=${rss_kib:-0}; \
       test "$rss_kib" -le "$peak_kib" || peak_kib=$rss_kib; \
       checks=$((checks + 1)); \
       test "$checks" -lt 100; \
@@ -94,9 +95,15 @@ RUN set -eu; \
 
 FROM --platform=linux/amd64 ${DEBIAN_IMAGE} AS runtime-base
 RUN rm -rf /var/lib/apt /var/lib/dpkg /var/cache/apt /var/cache/debconf /var/log/* \
-      /etc/apt /etc/dpkg /etc/systemd /usr/lib/apt /usr/lib/dpkg /usr/lib/systemd \
+      /etc/apt /etc/dpkg /etc/systemd /usr/lib/apt /usr/lib/dpkg /usr/lib/systemd /usr/share/systemd \
+      /etc/tmpfiles.d /etc/sysusers.d /usr/lib/tmpfiles.d /usr/lib/sysusers.d \
+      /usr/lib/init /usr/lib/lsb /etc/update-motd.d /etc/profile.d \
       /var/lib/systemd /etc/init.d /etc/rc0.d /etc/rc1.d /etc/rc2.d /etc/rc3.d /etc/rc4.d /etc/rc5.d /etc/rc6.d /etc/rcS.d \
-      /etc/cron.daily/apt-compat /etc/cron.daily/dpkg /etc/logrotate.d/apt /etc/logrotate.d/dpkg \
+      /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.monthly /etc/cron.weekly /etc/logrotate.d \
+      /etc/alternatives /etc/debconf.conf /usr/libexec/dpkg /usr/share/apt /usr/share/bash-completion \
+      /usr/share/bug /usr/share/debconf /usr/share/dpkg /usr/share/gcc /usr/share/lintian/profiles/dpkg \
+      /usr/share/doc/apt /usr/share/doc/debconf /usr/share/doc/dpkg /usr/share/doc/libsystemd0 \
+      /usr/share/polkit-1/actions/org.dpkg.pkexec.update-alternatives.policy /var/cache/ldconfig \
       /etc/perl /usr/lib/perl* /usr/share/perl* /usr/share/doc/perl* /usr/share/man/man1/perl* \
       /usr/sbin/* \
     && rm -f /usr/bin/apt /usr/bin/apt-cache /usr/bin/apt-cdrom /usr/bin/apt-config /usr/bin/apt-get /usr/bin/apt-key /usr/bin/apt-mark \
@@ -105,13 +112,20 @@ RUN rm -rf /var/lib/apt /var/lib/dpkg /var/cache/apt /var/cache/debconf /var/log
       /usr/bin/perl /usr/bin/perl5.* /usr/bin/bash /usr/bin/bashbug /usr/bin/rbash \
       /usr/bin/deb-systemd-helper /usr/bin/deb-systemd-invoke /usr/sbin/invoke-rc.d /usr/sbin/policy-rc.d /usr/sbin/service /usr/sbin/update-rc.d /usr/sbin/start-stop-daemon \
       /usr/bin/debconf /usr/bin/debconf-* /usr/bin/update-alternatives /usr/bin/run-parts /usr/bin/ischroot /usr/bin/savelog /usr/bin/tempfile /usr/bin/localedef /usr/bin/ldd /usr/bin/sqv \
+    && rm -f /usr/lib/x86_64-linux-gnu/libapt-pkg.so* /usr/lib/x86_64-linux-gnu/libapt-private.so* \
+      /usr/lib/x86_64-linux-gnu/libdebconfclient.so* /usr/lib/x86_64-linux-gnu/libsystemd.so* \
     && ! command -v apt && ! command -v apt-get && ! command -v dpkg && ! command -v curl && ! command -v wget \
     && ! command -v gcc && ! command -v ldc2 && ! command -v dub && ! command -v perl && ! command -v bash \
     && ! command -v node && ! command -v python && ! command -v python3 && ! command -v service \
     && ! command -v update-alternatives && ! command -v installkernel && ! command -v run-parts \
     && ! command -v ischroot && ! command -v savelog && ! command -v tempfile \
     && ! command -v pam-auth-update && ! command -v update-passwd && ! command -v add-shell \
-    && ! command -v remove-shell && ! command -v ldconfig && ! command -v ldd && ! command -v localedef
+    && ! command -v remove-shell && ! command -v ldconfig && ! command -v ldd && ! command -v localedef \
+    && test ! -e /etc/logrotate.d && test ! -e /etc/cron.d && test ! -e /etc/cron.daily \
+    && test ! -e /usr/lib/tmpfiles.d && test ! -e /usr/lib/sysusers.d \
+    && test ! -e /etc/alternatives && test ! -e /usr/libexec/dpkg && test ! -e /usr/share/systemd \
+    && test ! -e /usr/lib/init && test ! -e /usr/lib/lsb && test ! -e /etc/update-motd.d && test ! -e /etc/profile.d \
+    && test ! -e /usr/share/gcc && test ! -e /usr/lib/x86_64-linux-gnu/libsystemd.so.0
 # Debian's /lib is a symlink to /usr/lib, so copy the resolved directory rather
 # than attempting to overwrite that symlink.
 COPY --from=runtime-libs /runtime-root/usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
