@@ -26,6 +26,7 @@ void Client::debug_disconnect_for_adapter() { if (closed_) throw Error("Convex c
 Result Client::query(const std::string& path, const Json& args) { return call("query", path, args); }
 Result Client::mutation(const std::string& path, const Json& args) { return call("mutation", path, args); }
 Result Client::action(const std::string& path, const Json& args) { return call("action", path, args); }
+std::shared_ptr<Subscription> Client::subscribe(const std::string& path, const Json& args) { if (closed_) throw Error("Convex client is closed"); if (path.empty() || !args.is_object()) throw Error("Live query requires a path and named JSON arguments"); return std::shared_ptr<Subscription>(new Subscription(url_, path, args)); }
 Result Client::call(const std::string& op, const std::string& path, const Json& args) {
   if (closed_) throw Error("Convex client is closed");
   if (path.empty()) throw Error("Convex function path is required");

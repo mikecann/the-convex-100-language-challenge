@@ -6,9 +6,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends libboost-dev=1.
 COPY client ./client
 COPY examples ./examples
 RUN test "$(uname -m)" = x86_64 && test "$(g++ -dumpmachine | cut -d- -f1)" = x86_64
-RUN g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient client/convex.cpp client/tests/client_test.cpp -lssl -lcrypto -lpthread -o /tmp/client-test && /tmp/client-test
-RUN mkdir -p /out && g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient client/convex.cpp examples/basics/main.cpp -lssl -lcrypto -lpthread -o /out/convex-example
-RUN g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient client/convex.cpp client/tests/conformance/adapter.cpp -lssl -lcrypto -lpthread -o /out/convex-adapter
+RUN g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient client/convex.cpp client/live.cpp client/tests/client_test.cpp -lssl -lcrypto -lpthread -o /tmp/client-test && /tmp/client-test
+RUN mkdir -p /out && g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient client/convex.cpp client/live.cpp examples/basics/main.cpp -lssl -lcrypto -lpthread -o /out/convex-example
+RUN g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient client/convex.cpp client/live.cpp client/tests/conformance/adapter.cpp -lssl -lcrypto -lpthread -o /out/convex-adapter
 RUN printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | /out/convex-adapter >/tmp/events && grep -Fq '"language":"cpp"' /tmp/events && grep -Fq '"type":"closed"' /tmp/events
 CMD ["/bin/sh", "-c", "true"]
 
