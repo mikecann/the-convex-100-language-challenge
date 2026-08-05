@@ -27,14 +27,17 @@ No capability badge is earned until shared local and hosted black-box tests pass
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.py -->
 ```python
 #!/usr/local/bin/python3
-import os, secrets, sys
+import math, os, secrets, sys
 sys.path.insert(0, os.environ.get('CONVEX_CLIENT_PATH', os.path.abspath(os.path.join(os.path.dirname(__file__), '../../client'))))
 from convex import Client
 
 def whole(value, operation):
-    # Do not let a malformed JSON value look like a successful counter journey.
-    if not isinstance(value, int) or isinstance(value, bool): raise RuntimeError(f'{operation} count was {value!r}, expected a whole number')
-    return value
+    # Convex may encode a whole JSON number as 0.0. Normalize that to an int so
+    # stdout stays stable, but never hide booleans, fractions, or non-finite data.
+    if isinstance(value, bool): raise RuntimeError(f'{operation} count was {value!r}, expected a finite whole number')
+    if isinstance(value, int): return value
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer(): return int(value)
+    raise RuntimeError(f'{operation} count was {value!r}, expected a finite whole number')
 
 def main():
     # Create a native client for the verifier-provided Convex deployment.
