@@ -56,6 +56,8 @@ main = do
     testSplitUtf8AndBatchedRecords executable
     testFinalUnterminatedRecord executable
     testMalformedPartialRecord executable
+    testOversizedUnterminatedRecord executable
+    testStoppedReaderMemory executable
     testCleanClose executable
     testTcpPartialWrites executable
     testStructuredHttpFailures executable
@@ -97,6 +99,44 @@ testMalformedPartialRecord executable = withChild executable [] $ \child -> do
     hClose (childInput child)
     assertProtocolError =<< readEvent (childOutput child)
     expectExitSuccess child
+
+-- A missing newline must not let the adapter retain controller input forever.
+-- Feed beyond the documented record limit in ordinary pipe-sized chunks and
+-- prove it emits one structured failure before clean EOF.
+testOversizedUnterminatedRecord :: FilePath -> IO ()
+testOversizedUnterminatedRecord executable = withChild executable [] $ \child -> do
+    forM_ [1 .. 74 :: Int] $ \_ -> writeChunk (childInput child) (BS.replicate (32 * 1024) 97)
+    hClose (childInput child)
+    assertProtocolError =<< readEvent (childOutput child)
+    expectExitSuccess child
+
+-- Stop consuming the real adapter's stdout while a controller keeps sending
+-- valid commands. The write deadline must end the process, and the retained
+-- input/output state must stay comfortably below the shared 128 MiB ceiling.
+testStoppedReaderMemory :: FilePath -> IO ()
+testStoppedReaderMemory executable = withChild executable [] $ \child -> do
+    let nearMaximumId = BS.replicate (2 * 1024 * 1024) 97
+        record = "{\"protocolVersion\":1,\"id\":\"" <> nearMaximumId <> "\",\"op\":\"hello\"}\n"
+        command = BS.concat (replicate 16 record)
+    _ <- forkIO $ writeChunk (childInput child) command `catch` ignoreWriterClose
+    threadDelay 500000
+    processId <- maybe (fail "adapter process did not expose a pid") pure =<< getPid (childProcess child)
+    status <- readFile ("/proc/" <> show processId <> "/status")
+    residentKiB <- case find ("VmRSS:" `prefixOf`) (lines status) of
+        Just line -> case words line of
+            _ : amount : _ -> pure (read amount :: Int)
+            _ -> fail "VmRSS line omitted its value"
+        Nothing -> fail "adapter process status omitted VmRSS"
+    unless (residentKiB < 128 * 1024) (fail ("stopped-reader RSS reached " <> show residentKiB <> " KiB"))
+    outcome <- timeout 8000000 (waitForProcess (childProcess child))
+    case outcome of
+        Just (ExitFailure _) -> pure ()
+        Just ExitSuccess -> fail "blocked adapter output exited successfully instead of surfacing transport failure"
+        Nothing -> fail "blocked adapter output exceeded its write deadline"
+  where
+    prefixOf prefix value = take (length prefix) value == prefix
+    ignoreWriterClose :: IOException -> IO ()
+    ignoreWriterClose _ = pure ()
 
 -- Keep the normal shutdown assertion separate so a future UTF-8 regression
 -- cannot obscure whether close itself still flushes its event and exits zero.
@@ -182,12 +222,11 @@ testRelayAckBarriers executable = withRelayGate $ \gate -> do
             ]
             $ \child -> do
                 sendCommand child (subscribeCommand "first-subscribe")
-                assertAck "first-subscribe" =<< readEvent (childOutput child)
-
                 connection <- awaitFixtureConnection fixture
                 assertMessageType "Connect" =<< awaitFixtureMessage fixture
                 oldAdd <- awaitFixtureMessage fixture
                 oldQueryId <- modificationId "Add" oldAdd
+                assertAck "first-subscribe" =<< readEvent (childOutput child)
 
                 let zero = version 0 "AAAAAAAAAAA="
                     firstVersion = version 1 "AQAAAAAAAAA="

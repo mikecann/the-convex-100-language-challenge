@@ -28,6 +28,7 @@ RUN test "$(uname -m)" = x86_64 && \
       client/Convex.hs \
       client/tests/conformance/AdapterTest.hs \
       client/tests/conformance/Main.hs \
+      client/tests/example/CountTest.hs \
       client/tests/http/Main.hs \
       client/tests/live/Main.hs \
       examples/basics/Main.hs
@@ -55,13 +56,21 @@ RUN mkdir -p /out && \
 # required by the shared verifier, without retaining GHC or Cabal.
 FROM ${RUNTIME_IMAGE} AS runtime-base
 COPY --from=test /etc/ssl /etc/ssl
-RUN rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/log/* && \
-    rm -f /usr/bin/apt /usr/bin/apt-get /usr/bin/apt-cache /usr/bin/apt-config /usr/bin/apt-mark \
-      /usr/bin/dpkg /usr/bin/dpkg-query /usr/bin/dpkg-deb /usr/bin/dpkg-divert /usr/bin/dpkg-maintscript-helper \
-      /usr/bin/dpkg-realpath /usr/bin/dpkg-split /usr/bin/start-stop-daemon /usr/bin/deb-systemd-helper \
-      /usr/bin/deb-systemd-invoke /usr/bin/perl /usr/bin/perl5.36.0 && \
-    for command in ghc ghci ghc-pkg runghc runhaskell cabal stack gcc cc clang make ld as apt apt-get apt-cache dpkg perl ruby go rustc cargo curl wget node npm npx python python3 pip pip3 convex; do \
-      if command -v "$command" >/dev/null 2>&1; then echo "forbidden runtime command: $command -> $(command -v $command)" >&2; exit 1; fi; \
+RUN set -eu; \
+    find /usr/bin /usr/sbin -mindepth 1 -maxdepth 1 -print > /tmp/runtime-commands; \
+    while IFS= read -r path; do \
+      case "$path" in \
+        /usr/bin/awk|/usr/bin/mawk|/usr/bin/basename|/usr/bin/cmp|/usr/bin/cut|/usr/bin/dash|/usr/bin/dirname|/usr/bin/env|/usr/bin/find|/usr/bin/grep|/usr/bin/head|/usr/bin/id|/usr/bin/ls|/usr/bin/printf|/usr/bin/readlink|/usr/bin/rm|/usr/bin/sed|/usr/bin/sh|/usr/bin/sort|/usr/bin/tail|/usr/bin/tr|/usr/bin/true|/usr/bin/uname|/usr/bin/wc) ;; \
+        *) /usr/bin/rm -f "$path" ;; \
+      esac; \
+    done < /tmp/runtime-commands; \
+    /usr/bin/rm -rf /etc/apt /etc/dpkg /var/lib/apt /var/cache/apt /var/lib/dpkg /usr/lib/apt /usr/lib/dpkg /usr/share/dpkg /var/log/* /tmp/runtime-commands; \
+    /usr/bin/rm -f /usr/bin/rm; \
+    for command in apt apt-get apt-cache dpkg dpkg-query getent hostname ping nc openssl curl wget ghc ghci ghc-pkg runghc runhaskell cabal stack gcc cc clang make ld as perl ruby go rustc cargo node npm npx python python3 pip pip3 convex; do \
+      if command -v "$command" >/dev/null 2>&1; then echo "forbidden runtime command: $command" >&2; exit 1; fi; \
+    done; \
+    for path in /etc/apt /etc/dpkg /var/lib/dpkg /usr/lib/apt /usr/lib/dpkg /usr/share/dpkg; do \
+      if test -e "$path"; then echo "forbidden runtime helper tree: $path" >&2; exit 1; fi; \
     done
 USER 65532:65532
 

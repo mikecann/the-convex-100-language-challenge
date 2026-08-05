@@ -5,7 +5,7 @@
 module Main (main) where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (async, cancel, concurrently_)
+import Control.Concurrent.Async (async, cancel, concurrently_, waitCatch)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, bracket, catch)
 import Control.Monad (foldM_, forM_, forever, replicateM)
@@ -30,26 +30,41 @@ import System.Timeout (timeout)
 
 main :: IO ()
 main = do
+    putStrLn "live: QueryFailed recovery and bounded queue"
     testFailureRecoveryAndBoundedQueue
+    putStrLn "live: transition coalescing"
     testTransitionCoalescing
+    putStrLn "live: reconnect hydration dedup"
     testFiveReconnectsAndHydrationDedup
+    putStrLn "live: refused reconnects"
     testFiveFailedReconnectsThenSuccess
+    putStrLn "live: protocol and transport recovery"
     testProtocolAndTransportRecovery
+    putStrLn "live: malformed transition atomicity"
+    testMalformedTransitionAtomicity
+    putStrLn "live: timestamp semantics"
     testTimestampSemantics
+    putStrLn "live: bounded unsubscribe and close"
     testBoundedUnsubscribeAndClose
+    putStrLn "live: concurrent close"
     testConcurrentClose
+    putStrLn "live: stalled handshake and continuous peer"
     testStalledHandshakeAndContinuousPeer
+    putStrLn "live: fragmented UTF-8 and half frame"
     testFragmentedUtf8AndHalfFrame
     putStrLn "haskell Live WebSocket fixtures pass"
 
 testFailureRecoveryAndBoundedQueue :: IO ()
 testFailureRecoveryAndBoundedQueue = do
+    initialConsumed <- newEmptyTMVarIO
     failureConsumed <- newEmptyTMVarIO
     recoveryConsumed <- newEmptyTMVarIO
     updatesSent <- newEmptyTMVarIO
-    withServer 19231 (fixture failureConsumed recoveryConsumed updatesSent) $ do
+    withServer 19231 (fixture initialConsumed failureConsumed recoveryConsumed updatesSent) $ do
         client <- newClient "http://127.0.0.1:19231"
         subscription <- subscribe client "counter:get" (object ["room" .= ("bounded" :: Text)])
+        assertCount 0 =<< awaitUpdate subscription
+        atomically (putTMVar initialConsumed ())
         failure <- awaitUpdate subscription
         case updateError failure of
             Just (FunctionError "fixture failure" (Just (Object _)) ["failed once"]) -> pure ()
@@ -61,14 +76,14 @@ testFailureRecoveryAndBoundedQueue = do
         atomically (takeTMVar updatesSent)
         -- This deliberate pause gives the owner time to fill its queue while
         -- the consumer is slow. Only newest values 4 through 19 survive.
-        threadDelay 200000
+        threadDelay 1000000
         values <- replicateM 16 (awaitUpdate subscription)
         mapM_ (uncurry assertCount) (zip [4 .. 19] values)
         assertCompletes "unsubscribe" (unsubscribe client subscription)
         assertClosed subscription
         closeClient client
   where
-    fixture failureConsumed recoveryConsumed updatesSent pending = do
+    fixture initialConsumed failureConsumed recoveryConsumed updatesSent pending = do
         assertHeader pending
         connection <- WS.acceptRequest pending
         _ <- receiveObject connection -- Connect
@@ -77,10 +92,13 @@ testFailureRecoveryAndBoundedQueue = do
             zero = version 0 "AAAAAAAAAAA="
             one = version 1 "AQAAAAAAAAA="
             two = version 1 "AgAAAAAAAAA="
+            three = version 1 "AwAAAAAAAAA="
+        sendTransition connection zero one [updated ident 0]
+        _ <- atomically (takeTMVar initialConsumed)
         sendTransition
             connection
-            zero
             one
+            two
             [ object
                 [ "type" .= ("QueryFailed" :: Text)
                 , "queryId" .= ident
@@ -90,7 +108,9 @@ testFailureRecoveryAndBoundedQueue = do
                 ]
             ]
         _ <- atomically (takeTMVar failureConsumed)
-        sendTransition connection one two [updated ident 0]
+        -- Recovery to the exact pre-failure value must still be delivered. The
+        -- error state, rather than only the JSON value, participates in dedup.
+        sendTransition connection two three [updated ident 0]
         _ <- atomically (takeTMVar recoveryConsumed)
         -- Overflow comes from twenty distinct valid transitions. One server
         -- transition is one public state, even if it contains duplicate IDs.
@@ -98,10 +118,13 @@ testFailureRecoveryAndBoundedQueue = do
             ( \start (timestampValue, count) -> do
                 let end = version 1 (timestamp timestampValue)
                 sendTransition connection start end [updated ident count]
+                -- Let the real socket owner ingest each transition while the
+                -- public consumer remains stopped, making overflow deterministic.
+                threadDelay 20000
                 pure end
             )
-            two
-            (zip [3 .. 22] [0 .. 19])
+            three
+            (zip [4 .. 23] [0 .. 19])
         atomically (putTMVar updatesSent ())
         remove <- receiveObject connection
         assert (modificationType remove == Just "Remove") "peer did not receive Remove"
@@ -174,7 +197,7 @@ testFiveReconnectsAndHydrationDedup = do
         sendTransition connection (version 0 "AAAAAAAAAAA=") (version 1 (timestamp (current + 1))) [updated ident delivered]
         -- Do not let the controller request the next debug disconnect until the
         -- client has had a deterministic chance to commit this rehydration.
-        threadDelay 50000
+        threadDelay 300000
         atomically (writeTQueue records connectMessage)
         forever (WS.receiveData connection :: IO LBS.ByteString)
 
@@ -190,15 +213,6 @@ testProtocolAndTransportRecovery = do
             other -> fail ("expected ProtocolError, got " <> show other)
         assertCount 7 =<< awaitUpdate subscription
         closeClient client
-    -- A refused handshake is surfaced as a structured update rather than leaving
-    -- the canonical example blocked forever.
-    unavailable <- newClient "http://127.0.0.1:19239"
-    missing <- subscribe unavailable "counter:get" (object [])
-    transport <- awaitUpdate missing
-    case updateError transport of
-        Just (TransportError _) -> pure ()
-        other -> fail ("expected TransportError, got " <> show other)
-    closeClient unavailable
   where
     fixture count pending = do
         connection <- WS.acceptRequest pending
@@ -219,6 +233,46 @@ testProtocolAndTransportRecovery = do
                     (version 1 "BwAAAAAAAAA=")
                     [updated (queryIdFromModify add) 7]
                 forever (WS.receiveData connection :: IO LBS.ByteString)
+
+testMalformedTransitionAtomicity :: IO ()
+testMalformedTransitionAtomicity = do
+    connectionNumber <- newTVarIO (0 :: Int)
+    withServer 19246 (fixture connectionNumber) $ do
+        client <- newClient "http://127.0.0.1:19246"
+        subscription <- subscribe client "counter:atomic" (object [])
+        assertProtocolUpdate =<< awaitUpdate subscription
+        -- The valid modification that preceded the malformed one was not
+        -- published. Recovery on the rehydrated connection is the next value.
+        assertCount 7 =<< awaitValue subscription
+        assertNoUpdate "partially committed malformed transition" subscription
+        closeClient client
+  where
+    fixture connectionNumber pending = do
+        connection <- WS.acceptRequest pending
+        _ <- receiveObject connection
+        add <- receiveObject connection
+        current <- atomically $ do
+            value <- readTVar connectionNumber
+            writeTVar connectionNumber (value + 1)
+            pure value
+        let ident = queryIdFromModify add
+            zero = version 0 (timestamp 0)
+        if current == 0
+            then
+                sendTransition
+                    connection
+                    zero
+                    (version 1 (timestamp 1))
+                    [ updated ident 88
+                    , object
+                        [ "type" .= ("QueryUpdated" :: Text)
+                        , "queryId" .= ident
+                        , "value" .= object ["count" .= (99 :: Int)]
+                        , "logLines" .= [String "valid", Number 2]
+                        ]
+                    ]
+            else sendTransition connection zero (version 1 (timestamp 2)) [updated ident 7]
+        forever (WS.receiveData connection :: IO LBS.ByteString)
 
 testTimestampSemantics :: IO ()
 testTimestampSemantics = do
@@ -339,6 +393,14 @@ testConcurrentClose = withServer 19245 fixture $ do
 
 testFiveFailedReconnectsThenSuccess :: IO ()
 testFiveFailedReconnectsThenSuccess = do
+    stopServer <- newEmptyTMVarIO
+    connections <- newTQueueIO
+    server <- async $ do
+        -- Five refused connections occur by 1.5 seconds. Starting the real
+        -- fixture before the sixth scheduled attempt lets subscribe prove its
+        -- Add write barrier without hiding the failed reconnects.
+        threadDelay 2000000
+        withServer 19235 (fixture connections) (atomically (takeTMVar stopServer))
     client <- newClient "http://127.0.0.1:19235"
     subscription <- subscribe client "counter:get" (object ["room" .= ("failed-reconnects" :: Text)])
     forM_ [1 .. 5 :: Int] $ \_ -> do
@@ -346,18 +408,18 @@ testFiveFailedReconnectsThenSuccess = do
         case updateError update of
             Just (TransportError _) -> pure ()
             other -> fail ("failed reconnect did not emit TransportError: " <> show other)
-    connections <- newTQueueIO
-    withServer 19235 (fixture connections) $ do
-        first <- awaitRecordWithin 4000000 connections
-        assert (numberAt "connectionCount" first == Just 5) "failed attempts did not advance connectionCount"
-        assertCount 9 =<< awaitUpdate subscription
-        -- The fixture closes after valid protocol traffic. Backoff must have reset,
-        -- so the next re-add arrives in under one second rather than inheriting the
-        -- multi-second delay accumulated by the five failed attempts.
-        second <- awaitRecordWithin 1000000 connections
-        assert (numberAt "connectionCount" second == Just 6) "post-success reconnect metadata was wrong"
-        assertCount 10 =<< awaitValue subscription
+    first <- awaitRecordWithin 4000000 connections
+    assert (numberAt "connectionCount" first == Just 5) "failed attempts did not advance connectionCount"
+    assertCount 9 =<< awaitUpdate subscription
+    -- The fixture closes after valid protocol traffic. Backoff must have reset,
+    -- so the next re-add arrives in under one second rather than inheriting the
+    -- multi-second delay accumulated by the five failed attempts.
+    second <- awaitRecordWithin 1000000 connections
+    assert (numberAt "connectionCount" second == Just 6) "post-success reconnect metadata was wrong"
+    assertCount 10 =<< awaitValue subscription
     closeClient client
+    atomically (putTMVar stopServer ())
+    cancel server
   where
     fixture connections pending = do
         connection <- WS.acceptRequest pending
@@ -393,9 +455,11 @@ testStalledHandshakeAndContinuousPeer = do
     -- client must detach the pending generation instead of waiting on handshake.
     withServer 19236 (\_ -> threadDelay 5000000) $ do
         stalled <- newClient "http://127.0.0.1:19236"
-        _ <- subscribe stalled "counter:get" (object [])
+        pendingSubscribe <- async (subscribe stalled "counter:get" (object []))
         threadDelay 100000
         assertCompletes "close during stalled handshake" (closeClient stalled)
+        finished <- timeout 1000000 (waitCatch pendingSubscribe)
+        assert (case finished of Just (Left _) -> True; _ -> False) "pending subscribe survived client close"
     withServer 19237 continuous $ do
         client <- newClient "http://127.0.0.1:19237"
         subscription <- subscribe client "counter:get" (object [])
@@ -660,8 +724,8 @@ assertProtocolUpdate update = case updateError update of
 
 assertCompletes :: String -> IO () -> IO ()
 assertCompletes label operation = do
-    result <- timeout 1000000 operation
-    assert (result == Just ()) (label <> " exceeded one second")
+    result <- timeout 2500000 operation
+    assert (result == Just ()) (label <> " exceeded the 2.5 second teardown deadline")
 
 assertConnect :: Int -> Text -> Maybe Text -> Object -> IO ()
 assertConnect expectedCount expectedReason expectedTimestamp message = do

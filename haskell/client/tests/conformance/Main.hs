@@ -11,13 +11,14 @@ import Control.Concurrent.Async (Async, async, cancel, waitCatch)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (Exception, SomeException, bracket, bracketOnError, displayException, fromException, throwIO, try)
-import Control.Monad (forM_, unless, void)
+import Control.Monad (forM_, unless, void, when)
 import Convex
 import Data.Aeson
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KM
+import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as B8
-import Data.ByteString.Lazy.Char8 qualified as L8
+import Data.ByteString.Lazy qualified as LBS
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
@@ -25,7 +26,19 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Network.Socket
 import System.Environment (lookupEnv)
+import System.Exit (ExitCode (ExitFailure))
 import System.IO
+import System.Posix.Process (exitImmediately)
+import System.Timeout (timeout)
+
+-- Protocol records are a little larger than the largest accepted WebSocket
+-- message so the adapter can carry the envelope around a maximum-size value.
+-- The parser checks this incrementally, before searching indefinitely for LF.
+maxProtocolRecordBytes :: Int
+maxProtocolRecordBytes = 2 * 1024 * 1024 + 256 * 1024
+
+outputWriteTimeoutMicros :: Int
+outputWriteTimeoutMicros = 2 * 1000 * 1000
 
 data Relay = Relay
     { relayGeneration :: Int
@@ -90,23 +103,40 @@ runAdapter input output = do
         commandLoop state input
         closeRelays state
 
--- hGetLine assembles arbitrary partial reads. At EOF it still returns a final
--- non-empty unterminated record, which gives stdin and TCP identical NDJSON
--- semantics without assuming controller writes align with packets.
 commandLoop :: AdapterState -> Handle -> IO ()
-commandLoop state input = do
-    eof <- hIsEOF input
-    unless eof $ do
-        lineResult <- try (B8.hGetLine input) :: IO (Either SomeException B8.ByteString)
-        continue <- case lineResult of
-            Left failure -> writeProtocolError state Nothing ("read command: " <> T.pack (displayException failure)) >> pure False
-            Right line -> case eitherDecodeStrict' line of
-                Left problem -> writeProtocolError state Nothing ("decode command: " <> T.pack problem) >> pure True
-                Right command -> handleCommand state command
-        whenContinue continue (commandLoop state input)
+commandLoop state input = loop BS.empty False
   where
-    whenContinue True continuation = continuation
-    whenContinue False _ = pure ()
+    loop buffered discarding = do
+        chunkResult <- try (BS.hGetSome input (32 * 1024)) :: IO (Either SomeException BS.ByteString)
+        case chunkResult of
+            Left failure -> writeProtocolError state Nothing ("read command: " <> T.pack (displayException failure))
+            Right chunk
+                | BS.null chunk -> when (not discarding && not (BS.null buffered)) (void (handleLine buffered))
+                | otherwise ->
+                    consume buffered discarding chunk >>= \case
+                        Nothing -> pure ()
+                        Just (remaining, stillDiscarding) -> loop remaining stillDiscarding
+
+    consume _buffered True chunk = case BS.elemIndex 10 chunk of
+        Nothing -> pure (Just (BS.empty, True))
+        Just newline -> consume BS.empty False (BS.drop (newline + 1) chunk)
+    consume buffered False chunk =
+        let combined = buffered <> chunk
+         in case BS.elemIndex 10 combined of
+                Just newline -> do
+                    continue <- handleLine (BS.take newline combined)
+                    if continue
+                        then consume BS.empty False (BS.drop (newline + 1) combined)
+                        else pure Nothing
+                Nothing
+                    | BS.length combined <= maxProtocolRecordBytes -> pure (Just (combined, False))
+                    | otherwise -> do
+                        writeProtocolError state Nothing "command exceeds the NDJSON record byte limit"
+                        pure (Just (BS.empty, True))
+
+    handleLine line = case eitherDecodeStrict' line of
+        Left problem -> writeProtocolError state Nothing ("decode command: " <> T.pack problem) >> pure True
+        Right command -> handleCommand state command
 
 handleCommand :: AdapterState -> Value -> IO Bool
 handleCommand state (Object command) = do
@@ -150,8 +180,13 @@ dispatch state command = do
         "subscribe" -> do
             subscriptionName <- requiredText "subscriptionId" command
             path <- requiredText "path" command
-            replaceRelay state subscriptionName path arguments
-            ack
+            startGate <- replaceRelay state subscriptionName path arguments
+            -- Publishing the relay before the ACK prevents replacement races.
+            -- Holding its start gate until the ACK is flushed prevents initial
+            -- hydration from overtaking the controller-visible completion.
+            withMVar (adapterWriterLock state) $ \_ -> do
+                writeEventUnlocked state (object ["id" .= requestId, "type" .= ("ack" :: Text)])
+                putMVar startGate ()
             pure True
         "unsubscribe" -> do
             subscriptionName <- requiredText "subscriptionId" command
@@ -178,7 +213,7 @@ dispatch state command = do
                 ]
             )
 
-replaceRelay :: AdapterState -> Text -> Text -> Value -> IO ()
+replaceRelay :: AdapterState -> Text -> Text -> Value -> IO (MVar ())
 replaceRelay state name path arguments = do
     removeRelay state name
     subscription <- subscribe (adapterClient state) path arguments
@@ -190,7 +225,7 @@ replaceRelay state name path arguments = do
     startGate <- newEmptyMVar
     worker <- async (takeMVar startGate >> relayLoop state name generation subscription)
     atomically (modifyTVar' (adapterRelays state) (Map.insert name (Relay generation subscription worker)))
-    putMVar startGate ()
+    pure startGate
 
 removeRelay :: AdapterState -> Text -> IO ()
 removeRelay state name = do
@@ -224,8 +259,7 @@ relayLoop state name generation subscription = do
                         (Just result, _) -> object (base <> ["value" .= result, "logs" .= updateLogs update])
                         (_, Just failure) -> object (base <> ["error" .= convexErrorObject failure, "logs" .= updateLogs update])
                         _ -> object (base <> ["error" .= object ["name" .= ("ProtocolError" :: Text), "message" .= ("empty Live update" :: Text)]])
-                L8.hPutStrLn (adapterOutput state) (encode event)
-                hFlush (adapterOutput state)
+                writeEventUnlocked state event
             _ -> pure ()
     relayLoop state name generation subscription
 
@@ -254,9 +288,26 @@ pauseRelayAfterDequeue state name generation = forM_ (adapterTestRelayPause stat
             (\gateSocket -> connect gateSocket (addrAddress candidate) >> socketToHandle gateSocket ReadWriteMode)
 
 writeEvent :: AdapterState -> Value -> IO ()
-writeEvent state event = withMVar (adapterWriterLock state) $ \_ -> do
-    L8.hPutStrLn (adapterOutput state) (encode event)
-    hFlush (adapterOutput state)
+writeEvent state event = withMVar (adapterWriterLock state) $ \_ -> writeEventUnlocked state event
+
+writeEventUnlocked :: AdapterState -> Value -> IO ()
+writeEventUnlocked state event = do
+    let encoded = encode event
+        encodedBytes = LBS.length encoded + 1
+    when (encodedBytes > fromIntegral maxProtocolRecordBytes) $
+        throwIO (ProtocolError "adapter event exceeds the NDJSON record byte limit")
+    writer <- async $ do
+        LBS.hPut (adapterOutput state) encoded
+        BS.hPut (adapterOutput state) "\n"
+        hFlush (adapterOutput state)
+    completed <- timeout outputWriteTimeoutMicros (waitCatch writer)
+    case completed of
+        -- A blocked protocol sink cannot receive a structured error. _exit
+        -- avoids the normal stdout finalizer, which would wait forever on the
+        -- same blocked Handle and defeat the deadline we just enforced.
+        Nothing -> exitImmediately (ExitFailure 70)
+        Just (Left failure) -> throwIO failure
+        Just (Right ()) -> pure ()
 
 writeProtocolError :: AdapterState -> Maybe Text -> Text -> IO ()
 writeProtocolError state requestId message =

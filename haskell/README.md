@@ -20,7 +20,7 @@ It is an educational, unofficial experiment, not a production SDK or a package i
 ```haskell
 {-# LANGUAGE OverloadedStrings #-}
 
-module Main (main) where
+module Main (main, wholeCount) where
 
 import Control.Exception (bracket)
 import Convex
@@ -37,7 +37,13 @@ import System.Timeout (timeout)
 -- idiomatic Int this program needs and reject fractional or missing counts.
 wholeCount :: Text -> Value -> IO Int
 wholeCount operation (Object state) = case KM.lookup "count" state of
-    Just (Number count) | fromInteger (round count) == count -> pure (round count)
+    Just (Number count) ->
+        let integer = round count :: Integer
+         in if fromInteger integer == count
+                && integer >= toInteger (minBound :: Int)
+                && integer <= toInteger (maxBound :: Int)
+                then pure (fromInteger integer)
+                else fail (T.unpack operation <> " did not contain an in-range whole count")
     _ -> fail (T.unpack operation <> " did not contain a whole count")
 wholeCount operation _ = fail (T.unpack operation <> " was not an object")
 
@@ -117,9 +123,9 @@ The test target checks Fourmolu formatting, compiles the exact example and adapt
 
 ## Protocol notes
 
-The client owns Convex-specific HTTP envelopes and the pinned unversioned sync messages. `http-client-tls` 0.3.6.4 supplies ordinary HTTPS/TLS transport; `wuss` 2.0.2.5 and `websockets` 0.13.0.0 supply ordinary WSS and frame handling. The Live owner serializes reconnects and `Add`/`Remove` query-set changes. It validates canonical little-endian Convex timestamps, keeps their numeric maximum across reconnects, and publishes the final modification for each query in query-ID order. Each subscription retains the newest 16 updates, dropping older intermediate states when a consumer is slow.
+The client owns Convex-specific HTTP envelopes and the pinned unversioned sync messages. `http-client-tls` 0.3.6.4 supplies ordinary HTTPS/TLS transport; `wuss` 2.0.2.5 and `websockets` 0.13.0.0 supply ordinary WSS and frame handling. One socket actor performs every WebSocket read, write, and close while the Live state owner serializes reconnects and `Add`/`Remove` query-set changes. It validates canonical little-endian Convex timestamps, keeps their numeric maximum across reconnects, and publishes the final modification for each query in query-ID order. Each subscription retains at most the newest 16 updates. All subscriptions share a 16 MiB encoded-byte budget, and the client drops the globally oldest intermediate state first when a consumer is slow.
 
-The build uses GHC 9.10.1, Fourmolu 0.16.2.0, a Cabal index state of 2025-08-01, exact direct dependency constraints in `client/cabal.project`, and digest-pinned Haskell 9.10.1 and Debian Bookworm images. The final images contain the compiled Haskell executable and runtime library closure, CA certificates, `/bin/sh`, and the basic POSIX tools required by the shared verifier. They do not contain GHC, Cabal, Fourmolu, another language runtime, or the Convex CLI.
+The build uses GHC 9.10.1, Fourmolu 0.16.2.0, a Cabal index state of 2025-08-01, the fully resolved dependency and flag closure in `client/cabal.project.freeze`, and digest-pinned Haskell 9.10.1 and Debian Bookworm images. The final images contain the compiled Haskell executable and runtime library closure, CA certificates, `/bin/sh`, and an explicit small allowlist of POSIX text tools required by the shared verifier. They do not contain apt, dpkg, network helper commands, GHC, Cabal, Fourmolu, another language runtime, or the Convex CLI.
 
 ## Limitations
 

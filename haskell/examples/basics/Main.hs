@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module Main (main) where
+module Main (main, wholeCount) where
 
 import Control.Exception (bracket)
 import Convex
@@ -17,7 +17,13 @@ import System.Timeout (timeout)
 -- idiomatic Int this program needs and reject fractional or missing counts.
 wholeCount :: Text -> Value -> IO Int
 wholeCount operation (Object state) = case KM.lookup "count" state of
-    Just (Number count) | fromInteger (round count) == count -> pure (round count)
+    Just (Number count) ->
+        let integer = round count :: Integer
+         in if fromInteger integer == count
+                && integer >= toInteger (minBound :: Int)
+                && integer <= toInteger (maxBound :: Int)
+                then pure (fromInteger integer)
+                else fail (T.unpack operation <> " did not contain an in-range whole count")
     _ -> fail (T.unpack operation <> " did not contain a whole count")
 wholeCount operation _ = fail (T.unpack operation <> " was not an object")
 
