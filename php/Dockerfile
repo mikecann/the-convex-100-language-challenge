@@ -7,6 +7,8 @@ COPY examples ./examples
 # PHP itself parses every runnable source, including the adapter and example.
 RUN php -v && test "$(uname -m)" = x86_64 && find client examples -name '*.php' -exec php -l '{}' \;
 RUN php client/tests.php
+RUN php client/fixture_test.php
+RUN php client/adapter_fixture.php
 RUN printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | php client/tests/conformance/adapter.php | grep -q '"language":"php"'
 CMD ["php", "-r", "exit(0);"]
 

@@ -57,7 +57,13 @@ final class LiveManager {
   public function __construct(private string $url, private string $version) {}
   public function subscribe(string $path,array $args): Subscription { if($this->closed) throw new ClosedError('Live manager is closed'); $s=new Subscription($this,$this->next++); $this->subs[$s->id]=['path'=>$path,'args'=>$args,'subscription'=>$s]; $this->ensure(); if($this->ws) $this->modify([self::add($s->id,$this->subs[$s->id])]); return $s; }
   public function unsubscribe(int $id): void { $state=$this->subs[$id]??null; unset($this->subs[$id]); if($state){ $state['subscription']->finish(); if($this->ws) $this->modify([['type'=>'Remove','queryId'=>$id]]); } }
-  public function debugDisconnect(): void { if(!$this->ws) { $this->ensure(); if(!$this->ws) throw new TransportError('Live WebSocket is not connected','live'); } $this->disconnect('DebugDisconnect'); }
+  public function debugDisconnect(): void {
+    if(!$this->ws) { $this->ensure(); if(!$this->ws) throw new TransportError('Live WebSocket is not connected','live'); }
+    // Adapter-only: force and complete one reconnect so the controller can
+    // inspect the next Connect.connectionCount deterministically.
+    $this->disconnect('DebugDisconnect'); $this->reconnectAt=0.0; $this->ensure();
+    if(!$this->ws) throw new TransportError('Live reconnect failed','live');
+  }
   public function close(): void { $this->closed=true; $this->ws?->close(); $this->ws=null; foreach($this->subs as $s)$s['subscription']->finish(); $this->subs=[]; }
   public function pump(float $timeout=0): void { if($this->closed)return; $this->ensure(); if(!$this->ws){ if($timeout>0) usleep((int)($timeout*1000000)); return; } $this->ws->wait($timeout); while(($raw=$this->ws->read())!==false){ if($raw===null){$this->disconnect('ServerClosed');break;} $this->handle($raw); } }
   private function ensure(): void { if($this->ws||!$this->subs||microtime(true)<$this->reconnectAt)return; try { $p=parse_url($this->url); $scheme=$p['scheme']==='https'?'wss':'ws'; $host=$p['host']; $port=isset($p['port'])?':'.$p['port']:''; $path=rtrim($p['path']??'','/').'/api/sync'; $this->ws=new WebSocket("$scheme://$host$port$path",$this->version); $this->querySet=0;$this->remote=['querySet'=>0,'identity'=>0,'ts'=>'AAAAAAAAAAA=']; $this->ws->send(['type'=>'Connect','sessionId'=>self::uuid(),'connectionCount'=>$this->connections,'lastCloseReason'=>$this->lastClose,'clientTs'=>0]); $mods=[];foreach($this->subs as $id=>$s)$mods[]=self::add($id,$s);if($mods)$this->modify($mods);$this->backoff=.1; } catch(\Throwable $e){$this->disconnect($e->getMessage());} }
@@ -69,11 +75,26 @@ final class LiveManager {
 }
 
 final class WebSocket {
-  private $io; private string $buffer='';
+  private $io; private string $buffer=''; private string $fragments=''; private ?int $fragmentOpcode=null;
   public function __construct(string $url,string $version){$p=parse_url($url);$ssl=$p['scheme']==='wss';$target=($ssl?'ssl':'tcp').'://'.$p['host'].':'.($p['port']??($ssl?443:80));$this->io=@stream_socket_client($target,$e,$s,10,STREAM_CLIENT_CONNECT,stream_context_create(['ssl'=>['verify_peer'=>true,'peer_name'=>$p['host']]]));if(!$this->io)throw new TransportError("WebSocket connect: $s",'live');stream_set_blocking($this->io,true);$key=base64_encode(random_bytes(16));$resource=($p['path']??'/').(isset($p['query'])?'?'.$p['query']:'');fwrite($this->io,"GET $resource HTTP/1.1\r\nHost: {$p['host']}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: $key\r\nSec-WebSocket-Version: 13\r\nConvex-Client: $version\r\n\r\n");$h='';while(!str_contains($h,"\r\n\r\n")){$c=fread($this->io,1);if($c===''||$c===false)throw new ProtocolError('WebSocket upgrade closed');$h.=$c;if(strlen($h)>32768)throw new ProtocolError('WebSocket headers too large');}$lines=explode("\r\n",$h);if(!str_contains($lines[0],' 101 '))throw new ProtocolError('WebSocket upgrade failed');$headers=[];foreach($lines as $l)if(str_contains($l,':')){[$a,$b]=explode(':',$l,2);$headers[strtolower($a)]=trim($b);}if(($headers['sec-websocket-accept']??'')!==base64_encode(sha1($key.'258EAFA5-E914-47DA-95CA-C5AB0DC85B11',true)))throw new ProtocolError('invalid WebSocket accept');stream_set_blocking($this->io,false);}
   public function wait(float $seconds):void{$r=[$this->io];$w=$e=[];@stream_select($r,$w,$e,(int)$seconds,(int)(($seconds-(int)$seconds)*1000000));}
   public function send(array $v):void{$this->frame(1,json_encode($v,JSON_THROW_ON_ERROR|JSON_INVALID_UTF8_SUBSTITUTE));}
-  public function read():string|false|null { $this->buffer.=stream_get_contents($this->io)?:''; if(strlen($this->buffer)<2)return false;[$a,$b]=array_values(unpack('C2',substr($this->buffer,0,2)));$len=$b&127;$at=2;if($len===126){if(strlen($this->buffer)<4)return false;$len=unpack('n',substr($this->buffer,2,2))[1];$at=4;}elseif($len===127)throw new ProtocolError('oversized WebSocket frame');if(strlen($this->buffer)<$at+$len)return false;$payload=substr($this->buffer,$at,$len);$this->buffer=substr($this->buffer,$at+$len);$op=$a&15;if($op===8)return null;if($op===9){$this->frame(10,$payload);return false;}if($op!==1)throw new ProtocolError('unsupported WebSocket frame');return $payload; }
+  public function read():string|false|null {
+    $this->buffer.=stream_get_contents($this->io)?:'';
+    while(true) {
+      if(strlen($this->buffer)<2)return false;[$a,$b]=array_values(unpack('C2',substr($this->buffer,0,2)));$fin=(bool)($a&128);$len=$b&127;$at=2;
+      if($b&128)throw new ProtocolError('server WebSocket frames must not be masked');
+      if($len===126){if(strlen($this->buffer)<4)return false;$len=unpack('n',substr($this->buffer,2,2))[1];$at=4;}elseif($len===127)throw new ProtocolError('oversized WebSocket frame');
+      if($len>2097152)throw new ProtocolError('WebSocket frame too large');if(strlen($this->buffer)<$at+$len)return false;
+      $payload=substr($this->buffer,$at,$len);$this->buffer=substr($this->buffer,$at+$len);$op=$a&15;
+      if($op===8)return null;if($op===9){$this->frame(10,$payload);continue;}if($op===10)continue;
+      if($op===1){if($this->fragmentOpcode!==null)throw new ProtocolError('interleaved WebSocket text');$this->fragments=$payload;$this->fragmentOpcode=1;}
+      elseif($op===0){if($this->fragmentOpcode===null)throw new ProtocolError('unexpected WebSocket continuation');$this->fragments.=$payload;}
+      else throw new ProtocolError('unsupported WebSocket frame');
+      if(strlen($this->fragments)>2097152)throw new ProtocolError('WebSocket message too large');if(!$fin)continue;
+      $message=$this->fragments;$this->fragments='';$this->fragmentOpcode=null;return $message;
+    }
+  }
   private function frame(int $op,string $payload):void{$n=strlen($payload);$mask=random_bytes(4);$head=chr(128|$op).($n<126?chr(128|$n):chr(254).pack('n',$n));$out='';for($i=0;$i<$n;$i++)$out.=$payload[$i]^$mask[$i%4];fwrite($this->io,$head.$mask.$out);}
   public function close():void{if(is_resource($this->io))fclose($this->io);}
 }
