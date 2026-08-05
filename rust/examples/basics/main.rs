@@ -1,26 +1,3 @@
-# Convex from Rust
-
-This educational Rust demonstration calls Convex over its documented JSON HTTP
-endpoints and keeps one query updated through the pinned `/api/sync` WebSocket
-profile. It is unofficial and is not a production SDK.
-
-## Start here
-
-The [canonical basic example](examples/basics/main.rs) creates a client, reads
-a counter, starts Live, mutates the counter, and proves the Live update agrees.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP queries, mutations, actions, and bearer-token replacement | Works |
-| Live query snapshots, updates, unsubscribe, reconnect | In verification |
-| Live authentication and optimistic writes | Deferred |
-
-## Basic example
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.rs -->
-```rust
 use convex_rust_demo::Client;
 use serde_json::json;
 use std::{env, time::Duration};
@@ -61,23 +38,3 @@ fn main() {
     let _ = live.close();
     let _ = client.close();
 }
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-`./run test rust` formats, tests, and compiles the binaries inside Docker.
-`./run verify-example rust` executes the exact example. `./run verify rust`
-runs the shared black-box adapter conformance profile.
-
-## Protocol notes
-
-The adapter speaks NDJSON v1 over stdin/stdout or the exact `ADAPTER_LISTEN`
-TCP address. `debugDisconnect` is adapter-only and deliberately forces the
-ordinary reconnect path. Live delivery has a per-subscription newest-16
-mailbox, dropping the oldest value for a slow consumer.
-
-## Limitations
-
-This only implements the JSON-safe value subset. `TransitionChunk`, Live auth,
-optimistic updates, and WebSocket mutations/actions are explicitly deferred.
