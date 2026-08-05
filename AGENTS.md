@@ -79,10 +79,12 @@ language branch.
 - The `/usr/local/bin/convex-example` entrypoint must accept the verifier's
   unique room ID as its first argument. A language may also provide a friendly
   default for someone running the image by hand.
-- The shared verifier consumes these exact language-neutral output fragments:
-  `current count: 0`, `"applied": true`, and
-  `verified count: 0 -> 1`. Keep human-readable output around them, but do not
-  translate or rename these machine-checked lines per language.
+- Stdout from every canonical basic example is a universal happy-path test
+  surface. It must match `_shared/examples/basics.expected.txt` exactly,
+  line-for-line and in order. Do not add headings, pretty JSON, debug messages,
+  room IDs, timestamps, or language-specific decoration to stdout. Send useful
+  diagnostics to stderr instead. The shared root verifier owns the comparison;
+  do not duplicate the expected transcript or comparison logic in each language.
 - Never create a second test-only version of the example. Test the exact source
   file projected into the README and website.
 

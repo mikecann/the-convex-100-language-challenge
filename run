@@ -159,8 +159,10 @@ run_example_verification() {
   deployment_url=$2
   backend_kind=$3
   example_room="$language-example-$backend_kind-$(date +%s)-$$"
+  expected_output="$repo_root/_shared/examples/basics.expected.txt"
+  actual_output=$(mktemp "${TMPDIR:-/tmp}/convex-example-output.XXXXXX")
 
-  docker run --rm \
+  if ! docker run --rm \
     --platform linux/amd64 \
     --read-only \
     --cap-drop ALL \
@@ -172,15 +174,24 @@ run_example_verification() {
     --user 65532:65532 \
     --env CONVEX_URL="$deployment_url" \
     --env EXAMPLE_ROOM="$example_room" \
-    --entrypoint /bin/sh \
     "100-convex-clients-$language-example:local" \
-    -ec '
-      output=$(/usr/local/bin/convex-example "$EXAMPLE_ROOM")
-      printf "%s\n" "$output"
-      printf "%s\n" "$output" | grep -Fqx "current count: 0"
-      printf "%s\n" "$output" | grep -Fq "\"applied\": true"
-      printf "%s\n" "$output" | grep -Fqx "verified count: 0 -> 1"
-    '
+    "$example_room" >"$actual_output"; then
+    rm -f "$actual_output"
+    return 1
+  fi
+
+  if ! cmp -s "$expected_output" "$actual_output"; then
+    printf '%s\n' "example output did not exactly match the universal happy-path transcript" >&2
+    printf '%s\n' "expected:" >&2
+    cat "$expected_output" >&2
+    printf '%s\n' "actual:" >&2
+    cat "$actual_output" >&2
+    rm -f "$actual_output"
+    return 1
+  fi
+
+  cat "$actual_output"
+  rm -f "$actual_output"
   printf '%s\n' "PASS $language basic example returned the expected 0 -> 1 update against $backend_kind"
 }
 

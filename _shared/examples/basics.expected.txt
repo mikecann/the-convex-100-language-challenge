@@ -1,0 +1,6 @@
+current count: 0
+live initial count: 0
+mutation applied: true
+mutation count: 1
+live updated count: 1
+verified count: 0 -> 1
