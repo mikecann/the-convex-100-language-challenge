@@ -33,6 +33,14 @@ roster/                  sourced language selection and feasibility audit
 run                      root Docker-only orchestration entrypoint
 ```
 
+### Example comments
+
+Examples should use a small number of comments to explain Convex-specific
+behaviour and important sequencing. Good comments explain why a subscription
+starts before a mutation, where HTTP ends and Live begins, and what failure or
+timeout the reader should expect. Avoid comments that merely restate the target
+language's syntax or narrate every line.
+
 Client pull requests may modify only their own `<id>/` directory. Changes under `_shared/`, `docs/`, or `roster/` belong in separate reviewed pull requests. CI path policy must enforce that split before language work is parallelized.
 
 ## Docker policy

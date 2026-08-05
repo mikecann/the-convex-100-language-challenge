@@ -28,12 +28,17 @@ func main() {
 	if len(os.Args) > 1 {
 		room = os.Args[1]
 	}
+
+	// Subscribe before mutating so this example proves that the same database
+	// write arrives over Convex Live rather than through another HTTP read.
 	subscription, err := client.Subscribe(context.Background(), "demo:state", map[string]any{"room": room})
 	if err != nil {
 		panic(err)
 	}
 	defer subscription.Close()
 
+	// This mutation uses the documented HTTP API and returns its direct result.
+	// The unique run ID makes retries visible instead of silently double-writing.
 	result, err := client.Mutation(context.Background(), "demo:increment", map[string]any{
 		"room":     room,
 		"language": "go",
@@ -44,6 +49,8 @@ func main() {
 	}
 	printJSON("mutation", result.Value)
 
+	// The subscription delivers the updated room without polling. Keep a timeout
+	// so a broken realtime connection fails clearly instead of hanging forever.
 	select {
 	case update := <-subscription.Updates():
 		if update.Err != nil {
