@@ -4,5 +4,29 @@ displayName: "Kotlin"
 rank: 13
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Kotlin HTTP and experimental pinned-profile Live client. No capability badges are earned until shared local and hosted evidence passes.
+toolchain:
+  name: Kotlin and JDK
+  version: 2.2.21 and 21
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, WebSocket mutations/actions, optimistic updates, journals, and replay are deferred.
+  - TransitionChunk is treated as protocol drift and triggers a reconnect.
+  - Each Live subscription keeps at most its newest 16 pending updates; older intermediate values are deliberately dropped for a slow consumer.
 capabilities: []

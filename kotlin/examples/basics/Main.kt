@@ -1,32 +1,3 @@
-# Convex from Kotlin
-
-This folder shows a small Kotlin program talking directly to Convex. It uses
-the documented JSON HTTP endpoints and a native, experimental Live WebSocket
-implementation to follow a counter as it changes.
-
-This is educational and unofficial, not a production SDK or a package intended
-for publication.
-
-## Start here
-
-The [basic example](examples/basics/Main.kt) follows one useful journey: it
-reads a counter with HTTP, starts Live before changing anything, applies an
-idempotent mutation, and confirms the Live update agrees with the response.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| Native HTTP query, mutation, and action implementation | Implemented, pending shared evidence |
-| Native Live query implementation | Implemented, pending shared evidence |
-| Docker test and final runtime image | Implemented, pending shared evidence |
-| Earned capability badges | None until shared local and hosted verification passes |
-| Live authentication, WebSocket mutations/actions, optimistic updates, replay | Deferred |
-
-## Basic example
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.kt -->
-```kotlin
 package convex.kotlin.example
 
 import convex.kotlin.ConvexClient
@@ -102,46 +73,3 @@ private fun count(
 ): Int =
     value.jsonObject["count"]?.integralIntOrNull()
         ?: error("$operation did not return an integer count")
-```
-<!-- END GENERATED EXAMPLE -->
-
-The block above is generated from the exact runnable source used by the Docker
-image. Run `./run sync-examples` after editing it.
-
-## Docker-only verification
-
-```sh
-./run test kotlin
-./run build kotlin
-```
-
-`test` compiles the Kotlin sources, runs local HTTP tests, and assembles the
-canonical example plus conformance adapter inside Docker. `build` creates the
-minimal Linux amd64 adapter image. The coordinator runs the shared example and
-hosted conformance gates serially because they share a backend and evidence.
-
-## Conformance and protocol notes
-
-The test-only executable at `client/tests/conformance/AdapterMain.kt` accepts
-NDJSON protocol v1 through stdin/stdout or `ADAPTER_LISTEN` TCP. It calls the
-real Kotlin client for query, mutation, action, subscription, authentication,
-unsubscribe, clean close, and its adapter-only `debugDisconnect` hook.
-
-Live has one owner thread for socket reads, writes, reconnects, and query-set
-versions. Each subscription keeps the newest 16 updates, dropping old
-intermediate state for a slow consumer. A relay rechecks subscription identity
-after dequeue so a stale event cannot escape after unsubscribe or same-ID
-replacement.
-
-The implementation targets the experimental unversioned `/api/sync` profile
-documented by `convex-rs` 0.10.4 at commit
-`6f1df8a8ba1665084ec001e307ca841ca17074d7`. It uses JDK HTTP/WebSocket and
-Kotlin JSON only, never the Convex CLI, Node, Python, curl, or another Convex
-client.
-
-## Limitations
-
-Live authentication, WebSocket mutations/actions, optimistic updates, journals,
-replay, tagged Convex values beyond JSON-safe values, and TransitionChunk
-assembly are deferred. A TransitionChunk is treated as protocol drift and
-reconnects, rather than silently producing a partial state.
