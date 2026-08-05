@@ -8,8 +8,12 @@ use JSON::PP qw(decode_json encode_json);
 use Convex::Errors;
 
 sub new {
-    my ( $class, $queue ) = @_;
-    return bless { queue => $queue, closed => 0 }, $class;
+    my ( $class, $queue, $closed_event ) = @_;
+    return bless {
+        queue        => $queue,
+        closed       => 0,
+        closed_event => $closed_event,
+    }, $class;
 }
 
 sub next_update {
@@ -31,6 +35,7 @@ sub close {
     my ($self) = @_;
     return if $self->{closed}++;
     $self->{queue}->enqueue( encode_json( { kind => 'closed' } ) );
+    $self->{closed_event}->enqueue(1) if $self->{closed_event};
     return;
 }
 

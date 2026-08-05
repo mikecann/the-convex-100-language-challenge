@@ -4,6 +4,7 @@ use strict;
 use warnings;
 
 use Digest::SHA qw(sha1);
+use Errno       qw(EAGAIN EINTR EWOULDBLOCK);
 use IO::Select;
 use IO::Socket::INET;
 use IO::Socket::SSL;
@@ -15,8 +16,9 @@ use Convex::Errors;
 
 use constant GUID              => '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 use constant MAX_MESSAGE_BYTES => 2 * 1024 * 1024;
-use constant FRAME_READ_DEADLINE_SECONDS => 2;
-use constant UPGRADE_DEADLINE_SECONDS    => 2;
+use constant FRAME_READ_DEADLINE_SECONDS  => 2;
+use constant FRAME_WRITE_DEADLINE_SECONDS => 2;
+use constant UPGRADE_DEADLINE_SECONDS     => 2;
 
 sub connect {
     my ( $class, $url, $client_version ) = @_;
@@ -42,34 +44,47 @@ sub connect {
             'TLS handshake: ' . IO::Socket::SSL::errstr(), 'live' );
     }
 
-    my $key = encode_base64( _random_bytes(16), q{} );
-    print {$io} join( "\r\n",
-        "GET $target->{path} HTTP/1.1",
-        "Host: $target->{authority}",
-        'Upgrade: websocket',
-        'Connection: Upgrade',
-        "Sec-WebSocket-Key: $key",
-        'Sec-WebSocket-Version: 13',
-        "Convex-Client: $client_version",
-        q{},
-        q{},
-      )
-      or die Convex::Errors::transport_error( "WebSocket upgrade write: $!",
-        'live' );
+    my $key       = encode_base64( _random_bytes(16), q{} );
+    my $connected = eval {
+        _set_nonblocking($io);
+        _write_all_to(
+            $io,
+            join( "\r\n",
+                "GET $target->{path} HTTP/1.1",
+                "Host: $target->{authority}",
+                'Upgrade: websocket',
+                'Connection: Upgrade',
+                "Sec-WebSocket-Key: $key",
+                'Sec-WebSocket-Version: 13',
+                "Convex-Client: $client_version",
+                q{},
+                q{},
+            ),
+            time + UPGRADE_DEADLINE_SECONDS,
+            'WebSocket upgrade write',
+        );
 
-    my $headers = _read_headers( $io, time + UPGRADE_DEADLINE_SECONDS );
-    die Convex::Errors::protocol_error('WebSocket upgrade was rejected')
-      unless $headers->{_status} =~ m{\AHTTP/1\.[01] 101\b};
-    my $expected = encode_base64( sha1( $key . GUID ), q{} );
-    die Convex::Errors::protocol_error(
-        'WebSocket upgrade returned an invalid accept key')
-      unless ( $headers->{'sec-websocket-accept'} // q{} ) eq $expected;
+        my $headers = _read_headers( $io, time + UPGRADE_DEADLINE_SECONDS );
+        die Convex::Errors::protocol_error('WebSocket upgrade was rejected')
+          unless $headers->{_status} =~ m{\AHTTP/1\.[01] 101\b};
+        my $expected = encode_base64( sha1( $key . GUID ), q{} );
+        die Convex::Errors::protocol_error(
+            'WebSocket upgrade returned an invalid accept key')
+          unless ( $headers->{'sec-websocket-accept'} // q{} ) eq $expected;
+        1;
+    };
+    if ( !$connected ) {
+        my $error = $@;
+        eval { close $io; };
+        die $error;
+    }
 
     return bless { io => $io, tcp => $tcp }, $class;
 }
 
 sub from_io_for_test {
     my ( $class, $io ) = @_;
+    _set_nonblocking($io);
     return bless { io => $io }, $class;
 }
 
@@ -197,9 +212,14 @@ sub _read_exact_from {
             "$context timed out during partial read", 'live' )
           unless @ready;
         my $read = sysread( $io, my $chunk, $length - length($out) );
+        if ( !defined $read ) {
+            next if $! == EAGAIN || $! == EWOULDBLOCK || $! == EINTR;
+            die Convex::Errors::transport_error( "$context read failed: $!",
+                'live' );
+        }
         die Convex::Errors::transport_error(
             "$context closed during partial read", 'live' )
-          unless $read;
+          if $read == 0;
         $out .= $chunk;
     }
     return $out;
@@ -244,8 +264,71 @@ sub _write_frame {
     my $masked = join q{}, map {
         chr( ord( substr $payload, $_, 1 ) ^ ord( substr $mask, $_ % 4, 1 ) )
     } 0 .. $length - 1;
-    print { $self->{io} } $header . $mask . $masked
-      or die Convex::Errors::transport_error( "WebSocket write: $!", 'live' );
+    my $written = eval {
+        _write_all_to(
+            $self->{io},
+            $header . $mask . $masked,
+            time + FRAME_WRITE_DEADLINE_SECONDS,
+            'WebSocket frame write',
+        );
+        1;
+    };
+    if ( !$written ) {
+        my $error = $@;
+
+        # Any short frame leaves stream boundaries uncertain. Retire the
+        # connection before reporting the error so no later frame can append to
+        # corrupted transport state.
+        $self->close_now;
+        die $error;
+    }
+    return;
+}
+
+sub _set_nonblocking {
+    my ($io) = @_;
+    my $changed = eval { $io->blocking(0) };
+    die Convex::Errors::transport_error(
+        "make WebSocket nonblocking: " . ( $@ || $! ), 'live' )
+      unless defined $changed;
+    return;
+}
+
+sub _write_all_to {
+    my ( $io, $bytes, $deadline, $context ) = @_;
+    my $length = length $bytes;
+    my $offset = 0;
+    local $SIG{PIPE} = 'IGNORE';
+    while ( $offset < $length ) {
+        my $remaining = $deadline - time;
+        die Convex::Errors::transport_error(
+            "$context timed out after $offset of $length bytes", 'live' )
+          if $remaining <= 0;
+
+        # A nonblocking TLS write can require either socket direction. Wait for
+        # readiness, retry transient errors, and keep one absolute deadline for
+        # the complete frame.
+        my $read_selector  = IO::Select->new($io);
+        my $write_selector = IO::Select->new($io);
+        my ( $readable, $writable ) =
+          IO::Select->select( $read_selector, $write_selector, undef,
+            $remaining, );
+        die Convex::Errors::transport_error(
+            "$context timed out after $offset of $length bytes", 'live' )
+          unless ( $readable && @{$readable} )
+          || ( $writable && @{$writable} );
+
+        my $count = syswrite( $io, $bytes, $length - $offset, $offset );
+        if ( !defined $count ) {
+            next if $! == EAGAIN || $! == EWOULDBLOCK || $! == EINTR;
+            die Convex::Errors::transport_error( "$context failed: $!",
+                'live' );
+        }
+        die Convex::Errors::transport_error(
+            "$context closed after $offset of $length bytes", 'live' )
+          if $count == 0;
+        $offset += $count;
+    }
     return;
 }
 

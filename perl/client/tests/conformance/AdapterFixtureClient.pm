@@ -7,8 +7,11 @@ use Convex::Errors;
 use AdapterFixtureSubscription;
 
 sub new {
-    my ( $class, $subscription_queues ) = @_;
-    return bless { subscription_queues => $subscription_queues }, $class;
+    my ( $class, $subscription_queues, $events ) = @_;
+    return bless {
+        subscription_queues => $subscription_queues,
+        events              => $events // {},
+    }, $class;
 }
 
 sub query {
@@ -27,7 +30,8 @@ sub subscribe {
     my ($self) = @_;
     my $queue = shift @{ $self->{subscription_queues} };
     die 'fixture ran out of subscription queues' unless $queue;
-    return AdapterFixtureSubscription->new($queue);
+    return AdapterFixtureSubscription->new( $queue,
+        $self->{events}{subscription_closed} );
 }
 
 sub set_auth {
@@ -35,6 +39,9 @@ sub set_auth {
 }
 
 sub close {
+    my ($self) = @_;
+    $self->{events}{client_closed}->enqueue(1)
+      if $self->{events}{client_closed};
     return;
 }
 

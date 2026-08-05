@@ -7,8 +7,9 @@ use FindBin;
 use IO::Handle;
 use IO::Select;
 use JSON::PP qw(decode_json encode_json);
-use Socket   qw(AF_UNIX PF_UNSPEC SOCK_STREAM);
+use Socket   qw(AF_UNIX PF_UNSPEC SHUT_WR SOCK_STREAM);
 use Test::More;
+use Time::HiRes qw(sleep time);
 
 use lib "$FindBin::Bin/../..";
 use lib $FindBin::Bin;
@@ -279,5 +280,52 @@ is_event(
     'close has the exact adapter shape'
 );
 $adapter_thread->join;
+
+my $subscription_closed = Thread::Queue->new;
+my $client_closed       = Thread::Queue->new;
+my @eof_queues          = ( Thread::Queue->new );
+my $eof_client          = AdapterFixtureClient->new(
+    \@eof_queues,
+    {
+        subscription_closed => $subscription_closed,
+        client_closed       => $client_closed,
+    }
+);
+socketpair( $controller, $adapter, AF_UNIX, SOCK_STREAM, PF_UNSPEC )
+  or die "EOF socketpair: $!";
+$controller->autoflush(1);
+$adapter_thread = threads->create(
+    sub {
+        Adapter::run_adapter( $adapter, $adapter, { client => $eof_client } );
+        return;
+    }
+);
+send_command(
+    $controller,
+    {
+        id             => 'eof-subscribe',
+        op             => 'subscribe',
+        subscriptionId => 'eof-id',
+        path           => 'fixture:eof',
+        args           => {},
+    }
+);
+is_event(
+    read_event( $controller, 0.5 ),
+    { id => 'eof-subscribe', type => 'ack' },
+    'active EOF fixture subscribes'
+);
+shutdown $controller, SHUT_WR or die "shutdown controller writes: $!";
+my $eof_deadline = time + 1;
+sleep 0.01 while !$adapter_thread->is_joinable && time < $eof_deadline;
+ok( $adapter_thread->is_joinable, 'EOF cleanup stops the adapter promptly' );
+$adapter_thread->join;
+is( $subscription_closed->pending,
+    1, 'EOF cleanup closes the active subscription' );
+is( $client_closed->pending, 1, 'EOF cleanup closes the client' );
+is( scalar threads->list(threads::running),
+    0, 'EOF cleanup leaves no running or unjoined threads' );
+close $controller;
+close $adapter;
 
 done_testing;

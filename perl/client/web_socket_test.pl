@@ -1,10 +1,12 @@
 use strict;
 use warnings;
 use utf8;
+use threads;
+use Thread::Queue;
 
 use FindBin;
 use JSON::PP qw(decode_json encode_json);
-use Socket   qw(AF_UNIX SOCK_STREAM PF_UNSPEC);
+use Socket   qw(AF_UNIX PF_UNSPEC SOCK_STREAM SOL_SOCKET SO_SNDBUF);
 use Test::More;
 use Time::HiRes qw(time);
 
@@ -52,6 +54,49 @@ eval { $websocket->read_message };
 is( ref($@), 'Convex::TransportError', 'partial frame raises transport error' );
 cmp_ok( time - $started, '<', 2.5, 'partial frame read has a hard deadline' );
 $websocket->close_now;
+close $server_io;
+
+socketpair( $client_io, $server_io, AF_UNIX, SOCK_STREAM, PF_UNSPEC )
+  or die "partial write socketpair: $!";
+setsockopt $client_io, SOL_SOCKET, SO_SNDBUF, pack( 'i', 4_096 )
+  or die "partial write send buffer: $!";
+my $partial_bytes = Thread::Queue->new;
+my $partial_peer  = threads->create(
+    sub {
+        my $read = sysread $server_io, my $chunk, 4_096;
+        $partial_bytes->enqueue( $read // 0 );
+        close $server_io;
+        return;
+    }
+);
+$websocket = Convex::WebSocket->from_io_for_test($client_io);
+my $large_payload = 'x' x ( 512 * 1_024 );
+eval { $websocket->_write_frame( 1, $large_payload ) };
+is( ref($@), 'Convex::TransportError',
+    'partial frame write raises transport error' );
+cmp_ok( $partial_bytes->dequeue, '>', 0,
+    'partial peer receives a real frame prefix' );
+ok( !defined $websocket->io,
+    'partial frame write retires the uncertain connection' );
+eval { $websocket->write_json( { later => 1 } ) };
+is( ref($@), 'Convex::ClosedError',
+    'later traffic cannot reuse a partially written connection' );
+$partial_peer->join;
+close $server_io;
+
+socketpair( $client_io, $server_io, AF_UNIX, SOCK_STREAM, PF_UNSPEC )
+  or die "blocked write socketpair: $!";
+setsockopt $client_io, SOL_SOCKET, SO_SNDBUF, pack( 'i', 4_096 )
+  or die "blocked write send buffer: $!";
+$websocket = Convex::WebSocket->from_io_for_test($client_io);
+$started   = time;
+eval { $websocket->_write_frame( 1, $large_payload ) };
+is( ref($@), 'Convex::TransportError',
+    'blocked frame write raises transport error' );
+cmp_ok( time - $started,
+    '<', 2.5, 'blocked frame write has a complete-frame deadline' );
+ok( !defined $websocket->io,
+    'blocked frame write force-retires the connection' );
 close $server_io;
 
 done_testing;

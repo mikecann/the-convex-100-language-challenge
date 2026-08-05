@@ -123,10 +123,14 @@ before either capability can be awarded.
 The adapter speaks NDJSON protocol v1 over stdin/stdout or `ADAPTER_LISTEN` TCP.
 Live is implemented with one worker that owns WebSocket reads, writes,
 reconnects, and query-set versions; each subscriber gets a newest-16 mailbox.
-Partial handshake and frame reads abandon the connection after a two-second
-deadline. Deterministic fixtures cover Add/Remove, QueryFailed recovery, five
-reconnects and metadata, unchanged hydration suppression, stale relay races,
-fragmented UTF-8 and control frames, structured recovery, and hostile shutdown.
+Partial handshake and frame reads or writes abandon the connection after a
+two-second deadline. A partial write force-retires the uncertain stream before
+active Add operations are rehydrated on a new connection. Adapter EOF performs
+the same subscription, relay, client, and socket cleanup as an explicit close,
+without writing to the disconnected controller. Deterministic fixtures cover
+Add/Remove, QueryFailed recovery, five reconnects and metadata, unchanged
+hydration suppression, stale relay races, fragmented UTF-8 and control frames,
+structured recovery, partial and blocked writes, EOF, and hostile shutdown.
 `debugDisconnect` is adapter-only.
 
 Runtime transport modules are supplied by the digest-pinned Perl 5.42.0 image:

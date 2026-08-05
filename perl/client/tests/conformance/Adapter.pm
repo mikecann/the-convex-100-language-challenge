@@ -60,14 +60,14 @@ sub invalidate_relay {
     # A relay paused after dequeue can resume later, but it cannot publish.
     $guard->advance($subscription_id);
     my $subscription = delete $subscriptions->{$subscription_id};
-    $subscription->close if $subscription;
-    my $relay = delete $relays->{$subscription_id};
+    my $relay        = delete $relays->{$subscription_id};
     push @{$retired_relays}, $relay if $relay;
+    $subscription->close if $subscription;
     return;
 }
 
 sub reap_relays {
-    my ( $retired_relays, $wait_seconds, $detach_remaining ) = @_;
+    my ( $retired_relays, $wait_seconds ) = @_;
     my $deadline = time + $wait_seconds;
     while ( @{$retired_relays} ) {
         my @still_running;
@@ -83,11 +83,37 @@ sub reap_relays {
         last if !@still_running || time >= $deadline;
         sleep 0.01;
     }
-    if ($detach_remaining) {
-        $_->detach for @{$retired_relays};
-        @{$retired_relays} = ();
-    }
     return;
+}
+
+sub stop_adapter_lifecycle {
+    my ( $guard, $subscriptions, $relays, $retired_relays, $client_ref ) = @_;
+    my @errors;
+
+    # EOF and controller disconnects do not carry a close command, but they
+    # still own the same local lifecycle. Invalidate every relay first so none
+    # can publish while the controller stream is already gone.
+    for my $subscription_id ( keys %{$subscriptions} ) {
+        eval {
+            invalidate_relay(
+                $subscription_id, $guard, $subscriptions,
+                $relays,          $retired_relays,
+            );
+            1;
+        } or push @errors, "$@";
+    }
+
+    if ( ${$client_ref} ) {
+        eval { ${$client_ref}->close; 1 } or push @errors, "$@";
+        ${$client_ref} = undef;
+    }
+
+    # Closing each subscription wakes a relay blocked in next_update. Await
+    # every tracked relay so Perl exits with no running or unjoined threads.
+    reap_relays( $retired_relays, 2 );
+    push @errors, 'adapter relay did not stop within two seconds'
+      if @{$retired_relays};
+    return join q{}, @errors;
 }
 
 sub run_adapter {
@@ -216,10 +242,11 @@ sub run_adapter {
                 write_event( $output, $guard, { id => $id, type => 'ack' } );
             }
             elsif ( $command->{op} eq 'close' ) {
-                invalidate_relay( $_, $guard, \%subscriptions, \%relays,
-                    \@retired_relays, )
-                  for keys %subscriptions;
-                $client->close if $client;
+                my $cleanup_error = stop_adapter_lifecycle(
+                    $guard, \%subscriptions, \%relays,
+                    \@retired_relays, \$client,
+                );
+                die $cleanup_error if length $cleanup_error;
                 write_event( $output, $guard, { id => $id, type => 'closed' } );
                 $done = 1;
             }
@@ -239,13 +266,18 @@ sub run_adapter {
               if ref($error) eq 'Convex::FunctionError';
             write_event( $output, $guard, $event );
         }
-        reap_relays( \@retired_relays, 0, 0 );
+        reap_relays( \@retired_relays, 0 );
         last if $done;
     }
 
-    # The close event is already flushed. Reap cooperative relays briefly, then
-    # detach any hostile test relay so it cannot hold adapter shutdown forever.
-    reap_relays( \@retired_relays, 2, 1 );
+    # EOF has no command id and the output may already be closed. Perform the
+    # close-equivalent lifecycle without trying to emit a final protocol event.
+    if ( !$done ) {
+        my $cleanup_error =
+          stop_adapter_lifecycle( $guard, \%subscriptions, \%relays,
+            \@retired_relays, \$client, );
+        die $cleanup_error if length $cleanup_error;
+    }
     return;
 }
 
@@ -260,6 +292,8 @@ sub main {
         ) or die "listen: $!";
         my $socket = $server->accept;
         run_adapter( $socket, $socket );
+        close $socket or die "close controller socket: $!";
+        close $server or die "close adapter listener: $!";
     }
     else {
         run_adapter( *STDIN, *STDOUT );

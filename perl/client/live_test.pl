@@ -8,6 +8,7 @@ use FindBin;
 use IO::Socket::INET;
 use JSON::PP     qw(decode_json encode_json);
 use MIME::Base64 qw(encode_base64);
+use Socket       qw(SOL_SOCKET SO_SNDBUF);
 use Test::More;
 use Time::HiRes qw(sleep time);
 
@@ -134,6 +135,16 @@ sub finish_server {
     $thread->join;
     fail( 'fixture server failed: ' . $errors->dequeue ) if $errors->pending;
     return;
+}
+
+sub constrained_connector {
+    return sub {
+        my ( $url, $client_version ) = @_;
+        my $socket = Convex::WebSocket->connect( $url, $client_version );
+        setsockopt $socket->io, SOL_SOCKET, SO_SNDBUF, pack( 'i', 4_096 )
+          or die "set fixture send buffer: $!";
+        return $socket;
+    };
 }
 
 {
@@ -428,6 +439,146 @@ sub finish_server {
         1, 'valid value follows protocol and transport recovery' );
     $subscription->close;
     $client->close;
+    finish_server( $server, $thread, $errors );
+}
+
+{
+    my $observed = Thread::Queue->new;
+    my ( $server, $url, $thread, $errors ) = test_server(
+        sub {
+            my ($listener) = @_;
+            my $first = accept_websocket($listener);
+            read_client_json($first);
+            my $prefix = read_exact( $first, 4_096 );
+            $observed->enqueue( length( $prefix // q{} ) );
+            close $first;
+
+            my $second  = accept_websocket($listener);
+            my $connect = read_client_json($second);
+            my $add     = read_client_json($second);
+            my $id      = $add->{modifications}[0]{queryId};
+            $observed->enqueue(
+                $connect->{connectionCount},
+                length $add->{modifications}[0]{args}[0]{blob},
+            );
+            write_server_json(
+                $second,
+                transition(
+                    version( 0, 'AAAAAAAAAAA=' ),
+                    version( 1, 'write-recovered' ),
+                    updated( $id, 7 ),
+                )
+            );
+            read_client_json($second);
+            close $second;
+            return;
+        }
+    );
+    my $manager = Convex::Live->new( $url, 'perl-write-recovery',
+        connector => constrained_connector(), );
+    my $subscription =
+      $manager->subscribe( 'demo:state',
+        { room => 'partial-write', blob => 'x' x ( 512 * 1_024 ) },
+      );
+    is(
+        ref( $subscription->next_update(3)->{error} ),
+        'Convex::TransportError',
+        'partial Add write reports a transport error'
+    );
+    is( $observed->dequeue, 4_096,
+        'partial peer receives only a frame prefix' );
+    is( $observed->dequeue, 1,
+        'partial write recovery opens a new connection' );
+    is(
+        $observed->dequeue,
+        512 * 1_024,
+        'reconnect resends the complete active Add'
+    );
+    is( $subscription->next_update(3)->{value}{count},
+        7, 'subscription recovers after partial write retirement' );
+    $subscription->close;
+    $manager->close;
+    finish_server( $server, $thread, $errors );
+}
+
+{
+    my $stalled = Thread::Queue->new;
+    my $release = Thread::Queue->new;
+    my ( $server, $url, $thread, $errors ) = test_server(
+        sub {
+            my ($listener) = @_;
+            my $socket = accept_websocket($listener);
+            read_client_json($socket);
+            my $add = read_client_json($socket);
+            my $id  = $add->{modifications}[0]{queryId};
+            write_server_json(
+                $socket,
+                transition(
+                    version( 0, 'AAAAAAAAAAA=' ),
+                    version( 1, 'blocked-write-initial' ),
+                    updated( $id, 0 ),
+                )
+            );
+            my $prefix = read_exact( $socket, 4_096 );
+            $stalled->enqueue( length( $prefix // q{} ) );
+            $release->dequeue;
+            close $socket;
+            return;
+        }
+    );
+    my $manager = Convex::Live->new( $url, 'perl-write-deadline',
+        connector => constrained_connector(), );
+    my $subscription =
+      $manager->subscribe( 'demo:state', { room => 'blocked-write' } );
+    is( $subscription->next_update(2)->{value}{count},
+        0, 'blocking write fixture starts connected' );
+
+    my $large_reply = Thread::Queue->new;
+    my $large_queue = Thread::Queue->new;
+    $manager->{commands}->enqueue(
+        {
+            type => 'subscribe',
+            data => {
+                query_id => 99,
+                path     => 'demo:state',
+                args     => {
+                    room => 'blocked-large-write',
+                    blob => 'x' x ( 512 * 1_024 ),
+                },
+                queue => $large_queue,
+            },
+            reply => $large_reply,
+        }
+    );
+    is( $stalled->dequeue, 4_096,
+        'blocking peer stalls a real partial Add frame' );
+
+    my $small_unsubscribe = Thread::Queue->new;
+    my $large_unsubscribe = Thread::Queue->new;
+    $manager->{commands}->enqueue(
+        {
+            type  => 'unsubscribe',
+            data  => { query_id => 0 },
+            reply => $small_unsubscribe,
+        },
+        {
+            type  => 'unsubscribe',
+            data  => { query_id => 99 },
+            reply => $large_unsubscribe,
+        },
+    );
+    my $started = time;
+    $manager->close;
+    cmp_ok( time - $started,
+        '<', 2.5,
+        'stalled write cannot block unsubscribe and close past deadline' );
+    ok( $large_reply->pending,
+        'blocked Add command completes after retirement' );
+    ok( $small_unsubscribe->pending,
+        'existing unsubscribe completes after write retirement' );
+    ok( $large_unsubscribe->pending,
+        'partial Add unsubscribe completes after write retirement' );
+    $release->enqueue(1);
     finish_server( $server, $thread, $errors );
 }
 

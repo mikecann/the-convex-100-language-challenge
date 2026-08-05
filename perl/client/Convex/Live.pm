@@ -20,10 +20,11 @@ use constant INACTIVITY_SECONDS      => 30;
 my $CANONICAL_JSON = JSON::PP->new->canonical->allow_nonref;
 
 sub new {
-    my ( $class, $deployment_url, $client_version ) = @_;
+    my ( $class, $deployment_url, $client_version, %options ) = @_;
     my $self = bless {
         url            => _live_url($deployment_url),
         client_version => $client_version,
+        connector      => $options{connector},
         commands       => Thread::Queue->new,
         next_id        => 0,
         stopped        => 0,
@@ -111,15 +112,31 @@ sub _run {
                 if ( $type eq 'subscribe' ) {
                     my $id = $data->{query_id};
                     $subscriptions{$id} = { %{$data}, finished => 0, };
-                    $reply->enqueue( { value => undef } );
                     if ($socket) {
-                        _modify_query_set( $socket, \$query_version,
-                            [ _add_modification( $id, $subscriptions{$id} ) ],
-                        );
+                        my $sent = eval {
+                            _modify_query_set(
+                                $socket,
+                                \$query_version,
+                                [
+                                    _add_modification(
+                                        $id, $subscriptions{$id}
+                                    )
+                                ],
+                            );
+                            1;
+                        };
+                        _retire_transport(
+                            \$socket,            \%subscriptions,
+                            $@,                  \$connection_count,
+                            \$last_close_reason, \$query_version,
+                            \$remote_version,    \$retry_at,
+                            \$backoff,
+                        ) unless $sent;
                     }
                     else {
                         $retry_at = time;
                     }
+                    $reply->enqueue( { value => undef } );
                 }
                 elsif ( $type eq 'unsubscribe' ) {
                     my $id    = $data->{query_id};
@@ -130,9 +147,28 @@ sub _run {
                         # Invalidate and wake the relay before publishing the
                         # acknowledgement through the adapter.
                         _finish_state($state);
-                        _modify_query_set( $socket, \$query_version,
-                            [ { type => 'Remove', queryId => 0 + $id } ],
-                        ) if $socket;
+                        if ($socket) {
+                            my $sent = eval {
+                                _modify_query_set(
+                                    $socket,
+                                    \$query_version,
+                                    [
+                                        {
+                                            type    => 'Remove',
+                                            queryId => 0 + $id
+                                        }
+                                    ],
+                                );
+                                1;
+                            };
+                            _retire_transport(
+                                \$socket,            \%subscriptions,
+                                $@,                  \$connection_count,
+                                \$last_close_reason, \$query_version,
+                                \$remote_version,    \$retry_at,
+                                \$backoff,
+                            ) unless $sent;
+                        }
                     }
                     $retry_at = 0 unless %subscriptions;
                     $reply->enqueue( { value => undef } );
@@ -165,13 +201,29 @@ sub _run {
                 }
                 1;
             };
-            $reply->enqueue( { error => $@ } ) unless $ok;
+            if ( !$ok ) {
+                my $error = $@;
+                if ( $socket && ref($error) eq 'Convex::TransportError' ) {
+                    _retire_transport(
+                        \$socket,            \%subscriptions,
+                        $error,              \$connection_count,
+                        \$last_close_reason, \$query_version,
+                        \$remote_version,    \$retry_at,
+                        \$backoff,
+                    );
+                }
+                $reply->enqueue( { error => $error } );
+            }
         }
         last if $closed;
 
         if ( !$socket && %subscriptions && time >= $retry_at ) {
             my $connected = eval {
-                $socket = Convex::WebSocket->connect( $self->{url},
+                $socket =
+                    $self->{connector}
+                  ? $self->{connector}
+                  ->( $self->{url}, $self->{client_version} )
+                  : Convex::WebSocket->connect( $self->{url},
                     $self->{client_version} );
                 $query_version        = 0;
                 $remote_version       = _zero_version();
@@ -200,13 +252,13 @@ sub _run {
                 1;
             };
             if ( !$connected ) {
-                _publish_error( \%subscriptions, $@ );
-                $socket->close_now if $socket;
-                $socket            = undef;
-                $last_close_reason = "$@";
-                $connection_count += 1;
-                $retry_at = time + $backoff;
-                $backoff  = _next_backoff($backoff);
+                _retire_transport(
+                    \$socket,            \%subscriptions,
+                    $@,                  \$connection_count,
+                    \$last_close_reason, \$query_version,
+                    \$remote_version,    \$retry_at,
+                    \$backoff,
+                );
             }
         }
 
@@ -246,29 +298,25 @@ sub _run {
                     1;
                 };
                 if ( !$read_ok ) {
-                    _publish_error( \%subscriptions, $@ );
-                    $socket->close_now if $socket;
-                    $socket = undef;
-                    $connection_count += 1;
-                    $last_close_reason = "$@";
-                    $query_version     = 0;
-                    $remote_version    = _zero_version();
-                    $retry_at          = time + $backoff;
-                    $backoff           = _next_backoff($backoff);
+                    _retire_transport(
+                        \$socket,            \%subscriptions,
+                        $@,                  \$connection_count,
+                        \$last_close_reason, \$query_version,
+                        \$remote_version,    \$retry_at,
+                        \$backoff,
+                    );
                 }
             }
             elsif ( time - $last_server_response > INACTIVITY_SECONDS ) {
                 my $error =
                   Convex::Errors::transport_error( 'InactiveServer', 'live' );
-                _publish_error( \%subscriptions, $error );
-                $socket->close_now;
-                $socket = undef;
-                $connection_count += 1;
-                $last_close_reason = 'InactiveServer';
-                $query_version     = 0;
-                $remote_version    = _zero_version();
-                $retry_at          = time + $backoff;
-                $backoff           = _next_backoff($backoff);
+                _retire_transport(
+                    \$socket,            \%subscriptions,
+                    $error,              \$connection_count,
+                    \$last_close_reason, \$query_version,
+                    \$remote_version,    \$retry_at,
+                    \$backoff,
+                );
             }
         }
         else {
@@ -363,6 +411,34 @@ sub _publish_error {
     my ( $subscriptions, $error ) = @_;
     _deliver_state( $_, { error => $error } )
       for values %{$subscriptions};
+    return;
+}
+
+sub _retire_transport {
+    my (
+        $socket_ref,           $subscriptions,         $error,
+        $connection_count_ref, $last_close_reason_ref, $query_version_ref,
+        $remote_version_ref,   $retry_at_ref,          $backoff_ref
+    ) = @_;
+
+    # A failed complete-frame write makes the old stream unusable even when
+    # only a prefix reached the peer. Close it before scheduling any later Add
+    # or Remove so the next connection starts at a real frame boundary.
+    _publish_error( $subscriptions, $error );
+    ${$socket_ref}->close_now if ${$socket_ref};
+    ${$socket_ref} = undef;
+    ${$connection_count_ref} += 1;
+    ${$last_close_reason_ref} = "$error";
+    ${$query_version_ref}     = 0;
+    ${$remote_version_ref}    = _zero_version();
+
+    if ( keys %{$subscriptions} ) {
+        ${$retry_at_ref} = time + ${$backoff_ref};
+        ${$backoff_ref}  = _next_backoff( ${$backoff_ref} );
+    }
+    else {
+        ${$retry_at_ref} = 0;
+    }
     return;
 }
 
