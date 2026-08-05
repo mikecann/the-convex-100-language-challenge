@@ -1,0 +1,88 @@
+--- a/ws-client.scm
++++ b/ws-client.scm
+@@ -2,8 +2,9 @@
+  ws-client
+  (ws-connect
+   ws-connection?
++  ws-extra-headers
+ 
+-  ws-close
++  ws-close ws-disconnect! ws-data-ready?
+ 
+   recv-message recv-message-loop
+   send-message send-text-message send-binary-message
+@@ -72,6 +73,10 @@
+ 
+  (define ws-error error)
+ 
++ ;; Pinned client-local extension: the upstream handshake has no way to add
++ ;; application headers such as Convex-Client.
++ (define ws-extra-headers (make-parameter '()))
++
+  (define (ws-exn msg)
+    (signal (make-composite-condition
+ 	    (make-property-condition 'websocket)
+@@ -299,6 +304,16 @@
+    (rsv valid-rsv valid-rsv-set!)
+    (exts extensions extensions-set!))
+ 
++ ;; Pinned client-local extension: upstream ws-close only emits a close frame
++ ;; and never retires its TCP/TLS ports. A real acknowledgement barrier needs
++ ;; the old transport to be unreachable before it returns.
++ (define (ws-disconnect! conn)
++   (handle-exceptions _ (void) (close-input-port (in-port conn)))
++   (handle-exceptions _ (void) (close-output-port (out-port conn))))
++
++ (define (ws-data-ready? conn)
++   (char-ready? (in-port conn)))
++
+  (define (valid-rsv-set-bit! conn b)
+    (valid-rsv-set! conn (bitwise-ior b (valid-rsv conn))))
+ 
+@@ -335,7 +350,8 @@
+ 		(connection #("upgrade" raw))
+ 		(sec-websocket-key #(,key raw))
+ 		(sec-websocket-version #("13" raw))
+-		(sec-websocket-extensions #(,ext-offer raw))))))
++		(sec-websocket-extensions #(,ext-offer raw))
++                ,@(ws-extra-headers)))))
+      ;; apparently write-request might modify out-port, so we
+      ;; return this
+      (request-port (write-request (make-request
+@@ -560,18 +576,28 @@
+ 	((fin rsv op) (interpret-b0 conn b0))
+ 	((b1) (read-byte i))
+ 	((mask len0) (interpret-b1 b1)))
++     ;; A server-to-client frame must never be masked.
++     (if mask (ws-fail 'protocol-error "server frame is masked"))
+      (if (control-opcode? op)
+ 	 (cond
+ 	  ((not fin) (ws-fail 'protocol-error "fragmented control frame"))
+ 	  ((< 125 len0) (ws-fail 'protocol-error "control frame with payload length > 125"))))
+-     (let* ((len (read-payload-length i len0))
+-	    (key (if mask (read-full-u8vector 4 i) #f))
+-	    (buf (read-full-u8vector len i))
+-	    (f (make-ws-frame fin rsv op mask len buf)))
+-       (apply-extension-transforms
+-	(extensions conn)
+-	in-frame-transform
+-	f))))
++     (let ((len (read-payload-length i len0)))
++       ;; Reject non-canonical and dangerous lengths before allocating. This
++       ;; client caps each frame at the same 2 MiB as a decoded Live message.
++       (if (or (and (= len0 126) (< len 126))
++               (and (= len0 127) (< len 65536))
++               (>= len 9223372036854775808))
++           (ws-fail 'protocol-error "non-canonical frame length"))
++       (if (> len 2097152)
++           (ws-fail 'message-too-big "frame exceeds 2 MiB"))
++       (let* ((key (if mask (read-full-u8vector 4 i) #f))
++              (buf (read-full-u8vector len i))
++              (f (make-ws-frame fin rsv op mask len buf)))
++         (apply-extension-transforms
++          (extensions conn)
++          in-frame-transform
++          f)))))
+ 
+  (: recv-message-loop* (ws-connection (ws-message -> *) integer -> undefined))
+  (: recv-message-loop (ws-connection (ws-message -> *) -> undefined))

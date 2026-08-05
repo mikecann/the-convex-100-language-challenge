@@ -1,0 +1,56 @@
+--- a/openssl.socket.scm
++++ b/openssl.socket.scm
+@@ -90,6 +90,7 @@
+ 
+ #include <openssl/err.h>
+ #include <openssl/ssl.h>
++#include <openssl/x509v3.h>
+ <#
+ 
+ #>
+@@ -299,5 +300,28 @@
+   (void))
+ 
++;; OpenSSL verifies the trust chain when SSL_VERIFY_PEER is enabled, but it
++;; does not compare the certificate identity with the requested server unless
++;; the caller configures a verification parameter. Treat an IP literal as an
++;; IP SAN and every other name as a DNS hostname.
++(define (ssl-set-peer-name! ssl hostname)
++  (ssl-clear-error)
++  (unless
++   ((foreign-lambda*
++     bool ((c-pointer ssl) (c-string hostname))
++     "X509_VERIFY_PARAM *param = SSL_get0_param((SSL *)ssl);\n"
++     "int result = 0;\n"
++     "if (param != NULL) {\n"
++     "  result = X509_VERIFY_PARAM_set1_ip_asc(param, hostname);\n"
++     "  if (result != 1) {\n"
++     "    ERR_clear_error();\n"
++     "    X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);\n"
++     "    result = X509_VERIFY_PARAM_set1_host(param, hostname, 0);\n"
++     "  }\n"
++     "}\n"
++     "C_return(result == 1);")
++    ssl hostname)
++   (ssl-abort 'ssl-set-peer-name! #f hostname)))
++
+ (define (ssl-set-fd! ssl fd)
+   (ssl-clear-error)
+   (ssl-result-or-abort
+@@ -643,6 +667,16 @@
+                 (if (and (>= last 0) (eqv? (string-ref hostname last) #\.))
+                   (substring hostname 0 last)
+                   hostname)))))
++        ;; An explicit SNI value is the logical peer name when connecting
++        ;; through another address. Otherwise verify the requested hostname,
++        ;; even when SNI was deliberately disabled.
++        (let* ((peer-name (if (string? sni-name) sni-name hostname))
++               (last (sub1 (string-length peer-name)))
++               (peer-name (if (and (>= last 0)
++                                   (eqv? (string-ref peer-name last) #\.))
++                              (substring peer-name 0 last)
++                              peer-name)))
++          (ssl-set-peer-name! ssl peer-name))
+         (when sni-name
+           (ssl-set-tlsext-hostname! ssl sni-name))
+         (ssl-set-connect-state! ssl)
