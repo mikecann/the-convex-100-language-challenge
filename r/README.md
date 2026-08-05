@@ -19,7 +19,7 @@ starts Live before the mutation, and checks every observed value.
 | Live subscriptions and reconnects | Awaiting shared conformance |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.R -->
-```text
+```r
 #!/usr/local/bin/Rscript
 client_path <- Sys.getenv("CONVEX_CLIENT_PATH", "client")
 source(file.path(client_path, "convex.R"))
