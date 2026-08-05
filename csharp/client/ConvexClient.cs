@@ -38,14 +38,17 @@ public sealed class ConvexClient : IDisposable
         catch (Exception e) { throw new TransportException(operation, new Exception("non-Convex HTTP response", e)); }
         var logs = decoded["logLines"]?.AsArray().Select(x => x?.GetValue<string>() ?? "").ToArray() ?? [];
         if (decoded["status"]?.GetValue<string>() == "success")
-            return new Result(decoded["value"] ?? throw new ProtocolException("success response omitted value"), logs);
+        {
+            if (!decoded.ContainsKey("value")) throw new ProtocolException("success response omitted value");
+            return new Result(decoded["value"]?.DeepClone(), logs);
+        }
         if (decoded["status"]?.GetValue<string>() == "error")
             throw new FunctionException(operation, decoded["errorMessage"]?.GetValue<string>() ?? "Convex function failed", decoded["errorData"], logs);
         throw new ProtocolException($"HTTP {(int)response.StatusCode} response has unknown status");
     }
     private void EnsureOpen() { if (_closed) throw new ObjectDisposedException(nameof(ConvexClient)); }
     public void Dispose() { _closed = true; _http.Dispose(); }
-    public record Result(JsonNode Value, IReadOnlyList<string> Logs);
+    public record Result(JsonNode? Value, IReadOnlyList<string> Logs);
     public sealed class FunctionException(string operation, string message, JsonNode? data, IReadOnlyList<string> logs) : Exception(message) { public string Operation { get; } = operation; public JsonNode? ErrorData { get; } = data; public IReadOnlyList<string> Logs { get; } = logs; }
     public sealed class TransportException(string operation, Exception inner) : Exception(inner.Message, inner) { public string Operation { get; } = operation; }
     public sealed class ProtocolException(string message) : Exception(message);
