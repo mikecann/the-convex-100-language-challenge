@@ -11,6 +11,7 @@ whole() { convex_whole_number "$(jq -c .count <<<"$1")"; }
 # First obtain the authoritative HTTP snapshot.
 before=$(convex_query demo:state "$(jq -cn --arg room "$room" '{room:$room}')")
 count=$(whole "$before")
+test "$count" = 0 || { echo "expected room to start at 0, got $count" >&2; exit 1; }
 printf 'current count: %s\n' "$count"
 
 # Start Live before changing anything, then require its initial snapshot.

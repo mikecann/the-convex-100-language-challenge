@@ -53,7 +53,14 @@ while IFS= read -r header; do
   header=${header%$'\r'}; [[ -z $header ]] && break
   case ${header,,} in content-length:*) length=${header#*: }; length=${length%$'\r'};; sec-websocket-key:*) key=${header#*: }; key=${key%$'\r'};; esac
 done
-if [[ $request = GET\ /api/sync* ]]; then
+ws_path=${BASH_FIXTURE_WS_PATH:-/api/sync}
+if [[ $request = "GET $ws_path HTTP/1.1" ]]; then
+  printf '%s\n' "$request" >>"$state_dir/requests.log"
+  handshake_attempts_file=$state_dir/handshake-attempts
+  handshake_attempts=$(test -f "$handshake_attempts_file" && cat "$handshake_attempts_file" || printf 0)
+  handshake_attempts=$((handshake_attempts + 1)); printf '%s' "$handshake_attempts" >"$handshake_attempts_file"
+  fail_after=${BASH_FIXTURE_FAIL_AFTER:-0}; fail_count=${BASH_FIXTURE_FAIL_HANDSHAKES:-0}
+  if ((handshake_attempts > fail_after && handshake_attempts <= fail_after + fail_count)); then exit 0; fi
   accept=$(printf '%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11' "$key" | openssl dgst -sha1 -binary | openssl base64 -A)
   case ${BASH_FIXTURE_HANDSHAKE:-ok} in
     bad_accept) accept=definitely-wrong ;;
@@ -107,10 +114,17 @@ if [[ $request = GET\ /api/sync* ]]; then
     done
     # Poll the room state while still accepting control frames.
     while :; do
-      if IFS= read -r -N 1 -t 0.02 peek; then
+      read_status=0
+      first=$(timeout 0.02 dd bs=1 count=1 status=none | od -An -tu1 | tr -d ' \n') || read_status=$?
+      if [[ -n $first ]]; then
         # Put the already-read first header byte back through a tiny decoder path.
-        first=$(printf %s "$peek" | od -An -tu1 | tr -d ' ')
         if modify=$(client_frame "$first"); then printf '%s\n' "$modify" >>"$state_dir/ws.log"; break; else frame_status=$?; ((frame_status==8)) && exit 0; exit "$frame_status"; fi
+      elif ((read_status == 0)); then
+        # dd reached real EOF. A timeout is status 124 and leaves the connection
+        # alive for the next state poll.
+        printf 'peer-eof\n' >>"$state_dir/peer-eof.log"; exit 0
+      elif ((read_status != 124 && read_status != 143)); then
+        exit "$read_status"
       fi
       count=$(test -f "$count_file" && cat "$count_file" || printf 0)
       if [[ $count != "$last" ]]; then last=$count; transition=$(jq -cn --argjson q "$active_q" --arg room "$active_room" --argjson count "$count" '{type:"Transition",startVersion:{querySet:1,identity:0,ts:"AQAAAAAAAAA="},endVersion:{querySet:1,identity:0,ts:"AgAAAAAAAAA="},modifications:[{type:"QueryUpdated",queryId:$q,value:{room:$room,count:$count,lastLanguage:"Bash",latestRunId:"fixture",updatedAt:1},logLines:[]}]}'); server_frame "$transition"; fi
@@ -125,6 +139,7 @@ body=; ((length)) && body=$(dd bs=1 count="$length" status=none)
 path=$(jq -r .path <<<"$body"); args=$(jq -c .args <<<"$body")
 case $path in
   demo:echo) response=$(jq -cn --argjson value "$(jq -c .value <<<"$args")" '{status:"success",value:$value,logLines:["query demo:echo"]}') ;;
+  fixture:largeResponse) padding=$(dd if=/dev/zero bs=1024 count=2049 status=none | tr '\0' x); printf -v response '{"status":"success","value":{"padding":"%s"},"logLines":[]}' "$padding" ;;
   demo:fail) response=$(jq -cn --arg code "$(jq -r .code <<<"$args")" '{status:"error",errorMessage:"expected fixture error",errorData:{code:$code},logLines:["query demo:fail"]}') ;;
   demo:greet) response='{"status":"success","value":{"message":"Convex is responding to Bash"},"logLines":[]}' ;;
   demo:state|demo:increment)

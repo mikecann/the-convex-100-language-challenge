@@ -15,7 +15,7 @@ queue_live_error() {
 }
 drain_live() {
   local raw modification query sub update expected read_status frames=0 delivered=0
-  [[ -n ${LIVE_IN:-} ]] || return 0
+  if [[ -z ${LIVE_IN:-} ]]; then live_reconnect_tick; return 0; fi
   # One frame per controller turn keeps a hot subscription from starving close
   # and unsubscribe commands. The per-subscription queue remains bounded at 16.
   while ((frames < 1)); do
@@ -24,7 +24,7 @@ drain_live() {
     read_status=0; live_read 0.1 >/dev/null || read_status=$?; raw=$LIVE_READ
     if ((read_status)); then
       if ((read_status == 2)); then queue_live_error ProtocolError 'invalid RFC6455 or Convex Live frame'; live_disconnect
-      elif ((read_status == 3)); then live_disconnect; live_reconnect || queue_live_error TransportError 'Live transport closed and reconnect failed'
+      elif ((read_status == 3)); then live_disconnect; live_schedule_reconnect TransportError
       fi
       break
     fi
@@ -75,7 +75,7 @@ while :; do
     unsubscribe)
       sub=$(jq -r .subscriptionId <<<"$line"); for q in "${!LIVE_SUB[@]}"; do [[ ${LIVE_SUB[$q]} = "$sub" ]] && live_remove "$q"; done; send --arg id "$id" '{id:$id,type:"ack"}' ;;
     debugDisconnect)
-      if [[ -z ${LIVE_FD:-} ]]; then failure "$id" 'Live WebSocket is not connected'; else live_disconnect; if live_reconnect; then send --arg id "$id" '{id:$id,type:"ack"}'; else failure "$id" 'Live reconnect failed'; fi; fi ;;
+      if [[ -z ${LIVE_FD:-} ]]; then failure "$id" 'Live WebSocket is not connected'; else live_disconnect; live_schedule_reconnect DebugDisconnect 0; live_reconnect_tick; send --arg id "$id" '{id:$id,type:"ack"}'; fi ;;
     *) failure "$id" "unsupported operation $op" ;;
   esac
 done
