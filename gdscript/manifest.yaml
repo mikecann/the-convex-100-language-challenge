@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: gdscript
+displayName: "GDScript"
+rank: 49
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

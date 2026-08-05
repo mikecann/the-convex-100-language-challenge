@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: ada
+displayName: "Ada"
+rank: 26
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

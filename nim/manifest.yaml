@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: nim
+displayName: "Nim"
+rank: 80
+selectionTier: curated_backfill
+implementation:
+  status: planned
+capabilities: []

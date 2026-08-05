@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: groovy
+displayName: "Groovy"
+rank: 28
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: common-lisp
+displayName: "Common Lisp"
+rank: 31
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

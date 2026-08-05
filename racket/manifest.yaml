@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: racket
+displayName: "Racket"
+rank: 88
+selectionTier: curated_backfill
+implementation:
+  status: planned
+capabilities: []

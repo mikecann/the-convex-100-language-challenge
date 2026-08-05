@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: ruby
+displayName: "Ruby"
+rank: 14
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

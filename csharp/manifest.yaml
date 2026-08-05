@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: csharp
+displayName: "C#"
+rank: 5
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

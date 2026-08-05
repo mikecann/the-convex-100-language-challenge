@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: vala
+displayName: "Vala"
+rank: 74
+selectionTier: coverage
+implementation:
+  status: planned
+capabilities: []

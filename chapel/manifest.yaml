@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: chapel
+displayName: "Chapel"
+rank: 91
+selectionTier: curated_backfill
+implementation:
+  status: planned
+capabilities: []

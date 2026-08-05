@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: xbasepp
+displayName: "XBase++"
+rank: 76
+selectionTier: coverage
+implementation:
+  status: planned
+capabilities: []

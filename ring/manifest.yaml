@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: ring
+displayName: "Ring"
+rank: 71
+selectionTier: coverage
+implementation:
+  status: planned
+capabilities: []

@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: awk
+displayName: "Awk"
+rank: 59
+selectionTier: coverage
+implementation:
+  status: planned
+capabilities: []

@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: rust
+displayName: "Rust"
+rank: 11
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

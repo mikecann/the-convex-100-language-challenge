@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: agda
+displayName: "Agda"
+rank: 94
+selectionTier: curated_backfill
+implementation:
+  status: planned
+capabilities: []

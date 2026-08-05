@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: odin
+displayName: "Odin"
+rank: 87
+selectionTier: curated_backfill
+implementation:
+  status: planned
+capabilities: []

@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: freebasic
+displayName: "FreeBASIC"
+rank: 63
+selectionTier: coverage
+implementation:
+  status: planned
+capabilities: []
