@@ -4,5 +4,29 @@ displayName: "Crystal"
 rank: 81
 selectionTier: curated_backfill
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Crystal JSON HTTP client and Convex sync WebSocket worker.
+toolchain:
+  name: Crystal
+  version: 1.14.1
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication and TransitionChunk assembly are deferred.
+  - Convex values are limited to Crystal JSON types in this educational client.
+  - WebSocket mutations, optimistic updates, and mutation replay are deferred.
 capabilities: []
