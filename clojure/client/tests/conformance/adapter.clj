@@ -1,67 +1,235 @@
 (ns adapter
-  "Test-only NDJSON adapter v1. Its stdout is exclusively protocol events."
-  (:require [clojure.data.json :as json] [clojure.string :as string] [convex.client :as convex])
+  "Test-only NDJSON adapter v1. stdout is exclusively protocol events."
+  (:gen-class)
+  (:require [clojure.data.json :as json]
+            [clojure.string :as string]
+            [convex.client :as convex])
   (:import [java.io BufferedReader InputStreamReader OutputStreamWriter PrintWriter]
            [java.net InetAddress InetSocketAddress ServerSocket]
            [java.nio.charset StandardCharsets]
-           [java.util.concurrent ConcurrentHashMap]))
+           [java.util.concurrent ConcurrentHashMap TimeUnit]
+           [java.util.concurrent.atomic AtomicLong]))
 
-(defn- write! [^PrintWriter out value] (locking out (.println out (json/write-str value)) (.flush out)))
-(defn- error-value [id error]
-  (cond-> {"type" "error" "error" {"name" (name (or (:kind (ex-data error)) :protocol)) "message" (or (.getMessage error) "error")}}
-    (seq id) (assoc "id" id)))
-(defn- result-value [id result]
-  (cond-> {"type" "result" "id" id "value" (:value result)} (seq (:logs result)) (assoc "logs" (:logs result))))
+(def before-publish-hook (atom nil))
+(def inside-publication-lock-hook (atom nil))
 
-(defn- relay! [subscription-id subscription subscriptions out]
-  (future
-    (loop []
-      (when (and @(:active subscription) (identical? subscription (.get subscriptions subscription-id)))
-        (let [update (convex/next-update subscription 86400000)]
-          (when (and @(:active subscription) (identical? subscription (.get subscriptions subscription-id)))
-            (write! out (cond-> {"type" "subscription" "subscriptionId" subscription-id}
-                          (:error update) (assoc "error" {"name" (name (get-in update [:error :kind])) "message" (get-in update [:error :message])})
-                          (not (:error update)) (assoc "value" (:value update))
-                          (seq (:logs update)) (assoc "logs" (:logs update)))))
-        (recur))))))
+(defn reset-test-hooks! []
+  (reset! before-publish-hook nil)
+  (reset! inside-publication-lock-hook nil))
 
-(defn- process! [command deployment client live subscriptions out]
-  (let [id (get command "id") op (get command "op")]
-    (case op
-      "hello" (do (when-not (= 1 (get command "protocolVersion")) (throw (ex-info "unsupported adapter protocol version" {})))
-                  (write! out {"type" "ready" "id" id "protocolVersion" 1 "language" "clojure" "implementation" "native-clojure-1.12" "runtime" (clojure-version)}) false)
-      "close" (do (doseq [subscription (iterator-seq (.iterator (.values subscriptions)))] (.close ^java.lang.AutoCloseable subscription))
-                  (when @live (.close ^java.lang.AutoCloseable @live)) (when @client (.close ^java.lang.AutoCloseable @client))
-                  (write! out {"type" "closed" "id" id}) true)
-      (do (when-not (seq deployment) (throw (ex-info "CONVEX_URL is required" {})))
-          (when-not @client (reset! client (convex/client deployment)))
-          (case op
-            "setAuth" (do (convex/set-auth! @client (get command "token")) (write! out {"type" "ack" "id" id}))
-            ("query" "mutation" "action") (write! out (result-value id (convex/call @client op (get command "path") (get command "args" {}))))
-            "subscribe" (do (when-not @live (reset! live (convex/live-client deployment)))
-                            (let [subscription-id (get command "subscriptionId") old (.remove subscriptions subscription-id)]
-                              (when old (convex/unsubscribe! @live old))
-                              (let [subscription (convex/subscribe @live (get command "path") (get command "args" {}))]
-                                (.put subscriptions subscription-id subscription) (write! out {"type" "ack" "id" id}) (relay! subscription-id subscription subscriptions out))))
-            "unsubscribe" (do (when-let [subscription (.remove subscriptions (get command "subscriptionId"))] (convex/unsubscribe! @live subscription)) (write! out {"type" "ack" "id" id}))
-            "debugDisconnect" (do (convex/debug-disconnect! @live) (write! out {"type" "ack" "id" id}))
-            (throw (ex-info (str "unknown operation: " op) {}))) false))))
+(defn- error-name [error]
+  (case (:kind (ex-data error))
+    :function "FunctionError"
+    :protocol "ProtocolError"
+    :transport "TransportError"
+    :closed "ClosedError"
+    "Error"))
 
-(defn run! [input output deployment]
-  (let [reader (BufferedReader. (InputStreamReader. input StandardCharsets/UTF_8)) out (PrintWriter. (OutputStreamWriter. output StandardCharsets/UTF_8) true)
-        client (atom nil) live (atom nil) subscriptions (ConcurrentHashMap.)]
-    (try
-      (loop []
-        (when-let [line (.readLine reader)]
-          (let [command (json/read-str line)]
-            (if (process! command deployment client live subscriptions out) nil (recur)))))
-      (catch Exception error (write! out (error-value nil error)))
-      (finally (when @live (.close ^java.lang.AutoCloseable @live)) (when @client (.close ^java.lang.AutoCloseable @client))))))
+(defn- error-event [id subscription-id error]
+  (let [data (ex-data error)
+        detail (cond-> {"name" (error-name error)
+                        "message" (or (.getMessage ^Throwable error) "error")}
+                 (contains? data :data) (assoc "data" (:data data)))]
+    (cond-> {"type" (if subscription-id "subscription" "error")
+             "error" detail}
+      (and (nil? subscription-id) (seq id)) (assoc "id" id)
+      (seq subscription-id) (assoc "subscriptionId" subscription-id)
+      (seq (:logs data)) (assoc "logs" (vec (:logs data))))))
+
+(defrecord LockedWriter [^PrintWriter output closed]
+  java.lang.AutoCloseable
+  (close [_] (reset! closed true)))
+
+(defn- writer [output]
+  (->LockedWriter (PrintWriter. (OutputStreamWriter. output StandardCharsets/UTF_8) true)
+                  (atom false)))
+
+(defn- write-event! [writer event]
+  (locking writer
+    (when-not @(:closed writer)
+      (.println ^PrintWriter (:output writer) (json/write-str event))
+      (.flush ^PrintWriter (:output writer)))))
+
+(defn- write-if-current! [writer current? before-check event]
+  (locking writer
+    (when before-check (before-check))
+    (when (and (not @(:closed writer)) (current?))
+      (.println ^PrintWriter (:output writer) (json/write-str event))
+      (.flush ^PrintWriter (:output writer)))))
+
+(defn- close-writer! [writer event]
+  (locking writer
+    (when (compare-and-set! (:closed writer) false true)
+      (.println ^PrintWriter (:output writer) (json/write-str event))
+      (.flush ^PrintWriter (:output writer)))))
+
+(defn- relay! [subscription-id registration registrations writer]
+  (doto
+   (Thread.
+    (fn []
+      (try
+        (while @(:active (:subscription registration))
+          (let [update (try
+                         (convex/next-update (:subscription registration) 250)
+                         (catch clojure.lang.ExceptionInfo error
+                           (when-not (= "timed out waiting for Live update" (.getMessage error))
+                             (throw error))
+                           nil))]
+            (when update
+              (when-let [hook @before-publish-hook]
+                (hook subscription-id (:generation registration) update))
+              (let [event (if-let [detail (:error update)]
+                            (error-event nil subscription-id
+                                         (ex-info (:message detail)
+                                                  {:kind (:kind detail)
+                                                   :data (:data detail)
+                                                   :logs (:logs update)}))
+                            (cond-> {"type" "subscription"
+                                     "subscriptionId" subscription-id
+                                     "value" (:value update)}
+                              (seq (:logs update)) (assoc "logs" (:logs update))))]
+                (write-if-current!
+                 writer
+                 #(and (identical? registration (.get registrations subscription-id))
+                       @(:active (:subscription registration)))
+                 #(when-let [hook @inside-publication-lock-hook]
+                    (hook subscription-id (:generation registration)))
+                 event)))))
+        (catch InterruptedException _ (.interrupt (Thread/currentThread)))
+        (catch Throwable error
+          (write-if-current!
+           writer
+           #(and (identical? registration (.get registrations subscription-id))
+                 @(:active (:subscription registration)))
+           nil
+           (error-event nil subscription-id error))))))
+    (.setName (str "convex-clojure-adapter-relay-" (:generation registration)))
+    (.setDaemon true)
+    (.start)))
+
+(defn- ack [id] {"type" "ack" "id" id})
+
+(defn run-adapter! [input output deployment]
+  (let [reader (BufferedReader. (InputStreamReader. input StandardCharsets/UTF_8))
+        out (writer output)
+        client (atom nil)
+        registrations (ConcurrentHashMap.)
+        generation (AtomicLong. 1)]
+    (letfn [(get-client []
+              (or @client
+                  (let [url (or deployment
+                                (throw (ex-info "CONVEX_URL is required" {:kind :protocol})))
+                        created (convex/client url)]
+                    (when-let [token (System/getenv "CONVEX_AUTH_TOKEN")]
+                      (when (seq token) (convex/set-auth! created token)))
+                    (reset! client created)
+                    created)))
+            (process! [command]
+              (let [id (get command "id") operation (get command "op")]
+                (case operation
+                  "hello"
+                  (do
+                    (when-not (= 1 (get command "protocolVersion"))
+                      (throw (ex-info "unsupported adapter protocol version" {:kind :protocol})))
+                    (write-event! out {"type" "ready" "id" id "protocolVersion" 1
+                                       "language" "clojure" "implementation" "native-clojure-jdk21"
+                                       "runtime" (System/getProperty "java.runtime.version")})
+                    false)
+
+                  ("query" "mutation" "action")
+                  (let [result (convex/call (get-client) operation (get command "path")
+                                            (get command "args" {}))]
+                    (write-event! out (cond-> {"type" "result" "id" id "value" (:value result)}
+                                        (seq (:logs result)) (assoc "logs" (:logs result))))
+                    false)
+
+                  "setAuth"
+                  (do (convex/set-auth! (get-client) (get command "token" ""))
+                      (write-event! out (ack id)) false)
+
+                  "subscribe"
+                  (let [subscription-id (get command "subscriptionId")
+                        _ (when-not (seq subscription-id)
+                            (throw (ex-info "subscriptionId is required" {:kind :protocol})))
+                        old (.remove registrations subscription-id)]
+                    ;; Closing the old generation before publishing ack is the replacement barrier.
+                    (when old (.close ^java.lang.AutoCloseable (:subscription old)))
+                    (let [subscription (convex/subscribe-client (get-client) (get command "path")
+                                                                (get command "args" {}))
+                          registration {:generation (.getAndIncrement generation)
+                                        :subscription subscription}]
+                      (.put registrations subscription-id registration)
+                      (write-event! out (ack id))
+                      (relay! subscription-id registration registrations out))
+                    false)
+
+                  "unsubscribe"
+                  (do
+                    (when-let [registration (.remove registrations (get command "subscriptionId"))]
+                      (.close ^java.lang.AutoCloseable (:subscription registration)))
+                    ;; The writer lock is shared with relay publication. Once ack is visible,
+                    ;; no invalidated generation can publish another event.
+                    (write-event! out (ack id))
+                    false)
+
+                  "debugDisconnect"
+                  (do (convex/debug-disconnect-client! (get-client))
+                      (write-event! out (ack id)) false)
+
+                  "close"
+                  (do
+                    (doseq [registration (iterator-seq (.iterator (.values registrations)))]
+                      (.close ^java.lang.AutoCloseable (:subscription registration)))
+                    (.clear registrations)
+                    (when @client (.close ^java.lang.AutoCloseable @client))
+                    (close-writer! out {"type" "closed" "id" id})
+                    true)
+
+                  (throw (ex-info (str "unknown operation " operation) {:kind :protocol})))))]
+      (try
+        (loop []
+          (when-let [line (.readLine reader)]
+            (if (string/blank? line)
+              (recur)
+              (let [command (try
+                              (json/read-str line)
+                              (catch Exception error
+                                (write-event! out
+                                              (error-event nil nil
+                                                           (ex-info (str "decode command: " (.getMessage error))
+                                                                    {:kind :protocol})))
+                                nil))]
+                (let [stop? (if command
+                              (try
+                                (process! command)
+                                (catch Throwable error
+                                  ;; Per-command failures retain correlation and the stream continues.
+                                  (write-event! out (error-event (get command "id") nil error))
+                                  false))
+                              false)]
+                  (when-not stop? (recur)))))))
+        (finally
+          (doseq [registration (iterator-seq (.iterator (.values registrations)))]
+            (.close ^java.lang.AutoCloseable (:subscription registration)))
+          (.clear registrations)
+          (when @client (.close ^java.lang.AutoCloseable @client)))))))
+
+(defn parse-listen-address [address]
+  (let [split (.lastIndexOf ^String address ":")]
+    (when (or (<= split 0) (= split (dec (count address))))
+      (throw (IllegalArgumentException. "ADAPTER_LISTEN must be host:port")))
+    [(subs address 0 split) (Integer/parseInt (subs address (inc split)))]))
 
 (defn- bind [address]
-  (let [[host port] (string/split address #":(?=[^:]+$)") server (ServerSocket.)]
-    (.bind server (InetSocketAddress. (InetAddress/getByName host) (Integer/parseInt port))) server))
-(defn -main []
+  (let [[host port] (parse-listen-address address)
+        server (ServerSocket.)]
+    (.bind server (InetSocketAddress. (InetAddress/getByName host) port))
+    server))
+
+(defn -main [& _]
   (if-let [address (System/getenv "ADAPTER_LISTEN")]
-    (with-open [server (bind address) socket (.accept server)] (run! (.getInputStream socket) (.getOutputStream socket) (System/getenv "CONVEX_URL")))
-    (run! System/in System/out (System/getenv "CONVEX_URL"))))
+    (with-open [server (bind address)
+                socket (.accept server)]
+      (run-adapter! (.getInputStream socket) (.getOutputStream socket)
+                    (System/getenv "CONVEX_URL")))
+    (run-adapter! System/in System/out (System/getenv "CONVEX_URL"))))

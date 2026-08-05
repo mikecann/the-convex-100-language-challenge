@@ -1,6 +1,6 @@
 # Convex from Clojure
 
-This is a small Clojure client that calls Convex HTTP functions and follows the experimental pinned Live sync profile.
+This Clojure client calls Convex functions over HTTP, then keeps a query current over the experimental pinned Live sync profile.
 
 It is educational, unofficial, and not a production Convex SDK.
 
@@ -12,20 +12,26 @@ The [canonical basic example](examples/basics/main.clj) performs a unique room's
 
 | Capability | Status |
 | --- | --- |
-| HTTP query, mutation, action | Implemented, awaiting shared evidence |
-| Live query | Implemented for the pinned profile, awaiting shared evidence |
+| HTTP query, mutation, action, auth, logs, and structured errors | Implemented, awaiting shared evidence |
+| Live initial values, changes, query-error recovery, and reconnects | Implemented for the pinned profile, awaiting shared evidence |
+| Bounded delivery and lifecycle barriers | Implemented and covered by deterministic fixtures |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.clj -->
-```text
-(ns convex.example.main
+```clojure
+(ns main
+  (:gen-class)
   (:require [convex.client :as convex])
   (:import [java.util UUID]))
 
 (defn- count-of [state operation]
   (let [count (get state "count")]
-    (when-not (integer? count)
+    ;; Convex JSON may encode a whole count as 0 or 0.0. Validate before
+    ;; normalising so a fractional or non-finite value cannot be hidden.
+    (when-not (and (number? count)
+                   (Double/isFinite (double count))
+                   (== (double count) (double (long count))))
       (throw (ex-info (str operation " did not return a whole count") {})))
-    count))
+    (long count)))
 
 (defn- print-transcript [before initial applied mutation updated]
   (println (str "current count: " before))
@@ -62,12 +68,14 @@ The [canonical basic example](examples/basics/main.clj) performs a unique room's
 
 ## Docker verification
 
-`./run test clojure` runs formatting, unit tests, and adapter lifecycle checks inside Docker. `./run build clojure` creates the minimal non-root runtime images. Root runs `verify-example`, `verify`, and hosted evidence serially.
+`./run test clojure` checks standard formatting, runs the language-local HTTP, raw WebSocket, lifecycle, and adapter tests, then AOT-compiles the exact example and adapter. `./run build clojure` creates the minimal non-root runtime. Root owns the serial shared example and conformance evidence.
 
 ## Protocol notes
 
-The client uses the documented JSON HTTP endpoint and the pinned `convex-rs-0.10.4-unversioned-sync` profile. The adapter supports stdin/stdout and `ADAPTER_LISTEN` TCP NDJSON plus the test-only `debugDisconnect` command.
+The client uses the documented JSON HTTP endpoints and the pinned `convex-rs-0.10.4-unversioned-sync` profile. One Clojure actor owns every WebSocket, query-set version, reconnect, and serialized write. JDK callbacks only send events back to that owner. Reconnect metadata survives generations, backoff resets after valid protocol traffic, and unchanged hydration is suppressed.
+
+The adapter supports partial NDJSON over stdin/stdout and `ADAPTER_LISTEN` TCP, flushes each correlated event, and continues after request errors. Its test-only `debugDisconnect` command retires the old generation before acknowledgement.
 
 ## Limitations
 
-The Live profile is experimental and deliberately does not earn a capability badge without the shared controller's local and hosted evidence. Its bounded queue keeps only the newest 16 values.
+The Live profile is experimental and deliberately earns no badge until the shared controller passes locally and against the hosted drift target. Authentication, optimistic updates, transition chunks, journals, and replay are deferred. Each subscription keeps the newest 16 snapshots within a 256 KiB encoded budget.
