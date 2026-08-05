@@ -4,5 +4,29 @@ displayName: "R"
 rank: 16
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native R client. Convex HTTP and Sync protocol state are implemented in R; curl, jsonlite, and websocket provide ordinary transport and JSON primitives only.
+toolchain:
+  name: R
+  version: 4.5.1
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Capability badges remain empty until the coordinator runs shared local and hosted conformance.
+  - Live authentication, transition chunks, optimistic updates, and non-JSON Convex values are deferred.
+  - The Live delivery queue is bounded to the newest 16 events per subscription.
 capabilities: []

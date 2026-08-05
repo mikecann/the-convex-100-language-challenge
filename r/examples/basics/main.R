@@ -1,25 +1,3 @@
-# Convex from R
-
-This is a small R client that queries a Convex counter over HTTP, listens for
-the same value over Live, and proves the counter moved from `0` to `1`.
-
-It is educational and unofficial. It is not a production SDK or a package for
-publication.
-
-## Start here
-
-[The canonical basics example](examples/basics/main.R) creates the client,
-starts Live before the mutation, and checks every observed value.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP queries, mutations, and actions | Awaiting shared conformance |
-| Live subscriptions and reconnects | Awaiting shared conformance |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.R -->
-```text
 #!/usr/local/bin/Rscript
 client_path <- Sys.getenv("CONVEX_CLIENT_PATH", "client")
 source(file.path(client_path, "convex.R"))
@@ -64,21 +42,3 @@ cat("live updated count:", expected, "\n")
 }
 
 if (sys.nframe() == 0L) run_example()
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-`./run test r` runs R formatting, unit tests, and adapter lifecycle checks in
-Docker. `./run build r` builds the minimal linux/amd64 runtime images. The
-coordinator runs `verify-example`, `verify`, and `verify-hosted` serially.
-
-## Protocol notes
-
-The client owns Convex HTTP envelopes and the `/api/sync` query-set protocol in
-R. `curl`, `jsonlite`, and `websocket` are low-level transport/JSON libraries.
-
-## Limitations
-
-The implementation intentionally supports the JSON-safe values exercised by
-this experiment. Live auth and TransitionChunk assembly are deferred.

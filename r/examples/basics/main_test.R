@@ -1,0 +1,8 @@
+source("client/convex.R")
+Sys.setenv(CONVEX_CLIENT_PATH = normalizePath("client"))
+example <- new.env()
+source("examples/basics/main.R", chdir = TRUE, local = example)
+stopifnot(example$whole_count(1, "test") == 1L)
+bad <- tryCatch({ example$whole_count(1.5, "test"); NULL }, error = identity)
+stopifnot(inherits(bad, "error"))
+cat("PASS R example unit tests\n")

@@ -1,0 +1,8 @@
+source("client/convex.R")
+source("client/live.R")
+stopifnot(identical(`%||%`(NULL, "fallback"), "fallback"))
+error <- tryCatch({ convex_client("") ; NULL }, error = identity)
+stopifnot(inherits(error, "error"))
+condition <- convex_error("convex_function_error", "boom", "query", list(code = "bad"))
+stopifnot(inherits(condition, "convex_function_error"), identical(condition$data$code, "bad"))
+cat("PASS R client unit tests\n")
