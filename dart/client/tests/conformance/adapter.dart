@@ -15,50 +15,56 @@ Future<void> main() async {
     await _Adapter(stdin, stdout).run();
     return;
   }
-  final address = _parseListenAddress(listen);
+  final address = parseAdapterListenAddress(listen);
   final server = await ServerSocket.bind(address.host, address.port);
   stderr.writeln(
     'adapter listening on ${server.address.address}:${server.port}',
   );
   try {
-    final socket = await server.first;
-    await _Adapter(socket, socket).run();
+    // Keep the listening subscription alive while the one controller socket is
+    // in use. `server.first` cancels its subscription as soon as it yields and
+    // can reset the accepted socket on some Dart runtimes.
+    await for (final socket in server) {
+      try {
+        await _Adapter(socket, socket).run();
+      } finally {
+        socket.destroy();
+      }
+      break;
+    }
   } finally {
     await server.close();
   }
 }
 
-InternetAddress _localhostFor(String host) =>
-    host == '::1' ? InternetAddress.loopbackIPv6 : InternetAddress.loopbackIPv4;
-
-({InternetAddress host, int port}) _parseListenAddress(String value) {
-  final bracketed = RegExp(r'^\[([^]]+)]:(\d+)$').firstMatch(value);
+({String host, int port}) parseAdapterListenAddress(String value) {
+  final bracketed = RegExp(r'^\[([^\]]+)\]:(\d+)$').firstMatch(value);
   if (bracketed != null) {
-    return (
-      host: _localhostFor(bracketed.group(1)!),
-      port: int.parse(bracketed.group(2)!),
-    );
+    return (host: bracketed.group(1)!, port: int.parse(bracketed.group(2)!));
   }
   final split = value.lastIndexOf(':');
   if (split < 1)
     throw FormatException('ADAPTER_LISTEN must be host:port, got $value');
   return (
-    host: _localhostFor(value.substring(0, split)),
+    host: value.substring(0, split),
     port: int.parse(value.substring(split + 1)),
   );
 }
 
 class _Adapter {
-  _Adapter(this._input, this._output);
+  _Adapter(this._input, IOSink output)
+    : _events = SerializedAdapterOutput(output);
 
   final Stream<List<int>> _input;
-  final IOSink _output;
+  final SerializedAdapterOutput _events;
   final Map<String, LiveSubscription> _subscriptions = {};
-  Future<void> _outputTail = Future.value();
+  final Map<String, Object> _relayOwners = {};
+  final Map<String, StreamSubscription<LiveUpdate>> _relayListeners = {};
   ConvexClient? _client;
 
   Future<void> run() async {
     await for (final line in _input
+        .cast<List<int>>()
         .transform(utf8.decoder)
         .transform(const LineSplitter())) {
       try {
@@ -119,29 +125,26 @@ class _Adapter {
           _event({'id': id, 'type': 'ack'});
         case 'subscribe':
           final subscriptionId = _required(command, 'subscriptionId');
-          // Replace invalidates the old relay before this acknowledgement. The
-          // old stream's pending values are discarded by LiveSubscription.close.
-          await _subscriptions.remove(subscriptionId)?.close();
+          await _removeSubscription(subscriptionId);
           final subscription = await _ensureClient().subscribe(
             _path(command),
             _args(command),
           );
           _subscriptions[subscriptionId] = subscription;
-          _relay(subscriptionId, subscription);
+          _startRelay(subscriptionId, subscription);
           _event({'id': id, 'type': 'ack'});
         case 'unsubscribe':
-          await _subscriptions
-              .remove(command['subscriptionId']?.toString())
-              ?.close();
+          await _removeSubscription(
+            command['subscriptionId']?.toString() ?? '',
+          );
           _event({'id': id, 'type': 'ack'});
         case 'debugDisconnect':
           await _ensureClient().debugDisconnectForAdapter();
           _event({'id': id, 'type': 'ack'});
         case 'close':
-          for (final subscription in _subscriptions.values) {
-            await subscription.close();
+          for (final subscriptionId in _subscriptions.keys.toList()) {
+            await _removeSubscription(subscriptionId);
           }
-          _subscriptions.clear();
           await _client?.close();
           _event({'id': id, 'type': 'closed'});
           await _flush();
@@ -155,22 +158,30 @@ class _Adapter {
     return false;
   }
 
-  void _relay(String id, LiveSubscription subscription) {
-    subscription.updates.listen((update) {
-      // Replacement and unsubscribe remove the exact subscription before this
-      // callback can write. That makes queued stale relays harmless.
-      if (!identical(_subscriptions[id], subscription)) return;
+  void _startRelay(String id, LiveSubscription subscription) {
+    final owner = Object();
+    _relayOwners[id] = owner;
+    _relayListeners[id] = subscription.updates.listen((update) {
+      bool ownsRelay() => identical(_relayOwners[id], owner);
       if (update.error != null) {
-        _failure('', id, update.error!);
+        _failure('', id, update.error!, guard: ownsRelay);
       } else {
         _event({
           'type': 'subscription',
           'subscriptionId': id,
           'value': update.value,
           if (update.logs.isNotEmpty) 'logs': update.logs,
-        });
+        }, guard: ownsRelay);
       }
     });
+  }
+
+  Future<void> _removeSubscription(String id) async {
+    // Revoke ownership before waiting for either stream cancellation or the
+    // client Remove command. A queued output callback rechecks this token.
+    _relayOwners.remove(id);
+    await _relayListeners.remove(id)?.cancel();
+    await _subscriptions.remove(id)?.close();
   }
 
   ConvexClient _ensureClient() {
@@ -184,7 +195,12 @@ class _Adapter {
     return _client!;
   }
 
-  void _failure(String id, String? subscriptionId, Object error) {
+  void _failure(
+    String id,
+    String? subscriptionId,
+    Object error, {
+    bool Function()? guard,
+  }) {
     final kind = switch (error) {
       FunctionError() => 'FunctionError',
       TransportError() => 'TransportError',
@@ -199,7 +215,7 @@ class _Adapter {
       if (subscriptionId != null) 'subscriptionId': subscriptionId,
       'error': _error(kind, message, data),
       if (error is FunctionError && error.logs.isNotEmpty) 'logs': error.logs,
-    });
+    }, guard: guard);
   }
 
   Map<String, Object?> _error(String name, String message, [Object? data]) => {
@@ -208,14 +224,33 @@ class _Adapter {
     if (data != null) 'data': data,
   };
 
-  void _event(Map<String, Object?> event) {
-    _outputTail = _outputTail.then((_) async {
+  void _event(Map<String, Object?> event, {bool Function()? guard}) {
+    _events.add(event, guard: guard);
+  }
+
+  Future<void> _flush() => _events.flush();
+}
+
+/// Serializes adapter events and checks relay ownership at the last possible
+/// moment. The hook exists only for deterministic conformance-executable tests
+/// which pause an event after dequeue and reproduce stale relay races.
+class SerializedAdapterOutput {
+  SerializedAdapterOutput(this._output, {this.beforeWriteForTest});
+
+  final IOSink _output;
+  final Future<void> Function(Map<String, Object?> event)? beforeWriteForTest;
+  Future<void> _tail = Future.value();
+
+  void add(Map<String, Object?> event, {bool Function()? guard}) {
+    _tail = _tail.then((_) async {
+      await beforeWriteForTest?.call(event);
+      if (guard != null && !guard()) return;
       _output.writeln(jsonEncode(event));
       await _output.flush();
     });
   }
 
-  Future<void> _flush() => _outputTail;
+  Future<void> flush() => _tail;
 }
 
 String _required(Map<String, dynamic> command, String key) {

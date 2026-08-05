@@ -6,6 +6,7 @@ import 'dart:io';
 import 'dart:math';
 
 import 'convex_client.dart';
+import 'delivery_queue.dart';
 
 const _initialTimestamp = 'AAAAAAAAAAA=';
 const _initialBackoff = Duration(milliseconds: 100);
@@ -31,7 +32,7 @@ class LiveSubscription {
   final _SubscriptionState _state;
   bool _closed = false;
 
-  Stream<LiveUpdate> get updates => _state.controller.stream;
+  Stream<LiveUpdate> get updates => _state.relay.stream;
 
   Future<void> close() async {
     if (_closed) return;
@@ -203,7 +204,9 @@ class LiveClient {
           .toList(growable: false);
       if (additions.isNotEmpty) await _modify(additions, 'connect');
     } catch (error) {
-      _lastCloseReason = 'connect: $error';
+      final transport = TransportError('live connect', error.toString());
+      _publishFailure(transport);
+      _lastCloseReason = transport.message;
       _connectionCount += 1;
       _scheduleReconnect(_nextBackoff);
       _nextBackoff = _doubleBackoff(_nextBackoff);
@@ -236,7 +239,9 @@ class LiveClient {
 
   Future<void> _onSocketError(int generation, Object error) async {
     if (generation != _generation || _socket == null || _closed) return;
-    await _closeConnection(error.toString(), reconnect: true);
+    final transport = TransportError('live connection', error.toString());
+    _publishFailure(transport);
+    await _closeConnection(transport.message, reconnect: true);
   }
 
   Future<void> _closeConnection(
@@ -267,15 +272,15 @@ class LiveClient {
       );
       if (decoded is! Map<String, dynamic>)
         throw const ProtocolError('sync message was not an object');
-      // Any valid server message proves the connection is healthy, so a later
-      // disconnect starts from the small backoff rather than a stale maximum.
-      _nextBackoff = _initialBackoff;
       switch (decoded['type']) {
         case 'Transition':
           _handleTransition(decoded);
+          _nextBackoff = _initialBackoff;
         case 'Ping':
         case 'MutationResponse':
         case 'ActionResponse':
+          // Reset only after a recognized, successfully decoded server message.
+          _nextBackoff = _initialBackoff;
           break;
         case 'FatalError':
         case 'AuthError':
@@ -316,6 +321,9 @@ class LiveClient {
       final id = item['queryId'] as int;
       switch (item['type']) {
         case 'QueryUpdated':
+          if (!item.containsKey('value')) {
+            throw const ProtocolError('QueryUpdated omitted value');
+          }
           final update = LiveUpdate.value(
             item['value'],
             _logs(item['logLines']),
@@ -345,13 +353,17 @@ class LiveClient {
     _remoteVersion = end;
     _maxObservedTimestamp = end.timestamp;
     for (final entry in changed.entries) {
-      _active[entry.key]?.add(entry.value);
+      final state = _active[entry.key];
+      if (state != null && state.shouldDeliver(entry.value)) {
+        state.add(entry.value);
+      }
     }
   }
 
   void _publishFailure(ConvexError error) {
     for (final state in _active.values) {
-      state.add(LiveUpdate.failure(error, const []));
+      final update = LiveUpdate.failure(error, const []);
+      if (state.shouldDeliver(update)) state.add(update);
     }
   }
 }
@@ -362,10 +374,10 @@ class _SubscriptionState {
   final int queryId;
   final String path;
   final Map<String, Object?> args;
-  final StreamController<LiveUpdate> controller =
-      StreamController<LiveUpdate>();
-  final List<LiveUpdate> _pending = [];
-  bool _draining = false;
+  final BoundedLiveRelay<LiveUpdate> relay = BoundedLiveRelay();
+  Object? _lastValue;
+  bool _hasLastValue = false;
+  bool _lastWasFailure = false;
   bool _closed = false;
 
   Map<String, Object?> get addModification => {
@@ -377,28 +389,50 @@ class _SubscriptionState {
 
   void add(LiveUpdate update) {
     if (_closed) return;
-    if (_pending.length == 16) _pending.removeAt(0);
-    _pending.add(update);
-    if (!_draining) _drain();
+    relay.add(update);
   }
 
-  void _drain() {
-    _draining = true;
-    scheduleMicrotask(() {
-      if (_closed) return;
-      while (_pending.isNotEmpty && !_closed) {
-        controller.add(_pending.removeAt(0));
-      }
-      _draining = false;
-    });
+  bool shouldDeliver(LiveUpdate update) {
+    if (update.error != null) {
+      _lastWasFailure = true;
+      return true;
+    }
+    final duplicate =
+        _hasLastValue &&
+        !_lastWasFailure &&
+        _jsonEqual(_lastValue, update.value);
+    _lastValue = update.value;
+    _hasLastValue = true;
+    _lastWasFailure = false;
+    return !duplicate;
   }
 
   void close() {
     if (_closed) return;
     _closed = true;
-    _pending.clear();
-    controller.close();
+    relay.close();
   }
+}
+
+bool _jsonEqual(Object? left, Object? right) {
+  if (identical(left, right) || left == right) return true;
+  if (left is List && right is List) {
+    if (left.length != right.length) return false;
+    for (var index = 0; index < left.length; index += 1) {
+      if (!_jsonEqual(left[index], right[index])) return false;
+    }
+    return true;
+  }
+  if (left is Map && right is Map) {
+    if (left.length != right.length) return false;
+    for (final key in left.keys) {
+      if (!right.containsKey(key) || !_jsonEqual(left[key], right[key])) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return false;
 }
 
 class _Version {

@@ -3,11 +3,32 @@ import 'dart:convert';
 import 'dart:io';
 
 import '../convex_client.dart';
+import '../delivery_queue.dart';
 
 Future<void> main() async {
   await _httpSuccessAndStructuredError();
+  await _boundedNewestSixteen();
   await _liveAddUpdateRemoveAndRecovery();
   stdout.writeln('PASS Dart HTTP and Live owner tests');
+}
+
+Future<void> _boundedNewestSixteen() async {
+  final relay = BoundedLiveRelay<int>();
+  final delivered = <int>[];
+  final listener = relay.stream.listen(delivered.add);
+  listener.pause();
+  for (var value = 0; value < 32; value += 1) {
+    relay.add(value);
+  }
+  _check(relay.pendingLength == 16, 'paused relay exceeded newest-16 bound');
+  listener.resume();
+  await Future<void>.delayed(Duration.zero);
+  _check(
+    delivered.length == 16 && delivered.first == 16 && delivered.last == 31,
+    'paused relay did not retain exactly the newest 16 values',
+  );
+  await listener.cancel();
+  await relay.close();
 }
 
 Future<void> _httpSuccessAndStructuredError() async {
