@@ -1,10 +1,11 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce AS build
-RUN apk add --no-cache build-base=0.5-r3 curl-dev=8.14.1-r3 json-c-dev=0.18-r1
+RUN apk add --no-cache build-base=0.5-r3 clang19-extra-tools=19.1.7-r6 curl-dev=8.14.1-r3 json-c-dev=0.18-r1
 WORKDIR /src
 COPY client ./client
 COPY examples ./examples
-RUN gcc -D_POSIX_C_SOURCE=200809L -std=c17 -Wall -Wextra -Werror -pthread -Iclient client/convex.c client/tests/conformance/main.c -lcurl -ljson-c -o /out-adapter && \
+RUN /usr/lib/llvm19/bin/clang-format --style=LLVM --dry-run --Werror client/convex.c client/convex.h client/tests/conformance/main.c client/tests/live_test.c examples/basics/main.c && \
+    gcc -D_POSIX_C_SOURCE=200809L -std=c17 -Wall -Wextra -Werror -pthread -Iclient client/convex.c client/tests/conformance/main.c -lcurl -ljson-c -o /out-adapter && \
     gcc -DCONVEX_ADAPTER_TESTING -D_POSIX_C_SOURCE=200809L -std=c17 -Wall -Wextra -Werror -pthread -Iclient client/convex.c client/tests/conformance/main.c -lcurl -ljson-c -o /out-adapter-test && \
     gcc -D_POSIX_C_SOURCE=200809L -std=c17 -Wall -Wextra -Werror -pthread -Iclient client/convex.c examples/basics/main.c -lcurl -ljson-c -o /out-example && \
     gcc -DCONVEX_CLIENT_TESTING -D_POSIX_C_SOURCE=200809L -std=c17 -Wall -Wextra -Werror -pthread -Iclient client/convex.c client/tests/live_test.c -lcurl -ljson-c -lcrypto -o /out-live-test && \
