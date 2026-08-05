@@ -96,6 +96,11 @@ struct RelayGate {
     active = false;
   }
 
+  bool is_active() {
+    std::lock_guard lock(mutex);
+    return active;
+  }
+
   bool write_if_active(std::ostream &output, const Json &event) {
     pause_relay_after_dequeue_for_test();
     std::lock_guard lock(mutex);
@@ -106,6 +111,22 @@ struct RelayGate {
     return true;
   }
 };
+
+template <typename NextUpdate, typename Deliver>
+void relay_until_invalidated(const std::shared_ptr<RelayGate> &gate,
+                             NextUpdate next_update, Deliver deliver) {
+  while (gate->is_active()) {
+    auto update = next_update();
+    if (!update) {
+      // next_update uses a timeout so stop can remain bounded. A quiet minute
+      // is not end-of-stream; only invalidation retires this relay generation.
+      continue;
+    }
+    if (!deliver(*update)) {
+      return;
+    }
+  }
+}
 
 class SubscriptionRelay {
 public:
@@ -122,12 +143,12 @@ public:
 
   void start() {
     worker_ = std::thread([this, gate = gate_] {
-      while (auto update = subscription_->next_update(60000)) {
-        if (!gate->write_if_active(
-                output_, subscription_event(subscription_id_, *update))) {
-          return;
-        }
-      }
+      relay_until_invalidated(
+          gate, [&] { return subscription_->next_update(60000); },
+          [&](const convex::Update &update) {
+            return gate->write_if_active(
+                output_, subscription_event(subscription_id_, update));
+          });
     });
   }
 

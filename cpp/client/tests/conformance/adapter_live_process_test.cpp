@@ -1,10 +1,12 @@
 #include "convex.hpp"
+#include <array>
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 #include <boost/beast/websocket.hpp>
 #include <cassert>
 #include <chrono>
 #include <future>
+#include <openssl/evp.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -15,10 +17,30 @@ namespace websocket = beast::websocket;
 using tcp = asio::ip::tcp;
 using Json = convex::Json;
 
+static std::string timestamp(std::uint64_t value) {
+  std::array<unsigned char, 8> decoded{};
+  for (int index = 7; index >= 0; --index) {
+    decoded.at(static_cast<std::size_t>(index)) =
+        static_cast<unsigned char>(value & 0xff);
+    value >>= 8;
+  }
+  std::array<unsigned char, 13> encoded{};
+  assert(EVP_EncodeBlock(encoded.data(), decoded.data(), decoded.size()) == 12);
+  return reinterpret_cast<const char *>(encoded.data());
+}
+
 static Json version(int timestamp, int query_set = 1) {
   return {{"querySet", query_set},
           {"identity", 0},
-          {"ts", timestamp == 0 ? "AAAAAAAAAAA=" : std::to_string(timestamp)}};
+          {"ts", ::timestamp(static_cast<std::uint64_t>(timestamp))}};
+}
+
+static void accept_websocket(websocket::stream<tcp::socket> &websocket) {
+  beast::flat_buffer buffer;
+  beast::http::request<beast::http::string_body> request;
+  beast::http::read(websocket.next_layer(), buffer, request);
+  assert(request["Convex-Client"] == "cpp-0.1.0");
+  websocket.accept(request);
 }
 
 static Json read_websocket_json(websocket::stream<tcp::socket> &websocket) {
@@ -55,21 +77,23 @@ int main() {
   std::promise<void> fixture_ready;
   std::promise<void> send_failure;
   std::promise<void> send_recovery;
-  std::promise<void> send_malformed;
+  std::promise<void> send_missing_identity;
+  std::promise<void> send_malformed_timestamp;
   auto failure_signal = send_failure.get_future();
   auto recovery_signal = send_recovery.get_future();
-  auto malformed_signal = send_malformed.get_future();
+  auto missing_identity_signal = send_missing_identity.get_future();
+  auto malformed_timestamp_signal = send_malformed_timestamp.get_future();
 
   std::thread fixture([&] {
     asio::io_context io;
     tcp::acceptor acceptor(
         io, {asio::ip::make_address("127.0.0.1"), websocket_port});
     fixture_ready.set_value();
-    for (int connection = 0; connection < 3; ++connection) {
+    for (int connection = 0; connection < 4; ++connection) {
       tcp::socket socket(io);
       acceptor.accept(socket);
       websocket::stream<tcp::socket> websocket(std::move(socket));
-      websocket.accept();
+      accept_websocket(websocket);
       auto connect = read_websocket_json(websocket);
       auto add = read_websocket_json(websocket);
       assert(connect.at("connectionCount") == connection);
@@ -95,19 +119,36 @@ int main() {
                          {"value", {{"count", 10}}},
                          {"logLines", Json::array({"recovered"})}});
       } else if (connection == 1) {
-        malformed_signal.wait();
-        // A Transition with a missing endVersion exercises schema validation,
-        // not merely the explicit unknown-message branch.
-        Json malformed{{"type", "Transition"},
-                       {"startVersion", version(1)},
-                       {"modifications", Json::array()}};
+        missing_identity_signal.wait();
+        Json missing_identity{
+            {"type", "Transition"},
+            {"startVersion", version(1)},
+            {"endVersion", {{"querySet", 1}, {"ts", timestamp(2)}}},
+            {"modifications", Json::array({{{"type", "QueryUpdated"},
+                                            {"queryId", 0},
+                                            {"value", {{"count", 888}}},
+                                            {"logLines", Json::array()}}})}};
+        websocket.write(asio::buffer(missing_identity.dump()));
+      } else if (connection == 2) {
+        malformed_timestamp_signal.wait();
+        // A complete-looking Transition with a malformed timestamp and value
+        // proves validation finishes before any update can be published.
+        Json malformed{
+            {"type", "Transition"},
+            {"startVersion", version(1)},
+            {"endVersion",
+             {{"querySet", 1}, {"identity", 0}, {"ts", "not-base64"}}},
+            {"modifications", Json::array({{{"type", "QueryUpdated"},
+                                            {"queryId", 0},
+                                            {"value", {{"count", 999}}},
+                                            {"logLines", Json::array()}}})}};
         websocket.write(asio::buffer(malformed.dump()));
       }
 
       beast::flat_buffer buffer;
       beast::error_code error;
       websocket.read(buffer, error);
-      if (connection == 2 && !error) {
+      if (connection == 3 && !error) {
         auto remove = Json::parse(beast::buffers_to_string(buffer.data()));
         assert(remove.at("baseVersion") == 1);
         assert(remove.at("newVersion") == 2);
@@ -173,11 +214,17 @@ int main() {
   assert(disconnect.at("id") == "disconnect" && disconnect.at("type") == "ack");
   auto reconnected = read_controller_line(controller, buffer);
   assert(reconnected.at("value").at("count") == 1);
-  send_malformed.set_value();
-  auto protocol_error = read_controller_line(controller, buffer);
-  assert(protocol_error.at("error").at("name") == "ProtocolError");
+  send_missing_identity.set_value();
+  auto missing_identity_error = read_controller_line(controller, buffer);
+  assert(missing_identity_error.at("error").at("name") == "ProtocolError");
+  auto second_connection = read_controller_line(controller, buffer);
+  assert(second_connection.at("value").at("count") == 2);
+
+  send_malformed_timestamp.set_value();
+  auto timestamp_error = read_controller_line(controller, buffer);
+  assert(timestamp_error.at("error").at("name") == "ProtocolError");
   auto protocol_recovery = read_controller_line(controller, buffer);
-  assert(protocol_recovery.at("value").at("count") == 2);
+  assert(protocol_recovery.at("value").at("count") == 3);
 
   send_controller_line(controller, {{"id", "unsubscribe"},
                                     {"op", "unsubscribe"},

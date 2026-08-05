@@ -8,6 +8,7 @@
 #include <cassert>
 #include <chrono>
 #include <future>
+#include <openssl/evp.h>
 #include <thread>
 #include <vector>
 
@@ -25,10 +26,30 @@ struct SubscriptionTestAccess {
 };
 } // namespace convex
 
+static std::string timestamp(std::uint64_t value) {
+  std::array<unsigned char, 8> decoded{};
+  for (int index = 7; index >= 0; --index) {
+    decoded.at(static_cast<std::size_t>(index)) =
+        static_cast<unsigned char>(value & 0xff);
+    value >>= 8;
+  }
+  std::array<unsigned char, 13> encoded{};
+  assert(EVP_EncodeBlock(encoded.data(), decoded.data(), decoded.size()) == 12);
+  return reinterpret_cast<const char *>(encoded.data());
+}
+
 static Json version(int timestamp, int query_set = 1) {
   return {{"querySet", query_set},
           {"identity", 0},
-          {"ts", timestamp == 0 ? "AAAAAAAAAAA=" : std::to_string(timestamp)}};
+          {"ts", ::timestamp(static_cast<std::uint64_t>(timestamp))}};
+}
+
+static void accept_websocket(websocket::stream<tcp::socket> &websocket) {
+  beast::flat_buffer buffer;
+  beast::http::request<beast::http::string_body> request;
+  beast::http::read(websocket.next_layer(), buffer, request);
+  assert(request["Convex-Client"] == "cpp-0.1.0");
+  websocket.accept(request);
 }
 
 static void send_transition(websocket::stream<tcp::socket> &websocket,
@@ -60,7 +81,7 @@ int main() {
     tcp::socket socket(io);
     acceptor.accept(socket);
     websocket::stream<tcp::socket> websocket(std::move(socket));
-    websocket.accept();
+    accept_websocket(websocket);
     auto connect = read_json(websocket);
     auto add = read_json(websocket);
     assert(connect.at("connectionCount") == 0);
@@ -131,7 +152,7 @@ int main() {
       tcp::socket socket(io);
       acceptor.accept(socket);
       websocket::stream<tcp::socket> websocket(std::move(socket));
-      websocket.accept();
+      accept_websocket(websocket);
       auto connect = read_json(websocket);
       auto add = read_json(websocket);
       counts.push_back(connect.at("connectionCount"));
@@ -202,9 +223,10 @@ int main() {
       close_reasons.begin() + 1, close_reasons.end(),
       [](const auto &reason) { return reason == "DebugDisconnect"; }));
   assert(observed_timestamps.front().empty());
-  assert(observed_timestamps.at(1) == "1");
-  assert(std::all_of(observed_timestamps.begin() + 2, observed_timestamps.end(),
-                     [](const auto &timestamp) { return timestamp == "2"; }));
+  assert(observed_timestamps.at(1) == timestamp(1));
+  assert(std::all_of(
+      observed_timestamps.begin() + 2, observed_timestamps.end(),
+      [](const auto &observed) { return observed == timestamp(2); }));
   reconnect_client.close();
 
   // A peer can stop midway through a WebSocket frame. Closing must cancel that
@@ -221,7 +243,7 @@ int main() {
     tcp::socket socket(io);
     acceptor.accept(socket);
     websocket::stream<tcp::socket> websocket(std::move(socket));
-    websocket.accept();
+    accept_websocket(websocket);
     read_json(websocket);
     read_json(websocket);
     const std::array<unsigned char, 3> partial_frame{0x81, 0x05, '{'};
@@ -299,7 +321,7 @@ int main() {
       tcp::socket socket(io);
       acceptor.accept(socket);
       websocket::stream<tcp::socket> websocket(std::move(socket));
-      websocket.accept();
+      accept_websocket(websocket);
       read_json(websocket);
       read_json(websocket);
       accepted_at.push_back(std::chrono::steady_clock::now());
@@ -320,6 +342,10 @@ int main() {
   backing_off->close();
   backoff_server.join();
   assert(accepted_at.size() == 6);
-  assert(accepted_at.back() - accepted_at.front() < std::chrono::seconds(2));
+  // An HTTP/WebSocket handshake is not valid Convex traffic. Peers that vanish
+  // before Ping or Transition must retain exponential transport backoff.
+  const auto reconnect_span = accepted_at.back() - accepted_at.front();
+  assert(reconnect_span > std::chrono::milliseconds(2500));
+  assert(reconnect_span < std::chrono::seconds(8));
   backoff_client.close();
 }

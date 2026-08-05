@@ -6,12 +6,17 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/ssl.hpp>
 #include <boost/beast/websocket.hpp>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <limits>
 #include <random>
 #include <thread>
 
@@ -33,6 +38,88 @@ struct LiveParts {
   std::string target;
   bool secure;
 };
+
+struct StateVersion {
+  std::uint32_t query_set;
+  std::uint32_t identity;
+  std::string timestamp;
+  std::array<unsigned char, 8> decoded_timestamp;
+
+  bool operator==(const StateVersion &) const = default;
+};
+
+std::array<unsigned char, 8> decode_timestamp(const std::string &timestamp) {
+  // Convex timestamps are canonical base64 encodings of exactly eight bytes.
+  // Decode and re-encode them before they can become reconnect metadata.
+  if (timestamp.size() != 12) {
+    throw ProtocolError("Live timestamp must encode exactly eight bytes");
+  }
+
+  std::array<unsigned char, 9> decoded{};
+  const int encoded_bytes = EVP_DecodeBlock(
+      decoded.data(), reinterpret_cast<const unsigned char *>(timestamp.data()),
+      static_cast<int>(timestamp.size()));
+  if (encoded_bytes < 0) {
+    throw ProtocolError("Live timestamp is not valid base64");
+  }
+
+  std::size_t padding = 0;
+  if (!timestamp.empty() && timestamp.back() == '=') {
+    ++padding;
+  }
+  if (timestamp.size() > 1 && timestamp.at(timestamp.size() - 2) == '=') {
+    ++padding;
+  }
+  if (static_cast<std::size_t>(encoded_bytes) - padding != 8) {
+    throw ProtocolError("Live timestamp must decode to exactly eight bytes");
+  }
+
+  std::array<unsigned char, 13> canonical{};
+  const int canonical_size =
+      EVP_EncodeBlock(canonical.data(), decoded.data(), 8);
+  if (canonical_size != 12 ||
+      timestamp != reinterpret_cast<const char *>(canonical.data())) {
+    throw ProtocolError("Live timestamp is not canonical base64");
+  }
+
+  std::array<unsigned char, 8> result{};
+  std::copy_n(decoded.begin(), result.size(), result.begin());
+  return result;
+}
+
+std::uint32_t version_counter(const Json &version, const char *field,
+                              const char *label) {
+  if (!version.contains(field) || !version.at(field).is_number_integer()) {
+    throw ProtocolError(std::string(label) + " omitted integer " + field);
+  }
+  try {
+    const auto value = version.at(field).get<std::int64_t>();
+    if (value < 0 || static_cast<std::uint64_t>(value) >
+                         std::numeric_limits<std::uint32_t>::max()) {
+      throw ProtocolError(std::string(label) + " has invalid " + field);
+    }
+    return static_cast<std::uint32_t>(value);
+  } catch (const Json::exception &) {
+    throw ProtocolError(std::string(label) + " has invalid " + field);
+  }
+}
+
+StateVersion parse_state_version(const Json &version, const char *label) {
+  if (!version.is_object()) {
+    throw ProtocolError(std::string(label) + " must be an object");
+  }
+  if (!version.contains("ts") || !version.at("ts").is_string()) {
+    throw ProtocolError(std::string(label) + " omitted string ts");
+  }
+  const auto timestamp = version.at("ts").get<std::string>();
+  return {version_counter(version, "querySet", label),
+          version_counter(version, "identity", label), timestamp,
+          decode_timestamp(timestamp)};
+}
+
+StateVersion zero_state_version() {
+  return {0, 0, zero_timestamp, {0, 0, 0, 0, 0, 0, 0, 0}};
+}
 
 LiveParts parse_live_url(std::string url) {
   const auto scheme_end = url.find("://");
@@ -133,6 +220,7 @@ struct Subscription::State : std::enable_shared_from_this<Subscription::State> {
   std::uint64_t connection_count = 0;
   std::string last_close_reason = "InitialConnect";
   std::string max_observed_timestamp;
+  std::optional<std::array<unsigned char, 8>> max_observed_timestamp_bytes;
   bool have_last_value = false;
   bool last_delivery_was_error = false;
   Json last_value;
@@ -229,22 +317,33 @@ struct Subscription::State : std::enable_shared_from_this<Subscription::State> {
     }
   }
 
-  void validate_and_deliver_transition(const Json &message, Json &version,
+  void validate_and_deliver_transition(const Json &message,
+                                       StateVersion &version,
                                        unsigned &attempts,
                                        bool &awaiting_rehydration) {
     try {
-      if (!message.is_object() || message.value("type", "") != "Transition") {
+      if (!message.is_object() || !message.contains("type") ||
+          !message.at("type").is_string() ||
+          message.at("type").get<std::string>() != "Transition") {
         throw ProtocolError("unexpected Live server message");
       }
-      if (!message.contains("startVersion") ||
-          message.at("startVersion") != version) {
+      if (!message.contains("startVersion")) {
+        throw ProtocolError("Transition omitted startVersion");
+      }
+      const auto start_version =
+          parse_state_version(message.at("startVersion"), "startVersion");
+      if (start_version != version) {
         throw ProtocolError("Live transition version mismatch");
       }
-      if (!message.contains("endVersion") ||
-          !message.at("endVersion").is_object() ||
-          !message.at("endVersion").contains("ts") ||
-          !message.at("endVersion").at("ts").is_string()) {
-        throw ProtocolError("Live transition has an invalid endVersion");
+      if (!message.contains("endVersion")) {
+        throw ProtocolError("Transition omitted endVersion");
+      }
+      const auto end_version =
+          parse_state_version(message.at("endVersion"), "endVersion");
+      if (end_version.query_set < start_version.query_set ||
+          end_version.identity < start_version.identity ||
+          end_version.decoded_timestamp < start_version.decoded_timestamp) {
+        throw ProtocolError("Live transition version moved backwards");
       }
       if (!message.contains("modifications") ||
           !message.at("modifications").is_array()) {
@@ -286,8 +385,12 @@ struct Subscription::State : std::enable_shared_from_this<Subscription::State> {
       }
 
       // Commit the complete transition before publishing any part of it.
-      version = message.at("endVersion");
-      max_observed_timestamp = version.at("ts").get<std::string>();
+      version = end_version;
+      if (!max_observed_timestamp_bytes ||
+          end_version.decoded_timestamp > *max_observed_timestamp_bytes) {
+        max_observed_timestamp = end_version.timestamp;
+        max_observed_timestamp_bytes = end_version.decoded_timestamp;
+      }
       attempts = 0;
 
       for (auto &update : updates) {
@@ -323,7 +426,7 @@ struct Subscription::State : std::enable_shared_from_this<Subscription::State> {
   template <typename WebSocket>
   void exchange(WebSocket &socket, asio::io_context &io, unsigned &attempts,
                 bool is_reconnect) {
-    Json version{{"querySet", 0}, {"identity", 0}, {"ts", zero_timestamp}};
+    auto version = zero_state_version();
     bool awaiting_rehydration = is_reconnect;
 
     struct ConnectedGuard {
@@ -486,6 +589,10 @@ struct Subscription::State : std::enable_shared_from_this<Subscription::State> {
           std::move(tls));
       socket.set_option(
           websocket::stream_base::timeout::suggested(beast::role_type::client));
+      socket.set_option(websocket::stream_base::decorator(
+          [](websocket::request_type &request) {
+            request.set("Convex-Client", "cpp-0.1.0");
+          }));
       socket.read_message_max(maximum_live_message_bytes);
       bool websocket_ready = false;
       beast::error_code websocket_error;
@@ -499,7 +606,6 @@ struct Subscription::State : std::enable_shared_from_this<Subscription::State> {
         throw boost::system::system_error(websocket_error);
       }
 
-      attempts = 0;
       send_connect_and_add(socket, io, count);
       {
         std::lock_guard lock(mutex);
@@ -526,6 +632,10 @@ struct Subscription::State : std::enable_shared_from_this<Subscription::State> {
     websocket::stream<beast::tcp_stream> socket(std::move(tcp_stream));
     socket.set_option(
         websocket::stream_base::timeout::suggested(beast::role_type::client));
+    socket.set_option(
+        websocket::stream_base::decorator([](websocket::request_type &request) {
+          request.set("Convex-Client", "cpp-0.1.0");
+        }));
     socket.read_message_max(maximum_live_message_bytes);
     bool websocket_ready = false;
     beast::error_code websocket_error;
@@ -539,7 +649,6 @@ struct Subscription::State : std::enable_shared_from_this<Subscription::State> {
       throw boost::system::system_error(websocket_error);
     }
 
-    attempts = 0;
     send_connect_and_add(socket, io, count);
     {
       std::lock_guard lock(mutex);

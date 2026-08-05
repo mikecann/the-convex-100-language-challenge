@@ -42,6 +42,31 @@ int main() {
   assert(event.at("type") == "ack");
   assert(!std::getline(output, line));
 
+  // A timeout means the room was quiet, not that the subscription ended. The
+  // relay must poll again and deliver a later update.
+  auto quiet_gate = std::make_shared<RelayGate>();
+  int polls = 0;
+  bool quiet_update_delivered = false;
+  relay_until_invalidated(
+      quiet_gate,
+      [&]() -> std::optional<convex::Update> {
+        ++polls;
+        if (polls == 1) {
+          return std::nullopt;
+        }
+        if (polls == 2) {
+          return convex::Update{{{"count", 7}}, {}, "", Json(), ""};
+        }
+        quiet_gate->invalidate();
+        return std::nullopt;
+      },
+      [&](const convex::Update &update) {
+        quiet_update_delivered = update.value.at("count") == 7;
+        return true;
+      });
+  assert(polls == 3);
+  assert(quiet_update_delivered);
+
   // Keep the included adapter lifecycle compiled in this test translation too.
   std::istringstream empty_input;
   std::ostringstream empty_output;
