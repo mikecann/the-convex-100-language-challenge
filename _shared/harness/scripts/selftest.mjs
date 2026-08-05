@@ -56,6 +56,20 @@ assert.equal(
   }),
   null,
 );
+assert.equal(
+  targetRuntimeError("typescript", {
+    implementation: { status: "attempting" },
+    targetRuntimeCommand: "node",
+  }),
+  null,
+);
+assert.match(
+  targetRuntimeError("typescript", {
+    implementation: { status: "attempting" },
+    targetRuntimeCommand: "javascript",
+  }),
+  /must declare/,
+);
 assert.match(
   targetRuntimeError("python", { implementation: { status: "attempting" } }),
   /must declare/,
