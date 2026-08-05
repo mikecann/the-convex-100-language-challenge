@@ -6,6 +6,11 @@ import addFormats from "ajv-formats";
 import { bundledLanguages, codeToHtml } from "shiki";
 import { parse } from "yaml";
 import { projectReadmeExamples } from "./example-readme.mjs";
+import {
+  hasPassingTests,
+  requiredHTTPTests,
+  requiredLiveTests,
+} from "./required-tests.mjs";
 
 const root = process.env.REPO_ROOT ?? "/repo";
 const output = path.join(root, "_shared/site/dist");
@@ -23,49 +28,6 @@ const resultSchema = JSON.parse(
 const ajv = new Ajv2020({ allErrors: true });
 addFormats(ajv);
 const validateResult = ajv.compile(resultSchema);
-const requiredHTTPTests = [
-  "oracle/adapter/hello",
-  "oracle/http/query",
-  "oracle/http/nested-json-and-logs",
-  "oracle/http/mutation",
-  "oracle/http/idempotent-mutation",
-  "oracle/http/document-id-string",
-  "oracle/http/action",
-  "oracle/http/structured-error",
-  "oracle/http/utf8-round-trip",
-  "go/adapter/hello",
-  "go/http/query",
-  "go/http/nested-json-and-logs",
-  "go/http/mutation",
-  "go/http/idempotent-mutation",
-  "go/http/document-id-string",
-  "go/http/action",
-  "go/http/structured-error",
-  "go/http/utf8-round-trip",
-  "go/http/bearer-token-lifecycle",
-];
-const requiredLiveTests = [
-  "oracle/live/initial-result",
-  "oracle/live/external-update",
-  "oracle/live/unsubscribe",
-  "oracle/live/reconnect-five-times",
-  "oracle/live/query-error-recovery",
-  "oracle/live/clean-close",
-  "go/live/initial-result",
-  "go/live/external-update",
-  "go/live/unsubscribe",
-  "go/live/reconnect-five-times",
-  "go/live/query-error-recovery",
-  "go/live/clean-close",
-];
-
-function hasPassingTests(result, requiredNames) {
-  return requiredNames.every((name) => {
-    const matches = result.tests.filter((test) => test.name === name);
-    return matches.length === 1 && matches[0].status === "pass";
-  });
-}
-
 function checkedResult(result, source, trusted) {
   if (!validateResult(result)) {
     throw new Error(`${source}: invalid result: ${ajv.errorsText(validateResult.errors)}`);

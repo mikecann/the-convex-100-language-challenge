@@ -66,7 +66,12 @@
       "properties": {
         "harnessTreeHash": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
         "backendTreeHash": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-        "protocolSourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+        "protocolSourceCommit": {
+          "oneOf": [
+            { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+            { "type": "null" }
+          ]
+        }
       }
     },
     "evidence": {

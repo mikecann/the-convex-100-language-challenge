@@ -90,7 +90,14 @@ deployment has no configured identity provider.
 
 ## Adapter protocol
 
-Every client image contains the library and a thin language-native adapter. The controller sends newline-delimited JSON commands over stdin:
+Every client image contains the library and a thin language-native adapter. The
+same NDJSON stream works in two transports. With no `ADAPTER_LISTEN`, the
+controller may use stdin and stdout. When `ADAPTER_LISTEN` is set, the adapter
+listens on that TCP address, accepts one controller connection, and carries the
+stream over that socket. The isolated Docker harness uses TCP so the controller
+and client can remain separate containers without mounting the Docker socket.
+
+The controller sends these commands:
 
 - `hello`
 - `query`
@@ -99,16 +106,24 @@ Every client image contains the library and a thin language-native adapter. The 
 - `subscribe`
 - `unsubscribe`
 - `setAuth`
+- `debugDisconnect` for a client attempting Live
 - `close`
 
 The adapter emits NDJSON responses containing request or subscription IDs. The
 controller owns randomized fixtures, external reference mutations, assertions,
 timeouts, fault injection, and capability calculation.
 
-The first command is always `hello` and includes `protocolVersion: 1`. The
-adapter rejects unsupported protocol versions. Every later command carries a
-request ID, and every subscription event carries a subscription ID. Stdout is
-reserved for NDJSON protocol events; human diagnostics go to stderr.
+The first command is always `hello` and includes `protocolVersion: 1`. Its
+`ready` response reports `protocolVersion`, the roster language ID,
+implementation provenance, and runtime version. The adapter rejects unsupported
+protocol versions. Every later command carries a request ID, and every
+subscription event carries a subscription ID. Stdout is reserved for NDJSON
+protocol events; human diagnostics go to stderr.
+
+`debugDisconnect` is test-only fault injection. It closes the active WebSocket
+without closing the client, allowing the controller to prove five real
+reconnects and restored subscriptions. It must not appear in the educational
+client API.
 
 Every result records at least:
 

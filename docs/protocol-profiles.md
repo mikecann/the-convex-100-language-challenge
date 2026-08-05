@@ -6,7 +6,9 @@ and treat hosted compatibility drift as expected evidence.
 
 ## `convex-rs-0.10.4-unversioned-sync`
 
-The Go pilot implements only this profile:
+Go is the first implementation of this profile. Other native clients may target
+the same inspected revision, but each must independently pass local and hosted
+Live conformance and record any behaviour it deliberately does not implement:
 
 | Property | Pinned value |
 | --- | --- |
@@ -17,7 +19,7 @@ The Go pilot implements only this profile:
 | Transition chunks | Present in sync types, but not assembled by the pinned base client; Go treats one as profile drift |
 | Timestamps | Opaque base64 strings |
 
-The implementation covers query-set add/remove, atomic transition application,
+The Go implementation covers query-set add/remove, atomic transition application,
 initial and later query values, query failures, reconnect with active-query
 rebuild, unsubscribe, and clean close.
 

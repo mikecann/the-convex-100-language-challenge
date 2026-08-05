@@ -8,6 +8,8 @@ const blockPattern = /<!-- BEGIN GENERATED EXAMPLE: ([^\r\n]+) -->\r?\n[\s\S]*?<
 const fenceLanguages = {
   ".cc": "cpp",
   ".cs": "csharp",
+  ".ex": "elixir",
+  ".exs": "elixir",
   ".fs": "fsharp",
   ".fsx": "fsharp",
   ".go": "go",

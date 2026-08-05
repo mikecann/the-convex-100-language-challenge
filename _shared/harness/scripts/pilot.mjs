@@ -1,33 +1,72 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
+import { parse } from "yaml";
 import { AdapterProcess } from "./adapter-process.mjs";
+import { earnedCapabilitiesFor } from "./required-tests.mjs";
 
 const deploymentUrl = process.env.CONVEX_URL;
 if (!deploymentUrl) throw new Error("CONVEX_URL is required");
 
+const languageId = process.env.CLIENT_LANGUAGE;
+if (!languageId) throw new Error("CLIENT_LANGUAGE is required");
+
+const clientAdapterTCP = process.env.CLIENT_ADAPTER_TCP;
+if (!clientAdapterTCP) throw new Error("CLIENT_ADAPTER_TCP is required");
+
+const repositoryRoot = process.env.REPO_ROOT ?? "/repo";
+const languageDirectory = path.join(repositoryRoot, languageId);
+const manifest = parse(
+  fs.readFileSync(path.join(languageDirectory, "manifest.yaml"), "utf8"),
+);
+if (manifest.id !== languageId) {
+  throw new Error(`CLIENT_LANGUAGE ${languageId} does not match manifest ${manifest.id}`);
+}
+
+const intendedCapabilities = new Set(manifest.intendedCapabilities ?? []);
+const wantsLive = intendedCapabilities.has("live");
+if (wantsLive && !manifest.syncProfile) {
+  throw new Error(`${languageId}: Live intent requires a pinned syncProfile`);
+}
+
 const artifacts = process.env.ARTIFACTS_DIR ?? "/artifacts";
-const goAdapterTCP = process.env.CLIENT_ADAPTER_TCP;
-if (!goAdapterTCP) throw new Error("CLIENT_ADAPTER_TCP is required");
 const referenceAdapterPath = fileURLToPath(
   new URL("../reference-js/adapter.mjs", import.meta.url),
 );
 const startedAt = new Date();
 const testResults = [];
+const runNonce = `${languageId}-${Date.now()}-${randomBytes(6).toString("hex")}`;
 let sequence = 0;
-let goRuntime = "unknown";
+let clientRuntime = "unknown";
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function pinnedBaseImageDigests() {
+  const dockerfile = fs.readFileSync(path.join(languageDirectory, "Dockerfile"), "utf8");
+  const digests = new Set();
+  for (const line of dockerfile.split(/\r?\n/)) {
+    // The Dockerfile frontend is build machinery, not one of the resulting
+    // image's base layers, so it does not belong in this evidence field.
+    if (line.trimStart().startsWith("# syntax=")) continue;
+    for (const match of line.matchAll(/@sha256:([0-9a-f]{64})/g)) {
+      digests.add(`sha256:${match[1]}`);
+    }
+  }
+  if (digests.size === 0) {
+    throw new Error(`${languageId}: Dockerfile has no pinned base image digest`);
+  }
+  return [...digests];
+}
+
 const oracle = new AdapterProcess(process.execPath, [referenceAdapterPath]).start();
-const go = new AdapterProcess(null, [], { tcp: goAdapterTCP }).start();
+const client = new AdapterProcess(null, [], { tcp: clientAdapterTCP }).start();
 
 function nextId(prefix) {
   sequence += 1;
@@ -38,7 +77,7 @@ async function test(name, fn) {
   const start = performance.now();
   const transcriptStart = {
     oracle: oracle.transcript.length,
-    go: go.transcript.length,
+    client: client.transcript.length,
   };
   let result;
   try {
@@ -60,7 +99,7 @@ async function test(name, fn) {
   }
   const evidence = {
     oracle: oracle.transcript.slice(transcriptStart.oracle),
-    go: go.transcript.slice(transcriptStart.go),
+    client: client.transcript.slice(transcriptStart.client),
   };
   result.evidenceHash = sha256(JSON.stringify(evidence));
   testResults.push(result);
@@ -73,6 +112,7 @@ async function hello(adapter, label) {
     op: "hello",
   });
   assert.equal(response.type, "ready");
+  assert.equal(response.protocolVersion, 1);
   return response;
 }
 
@@ -124,8 +164,8 @@ async function externalIncrement(room, runId) {
   });
 }
 
-async function runHTTP(label, adapter, { expectLogs }) {
-  const room = `${label}-http-${Date.now()}`;
+async function runHTTP(label, adapter, { expectLogs, languageName, testAuth }) {
+  const room = `${runNonce}-${label}-http`;
 
   await test(`${label}/http/query`, async () => {
     const response = await call(adapter, "query", "demo:state", { room });
@@ -153,7 +193,7 @@ async function runHTTP(label, adapter, { expectLogs }) {
   await test(`${label}/http/mutation`, async () => {
     const response = await call(adapter, "mutation", "demo:increment", {
       room,
-      language: label,
+      language: languageName,
       runId: `${room}-once`,
     });
     assert.equal(response.value.applied, true);
@@ -163,7 +203,7 @@ async function runHTTP(label, adapter, { expectLogs }) {
   await test(`${label}/http/idempotent-mutation`, async () => {
     const response = await call(adapter, "mutation", "demo:increment", {
       room,
-      language: label,
+      language: languageName,
       runId: `${room}-once`,
     });
     assert.equal(response.value.applied, false);
@@ -182,7 +222,7 @@ async function runHTTP(label, adapter, { expectLogs }) {
 
   await test(`${label}/http/action`, async () => {
     const response = await call(adapter, "action", "demo:greet", {
-      language: label === "go" ? "Go" : "JavaScript",
+      language: languageName,
     });
     assert.match(response.value.message, /Convex is responding/);
   });
@@ -206,8 +246,8 @@ async function runHTTP(label, adapter, { expectLogs }) {
     assert.equal(response.value[3], "🟨🟩🟦");
   });
 
-  if (label === "go") {
-    await test("go/http/bearer-token-lifecycle", async () => {
+  if (testAuth) {
+    await test(`${label}/http/bearer-token-lifecycle`, async () => {
       await setAuth(adapter, "invalid-token-one");
       let response = await adapter.request({
         id: nextId("invalid-auth"),
@@ -236,7 +276,7 @@ async function runHTTP(label, adapter, { expectLogs }) {
 }
 
 async function runLive(label, adapter) {
-  const base = `${label}-live-${Date.now()}`;
+  const base = `${runNonce}-${label}-live`;
 
   await test(`${label}/live/initial-result`, async () => {
     const subscriptionId = `${label}-initial`;
@@ -299,82 +339,48 @@ async function runLive(label, adapter) {
 }
 
 await test("oracle/adapter/hello", async () => {
-  await hello(oracle, "oracle");
+  const response = await hello(oracle, "oracle");
+  assert.equal(response.language, "javascript");
+  assert.ok(response.implementation);
+  assert.ok(response.runtime);
 });
-await test("go/adapter/hello", async () => {
-  const response = await hello(go, "go");
-  goRuntime = response.runtime ?? "unknown";
+await test("client/adapter/hello", async () => {
+  const response = await hello(client, "client");
+  assert.equal(response.language, languageId);
+  assert.ok(response.implementation);
+  assert.ok(response.runtime);
+  clientRuntime = response.runtime;
 });
 
-await runHTTP("oracle", oracle, { expectLogs: false });
-await runLive("oracle", oracle);
-await runHTTP("go", go, { expectLogs: true });
-await runLive("go", go);
+await runHTTP("oracle", oracle, {
+  expectLogs: false,
+  languageName: "JavaScript",
+  testAuth: false,
+});
+await runHTTP("client", client, {
+  expectLogs: true,
+  languageName: manifest.displayName,
+  testAuth: true,
+});
 
-await test("go/live/clean-close", async () => {
-  const response = await go.request({ id: nextId("go-close"), op: "close" });
+if (wantsLive) {
+  await runLive("oracle", oracle);
+  await runLive("client", client);
+}
+
+await test("client/adapter/clean-close", async () => {
+  const response = await client.request({ id: nextId("client-close"), op: "close" });
   assert.equal(response.type, "closed", JSON.stringify(response));
-  assert.equal((await go.exitPromise).code, 0);
+  assert.equal((await client.exitPromise).code, 0);
 });
 
-await test("oracle/live/clean-close", async () => {
+await test("oracle/adapter/clean-close", async () => {
   const response = await oracle.request({ id: nextId("oracle-close"), op: "close" });
   assert.equal(response.type, "closed", JSON.stringify(response));
   assert.equal((await oracle.exitPromise).code, 0);
 });
 
-const requiredOracleTests = [
-  "oracle/adapter/hello",
-  "oracle/http/query",
-  "oracle/http/nested-json-and-logs",
-  "oracle/http/mutation",
-  "oracle/http/idempotent-mutation",
-  "oracle/http/document-id-string",
-  "oracle/http/action",
-  "oracle/http/structured-error",
-  "oracle/http/utf8-round-trip",
-  "oracle/live/initial-result",
-  "oracle/live/external-update",
-  "oracle/live/unsubscribe",
-  "oracle/live/reconnect-five-times",
-  "oracle/live/query-error-recovery",
-  "oracle/live/clean-close",
-];
-const requiredGoHTTPTests = [
-  "go/adapter/hello",
-  "go/http/query",
-  "go/http/nested-json-and-logs",
-  "go/http/mutation",
-  "go/http/idempotent-mutation",
-  "go/http/document-id-string",
-  "go/http/action",
-  "go/http/structured-error",
-  "go/http/utf8-round-trip",
-  "go/http/bearer-token-lifecycle",
-];
-const requiredGoLiveTests = [
-  "go/live/initial-result",
-  "go/live/external-update",
-  "go/live/unsubscribe",
-  "go/live/reconnect-five-times",
-  "go/live/query-error-recovery",
-  "go/live/clean-close",
-];
-
-function requiredTestsPassed(requiredNames) {
-  return requiredNames.every((name) => {
-    const matches = testResults.filter((entry) => entry.name === name);
-    return matches.length === 1 && matches[0].status === "pass";
-  });
-}
-
-const oraclePassed = requiredTestsPassed(requiredOracleTests);
-const goHTTPPassed = oraclePassed && requiredTestsPassed(requiredGoHTTPTests);
-const goLivePassed = goHTTPPassed && requiredTestsPassed(requiredGoLiveTests);
-
-const earnedCapabilities = [];
-if (oraclePassed && goHTTPPassed) earnedCapabilities.push("http");
-if (oraclePassed && goLivePassed) earnedCapabilities.push("live");
+const earnedCapabilities = earnedCapabilitiesFor(testResults);
 
 let backendVersion = "unknown";
 try {
@@ -384,33 +390,30 @@ try {
   // The individual calls already provide better failure evidence.
 }
 
-const transcript = { oracle: oracle.transcript, go: go.transcript };
+const transcript = { oracle: oracle.transcript, client: client.transcript };
 const transcriptJSON = `${JSON.stringify(transcript, null, 2)}\n`;
 const result = {
   schemaVersion: 1,
-  language: "go",
+  language: languageId,
   sourceCommit: process.env.SOURCE_COMMIT ?? "unknown",
   dirty: process.env.SOURCE_DIRTY === "true",
-  provenance: "native",
-  runtimeVersion: goRuntime,
+  provenance: manifest.implementation.provenance,
+  runtimeVersion: clientRuntime,
   platform: process.env.TEST_PLATFORM ?? "linux/amd64",
   imageDigest: process.env.CLIENT_IMAGE_DIGEST ?? "unknown",
   clientTreeHash: process.env.CLIENT_TREE_HASH ?? "unknown",
-  baseImageDigests: [
-    "sha256:f4490d7b261d73af4543c46ac6597d7d101b6e1755bcdd8c5159fda7046b6b3e",
-    "sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce",
-  ],
+  baseImageDigests: pinnedBaseImageDigests(),
   backend: {
     kind: process.env.BACKEND_KIND ?? "self-hosted",
     url: deploymentUrl,
     version: backendVersion.trim() || "unknown",
     imageDigest: process.env.BACKEND_IMAGE_DIGEST || null,
   },
-  protocol: "convex-rs-0.10.4-unversioned-sync",
+  protocol: manifest.syncProfile?.id ?? "documented-http-json",
   revisions: {
     harnessTreeHash: process.env.HARNESS_TREE_HASH ?? "unknown",
     backendTreeHash: process.env.BACKEND_TREE_HASH ?? "unknown",
-    protocolSourceCommit: "6f1df8a8ba1665084ec001e307ca841ca17074d7",
+    protocolSourceCommit: manifest.syncProfile?.sourceCommit ?? null,
   },
   evidence: {
     channel: process.env.EVIDENCE_CHANNEL ?? "local",
@@ -432,8 +435,14 @@ const validateResult = ajv.compile(resultSchema);
 if (!validateResult(result)) {
   throw new Error(`generated invalid result: ${ajv.errorsText(validateResult.errors)}`);
 }
-fs.writeFileSync(path.join(artifacts, "go-pilot-transcript.json"), transcriptJSON);
-fs.writeFileSync(path.join(artifacts, "go-pilot-result.json"), `${JSON.stringify(result, null, 2)}\n`);
+fs.writeFileSync(
+  path.join(artifacts, `${languageId}-pilot-transcript.json`),
+  transcriptJSON,
+);
+fs.writeFileSync(
+  path.join(artifacts, `${languageId}-pilot-result.json`),
+  `${JSON.stringify(result, null, 2)}\n`,
+);
 
 if (testResults.some((entry) => entry.status === "fail")) process.exitCode = 1;
 console.log(`Earned capabilities: ${earnedCapabilities.join(", ") || "none"}`);

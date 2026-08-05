@@ -45,6 +45,7 @@ async function handle(command) {
         type: "ready",
         language: "javascript",
         implementation: "official-convex-js-1.43.0",
+        runtime: process.version,
       });
       return;
     }

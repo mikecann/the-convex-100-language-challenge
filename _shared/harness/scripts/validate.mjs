@@ -24,12 +24,19 @@ for (const schemaName of ["adapter.schema.json", "result.schema.json"]) {
   ajv.compile(schema);
 }
 
-const workflowPath = path.join(root, ".github/workflows/go-pilot.yml");
-const workflow = parse(fs.readFileSync(workflowPath, "utf8"));
-const workflowSteps = workflow.jobs?.conformance?.steps ?? [];
-for (const step of workflowSteps) {
-  if (step.uses && !/@[0-9a-f]{40}$/.test(step.uses)) {
-    errors.push(`GitHub Action is not pinned by full commit: ${step.uses}`);
+const workflowsDirectory = path.join(root, ".github/workflows");
+for (const workflowFilename of fs.readdirSync(workflowsDirectory)) {
+  if (!/\.ya?ml$/.test(workflowFilename)) continue;
+  const workflowPath = path.join(workflowsDirectory, workflowFilename);
+  const workflow = parse(fs.readFileSync(workflowPath, "utf8"));
+  for (const job of Object.values(workflow.jobs ?? {})) {
+    for (const step of job.steps ?? []) {
+      if (step.uses && !/@[0-9a-f]{40}$/.test(step.uses)) {
+        errors.push(
+          `${workflowFilename}: GitHub Action is not pinned by full commit: ${step.uses}`,
+        );
+      }
+    }
   }
 }
 
@@ -110,6 +117,27 @@ for (const language of roster.languages) {
       if (!allowedEntries.has(entry)) {
         errors.push(`${language.id}: unexpected top-level entry ${entry}`);
       }
+    }
+    if (manifest.adapter?.entrypoint !== "/usr/local/bin/convex-adapter") {
+      errors.push(`${language.id}: adapter entrypoint must be /usr/local/bin/convex-adapter`);
+    }
+    if (!manifest.implementation?.provenance) {
+      errors.push(`${language.id}: implemented client must declare provenance`);
+    }
+    if (!manifest.toolchain?.name || !manifest.toolchain?.version) {
+      errors.push(`${language.id}: implemented client must pin its toolchain`);
+    }
+    if (!(manifest.platforms ?? []).includes("linux/amd64")) {
+      errors.push(`${language.id}: implemented client must declare linux/amd64`);
+    }
+    if (!(manifest.intendedCapabilities ?? []).includes("http")) {
+      errors.push(`${language.id}: implemented client must intend the HTTP baseline`);
+    }
+    if (
+      (manifest.intendedCapabilities ?? []).includes("live") &&
+      !(manifest.adapter?.adapterOnlyCommands ?? []).includes("debugDisconnect")
+    ) {
+      errors.push(`${language.id}: Live intent requires adapter-only debugDisconnect`);
     }
   }
 }

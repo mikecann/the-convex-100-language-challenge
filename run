@@ -38,6 +38,14 @@ require_docker() {
   docker info >/dev/null
 }
 
+require_implemented_language() {
+  language=${1:-}
+  if test -z "$language" || test ! -f "$repo_root/$language/Dockerfile"; then
+    printf '%s\n' "No implemented language exists for: ${language:-<missing>}" >&2
+    exit 1
+  fi
+}
+
 build_harness() {
   docker build \
     --file "$repo_root/_shared/harness/Dockerfile" \
@@ -86,7 +94,7 @@ image_policy() {
 
   test "$image_user" = "65532:65532"
   test "$image_os/$image_arch" = "linux/amd64"
-  test "$image_entrypoint" = '["/usr/local/bin/convex-go-adapter"]'
+  test "$image_entrypoint" = '["/usr/local/bin/convex-adapter"]'
 
   docker run --rm \
     --platform linux/amd64 \
@@ -147,9 +155,10 @@ build_example_image() {
 }
 
 run_example_verification() {
-  deployment_url=$1
-  backend_kind=$2
-  example_room="go-example-$backend_kind-$(date +%s)-$$"
+  language=$1
+  deployment_url=$2
+  backend_kind=$3
+  example_room="$language-example-$backend_kind-$(date +%s)-$$"
 
   docker run --rm \
     --platform linux/amd64 \
@@ -164,15 +173,15 @@ run_example_verification() {
     --env CONVEX_URL="$deployment_url" \
     --env EXAMPLE_ROOM="$example_room" \
     --entrypoint /bin/sh \
-    100-convex-clients-go-example:local \
+    "100-convex-clients-$language-example:local" \
     -ec '
-      output=$(/usr/local/bin/convex-go-example "$EXAMPLE_ROOM")
+      output=$(/usr/local/bin/convex-example "$EXAMPLE_ROOM")
       printf "%s\n" "$output"
       printf "%s\n" "$output" | grep -Fqx "current count: 0"
       printf "%s\n" "$output" | grep -Fq "\"applied\": true"
       printf "%s\n" "$output" | grep -Fqx "verified count: 0 -> 1"
     '
-  printf '%s\n' "PASS go basic example returned the expected 0 -> 1 update against $backend_kind"
+  printf '%s\n' "PASS $language basic example returned the expected 0 -> 1 update against $backend_kind"
 }
 
 build_pilot_image() {
@@ -180,19 +189,21 @@ build_pilot_image() {
     --load \
     --platform linux/amd64 \
     --file "$repo_root/_shared/harness/Dockerfile.pilot" \
-    --tag 100-convex-clients-go-pilot:local \
+    --tag 100-convex-clients-pilot:local \
     "$repo_root"
 }
 
 run_pilot_controller() {
-  deployment_url=$1
-  backend_kind=$2
-  artifacts_dir=$3
-  client_digest=$4
-  source_commit=$5
-  source_dirty=$6
-  client_container="one-hundred-convex-clients-go-$backend_kind-$$"
-  client_tree_hash=$(git -C "$repo_root" rev-parse "$source_commit:go")
+  language=$1
+  deployment_url=$2
+  backend_kind=$3
+  artifacts_dir=$4
+  client_digest=$5
+  source_commit=$6
+  source_dirty=$7
+  client_container="one-hundred-convex-clients-$language-$backend_kind-$$"
+  client_alias="$language-client"
+  client_tree_hash=$(git -C "$repo_root" rev-parse "$source_commit:$language")
   harness_tree_hash=$(git -C "$repo_root" rev-parse "$source_commit:_shared/harness")
   backend_tree_hash=$(git -C "$repo_root" rev-parse "$source_commit:_shared/backend")
   backend_image_digest=
@@ -222,11 +233,11 @@ run_pilot_controller() {
     --cpus 0.5 \
     --ulimit nofile=256:256 \
     --network "$backend_network" \
-    --network-alias go-client \
+    --network-alias "$client_alias" \
     --user 65532:65532 \
     --env CONVEX_URL="$deployment_url" \
     --env ADAPTER_LISTEN=0.0.0.0:8080 \
-    100-convex-clients-go:local >/dev/null
+    "100-convex-clients-$language:local" >/dev/null
 
   trap 'docker rm --force "$client_container" >/dev/null 2>&1 || true' 0 1 2 15
   controller_status=0
@@ -243,7 +254,8 @@ run_pilot_controller() {
     --user "$(id -u):$(id -g)" \
     --env npm_config_cache=/tmp/npm-cache \
     --env CONVEX_URL="$deployment_url" \
-    --env CLIENT_ADAPTER_TCP=go-client:8080 \
+    --env CLIENT_LANGUAGE="$language" \
+    --env CLIENT_ADAPTER_TCP="$client_alias:8080" \
     --env BACKEND_KIND="$backend_kind" \
     --env SOURCE_COMMIT="$source_commit" \
     --env SOURCE_DIRTY="$source_dirty" \
@@ -256,9 +268,11 @@ run_pilot_controller() {
     --env EVIDENCE_RUN_URL="$evidence_run_url" \
     --env EVIDENCE_OCI_ARCHIVE="$evidence_oci_archive" \
     --env TEST_PLATFORM=linux/amd64 \
+    --env REPO_ROOT=/repo \
     --tmpfs /tmp \
     --volume "$artifacts_dir:/artifacts" \
-    100-convex-clients-go-pilot:local || controller_status=$?
+    --volume "$repo_root:/repo:ro" \
+    100-convex-clients-pilot:local || controller_status=$?
 
   if test "$controller_status" -ne 0; then
     docker stop --time 2 "$client_container" >/dev/null 2>&1 || true
@@ -345,15 +359,13 @@ case "$command_name" in
   build)
     require_docker
     language=${2:-}
-    test -n "$language"
-    test -f "$repo_root/$language/Dockerfile"
+    require_implemented_language "$language"
     build_client_image "$language"
     ;;
   test)
     require_docker
     language=${2:-}
-    test -n "$language"
-    test -f "$repo_root/$language/Dockerfile"
+    require_implemented_language "$language"
     docker buildx build \
       --load \
       --platform linux/amd64 \
@@ -367,127 +379,103 @@ case "$command_name" in
   verify-example)
     require_docker
     language=${2:-}
-    case "$language" in
-      go)
-        backend_deploy
-        build_example_image go
-        run_example_verification http://backend:3210 self-hosted
-        ;;
-      *)
-        printf '%s\n' "No basic example verification exists for: $language" >&2
-        exit 1
-        ;;
-    esac
+    require_implemented_language "$language"
+    backend_deploy
+    build_example_image "$language"
+    run_example_verification "$language" http://backend:3210 self-hosted
     ;;
   verify)
     require_docker
     language=${2:-}
-    case "$language" in
-      go)
-        backend_deploy
-        "$repo_root/run" test go
-        "$repo_root/run" build go
-        image_policy go
-        build_example_image go
-        run_example_verification http://backend:3210 self-hosted
-        client_digest=$(
-          docker image inspect 100-convex-clients-go:local --format '{{.Id}}'
-        )
-        source_commit=$(git -C "$repo_root" rev-parse HEAD)
-        source_dirty=false
-        if test -n "$(git -C "$repo_root" status --porcelain)"; then
-          source_dirty=true
-        fi
-        build_pilot_image
-        run_pilot_controller \
-          http://backend:3210 \
-          self-hosted \
-          "$repo_root/_shared/results/local" \
-          "$client_digest" \
-          "$source_commit" \
-          "$source_dirty"
-        ;;
-      *)
-        printf '%s\n' "No conformance pilot exists for: $language" >&2
-        exit 1
-        ;;
-    esac
+    require_implemented_language "$language"
+    backend_deploy
+    "$repo_root/run" test "$language"
+    "$repo_root/run" build "$language"
+    image_policy "$language"
+    build_example_image "$language"
+    run_example_verification "$language" http://backend:3210 self-hosted
+    client_digest=$(
+      docker image inspect "100-convex-clients-$language:local" --format '{{.Id}}'
+    )
+    source_commit=$(git -C "$repo_root" rev-parse HEAD)
+    source_dirty=false
+    if test -n "$(git -C "$repo_root" status --porcelain)"; then
+      source_dirty=true
+    fi
+    build_pilot_image
+    run_pilot_controller \
+      "$language" \
+      http://backend:3210 \
+      self-hosted \
+      "$repo_root/_shared/results/local" \
+      "$client_digest" \
+      "$source_commit" \
+      "$source_dirty"
     ;;
   verify-hosted)
     require_docker
     language=${2:-}
-    case "$language" in
-      go)
-        backend_up
-        "$repo_root/run" test go
-        "$repo_root/run" build go
-        image_policy go
-        build_example_image go
-        run_example_verification https://usable-reindeer-44.convex.cloud hosted
-        client_digest=$(
-          docker image inspect 100-convex-clients-go:local --format '{{.Id}}'
-        )
-        source_commit=$(git -C "$repo_root" rev-parse HEAD)
-        source_dirty=false
-        if test -n "$(git -C "$repo_root" status --porcelain)"; then
-          source_dirty=true
-        fi
-        build_pilot_image
-        run_pilot_controller \
-          https://usable-reindeer-44.convex.cloud \
-          hosted \
-          "$repo_root/_shared/results/hosted" \
-          "$client_digest" \
-          "$source_commit" \
-          "$source_dirty"
-        ;;
-      *)
-        printf '%s\n' "No hosted conformance pilot exists for: $language" >&2
-        exit 1
-        ;;
-    esac
+    require_implemented_language "$language"
+    backend_up
+    "$repo_root/run" test "$language"
+    "$repo_root/run" build "$language"
+    image_policy "$language"
+    build_example_image "$language"
+    run_example_verification "$language" https://usable-reindeer-44.convex.cloud hosted
+    client_digest=$(
+      docker image inspect "100-convex-clients-$language:local" --format '{{.Id}}'
+    )
+    source_commit=$(git -C "$repo_root" rev-parse HEAD)
+    source_dirty=false
+    if test -n "$(git -C "$repo_root" status --porcelain)"; then
+      source_dirty=true
+    fi
+    build_pilot_image
+    run_pilot_controller \
+      "$language" \
+      https://usable-reindeer-44.convex.cloud \
+      hosted \
+      "$repo_root/_shared/results/hosted" \
+      "$client_digest" \
+      "$source_commit" \
+      "$source_dirty"
     ;;
   verify-all)
     require_docker
     language=${2:-}
-    case "$language" in
-      go)
-        backend_deploy
-        "$repo_root/run" test go
-        build_client_image go
-        image_policy go
-        build_example_image go
-        run_example_verification http://backend:3210 self-hosted
-        run_example_verification https://usable-reindeer-44.convex.cloud hosted
-        client_digest=$(
-          docker image inspect 100-convex-clients-go:local --format '{{.Id}}'
-        )
-        source_commit=$(git -C "$repo_root" rev-parse HEAD)
-        source_dirty=false
-        if test -n "$(git -C "$repo_root" status --porcelain)"; then
-          source_dirty=true
-        fi
-        build_pilot_image
-        run_pilot_controller \
-          http://backend:3210 \
-          self-hosted \
-          "$repo_root/_shared/results/local" \
-          "$client_digest" \
-          "$source_commit" \
-          "$source_dirty"
-        run_pilot_controller \
-          https://usable-reindeer-44.convex.cloud \
-          hosted \
-          "$repo_root/_shared/results/hosted" \
-          "$client_digest" \
-          "$source_commit" \
-          "$source_dirty"
-        ;;
-      *)
-        printf '%s\n' "No combined conformance pilot exists for: $language" >&2
-        exit 1
-        ;;
-    esac
+    require_implemented_language "$language"
+    backend_deploy
+    "$repo_root/run" test "$language"
+    build_client_image "$language"
+    image_policy "$language"
+    build_example_image "$language"
+    run_example_verification "$language" http://backend:3210 self-hosted
+    run_example_verification "$language" https://usable-reindeer-44.convex.cloud hosted
+    client_digest=$(
+      docker image inspect "100-convex-clients-$language:local" --format '{{.Id}}'
+    )
+    source_commit=$(git -C "$repo_root" rev-parse HEAD)
+    source_dirty=false
+    if test -n "$(git -C "$repo_root" status --porcelain)"; then
+      source_dirty=true
+    fi
+    build_pilot_image
+    run_pilot_controller \
+      "$language" \
+      http://backend:3210 \
+      self-hosted \
+      "$repo_root/_shared/results/local" \
+      "$client_digest" \
+      "$source_commit" \
+      "$source_dirty"
+    run_pilot_controller \
+      "$language" \
+      https://usable-reindeer-44.convex.cloud \
+      hosted \
+      "$repo_root/_shared/results/hosted" \
+      "$client_digest" \
+      "$source_commit" \
+      "$source_dirty"
     ;;
   site|site-preview)
     require_docker

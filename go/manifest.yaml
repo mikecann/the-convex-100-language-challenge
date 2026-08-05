@@ -22,7 +22,7 @@ platforms:
   - linux/amd64
 adapter:
   protocolVersion: 1
-  entrypoint: /usr/local/bin/convex-go-adapter
+  entrypoint: /usr/local/bin/convex-adapter
   adapterOnlyCommands:
     - debugDisconnect
 limitations:

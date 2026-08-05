@@ -71,6 +71,9 @@
         "protocolVersion": { "const": 1 },
         "id": { "$ref": "#/$defs/id" },
         "subscriptionId": { "$ref": "#/$defs/id" },
+        "language": { "type": "string" },
+        "implementation": { "type": "string" },
+        "runtime": { "type": "string" },
         "type": {
           "enum": ["ready", "result", "error", "ack", "subscription", "closed"]
         },

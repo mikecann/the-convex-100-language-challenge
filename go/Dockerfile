@@ -34,9 +34,9 @@ RUN apk add --no-cache ca-certificates=20260611-r0
 USER 65532:65532
 
 FROM runtime-base AS example-runtime
-COPY --from=example-build /out/convex-go-example /usr/local/bin/convex-go-example
-ENTRYPOINT ["/usr/local/bin/convex-go-example"]
+COPY --from=example-build /out/convex-go-example /usr/local/bin/convex-example
+ENTRYPOINT ["/usr/local/bin/convex-example"]
 
 FROM runtime-base AS runtime
-COPY --from=build /out/convex-go-adapter /usr/local/bin/convex-go-adapter
-ENTRYPOINT ["/usr/local/bin/convex-go-adapter"]
+COPY --from=build /out/convex-go-adapter /usr/local/bin/convex-adapter
+ENTRYPOINT ["/usr/local/bin/convex-adapter"]

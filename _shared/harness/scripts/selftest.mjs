@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { AdapterProcess } from "./adapter-process.mjs";
+import {
+  earnedCapabilitiesFor,
+  requiredHTTPTests,
+  requiredLiveTests,
+} from "./required-tests.mjs";
 
 const broken = fileURLToPath(new URL("./broken-adapter.mjs", import.meta.url));
 const hello = { protocolVersion: 1, id: "hello", op: "hello" };
@@ -31,4 +36,18 @@ async function checkDirtyExit() {
 await checkWrongValue();
 await checkHang();
 await checkDirtyExit();
-console.log("PASS harness rejects wrong values, hangs, and dirty exits");
+
+// A synthetic second language catches accidental Go-specific names in the
+// capability evaluator before real language work starts.
+const syntheticElixirTests = [...requiredHTTPTests, ...requiredLiveTests].map((name) => ({
+  name,
+  status: "pass",
+}));
+assert.deepEqual(earnedCapabilitiesFor(syntheticElixirTests), ["http", "live"]);
+assert.ok(
+  [...requiredHTTPTests, ...requiredLiveTests].every((name) => !name.includes("go/")),
+);
+
+console.log(
+  "PASS harness rejects wrong values, hangs, dirty exits, and language-specific test names",
+);

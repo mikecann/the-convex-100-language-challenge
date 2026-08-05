@@ -123,7 +123,10 @@ Local development may use emulation, but an emulated pass does not replace the n
 
 ## Adapter and controller
 
-Each client image runs a language-native adapter that reads NDJSON commands from stdin and emits NDJSON events on stdout. The adapter provides a common control surface while exercising the actual public client API underneath it.
+Each client image runs a language-native adapter using the shared NDJSON
+protocol. It supports stdin/stdout for direct inspection and a one-connection
+TCP mode for the isolated Docker controller. The adapter provides a common
+control surface while exercising the actual public client API underneath it.
 
 The controller owns:
 
@@ -262,6 +265,11 @@ Stop for Michael's review before starting any second language.
 
 Run adapters for official Rust, Python, Swift, and Kotlin clients. Their results
 broaden calibration and correctly record native or binding provenance.
+
+This remains explicit calibration debt while the first post-Go batch deliberately
+uses Ruby and Elixir to test whether the language-neutral harness works across
+an interpreted runtime and the BEAM. Complete the official-client calibration
+before treating the harness as mature enough for large batches.
 
 ### Stage 3: diverse pilot
 
