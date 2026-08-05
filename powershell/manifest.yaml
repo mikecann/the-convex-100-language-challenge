@@ -6,7 +6,7 @@ selectionTier: ranked
 implementation:
   status: attempting
   provenance: native
-  version: 0.1.0
+  version: 0.2.0
   notes: Native PowerShell implementation using only System.Net.Http and System.Net.WebSockets for ordinary transport primitives. Capability badges stay empty until root-owned evidence passes.
 toolchain:
   name: PowerShell
@@ -24,5 +24,5 @@ adapter:
 limitations:
   - Live authentication, optimistic updates, transition chunks, WebSocket mutations, and actions are deferred.
   - Live values use the JSON-safe subset exercised by this demonstration.
-  - The owner runspace keeps only newest 16 events per subscription and rejects events that exceed its one MiB encoded-byte budget.
+  - Live delivery keeps the newest 16 events per subscription within a global 64-event and 8 MiB encoded-output budget.
 capabilities: []
