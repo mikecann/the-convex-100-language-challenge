@@ -1,0 +1,20 @@
+{
+  "name": "convex-from-typescript-educational-client",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "dependencies": {
+    "ws": "8.21.2"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.21",
+    "@types/ws": "8.5.13",
+    "prettier": "3.6.2",
+    "typescript": "5.8.3"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/client/*.test.js dist/client/tests/conformance/*.test.js",
+    "check": "prettier --check . ../examples && tsc -p tsconfig.json --noEmit"
+  }
+}
