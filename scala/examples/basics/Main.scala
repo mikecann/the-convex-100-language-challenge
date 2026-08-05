@@ -1,28 +1,3 @@
-# Convex from Scala
-
-This is a small Scala 3 demonstration of Convex's documented JSON HTTP API and
-an experimental implementation of the pinned Live sync profile. It is
-educational and unofficial, not a production SDK.
-
-## Start here
-
-[The canonical basic example](examples/basics/Main.scala) reads a counter,
-starts Live before changing it, performs an idempotent HTTP mutation, and checks
-the Live update. The exact same commented program is installed in the example
-image.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| JSON HTTP queries, mutations, and actions | Implemented, awaiting shared evidence |
-| Live query subscriptions | Experimental pinned profile, awaiting shared evidence |
-| Authentication | HTTP bearer tokens only |
-
-## The basic example
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.scala -->
-```text
 package convex.example
 
 import convex.{ConvexClient, LiveClient}
@@ -76,34 +51,3 @@ object Main:
     finally
       live.close()
       client.close()
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-```sh
-./run test scala
-./run build scala
-./run verify-example scala
-./run verify scala
-```
-
-`test` compiles Scala and runs language-local checks inside Docker. `build`
-creates minimal amd64 runtime images. The latter two commands are coordinator-
-owned shared evidence, so no capability has been awarded here.
-
-## Protocol notes
-
-Live uses the pinned `convex-rs-0.10.4-unversioned-sync` profile at `/api/sync`.
-One Scala worker owns WebSocket transitions and commands. Each subscription has
-a bounded newest-16 queue. The test-only NDJSON v1 adapter includes
-`debugDisconnect` for reconnect conformance. Deterministic Scala-local fixtures
-cover reconnect backoff and metadata, unchanged hydration suppression,
-replacement and unsubscribe relay barriers, fragmented UTF-8 with control
-frames, structured failures and recovery, and bounded stalled-peer shutdown.
-
-## Limitations
-
-Live auth, WebSocket mutation/action calls, optimistic updates, journals,
-mutation replay, and `TransitionChunk` assembly are deliberately deferred. The
-sync protocol is an implementation experiment rather than a stability promise.
