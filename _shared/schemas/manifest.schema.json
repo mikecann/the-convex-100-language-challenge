@@ -47,7 +47,7 @@
     },
     "targetRuntimeCommand": {
       "description": "The narrowly allowed target interpreter command when it would otherwise look like a delegated runtime.",
-      "enum": ["node", "python", "python3"]
+      "enum": ["node", "php", "python", "python3"]
     },
     "syncProfile": {
       "type": "object",
