@@ -76,7 +76,7 @@ Public Module Program
                 Dim commandId As String = Nothing
                 Dim commandFailure As Exception = Nothing
                 Try
-                    command = JsonNode.Parse(line)?.AsObject()
+                    command = TryCast(JsonNode.Parse(line), JsonObject)
                     If command Is Nothing Then Throw New ConvexClient.ProtocolException("command must be a JSON object")
                     commandId = RequiredId(command)
                     Dim op = RequiredOperation(command)
@@ -110,11 +110,15 @@ Public Module Program
                             client.SetAuth(RequiredToken(command))
                             Await writer.WriteAsync(Ack(commandId))
                         Case "subscribe"
-                            If live Is Nothing Then live = New LiveClient(RequiredUrl(url))
-                            If subscriptions.Count >= MaxSubscriptions Then Throw New ConvexClient.ProtocolException("adapter subscription limit is 8")
                             Dim subscriptionId = RequiredSubscriptionId(command)
+                            Dim path = RequiredText(command, "path")
+                            Dim args = RequiredObject(command, "args")
+                            ' A same-ID replacement first retires the old relay and Live query.
+                            ' Its freed slot is therefore visible to both cap checks before Add.
                             Invalidate(subscriptionId, subscriptions, relays)
-                            Dim subscription = Await live.Subscribe(RequiredText(command, "path"), RequiredObject(command, "args"))
+                            If subscriptions.Count >= MaxSubscriptions Then Throw New ConvexClient.ProtocolException("adapter subscription limit is 8")
+                            If live Is Nothing Then live = New LiveClient(RequiredUrl(url))
+                            Dim subscription = Await live.Subscribe(path, args)
                             If Not subscriptions.TryAdd(subscriptionId, subscription) Then Throw New InvalidOperationException("subscription replacement failed")
                             Await writer.WriteAsync(Ack(commandId))
                             Dim relayState = New RelayState()
@@ -135,6 +139,8 @@ Public Module Program
                             Await writer.WriteAsync(New JsonObject From {{"id", commandId}, {"type", "closed"}})
                             Return
                     End Select
+                Catch ex As JsonException
+                    commandFailure = New ConvexClient.ProtocolException("invalid NDJSON command: " & ex.Message)
                 Catch ex As AdapterOutputException
                     Throw
                 Catch ex As Exception

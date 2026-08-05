@@ -21,6 +21,7 @@ Module Program
         Await TestAdapterValidationNullErrorsAndByteLimit()
         Await TestAdapterStaleRelay(False)
         Await TestAdapterStaleRelay(True)
+        Await TestAdapterReplacementAtCap()
         Await TestLiveFiveReconnectsAndRecovery()
         Await TestFiveFailedReconnectsThenRecovery()
         Await TestProtocolAndTransportRecovery()
@@ -90,6 +91,18 @@ Module Program
                         Check(TypeOf failure.Error Is ConvexClient.TransportException,
                             "failed handshake was not TransportError: " & observed)
                     Next
+
+                    ' The sixth retry is now waiting on the maximum observed backoff.
+                    ' Twenty thousand unrelated owner commands must reuse that one wait,
+                    ' not allocate twenty thousand abandoned Task.Delay timers.
+                    GC.Collect()
+                    Dim commandBaseline = GC.GetTotalMemory(True)
+                    Dim retired = New LiveClient.Subscription(live, -1, "demo:retired", New JsonObject())
+                    For commandIndex = 1 To 20000
+                        Await live.Unsubscribe(retired)
+                    Next
+                    Dim commandGrowth = GC.GetTotalMemory(True) - commandBaseline
+                    Check(commandGrowth < 4L * 1024L * 1024L, "20k owner commands retained reconnect timers: " & commandGrowth)
                     Equal(1, subscription.Next(TimeSpan.FromSeconds(10))("count").GetValue(Of Integer)(), "five-failure recovery value")
 
                     Dim resetTimer = Stopwatch.StartNew()
@@ -124,28 +137,76 @@ Module Program
         ExpectTimeout(Function() hydrated.Next(TimeSpan.FromMilliseconds(30)), "unchanged hydration crossed reconnect")
         hydrated.Offer(LiveClient.Update.Success(New JsonObject From {{"count", 1}}, Array.Empty(Of String)()))
         Equal(1, hydrated.Next(TestTimeout)("count").GetValue(Of Integer)(), "changed hydration was suppressed")
+        hydrated.BeginHydration()
+        hydrated.Offer(LiveClient.Update.Failure(
+            New ConvexClient.FunctionException("query", "temporary", New JsonObject From {{"code", "TEMP"}}, Array.Empty(Of String)()),
+            Array.Empty(Of String)()))
+        Check(TypeOf hydrated.NextUpdate(TestTimeout).Error Is ConvexClient.FunctionException, "QueryFailed was suppressed during hydration")
+        hydrated.Offer(LiveClient.Update.Success(New JsonObject From {{"count", 1}}, Array.Empty(Of String)()))
+        Equal(1, hydrated.Next(TestTimeout)("count").GetValue(Of Integer)(), "same value did not recover after QueryFailed")
 
-        Dim byteBounded = New LiveClient.Subscription(Nothing, 4, "demo:large", New JsonObject())
+        Dim reordered = New LiveClient.Subscription(Nothing, 4, "demo:order", New JsonObject())
+        reordered.Offer(LiveClient.Update.Success(New JsonObject From {
+            {"first", 1}, {"nested", New JsonObject From {{"left", Nothing}, {"right", 2}}}
+        }, Array.Empty(Of String)()))
+        reordered.Next(TestTimeout)
+        reordered.BeginHydration()
+        reordered.Offer(LiveClient.Update.Success(New JsonObject From {
+            {"nested", New JsonObject From {{"right", 2}, {"left", Nothing}}}, {"first", 1}
+        }, Array.Empty(Of String)()))
+        ExpectTimeout(Function() reordered.Next(TimeSpan.FromMilliseconds(30)), "property order defeated semantic hydration dedupe")
+        reordered.BeginHydration()
+        reordered.Offer(LiveClient.Update.Success(New JsonObject From {
+            {"nested", New JsonObject From {{"right", 2}}}, {"first", 1}
+        }, Array.Empty(Of String)()))
+        Check(reordered.Next(TestTimeout)("nested").AsObject().Count = 1, "missing property was treated as explicit null")
+
+        nullSubscription.BeginHydration()
+        nullSubscription.Offer(LiveClient.Update.Success(Nothing, Array.Empty(Of String)()))
+        ExpectTimeout(Function() nullSubscription.Next(TimeSpan.FromMilliseconds(30)), "unchanged JSON null crossed hydration")
+        nullSubscription.BeginHydration()
+        nullSubscription.Offer(LiveClient.Update.Failure(
+            New ConvexClient.FunctionException("query", "temporary", New JsonObject From {{"code", "TEMP"}}, {"failed"}), {"failed"}))
+        Check(TypeOf nullSubscription.NextUpdate(TestTimeout).Error Is ConvexClient.FunctionException, "QueryFailed was treated as unset null")
+        nullSubscription.Offer(LiveClient.Update.Success(Nothing, Array.Empty(Of String)()))
+        Dim recoveredNull = nullSubscription.NextUpdate(TestTimeout)
+        Check(recoveredNull.HasValue AndAlso recoveredNull.Value Is Nothing, "same null value did not recover after QueryFailed")
+
+        Dim byteBounded = New LiveClient.Subscription(Nothing, 5, "demo:large", New JsonObject())
         Dim nearMaximumLog = New String("雪"c, 400000)
         byteBounded.Offer(LiveClient.Update.Success(New JsonObject From {{"ok", True}}, {nearMaximumLog}))
         Dim oversized = byteBounded.NextUpdate(TestTimeout)
         Check(TypeOf oversized.Error Is ConvexClient.ProtocolException, "encoded logs were omitted from the byte budget")
 
-        ' The adapter permits eight subscriptions. Retain a distinct near-limit value in
-        ' every queue, stop consuming, and prove the real CLR process stays below the
-        ' shared 128 MiB ceiling rather than treating an event count as a memory bound.
-        Dim stoppedReaderQueues As New List(Of LiveClient.Subscription)()
+        Dim oversizedError = New LiveClient.Subscription(Nothing, 6, "demo:error", New JsonObject())
+        Dim errorWithHugeLogs = New ConvexClient.FunctionException(
+            "query", "failed", New JsonObject From {{"code", "HUGE"}}, {nearMaximumLog})
+        oversizedError.Offer(LiveClient.Update.Failure(errorWithHugeLogs, errorWithHugeLogs.Logs))
+        Check(TypeOf oversizedError.NextUpdate(TestTimeout).Error Is ConvexClient.ProtocolException,
+            "QueryFailed logs were omitted from the encoded byte budget")
+
+        ' Retain eight distinct near-limit QueryFailed events without consuming them.
+        ' Their error data and logs are both encoded and the real CLR process must stay
+        ' below the shared 128 MiB stopped-reader ceiling.
+        Dim stoppedErrorQueues As New List(Of LiveClient.Subscription)()
         For subscriptionId = 0 To 7
-            Dim payload = subscriptionId.ToString("D2") & New String(ChrW(65 + (subscriptionId Mod 26)), 749998)
-            Dim subscription = New LiveClient.Subscription(Nothing, 100 + subscriptionId, "demo:large", New JsonObject())
-            subscription.Offer(LiveClient.Update.Success(New JsonObject From {{"payload", payload}}, Array.Empty(Of String)()))
-            stoppedReaderQueues.Add(subscription)
+            Dim detail = subscriptionId.ToString("D2") & New String(ChrW(65 + (subscriptionId Mod 26)), 399998)
+            Dim errorLog = subscriptionId.ToString("D2") & New String(ChrW(97 + (subscriptionId Mod 26)), 339998)
+            Dim failure = New ConvexClient.FunctionException(
+                "query", "near-limit", New JsonObject From {{"detail", detail}}, {errorLog})
+            Dim subscription = New LiveClient.Subscription(Nothing, 100 + subscriptionId, "demo:error", New JsonObject())
+            subscription.Offer(LiveClient.Update.Failure(failure, failure.Logs))
+            stoppedErrorQueues.Add(subscription)
         Next
         GC.Collect()
         GC.WaitForPendingFinalizers()
         GC.Collect()
         Dim workingSet = Process.GetCurrentProcess().WorkingSet64
-        Check(workingSet < 128L * 1024L * 1024L, "stopped-reader queues exceeded 128 MiB: " & workingSet)
+        Check(workingSet < 128L * 1024L * 1024L, "eight stopped QueryFailed queues exceeded 128 MiB: " & workingSet)
+        For Each subscription In stoppedErrorQueues
+            Check(TypeOf subscription.NextUpdate(TestTimeout).Error Is ConvexClient.FunctionException,
+                "near-limit QueryFailed was replaced by the byte budget")
+        Next
     End Sub
 
     Private Async Function TestAdapterValidationNullErrorsAndByteLimit() As Task
@@ -196,6 +257,50 @@ Module Program
         Dim byteEvent = ParseEvents(byteOutput.ToString()).Single()
         Equal("ProtocolError", byteEvent("error")("name").GetValue(Of String)(), "UTF-8 byte-limit classification")
         Check(byteEvent("error")("message").GetValue(Of String)().Contains("UTF-8"), "limit counted characters instead of UTF-8 bytes")
+
+        For Each malformed In {"{""id"":""partial"",""op"":""close""", "{]" & ControlChars.Lf}
+            Dim malformedOutput As New StringWriter()
+            Await AdapterProgram.Run(New StringReader(malformed), malformedOutput, Nothing)
+            Dim malformedEvent = ParseEvents(malformedOutput.ToString()).Single()
+            Equal("ProtocolError", malformedEvent("error")("name").GetValue(Of String)(), "malformed or partial NDJSON EOF classification")
+        Next
+    End Function
+
+    Private Async Function TestAdapterReplacementAtCap() As Task
+        Using listener = Listen()
+            Dim server = Task.Run(Async Function()
+                                      Using peer = Await listener.AcceptTcpClientAsync()
+                                          Dim stream = peer.GetStream()
+                                          Await Handshake(stream)
+                                          Await ReadClientText(stream)
+                                          For addIndex = 0 To 7
+                                              Dim add = JsonNode.Parse(Await ReadClientText(stream))
+                                              Equal("Add", add("modifications")(0)("type").GetValue(Of String)(), "cap fixture Add")
+                                          Next
+                                          Dim remove = JsonNode.Parse(Await ReadClientText(stream))
+                                          Equal("Remove", remove("modifications")(0)("type").GetValue(Of String)(), "cap replacement Remove")
+                                          Dim replacement = JsonNode.Parse(Await ReadClientText(stream))
+                                          Equal("Add", replacement("modifications")(0)("type").GetValue(Of String)(), "cap replacement Add")
+                                          Await WaitForEof(stream)
+                                      End Using
+                                      Return True
+                                  End Function)
+
+            Dim input As New QueuedTextReader()
+            Dim output As New RecordingTextWriter()
+            Dim adapter = AdapterProgram.Run(input, output, Url(listener))
+            For subscriptionIndex = 0 To 7
+                input.Enqueue("{""id"":""s" & subscriptionIndex & """,""op"":""subscribe"",""subscriptionId"":""slot" & subscriptionIndex & """,""path"":""demo:state"",""args"":{}}")
+                Await output.WaitForCount(subscriptionIndex + 1)
+            Next
+            input.Enqueue("{""id"":""replace"",""op"":""subscribe"",""subscriptionId"":""slot0"",""path"":""demo:state"",""args"":{}}")
+            Await output.WaitForCount(9)
+            Equal("ack", output.Events()(8)("type").GetValue(Of String)(), "same-ID replacement failed at active cap")
+            input.Enqueue("{""id"":""close"",""op"":""close""}")
+            input.Complete()
+            Await adapter.WaitAsync(TestTimeout)
+            Await server.WaitAsync(TestTimeout)
+        End Using
     End Function
 
     Private Async Function TestAdapterStaleRelay(replace As Boolean) As Task

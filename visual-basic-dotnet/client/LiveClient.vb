@@ -40,6 +40,7 @@ Namespace ConvexVisualBasic
         Private version As JsonObject = ZeroVersion()
         Private reconnectDelayMilliseconds As Integer = 100
         Private reconnectAt As DateTimeOffset?
+        Private reconnectScheduleVersion As Long
         Private connectionGeneration As Long
         Private closed As Boolean
 
@@ -107,6 +108,8 @@ Namespace ConvexVisualBasic
 
         Private Async Function OwnerLoop() As Task
             Dim commandReady As Task(Of Boolean) = Nothing
+            Dim reconnectReady As Task = Nothing
+            Dim reconnectReadyVersion As Long = -1
             Try
                 While Not closed
                     If socket IsNot Nothing AndAlso receiveTask Is Nothing Then
@@ -115,10 +118,14 @@ Namespace ConvexVisualBasic
                     End If
 
                     If commandReady Is Nothing Then commandReady = commands.Reader.WaitToReadAsync(lifetime.Token).AsTask()
-                    Dim reconnectReady As Task = Nothing
                     If socket Is Nothing AndAlso subscriptions.Count > 0 AndAlso reconnectAt.HasValue Then
-                        Dim remaining = reconnectAt.Value - DateTimeOffset.UtcNow
-                        reconnectReady = Task.Delay(If(remaining > TimeSpan.Zero, remaining, TimeSpan.Zero), lifetime.Token)
+                        If reconnectReady Is Nothing OrElse reconnectReadyVersion <> reconnectScheduleVersion Then
+                            Dim remaining = reconnectAt.Value - DateTimeOffset.UtcNow
+                            reconnectReady = Task.Delay(If(remaining > TimeSpan.Zero, remaining, TimeSpan.Zero), lifetime.Token)
+                            reconnectReadyVersion = reconnectScheduleVersion
+                        End If
+                    Else
+                        reconnectReady = Nothing
                     End If
 
                     Dim completed As Task
@@ -155,6 +162,7 @@ Namespace ConvexVisualBasic
                     End If
 
                     If reconnectReady IsNot Nothing AndAlso completed Is reconnectReady AndAlso socket Is Nothing AndAlso subscriptions.Count > 0 Then
+                        reconnectReady = Nothing
                         reconnectAt = Nothing
                         Await TryConnect(False).ConfigureAwait(False)
                     End If
@@ -250,6 +258,7 @@ Namespace ConvexVisualBasic
                 version = ZeroVersion()
                 frame.SetLength(0)
                 reconnectAt = Nothing
+                reconnectScheduleVersion += 1
                 reconnectDelayMilliseconds = 100
 
                 Dim connect As New JsonObject From {
@@ -403,9 +412,11 @@ Namespace ConvexVisualBasic
             lastCloseReason = reason
             If reconnect AndAlso Not closed AndAlso subscriptions.Count > 0 Then
                 reconnectAt = DateTimeOffset.UtcNow.AddMilliseconds(reconnectDelayMilliseconds)
+                reconnectScheduleVersion += 1
                 reconnectDelayMilliseconds = Math.Min(reconnectDelayMilliseconds * 2, 15000)
             Else
                 reconnectAt = Nothing
+                reconnectScheduleVersion += 1
             End If
         End Sub
 
@@ -413,6 +424,7 @@ Namespace ConvexVisualBasic
             lastCloseReason = reason
             If Not closed AndAlso subscriptions.Count > 0 Then
                 reconnectAt = DateTimeOffset.UtcNow.AddMilliseconds(reconnectDelayMilliseconds)
+                reconnectScheduleVersion += 1
                 reconnectDelayMilliseconds = Math.Min(reconnectDelayMilliseconds * 2, 15000)
             End If
         End Sub
@@ -547,13 +559,13 @@ Namespace ConvexVisualBasic
 
             Private Shared Function Measure(hasValue As Boolean, value As JsonNode, failure As Exception, logs As IReadOnlyList(Of String)) As Integer
                 Dim envelope As New JsonObject From {{"type", "subscription"}, {"subscriptionId", New String("s"c, 128)}}
+                Dim logArray As New JsonArray()
+                For Each line In logs
+                    logArray.Add(line)
+                Next
+                envelope("logs") = logArray
                 If hasValue Then
                     envelope("value") = If(value Is Nothing, Nothing, value.DeepClone())
-                    Dim logArray As New JsonArray()
-                    For Each line In logs
-                        logArray.Add(line)
-                    Next
-                    envelope("logs") = logArray
                 Else
                     envelope("error") = New JsonObject From {
                         {"name", CanonicalErrorName(failure)}, {"message", failure.Message},
@@ -581,7 +593,9 @@ Namespace ConvexVisualBasic
             Private queuedBytes As Integer
             Private closed As Boolean
             Private hydrating As Boolean
-            Private lastSuccessfulFingerprint As String
+            Private hasLastSuccessfulValue As Boolean
+            Private lastSuccessfulWasNull As Boolean
+            Private lastSuccessfulValue As JsonNode
 
             Friend Sub New(client As LiveClient, id As Integer, functionPath As String, functionArgs As JsonObject)
                 owner = client
@@ -604,14 +618,17 @@ Namespace ConvexVisualBasic
                 SyncLock deliveryGate
                     If closed Then Return
                     If update.HasValue Then
-                        Dim fingerprint = If(update.Value Is Nothing, "null", update.Value.ToJsonString())
-                        If hydrating AndAlso lastSuccessfulFingerprint IsNot Nothing AndAlso fingerprint = lastSuccessfulFingerprint Then
+                        If hydrating AndAlso SameAsLastSuccessful(update.Value) Then
                             hydrating = False
                             Return
                         End If
                         hydrating = False
-                        lastSuccessfulFingerprint = fingerprint
+                        hasLastSuccessfulValue = True
+                        lastSuccessfulWasNull = update.Value Is Nothing
+                        lastSuccessfulValue = If(update.Value Is Nothing, Nothing, update.Value.DeepClone())
                     Else
+                        ' A QueryFailed is observable and ends hydration suppression. A later
+                        ' successful value, even if equal to the pre-error value, is recovery.
                         hydrating = False
                     End If
 
@@ -630,6 +647,41 @@ Namespace ConvexVisualBasic
                     Monitor.PulseAll(deliveryGate)
                 End SyncLock
             End Sub
+
+            Private Function SameAsLastSuccessful(value As JsonNode) As Boolean
+                If Not hasLastSuccessfulValue Then Return False
+                If value Is Nothing Then Return lastSuccessfulWasNull
+                If lastSuccessfulWasNull OrElse lastSuccessfulValue Is Nothing Then Return False
+                Return SemanticJsonEquals(lastSuccessfulValue, value)
+            End Function
+
+            Private Shared Function SemanticJsonEquals(left As JsonNode, right As JsonNode) As Boolean
+                If Object.ReferenceEquals(left, right) Then Return True
+                If left Is Nothing OrElse right Is Nothing Then Return False
+
+                Dim leftObject = TryCast(left, JsonObject)
+                Dim rightObject = TryCast(right, JsonObject)
+                If leftObject IsNot Nothing OrElse rightObject IsNot Nothing Then
+                    If leftObject Is Nothing OrElse rightObject Is Nothing OrElse leftObject.Count <> rightObject.Count Then Return False
+                    For Each entry In leftObject
+                        Dim rightValue As JsonNode = Nothing
+                        If Not rightObject.TryGetPropertyValue(entry.Key, rightValue) OrElse Not SemanticJsonEquals(entry.Value, rightValue) Then Return False
+                    Next
+                    Return True
+                End If
+
+                Dim leftArray = TryCast(left, JsonArray)
+                Dim rightArray = TryCast(right, JsonArray)
+                If leftArray IsNot Nothing OrElse rightArray IsNot Nothing Then
+                    If leftArray Is Nothing OrElse rightArray Is Nothing OrElse leftArray.Count <> rightArray.Count Then Return False
+                    For index = 0 To leftArray.Count - 1
+                        If Not SemanticJsonEquals(leftArray(index), rightArray(index)) Then Return False
+                    Next
+                    Return True
+                End If
+
+                Return JsonNode.DeepEquals(left, right)
+            End Function
 
             Friend Sub Finish()
                 SyncLock deliveryGate
