@@ -11,6 +11,7 @@ namespace ConvexAdapter;
 public static class Program
 {
     private static readonly JsonSerializerOptions Json = new() { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull };
+    internal static Func<string, LiveClient.Subscription, LiveClient.Update, Task>? RelayBeforePublish;
     public static async Task Main()
     {
         var listen = Environment.GetEnvironmentVariable("ADAPTER_LISTEN");
@@ -34,7 +35,19 @@ public static class Program
             } catch(Exception e) { await writer.Write(Failure(id,null,e)); }
         }} finally { subs.Clear(); live?.Dispose();client?.Dispose(); }
     }
-    private static async Task Relay(string sid,LiveClient.Subscription s,ConcurrentDictionary<string,LiveClient.Subscription> subs,LockedWriter outp) { try { while(subs.TryGetValue(sid,out var current)&&ReferenceEquals(current,s)) { var u=s.NextUpdate(TimeSpan.FromDays(1)); if(u.Error is not null)await outp.Write(Failure(null,sid,u.Error)); else await outp.Write(SubscriptionEvent(sid,u)); } }catch(Exception e){if(subs.ContainsKey(sid))await outp.Write(Failure(null,sid,e));} }
+    private static async Task Relay(string sid,LiveClient.Subscription s,ConcurrentDictionary<string,LiveClient.Subscription> subs,LockedWriter outp)
+    {
+        try {
+            while(subs.TryGetValue(sid,out var current)&&ReferenceEquals(current,s)) {
+                var update=s.NextUpdate(TimeSpan.FromDays(1));
+                if(RelayBeforePublish is { } barrier)await barrier(sid,s,update);
+                var value=update.Error is not null?Failure(null,sid,update.Error):SubscriptionEvent(sid,update);
+                await outp.WriteIf(()=>subs.TryGetValue(sid,out var active)&&ReferenceEquals(active,s),value);
+            }
+        } catch(Exception error) {
+            await outp.WriteIf(()=>subs.TryGetValue(sid,out var active)&&ReferenceEquals(active,s),Failure(null,sid,error));
+        }
+    }
     internal static JsonObject Event(string type,string? id,JsonObject? extra=null){var o=extra??[];o["type"]=type;if(id is not null)o["id"]=id;return o;}
     internal static JsonObject ResultEvent(string id, ConvexClient.Result result) { var value=Event("result",id); value["value"]=result.Value?.DeepClone(); if(result.Logs.Count>0)value["logs"]=JsonSerializer.SerializeToNode(result.Logs); return value; }
     internal static JsonObject SubscriptionEvent(string sid, LiveClient.Update update) { var value=Event("subscription",null); value["subscriptionId"]=sid; value["value"]=update.Value?.DeepClone(); if(update.Logs.Count>0)value["logs"]=JsonSerializer.SerializeToNode(update.Logs); return value; }
@@ -44,6 +57,7 @@ public static class Program
     {
         private readonly SemaphoreSlim gate=new(1,1);private bool closed;
         public async Task Write(JsonObject value){await gate.WaitAsync();try{if(!closed)await target.WriteLineAsync(Serialize(value));}finally{gate.Release();}}
+        public async Task WriteIf(Func<bool> current,JsonObject value){await gate.WaitAsync();try{if(!closed&&current())await target.WriteLineAsync(Serialize(value));}finally{gate.Release();}}
         public async Task Close(JsonObject value){await gate.WaitAsync();try{if(closed)return;closed=true;await target.WriteLineAsync(Serialize(value));}finally{gate.Release();}}
     }
 }

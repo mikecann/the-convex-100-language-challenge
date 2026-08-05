@@ -126,9 +126,9 @@ public sealed class LiveClient(string deployment) : IDisposable
     public void Dispose() { if (_closed) return; _closed=true; _lifetime.Cancel(); var socket=_socket;_socket=null;socket?.Abort();socket?.Dispose();foreach(var s in _subscriptions.Values)s.Finish();_subscriptions.Clear(); }
     public record Update(JsonNode? Value, Exception? Error, IReadOnlyList<string> Logs);
     public sealed class Subscription(LiveClient owner, int queryId, string path, JsonObject args) : IDisposable
-    { internal int QueryId {get;}=queryId; internal string Path {get;}=path; internal JsonObject Args {get;}=args; private readonly BlockingCollection<Update> _updates=new(16); private bool _closed;
-      internal void Offer(Update u) { if (_closed)return; if(!_updates.TryAdd(u)){_updates.TryTake(out _);_updates.TryAdd(u);} }
-      internal void Finish(){_closed=true;_updates.CompleteAdding();}
+    { internal int QueryId {get;}=queryId; internal string Path {get;}=path; internal JsonObject Args {get;}=args; private readonly BlockingCollection<Update> _updates=new(16); private readonly object _deliveryLock=new();private bool _closed;internal Action? OfferInsideLock;internal Action? FinishBeforeLock;
+      internal void Offer(Update u) { lock(_deliveryLock){if(_closed)return;OfferInsideLock?.Invoke();if(!_updates.TryAdd(u)){_updates.TryTake(out _);_updates.TryAdd(u);}} }
+      internal void Finish(){FinishBeforeLock?.Invoke();lock(_deliveryLock){if(_closed)return;_closed=true;_updates.CompleteAdding();}}
       public Update NextUpdate(TimeSpan timeout){if(_updates.TryTake(out var u,(int)timeout.TotalMilliseconds))return u; throw new TimeoutException("timed out waiting for Live update");}
       public JsonNode Next(TimeSpan timeout){var u=NextUpdate(timeout);if(u.Error is not null)throw u.Error;return u.Value!;}
       public void Dispose(){if(!_closed) owner.Unsubscribe(this).GetAwaiter().GetResult();}

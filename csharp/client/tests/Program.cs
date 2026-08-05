@@ -16,7 +16,10 @@ static class Tests
         await TestAdapterHttpOperations();
         await TestAdapterTcp();
         await TestAdapterLiveControllerLifecycle();
+        await TestAdapterSuppressesStaleRelayAfterUnsubscribe();
+        await TestAdapterSuppressesStaleRelayAfterReplacement();
         TestBoundedDelivery();
+        await TestOfferFinishOrdering();
         await TestLiveFlowAndUtf8Fragmentation();
         await TestReconnectAndResubscribe();
         await TestProtocolAndTransportRecovery();
@@ -183,6 +186,65 @@ static class Tests
         for(var value=0;value<20;value++) subscription.Offer(new LiveClient.Update(new JsonObject { ["count"] = value }, null, []));
         Equal(4, subscription.Next(Timeout)["count"]!.GetValue<int>(), "bounded queue did not drop oldest values");
         for(var value=5;value<20;value++) Equal(value,subscription.Next(Timeout)["count"]!.GetValue<int>(),"bounded queue order");
+    }
+
+    private static async Task TestOfferFinishOrdering()
+    {
+        var subscription=new LiveClient.Subscription(null!,8,"demo:state",new JsonObject());
+        var offerEntered=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var finishEntered=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseOffer=new ManualResetEventSlim();
+        subscription.OfferInsideLock=()=>{offerEntered.TrySetResult();releaseOffer.Wait(Timeout);};
+        subscription.FinishBeforeLock=()=>finishEntered.TrySetResult();
+        var offered=Task.Run(()=>subscription.Offer(new LiveClient.Update(new JsonObject{{"count",1}},null,[])));
+        await offerEntered.Task.WaitAsync(Timeout);
+        var finished=Task.Run(subscription.Finish);
+        await finishEntered.Task.WaitAsync(Timeout);Check(!finished.IsCompleted,"Finish interleaved with Offer inside delivery lock");
+        releaseOffer.Set();await offered.WaitAsync(Timeout);await finished.WaitAsync(Timeout);
+        subscription.OfferInsideLock=null;subscription.FinishBeforeLock=null;
+        subscription.Offer(new LiveClient.Update(new JsonObject{{"count",2}},null,[]));
+        Equal(1,subscription.Next(Timeout)["count"]!.GetValue<int>(),"pre-finish update was lost");
+        try{subscription.Next(TimeSpan.FromMilliseconds(20));throw new Exception("post-finish update was added");}catch(TimeoutException){}
+    }
+
+    private static Task TestAdapterSuppressesStaleRelayAfterUnsubscribe()=>TestStaleRelay(false);
+    private static Task TestAdapterSuppressesStaleRelayAfterReplacement()=>TestStaleRelay(true);
+
+    private static async Task TestStaleRelay(bool replace)
+    {
+        using var syncListener=Listen();
+        var relayEntered=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseRelay=new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var barrierCalls=0;
+        Adapter.RelayBeforePublish=(_,_,_)=>Interlocked.Increment(ref barrierCalls)==1?BlockRelay():Task.CompletedTask;
+        async Task BlockRelay(){relayEntered.TrySetResult();await releaseRelay.Task;}
+        var syncServer=Task.Run(async()=>{
+            using var socket=await syncListener.AcceptTcpClientAsync();var stream=socket.GetStream();await Handshake(stream);await ReadClientText(stream);
+            var oldAdd=JsonNode.Parse(await ReadClientText(stream))!;var oldId=oldAdd["modifications"]![0]!["queryId"]!.GetValue<int>();
+            var oldModification=replace
+                ?new JsonObject{{"type","QueryFailed"},{"queryId",oldId},{"errorMessage","stale"},{"errorData",new JsonObject{{"code","STALE"}}},{"logLines",new JsonArray()}}
+                :new JsonObject{{"type","QueryUpdated"},{"queryId",oldId},{"value",new JsonObject{{"count",99}}},{"logLines",new JsonArray()}};
+            await WriteServerText(stream,Transition(Zero(),Version(1),oldModification).ToJsonString());
+            var remove=JsonNode.Parse(await ReadClientText(stream))!;Equal("Remove",remove["modifications"]![0]!["type"]!.GetValue<string>(),"stale relay test Remove");
+            if(replace){var replacement=JsonNode.Parse(await ReadClientText(stream))!;var newId=replacement["modifications"]![0]!["queryId"]!.GetValue<int>();await WriteServerText(stream,Transition(Version(1),Version(2),new JsonObject{{"type","QueryUpdated"},{"queryId",newId},{"value",new JsonObject{{"count",2}}},{"logLines",new JsonArray()}}).ToJsonString());}
+            await WaitForEof(stream);
+        });
+        using var reserved=Listen();var adapterPort=((IPEndPoint)reserved.LocalEndpoint).Port;reserved.Stop();
+        Environment.SetEnvironmentVariable("CONVEX_URL",Url(syncListener));Environment.SetEnvironmentVariable("ADAPTER_LISTEN","127.0.0.1:"+adapterPort);
+        var adapter=Task.Run(Adapter.Main);TcpClient? controller=null;
+        for(var attempt=0;attempt<50&&controller is null;attempt++){try{controller=new TcpClient();await controller.ConnectAsync(IPAddress.Loopback,adapterPort);}catch{controller?.Dispose();controller=null;await Task.Delay(20);}}
+        var connected=controller??throw new Exception("stale relay adapter did not listen");
+        try{
+            using(connected)using(var stream=connected.GetStream())using(var reader=new StreamReader(stream))using(var writer=new StreamWriter(stream){AutoFlush=true}){
+                await writer.WriteLineAsync("{\"id\":\"old\",\"op\":\"subscribe\",\"subscriptionId\":\"same\",\"path\":\"demo:state\",\"args\":{}}");Equal("ack",(await ReadEvent(reader))["type"]!.GetValue<string>(),"old subscribe ack");
+                await relayEntered.Task.WaitAsync(Timeout);
+                if(replace){await writer.WriteLineAsync("{\"id\":\"new\",\"op\":\"subscribe\",\"subscriptionId\":\"same\",\"path\":\"demo:state\",\"args\":{}}");Equal("new",(await ReadEvent(reader))["id"]!.GetValue<string>(),"replacement ack");Equal(2,(await ReadEvent(reader))["value"]!["count"]!.GetValue<int>(),"replacement update");}
+                else{await writer.WriteLineAsync("{\"id\":\"unsubscribe\",\"op\":\"unsubscribe\",\"subscriptionId\":\"same\"}");Equal("unsubscribe",(await ReadEvent(reader))["id"]!.GetValue<string>(),"unsubscribe ack");}
+                releaseRelay.TrySetResult();await Task.Delay(150);Check(!stream.DataAvailable,replace?"old replacement relay emitted stale error":"unsubscribed relay emitted stale value");
+                await writer.WriteLineAsync("{\"id\":\"close\",\"op\":\"close\"}");Equal("closed",(await ReadEvent(reader))["type"]!.GetValue<string>(),"stale relay close");
+            }
+            await adapter.WaitAsync(Timeout);await syncServer.WaitAsync(Timeout);
+        }finally{releaseRelay.TrySetResult();Adapter.RelayBeforePublish=null;Environment.SetEnvironmentVariable("ADAPTER_LISTEN",null);Environment.SetEnvironmentVariable("CONVEX_URL",null);}
     }
 
     private static async Task TestLiveFlowAndUtf8Fragmentation()
