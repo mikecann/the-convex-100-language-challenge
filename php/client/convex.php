@@ -59,10 +59,10 @@ final class LiveManager {
   public function unsubscribe(int $id): void { $state=$this->subs[$id]??null; unset($this->subs[$id]); if($state){ $state['subscription']->finish(); if($this->ws) $this->modify([['type'=>'Remove','queryId'=>$id]]); } }
   public function debugDisconnect(): void {
     if(!$this->ws) { $this->ensure(); if(!$this->ws) throw new TransportError('Live WebSocket is not connected','live'); }
-    // Adapter-only: force and complete one reconnect so the controller can
-    // inspect the next Connect.connectionCount deterministically.
-    $this->disconnect('DebugDisconnect'); $this->reconnectAt=0.0; $this->ensure();
-    if(!$this->ws) throw new TransportError('Live reconnect failed','live');
+    // Adapter-only: confirm the old transport is closed, then return so the
+    // adapter can acknowledge before an external mutation is made. The normal
+    // 100 ms reconnect path will resubscribe and observe that newer value.
+    $this->disconnect('DebugDisconnect');
   }
   public function close(): void { $this->closed=true; $this->ws?->close(); $this->ws=null; foreach($this->subs as $s)$s['subscription']->finish(); $this->subs=[]; }
   public function pump(float $timeout=0): void { if($this->closed)return; $this->ensure(); if(!$this->ws){ if($timeout>0) usleep((int)($timeout*1000000)); return; } $this->ws->wait($timeout); while(($raw=$this->ws->read())!==false){ if($raw===null){$this->disconnect('ServerClosed');break;} $this->handle($raw); } }
