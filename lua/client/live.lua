@@ -310,6 +310,28 @@ function Manager:_recover_query_set_write(err)
 	self:_publish_error(err)
 end
 
+function Manager:_retire_socket(code, reason, timeout)
+	if not self.socket then
+		return false
+	end
+	local retired_socket = self.socket
+	local invoked, close_result = pcall(function()
+		return retired_socket:close(code, close_frame_reason(reason), timeout)
+	end)
+	if not (invoked and close_result) and retired_socket.socket then
+		-- lua-http exposes the owned cqueues socket here. If its graceful close
+		-- raises or returns failure, force the transport closed before proceeding.
+		pcall(function()
+			retired_socket.socket:shutdown()
+		end)
+		pcall(function()
+			retired_socket.socket:close()
+		end)
+	end
+	self.socket = nil
+	return true
+end
+
 function Manager:_process_commands()
 	while #self.commands > 0 do
 		local command = table.remove(self.commands, 1)
@@ -367,12 +389,7 @@ function Manager:_process_commands()
 				state.subscription:_finish()
 			end
 			self.subscriptions = {}
-			if self.socket then
-				pcall(function()
-					self.socket:close(1000, "client closed", 0.25)
-				end)
-			end
-			self.socket = nil
+			self:_retire_socket(1000, "client closed", 0.25)
 			self:_respond(command, true)
 		end
 	end
@@ -425,23 +442,7 @@ function Manager:_connect()
 end
 
 function Manager:_disconnect(reason, reconnect)
-	if self.socket then
-		local retired_socket = self.socket
-		local invoked, close_result = pcall(function()
-			return retired_socket:close(1001, close_frame_reason(reason), 0.1)
-		end)
-		local closed = invoked and close_result
-		if not closed and retired_socket.socket then
-			-- lua-http exposes the owned cqueues socket here. If its graceful
-			-- close path raises, force the transport closed before reconnecting.
-			pcall(function()
-				retired_socket.socket:shutdown()
-			end)
-			pcall(function()
-				retired_socket.socket:close()
-			end)
-		end
-		self.socket = nil
+	if self:_retire_socket(1001, reason, 0.1) then
 		self.connection_count = self.connection_count + 1
 	end
 	self.last_close_reason = reason

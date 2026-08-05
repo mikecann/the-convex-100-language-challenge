@@ -4,14 +4,19 @@ local json = require("json")
 
 local Output = {}
 Output.__index = Output
+Output.MAX_PENDING = 256
 
 function Output.new(stream, options)
 	options = options or {}
+	local max_pending = options.max_pending or Output.MAX_PENDING
+	assert(type(max_pending) == "number" and max_pending >= 1 and max_pending % 1 == 0)
 	return setmetatable({
 		stream = stream,
 		queue = {},
 		changed = condition.new(),
 		finished = false,
+		failed = nil,
+		max_pending = max_pending,
 		tcp_offset = 1,
 		now = options.now or socket.gettime,
 		wait_writable = options.wait_writable or function(peer, timeout)
@@ -24,11 +29,30 @@ function Output.new(stream, options)
 	}, Output)
 end
 
+function Output:_overflow()
+	self.failed = "adapter output queue exceeded " .. self.max_pending .. " pending events"
+	self.finished = true
+	-- Enqueue never waits for capacity because the Live owner may be producing
+	-- the event that unblocks a controller lifecycle command. Closing the stalled
+	-- stream wakes the sole writer and turns backpressure into a bounded adapter
+	-- transport failure instead of deadlocking either side.
+	if self.stream.close then
+		pcall(function()
+			self.stream:close()
+		end)
+	end
+	self.changed:signal(1)
+	error(self.failed, 3)
+end
+
 -- The generation check and JSON publication happen without yielding. Once a
 -- line enters this FIFO, the single writer must finish it before any later ack.
 function Output:enqueue(event, subscriptions, subscription_id, entry)
 	if entry and subscriptions[subscription_id] ~= entry then
 		return false
+	end
+	if #self.queue >= self.max_pending then
+		self:_overflow()
 	end
 	local encoded, encode_error = json.encode(event)
 	assert(encoded, encode_error)
@@ -47,12 +71,15 @@ function Output:run_stdio()
 		if #self.queue == 0 then
 			self.changed:wait()
 		else
-			local line = table.remove(self.queue, 1)
+			-- Keep the in-flight line in the queue so the bound includes a writer
+			-- blocked inside the kernel on a stopped stdout reader.
+			local line = self.queue[1]
 			local ok, write_error = self.stream:write(line)
 			assert(ok, write_error)
 			if self.stream.flush then
 				assert(self.stream:flush())
 			end
+			table.remove(self.queue, 1)
 		end
 	end
 end

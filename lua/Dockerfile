@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
 ARG DEBIAN_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+ARG BUSYBOX_IMAGE=busybox:1.37.0-musl@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23
 
 FROM ${DEBIAN_IMAGE} AS formatter
 ADD --checksum=sha256:bcb0d855e91f102f28a370e850f8566b3b44b79e6274d806ea5246837c0fd5ab \
@@ -47,12 +48,10 @@ CMD ["/bin/sh", "-c", "test \"$(uname -m)\" = x86_64 && lua5.1 -e 'assert(_VERSI
 
 FROM test AS runtime-rootfs
 # Copy only Lua, its declared runtime modules, TLS/CA data, loader closure,
-# and the POSIX commands required by the shared runtime policy. Package tools
-# stay behind in the build stage.
+# and resolver configuration. The pinned runtime OS stage supplies its own
+# deliberately limited POSIX tool set without a package manager.
 RUN set -eu; root=/runtime-root; \
-    mkdir -p "$root/bin" "$root/usr/bin" "$root/usr/lib/ssl" "$root/usr/local/bin" "$root/etc" "$root/opt/convex/client"; \
-    cp /bin/dash "$root/bin/dash"; ln -s dash "$root/bin/sh"; \
-    cp /usr/bin/id /usr/bin/grep "$root/usr/bin/"; \
+    mkdir -p "$root/usr/lib/ssl" "$root/usr/local/bin" "$root/etc" "$root/opt/convex/client"; \
     cp /usr/bin/lua5.1 "$root/usr/local/bin/lua"; \
     lua_modules=' \
       /usr/share/lua/5.1/basexx.lua /usr/share/lua/5.1/binaryheap.lua \
@@ -95,18 +94,31 @@ RUN set -eu; root=/runtime-root; \
     ln -s /etc/ssl/certs/ca-certificates.crt "$root/usr/lib/ssl/cert.pem"; \
     ln -s /etc/ssl/openssl.cnf "$root/usr/lib/ssl/openssl.cnf"; \
     cp -a /usr/share/ca-certificates "$root/usr/share/ca-certificates"; \
-    { ldd /bin/dash; ldd /usr/bin/id; ldd /usr/bin/grep; ldd /usr/bin/lua5.1; \
+    { ldd /usr/bin/lua5.1; \
       for module in $native_modules; do ldd "$module"; done; } | \
       awk '{ if ($3 ~ /^\//) print $3; if ($1 ~ /^\//) { path = $1; sub(/:$/, "", path); print path } }' | sort -u | while IFS= read -r library; do cp --parents "$library" "$root"; done; \
     for library in /lib/x86_64-linux-gnu/libnss_dns.so.2 /lib/x86_64-linux-gnu/libnss_files.so.2 /lib/x86_64-linux-gnu/libresolv.so.2; do test ! -e "$library" || cp --parents "$library" "$root"; done; \
     for config in /etc/nsswitch.conf /etc/host.conf /etc/gai.conf; do test ! -e "$config" || cp --parents "$config" "$root"; done; \
-    test ! -e "$root/usr/bin/lua5.1"; \
+    test ! -e "$root/bin"; test ! -e "$root/usr/bin/lua5.1"; \
     for version in 5.2 5.3 5.4; do test ! -d "$root/usr/share/lua/$version"; test ! -d "$root/usr/lib/x86_64-linux-gnu/lua/$version"; done; \
     for unused in socket/ftp.lua socket/smtp.lua http/server.lua openssl/pkcs12.lua openssl/cipher.lua cqueues/thread.lua; do test ! -e "$root/usr/share/lua/5.1/$unused"; done; \
     test ! -e "$root/usr/lib/x86_64-linux-gnu/lua/5.1/socket/serial.so"; \
     test -z "$(find "$root" -type f \( -name 'libapt*' -o -name 'libpam*' -o -name 'libsystemd*' -o -name 'libext2fs*' \) -print -quit)"
 
-FROM scratch AS runtime-base
+# BusyBox is a real, digest-pinned non-scratch runtime base. Keep only the
+# shell and basic POSIX text tools required by shared verification. Hard links
+# preserve one executable while removing package, network, and admin applets.
+FROM --platform=linux/amd64 ${BUSYBOX_IMAGE} AS runtime-os
+RUN set -eu; \
+    mkdir /runtime-tools; \
+    for tool in sh awk basename cat cmp cut dirname env grep head id sed tail test tr true false uname wc rm mv; do \
+      ln /bin/busybox "/runtime-tools/$tool"; \
+    done; \
+    /runtime-tools/rm -rf /bin; \
+    /runtime-tools/mv /runtime-tools /bin; \
+    /bin/rm -f /bin/rm /bin/mv
+
+FROM runtime-os AS runtime-base
 ENV CONVEX_CLIENT_PATH=/opt/convex/client
 COPY --from=runtime-rootfs /runtime-root /
 COPY client/convex.lua /opt/convex/client/convex.lua
@@ -114,6 +126,11 @@ COPY client/live.lua /opt/convex/client/live.lua
 COPY client/json.lua /opt/convex/client/json.lua
 COPY client/tests/conformance/adapter_events.lua /opt/convex/client/adapter_events.lua
 COPY client/tests/conformance/adapter_output.lua /opt/convex/client/adapter_output.lua
+RUN set -eu; \
+    test "$(/usr/local/bin/lua -e 'io.write(_VERSION)')" = "Lua 5.1"; \
+    for command in busybox apk apt apt-get apt-cache dpkg luac lua5.1 gcc cc make node npm npx python python3 pip pip3 curl wget nc telnet ftpget ftpput convex; do \
+      ! command -v "$command" >/dev/null 2>&1; \
+    done
 USER 65532:65532
 
 FROM runtime-base AS example-runtime

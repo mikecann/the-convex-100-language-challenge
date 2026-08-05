@@ -118,7 +118,10 @@ The adapter speaks NDJSON protocol v1 over stdin/stdout or `ADAPTER_LISTEN`
 TCP. HTTP and Live failures are serialized as `FunctionError`, `ProtocolError`,
 or `TransportError`. One cqueues owner controls WebSocket reads, writes,
 query-set versions, and reconnects. Each subscription keeps the newest 16
-updates. Lua-http supplies the low-level RFC 6455 framing, fragmented UTF-8,
+updates. The adapter output FIFO holds at most 256 complete events, including
+the in-flight stdout write; a controller that stops reading causes a bounded
+adapter transport failure instead of blocking the Live owner. Lua-http supplies
+the low-level RFC 6455 framing, fragmented UTF-8,
 control-frame, and bounded-close implementation; Convex-specific transitions,
 metadata, hydration suppression, and query recovery stay in this Lua client.
 

@@ -73,6 +73,10 @@ function FakeSocket:close(_, reason)
 		self.server.fail_next_close = false
 		error("fixture graceful close failure")
 	end
+	if self.server.fail_next_close_return then
+		self.server.fail_next_close_return = false
+		return nil, "fixture graceful close returned failure"
+	end
 	self.closed = true
 	return true
 end
@@ -145,6 +149,24 @@ if not close_ok then
 end
 assert_equal(server.sent[#server.sent].modifications[1].type, "Remove", "remove")
 assert(manager:close())
+
+-- Manager shutdown uses the same retirement path as reconnects. A graceful
+-- close exception or false return must still close the underlying transport.
+for _, failure_kind in ipairs({ "fail_next_close", "fail_next_close_return" }) do
+	server = server_for_updates()
+	manager = Live.Manager.new("http://unit.test", "lua-test", {
+		websocket_factory = function()
+			return server:new_socket()
+		end,
+	})
+	subscription = assert(manager:subscribe("demo:state", { room = "manager-close-" .. failure_kind }))
+	assert_equal(assert(subscription:next_update(1)).value.count, 0)
+	local closing_socket = server.connections[1]
+	server[failure_kind] = true
+	assert(manager:close())
+	assert(closing_socket.closed, "Manager close left the underlying transport open")
+	assert(closing_socket.forced_closed, "Manager close did not force transport retirement")
+end
 
 -- A failed Add may already have reached the server. The client rejects that
 -- subscription, retires the uncertain socket, reports a structured failure to
