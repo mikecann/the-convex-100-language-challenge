@@ -26,7 +26,9 @@ _convex_call() {
 		echo 'Convex args must be a named JSON object' >&2
 		return 2
 	}
-	body=$(jq -cn --arg path "$path" --argjson args "$args" '{path:$path,args:$args,format:"json"}')
+	# Keep request JSON on stdin. Linux limits each exec argument to much less
+	# than our 2 MiB protocol bound, so --argjson would reject valid large args.
+	body=$(printf '%s\n' "$args" | jq -c --arg path "$path" '{path:$path,args:.,format:"json"}')
 	if [[ -n $CONVEX_AUTH_TOKEN ]]; then auth=(--header="Authorization: Bearer $CONVEX_AUTH_TOKEN"); fi
 	# A raw record-separator byte cannot occur in valid JSON. Append wget's exit
 	# status after one, then read only enough bytes to enforce the response limit
@@ -34,7 +36,7 @@ _convex_call() {
 	response_envelope=
 	LC_ALL=C IFS= read -r -N "$((CONVEX_MAX_RESPONSE_BYTES + 5))" response_envelope < <(
 		set +e
-		wget -qO- --timeout=15 --header='Content-Type: application/json' --header="Convex-Client: $CONVEX_CLIENT_VERSION" "${auth[@]}" --post-data="$body" "${CONVEX_URL%/}/api/$operation"
+		printf %s "$body" | wget -qO- --timeout=15 --header='Content-Type: application/json' --header="Convex-Client: $CONVEX_CLIENT_VERSION" "${auth[@]}" --post-file=/dev/stdin "${CONVEX_URL%/}/api/$operation"
 		printf '\036%s' "$?"
 	) || true
 	[[ $response_envelope == *$'\036'* ]] || {

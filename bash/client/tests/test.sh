@@ -2,6 +2,20 @@
 set -euo pipefail
 trap 'printf "bash client test failed at line %s\n" "$LINENO" >&2' ERR
 root=$(cd -- "$(dirname -- "$0")/../.." && pwd)
+# A Docker test layer can be run again as a clean regression container. Remove
+# only this fixture's known state directories so prior room counts cannot leak.
+rm -rf \
+	/tmp/bash-convex-bad-accept \
+	/tmp/bash-convex-bad-upgrade \
+	/tmp/bash-convex-eof \
+	/tmp/bash-convex-fixture \
+	/tmp/bash-convex-many-headers \
+	/tmp/bash-convex-no-terminator \
+	/tmp/bash-convex-outage \
+	/tmp/bash-convex-oversized-headers \
+	/tmp/bash-convex-prefix \
+	/tmp/bash-convex-stalled-reconnect \
+	/tmp/bash-convex-tls
 wait_for_listener() {
 	local endpoint=$1 port=${1##*:}
 	for _ in $(seq 1 100); do
@@ -278,6 +292,34 @@ next_event() {
 	fi
 	printf '%s\n' "$event"
 }
+next_large_event() {
+	local event='' chunk='' status=0 started=$SECONDS
+	while ((SECONDS - started < 30)); do
+		chunk=
+		status=0
+		# The worker emits this line through several jq stages. Give each raw read
+		# enough time to fill so the fixture reader itself does not drop a timed
+		# partial chunk while testing the adapter's independent buffering.
+		IFS= read -r -t 2 -N 65536 chunk <&"$tcp_fd" || status=$?
+		if [[ $chunk == *$'\n'* ]]; then
+			event+=${chunk%%$'\n'*}
+			((${#event} <= 2097152)) || {
+				echo 'large adapter event exceeded 2 MiB' >&2
+				return 1
+			}
+			printf '%s\n' "$event"
+			return
+		fi
+		event+=$chunk
+		((${#event} <= 2097152)) || {
+			echo 'large adapter event exceeded 2 MiB' >&2
+			return 1
+		}
+		((status == 1)) && break
+	done
+	echo 'large adapter event timed out or reached EOF' >&2
+	return 1
+}
 next_for_id() {
 	local wanted=$1 event
 	for _ in $(seq 1 64); do
@@ -289,8 +331,58 @@ next_for_id() {
 	done
 	return 1
 }
-send_command '{"protocolVersion":1,"id":"hello","op":"hello"}'
-jq -e '.type=="ready" and .language=="bash"' <<<"$(next_event)" >/dev/null
+# A timeout with bytes but no newline must preserve the fragment. This used to
+# dispatch two unsupported operations instead of one ready event.
+printf '%s' '{"protocolVersion":1,"id":"split' >&"$tcp_fd"
+sleep 0.1
+printf '%s\n' '-hello","op":"hello"}' >&"$tcp_fd"
+jq -e '.id=="split-hello" and .type=="ready"' <<<"$(next_event)" >/dev/null
+
+# Keep one line buffered across several independent read deadlines.
+slow_hello='{"protocolVersion":1,"id":"slow-hello","op":"hello"}'
+for ((slow_index = 0; slow_index < ${#slow_hello}; slow_index++)); do
+	printf '%s' "${slow_hello:slow_index:1}" >&"$tcp_fd"
+	sleep 0.06
+done
+printf '\n' >&"$tcp_fd"
+jq -e '.id=="slow-hello" and .type=="ready"' <<<"$(next_event)" >/dev/null
+
+# One 1 MiB value crosses the controller, worker-command, and worker-event pipe
+# capacities. None of those streams may parse a timeout fragment as a line.
+{
+	printf '%s' '{"id":"large-query","op":"query","path":"demo:echo","args":{"value":{"padding":"'
+	dd if=/dev/zero bs=1024 count=1024 status=none | tr '\0' x
+	printf '%s\n' '"}}}'
+} >&"$tcp_fd"
+event=$(next_large_event)
+jq -e '.id=="large-query" and .type=="result" and (.value.padding|length)==1048576' <<<"$event" >/dev/null
+send_command '{"id":"large-sub","op":"subscribe","subscriptionId":"large","path":"fixture:largeLive","args":{"room":"large-room"}}'
+jq -e '.id=="large-sub" and .type=="ack"' <<<"$(next_event)" >/dev/null
+event=$(next_large_event)
+jq -e '.type=="subscription" and .subscriptionId=="large" and (.value.padding|length)==1048576' <<<"$event" >/dev/null || {
+	printf 'unexpected large subscription event: %s\n' "$(jq -c '{type,subscriptionId,error,paddingLength:(.value.padding | length?)}' <<<"$event")" >&2
+	tail -5 "$state/server-frames.log" >&2
+	exit 1
+}
+send_command '{"id":"large-unsub","op":"unsubscribe","subscriptionId":"large"}'
+jq -e '.id=="large-unsub" and .type=="ack"' <<<"$(next_event)" >/dev/null
+
+# Reject over-2-MiB input once, discard through its newline, then recover for
+# the next valid line without retaining the oversized bytes.
+oversized_padding=$(
+	dd if=/dev/zero bs=1048576 count=2 status=none | tr '\0' x
+	printf x
+)
+printf '{"id":"oversized","op":"hello","padding":"%s"}\n{"id":"after-limit","op":"hello"}\n' "$oversized_padding" >&"$tcp_fd"
+unset oversized_padding
+event=$(next_event)
+jq -e '.type=="error" and (.error.message|contains("exceeds 2 MiB"))' <<<"$event" >/dev/null || {
+	printf 'unexpected oversized-line response: %s\n' "$event" >&2
+	exit 1
+}
+event=$(next_event)
+jq -e '.id=="after-limit" and .type=="ready"' <<<"$event" >/dev/null
+
 send_command "$(jq -cn --argjson value "$value" '{id:"echo",op:"query",path:"demo:echo",args:{value:$value}}')"
 jq -e '.type=="result" and .value.unicode=="Hello, 世界 👋" and (.logs|length)==1' <<<"$(next_event)" >/dev/null
 send_command '{"id":"fail","op":"query","path":"demo:fail","args":{"code":"EXPECTED"}}'
@@ -298,7 +390,10 @@ jq -e '.type=="error" and .error.data.code=="EXPECTED" and (.logs|length)==1' <<
 send_command '{"id":"sub","op":"subscribe","subscriptionId":"same","path":"demo:requiresNonzero","args":{"room":"fixture-room"}}'
 test "$(jq -r .type <<<"$(next_event)")" = ack
 event=$(next_event)
-jq -e '.type=="subscription" and .error.data.code=="ROOM_EMPTY"' <<<"$event" >/dev/null
+jq -e '.type=="subscription" and .error.data.code=="ROOM_EMPTY"' <<<"$event" >/dev/null || {
+	printf 'unexpected function-error subscription event: %s\n' "$event" >&2
+	exit 1
+}
 send_command '{"id":"mut","op":"mutation","path":"demo:increment","args":{"room":"fixture-room","language":"Bash","runId":"fixture"}}'
 jq -e '.type=="result" and .value.state.count==1' <<<"$(next_event)" >/dev/null
 for _ in $(seq 1 20); do
@@ -347,8 +442,8 @@ test ! -s "$state/adapter.err"
 jq -se '[.[]|select(.type=="Connect")]|length >= 6' "$state/ws.log" >/dev/null
 jq -se '[.[]|select(.type=="Connect")|.connectionCount] == [0,1,2,3,4,5]' "$state/ws.log" >/dev/null
 jq -se '[.[]|select(.type=="Connect")|.lastCloseReason] == ["InitialConnect","DebugDisconnect","DebugDisconnect","DebugDisconnect","DebugDisconnect","DebugDisconnect"]' "$state/ws.log" >/dev/null
-jq -se '[.[]|select(.type=="ModifyQuerySet")|.modifications[]|select(.type=="Add")]|length == 7' "$state/ws.log" >/dev/null
-jq -se '[.[]|select(.type=="ModifyQuerySet")|.modifications[]|select(.type=="Remove")]|length == 2' "$state/ws.log" >/dev/null
+jq -se '[.[]|select(.type=="ModifyQuerySet")|.modifications[]|select(.type=="Add")]|length == 8' "$state/ws.log" >/dev/null
+jq -se '[.[]|select(.type=="ModifyQuerySet")|.modifications[]|select(.type=="Remove")]|length == 3' "$state/ws.log" >/dev/null
 jq -se 'all(.[]; .masked == true)' "$state/frames.log" >/dev/null
 jq -se 'any(.[]; .opcode==10 and .masked)' "$state/frames.log" >/dev/null
 jq -se 'any(.[]; .length>65535 and .lengthCode==127)' "$state/server-frames.log" >/dev/null
@@ -517,4 +612,17 @@ test "$(cat "$state/$reused_key")" = 1
 
 # Closing stdin while no Live bytes arrive must not leave a blocked reader.
 timeout 2 bash "$root/client/tests/conformance/adapter.sh" <<<'{"id":"close","op":"close"}' | jq -e '.type=="closed"' >/dev/null
+# EOF without a newline must not dispatch a fragment, and must diagnose why the
+# buffered bytes were discarded.
+partial_stdout=$(printf '%s' '{"id":"partial-eof"' | bash "$root/client/tests/conformance/adapter.sh" 2>"$state/partial-eof.err")
+test -z "$partial_stdout"
+grep -F 'incomplete NDJSON line' "$state/partial-eof.err" >/dev/null
+# The worker command pipe has the same framing contract. A 1 MiB close command
+# must remain one line even when the producer fills the pipe in many writes.
+{
+	printf '%s' '{"internal":"close","padding":"'
+	dd if=/dev/zero bs=1024 count=1024 status=none | tr '\0' x
+	printf '%s\n' '"}'
+} | timeout 5 bash "$root/client/tests/conformance/adapter.sh" --live-worker 2>"$state/large-worker-command.err"
+test ! -s "$state/large-worker-command.err"
 printf '%s\n' 'PASS Bash HTTP, RFC6455, queue, reconnect, and TCP fixtures'

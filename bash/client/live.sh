@@ -206,14 +206,14 @@ _read_byte_deadline() {
 }
 _read_payload_deadline() {
 	local count=$1 deadline=$2 read_status=0 value
-	value=$(timeout "$deadline" dd bs=1 count="$count" status=none <&"$LIVE_IN") || read_status=$?
+	value=$(timeout "$deadline" dd bs="$count" count=1 iflag=fullblock status=none <&"$LIVE_IN") || read_status=$?
 	((read_status == 124 || read_status == 143)) && return 4
 	[[ $(printf %s "$value" | wc -c | tr -d ' ') -eq $count ]] || return 3
 	LIVE_PAYLOAD=$value
 }
 _read_payload_hex_deadline() {
 	local count=$1 deadline=$2 read_status=0 value
-	value=$(timeout "$deadline" dd bs=1 count="$count" status=none <&"$LIVE_IN" | od -An -v -tx1 | tr -d ' \n') || read_status=$?
+	value=$(timeout "$deadline" dd bs="$count" count=1 iflag=fullblock status=none <&"$LIVE_IN" | od -An -v -tx1 | tr -d ' \n') || read_status=$?
 	((read_status == 124 || read_status == 143)) && return 4
 	((read_status == 0)) || return 3
 	((${#value} == count * 2)) || return 3
@@ -345,12 +345,14 @@ live_read() {
 
 live_modify() {
 	local modifications=$1 new=$((LIVE_QUERY_SET + 1))
-	live_send "$(jq -cn --argjson base "$LIVE_QUERY_SET" --argjson new "$new" --argjson mods "$modifications" '{type:"ModifyQuerySet",baseVersion:$base,newVersion:$new,modifications:$mods}')" || return
+	live_send "$(printf '%s\n' "$modifications" | jq -c --argjson base "$LIVE_QUERY_SET" --argjson new "$new" '{type:"ModifyQuerySet",baseVersion:$base,newVersion:$new,modifications:.}')" || return
 	LIVE_QUERY_SET=$new
 }
 live_resubscribe() {
 	local id mods='[]'
-	for id in "${!LIVE_PATH[@]}"; do mods=$(jq -cn --argjson old "$mods" --arg id "$id" --arg path "${LIVE_PATH[$id]}" --argjson args "${LIVE_ARGS[$id]}" '$old + [{type:"Add",queryId:($id|tonumber),udfPath:$path,args:[$args]}]'); done
+	for id in "${!LIVE_PATH[@]}"; do
+		mods=$(printf '%s\n%s\n' "$mods" "${LIVE_ARGS[$id]}" | jq -cs --arg id "$id" --arg path "${LIVE_PATH[$id]}" '.[0] + [{type:"Add",queryId:($id|tonumber),udfPath:$path,args:[.[1]]}]')
+	done
 	if [[ $mods != '[]' ]]; then live_modify "$mods" || return; fi
 	return 0
 }
@@ -364,7 +366,7 @@ live_add() {
 	LIVE_SUB[$id]=$sub
 	LIVE_PATH[$id]=$path
 	LIVE_ARGS[$id]=$args
-	if [[ -n ${LIVE_FD:-} ]]; then live_modify "$(jq -cn --argjson id "$id" --arg p "$path" --argjson a "$args" '[{type:"Add",queryId:$id,udfPath:$p,args:[$a]}]')" || return; fi
+	if [[ -n ${LIVE_FD:-} ]]; then live_modify "$(printf '%s\n' "$args" | jq -c --argjson id "$id" --arg p "$path" '[{type:"Add",queryId:$id,udfPath:$p,args:[.]}]')" || return; fi
 }
 live_remove() {
 	local id=$1
@@ -420,7 +422,7 @@ live_queue_push() {
 	local id=$1 update=$2 queue
 	queue=${LIVE_QUEUE[$id]:-[]}
 	# Reactive updates describe current state, so overflow drops the oldest value.
-	LIVE_QUEUE[$id]=$(printf '%s\n' "$queue" | jq -c --argjson update "$update" '(. + [$update]) | if length > 16 then .[-16:] else . end')
+	LIVE_QUEUE[$id]=$(printf '%s\n%s\n' "$queue" "$update" | jq -cs '(.[0] + [.[1]]) | if length > 16 then .[-16:] else . end')
 }
 live_queue_shift() {
 	local id=$1 queue

@@ -25,6 +25,72 @@ failure() {
 	jq -cn --arg id "$id" --arg message "$*" '{id:$id,type:"error",error:{name:"Error",message:$message}}'
 }
 
+ADAPTER_MAX_NDJSON_BYTES=2097152
+ADAPTER_READ_CHUNK_BYTES=65536
+# These per-stream variables are resolved through namerefs in ndjson_read.
+# shellcheck disable=SC2034
+CONTROLLER_BUFFER='' CONTROLLER_EOF=0 CONTROLLER_DISCARD=0 CONTROLLER_LINE='' CONTROLLER_ERROR=''
+# shellcheck disable=SC2034
+WORKER_COMMAND_BUFFER='' WORKER_COMMAND_EOF=0 WORKER_COMMAND_DISCARD=0 WORKER_COMMAND_LINE='' WORKER_COMMAND_ERROR=''
+WORKER_EVENT_BUFFER='' WORKER_EVENT_EOF=0 WORKER_EVENT_DISCARD=0 WORKER_EVENT_LINE='' WORKER_EVENT_ERROR=''
+
+# Read bounded chunks with newline-aware -n. Keep every timed partial result in
+# its stream buffer and report a line only after consuming newline. Statuses are:
+# 0 complete line, 1 clean EOF, 2 oversized line, 3 partial/error EOF, 4 pending.
+ndjson_read() {
+	local stream=$1 fd=$2 timeout_seconds=$3 chunk='' read_status=0 completed=0
+	local -n buffer="${stream}_BUFFER" eof="${stream}_EOF" discard="${stream}_DISCARD"
+	# shellcheck disable=SC2034 # Outputs are read through the stream variables.
+	local -n completed_line="${stream}_LINE" read_error="${stream}_ERROR"
+	local LC_ALL=C
+	completed_line=
+	read_error=
+	((eof == 0)) || return 1
+
+	# -n stops at either the byte cap or a newline. A timed read may still return
+	# partial bytes, but only status 0 below the cap proves it consumed newline.
+	IFS= read -r -t "$timeout_seconds" -n "$ADAPTER_READ_CHUNK_BYTES" chunk <&"$fd" || read_status=$?
+	if ((read_status == 0 && ${#chunk} < ADAPTER_READ_CHUNK_BYTES)); then completed=1; fi
+	if ((read_status == 1)); then eof=1; fi
+
+	if ((discard)); then
+		if ((completed || eof)); then discard=0; fi
+		((eof)) && return 1
+		return 4
+	fi
+
+	buffer+=$chunk
+	if ((${#buffer} > ADAPTER_MAX_NDJSON_BYTES)); then
+		buffer=
+		((completed == 0 && eof == 0)) && discard=1
+		read_error="$stream NDJSON line exceeds 2 MiB"
+		return 2
+	fi
+	if ((completed)); then
+		if [[ ${buffer: -1} == $'\r' ]]; then buffer=${buffer:0:${#buffer}-1}; fi
+		# shellcheck disable=SC2034 # Written through the stream nameref.
+		completed_line=$buffer
+		buffer=
+		return 0
+	fi
+	if ((eof)); then
+		if [[ -n $buffer ]]; then
+			buffer=
+			read_error="$stream reached EOF with an incomplete NDJSON line"
+			return 3
+		fi
+		return 1
+	fi
+	if ((read_status != 0 && read_status < 128)); then
+		buffer=
+		eof=1
+		# shellcheck disable=SC2034 # Written through the stream nameref.
+		read_error="$stream NDJSON read failed with status $read_status"
+		return 3
+	fi
+	return 4
+}
+
 worker_queue_live_error() {
 	local name=$1 message=$2 query
 	for query in "${!LIVE_SUB[@]}"; do
@@ -88,7 +154,7 @@ worker_drain_live() {
 			update=$LIVE_SHIFTED
 			# shellcheck disable=SC2034
 			LIVE_LAST["$query"]=$update
-			jq -cn --argjson query "$query" --argjson update "$update" '{internal:"subscription",queryId:$query} + $update'
+			printf '%s\n' "$update" | jq -c --argjson query "$query" '{internal:"subscription",queryId:$query} + .'
 			((delivered++)) || true
 		done
 	done
@@ -99,14 +165,19 @@ live_worker_main() {
 	trap 'live_close' EXIT
 	trap 'exit 0' INT TERM
 	while :; do
-		line=
 		status=0
-		IFS= read -r -t 0.05 line || status=$?
+		ndjson_read WORKER_COMMAND 0 0.05 || status=$?
 		worker_drain_live
-		if [[ -z $line ]]; then
-			((status == 1)) && break
+		if ((status)); then
+			if ((status == 1)); then break; fi
+			if ((status == 2 || status == 3)); then
+				printf '%s\n' "$WORKER_COMMAND_ERROR" >&2
+				((status == 3)) && break
+			fi
 			continue
 		fi
+		line=$WORKER_COMMAND_LINE
+		[[ -n $line ]] || continue
 		op=$(printf '%s\n' "$line" | jq -r '.internal // ""')
 		case $op in
 		subscribe)
@@ -151,6 +222,14 @@ declare -Ag ADAPTER_SUB
 start_live_worker() {
 	local coproc_in coproc_out
 	if [[ -n $worker_pid ]] && kill -0 "$worker_pid" 2>/dev/null; then return 0; fi
+	# shellcheck disable=SC2034 # Reset through ndjson_read's namerefs.
+	WORKER_EVENT_BUFFER=
+	# shellcheck disable=SC2034 # Reset through ndjson_read's namerefs.
+	WORKER_EVENT_EOF=0
+	# shellcheck disable=SC2034 # Reset through ndjson_read's namerefs.
+	WORKER_EVENT_DISCARD=0
+	WORKER_EVENT_LINE=
+	WORKER_EVENT_ERROR=
 	coproc BASH_LIVE_WORKER { bash "$0" --live-worker; }
 	coproc_out=${BASH_LIVE_WORKER[0]}
 	coproc_in=${BASH_LIVE_WORKER[1]}
@@ -165,8 +244,10 @@ start_live_worker() {
 }
 
 send_worker() {
+	local command=$1 LC_ALL=C
+	((${#command} <= ADAPTER_MAX_NDJSON_BYTES)) || return 2
 	start_live_worker
-	printf '%s\n' "$1" >&"$worker_in"
+	printf '%s\n' "$command" >&"$worker_in"
 }
 
 stop_live_worker() {
@@ -187,13 +268,18 @@ drain_worker() {
 	local event status=0 internal query sub delivered=0
 	[[ -n $worker_out ]] || return 0
 	while ((delivered < 16)); do
-		event=
 		status=0
-		IFS= read -r -t 0.001 event <&"$worker_out" || status=$?
-		if [[ -z $event ]]; then
-			((status == 1)) && stop_live_worker
+		ndjson_read WORKER_EVENT "$worker_out" 0.05 || status=$?
+		if ((status)); then
+			if ((status == 1)); then stop_live_worker; fi
+			if ((status == 2 || status == 3)); then
+				printf '%s\n' "$WORKER_EVENT_ERROR" >&2
+				stop_live_worker
+			fi
 			break
 		fi
+		event=$WORKER_EVENT_LINE
+		[[ -n $event ]] || continue
 		internal=$(printf '%s\n' "$event" | jq -r '.internal // ""')
 		case $internal in
 		connected) worker_connected=1 ;;
@@ -201,7 +287,7 @@ drain_worker() {
 		subscription)
 			query=$(printf '%s\n' "$event" | jq -r .queryId)
 			sub=${ADAPTER_SUB[$query]:-}
-			[[ -n $sub ]] && jq -cn --arg sub "$sub" --argjson update "$(printf '%s\n' "$event" | jq -c 'del(.internal,.queryId)')" '{type:"subscription",subscriptionId:$sub} + $update'
+			[[ -n $sub ]] && printf '%s\n' "$event" | jq -c --arg sub "$sub" 'del(.internal,.queryId) | {type:"subscription",subscriptionId:$sub} + .'
 			;;
 		esac
 		((delivered++)) || true
@@ -210,14 +296,20 @@ drain_worker() {
 
 trap 'stop_live_worker' EXIT INT TERM
 while :; do
-	line=
 	status=0
-	IFS= read -r -t 0.05 line || status=$?
+	ndjson_read CONTROLLER 0 0.05 || status=$?
 	drain_worker
-	if [[ -z $line ]]; then
-		((status == 1)) && break
+	if ((status)); then
+		if ((status == 1)); then break; fi
+		if ((status == 2)); then failure '' "$CONTROLLER_ERROR"; fi
+		if ((status == 3)); then
+			printf '%s\n' "$CONTROLLER_ERROR" >&2
+			break
+		fi
 		continue
 	fi
+	line=$CONTROLLER_LINE
+	[[ -n $line ]] || continue
 	id=$(printf '%s\n' "$line" | jq -r '.id // ""' 2>/dev/null || true)
 	op=$(printf '%s\n' "$line" | jq -r '.op // ""' 2>/dev/null || true)
 	case "$op" in
@@ -232,7 +324,7 @@ while :; do
 		# Capture the transport diagnostic without relying on /tmp: runtime images
 		# are deliberately exercised with a read-only filesystem.
 		if result=$(_convex_call "$op" "$path" "$args" 2>&1); then
-			send --arg id "$id" --argjson result "$result" '{id:$id,type:"result",value:$result.value} + (if ($result.logs|length)>0 then {logs:$result.logs} else {} end)'
+			printf '%s\n' "$result" | jq -c --arg id "$id" '{id:$id,type:"result",value:.value} + (if (.logs|length)>0 then {logs:.logs} else {} end)'
 		elif printf '%s\n' "$result" | jq -e '.name' >/dev/null 2>&1; then
 			send --arg id "$id" --argjson error "$result" '{id:$id,type:"error",error:($error|del(.logs))} + (if ($error.logs|length)>0 then {logs:$error.logs} else {} end)'
 		else jq -cn --arg id "$id" --arg message "$result" '{id:$id,type:"error",error:{name:"TransportError",message:$message}}'; fi
@@ -261,7 +353,7 @@ while :; do
 		q=$next_query
 		((next_query++)) || true
 		ADAPTER_SUB[$q]=$sub
-		if send_worker "$(jq -cn --argjson query "$q" --arg path "$path" --argjson args "$args" '{internal:"subscribe",queryId:$query,path:$path,args:$args}')"; then
+		if send_worker "$(printf '%s\n' "$line" | jq -c --argjson query "$q" '{internal:"subscribe",queryId:$query,path:.path,args:.args}')"; then
 			send --arg id "$id" '{id:$id,type:"ack"}'
 		else
 			unset 'ADAPTER_SUB[$q]'

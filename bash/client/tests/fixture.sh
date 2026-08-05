@@ -178,6 +178,12 @@ if [[ $request = "GET $ws_path HTTP/1.1" ]]; then
 			else
 				transition=$(jq -cn --argjson q "$q" --arg room "$room" --argjson count "$count" '{type:"Transition",startVersion:{querySet:0,identity:0,ts:"AAAAAAAAAAA="},endVersion:{querySet:1,identity:0,ts:"AQAAAAAAAAA="},modifications:[{type:"QueryUpdated",queryId:$q,value:{room:$room,count:$count,lastLanguage:(if $count > 0 then "Bash" else null end),latestRunId:(if $count > 0 then "fixture" else null end),updatedAt:(if $count > 0 then 1 else null end)},logLines:["query demo:state 世界 👋"]}]}')
 			fi
+			if [[ $path = fixture:largeLive ]]; then
+				padding=$(dd if=/dev/zero bs=1024 count=1024 status=none | tr '\0' x)
+				# Padding is generated as a safe JSON string, so avoid putting its 1 MiB
+				# value in jq's argv where Linux would reject it before jq starts.
+				printf -v transition '{"type":"Transition","startVersion":{"querySet":0,"identity":0,"ts":"AAAAAAAAAAA="},"endVersion":{"querySet":1,"identity":0,"ts":"AQAAAAAAAAA="},"modifications":[{"type":"QueryUpdated","queryId":%s,"value":{"padding":"%s"},"logLines":[]}]}' "$q" "$padding"
+			fi
 			if [[ $path = fixture:partial && ! -f $state_dir/partial-sent ]]; then
 				: >"$state_dir/partial-sent"
 				# Resume the abandoned frame after the client's read deadline. The
@@ -208,7 +214,9 @@ if [[ $request = "GET $ws_path HTTP/1.1" ]]; then
 				padding=$(dd if=/dev/zero bs=1024 count=65 status=none | tr '\0' x)
 				server_frame "$(jq -cn --arg padding "$padding" '{type:"Ping",padding:$padding}')"
 			fi
-			if [[ $path = fixture:continuous ]]; then
+			if [[ $path = fixture:largeLive ]]; then
+				server_frame "$transition"
+			elif [[ $path = fixture:continuous ]]; then
 				for sequence in $(seq 1 200); do server_frame "$(jq -cn --argjson q "$q" --argjson count "$sequence" '{type:"Transition",modifications:[{type:"QueryUpdated",queryId:$q,value:{count:$count},logLines:[]}]}')" || exit 0; done
 			else
 				# Split after the first byte of 世, deliberately inside its UTF-8 sequence.
@@ -256,11 +264,11 @@ fi
 # Content-Length is bytes, while Bash read -N counts locale characters. dd keeps
 # UTF-8 request bodies byte-exact.
 body=
-((length)) && body=$(dd bs=1 count="$length" status=none)
+((length)) && body=$(dd bs="$length" count=1 iflag=fullblock status=none)
 path=$(jq -r .path <<<"$body")
 args=$(jq -c .args <<<"$body")
 case $path in
-demo:echo) response=$(jq -cn --argjson value "$(jq -c .value <<<"$args")" '{status:"success",value:$value,logLines:["query demo:echo"]}') ;;
+demo:echo) response=$(printf '%s\n' "$args" | jq -c '{status:"success",value:.value,logLines:["query demo:echo"]}') ;;
 fixture:largeResponse)
 	padding=$(dd if=/dev/zero bs=1024 count=2049 status=none | tr '\0' x)
 	printf -v response '{"status":"success","value":{"padding":"%s"},"logLines":[]}' "$padding"
