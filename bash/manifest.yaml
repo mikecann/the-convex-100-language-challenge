@@ -1,8 +1,28 @@
 schemaVersion: 1
 id: bash
-displayName: "Bash"
+displayName: Bash
 rank: 9
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Bash implementation of Convex JSON HTTP and the pinned Live sync profile. BusyBox wget, jq, OpenSSL, and socat provide ordinary transport, parsing, TLS, randomness, and TCP-listener primitives; Convex-specific behavior and RFC6455 framing remain in Bash.
+toolchain:
+  name: GNU Bash
+  version: 5.2.37
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities: [http, live]
+platforms: [linux/amd64]
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands: [debugDisconnect]
+limitations:
+  - Live uses a direct Bash RFC6455 implementation. It supports the pinned sync profile only, with an intentionally bounded newest-16 delivery policy in the adapter.
+  - WebSocket mutations, actions, Live authentication, optimistic updates, and TransitionChunk assembly are deferred.
+  - The runtime deliberately includes jq, BusyBox wget, OpenSSL, and socat as low-level runtime tools.
 capabilities: []
