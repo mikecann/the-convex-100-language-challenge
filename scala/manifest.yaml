@@ -1,8 +1,32 @@
 schemaVersion: 1
 id: scala
-displayName: "Scala"
+displayName: Scala
 rank: 17
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Scala 3 client using JDK HTTP, TLS, JSON, and WebSocket primitives. Shared evidence is coordinator-owned.
+toolchain:
+  name: Scala
+  version: 3.3.5
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Shared local and hosted conformance is pending coordinator evidence.
+  - Live authentication, optimistic updates, journals, and TransitionChunk assembly are deferred.
+  - Live subscriptions retain only the newest 16 pending updates per subscriber.
 capabilities: []

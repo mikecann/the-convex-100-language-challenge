@@ -1,30 +1,3 @@
-# Convex from Dart
-
-This folder shows a small native Dart program that calls Convex queries,
-mutations, and actions over HTTP, then keeps a query updated over WebSocket.
-
-This is educational and unofficial. It is not a production SDK or a package
-intended for publication.
-
-## Start here
-
-Read the [basic example](examples/basics/main.dart). It queries a fresh counter,
-starts Live before a mutation, verifies the initial and updated values, then
-cleans up its subscription and client.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| Native Dart implementation | Implemented, awaiting shared evidence |
-| HTTP query, mutation, action, and bearer-token lifecycle | Awaiting coordinator conformance |
-| Experimental Live query and reconnect support | Awaiting coordinator conformance |
-| Earned capability badges | None yet |
-
-## Basic example
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.dart -->
-```dart
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -147,45 +120,3 @@ String _runId() =>
       16,
       (_) => Random.secure().nextInt(256),
     ).map((byte) => byte.toRadixString(16).padLeft(2, '0')).join();
-```
-<!-- END GENERATED EXAMPLE -->
-
-The block is generated from the canonical runnable source. Run `./run
-sync-examples` after changing it so the website and README stay identical.
-
-## Docker-only verification
-
-```sh
-./run test dart
-./run build dart
-./run verify-example dart
-./run verify dart
-./run verify-hosted dart
-```
-
-`test` formats, analyses, unit-tests, and compiles the canonical example and
-conformance adapter inside Docker. `build` creates the final linux/amd64
-runtime image; the coordinator's serial verification also applies the shared
-runtime policy and awards any HTTP or Live badges.
-
-## Conformance and protocol notes
-
-The test-only adapter under `client/tests/conformance/` accepts NDJSON protocol
-v1 on stdin/stdout or a single `ADAPTER_LISTEN` TCP connection. Its
-`debugDisconnect` command is adapter-only and forces a reconnect after retiring
-the old socket. It is not part of the educational Dart API.
-
-The client uses Dart's ordinary `dart:io` HTTP/TLS and WebSocket facilities.
-Convex-specific request bodies, query-set Add/Remove messages, transitions,
-error classes, reconnect metadata, and bounded newest-16 delivery are written
-in Dart. The Live profile is the unversioned `/api/sync` profile pinned to
-convex-rs 0.10.4 source commit `6f1df8a8ba1665084ec001e307ca841ca17074d7`.
-It is an experimental compatibility target, not a stable public protocol.
-
-## Limitations
-
-- Live authentication and token rotation are deferred.
-- Full tagged Convex values, WebSocket mutations/actions, journals, optimistic
-  updates, and `TransitionChunk` assembly are deferred.
-- No HTTP or Live capability is claimed until shared local and hosted evidence
-  passes on the reviewed commit.

@@ -1,0 +1,5 @@
+name: convex_dart_education
+description: Educational native Dart Convex client used only by this repository.
+version: 0.1.0
+environment:
+  sdk: ">=3.7.2 <4.0.0"
