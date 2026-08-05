@@ -1,24 +1,3 @@
-# Convex from F#
-
-An educational F# client that calls Convex HTTP functions and explores the pinned `/api/sync` Live protocol with .NET's built-in networking libraries.
-
-It is unofficial teaching code, not a production SDK.
-
-## Start here
-
-[The canonical basic example](examples/basics/Program.fs) reads a room's counter over HTTP, starts Live, applies one idempotent mutation, and checks the Live update.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP query, mutation, and action calls | Implemented locally; capability badge awaits root-owned shared conformance |
-| Live query updates and reconnects | Implemented locally; capability badge awaits root-owned shared conformance |
-| HTTP bearer authentication | Implemented locally |
-| Live authentication and optimistic updates | Not implemented |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/Program.fs -->
-```fsharp
 open System
 open System.Globalization
 open System.Text.Json.Nodes
@@ -105,25 +84,3 @@ let main argv =
     printfn "live updated count: %d" updated
     printfn "verified count: %d -> %d" before updated
     0
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-Run `./run test fsharp` to compile the client, adapter, and exact example in the pinned .NET SDK image and execute the deterministic language-local fixtures. Run `./run build fsharp` to produce the non-root minimal adapter runtime.
-
-The repository coordinator owns `verify-example`, `verify`, and `verify-hosted`. Those shared gates are still required before this client earns HTTP or Live capability badges.
-
-## Protocol notes
-
-The implementation sends Convex JSON HTTP requests directly and speaks the pinned `/api/sync` WebSocket protocol in F#. One mailbox owner controls socket generations, query-set versions, writes, metadata, and reconnect scheduling. Its single reader reassembles one frame at a time and waits for owner acknowledgement before reading again. Subscription replacement and unsubscribe invalidate the old relay before acknowledgement.
-
-Each subscription keeps the newest 16 deliveries and at most 262144 encoded bytes. If one delivery alone exceeds the byte budget, it is retained so callers can still observe its value or structured error. Valid protocol traffic resets reconnect backoff. Reconnect metadata carries the connection count, last close reason, and the maximum observed Convex timestamp.
-
-The adapter implements NDJSON protocol v1 over stdin/stdout or one TCP controller connection. It reserves stdout for protocol events and exposes `debugDisconnect` only for conformance testing.
-
-## Limitations
-
-This is pinned to an undocumented protocol profile, so it is evidence for this experiment rather than a stable SDK contract. Live authentication, optimistic updates, transition chunks, journals, and WebSocket mutation or action calls are not implemented. HTTP supports bearer authentication and remains the path for mutations and actions.
-
-The language-local fixtures cover fragmented multibyte UTF-8, partial frames, idle and continuously sending peers, stalled handshakes, structured protocol/transport/function errors, QueryFailed recovery, five refused reconnect attempts followed by success, five debug reconnects, hydration suppression, stale relay races, both delivery bounds, and partial NDJSON plus EOF. Shared local and hosted conformance evidence is deliberately left to the repository coordinator.
