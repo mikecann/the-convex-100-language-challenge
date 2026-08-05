@@ -10,6 +10,7 @@ RUN g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient client/convex.cpp cl
 RUN g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient client/convex.cpp client/live.cpp client/tests/live_test.cpp -lssl -lcrypto -lpthread -o /tmp/live-test && /tmp/live-test
 RUN mkdir -p /out && g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient client/convex.cpp client/live.cpp examples/basics/main.cpp -lssl -lcrypto -lpthread -o /out/convex-example
 RUN g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient client/convex.cpp client/live.cpp client/tests/conformance/adapter.cpp -lssl -lcrypto -lpthread -o /out/convex-adapter
+RUN g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Iclient -Iclient/tests/conformance client/convex.cpp client/live.cpp client/tests/conformance/adapter_integration_test.cpp -lssl -lcrypto -lpthread -o /tmp/adapter-integration-test && /tmp/adapter-integration-test
 RUN printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | /out/convex-adapter >/tmp/events && grep -Fq '"language":"cpp"' /tmp/events && grep -Fq '"type":"closed"' /tmp/events
 # The adapter accepts one TCP controller and runs exactly the same NDJSON
 # lifecycle over that socket as it does over stdin/stdout.
