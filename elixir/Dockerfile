@@ -95,7 +95,11 @@ COPY --from=target-erlang-runtime /usr/local/lib/erlang/lib/sasl-4.2.1 /usr/loca
 COPY --from=target-erlang-runtime /usr/local/lib/erlang/lib/ssl-11.1.4.13 /usr/local/lib/erlang/lib/ssl-11.1.4.13
 COPY --from=target-erlang-runtime /usr/local/lib/erlang/lib/stdlib-5.2.3.6 /usr/local/lib/erlang/lib/stdlib-5.2.3.6
 COPY --from=release-build /app/_build/prod/rel/convex_client /opt/convex
-ENV ERL_FLAGS="+S 2:2 +SDcpu 1 +SDio 1"
+# This educational client runs as one foreground process. Avoid the distributed
+# node and its epmd sidecar, and keep one scheduler so the canonical example
+# stays comfortably inside the shared verification resource limits.
+ENV ERL_FLAGS="+S 1:1 +SDcpu 1 +SDio 1" \
+    RELEASE_DISTRIBUTION=none
 USER 65532:65532
 # Prove the final runtime keeps the POSIX tools used by shared verification,
 # exposes no package/build frontends, and can boot the real adapter release to

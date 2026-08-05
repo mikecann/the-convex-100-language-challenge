@@ -223,23 +223,7 @@ defmodule Convex.Live do
     uri = state.uri
     port = uri.port || if(uri.scheme == "https", do: 443, else: 80)
 
-    options =
-      if uri.scheme == "https" do
-        [
-          transport: :tls,
-          protocols: [:http],
-          tls_opts: [
-            verify: :verify_peer,
-            cacertfile: String.to_charlist(CAStore.file_path()),
-            server_name_indication: String.to_charlist(uri.host),
-            customize_hostname_check: [
-              match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
-            ]
-          ]
-        ]
-      else
-        [transport: :tcp, protocols: [:http]]
-      end
+    options = connection_options(uri)
 
     with {:ok, connection} <- :gun.open(String.to_charlist(uri.host), port, options),
          {:ok, _protocol} <- :gun.await_up(connection, 10_000),
@@ -268,6 +252,30 @@ defmodule Convex.Live do
         state = disconnected_state(state, inspect(reason))
         {:noreply, if(map_size(state.active) > 0, do: schedule_reconnect(state), else: state)}
     end
+  end
+
+  # Gun 2.5 accepts its connection options as a map. TLS configuration remains
+  # a keyword list because that nested value is passed on to Erlang's SSL API.
+  defp connection_options(%URI{scheme: "https"} = uri) do
+    %{
+      transport: :tls,
+      protocols: [:http],
+      tls_opts: [
+        verify: :verify_peer,
+        cacertfile: String.to_charlist(CAStore.file_path()),
+        server_name_indication: String.to_charlist(uri.host),
+        customize_hostname_check: [
+          match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
+        ]
+      ]
+    }
+  end
+
+  defp connection_options(%URI{}), do: %{transport: :tcp, protocols: [:http]}
+
+  if Mix.env() == :test do
+    @doc false
+    def connection_options_for_test(url), do: url |> URI.parse() |> connection_options()
   end
 
   defp await_upgrade(connection, websocket_ref) do

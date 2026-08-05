@@ -51,6 +51,17 @@ defmodule Convex.LiveTest do
                     {:error, %FunctionError{data: %{"code" => "ROOM_EMPTY"}}}}
   end
 
+  test "Gun receives map-shaped TCP and TLS connection options" do
+    assert %{transport: :tcp, protocols: [:http]} =
+             Live.connection_options_for_test("http://backend:3210")
+
+    assert %{transport: :tls, protocols: [:http], tls_opts: tls_options} =
+             Live.connection_options_for_test("https://example.convex.cloud")
+
+    assert tls_options[:verify] == :verify_peer
+    assert tls_options[:server_name_indication] == ~c"example.convex.cloud"
+  end
+
   defp live_state(reference) do
     %{
       active: %{
