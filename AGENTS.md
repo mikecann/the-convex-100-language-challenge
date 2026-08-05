@@ -4,6 +4,12 @@
 
 This repository tests how many programming languages can support useful Convex clients. The result must remain evidence-led: a language earns a capability only when its container passes the shared black-box conformance test for that capability.
 
+This is a content and education project. These clients are demonstrations, not
+officially sanctioned Convex SDKs and not packages intended for publication.
+Optimise the checked-in source for clarity on the website and in the video.
+Do not add package publishing workflows, registry metadata, release automation,
+or ecosystem scaffolding that exists only to make a client distributable.
+
 ## Docker-only builds
 
 - Do not install compilers, interpreters, package managers, SDKs, or build dependencies on the host.
@@ -37,7 +43,9 @@ This repository tests how many programming languages can support useful Convex c
 - Put client library code under `<language-id>/client/` and its unit tests beside it, using the ecosystem's normal test convention.
 - Put the canonical introductory example under `<language-id>/examples/basics/`. Keep tests there only when they exercise example-specific behaviour.
 - Put the conformance adapter under `<language-id>/adapter/` and keep adapter-specific tests with it.
-- Do not create repository-level `<language-id>/src/` or `<language-id>/tests/` buckets. A client may still use paths such as `client/src/` or `client/src/test/` when its package ecosystem requires them.
+- Do not create repository-level `<language-id>/src/` or `<language-id>/tests/` buckets.
+- Keep checked-in client source directly under `client/` where practical. If a compiler or build tool expects an ecosystem-specific directory tree, let the Docker build copy the source into that temporary layout instead of reshaping the educational repository around package publishing conventions.
+- Commit only the build metadata needed to compile and verify the demonstration. Do not treat publishability as a design goal.
 - Keep cross-client black-box conformance tests under `_shared/harness/`; they do not belong to an individual client package.
 
 ## Convex safety

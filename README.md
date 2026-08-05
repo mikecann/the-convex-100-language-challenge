@@ -1,6 +1,12 @@
 # 100 Convex clients
 
-An experiment to make Convex usable from 100 programming languages and measure honestly how much of a client each language can support.
+An educational experiment demonstrating Convex from 100 programming languages
+and measuring honestly how much useful client behaviour each language can
+support.
+
+These implementations are made for the project, website, and video. They are
+not officially sanctioned Convex clients and are not intended to become
+published packages or production SDKs.
 
 The repository foundation and first native client pilot now exist. Go passes the
 shared HTTP and Live suites against both the pinned local backend and the
@@ -32,6 +38,8 @@ Live includes HTTP. Implementation provenance is a separate label:
 - Every build and test runs in Docker. Language toolchains are never installed on the host.
 - HTTP is the minimum useful target. Realtime and resilience are separate earned capabilities.
 - Every runnable example is a commented guided tour of the verified client API, and that same source is shown in its README and on the website.
+- Checked-in layouts favour readable educational source. Docker may rearrange files into temporary toolchain-specific paths during a build.
+- Package publishing, registry metadata, and release automation are outside the project's scope.
 - A native implementation may use ordinary transport libraries, but Convex-specific behavior must be written in the target language.
 - Shared-core and transpiled clients are labelled rather than hidden.
 - Results are attached to a source commit, container digest, runtime version, protocol revision, and conformance-suite version.

@@ -3,6 +3,7 @@
 ## Goals
 
 - Attempt the sourced 100-language roster without installing language toolchains on the host.
+- Produce clear educational source and demonstrations for the website and video, not publishable SDK packages.
 - Award capabilities from repeatable black-box evidence rather than self-reported implementation status.
 - Preserve useful failures and implementation provenance.
 - Make it safe to add many clients concurrently without letting agents rewrite the test oracle.
@@ -61,16 +62,18 @@ never maintain a second handwritten copy.
 
 ### Language-owned code
 
-The repository standardises ownership boundaries, not each ecosystem's internal
-package layout. Client code and its unit tests live under `client/`.
+The repository standardises ownership boundaries for an educational project.
+Client code and its unit tests live under `client/`.
 Example-specific tests live with the example under `examples/basics/`, and
 adapter-specific tests live under `adapter/`. Cross-client black-box tests stay
 under `_shared/harness/`.
 
-Do not add generic `<id>/src/` or `<id>/tests/` buckets. Ecosystem conventions
-still apply inside each boundary, so Rust can use `client/src/lib.rs`, Maven can
-use `client/src/main/java` and `client/src/test/java`, and Go can keep package
-files and `_test.go` files directly under `client/`.
+Do not add generic `<id>/src/` or `<id>/tests/` buckets, and do not reshape the
+checked-in tree merely to resemble a publishable package. Keep source directly
+under `client/` where practical. When a toolchain expects paths such as Rust's
+`src/lib.rs` or Maven's `src/main/java`, the Docker build can copy the readable
+repository source into that temporary build layout. Commit package metadata
+only when it is needed to compile or verify the demonstration.
 
 Client pull requests may modify only their own `<id>/` directory. Changes under `_shared/`, `docs/`, or `roster/` belong in separate reviewed pull requests. CI path policy must enforce that split before language work is parallelized.
 
