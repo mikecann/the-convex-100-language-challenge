@@ -86,6 +86,25 @@ backend_deploy() {
 image_policy() {
   language=$1
   image="100-convex-clients-$language:local"
+  build_harness
+  target_runtime=$(
+    docker run --rm \
+      --read-only \
+      --cap-drop ALL \
+      --security-opt no-new-privileges \
+      --volume "$repo_root:/repo:ro" \
+      --env REPO_ROOT=/repo \
+      100-convex-clients-harness:local \
+      node scripts/target-runtime-command.mjs "$language"
+  )
+
+  case "$target_runtime" in
+    "" | node | python | python3) ;;
+    *)
+      printf '%s\n' "Unsupported target runtime command: $target_runtime" >&2
+      exit 1
+      ;;
+  esac
 
   image_user=$(docker image inspect "$image" --format '{{.Config.User}}')
   image_os=$(docker image inspect "$image" --format '{{.Os}}')
@@ -101,16 +120,43 @@ image_policy() {
     --read-only \
     --cap-drop ALL \
     --security-opt no-new-privileges \
+    --env TARGET_RUNTIME_COMMAND="$target_runtime" \
     --entrypoint /bin/sh \
     "$image" \
     -lc '
       test "$(id -u)" != 0
-      for command_name in node npm python python3 curl convex; do
+      if test -n "$TARGET_RUNTIME_COMMAND"; then
+        if ! command -v "$TARGET_RUNTIME_COMMAND" >/dev/null 2>&1; then
+          printf "%s\n" "Declared target runtime is missing: $TARGET_RUNTIME_COMMAND" >&2
+          exit 1
+        fi
+      fi
+      for command_name in node python python3; do
+        if test "$command_name" = "$TARGET_RUNTIME_COMMAND"; then
+          continue
+        fi
         if command -v "$command_name" >/dev/null 2>&1; then
           printf "%s\n" "Unexpected delegated runtime in final image: $command_name" >&2
           exit 1
         fi
       done
+      for command_name in npm npx corepack pip pip3 pip3.13 curl convex; do
+        if command -v "$command_name" >/dev/null 2>&1; then
+          printf "%s\n" "Unexpected package or delegation tool in final image: $command_name" >&2
+          exit 1
+        fi
+      done
+      (
+        IFS=:
+        for path_directory in $PATH; do
+          for candidate in "$path_directory"/pip[0-9]*; do
+            if test -x "$candidate"; then
+              printf "%s\n" "Unexpected versioned pip command in final image: $candidate" >&2
+              exit 1
+            fi
+          done
+        done
+      )
     '
   printf '%s\n' "PASS $language final image policy"
 }
