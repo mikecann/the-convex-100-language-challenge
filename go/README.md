@@ -166,7 +166,7 @@ on the evidence website. Edit and run the source file, then use
 
 ## Conformance tests
 
-The test-only source under `tests/conformance/` builds a thin Go executable
+The test-only source under `client/tests/conformance/` builds a thin Go executable
 which accepts NDJSON protocol v1 on stdin and reserves stdout for NDJSON
 events. It lets the shared harness exercise the real client and is not part of
 the educational client API. It supports:

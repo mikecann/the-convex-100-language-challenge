@@ -42,10 +42,10 @@ or ecosystem scaffolding that exists only to make a client distributable.
 
 - Put client library code under `<language-id>/client/` and its unit tests beside it, using the ecosystem's normal test convention.
 - Put the canonical introductory example under `<language-id>/examples/basics/`. Keep tests there only when they exercise example-specific behaviour.
-- Put the test-only conformance executable and any tests specific to it under `<language-id>/tests/conformance/`. It may implement the shared adapter protocol, but it is not public client code.
-- Do not create a repository-level `<language-id>/src/` bucket or use `<language-id>/tests/` as a catch-all. The top-level tests directory is reserved for named integration boundaries such as `tests/conformance/`.
+- Put the test-only conformance executable and any tests specific to it under `<language-id>/client/tests/conformance/`. It may implement the shared adapter protocol, but it is not public client code.
+- Do not create repository-level `<language-id>/src/` or `<language-id>/tests/` buckets.
 - Keep checked-in client source directly under `client/` where practical. If a compiler or build tool expects an ecosystem-specific directory tree, let the Docker build copy the source into that temporary layout instead of reshaping the educational repository around package publishing conventions.
-- Commit only the build metadata needed to compile and verify the demonstration. Do not treat publishability as a design goal.
+- Keep build metadata needed to compile and verify the demonstration under `client/`; Docker may copy it elsewhere inside the build container. Do not treat publishability as a design goal.
 - Keep cross-client black-box conformance tests under `_shared/harness/`; they do not belong to an individual client package.
 
 ## Convex safety

@@ -4,11 +4,15 @@ ARG GO_IMAGE=golang:1.25.6-bookworm@sha256:f4490d7b261d73af4543c46ac6597d7d101b6
 
 FROM ${GO_IMAGE} AS dependencies
 WORKDIR /src
-COPY go.mod go.sum ./
+COPY client/go.mod client/go.sum ./
 RUN go mod download
 
 FROM dependencies AS test
-COPY . .
+# Assemble a conventional Go module only inside the container. The repository
+# keeps client and example ownership obvious for people reading the project.
+COPY client/*.go ./
+COPY client/tests ./tests
+COPY examples ./examples
 RUN test -z "$(gofmt -l .)"
 RUN go test -race ./...
 RUN go test -race -tags convexadapter ./...

@@ -51,9 +51,8 @@ Live includes HTTP. Implementation provenance is a separate label:
 <language-id>/             one top-level directory per roster language
   manifest.yaml            declared intent, toolchain, and provenance
   Dockerfile               pinned build and runtime image
-  client/                  idiomatic client library and its unit tests
+  client/                  client, build metadata, unit tests, and conformance entrypoint
   examples/basics/         the shared counter-room example and its own tests
-  tests/conformance/       test-only NDJSON conformance executable
   README.md                usage, evidence, and limitations
 _shared/                   trusted backend, harness, schemas, site, and results
 run                         Docker-only orchestration entrypoint

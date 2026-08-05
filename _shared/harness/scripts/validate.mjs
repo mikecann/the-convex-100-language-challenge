@@ -93,10 +93,22 @@ for (const language of roster.languages) {
       "Dockerfile",
       "client",
       "examples/basics",
-      "tests/conformance",
+      "client/tests/conformance",
     ]) {
       if (!fs.existsSync(path.join(directory, required))) {
         errors.push(`${language.id}: implemented client missing ${required}`);
+      }
+    }
+    const allowedEntries = new Set([
+      "Dockerfile",
+      "README.md",
+      "client",
+      "examples",
+      "manifest.yaml",
+    ]);
+    for (const entry of fs.readdirSync(directory)) {
+      if (!allowedEntries.has(entry)) {
+        errors.push(`${language.id}: unexpected top-level entry ${entry}`);
       }
     }
   }

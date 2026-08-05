@@ -15,9 +15,8 @@
 <id>/
   manifest.yaml          declared intent, toolchain, and provenance
   Dockerfile             pinned multi-stage build
-  client/                client library and its unit tests
+  client/                client, build metadata, unit tests, and conformance entrypoint
   examples/basics/       shared counter-room example and example-only tests
-  tests/conformance/     test-only NDJSON conformance executable
   README.md              idiomatic usage and limitations
 
 _shared/
@@ -66,17 +65,15 @@ The repository standardises ownership boundaries for an educational project.
 Client code and its unit tests live under `client/`.
 Example-specific tests live with the example under `examples/basics/`, and
 the language-specific executable that exposes the shared adapter protocol lives
-under `tests/conformance/`. Cross-client black-box scenarios and assertions
+under `client/tests/conformance/`. Cross-client black-box scenarios and assertions
 stay under `_shared/harness/`.
 
-Do not add a generic `<id>/src/` bucket or use `<id>/tests/` as a catch-all. Its
-named `tests/conformance/` child exists specifically because the adapter is test
-infrastructure rather than client code. Do not reshape the checked-in tree
-merely to resemble a publishable package. Keep source directly under `client/`
-where practical. When a toolchain expects paths such as Rust's `src/lib.rs` or
-Maven's `src/main/java`, the Docker build can copy the readable repository
-source into that temporary build layout. Commit package metadata only when it
-is needed to compile or verify the demonstration.
+Do not add generic `<id>/src/` or `<id>/tests/` buckets. An implemented language
+root contains only `README.md`, `Dockerfile`, `manifest.yaml`, `client/`, and
+`examples/`. Keep source directly under `client/` where practical, together
+with the minimum build metadata needed by the container. When a toolchain
+expects paths such as Rust's `src/lib.rs` or Maven's `src/main/java`, the Docker
+build can copy the readable repository source into that temporary layout.
 
 Client pull requests may modify only their own `<id>/` directory. Changes under `_shared/`, `docs/`, or `roster/` belong in separate reviewed pull requests. CI path policy must enforce that split before language work is parallelized.
 
