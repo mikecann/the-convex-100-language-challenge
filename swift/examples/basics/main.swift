@@ -1,23 +1,3 @@
-# Convex from Swift
-
-This is a small, native Swift demonstration of Convex HTTP functions and a pinned experimental Live WebSocket profile. On Linux, WebSocketKit 2.15.0 supplies the low-level SwiftNIO TLS and RFC 6455 transport.
-
-It is educational, unofficial, and not a production SDK.
-
-## Start here
-
-[`examples/basics/main.swift`](examples/basics/main.swift) queries a counter, starts Live before it changes the counter, performs one idempotent mutation, and verifies the Live update.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP query, mutation, action | Implemented, awaiting shared evidence |
-| Live query updates | Implemented against the pinned profile, awaiting shared evidence |
-| Authentication | HTTP bearer token only |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.swift -->
-```text
 import Convex
 import Foundation
 
@@ -85,17 +65,3 @@ import Foundation
     var description: String { message }
   }
 }
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-`./run test swift` compiles the native client and test adapter in Docker. `./run verify-example swift` exercises this exact example. `./run verify-all swift` is the root-owned local and hosted conformance gate.
-
-## Protocol notes
-
-The adapter speaks NDJSON protocol v1 on stdin/stdout or the single TCP controller specified by `ADAPTER_LISTEN`. `debugDisconnect` is adapter-only. A single actor owns the socket. Ordered transport callbacks use a bounded 8-event mailbox; overflow is reported as a protocol error and reconnects. Subscriptions use a newest-16 buffer, dropping old intermediate updates for a slow consumer.
-
-## Limitations
-
-Live auth, actions and mutations, optimistic updates, journals, replay, and transition-chunk assembly are intentionally deferred. The sync wire profile is undocumented and pinned for testing, not promised as stable.
