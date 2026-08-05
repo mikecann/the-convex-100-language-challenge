@@ -1,0 +1,5 @@
+%{
+  "cowlib": {:hex, :cowlib, "2.19.0", "c9d11c9d035472e27a740c9f327786c61ed209269b4be0260d59d3ec07b8949f", [:make, :rebar3], [], "hexpm", "6dc66e3135b229193ea4dcb14294e79520c923d391315c9c962ef0b4bea72356"},
+  "gun": {:hex, :gun, "2.5.0", "7be4c8d34a177f4213d48bb5fbffb03462ce871b4ec30b5aa3b08d2fd4fa424b", [:make, :rebar3], [{:cowlib, ">= 2.19.0 and < 3.0.0", [hex: :cowlib, repo: "hexpm", optional: false]}], "hexpm", "3839576181456f5553fc1be006fd95681576b916cc9ad68d422a287ed4a770dd"},
+  "jsx": {:hex, :jsx, "3.1.0", "d12516baa0bb23a59bb35dccaf02a1bd08243fcbb9efe24f2d9d056ccff71268", [:rebar3], [], "hexpm", "0c5cc8fdc11b53cc25cf65ac6705ad39e54ecc56d1c22e4adb8f5a53fb9427f3"},
+}

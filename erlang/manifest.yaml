@@ -4,5 +4,32 @@ displayName: "Erlang"
 rank: 38
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Erlang implementation of Convex HTTP and pinned /api/sync behavior using OTP plus ordinary Gun WebSocket and JSX JSON libraries. Capability badges remain empty until shared local and hosted evidence passes.
+toolchain:
+  name: Erlang/OTP
+  version: 26.2.5.15
+intendedCapabilities:
+  - http
+  - live
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Gun 2.5.0 and Cowlib 2.19.0 are flagged for request/response splitting (GHSA-w4f7-4cxr-rv3c), and Cowlib's cookie encoder is separately flagged for header injection (GHSA-g2wm-735q-3f56). This outbound client does not construct responses or call that cookie encoder, but the vulnerable dependency code remains and no patched Hex release currently exists.
+  - Live authentication, WebSocket mutations/actions, and tagged Convex values are deferred.
+  - TransitionChunk assembly is deferred; receiving one is reported as protocol drift.
+  - Each subscription retains the newest 16 undelivered events within a 256 KiB total byte bound, including the event currently held by its relay.
+  - Controller output has one global 16-event and 256 KiB encoded-byte budget, including a blocked socket send; saturation closes the stalled controller instead of retaining more events.
+  - Stdin and TCP commands share a 1 MiB newline-delimited frame limit and discard incomplete EOF fragments.
 capabilities: []
