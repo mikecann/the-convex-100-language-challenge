@@ -17,7 +17,7 @@ It is educational and unofficial, not a production SDK or a package to install f
 | Capability badges | None earned yet |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.pl -->
-```text
+```perl
 #!/usr/local/bin/perl
 use strict;
 use warnings;
