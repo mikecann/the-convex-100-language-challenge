@@ -414,7 +414,7 @@ static convex_subscription *find_subscription_locked(live_manager *manager,
 
 static void publish_error_locked(live_manager *manager, const char *name,
                                  const char *message, json_object *data,
-                                 json_object *logs) {
+                                 json_object *logs, int established_only) {
   convex_update update = {0};
   update.error.name = (char *)(name ? name : "ProtocolError");
   update.error.message = (char *)(message ? message : "Live protocol error");
@@ -422,7 +422,8 @@ static void publish_error_locked(live_manager *manager, const char *name,
   update.error.logs = logs;
   update.logs = logs;
   for (convex_subscription *sub = manager->subscriptions; sub; sub = sub->next)
-    if (sub->active && !sub->remove_pending)
+    if (sub->active && !sub->remove_pending &&
+        (!established_only || !sub->add_pending))
       enqueue_update_locked(sub, &update);
   pthread_cond_broadcast(&manager->updates);
 }
@@ -1046,7 +1047,10 @@ static void *live_worker(void *opaque) {
       else if (received < 0) {
         pthread_mutex_lock(&manager->mutex);
         if (received == -2)
-          publish_error_locked(manager, "ProtocolError", reason, NULL, NULL);
+          publish_error_locked(manager, "ProtocolError", reason, NULL, NULL, 0);
+        else if (!manager->closing && !manager->debug_requested)
+          publish_error_locked(manager, "TransportError", reason, NULL, NULL,
+                               1);
         disconnect_socket_locked(manager, reason);
         pthread_mutex_unlock(&manager->mutex);
         receive_state.message.length = 0;

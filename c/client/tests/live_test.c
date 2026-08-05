@@ -591,12 +591,20 @@ static void *fixture_thread(void *opaque) {
       if (stop)
         break;
       if (new_generation != generation) {
+        int close_transport = 0;
         generation = new_generation;
         if (malformed == 1) {
           send_frame(fd, 1, 1, "{not-json", 9);
         } else if (malformed >= 2 && malformed <= 6) {
           send_malformed_transition(fd, query_id, query_set, current_ts,
                                     serial + 1, count, malformed);
+        } else if (malformed == 7) {
+          /* A 1011 close frame deterministically models an established server
+           * transport failing without turning the test into a timing race. */
+          const char close_payload[] = "\x03\xf3"
+                                       "fixture transport failure";
+          send_frame(fd, 8, 1, close_payload, sizeof(close_payload) - 1);
+          close_transport = 1;
         } else {
           serial++;
           if (!send_transition(fd, query_id, query_set, query_set, current_ts,
@@ -608,6 +616,8 @@ static void *fixture_thread(void *opaque) {
         server->sent_generation = generation;
         pthread_cond_broadcast(&server->changed);
         pthread_mutex_unlock(&server->mutex);
+        if (close_transport)
+          break;
       }
       struct pollfd poller = {.fd = fd, .events = POLLIN};
       int ready = poll(&poller, 1, 5);
@@ -740,6 +750,10 @@ static int update_count(convex_subscription *sub, int expected,
     okay = update.error.name && update.error.data;
   else if (expect_error == 2)
     okay = update.error.name && !strcmp(update.error.name, "ProtocolError");
+  else if (expect_error == 3)
+    okay = update.error.name && !strcmp(update.error.name, "TransportError") &&
+           update.error.message &&
+           strstr(update.error.message, "server closed Live WebSocket");
   else {
     json_object *count = NULL, *text = NULL;
     okay = !update.error.name && update.value &&
@@ -1323,6 +1337,13 @@ int main(void) {
     check(update_count(sub, recovery_count, 0),
           "Live query recovers after malformed Transition");
   }
+  int before_transport_close = fixture_connections(&server);
+  fixture_change(&server, 50, 0, 7, 0);
+  check(update_count(sub, 0, 3),
+        "established transport failure is delivered to the subscription");
+  wait_connections(&server, before_transport_close + 1);
+  check(update_count(sub, 50, 0),
+        "Live query recovers after an established transport failure");
   check(convex_unsubscribe(sub, &error), "final unsubscribe");
   check(convex_close(client, 5000, &error), "blocked close completes");
   convex_free(client);
