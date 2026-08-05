@@ -6,6 +6,7 @@ import {
   requiredHTTPTests,
   requiredLiveTests,
 } from "./required-tests.mjs";
+import { targetRuntimeError } from "./target-runtime-policy.mjs";
 
 const broken = fileURLToPath(new URL("./broken-adapter.mjs", import.meta.url));
 const hello = { protocolVersion: 1, id: "hello", op: "hello" };
@@ -48,6 +49,32 @@ assert.ok(
   [...requiredHTTPTests, ...requiredLiveTests].every((name) => !name.includes("go/")),
 );
 
+assert.equal(
+  targetRuntimeError("python", {
+    implementation: { status: "attempting" },
+    targetRuntimeCommand: "python3",
+  }),
+  null,
+);
+assert.match(
+  targetRuntimeError("python", { implementation: { status: "attempting" } }),
+  /must declare/,
+);
+assert.match(
+  targetRuntimeError("go", {
+    implementation: { status: "attempting" },
+    targetRuntimeCommand: "node",
+  }),
+  /not approved/,
+);
+assert.match(
+  targetRuntimeError("javascript", {
+    implementation: { status: "planned" },
+    targetRuntimeCommand: "node",
+  }),
+  /planned client/,
+);
+
 console.log(
-  "PASS harness rejects wrong values, hangs, dirty exits, and language-specific test names",
+  "PASS harness rejects bad adapters, language-specific test names, and undeclared target runtimes",
 );
