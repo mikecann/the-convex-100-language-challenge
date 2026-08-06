@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -66,6 +67,7 @@ func TestPartialFrameStallBoundsCloseAndReconnect(t *testing.T) {
 		partialSent := make(chan struct{})
 		peerClosed := make(chan struct{})
 		secondFrameSent := make(chan struct{})
+		secondPeerClosed := make(chan struct{})
 		errorsSeen := make(chan error, 1)
 		server := newStalledFrameServer(t, func(connection net.Conn, connectionNumber int) {
 			switch connectionNumber {
@@ -82,7 +84,7 @@ func TestPartialFrameStallBoundsCloseAndReconnect(t *testing.T) {
 					return
 				}
 				close(secondFrameSent)
-				waitForPeerClose(connection, make(chan struct{}), errorsSeen)
+				waitForPeerClose(connection, secondPeerClosed, errorsSeen)
 			}
 		})
 		defer server.Close()
@@ -109,10 +111,17 @@ func TestPartialFrameStallBoundsCloseAndReconnect(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("debugDisconnect exceeded explicit one-second deadline")
 		}
+		waitForSignal(t, peerClosed, time.Second, "stalled peer close after disconnect")
 		waitForSignal(t, secondFrameSent, 3*time.Second, "reconnect frame")
 		assertLiveCount(t, sub, 1)
 		assertNoLiveUpdate(t, sub, 100*time.Millisecond)
-		assertSignalClosed(t, peerClosed, 3*time.Second, "stalled peer close")
+		closeContext, cancel := context.WithTimeout(context.Background(), time.Second)
+		if err := client.Close(closeContext); err != nil {
+			cancel()
+			t.Fatalf("reconnected client Close returned an error: %v", err)
+		}
+		cancel()
+		waitForSignal(t, secondPeerClosed, time.Second, "reconnected peer close")
 		assertNoTestServerError(t, errorsSeen)
 	})
 }
@@ -248,6 +257,11 @@ func waitForPeerClose(connection net.Conn, closed chan<- struct{}, errorsSeen ch
 	buffer := make([]byte, 4096)
 	for {
 		if _, err := connection.Read(buffer); err != nil {
+			var timeoutError net.Error
+			if errors.As(err, &timeoutError) && timeoutError.Timeout() {
+				errorsSeen <- fmt.Errorf("peer close deadline exceeded: %w", err)
+				return
+			}
 			if closed != nil {
 				close(closed)
 			}
@@ -263,11 +277,6 @@ func waitForSignal(t *testing.T, signal <-chan struct{}, timeout time.Duration, 
 	case <-time.After(timeout):
 		t.Fatalf("timed out waiting for %s", name)
 	}
-}
-
-func assertSignalClosed(t *testing.T, signal <-chan struct{}, timeout time.Duration, name string) {
-	t.Helper()
-	waitForSignal(t, signal, timeout, name)
 }
 
 func assertNoLiveUpdate(t *testing.T, sub *convex.Subscription, timeout time.Duration) {

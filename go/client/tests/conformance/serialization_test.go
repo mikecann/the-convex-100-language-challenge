@@ -41,6 +41,11 @@ func TestAdapterSerializationUsesExactNDJSONShapes(t *testing.T) {
 			want:  `{"id":"call-1","type":"error","logs":["backend"],"error":{"name":"FunctionError","message":"convex query failed: denied","data":{"code":"DENIED"}}}`,
 		},
 		{
+			name:  "function error omits absent data",
+			value: failureEvent("call-2", "", &convex.FunctionError{Operation: "query", Message: "denied"}),
+			want:  `{"id":"call-2","type":"error","error":{"name":"FunctionError","message":"convex query failed: denied"}}`,
+		},
+		{
 			name:  "protocol error omits absent data",
 			value: failureEvent("protocol-1", "", &convex.ProtocolError{Message: "malformed"}),
 			want:  `{"id":"protocol-1","type":"error","error":{"name":"ProtocolError","message":"convex protocol error: malformed"}}`,
