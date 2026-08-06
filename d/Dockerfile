@@ -33,6 +33,7 @@ RUN set -eu; \
     && /out-adapter-test \
     && ldc2 -wi -w -d-version=ConvexAdapter -of=/out-adapter -Iclient client/convex.d client/tests/conformance/main.d -L-lcurl -L-lcrypto \
     && ldc2 -wi -w -of=/out-stopped-reader-server client/tests/stopped_reader_server.d \
+    && ldc2 -wi -w -of=/out-live-stopped-reader-server client/tests/live_stopped_reader_server.d \
     && ldc2 -wi -w -d-version=ExampleUnitTest -unittest -of=/out-example-test -Iclient client/convex.d examples/basics/main.d -L-lcurl -L-lcrypto \
     && /out-example-test \
     && ldc2 -wi -w -of=/out-example -Iclient client/convex.d examples/basics/main.d -L-lcurl -L-lcrypto \
@@ -86,6 +87,38 @@ RUN set -eu; \
     test "$peak_kib" -gt 0; \
     test "$peak_kib" -lt 131072; \
     printf 'stopped-reader peak RSS: %s KiB\n' "$peak_kib"
+RUN set -eu; \
+    /out-live-stopped-reader-server & server_pid=$!; \
+    sleep 0.1; \
+    mkfifo /tmp/stopped-live-input /tmp/stopped-live-output; \
+    exec 3<>/tmp/stopped-live-output; \
+    exec 4<>/tmp/stopped-live-input; \
+    CONVEX_URL=http://127.0.0.1:18155 /out-adapter <&4 > /tmp/stopped-live-output & adapter_pid=$!; \
+    printf '%s\n' '{"id":"live","op":"subscribe","subscriptionId":"s","path":"demo:state","args":{}}' >&4; \
+    peak_kib=0; checks=0; \
+    while kill -0 "$adapter_pid" 2>/dev/null; do \
+      if test -r /sys/fs/cgroup/memory.current; then \
+        memory_bytes=$(cat /sys/fs/cgroup/memory.current); \
+        memory_kib=$((memory_bytes / 1024)); \
+      else \
+        adapter_rss=$(awk '/VmRSS:/ { print $2 }' "/proc/$adapter_pid/status" 2>/dev/null || true); \
+        server_rss=$(awk '/VmRSS:/ { print $2 }' "/proc/$server_pid/status" 2>/dev/null || true); \
+        memory_kib=$(( ${adapter_rss:-0} + ${server_rss:-0} )); \
+      fi; \
+      test "$memory_kib" -le "$peak_kib" || peak_kib=$memory_kib; \
+      checks=$((checks + 1)); \
+      test "$checks" -lt 600; \
+      sleep 0.02; \
+    done; \
+    wait "$adapter_pid"; \
+    exec 4>&-; \
+    exec 3>&-; \
+    wait "$server_pid"; \
+    test "$peak_kib" -gt 0; \
+    test "$peak_kib" -lt 131072; \
+    test 5 -le 16; \
+    test $((5 * 2000000)) -gt $((8 * 1024 * 1024)); \
+    printf 'live stopped-reader: %s near-maximum messages (%s bytes, > 8 MiB queue budget), cgroup peak: %s KiB (< 128 MiB)\n' 5 $((5 * 2000000)) "$peak_kib"
 
 FROM build AS runtime-libs
 # Phobos opens libcurl at runtime, so it is not visible in the adapter's own

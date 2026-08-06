@@ -642,13 +642,7 @@ private void handle(AdapterSession session, ref Relay[string] relays, string lin
                 result = client.mutation(fieldString(command, "path"), command.object["args"]);
             else
                 result = client.action(fieldString(command, "path"), command.object["args"]);
-            JSONValue[string] event;
-            event["id"] = JSONValue(id);
-            event["type"] = JSONValue("result");
-            event["value"] = result.value;
-            if (result.logs.length > 0)
-                event["logs"] = strings(result.logs);
-            output.send(JSONValue(event));
+            output.send(resultEvent(id, result));
         }
         catch (ConvexError error)
         {
@@ -778,6 +772,17 @@ private JSONValue subscriptionEvent(string subscriptionId, LiveUpdate update)
     return JSONValue(event);
 }
 
+private JSONValue resultEvent(string id, ConvexResult result)
+{
+    JSONValue[string] event;
+    event["id"] = JSONValue(id);
+    event["type"] = JSONValue("result");
+    event["value"] = result.value;
+    if (result.logs.length > 0)
+        event["logs"] = strings(result.logs);
+    return JSONValue(event);
+}
+
 private bool hasString(JSONValue value, string key)
 {
     return value.type == JSONType.object && key in value.object
@@ -879,6 +884,33 @@ private void setNonblocking(int descriptor)
 private long monotonicMilliseconds()
 {
     return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1_000);
+}
+
+version (AdapterUnitTest) unittest
+{
+    auto result = resultEvent("query", ConvexResult(JSONValue([
+        "count": JSONValue(1L)
+    ]), []));
+    assert(result.type == JSONType.object);
+    assert(hasOnlyFields(result, ["id", "type", "value"]));
+    assert(result.object.length == 3);
+    assert(result.object["id"].type == JSONType.string);
+    assert(result.object["id"].str == "query");
+    assert(result.object["type"].type == JSONType.string);
+    assert(result.object["type"].str == "result");
+    assert(result.object["value"].type == JSONType.object);
+    assert(result.object["value"].object["count"].type == JSONType.integer);
+    assert(result.object["value"].object["count"].integer == 1);
+    assert("logs" !in result.object);
+    assert("error" !in result.object);
+    assert("subscriptionId" !in result.object);
+
+    auto wire = result.toString();
+    auto roundTrip = parseJSON(wire);
+    assert(hasOnlyFields(roundTrip, ["id", "type", "value"]));
+    assert(roundTrip.object["id"].str == "query");
+    assert(roundTrip.object["type"].str == "result");
+    assert(roundTrip.object["value"].object["count"].integer == 1);
 }
 
 version (AdapterUnitTest) unittest
