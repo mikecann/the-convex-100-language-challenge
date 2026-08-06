@@ -1,24 +1,3 @@
-# Convex from Scheme
-
-This is a small native CHICKEN Scheme client that calls Convex functions over HTTP and keeps a query current over Live WebSockets.
-
-It is educational and unofficial. It is not a production SDK and is not intended for package publication.
-
-## Start here
-
-Read [`examples/basics/main.scm`](examples/basics/main.scm). It queries a fresh counter, starts Live before changing it, applies one idempotent mutation, and checks that HTTP, the mutation result, and Live all agree on `0 -> 1`.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP queries, mutations, and actions | Implemented, awaiting shared evidence |
-| Bearer authentication and structured function errors | Implemented, awaiting shared evidence |
-| Live initial values, updates, and query-error recovery | Implemented, awaiting shared evidence |
-| Remove, five reconnects, generation barriers, and bounded delivery | Implemented, awaiting shared evidence |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.scm -->
-```scheme
 (import scheme
         (chicken base)
         (chicken condition)
@@ -160,35 +139,3 @@ Read [`examples/basics/main.scm`](examples/basics/main.scm). It queries a fresh 
     (exit 1))
   (example-main)
   (exit 0))
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-```sh
-./run sync-examples
-./run validate
-./run test scheme
-./run verify-example scheme
-./run verify scheme
-./run verify-hosted scheme
-./run verify-all scheme
-```
-
-`test` builds the pinned CHICKEN dependency graph from source, then runs strict JSON, real HTTP, real-socket Live, stdin/TCP adapter, and canonical example tests. It saves the exact adapter and example as native `linux/amd64` executables. `verify-example` runs the example from its minimal image against a unique room. The remaining shared commands add local and hosted black-box conformance. Only the root result evaluator can award HTTP or Live badges, so this language branch does not claim them itself.
-
-## Conformance and protocol notes
-
-The public client implements Convex's documented JSON HTTP endpoints and the repository's pinned `/api/sync` profile directly in Scheme. HTTP request/response handling and RFC6455 framing are native Scheme code over CHICKEN's TCP and OpenSSL bindings. JSON, SHA-1, base64, and SRFI eggs provide ordinary language facilities only. One pinned patch makes OpenSSL 2.2.6 verify the requested DNS name or IP address as well as the certificate chain. No request invokes another Convex client, the Convex CLI, `curl`, Node.js, or Python.
-
-One owner thread exclusively opens, reads, writes, retires, and reconnects the Live socket. Controllers queue Add, Remove, reconnect, and close commands to that owner and wait for acknowledgements. Complete transitions are validated, coalesced per query, and committed atomically. Unchanged reconnect hydration is suppressed with a fixed-size FNV-1a signature rather than a retained JSON copy. Every delivered update carries its socket generation, which lets the adapter reject an update that was dequeued before a replacement, unsubscribe, or debug barrier.
-
-The manager retains the newest 16 updates within a conservative 20 MiB global budget, including four times the exact encoded event length and a fixed record allowance. Active subscriptions have a separate 64-count and 8 MiB path/argument budget. JSON decoding stops at 2 MiB, 128 levels, or 8,192 structural nodes before malformed or dense input can exhaust the runtime. Reconnect backoff starts at 100 ms, caps at 15 seconds, and resets after a valid connection or transition.
-
-The adapter speaks bounded UTF-8 NDJSON protocol v1 over stdin/stdout or one `ADAPTER_LISTEN` TCP connection. Its independent output queue retains at most the newest 16 encoded events within 6 MiB, including a TCP write currently in flight. Subscription values may be coalesced under pressure, while acknowledgements and errors wait for bounded room or fail the connection. Replacement, unsubscribe, reconnect, and close acknowledgements share the same publication lock as relay events.
-
-The final images contain the native executable, OpenSSL 3, zlib, certificate roots, `/bin/sh`, and the individual POSIX tools required by the verifier. They do not contain CHICKEN, a C compiler, package or network tools, delegated runtimes, services, or a multicall binary. Both run as `65532:65532` under the repository's read-only, capability-drop, no-new-privileges, 128 MiB policy.
-
-## Limitations
-
-Live authentication, optimistic updates, mutation and action messages over the WebSocket, journals, and `TransitionChunk` assembly are deferred. HTTP currently uses a bounded connection-close response exchange; chunked and persistent response framing are deferred. A `TransitionChunk` is treated as recoverable protocol drift and retires the socket rather than publishing partial state. Values cover Convex's JSON-safe subset; tagged Convex value encodings are not converted into richer Scheme types. Inputs beyond the documented line, JSON, subscription, delivery, or output bounds are rejected or coalesced instead of risking unbounded memory. The manifest deliberately leaves capability badges empty until root-owned shared evidence passes from a clean reviewed commit.
