@@ -20,6 +20,8 @@ COPY examples ./examples
 RUN test "$(uname -m)" = x86_64 \
     && test "$(printf 'puts [info patchlevel]\\n' | tclsh)" = 8.6.13 \
     && tclsh client/tests/run.tcl \
+    && tclsh client/tests/live_socket.test.tcl \
+    && tclsh client/tests/stopped_reader.test.tcl \
     && tclsh examples/basics/main.test.tcl
 RUN printf '%s\n' \
       '{"protocolVersion":1,"id":"hello","op":"hello"}' \

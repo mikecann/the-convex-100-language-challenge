@@ -18,6 +18,7 @@ namespace eval ::adapter {
     variable closing 0
     variable terminated 0
     variable maxEvents 16
+    variable controlReserveEvents 4
     variable maxBytes [expr {6 * 1024 * 1024}]
     # Leave room for a terminal acknowledgement even when a reader stops after
     # accepting a burst of subscription values. The per-event allowance covers
@@ -27,6 +28,7 @@ namespace eval ::adapter {
     variable channelOverhead 4096
     variable closeDeadline 0
     variable closeTimeoutMs 2000
+    variable flushTimer ""
     variable exitHook ""
     # Test-only pending override. It gives the unit test a deterministic
     # stopped-reader channel without depending on an OS socket buffer size.
@@ -47,6 +49,13 @@ proc ::adapter::terminate {status} {
 
 proc ::adapter::error_raw {message {name Error} {data null}} {
     return [::convex::object [list name [::convex::quote $name] message [::convex::quote $message] data $data]]
+}
+
+proc ::adapter::logs_present {logs} {
+    # A bare [] inside an expr is command substitution, not the JSON empty
+    # array literal. Compare it as a Tcl string so empty log arrays stay
+    # omitted from exact adapter envelopes.
+    return [expr {$logs ne "" && ![string equal $logs "\[\]"]}]
 }
 
 proc ::adapter::entry_cost {raw} {
@@ -121,15 +130,17 @@ proc ::adapter::emit {raw {droppable 0} {tag ""}} {
     variable queue
     variable queueBytes
     variable maxEvents
+    variable controlReserveEvents
     variable maxBytes
     variable controlReserve
     set cost [entry_cost $raw]
     set limit [expr {$droppable ? $maxBytes - $controlReserve : $maxBytes}]
+    set eventLimit [expr {$droppable ? $maxEvents - $controlReserveEvents : $maxEvents}]
     if {$cost > $limit} {
         if {$droppable} { return }
         error "adapter event exceeds the encoded output budget"
     }
-    while {[llength $queue] >= $maxEvents || $queueBytes + $cost > $limit} {
+    while {[llength $queue] >= $eventLimit || $queueBytes + $cost > $limit} {
         if {![drop_oldest_delivery]} {
             if {$droppable} { return }
             error "adapter output remained backpressured for a control event"
@@ -140,10 +151,26 @@ proc ::adapter::emit {raw {droppable 0} {tag ""}} {
     flush
 }
 
+proc ::adapter::schedule_flush {} {
+    variable flushTimer
+    if {$flushTimer eq ""} { set flushTimer [after 25 ::adapter::scheduled_flush] }
+}
+
+proc ::adapter::scheduled_flush {} {
+    variable flushTimer
+    set flushTimer ""
+    flush
+}
+
 proc ::adapter::flush {} {
     variable output
     variable queue
     variable queueBytes
+    variable flushTimer
+    if {$flushTimer ne ""} {
+        after cancel $flushTimer
+        set flushTimer ""
+    }
     set position 0
     while {$position < [llength $queue]} {
         lassign [lindex $queue $position] raw droppable tag state cost
@@ -159,6 +186,7 @@ proc ::adapter::flush {} {
             # The hook may invalidate and remove this queued delivery.
             if {$position >= [llength $queue]} { break }
             lassign [lindex $queue $position] raw droppable tag state cost
+            if {$state eq "accepted"} { incr position; continue }
         }
         if {$droppable && ![delivery_current $tag]} {
             discard_at $position
@@ -168,21 +196,36 @@ proc ::adapter::flush {} {
         # accepted prefix. A control event is allowed through the reserved
         # budget, so close/ack can be accepted in-order by a slow reader.
         if {$droppable && $position > 0} { break }
-        if {[catch {puts -nonewline $output $raw; ::flush $output} error]} {
+        if {[catch {puts -nonewline $output $raw} error]} {
             if {[string match {*would block*} [string tolower $error]]} {
                 fileevent $output writable ::adapter::flush
                 return
             }
             exit 1
         }
-        # Retain the record until Tcl reports that the channel has drained it.
+        # puts accepted the complete record into Tcl's channel layer. Mark that
+        # ownership before flush, because EAGAIN there must never cause a retry
+        # to append the same NDJSON event twice.
         lset queue $position 3 accepted
         incr position
+        if {[catch {::flush $output} error]} {
+            if {[string match {*would block*} [string tolower $error]]} {
+                # Tcl already owns this record. A writable fileevent can fire
+                # continuously while channel bytes remain pending and starve
+                # controller and WebSocket reads, so recheck with one bounded
+                # timer instead.
+                fileevent $output writable {}
+                schedule_flush
+                return
+            }
+            exit 1
+        }
     }
     if {![llength $queue]} { fileevent $output writable {}; return }
     if {[catch {set pending [output_pending]} error]} { exit 1 }
     if {$pending > 0} {
-        fileevent $output writable ::adapter::flush
+        fileevent $output writable {}
+        schedule_flush
         return
     }
     # The accepted prefix has drained. Keep any queued delivery behind it: it
@@ -230,18 +273,44 @@ proc ::adapter::ensure_client {} {
     return $client
 }
 
-proc ::adapter::respond_error {id message {name Error} {data null} {subscriptionId ""} {logs "[]"}} {
-    set fields [list type [::convex::quote [expr {$subscriptionId eq "" ? "error" : "subscription"}]]]
-    if {$subscriptionId eq ""} { lappend fields id [::convex::quote $id] } else { lappend fields subscriptionId [::convex::quote $subscriptionId] }
+proc ::adapter::respond_error {message {name Error} {data null} {logs "\[\]"} {id ""} {includeId 0}} {
+    set fields [list type [::convex::quote error]]
+    if {$includeId} { lappend fields id [::convex::quote $id] }
     lappend fields error [error_raw $message $name $data]
-    if {$logs ne "[]"} { lappend fields logs $logs }
+    if {[logs_present $logs]} { lappend fields logs $logs }
     emit [::convex::object $fields]
 }
 
-proc ::adapter::subscription_error {subscriptionId generation name message {data null} {logs "[]"}} {
+proc ::adapter::required_string {line command fieldName} {
+    set raw [::convex::field $line $fieldName 0]
+    if {$raw eq "" || [string index $raw 0] ne "\""} { ::convex::throw ProtocolError "command omitted valid $fieldName" }
+    if {[catch {set value [::convex::decode $raw]}]} { ::convex::throw ProtocolError "command omitted valid $fieldName" }
+    set length [string length $value]
+    if {$length < 1 || $length > 128} { ::convex::throw ProtocolError "command omitted valid $fieldName" }
+    return $value
+}
+
+proc ::adapter::error_details {message options} {
+    set name Error
+    set data null
+    set logs "\[\]"
+    set code [dict get $options -errorcode]
+    if {[lindex $code 0] eq "CONVEX"} {
+        set name [lindex $code 1]
+        set data [lindex $code 2]
+        set logs [lindex $code 3]
+    } elseif {[regexp {^(ProtocolError|TransportError|FunctionError):[ ]*(.*)$} $message -> classified detail]} {
+        set name $classified
+        set message $detail
+    }
+    if {[string match "$name:*" $message]} { set message [string trim [string range $message [expr {[string length $name] + 1}] end]] }
+    return [list $message $name $data $logs]
+}
+
+proc ::adapter::subscription_error {subscriptionId generation name message {data null} {logs "\[\]"}} {
     if {![delivery_current [list $subscriptionId $generation]]} { return }
     set fields [list type [::convex::quote subscription] subscriptionId [::convex::quote $subscriptionId] error [error_raw $message $name $data]]
-    if {$logs ne "[]" && $logs ne ""} { lappend fields logs $logs }
+    if {[logs_present $logs]} { lappend fields logs $logs }
     emit [::convex::object $fields] 1 [list $subscriptionId $generation]
 }
 
@@ -251,7 +320,7 @@ proc ::adapter::subscription_event {subscriptionId generation kind payload logs}
     if {![dict exists $generations $subscriptionId] || [dict get $generations $subscriptionId] != $generation || ![dict exists $subscriptions $subscriptionId]} { return }
     if {$kind eq "value"} {
         set fields [list type [::convex::quote subscription] subscriptionId [::convex::quote $subscriptionId] value $payload]
-        if {$logs ne "[]" && $logs ne ""} { lappend fields logs $logs }
+        if {[logs_present $logs]} { lappend fields logs $logs }
         emit [::convex::object $fields] 1 [list $subscriptionId $generation]
     } else {
         set text [::convex::decode [::convex::field $payload message]]
@@ -267,22 +336,29 @@ proc ::adapter::handle {line} {
     variable generations
     variable closing
     if {[catch {set command [::convex::decode $line]} parseError]} {
-        respond_error "" "decode command: $parseError" ProtocolError
+        respond_error "decode command: $parseError" ProtocolError
         return
     }
-    set id [expr {[dict exists $command id] ? [dict get $command id] : ""}]
-    if {![dict exists $command op]} { respond_error $id "command omitted op" ProtocolError; return }
-    set op [dict get $command op]
+    if {[catch {set id [required_string $line $command id]} idError idOptions]} {
+        lassign [error_details $idError $idOptions] message name data logs
+        respond_error $message $name $data $logs
+        return
+    }
+    if {[catch {set op [required_string $line $command op]} opError opOptions]} {
+        lassign [error_details $opError $opOptions] message name data logs
+        respond_error $message $name $data $logs $id 1
+        return
+    }
     if {[catch {
         switch -- $op {
             hello {
-                if {![dict exists $command protocolVersion] || [dict get $command protocolVersion] != 1} { error "unsupported adapter protocol version" }
+                if {![dict exists $command protocolVersion] || [dict get $command protocolVersion] != 1} { ::convex::throw ProtocolError "unsupported adapter protocol version" }
                 emit [::convex::object [list protocolVersion 1 id [::convex::quote $id] type [::convex::quote ready] language [::convex::quote tcl] implementation [::convex::quote native-tcl-8.6.13] runtime [::convex::quote tcl-8.6.13]]]
             }
             query - mutation - action {
                 set result [::convex::$op [ensure_client] [dict get $command path] [::convex::field $line args]]
                 set fields [list id [::convex::quote $id] type [::convex::quote result] value [dict get $result value]]
-                if {[dict get $result logs] ne "[]"} { lappend fields logs [dict get $result logs] }
+                if {[logs_present [dict get $result logs]]} { lappend fields logs [dict get $result logs] }
                 emit [::convex::object $fields]
             }
             setAuth {
@@ -290,7 +366,7 @@ proc ::adapter::handle {line} {
                 emit [::convex::object [list id [::convex::quote $id] type [::convex::quote ack]]]
             }
             subscribe {
-                set subscriptionId [dict get $command subscriptionId]
+                set subscriptionId [required_string $line $command subscriptionId]
                 if {[dict exists $subscriptions $subscriptionId]} {
                     # Invalidate before replacement can expose its ack. A
                     # queued old relay is discarded; accepted bytes stay ahead
@@ -305,7 +381,7 @@ proc ::adapter::handle {line} {
                 emit [::convex::object [list id [::convex::quote $id] type [::convex::quote ack]]]
             }
             unsubscribe {
-                set subscriptionId [dict get $command subscriptionId]
+                set subscriptionId [required_string $line $command subscriptionId]
                 if {[dict exists $subscriptions $subscriptionId]} {
                     ::convex::unsubscribe [ensure_client] [dict get $subscriptions $subscriptionId]
                     invalidate_subscription $subscriptionId
@@ -314,6 +390,10 @@ proc ::adapter::handle {line} {
             }
             debugDisconnect {
                 ::convex::debug_disconnect [ensure_client]
+                set liveState [::convex::state $client]
+                if {[dict get $liveState socket] ne "" || [dict get $liveState reconnectTimer] eq ""} {
+                    error "debugDisconnect acknowledgement barrier was not reached"
+                }
                 emit [::convex::object [list id [::convex::quote $id] type [::convex::quote ack]]]
             }
             close {
@@ -331,15 +411,11 @@ proc ::adapter::handle {line} {
                 # after merely scheduling a writable callback.
                 after 0 ::adapter::finish_close
             }
-            default { error "unknown adapter operation $op" }
+            default { ::convex::throw ProtocolError "unknown adapter operation $op" }
         }
     } error options]} {
-        set name Error
-        set data null
-        set logs "[]"
-        set code [dict get $options -errorcode]
-        if {[lindex $code 0] eq "CONVEX"} { set name [lindex $code 1]; set data [lindex $code 2]; set logs [lindex $code 3] }
-        respond_error $id $error $name $data "" $logs
+        lassign [error_details $error $options] message name data logs
+        respond_error $message $name $data $logs $id 1
     }
 }
 

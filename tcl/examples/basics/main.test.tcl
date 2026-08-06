@@ -8,4 +8,11 @@ if {[whole_count $zero test] != 0 || [whole_count $one test] != 1} { error "whol
 foreach raw {{{"count":0.5}} {{"count":"1"}} {{"count":Inf}}} {
     if {![catch {whole_count $raw test}]} { error "invalid count $raw was accepted" }
 }
+set waiting initial
+set complete 0
+set liveFailure ""
+example_update error {{"name":"FunctionError","message":"fixture failure","data":null}} {[]}
+if {$waiting ne "failed" || $complete != -1 || $liveFailure ne "Live query failed: fixture failure"} {
+    error "Live failure did not wake the canonical example driver"
+}
 puts "Tcl example number tests passed"

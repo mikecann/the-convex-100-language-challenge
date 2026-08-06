@@ -19,6 +19,26 @@ proc whole_count {raw operation} {
     return $whole
 }
 
+proc example_update {kind payload logs} {
+    global initialRaw updatedRaw waiting complete liveFailure
+    if {$kind eq "error"} {
+        set message [::convex::decode [::convex::field $payload message]]
+        set liveFailure "Live query failed: $message"
+        # Never throw from the socket callback. Wake whichever vwait owns the
+        # example so the outer try reports the real failure and still cleans up.
+        set waiting failed
+        set complete -1
+        return
+    }
+    if {$waiting eq "initial"} {
+        set initialRaw $payload
+        set waiting mutation
+    } elseif {$waiting eq "updated"} {
+        set updatedRaw $payload
+        set complete 1
+    }
+}
+
 # Tests source this canonical file to exercise the same decoder. A sourced
 # example must define its helpers without contacting a deployment or printing.
 if {[file normalize [info script]] ne [file normalize $::argv0]} { return }
@@ -28,18 +48,7 @@ if {$deployment eq ""} { error "CONVEX_URL is required" }
 set room [expr {$argc ? [lindex $argv 0] : "tcl-example"}]
 set client [::convex::new $deployment]
 set complete 0
-
-proc example_update {kind payload logs} {
-    global initialRaw updatedRaw waiting complete
-    if {$kind eq "error"} { error "Live query failed: $payload" }
-    if {$waiting eq "initial"} {
-        set initialRaw $payload
-        set waiting mutation
-    } elseif {$waiting eq "updated"} {
-        set updatedRaw $payload
-        set complete 1
-    }
-}
+set liveFailure ""
 
 try {
     # Ask Convex once over HTTP before opening Live, to establish the fresh room.
@@ -53,6 +62,7 @@ try {
     set waiting initial
     set subscription [::convex::subscribe $client demo:state [::convex::object [list room [::convex::quote $room]]] [list example_update]]
     vwait waiting
+    if {$liveFailure ne ""} { error $liveFailure }
     set initialCount [whole_count $initialRaw "initial Live value"]
     if {$initialCount != $currentCount} { error "initial Live count disagreed with HTTP" }
     puts "live initial count: $initialCount"
@@ -72,7 +82,8 @@ try {
     puts "mutation count: $mutationCount"
 
     # Wait for the changed value from Live rather than issuing another query.
-    vwait complete
+    if {$complete == 0} { vwait complete }
+    if {$liveFailure ne ""} { error $liveFailure }
     set updatedCount [whole_count $updatedRaw "updated Live value"]
     if {$updatedCount != 1} { error "updated Live count was $updatedCount, expected 1" }
     puts "live updated count: $updatedCount"

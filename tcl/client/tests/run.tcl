@@ -3,6 +3,19 @@ source [file normalize [file join [file dirname [info script]] .. convex.tcl]]
 
 proc assert {condition message} { if {![uplevel 1 [list expr $condition]]} { error $message } }
 
+# The registered HTTPS transport must require a trusted certificate. Capture
+# the exact TclTLS arguments without making a network request.
+rename ::tls::socket ::tls::socket_real
+proc ::tls::socket {args} { set ::tlsSocketArgs $args; return tls-fixture }
+set tlsResult [::convex::tls_socket example.test 443]
+assert {$tlsResult eq "tls-fixture"} "HTTPS socket factory did not delegate to TclTLS"
+set requireIndex [lsearch -exact $::tlsSocketArgs -require]
+set caIndex [lsearch -exact $::tlsSocketArgs -cafile]
+assert {$requireIndex >= 0 && [lindex $::tlsSocketArgs [expr {$requireIndex + 1}]] == 1} "HTTPS socket did not require certificate validation"
+assert {$caIndex >= 0 && [lindex $::tlsSocketArgs [expr {$caIndex + 1}]] eq "/etc/ssl/certs/ca-certificates.crt"} "HTTPS socket did not use the runtime CA bundle"
+rename ::tls::socket {}
+rename ::tls::socket_real ::tls::socket
+
 set nested {"unicode":"Hello, 世界 👋","nested":{"booleans":[true,false],"number":42.5,"nil":null}}
 set raw "\{$nested\}"
 assert {[::convex::field $raw unicode] eq {"Hello, 世界 👋"}} "raw string field was not retained"
@@ -11,6 +24,7 @@ assert {[dict get [::convex::decode $nestedRaw] number] == 42.5} "nested field w
 assert {[llength [::convex::elements {[1,{"x":true},null]}]] == 3} "array splitter lost an element"
 assert {[::convex::timestamp_key AAAAAAAAAAA=] eq 0000000000000000} "little-endian zero timestamp failed"
 assert {[::convex::timestamp_key AQAAAAAAAAA=] eq 0000000000000001} "little-endian timestamp ordering failed"
+assert {[string compare [::convex::timestamp_key /wAAAAAAAAA=] [::convex::timestamp_key AAEAAAAAAAA=]] < 0} "numeric timestamp ordering failed at 255 -> 256"
 set frame [::convex::ws_frame 1 [encoding convertto utf-8 {Hello, 世界 👋}]]
 assert {[string bytelength $frame] > 10} "masked WebSocket frame was not built"
 
@@ -73,18 +87,18 @@ set ::adapter::generations [dict create same 1]
 # is the exact barrier used by unsubscribe and same-ID replacement.
 proc adapter_invalidate_then_ack {} {
     ::adapter::invalidate_subscription same
-    ::adapter::emit {"id":"replace","type":"ack"}
+    ::adapter::emit {{"id":"replace","type":"ack"}}
 }
 set ::adapter::pauseAfterDequeue adapter_invalidate_then_ack
-::adapter::emit {"type":"subscription","subscriptionId":"same","value":{"count":99}} 1 [list same 1]
+::adapter::emit {{"type":"subscription","subscriptionId":"same","value":{"count":99}}} 1 [list same 1]
 assert {[llength $::adapter::queue] == 0} "paused stale delivery stayed queued"
 set barrierTranscript [::read $adapterRead]
-assert {[string first {"id":"replace","type":"ack"} $barrierTranscript] == 0} "replacement acknowledgement was not delivered"
+assert {[string first {{"id":"replace","type":"ack"}} $barrierTranscript] == 0} "replacement acknowledgement was not delivered"
 assert {[string first {"count":99} $barrierTranscript] < 0} "stale delivery crossed replacement acknowledgement"
 
 set ::adapter::subscriptions [dict create same 8]
 set ::adapter::generations [dict create same 2]
-::adapter::emit {"type":"subscription","subscriptionId":"same","value":{"count":98}} 1 [list same 1]
+::adapter::emit {{"type":"subscription","subscriptionId":"same","value":{"count":98}}} 1 [list same 1]
 assert {[::read $adapterRead] eq ""} "same-ID replacement admitted an old generation"
 
 # A delivery cannot consume the reserved control headroom. The cost includes
@@ -101,6 +115,31 @@ assert {[::adapter::entry_cost x] == 1538} "adapter byte cost omitted newline or
 set adapterError [::read $adapterRead]
 assert {[string first {"name":"ProtocolError"} $adapterError] >= 0} "adapter did not serialize structured subscription ProtocolError"
 
+# Accepted deliveries can consume neither the count slots nor bytes reserved
+# for controller responses. The real stopped-reader process test below the unit
+# layer exercises the same limits against an OS channel and measures RSS.
+set ::adapter::maxEvents 8
+set ::adapter::controlReserveEvents 3
+set ::adapter::maxBytes [expr {1024 * 1024}]
+set ::adapter::pendingOutputHook {expr {1}}
+set ::adapter::queue {}
+set ::adapter::queueBytes 0
+for {set index 0} {$index < 6} {incr index} {
+    ::adapter::emit [format {{"type":"subscription","subscriptionId":"same","value":{"count":%d}}} $index] 1 [list same 2]
+}
+assert {[llength $::adapter::queue] == 5} "delivery events consumed reserved count slots"
+foreach id {unsubscribe replace close} {
+    ::adapter::emit [format {{"id":"%s","type":"ack"}} $id]
+}
+assert {[llength $::adapter::queue] == 8} "accepted deliveries prevented reserved control events"
+foreach id {unsubscribe replace close} {
+    assert {[string first [format {"id":"%s"} $id] $::adapter::queue] >= 0} "reserved control event $id was lost"
+}
+set ::adapter::pendingOutputHook ""
+set ::adapter::queue {}
+set ::adapter::queueBytes 0
+::read $adapterRead
+
 # A value already accepted by Tcl's channel cannot be unsent, so it stays ahead
 # of the terminal response. finish_close writes and observes the closed event
 # before termination rather than merely registering a future writable callback.
@@ -108,7 +147,7 @@ proc adapter_close_exit {status} { set ::adapterCloseStatus $status }
 set acceptedRaw "{\"type\":\"subscription\",\"subscriptionId\":\"same\",\"value\":{\"count\":7}}\n"
 puts -nonewline $adapterWrite $acceptedRaw
 ::flush $adapterWrite
-set closedRaw {"id":"close","type":"closed"}
+set closedRaw {{"id":"close","type":"closed"}}
 set acceptedCost [::adapter::entry_cost [string trimright $acceptedRaw "\n"]]
 set closedCost [::adapter::entry_cost $closedRaw]
 set ::adapter::queue [list [list $acceptedRaw 1 [list same 2] accepted $acceptedCost] [list "$closedRaw\n" 0 "" queued $closedCost]]

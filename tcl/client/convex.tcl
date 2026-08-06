@@ -24,7 +24,7 @@ namespace eval ::convex {
         # http::register supplies the socket command's normal host/port tail.
         # Keeping it intact avoids assuming which optional async arguments the
         # HTTP package prepends, while Tcl TLS still performs CA validation.
-        return [::tls::socket -autoservername 1 {*}$args]
+        return [::tls::socket -autoservername 1 -require 1 -cafile /etc/ssl/certs/ca-certificates.crt {*}$args]
     }
     ::http::register https 443 [list ::convex::tls_socket]
 }
@@ -158,6 +158,10 @@ proc ::convex::elements {jsonArray} {
 
 proc ::convex::decode {raw} { return [::json::json2dict $raw] }
 
+proc ::convex::throw {name message {data null} {logs "\[\]"}} {
+    return -code error -errorcode [list CONVEX $name $data $logs] "$name: $message"
+}
+
 proc ::convex::new {url {clientVersion tcl-0.1.0} {authToken ""}} {
     variable nextClient
     variable clients
@@ -183,21 +187,23 @@ proc ::convex::http_call {id operation path argsRaw} {
     variable maximumResponseBytes
     set client [state $id]
     if {[dict get $client closed]} { error "client is closed" }
-    if {![regexp {^[^:]+:[^:]+$} $path]} { error "Convex function path is required" }
+    if {![regexp {^[^:]+:[^:]+$} $path]} { throw ProtocolError "Convex function path is required" }
     # Parse once to reject malformed or non-object arguments before passing the
     # exact original JSON through to Convex.
-    set parsedArgs [decode $argsRaw]
-    if {[llength $parsedArgs] % 2} { error "Convex arguments must be a JSON object" }
+    if {![regexp {^[ \t\r\n]*\{} $argsRaw]} { throw ProtocolError "Convex arguments must be a JSON object" }
+    if {[catch {set parsedArgs [decode $argsRaw]} problem]} { throw ProtocolError "invalid Convex arguments: $problem" }
+    if {[llength $parsedArgs] % 2} { throw ProtocolError "Convex arguments must be a JSON object" }
     set body [object [list path [quote $path] args $argsRaw format [quote json]]]
     set headers [list Content-Type application/json Accept application/json Convex-Client [dict get $client version]]
     if {[dict get $client auth] ne ""} { lappend headers Authorization "Bearer [dict get $client auth]" }
-    if {[catch {::http::geturl "[dict get $client url]/api/$operation" -method POST -headers $headers -query $body -timeout 10000} token]} {
-        error "TransportError: $token"
+    if {[catch {set token [::http::geturl "[dict get $client url]/api/$operation" -method POST -headers $headers -query $body -timeout 10000]} problem]} {
+        throw TransportError $problem
     }
     try {
         set raw [::http::data $token]
-        if {[string bytelength $raw] > $maximumResponseBytes} { error "TransportError: response exceeds byte limit" }
-        set bodyDict [decode $raw]
+        if {[string bytelength $raw] > $maximumResponseBytes} { throw TransportError "response exceeds byte limit" }
+        if {[catch {set bodyDict [decode $raw]} problem]} { throw ProtocolError "invalid HTTP JSON: $problem" }
+        if {![dict exists $bodyDict status]} { throw ProtocolError "HTTP response omitted status" }
         set status [dict get $bodyDict status]
         if {$status eq "success"} {
             set logsRaw [field $raw logLines 0]
@@ -210,9 +216,9 @@ proc ::convex::http_call {id operation path argsRaw} {
             set logs [field $raw logLines 0]
             if {$data eq ""} { set data null }
             if {$logs eq ""} { set logs "\[\]" }
-            return -code error -errorcode [list CONVEX FunctionError $data $logs] "FunctionError: $message"
+            throw FunctionError $message $data $logs
         }
-        error "ProtocolError: HTTP response had unknown status"
+        throw ProtocolError "HTTP response had unknown status"
     } finally {
         ::http::cleanup $token
     }
@@ -260,13 +266,18 @@ proc ::convex::ws_flush {id} {
     set client [state $id]
     set socket [dict get $client socket]
     if {$socket eq "" || [dict get $client wsOut] eq ""} { return }
-    if {[catch {puts -nonewline $socket [dict get $client wsOut]; flush $socket} error]} {
-        # EAGAIN leaves Tcl's nonblocking channel buffer intact. Other channel
-        # failures retire this exact connection and make reconnect runnable.
-        if {![string match {*would block*} [string tolower $error]]} { retire $id $error }
+    set bytes [dict get $client wsOut]
+    if {[catch {puts -nonewline $socket $bytes} error]} {
+        if {![string match {*would block*} [string tolower $error]]} { retire $id "TransportError: $error" }
         return
     }
+    # Once puts succeeds Tcl owns the complete record, even when flush reports
+    # EAGAIN. Clear the source buffer now so a writable retry cannot duplicate
+    # an already accepted WebSocket frame.
     put $id wsOut ""
+    if {[catch {flush $socket} error] && ![string match {*would block*} [string tolower $error]]} {
+        retire $id "TransportError: $error"
+    }
 }
 
 proc ::convex::ws_frame {opcode payload} {
@@ -470,7 +481,7 @@ proc ::convex::ws_frame_received {id fin opcode payload} {
             put $id wsFragments $payload
             return
         }
-    } else { error "unsupported WebSocket opcode" }
+    } else { error "unsupported WebSocket opcode $opcode" }
     if {$opcode != 1} { error "binary WebSocket data is unsupported" }
     if {[catch {set text [encoding convertfrom utf-8 $payload]} error]} { error "invalid UTF-8 WebSocket text: $error" }
     handle_live_message $id $text
@@ -498,7 +509,7 @@ proc ::convex::subscribe {id path argsRaw callback} {
     if {[dict get $client closed]} { error "client is closed" }
     decode $argsRaw
     set queryId [dict get $client nextQueryId]
-    put $id nextQueryId [expr {$queryId + 1}]
+    dict set client nextQueryId [expr {$queryId + 1}]
     dict set client subscriptions $queryId [dict create path $path args $argsRaw callback $callback active 1 last ""]
     variable clients
     set clients($id) $client
@@ -533,6 +544,10 @@ proc ::convex::debug_disconnect {id} {
     set socket [dict get [state $id] socket]
     if {$socket eq ""} { error "Live WebSocket is not connected" }
     retire $id DebugDisconnect
+    set client [state $id]
+    if {[dict get $client socket] ne "" || [dict get $client reconnectTimer] eq ""} {
+        error "debugDisconnect did not retire the old socket and schedule reconnect"
+    }
 }
 
 proc ::convex::close {id} {

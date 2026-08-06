@@ -48,6 +48,26 @@ proc whole_count {raw operation} {
     return $whole
 }
 
+proc example_update {kind payload logs} {
+    global initialRaw updatedRaw waiting complete liveFailure
+    if {$kind eq "error"} {
+        set message [::convex::decode [::convex::field $payload message]]
+        set liveFailure "Live query failed: $message"
+        # Never throw from the socket callback. Wake whichever vwait owns the
+        # example so the outer try reports the real failure and still cleans up.
+        set waiting failed
+        set complete -1
+        return
+    }
+    if {$waiting eq "initial"} {
+        set initialRaw $payload
+        set waiting mutation
+    } elseif {$waiting eq "updated"} {
+        set updatedRaw $payload
+        set complete 1
+    }
+}
+
 # Tests source this canonical file to exercise the same decoder. A sourced
 # example must define its helpers without contacting a deployment or printing.
 if {[file normalize [info script]] ne [file normalize $::argv0]} { return }
@@ -57,18 +77,7 @@ if {$deployment eq ""} { error "CONVEX_URL is required" }
 set room [expr {$argc ? [lindex $argv 0] : "tcl-example"}]
 set client [::convex::new $deployment]
 set complete 0
-
-proc example_update {kind payload logs} {
-    global initialRaw updatedRaw waiting complete
-    if {$kind eq "error"} { error "Live query failed: $payload" }
-    if {$waiting eq "initial"} {
-        set initialRaw $payload
-        set waiting mutation
-    } elseif {$waiting eq "updated"} {
-        set updatedRaw $payload
-        set complete 1
-    }
-}
+set liveFailure ""
 
 try {
     # Ask Convex once over HTTP before opening Live, to establish the fresh room.
@@ -82,6 +91,7 @@ try {
     set waiting initial
     set subscription [::convex::subscribe $client demo:state [::convex::object [list room [::convex::quote $room]]] [list example_update]]
     vwait waiting
+    if {$liveFailure ne ""} { error $liveFailure }
     set initialCount [whole_count $initialRaw "initial Live value"]
     if {$initialCount != $currentCount} { error "initial Live count disagreed with HTTP" }
     puts "live initial count: $initialCount"
@@ -101,7 +111,8 @@ try {
     puts "mutation count: $mutationCount"
 
     # Wait for the changed value from Live rather than issuing another query.
-    vwait complete
+    if {$complete == 0} { vwait complete }
+    if {$liveFailure ne ""} { error $liveFailure }
     set updatedCount [whole_count $updatedRaw "updated Live value"]
     if {$updatedCount != 1} { error "updated Live count was $updatedCount, expected 1" }
     puts "live updated count: $updatedCount"
@@ -123,7 +134,8 @@ try {
 ./run verify-all tcl
 ```
 
-`test` runs Tcl parsing and focused language-local checks inside Docker.
+`test` runs Tcl parsing, real loopback HTTP and WebSocket fixtures, five forced
+reconnects, and stopped-reader memory and shutdown checks inside Docker.
 `verify-example` executes the canonical source above and compares its stdout
 with the universal transcript. The remaining commands are root-owned shared
 gates for the approved local and hosted deployments.
@@ -148,13 +160,14 @@ protocol is not documented as stable, so hosted verification remains required.
   Int64, bytes, special floats, and negative zero are outside scope.
 - Mutations and actions use HTTP. Optimistic updates, journals, mutation replay,
   and WebSocket writes are deferred.
-- Language-local tests cover parsing, framing, number boundaries, and adapter
-  protocol serialization. Adapter output uses generation ownership at dequeue
-  and immediately before channel acceptance, so an unsubscribe or same-ID
-  replacement cannot let an old queued relay cross its acknowledgement.
-  Accepted bytes remain ordered and budgeted until Tcl drains them. The
-  newest-16 delivery queue reserves 64 KiB for control events and charges each
-  entry's NDJSON newline plus conservative Tcl/channel overhead. Close waits
-  up to two seconds for the terminal response to drain, then fails boundedly.
-  Shared conformance remains the gate for hosted protocol behaviour, five real
-  reconnects, and full Live lifecycle acceptance.
+- Language-local tests cover exact adapter envelopes, five real socket
+  reconnects, structured error recovery, fragmented UTF-8 and control frames,
+  generation barriers, and a real stopped reader with near-maximum values.
+  Adapter output uses generation ownership at dequeue and immediately before
+  channel acceptance, so an unsubscribe or same-ID replacement cannot let an
+  old queued relay cross its acknowledgement. Accepted bytes remain ordered
+  and budgeted until Tcl drains them. The newest-16 queue reserves four event
+  slots and 64 KiB for control events, and charges each NDJSON newline plus
+  conservative Tcl and channel overhead. Close waits up to two seconds for the
+  terminal response to drain, then fails boundedly. Root-owned local and hosted
+  conformance remain the final capability gates.
