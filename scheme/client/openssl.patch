@@ -1,16 +1,16 @@
 --- a/openssl.socket.scm
 +++ b/openssl.socket.scm
 @@ -90,6 +90,7 @@
- 
+
  #include <openssl/err.h>
  #include <openssl/ssl.h>
 +#include <openssl/x509v3.h>
  <#
- 
+
  #>
 @@ -299,5 +300,28 @@
    (void))
- 
+
 +;; OpenSSL verifies the trust chain when SSL_VERIFY_PEER is enabled, but it
 +;; does not compare the certificate identity with the requested server unless
 +;; the caller configures a verification parameter. Treat an IP literal as an
