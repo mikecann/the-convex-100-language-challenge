@@ -134,9 +134,11 @@ try {
 ./run verify-all tcl
 ```
 
-`test` runs Tcl parsing, real loopback HTTP and WebSocket fixtures, five forced
-reconnects, partial-frame deadlines, and real stopped-reader memory,
-backpressure, ordering, and shutdown checks inside Docker.
+`test` runs Tcl parsing, real loopback HTTP, TLS, and WebSocket fixtures, five
+forced reconnects, absolute transport deadlines, and real stopped-reader memory,
+backpressure, ordering, and shutdown checks inside Docker. The TLS fixture
+certificates are generated during that build, so no key material is stored in
+this repository.
 `verify-example` executes the canonical source above and compares its stdout
 with the universal transcript. The remaining commands are root-owned shared
 gates for the approved local and hosted deployments.
@@ -146,12 +148,32 @@ gates for the approved local and hosted deployments.
 The test-only adapter under `client/tests/conformance/` speaks NDJSON protocol
 v1 on stdin/stdout and TCP. It calls the real Tcl client for every operation.
 Its adapter-only `debugDisconnect` command lets the shared harness prove five
-real reconnects.
+real reconnects. Command schemas are strict: a missing or wrongly typed `id`,
+`op`, `path`, `args`, `subscriptionId`, or `token` is a structured
+`ProtocolError` and never reaches a deployment.
 
 HTTP uses Convex's documented `format: "json"` endpoints. Live pins
 `convex-rs-0.10.4-unversioned-sync` at
 `6f1df8a8ba1665084ec001e307ca841ca17074d7` and `/api/sync`. That realtime
 protocol is not documented as stable, so hosted verification remains required.
+
+Responses are classified by what the deployment actually said, not only by the
+status line:
+
+| Response | Result | Why |
+| --- | --- | --- |
+| `200` with `status: "success"` | value and logs | the documented success envelope |
+| `200` with `status: "error"`, or `560` | `FunctionError` | the function ran and failed, so the caller can act on it |
+| `408`, `429`, `5xx` | `TransportError` | this attempt was not answered and may be retried |
+| any other non-`200` | `ProtocolError` | the deployment refused the request and would refuse it again |
+
+Transport limits are enforced while data is arriving rather than afterwards. A
+response is abandoned once its declared or accumulated size passes 2 MiB, a
+WebSocket frame is refused from its header alone, and connect, partial-frame,
+and write deadlines are absolute, so a peer that trickles bytes forever cannot
+extend them. HTTPS and WSS share one TLS policy: the pinned CA bundle, TLS 1.2
+or newer, SNI for a named host, and a peer identity that has to match the host
+being connected to.
 
 ## Limitations
 
@@ -161,11 +183,21 @@ protocol is not documented as stable, so hosted verification remains required.
   Int64, bytes, special floats, and negative zero are outside scope.
 - Mutations and actions use HTTP. Optimistic updates, journals, mutation replay,
   and WebSocket writes are deferred.
-- Language-local tests cover exact adapter envelopes, five real socket
+- TclTLS 1.7.22 verifies the certificate chain but does not check the host name,
+  so this client checks the peer identity itself inside the TLS verify callback
+  and refuses a certificate that names nothing it can compare. Hosted
+  verification is where real Convex certificates are first exercised.
+- A chunked HTTP response is bounded by its current chunk, because Tcl's `http`
+  package reads a complete chunk before it reports progress. Identity-encoded
+  and connection-close responses are bounded to one 64 KiB block of overshoot.
+- Language-local tests cover exact adapter envelopes, strict command schemas,
+  structured `560`, `500`, and `400` responses, streaming response bounds, TLS
+  chain and hostname refusals against real handshakes, five real socket
   reconnects, structured error recovery, fragmented UTF-8 and control frames,
-  partial-frame timeout recovery, strict uint32 Live counters and query IDs,
-  QueryFailed shape and rollback, generation barriers, and a real stopped
-  reader with near-maximum values.
+  absolute connect, partial-frame, and write deadlines, frame limits enforced
+  from the header, strict uint32 Live counters and query IDs, QueryFailed shape
+  and rollback, generation barriers, and a real stopped reader with
+  near-maximum values.
   Adapter output uses generation ownership at dequeue and immediately before
   channel acceptance, so an unsubscribe or same-ID replacement cannot let an
   old queued relay cross its acknowledgement. Accepted bytes remain ordered,

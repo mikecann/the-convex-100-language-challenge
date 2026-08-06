@@ -308,13 +308,24 @@ proc ::adapter::respond_error {message {name Error} {data null} {logs "\[\]"} {i
     emit [::convex::object $fields]
 }
 
-proc ::adapter::required_string {line command fieldName} {
+proc ::adapter::required_string {line command fieldName {maximumLength 128}} {
     set raw [::convex::field $line $fieldName 0]
     if {$raw eq "" || [string index $raw 0] ne "\""} { ::convex::throw ProtocolError "command omitted valid $fieldName" }
     if {[catch {set value [::convex::decode $raw]}]} { ::convex::throw ProtocolError "command omitted valid $fieldName" }
     set length [string length $value]
-    if {$length < 1 || $length > 128} { ::convex::throw ProtocolError "command omitted valid $fieldName" }
+    if {$length < 1 || $length > $maximumLength} { ::convex::throw ProtocolError "command omitted valid $fieldName" }
     return $value
+}
+
+# Arguments are a named JSON object on the wire and stay exactly that. Decoding
+# is only a syntax check here: the original subtree is what reaches Convex.
+proc ::adapter::required_object {line fieldName} {
+    set raw [::convex::field $line $fieldName 0]
+    if {$raw eq "" || ![regexp {^[ \t\r\n]*\{} $raw]} { ::convex::throw ProtocolError "command omitted valid $fieldName" }
+    if {[catch {set decoded [::convex::decode $raw]}] || [llength $decoded] % 2} {
+        ::convex::throw ProtocolError "command omitted valid $fieldName"
+    }
+    return $raw
 }
 
 proc ::adapter::error_details {message options} {
@@ -383,17 +394,34 @@ proc ::adapter::handle {line} {
                 emit [::convex::object [list protocolVersion 1 id [::convex::quote $id] type [::convex::quote ready] language [::convex::quote tcl] implementation [::convex::quote native-tcl-8.6.13] runtime [::convex::quote tcl-8.6.13]]]
             }
             query - mutation - action {
-                set result [::convex::$op [ensure_client] [dict get $command path] [::convex::field $line args]]
+                # Validate the whole command before a client is created, so a
+                # malformed command fails the same way with or without a
+                # deployment URL in the environment.
+                set functionPath [required_string $line $command path 512]
+                set callArgs [required_object $line args]
+                set result [::convex::$op [ensure_client] $functionPath $callArgs]
                 set fields [list id [::convex::quote $id] type [::convex::quote result] value [dict get $result value]]
                 if {[logs_present [dict get $result logs]]} { lappend fields logs [dict get $result logs] }
                 emit [::convex::object $fields]
             }
             setAuth {
-                ::convex::set_auth [ensure_client] [dict get $command token]
+                # An absent, null, or empty token clears authentication. That is
+                # the second half of the controller's bearer-token lifecycle, not
+                # a malformed command.
+                set tokenRaw [::convex::field $line token 0]
+                set token ""
+                if {$tokenRaw ne "" && $tokenRaw ne "null"} {
+                    if {[string index $tokenRaw 0] ne "\"" || [catch {set token [::convex::decode $tokenRaw]}]} {
+                        ::convex::throw ProtocolError "command omitted valid token"
+                    }
+                }
+                ::convex::set_auth [ensure_client] $token
                 emit [::convex::object [list id [::convex::quote $id] type [::convex::quote ack]]]
             }
             subscribe {
                 set subscriptionId [required_string $line $command subscriptionId]
+                set functionPath [required_string $line $command path 512]
+                set subscribeArgs [required_object $line args]
                 if {[dict exists $subscriptions $subscriptionId]} {
                     # Invalidate before replacement can expose its ack. A
                     # queued old relay is discarded; accepted bytes stay ahead
@@ -403,7 +431,7 @@ proc ::adapter::handle {line} {
                 }
                 if {![dict exists $generations $subscriptionId]} { dict set generations $subscriptionId 1 }
                 set generation [dict get $generations $subscriptionId]
-                set queryId [::convex::subscribe [ensure_client] [dict get $command path] [::convex::field $line args] [list ::adapter::subscription_event $subscriptionId $generation]]
+                set queryId [::convex::subscribe [ensure_client] $functionPath $subscribeArgs [list ::adapter::subscription_event $subscriptionId $generation]]
                 dict set subscriptions $subscriptionId $queryId
                 emit [::convex::object [list id [::convex::quote $id] type [::convex::quote ack]]]
             }
