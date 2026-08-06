@@ -1,0 +1,81 @@
+-- The AWS aggregate project also builds SOAP, HTTP/2, demos, and server-only
+-- units. This project intentionally exposes AWS's source directories as
+-- ordinary Ada sources so gprbuild compiles only the dependency closure of
+-- this client and adapter.
+project Convex_Ada_Subset is
+   for Languages use ("Ada");
+   for Source_Dirs use
+     (".",
+      "tests",
+      "tests/conformance",
+      "../examples/basics",
+      "/opt/aws/src/core",
+      "/opt/aws/config",
+      "/opt/aws/config/src",
+      "/opt/aws/config/ssl",
+      "/opt/aws/build/setup/src",
+      "/opt/aws/include",
+      "/opt/aws/ssl",
+      "/opt/aws/templates_parser/src",
+      "/opt/gnatcoll/core/src",
+      "/opt/gnatcoll/core/src/os",
+      "/opt/gnatcoll/core/src/os/unix",
+      "/opt/gnatcoll/minimal/src");
+   for Object_Dir use "obj";
+   for Exec_Dir use "bin";
+   for Main use
+     ("convex_adapter.adb",
+      "convex_example.adb",
+      "convex_tests.adb",
+      "convex_socket_tests.adb");
+
+   package Compiler is
+      for Default_Switches ("Ada") use
+           ("-gnat2022", "-gnatW8", "-O2");
+   end Compiler;
+
+   package Binder is
+      for Default_Switches ("Ada") use ("-Es");
+   end Binder;
+
+   package Naming is
+      for Implementation ("GNATCOLL.OS.Random")
+        use "gnatcoll-os-random__unix.adb";
+      for Implementation ("GNATCOLL.OS.STAT.STAT")
+        use "gnatcoll-os-stat-stat__unix.adb";
+      for Implementation ("GNATCOLL.OS.STAT.FSTAT")
+        use "gnatcoll-os-stat-fstat__unix.adb";
+      for Specification ("GNATCOLL.OS.LIBC_CONSTANTS")
+        use "gnatcoll-os-libc_constants__linux.ads";
+      for Specification ("GNATCOLL.MMAP.SYSTEM")
+        use "gnatcoll-mmap-system__unix.ads";
+      for Implementation ("GNATCOLL.MMAP.SYSTEM")
+        use "gnatcoll-mmap-system__unix.adb";
+      for Implementation ("GNATCOLL.OS.FS.IS_CONSOLE")
+        use "gnatcoll-os-fs-is_console__unix.adb";
+      for Implementation ("GNATCOLL.OS.FS.NULL_FILE")
+        use "gnatcoll-os-fs-null_file__unix.adb";
+      for Implementation ("GNATCOLL.OS.FS.OPEN")
+        use "gnatcoll-os-fs-open__unix.adb";
+      for Implementation ("GNATCOLL.OS.FS.OPEN_PIPE")
+        use "gnatcoll-os-fs-open_pipe__unix.adb";
+      for Implementation ("GNATCOLL.OS.FS.SET_CLOSE_ON_EXEC")
+        use "gnatcoll-os-fs-set_close_on_exec__unix.adb";
+      for Implementation ("AWS.Net.Std")
+        use "aws-net-std__ipv4.adb";
+      for Implementation ("AWS.Net.Poll_Events.Wait")
+        use "aws-net-poll_events-wait__native.adb";
+      for Implementation ("AWS.Net.SSL")
+        use "aws-net-ssl__openssl.adb";
+      for Specification ("SSL.Thin")
+        use "ssl-thin__openssl.ads";
+      for Specification ("AWS.Net.SSL.Certificate.Impl")
+        use "aws-net-ssl-certificate-impl__openssl.ads";
+      for Implementation ("AWS.Net.SSL.Certificate.Impl")
+        use "aws-net-ssl-certificate-impl__openssl.adb";
+      for Specification ("Templates_Parser.Configuration")
+        use "templates_parser-configuration__aws.ads";
+      for Implementation ("Templates_Parser.Input")
+        use "templates_parser-input__aws.adb";
+   end Naming;
+end Convex_Ada_Subset;

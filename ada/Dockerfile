@@ -28,7 +28,7 @@ RUN alr index --add \
        git+https://github.com/alire-project/alire-index#6d5ac6687c1a0f64dd861e80c75405e6c7ec1e62 \
        --name community \
     && alr index --list | grep -Fq '6d5ac6687c1a0f64dd861e80c75405e6c7ec1e62' \
-    && alr toolchain --select gnat_native=15.3.1 gprbuild=25.0.1 \
+    && alr toolchain --select gnat_native=14.2.1 gprbuild=25.0.1 \
     && alr install gnatformat_bin=26.0.0 \
     && /root/.alire/bin/gnatformat --version | grep -Fq 'GNATformat 26.0'
 
@@ -41,18 +41,40 @@ ENV SOCKET=openssl \
 COPY client/alire.toml ./alire.toml
 RUN alr with --solve \
     && alr build --stop-after=post-fetch --release
+RUN aws_gpr="$(find /root/.local/share/alire/builds -type f -name aws.gpr -print \
+      | while IFS= read -r candidate; do \
+          candidate_root="$(dirname "$candidate")"; \
+          if test -d "$candidate_root/src"; then printf '%s\n' "$candidate"; break; fi; \
+        done)" \
+    && aws_root="$(dirname "$aws_gpr")" \
+    && ln -s "$aws_root" /opt/aws \
+    && test -d /opt/aws/src \
+    && gnatcoll_gpr="$(find /root/.local/share/alire/builds -type f -name gnatcoll.gpr -print \
+      | while IFS= read -r candidate; do \
+          candidate_root="$(dirname "$candidate")"; \
+          if test -d "$candidate_root/core/src"; then printf '%s\n' "$candidate"; break; fi; \
+        done)" \
+    && ln -s "$(dirname "$gnatcoll_gpr")" /opt/gnatcoll \
+    && test -d /opt/gnatcoll/core/src
 COPY client/convex_ada.gpr ./convex_ada.gpr
+COPY client/convex_ada_subset.gpr ./convex_ada_subset.gpr
 COPY client/*.ads client/*.adb ./
 COPY client/tests ./tests
 COPY examples /project/examples
 RUN /root/.alire/bin/gnatformat --no-project --check --charset utf-8 \
       convex.ads convex.adb convex-live.ads convex-live.adb \
-      convex_websocket.ads convex_websocket.adb \
+      convex_websocket.ads convex_websocket.adb convex_url.ads convex_url.adb \
       tests/conformance/*.ads tests/conformance/*.adb tests/*.adb \
       /project/examples/basics/*.adb
-RUN alr exec -- gprbuild -P convex_ada.gpr -u \
+
+# AWS 25.2 contains a large Ada dependency graph. Keep this language-local
+# build deterministic and below the remote runner's 10 GiB VM limit. The
+# dependency build also avoids optimizer memory spikes in GNAT 14; the final
+# runtime is still built from these complete native objects.
+RUN alr exec -- gprbuild -j1 -XGNATCOLL_BUILD_MODE=DEBUG -P convex_ada_subset.gpr \
       convex.adb convex-live.adb convex_websocket.adb \
-    && alr exec -- gprbuild -P convex_ada.gpr
+      -cargs:Ada -O0 -fno-inline \
+    && alr exec -- gprbuild -j1 -XGNATCOLL_BUILD_MODE=DEBUG -P convex_ada_subset.gpr -cargs:Ada -O0 -fno-inline
 RUN ./bin/convex_tests \
     && if test -x ./bin/convex_socket_tests; then ./bin/convex_socket_tests; fi \
     && printf '%s\n' \
@@ -74,8 +96,8 @@ RUN set -eu; \
       | sort -u \
       | while IFS= read -r library; do cp -L "$library" "/out/lib/$(basename "$library")"; done; \
     chmod 0555 /out/convex-adapter /out/convex-example; \
-    test -f /out/lib/libgnat-15.so; \
-    test -f /out/lib/libgnarl-15.so; \
+    test -f /out/lib/libgnat-14.so; \
+    test -f /out/lib/libgnarl-14.so; \
     test -f /out/lib/ld-linux-x86-64.so.2
 CMD ["/bin/sh", "-c", "true"]
 

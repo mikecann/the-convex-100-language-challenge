@@ -10,7 +10,7 @@ implementation:
   notes: Native Ada implementation using pinned AWS/OpenSSL for HTTP and TLS, plus an Ada RFC 6455 and Convex sync-profile implementation. Badges remain unearned until root-owned conformance succeeds.
 toolchain:
   name: GNAT
-  version: 15.3.1
+  version: 14.2.1
 syncProfile:
   id: convex-rs-0.10.4-unversioned-sync
   sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
@@ -26,6 +26,7 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
+  - The remote linux/amd64 Docker test is currently blocked before linking by repeatable GNAT internal compiler segmentation faults in the AWS/GNATCOLL dependency closure under the approved arm64 Colima runner; no capability badge is awarded from source compilation alone.
   - Live authentication, optimistic updates, WebSocket mutations, WebSocket actions, and TransitionChunk assembly are deferred.
   - The educational client supports Convex's JSON-safe value subset; tagged Convex value conversions are deferred.
   - Active Live subscriptions are bounded to 64 and 8 MiB of conservatively charged paths and arguments. One manager-wide queue retains the newest 16 deliveries within a conservative 20 MiB encoded and runtime-overhead budget, including an in-flight adapter write.

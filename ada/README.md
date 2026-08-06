@@ -276,7 +276,7 @@ end Convex_Example;
 ./run build ada
 ```
 
-The `test` target checks GNATformat, builds every source with GNAT 15.3.1 for real `linux/amd64`, runs focused unit tests and deterministic loopback HTTP/WebSocket tests, and exercises the real NDJSON adapter lifecycle. The build target creates the non-root adapter image. Root owns `verify-example`, `verify`, and `verify-hosted` because those commands serialize the shared backend and evidence store.
+The `test` target checks GNATformat, builds every source with GNAT 14.2.1 for real `linux/amd64`, runs focused unit tests and deterministic loopback HTTP/WebSocket tests, and exercises the real NDJSON adapter lifecycle. The build target creates the non-root adapter image. Root owns `verify-example`, `verify`, and `verify-hosted` because those commands serialize the shared backend and evidence store.
 
 ## Protocol and runtime notes
 
@@ -286,9 +286,11 @@ One Ada task exclusively owns the Live socket, reconnect metadata, and query-set
 
 At most 64 subscriptions and 8 MiB of conservatively charged paths and arguments are active. One manager-wide queue keeps the newest 16 deliveries and drops the globally oldest intermediate state first. It conservatively charges encoded value, log, error, and envelope bytes plus runtime overhead against 20 MiB, including the adapter event currently blocked in output. The adapter has one publisher for stdin/stdout or one `ADAPTER_LISTEN` TCP controller, bounds each UTF-8 NDJSON command to 2 MiB, and exposes `debugDisconnect` only for conformance.
 
-Alire 2.1.0 pins GNAT 15.3.1, GPRbuild 25.0.1, AWS 25.2.0, GNATCOLL 25.0.0, libgpr 25.0.0, and XMLAda 25.0.0 inside Docker. AWS is explicitly built with its OpenSSL socket backend. The final digest-pinned Debian images contain only the native executable closure, CA/OpenSSL data, `/bin/sh`, and individual POSIX text tools. They run as `65532:65532` with a read-only filesystem, dropped capabilities, no new privileges, and the shared 128 MiB limit. Compilers, Alire, apt/dpkg, network helpers, delegated runtimes, service residue, and multicall binaries are absent.
+Alire 2.1.0 pins GNAT 14.2.1, GPRbuild 25.0.1, AWS 25.2.0, GNATCOLL 25.0.0, libgpr 25.0.0, and XMLAda 25.0.0 inside Docker. AWS is explicitly built with its OpenSSL socket backend, while the client uses its native AWS.Net socket API and a small checked-in URL parser. The final digest-pinned Debian images contain only the native executable closure, CA/OpenSSL data, `/bin/sh`, and individual POSIX text tools. They run as `65532:65532` with a read-only filesystem, dropped capabilities, no new privileges, and the shared 128 MiB limit. Compilers, Alire, apt/dpkg, network helpers, delegated runtimes, service residue, and multicall binaries are absent.
 
 ## Limitations
+
+The native transport repair is present, but the assigned remote `linux/amd64` Docker gate is currently blocked before linking by repeatable GNAT internal compiler segmentation faults in the AWS/GNATCOLL dependency closure under the approved arm64 Colima runner. The implementation therefore earns no capability badge from this branch until a root-owned build and conformance run completes.
 
 Live authentication, optimistic updates, mutations and actions over the WebSocket, journals, and `TransitionChunk` assembly are deferred. Receiving an unsupported or malformed Live shape produces a structured protocol event, retires that socket, and reconnects active subscriptions. Values cover Convex's JSON-safe subset; tagged Convex value conversions are not implemented. Capability badges stay empty until the root-owned local and hosted evaluators pass from a clean reviewed commit.
 

@@ -7,7 +7,7 @@ executables = ["convex_adapter", "convex_example", "convex_tests", "convex_socke
 
 [[depends-on]]
 aws = "=25.2.0"
-gnat = "=15.3.1"
+gnat = "=14.2.1"
 gnatcoll = "=25.0.0"
 libgpr = "=25.0.0"
 xmlada = "=25.0.0"

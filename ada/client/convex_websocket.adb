@@ -6,8 +6,8 @@ with Ada.Strings.Fixed;
 with GNAT.SHA1;
 with GNATCOLL.Random;
 with Interfaces.C;
+with Convex_URL;
 with AWS.Net.SSL;
-with AWS.URL;
 
 package body Convex_WebSocket is
    use Ada.Streams;
@@ -453,11 +453,12 @@ package body Convex_WebSocket is
    end Header_Has_Token;
 
    procedure Open (Socket : in out Connection; Deployment_URL : String) is
-      Parsed    : constant AWS.URL.Object := AWS.URL.Parse (Deployment_URL);
-      Host      : constant String := AWS.URL.Host (Parsed);
-      Port      : constant Positive := AWS.URL.Port (Parsed);
-      Secure    : constant Boolean := AWS.URL.Security (Parsed);
-      Base_Path : constant String := AWS.URL.Pathname_And_Parameters (Parsed);
+      Parsed    : constant Convex_URL.Object :=
+        Convex_URL.Parse (Deployment_URL);
+      Host      : constant String := Convex_URL.Host (Parsed);
+      Port      : constant Positive := Convex_URL.Port (Parsed);
+      Secure    : constant Boolean := Convex_URL.Secure (Parsed);
+      Base_Path : constant String := Convex_URL.Path (Parsed);
       Path      : constant String :=
         (if Base_Path = "/"
          then "/api/sync"
@@ -498,8 +499,8 @@ package body Convex_WebSocket is
            & ASCII.CR
            & ASCII.LF
            & "Host: "
-           & Host
-           & AWS.URL.Port_Not_Default (Parsed)
+           & Convex_URL.Host_Header (Parsed)
+           & Convex_URL.Port_Suffix (Parsed)
            & ASCII.CR
            & ASCII.LF
            & "Upgrade: websocket"

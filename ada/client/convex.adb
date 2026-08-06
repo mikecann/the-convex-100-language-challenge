@@ -1,14 +1,15 @@
 with Ada.Exceptions;
 with Ada.Streams;
 with Ada.Strings.Fixed;
-with AWS.Client;
+with Ada.Characters.Handling;
+with Convex_URL;
+with AWS.Net;
 with AWS.Net.SSL;
-with AWS.Response;
-with AWS.URL;
 
 package body Convex is
    use type JSON.JSON_Value_Type;
    use type Ada.Streams.Stream_Element_Offset;
+   use type AWS.Net.Socket_Access;
 
    Max_Response_Bytes : constant := 2 * 1024 * 1024;
    Max_JSON_Nodes     : constant := 65_536;
@@ -67,47 +68,243 @@ package body Convex is
    procedure Post_Bounded
      (URL     : String;
       Data    : String;
-      Headers : AWS.Client.Header_List;
+      Auth    : String;
       Payload : out US.Unbounded_String)
    is
-      Connection : AWS.Client.HTTP_Connection;
-      Response   : AWS.Response.Data;
-      Buffer     : Ada.Streams.Stream_Element_Array (1 .. 16 * 1024);
-      Last       : Ada.Streams.Stream_Element_Offset;
+      Parsed      : Convex_URL.Object;
+      Port        : Positive;
+      Secure      : Boolean;
+      Path        : US.Unbounded_String;
+      Socket      : AWS.Net.Socket_Access := null;
+      Raw         : US.Unbounded_String;
+      Body_Start  : Natural := 0;
+      Body_Length : Natural := 0;
+      Has_Length  : Boolean := False;
+      Header_Done : Boolean := False;
+
+      procedure Send_Text (Text : String) is
+         Buffer : Ada.Streams.Stream_Element_Array (1 .. 16 * 1024);
+         Sent   : Natural := 0;
+      begin
+         while Sent < Text'Length loop
+            declare
+               Count : constant Natural :=
+                 Natural'Min (Buffer'Length, Text'Length - Sent);
+            begin
+               for I in 0 .. Count - 1 loop
+                  Buffer
+                    (Buffer'First + Ada.Streams.Stream_Element_Offset (I)) :=
+                    Ada.Streams.Stream_Element
+                      (Character'Pos (Text (Text'First + Sent + I)));
+               end loop;
+               AWS.Net.Send
+                 (Socket.all,
+                  Buffer
+                    (Buffer'First
+                     .. Buffer'First
+                        + Ada.Streams.Stream_Element_Offset (Count)
+                        - 1));
+               Sent := Sent + Count;
+            end;
+         end loop;
+      end Send_Text;
+
+      function Header_Value (Headers, Name : String) return String is
+         Lower_Headers : constant String :=
+           Ada.Characters.Handling.To_Lower (Headers);
+         Needle        : constant String :=
+           Ada.Characters.Handling.To_Lower (Name) & ":";
+         First         : Natural := Headers'First;
+      begin
+         loop
+            declare
+               Stop : constant Natural :=
+                 Ada.Strings.Fixed.Index (Headers, ASCII.CR & ASCII.LF, First);
+               Last : constant Natural :=
+                 (if Stop = 0 then Headers'Last else Stop - 1);
+               Line : constant String := Lower_Headers (First .. Last);
+            begin
+               if Line'Length >= Needle'Length
+                 and then Line (Line'First .. Line'First + Needle'Length - 1)
+                          = Needle
+               then
+                  declare
+                     Value_First : Natural := First + Needle'Length;
+                  begin
+                     while Value_First <= Last
+                       and then Headers (Value_First) in ' ' | ASCII.HT
+                     loop
+                        Value_First := Value_First + 1;
+                     end loop;
+                     return Headers (Value_First .. Last);
+                  end;
+               end if;
+               exit when Stop = 0;
+               First := Stop + 2;
+            end;
+         end loop;
+         return "";
+      end Header_Value;
+
+      procedure Close_Socket is
+      begin
+         if Socket /= null then
+            begin
+               Socket.all.Shutdown;
+            exception
+               when others =>
+                  null;
+            end;
+            AWS.Net.Free (Socket);
+         end if;
+      end Close_Socket;
    begin
+      Convex_URL.Parse (URL, Parsed);
+      Port := Convex_URL.Port (Parsed);
+      Secure := Convex_URL.Secure (Parsed);
+      Path := US.To_Unbounded_String (Convex_URL.Path (Parsed));
       Payload := US.Null_Unbounded_String;
-      AWS.Client.Create
-        (Connection,
-         Host        => URL,
-         Retry       => 0,
-         Persistent  => False,
-         Timeouts    => AWS.Client.Timeouts (Each => 5.0),
-         Server_Push => True,
-         User_Agent  => "convex-ada/0.1.0");
-      AWS.Client.Post
-        (Connection,
-         Response,
-         Data,
-         Content_Type => "application/json",
-         Headers      => Headers);
+      Socket := AWS.Net.Socket (Security => Secure);
+      AWS.Net.Set_Timeout (Socket.all, 5.0);
+      Socket.all.Connect (Convex_URL.Host (Parsed), Port);
+      Send_Text
+        ("POST "
+         & US.To_String (Path)
+         & " HTTP/1.1"
+         & ASCII.CR
+         & ASCII.LF
+         & "Host: "
+         & Convex_URL.Host_Header (Parsed)
+         & Convex_URL.Port_Suffix (Parsed)
+         & ASCII.CR
+         & ASCII.LF
+         & "Accept: application/json"
+         & ASCII.CR
+         & ASCII.LF
+         & "Content-Type: application/json"
+         & ASCII.CR
+         & ASCII.LF
+         & "Content-Length: "
+         & Natural'Image (Data'Length)
+         & ASCII.CR
+         & ASCII.LF
+         & "Connection: close"
+         & ASCII.CR
+         & ASCII.LF
+         & "Convex-Client: ada-0.1.0"
+         & ASCII.CR
+         & ASCII.LF
+         & (if Auth'Length > 0
+            then "Authorization: Bearer " & Auth & ASCII.CR & ASCII.LF
+            else "")
+         & ASCII.CR
+         & ASCII.LF
+         & Data);
       loop
-         AWS.Client.Read_Some (Connection, Buffer, Last);
-         exit when Last < Buffer'First;
          declare
-            Length : constant Natural := Natural (Last - Buffer'First + 1);
+            Events : AWS.Net.Event_Set := [others => False];
+            Buffer : Ada.Streams.Stream_Element_Array (1 .. 16 * 1024);
+            Last   : Ada.Streams.Stream_Element_Offset;
          begin
-            if US.Length (Payload) + Length > Max_Response_Bytes then
-               raise Response_Too_Large with "response exceeds 2 MiB";
+            Events :=
+              AWS.Net.Poll
+                (Socket.all,
+                 [AWS.Net.Input => True, AWS.Net.Output => False],
+                 5.0);
+            if not Events (AWS.Net.Input) then
+               raise AWS.Net.Socket_Error with "HTTP response timed out";
             end if;
-            for I in Buffer'First .. Last loop
-               US.Append (Payload, Character'Val (Buffer (I)));
-            end loop;
+            Socket.all.Receive (Buffer, Last);
+            exit when Last < Buffer'First;
+            declare
+               Length : constant Natural := Natural (Last - Buffer'First + 1);
+            begin
+               if US.Length (Raw) + Length > Max_Response_Bytes + 64 * 1024
+               then
+                  raise Response_Too_Large
+                    with "response exceeds bounded headers and 2 MiB body";
+               end if;
+               for I in Buffer'First .. Last loop
+                  US.Append (Raw, Character'Val (Buffer (I)));
+               end loop;
+            end;
+         end;
+         declare
+            Text   : constant String := US.To_String (Raw);
+            End_At : constant Natural :=
+              Ada.Strings.Fixed.Index
+                (Text, ASCII.CR & ASCII.LF & ASCII.CR & ASCII.LF);
+         begin
+            if End_At > 0 and then not Header_Done then
+               if End_At > 64 * 1024 then
+                  raise Response_Too_Large
+                    with "HTTP response headers exceed 64 KiB";
+               end if;
+               declare
+                  Headers     : constant String :=
+                    Text (Text'First .. End_At + 1);
+                  Status_End  : constant Natural :=
+                    Ada.Strings.Fixed.Index (Headers, ASCII.CR & ASCII.LF);
+                  Status_Line : constant String :=
+                    Headers (Headers'First .. Status_End - 1);
+                  Length_Text : constant String :=
+                    Ada.Strings.Fixed.Trim
+                      (Header_Value (Headers, "Content-Length"),
+                       Ada.Strings.Both);
+               begin
+                  if Status_Line'Length < 10
+                    or else Status_Line
+                              (Status_Line'First .. Status_Line'First + 8)
+                            /= "HTTP/1.1 "
+                    or else Status_Line (Status_Line'First + 9) not in '2'
+                  then
+                     raise AWS.Net.Socket_Error
+                       with "HTTP response status was not successful";
+                  end if;
+                  if Length_Text'Length > 0 then
+                     Body_Length := Natural'Value (Length_Text);
+                     if Body_Length > Max_Response_Bytes then
+                        raise Response_Too_Large
+                          with "HTTP response body exceeds 2 MiB";
+                     end if;
+                     Has_Length := True;
+                  end if;
+                  Body_Start := End_At + 4;
+                  Header_Done := True;
+               end;
+            end if;
+            exit when
+              Header_Done
+              and then Has_Length
+              and then Text'Length - Body_Start + 1 >= Body_Length;
          end;
       end loop;
-      AWS.Client.Close (Connection);
+      declare
+         Text : constant String := US.To_String (Raw);
+      begin
+         if not Header_Done then
+            raise AWS.Net.Socket_Error with "HTTP response omitted headers";
+         end if;
+         if Has_Length and then Text'Length - Body_Start + 1 < Body_Length then
+            raise AWS.Net.Socket_Error
+              with "HTTP response ended before Content-Length";
+         end if;
+         declare
+            Body_Last : constant Natural :=
+              (if Has_Length then Body_Start + Body_Length - 1 else Text'Last);
+         begin
+            if Body_Length = 0 then
+               Payload := US.Null_Unbounded_String;
+            elsif Body_Start <= Body_Last then
+               Payload :=
+                 US.To_Unbounded_String (Text (Body_Start .. Body_Last));
+            end if;
+         end;
+      end;
+      Close_Socket;
    exception
       when others =>
-         AWS.Client.Close (Connection);
+         Close_Socket;
          raise;
    end Post_Bounded;
 
@@ -170,7 +367,6 @@ package body Convex is
       Path      : String;
       Args      : JSON.JSON_Value) return Call_Result
    is
-      Headers  : AWS.Client.Header_List;
       Envelope : constant JSON.JSON_Value := JSON.Create_Object;
    begin
       if not C.Opened then
@@ -186,11 +382,6 @@ package body Convex is
       Envelope.Set_Field ("path", Path);
       Envelope.Set_Field ("args", Args);
       Envelope.Set_Field ("format", "json");
-      Headers.Add ("Accept", "application/json");
-      Headers.Add ("Convex-Client", "ada-0.1.0");
-      if US.Length (C.Auth) > 0 then
-         Headers.Add ("Authorization", "Bearer " & US.To_String (C.Auth));
-      end if;
 
       declare
          Payload : US.Unbounded_String;
@@ -198,7 +389,7 @@ package body Convex is
          Post_Bounded
            (US.To_String (C.URL) & "/api/" & Operation,
             JSON.Write (Envelope),
-            Headers,
+            (if US.Length (C.Auth) > 0 then US.To_String (C.Auth) else ""),
             Payload);
          declare
             Payload_Text : constant String := US.To_String (Payload);
@@ -311,12 +502,9 @@ package body Convex is
       C.URL :=
         US.To_Unbounded_String (Deployment_URL (Deployment_URL'First .. Last));
       declare
-         Parsed : constant AWS.URL.Object :=
-           AWS.URL.Parse (US.To_String (C.URL));
+         Parsed : Convex_URL.Object;
       begin
-         if AWS.URL.Host (Parsed)'Length = 0 then
-            raise Constraint_Error with "deployment URL must include a host";
-         end if;
+         Convex_URL.Parse (US.To_String (C.URL), Parsed);
       end;
       C.Auth := US.Null_Unbounded_String;
       C.Opened := True;
