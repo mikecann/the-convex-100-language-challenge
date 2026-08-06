@@ -260,7 +260,7 @@ adapter_live_output_reader = @async begin
     end
 end
 adapter_live_task = @async
-    Adapter.run_adapter(adapter_live_input.out, adapter_live_output_pipe.in)
+Adapter.run_adapter(adapter_live_input.out, adapter_live_output_pipe.in)
 try
     write(
         adapter_live_input.in,
