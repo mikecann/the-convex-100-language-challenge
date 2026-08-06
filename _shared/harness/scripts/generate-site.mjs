@@ -74,7 +74,6 @@ const syntaxAliases = {
   "assembly-x86-64": "asm",
   "delphi-object-pascal": "pascal",
   fortran: "fortran-free-form",
-  "objective-c": "objective-c",
   "visual-basic-dotnet": "vb",
   "wolfram-language": "wolfram",
 };
@@ -82,7 +81,6 @@ const syntaxAliases = {
 const extensionAliases = {
   clj: "clojure",
   cs: "csharp",
-  dart: "dart",
   erl: "erlang",
   fs: "fsharp",
   fsx: "fsharp",
@@ -91,17 +89,14 @@ const extensionAliases = {
   hs: "haskell",
   hpp: "cpp",
   kts: "kotlin",
-  lua: "lua",
   m: "objective-c",
   ml: "ocaml",
   mli: "ocaml",
   pl: "perl",
   ps1: "powershell",
   py: "python",
-  r: "r",
   rb: "ruby",
   rs: "rust",
-  scala: "scala",
   sh: "bash",
   ts: "typescript",
 };

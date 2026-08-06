@@ -41,17 +41,19 @@ await checkDirtyExit();
 
 // These are the ambiguous or easily mistyped additions. Keep the unit check
 // pure so `./run validate` can retain its read-only filesystem contract.
-assert.equal(fenceLanguageFor("main.asm"), "nasm");
-assert.equal(fenceLanguageFor("main.bas"), "freebasic");
-assert.equal(fenceLanguageFor("main.c"), "c");
-assert.equal(fenceLanguageFor("main.groovy"), "groovy");
-assert.equal(fenceLanguageFor("main.jl"), "julia");
-assert.equal(fenceLanguageFor("main.m"), "objective-c");
-assert.equal(fenceLanguageFor("main.mbt"), "moonbit");
-assert.equal(fenceLanguageFor("main.res"), "rescript");
-assert.equal(fenceLanguageFor("main.v"), "v");
-assert.equal(fenceLanguageFor("main.vb"), "vbnet");
-assert.equal(fenceLanguageFor("main.zig"), "zig");
+assert.equal(fenceLanguageFor("assembly-x86-64", "main.asm"), "nasm");
+assert.equal(fenceLanguageFor("freebasic", "main.bas"), "freebasic");
+assert.equal(fenceLanguageFor("c", "main.c"), "c");
+assert.equal(fenceLanguageFor("groovy", "main.groovy"), "groovy");
+assert.equal(fenceLanguageFor("julia", "main.jl"), "julia");
+assert.equal(fenceLanguageFor("objective-c", "main.m"), "objective-c");
+assert.equal(fenceLanguageFor("matlab", "main.m"), "matlab");
+assert.equal(fenceLanguageFor("wolfram-language", "main.m"), "mathematica");
+assert.equal(fenceLanguageFor("moonbit", "main.mbt"), "moonbit");
+assert.equal(fenceLanguageFor("rescript", "main.res"), "rescript");
+assert.equal(fenceLanguageFor("v", "main.v"), "v");
+assert.equal(fenceLanguageFor("visual-basic-dotnet", "main.vb"), "vbnet");
+assert.equal(fenceLanguageFor("zig", "main.zig"), "zig");
 
 // A synthetic second language catches accidental Go-specific names in the
 // capability evaluator before real language work starts.

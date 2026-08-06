@@ -89,7 +89,19 @@ const fenceLanguages = {
   ".zig": "zig",
 };
 
-export function fenceLanguageFor(sourcePath) {
+// Some ecosystems intentionally share an extension. Resolve the roster
+// language first so a MATLAB .m file is never presented as Objective-C, while
+// retaining the simple extension table for unambiguous examples.
+const languageFenceOverrides = {
+  matlab: "matlab",
+  "objective-c": "objective-c",
+  "wolfram-language": "mathematica",
+};
+
+export function fenceLanguageFor(languageId, sourcePath) {
+  if (languageId in languageFenceOverrides) {
+    return languageFenceOverrides[languageId];
+  }
   return fenceLanguages[path.extname(sourcePath).toLowerCase()] ?? "text";
 }
 
@@ -103,7 +115,7 @@ function renderExampleBlock(languageDirectory, relativeSource) {
   }
 
   const source = fs.readFileSync(sourcePath, "utf8").trimEnd();
-  const fence = fenceLanguageFor(sourcePath);
+  const fence = fenceLanguageFor(path.basename(languageDirectory), sourcePath);
   return `${beginPrefix}${relativeSource} -->\n\`\`\`${fence}\n${source}\n\`\`\`\n${endMarker}`;
 }
 
