@@ -33,6 +33,12 @@ namespace eval ::adapter {
     # Test-only pending override. It gives the unit test a deterministic
     # stopped-reader channel without depending on an OS socket buffer size.
     variable pendingOutputHook ""
+    # Tests observe these counters while using real nonblocking channels. They
+    # never alter channel readiness or queue ownership.
+    variable acceptedWriteCount 0
+    variable acceptedBackpressureCount 0
+    variable observeBackpressure 0
+    variable lastBackpressuredRaw ""
     # Test-only deterministic barrier. A test invalidates a relay after it has
     # been dequeued but before Tcl accepts it into the output channel.
     variable pauseAfterDequeue ""
@@ -171,6 +177,23 @@ proc ::adapter::flush {} {
         after cancel $flushTimer
         set flushTimer ""
     }
+    # Tcl owns every accepted record until the channel reports no pending output.
+    # Do not append another record behind that prefix, even a control response.
+    # Controls remain admitted to the reserved queue and are written in order as
+    # soon as the accepted bytes drain.
+    set accepted 0
+    foreach item $queue {
+        if {[lindex $item 3] eq "accepted"} { set accepted 1; break }
+    }
+    if {$accepted} {
+        if {[catch {set pending [output_pending]} error]} { exit 1 }
+        if {$pending > 0} {
+            fileevent $output writable {}
+            schedule_flush
+            return
+        }
+        release_accepted
+    }
     set position 0
     while {$position < [llength $queue]} {
         lassign [lindex $queue $position] raw droppable tag state cost
@@ -198,7 +221,8 @@ proc ::adapter::flush {} {
         if {$droppable && $position > 0} { break }
         if {[catch {puts -nonewline $output $raw} error]} {
             if {[string match {*would block*} [string tolower $error]]} {
-                fileevent $output writable ::adapter::flush
+                fileevent $output writable {}
+                schedule_flush
                 return
             }
             exit 1
@@ -207,19 +231,35 @@ proc ::adapter::flush {} {
         # ownership before flush, because EAGAIN there must never cause a retry
         # to append the same NDJSON event twice.
         lset queue $position 3 accepted
-        incr position
+        variable acceptedWriteCount
+        variable acceptedBackpressureCount
+        variable observeBackpressure
+        variable lastBackpressuredRaw
+        incr acceptedWriteCount
         if {[catch {::flush $output} error]} {
             if {[string match {*would block*} [string tolower $error]]} {
                 # Tcl already owns this record. A writable fileevent can fire
                 # continuously while channel bytes remain pending and starve
                 # controller and WebSocket reads, so recheck with one bounded
                 # timer instead.
+                incr acceptedBackpressureCount
+                if {$observeBackpressure} { set lastBackpressuredRaw $raw }
                 fileevent $output writable {}
                 schedule_flush
                 return
             }
             exit 1
         }
+        if {[catch {set pending [output_pending]} error]} { exit 1 }
+        if {$pending > 0} {
+            incr acceptedBackpressureCount
+            if {$observeBackpressure} { set lastBackpressuredRaw $raw }
+            fileevent $output writable {}
+            schedule_flush
+            return
+        }
+        release_accepted
+        set position 0
     }
     if {![llength $queue]} { fileevent $output writable {}; return }
     if {[catch {set pending [output_pending]} error]} { exit 1 }

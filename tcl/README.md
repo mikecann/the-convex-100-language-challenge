@@ -135,7 +135,8 @@ try {
 ```
 
 `test` runs Tcl parsing, real loopback HTTP and WebSocket fixtures, five forced
-reconnects, and stopped-reader memory and shutdown checks inside Docker.
+reconnects, partial-frame deadlines, and real stopped-reader memory,
+backpressure, ordering, and shutdown checks inside Docker.
 `verify-example` executes the canonical source above and compares its stdout
 with the universal transcript. The remaining commands are root-owned shared
 gates for the approved local and hosted deployments.
@@ -162,12 +163,15 @@ protocol is not documented as stable, so hosted verification remains required.
   and WebSocket writes are deferred.
 - Language-local tests cover exact adapter envelopes, five real socket
   reconnects, structured error recovery, fragmented UTF-8 and control frames,
-  generation barriers, and a real stopped reader with near-maximum values.
+  partial-frame timeout recovery, generation barriers, and a real stopped
+  reader with near-maximum values.
   Adapter output uses generation ownership at dequeue and immediately before
   channel acceptance, so an unsubscribe or same-ID replacement cannot let an
-  old queued relay cross its acknowledgement. Accepted bytes remain ordered
-  and budgeted until Tcl drains them. The newest-16 queue reserves four event
-  slots and 64 KiB for control events, and charges each NDJSON newline plus
-  conservative Tcl and channel overhead. Close waits up to two seconds for the
-  terminal response to drain, then fails boundedly. Root-owned local and hosted
-  conformance remain the final capability gates.
+  old queued relay cross its acknowledgement. Accepted bytes remain ordered,
+  nonduplicated, and budgeted until Tcl drains them. A bounded timer retries
+  genuine channel backpressure without starving controller or Live reads. The
+  newest-16 queue reserves four event slots and 64 KiB for control events, and
+  charges each NDJSON newline plus conservative Tcl and channel overhead. Close
+  waits up to two seconds for the terminal response to drain, then fails
+  boundedly. Root-owned local and hosted conformance remain the final capability
+  gates.

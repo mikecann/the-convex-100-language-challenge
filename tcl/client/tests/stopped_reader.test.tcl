@@ -186,3 +186,87 @@ if {$closeFailed} {
 }
 ::livefixture::stop
 puts "Tcl real stopped-reader test passed: RSS ${rss} KiB, close ${elapsed} ms, deliveryFailure=$closeFailed"
+
+# Exercise the adapter queue in this process against a genuine nonblocking OS
+# pipe. The read end stays open but unread until Tcl accepts a complete NDJSON
+# record and reports pending output. No pending hook or hand-built queue state is
+# involved in this proof.
+set ::env(ADAPTER_TEST_ONLY) 1
+source $adapter
+unset ::env(ADAPTER_TEST_ONLY)
+lassign [chan pipe] eagainRead eagainWrite
+fconfigure $eagainRead -blocking 0 -buffering none -translation binary -encoding utf-8
+fconfigure $eagainWrite -blocking 0 -buffering none -translation binary -encoding utf-8
+set ::adapter::output $eagainWrite
+set ::adapter::queue {}
+set ::adapter::queueBytes 0
+set ::adapter::subscriptions [dict create same 1]
+set ::adapter::generations [dict create same 1]
+set ::adapter::acceptedWriteCount 0
+set ::adapter::acceptedBackpressureCount 0
+set ::adapter::observeBackpressure 1
+set ::adapter::lastBackpressuredRaw ""
+set eagainBlob [string repeat z [expr {64 * 1024}]]
+for {set index 0} {$index < 12 && $::adapter::acceptedBackpressureCount == 0} {incr index} {
+    set raw [::convex::object [list type [::convex::quote subscription] subscriptionId [::convex::quote same] value [::convex::object [list sequence $index blob [::convex::quote $eagainBlob]]]]]
+    ::adapter::emit $raw 1 [list same 1]
+}
+assert {$::adapter::acceptedWriteCount > 0} "real pipe accepted no adapter record"
+assert {$::adapter::acceptedBackpressureCount > 0} "real pipe did not expose accepted output backpressure"
+set acceptedLine [string trimright $::adapter::lastBackpressuredRaw "\n"]
+set markerLine {{"id":"accepted-marker","type":"ack"}}
+set tailLine {{"type":"subscription","subscriptionId":"same","value":{"tail":true}}}
+::adapter::emit $markerLine
+::adapter::emit $tailLine 1 [list same 1]
+
+set ::eagainBuffer ""
+set ::eagainLines {}
+proc eagain_readable {} {
+    append ::eagainBuffer [read $::eagainRead]
+    while {[set newline [string first "\n" $::eagainBuffer]] >= 0} {
+        lappend ::eagainLines [string range $::eagainBuffer 0 [expr {$newline - 1}]]
+        set ::eagainBuffer [string range $::eagainBuffer [expr {$newline + 1}] end]
+    }
+    ::livefixture::signal
+}
+fileevent $eagainRead readable eagain_readable
+wait_for {[llength $::adapter::queue] == 0 && [lsearch -exact $::eagainLines $markerLine] >= 0 && [lsearch -exact $::eagainLines $tailLine] >= 0} "accepted output did not drain without starvation" 5000
+set acceptedPositions [lsearch -all -exact $::eagainLines $acceptedLine]
+set markerPositions [lsearch -all -exact $::eagainLines $markerLine]
+set tailPositions [lsearch -all -exact $::eagainLines $tailLine]
+assert {[llength $acceptedPositions] == 1} "accepted NDJSON record was duplicated"
+assert {[llength $markerPositions] == 1 && [llength $tailPositions] == 1} "queued records were duplicated or lost"
+assert {[lindex $acceptedPositions 0] < [lindex $markerPositions 0] && [lindex $markerPositions 0] < [lindex $tailPositions 0]} "accepted and queued records drained out of order"
+
+# Fill the same real pipe again, keep its reader stopped, and prove terminal
+# output fails on the adapter deadline instead of hanging behind accepted bytes.
+fileevent $eagainRead readable {}
+append ::eagainBuffer [read $eagainRead]
+set ::adapter::queue {}
+set ::adapter::queueBytes 0
+set ::adapter::acceptedBackpressureCount 0
+set ::adapter::lastBackpressuredRaw ""
+for {set index 0} {$index < 12 && $::adapter::acceptedBackpressureCount == 0} {incr index} {
+    set raw [::convex::object [list type [::convex::quote subscription] subscriptionId [::convex::quote same] value [::convex::object [list closeSequence $index blob [::convex::quote $eagainBlob]]]]]
+    ::adapter::emit $raw 1 [list same 1]
+}
+assert {$::adapter::acceptedBackpressureCount > 0} "real close pipe did not become backpressured"
+set closedLine {{"id":"real-close","type":"closed"}}
+::adapter::emit $closedLine
+proc eagain_exit {code} { set ::eagainExit $code; ::livefixture::signal }
+set ::adapter::exitHook eagain_exit
+set ::eagainExit ""
+set realCloseStarted [clock milliseconds]
+set ::adapter::closeDeadline [expr {$realCloseStarted + 350}]
+::adapter::finish_close
+wait_for {$::eagainExit ne ""} "real backpressured close ignored its deadline" 1200
+set realCloseElapsed [expr {[clock milliseconds] - $realCloseStarted}]
+assert {$::eagainExit == 1} "real backpressured close did not fail"
+assert {$realCloseElapsed >= 300 && $realCloseElapsed < 1000} "real backpressured close finished at ${realCloseElapsed}ms"
+if {$::adapter::flushTimer ne ""} { after cancel $::adapter::flushTimer; set ::adapter::flushTimer "" }
+fileevent $eagainWrite writable {}
+close $eagainRead
+close $eagainWrite
+set ::adapter::exitHook ""
+set ::adapter::observeBackpressure 0
+puts "Tcl genuine accepted-byte backpressure test passed: close ${realCloseElapsed} ms"

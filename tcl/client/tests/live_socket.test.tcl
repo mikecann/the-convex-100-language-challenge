@@ -277,14 +277,54 @@ assert {[dict get $finalState connectionCount] == 7} "real reconnect count did n
 assert {[dict get $finalState lastCloseReason] eq "TransportError: peer closed"} "final close reason was not retained"
 assert {[dict get $finalState reconnectDelay] == 100} "healthy transport recovery kept stale backoff"
 
+# A peer that sends only a frame prefix must be abandoned on a deterministic
+# deadline. The retained subscription reconnects, resends Add, suppresses its
+# unchanged hydration, and publishes the next valid value.
+set savedPartialTimeout $::convex::partialFrameTimeoutMs
+set ::convex::partialFrameTimeoutMs 300
+set before [llength $::adapterLines]
+set timeoutStarted [clock milliseconds]
+::livefixture::stall_partial_frame
+wait_for {[dict get [::convex::state $::adapter::client] wsFrameTimer] ne ""} "partial frame did not arm its deadline"
+wait_for {[llength $::adapterLines] > $before} "partial-frame timeout emitted no adapter envelope" 1500
+set timeoutElapsed [expr {[clock milliseconds] - $timeoutStarted}]
+assert {$timeoutElapsed >= 250 && $timeoutElapsed < 1200} "partial-frame deadline fired at ${timeoutElapsed}ms"
+set timeoutEnvelope [::convex::decode [lindex $::adapterLines $before]]
+assert {[dict get [dict get $timeoutEnvelope error] name] eq "TransportError"} "partial-frame timeout was not TransportError"
+wait_for {[::livefixture::connections] == 9} "partial-frame timeout did not reconnect"
+wait_for {[llength [modification_records 8 Add]] == 1} "partial-frame reconnect did not resend Add"
+wait_for {[dict get [::convex::state $::adapter::client] remote] eq [::livefixture::active_remote]} "partial-frame reconnect did not hydrate"
+set before [llength $::adapterLines]
+::livefixture::update 9
+wait_for {[llength $::adapterLines] > $before} "partial-frame recovery value was not emitted"
+assert {[dict get [dict get [::convex::decode [lindex $::adapterLines $before]] value] count] == 9} "partial-frame timeout stranded the subscription"
+
+# Unsubscribe and close are controller operations, so neither may wait for a
+# half-frame owned by the reader. The timer is still armed when both return.
+::livefixture::stall_partial_frame
+wait_for {[dict get [::convex::state $::adapter::client] wsFrameTimer] ne ""} "bounded-operation frame did not arm its deadline"
+set before [llength $::adapterLines]
+set unsubscribeStarted [clock milliseconds]
+::adapter::handle {{"id":"unsubscribe-partial","op":"unsubscribe","subscriptionId":"same"}}
+wait_for {[llength $::adapterLines] > $before} "unsubscribe behind partial frame emitted no acknowledgement"
+set unsubscribeElapsed [expr {[clock milliseconds] - $unsubscribeStarted}]
+assert {$unsubscribeElapsed < 200} "unsubscribe waited ${unsubscribeElapsed}ms for a partial frame"
+assert {[lindex $::adapterLines $before] eq {{"id":"unsubscribe-partial","type":"ack"}}} "partial-frame unsubscribe acknowledgement changed"
+wait_for {[llength [modification_records 8 Remove]] == 1} "partial-frame unsubscribe did not send Remove"
+set ::convex::partialFrameTimeoutMs $savedPartialTimeout
+
 proc adapter_test_exit {status} { set ::adapterExitStatus $status; ::livefixture::signal }
 set ::adapter::exitHook adapter_test_exit
 set ::adapterExitStatus ""
 set before [llength $::adapterLines]
+set closeStarted [clock milliseconds]
 ::adapter::handle {{"id":"close","op":"close"}}
 wait_for {[llength $::adapterLines] > $before && $::adapterExitStatus ne ""} "close envelope did not drain"
+set closeElapsed [expr {[clock milliseconds] - $closeStarted}]
+assert {$closeElapsed < 200} "close waited ${closeElapsed}ms for a partial frame"
 assert {[lindex $::adapterLines $before] eq {{"id":"close","type":"closed"}}} "close envelope serialization changed"
 assert {$::adapterExitStatus == 0} "cooperative close did not exit successfully"
+assert {[dict get [::convex::state $::adapter::client] wsFrameTimer] eq ""} "close retained the partial-frame timer"
 fileevent $adapterRead readable {}
 close $adapterRead
 close $adapterWrite

@@ -15,6 +15,9 @@ namespace eval ::convex {
     array set clients {}
     variable initialTimestamp AAAAAAAAAAA=
     variable maximumResponseBytes [expr {2 * 1024 * 1024}]
+    # A partial frame retains its exact bytes, but cannot hold the only Live
+    # connection forever. Tests shorten this production deadline explicitly.
+    variable partialFrameTimeoutMs 5000
     variable callbackDepth 0
 
     # Tcl's http package invokes this command with host and port. Keeping SNI
@@ -171,7 +174,7 @@ proc ::convex::new {url {clientVersion tcl-0.1.0} {authToken ""}} {
     set clients($id) [dict create url $url version $clientVersion auth $authToken closed 0 socket "" \
         subscriptions {} nextQueryId 0 querySet 0 remote [object [list querySet 0 identity 0 ts [quote $::convex::initialTimestamp]]] \
         connectionCount 0 lastCloseReason InitialConnect reconnectTimer "" connecting 0 reconnectDelay 100 \
-        maxTimestamp "" wsStage closed wsBuffer "" wsFragments "" wsFragmentOpcode -1 wsKey "" wsOut ""]
+        maxTimestamp "" wsStage closed wsBuffer "" wsFragments "" wsFragmentOpcode -1 wsFrameTimer "" wsKey "" wsOut ""]
     return $id
 }
 
@@ -314,6 +317,10 @@ proc ::convex::send {id raw} {
 proc ::convex::retire {id reason {reconnect 1}} {
     set client [state $id]
     set socket [dict get $client socket]
+    if {[dict get $client wsFrameTimer] ne ""} {
+        after cancel [dict get $client wsFrameTimer]
+        put $id wsFrameTimer ""
+    }
     if {$reason ne "client-closed" && $reason ne "DebugDisconnect"} { puts stderr "Convex Live retired connection: $reason" }
     # A parser failure and an unexpected peer close are subscription failures,
     # not invisible diagnostics. Keep the subscriptions active so the same
@@ -406,6 +413,28 @@ proc ::convex::ws_readable {id socket} {
     } error]} { retire $id "ProtocolError: $error" }
 }
 
+proc ::convex::ws_partial_timeout {id socket} {
+    set client [state $id]
+    if {[dict get $client socket] ne $socket || [dict get $client wsFrameTimer] eq ""} { return }
+    put $id wsFrameTimer ""
+    if {[dict get $client wsBuffer] eq "" && [dict get $client wsFragmentOpcode] < 0} { return }
+    retire $id "TransportError: partial WebSocket frame timed out"
+}
+
+proc ::convex::ws_sync_partial_timer {id socket} {
+    variable partialFrameTimeoutMs
+    set client [state $id]
+    if {[dict get $client socket] ne $socket} { return }
+    set incomplete [expr {[dict get $client wsBuffer] ne "" || [dict get $client wsFragmentOpcode] >= 0}]
+    set timer [dict get $client wsFrameTimer]
+    if {$incomplete && $timer eq ""} {
+        put $id wsFrameTimer [after $partialFrameTimeoutMs [list ::convex::ws_partial_timeout $id $socket]]
+    } elseif {!$incomplete && $timer ne ""} {
+        after cancel $timer
+        put $id wsFrameTimer ""
+    }
+}
+
 proc ::convex::ws_handshake {id} {
     set buffer [dict get [state $id] wsBuffer]
     set end [string first "\r\n\r\n" $buffer]
@@ -429,6 +458,7 @@ proc ::convex::ws_handshake {id} {
 proc ::convex::byte_at {bytes index} { binary scan $bytes @${index}cu value; return $value }
 
 proc ::convex::ws_frames {id} {
+    set socket [dict get [state $id] socket]
     set buffer [dict get [state $id] wsBuffer]
     while {[string bytelength $buffer] >= 2} {
         set first [byte_at $buffer 0]
@@ -453,8 +483,10 @@ proc ::convex::ws_frames {id} {
         set payload [string range $buffer $offset [expr {$offset + $length - 1}]]
         set buffer [string range $buffer [expr {$offset + $length}] end]
         ws_frame_received $id $fin $opcode $payload
+        if {[dict get [state $id] socket] ne $socket} { return }
     }
     put $id wsBuffer $buffer
+    ws_sync_partial_timer $id $socket
 }
 
 proc ::convex::ws_frame_received {id fin opcode payload} {

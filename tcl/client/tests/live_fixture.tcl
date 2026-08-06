@@ -363,6 +363,19 @@ proc ::livefixture::protocol_error {} {
     signal
 }
 
+proc ::livefixture::stall_partial_frame {} {
+    variable current
+    # Send the complete frame header and one payload byte, then deliberately
+    # leave the TCP connection open. The client must retain these exact bytes
+    # until its partial-frame deadline abandons this socket.
+    set frame [server_frame 1 {{"type":"Ping"}}]
+    binary scan $frame cu* bytes
+    set prefix [binary format cu* [lrange $bytes 0 2]]
+    puts -nonewline $current $prefix
+    flush $current
+    signal
+}
+
 proc ::livefixture::transport_error {} {
     variable current
     disconnect $current
