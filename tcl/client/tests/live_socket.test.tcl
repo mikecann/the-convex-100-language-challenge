@@ -197,6 +197,8 @@ proc ::httpfixture::stop {} {
     catch {close $server}
     set server ""
 }
+set httpSystemEncoding [encoding system]
+encoding system iso8859-1
 set httpPort [::httpfixture::start [list \
     {{"status":"success","value":{"ok":true},"logLines":[]}} \
     {{"status":"success","value":{"unicode":"Hello, 世界 👋","nested":{"booleans":[true,false],"number":42.5,"nil":null}},"logLines":["[LOG] 'demo:echo received a JSON-safe value'"]}} \
@@ -221,6 +223,7 @@ set httpProtocol [adapter_command {{"id":"http-protocol","op":"query","path":"de
 set httpProtocolObject [::convex::decode $httpProtocol]
 assert {[dict get [dict get $httpProtocolObject error] name] eq "ProtocolError"} "malformed HTTP response was not ProtocolError"
 ::httpfixture::stop
+encoding system $httpSystemEncoding
 ::convex::close $::adapter::client
 set ::adapter::client ""
 set httpTransport [adapter_command {{"id":"http-transport","op":"query","path":"demo:state","args":{}}}]

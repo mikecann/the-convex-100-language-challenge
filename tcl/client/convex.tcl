@@ -229,8 +229,11 @@ proc ::convex::http_call {id operation path argsRaw} {
         throw TransportError $problem
     }
     try {
-        set raw [::http::data $token]
-        if {[string bytelength $raw] > $maximumResponseBytes} { throw TransportError "response exceeds byte limit" }
+        set wireRaw [::http::data $token]
+        if {[string bytelength $wireRaw] > $maximumResponseBytes} { throw TransportError "response exceeds byte limit" }
+        if {[catch {set raw [encoding convertfrom utf-8 $wireRaw]} problem]} {
+            throw ProtocolError "invalid UTF-8 HTTP response: $problem"
+        }
         # Keep the envelope classifier on raw JSON subtrees. Decoding the
         # complete response into Tcl's deliberately untyped dict representation
         # lets nested values and log strings participate in list parsing before
