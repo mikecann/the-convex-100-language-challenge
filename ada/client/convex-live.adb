@@ -383,6 +383,9 @@ package body Convex.Live is
          Message.Set_Field
            ("newVersion", JSON.Create (Long_Long_Integer (New_Version)));
          Message.Set_Field ("modifications", Modifications);
+         --  Send_Text owns one deadline for the complete frame. A slow peer
+         --  therefore releases this sole owner to service Remove or Stop
+         --  instead of renewing a timeout for every encoded chunk.
          Convex_WebSocket.Send_Text (Socket, JSON.Write (Message));
          Query_Set_Version := New_Version;
       end Send_Modifications;

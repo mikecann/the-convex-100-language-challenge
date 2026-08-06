@@ -283,6 +283,58 @@ procedure Convex_Socket_Tests is
       end;
    end Read_Client_Text;
 
+   function Read_Client_Text_Length
+     (Socket : GNAT.Sockets.Socket_Type) return Natural
+   is
+      Header : String (1 .. 2);
+   begin
+      Read_Exactly (Socket, Header);
+      declare
+         B1     : constant Interfaces.Unsigned_8 :=
+           Interfaces.Unsigned_8 (Character'Pos (Header (1)));
+         B2     : constant Interfaces.Unsigned_8 :=
+           Interfaces.Unsigned_8 (Character'Pos (Header (2)));
+         Length : Natural := Natural (B2 and 16#7F#);
+      begin
+         Check
+           ((B1 and 16#80#) /= 0 and then (B1 and 16#0F#) = 1,
+            "slow-reader fixture expected a final client text frame");
+         Check
+           ((B2 and 16#80#) /= 0,
+            "slow-reader fixture expected a masked client frame");
+         if Length = 126 then
+            declare
+               Extended : String (1 .. 2);
+            begin
+               Read_Exactly (Socket, Extended);
+               Length :=
+                 Character'Pos (Extended (1))
+                 * 256
+                 + Character'Pos (Extended (2));
+            end;
+         elsif Length = 127 then
+            declare
+               Extended : String (1 .. 8);
+            begin
+               Read_Exactly (Socket, Extended);
+               Check
+                 (Extended (1 .. 4) = String'(1 .. 4 => Byte (0)),
+                  "slow-reader client frame exceeds the test range");
+               Length := 0;
+               for I in 5 .. 8 loop
+                  Length := Length * 256 + Character'Pos (Extended (I));
+               end loop;
+            end;
+         end if;
+         declare
+            Mask : String (1 .. 4);
+         begin
+            Read_Exactly (Socket, Mask);
+         end;
+         return Length;
+      end;
+   end Read_Client_Text_Length;
+
    function Read_Client_Opcode
      (Socket : GNAT.Sockets.Socket_Type) return Natural
    is
@@ -727,6 +779,58 @@ procedure Convex_Socket_Tests is
       entry Finish (Success : out Boolean; Message : out US.Unbounded_String);
    end HTTP_Edge_Server;
 
+   task type HTTP_Write_Deadline_Server is
+      entry Start (Listener : GNAT.Sockets.Socket_Type);
+      entry Finish (Success : out Boolean; Message : out US.Unbounded_String);
+   end HTTP_Write_Deadline_Server;
+
+   task body HTTP_Write_Deadline_Server is
+      Listen  : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Peer    : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Passed  : Boolean := False;
+      Error   : US.Unbounded_String;
+      Address : GNAT.Sockets.Sock_Addr_Type;
+      Data    : Ada.Streams.Stream_Element_Array (1 .. 16 * 1024);
+      Last    : Ada.Streams.Stream_Element_Offset;
+   begin
+      accept Start (Listener : GNAT.Sockets.Socket_Type) do
+         Listen := Listener;
+      end Start;
+      begin
+         --  Keep the advertised window small before accept so a near-maximum
+         --  request cannot disappear into kernel buffering. One chunk is
+         --  drained just inside the former five-second per-send timeout.
+         GNAT.Sockets.Set_Socket_Option
+           (Listen,
+            GNAT.Sockets.Socket_Level,
+            (Name => GNAT.Sockets.Receive_Buffer, Size => 16 * 1024));
+         GNAT.Sockets.Accept_Socket (Listen, Peer, Address);
+         delay 4.7;
+         GNAT.Sockets.Receive_Socket (Peer, Data, Last);
+         Check
+           (Last >= Data'First,
+            "HTTP request writer closed before the delayed drain");
+         --  The old implementation renewed another five seconds here. Keep
+         --  the peer open past the one operation deadline so the elapsed-time
+         --  assertion distinguishes that behavior from an absolute deadline.
+         delay 1.2;
+         Passed := True;
+      exception
+         when E : others =>
+            Error :=
+              US.To_Unbounded_String
+                (Ada.Exceptions.Exception_Information (E));
+      end;
+      Close_Quietly (Peer);
+      Close_Quietly (Listen);
+      accept Finish
+        (Success : out Boolean; Message : out US.Unbounded_String)
+      do
+         Success := Passed;
+         Message := Error;
+      end Finish;
+   end HTTP_Write_Deadline_Server;
+
    task body HTTP_Edge_Server is
       Listen  : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
       Peer    : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
@@ -880,6 +984,47 @@ procedure Convex_Socket_Tests is
          abort Server;
          raise;
    end Run_HTTP_Edges;
+
+   procedure Run_HTTP_Write_Deadline is
+      Listener : GNAT.Sockets.Socket_Type;
+      Port     : GNAT.Sockets.Port_Type;
+      Server   : HTTP_Write_Deadline_Server;
+      Client   : Convex.Client;
+      Args     : constant JSON.JSON_Value := JSON.Create_Object;
+      Success  : Boolean;
+      Message  : US.Unbounded_String;
+      Started  : Ada.Real_Time.Time;
+      Elapsed  : Duration;
+   begin
+      Args.Set_Field ("payload", String'(1 .. 1_900_000 => 'h'));
+      Open_Listener (Listener, Port);
+      Server.Start (Listener);
+      Convex.Open (Client, URL (Port));
+      Started := Ada.Real_Time.Clock;
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:largeRequest", Args);
+      begin
+         Elapsed := Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - Started);
+         Check
+           (not Result.Success
+            and then Result.Error.Kind = Convex.Transport_Error,
+            "slow-reading HTTP peer did not stop request transmission");
+         Check
+           (Elapsed >= 4.5 and then Elapsed < 5.6,
+            "HTTP request chunks did not share one five-second deadline");
+      end;
+      Convex.Close (Client);
+      Server.Finish (Success, Message);
+      Check
+        (Success,
+         "HTTP write-deadline fixture failed: " & US.To_String (Message));
+   exception
+      when others =>
+         Convex.Close (Client);
+         abort Server;
+         raise;
+   end Run_HTTP_Write_Deadline;
 
    type Transport_Scenario is
      (Valid_Text,
@@ -1801,6 +1946,196 @@ procedure Convex_Socket_Tests is
          raise;
    end Run_Backpressure;
 
+   type Slow_Live_Write_Action is (Concurrent_Unsubscribe, Concurrent_Close);
+   type Live_Manager_Access is access all Convex.Live.Manager;
+   type JSON_Value_Access is access all JSON.JSON_Value;
+
+   task type Slow_Add_Worker is
+      entry Start (Manager : Live_Manager_Access; Args : JSON_Value_Access);
+      entry Finish
+        (Success : out Boolean;
+         Message : out US.Unbounded_String;
+         Elapsed : out Duration);
+   end Slow_Add_Worker;
+
+   task body Slow_Add_Worker is
+      Live         : Live_Manager_Access;
+      Arguments    : JSON_Value_Access;
+      Sub          : Convex.Live.Subscription;
+      Added        : Boolean := False;
+      Detail       : US.Unbounded_String;
+      Started      : Ada.Real_Time.Time;
+      Add_Duration : Duration := 0.0;
+   begin
+      accept Start (Manager : Live_Manager_Access; Args : JSON_Value_Access) do
+         Live := Manager;
+         Arguments := Args;
+      end Start;
+      Started := Ada.Real_Time.Clock;
+      begin
+         Convex.Live.Subscribe
+           (Live.all, "messages:large", Arguments.all, Sub, Added, Detail);
+      exception
+         when E : others =>
+            Added := False;
+            Detail :=
+              US.To_Unbounded_String
+                (Ada.Exceptions.Exception_Information (E));
+      end;
+      Add_Duration :=
+        Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - Started);
+      accept Finish
+        (Success : out Boolean;
+         Message : out US.Unbounded_String;
+         Elapsed : out Duration)
+      do
+         Success := Added;
+         Message := Detail;
+         Elapsed := Add_Duration;
+      end Finish;
+   end Slow_Add_Worker;
+
+   task type Slow_Live_Write_Server is
+      entry Start
+        (Listener : GNAT.Sockets.Socket_Type; Action : Slow_Live_Write_Action);
+      entry Initial_Ready;
+      entry Large_Frame_Started;
+      entry Finish (Success : out Boolean; Message : out US.Unbounded_String);
+   end Slow_Live_Write_Server;
+
+   task body Slow_Live_Write_Server is
+      Listen       : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Peer         : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Mode         : Slow_Live_Write_Action := Concurrent_Unsubscribe;
+      Passed       : Boolean := False;
+      Error        : US.Unbounded_String;
+      Large_Length : Natural := 0;
+   begin
+      accept Start
+        (Listener : GNAT.Sockets.Socket_Type; Action : Slow_Live_Write_Action)
+      do
+         Listen := Listener;
+         Mode := Action;
+      end Start;
+      begin
+         GNAT.Sockets.Set_Socket_Option
+           (Listen,
+            GNAT.Sockets.Socket_Level,
+            (Name => GNAT.Sockets.Receive_Buffer, Size => 16 * 1024));
+         Upgrade (Listen, Peer);
+         Check
+           (String_Field (Read_Object (Read_Client_Text (Peer)), "type")
+            = "Connect",
+            "slow Live writer fixture expected Connect first");
+         Validate_Add (Read_Client_Text (Peer));
+         accept Initial_Ready;
+
+         --  Consume only the near-maximum Add frame's header and mask. The
+         --  small receive window then keeps the owner inside frame output
+         --  while the controller queues Remove or Stop.
+         Large_Length := Read_Client_Text_Length (Peer);
+         Check
+           (Large_Length > 2_000_000,
+            "slow Live writer fixture did not receive a near-maximum Add");
+         --  The owner must reach the first frame bytes promptly. Without this
+         --  bounded rendezvous, an allocation or transport regression before
+         --  the header would leave the test waiting forever instead of giving
+         --  a useful failure at the actual boundary.
+         select
+            accept Large_Frame_Started;
+         or
+            delay 2.0;
+            raise Program_Error
+              with "slow Live writer client never reached the frame barrier";
+         end select;
+         delay 1.1;
+         Wait_For_Close (Peer);
+         Passed := True;
+      exception
+         when E : others =>
+            Error :=
+              US.To_Unbounded_String
+                (Slow_Live_Write_Action'Image (Mode)
+                 & ": "
+                 & Ada.Exceptions.Exception_Information (E));
+      end;
+      Close_Quietly (Peer);
+      Close_Quietly (Listen);
+      accept Finish
+        (Success : out Boolean; Message : out US.Unbounded_String)
+      do
+         Success := Passed;
+         Message := Error;
+      end Finish;
+   end Slow_Live_Write_Server;
+
+   procedure Run_Slow_Live_Write (Mode : Slow_Live_Write_Action) is
+      Listener    : GNAT.Sockets.Socket_Type;
+      Port        : GNAT.Sockets.Port_Type;
+      Server      : Slow_Live_Write_Server;
+      Worker      : Slow_Add_Worker;
+      Manager     : aliased Convex.Live.Manager;
+      Small_Sub   : Convex.Live.Subscription;
+      Small_Args  : constant JSON.JSON_Value := JSON.Create_Object;
+      Large_Args  : aliased JSON.JSON_Value := JSON.Create_Object;
+      Success     : Boolean;
+      Message     : US.Unbounded_String;
+      Started     : Ada.Real_Time.Time;
+      Action_Time : Duration;
+      Add_Time    : Duration;
+   begin
+      --  This is close to the largest argument that fits beside the first
+      --  subscription under Live's conservative 8 MiB ownership budget.
+      Large_Args.Set_Field ("payload", String'(1 .. 2_096_000 => 'w'));
+      Open_Listener (Listener, Port);
+      Server.Start (Listener, Mode);
+      Convex.Live.Open (Manager, URL (Port));
+      Convex.Live.Subscribe
+        (Manager, "messages:small", Small_Args, Small_Sub, Success, Message);
+      Check
+        (Success,
+         "slow Live writer initial subscribe failed: "
+         & US.To_String (Message));
+      Server.Initial_Ready;
+
+      Worker.Start (Manager'Unchecked_Access, Large_Args'Unchecked_Access);
+      Server.Large_Frame_Started;
+      Started := Ada.Real_Time.Clock;
+      case Mode is
+         when Concurrent_Unsubscribe =>
+            Convex.Live.Unsubscribe (Manager, Small_Sub);
+
+         when Concurrent_Close       =>
+            Convex.Live.Close (Manager);
+      end case;
+      Action_Time := Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - Started);
+      Check
+        (Action_Time < 0.9,
+         "slow Live frame kept the owner from "
+         & Slow_Live_Write_Action'Image (Mode)
+         & " for 900 ms");
+
+      Worker.Finish (Success, Message, Add_Time);
+      Check
+        (Success,
+         "near-maximum Live Add was rejected: " & US.To_String (Message));
+      Check
+        (Add_Time < 0.9,
+         "near-maximum Live Add renewed its frame deadline per chunk");
+      if Mode = Concurrent_Unsubscribe then
+         Convex.Live.Close (Manager);
+      end if;
+      Server.Finish (Success, Message);
+      Check
+        (Success, "slow Live write fixture failed: " & US.To_String (Message));
+   exception
+      when others =>
+         Convex.Live.Close (Manager);
+         abort Worker;
+         abort Server;
+         raise;
+   end Run_Slow_Live_Write;
+
    task type Live_Shutdown_Server is
       entry Start
         (Listener : GNAT.Sockets.Socket_Type; Scenario : Transport_Scenario);
@@ -2064,6 +2399,8 @@ begin
    Run_HTTP;
    Ada.Text_IO.Put_Line ("http: strict status and absolute response deadline");
    Run_HTTP_Edges;
+   Ada.Text_IO.Put_Line ("http: absolute request transmission deadline");
+   Run_HTTP_Write_Deadline;
 
    Ada.Text_IO.Put_Line ("live: recovery, reconnects, and bounded lifecycle");
    Run_Live_Flow;
@@ -2075,6 +2412,10 @@ begin
    Run_Reconnects;
    Ada.Text_IO.Put_Line ("live: count and byte backpressure");
    Run_Backpressure;
+   Ada.Text_IO.Put_Line ("live: slow-reader frame transmission deadline");
+   for Mode in Slow_Live_Write_Action loop
+      Run_Slow_Live_Write (Mode);
+   end loop;
    Ada.Text_IO.Put_Line ("live: unsubscribe and close deadlines");
    for Mode in Idle_Shutdown .. Continuous_Shutdown loop
       Run_Live_Bounded_Lifecycle (Mode, Remove_First => True);

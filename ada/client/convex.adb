@@ -85,6 +85,7 @@ package body Convex is
       Chunked           : Boolean := False;
       Header_Done       : Boolean := False;
       Peer_Closed       : Boolean := False;
+      Request_Deadline  : Ada.Real_Time.Time;
       Response_Deadline : Ada.Real_Time.Time;
 
       function Chunk_Size (Line : String) return Natural is
@@ -195,31 +196,26 @@ package body Convex is
          return Result;
       end Decode_Chunks;
 
-      procedure Send_Text (Text : String) is
-         Buffer : Ada.Streams.Stream_Element_Array (1 .. 16 * 1024);
-         Sent   : Natural := 0;
+      procedure Send_Text (Text : String; Deadline : Ada.Real_Time.Time) is
+         Buffer : Ada.Streams.Stream_Element_Array (1 .. Text'Length);
       begin
-         while Sent < Text'Length loop
-            declare
-               Count : constant Natural :=
-                 Natural'Min (Buffer'Length, Text'Length - Sent);
-            begin
-               for I in 0 .. Count - 1 loop
-                  Buffer
-                    (Buffer'First + Ada.Streams.Stream_Element_Offset (I)) :=
-                    Ada.Streams.Stream_Element
-                      (Character'Pos (Text (Text'First + Sent + I)));
-               end loop;
-               AWS.Net.Send
-                 (Socket.all,
-                  Buffer
-                    (Buffer'First
-                     .. Buffer'First
-                        + Ada.Streams.Stream_Element_Offset (Count)
-                        - 1));
-               Sent := Sent + Count;
-            end;
+         if Ada.Real_Time.Clock >= Deadline then
+            raise AWS.Net.Socket_Error with "HTTP request timed out";
+         end if;
+         for I in Text'Range loop
+            Buffer (Ada.Streams.Stream_Element_Offset (I - Text'First + 1)) :=
+              Ada.Streams.Stream_Element (Character'Pos (Text (I)));
          end loop;
+         --  AWS.Net.Send owns the TLS-aware poll/write loop and creates one
+         --  absolute deadline when this call begins. Supplying the complete
+         --  request is deliberate: calling it once per 16 KiB chunk would
+         --  restart that deadline and let a slow peer hold the client forever.
+         AWS.Net.Set_Timeout
+           (Socket.all,
+            Duration'Max
+              (0.001,
+               Ada.Real_Time.To_Duration (Deadline - Ada.Real_Time.Clock)));
+         AWS.Net.Send (Socket.all, Buffer);
       end Send_Text;
 
       function Header_Value (Headers, Name : String) return String is
@@ -278,7 +274,11 @@ package body Convex is
       Path := US.To_Unbounded_String (Convex_URL.Path (Parsed));
       Payload := US.Null_Unbounded_String;
       Socket := AWS.Net.Socket (Security => Secure);
-      AWS.Net.Set_Timeout (Socket.all, 5.0);
+      Request_Deadline :=
+        Ada.Real_Time.Clock + Ada.Real_Time.To_Time_Span (5.0);
+      AWS.Net.Set_Timeout
+        (Socket.all,
+         Ada.Real_Time.To_Duration (Request_Deadline - Ada.Real_Time.Clock));
       Socket.all.Connect (Convex_URL.Host (Parsed), Port);
       Send_Text
         ("POST "
@@ -312,7 +312,8 @@ package body Convex is
             else "")
          & ASCII.CR
          & ASCII.LF
-         & Data);
+         & Data,
+         Request_Deadline);
       --  Partial reads must not extend the operation forever. Every poll below
       --  consumes the same absolute five-second response budget.
       Response_Deadline :=

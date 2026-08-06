@@ -3,6 +3,7 @@ with Ada.Exceptions;
 with Ada.Real_Time;
 with Ada.Strings;
 with Ada.Strings.Fixed;
+with Ada.Unchecked_Deallocation;
 with GNAT.SHA1;
 with GNATCOLL.Random;
 with Interfaces.C;
@@ -21,6 +22,7 @@ package body Convex_WebSocket is
    WebSocket_GUID      : constant String :=
      "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
    Max_Handshake_Bytes : constant := 16 * 1024;
+   Frame_Write_Timeout : constant Duration := 0.5;
 
    function C_Shutdown
      (FD : Interfaces.C.int; How : Interfaces.C.int) return Interfaces.C.int
@@ -225,76 +227,107 @@ package body Convex_WebSocket is
    procedure Send_Frame
      (Socket : in out Connection; Opcode : Natural; Payload : String)
    is
-      Header : Stream_Element_Array (1 .. 14);
-      Data   : Stream_Element_Array (1 .. 16 * 1_024);
-      Cursor : Stream_Element_Offset := Header'First;
-      Mask   : constant Interfaces.Unsigned_32 := Next_Mask (Socket);
-      Keys   : constant array (Natural range 0 .. 3) of Stream_Element :=
+      --  AWS.Net.Send owns the TLS-aware poll/write loop. It creates one
+      --  deadline for each call, so a complete masked frame must be supplied
+      --  in one call instead of resetting the deadline per 16 KiB chunk.
+      --  The public 4 MiB message cap keeps this temporary frame bounded.
+      type Frame_Access is access Stream_Element_Array;
+      procedure Free_Frame is new
+        Ada.Unchecked_Deallocation (Stream_Element_Array, Frame_Access);
+
+      --  This belongs on the heap rather than the Live owner task's stack.
+      --  A valid 4 MiB message is part of the public bound and must not turn
+      --  into an unbounded task-stack requirement.
+      Frame    : Frame_Access :=
+        new Stream_Element_Array (1 .. Payload'Length + 14);
+      Cursor   : Stream_Element_Offset := Frame.all'First;
+      Mask     : constant Interfaces.Unsigned_32 := Next_Mask (Socket);
+      Keys     : constant array (Natural range 0 .. 3) of Stream_Element :=
         [Stream_Element (Interfaces.Shift_Right (Mask, 24) and 16#FF#),
          Stream_Element (Interfaces.Shift_Right (Mask, 16) and 16#FF#),
          Stream_Element (Interfaces.Shift_Right (Mask, 8) and 16#FF#),
          Stream_Element (Mask and 16#FF#)];
-      Work   : Interfaces.Unsigned_64 :=
+      Work     : Interfaces.Unsigned_64 :=
         Interfaces.Unsigned_64 (Payload'Length);
+      Deadline : constant Ada.Real_Time.Time :=
+        Ada.Real_Time.Clock + Ada.Real_Time.To_Time_Span (Frame_Write_Timeout);
       use type Interfaces.Unsigned_64;
+
+      procedure Send_Bounded is
+      begin
+         if Ada.Real_Time.Clock >= Deadline then
+            raise AWS.Net.Socket_Error with "WebSocket frame write timed out";
+         end if;
+         --  Let AWS drive its native or OpenSSL send loop against the time
+         --  left in this frame. A raw send(2) loop would bypass TLS.
+         AWS.Net.Set_Timeout
+           (Socket.Net.all,
+            Duration'Max
+              (0.001,
+               Ada.Real_Time.To_Duration (Deadline - Ada.Real_Time.Clock)));
+         AWS.Net.Send
+           (Socket.Net.all, Frame.all (Frame.all'First .. Cursor - 1));
+      end Send_Bounded;
    begin
       if not Socket.Opened or else Socket.Net = null then
          raise AWS.Net.Socket_Error with "WebSocket is closed";
       end if;
-      AWS.Net.Set_Timeout (Socket.Net.all, 0.5);
-      Header (Cursor) := Stream_Element (16#80# + Opcode);
+      Frame.all (Cursor) := Stream_Element (16#80# + Opcode);
       Cursor := Cursor + 1;
       if Payload'Length <= 125 then
-         Header (Cursor) := Stream_Element (16#80# + Payload'Length);
+         Frame.all (Cursor) := Stream_Element (16#80# + Payload'Length);
          Cursor := Cursor + 1;
       elsif Payload'Length <= 65_535 then
-         Header (Cursor) := 16#FE#;
-         Header (Cursor + 1) := Stream_Element (Payload'Length / 256);
-         Header (Cursor + 2) := Stream_Element (Payload'Length mod 256);
+         Frame.all (Cursor) := 16#FE#;
+         Frame.all (Cursor + 1) := Stream_Element (Payload'Length / 256);
+         Frame.all (Cursor + 2) := Stream_Element (Payload'Length mod 256);
          Cursor := Cursor + 3;
       else
-         Header (Cursor) := 16#FF#;
+         Frame.all (Cursor) := 16#FF#;
          Cursor := Cursor + 1;
          for I in reverse 0 .. 7 loop
-            Header (Cursor + Stream_Element_Offset (I)) :=
+            Frame.all (Cursor + Stream_Element_Offset (I)) :=
               Stream_Element (Work mod 256);
             Work := Work / 256;
          end loop;
          Cursor := Cursor + 8;
       end if;
       for Key of Keys loop
-         Header (Cursor) := Key;
+         Frame.all (Cursor) := Key;
          Cursor := Cursor + 1;
       end loop;
-      AWS.Net.Send (Socket.Net.all, Header (Header'First .. Cursor - 1));
 
-      -- Stream large JSON arguments instead of placing a complete masked frame
-      -- on the Live owner's task stack.
-      declare
-         Processed : Natural := 0;
-      begin
-         while Processed < Payload'Length loop
-            declare
-               Length : constant Natural :=
-                 Natural'Min
-                   (Natural (Data'Length), Payload'Length - Processed);
-            begin
-               for Offset in 0 .. Length - 1 loop
-                  Data (Stream_Element_Offset (Offset + 1)) :=
-                    Stream_Element
-                      (Interfaces.Unsigned_8
-                         (Character'Pos
-                            (Payload (Payload'First + Processed + Offset)))
-                       xor Interfaces.Unsigned_8
-                             (Keys ((Processed + Offset) mod 4)));
-               end loop;
-               AWS.Net.Send
-                 (Socket.Net.all,
-                  Data (Data'First .. Stream_Element_Offset (Length)));
-               Processed := Processed + Length;
-            end;
+      if Payload'Length > 0 then
+         for Offset in 0 .. Payload'Length - 1 loop
+            Frame.all (Cursor + Stream_Element_Offset (Offset)) :=
+              Stream_Element
+                (Interfaces.Unsigned_8
+                   (Character'Pos (Payload (Payload'First + Offset)))
+                 xor Interfaces.Unsigned_8 (Keys (Offset mod 4)));
          end loop;
-      end;
+      end if;
+      Cursor := Cursor + Stream_Element_Offset (Payload'Length);
+      Send_Bounded;
+      Free_Frame (Frame);
+   exception
+      when others =>
+         Free_Frame (Frame);
+         --  Do not let Live cleanup attempt another graceful frame after this
+         --  frame exhausted its operation budget. Retire the descriptor now
+         --  so the owner can service queued commands immediately.
+         if Socket.Net /= null then
+            declare
+               Ignored : Interfaces.C.int;
+               pragma Unreferenced (Ignored);
+            begin
+               Ignored :=
+                 C_Shutdown
+                   (Interfaces.C.int (Socket.Net.Get_FD),
+                    Interfaces.C.int (2));
+            end;
+         end if;
+         Socket.Opened := False;
+         raise;
    end Send_Frame;
 
    procedure Send_Text (Socket : in out Connection; Message : String) is
