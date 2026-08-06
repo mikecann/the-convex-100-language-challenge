@@ -27,9 +27,9 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - The Docker build applies a checked-in native source patch to treeform/ws 0.6.0 for the Convex-Client header and control frames between fragmented messages.
+  - The Docker build patches the pinned Nim HTTP parser and treeform/ws 0.6.0 sources for pre-materialisation limits, observable writes, bounded handshakes and frames, the Convex-Client header, and control frames between fragments.
   - Live authentication, WebSocket mutations/actions, and TransitionChunk assembly are deferred.
-  - The language-local reconnect test covers five real hosted reconnects; fragmented-frame, stale-barrier, QueryFailed recovery, and stopped-reader fixtures remain for independent review.
-  - The language-local deterministic adversarial fixture suite remains for independent review; root shared conformance has not run on this branch.
+  - Evidence for this head came from Docker Desktop Rosetta linux/amd64 emulation on Apple Silicon. The images are genuine linux/amd64 and the build asserts uname -m is x86_64, but no native x86_64 host has run this exact source commit.
+  - Root shared conformance has not run on this branch.
   - Authentication is supported for HTTP only.
 capabilities: []

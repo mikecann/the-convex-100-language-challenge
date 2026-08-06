@@ -1,88 +1,98 @@
 ## NDJSON adapter used only by the shared black-box controller.
-## Stdout or the accepted TCP stream is reserved for protocol events.  Human
+## Stdout or the accepted TCP stream is reserved for protocol events. Human
 ## diagnostics go to stderr so the canonical example remains clean.
 
-import std/[json, locks, net, os, strutils, tables]
+import std/[atomics, json, net, os, posix, strutils, tables, times]
 import ../../convex
+import ./adapter_output
+import ./adapter_protocol
 
 const
-  adapterProtocolVersion = 1
-  maxAdapterEventBytes = 2 * 1024 * 1024 + 64 * 1024
-
-var outputLock: Lock
-var controller: Socket
-var activeRelays: Table[string, uint64]
+  maxAdapterSubscriptions = 16
+  relayShutdownDeadlineSeconds = 2.0
 
 type
+  CommandLine = object
+    value: string
+    oversized: bool
+
   AdapterSubscription = object
     subscription: LiveSubscription
     generation: uint64
+    relay: ptr Thread[RelayArgs]
+    relayDone: ptr Atomic[bool]
 
   RelayArgs = object
     subscriptionId: string
     generation: uint64
     updates: ptr LiveMailbox
+    closed: ptr Atomic[bool]
+    done: ptr Atomic[bool]
+    output: OutputProducer
 
-proc writeEncoded(encoded: string) {.gcsafe.} =
-  if encoded.len > maxAdapterEventBytes:
-    stderr.writeLine("adapter event exceeds bounded output budget")
-    return
-  acquire(outputLock)
-  defer: release(outputLock)
-  if not controller.isNil:
-    controller.send(encoded)
-  else:
-    stdout.write(encoded)
-    stdout.flushFile()
+proc sharedAtomic(initial: bool): ptr Atomic[bool] =
+  result = cast[ptr Atomic[bool]](allocShared0(sizeof(Atomic[bool])))
+  result[].store(initial)
 
-proc emit(node: JsonNode) =
-  writeEncoded($node & "\n")
-
-proc activateRelay(subscriptionId: string; generation: uint64) =
-  acquire(outputLock)
-  activeRelays[subscriptionId] = generation
-  release(outputLock)
-
-proc invalidateRelay(subscriptionId: string; generation: uint64) =
-  acquire(outputLock)
-  if activeRelays.hasKey(subscriptionId) and activeRelays[subscriptionId] == generation:
-    activeRelays.del(subscriptionId)
-  release(outputLock)
-
-proc emitRelay(subscriptionId: string; generation: uint64; node: JsonNode) =
+proc enqueueNode(output: OutputProducer; node: JsonNode; id = "";
+    subscriptionId = ""; generation: uint64 = 0; relayData = false): bool {.gcsafe.} =
   let encoded = $node & "\n"
-  if encoded.len > maxAdapterEventBytes:
-    return
-  acquire(outputLock)
-  defer: release(outputLock)
-  if not activeRelays.hasKey(subscriptionId) or activeRelays[subscriptionId] != generation:
-    return
-  if not controller.isNil:
-    controller.send(encoded)
+  let outcome = output.enqueueEvent(encoded, subscriptionId, generation, relayData)
+  if outcome == outputAccepted:
+    return true
+  if outcome in {outputClosed, outputFailed}:
+    return false
+
+  # Oversized or over-budget values become a small valid protocol error. The
+  # output owner reserves control capacity separately from subscription data,
+  # so the error can still make progress after a stopped-reader flood.
+  let message = if outcome == outputTooLarge:
+    "adapter event exceeds encoded output limit"
   else:
-    stdout.write(encoded)
-    stdout.flushFile()
+    "adapter output budget exhausted"
+  let fallback = failureEvent(id, subscriptionId, "TransportError", message)
+  result = output.enqueueEvent($fallback & "\n", subscriptionId, generation,
+    false) == outputAccepted
+  if not result:
+    output.failOutput()
 
-proc wakeRelay(subscription: LiveSubscription) =
-  ## The adapter owns the relay lifetime.  Send its private marker directly so
-  ## a blocked relay wakes even if the Live worker is already stopping.
-  sendLiveFrame(subscription.updates,
-    makeLiveFrame(LiveUpdate(isError: true, errorName: "__closed__")))
+proc emitFailure(output: OutputProducer; id, subscriptionId: string;
+    error: ref CatchableError): bool =
+  var name = "Error"
+  var data: JsonNode
+  var logs: JsonNode
+  if error of FunctionError:
+    name = "FunctionError"
+    let functionError = cast[ref FunctionError](error)
+    if functionError.hasData:
+      data = functionError.data
+    if functionError.logs.len > 0:
+      logs = %functionError.logs
+  elif error of AdapterValidationError or error of ProtocolError:
+    name = "ProtocolError"
+  elif error of TransportError:
+    name = "TransportError"
+  result = enqueueNode(output,
+    failureEvent(id, subscriptionId, name, error.msg, data, logs), id,
+    subscriptionId)
 
-proc relayUpdates(args: RelayArgs) {.thread, gcsafe.} =
-  ## The owner sends a closed marker before retiring a subscription.  The
-  ## relay can therefore block efficiently without ever closing a channel
-  ## underneath a parked receiver.
-  let mailbox = args.updates
+proc relayUpdates(args: RelayArgs) {.thread.} =
+  # Copy thread arguments once. Nim's thread trampoline owns the argument
+  # storage, so a long-lived relay must not repeatedly dereference that storage
+  # across reconnects and allocations.
   let subscriptionId = args.subscriptionId
   let generation = args.generation
+  let updates = args.updates
+  let closed = args.closed
+  let done = args.done
+  let output = args.output
   while true:
+    var received = recvLiveFrame(updates, closed)
+    if not received.available:
+      break
+    let update = liveUpdateFromFrame(received.frame)
+    releaseLiveFrame(received.frame)
     try:
-      var frame = recvLiveFrame(mailbox)
-      let update = liveUpdateFromFrame(frame)
-      releaseLiveFrame(frame)
-      if update.isError and update.errorName == "__closed__":
-        break
       var eventOut = %*{
         "type": "subscription",
         "subscriptionId": subscriptionId
@@ -97,59 +107,106 @@ proc relayUpdates(args: RelayArgs) {.thread, gcsafe.} =
         eventOut["error"] = errorOut
       else:
         eventOut["value"] = parseJson(update.value)
-      if update.logs.len > 0:
-        let logs = parseJson(update.logs)
-        if logs.kind == JArray and logs.len > 0:
-          eventOut["logs"] = logs
-      emitRelay(subscriptionId, generation, eventOut)
-    except CatchableError:
-      break
-
-proc failureEvent(id, subscriptionId, name, message: string; data = "";
-    logs = ""): JsonNode =
-  result = newJObject()
-  if subscriptionId.len == 0:
-    result["id"] = %id
-    result["type"] = %"error"
-  else:
-    result["type"] = %"subscription"
-    result["subscriptionId"] = %subscriptionId
-  var errorOut = %*{"name": name, "message": message}
-  if data.len > 0:
-    errorOut["data"] = parseJson(data)
-  result["error"] = errorOut
-  if logs.len > 0:
-    let parsedLogs = parseJson(logs)
-    if parsedLogs.kind == JArray and parsedLogs.len > 0:
-      result["logs"] = parsedLogs
-
-proc emitFailure(id, subscriptionId: string; error: ref CatchableError) =
-  var name = "Error"
-  var data = ""
-  var logs = ""
-  if error of FunctionError:
-    name = "FunctionError"
-    let functionError = cast[ref FunctionError](error)
-    if functionError.hasData:
-      data = $functionError.data
-    if functionError.logs.len > 0:
-      logs = $(%functionError.logs)
-  elif error of ProtocolError:
-    name = "ProtocolError"
-  elif error of TransportError:
-    name = "TransportError"
-  emit(failureEvent(id, subscriptionId, name, error.msg, data, logs))
-
-iterator commandLines(): string =
-  if controller.isNil:
-    for line in stdin.lines:
-      yield line
-  else:
-    while true:
-      let line = controller.recvLine()
-      if line.len == 0:
+      let logs = validatedLogs(update.logs)
+      if not logs.isNil:
+        eventOut["logs"] = logs
+      if not enqueueNode(output, eventOut,
+          subscriptionId = subscriptionId,
+          generation = generation, relayData = true):
         break
-      yield line
+    except CatchableError as error:
+      let eventOut = failureEvent("", subscriptionId, "ProtocolError",
+        "invalid Live relay payload: " & error.msg)
+      if not enqueueNode(output, eventOut,
+          subscriptionId = subscriptionId,
+          generation = generation):
+        break
+  drainLiveMailbox(updates)
+  done[].store(true)
+
+proc stopSubscription(current: var AdapterSubscription): string =
+  try:
+    current.subscription.close()
+  except CatchableError as error:
+    result = error.msg
+  let deadline = epochTime() + relayShutdownDeadlineSeconds
+  while epochTime() < deadline and not current.relayDone[].load:
+    sleep(1)
+  if current.relayDone[].load:
+    joinThread(current.relay[])
+    deallocShared(current.relay)
+    current.relay = nil
+    # A timed-out owner can still hold the mailbox pointers. Only release
+    # shared storage after close's owner acknowledgement is a real barrier.
+    if result.len == 0:
+      current.subscription.releaseAdapterSubscription()
+  elif result.len == 0:
+    result = "adapter relay did not stop before deadline"
+
+proc stopSubscription(subscriptionId: string; current: var AdapterSubscription;
+    output: OutputProducer): string =
+  let outcome = output.invalidateRelay(subscriptionId, current.generation)
+  if outcome != outputAccepted:
+    result = "could not reserve relay invalidation barrier"
+  let closeError = stopSubscription(current)
+  if result.len == 0:
+    result = closeError
+
+iterator commandLines(controller: Socket; output: AdapterOutput): CommandLine =
+  ## Read NDJSON incrementally. stdio.readLine and Socket.recvLine allocate the
+  ## whole line before schema validation, which lets an untrusted controller
+  ## bypass the declared command budget.
+  let inputDescriptor = if controller.isNil: cint(0)
+    else: cint(controller.getFd)
+  var buffered = ""
+  var discardingOversized = false
+  var reachedEof = false
+  while not reachedEof and not output.failed():
+    var descriptor = TPollfd(fd: inputDescriptor, events: POLLIN)
+    let ready = poll(addr descriptor, Tnfds(1), 100)
+    if ready < 0:
+      if errno == EINTR:
+        continue
+      break
+    if ready == 0:
+      continue
+    var chunk = newString(8 * 1024)
+    let count = posix.read(inputDescriptor, chunk[0].addr, chunk.len)
+    if count < 0:
+      if errno in {EINTR, EAGAIN, EWOULDBLOCK}:
+        continue
+      break
+    if count == 0:
+      reachedEof = true
+      break
+    chunk.setLen(int(count))
+    var cursor = 0
+    while cursor < chunk.len:
+      let newline = chunk.find('\n', cursor)
+      let finish = if newline < 0: chunk.len else: newline
+      let piece = chunk[cursor ..< finish]
+      if not discardingOversized:
+        if piece.len > maxAdapterCommandBytes - buffered.len:
+          buffered.setLen(0)
+          discardingOversized = true
+        else:
+          buffered.add(piece)
+      if newline >= 0:
+        if discardingOversized:
+          yield CommandLine(oversized: true)
+        else:
+          if buffered.endsWith("\r"):
+            buffered.setLen(buffered.len - 1)
+          yield CommandLine(value: buffered)
+        buffered.setLen(0)
+        discardingOversized = false
+        cursor = newline + 1
+      else:
+        cursor = chunk.len
+  if discardingOversized:
+    yield CommandLine(oversized: true)
+  elif buffered.len > 0:
+    yield CommandLine(value: buffered)
 
 proc ensureClient(client: var Client): Client =
   if client.isNil:
@@ -157,137 +214,186 @@ proc ensureClient(client: var Client): Client =
     if deployment.len == 0:
       raise newException(TransportError, "CONVEX_URL is required")
     client = newClient(deployment, getEnv("CONVEX_AUTH_TOKEN"))
-  return client
+  result = client
 
-proc main() =
-  initLock(outputLock)
-  activeRelays = initTable[string, uint64]()
+proc runAdapter(controller: Socket; outputDescriptor: cint; socketOutput: bool) =
+  let output = newAdapterOutput(outputDescriptor, socketOutput)
+  let producer = output.producer
   var client: Client
   var subscriptions = initTable[string, AdapterSubscription]()
   var nextGeneration: uint64 = 0
+  var closeReceived = false
 
-  for line in commandLines():
+  for input in commandLines(controller, output):
+    if input.oversized:
+      if not emitFailure(producer, "", "", commandInputLimitError()):
+        break
+      continue
+    let line = input.value
     if line.strip.len == 0:
       continue
-    var command: JsonNode
+    var command: AdapterCommand
     try:
-      command = parseJson(line)
-      if command.kind != JObject:
-        raise newException(ValueError, "adapter command must be an object")
-    except CatchableError as error:
-      emitFailure("", "", newException(ProtocolError,
-        "malformed adapter command: " & error.msg))
+      command = parseAdapterCommand(line)
+    except AdapterValidationError as error:
+      if not emitFailure(producer, error.commandId, "", error):
+        break
       continue
 
-    let id = if command.hasKey("id"): command["id"].getStr else: ""
-    let operation = if command.hasKey("op"): command["op"].getStr else: ""
     try:
-      case operation
+      case command.operation
       of "hello":
-        if not command.hasKey("protocolVersion") or
-            command["protocolVersion"].getInt != adapterProtocolVersion:
-          raise newException(ProtocolError, "unsupported adapter protocol version")
-        emit(%*{
-          "protocolVersion": adapterProtocolVersion,
-          "id": id,
-          "type": "ready",
-          "language": "nim",
-          "implementation": "native-nim-2.2.4",
-          "runtime": NimVersion
-        })
+        if not enqueueNode(producer, %*{
+            "protocolVersion": adapterProtocolVersion,
+            "id": command.id,
+            "type": "ready",
+            "language": "nim",
+            "implementation": "native-nim-2.2.4",
+            "runtime": NimVersion
+          }, command.id):
+          break
       of "query", "mutation", "action":
         let activeClient = ensureClient(client)
-        let args = if command.hasKey("args"): command["args"] else: newJObject()
-        let answer = case operation
-          of "query": activeClient.query(command["path"].getStr, args)
-          of "mutation": activeClient.mutation(command["path"].getStr, args)
-          else: activeClient.action(command["path"].getStr, args)
-        var eventOut = %*{"id": id, "type": "result", "value": answer.value}
+        let answer = case command.operation
+          of "query": activeClient.query(command.node["path"].getStr,
+            command.node["args"])
+          of "mutation": activeClient.mutation(command.node["path"].getStr,
+            command.node["args"])
+          else: activeClient.action(command.node["path"].getStr,
+            command.node["args"])
+        var eventOut = %*{
+          "id": command.id,
+          "type": "result",
+          "value": answer.value
+        }
         if answer.logs.len > 0:
           eventOut["logs"] = %answer.logs
-        emit(eventOut)
+        if not enqueueNode(producer, eventOut, command.id):
+          break
       of "setAuth":
-        let activeClient = ensureClient(client)
-        activeClient.setAuth(if command.hasKey("token"): command["token"].getStr else: "")
-        emit(%*{"id": id, "type": "ack"})
+        ensureClient(client).setAuth(command.node["token"].getStr)
+        if not enqueueNode(producer,
+            %*{"id": command.id, "type": "ack"}, command.id):
+          break
       of "subscribe":
-        if not command.hasKey("subscriptionId"):
-          raise newException(ProtocolError, "subscriptionId is required")
-        let subscriptionId = command["subscriptionId"].getStr
+        let subscriptionId = command.subscriptionId
         if subscriptions.hasKey(subscriptionId):
-          let old = subscriptions[subscriptionId]
-          invalidateRelay(subscriptionId, old.generation)
-          old.subscription.close()
-          wakeRelay(old.subscription)
+          var old = subscriptions[subscriptionId]
           subscriptions.del(subscriptionId)
-        let activeClient = ensureClient(client)
-        let args = if command.hasKey("args"): command["args"] else: newJObject()
-        let subscription = activeClient.subscribe(command["path"].getStr, args)
+          let stopError = stopSubscription(subscriptionId, old, producer)
+          if stopError.len > 0:
+            raise newException(TransportError, stopError)
+        elif subscriptions.len >= maxAdapterSubscriptions:
+          raise newException(TransportError,
+            "adapter subscription limit reached")
+
+        # Client.subscribe returns only after the owner has written Add. This
+        # makes the adapter acknowledgement a real activation barrier.
+        let subscription = ensureClient(client).subscribe(
+          command.node["path"].getStr, command.node["args"])
+        subscription.markAdapterRelay()
         nextGeneration.inc
         let generation = nextGeneration
+        let relayDone = sharedAtomic(false)
+        if producer.activateRelay(subscriptionId, generation) != outputAccepted:
+          subscription.close()
+          subscription.releaseAdapterSubscription()
+          raise newException(TransportError,
+            "could not reserve relay activation barrier")
+        if not enqueueNode(producer,
+            %*{"id": command.id, "type": "ack"}, command.id):
+          subscription.close()
+          subscription.releaseAdapterSubscription()
+          raise newException(TransportError,
+            "could not reserve subscribe acknowledgement")
+        let relay = cast[ptr Thread[RelayArgs]](
+          allocShared0(sizeof(Thread[RelayArgs])))
+        createThread(relay[], relayUpdates, RelayArgs(
+          subscriptionId: subscriptionId, generation: generation,
+          updates: subscription.updates, closed: subscription.closed,
+          done: relayDone, output: producer))
         subscriptions[subscriptionId] = AdapterSubscription(
-          subscription: subscription, generation: generation)
-        activateRelay(subscriptionId, generation)
-        emit(%*{"id": id, "type": "ack"})
-        var relay: Thread[RelayArgs]
-        createThread(relay, relayUpdates, RelayArgs(subscriptionId: subscriptionId,
-          generation: generation, updates: subscription.updates))
+          subscription: subscription, generation: generation,
+          relay: relay, relayDone: relayDone)
       of "unsubscribe":
-        if command.hasKey("subscriptionId"):
-          let subscriptionId = command["subscriptionId"].getStr
-          if subscriptions.hasKey(subscriptionId):
-            let current = subscriptions[subscriptionId]
-            invalidateRelay(subscriptionId, current.generation)
-            current.subscription.close()
-            wakeRelay(current.subscription)
-            subscriptions.del(subscriptionId)
-        emit(%*{"id": id, "type": "ack"})
+        let subscriptionId = command.subscriptionId
+        if subscriptions.hasKey(subscriptionId):
+          var current = subscriptions[subscriptionId]
+          subscriptions.del(subscriptionId)
+          let stopError = stopSubscription(subscriptionId, current, producer)
+          if stopError.len > 0:
+            raise newException(TransportError, stopError)
+        if not enqueueNode(producer,
+            %*{"id": command.id, "type": "ack"}, command.id):
+          break
       of "debugDisconnect":
         when defined(convexadapter):
           let message = ensureClient(client).debugDisconnectForAdapter()
           if message.len > 0:
             raise newException(TransportError, message)
-          emit(%*{"id": id, "type": "ack"})
+          if not enqueueNode(producer,
+              %*{"id": command.id, "type": "ack"}, command.id):
+            break
         else:
-          raise newException(ProtocolError, "debugDisconnect is adapter-only")
+          raise newException(ProtocolError,
+            "debugDisconnect is adapter-only")
       of "close":
-        for subscription in subscriptions.values:
-          wakeRelay(subscription.subscription)
-        if not client.isNil:
-          client.close()
-        ## Client.close stops the owner without answering later unsubscribe
-        ## commands.  Drop this table before the common cleanup path.
+        var closeError = ""
+        for subscriptionId, stored in subscriptions.mpairs:
+          let error = stopSubscription(subscriptionId, stored, producer)
+          if closeError.len == 0:
+            closeError = error
         subscriptions.clear()
-        emit(%*{"id": id, "type": "closed"})
+        if not client.isNil:
+          try:
+            client.close()
+          except CatchableError as error:
+            if closeError.len == 0:
+              closeError = error.msg
+        if closeError.len > 0:
+          discard emitFailure(producer, command.id, "",
+            newException(TransportError, closeError))
+        else:
+          discard enqueueNode(producer,
+            %*{"id": command.id, "type": "closed"}, command.id)
+        closeReceived = true
         break
       else:
-        raise newException(ProtocolError, "unknown adapter operation: " & operation)
-    except FunctionError as error:
-      emitFailure(id, "", error)
-    except ProtocolError as error:
-      emitFailure(id, "", error)
-    except TransportError as error:
-      emitFailure(id, "", error)
+        raise newException(ProtocolError, "unknown adapter operation")
     except CatchableError as error:
-      emitFailure(id, "", error)
+      if not emitFailure(producer, command.id, "", error):
+        break
 
-  for subscription in subscriptions.values:
-    subscription.subscription.close()
-  if not client.isNil:
-    client.close()
+  if not closeReceived:
+    for subscriptionId, stored in subscriptions.mpairs:
+      discard stopSubscription(subscriptionId, stored, producer)
+    subscriptions.clear()
+    if not client.isNil:
+      try:
+        client.close()
+      except CatchableError:
+        discard
+  if not output.close():
+    stderr.writeLine("adapter output owner did not stop before deadline")
+    quit(1)
 
 let listenAddress = getEnv("ADAPTER_LISTEN")
 if listenAddress.len > 0:
   let pieces = listenAddress.rsplit(":", maxsplit = 1)
   let server = newSocket()
   server.setSockOpt(OptReuseAddr, true)
-  server.bindAddr(Port(parseInt(pieces[^1])), if pieces.len > 1: pieces[0] else: "0.0.0.0")
+  server.bindAddr(Port(parseInt(pieces[^1])),
+    if pieces.len > 1: pieces[0] else: "0.0.0.0")
   server.listen()
+  let (_, boundPort) = server.getLocalAddr()
+  # TCP mode has no stdout readiness message because stdout belongs to NDJSON.
+  # A controller test can wait on this stderr barrier without guessing sleeps.
+  stderr.writeLine("adapter-listening:" & $int(boundPort))
+  stderr.flushFile()
   var accepted: owned(Socket)
   server.accept(accepted)
-  controller = accepted
-  main()
-  controller.close()
+  runAdapter(accepted, cint(accepted.getFd), true)
+  accepted.close()
   server.close()
 else:
-  main()
+  runAdapter(nil, cint(1), false)

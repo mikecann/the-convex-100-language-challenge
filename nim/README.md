@@ -12,11 +12,11 @@ Read the [canonical basic example](examples/basics/main.nim). It accepts a uniqu
 
 | Capability | Status | Evidence |
 | --- | --- | --- |
-| HTTP query, mutation, action | Implemented in the client | Native `std/httpclient`, strict Convex response decoding, and structured errors |
+| HTTP query, mutation, action | Implemented in the client | Native bounded `std/httpclient` streaming, strict Convex response decoding, and structured errors |
 | HTTP bearer authentication | Implemented in the client | `setAuth` and `CONVEX_AUTH_TOKEN` set or replace the Authorization header |
-| Live subscriptions | Implemented in the client, shared badge pending | One socket owner, active Add replay, five reconnect barriers, unchanged rehydration suppression, strict timestamp ordering, and a bounded relay mailbox; shared evidence is not claimed |
+| Live subscriptions | Implemented; the canonical example completes its journey against a real deployment | One socket owner, Add replay across five real reconnects, transactional transitions, strict timestamp ordering, and a bounded delivery mailbox whose overflow is tested; shared conformance evidence is not claimed |
 
-The capability list in `manifest.yaml` remains empty until the root-owned shared verifier records evidence for this exact source commit. This checkpoint is not a complete Live handoff: reconnect replay needs further repair and deterministic adversarial fixtures are still pending.
+The capability list in `manifest.yaml` remains empty until the root-owned shared verifier records evidence for the reviewed source commit.
 
 ## Canonical example
 
@@ -90,23 +90,29 @@ main()
 
 ## Docker verification
 
-Run these on Bruce, not on a development Mac:
+Run these on a genuine x86_64 Docker lane, not on a development Mac:
 
 ```sh
 ./run test nim
 ./run verify-example nim
 ```
 
-The `test` target runs the focused JSON/timestamp regressions, compiles the exact example, NDJSON adapter, and deterministic five-reconnect real-socket test, and exercises the adapter hello path. Run the compiled reconnect test from the test image with `CONVEX_URL` to prove the hosted five-barrier sequence. `verify-example` runs the exact canonical source from its minimal amd64 image against a unique room. Root-owned `verify`, `verify-hosted`, and `verify-all` add the shared black-box evidence later.
+The `test` target executes strict adapter-schema serialization, exact stdin and TCP adapter modes, atomic Live transition recovery, fragmented Unicode/control/oversize frames, a failed Add against a stalled peer, idle/flood/half-frame close deadlines, bounded HTTP streams, stale relay generations, count-plus-byte output limits, the bounded Live delivery mailbox and its overflow ordering, and the real stopped-reader process fixture. It also compiles the exact example, adapter, and hosted five-reconnect test. Run the reconnect executable with `CONVEX_URL` to prove the hosted five-barrier sequence. `verify-example` runs the exact canonical source from its pinned amd64 runtime image against a unique room. Root-owned `verify`, `verify-hosted`, and `verify-all` add shared black-box evidence later.
 
-The build pins Nim 2.2.4, treeform/ws 0.6.0, the dependency archive checksum, and the Debian runtime image digest. A small checked-in build script patches treeform/ws to send the Convex client header and to handle Ping/Pong/Close control frames between fragmented data frames. TLS verification uses the runtime CA bundle.
+Each binary compiles in its own Docker layer. The commands and assertions are the same as one combined step; the split simply lets an emulated amd64 lane whose `gcc` crashes at random resume from the last good binary.
+
+The build pins Nim 2.2.4, treeform/ws 0.6.0, the dependency archive checksum, and the non-scratch Debian runtime image digest. Checked-in build scripts patch Nim's native HTTP parser and treeform/ws before compilation, enforcing response/frame limits before unbounded materialisation, exposing failed writes, and handling control frames between fragments. Nim's asynchronous sockets default to `SafeDisconn`, which completes a write to a reset peer without raising; the patch drops that flag so a Live `Add` that never reached the server fails activation instead of being acknowledged. The final image remains based on that pinned Debian digest while pruning its filesystem to the exact native binary, approved POSIX commands, TLS libraries, OpenSSL configuration/provider modules, CA bundle, and name-resolution closure. It explicitly removes the `openssl` and `perl` commands and checks the complete final command surface in both runtime targets.
 
 ## Adapter and protocol notes
 
-The test-only adapter speaks NDJSON protocol v1 over stdin/stdout or one TCP controller connection. It omits absent optional fields, reports structured `FunctionError`, `ProtocolError`, and `TransportError` values, and reserves `debugDisconnect` for the adapter build. Live state is owned by one worker, while four two-megabyte shared-memory slots bound each subscription's queued data; a full single-producer/single-consumer mailbox drops a new frame rather than overwriting a frame being read.
+The test-only adapter speaks NDJSON protocol v1 over stdin/stdout or one TCP controller connection. It validates every command before field access, rejects additional properties and wrong types, omits absent optional fields, reports structured `FunctionError`, `ProtocolError`, and `TransportError` values, and reserves `debugDisconnect` for the adapter build.
 
-The Live implementation validates state versions and little-endian uint64 timestamps, replays active Add operations after reconnect, suppresses unchanged rehydration, and retires a connection when a bounded read slice expires so a partial frame is never reused.
+A Transition from a real deployment also carries `clientClockSkew` and `serverTs` beside the four fields this client acts on. Both are accepted by name and ignored, so the field allow-list still rejects genuinely unknown fields.
+
+The Live implementation validates a complete Transition into temporary state before commit, replays active Add operations after reconnect, suppresses unchanged rehydration, and abandons the entire connection after a frame deadline so consumed partial bytes are never reused. A global 16-record, 8 MiB Live-delivery budget complements each four-slot mailbox. One adapter output owner reserves at most 16 records and 10 MiB, invalidates stale relay generations in queue order, and applies a bounded write deadline.
 
 ## Limitations
 
-This branch does not run the root shared conformance pilots or award badges. Live authentication, WebSocket mutations/actions, and `TransitionChunk` assembly are deferred. The pinned third-party WebSocket transport is patched in the Docker build. Deterministic local coverage now includes the real-socket five-reconnect barrier and final mutation; fragmented-frame, stale-barrier, QueryFailed recovery, and stopped-reader fixtures still need independent reviewer execution.
+This branch does not run root shared conformance or award badges. Live authentication, WebSocket mutations/actions, and `TransitionChunk` assembly are deferred. The pinned third-party WebSocket transport is patched during the Docker build.
+
+The evidence for this head was produced on Apple Silicon through Docker Desktop's Rosetta `linux/amd64` emulation. The images are genuine `linux/amd64` — the build fails unless `uname -m` reports `x86_64` — but no native x86_64 host has executed this exact source commit, and Rosetta's `gcc` segfaults at random during compilation. Read every timing-sensitive result here as emulated rather than native.
