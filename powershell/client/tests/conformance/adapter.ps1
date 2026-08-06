@@ -340,30 +340,93 @@ function Drain-Subscriptions {
 
 function Assert-AdapterCommand {
     param([hashtable] $Command)
-    if (-not $Command.ContainsKey('op') -or [string]::IsNullOrWhiteSpace([string]$Command['op'])) {
-        throw (New-AdapterProtocolException 'adapter command omitted op')
+
+    function Get-JsonStringLength([string] $Value) {
+        $length = 0
+        $offset = 0
+        while ($offset -lt $Value.Length) {
+            $rune = [Text.Rune]::GetRuneAt($Value, $offset)
+            $offset += $rune.Utf16SequenceLength
+            $length++
+        }
+        $length
     }
-    $operation = [string]$Command['op']
-    if ($operation -in @('hello', 'close', 'setAuth', 'query', 'mutation', 'action', 'subscribe', 'unsubscribe', 'debugDisconnect')) {
-        if (-not $Command.ContainsKey('id') -or [string]::IsNullOrWhiteSpace([string]$Command['id'])) {
-            throw (New-AdapterProtocolException "$operation command omitted id")
+
+    function Assert-RequiredString(
+        [hashtable] $Value,
+        [string] $Field,
+        [int] $MinimumLength,
+        [int] $MaximumLength = [int]::MaxValue
+    ) {
+        if (-not $Value.ContainsKey($Field) -or $Value[$Field] -isnot [string]) {
+            throw (New-AdapterProtocolException "adapter command $Field must be a string")
+        }
+        # JSON Schema measures string length in Unicode code points, not .NET
+        # UTF-16 code units. This keeps astral IDs within the shared 128 limit.
+        $length = Get-JsonStringLength $Value[$Field]
+        if ($length -lt $MinimumLength -or $length -gt $MaximumLength) {
+            throw (New-AdapterProtocolException "adapter command $Field length is out of range")
         }
     }
-    if ($operation -in @('query', 'mutation', 'action', 'subscribe')) {
-        if (-not $Command.ContainsKey('path') -or [string]::IsNullOrWhiteSpace([string]$Command['path'])) {
-            throw (New-AdapterProtocolException "$operation command omitted path")
+
+    function Assert-Fields([hashtable] $Value, [string[]] $Required, [string[]] $Allowed) {
+        foreach ($field in $Required) {
+            if (-not $Value.ContainsKey($field)) {
+                throw (New-AdapterProtocolException "adapter command omitted $field")
+            }
         }
-        if (-not $Command.ContainsKey('args') -or $Command['args'] -isnot [hashtable]) {
-            throw (New-AdapterProtocolException "$operation args must be a JSON object")
+        foreach ($field in $Value.Keys) {
+            if ($field -notin $Allowed) {
+                throw (New-AdapterProtocolException "adapter command contains unexpected field $field")
+            }
         }
     }
-    if ($operation -in @('subscribe', 'unsubscribe')) {
-        if (-not $Command.ContainsKey('subscriptionId') -or [string]::IsNullOrWhiteSpace([string]$Command['subscriptionId'])) {
-            throw (New-AdapterProtocolException "$operation command omitted subscriptionId")
-        }
+
+    Assert-RequiredString $Command 'op' 1
+    $operation = $Command['op']
+    if ($operation -notin @('hello', 'close', 'setAuth', 'query', 'mutation', 'action', 'subscribe', 'unsubscribe', 'debugDisconnect')) {
+        throw (New-AdapterProtocolException "unknown operation $operation")
     }
-    if ($operation -eq 'setAuth' -and -not $Command.ContainsKey('token')) {
-        throw (New-AdapterProtocolException 'setAuth command omitted token')
+    Assert-RequiredString $Command 'id' 1 128
+
+    switch ($operation) {
+        'hello' {
+            Assert-Fields $Command @('protocolVersion', 'id', 'op') @('protocolVersion', 'id', 'op')
+            $protocolVersion = $Command['protocolVersion']
+            $isVersionOne = $false
+            if ($protocolVersion -isnot [bool] -and $protocolVersion -is [ValueType]) {
+                try { $isVersionOne = [decimal]$protocolVersion -eq 1 } catch {}
+            }
+            if (-not $isVersionOne) {
+                throw (New-AdapterProtocolException 'unsupported adapter protocol version')
+            }
+        }
+        { $_ -in @('query', 'mutation', 'action') } {
+            Assert-Fields $Command @('id', 'op', 'path', 'args') @('id', 'op', 'path', 'args')
+            Assert-RequiredString $Command 'path' 3
+            if ($Command['args'] -isnot [hashtable]) {
+                throw (New-AdapterProtocolException "$operation args must be a JSON object")
+            }
+        }
+        'subscribe' {
+            Assert-Fields $Command @('id', 'op', 'subscriptionId', 'path', 'args') @('id', 'op', 'subscriptionId', 'path', 'args')
+            Assert-RequiredString $Command 'subscriptionId' 1 128
+            Assert-RequiredString $Command 'path' 3
+            if ($Command['args'] -isnot [hashtable]) {
+                throw (New-AdapterProtocolException 'subscribe args must be a JSON object')
+            }
+        }
+        'unsubscribe' {
+            Assert-Fields $Command @('id', 'op', 'subscriptionId') @('id', 'op', 'subscriptionId')
+            Assert-RequiredString $Command 'subscriptionId' 1 128
+        }
+        'setAuth' {
+            Assert-Fields $Command @('id', 'op', 'token') @('id', 'op', 'token')
+            Assert-RequiredString $Command 'token' 0
+        }
+        { $_ -in @('close', 'debugDisconnect') } {
+            Assert-Fields $Command @('id', 'op') @('id', 'op')
+        }
     }
 }
 
@@ -415,9 +478,9 @@ function Run-Adapter {
                 Write-AdapterFailure $Writer '' '' $_.Exception
                 continue
             }
-            $id = if ($command.ContainsKey('id')) { [string]$command['id'] } else { '' }
+            $id = $command['id']
             try {
-                switch ([string]$command['op']) {
+                switch ($command['op']) {
                     'hello' {
                         if ($command['protocolVersion'] -ne 1) {
                             throw (New-AdapterProtocolException 'unsupported adapter protocol version')
@@ -451,7 +514,7 @@ function Run-Adapter {
                         if (-not $client) {
                             $client = New-ConvexClient $Url
                         }
-                        Set-ConvexAuth $client ([string]$command['token'])
+                        Set-ConvexAuth $client $command['token']
                         Write-AdapterEvent $Writer @{ id = $id; type = 'ack' }
                     }
                     { $_ -in @('query', 'mutation', 'action') } {
@@ -460,8 +523,8 @@ function Run-Adapter {
                         }
                         $callArguments = @{
                             Client       = $client
-                            Operation    = [string]$command['op']
-                            Path         = [string]$command['path']
+                            Operation    = $command['op']
+                            Path         = $command['path']
                             FunctionArgs = [hashtable]$command['args']
                         }
                         $result = Invoke-ConvexFunction @callArguments
@@ -478,20 +541,20 @@ function Run-Adapter {
                         }
                         $subscriptionArguments = @{
                             Live         = $live
-                            Id           = [string]$command['subscriptionId']
-                            Path         = [string]$command['path']
+                            Id           = $command['subscriptionId']
+                            Path         = $command['path']
                             FunctionArgs = [hashtable]$command['args']
                         }
                         $record = Add-ConvexSubscription @subscriptionArguments
-                        $subscriptions[[string]$command['subscriptionId']] = $record
+                        $subscriptions[$command['subscriptionId']] = $record
                         Write-AdapterEvent $Writer @{ id = $id; type = 'ack' }
                     }
                     'unsubscribe' {
                         if ($live) {
-                            Remove-ConvexSubscription $live ([string]$command['subscriptionId'])
+                            Remove-ConvexSubscription $live $command['subscriptionId']
                         }
                         $old = $null
-                        $subscriptions.TryRemove([string]$command['subscriptionId'], [ref]$old) | Out-Null
+                        $subscriptions.TryRemove($command['subscriptionId'], [ref]$old) | Out-Null
                         # The adapter's sole Live owner remains alive for the
                         # controller's TCP session. Unsubscribe has already
                         # retired its WebSocket, and stopping this runspace

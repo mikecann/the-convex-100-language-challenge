@@ -5,6 +5,14 @@ function Assert-True([bool] $Condition, [string] $Message) {
     if (-not $Condition) { throw $Message }
 }
 
+function Assert-ExactKeys([hashtable] $Value, [string[]] $Expected, [string] $Message) {
+    $actualKeys = @($Value.Keys | Sort-Object)
+    $expectedKeys = @($Expected | Sort-Object)
+    Assert-True (($actualKeys -join ',') -eq ($expectedKeys -join ',')) (
+        "$Message. expected=$($expectedKeys -join ',') actual=$($actualKeys -join ',')"
+    )
+}
+
 function Start-Fixture([int] $Port) {
     $ready = "/tmp/powershell-adapter-fixture-$Port.ready"
     [IO.File]::Delete($ready)
@@ -72,6 +80,14 @@ function Send-Line($Process, [string] $Line) {
     $Process.StandardInput.Flush()
 }
 
+function Assert-ProtocolCommandRejected($Process, [string] $Command, [string] $Name) {
+    Send-Line $Process $Command
+    $event = Read-LineBefore $Process.StandardOutput
+    Assert-True ($event.type -eq 'error') "$Name did not emit an error event"
+    Assert-True ($event.error.name -eq 'ProtocolError') "$Name was not ProtocolError"
+    Assert-ExactKeys $event @('error', 'type') "$Name emitted optional fields for invalid input"
+}
+
 function Connect-Adapter([int] $Port) {
     $deadline = [datetime]::UtcNow.AddSeconds(5)
     while ([datetime]::UtcNow -lt $deadline) {
@@ -110,8 +126,13 @@ function Send-TcpCommand([Net.Sockets.NetworkStream] $Stream, [hashtable] $Comma
 }
 
 function Read-TcpEvent([Net.Sockets.NetworkStream] $Stream) {
-    [Text.Encoding]::UTF8.GetString((Read-RawLine $Stream)) |
-        ConvertFrom-Json -AsHashtable -Depth 64
+    $text = [Text.Encoding]::UTF8.GetString((Read-RawLine $Stream))
+    $event = $text | ConvertFrom-Json -AsHashtable -Depth 64
+    if ($event -isnot [Collections.IDictionary]) {
+        $eventType = if ($null -eq $event) { 'null' } else { $event.GetType().FullName }
+        throw "TCP adapter emitted a non-object event ($eventType): $text"
+    }
+    $event
 }
 
 $fixture = Start-Fixture 43138
@@ -119,39 +140,99 @@ try {
     # Stdin mode keeps malformed input as structured ProtocolError events, keeps
     # single log lines as JSON arrays, and cleans up after a complete close.
     $adapter = Start-Adapter $fixture.Url
-    foreach ($bad in @('{', '[]', '{}', '{"id":"bad","op":"query","path":"demo:echo"}')) {
-        Send-Line $adapter $bad
-        $event = Read-LineBefore $adapter.StandardOutput
-        Assert-True ($event.type -eq 'error') 'malformed command did not emit an error event'
-        Assert-True ($event.error.name -eq 'ProtocolError') 'malformed command was not ProtocolError'
+    $longId = 'i' * 129
+    $longSubscriptionId = 's' * 129
+    $invalidCommands = [ordered]@{
+        'malformed JSON'              = '{'
+        'array root'                  = '[]'
+        'null root'                   = 'null'
+        'scalar root'                 = '42'
+        'string root'                 = '"command"'
+        'missing operation and ID'    = '{}'
+        'null operation'              = '{"protocolVersion":1,"id":"bad","op":null}'
+        'boolean operation'           = '{"protocolVersion":1,"id":"bad","op":true}'
+        'unknown operation'           = '{"id":"bad","op":"unknown"}'
+        'numeric ID'                  = '{"protocolVersion":1,"id":12,"op":"hello"}'
+        'null ID'                     = '{"protocolVersion":1,"id":null,"op":"hello"}'
+        'empty ID'                    = '{"protocolVersion":1,"id":"","op":"hello"}'
+        'overlong ID'                 = (@{ protocolVersion = 1; id = $longId; op = 'hello' } | ConvertTo-Json -Compress)
+        'hello missing version'       = '{"id":"bad","op":"hello"}'
+        'hello null version'          = '{"protocolVersion":null,"id":"bad","op":"hello"}'
+        'hello string version'        = '{"protocolVersion":"1","id":"bad","op":"hello"}'
+        'hello boolean version'       = '{"protocolVersion":true,"id":"bad","op":"hello"}'
+        'hello wrong version'         = '{"protocolVersion":2,"id":"bad","op":"hello"}'
+        'hello extra field'           = '{"protocolVersion":1,"id":"bad","op":"hello","extra":true}'
+        'query missing args'          = '{"id":"bad","op":"query","path":"demo:echo"}'
+        'query null path'             = '{"id":"bad","op":"query","path":null,"args":{}}'
+        'query numeric path'          = '{"id":"bad","op":"query","path":12,"args":{}}'
+        'query short path'            = '{"id":"bad","op":"query","path":"ab","args":{}}'
+        'mutation array args'         = '{"id":"bad","op":"mutation","path":"demo:increment","args":[]}'
+        'action null args'            = '{"id":"bad","op":"action","path":"demo:greet","args":null}'
+        'action extra field'          = '{"id":"bad","op":"action","path":"demo:greet","args":{},"extra":true}'
+        'subscribe missing path'      = '{"id":"bad","op":"subscribe","subscriptionId":"sub","args":{}}'
+        'subscribe null args'         = '{"id":"bad","op":"subscribe","subscriptionId":"sub","path":"demo:state","args":null}'
+        'subscribe numeric ID'        = '{"id":"bad","op":"subscribe","subscriptionId":12,"path":"demo:state","args":{}}'
+        'subscribe null ID'           = '{"id":"bad","op":"subscribe","subscriptionId":null,"path":"demo:state","args":{}}'
+        'subscribe empty ID'          = '{"id":"bad","op":"subscribe","subscriptionId":"","path":"demo:state","args":{}}'
+        'subscribe overlong ID'       = (@{ id = 'bad'; op = 'subscribe'; subscriptionId = $longSubscriptionId; path = 'demo:state'; args = @{} } | ConvertTo-Json -Compress)
+        'subscribe extra field'       = '{"id":"bad","op":"subscribe","subscriptionId":"sub","path":"demo:state","args":{},"extra":true}'
+        'unsubscribe missing ID'      = '{"id":"bad","op":"unsubscribe"}'
+        'unsubscribe extra path'      = '{"id":"bad","op":"unsubscribe","subscriptionId":"sub","path":"demo:state"}'
+        'setAuth missing token'       = '{"id":"bad","op":"setAuth"}'
+        'setAuth null token'          = '{"id":"bad","op":"setAuth","token":null}'
+        'setAuth numeric token'       = '{"id":"bad","op":"setAuth","token":12}'
+        'setAuth extra field'         = '{"id":"bad","op":"setAuth","token":"","extra":true}'
+        'close extra field'           = '{"id":"bad","op":"close","extra":true}'
+        'debugDisconnect missing ID'  = '{"op":"debugDisconnect"}'
+        'debugDisconnect extra field' = '{"id":"bad","op":"debugDisconnect","extra":true}'
+    }
+    foreach ($entry in $invalidCommands.GetEnumerator()) {
+        Assert-ProtocolCommandRejected $adapter $entry.Value $entry.Key
     }
     Send-Line $adapter ('x' * 66000)
     $overflow = Read-LineBefore $adapter.StandardOutput
     Assert-True ($overflow.error.name -eq 'ProtocolError') 'oversized partial NDJSON was not ProtocolError'
+    Assert-ExactKeys $overflow @('error', 'type') 'oversized NDJSON emitted optional fields'
     Send-Line $adapter '{"protocolVersion":1,"id":"hello","op":"hello"}'
-    Assert-True ((Read-LineBefore $adapter.StandardOutput).type -eq 'ready') 'stdin hello failed after malformed input'
+    $ready = Read-LineBefore $adapter.StandardOutput
+    Assert-True ($ready.type -eq 'ready') 'stdin hello failed after malformed input'
+    Assert-ExactKeys $ready @('protocolVersion', 'id', 'type', 'language', 'implementation', 'runtime') 'ready event shape'
+    Send-Line $adapter '{"id":"auth","op":"setAuth","token":""}'
+    $auth = Read-LineBefore $adapter.StandardOutput
+    Assert-True ($auth.type -eq 'ack') 'setAuth failed after ProtocolError recovery'
+    Assert-ExactKeys $auth @('id', 'type') 'setAuth acknowledgement shape'
+    Send-Line $adapter '{"id":"action","op":"action","path":"demo:greet","args":{}}'
+    $action = Read-LineBefore $adapter.StandardOutput
+    Assert-True ($action.value.message -eq 'Convex is responding from fixture') 'valid action command failed'
+    Assert-ExactKeys $action @('id', 'type', 'value') 'result without logs shape'
     Send-Line $adapter '{"id":"q","op":"query","path":"demo:echo","args":{"value":"ok"}}'
     $query = Read-LineBefore $adapter.StandardOutput
     Assert-True ($query.value -eq 'ok') 'stdin query did not use real client'
     Assert-True ($query.logs -is [array] -and $query.logs.Count -eq 1) 'adapter collapsed one HTTP log to a scalar'
+    Assert-ExactKeys $query @('id', 'type', 'value', 'logs') 'result with logs shape'
     Send-Line $adapter '{"id":"f","op":"query","path":"demo:fail","args":{"code":"EXPECTED"}}'
     $failure = Read-LineBefore $adapter.StandardOutput
     Assert-True ($failure.error.name -eq 'FunctionError') 'adapter flattened FunctionError'
     Assert-True ($failure.logs -is [array] -and $failure.logs.Count -eq 1) 'adapter collapsed one error log to a scalar'
+    Assert-ExactKeys $failure @('id', 'type', 'error', 'logs') 'structured HTTP error shape'
     Send-Line $adapter '{"id":"sub","op":"subscribe","subscriptionId":"recover","path":"demo:requiresNonzero","args":{"room":"adapter"}}'
     Assert-True ((Read-LineBefore $adapter.StandardOutput).type -eq 'ack') 'subscribe ack failed'
     $subscriptionFailure = Read-LineBefore $adapter.StandardOutput
     Assert-True ($subscriptionFailure.subscriptionId -eq 'recover') 'subscription failure omitted ID'
     Assert-True ($subscriptionFailure.error.name -eq 'FunctionError') 'QueryFailed adapter classification'
     Assert-True ($subscriptionFailure.logs -is [array] -and $subscriptionFailure.logs.Count -eq 1) 'adapter collapsed one subscription log to a scalar'
+    Assert-ExactKeys $subscriptionFailure @('type', 'subscriptionId', 'error', 'logs') 'subscription error shape'
     Send-Line $adapter '{"id":"mutate","op":"mutation","path":"demo:increment","args":{"room":"adapter","runId":"recover"}}'
     Assert-True ((Read-LineBefore $adapter.StandardOutput).type -eq 'result') 'recovery mutation failed'
     $subscriptionRecovery = Read-LineBefore $adapter.StandardOutput
     Assert-True ($subscriptionRecovery.value.count -eq 1) 'subscription did not recover after QueryFailed'
+    Assert-ExactKeys $subscriptionRecovery @('type', 'subscriptionId', 'value', 'logs') 'subscription value shape'
     Send-Line $adapter '{"id":"unsub","op":"unsubscribe","subscriptionId":"recover"}'
     Assert-True ((Read-LineBefore $adapter.StandardOutput).type -eq 'ack') 'unsubscribe ack failed'
     Send-Line $adapter '{"id":"close","op":"close"}'
-    Assert-True ((Read-LineBefore $adapter.StandardOutput).type -eq 'closed') 'stdin close failed'
+    $closed = Read-LineBefore $adapter.StandardOutput
+    Assert-True ($closed.type -eq 'closed') 'stdin close failed'
+    Assert-ExactKeys $closed @('id', 'type') 'closed event shape'
     $adapter.StandardInput.Close()
     Assert-True ($adapter.WaitForExit(4000)) 'stdin adapter did not exit after close'
     Assert-True ($adapter.ExitCode -eq 0) "stdin adapter exit was $($adapter.ExitCode)"

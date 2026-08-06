@@ -63,6 +63,138 @@ function Stop-Fixture {
     }
 }
 
+function Start-HttpFixture {
+    param([int] $Port)
+    $ready = "/tmp/powershell-http-fixture-$Port.ready"
+    [IO.File]::Delete($ready)
+    $arguments = @(
+        '-NoLogo', '-NoProfile', '-File', (Join-Path $PSScriptRoot 'http-fixture-server.ps1'),
+        '-Port', [string]$Port, '-ReadyFile', $ready
+    )
+    $process = Start-Process -FilePath pwsh -ArgumentList $arguments -PassThru
+    $deadline = [datetime]::UtcNow.AddSeconds(5)
+    while (-not [IO.File]::Exists($ready) -and [datetime]::UtcNow -lt $deadline) {
+        if ($process.HasExited) {
+            throw "HTTP fixture exited early with $($process.ExitCode)"
+        }
+        Start-Sleep -Milliseconds 20
+    }
+    Assert-True ([IO.File]::Exists($ready)) 'HTTP fixture did not become ready'
+    [pscustomobject]@{ Process = $process; Url = "http://127.0.0.1:$Port" }
+}
+
+function Stop-HttpFixture {
+    param($Fixture, $Client)
+    try {
+        Invoke-ConvexFunction $Client query 'fixture:httpShutdown' @{} | Out-Null
+    }
+    catch {}
+    if (-not $Fixture.Process.WaitForExit(5000)) {
+        $Fixture.Process.Kill($true)
+        throw 'HTTP fixture did not stop after shutdown deadline'
+    }
+}
+
+function Assert-HttpFailure {
+    param($Client, [string] $Path, [string] $ExpectedName)
+    $caught = $null
+    try {
+        Get-ConvexQuery $Client $Path @{} | Out-Null
+    }
+    catch {
+        $caught = $_.Exception
+    }
+    Assert-True ($null -ne $caught) "$Path unexpectedly succeeded"
+    $failure = Get-ConvexError $caught
+    Assert-Equal $failure.Name $ExpectedName "$Path error classification"
+    $failure
+}
+
+# Exercise the HTTP parser against a raw peer. These cases cannot be represented
+# by the ordinary Convex fixture because HttpListener normalizes framing and
+# status behaviour before the client sees it.
+$httpFixture = Start-HttpFixture 43144
+$httpClient = New-ConvexClient $httpFixture.Url
+try {
+    foreach ($path in @('fixture:http4xxSuccess', 'fixture:http5xxSuccess')) {
+        Assert-HttpFailure $httpClient $path 'TransportError' | Out-Null
+    }
+    foreach ($path in @(
+            'fixture:httpScalar',
+            'fixture:httpArray',
+            'fixture:httpNull',
+            'fixture:httpMalformed',
+            'fixture:httpMissingStatus',
+            'fixture:httpStatusType',
+            'fixture:httpUnknownStatus',
+            'fixture:httpMissingValue',
+            'fixture:httpMissingErrorMessage',
+            'fixture:httpErrorMessageType',
+            'fixture:httpLogLinesType',
+            'fixture:httpLogLineType'
+        )) {
+        Assert-HttpFailure $httpClient $path 'ProtocolError' | Out-Null
+    }
+
+    $functionFailure = Assert-HttpFailure $httpClient 'fixture:httpFunctionError' 'FunctionError'
+    Assert-Equal $functionFailure.Message 'expected raw failure' 'raw FunctionError message'
+    Assert-Equal $functionFailure.Data.code 'RAW' 'raw FunctionError data'
+    Assert-Array $functionFailure.Logs 'raw FunctionError logs must remain an array'
+    Assert-Equal $functionFailure.Logs.Count 1 'raw FunctionError log count'
+    Assert-True (Get-ConvexQuery $httpClient 'fixture:httpRecovery' @{}).Value.recovered 'HTTP parser did not recover after invalid envelopes'
+
+    $boundary = Get-ConvexQuery $httpClient 'fixture:httpExactBoundary' @{}
+    Assert-Equal $boundary.Value.blob.Length (8MB - 40) 'exact 8 MiB HTTP response was not accepted completely'
+    $boundary = $null
+    [GC]::Collect()
+
+    foreach ($path in @(
+            'fixture:httpFixedOverLimit',
+            'fixture:httpDishonestLength',
+            'fixture:httpChunkedOverLimit',
+            'fixture:httpNoLengthOverLimit',
+            'fixture:httpSlowOverLimit'
+        )) {
+        Assert-HttpFailure $httpClient $path 'TransportError' | Out-Null
+    }
+
+    $httpClient.HttpTimeoutMilliseconds = 200
+    $deadlineTimer = [Diagnostics.Stopwatch]::StartNew()
+    $deadlineFailure = Assert-HttpFailure $httpClient 'fixture:httpSlow' 'TransportError'
+    $deadlineTimer.Stop()
+    Assert-True ($deadlineFailure.Message.Contains('deadline')) 'slow HTTP response was not reported as a deadline'
+    Assert-True ($deadlineTimer.ElapsedMilliseconds -lt 900) 'slow HTTP response exceeded its deterministic deadline'
+
+    $httpClient.HttpTimeoutMilliseconds = 5000
+    $cancellation = [Threading.CancellationTokenSource]::new()
+    try {
+        $cancellation.CancelAfter(150)
+        $cancelTimer = [Diagnostics.Stopwatch]::StartNew()
+        $caught = $null
+        try {
+            Get-ConvexQuery $httpClient 'fixture:httpSlow' @{} $cancellation.Token | Out-Null
+        }
+        catch {
+            $caught = $_.Exception
+        }
+        $cancelTimer.Stop()
+        Assert-True ($null -ne $caught) 'cancelled HTTP response unexpectedly succeeded'
+        $cancelFailure = Get-ConvexError $caught
+        Assert-Equal $cancelFailure.Name 'TransportError' 'HTTP cancellation classification'
+        Assert-True ($cancelFailure.Message.Contains('cancelled')) 'HTTP cancellation message'
+        Assert-True ($cancelTimer.ElapsedMilliseconds -lt 900) 'HTTP cancellation exceeded its deterministic deadline'
+    }
+    finally {
+        $cancellation.Dispose()
+    }
+    $httpClient.HttpTimeoutMilliseconds = 30000
+    Assert-True (Get-ConvexQuery $httpClient 'fixture:httpRecovery' @{}).Value.recovered 'HTTP client did not recover after streaming failures'
+}
+finally {
+    Stop-HttpFixture $httpFixture $httpClient
+    Close-ConvexClient $httpClient
+}
+
 $fixture = Start-Fixture 43137
 $client = New-ConvexClient $fixture.Url
 $live = New-ConvexLiveState $fixture.Url

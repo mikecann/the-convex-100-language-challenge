@@ -5,6 +5,8 @@ Set-StrictMode -Version Latest
 
 $script:ConvexJsonDepth = 64
 $script:ConvexMaxHttpBytes = 8MB
+$script:ConvexHttpReadBufferBytes = 16KB
+$script:ConvexHttpTimeoutMilliseconds = 30000
 $script:ConvexMaxLiveBytes = 4MB
 $script:ConvexPerSubscriptionItems = 16
 $script:ConvexGlobalQueueItems = 64
@@ -57,14 +59,118 @@ function ConvertFrom-ConvexJsonElement {
 }
 
 function ConvertFrom-ConvexJsonBytes {
-    param([Parameter(Mandatory)][byte[]] $Bytes)
-    $document = [Text.Json.JsonDocument]::Parse([ReadOnlyMemory[byte]]::new($Bytes))
+    param(
+        [Parameter(Mandatory)][byte[]] $Bytes,
+        [int] $Length = $Bytes.Length
+    )
+    $document = [Text.Json.JsonDocument]::Parse([ReadOnlyMemory[byte]]::new($Bytes, 0, $Length))
     try {
         ConvertFrom-ConvexJsonElement $document.RootElement
     }
     finally {
         $document.Dispose()
     }
+}
+
+function Read-ConvexHttpBody {
+    param(
+        [Parameter(Mandatory)][Net.Http.HttpContent] $Content,
+        [Parameter(Mandatory)][Threading.CancellationToken] $CancellationToken
+    )
+    $declaredLength = $Content.Headers.ContentLength
+    if ($null -ne $declaredLength -and $declaredLength -gt $script:ConvexMaxHttpBytes) {
+        Throw-ConvexError (
+            New-ConvexError -Name TransportError -Message 'Convex HTTP response exceeds 8 MiB'
+        )
+    }
+
+    $input = $null
+    $output = [IO.MemoryStream]::new()
+    try {
+        $input = $Content.ReadAsStreamAsync($CancellationToken).GetAwaiter().GetResult()
+        [byte[]]$buffer = [byte[]]::new($script:ConvexHttpReadBufferBytes)
+        while ($true) {
+            $read = $input.ReadAsync(
+                $buffer,
+                0,
+                $buffer.Length,
+                $CancellationToken
+            ).GetAwaiter().GetResult()
+            if ($read -eq 0) {
+                break
+            }
+            if (($output.Length + $read) -gt $script:ConvexMaxHttpBytes) {
+                Throw-ConvexError (
+                    New-ConvexError -Name TransportError -Message 'Convex HTTP response exceeds 8 MiB'
+                )
+            }
+            $output.Write($buffer, 0, $read)
+        }
+        [pscustomobject]@{
+            Bytes  = $output.GetBuffer()
+            Length = [int]$output.Length
+        }
+    }
+    finally {
+        if ($null -ne $input) {
+            $input.Dispose()
+        }
+        $output.Dispose()
+    }
+}
+
+function ConvertFrom-ConvexHttpEnvelope {
+    param($Decoded, [string] $Operation)
+    if ($Decoded -isnot [hashtable]) {
+        Throw-ConvexError (
+            New-ConvexError -Name ProtocolError -Message "Convex $Operation response root must be an object" -Operation $Operation
+        )
+    }
+    if (-not $Decoded.ContainsKey('status') -or $Decoded['status'] -isnot [string]) {
+        Throw-ConvexError (
+            New-ConvexError -Name ProtocolError -Message "Convex $Operation response status must be a string" -Operation $Operation
+        )
+    }
+
+    [string[]]$logs = @()
+    if ($Decoded.ContainsKey('logLines')) {
+        if ($Decoded['logLines'] -isnot [array]) {
+            Throw-ConvexError (
+                New-ConvexError -Name ProtocolError -Message "Convex $Operation response logLines must be an array" -Operation $Operation
+            )
+        }
+        foreach ($line in $Decoded['logLines']) {
+            if ($line -isnot [string]) {
+                Throw-ConvexError (
+                    New-ConvexError -Name ProtocolError -Message "Convex $Operation response logLines must contain strings" -Operation $Operation
+                )
+            }
+            $logs += $line
+        }
+    }
+
+    if ($Decoded['status'] -eq 'success') {
+        if (-not $Decoded.ContainsKey('value')) {
+            Throw-ConvexError (
+                New-ConvexError -Name ProtocolError -Message "Convex $Operation success response omitted value" -Operation $Operation
+            )
+        }
+        return [pscustomobject]@{ Value = $Decoded['value']; Logs = [string[]]$logs }
+    }
+    if ($Decoded['status'] -eq 'error') {
+        if (-not $Decoded.ContainsKey('errorMessage') -or $Decoded['errorMessage'] -isnot [string]) {
+            Throw-ConvexError (
+                New-ConvexError -Name ProtocolError -Message "Convex $Operation error response requires a string errorMessage" -Operation $Operation
+            )
+        }
+        $errorData = if ($Decoded.ContainsKey('errorData')) { $Decoded['errorData'] } else { $null }
+        Throw-ConvexError (
+            New-ConvexError -Name FunctionError -Message $Decoded['errorMessage'] -Data $errorData -Logs $logs -Operation $Operation
+        )
+    }
+    Throw-ConvexError (
+        New-ConvexError -Name ProtocolError -Message "Convex $Operation response had unexpected status" -Operation $Operation
+    )
 }
 
 function New-ConvexError {
@@ -122,13 +228,16 @@ function New-ConvexClient {
         )
     }
     $http = [System.Net.Http.HttpClient]::new()
-    $http.Timeout = [TimeSpan]::FromSeconds(30)
+    # ResponseHeadersRead makes HttpClient.Timeout stop at the headers. Keep one
+    # explicit cancellation deadline across headers and every body read instead.
+    $http.Timeout = [Threading.Timeout]::InfiniteTimeSpan
     [pscustomobject]@{
-        Url     = $uri.AbsoluteUri.TrimEnd('/')
-        Token   = ''
-        Version = $ClientVersion
-        Closed  = $false
-        Http    = $http
+        Url                     = $uri.AbsoluteUri.TrimEnd('/')
+        Token                   = ''
+        Version                 = $ClientVersion
+        Closed                  = $false
+        Http                    = $http
+        HttpTimeoutMilliseconds = $script:ConvexHttpTimeoutMilliseconds
     }
 }
 
@@ -150,7 +259,8 @@ function Invoke-ConvexFunction {
         [Parameter(Mandatory)] $Client,
         [ValidateSet('query', 'mutation', 'action')][string] $Operation,
         [Parameter(Mandatory)][string] $Path,
-        [hashtable] $FunctionArgs = @{}
+        [hashtable] $FunctionArgs = @{},
+        [Threading.CancellationToken] $CancellationToken = [Threading.CancellationToken]::None
     )
     if ($Client.Closed) {
         Throw-ConvexError (New-ConvexError -Name ClosedError -Message 'Convex client is closed')
@@ -171,18 +281,40 @@ function Invoke-ConvexFunction {
         'application/json'
     )
     $response = $null
+    $deadline = [Threading.CancellationTokenSource]::CreateLinkedTokenSource($CancellationToken)
     try {
-        $response = $Client.Http.Send($request)
-        $bytes = $response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
-        if ($bytes.Length -gt $script:ConvexMaxHttpBytes) {
+        $deadline.CancelAfter([int]$Client.HttpTimeoutMilliseconds)
+        $response = $Client.Http.Send(
+            $request,
+            [Net.Http.HttpCompletionOption]::ResponseHeadersRead,
+            $deadline.Token
+        )
+        if (-not $response.IsSuccessStatusCode) {
             Throw-ConvexError (
-                New-ConvexError -Name TransportError -Message 'Convex HTTP response exceeds 8 MiB' -Operation $Operation
+                New-ConvexError -Name TransportError -Message "Convex HTTP request failed with status $([int]$response.StatusCode)" -Operation $Operation
             )
         }
+        $bodyBytes = Read-ConvexHttpBody $response.Content $deadline.Token
         # Parse UTF-8 directly. Converting an 8 MiB response to one giant
         # UTF-16 string first would duplicate the payload inside the final
         # adapter's 128 MiB cgroup before the result can be emitted.
-        $decoded = ConvertFrom-ConvexJsonBytes $bytes
+        try {
+            $decoded = ConvertFrom-ConvexJsonBytes $bodyBytes.Bytes $bodyBytes.Length
+        }
+        catch {
+            Throw-ConvexError (
+                New-ConvexError -Name ProtocolError -Message "Convex $Operation response was not valid JSON: $($_.Exception.Message)" -Operation $Operation
+            )
+        }
+    }
+    catch [OperationCanceledException] {
+        $message = if ($CancellationToken.IsCancellationRequested) {
+            'Convex HTTP request was cancelled'
+        }
+        else {
+            'Convex HTTP request exceeded its deadline'
+        }
+        Throw-ConvexError (New-ConvexError -Name TransportError -Message $message -Operation $Operation)
     }
     catch {
         Throw-ConvexError (Get-ConvexError $_.Exception $Operation)
@@ -192,43 +324,39 @@ function Invoke-ConvexFunction {
         if ($null -ne $response) {
             $response.Dispose()
         }
+        $deadline.Dispose()
     }
-    [string[]] $logs = @()
-    if ($decoded.ContainsKey('logLines')) {
-        [string[]] $logs = @($decoded['logLines'] | ForEach-Object { [string] $_ })
-    }
-    if ($decoded['status'] -eq 'success' -and $decoded.ContainsKey('value')) {
-        return [pscustomobject]@{ Value = $decoded['value']; Logs = [string[]]$logs }
-    }
-    if ($decoded['status'] -eq 'error') {
-        $message = if ($decoded.ContainsKey('errorMessage')) {
-            [string]$decoded['errorMessage']
-        }
-        else {
-            'Convex function failed'
-        }
-        Throw-ConvexError (
-            New-ConvexError -Name FunctionError -Message $message -Data $decoded['errorData'] -Logs $logs -Operation $Operation
-        )
-    }
-    Throw-ConvexError (
-        New-ConvexError -Name ProtocolError -Message "Convex $Operation response had unexpected status" -Operation $Operation
-    )
+    ConvertFrom-ConvexHttpEnvelope $decoded $Operation
 }
 
 function Get-ConvexQuery {
-    param($Client, [string] $Path, [hashtable] $FunctionArgs = @{})
-    Invoke-ConvexFunction -Client $Client -Operation query -Path $Path -FunctionArgs $FunctionArgs
+    param(
+        $Client,
+        [string] $Path,
+        [hashtable] $FunctionArgs = @{},
+        [Threading.CancellationToken] $CancellationToken = [Threading.CancellationToken]::None
+    )
+    Invoke-ConvexFunction -Client $Client -Operation query -Path $Path -FunctionArgs $FunctionArgs -CancellationToken $CancellationToken
 }
 
 function Invoke-ConvexMutation {
-    param($Client, [string] $Path, [hashtable] $FunctionArgs = @{})
-    Invoke-ConvexFunction -Client $Client -Operation mutation -Path $Path -FunctionArgs $FunctionArgs
+    param(
+        $Client,
+        [string] $Path,
+        [hashtable] $FunctionArgs = @{},
+        [Threading.CancellationToken] $CancellationToken = [Threading.CancellationToken]::None
+    )
+    Invoke-ConvexFunction -Client $Client -Operation mutation -Path $Path -FunctionArgs $FunctionArgs -CancellationToken $CancellationToken
 }
 
 function Invoke-ConvexAction {
-    param($Client, [string] $Path, [hashtable] $FunctionArgs = @{})
-    Invoke-ConvexFunction -Client $Client -Operation action -Path $Path -FunctionArgs $FunctionArgs
+    param(
+        $Client,
+        [string] $Path,
+        [hashtable] $FunctionArgs = @{},
+        [Threading.CancellationToken] $CancellationToken = [Threading.CancellationToken]::None
+    )
+    Invoke-ConvexFunction -Client $Client -Operation action -Path $Path -FunctionArgs $FunctionArgs -CancellationToken $CancellationToken
 }
 
 function New-ConvexLiveState {
