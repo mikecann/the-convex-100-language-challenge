@@ -239,7 +239,11 @@ end
 old_adapter_live_url = get(ENV, "CONVEX_URL", nothing)
 ENV["CONVEX_URL"] = "http://127.0.0.1:$(adapter_live_port)"
 adapter_live_input = Pipe()
-Base.link_pipe!(adapter_live_input; reader_supports_async = true, writer_supports_async = true)
+Base.link_pipe!(
+    adapter_live_input;
+    reader_supports_async = true,
+    writer_supports_async = true,
+)
 adapter_live_output = IOBuffer()
 adapter_live_task = @async Adapter.run_adapter(adapter_live_input.out, adapter_live_output)
 try
