@@ -161,6 +161,28 @@ proc ::convex::elements {jsonArray} {
 
 proc ::convex::decode {raw} { return [::json::json2dict $raw] }
 
+# Tcl values do not retain whether JSON supplied a number, string, boolean, or
+# null. Validate protocol counters against their exact wire token before using
+# the decoded value, and return a canonical decimal integer for state storage.
+proc ::convex::json_uint32 {raw fieldName} {
+    set token [string trim $raw " \t\r\n"]
+    if {![regexp {^(0|[1-9][0-9]*)$} $token] || [expr {$token > 4294967295}]} {
+        error "$fieldName must be a JSON uint32 integer"
+    }
+    return [expr {$token + 0}]
+}
+
+proc ::convex::json_string {raw fieldName} {
+    set token [string trim $raw " \t\r\n"]
+    if {$token eq "" || [string index $token 0] ne "\""} {
+        error "$fieldName must be a JSON string"
+    }
+    if {[catch {set value [decode $token]}]} {
+        error "$fieldName must be a JSON string"
+    }
+    return $value
+}
+
 proc ::convex::throw {name message {data null} {logs "\[\]"}} {
     return -code error -errorcode [list CONVEX $name $data $logs] "$name: $message"
 }
@@ -603,10 +625,14 @@ proc ::convex::timestamp_key {encoded} {
 }
 
 proc ::convex::normalize_version {raw} {
-    set version [decode $raw]
-    foreach key {querySet identity ts} { if {![dict exists $version $key]} { error "state version omitted $key" } }
-    timestamp_key [dict get $version ts]
-    return [object [list querySet [dict get $version querySet] identity [dict get $version identity] ts [quote [dict get $version ts]]]]
+    # Decode once for whole-object syntax, then validate untyped counters from
+    # their raw JSON fields so quoted and boolean lookalikes cannot enter state.
+    decode $raw
+    set querySet [json_uint32 [field $raw querySet 0] "state version querySet"]
+    set identity [json_uint32 [field $raw identity 0] "state version identity"]
+    set timestamp [json_string [field $raw ts] "state version ts"]
+    timestamp_key $timestamp
+    return [object [list querySet $querySet identity $identity ts [quote $timestamp]]]
 }
 
 proc ::convex::handle_live_message {id raw} {
@@ -630,19 +656,21 @@ proc ::convex::handle_live_message {id raw} {
     set pending {}
     foreach modificationRaw [elements [field $raw modifications]] {
         set modification [decode $modificationRaw]
-        set queryId [dict get $modification queryId]
-        if {![dict exists [state $id] subscriptions $queryId]} { continue }
+        set queryId [json_uint32 [field $modificationRaw queryId 0] "Live queryId"]
         set kind [dict get $modification type]
         if {$kind eq "QueryUpdated"} {
-            dict set pending $queryId [list value [field $modificationRaw value] [field $modificationRaw logLines 0]]
+            set item [list value [field $modificationRaw value] [field $modificationRaw logLines 0]]
         } elseif {$kind eq "QueryFailed"} {
             set data [field $modificationRaw errorData 0]
-            if {$data eq ""} { set data null }
             set logs [field $modificationRaw logLines 0]
             if {$logs eq ""} { set logs "\[\]" }
-            set text [expr {[dict exists $modification errorMessage] ? [dict get $modification errorMessage] : "Live query failed"}]
-            dict set pending $queryId [list error [object [list name [quote FunctionError] message [quote $text] data $data]] $logs]
+            set text [json_string [field $modificationRaw errorMessage 0] "QueryFailed.errorMessage"]
+            set errorFields [list name [quote FunctionError] message [quote $text]]
+            if {$data ne ""} { lappend errorFields data $data }
+            set item [list error [object $errorFields] $logs]
         } elseif {$kind ne "QueryRemoved"} { error "ProtocolError: unsupported Live modification $kind" }
+        if {![dict exists [state $id] subscriptions $queryId]} { continue }
+        if {$kind ne "QueryRemoved"} { dict set pending $queryId $item }
     }
     set previous [dict get [state $id] maxTimestamp]
     set timestamp [dict get $end ts]

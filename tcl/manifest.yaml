@@ -30,5 +30,5 @@ limitations:
   - The educational API covers Convex's JSON-safe values. Full tagged Convex values, including Int64 and bytes, are deferred.
   - Capability badges remain empty until the root-owned local and hosted conformance gates pass.
   - Adapter output uses a newest-16 queue with a 6 MiB global byte budget, including NDJSON newlines and conservative Tcl/channel overhead. It reserves four event slots and 64 KiB for control events, and retains accepted writes until Tcl drains them without duplication.
-  - Language-local loopback tests cover five real reconnects, structured Live recovery, ownership barriers, fragmented and timed-out partial frames, and genuine stopped-reader backpressure, memory, ordering, and close bounds. Root-owned local and hosted conformance remain required before capabilities can be awarded.
+  - Language-local loopback tests cover five real reconnects, strict uint32 state and query IDs, QueryFailed shape and rollback, structured Live recovery, ownership barriers, fragmented and timed-out partial frames, and genuine stopped-reader EAGAIN, memory, ordering, and close bounds. Root-owned local and hosted conformance remain required before capabilities can be awarded.
 capabilities: []

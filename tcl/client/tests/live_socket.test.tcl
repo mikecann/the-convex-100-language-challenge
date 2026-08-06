@@ -41,6 +41,21 @@ proc client_state_changed {args} {
     ::livefixture::signal
 }
 
+proc assert_malformed_live_recovery {fixtureCommand expectedMessage expectedConnections connectionIndex recoveryValue} {
+    set before [llength $::adapterLines]
+    {*}$fixtureCommand
+    wait_for {[llength $::adapterLines] > $before} "malformed Live transition emitted no adapter envelope"
+    set expected [::convex::object [list type [::convex::quote subscription] subscriptionId [::convex::quote same] error [::adapter::error_raw $expectedMessage ProtocolError null]]]
+    assert {[lindex $::adapterLines $before] eq $expected} "malformed Live ProtocolError envelope changed: actual=[lindex $::adapterLines $before] expected=$expected"
+    wait_for {[::livefixture::connections] == $expectedConnections} "malformed Live transition did not reconnect"
+    wait_for {[llength [modification_records $connectionIndex Add]] == 1} "malformed Live reconnect did not resend Add"
+    wait_for {[dict get [::convex::state $::adapter::client] remote] eq [::livefixture::active_remote]} "malformed Live reconnect did not hydrate"
+    set before [llength $::adapterLines]
+    ::livefixture::update $recoveryValue
+    wait_for {[llength $::adapterLines] > $before} "malformed Live transition stranded the subscription"
+    assert {[dict get [dict get [::convex::decode [lindex $::adapterLines $before]] value] count] == $recoveryValue} "malformed Live recovery value was wrong"
+}
+
 # Two real subscriptions prove nextQueryId survives the state write and that
 # fragmentation across a UTF-8 code point with an interleaved Ping preserves
 # both callbacks and produces a Pong.
@@ -243,6 +258,26 @@ set before [llength $::adapterLines]
 wait_for {[llength $::adapterLines] > $before} "subscription did not recover after QueryFailed"
 assert {[dict get [dict get [::convex::decode [lindex $::adapterLines $before]] value] count] == 6} "QueryFailed recovery value was wrong"
 
+# Missing errorData stays omitted rather than becoming data:null, while the
+# valid FunctionError still leaves the same subscription live.
+set before [llength $::adapterLines]
+::livefixture::query_failed_without_data "fixture without data"
+wait_for {[llength $::adapterLines] > $before} "QueryFailed without data emitted no adapter envelope"
+assert {[lindex $::adapterLines $before] eq {{"type":"subscription","subscriptionId":"same","error":{"name":"FunctionError","message":"fixture without data"}}}} "QueryFailed without data changed its exact envelope"
+set before [llength $::adapterLines]
+::livefixture::update 7
+wait_for {[llength $::adapterLines] > $before} "subscription did not recover after omitted errorData"
+assert {[dict get [dict get [::convex::decode [lindex $::adapterLines $before]] value] count] == 7} "omitted errorData recovery value was wrong"
+
+# Each malformed wire field is a structured ProtocolError, never a value or
+# FunctionError. Reconnect must replay Add and deliver a later valid value.
+assert_malformed_live_recovery ::livefixture::malformed_version \
+    "state version querySet must be a JSON uint32 integer" 7 6 8
+assert_malformed_live_recovery ::livefixture::malformed_query_id \
+    "Live queryId must be a JSON uint32 integer" 8 7 9
+assert_malformed_live_recovery ::livefixture::malformed_query_failed \
+    "QueryFailed.errorMessage must be a JSON string" 9 8 10
+
 # A malformed real server frame must cross the adapter as ProtocolError, then
 # reconnect and publish a later value on the same subscription.
 set before [llength $::adapterLines]
@@ -251,13 +286,13 @@ wait_for {[llength $::adapterLines] > $before} "real socket ProtocolError emitte
 set protocolEnvelope [::convex::decode [lindex $::adapterLines $before]]
 assert {[dict get $protocolEnvelope type] eq "subscription" && [dict get $protocolEnvelope subscriptionId] eq "same"} "ProtocolError lost subscription identity"
 assert {[dict get [dict get $protocolEnvelope error] name] eq "ProtocolError"} "real socket error was not ProtocolError"
-wait_for {[::livefixture::connections] == 7} "ProtocolError did not reconnect"
-wait_for {[llength [modification_records 6 Add]] == 1} "ProtocolError reconnect did not resend Add"
+wait_for {[::livefixture::connections] == 10} "ProtocolError did not reconnect"
+wait_for {[llength [modification_records 9 Add]] == 1} "ProtocolError reconnect did not resend Add"
 wait_for {[dict get [::convex::state $::adapter::client] remote] eq [::livefixture::active_remote]} "ProtocolError reconnect did not hydrate"
 set before [llength $::adapterLines]
-::livefixture::update 7
+::livefixture::update 11
 wait_for {[llength $::adapterLines] > $before} "ProtocolError recovery value was not emitted"
-assert {[dict get [dict get [::convex::decode [lindex $::adapterLines $before]] value] count] == 7} "ProtocolError stranded the subscription"
+assert {[dict get [dict get [::convex::decode [lindex $::adapterLines $before]] value] count] == 11} "ProtocolError stranded the subscription"
 
 # Closing the actual peer must produce TransportError, reconnect, and recover.
 set before [llength $::adapterLines]
@@ -265,15 +300,15 @@ set before [llength $::adapterLines]
 wait_for {[llength $::adapterLines] > $before} "real socket TransportError emitted no adapter envelope"
 set transportEnvelope [::convex::decode [lindex $::adapterLines $before]]
 assert {[dict get [dict get $transportEnvelope error] name] eq "TransportError"} "peer close was not TransportError"
-wait_for {[::livefixture::connections] == 8} "TransportError did not reconnect"
-wait_for {[llength [modification_records 7 Add]] == 1} "TransportError reconnect did not resend Add"
+wait_for {[::livefixture::connections] == 11} "TransportError did not reconnect"
+wait_for {[llength [modification_records 10 Add]] == 1} "TransportError reconnect did not resend Add"
 wait_for {[dict get [::convex::state $::adapter::client] remote] eq [::livefixture::active_remote]} "TransportError reconnect did not hydrate"
 set before [llength $::adapterLines]
-::livefixture::update 8
+::livefixture::update 12
 wait_for {[llength $::adapterLines] > $before} "TransportError recovery value was not emitted"
-assert {[dict get [dict get [::convex::decode [lindex $::adapterLines $before]] value] count] == 8} "TransportError stranded the subscription"
+assert {[dict get [dict get [::convex::decode [lindex $::adapterLines $before]] value] count] == 12} "TransportError stranded the subscription"
 set finalState [::convex::state $::adapter::client]
-assert {[dict get $finalState connectionCount] == 7} "real reconnect count did not include protocol and transport retirements"
+assert {[dict get $finalState connectionCount] == 10} "real reconnect count did not include protocol and transport retirements"
 assert {[dict get $finalState lastCloseReason] eq "TransportError: peer closed"} "final close reason was not retained"
 assert {[dict get $finalState reconnectDelay] == 100} "healthy transport recovery kept stale backoff"
 
@@ -291,13 +326,13 @@ set timeoutElapsed [expr {[clock milliseconds] - $timeoutStarted}]
 assert {$timeoutElapsed >= 250 && $timeoutElapsed < 1200} "partial-frame deadline fired at ${timeoutElapsed}ms"
 set timeoutEnvelope [::convex::decode [lindex $::adapterLines $before]]
 assert {[dict get [dict get $timeoutEnvelope error] name] eq "TransportError"} "partial-frame timeout was not TransportError"
-wait_for {[::livefixture::connections] == 9} "partial-frame timeout did not reconnect"
-wait_for {[llength [modification_records 8 Add]] == 1} "partial-frame reconnect did not resend Add"
+wait_for {[::livefixture::connections] == 12} "partial-frame timeout did not reconnect"
+wait_for {[llength [modification_records 11 Add]] == 1} "partial-frame reconnect did not resend Add"
 wait_for {[dict get [::convex::state $::adapter::client] remote] eq [::livefixture::active_remote]} "partial-frame reconnect did not hydrate"
 set before [llength $::adapterLines]
-::livefixture::update 9
+::livefixture::update 13
 wait_for {[llength $::adapterLines] > $before} "partial-frame recovery value was not emitted"
-assert {[dict get [dict get [::convex::decode [lindex $::adapterLines $before]] value] count] == 9} "partial-frame timeout stranded the subscription"
+assert {[dict get [dict get [::convex::decode [lindex $::adapterLines $before]] value] count] == 13} "partial-frame timeout stranded the subscription"
 
 # Unsubscribe and close are controller operations, so neither may wait for a
 # half-frame owned by the reader. The timer is still armed when both return.
@@ -310,7 +345,7 @@ wait_for {[llength $::adapterLines] > $before} "unsubscribe behind partial frame
 set unsubscribeElapsed [expr {[clock milliseconds] - $unsubscribeStarted}]
 assert {$unsubscribeElapsed < 200} "unsubscribe waited ${unsubscribeElapsed}ms for a partial frame"
 assert {[lindex $::adapterLines $before] eq {{"id":"unsubscribe-partial","type":"ack"}}} "partial-frame unsubscribe acknowledgement changed"
-wait_for {[llength [modification_records 8 Remove]] == 1} "partial-frame unsubscribe did not send Remove"
+wait_for {[llength [modification_records 11 Remove]] == 1} "partial-frame unsubscribe did not send Remove"
 set ::convex::partialFrameTimeoutMs $savedPartialTimeout
 
 proc adapter_test_exit {status} { set ::adapterExitStatus $status; ::livefixture::signal }

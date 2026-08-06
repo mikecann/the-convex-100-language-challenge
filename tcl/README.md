@@ -163,13 +163,15 @@ protocol is not documented as stable, so hosted verification remains required.
   and WebSocket writes are deferred.
 - Language-local tests cover exact adapter envelopes, five real socket
   reconnects, structured error recovery, fragmented UTF-8 and control frames,
-  partial-frame timeout recovery, generation barriers, and a real stopped
+  partial-frame timeout recovery, strict uint32 Live counters and query IDs,
+  QueryFailed shape and rollback, generation barriers, and a real stopped
   reader with near-maximum values.
   Adapter output uses generation ownership at dequeue and immediately before
   channel acceptance, so an unsubscribe or same-ID replacement cannot let an
   old queued relay cross its acknowledgement. Accepted bytes remain ordered,
   nonduplicated, and budgeted until Tcl drains them. A bounded timer retries
-  genuine channel backpressure without starving controller or Live reads. The
+  genuine channel backpressure without starving controller or Live reads, and
+  a real nonblocking-pipe fixture exercises the accepted EAGAIN catch path. The
   newest-16 queue reserves four event slots and 64 KiB for control events, and
   charges each NDJSON newline plus conservative Tcl and channel overhead. Close
   waits up to two seconds for the terminal response to drain, then fails

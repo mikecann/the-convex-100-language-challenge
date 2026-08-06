@@ -68,6 +68,100 @@ assert {[dict get [::convex::state $liveClient] reconnectTimer] ne ""} "transpor
 ::convex::close $liveClient
 assert {[dict get [::convex::state $liveClient] reconnectTimer] eq ""} "close did not clear the cancelled reconnect timer"
 
+# Live protocol counters are JSON uint32 integers, not merely Tcl values that
+# happen to compare numerically. Exercise both boundaries and every token shape
+# that json2dict would otherwise blur together.
+set maximumVersion {{"querySet":4294967295,"identity":4294967295,"ts":"AAAAAAAAAAA="}}
+assert {[::convex::normalize_version $maximumVersion] eq $maximumVersion} "uint32 maximum state version was not retained"
+set zeroVersion {{"querySet":0,"identity":0,"ts":"AAAAAAAAAAA="}}
+assert {[::convex::normalize_version $zeroVersion] eq $zeroVersion} "uint32 zero state version was not retained"
+set invalidCounters [list {"0"} true false null 1.5 -1 4294967296]
+foreach fieldName {querySet identity} {
+    foreach token $invalidCounters {
+        set querySet 0
+        set identity 0
+        if {$fieldName eq "querySet"} { set querySet $token } else { set identity $token }
+        set raw [format {{"querySet":%s,"identity":%s,"ts":"AAAAAAAAAAA="}} $querySet $identity]
+        set failed [catch {::convex::normalize_version $raw} problem]
+        assert {$failed && $problem eq "state version $fieldName must be a JSON uint32 integer"} \
+            "state version accepted invalid $fieldName token $token: $problem"
+    }
+}
+
+proc validation_callback {kind payload logs} {
+    lappend ::validationEvents [list $kind $payload $logs]
+}
+
+proc assert_live_rollback {client raw expected} {
+    set before [::convex::state $client]
+    set eventCount [llength $::validationEvents]
+    set failed [catch {::convex::handle_live_message $client $raw} problem]
+    assert {$failed} "malformed Live transition was accepted"
+    assert {$problem eq $expected} "malformed Live transition changed its error: actual=$problem expected=$expected"
+    set after [::convex::state $client]
+    assert {[dict get $after remote] eq [dict get $before remote]} "malformed Live transition committed its version"
+    assert {[dict get $after maxTimestamp] eq [dict get $before maxTimestamp]} "malformed Live transition committed its timestamp"
+    assert {[dict get $after subscriptions] eq [dict get $before subscriptions]} "malformed Live transition committed a query update"
+    assert {[llength $::validationEvents] == $eventCount} "malformed Live transition published a callback"
+}
+
+set validationClient [::convex::new http://127.0.0.1]
+::convex::put $validationClient subscriptions [dict create 0 [dict create path demo:state args {} callback validation_callback active 1 last {}]]
+set validationEvents {}
+set validationStart {{"querySet":0,"identity":0,"ts":"AAAAAAAAAAA="}}
+set validationEnd1 {{"querySet":0,"identity":0,"ts":"AQAAAAAAAAA="}}
+
+# Invalid version fields roll back the entire transition, including otherwise
+# valid query updates.
+set invalidVersionEnd {{"querySet":"0","identity":0,"ts":"AQAAAAAAAAA="}}
+set invalidVersionTransition [format {{"type":"Transition","startVersion":%s,"endVersion":%s,"modifications":[{"type":"QueryUpdated","queryId":0,"value":{"count":10}}]}} $validationStart $invalidVersionEnd]
+assert_live_rollback $validationClient $invalidVersionTransition "state version querySet must be a JSON uint32 integer"
+set invalidIdentityEnd {{"querySet":0,"identity":4294967296,"ts":"AQAAAAAAAAA="}}
+set invalidIdentityTransition [format {{"type":"Transition","startVersion":%s,"endVersion":%s,"modifications":[{"type":"QueryUpdated","queryId":0,"value":{"count":10}}]}} $validationStart $invalidIdentityEnd]
+assert_live_rollback $validationClient $invalidIdentityTransition "state version identity must be a JSON uint32 integer"
+
+# Every malformed queryId form is rejected before subscription lookup, version
+# commit, or value publication. Zero and uint32 max remain valid boundaries.
+foreach token $invalidCounters {
+    set transition [format {{"type":"Transition","startVersion":%s,"endVersion":%s,"modifications":[{"type":"QueryUpdated","queryId":%s,"value":{"count":11}}]}} $validationStart $validationEnd1 $token]
+    assert_live_rollback $validationClient $transition "Live queryId must be a JSON uint32 integer"
+}
+set missingQueryId [format {{"type":"Transition","startVersion":%s,"endVersion":%s,"modifications":[{"type":"QueryUpdated","value":{"count":11}}]}} $validationStart $validationEnd1]
+assert_live_rollback $validationClient $missingQueryId "Live queryId must be a JSON uint32 integer"
+set maxQueryTransition [format {{"type":"Transition","startVersion":%s,"endVersion":%s,"modifications":[{"type":"QueryUpdated","queryId":4294967295,"value":{"count":12}}]}} $validationStart $validationEnd1]
+::convex::handle_live_message $validationClient $maxQueryTransition
+assert {[dict get [::convex::state $validationClient] remote] eq $validationEnd1} "uint32 maximum queryId was rejected"
+assert {[llength $validationEvents] == 0} "unknown maximum queryId published a callback"
+
+# Reset the isolated state, then reject every non-string QueryFailed message
+# atomically. A valid nested errorData subtree is preserved byte-for-byte, an
+# absent one stays absent, and a later value still reaches the subscription.
+::convex::put $validationClient remote $validationStart
+::convex::put $validationClient maxTimestamp ""
+foreach messageToken [list 7 true false null 1.5 {{"nested":true}} {["array"]}] {
+    set transition [format {{"type":"Transition","startVersion":%s,"endVersion":%s,"modifications":[{"type":"QueryFailed","queryId":0,"errorMessage":%s}]}} $validationStart $validationEnd1 $messageToken]
+    assert_live_rollback $validationClient $transition "QueryFailed.errorMessage must be a JSON string"
+}
+set missingMessage [format {{"type":"Transition","startVersion":%s,"endVersion":%s,"modifications":[{"type":"QueryFailed","queryId":0}]}} $validationStart $validationEnd1]
+assert_live_rollback $validationClient $missingMessage "QueryFailed.errorMessage must be a JSON string"
+set unknownMalformedMessage [format {{"type":"Transition","startVersion":%s,"endVersion":%s,"modifications":[{"type":"QueryFailed","queryId":4294967295,"errorMessage":7}]}} $validationStart $validationEnd1]
+assert_live_rollback $validationClient $unknownMalformedMessage "QueryFailed.errorMessage must be a JSON string"
+set nestedData {{"code":"NESTED","details":[1,{"ok":true}],"nullable":null}}
+set nestedFailure [format {{"type":"Transition","startVersion":%s,"endVersion":%s,"modifications":[{"type":"QueryFailed","queryId":0,"errorMessage":"nested failure","errorData":%s}]}} $validationStart $validationEnd1 $nestedData]
+::convex::handle_live_message $validationClient $nestedFailure
+set nestedError [lindex $validationEvents 0]
+assert {[lindex $nestedError 0] eq "error"} "valid QueryFailed did not publish FunctionError"
+assert {[::convex::field [lindex $nestedError 1] data] eq $nestedData} "QueryFailed errorData shape changed"
+set validationEnd2 {{"querySet":0,"identity":0,"ts":"AgAAAAAAAAA="}}
+set omittedFailure [format {{"type":"Transition","startVersion":%s,"endVersion":%s,"modifications":[{"type":"QueryFailed","queryId":0,"errorMessage":"without data"}]}} $validationEnd1 $validationEnd2]
+::convex::handle_live_message $validationClient $omittedFailure
+assert {[::convex::field [lindex [lindex $validationEvents 1] 1] data 0] eq ""} "absent QueryFailed errorData became data:null"
+set validationEnd3 {{"querySet":0,"identity":0,"ts":"AwAAAAAAAAA="}}
+set recoveredUpdate [format {{"type":"Transition","startVersion":%s,"endVersion":%s,"modifications":[{"type":"QueryUpdated","queryId":0,"value":{"count":13}}]}} $validationEnd2 $validationEnd3]
+::convex::handle_live_message $validationClient $recoveredUpdate
+assert {[lmap event $validationEvents {lindex $event 0}] eq {error error value}} "valid QueryFailed sequence did not recover"
+::convex::close $validationClient
+
 # Import the test-only adapter without running its stdin/TCP event loop. This
 # lets the ordering and budget tests exercise the exact queue implementation.
 set ::env(ADAPTER_TEST_ONLY) 1

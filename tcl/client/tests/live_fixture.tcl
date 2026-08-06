@@ -319,6 +319,54 @@ proc ::livefixture::query_failed {message} {
     return [transition $current [dict get $sockets $current querySet] $modifications]
 }
 
+proc ::livefixture::query_failed_without_data {message} {
+    variable sockets
+    variable current
+    set modifications {}
+    foreach queryId [dict keys [dict get $sockets $current active]] {
+        lappend modifications [::convex::object [list type [::convex::quote QueryFailed] queryId $queryId errorMessage [::convex::quote $message] logLines "\[\]"]]
+    }
+    return [transition $current [dict get $sockets $current querySet] $modifications]
+}
+
+proc ::livefixture::malformed_transition {end modifications} {
+    variable sockets
+    variable current
+    set start [dict get $sockets $current remote]
+    set raw [::convex::object [list type [::convex::quote Transition] startVersion $start endVersion $end modifications [::convex::array $modifications]]]
+    send_json $current $raw
+    signal
+}
+
+proc ::livefixture::malformed_version {} {
+    variable sockets
+    variable current
+    variable timestampCounter
+    incr timestampCounter
+    set end [::convex::object [list querySet [::convex::quote 0] identity 0 ts [::convex::quote [timestamp $timestampCounter]]]]
+    set modifications {}
+    foreach queryId [dict keys [dict get $sockets $current active]] {
+        lappend modifications [::convex::object [list type [::convex::quote QueryUpdated] queryId $queryId value {{"count":800}}]]
+    }
+    malformed_transition $end $modifications
+}
+
+proc ::livefixture::malformed_query_id {} {
+    variable sockets
+    variable current
+    set end [next_version [dict get $sockets $current querySet]]
+    set modification [::convex::object [list type [::convex::quote QueryUpdated] queryId [::convex::quote 0] value {{"count":900}}]]
+    malformed_transition $end [list $modification]
+}
+
+proc ::livefixture::malformed_query_failed {} {
+    variable sockets
+    variable current
+    set end [next_version [dict get $sockets $current querySet]]
+    set modification [::convex::object [list type [::convex::quote QueryFailed] queryId 0 errorMessage 7 errorData {{"code":"MALFORMED"}}]]
+    malformed_transition $end [list $modification]
+}
+
 proc ::livefixture::fragmented_update {value} {
     variable sockets
     variable current

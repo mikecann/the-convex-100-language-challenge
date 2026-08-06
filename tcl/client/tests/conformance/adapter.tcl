@@ -30,13 +30,19 @@ namespace eval ::adapter {
     variable closeTimeoutMs 2000
     variable flushTimer ""
     variable exitHook ""
+    variable testHooksEnabled [info exists ::env(ADAPTER_TEST_ONLY)]
     # Test-only pending override. It gives the unit test a deterministic
     # stopped-reader channel without depending on an OS socket buffer size.
     variable pendingOutputHook ""
+    # Tcl normally hides an OS EAGAIN behind its unbounded channel buffer. The
+    # test-only flush hook surfaces that condition after a real pipe is full so
+    # the production catch branch can be observed without mutating the queue.
+    variable outputFlushHook ""
     # Tests observe these counters while using real nonblocking channels. They
     # never alter channel readiness or queue ownership.
     variable acceptedWriteCount 0
     variable acceptedBackpressureCount 0
+    variable acceptedWouldBlockCount 0
     variable observeBackpressure 0
     variable lastBackpressuredRaw ""
     # Test-only deterministic barrier. A test invalidates a relay after it has
@@ -54,7 +60,9 @@ proc ::adapter::terminate {status} {
 }
 
 proc ::adapter::error_raw {message {name Error} {data null}} {
-    return [::convex::object [list name [::convex::quote $name] message [::convex::quote $message] data $data]]
+    set fields [list name [::convex::quote $name] message [::convex::quote $message]]
+    if {$data ne ""} { lappend fields data $data }
+    return [::convex::object $fields]
 }
 
 proc ::adapter::logs_present {logs} {
@@ -99,6 +107,25 @@ proc ::adapter::output_pending {} {
     variable pendingOutputHook
     if {$pendingOutputHook ne ""} { return [uplevel #0 $pendingOutputHook] }
     return [chan pending output $output]
+}
+
+proc ::adapter::output_flush {} {
+    variable output
+    variable outputFlushHook
+    variable testHooksEnabled
+    if {$testHooksEnabled && $outputFlushHook ne ""} {
+        return [uplevel #0 [list {*}$outputFlushHook $output]]
+    }
+    return [::flush $output]
+}
+
+proc ::adapter::would_block {message options} {
+    set code [dict get $options -errorcode]
+    return [expr {
+        ([lindex $code 0] eq "POSIX" && [lindex $code 1] in {EAGAIN EWOULDBLOCK})
+        || [string match {*would block*} [string tolower $message]]
+        || [string match {*resource temporarily unavailable*} [string tolower $message]]
+    }]
 }
 
 proc ::adapter::release_accepted {} {
@@ -219,8 +246,8 @@ proc ::adapter::flush {} {
         # accepted prefix. A control event is allowed through the reserved
         # budget, so close/ack can be accepted in-order by a slow reader.
         if {$droppable && $position > 0} { break }
-        if {[catch {puts -nonewline $output $raw} error]} {
-            if {[string match {*would block*} [string tolower $error]]} {
+        if {[catch {puts -nonewline $output $raw} error options]} {
+            if {[would_block $error $options]} {
                 fileevent $output writable {}
                 schedule_flush
                 return
@@ -233,16 +260,18 @@ proc ::adapter::flush {} {
         lset queue $position 3 accepted
         variable acceptedWriteCount
         variable acceptedBackpressureCount
+        variable acceptedWouldBlockCount
         variable observeBackpressure
         variable lastBackpressuredRaw
         incr acceptedWriteCount
-        if {[catch {::flush $output} error]} {
-            if {[string match {*would block*} [string tolower $error]]} {
+        if {[catch {output_flush} error options]} {
+            if {[would_block $error $options]} {
                 # Tcl already owns this record. A writable fileevent can fire
                 # continuously while channel bytes remain pending and starve
                 # controller and WebSocket reads, so recheck with one bounded
                 # timer instead.
                 incr acceptedBackpressureCount
+                incr acceptedWouldBlockCount
                 if {$observeBackpressure} { set lastBackpressuredRaw $raw }
                 fileevent $output writable {}
                 schedule_flush
@@ -364,7 +393,7 @@ proc ::adapter::subscription_event {subscriptionId generation kind payload logs}
         emit [::convex::object $fields] 1 [list $subscriptionId $generation]
     } else {
         set text [::convex::decode [::convex::field $payload message]]
-        set data [::convex::field $payload data]
+        set data [::convex::field $payload data 0]
         set name [::convex::decode [::convex::field $payload name]]
         subscription_error $subscriptionId $generation $name $text $data $logs
     }

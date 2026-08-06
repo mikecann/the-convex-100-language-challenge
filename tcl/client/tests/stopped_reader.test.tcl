@@ -188,9 +188,10 @@ if {$closeFailed} {
 puts "Tcl real stopped-reader test passed: RSS ${rss} KiB, close ${elapsed} ms, deliveryFailure=$closeFailed"
 
 # Exercise the adapter queue in this process against a genuine nonblocking OS
-# pipe. The read end stays open but unread until Tcl accepts a complete NDJSON
-# record and reports pending output. No pending hook or hand-built queue state is
-# involved in this proof.
+# pipe. Tcl 8.6 normally converts the pipe's EAGAIN into buffered channel bytes,
+# so this test-only hook first performs the real flush, verifies those undrained
+# bytes, then surfaces POSIX EAGAIN through the production catch branch. It does
+# not mutate readiness, accepted ownership, or queue state.
 set ::env(ADAPTER_TEST_ONLY) 1
 source $adapter
 unset ::env(ADAPTER_TEST_ONLY)
@@ -204,15 +205,24 @@ set ::adapter::subscriptions [dict create same 1]
 set ::adapter::generations [dict create same 1]
 set ::adapter::acceptedWriteCount 0
 set ::adapter::acceptedBackpressureCount 0
+set ::adapter::acceptedWouldBlockCount 0
 set ::adapter::observeBackpressure 1
 set ::adapter::lastBackpressuredRaw ""
+proc eagain_flush {channel} {
+    ::flush $channel
+    if {[chan pending output $channel] == 0} { return }
+    return -code error -errorcode {POSIX EAGAIN {resource temporarily unavailable}} \
+        "error flushing channel: resource temporarily unavailable"
+}
+set ::adapter::outputFlushHook eagain_flush
 set eagainBlob [string repeat z [expr {64 * 1024}]]
-for {set index 0} {$index < 12 && $::adapter::acceptedBackpressureCount == 0} {incr index} {
+for {set index 0} {$index < 12 && $::adapter::acceptedWouldBlockCount == 0} {incr index} {
     set raw [::convex::object [list type [::convex::quote subscription] subscriptionId [::convex::quote same] value [::convex::object [list sequence $index blob [::convex::quote $eagainBlob]]]]]
     ::adapter::emit $raw 1 [list same 1]
 }
 assert {$::adapter::acceptedWriteCount > 0} "real pipe accepted no adapter record"
 assert {$::adapter::acceptedBackpressureCount > 0} "real pipe did not expose accepted output backpressure"
+assert {$::adapter::acceptedWouldBlockCount > 0} "real pipe did not enter the accepted EAGAIN catch branch"
 set acceptedLine [string trimright $::adapter::lastBackpressuredRaw "\n"]
 set markerLine {{"id":"accepted-marker","type":"ack"}}
 set tailLine {{"type":"subscription","subscriptionId":"same","value":{"tail":true}}}
@@ -245,12 +255,14 @@ append ::eagainBuffer [read $eagainRead]
 set ::adapter::queue {}
 set ::adapter::queueBytes 0
 set ::adapter::acceptedBackpressureCount 0
+set ::adapter::acceptedWouldBlockCount 0
 set ::adapter::lastBackpressuredRaw ""
-for {set index 0} {$index < 12 && $::adapter::acceptedBackpressureCount == 0} {incr index} {
+for {set index 0} {$index < 12 && $::adapter::acceptedWouldBlockCount == 0} {incr index} {
     set raw [::convex::object [list type [::convex::quote subscription] subscriptionId [::convex::quote same] value [::convex::object [list closeSequence $index blob [::convex::quote $eagainBlob]]]]]
     ::adapter::emit $raw 1 [list same 1]
 }
 assert {$::adapter::acceptedBackpressureCount > 0} "real close pipe did not become backpressured"
+assert {$::adapter::acceptedWouldBlockCount > 0} "real close pipe did not enter the accepted EAGAIN catch branch"
 set closedLine {{"id":"real-close","type":"closed"}}
 ::adapter::emit $closedLine
 proc eagain_exit {code} { set ::eagainExit $code; ::livefixture::signal }
@@ -269,4 +281,5 @@ close $eagainRead
 close $eagainWrite
 set ::adapter::exitHook ""
 set ::adapter::observeBackpressure 0
-puts "Tcl genuine accepted-byte backpressure test passed: close ${realCloseElapsed} ms"
+set ::adapter::outputFlushHook ""
+puts "Tcl genuine accepted-byte EAGAIN test passed: close ${realCloseElapsed} ms"
