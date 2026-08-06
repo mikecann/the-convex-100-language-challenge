@@ -244,8 +244,23 @@ Base.link_pipe!(
     reader_supports_async = true,
     writer_supports_async = true,
 )
-adapter_live_output = IOBuffer()
-adapter_live_task = @async Adapter.run_adapter(adapter_live_input.out, adapter_live_output)
+adapter_live_output_pipe = Pipe()
+Base.link_pipe!(
+    adapter_live_output_pipe;
+    reader_supports_async = true,
+    writer_supports_async = true,
+)
+adapter_live_output_text = IOBuffer()
+adapter_live_update_seen = Channel{Nothing}(1)
+adapter_live_output_reader = @async begin
+    while !eof(adapter_live_output_pipe.out)
+        line = readline(adapter_live_output_pipe.out)
+        write(adapter_live_output_text, line, '\n')
+        occursin("\"type\":\"update\"", line) && put!(adapter_live_update_seen, nothing)
+    end
+end
+adapter_live_task = @async
+    Adapter.run_adapter(adapter_live_input.out, adapter_live_output_pipe.in)
 try
     write(
         adapter_live_input.in,
@@ -256,6 +271,9 @@ try
     )
     flush(adapter_live_input.in)
     take!(adapter_live_transition_sent)
+    # Wait for the relay to publish the update before allowing unsubscribe and
+    # close to retire the subscription and its output queue.
+    take!(adapter_live_update_seen)
     write(
         adapter_live_input.in,
         "{\"id\":\"unsub\",\"op\":\"unsubscribe\",\"subscriptionId\":\"s1\"}\n" *
@@ -266,12 +284,14 @@ try
     wait(adapter_live_task)
 finally
     isopen(adapter_live_input.in) && close(adapter_live_input.in)
+    wait(adapter_live_task)
+    isopen(adapter_live_output_pipe.in) && close(adapter_live_output_pipe.in)
+    wait(adapter_live_output_reader)
     isnothing(old_adapter_live_url) ? delete!(ENV, "CONVEX_URL") :
     (ENV["CONVEX_URL"] = old_adapter_live_url)
 end
-close(adapter_live_input.out)
 wait(adapter_live_server)
-adapter_live_text = String(take!(adapter_live_output))
+adapter_live_text = String(take!(adapter_live_output_text))
 occursin("\"type\":\"ready\"", adapter_live_text) || error("adapter live omitted ready")
 occursin("\"type\":\"ack\"", adapter_live_text) ||
     error("adapter live omitted subscribe ack")
