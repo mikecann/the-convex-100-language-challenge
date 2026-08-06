@@ -22,6 +22,8 @@ using GLib;
 using Json;
 using Convex;
 
+// Build the shared demo's argument object, including the mutation's optional
+// language label and idempotency key when that operation needs them.
 static Json.Node object_node (string room, string? language = null, string? run_id = null) {
   var builder = new Builder ();
   builder.begin_object ();
@@ -39,6 +41,8 @@ static Json.Node object_node (string room, string? language = null, string? run_
   return builder.get_root ().copy ();
 }
 
+// Convex may encode an integral JSON number as either 1 or 1.0. Accept both
+// forms while rejecting fractional, non-finite, negative, or overflowing data.
 static int64 count_from (Json.Node value, string operation) throws Error {
   if (value.get_node_type () != NodeType.OBJECT) {
     throw new ClientError.PROTOCOL (operation + " did not return an object");
@@ -102,6 +106,7 @@ int main (string[] args) {
           }
           stdout.printf ("live updated count: %" + int64.FORMAT + "\n", observed);
           stdout.printf ("verified count: %" + int64.FORMAT + " -> %" + int64.FORMAT + "\n", current, observed);
+          // Retire the Live query and its transport after the proof is complete.
           client.unsubscribe (subscription);
           client.close ();
           exit_code = 0;
@@ -114,6 +119,7 @@ int main (string[] args) {
         loop.quit ();
       }
     });
+    // Fail clearly instead of leaving a viewer with an example that hangs.
     timeout_source = Timeout.add_seconds (20, () => {
       stderr.printf ("Vala example timed out\n");
       client.close ();
@@ -143,10 +149,10 @@ int main (string[] args) {
 
 ## Conformance and protocol notes
 
-The client implements Convex-specific HTTP envelopes and an attempted pinned `/api/sync` query-set profile in Vala. libsoup supplies ordinary TLS, HTTP, and RFC6455 transport only. One GLib-main-context Live owner opens, reads, writes, retires, and reconnects the socket. It commits a complete Transition before publishing updates, validates query-set versions and uint32 bounds, tracks the little-endian timestamp numerically, reports transport failures as structured events, and suppresses unchanged rehydration. Delivery relays are generation-tagged and bounded to sixteen events and eight MiB; adapter output has a two MiB event cap and eight MiB in-flight budget.
+The client implements Convex-specific HTTP envelopes and the pinned `/api/sync` query-set profile in Vala. libsoup supplies status-first streaming HTTP with a two MiB body limit and one absolute operation deadline, while a GLib/GIO `SocketClient` and TLS connection carry the client-owned RFC6455 handshake, masking, incremental frame parser, control frames, and close deadlines. One GLib-main-context Live owner opens, reads, writes, retires, and reconnects the socket. It commits a complete Transition before publishing updates, validates query-set versions and uint32 bounds, tracks the little-endian timestamp numerically, reports structured failures, and suppresses unchanged rehydration. Delivery relays are generation-tagged and bounded to sixteen reserved queued or in-flight events and eight MiB including encoded error logs and runtime overhead. Adapter output has a two MiB event cap, conservative in-flight byte accounting, and a one-second default absolute write deadline so a stopped controller cannot pin the process indefinitely.
 
 The test-only adapter accepts strict NDJSON v1 over stdin/stdout or one `ADAPTER_LISTEN` TCP controller. `debugDisconnect` is adapter-only and lets the shared harness prove real reconnections.
 
 ## Limitations
 
-The basic Live path still lacks deterministic raw-peer coverage for fragmented frames, stalled-frame deadlines, five reconnects, and full recovery behaviour required for a Live badge. The new local tests cover relay invalidation, deduplication, numeric bounds, and the stopped-reader relay budget, but do not replace root-owned shared conformance. Live authentication lifecycle, optimistic updates, mutation and action messages over WebSocket, journals, and TransitionChunk assembly are also deferred. The manifest deliberately declares no earned badges until root-owned local and hosted evidence passes from a clean reviewed commit.
+The language-local raw peers cover strict HTTP status and bounded streaming, inactivity and continuous-drip deadlines, malformed-envelope recovery, strict RFC6455 upgrade validation, fragmented UTF-8 with control traffic, absolute partial-frame timeout and recovery, five reconnects with `Add` replay, stale relay barriers, and bounded close. They also exercise queued and in-flight count/byte reservations, but they do not replace fresh independent review or root-owned shared conformance. Live authentication lifecycle, optimistic updates, mutation and action messages over WebSocket, journals, and TransitionChunk assembly are deferred. The manifest deliberately declares no earned badges.

@@ -6,41 +6,98 @@ using Convex;
 class Adapter : GLib.Object {
   private Client? client;
   private HashTable<string, Subscription> subscriptions = new HashTable<string, Subscription> (str_hash, str_equal);
-  private OutputStream? tcp_output;
+  private OutputStream protocol_output = new UnixOutputStream (1, false);
   private MainLoop loop;
   private bool closed = false;
+  private bool failed = false;
   private size_t output_in_flight_bytes = 0;
   private uint output_in_flight_events = 0;
   private const size_t MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
   private const uint MAX_OUTPUT_EVENTS = 64;
+  private const size_t OUTPUT_RUNTIME_OVERHEAD = 256;
+  // The project targets Linux/amd64. Keep the controller socket's kernel
+  // buffering much smaller than one maximum event so a stopped reader reaches
+  // the userspace absolute-deadline path instead of being hidden by autotune.
+  private const int LINUX_SOL_SOCKET = 1;
+  private const int LINUX_SO_SNDBUF = 7;
+  private const int CONTROLLER_SEND_BUFFER_BYTES = 64 * 1024;
   // Language-local tests attach here to assert the exact NDJSON event that is
   // written. This never changes adapter stdout or the production client API.
   internal signal void emitted_for_test (string event);
 
   public Adapter (MainLoop loop) { this.loop = loop; }
 
+  internal uint output_in_flight_count_for_test () { return output_in_flight_events; }
+  internal size_t output_in_flight_bytes_for_test () { return output_in_flight_bytes; }
+  internal bool failed_for_process () { return failed; }
+  internal void set_output_for_test (OutputStream output) { protocol_output = output; }
+
+  private uint output_deadline_ms () {
+    var configured = Environment.get_variable ("ADAPTER_OUTPUT_DEADLINE_MS");
+    if (configured == null || configured.length == 0) return 1000;
+    uint64 parsed;
+    if (!uint64.try_parse (configured, out parsed) || parsed == 0 || parsed > 60000) return 1000;
+    return (uint) parsed;
+  }
+
+  private void stop_with_failure (string message) {
+    failed = true;
+    closed = true;
+    stderr.printf ("adapter failed: %s\n", message);
+    if (client != null) client.close ();
+    loop.quit ();
+  }
+
   private void emit (string event) {
-    size_t encoded_bytes = event.length + 1;
-    if (encoded_bytes > 2 * 1024 * 1024) { stderr.printf ("adapter event exceeds 2 MiB\n"); loop.quit (); return; }
+    size_t wire_bytes = event.length + 1;
+    size_t encoded_bytes = wire_bytes + OUTPUT_RUNTIME_OVERHEAD;
+    if (wire_bytes > 2 * 1024 * 1024) { stop_with_failure ("adapter event exceeds 2 MiB"); return; }
     if (output_in_flight_events >= MAX_OUTPUT_EVENTS || output_in_flight_bytes + encoded_bytes > MAX_OUTPUT_BYTES) {
-      stderr.printf ("adapter output budget exhausted\n");
-      loop.quit ();
+      stop_with_failure ("adapter output budget exhausted");
       return;
     }
     output_in_flight_events++;
     output_in_flight_bytes += encoded_bytes;
     emitted_for_test (event);
     try {
-      if (tcp_output != null) {
-        size_t written;
-        tcp_output.write_all ((event + "\n").data, out written, null);
-      } else {
-        stdout.printf ("%s\n", event);
-        stdout.flush ();
-      }
-    } catch (Error error) { stderr.printf ("adapter output failed: %s\n", error.message); }
+      string line = event + "\n";
+      write_with_deadline (line);
+    } catch (Error error) {
+      stop_with_failure ("adapter output failed: " + error.message);
+    }
     output_in_flight_events--;
     output_in_flight_bytes -= encoded_bytes;
+  }
+
+  private void write_with_deadline (string line) throws Error {
+    var pollable = protocol_output as PollableOutputStream;
+    if (pollable == null || !pollable.can_poll ()) {
+      // Docker's build smoke redirects stdout to a regular file, which GLib
+      // reports as non-pollable even though it cannot apply controller
+      // backpressure. Production pipes and TCP sockets take the bounded path
+      // below; retain ordinary file redirection as a useful adapter mode.
+      size_t written;
+      protocol_output.write_all (line.data, out written, null);
+      if (written != line.length) throw new IOError.FAILED ("short adapter output write");
+      return;
+    }
+    int64 deadline = get_monotonic_time () + ((int64) output_deadline_ms () * TimeSpan.MILLISECOND);
+    size_t offset = 0;
+    while (offset < line.length) {
+      int64 remaining = deadline - get_monotonic_time ();
+      if (remaining <= 0) throw new IOError.TIMED_OUT ("adapter output exceeded its absolute deadline");
+      try {
+        ssize_t written = pollable.write_nonblocking (line.data[(int) offset: line.length], null);
+        if (written <= 0) throw new IOError.FAILED ("short adapter output write");
+        offset += (size_t) written;
+      } catch (IOError error) {
+        if (!(error is IOError.WOULD_BLOCK)) throw error;
+        // Poll in short bounded intervals. GLib's synchronous write_all()
+        // cannot reliably be interrupted from another thread on every socket
+        // backend, while this path never enters a blocking write at all.
+        Thread.usleep ((ulong) int64.min (remaining, TimeSpan.MILLISECOND));
+      }
+    }
   }
 
   private void error (string id, string name, string message, Json.Node? data = null, string? subscription_id = null, string[] logs = {}) {
@@ -88,7 +145,7 @@ class Adapter : GLib.Object {
       var op = object.get_string_member ("op");
       if (op == "hello") {
         if (!object.has_member ("protocolVersion") || Convex.uint32_member (object, "protocolVersion") != 1) throw new ClientError.PROTOCOL ("unsupported adapter protocol version");
-        emit ("{\"protocolVersion\":1,\"id\":" + Convex.json_string (id) + ",\"type\":\"ready\",\"language\":\"vala\",\"implementation\":\"native-vala-libsoup3\",\"runtime\":" + Convex.json_string (Environment.get_variable ("VALA_RUNTIME") ?? "glib") + "}");
+        emit ("{\"protocolVersion\":1,\"id\":" + Convex.json_string (id) + ",\"type\":\"ready\",\"language\":\"vala\",\"implementation\":\"native-vala-glib-gio-libsoup3\",\"runtime\":" + Convex.json_string (Environment.get_variable ("VALA_RUNTIME") ?? "glib") + "}");
       } else if (op == "query" || op == "mutation" || op == "action") {
         if (!object.has_member ("path") || !object.has_member ("args")) throw new ClientError.PROTOCOL ("call requires path and args");
         var service = get_client (); Result result;
@@ -128,28 +185,34 @@ class Adapter : GLib.Object {
         loop.quit ();
       } else throw new ClientError.PROTOCOL ("unknown adapter operation");
     } catch (Error command_error) {
-      if (client != null && client.last_function_error != null) {
+      if (command_error is ClientError.FUNCTION && client != null && client.last_function_error != null) {
         var failure = client.last_function_error;
         error (id, failure.name, failure.message, failure.data, null, failure.logs);
       } else {
-        error (id, "ProtocolError", command_error.message);
+        string name = (command_error is ClientError.TRANSPORT || command_error is ClientError.CLOSED) ? "TransportError" : "ProtocolError";
+        error (id, name, command_error.message);
       }
     }
   }
 
   // The harness relies on a strict protocol. Rejecting unknown fields makes
   // client-side typos visible instead of silently treating them as success.
-  private string required_string (Json.Object object, string field, size_t minimum = 0) throws ClientError {
+  private string required_string (Json.Object object, string field, long minimum = 0, long maximum = -1) throws ClientError {
     if (!object.has_member (field) || object.get_member (field).get_value_type () != typeof (string)) {
       throw new ClientError.PROTOCOL (field + " must be a string");
     }
     var value = object.get_string_member (field);
-    if (value.length < minimum || value.length > 128) throw new ClientError.PROTOCOL (field + " has invalid length");
+    // JSON Schema's maxLength counts Unicode code points, not encoded UTF-8
+    // bytes. This accepts 128 astral characters and rejects the 129th.
+    long characters = value.char_count ();
+    if (characters < minimum || (maximum >= 0 && characters > maximum)) {
+      throw new ClientError.PROTOCOL (field + " has invalid length");
+    }
     return value;
   }
 
   private void validate_envelope (Json.Object object) throws ClientError {
-    var id = required_string (object, "id", 1);
+    var id = required_string (object, "id", 1, 128);
     var op = required_string (object, "op", 1);
     string[] permitted;
     if (op == "hello") permitted = { "id", "op", "protocolVersion" };
@@ -178,13 +241,13 @@ class Adapter : GLib.Object {
     } else if (op == "setAuth") {
       required_string (object, "token");
     } else if (op == "subscribe") {
-      required_string (object, "subscriptionId", 1);
+      required_string (object, "subscriptionId", 1, 128);
       required_string (object, "path", 1);
       if (!object.has_member ("args") || object.get_member ("args").get_node_type () != NodeType.OBJECT) {
         throw new ClientError.PROTOCOL ("subscribe needs object args");
       }
     } else if (op == "unsubscribe") {
-      required_string (object, "subscriptionId", 1);
+      required_string (object, "subscriptionId", 1, 128);
     }
   }
 
@@ -201,7 +264,13 @@ class Adapter : GLib.Object {
   }
 
   public async void read_tcp (SocketConnection connection) {
-    tcp_output = connection.output_stream;
+    try {
+      connection.socket.set_option (LINUX_SOL_SOCKET, LINUX_SO_SNDBUF, CONTROLLER_SEND_BUFFER_BYTES);
+    } catch (Error error) {
+      stop_with_failure ("could not bound controller send buffer: " + error.message);
+      return;
+    }
+    protocol_output = connection.output_stream;
     var input = new DataInputStream (connection.input_stream);
     try {
       while (!closed) {
@@ -239,6 +308,6 @@ int main (string[] args) {
     } catch (Error error) { stderr.printf ("adapter listen failed: %s\n", error.message); return 1; }
   }
   loop.run ();
-  return 0;
+  return adapter.failed_for_process () ? 1 : 0;
 }
 #endif

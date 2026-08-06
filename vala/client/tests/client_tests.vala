@@ -99,6 +99,74 @@ private static void stopped_reader_budget_is_bounded () {
   assert (subscription.pending_byte_count () == 0);
 }
 
+private static string large_string (int bytes, char fill = 'x') {
+  var builder = new StringBuilder ();
+  for (int index = 0; index < bytes; index++) builder.append_c (fill);
+  return builder.str;
+}
+
+private static Json.Node large_string_node (int bytes, char fill = 'x') {
+  var node = new Json.Node (NodeType.VALUE);
+  node.set_string (large_string (bytes, fill));
+  return node;
+}
+
+private static void in_flight_reservation_refills_after_publish () {
+  var args = new Json.Node (NodeType.OBJECT);
+  args.set_object (new Json.Object ());
+  var subscription = new Subscription (4, "demo:state", args);
+  int deliveries = 0;
+  subscription.updated.connect ((value, failure) => { deliveries++; });
+  for (int index = 0; index < 4; index++) subscription.publish (large_string_node (1900 * 1024), null);
+  assert (subscription.pending_count () == 4);
+  bool observed_in_flight = false;
+  Subscription.before_delivery_for_test = (current) => {
+    if (observed_in_flight) return;
+    observed_in_flight = true;
+    // poll() has happened, but count and bytes still include this callback.
+    assert (current.pending_count () == 4);
+    assert (current.pending_byte_count () > 7 * 1024 * 1024);
+    current.publish (large_string_node (1900 * 1024, 'z'), null);
+    assert (current.pending_count () <= 4);
+    assert (current.pending_byte_count () <= 8 * 1024 * 1024);
+  };
+  while (MainContext.default ().pending ()) MainContext.default ().iteration (false);
+  Subscription.before_delivery_for_test = null;
+  assert (observed_in_flight);
+  assert (subscription.pending_count () == 0);
+  assert (subscription.pending_byte_count () == 0);
+  int delivered_before_refill = deliveries;
+  subscription.publish (number_node (99), null);
+  while (MainContext.default ().pending ()) MainContext.default ().iteration (false);
+  assert (deliveries == delivered_before_refill + 1);
+}
+
+private static void revocation_releases_log_and_runtime_reservation_once () {
+  var args = new Json.Node (NodeType.OBJECT);
+  args.set_object (new Json.Object ());
+  var subscription = new Subscription (5, "demo:state", args);
+  string[] logs = { large_string (512 * 1024), large_string (512 * 1024, 'y') };
+  var failure = new FunctionError ("FunctionError", "large logged failure", null, logs);
+  int deliveries = 0;
+  subscription.updated.connect ((value, error) => { deliveries++; });
+  subscription.publish (null, failure);
+  bool revoked = false;
+  Subscription.before_delivery_for_test = (current) => {
+    revoked = true;
+    assert (current.pending_count () == 1);
+    // This is larger than the raw log bytes because encoded JSON and runtime
+    // overhead remain charged through callback publication.
+    assert (current.pending_byte_count () > 1024 * 1024);
+    current.invalidate ();
+  };
+  while (MainContext.default ().pending ()) MainContext.default ().iteration (false);
+  Subscription.before_delivery_for_test = null;
+  assert (revoked);
+  assert (deliveries == 0);
+  assert (subscription.pending_count () == 0);
+  assert (subscription.pending_byte_count () == 0);
+}
+
 private static void invalidation_is_a_delivery_barrier () {
   var args = new Json.Node (NodeType.OBJECT);
   args.set_object (new Json.Object ());
@@ -119,6 +187,8 @@ int main (string[] args) {
   Test.add_func ("/convex/subscription/rehydration-suppression", subscriptions_only_suppress_rehydration);
   Test.add_func ("/convex/protocol/uint32-bounds", uint32_numbers_are_strict);
   Test.add_func ("/convex/live/stopped-reader-budget", stopped_reader_budget_is_bounded);
+  Test.add_func ("/convex/live/in-flight-refill", in_flight_reservation_refills_after_publish);
+  Test.add_func ("/convex/live/revocation-log-runtime-budget", revocation_releases_log_and_runtime_reservation_once);
   Test.add_func ("/convex/live/invalidation-barrier", invalidation_is_a_delivery_barrier);
   return Test.run ();
 }

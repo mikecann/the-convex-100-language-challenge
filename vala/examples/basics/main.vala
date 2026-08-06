@@ -2,6 +2,8 @@ using GLib;
 using Json;
 using Convex;
 
+// Build the shared demo's argument object, including the mutation's optional
+// language label and idempotency key when that operation needs them.
 static Json.Node object_node (string room, string? language = null, string? run_id = null) {
   var builder = new Builder ();
   builder.begin_object ();
@@ -19,6 +21,8 @@ static Json.Node object_node (string room, string? language = null, string? run_
   return builder.get_root ().copy ();
 }
 
+// Convex may encode an integral JSON number as either 1 or 1.0. Accept both
+// forms while rejecting fractional, non-finite, negative, or overflowing data.
 static int64 count_from (Json.Node value, string operation) throws Error {
   if (value.get_node_type () != NodeType.OBJECT) {
     throw new ClientError.PROTOCOL (operation + " did not return an object");
@@ -82,6 +86,7 @@ int main (string[] args) {
           }
           stdout.printf ("live updated count: %" + int64.FORMAT + "\n", observed);
           stdout.printf ("verified count: %" + int64.FORMAT + " -> %" + int64.FORMAT + "\n", current, observed);
+          // Retire the Live query and its transport after the proof is complete.
           client.unsubscribe (subscription);
           client.close ();
           exit_code = 0;
@@ -94,6 +99,7 @@ int main (string[] args) {
         loop.quit ();
       }
     });
+    // Fail clearly instead of leaving a viewer with an example that hangs.
     timeout_source = Timeout.add_seconds (20, () => {
       stderr.printf ("Vala example timed out\n");
       client.close ();

@@ -4,9 +4,9 @@ using Convex;
 
 /*
  * This deliberately speaks RFC6455 over a plain TCP socket instead of using
- * Soup's server APIs.  The production client is free to use libsoup, but the
- * regression needs to prove the integration below its convenient message API:
- * masked client frames, control frames, fragmentation, close, and reconnect.
+ * server library. The production client uses the same GIO stream path under
+ * test here: masked client frames, incremental control/data parsing,
+ * fragmentation, close, and reconnect.
  */
 
 private delegate bool RawCondition ();
@@ -273,7 +273,7 @@ private class RawPeer : GLib.Object {
     lock (state_lock) { peer_closed = true; peer_closed_at = get_monotonic_time () - started; state_changed.broadcast (); }
   }
 
-  private DataInputStream handshake (SocketConnection connection) throws Error {
+  private DataInputStream handshake (SocketConnection connection, int failure_kind = 0) throws Error {
     var input = new DataInputStream (connection.input_stream);
     size_t line_length = 0;
     string? request = input.read_line_utf8 (out line_length, null);
@@ -299,14 +299,18 @@ private class RawPeer : GLib.Object {
       if (name == "sec-websocket-version" && value == "13") saw_version = true;
     }
     if (key == null || !saw_upgrade || !saw_connection || !saw_version) throw new IOError.INVALID_DATA ("invalid WebSocket upgrade headers");
-    string response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + raw_accept (key) + "\r\n\r\n";
+    string status = failure_kind == 1 ? "HTTP/1.1 503 Service Unavailable" : "HTTP/1.1 101 Switching Protocols";
+    string response = status + "\r\n";
+    if (failure_kind != 2) response += "Upgrade: websocket\r\n";
+    if (failure_kind != 3) response += "Connection: keep-alive, Upgrade\r\n";
+    response += "Sec-WebSocket-Accept: " + (failure_kind == 4 ? "wrong" : raw_accept (key)) + "\r\n\r\n";
     raw_write_all (connection.output_stream, response.data);
     // Keep using this buffered reader. Switching back to the raw socket can
     // lose a client frame prefetched with the HTTP upgrade headers.
     return input;
   }
 
-  private uint accept_add (InputStream input, OutputStream output, uint expected_count, string expected_reason) throws Error {
+  private uint accept_add (InputStream input, OutputStream output, uint expected_count, string expected_reason, bool expect_timestamp = true) throws Error {
     var connect = raw_read_client_json (input, output);
     if (connect.get_string_member ("type") != "Connect" || Convex.uint32_member (connect, "connectionCount") != expected_count) {
       throw new IOError.INVALID_DATA ("wrong Connect metadata");
@@ -314,8 +318,8 @@ private class RawPeer : GLib.Object {
     if (expected_reason.length > 0 && connect.get_string_member ("lastCloseReason") != expected_reason) {
       throw new IOError.INVALID_DATA ("wrong reconnect close reason");
     }
-    if (expected_count == 0) {
-      if (connect.has_member ("maxObservedTimestamp")) throw new IOError.INVALID_DATA ("initial Connect carried a timestamp");
+    if (expected_count == 0 || !expect_timestamp) {
+      if (connect.has_member ("maxObservedTimestamp")) throw new IOError.INVALID_DATA ("Connect carried an unobserved timestamp");
     } else if (!connect.has_member ("maxObservedTimestamp") || connect.get_string_member ("maxObservedTimestamp") != raw_timestamp (timestamp)) {
       throw new IOError.INVALID_DATA ("reconnect lost the numeric maximum timestamp");
     }
@@ -328,10 +332,13 @@ private class RawPeer : GLib.Object {
     var add = modifications.get_object_element (0);
     if (add.get_string_member ("type") != "Add" || add.get_string_member ("udfPath") != "demo:state") throw new IOError.INVALID_DATA ("wrong Add");
     string encoded_args = Convex.node_text (add.get_member ("args"));
-    if (expected_count == 0) replay_args = encoded_args;
+    // A failed upgrade increments connectionCount without ever sending an
+    // Add. Establish replay identity from the first successful connection,
+    // rather than assuming that connectionCount must still be zero.
+    if (replay_args == null) replay_args = encoded_args;
     else if (replay_args != encoded_args) throw new IOError.INVALID_DATA ("reconnect changed Add arguments");
     uint query_id = Convex.uint32_member (add, "queryId");
-    if (expected_count == 0) replay_query_id = query_id;
+    if (replay_query_id == uint.MAX) replay_query_id = query_id;
     else if (replay_query_id != query_id) throw new IOError.INVALID_DATA ("reconnect changed Add query id");
     observe_add ();
     return query_id;
@@ -351,7 +358,7 @@ private class RawPeer : GLib.Object {
     for (int index = split; index < bytes.length; index++) second[index - split] = bytes[index];
     raw_write_frame (connection.output_stream, false, 0x1, first);
     raw_write_frame (connection.output_stream, true, 0x9, "probe".data);
-    // libsoup must answer the control frame while it retains the fragmented
+    // The client must answer the control frame while retaining the fragmented
     // UTF-8 text message; only then may the continuation complete it.
     for (;;) {
       var reply = raw_read_client_frame (input);
@@ -385,6 +392,9 @@ private class RawPeer : GLib.Object {
     else if (mode == 5) serve_same_id_replacement ();
     else if (mode == 6) serve_adapter_stress ();
     else if (mode == 7) serve_protocol_recovery ();
+    else if (mode == 8) serve_idle_then_update (false);
+    else if (mode == 9) serve_idle_then_update (true);
+    else if (mode == 10) serve_handshake_validation ();
     else serve_stalled_close ();
   }
 
@@ -443,16 +453,24 @@ private class RawPeer : GLib.Object {
     var input = handshake (connection);
     observe_connection ();
     uint query_id = accept_add (input, connection.output_stream, 0, "InitialConnect");
+    int64 started = get_monotonic_time ();
     if (mode == 3) {
       string partial = raw_transition (0, 1, 0, ++timestamp, query_id, raw_update (query_id, 0));
       raw_write_partial_text_header (connection.output_stream, partial.length);
       raw_write_all (connection.output_stream, partial.data[0 : 4]);
     } else if (mode == 4) {
-      for (uint count = 0; count < 64; count++) {
-        raw_write_text (connection.output_stream, raw_transition (count == 0 ? 0 : 1, 1, count == 0 ? 0 : timestamp, ++timestamp, query_id, raw_update (query_id, count)));
+      try {
+        for (uint count = 0; count < 64; count++) {
+          raw_write_text (connection.output_stream, raw_transition (count == 0 ? 0 : 1, 1, count == 0 ? 0 : timestamp, ++timestamp, query_id, raw_update (query_id, count)));
+        }
+      } catch (Error error) {
+        // A bounded client close may retire the socket while this deliberately
+        // noisy peer is still writing. That reset is the expected close proof.
+        observe_close (started);
+        return;
       }
     }
-    wait_for_close (input, connection.output_stream, get_monotonic_time ());
+    wait_for_close (input, connection.output_stream, started);
   }
 
   private void serve_same_id_replacement () throws Error {
@@ -488,8 +506,13 @@ private class RawPeer : GLib.Object {
     var text = new StringBuilder ();
     for (int index = 0; index < 1536 * 1024; index++) text.append_c ('x');
     raw_write_text (connection.output_stream, raw_transition (0, 1, 0, ++timestamp, query_id, raw_update (query_id, 0, text.str)));
+    // Pace each near-maximum update just enough for the adapter to begin its
+    // corresponding controller write. A blast would be collapsed by the
+    // deliberately bounded client queue before it could exercise backpressure.
+    Thread.usleep (25 * 1000);
     for (uint count = 1; count < 64; count++) {
       raw_write_text (connection.output_stream, raw_transition (1, 1, timestamp, ++timestamp, query_id, raw_update (query_id, count, text.str)));
+      Thread.usleep (25 * 1000);
     }
     // The caller deliberately stops reading adapter stdout. Keep the peer
     // alive briefly so the real final adapter is measured while writes stall.
@@ -512,6 +535,45 @@ private class RawPeer : GLib.Object {
     uint recovery_query_id = accept_add (recovery_input, recovery_connection.output_stream, 1, "");
     raw_write_text (recovery_connection.output_stream, raw_transition (0, 1, 0, ++timestamp, recovery_query_id, raw_update (recovery_query_id, 2)));
     wait_for_close (recovery_input, recovery_connection.output_stream, get_monotonic_time ());
+  }
+
+  private void serve_idle_then_update (bool control_traffic) throws Error {
+    GLib.Object? source;
+    var connection = listener.accept (out source, null);
+    var input = handshake (connection);
+    observe_connection ();
+    uint query_id = accept_add (input, connection.output_stream, 0, "InitialConnect");
+    for (int second = 0; second < 6; second++) {
+      Thread.usleep (1100 * 1000);
+      if (!control_traffic) continue;
+      string probe = "idle-" + second.to_string ();
+      raw_write_frame (connection.output_stream, true, 0x9, probe.data);
+      var pong = raw_read_client_frame (input);
+      if (pong.opcode != 0xa || raw_text (pong.payload) != probe) {
+        throw new IOError.INVALID_DATA ("idle control traffic did not receive matching Pong");
+      }
+    }
+    raw_write_text (connection.output_stream, raw_transition (0, 1, 0, ++timestamp, query_id, raw_update (query_id, 7)));
+    wait_for_close (input, connection.output_stream, get_monotonic_time ());
+  }
+
+  private void serve_handshake_validation () throws Error {
+    GLib.Object? source;
+    for (int failure_kind = 1; failure_kind <= 4; failure_kind++) {
+      var rejected = listener.accept (out source, null);
+      var rejected_input = handshake (rejected, failure_kind);
+      observe_connection ();
+      uint8[] byte = new uint8[1];
+      try { rejected_input.read (byte, null); } catch (Error error) {}
+    }
+    var connection = listener.accept (out source, null);
+    var input = handshake (connection);
+    observe_connection ();
+    // Four failed upgrades increment connectionCount, but none observed a
+    // server transition, so Connect must still omit maxObservedTimestamp.
+    uint query_id = accept_add (input, connection.output_stream, 4, "invalid WebSocket upgrade response", false);
+    raw_write_text (connection.output_stream, raw_transition (0, 1, 0, ++timestamp, query_id, raw_update (query_id, 11)));
+    wait_for_close (input, connection.output_stream, get_monotonic_time ());
   }
 }
 
@@ -638,6 +700,62 @@ private static void raw_close_stays_bounded_with_idle_flood_and_half_frame () {
   }
 }
 
+private static void raw_idle_and_control_traffic_do_not_start_frame_deadline () {
+  for (int mode = 8; mode <= 9; mode++) {
+    try {
+      var peer = new RawPeer (mode);
+      peer.start ();
+      var client = new Client ("http://127.0.0.1:" + peer.port.to_string ());
+      var subscription = client.subscribe ("demo:state", raw_object (mode == 8 ? "idle" : "control"));
+      bool delivered = false;
+      int failures = 0;
+      subscription.updated.connect ((value, failure) => {
+        if (failure != null) failures++;
+        if (value != null && value.get_object ().get_int_member ("count") == 7) delivered = true;
+      });
+      int64 started = get_monotonic_time ();
+      spin_until (() => delivered || peer.failure_message != null, 10 * 1000 * 1000, "idle Live update after frame deadline window");
+      assert (get_monotonic_time () - started > 5 * 1000 * 1000);
+      assert (peer.failure_message == null);
+      assert (failures == 0);
+      assert (peer.connections == 1);
+      client.close ();
+      peer.stop ();
+    } catch (Error error) {
+      stderr.printf ("raw idle deadline test failed: %s\n", error.message);
+      assert_not_reached ();
+    }
+  }
+}
+
+private static void raw_upgrade_validation_rejects_then_recovers () {
+  try {
+    var peer = new RawPeer (10);
+    peer.start ();
+    var client = new Client ("http://127.0.0.1:" + peer.port.to_string ());
+    var subscription = client.subscribe ("demo:state", raw_object ("handshake-validation"));
+    int transport_failures = 0;
+    int protocol_failures = 0;
+    bool recovered = false;
+    subscription.updated.connect ((value, failure) => {
+      if (failure != null && failure.name == "TransportError") transport_failures++;
+      if (failure != null && failure.name == "ProtocolError") protocol_failures++;
+      if (value != null && value.get_object ().get_int_member ("count") == 11) recovered = true;
+    });
+    spin_until (() => recovered || peer.failure_message != null, 10 * 1000 * 1000, "strict WebSocket upgrade recovery");
+    if (peer.failure_message != null) stderr.printf ("strict upgrade peer failure: %s\n", peer.failure_message);
+    assert (peer.failure_message == null);
+    assert (peer.connections == 5);
+    assert (transport_failures == 1);
+    assert (protocol_failures == 3);
+    client.close ();
+    peer.stop ();
+  } catch (Error error) {
+    stderr.printf ("raw WebSocket upgrade test failed: %s\n", error.message);
+    assert_not_reached ();
+  }
+}
+
 #endif
 #endif
 
@@ -665,6 +783,8 @@ int main (string[] args) {
   Test.add_func ("/convex/live/raw-peer/partial-frame-timeout", raw_partial_frame_times_out_and_abandons_connection);
   Test.add_func ("/convex/live/raw-peer/protocol-recovery", raw_protocol_error_recovers_on_a_new_connection);
   Test.add_func ("/convex/live/raw-peer/bounded-close", raw_close_stays_bounded_with_idle_flood_and_half_frame);
+  Test.add_func ("/convex/live/raw-peer/idle-and-control-deadline", raw_idle_and_control_traffic_do_not_start_frame_deadline);
+  Test.add_func ("/convex/live/raw-peer/strict-upgrade-recovery", raw_upgrade_validation_rejects_then_recovers);
   return Test.run ();
 }
 #endif

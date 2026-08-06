@@ -18,28 +18,40 @@ COPY examples ./examples
 RUN test "$(uname -m)" = x86_64 && test "$(valac --version)" = "Vala 0.56.3"
 RUN find client examples -type f -name '*.vala' -print0 | sort -z | xargs -0 uncrustify -l VALA -c client/uncrustify.cfg --check
 RUN mkdir -p /out
+RUN valac --pkg gee-0.8 --pkg gio-2.0 --pkg gio-unix-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
+    --target-glib=2.74 \
+    -o /out/convex-adapter client/websocket_transport.vala client/convex.vala client/tests/conformance/adapter.vala
 RUN valac --pkg gee-0.8 --pkg gio-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
     --target-glib=2.74 \
-    -o /out/convex-adapter client/convex.vala client/tests/conformance/adapter.vala
+    -o /out/convex-example client/websocket_transport.vala client/convex.vala examples/basics/main.vala
 RUN valac --pkg gee-0.8 --pkg gio-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
     --target-glib=2.74 \
-    -o /out/convex-example client/convex.vala examples/basics/main.vala
-RUN valac --pkg gee-0.8 --pkg gio-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
-    --target-glib=2.74 \
-    -o /out/convex-client-tests client/convex.vala client/tests/client_tests.vala \
+    -o /out/convex-client-tests client/websocket_transport.vala client/convex.vala client/tests/client_tests.vala \
     && /out/convex-client-tests
 RUN valac --pkg gee-0.8 --pkg gio-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
     --target-glib=2.74 \
-    -o /out/convex-live-raw-peer-tests client/convex.vala client/tests/live_raw_peer_tests.vala \
+    -o /out/convex-live-raw-peer-tests client/websocket_transport.vala client/convex.vala client/tests/live_raw_peer_tests.vala \
     && /out/convex-live-raw-peer-tests
-RUN valac -D ADAPTER_TEST --pkg gee-0.8 --pkg gio-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
+RUN valac --pkg gee-0.8 --pkg gio-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
     --target-glib=2.74 \
-    -o /out/convex-adapter-live-raw-peer-tests client/convex.vala client/tests/conformance/adapter.vala \
+    -o /out/convex-http-raw-peer-tests client/websocket_transport.vala client/convex.vala client/tests/http_raw_peer_tests.vala \
+    && /out/convex-http-raw-peer-tests
+RUN valac -D ADAPTER_TEST --pkg gee-0.8 --pkg gio-2.0 --pkg gio-unix-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 --pkg posix \
+    --target-glib=2.74 \
+    -o /out/convex-adapter-live-raw-peer-tests client/websocket_transport.vala client/convex.vala client/tests/conformance/adapter.vala \
     client/tests/live_raw_peer_tests.vala client/tests/conformance/adapter_live_raw_peer_tests.vala \
     && /out/convex-adapter-live-raw-peer-tests
+RUN valac -D ADAPTER_TEST -D ADAPTER_HTTP_TEST --pkg gee-0.8 --pkg gio-2.0 --pkg gio-unix-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
+    --target-glib=2.74 \
+    -o /out/convex-adapter-http-raw-peer-tests client/websocket_transport.vala client/convex.vala client/tests/conformance/adapter.vala \
+    client/tests/http_raw_peer_tests.vala client/tests/conformance/adapter_http_raw_peer_tests.vala \
+    && /out/convex-adapter-http-raw-peer-tests
 RUN valac -D ADAPTER_STRESS_PEER --pkg gee-0.8 --pkg gio-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
     --target-glib=2.74 \
-    -o /out/convex-adapter-stress-peer client/convex.vala client/tests/live_raw_peer_tests.vala
+    -o /out/convex-adapter-stress-peer client/websocket_transport.vala client/convex.vala client/tests/live_raw_peer_tests.vala
+RUN valac -D HTTP_STANDALONE_PEER --pkg gee-0.8 --pkg gio-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
+    --target-glib=2.74 \
+    -o /out/convex-http-raw-peer client/websocket_transport.vala client/convex.vala client/tests/http_raw_peer_tests.vala
 RUN printf '%s\n' \
     '{"protocolVersion":1,"id":"hello","op":"hello"}' \
     '{"id":"close","op":"close"}' | /out/convex-adapter > /tmp/events \

@@ -7,7 +7,7 @@ implementation:
   status: attempting
   provenance: native
   version: 0.1.0
-  notes: Native Vala implementation using GLib, JSON-GLib, and libsoup for ordinary JSON, TLS, HTTP, and RFC6455 transport.
+  notes: Native Vala implementation using JSON-GLib and status-first, deadline-bounded libsoup HTTP, plus GLib/GIO sockets and TLS for the owned RFC6455 Live transport.
 toolchain:
   name: Vala
   version: 0.56.3
@@ -28,6 +28,7 @@ adapter:
 limitations:
   - Live authentication, optimistic updates, WebSocket mutations, and WebSocket actions are deferred.
   - TransitionChunk assembly is rejected as protocol drift and reconnects the shared Live owner.
-  - Each Live relay is bounded to 16 queued events and 8 MiB of encoded value/error data; invalidation is an adapter acknowledgement barrier.
+  - Each Live relay is bounded to 16 reserved queued/in-flight events and 8 MiB of encoded value/error/log data plus runtime overhead; invalidation is an adapter acknowledgement barrier.
+  - HTTP bodies are capped at 2 MiB under one absolute operation deadline; adapter writes use a 1 second default absolute deadline.
   - Values use Convex's JSON-safe subset and are exposed as JSON-GLib nodes.
 capabilities: []
