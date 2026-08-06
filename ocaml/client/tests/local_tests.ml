@@ -129,6 +129,22 @@ let () =
     | Ok { value = `Assoc [ ("ok", `Bool true) ]; logs = [ "fixture" ] } -> ()
     | Ok result -> fail ("unexpected success result " ^ J.to_string result.value)
     | Error error -> fail (Convex.error_message error));
+  with_http_response 200 {|{"status":"success","value":{"ok":true}}|} (function
+    | Ok { value = `Assoc [ ("ok", `Bool true) ]; logs = [] } -> ()
+    | Ok result ->
+        fail ("absent logLines changed result " ^ J.to_string result.value)
+    | Error error -> fail (Convex.error_message error));
+  with_http_response 200 {|{"status":"success","value":null,"logLines":null}|}
+    (expect_protocol_error "field logLines must be an array");
+  with_http_response 200
+    {|{"status":"success","value":null,"logLines":["ok",7]}|}
+    (expect_protocol_error "field logLines must contain strings");
+  with_http_response 200 {|{"status":"success","value":null}|} (function
+    | Ok { value = `Null; logs = [] } -> ()
+    | Ok _ -> fail "JSON null is a valid Convex value"
+    | Error error -> fail (Convex.error_message error));
+  with_http_response 200 {|{"status":"success","logLines":[]}|}
+    (expect_protocol_error "success response omitted value");
   with_http_response 503
     {|{"status":"success","value":{"ok":true},"logLines":[]}|} (function
     | Error
@@ -161,13 +177,66 @@ let () =
           ("expected structured FunctionError, got " ^ Convex.error_name error
          ^ ": " ^ Convex.error_message error)
     | Ok _ -> fail "HTTP 560 function failure must not return success");
+  with_http_response 560 {|{"status":"error","errorMessage":"plain failure"}|}
+    (function
+    | Error
+        (Convex.Function_error
+           {
+             operation = "query";
+             message = "plain failure";
+             data = None;
+             logs = [];
+           }) ->
+        ()
+    | Error error ->
+        fail
+          ("expected FunctionError without optional fields, got "
+         ^ Convex.error_name error ^ ": " ^ Convex.error_message error)
+    | Ok _ -> fail "function failure without optional fields returned success");
+  with_http_response 560 {|{"status":"error","errorMessage":7,"logLines":[]}|}
+    (expect_protocol_error "field errorMessage must be a string");
+  with_http_response 560
+    {|{"status":"error","errorMessage":"bad logs","logLines":null}|}
+    (expect_protocol_error "field logLines must be an array");
   with_http_response 200 {|{"status":1,"value":null}|}
     (expect_protocol_error "field status must be a string");
+  with_http_response 200 {|{"status":"unknown","value":null}|}
+    (expect_protocol_error "HTTP 200 response has unknown status unknown");
+  with_http_response 200 "[]"
+    (expect_protocol_error "HTTP 200 response body must be a JSON object");
   with_http_response 200 {|{"status":"success","value":null,"logLines":{}}|}
     (expect_protocol_error "field logLines must be an array");
   with_http_response 200 {|{"status":"error","errorData":null}|}
     (expect_protocol_error "response omitted errorMessage");
   with_http_response 200 "not-json"
     (expect_protocol_error "HTTP 200 response body was not valid JSON");
+  with_http_response 503 "not-json" (function
+    | Error
+        (Convex.Http_error
+           {
+             operation = "query";
+             status_code = 503;
+             message = "response body was not valid JSON";
+           }) ->
+        ()
+    | Error error ->
+        fail
+          ("expected HttpError for invalid 503 body, got "
+         ^ Convex.error_name error ^ ": " ^ Convex.error_message error)
+    | Ok _ -> fail "invalid HTTP 503 body returned success");
+  with_http_response 503 "[]" (function
+    | Error
+        (Convex.Http_error
+           {
+             operation = "query";
+             status_code = 503;
+             message = "response body was not a JSON object";
+           }) ->
+        ()
+    | Error error ->
+        fail
+          ("expected HttpError for non-object 503 body, got "
+         ^ Convex.error_name error ^ ": " ^ Convex.error_message error)
+    | Ok _ -> fail "non-object HTTP 503 body returned success");
   test_transport_error ();
   print_endline "PASS OCaml local HTTP, protocol, and numeric fixtures"

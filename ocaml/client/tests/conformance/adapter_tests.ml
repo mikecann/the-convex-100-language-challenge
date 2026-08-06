@@ -104,7 +104,9 @@ let read_http_request channel =
   headers ();
   really_input_string channel !content_length
 
-let start_http_fixture responses =
+type http_action = Respond of int * string | Close_early | Timeout
+
+let start_http_fixture actions =
   let listener = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   Unix.setsockopt listener Unix.SO_REUSEADDR true;
   Unix.bind listener (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
@@ -121,23 +123,27 @@ let start_http_fixture responses =
           ~finally:(fun () -> Unix.close listener)
           (fun () ->
             List.iter
-              (fun (status, body) ->
+              (fun action ->
                 let socket, _ = Unix.accept listener in
                 let input = Unix.in_channel_of_descr socket in
                 let output = Unix.out_channel_of_descr socket in
                 ignore (read_http_request input);
-                Printf.fprintf output
-                  "HTTP/1.1 %d fixture\r\n\
-                   Content-Type: application/json\r\n\
-                   Content-Length: %d\r\n\
-                   Connection: close\r\n\
-                   \r\n\
-                   %s"
-                  status (String.length body) body;
-                flush output;
+                (match action with
+                | Respond (status, body) ->
+                    Printf.fprintf output
+                      "HTTP/1.1 %d fixture\r\n\
+                       Content-Type: application/json\r\n\
+                       Content-Length: %d\r\n\
+                       Connection: close\r\n\
+                       \r\n\
+                       %s"
+                      status (String.length body) body;
+                    flush output
+                | Close_early -> ()
+                | Timeout -> Thread.delay 30.25);
                 close_in_noerr input;
                 close_out_noerr output)
-              responses))
+              actions))
       ()
   in
   (port, thread)
@@ -152,9 +158,34 @@ let test_serialized_http_and_validation executable =
   let false_success =
     {|{"status":"success","value":{"ok":true},"logLines":[]}|}
   in
+  let absent_logs = {|{"status":"success","value":{"logs":"absent"}}|} in
+  let null_logs = {|{"status":"success","value":null,"logLines":null}|} in
+  let wrong_log_element =
+    {|{"status":"success","value":null,"logLines":["ok",7]}|}
+  in
+  let status_wrong_type = {|{"status":1,"value":null}|} in
+  let valid_after_close =
+    {|{"status":"success","value":{"recovered":"close"},"logLines":[]}|}
+  in
+  let valid_after_timeout =
+    {|{"status":"success","value":{"recovered":"timeout"},"logLines":[]}|}
+  in
   let port, fixture =
     start_http_fixture
-      [ (200, success); (560, function_error); (503, false_success) ]
+      [
+        Respond (200, success);
+        Respond (200, absent_logs);
+        Respond (200, null_logs);
+        Respond (200, wrong_log_element);
+        Respond (560, function_error);
+        Respond (503, false_success);
+        Respond (200, status_wrong_type);
+        Respond (200, "[]");
+        Close_early;
+        Respond (200, valid_after_close);
+        Timeout;
+        Respond (200, valid_after_timeout);
+      ]
   in
   let process =
     start_adapter executable (Printf.sprintf "http://127.0.0.1:%d" port)
@@ -167,23 +198,42 @@ let test_serialized_http_and_validation executable =
       {|{"protocolVersion":1,"id":"typed","op":7}|};
       {|{"protocolVersion":1,"id":"hello-1","op":"hello"}|};
       {|{"id":"query-1","op":"query","path":"tests:ok","args":{}}|};
-      {|{"id":"query-2","op":"query","path":"tests:fail","args":{}}|};
-      {|{"id":"query-3","op":"query","path":"tests:falseSuccess","args":{}}|};
+      {|{"id":"query-absent-logs","op":"query","path":"tests:absentLogs","args":{}}|};
+      {|{"id":"query-null-logs","op":"query","path":"tests:nullLogs","args":{}}|};
+      {|{"id":"query-wrong-log-element","op":"query","path":"tests:wrongLogElement","args":{}}|};
+      {|{"id":"query-function","op":"query","path":"tests:fail","args":{}}|};
+      {|{"id":"query-http","op":"query","path":"tests:falseSuccess","args":{}}|};
+      {|{"id":"query-status-type","op":"query","path":"tests:statusType","args":{}}|};
+      {|{"id":"query-root","op":"query","path":"tests:root","args":{}}|};
+      {|{"id":"query-close","op":"query","path":"tests:close","args":{}}|};
+      {|{"id":"query-after-close","op":"query","path":"tests:afterClose","args":{}}|};
+      {|{"id":"query-timeout","op":"query","path":"tests:timeout","args":{}}|};
+      {|{"id":"query-after-timeout","op":"query","path":"tests:afterTimeout","args":{}}|};
       {|{"id":"close-1","op":"close"}|};
     ];
   close_out process.input;
-  let events = List.init 9 (fun _ -> receive process) in
+  let events = List.init 18 (fun _ -> receive process) in
   let ( malformed,
         missing_id,
         wrong_id,
         wrong_op,
         ready,
         result,
+        absent_logs_result,
+        null_logs_error,
+        wrong_log_element_error,
         function_error_event,
         http_error_event,
+        status_type_error,
+        root_error,
+        close_error,
+        after_close_result,
+        timeout_error,
+        after_timeout_result,
         closed ) =
     match events with
-    | [ a; b; c; d; e; f; g; h; i ] -> (a, b, c, d, e, f, g, h, i)
+    | [ a; b; c; d; e; f; g; h; i; j; k; l; m; n; o; p; q; r ] ->
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r)
     | _ -> assert false
   in
   require_error "ProtocolError" "malformed adapter command" malformed;
@@ -201,7 +251,16 @@ let test_serialized_http_and_validation executable =
   require
     (member "logs" result = Some (`List [ `String "normal" ]))
     ("normal result lost its logs: " ^ J.to_string result);
-  require_error ~id:"query-2" "FunctionError" "expected failure"
+  require_string "type" "result" absent_logs_result;
+  require_string "id" "query-absent-logs" absent_logs_result;
+  require
+    (member "logs" absent_logs_result = None)
+    ("absent logs must stay omitted: " ^ J.to_string absent_logs_result);
+  require_error ~id:"query-null-logs" "ProtocolError"
+    "field logLines must be an array" null_logs_error;
+  require_error ~id:"query-wrong-log-element" "ProtocolError"
+    "field logLines must contain strings" wrong_log_element_error;
+  require_error ~id:"query-function" "FunctionError" "expected failure"
     function_error_event;
   require
     (member "logs" function_error_event
@@ -213,10 +272,32 @@ let test_serialized_http_and_validation executable =
         member "data" body = Some (`Assoc [ ("code", `String "EXPECTED_560") ])
     | None -> false)
     ("function error lost structured data: " ^ J.to_string function_error_event);
-  require_error ~id:"query-3" "HttpError"
+  require_error ~id:"query-http" "HttpError"
     "HTTP query returned 503: unsuccessful HTTP status carried a success \
      response"
     http_error_event;
+  require_error ~id:"query-status-type" "ProtocolError"
+    "field status must be a string" status_type_error;
+  require_error ~id:"query-root" "ProtocolError"
+    "HTTP 200 response body must be a JSON object" root_error;
+  require_error ~id:"query-close" "TransportError"
+    "HTTP query: connection closed before the response completed" close_error;
+  require_string "type" "result" after_close_result;
+  require_string "id" "query-after-close" after_close_result;
+  require
+    (member "value" after_close_result
+    = Some (`Assoc [ ("recovered", `String "close") ]))
+    ("adapter did not recover after early close: "
+    ^ J.to_string after_close_result);
+  require_error ~id:"query-timeout" "TransportError"
+    "HTTP query: timed out while waiting for the response" timeout_error;
+  require_string "type" "result" after_timeout_result;
+  require_string "id" "query-after-timeout" after_timeout_result;
+  require
+    (member "value" after_timeout_result
+    = Some (`Assoc [ ("recovered", `String "timeout") ]))
+    ("adapter did not recover after timeout: "
+    ^ J.to_string after_timeout_result);
   require_string "type" "closed" closed;
   require_string "id" "close-1" closed;
   close_in_noerr process.output;
@@ -296,7 +377,12 @@ let start_live_fixture () =
             ignore (read_websocket_frame input);
             write_websocket_text output
               {|{"type":"Transition","startVersion":{"querySet":0,"identity":0,"ts":"AAAAAAAAAAA="},"endVersion":{"querySet":1,"identity":0,"ts":"AQAAAAAAAAA="},"modifications":[{"type":"QueryFailed","queryId":0,"errorMessage":"live fixture failed","errorData":{"code":"LIVE_FAILED"},"logLines":["live log"]}]}|};
-            Thread.delay 0.5))
+            (* Begin another frame, then stall before its length byte. The
+               socket owner must abandon this partial frame when the adapter
+               asks it to retire the connection. *)
+            output_char output (Char.chr 0x81);
+            flush output;
+            Thread.delay 2.0))
       ()
   in
   (port, thread)
@@ -323,6 +409,10 @@ let test_serialized_subscription_error executable =
         member "data" body = Some (`Assoc [ ("code", `String "LIVE_FAILED") ])
     | None -> false)
     ("subscription error lost structured data: " ^ J.to_string event);
+  send process {|{"id":"disconnect-live","op":"debugDisconnect"}|};
+  let disconnected = receive process in
+  require_string "type" "ack" disconnected;
+  require_string "id" "disconnect-live" disconnected;
   send process {|{"id":"close-live","op":"close"}|};
   let closed = receive process in
   require_string "type" "closed" closed;

@@ -39,8 +39,27 @@ let error_message = function
 let error_data = function Function_error { data; _ } -> data | _ -> None
 let error_logs = function Function_error { logs; _ } -> logs | _ -> []
 
+exception Channel_closed
+exception Read_timeout
+exception Read_interrupted
+exception Http_protocol of string
+exception Websocket_closed of string
+exception Websocket_protocol of string
+
 let protect_error operation f =
   try f () with
+  | Http_protocol message -> Error (Protocol_error message)
+  | Channel_closed ->
+      Error
+        (Transport_error
+           {
+             operation;
+             message = "connection closed before the response completed";
+           })
+  | Read_timeout ->
+      Error
+        (Transport_error
+           { operation; message = "timed out while waiting for the response" })
   | Unix.Unix_error (e, fn, arg) ->
       Error
         (Transport_error
@@ -48,6 +67,22 @@ let protect_error operation f =
              operation;
              message = fn ^ "(" ^ arg ^ "): " ^ Unix.error_message e;
            })
+  | Ssl.Connection_error _ ->
+      Error (Transport_error { operation; message = "TLS connection failed" })
+  | Ssl.Read_error _ ->
+      Error (Transport_error { operation; message = "TLS read failed" })
+  | Ssl.Write_error _ ->
+      Error (Transport_error { operation; message = "TLS write failed" })
+  | Ssl.Verify_error _ ->
+      Error
+        (Transport_error
+           { operation; message = "TLS certificate verification failed" })
+  | Ssl.Invalid_socket ->
+      Error (Transport_error { operation; message = "invalid TLS socket" })
+  | Ssl.Method_error | Ssl.Context_error | Ssl.Handler_error ->
+      Error
+        (Transport_error
+           { operation; message = "TLS transport initialization failed" })
   | Failure message -> Error (Transport_error { operation; message })
   | Sys_error message -> Error (Transport_error { operation; message })
 
@@ -68,7 +103,7 @@ let list_string_member name json =
             Error (Protocol_error ("field " ^ name ^ " must contain strings"))
       in
       collect [] values
-  | Some `Null | None -> Ok []
+  | None -> Ok []
   | _ -> Error (Protocol_error ("field " ^ name ^ " must be an array"))
 
 let response_logs json =
@@ -146,12 +181,8 @@ type channel = {
   fd : Unix.file_descr;
   ssl : Ssl.socket option;
   mutable closed : bool;
+  mutable nonblocking : bool;
 }
-
-exception Channel_closed
-exception Read_timeout
-exception Websocket_closed of string
-exception Websocket_protocol of string
 
 let close_channel channel =
   if not channel.closed then (
@@ -161,45 +192,101 @@ let close_channel channel =
     | None -> ());
     try Unix.close channel.fd with _ -> ())
 
-let wait_readable fd timeout =
-  let ready, _, _ = Unix.select [ fd ] [] [] timeout in
-  match ready with [] -> raise Read_timeout | _ -> ()
+let wait_for_io ?interrupt ~readable ~writable fd timeout =
+  let reads = if readable then [ fd ] else [] in
+  let reads =
+    match interrupt with Some value -> value :: reads | None -> reads
+  in
+  let writes = if writable then [ fd ] else [] in
+  let ready_reads, ready_writes, _ = Unix.select reads writes [] timeout in
+  (match interrupt with
+  | Some value when List.mem value ready_reads -> raise Read_interrupted
+  | _ -> ());
+  if
+    ((not readable) || not (List.mem fd ready_reads))
+    && ((not writable) || not (List.mem fd ready_writes))
+  then raise Read_timeout
 
-let read_some channel bytes offset length timeout =
+let wait_readable ?interrupt fd timeout =
+  wait_for_io ?interrupt ~readable:true ~writable:false fd timeout
+
+let wait_writable ?interrupt fd timeout =
+  wait_for_io ?interrupt ~readable:false ~writable:true fd timeout
+
+let read_some ?interrupt channel bytes offset length timeout =
   if channel.closed then raise Channel_closed;
-  wait_readable channel.fd timeout;
+  let deadline = Unix.gettimeofday () +. timeout in
+  let remaining () = max 0.0 (deadline -. Unix.gettimeofday ()) in
+  let rec read_nonblocking () =
+    try
+      match channel.ssl with
+      | None -> Unix.read channel.fd bytes offset length
+      | Some ssl -> Ssl.read ssl bytes offset length
+    with
+    | Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _)
+    | Ssl.Read_error Ssl.Error_want_read ->
+        wait_readable ?interrupt channel.fd (remaining ());
+        read_nonblocking ()
+    | Ssl.Read_error Ssl.Error_want_write ->
+        wait_writable ?interrupt channel.fd (remaining ());
+        read_nonblocking ()
+  in
   let count =
-    match channel.ssl with
-    | None -> Unix.read channel.fd bytes offset length
-    | Some ssl -> Ssl.read ssl bytes offset length
+    if channel.nonblocking then read_nonblocking ()
+    else (
+      wait_readable ?interrupt channel.fd timeout;
+      match channel.ssl with
+      | None -> Unix.read channel.fd bytes offset length
+      | Some ssl -> Ssl.read ssl bytes offset length)
   in
   if count = 0 then raise Channel_closed else count
 
-let read_exact channel length timeout =
+let read_exact ?interrupt channel length timeout =
   let bytes = Bytes.create length in
   let rec loop offset =
     if offset = length then bytes
-    else loop (offset + read_some channel bytes offset (length - offset) timeout)
+    else
+      loop
+        (offset
+        + read_some ?interrupt channel bytes offset (length - offset) timeout)
   in
   loop 0
 
-let write_all channel bytes offset length =
+let write_all ?interrupt channel bytes offset length =
   if channel.closed then raise Channel_closed;
+  let deadline = Unix.gettimeofday () +. 30.0 in
+  let remaining () = max 0.0 (deadline -. Unix.gettimeofday ()) in
+  let rec write_nonblocking position remaining_length =
+    try
+      match channel.ssl with
+      | None -> Unix.write channel.fd bytes position remaining_length
+      | Some ssl -> Ssl.write ssl bytes position remaining_length
+    with
+    | Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _)
+    | Ssl.Write_error Ssl.Error_want_write ->
+        wait_writable ?interrupt channel.fd (remaining ());
+        write_nonblocking position remaining_length
+    | Ssl.Write_error Ssl.Error_want_read ->
+        wait_readable ?interrupt channel.fd (remaining ());
+        write_nonblocking position remaining_length
+  in
   let rec loop position remaining =
     if remaining > 0 then
       let count =
-        match channel.ssl with
-        | None -> Unix.write channel.fd bytes position remaining
-        | Some ssl -> Ssl.write ssl bytes position remaining
+        if channel.nonblocking then write_nonblocking position remaining
+        else
+          match channel.ssl with
+          | None -> Unix.write channel.fd bytes position remaining
+          | Some ssl -> Ssl.write ssl bytes position remaining
       in
       if count = 0 then raise Channel_closed
       else loop (position + count) (remaining - count)
   in
   loop offset length
 
-let write_string channel string =
+let write_string ?interrupt channel string =
   let bytes = Bytes.of_string string in
-  write_all channel bytes 0 (Bytes.length bytes)
+  write_all ?interrupt channel bytes 0 (Bytes.length bytes)
 
 let connect_tcp host port =
   let addresses =
@@ -227,7 +314,7 @@ let connect_tcp host port =
 let open_channel endpoint =
   let fd = connect_tcp endpoint.host endpoint.port in
   match endpoint.scheme with
-  | "http" -> { fd; ssl = None; closed = false }
+  | "http" -> { fd; ssl = None; closed = false; nonblocking = false }
   | "https" -> (
       try
         Ssl.init ();
@@ -240,7 +327,7 @@ let open_channel endpoint =
         let ssl = Ssl.embed_socket fd context in
         (try Ssl.set_client_SNI_hostname ssl endpoint.host with _ -> ());
         Ssl.connect ssl;
-        { fd; ssl = Some ssl; closed = false }
+        { fd; ssl = Some ssl; closed = false; nonblocking = false }
       with error ->
         Unix.close fd;
         raise error)
@@ -260,7 +347,7 @@ let read_line channel timeout =
       && Buffer.nth buffer (length - 1) = '\n'
     then Buffer.contents buffer
     else if length > 8192 then
-      raise (Failure "HTTP header line exceeds 8192 bytes")
+      raise (Http_protocol "HTTP header line exceeds 8192 bytes")
     else loop ()
   in
   loop ()
@@ -268,8 +355,17 @@ let read_line channel timeout =
 let read_http_response channel =
   let status_line = read_line channel 30.0 in
   let status_code =
-    try int_of_string (String.sub status_line 9 3)
-    with _ -> raise (Failure "invalid HTTP status line")
+    try
+      if
+        String.length status_line < 12
+        || String.sub status_line 0 5 <> "HTTP/"
+        || status_line.[8] <> ' '
+      then raise Exit;
+      let code = String.sub status_line 9 3 in
+      if String.exists (fun char -> char < '0' || char > '9') code then
+        raise Exit;
+      int_of_string code
+    with _ -> raise (Http_protocol "invalid HTTP status line")
   in
   let rec headers content_length chunked =
     let line = read_line channel 30.0 in
@@ -284,7 +380,14 @@ let read_http_response channel =
               (String.sub line (colon + 1) (String.length line - colon - 3))
           in
           if key = "content-length" then
-            headers (Some (int_of_string value)) chunked
+            let length =
+              try int_of_string value
+              with _ ->
+                raise (Http_protocol "invalid HTTP Content-Length header")
+            in
+            if length < 0 then
+              raise (Http_protocol "invalid HTTP Content-Length header")
+            else headers (Some length) chunked
           else if
             key = "transfer-encoding"
             && String.lowercase_ascii value = "chunked"
@@ -296,20 +399,37 @@ let read_http_response channel =
     match (content_length, chunked) with
     | Some length, _ when length <= 2 * 1024 * 1024 ->
         Bytes.to_string (read_exact channel length 30.0)
-    | Some _, _ -> raise (Failure "HTTP response exceeds 2097152 bytes")
+    | Some _, _ -> raise (Http_protocol "HTTP response exceeds 2097152 bytes")
     | None, true ->
         let output = Buffer.create 256 in
         let rec chunks () =
           let line = read_line channel 30.0 in
           let size =
-            int_of_string
-              (String.trim (String.sub line 0 (String.length line - 2)))
+            try
+              let text =
+                String.trim (String.sub line 0 (String.length line - 2))
+              in
+              let text =
+                match String.index_opt text ';' with
+                | Some index -> String.sub text 0 index
+                | None -> text
+              in
+              int_of_string ("0x" ^ text)
+            with _ -> raise (Http_protocol "invalid HTTP chunk size")
           in
-          if size = 0 then ignore (read_line channel 30.0)
+          if size < 0 then raise (Http_protocol "invalid HTTP chunk size")
+          else if size = 0 then
+            let rec trailers () =
+              if read_line channel 30.0 <> "\r\n" then trailers ()
+            in
+            trailers ()
           else (
+            if Buffer.length output + size > 2 * 1024 * 1024 then
+              raise (Http_protocol "HTTP response exceeds 2097152 bytes");
             Buffer.add_string output
               (Bytes.to_string (read_exact channel size 30.0));
-            ignore (read_line channel 30.0);
+            if read_line channel 30.0 <> "\r\n" then
+              raise (Http_protocol "invalid HTTP chunk terminator");
             chunks ())
         in
         chunks ();
@@ -486,10 +606,14 @@ let random_bytes length =
   let fd = Unix.openfile "/dev/urandom" [ Unix.O_RDONLY ] 0 in
   Fun.protect
     ~finally:(fun () -> Unix.close fd)
-    (fun () -> read_exact { fd; ssl = None; closed = false } length 5.0)
+    (fun () ->
+      read_exact
+        { fd; ssl = None; closed = false; nonblocking = false }
+        length 5.0)
 
 type ws = {
   channel : channel;
+  interrupt : Unix.file_descr;
   mutable fragment_opcode : int option;
   fragments : Buffer.t;
 }
@@ -527,11 +651,11 @@ let ws_write_frame ws opcode payload =
          (Char.code (Bytes.get body index)
          lxor Char.code (Bytes.get mask (index mod 4))))
   done;
-  write_all ws.channel header 0 (Bytes.length header);
-  write_all ws.channel body 0 length
+  write_all ~interrupt:ws.interrupt ws.channel header 0 (Bytes.length header);
+  write_all ~interrupt:ws.interrupt ws.channel body 0 length
 
 let ws_read_frame ws timeout =
-  let header = read_exact ws.channel 2 timeout in
+  let header = read_exact ~interrupt:ws.interrupt ws.channel 2 timeout in
   let first, second =
     (Char.code (Bytes.get header 0), Char.code (Bytes.get header 1))
   in
@@ -542,11 +666,11 @@ let ws_read_frame ws timeout =
   let length =
     if short_length < 126 then Int64.of_int short_length
     else if short_length = 126 then
-      let bytes = read_exact ws.channel 2 timeout in
+      let bytes = read_exact ~interrupt:ws.interrupt ws.channel 2 timeout in
       Int64.of_int
         ((Char.code (Bytes.get bytes 0) lsl 8) lor Char.code (Bytes.get bytes 1))
     else
-      let bytes = read_exact ws.channel 8 timeout in
+      let bytes = read_exact ~interrupt:ws.interrupt ws.channel 8 timeout in
       let value = ref 0L in
       for index = 0 to 7 do
         value :=
@@ -560,8 +684,14 @@ let ws_read_frame ws timeout =
   in
   if Int64.compare length (Int64.of_int (2 * 1024 * 1024)) > 0 then
     raise (Websocket_protocol "WebSocket message exceeds 2097152 bytes");
-  let mask = if masked then Some (read_exact ws.channel 4 timeout) else None in
-  let payload = read_exact ws.channel (Int64.to_int length) timeout in
+  let mask =
+    if masked then
+      Some (read_exact ~interrupt:ws.interrupt ws.channel 4 timeout)
+    else None
+  in
+  let payload =
+    read_exact ~interrupt:ws.interrupt ws.channel (Int64.to_int length) timeout
+  in
   (match mask with
   | Some mask ->
       for index = 0 to Bytes.length payload - 1 do
@@ -603,7 +733,7 @@ let ws_read_message ws =
   in
   loop ()
 
-let websocket_connect endpoint ~client_version ~auth_token =
+let websocket_connect endpoint ~client_version ~auth_token ~interrupt =
   let channel = open_channel endpoint in
   try
     let key = base64_encode (random_bytes 16) in
@@ -623,7 +753,14 @@ let websocket_connect endpoint ~client_version ~auth_token =
     if status <> 101 then
       raise
         (Failure ("WebSocket handshake returned HTTP " ^ string_of_int status));
-    { channel; fragment_opcode = None; fragments = Buffer.create 256 }
+    Unix.set_nonblock channel.fd;
+    channel.nonblocking <- true;
+    {
+      channel;
+      interrupt;
+      fragment_opcode = None;
+      fragments = Buffer.create 256;
+    }
   with error ->
     close_channel channel;
     raise error
@@ -827,6 +964,7 @@ let live_owner (manager : live_manager) =
   let max_timestamp : string option ref = ref None in
   let reconnect_at = ref None in
   let backoff = ref 0.1 in
+  let retired_for_disconnect = ref false in
   let set_reconnect delay =
     reconnect_at := Some (Unix.gettimeofday () +. delay)
   in
@@ -862,6 +1000,7 @@ let live_owner (manager : live_manager) =
       let ws =
         websocket_connect manager.endpoint
           ~client_version:manager.client_version ~auth_token:manager.auth_token
+          ~interrupt:manager.wake_read
       in
       connection := Some ws;
       remote_version := zero_version ();
@@ -1041,6 +1180,21 @@ let live_owner (manager : live_manager) =
     Mutex.unlock manager.command_mutex;
     List.rev !commands
   in
+  let queued_disconnect () =
+    Mutex.lock manager.command_mutex;
+    let found =
+      Queue.fold
+        (fun found command ->
+          found
+          ||
+          match command with
+          | Disconnect _ -> true
+          | Add _ | Remove _ | Stop -> false)
+        false manager.commands
+    in
+    Mutex.unlock manager.command_mutex;
+    found
+  in
   let rec loop () =
     let timeout =
       match !reconnect_at with
@@ -1073,7 +1227,7 @@ let live_owner (manager : live_manager) =
               state.closed <- true;
               Mutex.unlock state.mutex
           | Disconnect reply ->
-              if !connection = None then
+              if !connection = None && not !retired_for_disconnect then
                 reply :=
                   Some
                     (Error
@@ -1083,7 +1237,10 @@ let live_owner (manager : live_manager) =
                             message = "WebSocket is not connected";
                           }))
               else (
-                close_connection "DebugDisconnect" true;
+                if !connection <> None then
+                  close_connection "DebugDisconnect" true
+                else last_close_reason := "DebugDisconnect";
+                retired_for_disconnect := false;
                 reply := Some (Ok ()))
           | Stop ->
               close_connection "ClientClosed" false;
@@ -1103,11 +1260,17 @@ let live_owner (manager : live_manager) =
       | _ -> ());
       match !connection with
       | Some ws when List.mem ws.channel.fd ready ->
-          (try handle_message (J.from_string (ws_read_message ws))
-           with error ->
-             let message = Printexc.to_string error in
-             protocol_failure (Protocol_error message);
-             close_connection message true);
+          (try handle_message (J.from_string (ws_read_message ws)) with
+          | Read_interrupted ->
+              retired_for_disconnect := queued_disconnect ();
+              close_connection
+                (if !retired_for_disconnect then "DebugDisconnect"
+                 else "ControllerCommand")
+                true
+          | error ->
+              let message = Printexc.to_string error in
+              protocol_failure (Protocol_error message);
+              close_connection message true);
           if not manager.closed then loop ()
       | _ -> if not manager.closed then loop ())
   in
@@ -1233,8 +1396,20 @@ let close client =
     command client.live Stop;
     Mutex.unlock client.mutex;
     Thread.join client.live.owner;
-    close_channel { fd = client.live.wake_read; ssl = None; closed = false };
-    close_channel { fd = client.live.wake_write; ssl = None; closed = false })
+    close_channel
+      {
+        fd = client.live.wake_read;
+        ssl = None;
+        closed = false;
+        nonblocking = false;
+      };
+    close_channel
+      {
+        fd = client.live.wake_write;
+        ssl = None;
+        closed = false;
+        nonblocking = false;
+      })
   else Mutex.unlock client.mutex
 
 let parse_integral_int64 json =
