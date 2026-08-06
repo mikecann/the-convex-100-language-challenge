@@ -13,9 +13,11 @@ RUN zig test client/convex.zig
 RUN mkdir -p /out
 RUN zig build-exe -O ReleaseSafe -target x86_64-linux-musl --dep convex -Mroot=client/tests/conformance/main.zig -Mconvex=client/convex.zig -femit-bin=/out/convex-adapter
 RUN zig build-exe -O ReleaseSafe -target x86_64-linux-musl --dep convex -Mroot=examples/basics/main.zig -Mconvex=client/convex.zig -femit-bin=/out/convex-example
+RUN zig build-exe -O ReleaseSafe -target x86_64-linux-musl -Mroot=client/tests/conformance/memory_fixture.zig -femit-bin=/out/convex-memory-fixture
 RUN test "$(uname -m)" = x86_64 \
     && file /out/convex-adapter | grep -Eq 'ELF 64-bit.*x86-64.*(statically linked|static-pie linked)' \
     && file /out/convex-example | grep -Eq 'ELF 64-bit.*x86-64.*(statically linked|static-pie linked)' \
+    && file /out/convex-memory-fixture | grep -Eq 'ELF 64-bit.*x86-64.*(statically linked|static-pie linked)' \
     && readelf -h /out/convex-adapter | grep -Eq 'Machine:.*Advanced Micro Devices X86-64'
 CMD ["/bin/sh", "-ec", "/out/convex-adapter <<'EOF'\n{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}\n{\"id\":\"close\",\"op\":\"close\"}\nEOF"]
 

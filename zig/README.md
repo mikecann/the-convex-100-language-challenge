@@ -56,6 +56,12 @@ are masked on client writes, control frames are answered, timestamps are
 compared as little-endian `uint64` values, and rehydration suppresses an
 unchanged value.
 
+Live output uses a two-phase delivery token. Dequeue keeps the event charged
+to the sixteen-event and eight MiB budgets, unsubscribe or replacement revokes
+the old generation, and the output worker checks that generation immediately
+before writing. A stopped reader therefore retains bounded recent state without
+letting an old relay cross its acknowledgement.
+
 The Live profile is the unversioned `convex-rs` 0.10.4 sync shape at commit
 `6f1df8a8ba1665084ec001e307ca841ca17074d7`. It is a protocol experiment, not
 an official compatibility promise.
@@ -63,9 +69,9 @@ an official compatibility promise.
 ## Limitations
 
 Live authentication, optimistic updates, WebSocket mutations/actions, and
-`TransitionChunk` assembly remain deferred. Fragmented WebSocket data and
-partial-frame deadline recovery still need deterministic language-local
-coverage, so Live remains an attempted profile rather than an earned badge.
-Only the JSON-safe subset is decoded. Capability badges stay empty until the
-shared evaluator records clean local and hosted evidence from the reviewed
-commit.
+`TransitionChunk` assembly remain deferred. The language-local fixtures cover
+fragmented UTF-8 data, interleaved control frames, partial-frame deadlines,
+structured recovery, five reconnects, stale-generation barriers, bounded close,
+and stopped-reader memory. Only the JSON-safe subset is decoded. Capability
+badges stay empty until the shared evaluator records clean local and hosted
+evidence from the reviewed commit.

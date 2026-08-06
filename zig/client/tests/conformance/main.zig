@@ -11,18 +11,19 @@ const Adapter = struct {
     client: *convex.Client,
     output: convex.Output,
 
-    fn init(allocator: std.mem.Allocator, writer: std.io.AnyWriter) !Adapter {
+    fn init(allocator: std.mem.Allocator, writer: std.io.AnyWriter, writer_fd: ?std.posix.fd_t, fd_kind: convex.Output.FdKind) !Adapter {
         const url = std.process.getEnvVarOwned(allocator, "CONVEX_URL") catch return error.MissingConvexUrl;
         defer allocator.free(url);
         return .{
             .allocator = allocator,
             .client = try convex.Client.init(allocator, url),
-            .output = .{ .writer = writer },
+            .output = convex.Output.init(allocator, writer, writer_fd, fd_kind),
         };
     }
 
     fn deinit(self: *Adapter) void {
         self.client.deinit();
+        self.output.deinit();
     }
 
     fn emit(self: *Adapter, object: std.json.ObjectMap) !void {
@@ -170,11 +171,11 @@ const Adapter = struct {
     }
 };
 
-fn run(reader: std.io.AnyReader, writer: std.io.AnyWriter) !void {
+fn run(reader: std.io.AnyReader, writer: std.io.AnyWriter, writer_fd: ?std.posix.fd_t, fd_kind: convex.Output.FdKind) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-    var adapter = try Adapter.init(allocator, writer);
+    var adapter = try Adapter.init(allocator, writer, writer_fd, fd_kind);
     defer adapter.deinit();
     while (true) {
         const line = reader.readUntilDelimiterAlloc(allocator, '\n', max_command_bytes) catch |err| {
@@ -197,8 +198,8 @@ pub fn main() !void {
         defer server.deinit();
         const connection = try server.accept();
         defer connection.stream.close();
-        return run(connection.stream.reader().any(), connection.stream.writer().any());
+        return run(connection.stream.reader().any(), connection.stream.writer().any(), connection.stream.handle, .socket);
     } else |_| {
-        return run(std.io.getStdIn().reader().any(), std.io.getStdOut().writer().any());
+        return run(std.io.getStdIn().reader().any(), std.io.getStdOut().writer().any(), std.io.getStdOut().handle, .pipe);
     }
 }

@@ -44,7 +44,9 @@ pub fn main() !void {
     // Start Live before the mutation so the initial snapshot cannot be missed.
     var capture = convex.Capture.init(allocator);
     defer capture.deinit();
-    var output = convex.Output{ .writer = std.io.getStdErr().writer().any(), .capture = &capture };
+    var output = convex.Output.init(allocator, std.io.getStdErr().writer().any(), std.io.getStdErr().handle, .none);
+    output.capture = &capture;
+    defer output.deinit();
     try client.subscribe("example", "demo:state", query_args, &output);
     // Decode the actual initial Live value from the bounded mailbox.
     var live_arena = std.heap.ArenaAllocator.init(allocator);
