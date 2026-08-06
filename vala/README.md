@@ -139,7 +139,7 @@ int main (string[] args) {
 ./run verify-example vala
 ```
 
-`test` formats, compiles, and runs Vala's language-local adapter checks inside Docker. `verify-example` exercises the exact canonical example in its final runtime image. Root-owned shared conformance is still required before either capability can be earned.
+`test` compiles and runs Vala's language-local adapter checks inside Docker. The final-image probes exercise the exact canonical example and adapter under the runtime policy. Root-owned shared conformance is still required before either capability can be earned.
 
 ## Conformance and protocol notes
 
