@@ -480,8 +480,16 @@ function close!(client::Client)
         return nothing
     end
     try
-        already_closing ||
-            manager_command(manager, (:close,); timeout = CLOSE_TIMEOUT_SECONDS)
+        if !already_closing
+            try
+                manager_command(manager, (:close,); timeout = CLOSE_TIMEOUT_SECONDS)
+            catch error
+                # A worker that already stopped cannot acknowledge close, and it
+                # has retired its own subscriptions. Finish closing rather than
+                # stranding a client that could never be closed again.
+                error isa ConvexError && error.kind == :closed || rethrow()
+            end
+        end
         status = timedwait(
             () -> istaskdone(manager.supervisor),
             CLOSE_TIMEOUT_SECONDS;
@@ -490,11 +498,13 @@ function close!(client::Client)
         status == :ok || throw(
             ConvexError(:transport, "timed out closing Live worker", nothing, String[]),
         )
-        wait(manager.supervisor)
         lock(client.lock) do
             client.closed = true
             client.closing = false
         end
+        # Surface an owner that died from an unexpected error, but only once the
+        # client is already marked closed so close! stays idempotent.
+        istaskfailed(manager.supervisor) && wait(manager.supervisor)
     catch
         lock(client.lock) do
             client.closing = false
@@ -691,6 +701,18 @@ end
 # commands, which makes every acknowledgement an owner-ordered barrier.
 function live_worker(manager::LiveManager)
     manager.owner_task = current_task()
+    try
+        live_worker_loop!(manager)
+    finally
+        # A fail-stopped or unexpectedly broken owner must still retire its
+        # subscriptions and reject queued commands, otherwise callers would
+        # wait out their own deadlines on a worker that no longer exists.
+        retire_worker!(manager)
+    end
+    return nothing
+end
+
+function live_worker_loop!(manager::LiveManager)
     while !manager.closing
         while isready(manager.commands)
             handle_disconnected_command!(manager, take!(manager.commands))
@@ -752,7 +774,10 @@ function live_worker(manager::LiveManager)
             schedule_reconnect!(manager, transport.message)
         end
     end
+    return nothing
+end
 
+function retire_worker!(manager::LiveManager)
     for state in values(manager.subscriptions)
         if hasproperty(state, :pending_reply) && !isnothing(state.pending_reply)
             respond_command!(
@@ -833,7 +858,14 @@ function open_plain_websocket(manager::LiveManager)
                 ),
             )
             if poll_read_ready(descriptor)
-                append!(response, recv_nonblocking(descriptor))
+                append!(
+                    response,
+                    recv_nonblocking(
+                        descriptor,
+                        NETWORK_READ_CHUNK,
+                        "Live peer closed during WebSocket handshake",
+                    ),
+                )
                 length(response) <= 64 * 1024 || throw(
                     ConvexError(
                         :protocol,
@@ -858,8 +890,11 @@ function open_plain_websocket(manager::LiveManager)
     end
 end
 
-function recv_nonblocking(descriptor::Cint)
-    bytes = Vector{UInt8}(undef, NETWORK_READ_CHUNK)
+# The handshake and the connected owner share this bounded read. Each supplies
+# its own end-of-stream message so a peer that disappears mid-session is never
+# reported, or replayed as `lastCloseReason`, as a handshake failure.
+function recv_nonblocking(descriptor::Cint, limit::Int, closed_message::String)
+    bytes = Vector{UInt8}(undef, min(NETWORK_READ_CHUNK, limit))
     count = GC.@preserve bytes ccall(
         :recv,
         Cssize_t,
@@ -870,20 +905,13 @@ function recv_nonblocking(descriptor::Cint)
         0x40,
     )
     count > 0 && return resize!(bytes, Int(count))
-    count == 0 && throw(
-        ConvexError(
-            :transport,
-            "Live peer closed during WebSocket handshake",
-            nothing,
-            String[],
-        ),
-    )
+    count == 0 && throw(ConvexError(:transport, closed_message, nothing, String[]))
     error_code = Base.Libc.errno()
     error_code in (Base.Libc.EAGAIN, Base.Libc.EWOULDBLOCK) && return UInt8[]
     throw(
         ConvexError(
             :transport,
-            "WebSocket handshake read failed with errno $(error_code)",
+            "Live socket read failed with errno $(error_code)",
             nothing,
             String[],
         ),
@@ -1139,28 +1167,38 @@ function connected_loop!(manager::LiveManager, websocket)
     return :close
 end
 
+# One maximal frame, its header, and any retained fragmented payload share the
+# same bounded buffer. Reading only up to the remaining budget lets a peer
+# pipeline the next frame behind a near-maximum one without ever growing the
+# parser past its documented limit or rejecting a conforming stream.
+function read_budget(parser::FrameParser)
+    remaining =
+        MAX_LIVE_BYTES + 14 - length(parser.bytes) - length(parser.fragmented_payload)
+    remaining > 0 ||
+        throw(ConvexError(:protocol, "Live frame exceeds byte limit", nothing, String[]))
+    return min(NETWORK_READ_CHUNK, remaining)
+end
+
 function read_ready_websocket_bytes(
     websocket,
     transport_socket,
     descriptor::Cint,
     parser::FrameParser,
 )
+    limit = read_budget(parser)
     if websocket isa RawWebSocket
         if !isempty(websocket.buffer)
-            count = min(length(websocket.buffer), NETWORK_READ_CHUNK)
+            count = min(length(websocket.buffer), limit)
             bytes = copy(websocket.buffer[1:count])
             deleteat!(websocket.buffer, 1:count)
             return bytes
         end
         poll_read_ready(descriptor) || return UInt8[]
-        return recv_nonblocking(descriptor)
+        return recv_nonblocking(descriptor, limit, "Live peer closed the connection")
     end
     connection = websocket.io
     if bytesavailable(connection.buffer) > 0
-        return read(
-            connection.buffer,
-            min(bytesavailable(connection.buffer), NETWORK_READ_CHUNK),
-        )
+        return read(connection.buffer, min(bytesavailable(connection.buffer), limit))
     end
     transport = connection.io
     buffered = bytesavailable(transport)
@@ -1200,9 +1238,12 @@ function read_ready_websocket_bytes(
             return UInt8[]
         end
         raw_before_read = bytesavailable(transport.io)
-        bytes, status, application_pending = read_tls_once(transport)
+        bytes, status, application_pending = read_tls_once(transport, limit)
         parser.tls_wants_write = status == :want_write
-        parser.tls_retry_read = status == :want_read && application_pending
+        # OpenSSL may still hold decrypted bytes when the bounded read stopped
+        # short of a whole record. Retry regardless of status, or that record
+        # would wait for unrelated inbound traffic to make the socket readable.
+        parser.tls_retry_read = application_pending
         if status == :ok
             parser.tls_stall_deadline = 0.0
         elseif parser.tls_stall_deadline == 0.0 &&
@@ -1216,18 +1257,18 @@ function read_ready_websocket_bytes(
     ready || return UInt8[]
     if transport isa TCPSocket
         first = read(transport, UInt8)
-        remaining = min(bytesavailable(transport), NETWORK_READ_CHUNK - 1)
+        remaining = min(bytesavailable(transport), limit - 1)
         rest = remaining > 0 ? read(transport, remaining) : UInt8[]
         return vcat(UInt8[first], rest)
     elseif buffered == 0
         # Read through the HTTP transport, never from the raw fd. For TLS this
         # decrypts ready ciphertext; SO_RCVTIMEO abandons a partial TLS record.
         first = read(transport, UInt8)
-        remaining = min(bytesavailable(transport), NETWORK_READ_CHUNK - 1)
+        remaining = min(bytesavailable(transport), limit - 1)
         rest = remaining > 0 ? read(transport, remaining) : UInt8[]
         chunk = vcat(UInt8[first], rest)
     else
-        chunk = read(transport, min(buffered, NETWORK_READ_CHUNK))
+        chunk = read(transport, min(buffered, limit))
     end
     length(chunk) <= NETWORK_READ_CHUNK || throw(
         ConvexError(
@@ -1244,8 +1285,8 @@ end
 # socket). One SSL_read_ex attempt lets the sole WebSocket owner preserve the
 # library's TLS parser state, return to its command mailbox, and retry only when
 # the raw socket or OpenSSL pending buffer reports progress.
-function read_tls_once(transport::OpenSSL.SSLStream)
-    buffer = Vector{UInt8}(undef, NETWORK_READ_CHUNK)
+function read_tls_once(transport::OpenSSL.SSLStream, limit::Int)
+    buffer = Vector{UInt8}(undef, min(NETWORK_READ_CHUNK, limit))
     error_code, application_pending = lock(transport.lock) do
         transport.closed &&
             throw(ConvexError(:transport, "TLS stream is closed", nothing, String[]))
@@ -1273,7 +1314,7 @@ function read_tls_once(transport::OpenSSL.SSLStream)
             ) > 0
         (code, pending_application_bytes)
     end
-    error_code == OpenSSL.SSL_ERROR_NONE && return buffer, :ok, false
+    error_code == OpenSSL.SSL_ERROR_NONE && return buffer, :ok, application_pending
     error_code == OpenSSL.SSL_ERROR_WANT_READ &&
         return UInt8[], :want_read, application_pending
     error_code == OpenSSL.SSL_ERROR_WANT_WRITE &&
@@ -1860,7 +1901,12 @@ function parse_frames!(
         length(parser.bytes) >= needed || break
         payload = copy(parser.bytes[(header_bytes+1):needed])
         deleteat!(parser.bytes, 1:needed)
-        isempty(parser.bytes) && (parser.frame_stall_deadline = 0.0)
+        # A completed frame is real frame-level progress. Restart the deadline
+        # for whatever remains buffered so a peer that keeps delivering whole
+        # frames faster than they are drained is never mistaken for one that
+        # stalled halfway through a frame.
+        parser.frame_stall_deadline =
+            isempty(parser.bytes) ? 0.0 : time() + FRAME_STALL_TIMEOUT_SECONDS
         frames += 1
 
         control = opcode >= 0x08

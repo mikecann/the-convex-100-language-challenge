@@ -1,9 +1,9 @@
 #!/usr/local/bin/julia
 
-client_root =
-    isfile("/opt/convex/client/Convex.jl") ? "/opt/convex/client" :
-    joinpath(@__DIR__, "..", "..")
-isdefined(@__MODULE__, :Convex) || include(joinpath(client_root, "Convex.jl"))
+# PackageCompiler's generated runtime includes this file inside a module that
+# already loaded the client, so only a direct `julia adapter.jl` run needs its
+# own include.
+isdefined(@__MODULE__, :Convex) || include(joinpath(@__DIR__, "..", "..", "Convex.jl"))
 using .Convex
 using JSON3
 using Sockets
@@ -421,8 +421,26 @@ function get_client(current)
     url = get(ENV, "CONVEX_URL", "")
     isempty(url) &&
         throw(ConvexError(:transport, "CONVEX_URL is required", nothing, String[]))
-    current[] = Client(url; auth_token = get(ENV, "CONVEX_AUTH_TOKEN", ""))
+    # A malformed deployment URL is an environment fault. Reporting it as a
+    # typed protocol error keeps the client's ArgumentError out of the NDJSON
+    # stream, where it would serialize as an untyped Error event.
+    current[] = try
+        Client(url; auth_token = get(ENV, "CONVEX_AUTH_TOKEN", ""))
+    catch error
+        error isa ConvexError && rethrow()
+        throw(ConvexError(:protocol, "CONVEX_URL is not a Convex URL", nothing, String[]))
+    end
     return current[]
+end
+
+# The controller may omit `path` or send an empty one. Both are protocol faults
+# rather than argument bugs in the educational client.
+function adapter_path(command)
+    path = Convex.jsonget(command, "path", "")
+    if !(path isa AbstractString) || isempty(path)
+        throw(ConvexError(:protocol, "path must be a non-empty string", nothing, String[]))
+    end
+    return String(path)
 end
 
 function take_available_update(subscription)
@@ -590,18 +608,17 @@ function run_adapter(input::IO, output::IO)
                             "id" => id,
                             "type" => "ready",
                             "language" => "julia",
-                            "implementation" => "native-julia-1.11.6",
+                            # Derive provenance from the running toolchain so a
+                            # rebuild can never report a version it is not.
+                            "implementation" => "native-julia-" * string(VERSION),
                             "runtime" => "julia-" * string(VERSION),
                         ),
                     )
                 elseif operation in ("query", "mutation", "action")
-                    path = Convex.jsonget(command, "path", "")
-                    path isa AbstractString || throw(
-                        ConvexError(:protocol, "path must be a string", nothing, String[]),
-                    )
+                    path = adapter_path(command)
                     result = getfield(Convex, Symbol(operation))(
                         get_client(current),
-                        String(path),
+                        path,
                         command_args(command),
                     )
                     event = Dict{String,Any}(
@@ -641,13 +658,19 @@ function run_adapter(input::IO, output::IO)
                         delete!(subscriptions, subscription_id)
                     end
                     generation = next_adapter_generation!(generation_counter)
-                    path = Convex.jsonget(command, "path", "")
-                    path isa AbstractString || throw(
-                        ConvexError(:protocol, "path must be a string", nothing, String[]),
-                    )
+                    path = adapter_path(command)
                     subscription =
-                        subscribe(get_client(current), String(path), command_args(command))
-                    activate_and_ack!(pump, subscription_id, generation, id)
+                        subscribe(get_client(current), path, command_args(command))
+                    try
+                        activate_and_ack!(pump, subscription_id, generation, id)
+                    catch
+                        # No acknowledgement reached the controller, so retire
+                        # this subscription instead of leaving a live relay the
+                        # controller can neither observe nor unsubscribe.
+                        invalidate_generation!(pump, subscription_id)
+                        unsubscribe!(subscription)
+                        rethrow()
+                    end
                     subscriptions[subscription_id] =
                         (subscription = subscription, generation = generation)
                 elseif operation == "unsubscribe"

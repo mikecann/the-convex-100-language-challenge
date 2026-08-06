@@ -475,6 +475,28 @@ end
 end
 
 
+@testset "bounded parser read budget accepts pipelined frames" begin
+    parser = Convex.FrameParser()
+    @test Convex.read_budget(parser) == Convex.NETWORK_READ_CHUNK
+    resize!(parser.bytes, Convex.MAX_LIVE_BYTES + 14 - 1000)
+    # A near-maximum frame still gets room for its own remaining bytes, and no
+    # more, so bytes pipelined behind it stay in the transport.
+    @test Convex.read_budget(parser) == 1000
+    resize!(parser.bytes, Convex.MAX_LIVE_BYTES + 14)
+    overflow = try
+        Convex.read_budget(parser)
+        nothing
+    catch caught
+        caught
+    end
+    @test overflow isa ConvexError
+    @test overflow.kind == :protocol
+    fragmented = Convex.FrameParser()
+    resize!(fragmented.fragmented_payload, Convex.MAX_LIVE_BYTES - 2000)
+    resize!(fragmented.bytes, 1500)
+    @test Convex.read_budget(fragmented) == 514
+end
+
 function fake_manager()
     return Convex.LiveManager(
         "ws://unused",
@@ -502,6 +524,73 @@ function fake_manager()
         current_task(),
         current_task(),
     )
+end
+
+@testset "frame progress refreshes the partial-frame stall deadline" begin
+    manager = fake_manager()
+    parser = Convex.FrameParser()
+    complete = frame_bytes(0x01, Vector{UInt8}("{}"))
+    append!(parser.bytes, complete)
+    append!(parser.bytes, UInt8[0x81]) # one deliberate partial header byte
+    parser.frame_stall_deadline = time() - 1
+    messages, frames = Convex.parse_frames!(parser, manager, nothing; frame_limit = 1)
+    @test frames == 1
+    @test String(messages[1]) == "{}"
+    # A completed frame is progress, so the retained partial frame starts its
+    # own deadline instead of inheriting an already expired one.
+    @test parser.frame_stall_deadline > time()
+    @test parser.bytes == UInt8[0x81]
+    armed = parser.frame_stall_deadline
+    drained, retried = Convex.parse_frames!(parser, manager, nothing; frame_limit = 1)
+    @test isempty(drained)
+    @test retried == 0
+    # An incomplete frame must never refresh or clear the deadline itself.
+    @test parser.frame_stall_deadline == armed
+    empty!(parser.bytes)
+    append!(parser.bytes, complete)
+    Convex.parse_frames!(parser, manager, nothing; frame_limit = 1)
+    @test parser.frame_stall_deadline == 0.0
+end
+
+@testset "worker retirement finishes subscriptions and rejects commands" begin
+    manager = fake_manager()
+    subscription =
+        Convex.Subscription(manager, 3, 1, Convex.QueuedUpdate[], manager.budget, false)
+    pending = Channel{Any}(1)
+    manager.subscriptions[3] = (
+        path = "demo:state",
+        args = Dict(),
+        subscription = subscription,
+        generation = 1,
+        pending_reply = Convex.owner_command(((:subscribe,), pending)),
+        request_bytes = 0,
+    )
+    queued = Channel{Any}(1)
+    put!(manager.commands, ((:close,), queued))
+    Convex.retire_worker!(manager)
+    @test isempty(manager.subscriptions)
+    @test subscription.finished
+    @test take_deadline(pending; message = "pending subscribe rejection") isa ConvexError
+    @test take_deadline(queued; message = "queued command rejection") isa ConvexError
+    @test Base.n_avail(manager.commands) == 0
+end
+
+@testset "close! completes when the Live worker already stopped" begin
+    client = Client("http://127.0.0.1:1")
+    manager = fake_manager()
+    stopped = @async nothing
+    wait(stopped)
+    manager.supervisor = stopped
+    manager.worker = stopped
+    client.live = manager
+    started = time()
+    close!(client)
+    @test time() - started < Convex.CLOSE_TIMEOUT_SECONDS
+    @test client.closed
+    @test !client.closing
+    # Closing twice must stay a bounded no-op rather than throwing.
+    close!(client)
+    @test client.closed
 end
 
 @testset "expired owner commands never execute or leak senders" begin
@@ -808,6 +897,11 @@ end
         line in split(String(take!(adapter_output)), '\n') if !isempty(line)
     ]
     @test [event[:type] for event in events] == ["ready", "result", "error", "error", "closed"]
+    @test events[1][:language] == "julia"
+    # Provenance and runtime are evidence. Both must describe the toolchain
+    # that actually built this adapter rather than a pinned literal.
+    @test events[1][:implementation] == "native-julia-" * string(VERSION)
+    @test events[1][:runtime] == "julia-" * string(VERSION)
     @test events[2][:logs] == ["query log"]
     @test events[3][:error][:name] == "FunctionError"
     @test events[3][:error][:data][:code] == "fixture"
@@ -826,6 +920,23 @@ end
     end
     @test transport_error isa ConvexError
     @test transport_error.kind == :transport
+end
+
+@testset "adapter reports missing command fields as protocol errors" begin
+    input = IOBuffer(
+        "{\"id\":\"no-path\",\"op\":\"query\",\"args\":{}}\n" *
+        "{\"id\":\"empty-path\",\"op\":\"subscribe\",\"subscriptionId\":\"s\",\"path\":\"\"}\n" *
+        "{\"id\":\"close\",\"op\":\"close\"}\n",
+    )
+    output = IOBuffer()
+    run_adapter(input, output)
+    events =
+        [JSON3.read(line) for line in split(String(take!(output)), '\n') if !isempty(line)]
+    @test [event[:type] for event in events] == ["error", "error", "closed"]
+    # A command the controller malformed is a protocol fault, not an untyped
+    # Julia ArgumentError leaking into the NDJSON stream.
+    @test [event[:error][:name] for event in events[1:2]] == ["ProtocolError", "ProtocolError"]
+    @test [event[:id] for event in events] == ["no-path", "empty-path", "close"]
 end
 
 @testset "HTTP status and declared/chunked response limits" begin
@@ -979,6 +1090,27 @@ end
     @test next_update(subscription).logs == ["same value later"]
     unsubscribe!(subscription)
     @test take_deadline(remove_seen; message = "Remove frame")
+    close!(client)
+    finish_fixture(fixture, fixture_errors)
+end
+
+@testset "connected peer EOF is not reported as a handshake failure" begin
+    url, fixture, fixture_errors = fixture_listener() do listener
+        socket = accept(listener)
+        server_handshake(socket)
+        read_client_json(socket)
+        read_client_json(socket)
+        close(socket)
+    end
+    client = Client(url)
+    subscription = subscribe(client, "demo:state", Dict("room" => "connected-eof"))
+    failure = next_update(subscription; timeout = 4)
+    @test failure.error.kind == :transport
+    # The same bounded read serves the handshake and the connected owner. A
+    # session that ends after Add must not be reported, or replayed to the
+    # server as lastCloseReason, as a handshake failure.
+    @test !occursin("handshake", failure.error.message)
+    @test !occursin("handshake", client.live.last_close_reason)
     close!(client)
     finish_fixture(fixture, fixture_errors)
 end
@@ -1341,6 +1473,10 @@ end
             )
             @test length(payload) == Convex.MAX_LIVE_BYTES
             write(socket, long_frame_bytes(0x01, payload))
+            # Pipeline a control frame directly behind the near-maximum text
+            # frame. A bounded reader must leave those bytes in the transport
+            # rather than treating a conforming peer as an oversized frame.
+            write(socket, frame_bytes(0x0a, UInt8[]))
             flush(socket)
             try
                 while true

@@ -25,8 +25,10 @@ the `0 -> 1` journey rather than merely issuing individual requests.
 ```text
 #!/usr/local/bin/julia
 
-client_root = isfile("/opt/convex/client/Convex.jl") ? "/opt/convex/client" : joinpath(@__DIR__, "..", "..", "client")
-include(joinpath(client_root, "Convex.jl"))
+# Load the client from this repository. The compiled image already defines it,
+# because PackageCompiler includes this same file inside its runtime module.
+isdefined(@__MODULE__, :Convex) ||
+    include(joinpath(@__DIR__, "..", "..", "client", "Convex.jl"))
 using .Convex
 using Random
 
@@ -46,6 +48,9 @@ function run_example(room::String = get(ENV, "EXAMPLE_ROOM", "julia-example"))
 
         # Fetch the current shared state with Convex's JSON HTTP query API.
         current = query(client, "demo:state", Dict("room" => room))
+        # Convex counters arrive as JSON numbers, so 0 may be encoded as 0.0.
+        # whole_count decodes any mathematically integral, in-range number and
+        # rejects fractional, quoted, non-finite, or overflowing values.
         current_count = whole_count(current.value["count"], "current count")
         current_count == 0 || error("current count was $(current_count), expected 0")
         println("current count: $(current_count)")
@@ -60,7 +65,11 @@ function run_example(room::String = get(ENV, "EXAMPLE_ROOM", "julia-example"))
 
         # runId is the mutation idempotency key. Retrying this logical request
         # therefore cannot increment the test room twice.
-        changed = mutation(client, "demo:increment", Dict("room" => room, "language" => "julia", "runId" => randstring(16)))
+        changed = mutation(
+            client,
+            "demo:increment",
+            Dict("room" => room, "language" => "julia", "runId" => randstring(16)),
+        )
         changed.value["applied"] == true || error("mutation was not applied")
         println("mutation applied: true")
         mutation_count = whole_count(changed.value["state"]["count"], "mutation count")
@@ -85,7 +94,11 @@ function run_example(room::String = get(ENV, "EXAMPLE_ROOM", "julia-example"))
     end
 end
 
-run_example(length(ARGS) >= 1 ? ARGS[1] : get(ENV, "EXAMPLE_ROOM", "julia-example"))
+# PackageCompiler includes this exact file in its generated package. Only run
+# automatically when Julia launched the canonical source file itself.
+if abspath(PROGRAM_FILE) == abspath(@__FILE__)
+    run_example(length(ARGS) >= 1 ? ARGS[1] : get(ENV, "EXAMPLE_ROOM", "julia-example"))
+end
 ```
 <!-- END GENERATED EXAMPLE -->
 
@@ -121,6 +134,12 @@ encoded payload. This source-level bound is tested separately from process RSS;
 the hard 128 MiB final-image gate must still pass before any capability is
 claimed. Oldest queued subscription values are dropped for a slow consumer;
 command acknowledgements instead fail on bounded backpressure.
+
+The frame parser is bounded separately. It retains at most one maximal frame
+with its header plus any fragmented payload still being assembled, and every
+transport read is capped by whatever remains of that budget. A peer that
+pipelines the next frame directly behind a near-maximum one therefore leaves
+those bytes in the transport instead of being rejected as oversized.
 
 ## Limitations
 

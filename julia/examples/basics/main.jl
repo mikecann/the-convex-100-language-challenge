@@ -1,9 +1,9 @@
 #!/usr/local/bin/julia
 
-client_root =
-    isfile("/opt/convex/client/Convex.jl") ? "/opt/convex/client" :
-    joinpath(@__DIR__, "..", "..", "client")
-isdefined(@__MODULE__, :Convex) || include(joinpath(client_root, "Convex.jl"))
+# Load the client from this repository. The compiled image already defines it,
+# because PackageCompiler includes this same file inside its runtime module.
+isdefined(@__MODULE__, :Convex) ||
+    include(joinpath(@__DIR__, "..", "..", "client", "Convex.jl"))
 using .Convex
 using Random
 
@@ -23,6 +23,9 @@ function run_example(room::String = get(ENV, "EXAMPLE_ROOM", "julia-example"))
 
         # Fetch the current shared state with Convex's JSON HTTP query API.
         current = query(client, "demo:state", Dict("room" => room))
+        # Convex counters arrive as JSON numbers, so 0 may be encoded as 0.0.
+        # whole_count decodes any mathematically integral, in-range number and
+        # rejects fractional, quoted, non-finite, or overflowing values.
         current_count = whole_count(current.value["count"], "current count")
         current_count == 0 || error("current count was $(current_count), expected 0")
         println("current count: $(current_count)")
