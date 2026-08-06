@@ -17,7 +17,7 @@ This is educational and unofficial, not a production Convex SDK.
 | Remove, reconnect, query-error recovery, and bounded delivery | Implemented, awaiting root-owned shared evidence |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.m -->
-```text
+```objective-c
 #import "ConvexClient.h"
 #include <limits.h>
 #include <math.h>

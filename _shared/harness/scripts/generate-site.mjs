@@ -72,9 +72,7 @@ function readOptionalResult(directory, languageId) {
 
 const syntaxAliases = {
   "assembly-x86-64": "asm",
-  "c-sharp": "csharp",
   "delphi-object-pascal": "pascal",
-  "f-sharp": "fsharp",
   fortran: "fortran-free-form",
   "objective-c": "objective-c",
   "visual-basic-dotnet": "vb",
@@ -93,7 +91,6 @@ const extensionAliases = {
   hs: "haskell",
   hpp: "cpp",
   kts: "kotlin",
-  lean: "lean",
   lua: "lua",
   m: "objective-c",
   ml: "ocaml",
@@ -107,18 +104,17 @@ const extensionAliases = {
   scala: "scala",
   sh: "bash",
   ts: "typescript",
-  zig: "zig",
 };
 
 // Aliases are promises that the bundled highlighter can actually keep. Fail
 // the site build if a future edit invents a plausible-looking identifier that
 // Shiki silently degrades to plain text.
-for (const [source, target] of [
+for (const [alias, target] of [
   ...Object.entries(syntaxAliases),
   ...Object.entries(extensionAliases),
 ]) {
   if (!(target in bundledLanguages)) {
-    throw new Error(`syntax alias ${source} resolves to unavailable Shiki language ${target}`);
+    throw new Error(`syntax alias ${alias} resolves to unavailable Shiki language ${target}`);
   }
 }
 
