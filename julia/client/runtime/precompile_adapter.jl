@@ -29,9 +29,7 @@ function consume_http_request(socket, headers = read_headers(socket))
     content_length == 0 || read_exact(socket, content_length)
 end
 
-function send_http_response(socket, value)
-    body =
-        JSON3.write(Dict("status" => "success", "value" => value, "logLines" => String[]))
+function send_http_body(socket, body)
     write(
         socket,
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" *
@@ -41,17 +39,56 @@ function send_http_response(socket, value)
     flush(socket)
 end
 
+# Real Convex responses carry log lines, so the adapter serializes a
+# Vector{String} inside an untyped event. An empty-logs fixture never compiles
+# that writer, and the stripped image then dies with a MissingCodeError on the
+# first hosted response that logs anything.
+function send_http_response(socket, value; logs = String[])
+    send_http_body(
+        socket,
+        JSON3.write(Dict("status" => "success", "value" => value, "logLines" => logs)),
+    )
+end
+
+function send_http_function_error(socket)
+    send_http_body(
+        socket,
+        JSON3.write(
+            Dict(
+                "status" => "error",
+                "errorMessage" => "precompile function failure",
+                "errorData" => Dict("code" => "PRECOMPILE"),
+                "logLines" => ["precompile error log"],
+            ),
+        ),
+    )
+end
+
 # Drive the exact compiled adapter module through real TCP HTTP requests and a
 # malformed NDJSON line before close. This records the output-pump, JSON, HTTP,
 # function-error isolation, and bounded command-loop specializations.
 http_listener = listen(ip"127.0.0.1", 0)
 http_port = getsockname(http_listener)[2]
 http_server = @async begin
-    for value in (Dict("count" => 0.0), Dict("applied" => true), Dict("acted" => true))
+    responders = (
+        socket -> send_http_response(
+            socket,
+            Dict("count" => 0.0);
+            logs = ["precompile query log"],
+        ),
+        socket -> send_http_response(
+            socket,
+            Dict("applied" => true);
+            logs = ["precompile mutation log"],
+        ),
+        socket -> send_http_response(socket, Dict("acted" => true)),
+        send_http_function_error,
+    )
+    for responder in responders
         socket = accept(http_listener)
         try
             consume_http_request(socket)
-            send_http_response(socket, value)
+            responder(socket)
         finally
             close(socket)
         end
@@ -67,6 +104,7 @@ adapter_input = IOBuffer(
     "{\"id\":\"query\",\"op\":\"query\",\"path\":\"demo:state\",\"args\":{}}\n" *
     "{\"id\":\"mutation\",\"op\":\"mutation\",\"path\":\"demo:increment\",\"args\":{}}\n" *
     "{\"id\":\"action\",\"op\":\"action\",\"path\":\"demo:action\",\"args\":{}}\n" *
+    "{\"id\":\"failure\",\"op\":\"query\",\"path\":\"demo:fail\",\"args\":{}}\n" *
     "{\"id\":\"close\",\"op\":\"close\"}\n",
 )
 try
@@ -218,7 +256,9 @@ adapter_live_server = @async begin
                     "type" => "QueryUpdated",
                     "queryId" => query_id,
                     "value" => Dict("count" => 0.0),
-                    "logLines" => String[],
+                    # Live updates carry log lines too, and the adapter relay
+                    # serializes them on the same stripped path as HTTP results.
+                    "logLines" => ["precompile subscription log"],
                     "journal" => nothing,
                 ),
             ],
@@ -382,6 +422,32 @@ precompile(Adapter.run_adapter, (Base.PipeEndpoint, Base.PipeEndpoint))
 precompile(Adapter.failure, (Adapter.OutputPump, String, Client.ConvexError))
 precompile(Adapter.failure, (Adapter.OutputPump, Nothing, Client.ConvexError))
 precompile(Adapter.serialise_error, (Client.ConvexError,))
+# The stalled-controller diagnostic is the one message the adapter must still
+# be able to emit when its output peer has stopped reading entirely.
+Adapter.report_output_failure("convex-adapter: precompile diagnostic")
+# Pin the concrete event writers rather than trusting a fixture to reach every
+# shape. Convex log lines and structured error data must never be the first
+# thing the stripped image tries to serialize.
+JSON3.write(
+    Dict{String,Any}(
+        "id" => "pin",
+        "type" => "result",
+        "value" => Dict{String,Any}("count" => 1),
+        "logs" => String["pin log"],
+    ),
+)
+JSON3.write(
+    Dict{String,Any}(
+        "type" => "subscription",
+        "subscriptionId" => "pin",
+        "error" => Dict{String,Any}(
+            "name" => "FunctionError",
+            "message" => "pin",
+            "data" => Dict{String,Any}("code" => "PIN"),
+        ),
+        "logs" => String["pin log"],
+    ),
+)
 # Keep HTTP.jl's generic WebSocket wrapper and its GET upgrade dispatch in the
 # stripped image. The deterministic WSS fixture exercises the same API, but
 # PackageCompiler can otherwise leave this generic path to first use in the
@@ -494,11 +560,24 @@ old_example_url = get(ENV, "CONVEX_URL", nothing)
 old_example_room = get(ENV, "EXAMPLE_ROOM", nothing)
 ENV["CONVEX_URL"] = "http://127.0.0.1:$(example_port)"
 ENV["EXAMPLE_ROOM"] = "precompile-example"
+# Send the example's stdout through a real pipe, which is exactly what the
+# entrypoint gets under `docker run`. Tracing it against devnull compiled the
+# wrong writer and left the released image unable to print its own transcript.
+example_output = Pipe()
+Base.link_pipe!(example_output; reader_supports_async = true, writer_supports_async = true)
 try
-    example_status = redirect_stdout(devnull) do
+    example_status = redirect_stdout(example_output.in) do
         ConvexRuntime.example_main()
     end
     example_status == 0 || error("canonical example precompile failed")
+    close(example_output.in)
+    example_transcript = read(example_output.out, String)
+    close(example_output.out)
+    # The traced run is also the earliest place the canonical transcript can be
+    # checked, so require the journey the README and website advertise.
+    occursin("current count: 0", example_transcript) &&
+    occursin("verified count: 0 -> 1", example_transcript) ||
+        error("canonical example precompile transcript was wrong: " * example_transcript)
 finally
     isnothing(old_example_url) ? delete!(ENV, "CONVEX_URL") :
     (ENV["CONVEX_URL"] = old_example_url)
@@ -506,6 +585,14 @@ finally
     (ENV["EXAMPLE_ROOM"] = old_example_room)
 end
 wait(example_server)
+
+# A redirected file gives stdout a different concrete type again, so compile
+# that writer too rather than discovering it in someone's log capture.
+mktemp() do stream_path, stream_io
+    redirect_stdout(stream_io) do
+        println("precompile stdout probe")
+    end
+end
 
 # Reuse the deterministic test-only identity from the language-local WSS test.
 # Executing a real Julia TLS server here records HTTP's WSS handshake and the
@@ -697,6 +784,11 @@ precompile(Client.subscribe, (Client.Client, String, Dict{String,Any}))
 precompile(Client.query, (Client.Client, String, Dict{String,Any}))
 precompile(Client.mutation, (Client.Client, String, Dict{String,Any}))
 precompile(Client.action, (Client.Client, String, Dict{String,Any}))
+# These adapter-only entrypoints are reached after the native image has had its
+# compiler removed. Keep their concrete String/client specializations in the
+# image so a hosted auth change or deliberate reconnect cannot hit MissingCode.
+precompile(Client.set_auth!, (Client.Client, String))
+precompile(Client.debug_disconnect_for_adapter, (Client.Client,))
 precompile(Client.typed_error, (Any, Symbol))
 precompile(Client.canonicalize_args, (Dict{String,Any},))
 precompile(Client.canonicalize_args, (Dict{String,String},))

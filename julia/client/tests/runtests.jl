@@ -922,6 +922,88 @@ end
     @test transport_error.kind == :transport
 end
 
+@testset "decoded values are plain Julia trees, not JSON3 views" begin
+    url, fixture, fixture_errors = http_fixture(2) do index, request
+        index == 1 && return Dict(
+            "status" => "success",
+            "value" => Dict(
+                "unicode" => "Hello, 世界 👋",
+                "nested" => Dict(
+                    "booleans" => [true, false],
+                    "number" => 42.5,
+                    "nil" => nothing,
+                ),
+                "ids" => ["a", "b"],
+            ),
+            "logLines" => String[],
+        )
+        return Dict(
+            "status" => "error",
+            "errorMessage" => "expected failure",
+            "errorData" => Dict("code" => "FIXTURE", "flags" => [true, false]),
+            "logLines" => String[],
+        )
+    end
+    client = Client(url)
+    value = query(client, "demo:echo", Dict()).value
+    failure = try
+        query(client, "demo:fail", Dict())
+        nothing
+    catch caught
+        caught
+    end
+    close!(client)
+
+    # A JSON3 view would pin the whole response it arrived in, and a stripped
+    # AOT image would need a serializer specialization for every concrete view
+    # type a deployment happens to return.
+    @test value isa Dict{String,Any}
+    @test value["nested"] isa Dict{String,Any}
+    @test value["nested"]["booleans"] isa Vector{Any}
+    @test value["nested"]["booleans"] == Any[true, false]
+    @test value["nested"]["booleans"][1] === true
+    @test value["nested"]["number"] == 42.5
+    @test value["nested"]["nil"] === nothing
+    @test value["ids"] isa Vector{Any}
+    @test value["unicode"] == "Hello, 世界 👋"
+    @test failure isa ConvexError
+    @test failure.data isa Dict{String,Any}
+    @test failure.data["flags"] isa Vector{Any}
+    finish_fixture(fixture, fixture_errors)
+
+    manager = fake_manager()
+    subscription =
+        Convex.Subscription(manager, 0, 1, Convex.QueuedUpdate[], manager.budget, false)
+    manager.subscriptions[0] = (
+        path = "demo:state",
+        args = Dict(),
+        subscription = subscription,
+        generation = 1,
+        pending_reply = nothing,
+        request_bytes = 0,
+    )
+    Convex.apply_transition!(
+        manager,
+        transition(
+            0,
+            1,
+            0,
+            1,
+            [
+                Dict(
+                    "type" => "QueryUpdated",
+                    "queryId" => 0,
+                    "value" => Dict("flags" => [true, false]),
+                    "logLines" => String[],
+                ),
+            ],
+        ),
+    )
+    live_value = next_update(subscription).value
+    @test live_value isa Dict{String,Any}
+    @test live_value["flags"] isa Vector{Any}
+end
+
 @testset "adapter reports missing command fields as protocol errors" begin
     input = IOBuffer(
         "{\"id\":\"no-path\",\"op\":\"query\",\"args\":{}}\n" *
@@ -2621,13 +2703,110 @@ end
         @test pump.buffered_items <= MAX_OUTPUT_ITEMS
         @test pump.encoded_bytes <= MAX_OUTPUT_BYTES
     end
+    started = time()
     wait_until(
         () -> pump.failed;
         timeout = 4,
         message = "bounded stopped-reader write failure",
     )
+    # The deadline is cumulative across records, so a permanently unread peer
+    # retires the writer in about a second however much is queued behind it.
+    @test time() - started < 3 * OUTPUT_STALL_SECONDS
+    # A connected peer that never reads is a stall, not a vanished peer.
+    @test pump.stalled
     @test stop_output!(pump)
+    # Every byte and slot the failed writer was holding must be released, or a
+    # later event would be refused by a budget that is permanently reserved.
+    lock(pump.lock) do
+        @test pump.encoded_bytes == 0
+        @test pump.buffered_items == 0
+        @test isempty(pump.queue)
+    end
     close(output_socket)
     close(stopped_reader)
     wait(server)
+end
+
+@testset "process-wide admission bounds in-flight near-maximum work" begin
+    admission = Admission()
+    @test try_admit!(admission, Convex.MAX_HTTP_BYTES)
+    # One near-maximum payload is the whole budget: the next caller waits
+    # rather than let a second near-maximum value exist inside the limit.
+    @test !try_admit!(admission, Convex.MAX_HTTP_BYTES)
+    @test admission.items == MAX_INFLIGHT_ITEMS
+    @test admission.bytes == MAX_INFLIGHT_BYTES
+    release!(admission, Convex.MAX_HTTP_BYTES)
+    @test admission.items == 0
+    @test admission.bytes == 0
+
+    # A byte budget bounds admission even when the item count would allow it.
+    small = Admission()
+    @test try_admit!(small, MAX_INFLIGHT_BYTES)
+    @test !try_admit!(small, 1)
+    release!(small, MAX_INFLIGHT_BYTES)
+    @test small.items == 0
+    @test small.bytes == 0
+
+    # Blocking admission is deadline bounded, and a caller that times out must
+    # not leave a reservation behind.
+    saturated = Admission()
+    @test try_admit!(saturated, Convex.MAX_HTTP_BYTES)
+    started = time()
+    denied = try
+        admit!(saturated, Convex.MAX_HTTP_BYTES; timeout = 0.05)
+        nothing
+    catch caught
+        caught
+    end
+    @test denied isa ConvexError
+    @test denied.kind == :transport
+    @test time() - started < 1
+    @test saturated.items == MAX_INFLIGHT_ITEMS
+    @test saturated.bytes == MAX_INFLIGHT_BYTES
+    release!(saturated, Convex.MAX_HTTP_BYTES)
+    @test saturated.items == 0
+    @test saturated.bytes == 0
+
+    # A waiter admitted only once room appears still leaves the budget clean.
+    handoff = Admission()
+    @test try_admit!(handoff, Convex.MAX_HTTP_BYTES)
+    waiter = @async try
+        admit!(handoff, Convex.MAX_HTTP_BYTES; timeout = TEST_TIMEOUT)
+        :admitted
+    catch caught
+        caught
+    end
+    sleep(0.05)
+    @test !istaskdone(waiter)
+    release!(handoff, Convex.MAX_HTTP_BYTES)
+    @test fetch(waiter) === :admitted
+    release!(handoff, Convex.MAX_HTTP_BYTES)
+    @test handoff.items == 0
+    @test handoff.bytes == 0
+end
+
+@testset "adapter status separates a clean close from a stalled controller" begin
+    input = IOBuffer(
+        "{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}\n" *
+        "{\"id\":\"close\",\"op\":\"close\"}\n",
+    )
+    @test run_adapter(input, IOBuffer()) === :closed
+    # End of input is a clean session too: the controller simply went away.
+    @test run_adapter(
+        IOBuffer("{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}\n"),
+        IOBuffer(),
+    ) === :closed
+    # Whatever happened, the process-wide budget must be fully released.
+    @test ADMISSION.items == 0
+    @test ADMISSION.bytes == 0
+
+    # A writer that hit its cumulative deadline must be reported, not flattened
+    # into a successful close.
+    output = IOBuffer()
+    pump = OutputPump(output; interrupt_on_failure = false)
+    lock(pump.lock) do
+        pump.stalled = true
+    end
+    @test stop_output!(pump)
+    @test pump.stalled
 end

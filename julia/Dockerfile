@@ -25,10 +25,12 @@ COPY --from=c-format /c-format.ok /tmp/c-format.ok
 RUN test "$(uname -m)" = x86_64 && julia -e '@assert Sys.ARCH === :x86_64'
 RUN julia --project=client/formatter -e 'using JuliaFormatter; for path in ARGS; source = read(path, String); source == format_text(source) || error("not formatted: " * path); end' \
     client/Convex.jl client/tests/runtests.jl client/tests/conformance/adapter.jl \
-    client/runtime/ConvexRuntime.jl client/runtime/precompile_adapter.jl examples/basics/main.jl
+    client/runtime/ConvexRuntime.jl client/runtime/precompile_adapter.jl \
+    client/runtime/precompile_statements.jl examples/basics/main.jl
 RUN julia --project=client -e 'for path in ARGS; Meta.parseall(read(path, String); filename=path); end' \
     client/Convex.jl client/tests/runtests.jl client/tests/conformance/adapter.jl \
-    client/runtime/ConvexRuntime.jl client/runtime/precompile_adapter.jl examples/basics/main.jl
+    client/runtime/ConvexRuntime.jl client/runtime/precompile_adapter.jl \
+    client/runtime/precompile_statements.jl examples/basics/main.jl
 RUN julia --project=client -e 'include("examples/basics/main.jl"); @assert hasmethod(run_example, Tuple{String})'
 RUN julia --project=client -e 'using Test; include("client/tests/runtests.jl")'
 RUN printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | \
@@ -61,6 +63,7 @@ RUN julia --project=client/compiler -e 'using PackageCompiler; create_app( \
         "/opt/runtime", "/opt/convex-app"; \
         executables=["convex-adapter" => "adapter_main", "convex-example" => "example_main"], \
         precompile_execution_file="/work/client/runtime/precompile_adapter.jl", \
+        precompile_statements_file="/work/client/runtime/precompile_statements.jl", \
         incremental=false, filter_stdlibs=true, include_lazy_artifacts=true, \
         include_transitive_dependencies=false, \
         c_driver_program="/work/client/runtime/fixed_launcher.c", \

@@ -25,8 +25,82 @@ const MAX_SERIALIZED_PIPELINE_BYTES =
     MAX_TRANSIENT_ENCODED_BYTES +
     MAX_HTTP_TRANSIENT_BYTES
 const MAX_EVENT_BYTES = Convex.MAX_LIVE_BYTES + 64 * 1024
+# Cumulative, not per record. A controller that stays connected but never
+# drains its socket must retire the adapter in about a second no matter how
+# many events are queued behind it. Only a fully written record restarts it.
+const OUTPUT_STALL_SECONDS = 1.0
 const TEST_RELAY_DEQUEUED = Ref{Any}(nothing)
 const TEST_RELAY_RELEASE = Ref{Any}(nothing)
+
+# The compiled runtime already occupies about 84 MiB of anonymous memory before
+# it does any work, so the shared 128 MiB limit leaves headroom for roughly one
+# near-maximum payload. Individually bounded stages are not enough: the command
+# loop and the relay must draw on one process-wide budget, or a controller that
+# stops reading lets result after result pile up behind it. Large operations
+# therefore serialize against each other.
+const MAX_INFLIGHT_ITEMS = 1
+const MAX_INFLIGHT_BYTES = Convex.MAX_HTTP_BYTES
+const ADMISSION_TIMEOUT_SECONDS = 2.0
+# Julia sizes its heap from the machine, not from this container's cgroup, so a
+# stream of near-maximum payloads can outrun the collector well inside the
+# limit. Reclaim explicitly, but only once the live heap is actually large, so
+# ordinary small conformance traffic never pays for it.
+const RECLAIM_LIVE_BYTES = 8 * 1024 * 1024
+
+mutable struct Admission
+    lock::ReentrantLock
+    items::Int
+    bytes::Int
+end
+
+Admission() = Admission(ReentrantLock(), 0, 0)
+
+const ADMISSION = Admission()
+
+function try_admit!(admission::Admission, bytes::Int)
+    return lock(admission.lock) do
+        admission.items < MAX_INFLIGHT_ITEMS || return false
+        admission.bytes + bytes <= MAX_INFLIGHT_BYTES || return false
+        admission.items += 1
+        admission.bytes += bytes
+        return true
+    end
+end
+
+# Blocking admission is still bounded. A caller that cannot be admitted inside
+# its deadline fails with a typed transport error instead of waiting on a peer
+# that may never drain, and it never holds a reservation it did not obtain.
+function admit!(admission::Admission, bytes::Int; timeout = ADMISSION_TIMEOUT_SECONDS)
+    deadline = time() + timeout
+    while true
+        try_admit!(admission, bytes) && return nothing
+        time() < deadline || throw(
+            ConvexError(
+                :transport,
+                "adapter admission control timed out",
+                nothing,
+                String[],
+            ),
+        )
+        sleep(0.002)
+    end
+end
+
+function release!(admission::Admission, bytes::Int)
+    lock(admission.lock) do
+        admission.items -= 1
+        admission.bytes -= bytes
+    end
+    return nothing
+end
+
+function reclaim!()
+    # A full collection, not an incremental one: the payload that just retired
+    # may already have been promoted, and the headroom here is far too small to
+    # leave it for the next generation.
+    Base.gc_live_bytes() > RECLAIM_LIVE_BYTES && GC.gc()
+    return nothing
+end
 
 struct OutputRecord
     bytes::Vector{UInt8}
@@ -43,6 +117,8 @@ mutable struct OutputPump
     buffered_items::Int
     closing::Bool
     failed::Bool
+    stalled::Bool
+    write_deadline::Float64
     interrupt_on_failure::Bool
     controller_task::Task
     writer::Task
@@ -58,6 +134,8 @@ function OutputPump(io::IO; interrupt_on_failure = true)
         0,
         false,
         false,
+        false,
+        0.0,
         interrupt_on_failure,
         current_task(),
         current_task(),
@@ -66,7 +144,12 @@ function OutputPump(io::IO; interrupt_on_failure = true)
     return pump
 end
 
-function bounded_write(io::IO, bytes::Vector{UInt8}; timeout = 2.0)
+function bounded_write(
+    io::IO,
+    bytes::Vector{UInt8};
+    timeout = 2.0,
+    deadline = time() + timeout,
+)
     if !Sys.islinux()
         write(io, bytes)
         flush(io)
@@ -94,7 +177,6 @@ function bounded_write(io::IO, bytes::Vector{UInt8}; timeout = 2.0)
     end
     try
         offset = 1
-        deadline = time() + timeout
         while offset <= length(bytes)
             time() < deadline || throw(
                 ConvexError(
@@ -164,7 +246,13 @@ function bounded_write(io::IO, bytes::Vector{UInt8}; timeout = 2.0)
 end
 
 function encode_event(event)
-    encoded = Vector{UInt8}(JSON3.write(event) * "\n")
+    # Serialize straight into one buffer and take its bytes. Building a string,
+    # concatenating a newline, and then copying to bytes held three copies of a
+    # near-maximum event at once, which the container's limit cannot afford.
+    buffer = IOBuffer()
+    JSON3.write(buffer, event)
+    write(buffer, UInt8('\n'))
+    encoded = take!(buffer)
     length(encoded) <= MAX_EVENT_BYTES ||
         throw(ConvexError(:protocol, "adapter event exceeds byte limit", nothing, String[]))
     return encoded
@@ -280,6 +368,9 @@ function output_writer(pump::OutputPump)
     while true
         record = lock(pump.lock) do
             if isempty(pump.queue)
+                # Nothing to write is not a stall, so the cumulative deadline
+                # only accrues while a record is actually waiting on the peer.
+                pump.write_deadline = 0.0
                 pump.closing && return nothing
                 return missing
             end
@@ -295,11 +386,26 @@ function output_writer(pump::OutputPump)
                 get(pump.active_generations, record.subscription_id, UInt64(0)) ==
                 record.generation
         end
+        deadline = lock(pump.lock) do
+            pump.write_deadline == 0.0 &&
+                (pump.write_deadline = time() + OUTPUT_STALL_SECONDS)
+            pump.write_deadline
+        end
         try
-            valid && bounded_write(pump.io, record.bytes)
-        catch
+            valid && bounded_write(pump.io, record.bytes; deadline)
+            # A completely written record is real progress, so the next record
+            # starts the cumulative deadline again rather than inheriting it.
+            lock(pump.lock) do
+                pump.write_deadline = 0.0
+            end
+        catch error
+            # A peer that vanished reports a write error; one that stays
+            # connected and never reads can only be detected by the deadline.
+            # Only the latter is a transport failure worth a nonzero exit.
+            stalled = error isa ConvexError && error.kind == :transport
             lock(pump.lock) do
                 pump.failed = true
+                pump.stalled = stalled
                 pump.closing = true
                 for queued in pump.queue
                     pump.encoded_bytes -= length(queued.bytes)
@@ -326,6 +432,22 @@ function output_writer(pump::OutputPump)
             end
         end
     end
+end
+
+# stdout carries protocol events only, so diagnostics go straight to fd 2. A
+# raw write avoids depending on whichever concrete stderr IO type the process
+# was started with, which a stripped image may have no compiled code for.
+function report_output_failure(message::String)
+    bytes = Vector{UInt8}(codeunits(message * "\n"))
+    GC.@preserve bytes ccall(
+        :write,
+        Cssize_t,
+        (Cint, Ptr{UInt8}, Csize_t),
+        2,
+        pointer(bytes),
+        length(bytes),
+    )
+    return nothing
 end
 
 function stop_output!(pump::OutputPump; timeout = 3.0)
@@ -471,27 +593,36 @@ function relay_subscriptions(pump, subscriptions, closing)
             for offset = 0:(length(snapshot)-1)
                 index = mod1(cursor + offset, length(snapshot))
                 subscription_id, state = snapshot[index]
-                update = take_available_update(state.subscription)
-                isnothing(update) && continue
-                generation = state.generation
-                cursor = mod1(index + 1, length(snapshot))
-                forwarded = true
-                if TEST_RELAY_DEQUEUED[] !== nothing
-                    put!(TEST_RELAY_DEQUEUED[], (subscription_id, generation))
-                    take!(TEST_RELAY_RELEASE[])
-                end
-                delay_ms = tryparse(Int, get(ENV, "ADAPTER_TEST_RELAY_DELAY_MS", "0"))
-                !isnothing(delay_ms) && delay_ms > 0 && sleep(delay_ms / 1000)
-                if update.error === nothing
-                    event = Dict{String,Any}(
-                        "type" => "subscription",
-                        "subscriptionId" => subscription_id,
-                        "value" => update.value,
-                    )
-                    isempty(update.logs) || (event["logs"] = update.logs)
-                    write_event(pump, event; subscription_id, generation)
-                else
-                    failure(pump, nothing, update.error; subscription_id, generation)
+                # Never dequeue an update there is no room to encode yet. It
+                # stays in the client's own bounded queue instead of becoming
+                # another near-maximum value this process has to hold.
+                try_admit!(ADMISSION, Convex.MAX_LIVE_BYTES) || break
+                try
+                    update = take_available_update(state.subscription)
+                    isnothing(update) && continue
+                    generation = state.generation
+                    cursor = mod1(index + 1, length(snapshot))
+                    forwarded = true
+                    if TEST_RELAY_DEQUEUED[] !== nothing
+                        put!(TEST_RELAY_DEQUEUED[], (subscription_id, generation))
+                        take!(TEST_RELAY_RELEASE[])
+                    end
+                    delay_ms = tryparse(Int, get(ENV, "ADAPTER_TEST_RELAY_DELAY_MS", "0"))
+                    !isnothing(delay_ms) && delay_ms > 0 && sleep(delay_ms / 1000)
+                    if update.error === nothing
+                        event = Dict{String,Any}(
+                            "type" => "subscription",
+                            "subscriptionId" => subscription_id,
+                            "value" => update.value,
+                        )
+                        isempty(update.logs) || (event["logs"] = update.logs)
+                        write_event(pump, event; subscription_id, generation)
+                    else
+                        failure(pump, nothing, update.error; subscription_id, generation)
+                    end
+                finally
+                    release!(ADMISSION, Convex.MAX_LIVE_BYTES)
+                    reclaim!()
                 end
                 break
             end
@@ -552,7 +683,9 @@ function run_adapter(input::IO, output::IO)
             line === nothing && break
             isempty(strip(line)) && continue
             command = try
-                JSON3.read(line)
+                # Plain containers only, for the same reason the client
+                # materializes its Convex responses.
+                JSON3.read(line, Any)
             catch error
                 error isa Core.MissingCodeError && rethrow()
                 failure(
@@ -616,18 +749,28 @@ function run_adapter(input::IO, output::IO)
                     )
                 elseif operation in ("query", "mutation", "action")
                     path = adapter_path(command)
-                    result = getfield(Convex, Symbol(operation))(
-                        get_client(current),
-                        path,
-                        command_args(command),
-                    )
-                    event = Dict{String,Any}(
-                        "id" => id,
-                        "type" => "result",
-                        "value" => result.value,
-                    )
-                    isempty(result.logs) || (event["logs"] = result.logs)
-                    write_event(pump, event)
+                    # Reserve before materializing anything: the response
+                    # bytes, the decoded tree, and the encoded event are all
+                    # live together, so this is where concurrency has to be
+                    # bounded rather than after the fact.
+                    admit!(ADMISSION, Convex.MAX_HTTP_BYTES)
+                    try
+                        result = getfield(Convex, Symbol(operation))(
+                            get_client(current),
+                            path,
+                            command_args(command),
+                        )
+                        event = Dict{String,Any}(
+                            "id" => id,
+                            "type" => "result",
+                            "value" => result.value,
+                        )
+                        isempty(result.logs) || (event["logs"] = result.logs)
+                        write_event(pump, event)
+                    finally
+                        release!(ADMISSION, Convex.MAX_HTTP_BYTES)
+                        reclaim!()
+                    end
                 elseif operation == "setAuth"
                     token = Convex.jsonget(command, "token", nothing)
                     token isa AbstractString || throw(
@@ -763,7 +906,19 @@ function run_adapter(input::IO, output::IO)
             ),
         )
     end
-    return nothing
+    # A controller that stayed connected but never drained its socket is a
+    # transport failure, not a clean session. Say so on stderr and report it to
+    # the caller, which must exit nonzero rather than claim a clean close.
+    stalled = lock(pump.lock) do
+        pump.stalled
+    end
+    if stalled
+        report_output_failure(
+            "convex-adapter: controller output stalled past the bounded write deadline",
+        )
+        return :output_failed
+    end
+    return :closed
 end
 
 function parse_listen_address(value::String)
@@ -779,7 +934,7 @@ function parse_listen_address(value::String)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    if haskey(ENV, "ADAPTER_LISTEN")
+    status = if haskey(ENV, "ADAPTER_LISTEN")
         host, port = parse_listen_address(ENV["ADAPTER_LISTEN"])
         server = listen(parse(IPAddr, host), port)
         socket = accept(server)
@@ -792,4 +947,5 @@ if abspath(PROGRAM_FILE) == @__FILE__
     else
         run_adapter(stdin, stdout)
     end
+    exit(status === :output_failed ? 1 : 0)
 end

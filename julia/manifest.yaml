@@ -23,6 +23,8 @@ adapter:
   adapterOnlyCommands: [debugDisconnect]
 limitations:
   - Live and adapter delivery share a global newest-value budget of 5 client records, 7 output records, and 4 charged transient slots, bounded to 14 MiB of encoded payload.
+  - The conformance adapter serializes near-maximum payload work through one process-wide admission budget, so a query result and a Live update never materialise together.
+  - A controller that stays connected but never reads retires the adapter on a cumulative one-second write deadline, with a stderr diagnostic and a nonzero exit rather than a clean close.
   - Live authentication, WebSocket mutations and actions, optimistic updates, journals, and TransitionChunk assembly are deferred.
   - The client accepts the JSON-safe Convex value subset used by this experiment.
   - Capability badges remain unearned until root-owned shared verification passes.

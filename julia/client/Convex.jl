@@ -281,7 +281,10 @@ function call(client::Client, operation::String, path::AbstractString, args::Abs
         ),
     )
     decoded = try
-        JSON3.read(String(response_body))
+        # Materialize into plain Julia containers instead of JSON3's lazy,
+        # element-typed views. See public_value for why the view types are
+        # unusable in a runtime that cannot compile new code.
+        JSON3.read(String(response_body), Any)
     catch error
         throw(
             ConvexError(
@@ -300,7 +303,7 @@ function call(client::Client, operation::String, path::AbstractString, args::Abs
     if status == "success"
         jsonhas(decoded, "value") ||
             throw(ConvexError(:protocol, "success response omitted value", nothing, logs))
-        return Result(jsonget(decoded, "value", nothing), logs)
+        return Result(public_value(jsonget(decoded, "value", nothing)), logs)
     elseif status == "error"
         message = jsonget(decoded, "errorMessage", "Convex function failed")
         message isa AbstractString ||
@@ -309,7 +312,7 @@ function call(client::Client, operation::String, path::AbstractString, args::Abs
             ConvexError(
                 :function_error,
                 String(message),
-                jsonget(decoded, "errorData", nothing),
+                public_value(jsonget(decoded, "errorData", nothing)),
                 logs,
             ),
         )
@@ -1653,7 +1656,7 @@ function apply_transition!(manager::LiveManager, message)
             )
             if haskey(manager.subscriptions, id)
                 next_values[id] = sha256(encoded)
-                changed[id] = LiveUpdate(value, nothing, logs)
+                changed[id] = LiveUpdate(public_value(value), nothing, logs)
             end
         elseif modification_type == "QueryFailed"
             message_value = jsonget(modification, "errorMessage", "Live query failed")
@@ -1668,7 +1671,7 @@ function apply_transition!(manager::LiveManager, message)
             error = ConvexError(
                 :function_error,
                 String(message_value),
-                jsonget(modification, "errorData", nothing),
+                public_value(jsonget(modification, "errorData", nothing)),
                 logs,
             )
             if haskey(manager.subscriptions, id)
@@ -1718,7 +1721,7 @@ function apply_transition!(manager::LiveManager, message)
     return nothing
 end
 
-function decode_version(value, label::String)
+function decode_version(@nospecialize(value), label::String)
     value isa AbstractDict ||
         throw(ConvexError(:protocol, "$(label) must be an object", nothing, String[]))
     query_set = wire_int(jsonget(value, "querySet", nothing), "$(label).querySet")
@@ -1819,7 +1822,7 @@ function decode_live_message(payload::Vector{UInt8})
         ConvexError(:protocol, "Live text frame was not valid UTF-8", nothing, String[]),
     )
     try
-        decoded = JSON3.read(text)
+        decoded = JSON3.read(text, Any)
         decoded isa AbstractDict || throw(
             ConvexError(:protocol, "Live message must be a JSON object", nothing, String[]),
         )
@@ -2086,7 +2089,7 @@ function force_close!(websocket)
     return nothing
 end
 
-function typed_error(error, kind)
+function typed_error(@nospecialize(error), kind::Symbol)
     error isa ConvexError && return error
     if hasproperty(error, :error)
         nested = getproperty(error, :error)
@@ -2117,7 +2120,43 @@ function canonicalize_args(args::AbstractDict)
     return canonical
 end
 
-function canonicalize_json_value(value)
+# These boundary helpers all receive a value whose type is only known at run
+# time. `@nospecialize` keeps each of them to a single compiled instance, so an
+# image with runtime compilation disabled can dispatch to them for any payload
+# shape instead of needing one specialization per type a deployment sends.
+#
+# Every value this client hands back is a plain Julia tree, never a JSON3 view
+# into a transport buffer. That keeps a queued Live update from pinning the
+# whole response it arrived in, and it keeps the type surface finite. JSON3's
+# lazy views are parameterised by the element types a payload happens to
+# contain, so `[true, false]` and `[1, 2]` are different concrete types. An AOT
+# image with runtime compilation disabled needs compiled code for every one of
+# them, and dies on the first shape nobody predicted; decoding straight into
+# plain containers keeps that set closed.
+#
+# Decoding already produced plain containers, so normalize them in place. Deep
+# copying here would mean holding a second near-maximum tree while the response
+# bytes, the JSON text, and the encoded event are all still alive, which is more
+# than the container's memory limit leaves room for.
+function public_value(@nospecialize(value))
+    if value isa Dict{String,Any}
+        for (key, item) in value
+            normalized = public_value(item)
+            normalized === item || (value[key] = normalized)
+        end
+        return value
+    elseif value isa Vector{Any}
+        for index in eachindex(value)
+            item = value[index]
+            normalized = public_value(item)
+            normalized === item || (value[index] = normalized)
+        end
+        return value
+    end
+    return canonicalize_json_value(value)
+end
+
+function canonicalize_json_value(@nospecialize(value))
     if value isa AbstractDict
         object = Dict{String,Any}()
         for (key, item) in pairs(value)
@@ -2159,7 +2198,7 @@ function canonicalize_json_value(value)
     )
 end
 
-function validated_logs(items)
+function validated_logs(@nospecialize(items))
     items isa AbstractVector ||
         throw(ConvexError(:protocol, "logLines must be an array", nothing, String[]))
     all(item -> item isa AbstractString, items) ||
@@ -2167,7 +2206,7 @@ function validated_logs(items)
     return String[String(item) for item in items]
 end
 
-function wire_int(value, label::AbstractString)
+function wire_int(@nospecialize(value), label::AbstractString)
     value isa Integer ||
         throw(ConvexError(:protocol, "$(label) must be an integer", nothing, String[]))
     # Convex's sync queryId, querySet, and identity fields are unsigned 32-bit
@@ -2206,7 +2245,7 @@ function timestamp_value(encoded::AbstractString)
     return value
 end
 
-function whole_count(value, label::AbstractString)
+function whole_count(@nospecialize(value), label::AbstractString)
     value isa Integer && typemin(Int) <= value <= typemax(Int) && return Int(value)
     value isa AbstractFloat &&
         isfinite(value) &&

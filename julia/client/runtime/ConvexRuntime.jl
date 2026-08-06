@@ -18,10 +18,12 @@ include(joinpath(@__DIR__, "..", "examples", "basics", "main.jl"))
 end
 
 function adapter_main()::Cint
-    if haskey(ENV, "ADAPTER_LISTEN")
+    status = if haskey(ENV, "ADAPTER_LISTEN")
         host, port = AdapterProgram.parse_listen_address(ENV["ADAPTER_LISTEN"])
-        server =
-            AdapterProgram.listen(AdapterProgram.parse(AdapterProgram.IPAddr, host), port)
+        server = AdapterProgram.listen(
+            AdapterProgram.parse(AdapterProgram.IPAddr, host),
+            port,
+        )
         socket = AdapterProgram.accept(server)
         AdapterProgram.close(server)
         try
@@ -32,7 +34,8 @@ function adapter_main()::Cint
     else
         AdapterProgram.run_adapter(stdin, stdout)
     end
-    return 0
+    # A stalled, permanently unread controller must not look like a clean run.
+    return status === :output_failed ? Cint(1) : Cint(0)
 end
 
 function example_main()::Cint

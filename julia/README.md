@@ -135,6 +135,19 @@ the hard 128 MiB final-image gate must still pass before any capability is
 claimed. Oldest queued subscription values are dropped for a slow consumer;
 command acknowledgements instead fail on bounded backpressure.
 
+The compiled runtime occupies roughly 84 MiB of anonymous memory before it does
+any work, so the shared 128 MiB limit leaves headroom for about one
+near-maximum payload. The conformance adapter therefore admits large work
+through one process-wide budget: a query result and a Live update cannot
+materialise at the same time, admission itself is deadline bounded so a caller
+fails with a typed error rather than waiting forever, and reservations are
+released on every path. A controller that stays connected but never reads is
+treated as a transport failure, not a clean session: the writer's cumulative
+one-second deadline retires the adapter, which reports the stall on stderr and
+exits nonzero. Measured with a permanently unread controller and 32
+near-maximum HTTP results, peak container memory was 110.4 MiB of the 128 MiB
+limit with no OOM kill.
+
 The frame parser is bounded separately. It retains at most one maximal frame
 with its header plus any fragmented payload still being assembled, and every
 transport read is capped by whatever remains of that budget. A peer that
