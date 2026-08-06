@@ -40,15 +40,21 @@ limitations:
     local and hosted black-box conformance have not run, so capabilities remain
     deliberately empty.
   - >-
+    A checked-in final-adapter pressure gate now exercises stopped TCP output,
+    near-limit NDJSON and WebSocket messages, bounded send failure, later-value
+    recovery, output-reservation cleanup, and adapter-only cgroup memory. A
+    fresh Bruce run measured 113004544 bytes for the near-9-MiB command,
+    107626496 bytes for stopped-reader recovery, and 118751232 bytes for the
+    deadline case, all without OOM or leaked output reservations.
+  - >-
     Gleam has no conditional compilation, so the relay pause point used by the
     deterministic Live tests is an ordinary option that convex.new never
     supplies rather than test-only code excluded from the build. It is inert
     unless a caller passes a gate to convex.new_with_relay_gate.
   - >-
-    The shared README projector has no fence mapping for .gleam, so the
-    canonical README block uses a plain-text fence. The website reads the same
-    source and selects syntax by language ID, but its generated preview has not
-    been inspected in this Docker-only verification.
+    The test-only ADAPTER_TEST_SEND_BUFFER environment hook narrows only an
+    accepted adapter-controller socket for deterministic stopped-reader proof.
+    Public client HTTP and Live connections never use that accepting path.
   - >-
     Live authentication, WebSocket mutations and actions, and tagged Convex
     values are deferred.
@@ -69,7 +75,7 @@ limitations:
     Stdin and TCP commands share a 9 MiB newline-delimited frame limit and
     discard an incomplete fragment at end of input.
   - >-
-    A single WebSocket message is bounded at 8 MiB; a larger frame is protocol
+    A single WebSocket message is bounded at 7 MiB; a larger frame is protocol
     drift rather than something to buffer. A partial message has one absolute
     three-second deadline, even if the peer keeps dribbling bytes.
   - >-

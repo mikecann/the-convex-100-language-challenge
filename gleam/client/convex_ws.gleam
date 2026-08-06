@@ -25,7 +25,7 @@ const handshake_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 /// Largest single message this client will reassemble. Convex transitions in
 /// this demonstration are kilobytes; the bound turns a hostile or broken peer
 /// into a clear protocol error instead of unbounded growth.
-const max_message_bytes = 8_388_608
+const max_message_bytes = 7_340_032
 
 /// Largest handshake response head, matching the HTTP client's own bound.
 const max_head_bytes = 65_536
@@ -38,10 +38,19 @@ pub type Message {
   Close(code: Int, reason: String)
 }
 
-/// Incremental frame decoder. `fragment` holds the opcode and bytes of a
-/// message that is still arriving as continuation frames.
+/// Incremental frame decoder. Incoming TCP chunks stay separate until a whole
+/// frame is present, avoiding a quadratic copy of every partial large frame.
+/// `fragment` applies the same rule across continuation frames.
 pub opaque type Decoder {
-  Decoder(buffer: BitArray, fragment: Option(#(Int, BitArray)))
+  Decoder(
+    chunks: List(BitArray),
+    buffered_bytes: Int,
+    fragment: Option(Fragment),
+  )
+}
+
+type Fragment {
+  Fragment(opcode: Int, chunks: List(BitArray), bytes: Int)
 }
 
 /// One step of decoding: either a complete message, or a request for more
@@ -53,29 +62,140 @@ pub type Step {
 }
 
 pub fn new_decoder() -> Decoder {
-  Decoder(buffer: <<>>, fragment: None)
+  Decoder(chunks: [], buffered_bytes: 0, fragment: None)
 }
 
 /// Add freshly read bytes. Buffered bytes are kept, which is what makes a read
 /// timeout harmless part-way through a frame.
 pub fn feed(decoder: Decoder, bytes: BitArray) -> Decoder {
-  Decoder(..decoder, buffer: <<decoder.buffer:bits, bytes:bits>>)
+  Decoder(
+    ..decoder,
+    chunks: [bytes, ..decoder.chunks],
+    buffered_bytes: decoder.buffered_bytes + bit_array.byte_size(bytes),
+  )
 }
 
 /// True when the decoder is holding bytes of a frame it has not finished. A
 /// caller that wants to abandon a stalled connection can tell the difference
 /// between "idle" and "mid-frame".
 pub fn is_mid_message(decoder: Decoder) -> Bool {
-  decoder.fragment != None || bit_array.byte_size(decoder.buffer) > 0
+  decoder.fragment != None || decoder.buffered_bytes > 0
 }
 
 /// Pull the next complete message out of the buffer.
 pub fn next(decoder: Decoder) -> Step {
-  case parse_frame(decoder.buffer) {
+  let header = first_bytes(list.reverse(decoder.chunks), 10, [])
+  case frame_wire_bytes(header) {
     Error(message) -> Failed(message)
     Ok(None) -> NeedMore(decoder)
-    Ok(Some(#(final, opcode, payload, rest))) ->
-      apply_frame(Decoder(..decoder, buffer: rest), final, opcode, payload)
+    Ok(Some(frame_bytes)) ->
+      case decoder.buffered_bytes < frame_bytes {
+        True -> NeedMore(decoder)
+        False -> {
+          // Join once at the complete-frame boundary. The old implementation
+          // appended on every TCP read, making a near-limit frame quadratic.
+          let input =
+            decoder.chunks
+            |> list.reverse
+            |> convex_sys.concat_binaries
+          case parse_frame(input) {
+            Error(message) -> Failed(message)
+            Ok(None) -> Failed("complete WebSocket frame could not be decoded")
+            Ok(Some(#(final, opcode, payload, rest))) -> {
+              let rest_bytes = bit_array.byte_size(rest)
+              let decoder =
+                Decoder(
+                  ..decoder,
+                  chunks: case rest_bytes == 0 {
+                    True -> []
+                    False -> [rest]
+                  },
+                  buffered_bytes: rest_bytes,
+                )
+              apply_frame(decoder, final, opcode, payload)
+            }
+          }
+        }
+      }
+  }
+}
+
+/// Copy at most the ten bytes needed to inspect an RFC 6455 frame header.
+fn first_bytes(
+  chunks: List(BitArray),
+  remaining: Int,
+  taken: List(BitArray),
+) -> BitArray {
+  case chunks, remaining {
+    _, 0 | [], _ ->
+      taken
+      |> list.reverse
+      |> convex_sys.concat_binaries
+    [chunk, ..rest], _ -> {
+      let size = bit_array.byte_size(chunk)
+      case size <= remaining {
+        True -> first_bytes(rest, remaining - size, [chunk, ..taken])
+        False -> {
+          let assert Ok(prefix) = bit_array.slice(chunk, 0, remaining)
+          first_bytes([], 0, [prefix, ..taken])
+        }
+      }
+    }
+  }
+}
+
+/// Return the complete on-wire frame size as soon as its header is present.
+/// Oversized frames fail from the header without retaining their payload.
+fn frame_wire_bytes(header: BitArray) -> Result(Option(Int), String) {
+  case header {
+    <<
+      final:size(1),
+      reserved:size(3),
+      opcode:size(4),
+      masked:size(1),
+      length:size(7),
+      rest:bits,
+    >> ->
+      case
+        reserved != 0,
+        masked == 1,
+        control_frame_is_valid(opcode, final == 1, length)
+      {
+        True, _, _ -> Error("reserved WebSocket bits are set")
+        _, True, _ -> Error("server sent a masked WebSocket frame")
+        _, _, False -> Error("fragmented or oversized control frame")
+        False, False, True -> frame_wire_bytes_for_length(length, rest)
+      }
+    _ -> Ok(None)
+  }
+}
+
+fn frame_wire_bytes_for_length(
+  length: Int,
+  rest: BitArray,
+) -> Result(Option(Int), String) {
+  case length {
+    126 ->
+      case rest {
+        <<extended:size(16)-unsigned-big-int, _rest:bits>> ->
+          case extended >= 126, extended <= max_message_bytes {
+            False, _ -> Error("WebSocket length is not minimally encoded")
+            _, False -> Error("WebSocket frame exceeds the client limit")
+            True, True -> Ok(Some(4 + extended))
+          }
+        _ -> Ok(None)
+      }
+    127 ->
+      case rest {
+        <<extended:size(64)-unsigned-big-int, _rest:bits>> ->
+          case extended >= 65_536, extended <= max_message_bytes {
+            False, _ -> Error("WebSocket length is not minimally encoded")
+            _, False -> Error("WebSocket frame exceeds the client limit")
+            True, True -> Ok(Some(10 + extended))
+          }
+        _ -> Ok(None)
+      }
+    _ -> Ok(Some(2 + length))
   }
 }
 
@@ -94,25 +214,51 @@ fn apply_frame(
     0x0 ->
       case decoder.fragment {
         None -> Failed("continuation frame without a started message")
-        Some(#(started, bytes)) ->
-          finish(decoder, final, started, <<bytes:bits, payload:bits>>)
+        Some(Fragment(started, chunks, bytes)) ->
+          finish(
+            decoder,
+            final,
+            started,
+            [payload, ..chunks],
+            bytes + bit_array.byte_size(payload),
+          )
       }
     0x1 | 0x2 ->
       case decoder.fragment {
         Some(_) -> Failed("new data frame while a message was still arriving")
-        None -> finish(decoder, final, opcode, payload)
+        None ->
+          finish(
+            decoder,
+            final,
+            opcode,
+            [payload],
+            bit_array.byte_size(payload),
+          )
       }
     _ -> Failed("unknown WebSocket opcode")
   }
 }
 
-fn finish(decoder: Decoder, final: Bool, opcode: Int, bytes: BitArray) -> Step {
-  case bit_array.byte_size(bytes) > max_message_bytes {
+fn finish(
+  decoder: Decoder,
+  final: Bool,
+  opcode: Int,
+  chunks: List(BitArray),
+  bytes: Int,
+) -> Step {
+  case bytes > max_message_bytes {
     True -> Failed("WebSocket message exceeds the client limit")
     False ->
       case final {
-        False -> NeedMore(Decoder(..decoder, fragment: Some(#(opcode, bytes))))
-        True ->
+        False ->
+          NeedMore(
+            Decoder(..decoder, fragment: Some(Fragment(opcode, chunks, bytes))),
+          )
+        True -> {
+          let bytes =
+            chunks
+            |> list.reverse
+            |> convex_sys.concat_binaries
           case opcode {
             0x1 ->
               // Text is decoded only once the whole message is present, so a
@@ -123,6 +269,7 @@ fn finish(decoder: Decoder, final: Bool, opcode: Int, bytes: BitArray) -> Step {
               }
             _ -> Decoded(BinaryMessage(bytes), clear(decoder))
           }
+        }
       }
   }
 }

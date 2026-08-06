@@ -20,7 +20,8 @@ COPY client/convex.gleam client/convex_error.gleam client/convex_http.gleam \
 COPY client/tests/convex_check.gleam client/tests/convex_codec_test.gleam \
      client/tests/convex_live_socket_test.gleam ./src/
 COPY client/tests/conformance/adapter.gleam \
-     client/tests/conformance/adapter_test.gleam ./src/
+     client/tests/conformance/adapter_test.gleam \
+     client/tests/conformance/adapter_pressure.erl ./src/
 COPY examples/basics/main.gleam examples/basics/main_test.gleam ./src/
 
 # The toolchain in the image must be the one the adapter reports as its
@@ -41,6 +42,7 @@ RUN gleam build --target erlang
 RUN erl -noshell -pa build/dev/erlang/*/ebin -s convex_codec_test main -s init stop
 RUN erl -noshell -pa build/dev/erlang/*/ebin -s convex_live_socket_test main -s init stop
 RUN erl -noshell -pa build/dev/erlang/*/ebin -s adapter_test main -s init stop
+RUN erl -noshell -pa build/dev/erlang/*/ebin -s adapter_pressure self_test -s init stop
 RUN erl -noshell -pa build/dev/erlang/*/ebin -s main_test main -s init stop
 
 # The adapter must speak protocol v1 over stdin/stdout before anything else
@@ -190,6 +192,18 @@ RUN set -eu; \
     code=0; CONVEX_URL=invalid /usr/local/bin/convex-example >/tmp/example.out 2>/tmp/example.err || code=$?; \
     test "$code" -ne 0 && test ! -s /tmp/example.out
 ENTRYPOINT ["/usr/local/bin/convex-example"]
+
+# These two images contain only the checked-in pressure fixture/controller and
+# the same minimal Erlang runtime. The host-side probe runs them in sibling
+# cgroups while the untouched `runtime` image runs its exact default adapter
+# entrypoint under the 128 MiB limit.
+FROM runtime-base AS adapter-pressure-fixture
+COPY --from=build /app/build/dev/erlang/convex/ebin/adapter_pressure.beam /opt/pressure/adapter_pressure.beam
+ENTRYPOINT ["erl", "-noshell", "-pa", "/opt/pressure", "-s", "adapter_pressure", "fixture_main", "-s", "init", "stop"]
+
+FROM runtime-base AS adapter-pressure-controller
+COPY --from=build /app/build/dev/erlang/convex/ebin/adapter_pressure.beam /opt/pressure/adapter_pressure.beam
+ENTRYPOINT ["erl", "-noshell", "-pa", "/opt/pressure", "-s", "adapter_pressure", "controller_main", "-s", "init", "stop"]
 
 FROM runtime-base AS runtime
 COPY --from=build /app/adapter-ebin /opt/convex

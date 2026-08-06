@@ -48,7 +48,7 @@ black-box conformance runs, so no capability has been earned or claimed.
 ## The canonical example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.gleam -->
-```text
+```gleam
 //// Convex from Gleam: one shared counter, read two different ways.
 ////
 //// The program reads a room's counter over Convex's HTTP API, subscribes to
@@ -220,6 +220,10 @@ Everything is built and run inside Docker; nothing is installed on the host.
 ./run verify gleam         # example plus shared conformance, local backend
 ./run verify-hosted gleam  # the same, against the hosted drift target
 ./run verify-all gleam     # both deployment profiles from one built image
+
+# On an approved Linux Docker host, isolate the real final adapter under its
+# 128 MiB cgroup and stop its TCP output reader near the 8/9 MiB boundaries.
+REPO_ROOT=$PWD gleam/client/tests/conformance/final_adapter_pressure_probe.sh
 ```
 
 `test` proves the source compiles and that the codec, fixture-server, and
@@ -229,6 +233,22 @@ shared transcript. `verify` adds the shared black-box conformance suite, and
 `verify-hosted` repeats it against the drift target so protocol changes are
 caught. Compilation is not example evidence, and example success is not
 conformance.
+
+The dedicated pressure probe builds the exact final `runtime` image plus two
+test-only sibling images. It keeps the fixture and controller out of the
+adapter's cgroup, runs `/usr/local/bin/convex-adapter` through its unchanged
+default entrypoint, and measures only that process tree. A first process proves
+a legal NDJSON command above 8 MiB but below the 9 MiB limit is rejected as an
+unknown operation and the same parser recovers. Two fresh processes receive a
+declared WebSocket frame above the conservative 7 MiB client limit but below 8
+MiB, report that bounded protocol error, and reconnect for legal large values.
+One resumes a physically stalled reader; the other remains stopped until the
+one-second send deadline closes it. The fresh Bruce Docker run measured peaks
+of 113,004,544, 107,626,496, and 118,751,232 bytes respectively, with no OOM
+and zero retained output reservations at every shutdown.
+The probe sets the adapter-only `ADAPTER_TEST_SEND_BUFFER` hook to 4 KiB so
+kernel autotuning cannot turn the stopped reader into a false non-blocking
+pass; public client connections never use the accepting-socket code path.
 
 ## How it fits together
 
@@ -276,7 +296,7 @@ structured function errors even when an HTTP intermediary changes the status;
 a non-success status carrying a success-shaped envelope is protocol drift.
 Live permits at most eight active subscriptions and 8 MiB of retained encoded
 paths and arguments. The connection keeps one session identifier across
-reconnects, limits each WebSocket message to 8 MiB, and abandons a partial
+reconnects, limits each WebSocket message to 7 MiB, and abandons a partial
 message if it cannot finish within three seconds.
 
 ## Limitations
@@ -290,10 +310,6 @@ message if it cannot finish within three seconds.
 * Gleam has no conditional compilation, so the relay pause point the
   deterministic tests use is an inert option rather than test-only code
   excluded from the build. `convex.new` never supplies one.
-* The shared README projector has no fence mapping for `.gleam`, so the block
-  above uses a plain-text fence. The website reads the same source and selects
-  syntax by language ID, but its generated preview has not been inspected in
-  this Docker-only verification.
 * Live authentication, WebSocket mutations and actions, and tagged Convex
   values are deferred.
 * `TransitionChunk` assembly is deferred; receiving one is treated as protocol
@@ -301,4 +317,4 @@ message if it cannot finish within three seconds.
 * Delivery is bounded: at most eight active subscriptions; 16 newest
   undelivered events and 8 MiB of conservatively charged storage per
   subscription; one global 16-event and 12 MiB encoded output budget in the
-  adapter; a 9 MiB NDJSON command limit; and an 8 MiB WebSocket message limit.
+  adapter; a 9 MiB NDJSON command limit; and a 7 MiB WebSocket message limit.

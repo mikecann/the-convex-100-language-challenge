@@ -348,6 +348,13 @@ fn websocket_framing() -> Nil {
     },
   )
   check.ok(
+    "an oversized data frame is refused from its header",
+    case ws.next(ws.feed(ws.new_decoder(), <<0x81, 127, 7_864_320:size(64)>>)) {
+      ws.Failed(_) -> True
+      _ -> False
+    },
+  )
+  check.ok(
     "an invalid close code is refused",
     case ws.next(ws.feed(ws.new_decoder(), <<0x88, 0x02, 0x03, 0xED>>)) {
       ws.Failed(_) -> True

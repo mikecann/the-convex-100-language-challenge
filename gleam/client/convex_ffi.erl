@@ -99,8 +99,29 @@ listen_port({tcp, Socket}) ->
 
 accept({tcp, Socket}, Timeout) ->
     case gen_tcp:accept(Socket, Timeout) of
-        {ok, Accepted} -> {ok, {tcp, Accepted}};
+        {ok, Accepted} ->
+            case apply_test_send_buffer(Accepted) of
+                ok -> {ok, {tcp, Accepted}};
+                {error, Reason} ->
+                    _ = gen_tcp:close(Accepted),
+                    {error, reason(Reason)}
+            end;
         {error, Reason} -> {error, reason(Reason)}
+    end.
+
+%% The conformance adapter is itself test infrastructure. Its stopped-reader
+%% probe narrows the accepted controller socket's kernel send buffer so a
+%% near-maximum event must physically block instead of fitting in host-specific
+%% autotuned capacity. Public client connections never call accept/2.
+apply_test_send_buffer(Socket) ->
+    case os:getenv("ADAPTER_TEST_SEND_BUFFER") of
+        false -> ok;
+        Text ->
+            case string:to_integer(Text) of
+                {Size, []} when Size >= 1024, Size =< 65536 ->
+                    inet:setopts(Socket, [{sndbuf, Size}]);
+                _ -> {error, invalid_test_send_buffer}
+            end
     end.
 
 sha1(Data) ->

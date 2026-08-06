@@ -58,6 +58,19 @@ const ack_timeout = 5000
 
 const read_chunk = 16_384
 
+/// The adapter accepts individual commands close to 9 MiB. Once one command
+/// has been acknowledged, retaining its expanded JSON heap until a later
+/// generational collection would make two sequential legal messages overlap
+/// inside the shared 128 MiB runtime cgroup. This adapter-local collection
+/// barrier releases that completed command before the reader accepts another.
+@external(erlang, "erlang", "garbage_collect")
+fn garbage_collect() -> Bool
+
+fn release_completed_command() -> Nil {
+  let _ = garbage_collect()
+  Nil
+}
+
 pub fn main() -> Nil {
   let url = convex_sys.env("CONVEX_URL", "http://127.0.0.1:3210")
   case convex.new(url) {
@@ -176,7 +189,22 @@ fn run(client: Client, channel: Channel) -> Nil {
     )
   serve(controller)
   let _ = flush(writer, 2000)
-  process.send(writer, StopWriter)
+  let stopped = stop_writer(writer)
+  case convex_sys.getenv("ADAPTER_RESERVATION_DIAGNOSTIC"), stopped {
+    Ok("1"), Ok(WriterStopped(released_count, released_bytes, 0, 0)) ->
+      convex_sys.stderr_write(
+        "adapter output reservations released: count="
+        <> int.to_string(released_count)
+        <> " bytes="
+        <> int.to_string(released_bytes)
+        <> " remaining_count=0 remaining_bytes=0",
+      )
+    Ok("1"), _ ->
+      convex_sys.stderr_write(
+        "adapter output reservation cleanup did not complete cleanly",
+      )
+    _, _ -> Nil
+  }
   Nil
 }
 
@@ -219,6 +247,7 @@ fn serve(controller: Controller) -> Nil {
     Ok(Incoming(payload, ack)) -> {
       let #(controller, outcome, stop) = handle_line(controller, payload)
       process.send(ack, Nil)
+      release_completed_command()
       case stop {
         True -> {
           let _ = flush(controller.writer, 2000)
@@ -837,7 +866,11 @@ fn deliver(
 ) -> Result(Nil, Nil) {
   let ack = process.new_subject()
   process.send(events, build(ack))
-  process.receive(ack, ack_timeout)
+  let outcome = process.receive(ack, ack_timeout)
+  // The controller has finished with this command, so the reader must not
+  // retain its assembled binary while it waits for the next line.
+  release_completed_command()
+  outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -853,7 +886,16 @@ type WriterMessage {
   Enqueue(payload: BitArray, reply: Subject(EmitResult))
   SendDone(result: Result(Nil, String))
   FlushWhenIdle(reply: Subject(Nil))
-  StopWriter
+  StopWriter(reply: Subject(WriterStop))
+}
+
+type WriterStop {
+  WriterStopped(
+    released_count: Int,
+    released_bytes: Int,
+    remaining_count: Int,
+    remaining_bytes: Int,
+  )
 }
 
 type Writer {
@@ -906,10 +948,26 @@ fn start_writer(
 fn writer_loop(writer: Writer, inbox: Subject(WriterMessage)) -> Nil {
   case process.receive(inbox, 60_000) {
     Error(_) -> writer_loop(writer, inbox)
-    Ok(StopWriter) -> {
+    Ok(StopWriter(reply)) -> {
       // Killing the sender before anything else bounds shutdown even when the
-      // peer has stopped reading and a write is blocked in the kernel.
+      // peer has stopped reading and a write is blocked in the kernel. Ending
+      // this owner then drops every queued and in-flight binary together. The
+      // pressure probe asks for the before/after counts so that cleanup is an
+      // observed final-adapter property rather than an assumption.
       let _ = convex_sys.kill_and_wait(writer.sender_pid, 1000)
+      let cleared =
+        Writer(
+          ..writer,
+          queue: [],
+          count: 0,
+          bytes: 0,
+          inflight: None,
+          waiters: [],
+        )
+      process.send(
+        reply,
+        WriterStopped(writer.count, writer.bytes, cleared.count, cleared.bytes),
+      )
       Nil
     }
     Ok(Enqueue(payload, reply)) -> {
@@ -1040,4 +1098,10 @@ fn flush(writer: Subject(WriterMessage), timeout: Int) -> Result(Nil, Nil) {
   let reply = process.new_subject()
   process.send(writer, FlushWhenIdle(reply))
   process.receive(reply, timeout)
+}
+
+fn stop_writer(writer: Subject(WriterMessage)) -> Result(WriterStop, Nil) {
+  let reply = process.new_subject()
+  process.send(writer, StopWriter(reply))
+  process.receive(reply, 2000)
 }
