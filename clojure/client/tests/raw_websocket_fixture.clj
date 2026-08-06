@@ -130,7 +130,12 @@
   java.lang.AutoCloseable
   (close [_]
     (.set ^AtomicBoolean stopped true)
-    (.close server)
+    ;; Closing the listener interrupts a concurrent accept. Some runtimes report
+    ;; that expected interruption as IOException, so cleanup must continue and
+    ;; still surface a real fixture-worker failure below.
+    (try
+      (.close server)
+      (catch java.io.IOException _ nil))
     (doseq [socket sockets]
       (try (.close ^Socket socket) (catch Throwable _ nil)))
     (.shutdownNow executor)
