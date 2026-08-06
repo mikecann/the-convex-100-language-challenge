@@ -12,12 +12,14 @@ import (
 	"net"
 	"os"
 	"runtime"
-	"sync"
+	"time"
 
 	convex "github.com/mikecann/100-convex-clients/go/client"
 )
 
 const adapterProtocolVersion = 1
+
+const adapterClientCloseTimeout = time.Second
 
 type command struct {
 	ID              string          `json:"id"`
@@ -32,7 +34,7 @@ type command struct {
 type adapterError struct {
 	Name    string          `json:"name"`
 	Message string          `json:"message"`
-	Data    json.RawMessage `json:"data"`
+	Data    json.RawMessage `json:"data,omitempty"`
 }
 
 type event struct {
@@ -48,16 +50,80 @@ type event struct {
 	Error           *adapterError   `json:"error,omitempty"`
 }
 
-type output struct {
-	mu     sync.Mutex
-	writer io.Writer
+type adapterHooks struct {
+	afterRelayDequeue func(subscriptionID string, generation uint64)
 }
 
-func (o *output) write(value event) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if err := json.NewEncoder(o.writer).Encode(value); err != nil {
-		fmt.Fprintln(os.Stderr, "encode adapter event:", err)
+type adapterSubscription struct {
+	subscription *convex.Subscription
+	generation   uint64
+}
+
+func failureEvent(id string, subscriptionID string, err error) event {
+	name := "Error"
+	var data json.RawMessage
+	var functionErr *convex.FunctionError
+	var protocolErr *convex.ProtocolError
+	var transportErr *convex.TransportError
+	switch {
+	case errors.As(err, &functionErr):
+		name = "FunctionError"
+		data = functionErr.Data
+	case errors.As(err, &protocolErr):
+		name = "ProtocolError"
+	case errors.As(err, &transportErr):
+		name = "TransportError"
+	}
+
+	failure := event{
+		ID:             id,
+		Type:           "error",
+		SubscriptionID: subscriptionID,
+		Error: &adapterError{
+			Name:    name,
+			Message: err.Error(),
+			Data:    data,
+		},
+	}
+	return finishFailureEvent(failure, subscriptionID, functionErr)
+}
+
+func finishFailureEvent(failure event, subscriptionID string, functionErr *convex.FunctionError) event {
+	if subscriptionID != "" {
+		failure.ID = ""
+		failure.Type = "subscription"
+	}
+	if functionErr != nil {
+		failure.Logs = functionErr.LogLines
+	}
+	return failure
+}
+
+func relaySubscription(
+	subscriptionID string,
+	generation uint64,
+	updates <-chan convex.Update,
+	out *output,
+	hooks *adapterHooks,
+) {
+	for update := range updates {
+		if hooks != nil && hooks.afterRelayDequeue != nil {
+			hooks.afterRelayDequeue(subscriptionID, generation)
+		}
+		var value event
+		if update.Err != nil {
+			value = failureEvent("", subscriptionID, update.Err)
+		} else {
+			value = event{
+				Type:           "subscription",
+				SubscriptionID: subscriptionID,
+				Value:          update.Value,
+				Logs:           update.LogLines,
+			}
+		}
+		if err := out.writeRelay(value, subscriptionID, generation); err != nil {
+			return
+		}
 	}
 }
 
@@ -85,15 +151,25 @@ func main() {
 }
 
 func runAdapter(reader io.Reader, writer io.Writer) {
-	out := &output{writer: writer}
+	runAdapterWithHooks(reader, writer, nil)
+}
+
+func runAdapterWithHooks(reader io.Reader, writer io.Writer, hooks *adapterHooks) {
+	out := newOutput(writer)
+	defer out.close(adapterOutputCloseTimeout)
 	var client *convex.Client
-	var clientMu sync.Mutex
-	subscriptions := make(map[string]*convex.Subscription)
-	var subscriptionsMu sync.Mutex
+	defer func() {
+		if client == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), adapterClientCloseTimeout)
+		defer cancel()
+		_ = client.Close(ctx)
+	}()
+	subscriptions := make(map[string]adapterSubscription)
+	nextRelayGeneration := uint64(0)
 
 	ensureClient := func() (*convex.Client, error) {
-		clientMu.Lock()
-		defer clientMu.Unlock()
 		if client != nil {
 			return client, nil
 		}
@@ -113,42 +189,8 @@ func runAdapter(reader io.Reader, writer io.Writer) {
 		return client, nil
 	}
 
-	writeFailure := func(id string, subscriptionID string, err error) {
-		name := "Error"
-		data := json.RawMessage(`null`)
-		var functionErr *convex.FunctionError
-		var protocolErr *convex.ProtocolError
-		var transportErr *convex.TransportError
-		switch {
-		case errors.As(err, &functionErr):
-			name = "FunctionError"
-			if functionErr.Data != nil {
-				data = functionErr.Data
-			}
-		case errors.As(err, &protocolErr):
-			name = "ProtocolError"
-		case errors.As(err, &transportErr):
-			name = "TransportError"
-		}
-
-		failure := event{
-			ID:             id,
-			Type:           "error",
-			SubscriptionID: subscriptionID,
-			Error: &adapterError{
-				Name:    name,
-				Message: err.Error(),
-				Data:    data,
-			},
-		}
-		if subscriptionID != "" {
-			failure.ID = ""
-			failure.Type = "subscription"
-		}
-		if functionErr != nil {
-			failure.Logs = functionErr.LogLines
-		}
-		out.write(failure)
+	writeFailure := func(id string, subscriptionID string, err error) error {
+		return out.write(failureEvent(id, subscriptionID, err))
 	}
 
 	scanner := bufio.NewScanner(reader)
@@ -156,7 +198,9 @@ func runAdapter(reader io.Reader, writer io.Writer) {
 	for scanner.Scan() {
 		var cmd command
 		if err := json.Unmarshal(scanner.Bytes(), &cmd); err != nil {
-			writeFailure("", "", fmt.Errorf("decode command: %w", err))
+			if writeErr := writeFailure("", "", fmt.Errorf("decode command: %w", err)); writeErr != nil {
+				return
+			}
 			continue
 		}
 		if cmd.Args == nil {
@@ -166,24 +210,30 @@ func runAdapter(reader io.Reader, writer io.Writer) {
 		switch cmd.Op {
 		case "hello":
 			if cmd.ProtocolVersion != adapterProtocolVersion {
-				writeFailure(cmd.ID, "", fmt.Errorf(
+				if err := writeFailure(cmd.ID, "", fmt.Errorf(
 					"unsupported adapter protocol version %d", cmd.ProtocolVersion,
-				))
+				)); err != nil {
+					return
+				}
 				continue
 			}
-			out.write(event{
+			if err := out.write(event{
 				ProtocolVersion: adapterProtocolVersion,
 				ID:              cmd.ID,
 				Type:            "ready",
 				Language:        "go",
 				Implementation:  "native-go-" + runtime.Version(),
 				Runtime:         runtime.Version(),
-			})
+			}); err != nil {
+				return
+			}
 
 		case "query", "mutation", "action":
 			activeClient, err := ensureClient()
 			if err != nil {
-				writeFailure(cmd.ID, "", err)
+				if writeErr := writeFailure(cmd.ID, "", err); writeErr != nil {
+					return
+				}
 				continue
 			}
 			var result convex.Result
@@ -196,15 +246,19 @@ func runAdapter(reader io.Reader, writer io.Writer) {
 				result, err = activeClient.Action(context.Background(), cmd.Path, cmd.Args)
 			}
 			if err != nil {
-				writeFailure(cmd.ID, "", err)
+				if writeErr := writeFailure(cmd.ID, "", err); writeErr != nil {
+					return
+				}
 				continue
 			}
-			out.write(event{
+			if err := out.write(event{
 				ID:    cmd.ID,
 				Type:  "result",
 				Value: result.Value,
 				Logs:  result.LogLines,
-			})
+			}); err != nil {
+				return
+			}
 
 		case "setAuth":
 			activeClient, err := ensureClient()
@@ -212,66 +266,81 @@ func runAdapter(reader io.Reader, writer io.Writer) {
 				err = activeClient.SetAuth(cmd.Token)
 			}
 			if err != nil {
-				writeFailure(cmd.ID, "", err)
+				if writeErr := writeFailure(cmd.ID, "", err); writeErr != nil {
+					return
+				}
 				continue
 			}
-			out.write(event{ID: cmd.ID, Type: "ack"})
+			if err := out.write(event{ID: cmd.ID, Type: "ack"}); err != nil {
+				return
+			}
 
 		case "subscribe":
 			if cmd.SubscriptionID == "" {
-				writeFailure(cmd.ID, "", errors.New("subscriptionId is required"))
+				if err := writeFailure(cmd.ID, "", errors.New("subscriptionId is required")); err != nil {
+					return
+				}
 				continue
 			}
 			activeClient, err := ensureClient()
 			if err != nil {
-				writeFailure(cmd.ID, "", err)
+				if writeErr := writeFailure(cmd.ID, "", err); writeErr != nil {
+					return
+				}
 				continue
 			}
 			subscription, err := activeClient.Subscribe(context.Background(), cmd.Path, cmd.Args)
 			if err != nil {
-				writeFailure(cmd.ID, "", err)
+				if writeErr := writeFailure(cmd.ID, "", err); writeErr != nil {
+					return
+				}
 				continue
 			}
-			subscriptionsMu.Lock()
-			if previous := subscriptions[cmd.SubscriptionID]; previous != nil {
-				_ = previous.Close()
+			if previous, ok := subscriptions[cmd.SubscriptionID]; ok {
+				if err := out.invalidateRelay(cmd.SubscriptionID, previous.generation); err != nil {
+					_ = subscription.Close()
+					return
+				}
+				_ = previous.subscription.Close()
 			}
-			subscriptions[cmd.SubscriptionID] = subscription
-			subscriptionsMu.Unlock()
-			out.write(event{
+			nextRelayGeneration++
+			generation := nextRelayGeneration
+			if err := out.activateRelay(cmd.SubscriptionID, generation); err != nil {
+				_ = subscription.Close()
+				return
+			}
+			subscriptions[cmd.SubscriptionID] = adapterSubscription{
+				subscription: subscription,
+				generation:   generation,
+			}
+			if err := out.write(event{
 				ID:   cmd.ID,
 				Type: "ack",
-			})
-			go func(subscriptionID string, sub *convex.Subscription) {
-				for update := range sub.Updates() {
-					if update.Err != nil {
-						writeFailure("", subscriptionID, update.Err)
-						continue
-					}
-					out.write(event{
-						Type:           "subscription",
-						SubscriptionID: subscriptionID,
-						Value:          update.Value,
-						Logs:           update.LogLines,
-					})
-				}
-			}(cmd.SubscriptionID, subscription)
+			}); err != nil {
+				return
+			}
+			go relaySubscription(cmd.SubscriptionID, generation, subscription.Updates(), out, hooks)
 
 		case "unsubscribe":
-			subscriptionsMu.Lock()
-			subscription := subscriptions[cmd.SubscriptionID]
+			state, ok := subscriptions[cmd.SubscriptionID]
 			delete(subscriptions, cmd.SubscriptionID)
-			subscriptionsMu.Unlock()
-			if subscription != nil {
-				if err := subscription.Close(); err != nil {
-					writeFailure(cmd.ID, "", err)
+			if ok {
+				if err := out.invalidateRelay(cmd.SubscriptionID, state.generation); err != nil {
+					return
+				}
+				if err := state.subscription.Close(); err != nil {
+					if writeErr := writeFailure(cmd.ID, "", err); writeErr != nil {
+						return
+					}
 					continue
 				}
 			}
-			out.write(event{
+			if err := out.write(event{
 				ID:   cmd.ID,
 				Type: "ack",
-			})
+			}); err != nil {
+				return
+			}
 
 		case "debugDisconnect":
 			activeClient, err := ensureClient()
@@ -279,31 +348,39 @@ func runAdapter(reader io.Reader, writer io.Writer) {
 				err = activeClient.DebugDisconnectForAdapter()
 			}
 			if err != nil {
-				writeFailure(cmd.ID, "", err)
+				if writeErr := writeFailure(cmd.ID, "", err); writeErr != nil {
+					return
+				}
 				continue
 			}
-			out.write(event{
+			if err := out.write(event{
 				ID:   cmd.ID,
 				Type: "ack",
-			})
+			}); err != nil {
+				return
+			}
 
 		case "close":
-			subscriptionsMu.Lock()
-			for id, subscription := range subscriptions {
-				_ = subscription.Close()
+			for id, state := range subscriptions {
+				if err := out.invalidateRelay(id, state.generation); err != nil {
+					return
+				}
 				delete(subscriptions, id)
 			}
-			subscriptionsMu.Unlock()
-			clientMu.Lock()
 			if client != nil {
-				_ = client.Close(context.Background())
+				ctx, cancel := context.WithTimeout(context.Background(), adapterClientCloseTimeout)
+				_ = client.Close(ctx)
+				cancel()
 			}
-			clientMu.Unlock()
-			out.write(event{ID: cmd.ID, Type: "closed"})
+			if err := out.write(event{ID: cmd.ID, Type: "closed"}); err != nil {
+				return
+			}
 			return
 
 		default:
-			writeFailure(cmd.ID, "", fmt.Errorf("unknown operation %q", cmd.Op))
+			if err := writeFailure(cmd.ID, "", fmt.Errorf("unknown operation %q", cmd.Op)); err != nil {
+				return
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {

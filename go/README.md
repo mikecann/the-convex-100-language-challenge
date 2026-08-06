@@ -24,11 +24,11 @@ and tested inside Docker, so no Go toolchain is installed on the host.
 
 | Capability | Status |
 | --- | --- |
-| Queries, mutations, and actions over HTTP | Works |
-| Bearer-token authentication for HTTP calls | Works |
-| Initial and updated Live query values | Works |
-| Unsubscribe, reconnect, timeouts, and clean shutdown | Works |
-| Canonical basic example executed in Docker | Works |
+| Queries, mutations, and actions over HTTP | Implemented and covered by Go-local tests; shared verification pending |
+| Bearer-token authentication for HTTP calls | Implemented and covered by Go-local tests |
+| Initial and updated Live query values | Implemented and covered by Go-local tests; shared verification pending |
+| Unsubscribe, reconnect, timeouts, and clean shutdown | Implemented and covered by Go-local tests |
+| Canonical basic example executed in Docker | Shared example verification pending |
 | Authentication for Live subscriptions | Not yet |
 | Full tagged Convex value types | Not yet |
 
@@ -39,11 +39,13 @@ and tested inside Docker, so no Go toolchain is installed on the host.
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"os"
 	"time"
 
@@ -52,7 +54,45 @@ import (
 
 // roomState is the part of the Convex query result used by this example.
 type roomState struct {
-	Count float64 `json:"count"`
+	Count integralCount
+}
+
+// integralCount accepts Convex's integral decimal forms, such as 1.0, without
+// letting float rounding turn a fractional or overflowing value into an integer.
+type integralCount int64
+
+func (state *roomState) UnmarshalJSON(raw []byte) error {
+	var encoded struct {
+		Count json.RawMessage `json:"count"`
+	}
+	if err := json.Unmarshal(raw, &encoded); err != nil {
+		return err
+	}
+	if encoded.Count == nil {
+		return fmt.Errorf("count is required")
+	}
+	return json.Unmarshal(encoded.Count, &state.Count)
+}
+
+func (count *integralCount) UnmarshalJSON(raw []byte) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] == '"' {
+		return fmt.Errorf("count must be a JSON number")
+	}
+	var number json.Number
+	if err := json.Unmarshal(trimmed, &number); err != nil {
+		return fmt.Errorf("count must be a finite JSON number: %w", err)
+	}
+	rational, ok := new(big.Rat).SetString(number.String())
+	if !ok || !rational.IsInt() {
+		return fmt.Errorf("count must be mathematically integral")
+	}
+	integer := rational.Num()
+	if !integer.IsInt64() {
+		return fmt.Errorf("count is outside the int64 range")
+	}
+	*count = integralCount(integer.Int64())
+	return nil
 }
 
 // incrementResult mirrors the mutation response so the example can verify that
@@ -93,7 +133,7 @@ func main() {
 	var state roomState
 	// Decode the JSON result into a typed Go value the application can use.
 	decodeJSON("current query", result.Value, &state)
-	fmt.Printf("current count: %.0f\n", state.Count)
+	fmt.Printf("current count: %d\n", state.Count)
 
 	// Begin listening for changes to the same query over Convex Live.
 	subscription, err := client.Subscribe(ctx, "demo:state", map[string]any{"room": room})
@@ -110,7 +150,7 @@ func main() {
 	var initialState roomState
 	decodeJSON("initial Live value", initialValue, &initialState)
 	expectCount("initial Live value", initialState.Count, state.Count)
-	fmt.Printf("live initial count: %.0f\n", initialState.Count)
+	fmt.Printf("live initial count: %d\n", initialState.Count)
 
 	// Run a mutation over HTTP. The subscription above will observe this write.
 	mutation, err := client.Mutation(ctx, "demo:increment", map[string]any{
@@ -127,20 +167,23 @@ func main() {
 		panic("mutation was not applied")
 	}
 	fmt.Printf("mutation applied: %t\n", increment.Applied)
+	if state.Count == integralCount(1<<63-1) {
+		panic("current count cannot be incremented within the int64 range")
+	}
 	expectedCount := state.Count + 1
 	expectCount("mutation", increment.State.Count, expectedCount)
-	fmt.Printf("mutation count: %.0f\n", increment.State.Count)
+	fmt.Printf("mutation count: %d\n", increment.State.Count)
 
 	// Receive the changed room through Live without issuing another HTTP query.
 	updatedValue := nextUpdate(subscription)
 	var updatedState roomState
 	decodeJSON("updated Live value", updatedValue, &updatedState)
 	expectCount("updated Live value", updatedState.Count, expectedCount)
-	fmt.Printf("live updated count: %.0f\n", updatedState.Count)
+	fmt.Printf("live updated count: %d\n", updatedState.Count)
 
 	// Reaching this line proves the query, mutation, and Live subscription all
 	// agreed on the same change.
-	fmt.Printf("verified count: %.0f -> %.0f\n", state.Count, updatedState.Count)
+	fmt.Printf("verified count: %d -> %d\n", state.Count, updatedState.Count)
 }
 
 // nextUpdate waits for one value from a Live subscription. It turns a closed
@@ -170,9 +213,9 @@ func decodeJSON(operation string, raw json.RawMessage, destination any) {
 
 // expectCount makes the example fail instead of merely printing an unexpected
 // value. Docker uses that failure to reject a broken example.
-func expectCount(operation string, actual float64, expected float64) {
+func expectCount(operation string, actual integralCount, expected integralCount) {
 	if actual != expected {
-		panic(fmt.Sprintf("%s count was %.0f, expected %.0f", operation, actual, expected))
+		panic(fmt.Sprintf("%s count was %d, expected %d", operation, actual, expected))
 	}
 }
 
@@ -213,6 +256,13 @@ and test-only. It force-closes the current WebSocket while leaving the client
 alive so the shared controller can test reconnect without Docker socket or host
 network access. The hook is hidden from normal Go builds by the
 `convexadapter` build tag.
+
+Each Live subscription buffers at most 16 updates. If a subscriber falls
+behind, the client discards the oldest buffered state and keeps the newest one.
+The adapter's separate output owner accepts at most 16 encoded records and 8
+MiB including conservative per-record overhead. It fails closed when either
+budget is exhausted, and adapter shutdown does not wait indefinitely for a
+controller that has stopped reading.
 
 Example handshake:
 
