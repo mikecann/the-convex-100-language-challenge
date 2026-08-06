@@ -175,13 +175,87 @@ end
 
 # Drive the exact shared client module through a real WebSocket handshake,
 # fragmented UTF-8 transition, control frame, Add, update, and Remove.
+# Use a JSON3.Object args value so the stripped image records the same
+# canonicalize → Dict{String,Any} Subscribe path the adapter harness uses.
 live_client = Client.Client("http://127.0.0.1:$(live_port)")
-subscription = Client.subscribe(live_client, "demo:state", Dict("room" => "precompile"))
+subscription = Client.subscribe(
+    live_client,
+    "demo:state",
+    JSON3.read("{\"room\":\"precompile\",\"nested\":{\"k\":\"v\"},\"n\":1,\"ok\":true}"),
+)
 update = Client.next_update(subscription; timeout = 5)
 update.error === nothing || throw(update.error)
 Client.unsubscribe!(subscription)
 Client.close!(live_client)
 wait(live_server)
+
+# Drive the exact adapter Subscribe path the hosted harness uses: NDJSON args
+# decode to JSON3.Object, command_args canonicalizes them, then the Live owner
+# sends Connect + Add over a real socket. Without this, --strip-ir drops the
+# adapter-only Subscribe specialization that Dict-literal client calls miss.
+adapter_live_listener = listen(ip"127.0.0.1", 0)
+adapter_live_port = getsockname(adapter_live_listener)[2]
+adapter_live_server = @async begin
+    socket = accept(adapter_live_listener)
+    close(adapter_live_listener)
+    try
+        server_handshake(socket)
+        read_client_json(socket) # Connect
+        add = read_client_json(socket)
+        query_id = Int(add["modifications"][1]["queryId"])
+        add_args = add["modifications"][1]["args"][1]
+        add_args["room"] == "adapter-precompile" ||
+            error("adapter subscribe args lost room")
+        add_args["nested"]["k"] == "v" || error("adapter subscribe nested args lost")
+        transition = Dict(
+            "type" => "Transition",
+            "startVersion" =>
+                Dict("querySet" => 0, "identity" => 0, "ts" => "AAAAAAAAAAA="),
+            "endVersion" => Dict("querySet" => 1, "identity" => 0, "ts" => timestamp),
+            "modifications" => [
+                Dict(
+                    "type" => "QueryUpdated",
+                    "queryId" => query_id,
+                    "value" => Dict("count" => 0.0),
+                    "logLines" => String[],
+                    "journal" => nothing,
+                ),
+            ],
+        )
+        write(socket, server_frame(0x01, Vector{UInt8}(JSON3.write(transition))))
+        flush(socket)
+        remove = read_client_json(socket)
+        remove["modifications"][1]["type"] == "Remove" ||
+            error("adapter live expected Remove")
+    finally
+        close(socket)
+    end
+end
+
+old_adapter_live_url = get(ENV, "CONVEX_URL", nothing)
+ENV["CONVEX_URL"] = "http://127.0.0.1:$(adapter_live_port)"
+adapter_live_input = IOBuffer(
+    "{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}\n" *
+    "{\"id\":\"sub\",\"op\":\"subscribe\",\"subscriptionId\":\"s1\"," *
+    "\"path\":\"demo:state\"," *
+    "\"args\":{\"room\":\"adapter-precompile\",\"nested\":{\"k\":\"v\"},\"n\":1,\"ok\":true}}\n" *
+    "{\"id\":\"unsub\",\"op\":\"unsubscribe\",\"subscriptionId\":\"s1\"}\n" *
+    "{\"id\":\"close\",\"op\":\"close\"}\n",
+)
+adapter_live_output = IOBuffer()
+try
+    Adapter.run_adapter(adapter_live_input, adapter_live_output)
+finally
+    isnothing(old_adapter_live_url) ? delete!(ENV, "CONVEX_URL") :
+    (ENV["CONVEX_URL"] = old_adapter_live_url)
+end
+wait(adapter_live_server)
+adapter_live_text = String(take!(adapter_live_output))
+occursin("\"type\":\"ready\"", adapter_live_text) || error("adapter live omitted ready")
+occursin("\"type\":\"ack\"", adapter_live_text) ||
+    error("adapter live omitted subscribe ack")
+occursin("\"type\":\"update\"", adapter_live_text) || error("adapter live omitted update")
+occursin("\"type\":\"closed\"", adapter_live_text) || error("adapter live omitted close")
 
 function connect_with_deadline(port; timeout = 5.0)
     deadline = time() + timeout
@@ -441,7 +515,11 @@ end
 https_port = getsockname(https_server.listener.server)[2]
 https_client = Client.Client("https://127.0.0.1:$(https_port)")
 try
-    https_result = Client.query(https_client, "demo:state", Dict("room" => "precompile"))
+    https_result = Client.query(
+        https_client,
+        "demo:state",
+        JSON3.read("{\"room\":\"precompile\",\"n\":1}"),
+    )
     Client.whole_count(https_result.value["count"], "HTTPS precompile count") == 1 ||
         error("HTTPS precompile query returned an unexpected count")
 finally
@@ -451,8 +529,13 @@ end
 
 tls_client = Client.Client("https://127.0.0.1:$(tls_port)")
 try
-    tls_subscription =
-        Client.subscribe(tls_client, "demo:state", Dict("room" => "precompile-wss"))
+    # Hosted Live always arrives as wss:// with adapter-normalized args. Record
+    # that exact signature before PackageCompiler strips unused IR.
+    tls_subscription = Client.subscribe(
+        tls_client,
+        "demo:state",
+        JSON3.read("{\"room\":\"precompile-wss\",\"nested\":{\"k\":\"v\"},\"n\":1}"),
+    )
     tls_update = Client.next_update(tls_subscription; timeout = 5)
     tls_update.error === nothing || throw(tls_update.error)
     Client.unsubscribe!(tls_subscription)
@@ -521,3 +604,37 @@ precompile(Client.ConvexError, (Symbol, String, Nothing, Vector{String}))
 # The example and adapter share this decoder, but retain an explicit
 # mathematically-integral decimal specialization for the canonical example.
 Client.whole_count(1.0, "precompile count") == 1 || error("whole_count precompile failed")
+
+# Pin the concrete signatures hosted Subscribe must retain after IR stripping.
+let
+    sample_args = Dict{String,Any}(
+        "room" => "pin",
+        "nested" => Dict{String,Any}("k" => "v"),
+        "n" => 1,
+        "ok" => true,
+        "list" => Any[1, true, nothing],
+    )
+    Client.canonicalize_args(sample_args)
+    Client.canonicalize_args(Dict("room" => "pin"))
+    Client.canonicalize_args(JSON3.read("{\"room\":\"pin\"}"))
+    JSON3.write(Dict{String,Any}("path" => "demo:state", "args" => sample_args))
+    JSON3.write(
+        Dict{String,Any}(
+            "type" => "ModifyQuerySet",
+            "baseVersion" => 0,
+            "newVersion" => 1,
+            "modifications" => Any[Dict{String,Any}(
+                "type" => "Add",
+                "queryId" => 1,
+                "udfPath" => "demo:state",
+                "args" => Any[sample_args],
+            ),],
+        ),
+    )
+end
+precompile(Client.subscribe, (Client.Client, String, Dict{String,Any}))
+precompile(Client.query, (Client.Client, String, Dict{String,Any}))
+precompile(Client.mutation, (Client.Client, String, Dict{String,Any}))
+precompile(Client.action, (Client.Client, String, Dict{String,Any}))
+precompile(Client.canonicalize_args, (Dict{String,Any},))
+precompile(Client.canonicalize_args, (Dict{String,String},))

@@ -373,11 +373,21 @@ function http_fixture(handler, count::Int)
 end
 
 @testset "adapter normalizes decoded command args" begin
-    command = JSON3.read("""{"args":{"room":"stable","nested":{"count":1}}}""")
+    command = JSON3.read(
+        """{"args":{"room":"stable","nested":{"count":1},"ok":true,"list":[1,null]}}""",
+    )
     normalized = command_args(command)
     @test normalized isa Dict{String,Any}
     @test normalized["room"] == "stable"
-    @test normalized["nested"] isa JSON3.Object
+    @test normalized["ok"] === true
+    @test normalized["nested"] isa Dict{String,Any}
+    @test normalized["nested"]["count"] == 1
+    @test normalized["list"] isa Vector{Any}
+    @test normalized["list"] == Any[1, nothing]
+    # Public client entry points must collapse every caller shape to the same
+    # concrete tree, or the stripped AOT Subscribe path diverges by args type.
+    @test Convex.canonicalize_args(Dict("room" => "stable")) isa Dict{String,Any}
+    @test Convex.canonicalize_args(normalized) == normalized
 end
 
 @testset "canonical values and global delivery budget" begin

@@ -496,11 +496,10 @@ end
 function command_args(command)
     args = Convex.jsonget(command, "args", Dict{String,Any}())
     args isa AbstractDict ||
-        throw(ConvexError(:protocol, "args must be an object", nothing, String[]))
-    # JSON3 decodes objects to a value-parameterized JSON3.Object. Normalize
-    # only the outer command object so every public client call has one stable
-    # dispatch type in the stripped runtime; nested Convex values stay intact.
-    return Dict{String,Any}(String(key) => value for (key, value) in pairs(args))
+        throw(ConvexError(:protocol, "args must be a JSON object", nothing, String[]))
+    # Collapse JSON3.Object / mixed key shapes into the client's one concrete
+    # Dict{String,Any} tree before Subscribe reaches the stripped AOT image.
+    return Convex.canonicalize_args(args)
 end
 
 function next_adapter_generation!(counter::Base.RefValue{UInt64})

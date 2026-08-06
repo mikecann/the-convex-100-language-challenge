@@ -232,7 +232,17 @@ function call(client::Client, operation::String, path::AbstractString, args::Abs
     operation in ("query", "mutation", "action") ||
         throw(ArgumentError("unknown Convex operation"))
     isempty(path) && throw(ArgumentError("Convex function path is required"))
-    body = JSON3.write(Dict("path" => String(path), "args" => args, "format" => "json"))
+    # Every public entry point stores one concrete args tree so PackageCompiler
+    # with --strip-ir only needs one Live/HTTP specialization, not one per
+    # Dict{String,String} vs adapter Dict{String,Any}/JSON3.Object shape.
+    canonical_args = canonicalize_args(args)
+    body = JSON3.write(
+        Dict{String,Any}(
+            "path" => String(path),
+            "args" => canonical_args,
+            "format" => "json",
+        ),
+    )
     ncodeunits(body) <= MAX_HTTP_BYTES ||
         throw(ConvexError(:protocol, "HTTP request exceeds byte limit", nothing, String[]))
     token = lock(client.lock) do
@@ -391,7 +401,10 @@ function subscribe(
     args::AbstractDict = Dict{String,Any}(),
 )
     isempty(path) && throw(ArgumentError("Convex function path is required"))
-    request_bytes = ncodeunits(JSON3.write(Dict("path" => String(path), "args" => args)))
+    canonical_args = canonicalize_args(args)
+    request_bytes = ncodeunits(
+        JSON3.write(Dict{String,Any}("path" => String(path), "args" => canonical_args)),
+    )
     request_bytes <= MAX_SUBSCRIPTION_BYTES || throw(
         ConvexError(
             :protocol,
@@ -410,7 +423,7 @@ function subscribe(
     end
     return manager_command(
         manager,
-        (:subscribe, String(path), deepcopy(args), request_bytes);
+        (:subscribe, String(path), canonical_args, request_bytes);
         timeout = CLOSE_TIMEOUT_SECONDS,
     )
 end
@@ -1042,7 +1055,7 @@ function connected_loop!(manager::LiveManager, websocket)
                         modify_query_set!(
                             manager,
                             websocket,
-                            [Dict("type" => "Remove", "queryId" => id)],
+                            [Dict{String,Any}("type" => "Remove", "queryId" => id)],
                         )
                     end
                 catch error
@@ -1060,7 +1073,7 @@ function connected_loop!(manager::LiveManager, websocket)
                     modify_query_set!(
                         manager,
                         websocket,
-                        [Dict("type" => "Remove", "queryId" => id)],
+                        [Dict{String,Any}("type" => "Remove", "queryId" => id)],
                     )
                 end
                 respond_command!(envelope, nothing)
@@ -1350,7 +1363,7 @@ function send_connect_and_hydrate!(manager::LiveManager, websocket)
         modify_query_set!(
             manager,
             websocket,
-            [Dict("type" => "Remove", "queryId" => id) for id in cancelled_ids],
+            [Dict{String,Any}("type" => "Remove", "queryId" => id) for id in cancelled_ids],
         )
     end
     return nothing
@@ -1439,19 +1452,23 @@ function timed_owner_write!(action::Function, manager::LiveManager, websocket)
 end
 
 function modify_query_set!(manager::LiveManager, websocket, modifications)
-    message = Dict(
+    message = Dict{String,Any}(
         "type" => "ModifyQuerySet",
         "baseVersion" => manager.query_set_version,
         "newVersion" => manager.query_set_version + 1,
-        "modifications" => modifications,
+        "modifications" => collect(Any, modifications),
     )
     send_json!(manager, websocket, message)
     manager.query_set_version += 1
     return nothing
 end
 
-add_modification(id, state) =
-    Dict("type" => "Add", "queryId" => id, "udfPath" => state.path, "args" => [state.args])
+add_modification(id, state) = Dict{String,Any}(
+    "type" => "Add",
+    "queryId" => id,
+    "udfPath" => state.path,
+    "args" => Any[state.args],
+)
 
 function schedule_reconnect!(
     manager::LiveManager,
@@ -2035,6 +2052,60 @@ jsonhas(object, key) = haskey(object, Symbol(key)) || haskey(object, key)
 jsonget(object, key, default) =
     haskey(object, Symbol(key)) ? object[Symbol(key)] :
     (haskey(object, key) ? object[key] : default)
+
+# Adapter NDJSON, JSON3.Object values, and hand-written Dict{String,String}
+# literals all enter here and leave as one concrete tree. That keeps the
+# stripped AOT image from needing a separate Subscribe specialization per
+# caller-shaped dictionary.
+function canonicalize_args(args::AbstractDict)
+    canonical = canonicalize_json_value(args)
+    canonical isa Dict{String,Any} || throw(
+        ConvexError(:protocol, "function args must be a JSON object", nothing, String[]),
+    )
+    return canonical
+end
+
+function canonicalize_json_value(value)
+    if value isa AbstractDict
+        object = Dict{String,Any}()
+        for (key, item) in pairs(value)
+            key isa Symbol ||
+                key isa AbstractString ||
+                throw(
+                    ConvexError(
+                        :protocol,
+                        "JSON object keys must be strings",
+                        nothing,
+                        String[],
+                    ),
+                )
+            object[String(key)] = canonicalize_json_value(item)
+        end
+        return object
+    elseif value isa AbstractVector
+        return Any[canonicalize_json_value(item) for item in value]
+    elseif value isa Bool
+        return value
+    elseif value isa Integer
+        typemin(Int) <= value <= typemax(Int) ||
+            throw(ConvexError(:protocol, "JSON integer is out of range", nothing, String[]))
+        return Int(value)
+    elseif value isa AbstractFloat
+        return Float64(value)
+    elseif value isa AbstractString
+        return String(value)
+    elseif value === nothing
+        return nothing
+    end
+    throw(
+        ConvexError(
+            :protocol,
+            "unsupported JSON value type $(typeof(value))",
+            nothing,
+            String[],
+        ),
+    )
+end
 
 function validated_logs(items)
     items isa AbstractVector ||
