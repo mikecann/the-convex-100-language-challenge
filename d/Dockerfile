@@ -4,17 +4,25 @@ ARG DEBIAN_IMAGE=debian:trixie-slim@sha256:38a76d01668772e381ad2826d876627c89e71
 FROM --platform=linux/amd64 ${DEBIAN_IMAGE} AS build
 RUN apt-get update && apt-get install --no-install-recommends --yes \
     ca-certificates=20250419 dub=1.40.0-1 file=1:5.46-5 ldc=1:1.40.0-5 gcc=4:14.2.0-1 libc6-dev=2.41-12+deb13u3 libcurl4-openssl-dev=8.14.1-2+deb13u4 \
+    && ln -sf /usr/bin/gcc-14 /usr/bin/cc \
+    && test -x /usr/bin/cc \
     && curl-config --protocols | grep -Fx WS \
     && curl-config --protocols | grep -Fx WSS \
     && rm -rf /var/lib/apt/lists/*
-RUN dub fetch libdparse@0.25.1 \
-    && dub run dfmt@0.15.1 -- --version \
-    && test -x /root/.dub/packages/dfmt/0.15.1/dfmt/bin/dfmt
 WORKDIR /project
+RUN DUB_HOME=/tmp/dub-home dub fetch libdparse@0.25.1 \
+    && DUB_HOME=/tmp/dub-home dub fetch dfmt@0.15.1 \
+    && cd /tmp/dub-home/packages/dfmt/0.15.1/dfmt \
+    && ldc2 -run dubhash.d \
+    && includes=$(find /tmp/dub-home/packages -type d -name src -print | sort | sed 's#^#-I#') \
+    && sources=$(find /tmp/dub-home/packages -type f -name '*.d' -path '*/src/*' -print | sort) \
+    && ldc2 -wi -w -d-version=built_with_dub -of=/usr/local/bin/dfmt $includes -J bin $sources \
+    && test -x /usr/local/bin/dfmt \
+    && /usr/local/bin/dfmt --version
 COPY client ./client
 COPY examples ./examples
 RUN set -eu; \
-    formatter=/root/.dub/packages/dfmt/0.15.1/dfmt/bin/dfmt; \
+    formatter=/usr/local/bin/dfmt; \
     find client examples -name '*.d' -type f -print | sort | while read -r source; do \
       "$formatter" "$source" > /tmp/formatted.d; \
       cmp -s "$source" /tmp/formatted.d || { echo "dfmt check failed: $source" >&2; exit 1; }; \
