@@ -259,8 +259,10 @@ adapter_live_output_reader = @async begin
         occursin("\"type\":\"update\"", line) && put!(adapter_live_update_seen, nothing)
     end
 end
-adapter_live_task = @async
-Adapter.run_adapter(adapter_live_input.out, adapter_live_output_pipe.in)
+adapter_live_task = @async Adapter.run_adapter(
+    adapter_live_input.out,
+    adapter_live_output_pipe.in,
+)
 try
     write(
         adapter_live_input.in,
