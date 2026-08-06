@@ -242,7 +242,7 @@ $socketWorker = {
                                             modifications = @(@{
                                                     type     = 'QueryUpdated'
                                                     queryId  = $queryId
-                                                    value    = @{ count = (Current-Count); text = 'café 🦘' }
+                                                    value    = @{ count = (Current-Count); text = 'café 🦘'; boundary = $true }
                                                     logLines = @('timestamp boundary')
                                                 })
                                         }
@@ -341,6 +341,42 @@ function Write-JsonResponse($Response, $Value) {
     $Response.Close()
 }
 
+function Remove-CompletedSocketWorkers {
+    # EndInvoke and Dispose release the runspace and its thread. Retaining every
+    # completed reconnect worker can starve a later accepted socket even though
+    # its WebSocket handshake has already succeeded.
+    for ($index = $state.Workers.Count - 1; $index -ge 0; $index--) {
+        $worker = $state.Workers[$index]
+        if (-not $worker.Handle.IsCompleted) {
+            continue
+        }
+        try { $worker.PowerShell.EndInvoke($worker.Handle) | Out-Null } catch {}
+        $worker.PowerShell.Dispose()
+        $state.Workers.RemoveAt($index)
+    }
+}
+
+function Wait-ForSocketWorkerRetention([int] $Maximum, [int] $TimeoutMilliseconds) {
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while ($state.Workers.Count -gt $Maximum) {
+        Remove-CompletedSocketWorkers
+        if ($state.Workers.Count -le $Maximum) {
+            break
+        }
+        $remaining = $TimeoutMilliseconds - [int]$timer.ElapsedMilliseconds
+        if ($remaining -le 0) {
+            return $false
+        }
+        [Threading.WaitHandle[]]$handles = @(
+            $state.Workers | ForEach-Object { $_.Handle.AsyncWaitHandle }
+        )
+        if ([Threading.WaitHandle]::WaitAny($handles, $remaining) -eq [Threading.WaitHandle]::WaitTimeout) {
+            return $false
+        }
+    }
+    $true
+}
+
 $listener = [Net.HttpListener]::new()
 $listener.Prefixes.Add("http://${BindHost}:$Port/")
 $listener.Start()
@@ -348,6 +384,7 @@ $listener.Start()
 try {
     while (-not $state.Stop) {
         $context = $listener.GetContext()
+        Remove-CompletedSocketWorkers
         if ($context.Request.IsWebSocketRequest) {
             $webSocketContext = $context.AcceptWebSocketAsync('convex-1.0.0').GetAwaiter().GetResult()
             $powerShell = [PowerShell]::Create()
@@ -374,10 +411,27 @@ try {
                 value    = @{
                     connections     = $state.Connections
                     adds            = $state.Adds
+                    retainedWorkers = $state.Workers.Count
                     connectMessages = $messages
                     addBatches      = $addBatches
                 }
                 logLines = @('metadata log')
+            }
+            continue
+        }
+        if ($path -eq 'fixture:reapWorkers') {
+            $maximum = [int]$request['args']['maximum']
+            if (-not (Wait-ForSocketWorkerRetention $maximum 3000)) {
+                Write-JsonResponse $context.Response @{
+                    status       = 'error'
+                    errorMessage = 'fixture workers did not reach the retention barrier'
+                    errorData    = @{ retainedWorkers = $state.Workers.Count; maximum = $maximum }
+                }
+                continue
+            }
+            Write-JsonResponse $context.Response @{
+                status = 'success'
+                value  = @{ retainedWorkers = $state.Workers.Count }
             }
             continue
         }

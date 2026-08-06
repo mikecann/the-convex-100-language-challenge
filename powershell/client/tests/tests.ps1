@@ -103,7 +103,7 @@ try {
         mode = 'timestampBoundary'
     }
     Assert-Equal (Receive-ConvexSubscription $live $timestampBoundary 5000).value.count 0 'timestamp boundary initial value'
-    Start-Sleep -Milliseconds 100
+    Assert-True (Receive-ConvexSubscription $live $timestampBoundary 5000).value.boundary 'timestamp boundary transition was not applied'
     Disconnect-ConvexLiveForAdapter $live
     $boundaryDeadline = [datetime]::UtcNow.AddSeconds(5)
     do {
@@ -280,6 +280,9 @@ try {
     for ($attempt = 1; $attempt -le 5; $attempt++) {
         $reconnectTimer = [Diagnostics.Stopwatch]::StartNew()
         Disconnect-ConvexLiveForAdapter $live
+        Assert-True $live.Owner.HydrationApplied.IsSet "reconnect $attempt did not cross the transition barrier"
+        Assert-Equal $live.Owner.HydrationQueryIds.Count 0 "reconnect $attempt left hydration queries pending"
+        Assert-Equal $live.Owner.Socket.State ([Net.WebSockets.WebSocketState]::Open) "reconnect $attempt owner was not open at acknowledgement"
         $expected++
         Invoke-ConvexMutation $client 'demo:increment' @{
             room  = 'reconnect'
@@ -291,9 +294,12 @@ try {
         Assert-True ($reconnectTimer.ElapsedMilliseconds -lt 2500) "reconnect $attempt inherited stale backoff"
     }
     Remove-ConvexSubscription $live 'reconnect'
+    $workerRetention = (Get-ConvexQuery $client 'fixture:reapWorkers' @{ maximum = 0 }).Value
+    Assert-Equal $workerRetention.retainedWorkers 0 'completed reconnect fixture workers crossed the lifecycle barrier'
     $metadata = (Get-ConvexQuery $client 'fixture:metadata' @{}).Value
     Assert-True ($metadata.connections -ge 6) 'five reconnects did not create real sockets'
     Assert-True ($metadata.adds -ge 6) 'active Add was not resent after every reconnect'
+    Assert-True ($metadata.retainedWorkers -le 2) 'completed reconnect fixture workers were not reaped'
     $connects = @($metadata.connectMessages)
     $debugMessages = @(
         $connects |
@@ -322,7 +328,8 @@ try {
     Receive-ConvexSubscription $live $orderB 5000 | Out-Null
     Receive-ConvexSubscription $live $orderC 5000 | Out-Null
     Disconnect-ConvexLiveForAdapter $live
-    Start-Sleep -Milliseconds 500
+    Assert-True $live.Owner.HydrationApplied.IsSet 'ordered rehydration transition barrier did not complete'
+    Assert-Equal $live.Owner.HydrationQueryIds.Count 0 'ordered rehydration left active query IDs pending'
     Assert-Equal $orderA.Updates.Count 0 'unchanged hydration leaked for order-a'
     Assert-Equal $orderB.Updates.Count 0 'unchanged hydration leaked for order-b'
     Assert-Equal $orderC.Updates.Count 0 'unchanged hydration leaked for order-c'

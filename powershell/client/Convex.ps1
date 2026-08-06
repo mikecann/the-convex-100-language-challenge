@@ -270,6 +270,10 @@ function New-ConvexLiveState {
             ReceiveTask         = $null
             Frame               = [IO.MemoryStream]::new()
             Buffer              = [byte[]]::new(4096)
+            # Adapter-only disconnect uses this barrier to acknowledge only after
+            # every active query has applied its replacement-socket hydration.
+            HydrationQueryIds   = [System.Collections.Generic.HashSet[uint32]]::new()
+            HydrationApplied    = [Threading.ManualResetEventSlim]::new($true)
         }
     }
 }
@@ -668,6 +672,10 @@ $script:ConvexLiveWorker = {
         $State.Owner.BackoffMilliseconds = 100
         foreach ($candidateUpdate in $Candidate.Updates) {
             Offer-Update $candidateUpdate.Record $candidateUpdate.Update $candidateUpdate.ResetDedupe
+            $State.Owner.HydrationQueryIds.Remove([uint32]$candidateUpdate.Record.QueryId) | Out-Null
+        }
+        if ($State.Owner.HydrationQueryIds.Count -eq 0) {
+            $State.Owner.HydrationApplied.Set() | Out-Null
         }
     }
 
@@ -701,7 +709,20 @@ $script:ConvexLiveWorker = {
                         }
                         'DebugDisconnect' {
                             Retire-Socket 'DebugDisconnect' '' '' $true
-                            $State.Owner.NextConnectAt = [datetime]::UtcNow.AddMilliseconds(100)
+                            $State.Owner.HydrationQueryIds.Clear()
+                            foreach ($record in $State.Subscriptions.Values) {
+                                $State.Owner.HydrationQueryIds.Add([uint32]$record.QueryId) | Out-Null
+                            }
+                            $State.Owner.HydrationApplied.Reset()
+                            if ($State.Owner.HydrationQueryIds.Count -eq 0) {
+                                $State.Owner.HydrationApplied.Set() | Out-Null
+                            }
+                            else {
+                                # Connect synchronously on the sole owner. The
+                                # caller's acknowledgement barrier below then
+                                # waits for every rehydrated transition to apply.
+                                Connect-Socket
+                            }
                         }
                         'Subscribe' {
                             $changes = [System.Collections.Generic.List[object]]::new()
@@ -967,7 +988,8 @@ function Receive-ConvexSubscription {
         }
         Start-Sleep -Milliseconds 5
     }
-    throw 'timed out waiting for Live update'
+    $socketState = if ($null -eq $Live.Owner.Socket) { 'Disconnected' } else { [string]$Live.Owner.Socket.State }
+    throw "timed out waiting for Live update id=$($Record.Id) active=$($Record.Active) socket=$socketState connections=$($Live.ConnectionCount) close=$($Live.LastCloseReason)"
 }
 
 function Disconnect-ConvexLiveForAdapter {
@@ -984,6 +1006,15 @@ function Disconnect-ConvexLiveForAdapter {
         throw 'Live command queue is full'
     }
     Wait-ConvexControl $command 'debug disconnect'
+    if (-not $Live.Owner.HydrationApplied.Wait($script:ConvexControlTimeoutMilliseconds)) {
+        throw 'Live debug disconnect exceeded the rehydration transition deadline'
+    }
+    if (
+        $Live.Subscriptions.Count -gt 0 -and
+        ($null -eq $Live.Owner.Socket -or $Live.Owner.Socket.State -ne [Net.WebSockets.WebSocketState]::Open)
+    ) {
+        throw 'Live debug disconnect acknowledged without an open replacement owner'
+    }
 }
 
 function Close-ConvexLive {
