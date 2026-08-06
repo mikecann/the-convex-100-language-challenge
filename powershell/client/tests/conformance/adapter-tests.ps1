@@ -237,6 +237,23 @@ try {
         Send-TcpCommand $longLivedStream @{ id = "long-unsubscribe-$attempt"; op = 'unsubscribe'; subscriptionId = $subscriptionId }
         Assert-True ((Read-TcpEvent $longLivedStream).type -eq 'ack') "long-lived unsubscribe $attempt failed"
     }
+    # Mirror the hosted boundary exactly: after a real initial result and
+    # external update, unsubscribe-64 must acknowledge while the TCP adapter
+    # remains available for a later ordinary command and final close.
+    Send-TcpCommand $longLivedStream @{
+        id = 'client-subscribe'; op = 'subscribe'; subscriptionId = 'client-unsubscribe'
+        path = 'demo:state'; args = @{ room = 'client-unsubscribe' }
+    }
+    Assert-True ((Read-TcpEvent $longLivedStream).type -eq 'ack') 'client-unsubscribe subscribe failed'
+    Assert-True ((Read-TcpEvent $longLivedStream).value.count -eq 6) 'client-unsubscribe initial value failed'
+    Send-TcpCommand $longLivedStream @{
+        id = 'client-mutation'; op = 'mutation'; path = 'demo:increment'
+        args = @{ room = 'client-unsubscribe'; runId = 'client-unsubscribe' }
+    }
+    Assert-True ((Read-TcpEvent $longLivedStream).type -eq 'result') 'client-unsubscribe mutation failed'
+    Assert-True ((Read-TcpEvent $longLivedStream).value.count -eq 7) 'client-unsubscribe external update failed'
+    Send-TcpCommand $longLivedStream @{ id = 'unsubscribe-64'; op = 'unsubscribe'; subscriptionId = 'client-unsubscribe' }
+    Assert-True ((Read-TcpEvent $longLivedStream).type -eq 'ack') 'unsubscribe-64 acknowledgement failed'
     Start-Sleep -Milliseconds 250
     Assert-True (-not $longLivedAdapter.HasExited) 'long-lived adapter exited before explicit close'
     Send-TcpCommand $longLivedStream @{ id = 'long-echo'; op = 'query'; path = 'demo:echo'; args = @{ value = 'still-listening' } }

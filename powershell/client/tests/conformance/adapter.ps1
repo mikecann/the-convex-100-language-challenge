@@ -358,16 +358,12 @@ function Run-Adapter {
                         }
                         $old = $null
                         $subscriptions.TryRemove([string]$command['subscriptionId'], [ref]$old) | Out-Null
-                        # The adapter itself stays alive for the controller's
-                        # whole TCP session, but an idle Live owner has no
-                        # subscriptions or useful state to preserve. Retiring
-                        # it here releases its WebSocket and worker runspace
-                        # between sequential conformance cases. A later
-                        # subscribe deliberately constructs a new owner.
-                        if ($live -and $subscriptions.IsEmpty) {
-                            Close-ConvexLive $live
-                            $live = $null
-                        }
+                        # The adapter's sole Live owner remains alive for the
+                        # controller's TCP session. Unsubscribe has already
+                        # retired its WebSocket, and stopping this runspace
+                        # before publishing the acknowledgement races a later
+                        # controller command. Explicit close or input EOF owns
+                        # the final worker cleanup.
                         Write-AdapterEvent $Writer @{ id = $id; type = 'ack' }
                     }
                     'debugDisconnect' {
