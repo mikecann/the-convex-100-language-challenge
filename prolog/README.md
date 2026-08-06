@@ -26,7 +26,7 @@ black-box conformance can earn them.
 ## Basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.prolog -->
-```text
+```prolog
 :- use_module('../../client/convex').
 :- use_module(library(random)).
 

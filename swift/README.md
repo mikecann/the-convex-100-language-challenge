@@ -17,7 +17,7 @@ It is educational, unofficial, and not a production SDK.
 | Authentication | HTTP bearer token only |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.swift -->
-```text
+```swift
 import Convex
 import Foundation
 

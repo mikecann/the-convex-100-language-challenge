@@ -7,38 +7,103 @@ const blockPattern = /<!-- BEGIN GENERATED EXAMPLE: ([^\r\n]+) -->\r?\n[\s\S]*?<
 
 const fenceLanguages = {
   ".adb": "ada",
+  ".ads": "ada",
+  ".agda": "agda",
+  ".asm": "nasm",
+  ".awk": "awk",
+  ".bas": "freebasic",
+  ".bmx": "blitzmax",
+  ".c": "c",
+  ".cbl": "cobol",
   ".cc": "cpp",
+  ".chpl": "chapel",
   ".clj": "clojure",
+  ".cob": "cobol",
+  ".coffee": "coffeescript",
+  ".cr": "crystal",
   ".cs": "csharp",
   ".dart": "dart",
   ".d": "d",
+  ".e": "eiffel",
+  ".elm": "elm",
   ".erl": "erlang",
   ".ex": "elixir",
   ".exs": "elixir",
+  ".factor": "factor",
+  ".f90": "fortran",
+  ".fth": "forth",
   ".fs": "fsharp",
   ".fsx": "fsharp",
+  ".gd": "gdscript",
+  ".gleam": "gleam",
   ".go": "go",
+  ".groovy": "groovy",
   ".hs": "haskell",
+  ".hx": "haxe",
+  ".idr": "idris",
+  ".io": "io",
   ".java": "java",
+  ".janet": "janet",
+  ".jl": "julia",
   ".js": "javascript",
   ".jsx": "jsx",
   ".kt": "kotlin",
   ".kts": "kotlin",
+  ".lean": "lean",
+  ".lisp": "common-lisp",
   ".lua": "lua",
+  ".m": "objective-c",
+  ".ml": "ocaml",
+  ".mli": "ocaml",
+  ".mbt": "moonbit",
+  ".nim": "nim",
+  ".odin": "odin",
+  ".pas": "pascal",
   ".pl": "perl",
   ".php": "php",
+  ".pike": "pike",
+  ".pony": "pony",
+  ".prolog": "prolog",
+  ".ps1": "powershell",
+  ".purs": "purescript",
   ".py": "python",
   ".r": "r",
+  ".raku": "raku",
   ".rb": "ruby",
+  ".res": "rescript",
   ".rkt": "racket",
   ".rs": "rust",
   ".scala": "scala",
   ".scm": "scheme",
+  ".sh": "bash",
+  ".sml": "sml",
+  ".sol": "solidity",
+  ".st": "smalltalk",
+  ".swift": "swift",
   ".tcl": "tcl",
   ".ts": "typescript",
   ".tsx": "tsx",
+  ".v": "v",
   ".vala": "vala",
+  ".vb": "vbnet",
+  ".zig": "zig",
 };
+
+// Some ecosystems intentionally share an extension. Resolve the roster
+// language first so a MATLAB .m file is never presented as Objective-C, while
+// retaining the simple extension table for unambiguous examples.
+const languageFenceOverrides = {
+  matlab: "matlab",
+  "objective-c": "objective-c",
+  "wolfram-language": "mathematica",
+};
+
+export function fenceLanguageFor(languageId, sourcePath) {
+  if (languageId in languageFenceOverrides) {
+    return languageFenceOverrides[languageId];
+  }
+  return fenceLanguages[path.extname(sourcePath).toLowerCase()] ?? "text";
+}
 
 function renderExampleBlock(languageDirectory, relativeSource) {
   const sourcePath = path.resolve(languageDirectory, relativeSource);
@@ -50,7 +115,7 @@ function renderExampleBlock(languageDirectory, relativeSource) {
   }
 
   const source = fs.readFileSync(sourcePath, "utf8").trimEnd();
-  const fence = fenceLanguages[path.extname(sourcePath).toLowerCase()] ?? "text";
+  const fence = fenceLanguageFor(path.basename(languageDirectory), sourcePath);
   return `${beginPrefix}${relativeSource} -->\n\`\`\`${fence}\n${source}\n\`\`\`\n${endMarker}`;
 }
 
