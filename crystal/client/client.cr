@@ -53,31 +53,62 @@ module Convex
     end
 
     def next(timeout : Time::Span? = nil) : Update
-      if timeout
-        select
-        when update = @queue.receive
-          @mutex.synchronize { @bytes -= update.to_json.bytesize }
-          update
-        when timeout(timeout.not_nil!)
-          raise TransportError.new("timed out waiting for Live update", "live")
-        end
-      else
-        update = @queue.receive
-        @mutex.synchronize { @bytes -= update.to_json.bytesize }
-        update
-      end
+      update = if timeout
+                 select
+                 when value = @queue.receive
+                   value
+                 when timeout(timeout.not_nil!)
+                   raise TransportError.new("timed out waiting for Live update", "live")
+                 end
+               else
+                 @queue.receive
+               end
+      @mutex.synchronize { @bytes -= update.to_json.bytesize }
+      update
+    rescue Channel::ClosedError
+      raise ClosedError.new("Live subscription is closed", "live")
     end
 
     def deliver(update : Update)
       encoded = update.to_json.bytesize
       return if encoded > MAX_BYTES
-      @mutex.synchronize { return if @finished; @bytes += encoded }
-      select
-      when @queue.send(update)
-      else
-        dropped = @queue.receive?
-        @mutex.synchronize { @bytes -= dropped.not_nil!.to_json.bytesize } if dropped
-        @queue.send(update)
+      @mutex.synchronize do
+        return if @finished
+
+        # Keep both bounds real. A full queue can still be well below the byte
+        # limit, and a few large JSON values can fill the byte budget first.
+        while @bytes + encoded > MAX_BYTES
+          select
+          when dropped = @queue.receive
+            @bytes -= dropped.to_json.bytesize
+          else
+            break
+          end
+        end
+
+        begin
+          select
+          when @queue.send(update)
+            @bytes += encoded
+          else
+            select
+            when dropped = @queue.receive
+              @bytes -= dropped.to_json.bytesize
+            else
+              return
+            end
+            select
+            when @queue.send(update)
+              @bytes += encoded
+            else
+              # A slow consumer must never make the Live owner wait. The
+              # newest state is optional when the bounded queue is racing
+              # with a consumer, so drop this update rather than blocking.
+            end
+          end
+        rescue Channel::ClosedError
+          # finish closed the queue while this update was being prepared.
+        end
       end
     end
 
@@ -85,8 +116,9 @@ module Convex
       @mutex.synchronize do
         return if @finished
         @finished = true
-        while @queue.receive?
-        end
+        # Closing wakes a blocked consumer immediately. Draining an open
+        # channel with receive? can wait forever once its last value is gone.
+        @queue.close
         @bytes = 0
       end
     end
@@ -107,6 +139,7 @@ module Convex
       @incoming = Channel(String).new(64)
       @closed = false
       @next_id = 0
+      @query_set_version = 0_u32
       spawn { run }
     end
 
@@ -154,19 +187,24 @@ module Convex
               subscription = Subscription.new(self, query_id)
               @mutex.synchronize { @subscriptions[query_id] = {path.not_nil!, args.not_nil!, subscription} }
               connect(socket) unless socket
-              send_query_set(socket, query_id, path.not_nil!, args.not_nil!) if socket
+              if socket
+                send_query_set(socket.not_nil!, query_id, path.not_nil!, args.not_nil!)
+              end
               response.send(nil)
             when :unsubscribe
               state = @mutex.synchronize { @subscriptions.delete(id.not_nil!) }
               state.try &.[2].finish
               if socket
-                send_json(socket, {"type" => "ModifyQuerySet", "baseVersion" => 0, "newVersion" => 1, "modifications" => [{"type" => "Remove", "queryId" => id.not_nil!}]})
+                base_version = @query_set_version
+                send_json(socket, {"type" => "ModifyQuerySet", "baseVersion" => base_version, "newVersion" => base_version + 1, "modifications" => [{"type" => "Remove", "queryId" => id.not_nil!}]})
+                @query_set_version = base_version + 1
               end
               response.send(nil)
             when :disconnect
               raise TransportError.new("Live WebSocket is not connected", "live") unless socket
               socket.not_nil!.close
               socket = nil
+              @query_set_version = 0_u32
               response.send(nil)
             when :close
               socket.try &.close
@@ -185,7 +223,8 @@ module Convex
           if !socket && @mutex.synchronize { !@subscriptions.empty? }
             begin
               socket = connect(nil)
-              @mutex.synchronize { @subscriptions.each { |id, state| send_query_set(socket, id, state[0], state[1]) } }
+              @query_set_version = 0_u32
+              @mutex.synchronize { @subscriptions.each { |id, state| send_query_set(socket.not_nil!, id, state[0], state[1]) } }
             rescue
               sleep 250.milliseconds
             end
@@ -211,7 +250,9 @@ module Convex
     end
 
     private def send_query_set(socket : HTTP::WebSocket, id : Int32, path : String, args : JSON::Any)
-      send_json(socket, {"type" => "ModifyQuerySet", "baseVersion" => 0, "newVersion" => 1, "modifications" => [{"type" => "Add", "queryId" => id, "udfPath" => path, "args" => [args]}]})
+      base_version = @query_set_version
+      send_json(socket, {"type" => "ModifyQuerySet", "baseVersion" => base_version, "newVersion" => base_version + 1, "modifications" => [{"type" => "Add", "queryId" => id, "udfPath" => path, "args" => [args]}]})
+      @query_set_version = base_version + 1
     end
 
     private def send_json(socket : HTTP::WebSocket, value)

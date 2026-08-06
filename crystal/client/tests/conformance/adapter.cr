@@ -10,13 +10,48 @@ def emit_event(output : IO, writer : Mutex, event : Event)
   writer.synchronize { output.puts(event.to_json); output.flush }
 end
 
-def error_details(error : Exception)
-  {"name" => error.class.name.split("::").last, "message" => error.message || "error"}
+def error_details(error : Exception) : JSON::Any
+  details = {
+    "name"    => JSON::Any.new(error.class.name.split("::").last),
+    "message" => JSON::Any.new(error.message || "error"),
+  } of String => JSON::Any
+  if convex_error = error.as?(Convex::Error)
+    if operation = convex_error.operation
+      details["operation"] = JSON::Any.new(operation)
+    end
+    if data = convex_error.data
+      details["data"] = data
+    end
+    details["logs"] = JSON::Any.new(convex_error.logs.map { |log| JSON::Any.new(log) })
+  end
+  JSON::Any.new(details)
+end
+
+class SubscriptionRelay
+  def initialize
+    @mutex = Mutex.new
+    @active = true
+  end
+
+  def invalidate
+    @mutex.synchronize { @active = false }
+  end
+
+  # The writer lock makes invalidation an acknowledgement barrier. A relay
+  # that already owns the writer may finish before the ack; a relay that has
+  # not emitted yet observes inactive and cannot cross the ack.
+  def emit(output : IO, writer : Mutex, event : Event)
+    writer.synchronize do
+      return unless @mutex.synchronize { @active }
+      output.puts(event.to_json)
+      output.flush
+    end
+  end
 end
 
 def run_adapter(input : IO, output : IO)
   client = Convex::Client.new(ENV.fetch("CONVEX_URL"), ENV["CONVEX_AUTH_TOKEN"]?)
-  subscriptions = {} of String => Convex::Subscription
+  subscriptions = {} of String => {Convex::Subscription, SubscriptionRelay}
   writer = Mutex.new
   input.each_line do |line|
     id = "error"
@@ -40,30 +75,40 @@ def run_adapter(input : IO, output : IO)
         emit_event(output, writer, {"id" => id, "type" => "ack"})
       when "subscribe"
         sid = command["subscriptionId"].as_s
-        subscriptions.delete(sid).try &.close
+        if previous = subscriptions.delete(sid)
+          previous[1].invalidate
+          previous[0].close
+        end
         sub = client.subscribe(command["path"].as_s, command["args"]?.try(&.as_h) || {} of String => JSON::Any)
-        subscriptions[sid] = sub
+        relay = SubscriptionRelay.new
+        subscriptions[sid] = {sub, relay}
         emit_event(output, writer, {"id" => id, "type" => "ack"})
         spawn do
           loop do
             update = sub.next
             if error = update.error
-              emit_event(output, writer, {"type" => "subscription", "subscriptionId" => sid, "error" => error_details(error)})
+              relay.emit(output, writer, {"type" => "subscription", "subscriptionId" => sid, "error" => error_details(error)})
             else
-              emit_event(output, writer, {"type" => "subscription", "subscriptionId" => sid, "value" => update.value.not_nil!, "logs" => update.logs})
+              relay.emit(output, writer, {"type" => "subscription", "subscriptionId" => sid, "value" => update.value.not_nil!, "logs" => update.logs})
             end
           end
         rescue Convex::ClosedError
         end
       when "unsubscribe"
         sid = command["subscriptionId"].as_s
-        subscriptions.delete(sid).try &.close
+        if previous = subscriptions.delete(sid)
+          previous[1].invalidate
+          previous[0].close
+        end
         emit_event(output, writer, {"id" => id, "type" => "ack"})
       when "debugDisconnect"
         client.debug_disconnect
         emit_event(output, writer, {"id" => id, "type" => "ack"})
       when "close"
-        subscriptions.each_value(&.close)
+        subscriptions.each_value do |state|
+          state[1].invalidate
+          state[0].close
+        end
         client.close
         emit_event(output, writer, {"id" => id, "type" => "closed"})
         break
