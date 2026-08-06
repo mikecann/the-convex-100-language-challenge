@@ -3,12 +3,12 @@
 (require racket/random
          "../../client/client.rkt")
 
-;; Convex's JSON format represents the demo counter as a number. Reject a
-;; fractional or inexact value instead of printing a misleading success line.
+;; Convex's JSON format represents the demo counter as a number. Accept an
+;; integral decimal such as 0.0, but normalize it before counter arithmetic.
 (define (verified-whole-count value operation)
-  (unless (exact-integer? value)
-    (error operation "count was ~e, expected an exact whole number" value))
-  value)
+  (unless (integer? value)
+    (error operation "count was ~e, expected a whole number" value))
+  (if (exact? value) value (inexact->exact value)))
 
 (define (random-run-id)
   (apply string-append
@@ -100,3 +100,10 @@
     (lambda () (convex-client-close! client))))
 
 (module+ main (run-example))
+
+(module+ test
+  (require rackunit)
+  (check-equal? (verified-whole-count 0.0 'test) 0)
+  (check-equal? (verified-whole-count 1.0 'test) 1)
+  (check-equal? (verified-whole-count 2 'test) 2)
+  (check-exn exn:fail? (lambda () (verified-whole-count 1.5 'test))))

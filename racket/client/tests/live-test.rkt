@@ -166,6 +166,11 @@
    connection
    (server-frame 1 (string->bytes/utf-8 (jsexpr->string value)))))
 
+(define (peer-send-text! connection value)
+  (peer-send-bytes!
+   connection
+   (server-frame 1 (string->bytes/utf-8 value))))
+
 (define (read-client-frame connection)
   (define stop (deadline))
   (define input (peer-input connection))
@@ -250,6 +255,9 @@
           'errorMessage "room empty"
           'errorData (hasheq 'code "ROOM_EMPTY")
           'logLines '("before failure")))
+
+(define (removed query-id)
+  (hasheq 'type "QueryRemoved" 'queryId query-id))
 
 (define (message-modification message)
   (define modifications (hash-ref message 'modifications '()))
@@ -481,6 +489,209 @@
        (check-equal?
         (hash-ref (message-modification (await-json remove-result)) 'type #f)
         "Remove"))))
+
+   (test-case
+    "socket EOF publishes TransportError, reconnects, and recovers"
+    (with-client-fixture
+     (lambda (fixture client)
+       (define subscription
+         (convex-client-subscribe client "demo:state" (hasheq 'room "eof")))
+       (define first (fixture-accept! fixture))
+       (define-values (_connect add)
+         (check-connect-and-add first 0 "InitialConnect" #f))
+       (define query-id (hash-ref add 'queryId))
+       (peer-send-json!
+        first
+        (transition (version 0 0) (version 1 1)
+                    (list (updated query-id 1))))
+       (check-equal?
+        (convex-update-value
+         (subscription-next-update subscription #:timeout socket-timeout-seconds))
+        (hasheq 'count 1))
+
+       ;; Closing the real TCP peer is a transport event, not a protocol or
+       ;; function failure. It must be observable without terminating the
+       ;; subscription that the owner will rehydrate on the next connection.
+       (peer-close! first)
+       (define transport-update
+         (subscription-next-update subscription #:timeout socket-timeout-seconds))
+       (define transport-failure (convex-update-error transport-update))
+       (check-true (exn:fail:convex:transport? transport-failure))
+       (check-equal? (exn:fail:convex:transport-operation transport-failure)
+                     "live read")
+
+       (define second (fixture-accept! fixture))
+       (define-values (_reconnect resent-add)
+         (check-connect-and-add second 1 (exn-message transport-failure)
+                                (timestamp 1)))
+       (check-equal? (hash-ref resent-add 'queryId #f) query-id)
+       (peer-send-json!
+        second
+        (transition (version 0 0) (version 1 2)
+                    (list (updated query-id 2))))
+       (check-equal?
+        (convex-update-value
+         (subscription-next-update subscription #:timeout socket-timeout-seconds))
+        (hasheq 'count 2))
+       (subscription-close! subscription))))
+
+   (test-case
+    "a malformed RFC6455 frame publishes ProtocolError and recovers"
+    (with-client-fixture
+     (lambda (fixture client)
+       (define subscription
+         (convex-client-subscribe client "demo:state" (hasheq 'room "frame")))
+       (define first (fixture-accept! fixture))
+       (define-values (_connect add)
+         (check-connect-and-add first 0 "InitialConnect" #f))
+       (define query-id (hash-ref add 'queryId))
+       (peer-send-json!
+        first
+        (transition (version 0 0) (version 1 2)
+                    (list (updated query-id 2))))
+       (check-equal?
+        (convex-update-value
+         (subscription-next-update subscription #:timeout socket-timeout-seconds))
+        (hasheq 'count 2))
+
+       ;; RFC 6455 forbids masked server frames. The parser can reject this
+       ;; complete two-byte frame immediately, without a timing-sensitive
+       ;; partial read or fixture-side EOF.
+       (peer-send-bytes! first #"\201\200")
+       (define protocol-update
+         (subscription-next-update subscription #:timeout socket-timeout-seconds))
+       (define protocol-failure (convex-update-error protocol-update))
+       (check-true (exn:fail:convex:protocol? protocol-failure))
+       (check-true (string-contains? (exn-message protocol-failure)
+                                     "server WebSocket frames must not be masked"))
+       (peer-close! first)
+
+       (define second (fixture-accept! fixture))
+       (define-values (_reconnect resent-add)
+         (check-connect-and-add second 1 (exn-message protocol-failure)
+                                (timestamp 2)))
+       (check-equal? (hash-ref resent-add 'queryId #f) query-id)
+       (peer-send-json!
+        second
+        (transition (version 0 0) (version 1 3)
+                    (list (updated query-id 3))))
+       (check-equal?
+        (convex-update-value
+         (subscription-next-update subscription #:timeout socket-timeout-seconds))
+        (hasheq 'count 3))
+       (subscription-close! subscription))))
+
+   (test-case
+    "one Transition publishes only its final coalesced state per query"
+    (with-client-fixture
+     (lambda (fixture client)
+       (define subscription
+         (convex-client-subscribe client "demo:state" (hasheq 'room "coalesced")))
+       (define connection (fixture-accept! fixture))
+       (define-values (_connect add)
+         (check-connect-and-add connection 0 "InitialConnect" #f))
+       (define query-id (hash-ref add 'queryId))
+       (define v0 (version 0 0))
+       (define v1 (version 1 1))
+       (peer-send-json! connection
+                        (transition v0 v1 (list (updated query-id 0))))
+       (check-equal?
+        (convex-update-value
+         (subscription-next-update subscription #:timeout socket-timeout-seconds))
+        (hasheq 'count 0))
+
+       ;; A transient new value followed by the committed value has no net
+       ;; observable effect and therefore publishes nothing.
+       (define v2 (version 1 2))
+       (peer-send-json!
+        connection
+        (transition v1 v2
+                    (list (updated query-id 1)
+                          (updated query-id 0))))
+       (check-no-update subscription)
+
+       ;; QueryFailed is not leaked when a later modification in the same
+       ;; atomic transition supplies the final healthy result.
+       (define v3 (version 1 3))
+       (peer-send-json!
+        connection
+        (transition v2 v3
+                    (list (failed query-id)
+                          (updated query-id 2))))
+       (define after-failure
+         (subscription-next-update subscription #:timeout socket-timeout-seconds))
+       (check-false (convex-update-error after-failure))
+       (check-equal? (convex-update-value after-failure) (hasheq 'count 2))
+       (check-no-update subscription)
+
+       ;; QueryRemoved is likewise only intermediate when QueryUpdated is the
+       ;; final modification for that query ID.
+       (define v4 (version 1 4))
+       (peer-send-json!
+        connection
+        (transition v3 v4
+                    (list (removed query-id)
+                          (updated query-id 3))))
+       (check-equal?
+        (convex-update-value
+         (subscription-next-update subscription #:timeout socket-timeout-seconds))
+        (hasheq 'count 3))
+       (check-no-update subscription)
+
+       ;; Multiple healthy values also collapse to exactly the final state.
+       (define v5 (version 1 5))
+       (peer-send-json!
+        connection
+        (transition v4 v5
+                    (list (updated query-id 4)
+                          (updated query-id 5))))
+       (check-equal?
+        (convex-update-value
+         (subscription-next-update subscription #:timeout socket-timeout-seconds))
+        (hasheq 'count 5))
+       (check-no-update subscription)
+       (subscription-close! subscription))))
+
+   (test-case
+    "trailing or second JSON values are ProtocolError and reconnect cleanly"
+    (with-client-fixture
+     (lambda (fixture client)
+       (define subscription
+         (convex-client-subscribe client "demo:state" (hasheq 'room "json")))
+       (define connection (fixture-accept! fixture))
+       (define-values (_connect add)
+         (check-connect-and-add connection 0 "InitialConnect" #f))
+       (define query-id (hash-ref add 'queryId))
+
+       (for ([payload (in-list '("{\"type\":\"Ping\"} garbage"
+                                 "{\"type\":\"Ping\"}{\"type\":\"Ping\"}"
+                                 "{\"type\":\"Ping\"}\f"))]
+             [connection-count (in-range 1 4)])
+         (peer-send-text! connection payload)
+         (define protocol-update
+           (subscription-next-update subscription #:timeout socket-timeout-seconds))
+         (define protocol-failure (convex-update-error protocol-update))
+         (check-true (exn:fail:convex:protocol? protocol-failure))
+         (check-true (string-contains? (exn-message protocol-failure)
+                                       "trailing content"))
+         (peer-close! connection)
+         (set! connection (fixture-accept! fixture))
+         (define-values (_reconnect resent-add)
+           (check-connect-and-add connection connection-count
+                                  (exn-message protocol-failure) #f))
+         (check-equal? (hash-ref resent-add 'queryId #f) query-id))
+
+       ;; Both malformed generations are retired. A valid Transition on the
+       ;; third real socket still reaches the original subscription.
+       (peer-send-json!
+        connection
+        (transition (version 0 0) (version 1 1)
+                    (list (updated query-id 1))))
+       (check-equal?
+        (convex-update-value
+         (subscription-next-update subscription #:timeout socket-timeout-seconds))
+        (hasheq 'count 1))
+       (subscription-close! subscription))))
 
    (test-case
     "malformed Live JSON reports ProtocolError, reconnects, and recovers"

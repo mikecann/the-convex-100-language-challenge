@@ -366,7 +366,13 @@
              (format "HTTP ~a response is not valid JSON: ~a"
                      status-code
                      (exn-message error))))])
-      (string->jsexpr text)))
+      (define input (open-input-string text))
+      (define value (read-json input))
+      (define remainder (port->string input))
+      (unless (for/and ([character (in-string remainder)])
+                (memv character '(#\space #\tab #\return #\newline)))
+        (error 'decode-response "trailing content after JSON value"))
+      value))
   (unless (hash? decoded)
     (raise-convex-protocol
      (format "HTTP ~a Convex response is not an object" status-code)))

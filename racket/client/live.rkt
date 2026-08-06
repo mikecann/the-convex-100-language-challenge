@@ -9,6 +9,7 @@
          racket/async-channel
          racket/list
          racket/match
+         racket/port
          racket/random
          racket/string
          "errors.rkt"
@@ -32,7 +33,7 @@
 (define maximum-backoff-ms 15000.0)
 (define owner-response-timeout-seconds 3.0)
 (define mailbox-capacity 16)
-(define global-mailbox-budget-bytes (* 4 1024 1024))
+(define global-mailbox-budget-bytes (* 3 1024 1024))
 (define protocol-read-headroom-bytes (* 2 1024 1024))
 (define queued-update-overhead-bytes 512)
 (define closed-marker (gensym 'closed))
@@ -46,7 +47,7 @@
 (struct sub-state (path args mailbox) #:transparent)
 (struct connector-result (generation socket error) #:transparent)
 (struct pending-connector (generation custodian) #:transparent)
-(struct socket-event (generation value error processed) #:transparent)
+(struct socket-event (generation [value #:mutable] error processed) #:transparent)
 
 (define (protocol-error message)
   (exn:fail:convex:protocol message (current-continuation-marks)))
@@ -62,6 +63,47 @@
 
 (define (mailbox-try-put channel value)
   (and (sync/timeout 0 (async-channel-put-evt channel value)) #t))
+
+(define json-escape-regexp #rx"[\0-\37\\\"\177]")
+
+(define (json-string-size value)
+  ;; `jsexpr->bytes` materializes a second copy of every large result merely to
+  ;; count it. Count the exact default JSON encoding instead, so accounting
+  ;; itself cannot consume the memory that it is supposed to bound.
+  (+ 2
+     (string-utf-8-length value)
+     (for/sum ([position (in-list
+                          (regexp-match-positions* json-escape-regexp value))])
+       (define character (string-ref value (car position)))
+       ;; Every matched character occupies one UTF-8 byte before escaping.
+       (if (or (char=? character #\") (char=? character #\\)
+               (memv character '(#\backspace #\newline #\return #\page #\tab)))
+           1
+           5))))
+
+(define (encoded-jsexpr-size value)
+  (cond
+    [(exact-integer? value) (string-length (number->string value))]
+    [(and (inexact-real? value) (rational? value))
+     (string-length (number->string value))]
+    [(eq? value #f) 5]
+    [(eq? value #t) 4]
+    [(eq? value 'null) 4]
+    [(string? value) (json-string-size value)]
+    [(list? value)
+     (+ 2
+        (if (null? value) 0 (sub1 (length value)))
+        (for/sum ([item (in-list value)]) (encoded-jsexpr-size item)))]
+    [(hash? value)
+     (+ 2
+        (if (zero? (hash-count value)) 0 (sub1 (hash-count value)))
+        (for/sum ([(key item) (in-hash value)])
+          (+ (json-string-size (symbol->string key)) 1
+             (encoded-jsexpr-size item))))]
+    [else
+     ;; The public APIs validate jsexprs before they reach the owner. Keeping a
+     ;; defensive failure here is clearer than silently undercounting one.
+     (raise (protocol-error "Live update is not valid JSON"))]))
 
 (define (encoded-update-size update)
   (define error (convex-update-error update))
@@ -86,7 +128,7 @@
       [else
        (hasheq 'value (convex-update-value update)
                'logs (convex-update-logs update))]))
-  (+ queued-update-overhead-bytes (bytes-length (jsexpr->bytes payload))))
+  (+ queued-update-overhead-bytes (encoded-jsexpr-size payload)))
 
 (define (release-queued-update! item)
   (define budget (queued-update-budget item))
@@ -485,6 +527,15 @@
       (raise (protocol-error (format "~a omitted ~a" context key))))
     (hash-ref value key))
 
+  (define (decode-live-message value)
+    (define input (open-input-string value))
+    (define message (read-json input))
+    (define remainder (port->string input))
+    (unless (for/and ([character (in-string remainder)])
+              (memv character '(#\space #\tab #\return #\newline)))
+      (raise (protocol-error "Live message has trailing content")))
+    message)
+
   (define (validate-version value context)
     (unless (hash? value)
       (raise (protocol-error (format "~a is not an object" context))))
@@ -521,8 +572,12 @@
          (unless (and (list? logs) (andmap string? logs))
            (raise (protocol-error "QueryUpdated logLines is invalid")))
          (define update (convex-update value #f logs))
-         (unless (equal? update (hash-ref remote-results id #f))
-           (hash-set! changed id (cons 'publish update)))]
+         ;; Coalesce against the committed state, but replace any earlier
+         ;; pending modification for this query. Returning to the committed
+         ;; value means the whole transition is observationally unchanged.
+         (if (equal? update (hash-ref remote-results id #f))
+             (hash-remove! changed id)
+             (hash-set! changed id (cons 'publish update)))]
         [(QueryFailed)
          (define message-text (require-field modification 'errorMessage "QueryFailed"))
          (define data (if (hash-has-key? modification 'errorData)
@@ -556,7 +611,17 @@
     (when (and socket (= (socket-event-generation event) generation))
       (cond
         [(socket-event-error event)
-         (disconnect! (exn-message (socket-event-error event)) #t)]
+         (define raw-error (socket-event-error event))
+         (define published-error
+           (cond
+             [(exn:fail:convex? raw-error) raw-error]
+             [(and (exn:fail:websocket? raw-error)
+                   (eq? (exn:fail:websocket-kind raw-error) 'protocol))
+              (protocol-error (exn-message raw-error))]
+             [else
+              (transport-error (exn-message raw-error) "live read" raw-error)]))
+         (publish-protocol-error! published-error)
+         (disconnect! (exn-message published-error) #t)]
         [else
          (with-handlers ([exn:fail?
                           (lambda (error)
@@ -567,7 +632,15 @@
                                    (format "decode server message: ~a" (exn-message error)))))
                             (publish-protocol-error! wrapped)
                             (disconnect! (exn-message wrapped) #t))])
-           (define message (string->jsexpr (socket-event-value event)))
+           (define large-message?
+             (> (string-length (socket-event-value event)) (* 256 1024)))
+           (define message
+             (begin0 (decode-live-message (socket-event-value event))
+               ;; The parsed result owns its strings. The complete raw frame is
+               ;; now redundant, and on conservative GC retaining both through
+               ;; publication can cross the 128 MiB runtime boundary.
+               (set-socket-event-value! event #f)))
+           (when large-message? (collect-garbage))
            (define type (require-field message 'type "Live message"))
            (cond
              [(string=? type "Transition") (handle-transition! message)]
@@ -610,7 +683,12 @@
                             (when socket (disconnect! (exn-message error) #t)))])
            (when socket
              (modify! (list (hasheq 'type "Remove" 'queryId id))))))
-       (when (zero? (hash-count active)) (invalidate-connector!))
+       (when (zero? (hash-count active))
+         ;; Do not merely advance the generation while leaving the current
+         ;; reader attached to an open socket. A later subscription would then
+         ;; reuse a socket whose every event is stale. Retire the transport and
+         ;; let a future Add reconnect with a fresh reader generation.
+         (disconnect! "NoActiveSubscriptions" #f))
        ;; This shares the owner turn with removal, so no later delivery can
        ;; cross the acknowledgement barrier.
        (reply! response (list 'ok (void)))]
@@ -666,6 +744,10 @@
           [(connector) (install! (cdr event))]
           [(socket)
            (define socket-value (cdr event))
+           (define large-socket-event?
+             (and (string? (socket-event-value socket-value))
+                  (> (string-length (socket-event-value socket-value))
+                     (* 256 1024))))
            (dynamic-wind
              void
              (lambda ()
@@ -673,9 +755,7 @@
                ;; Conservative GC otherwise lets transient decoded JSON from a
                ;; sustained stream approach the container limit before deciding
                ;; to collect. Large frames get an explicit memory boundary.
-               (when (and (string? (socket-event-value socket-value))
-                          (> (string-length (socket-event-value socket-value))
-                             (* 256 1024)))
+               (when large-socket-event?
                  (collect-garbage)))
              (lambda () (semaphore-post (socket-event-processed socket-value))))]))
       (loop)))

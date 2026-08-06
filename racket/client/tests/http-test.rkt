@@ -241,12 +241,16 @@
          (hasheq 'status "success" 'value 1 'logLines '("ok" 2)))
         (json-response
          (hasheq 'status "error" 'errorMessage 42))
-        (json-response (hasheq 'status "mystery" 'value 1)))))
+        (json-response (hasheq 'status "mystery" 'value 1))
+        (raw-response #"{\"status\":\"success\",\"value\":1} trailing")
+        (raw-response
+         #"{\"status\":\"success\",\"value\":1}{\"status\":\"success\",\"value\":2}")
+        (raw-response #"{\"status\":\"success\",\"value\":1}\f"))))
     (define client (make-convex-client (fixture-url server)))
     (dynamic-wind
      void
      (lambda ()
-       (for ([index (in-range 7)])
+       (for ([index (in-range 10)])
          (check-exn
           exn:fail:convex:protocol?
           (lambda ()
