@@ -33,12 +33,20 @@ RUN set -eu; \
 
 FROM build AS test
 RUN set -eu; \
-    actual=$(printf '%s\n' \
-      '{"protocolVersion":1,"id":"hello","op":"hello"}' \
-      '{"id":"unknown","op":"nope"}' \
-      '{"id":"live","op":"subscribe","subscriptionId":"s","path":"demo:state","args":{}}' \
-      '{"id":"close","op":"close"}' | /out-adapter); \
+    long_id=$(printf '%129s' '' | tr ' ' x); \
+    actual=$({ \
+      printf '%s\n' \
+        '{"protocolVersion":1,"id":"hello","op":"hello"}' \
+        '{"protocolVersion":1,"op":"hello"}' \
+        '{"id":"","op":"query","path":"demo:state","args":{}}' \
+        '{"id":"unknown","op":"nope"}' \
+        '{"id":"live","op":"subscribe","subscriptionId":"s","path":"demo:state","args":{}}'; \
+      printf '{"id":"%s","op":"close"}\n' "$long_id"; \
+      printf '%s\n' '{"id":"close","op":"close"}'; \
+    } | /out-adapter); \
     printf '%s\n' "$actual" | grep -F '"id":"hello"' | grep -F '"type":"ready"'; \
+    test "$(printf '%s\n' "$actual" | grep -F '"message":"adapter command id must be 1 to 128 bytes"' | wc -l)" -eq 3; \
+    ! printf '%s\n' "$actual" | grep -F '"id":""'; \
     printf '%s\n' "$actual" | grep -F '"id":"unknown"' | grep -F '"type":"error"'; \
     printf '%s\n' "$actual" | grep -F '"id":"live"' | grep -F '"type":"error"'; \
     printf '%s\n' "$actual" | grep -F '"id":"close","type":"closed"'
@@ -102,18 +110,28 @@ RUN rm -rf /var/lib/apt /var/lib/dpkg /var/cache/apt /var/cache/debconf /var/log
       /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.monthly /etc/cron.weekly /etc/logrotate.d \
       /etc/alternatives /etc/debconf.conf /usr/libexec/dpkg /usr/share/apt /usr/share/bash-completion \
       /usr/share/bug /usr/share/debconf /usr/share/dpkg /usr/share/gcc /usr/share/lintian/profiles/dpkg \
-      /usr/share/doc/apt /usr/share/doc/debconf /usr/share/doc/dpkg /usr/share/doc/libsystemd0 \
+      /usr/share/base-files /usr/share/doc/apt /usr/share/doc/debconf /usr/share/doc/dpkg \
+      /usr/share/doc/init-system-helpers /usr/share/doc/libapt-pkg* /usr/share/doc/libsystemd0 /usr/share/doc/sysvinit-utils \
       /usr/share/polkit-1/actions/org.dpkg.pkexec.update-alternatives.policy /var/cache/ldconfig \
-      /etc/perl /usr/lib/perl* /usr/share/perl* /usr/share/doc/perl* /usr/share/man/man1/perl* \
+      /etc/perl /usr/lib/perl* /usr/lib/x86_64-linux-gnu/perl-base /usr/share/perl* /usr/share/doc/perl* /usr/share/man/man1/perl* \
+      /usr/share/doc /usr/share/doc-base /usr/share/man /usr/share/info /usr/share/keyrings \
+      /etc/kernel /etc/pam.conf /etc/pam.d /etc/security /usr/lib/x86_64-linux-gnu/security /usr/share/pam* /var/lib/pam \
+      /etc/bash.bashrc /etc/skel /usr/share/debianutils /usr/share/menu /etc/issue /etc/issue.net \
       /usr/sbin/* \
     && rm -f /usr/bin/apt /usr/bin/apt-cache /usr/bin/apt-cdrom /usr/bin/apt-config /usr/bin/apt-get /usr/bin/apt-key /usr/bin/apt-mark \
       /usr/bin/dpkg /usr/bin/dpkg-deb /usr/bin/dpkg-divert /usr/bin/dpkg-maintscript-helper /usr/bin/dpkg-query /usr/bin/dpkg-realpath /usr/bin/dpkg-split /usr/bin/dpkg-statoverride /usr/bin/dpkg-trigger \
       /usr/bin/dpkg-preconfigure /usr/sbin/dpkg-preconfigure /usr/sbin/dpkg-reconfigure \
       /usr/bin/perl /usr/bin/perl5.* /usr/bin/bash /usr/bin/bashbug /usr/bin/rbash \
+      /usr/bin/login /usr/bin/su /usr/bin/passwd /usr/bin/chfn /usr/bin/chsh /usr/bin/chage \
+      /usr/bin/gpasswd /usr/bin/newgrp /usr/bin/sg /usr/bin/expiry \
+      /etc/motd /usr/lib/x86_64-linux-gnu/security/pam_motd.so \
       /usr/bin/deb-systemd-helper /usr/bin/deb-systemd-invoke /usr/sbin/invoke-rc.d /usr/sbin/policy-rc.d /usr/sbin/service /usr/sbin/update-rc.d /usr/sbin/start-stop-daemon \
       /usr/bin/debconf /usr/bin/debconf-* /usr/bin/update-alternatives /usr/bin/run-parts /usr/bin/ischroot /usr/bin/savelog /usr/bin/tempfile /usr/bin/localedef /usr/bin/ldd /usr/bin/sqv \
     && rm -f /usr/lib/x86_64-linux-gnu/libapt-pkg.so* /usr/lib/x86_64-linux-gnu/libapt-private.so* \
       /usr/lib/x86_64-linux-gnu/libdebconfclient.so* /usr/lib/x86_64-linux-gnu/libsystemd.so* \
+      /usr/lib/x86_64-linux-gnu/libpam.so* /usr/lib/x86_64-linux-gnu/libpam_misc.so* /usr/lib/x86_64-linux-gnu/libpamc.so* \
+    && ln -sf mawk /usr/bin/awk \
+    && for required in sh awk sed grep cut tr head tail sort uniq wc find xargs; do command -v "$required" >/dev/null; done \
     && ! command -v apt && ! command -v apt-get && ! command -v dpkg && ! command -v curl && ! command -v wget \
     && ! command -v gcc && ! command -v ldc2 && ! command -v dub && ! command -v perl && ! command -v bash \
     && ! command -v node && ! command -v python && ! command -v python3 && ! command -v service \
@@ -121,11 +139,18 @@ RUN rm -rf /var/lib/apt /var/lib/dpkg /var/cache/apt /var/cache/debconf /var/log
     && ! command -v ischroot && ! command -v savelog && ! command -v tempfile \
     && ! command -v pam-auth-update && ! command -v update-passwd && ! command -v add-shell \
     && ! command -v remove-shell && ! command -v ldconfig && ! command -v ldd && ! command -v localedef \
+    && ! command -v login && ! command -v su && ! command -v passwd && ! command -v chfn && ! command -v chsh \
+    && ! command -v chage && ! command -v gpasswd && ! command -v newgrp && ! command -v sg && ! command -v expiry \
     && test ! -e /etc/logrotate.d && test ! -e /etc/cron.d && test ! -e /etc/cron.daily \
     && test ! -e /usr/lib/tmpfiles.d && test ! -e /usr/lib/sysusers.d \
     && test ! -e /etc/alternatives && test ! -e /usr/libexec/dpkg && test ! -e /usr/share/systemd \
     && test ! -e /usr/lib/init && test ! -e /usr/lib/lsb && test ! -e /etc/update-motd.d && test ! -e /etc/profile.d \
-    && test ! -e /usr/share/gcc && test ! -e /usr/lib/x86_64-linux-gnu/libsystemd.so.0
+    && test ! -e /etc/motd && test ! -e /usr/share/base-files && test ! -e /usr/share/gcc \
+    && test ! -e /usr/lib/x86_64-linux-gnu/perl-base && test ! -e /usr/lib/x86_64-linux-gnu/security/pam_motd.so \
+    && test ! -e /usr/share/doc && test ! -e /usr/share/man && test ! -e /usr/share/keyrings \
+    && test ! -e /etc/kernel && test ! -e /etc/pam.d && test ! -e /usr/lib/x86_64-linux-gnu/security \
+    && test ! -e /var/lib/pam && test ! -e /etc/skel && test ! -e /usr/share/debianutils && test ! -e /usr/share/menu \
+    && test ! -e /usr/lib/x86_64-linux-gnu/libsystemd.so.0
 # Debian's /lib is a symlink to /usr/lib, so copy the resolved directory rather
 # than attempting to overwrite that symlink.
 COPY --from=runtime-libs /runtime-root/usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/

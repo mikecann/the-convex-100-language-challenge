@@ -1138,6 +1138,16 @@ private class LiveManager
                     return -2;
                 }
             }
+            string replyFailure;
+            /* Raw WebSocket mode makes this client responsible for the Close
+             * handshake. Echo the validated payload before retiring the
+             * transport, using the same bounded send path as every other
+             * client frame. */
+            if (!sendFrame(8, payload, null, true, replyFailure))
+            {
+                reason = "server closed Live WebSocket; Close reply failed: " ~ replyFailure;
+                return -1;
+            }
             reason = "server closed Live WebSocket";
             return -1;
         }

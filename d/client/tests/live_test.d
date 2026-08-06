@@ -3,6 +3,7 @@ module live_test;
 import convex : ConvexClient, ConvexError, LiveUpdate;
 
 version (ConvexAdapter) import convex : adapterDebugDisconnect;
+import core.sync.mutex : Mutex;
 import core.thread : Thread;
 import core.time : msecs;
 import std.base64 : Base64;
@@ -261,6 +262,48 @@ unittest
     subscription.close();
     client.close();
     server.join();
+}
+
+unittest
+{
+    /* A valid server-initiated Close must receive the client's masked Close
+     * reply before the connection owner retires the raw WebSocket. */
+    enum port = 18154;
+    auto listener = new TcpSocket();
+    listener.bind(new InternetAddress("127.0.0.1", port));
+    listener.listen(1);
+    auto gate = new Mutex();
+    bool subscriptionReady;
+    auto server = new Thread({
+        scope (exit)
+            listener.close();
+        auto peer = listener.accept();
+        scope (exit)
+            peer.close();
+        handshake(peer);
+        parseJSON(receiveText(peer));
+        parseJSON(receiveText(peer));
+        for (;;)
+        {
+            synchronized (gate)
+                if (subscriptionReady)
+                    break;
+            Thread.sleep(5.msecs);
+        }
+        ubyte[] closePayload = [0x03, 0xE8, 'b', 'y', 'e'];
+        sendFrame(peer, true, 8, closePayload);
+        auto reply = receiveFrame(peer);
+        assert(reply.opcode == 8);
+        assert(reply.payload == closePayload);
+    });
+    server.start();
+
+    auto client = new ConvexClient("http://127.0.0.1:" ~ port.to!string);
+    client.subscribe("demo:state", JSONValue(["room": JSONValue("server-close")]));
+    synchronized (gate)
+        subscriptionReady = true;
+    server.join();
+    client.close();
 }
 
 unittest

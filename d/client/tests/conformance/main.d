@@ -547,18 +547,29 @@ private void handle(AdapterSession session, ref Relay[string] relays, string lin
         output.send(errorEvent("", "ProtocolError", "malformed adapter command"));
         return;
     }
-    if (command.type != JSONType.object || !hasString(command, "op"))
+    if (command.type != JSONType.object)
     {
-        output.send(errorEvent(fieldString(command, "id"), "ProtocolError",
-                "malformed adapter command"));
+        output.send(errorEvent("", "ProtocolError", "malformed adapter command"));
         return;
     }
     auto id = fieldString(command, "id");
+    if (!hasIdentifier(command, "id"))
+    {
+        /* An invalid ID cannot be echoed because that would make the error
+         * event itself fail the adapter schema. */
+        output.send(errorEvent("", "ProtocolError", "adapter command id must be 1 to 128 bytes"));
+        return;
+    }
+    if (!hasString(command, "op"))
+    {
+        output.send(errorEvent(id, "ProtocolError", "malformed adapter command"));
+        return;
+    }
     auto op = fieldString(command, "op");
     if (op == "hello")
     {
-        if (!hasInteger(command, "protocolVersion")
-                || command.object["protocolVersion"].integer != 1)
+        if (!hasOnlyFields(command, ["protocolVersion", "id", "op"]) || !hasInteger(command,
+                "protocolVersion") || command.object["protocolVersion"].integer != 1)
         {
             output.send(errorEvent(id, "ProtocolError", "unsupported adapter protocol version"));
         }
@@ -577,6 +588,11 @@ private void handle(AdapterSession session, ref Relay[string] relays, string lin
     }
     if (op == "close")
     {
+        if (!hasOnlyFields(command, ["id", "op"]))
+        {
+            output.send(errorEvent(id, "ProtocolError", "malformed close command"));
+            return;
+        }
         output.invalidateAll();
         foreach (relay; relays.byValue())
             relay.stop();
@@ -597,9 +613,9 @@ private void handle(AdapterSession session, ref Relay[string] relays, string lin
     {
         try
         {
-            auto client = session.ensureClient();
-            if (!hasString(command, "token"))
+            if (!hasOnlyFields(command, ["id", "op", "token"]) || !hasString(command, "token"))
                 throw new ConvexError("ProtocolError", "setAuth needs token");
+            auto client = session.ensureClient();
             client.setAuth(fieldString(command, "token"));
             output.acknowledge(id);
         }
@@ -613,7 +629,10 @@ private void handle(AdapterSession session, ref Relay[string] relays, string lin
     {
         try
         {
-            if (!hasString(command, "path") || !("args" in command.object))
+            if (!hasOnlyFields(command, ["id", "op", "path", "args"])
+                    || !hasString(command, "path") || fieldString(command, "path").length < 3
+                    || !("args" in command.object) || command.object["args"].type != JSONType
+                        .object)
                 throw new ConvexError("ProtocolError", "adapter call needs path and args");
             auto client = session.ensureClient();
             ConvexResult result;
@@ -640,6 +659,11 @@ private void handle(AdapterSession session, ref Relay[string] relays, string lin
     if (op == "subscribe")
     {
         auto subscriptionId = fieldString(command, "subscriptionId");
+        if (!hasIdentifier(command, "subscriptionId"))
+        {
+            output.send(errorEvent(id, "ProtocolError", "subscriptionId must be 1 to 128 bytes"));
+            return;
+        }
         output.invalidate(subscriptionId);
         if (subscriptionId in relays)
         {
@@ -648,8 +672,10 @@ private void handle(AdapterSession session, ref Relay[string] relays, string lin
         }
         try
         {
-            if (subscriptionId.length == 0 || !hasString(command, "path")
-                    || !("args" in command.object))
+            if (!hasOnlyFields(command, [
+                "id", "op", "subscriptionId", "path", "args"
+            ]) || !hasString(command, "path") || !("args" in command.object)
+                    || command.object["args"].type != JSONType.object)
                 throw new ConvexError("ProtocolError",
                         "subscribe needs subscriptionId, path, and args");
             if (relays.length >= maxSubscriptions)
@@ -670,6 +696,15 @@ private void handle(AdapterSession session, ref Relay[string] relays, string lin
     if (op == "unsubscribe")
     {
         auto subscriptionId = fieldString(command, "subscriptionId");
+        if (!hasOnlyFields(command, [
+            "id", "op", "subscriptionId", "path", "args"
+        ]) || !hasIdentifier(command, "subscriptionId") || ("path" in command.object
+                    && !hasString(command, "path")) || ("args" in command.object
+                    && command.object["args"].type != JSONType.object))
+        {
+            output.send(errorEvent(id, "ProtocolError", "malformed unsubscribe command"));
+            return;
+        }
         output.invalidate(subscriptionId);
         if (subscriptionId in relays)
         {
@@ -683,6 +718,8 @@ private void handle(AdapterSession session, ref Relay[string] relays, string lin
     {
         try
         {
+            if (!hasOnlyFields(command, ["id", "op"]))
+                throw new ConvexError("ProtocolError", "malformed debugDisconnect command");
             auto client = session.ensureClient();
             adapterDebugDisconnect(client);
             output.acknowledge(id);
@@ -702,7 +739,8 @@ private bool isCloseCommand(string line)
     {
         auto command = parseJSON(line);
         return command.type == JSONType.object && hasString(command, "op")
-            && command.object["op"].str == "close";
+            && command.object["op"].str == "close" && hasIdentifier(command,
+                    "id") && hasOnlyFields(command, ["id", "op"]);
     }
     catch (Exception)
     {
@@ -750,6 +788,35 @@ private bool hasInteger(JSONValue value, string key)
 {
     return value.type == JSONType.object && key in value.object
         && value.object[key].type == JSONType.integer;
+}
+
+private bool hasIdentifier(JSONValue value, string key)
+{
+    if (!hasString(value, key))
+        return false;
+    auto identifier = value.object[key].str;
+    return identifier.length >= 1 && identifier.length <= 128;
+}
+
+private bool hasOnlyFields(JSONValue value, string[] allowed)
+{
+    if (value.type != JSONType.object)
+        return false;
+    foreach (key; value.object.keys)
+    {
+        bool known;
+        foreach (candidate; allowed)
+        {
+            if (key == candidate)
+            {
+                known = true;
+                break;
+            }
+        }
+        if (!known)
+            return false;
+    }
+    return true;
 }
 
 private string fieldString(JSONValue value, string key)
