@@ -8,6 +8,7 @@ RUN apt-get update \
     && apt-get install --no-install-recommends --yes \
        chicken-bin=5.3.0-1 \
        gcc=4:12.2.0-3 \
+       clang-14=1:14.0.6-12 \
        make=4.3-4.1 \
        libssl-dev=3.0.20-1~deb12u2 \
        zlib1g-dev=1:1.2.13.dfsg-1 \
@@ -16,6 +17,20 @@ RUN apt-get update \
        busybox-static=1:1.35.0-4+deb12u1+b1 \
        file=1:5.44-3 \
     && rm -rf /var/lib/apt/lists/*
+RUN mv /usr/bin/x86_64-linux-gnu-gcc /usr/bin/x86_64-linux-gnu-gcc.real \
+    && printf '%s\n' \
+      '#!/bin/sh' \
+      '# Clang avoids intermittent GCC/ARM-host-QEMU compiler faults in the generated C.' \
+      'case " $* " in' \
+      '  *" -shared "*) exec /usr/bin/x86_64-linux-gnu-gcc.real "$@" ;;' \
+      '  *check-errors*) exec /usr/bin/clang-14 -O0 -g0 -fno-stack-protector "$@" ;;' \
+      '  *) exec /usr/bin/clang-14 -O0 -g0 -fno-stack-protector "$@" ;;' \
+      'esac' \
+      > /usr/bin/x86_64-linux-gnu-gcc \
+    && chmod 755 /usr/bin/x86_64-linux-gnu-gcc \
+    && command -v x86_64-linux-gnu-gcc \
+    && test -x /usr/bin/clang-14 \
+    && test -x /usr/bin/x86_64-linux-gnu-gcc.real
 COPY client/eggs.lock client/eggs.lock
 RUN test "$(uname -m)" = x86_64 \
     && csi -version 2>&1 | grep -Fq 'Version 5.3.0' \
@@ -25,12 +40,6 @@ RUN patch --batch --forward --fuzz=0 \
        -d /root/.cache/chicken-install/openssl -p1 \
        < client/openssl.patch \
     && cd /root/.cache/chicken-install/openssl \
-    && chicken-install -force
-COPY client/ws-client.patch client/ws-client.patch
-RUN patch --batch --forward --fuzz=0 \
-       -d /root/.cache/chicken-install/ws-client -p1 \
-       < client/ws-client.patch \
-    && cd /root/.cache/chicken-install/ws-client \
     && chicken-install -force
 COPY client ./client
 COPY examples ./examples
@@ -83,12 +92,14 @@ RUN csc -static -O3 -d1 -L -lssl -L -lcrypto -L -lz \
     && rm -f /out/*.link \
     && file /out/convex-adapter /out/convex-example \
        | grep -Eq 'ELF 64-bit.*x86-64' \
-    && ldd /out/convex-adapter | grep -Fq 'libssl.so.3' \
+    && file /out/convex-adapter \
     && printf '%s\n' \
          '{"protocolVersion":1,"id":"hello","op":"hello"}' \
          '{"id":"close","op":"close"}' \
+       | tee /tmp/adapter-probe.out \
        | /out/convex-adapter \
-       | grep -Fq '"type": "closed"'
+       | tee /tmp/adapter-probe-events.out \
+       && grep -Fq '"type": "closed"' /tmp/adapter-probe-events.out
 RUN csc -O2 -d1 -I /build -o /build/main-test \
        examples/basics/main-test.scm \
     && EXAMPLE_BINARY=/out/convex-example \

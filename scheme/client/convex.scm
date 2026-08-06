@@ -1,11 +1,12 @@
 (module convex
   (json-null json-null? json-object json-object? json-get json-has?
-   json-encode json-decode json-byte-length utf8-valid?
+   json-encode json-decode json-byte-length utf8-valid? utf8-octet-length
    convex-error? convex-error-name convex-error-message convex-error-data
    convex-error-logs convex-error-operation
    result? result-value result-logs
    make-client client? client-set-auth! client-query client-mutation
    client-action client-subscribe client-close! client-debug-disconnect!
+   client-live-generation
    subscription? subscription-next subscription-close!
    update? update-value update-logs update-error update-generation)
 
@@ -26,16 +27,15 @@
           srfi-4
           srfi-18
           srfi-69
+          base64
           json
-          intarweb
-          uri-common
           openssl
-          http-client
-          ws-client)
+          simple-sha1)
 
   (define +max-json-bytes+ (* 2 1024 1024))
   (define +max-json-depth+ 128)
   (define +max-json-nodes+ 8192)
+  (define +max-uint32+ 4294967295)
 
   ;; The json egg maps JSON null to CHICKEN's singleton void value. Keeping the
   ;; representation behind these two procedures avoids leaking that oddity to
@@ -86,7 +86,30 @@
      (lambda (port) (json-write value port))))
 
   (define (json-byte-length value)
-    (string-length (json-encode value)))
+    (utf8-octet-length (json-encode value)))
+
+  ;; CHICKEN strings at this boundary are byte strings. Validate the encoding
+  ;; and then count the actual octets, rather than treating a Unicode codepoint
+  ;; count as a wire-size estimate.
+  (define (utf8-octet-length text)
+    (unless (utf8-valid? text)
+      (error 'utf8-octet-length "text is not valid UTF-8"))
+    (string-length text))
+
+  ;; JSON numbers may be decoded as exact integers or inexact values such as
+  ;; 1.0. Normalize only mathematically integral real numbers. integer? also
+  ;; rejects NaN and infinities in CHICKEN, so those never reach a range check.
+  (define (exact-integral-number value)
+    (and (number? value)
+         (real? value)
+         (integer? value)
+         (if (exact? value) value (inexact->exact value))))
+
+  (define (uint32-number value who)
+    (let ((number (exact-integral-number value)))
+      (unless (and number (<= 0 number +max-uint32+))
+        (error who "expected an unsigned 32-bit integer" value))
+      number))
 
   ;; Validate bytes before handing untrusted NDJSON or WebSocket text to the
   ;; parser. CHICKEN strings are byte strings here, which makes the boundary
@@ -376,15 +399,119 @@
              (write-char character output)
              (loop (+ count 1))))))))
 
-  (define (convex-request-headers client token)
-    (headers
-     `((content-type application/json)
-       (accept application/json)
-       (convex-client ,(client-version client))
-       (connection close)
-       ,@(if (string=? token "")
-             '()
-             `((authorization #(,(string-append "Bearer " token) raw)))))))
+  (define (last-index-in text character)
+    (let loop ((index (- (string-length text) 1)))
+      (cond ((< index 0) #f)
+            ((char=? (string-ref text index) character) index)
+            (else (loop (- index 1))))))
+
+  (define (validated-port value default who)
+    (if (not value)
+        default
+        (let ((port (string->number value)))
+          (unless (and port (integer? port) (exact? port) (<= 1 port 65535))
+            (error who "URL port is invalid" value))
+          port)))
+
+  (define (deployment-connection deployment-url)
+    (let* ((secure? (string-prefix? "https://" deployment-url))
+           (scheme-end (if secure? 8 7))
+           (authority-end (or (string-index-from deployment-url #\/ scheme-end)
+                              (string-length deployment-url)))
+           (authority (substring deployment-url scheme-end authority-end)))
+      (if (and (> (string-length authority) 0)
+               (char=? (string-ref authority 0) #\[))
+          (let ((closing (string-index-from authority #\] 1)))
+            (unless closing (error 'make-client "IPv6 URL is missing ]"))
+            (let ((host (substring authority 1 closing))
+                  (port-text
+                   (and (< (+ closing 1) (string-length authority))
+                        (substring authority (+ closing 2)))))
+              (unless (> (string-length host) 0)
+                (error 'make-client "URL host must not be empty"))
+              (values secure? host
+                      (validated-port port-text (if secure? 443 80)
+                                      'make-client))))
+          (let* ((colon (last-index-in authority #\:))
+                 (has-port? (and colon
+                                 (not (string-contains-char?
+                                       (substring authority (+ colon 1)) #\:))))
+                 (host (if has-port? (substring authority 0 colon) authority))
+                 (port-text (and has-port?
+                                 (substring authority (+ colon 1)))))
+            (unless (> (string-length host) 0)
+              (error 'make-client "URL host must not be empty"))
+            (values secure? host
+                    (validated-port port-text (if secure? 443 80)
+                                    'make-client))))))
+
+  (define (close-http-port! port)
+    (when port
+      (handle-exceptions condition #f (close-input-port port))
+      (handle-exceptions condition #f (close-output-port port))))
+
+  (define (read-http-response input)
+    (let* ((status-line (read-line input))
+           (status-code
+            (and (string? status-line)
+                 (>= (string-length status-line) 12)
+                 (string=? (substring status-line 0 5) "HTTP/")
+                 (string->number (substring status-line 9 12)))))
+      (unless (and status-code (integer? status-code))
+        (error 'read-http-response "HTTP status line is invalid"))
+      (let header-loop ((line (read-line input)))
+        (unless (string? line)
+          (error 'read-http-response "HTTP headers ended unexpectedly"))
+        (if (string=? line "")
+            (values (read-bounded-response input) status-code)
+            (header-loop (read-line input))))))
+
+  (define (write-http-request output host path body token version)
+    (display "POST " output)
+    (display path output)
+    (display " HTTP/1.1\r\nHost: " output)
+    (display host output)
+    (display "\r\nContent-Type: application/json\r\nAccept: application/json\r\nConnection: close\r\nConvex-Client: " output)
+    (display version output)
+    (display "\r\nContent-Length: " output)
+    (display (string-length body) output)
+    (display "\r\n" output)
+    (unless (string=? token "")
+      (display "Authorization: Bearer " output)
+      (display token output)
+      (display "\r\n" output))
+    (display "\r\n" output)
+    (display body output)
+    (flush-output output))
+
+  (define (http-post-response client operation body token)
+    (let-values (((secure? host port)
+                  (deployment-connection (client-deployment-url client))))
+      (parameterize ((tcp-connect-timeout 5000)
+                     (tcp-read-timeout 10000)
+                     (tcp-write-timeout 5000)
+                     (ssl-handshake-timeout 2000)
+                     (ssl-shutdown-timeout 500))
+        (call-with-values
+          (lambda ()
+            (if secure?
+                (ssl-connect* hostname: host port: port)
+                (tcp-connect host port)))
+          (lambda (input output)
+            (handle-exceptions condition
+              (begin
+                (close-http-port! input)
+                (close-http-port! output)
+                (raise condition))
+              (begin
+                (write-http-request
+                 output host (string-append "/api/" operation)
+                 body token (client-version client))
+                (let-values (((response-text status-code)
+                              (read-http-response input)))
+                  (close-http-port! input)
+                  (close-http-port! output)
+                  (list response-text status-code)))))))))
 
   (define (call-convex client operation path args)
     (unless (client? client) (error 'call-convex "expected a client"))
@@ -395,67 +522,48 @@
     (let* ((token (client-snapshot client))
            (body (json-encode
                   (json-object "path" path "args" args "format" "json")))
-           (url (string-append (client-deployment-url client) "/api/" operation))
-           (request (make-request method: 'POST
-                                  uri: (uri-reference url)
-                                  headers: (convex-request-headers client token))))
-      (handle-exceptions condition
-        (if (convex-error? condition)
-            (raise condition)
-            (raise-convex
-             "TransportError"
-             (string-append operation " transport failed: "
-                            (condition-message condition))
-             json-null '() operation))
-        (let* ((values
-                 (call-with-values
-                   (lambda ()
-                     (parameterize ((max-redirect-depth 0)
-                                    (max-retry-attempts 0)
-                                    (tcp-connect-timeout 5000)
-                                    (tcp-read-timeout 10000)
-                                    (tcp-write-timeout 5000)
-                                    (ssl-handshake-timeout 2000)
-                                    (ssl-shutdown-timeout 500))
-                       (call-with-input-request*
-                        request body
-                        (lambda (port response)
-                          (list (read-bounded-response port)
-                                (response-code response))))))
-                   list))
-               (reader-result (car values))
-               (response-text (car reader-result))
-               (status-code (cadr reader-result))
-               (payload
-                 (handle-exceptions parse-error
-                   (raise-convex
-                    "TransportError"
-                    (string-append "HTTP " (number->string status-code)
-                                   " returned non-Convex JSON")
-                    json-null '() operation)
-                   (json-decode response-text)))
-               (status (json-get payload "status" #f))
-               (logs (json-get payload "logLines" '())))
-          (unless (and (list? logs) (every string? logs))
-            (raise-convex "ProtocolError" "Convex logLines must be an array of strings"
-                          json-null '() operation))
-          (cond
-            ((and (string? status) (string=? status "success")
-                  (json-has? payload "value"))
-             (%make-result (json-get payload "value") logs))
-            ((and (string? status) (string=? status "error"))
-             (raise-convex
-              "FunctionError"
-              (let ((message (json-get payload "errorMessage" #f)))
-                (if (string? message) message "Convex function failed"))
-              (json-get payload "errorData" json-null)
-              logs operation))
-            (else
-             (raise-convex
-              "ProtocolError"
-              (string-append "HTTP " (number->string status-code)
-                             " response has unknown status")
-              json-null logs operation)))))))
+           (response-text+status
+            (handle-exceptions condition
+              (if (convex-error? condition)
+                  (raise condition)
+                  (raise-convex
+                   "TransportError"
+                   (string-append operation " transport failed: "
+                                  (condition-message condition))
+                   json-null '() operation))
+              (http-post-response client operation body token)))
+           (response-text (car response-text+status))
+           (status-code (cadr response-text+status))
+           (payload
+            (handle-exceptions parse-error
+              (raise-convex
+               "TransportError"
+               (string-append "HTTP " (number->string status-code)
+                              " returned non-Convex JSON")
+               json-null '() operation)
+              (json-decode response-text)))
+           (status (json-get payload "status" #f))
+           (logs (json-get payload "logLines" '())))
+      (unless (and (list? logs) (every string? logs))
+        (raise-convex "ProtocolError" "Convex logLines must be an array of strings"
+                      json-null '() operation))
+      (cond
+        ((and (string? status) (string=? status "success")
+              (json-has? payload "value"))
+         (%make-result (json-get payload "value") logs))
+        ((and (string? status) (string=? status "error"))
+         (raise-convex
+          "FunctionError"
+          (let ((message (json-get payload "errorMessage" #f)))
+            (if (string? message) message "Convex function failed"))
+          (json-get payload "errorData" json-null)
+          logs operation))
+        (else
+         (raise-convex
+          "ProtocolError"
+          (string-append "HTTP " (number->string status-code)
+                         " response has unknown status")
+          json-null logs operation)))))
 
   (define (client-query client path #!optional (args (json-object)))
     (call-convex client "query" path args))
@@ -854,10 +962,10 @@
     (let ((query-set (json-get object "querySet" #f))
           (identity (json-get object "identity" #f))
           (timestamp (json-get object "ts" #f)))
-      (unless (and (integer? query-set) (exact? query-set) (>= query-set 0)
-                   (integer? identity) (exact? identity) (>= identity 0)
-                   (string? timestamp))
-        (error 'valid-version "Live state version fields are invalid"))
+      (set! query-set (uint32-number query-set 'valid-version))
+      (set! identity (uint32-number identity 'valid-version))
+      (unless (string? timestamp)
+        (error 'valid-version "Live state version timestamp must be a string"))
       (timestamp-decode timestamp)
       (vector query-set identity timestamp)))
 
@@ -868,6 +976,16 @@
 
   (define (zero-version)
     (vector 0 0 +initial-timestamp+))
+
+  (define (client-live-generation client)
+    ;; The adapter uses this owner-published generation as a second check after
+    ;; dequeue. It closes the automatic transport-failure race where a relay
+    ;; has already removed an old update from the manager queue.
+    (unless (client? client) (error 'client-live-generation "expected a client"))
+    (mutex-lock! (client-lock client))
+    (let ((manager (client-live client)))
+      (mutex-unlock! (client-lock client))
+      (if manager (live-generation manager) 0)))
 
   (define (hex-digit number)
     (string-ref "0123456789abcdef" number))
@@ -914,9 +1032,17 @@
           (loop (+ index 1))))
       text))
 
+  (define (byte-string->u8vector text)
+    (let ((bytes (make-u8vector (string-length text) 0)))
+      (let loop ((index 0))
+        (when (< index (string-length text))
+          (u8vector-set! bytes index (char->integer (string-ref text index)))
+          (loop (+ index 1))))
+      bytes))
+
   (define (join-chunks chunks size)
     (let ((result (make-u8vector size 0)))
-      (let outer ((remaining chunks) (offset 0))
+      (let outer ((remaining (reverse chunks)) (offset 0))
         (if (null? remaining)
             result
             (let* ((chunk (car remaining))
@@ -928,6 +1054,304 @@
                   (inner (+ index 1))))
               (outer (cdr remaining) (+ offset length)))))))
 
+  ;; Keep the WebSocket transport in this module so the demonstration remains
+  ;; a native Scheme client. The wire format is small enough to audit directly
+  ;; and avoids delegating Convex Live to a second client runtime.
+  (define-record-type <live-socket>
+    (%make-live-socket input output)
+    live-socket?
+    (input live-socket-input)
+    (output live-socket-output))
+
+  (define-record-type <websocket-frame>
+    (%make-websocket-frame fin? opcode masked? payload)
+    websocket-frame?
+    (fin? frame-fin?)
+    (opcode frame-opcode)
+    (masked? frame-mask?)
+    (payload frame-payload-data))
+
+  (define (frame-optype frame)
+    (case (frame-opcode frame)
+      ((1) 'text) ((2) 'binary) ((0) 'continuation)
+      ((8) 'connection-close) ((9) 'ping) ((10) 'pong)
+      (else 'unsupported)))
+
+  (define (frame-payload-length frame)
+    (u8vector-length (frame-payload-data frame)))
+
+  (define (random-bytes count)
+    (call-with-input-file
+     "/dev/urandom"
+     (lambda (port)
+       (let ((bytes (read-u8vector count port)))
+         (unless (= (u8vector-length bytes) count)
+           (error 'random-bytes "could not read secure random bytes"))
+         bytes))))
+
+  (define (hex-digit-value character)
+    (cond ((and (char<=? #\0 character) (char<=? character #\9))
+           (- (char->integer character) (char->integer #\0)))
+          ((and (char<=? #\a character) (char<=? character #\f))
+           (+ 10 (- (char->integer character) (char->integer #\a))))
+          ((and (char<=? #\A character) (char<=? character #\F))
+           (+ 10 (- (char->integer character) (char->integer #\A))))
+          (else #f)))
+
+  (define (hex-string->byte-string text)
+    (unless (and (string? text) (even? (string-length text)))
+      (error 'hex-string->byte-string "expected an even-length hexadecimal string"))
+    (let ((result (make-string (/ (string-length text) 2) #\nul)))
+      (let loop ((index 0))
+        (when (< index (string-length result))
+          (let ((high (hex-digit-value (string-ref text (* index 2))))
+                (low (hex-digit-value (string-ref text (+ (* index 2) 1)))))
+            (unless (and high low)
+              (error 'hex-string->byte-string "invalid hexadecimal string"))
+            (string-set! result index
+                         (integer->char (+ (* high 16) low)))
+            (loop (+ index 1)))))
+      result))
+
+  (define (write-u16 output value)
+    (write-byte (quotient value 256) output)
+    (write-byte (modulo value 256) output))
+
+  (define (read-u16 bytes)
+    (+ (* 256 (u8vector-ref bytes 0)) (u8vector-ref bytes 1)))
+
+  (define (write-u64 output value)
+    (let loop ((index 7) (remaining value))
+      (when (>= index 0)
+        (let ((divisor (expt 256 index)))
+          (write-byte (modulo (quotient remaining divisor) 256) output)
+          (loop (- index 1) remaining)))))
+
+  (define (read-exact-u8vector input count)
+    ;; A stream read may return fewer bytes than requested without reaching
+    ;; EOF. Read one byte at a time so a fragmented TCP delivery never shifts
+    ;; the WebSocket parser to a false frame boundary.
+    (let ((bytes (make-u8vector count 0)))
+      (let loop ((index 0))
+        (if (= index count)
+            bytes
+            (let ((byte (read-byte input)))
+              (if (eof-object? byte)
+                  (signal (make-composite-condition
+                           (make-property-condition 'websocket)
+                           (make-property-condition 'exn
+                                                    'message "WebSocket EOF")))
+                  (begin
+                    (u8vector-set! bytes index byte)
+                    (loop (+ index 1)))))))))
+
+  (define (read-u64 bytes)
+    (let loop ((index 0) (value 0))
+      (if (= index 8)
+          value
+          (loop (+ index 1)
+                (+ (* value 256) (u8vector-ref bytes index))))))
+
+  (define (websocket-endpoint endpoint)
+    (let* ((secure? (string-prefix? "wss://" endpoint))
+           (scheme-length (if secure? 6 5))
+           (authority-end (or (string-index-from endpoint #\/ scheme-length)
+                              (string-length endpoint)))
+           (authority (substring endpoint scheme-length authority-end))
+           (path (if (< authority-end (string-length endpoint))
+                     (substring endpoint authority-end)
+                     "/")))
+      ;; deployment-connection returns multiple values, so capture them with
+      ;; let-values instead of accidentally treating the values as a list.
+      (let-values (((_secure host port)
+                    (deployment-connection
+                     (string-append (if secure? "https://" "http://") authority))))
+        (list secure? host port path))))
+
+  (define (read-websocket-response input expected-accept)
+    (define (lowercase-ascii text)
+      (list->string
+       (map (lambda (character)
+              (if (and (char<=? #\A character) (char<=? character #\Z))
+                  (integer->char (+ (char->integer character) 32))
+                  character))
+            (string->list text))))
+    (define (trim-space text)
+      (let* ((length (string-length text))
+             (start (let loop ((index 0))
+                      (if (and (< index length)
+                               (char-whitespace? (string-ref text index)))
+                          (loop (+ index 1))
+                          index)))
+             (end (let loop ((index length))
+                    (if (and (> index start)
+                             (char-whitespace? (string-ref text (- index 1))))
+                        (loop (- index 1))
+                        index))))
+        (substring text start end)))
+    (let ((status (read-line input)))
+      (unless (and (string? status)
+                   (string-prefix? "HTTP/1.1 101 " status))
+        (error 'ws-connect "WebSocket upgrade was rejected"))
+      (let loop ((accept #f) (count 0))
+        (when (> count 64)
+          (error 'ws-connect "WebSocket handshake has too many headers"))
+        (let ((line (read-line input)))
+          (cond
+            ((eof-object? line)
+             (error 'ws-connect "WebSocket handshake ended unexpectedly"))
+            ((string=? (trim-space line) "")
+             (unless (and accept (string=? accept expected-accept))
+               (error 'ws-connect "WebSocket accept key did not match")))
+            (else
+             (let ((colon (string-index-from line #\: 0)))
+               (unless colon
+                 (error 'ws-connect "malformed WebSocket handshake header"))
+               (let ((name (lowercase-ascii (substring line 0 colon)))
+                     (value (trim-space (substring line (+ colon 1)))))
+                 (loop (if (string=? name "sec-websocket-accept") value accept)
+                       (+ count 1))))))))))
+
+  (define (optype->opcode kind)
+    (case kind ((text) 1) ((binary) 2) ((continuation) 0)
+          ((connection-close) 8) ((ping) 9) ((pong) 10)
+          (else (error 'optype->opcode "unsupported WebSocket opcode" kind))))
+
+  ;; Preserve the small constructor shape used by the Live state machine while
+  ;; the transport record keeps only the fields the client actually needs.
+  (define (make-ws-frame fin? _rsv opcode masked length payload)
+    (unless (= length (u8vector-length payload))
+      (error 'make-ws-frame "frame length does not match payload"))
+    (%make-websocket-frame fin? opcode masked payload))
+
+  (define (ws-connect endpoint headers)
+    (let* ((parts (websocket-endpoint endpoint))
+           (secure? (car parts))
+           (host (cadr parts))
+           (port (caddr parts))
+           (path (cadddr parts))
+           (input #f)
+           (output #f)
+           (key (base64-encode (u8vector->byte-string (random-bytes 16))))
+           (expected-accept
+             (base64-encode
+              (hex-string->byte-string
+               (string->sha1sum
+                (string-append key
+                               "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))))))
+      (handle-exceptions condition
+        (begin
+          (when input (handle-exceptions ignored #f (close-input-port input)))
+          (when output (handle-exceptions ignored #f (close-output-port output)))
+          (raise condition))
+        (let-values (((new-input new-output)
+                      (parameterize ((tcp-connect-timeout 2000)
+                                     (tcp-read-timeout 1000)
+                                     (tcp-write-timeout 1000)
+                                     ;; ssl-connect* defers the handshake until
+                                     ;; the first write, so keep this deadline
+                                     ;; below the public Live close bound.
+                                     (ssl-handshake-timeout 500))
+                      (if secure?
+                          (ssl-connect* hostname: host port: port)
+                          (tcp-connect host port)))))
+          (set! input new-input)
+          (set! output new-output)
+          (parameterize ((tcp-read-timeout 1000)
+                         (tcp-write-timeout 1000)
+                         (ssl-handshake-timeout 500)
+                         (ssl-shutdown-timeout 500))
+            (display (string-append "GET " path " HTTP/1.1\r\n"
+                                    "Host: " host "\r\n"
+                                    "Upgrade: websocket\r\n"
+                                    "Connection: Upgrade\r\n"
+                                    "Sec-WebSocket-Key: " key "\r\n"
+                                    "Sec-WebSocket-Version: 13\r\n"
+                                    "Convex-Client: " (car headers) "\r\n\r\n")
+                     output)
+            (flush-output output)
+            (read-websocket-response input expected-accept)
+            (%make-live-socket input output))))))
+
+  (define (ws-disconnect! socket)
+    (handle-exceptions ignored #f
+      (close-input-port (live-socket-input socket)))
+    (handle-exceptions ignored #f
+      (close-output-port (live-socket-output socket))))
+
+  (define (ws-close socket)
+    (let ((payload (make-u8vector 2 0)))
+      (u8vector-set! payload 0 3)
+      (u8vector-set! payload 1 232)
+      (send-frame socket (%make-websocket-frame #t 8 #t payload))))
+
+  (define (ws-data-ready? socket)
+    (char-ready? (live-socket-input socket)))
+
+  (define (send-frame socket frame)
+    (let* ((output (live-socket-output socket))
+           (payload (frame-payload-data frame))
+           (length (u8vector-length payload))
+           (mask (random-bytes 4)))
+      (write-byte (+ #x80 (frame-opcode frame)) output)
+      (cond ((< length 126) (write-byte (+ #x80 length) output))
+            ((< length 65536)
+             (write-byte #xfe output)
+             (write-u16 output length))
+            (else
+             (write-byte #xff output)
+             (write-u64 output length)))
+      (write-u8vector mask output)
+      (let ((encoded (make-u8vector length 0)))
+        (let loop ((index 0))
+          (when (< index length)
+            (u8vector-set! encoded index
+                           (bitwise-xor (u8vector-ref payload index)
+                                        (u8vector-ref mask (modulo index 4))))
+            (loop (+ index 1))))
+        (write-u8vector encoded output))
+      (flush-output output)))
+
+  (define (send-text-message socket text)
+    (send-frame socket
+                (%make-websocket-frame #t 1 #t
+                                       (byte-string->u8vector text))))
+
+  (define (recv-frame socket)
+    (let* ((input (live-socket-input socket))
+           (first (read-byte input)))
+      (when (eof-object? first)
+        (signal (make-composite-condition
+                 (make-property-condition 'websocket)
+                 (make-property-condition 'exn 'message "WebSocket EOF"))))
+      (let* ((second (read-byte input))
+             (_second-check
+              (unless (number? second)
+                (signal (make-composite-condition
+                         (make-property-condition 'websocket)
+                         (make-property-condition 'exn
+                                                  'message "WebSocket EOF")))))
+             (fin? (not (zero? (bitwise-and first #x80))))
+             (opcode (bitwise-and first #x0f))
+             (masked? (not (zero? (bitwise-and second #x80))))
+             (marker (bitwise-and second #x7f))
+             (length
+               (cond ((< marker 126) marker)
+                     ((= marker 126)
+                      (read-u16 (read-exact-u8vector input 2)))
+                     (else (read-u64 (read-exact-u8vector input 8))))))
+        (when masked? (error 'recv-frame "server WebSocket frame was masked"))
+        (when (and (member opcode '(8 9 10))
+                   (or (not fin?) (> length 125)))
+          (error 'recv-frame "invalid WebSocket control frame"))
+        (when (or (and (= marker 126) (< length 126))
+                  (and (= marker 127) (< length 65536))
+                  (>= length 9223372036854775808)
+                  (> length +live-message-byte-limit+))
+          (error 'recv-frame "invalid or oversized WebSocket frame"))
+        (%make-websocket-frame fin? opcode #f
+                               (read-exact-u8vector input length)))))
+
   (define (timeout-condition? condition)
     (and (condition? condition) ((condition-predicate 'timeout) condition)))
 
@@ -937,7 +1361,7 @@
   (define (transport-condition? condition)
     (or (timeout-condition? condition)
         (condition-kind? condition 'i/o)
-        ;; ws-client represents an EOF as websocket + exn. Its protocol
+        ;; Native frame reads represent an EOF as websocket + exn. Protocol
         ;; failures instead carry the distinct fail component.
         (and (condition-kind? condition 'websocket)
              (condition-kind? condition 'exn)
@@ -1001,11 +1425,10 @@
                          (tcp-write-timeout 500))
             (when graceful
               (handle-exceptions condition #f
-                (ws-close socket 'normal-closure)))
-            ;; ws-client's public close sends a close frame but intentionally
-            ;; leaves the TCP ports open. Our pinned language-local patch adds
-            ;; this hard retirement primitive so barriers are real, including
-            ;; when a TLS peer withholds close_notify.
+                (ws-close socket)))
+            ;; Close the ports after the optional close frame. The owner
+            ;; generation is advanced below, so no old relay can cross a
+            ;; command acknowledgement barrier.
             (handle-exceptions condition #f (ws-disconnect! socket)))
           (set! socket #f)
           (live-generation-set! manager (+ (live-generation manager) 1))
@@ -1021,6 +1444,35 @@
         (if (and reconnect? (pair? (sorted-active-subscriptions manager)))
             (schedule-reconnect! backoff)
             (set! next-connect-at #f)))
+
+      (define (purge-live-deliveries!)
+        (mutex-lock! (live-lock manager))
+        (live-deliveries-set! manager '())
+        (live-delivery-bytes-set! manager 0)
+        (condition-variable-broadcast! (live-condition manager))
+        (mutex-unlock! (live-lock manager)))
+
+      (define (rebase-live-deliveries!)
+        ;; A valid update received before a transport failure must remain ahead
+        ;; of the structured failure event. Retiring increments the owner
+        ;; generation, so stamp queued values with that new generation while
+        ;; retaining their order and byte charges. Explicit
+        ;; unsubscribe/replacement barriers still purge their deliveries.
+        (mutex-lock! (live-lock manager))
+        (live-deliveries-set!
+         manager
+         (map
+          (lambda (delivery)
+            (let ((update (vector-ref delivery 1)))
+              (vector (vector-ref delivery 0)
+                      (%make-update (update-value update)
+                                    (update-logs update)
+                                    (update-error update)
+                                    (live-generation manager))
+                      (vector-ref delivery 2))))
+          (live-deliveries manager)))
+        (condition-variable-broadcast! (live-condition manager))
+        (mutex-unlock! (live-lock manager)))
 
       (define (publish-recoverable-error! name message)
         (let ((generation (live-generation manager)))
@@ -1038,12 +1490,13 @@
         (let* ((message (condition-message condition))
                (name (if (transport-condition? condition)
                          "TransportError" "ProtocolError")))
-          ;; Publish before incrementing the transport generation. Consumers
-          ;; receive a typed failure and the still-active query is then
-          ;; rehydrated on a fresh connection.
+          ;; Retire first. This increments the owner generation. Queued values
+          ;; are rebased so they remain before the failure, while a paused
+          ;; relay still fails its generation check.
+          (retire! message #t)
+          (rebase-live-deliveries!)
           (handle-exceptions publish-condition #f
-            (publish-recoverable-error! name message))
-          (retire! message #t)))
+            (publish-recoverable-error! name message))))
 
       (define (connect-message)
         (apply json-object
@@ -1068,18 +1521,12 @@
             (live-last-close-reason-set! manager (condition-message condition))
             (schedule-reconnect! backoff)
             #f)
-          (parameterize
-              ((tcp-connect-timeout 2000)
-               (tcp-read-timeout 1000)
-               (tcp-write-timeout 1000)
-               (ssl-handshake-timeout 2000)
-               (ssl-shutdown-timeout 500)
-               (ws-extra-headers
-                `((convex-client #(,(live-client-version manager) raw)))))
-            (let ((candidate (ws-connect (live-url (live-deployment-url manager)))))
-              (unless (ws-connection? candidate)
-                (error 'connect-now! "WebSocket upgrade was rejected"))
-              (set! socket candidate)))
+          (let ((candidate
+                  (ws-connect (live-url (live-deployment-url manager))
+                              (list (live-client-version manager)))))
+            (unless (live-socket? candidate)
+              (error 'connect-now! "WebSocket upgrade was rejected"))
+            (set! socket candidate))
           (send-json! (connect-message))
           (let ((subscriptions (sorted-active-subscriptions manager)))
             (when (pair? subscriptions)
@@ -1101,6 +1548,8 @@
 
       (define (send-modification! kind subscription)
         (unless socket (error 'send-modification! "Live socket is not connected"))
+        (when (= query-set-version +max-uint32+)
+          (error 'send-modification! "Live query-set version exhausted"))
         (send-json!
          (json-object "type" "ModifyQuerySet"
                       "baseVersion" query-set-version
@@ -1128,6 +1577,8 @@
                     (> (+ (live-active-bytes manager) charge)
                        +subscription-byte-limit+))
             (raise-convex "ProtocolError" "Live subscription capacity exceeded"))
+          (when (>= (live-next-query-id manager) +max-uint32+)
+            (raise-convex "ProtocolError" "Live query ID space exhausted"))
           (let* ((query-id (live-next-query-id manager))
                  (subscription
                    (%make-subscription manager query-id path args charge #t #f)))
@@ -1233,9 +1684,9 @@
           (error 'parse-live-change "Live modification must be an object"))
         (let ((kind (json-get change "type" #f))
               (query-id (json-get change "queryId" #f)))
-          (unless (and (string? kind) (integer? query-id) (exact? query-id)
-                       (>= query-id 0))
-            (error 'parse-live-change "Live modification fields are invalid"))
+          (unless (string? kind)
+            (error 'parse-live-change "Live modification type must be a string"))
+          (set! query-id (uint32-number query-id 'parse-live-change))
           (let ((subscription (active-subscription manager query-id)))
             (cond
               ((string=? kind "QueryUpdated")
@@ -1317,7 +1768,11 @@
         (let ((new-size (+ fragment-size (u8vector-length data))))
           (when (> new-size +live-message-byte-limit+)
             (error 'append-fragment! "fragmented Live message exceeds byte limit"))
-          (set! fragment-chunks (append fragment-chunks (list data)))
+          (when (>= (length fragment-chunks) 4096)
+            (error 'append-fragment! "fragmented Live message has too many frames"))
+          ;; Keep chunks in reverse order so each fragment is O(1) to append.
+          ;; join-chunks reverses once when the final frame arrives.
+          (set! fragment-chunks (cons data fragment-chunks))
           (set! fragment-size new-size)))
 
       (define (process-frame! frame)
@@ -1334,10 +1789,11 @@
             ((pong) #t)
             ((connection-close)
              (unless (close-frame-valid? frame)
-               (error 'process-frame! "invalid WebSocket close payload"))
+             (error 'process-frame! "invalid WebSocket close payload"))
+             (retire! "ServerClosed" #t #t)
+             (rebase-live-deliveries!)
              (publish-recoverable-error!
-              "TransportError" "Live server closed the WebSocket")
-             (retire! "ServerClosed" #t #t))
+              "TransportError" "Live server closed the WebSocket"))
             ((binary)
              (error 'process-frame! "binary Live messages are unsupported"))
             ((text)

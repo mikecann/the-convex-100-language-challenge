@@ -12,8 +12,25 @@
         srfi-18
         base64
         simple-sha1
-        to-hex
         convex)
+
+(define (hex-digit-value character)
+  (cond ((and (char<=? #\0 character) (char<=? character #\9))
+         (- (char->integer character) (char->integer #\0)))
+        ((and (char<=? #\a character) (char<=? character #\f))
+         (+ 10 (- (char->integer character) (char->integer #\a))))
+        (else (+ 10 (- (char->integer character) (char->integer #\A))))))
+
+(define (hex-string->byte-string text)
+  (let ((result (make-string (/ (string-length text) 2) #\nul)))
+    (let loop ((index 0))
+      (when (< index (string-length result))
+        (string-set! result index
+                     (integer->char
+                      (+ (* 16 (hex-digit-value (string-ref text (* 2 index))))
+                         (hex-digit-value (string-ref text (+ (* 2 index) 1))))))
+        (loop (+ index 1))))
+    result))
 
 (define checks 0)
 (define (check truth label)
@@ -52,11 +69,9 @@
          (key (cdr (assoc "sec-websocket-key" headers)))
          (accept
            (base64-encode
-            (hex_to_str
-             (make-string 20)
+            (hex-string->byte-string
              (string->sha1sum
-              (string-append key "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-             0 40))))
+              (string-append key "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))))))
     (check (string-contains (vector-ref request 0) "/api/sync")
            "unversioned sync endpoint")
     (check (string=? (cdr (assoc "convex-client" headers)) "scheme-0.1.0")
@@ -67,10 +82,16 @@
     (flush-output output)))
 
 (define (read-exact count input)
-  (let ((bytes (read-u8vector count input)))
-    (unless (= (u8vector-length bytes) count)
-      (error 'live-test "short WebSocket frame"))
-    bytes))
+  (let ((bytes (make-u8vector count 0)))
+    (let loop ((index 0))
+      (if (= index count)
+          bytes
+          (let ((byte (read-byte input)))
+            (if (eof-object? byte)
+                (error 'live-test "short WebSocket frame")
+                (begin
+                  (u8vector-set! bytes index byte)
+                  (loop (+ index 1)))))))))
 
 (define (read-network-length input marker)
   (cond
@@ -199,6 +220,11 @@
 (define (version ts)
   (json-object "querySet" 1 "identity" 0 "ts" (timestamp ts)))
 
+(define (decimal-version ts)
+  ;; Convex JSON may spell mathematically integral counters as 1.0. The client
+  ;; must normalize those values before comparing the live state version.
+  (json-object "querySet" 1.0 "identity" 0.0 "ts" (timestamp ts)))
+
 (define (updated query-id count #!optional (extra #f))
   (json-object "type" "QueryUpdated"
                "queryId" query-id
@@ -254,7 +280,11 @@
   (thread-start!
    (make-thread
     (lambda ()
-      (parameterize ((tcp-read-timeout 5000) (tcp-write-timeout 500))
+      (handle-exceptions condition
+        (begin
+          (print-error-message condition (current-error-port))
+          (raise condition))
+        (parameterize ((tcp-read-timeout 5000) (tcp-write-timeout 500))
         ;; Initial hydration, update, QueryFailed recovery, and one fragmented
         ;; UTF-8 message with a ping interleaved between fragments.
         (call-with-values
@@ -266,8 +296,8 @@
            (send-text
             output
             (json-encode
-             (transition (version 1) (version 2)
-                         (list (updated query-id 100)
+             (transition (decimal-version 1) (decimal-version 2)
+                         (list (updated (+ query-id 0.0) 100)
                                (updated query-id 1)))))
            (send-transition output 2 3 query-id (failed query-id))
            (send-transition output 3 4 query-id (updated query-id 2))
@@ -395,7 +425,7 @@
                          (ping-loop (- remaining 1)))))
                    (close-input-port input)
                    (close-output-port output))))))
-        (tcp-close listener)))
+          (tcp-close listener))))
     'live-fixture)))
 
 (define client

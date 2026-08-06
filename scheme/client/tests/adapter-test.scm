@@ -55,7 +55,28 @@
   (check (string=? (json-get (list-ref events 10) "type") "closed")
          "close emits closed")
   (check (not (json-has? (car events) "id"))
-         "malformed input does not invent an id"))
+         "malformed input does not invent an id")
+  ;; Keep serialized success, structured error, and close shapes close to the
+  ;; shared schema so a local test catches null optional fields or drift before
+  ;; the black-box controller does.
+  (let ((ready (list-ref events 5))
+        (error-event (list-ref events 6))
+        (closed (list-ref events 10)))
+    (check (= (json-get ready "protocolVersion") 1)
+           "hello reports protocol version")
+    (check (and (string? (json-get ready "language"))
+                (string? (json-get ready "implementation"))
+                (string? (json-get ready "runtime")))
+           "hello reports implementation provenance")
+    (check (and (json-object? (json-get error-event "error"))
+                (string? (json-get (json-get error-event "error") "name"))
+                (string? (json-get (json-get error-event "error") "message")))
+           "structured error has name and message")
+    (check (not (json-has? error-event "subscriptionId"))
+           "HTTP error omits subscriptionId")
+    (check (and (string=? (json-get closed "id") "close")
+                (not (json-has? closed "error")))
+           "close omits error")))
 
 ;; Reject hostile structure before the json egg allocates the nested value.
 ;; This exact 400 KiB shape previously OOM-killed the final 128 MiB image.

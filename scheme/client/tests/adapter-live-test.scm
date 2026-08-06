@@ -12,8 +12,23 @@
         srfi-18
         base64
         simple-sha1
-        to-hex
         convex)
+
+(define (hex-digit-value character)
+  (if (and (char<=? #\0 character) (char<=? character #\9))
+      (- (char->integer character) (char->integer #\0))
+      (+ 10 (- (char->integer character) (char->integer #\a)))))
+
+(define (hex-string->byte-string text)
+  (let ((result (make-string (/ (string-length text) 2) #\nul)))
+    (let loop ((index 0))
+      (when (< index (string-length result))
+        (string-set! result index
+                     (integer->char
+                      (+ (* 16 (hex-digit-value (string-ref text (* 2 index))))
+                         (hex-digit-value (string-ref text (+ (* 2 index) 1))))))
+        (loop (+ index 1))))
+    result))
 
 ;; Include the actual adapter loop. Docker sets ADAPTER_LIBRARY_ONLY, so the
 ;; entrypoint does not run while this test drives it over a real TCP socket.
@@ -54,11 +69,9 @@
          (key (cdr (assoc "sec-websocket-key" headers)))
          (accept
            (base64-encode
-            (hex_to_str
-             (make-string 20)
+            (hex-string->byte-string
              (string->sha1sum
-              (string-append key "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-             0 40))))
+              (string-append key "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))))))
     (check (string-contains request-line "/api/sync")
            "adapter Live uses sync endpoint")
     (display "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " output)
@@ -67,10 +80,16 @@
     (flush-output output)))
 
 (define (read-exact count input)
-  (let ((bytes (read-u8vector count input)))
-    (unless (= (u8vector-length bytes) count)
-      (error 'adapter-live-test "short WebSocket frame"))
-    bytes))
+  (let ((bytes (make-u8vector count 0)))
+    (let loop ((index 0))
+      (if (= index count)
+          bytes
+          (let ((byte (read-byte input)))
+            (if (eof-object? byte)
+                (error 'adapter-live-test "short WebSocket frame")
+                (begin
+                  (u8vector-set! bytes index byte)
+                  (loop (+ index 1)))))))))
 
 (define (read-network-length input marker)
   (cond

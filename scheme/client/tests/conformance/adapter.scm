@@ -169,7 +169,7 @@
               (raise condition))
             (string-append (json-encode object) "\n"))))
     (mutex-unlock! (output-sink-encoder-lock sink))
-    (let ((size (string-length text))
+    (let ((size (utf8-octet-length text))
           (deadline (+ (current-seconds) timeout)))
       (when (> size +output-byte-limit+)
         (error 'output-publish! "adapter event exceeds encoded output budget"))
@@ -362,7 +362,9 @@
                                (hash-table-ref/default
                                 (adapter-generations state) subscription-id -1))
                             (>= (update-generation update)
-                                (adapter-minimum-live-generation state)))
+                                (max (adapter-minimum-live-generation state)
+                                     (client-live-generation
+                                      (adapter-client state)))))
                    (output-publish! (adapter-output state)
                                     (relay-event subscription-id update)
                                     droppable?: #t)))))
