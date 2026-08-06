@@ -4,7 +4,7 @@
   (:require [clojure.data.json :as json]
             [clojure.string :as string])
   (:import [java.io ByteArrayOutputStream DataInputStream InputStream OutputStream]
-           [java.net InetAddress ServerSocket Socket SocketException]
+           [java.net InetAddress ServerSocket Socket SocketException SocketTimeoutException]
            [java.nio.charset StandardCharsets]
            [java.security MessageDigest]
            [java.time Duration]
@@ -130,12 +130,20 @@
   java.lang.AutoCloseable
   (close [_]
     (.set ^AtomicBoolean stopped true)
-    ;; Closing the listener interrupts a concurrent accept. Some runtimes report
-    ;; that expected interruption as IOException, so cleanup must continue and
-    ;; still surface a real fixture-worker failure below.
-    (try
-      (.close server)
-      (catch java.io.IOException _ nil))
+    ;; Closing the listener interrupts a concurrent accept. Under emulation the
+    ;; first close can return EINPROGRESS before it actually closes, so retry
+    ;; briefly rather than leaving the accept worker alive through teardown.
+    (letfn [(close-listener! [attempt]
+              (when-not (.isClosed server)
+                (try
+                  (.close server)
+                  (catch java.io.IOException error
+                    (if (< attempt 50)
+                      (do
+                        (Thread/sleep 10)
+                        (close-listener! (inc attempt)))
+                      (throw error))))))]
+      (close-listener! 0))
     (doseq [socket sockets]
       (try (.close ^Socket socket) (catch Throwable _ nil)))
     (.shutdownNow executor)
@@ -146,7 +154,10 @@
 (defn fixture
   ([handler] (fixture {} handler))
   ([{:keys [drop-handshake? reject-handshake? allow-peer-close?]} handler]
-   (let [server (ServerSocket. 0 20 (InetAddress/getLoopbackAddress))
+   (let [server (doto (ServerSocket. 0 20 (InetAddress/getLoopbackAddress))
+                  ;; Poll accept so teardown stays bounded even if an emulated
+                  ;; listener close is delayed by the host kernel.
+                  (.setSoTimeout 100))
          executor (Executors/newCachedThreadPool)
          stopped (AtomicBoolean. false)
          connections (AtomicInteger. 0)
@@ -194,6 +205,7 @@
                                            (record-failure! error))
                                          (catch Throwable error (record-failure! error))
                                          (finally (.remove sockets socket)))))))
+                       (catch SocketTimeoutException _ nil)
                        (catch SocketException error (record-failure! error)))))))
      result)))
 
