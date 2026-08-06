@@ -7,11 +7,11 @@
 %% tagged tuples such as `{received, Bytes}` become Gleam custom-type variants.
 -module(convex_ffi).
 -export([connect/5, socket_send/3, socket_recv/3, socket_close/1,
-         listen/1, listen_port/1, accept/2,
+         listen/2, listen_port/1, accept/2,
          sha1/1, base64_encode/1, base64_decode/1, random_bytes/1,
          xor_repeating/2,
          concat_binaries/1,
-         split_newline/1,
+         split_newline/1, find_sequence/2,
          scan_json_string/1,
          monotonic_ms/0, stdin_read/1, stdout_write/1, stderr_write/1,
          otp_release/0, plain_arguments/0, getenv/1, kill_and_wait/2]).
@@ -84,10 +84,14 @@ socket_close({tls, Socket}) ->
 
 %% Port 0 asks the kernel for a free port, which keeps the fixture servers in
 %% the language-local tests independent of each other.
-listen(Port) ->
-    Options = tcp_options() ++ [{reuseaddr, true}, {ip, {127, 0, 0, 1}}],
-    case gen_tcp:listen(Port, Options) of
-        {ok, Socket} -> {ok, {tcp, Socket}};
+listen(Host, Port) ->
+    case inet:parse_address(binary_to_list(Host)) of
+        {ok, Address} ->
+            Options = tcp_options() ++ [{reuseaddr, true}, {ip, Address}],
+            case gen_tcp:listen(Port, Options) of
+                {ok, Socket} -> {ok, {tcp, Socket}};
+                {error, Reason} -> {error, reason(Reason)}
+            end;
         {error, Reason} -> {error, reason(Reason)}
     end.
 
@@ -100,7 +104,7 @@ listen_port({tcp, Socket}) ->
 accept({tcp, Socket}, Timeout) ->
     case gen_tcp:accept(Socket, Timeout) of
         {ok, Accepted} ->
-            case apply_test_send_buffer(Accepted) of
+            case apply_adapter_send_buffer(Accepted) of
                 ok -> {ok, {tcp, Accepted}};
                 {error, Reason} ->
                     _ = gen_tcp:close(Accepted),
@@ -109,20 +113,12 @@ accept({tcp, Socket}, Timeout) ->
         {error, Reason} -> {error, reason(Reason)}
     end.
 
-%% The conformance adapter is itself test infrastructure. Its stopped-reader
-%% probe narrows the accepted controller socket's kernel send buffer so a
-%% near-maximum event must physically block instead of fitting in host-specific
-%% autotuned capacity. Public client connections never call accept/2.
-apply_test_send_buffer(Socket) ->
-    case os:getenv("ADAPTER_TEST_SEND_BUFFER") of
-        false -> ok;
-        Text ->
-            case string:to_integer(Text) of
-                {Size, []} when Size >= 1024, Size =< 65536 ->
-                    inet:setopts(Socket, [{sndbuf, Size}]);
-                _ -> {error, invalid_test_send_buffer}
-            end
-    end.
+%% Adapter controller output is deliberately bounded at the socket as well as
+%% in its userspace writer. A fixed 64 KiB request makes backpressure behavior
+%% portable without a test-only environment hook in the final client beam.
+%% Public HTTP and Live connections never call accept/2.
+apply_adapter_send_buffer(Socket) ->
+    inet:setopts(Socket, [{sndbuf, 65536}]).
 
 sha1(Data) ->
     ensure_started(crypto),
@@ -161,6 +157,15 @@ split_newline(Data) ->
             {line_found,
              binary:part(Data, 0, Index),
              binary:part(Data, Index + 1, byte_size(Data) - Index - 1)}
+    end.
+
+%% Return the byte offset of a delimiter without copying the bytes before it.
+%% Gleam's HTTP readers retain chunks and flatten only after this search finds
+%% the complete boundary.
+find_sequence(Data, Sequence) ->
+    case binary:match(Data, Sequence) of
+        nomatch -> {error, nil};
+        {Index, _Length} -> {ok, Index}
     end.
 
 scan_json_string(Data) ->

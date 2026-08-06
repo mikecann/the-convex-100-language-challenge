@@ -95,17 +95,18 @@ type Channel {
   Tcp(socket: convex_sys.Socket)
 }
 
-/// `ADAPTER_LISTEN` is `host:port`. The harness always connects to loopback,
-/// and binding elsewhere would expose a test-only control surface, so the host
-/// part is accepted and ignored in favour of loopback.
+/// `ADAPTER_LISTEN` is `host:port`. The shared controller runs in a sibling
+/// container, so `0.0.0.0` must reach the actual listener rather than being
+/// silently narrowed to loopback.
 fn listen(client: Client, address: String) -> Nil {
   case parse_listen(address) {
     Error(reason) -> convex_sys.stderr_write(reason)
-    Ok(port) -> listen_on_port(client, port)
+    Ok(#(host, port)) -> listen_on_address(client, host, port)
   }
 }
 
-fn parse_listen(address: String) -> Result(Int, String) {
+@internal
+pub fn parse_listen(address: String) -> Result(#(String, Int), String) {
   use #(host, raw_port) <- result.try(
     string.split_once(address, ":")
     |> result.replace_error("ADAPTER_LISTEN must be host:port"),
@@ -114,20 +115,24 @@ fn parse_listen(address: String) -> Result(Int, String) {
     int.parse(raw_port)
     |> result.replace_error("ADAPTER_LISTEN has an invalid port"),
   )
+  let bind_host = case host {
+    "localhost" -> "127.0.0.1"
+    other -> other
+  }
   case
     host == "127.0.0.1" || host == "localhost" || host == "0.0.0.0",
     port > 0 && port < 65_536
   {
-    True, True -> Ok(port)
+    True, True -> Ok(#(bind_host, port))
     _, _ ->
       Error(
-        "ADAPTER_LISTEN must name a loopback-compatible host and valid port",
+        "ADAPTER_LISTEN must name an approved numeric host and valid port",
       )
   }
 }
 
-fn listen_on_port(client: Client, port: Int) -> Nil {
-  case convex_sys.listen(port) {
+fn listen_on_address(client: Client, host: String, port: Int) -> Nil {
+  case convex_sys.listen(host, port) {
     Error(reason) ->
       convex_sys.stderr_write("adapter cannot listen: " <> reason)
     Ok(listener) -> {

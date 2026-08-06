@@ -16,6 +16,9 @@ self_test() ->
     NearCommand = near_command(),
     true = byte_size(NearCommand) > 8 * 1024 * 1024,
     true = byte_size(NearCommand) < ?NDJSON_MAX_BYTES,
+    NearNumber = near_numeric_command(),
+    true = byte_size(NearNumber) > 8 * 1024 * 1024,
+    true = byte_size(NearNumber) < ?NDJSON_MAX_BYTES,
     NearWs = transition(0, 0, 1, 1, 0, ?NEAR_WS_BLOB_BYTES),
     true = byte_size(NearWs) > 7 * 1024 * 1024,
     true = byte_size(NearWs) < ?WS_MAX_BYTES,
@@ -101,6 +104,13 @@ near_command_probe(Socket) ->
                                 erlang:monotonic_time(millisecond) + 10000),
     true = contains(NearError, <<"\"id\":\"near-limit\"">>),
     true = contains(NearError, <<"\"name\":\"ProtocolError\"">>),
+    %% A near-limit number used to append one byte to a growing binary on every
+    %% parser step. This second legal NDJSON line proves the linear scanner
+    %% rejects the unreasonable numeric token and releases it before recovery.
+    ok = gen_tcp:send(Socket, near_numeric_command()),
+    NumericError = read_small_line(Socket, <<>>, 4096,
+                                   erlang:monotonic_time(millisecond) + 10000),
+    true = contains(NumericError, <<"\"name\":\"ProtocolError\"">>),
     ok = send_line(Socket,
                    <<"{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}">>),
     Ready = read_small_line(Socket, <<>>, 4096,
@@ -207,6 +217,13 @@ near_command() ->
         <<"{\"id\":\"near-limit\",\"op\":\"unknown\",\"padding\":\"">>,
         binary:copy(<<"x">>, ?NEAR_COMMAND_BLOB_BYTES),
         <<"\"}\n">>
+    ]).
+
+near_numeric_command() ->
+    iolist_to_binary([
+        <<"{\"id\":\"near-number\",\"op\":\"unknown\",\"padding\":" >>,
+        binary:copy(<<"1">>, ?NEAR_COMMAND_BLOB_BYTES),
+        <<"}\n">>
     ]).
 
 send_line(Socket, Line) ->

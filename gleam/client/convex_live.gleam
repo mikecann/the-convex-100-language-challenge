@@ -105,6 +105,7 @@ pub opaque type Live {
   Live(commands: Subject(Command))
 }
 
+// TEST_ONLY_BEGIN
 /// A test-only pause point. `convex.new` never supplies one; the deterministic
 /// relay tests use it to hold an event after it has been dequeued and prove no
 /// stale value can cross an unsubscribe acknowledgement.
@@ -115,6 +116,7 @@ pub type GateMessage {
   /// The relay has taken an event and is waiting to be released.
   GateHeld(release: Subject(Nil), subscription_id: String, event: LiveEvent)
 }
+// TEST_ONLY_END
 
 pub opaque type Command {
   DoSubscribe(
@@ -139,6 +141,7 @@ pub opaque type Command {
   ConnUp(connection: Int, inbox: Subject(ConnCommand), leftover: BitArray)
   ConnBytes(connection: Int, bytes: BitArray, acknowledged: Subject(Nil))
   ConnDown(connection: Int, reason: String)
+  ConnShutdownDone(connection: Int, reply: Subject(Nil))
   HandshakeExpired(connection: Int)
   FrameExpired(connection: Int, token: Int)
   ReconnectDue(token: Int)
@@ -151,7 +154,18 @@ pub type ConnCommand {
   /// A final Remove must reach the kernel before the owner retires the last
   /// connection, otherwise an eager close can erase it from the wire.
   ConnSendAndAcknowledge(frame: BitArray, reply: Subject(Result(Nil, String)))
+  /// Reply to a peer Close, then retire this socket and let the owner reconnect.
+  ConnReplyAndClose(frame: BitArray, reason: String)
+  ConnShutdown(frame: BitArray, reply: Subject(Nil))
   ConnStop
+}
+
+type DrainOutcome {
+  ContinueReading
+  StopRequested
+  CloseRequested(reason: String)
+  ShutdownRequested(reply: Subject(Nil))
+  SendFailed(reason: String)
 }
 
 type RelayMessage {
@@ -204,7 +218,9 @@ type State {
     self: Subject(Command),
     url: Url,
     verify_peer: Bool,
+    // TEST_ONLY_BEGIN
     gate: Option(RelayGate),
+    // TEST_ONLY_END
     connection: Option(Connection),
     next_connection_id: Int,
     subscriptions: Dict(String, Subscription),
@@ -239,18 +255,24 @@ type State {
 
 /// Start the single owner for a deployment. One client has exactly one owner,
 /// so subscriptions share one WebSocket and one query set.
+// PROD pub fn start(url: Url, verify_peer: Bool) -> Result(Live, String) {
+// TEST_ONLY_BEGIN
 pub fn start(
   url: Url,
   verify_peer: Bool,
   gate: Option(RelayGate),
 ) -> Result(Live, String) {
+// TEST_ONLY_END
   let handshake = process.new_subject()
   let _pid =
     process.start(
       fn() {
         let self = process.new_subject()
         process.send(handshake, self)
+        // PROD loop(initial_state(self, url, verify_peer))
+        // TEST_ONLY_BEGIN
         loop(initial_state(self, url, verify_peer, gate))
+        // TEST_ONLY_END
       },
       False,
     )
@@ -305,17 +327,22 @@ pub fn close(live: Live) -> Result(Nil, Nil) {
 // Owner
 // ---------------------------------------------------------------------------
 
+// PROD fn initial_state(self: Subject(Command), url: Url, verify_peer: Bool) -> State {
+// TEST_ONLY_BEGIN
 fn initial_state(
   self: Subject(Command),
   url: Url,
   verify_peer: Bool,
   gate: Option(RelayGate),
 ) -> State {
+// TEST_ONLY_END
   State(
     self: self,
     url: url,
     verify_peer: verify_peer,
+    // TEST_ONLY_BEGIN
     gate: gate,
+    // TEST_ONLY_END
     connection: None,
     next_connection_id: 1,
     subscriptions: dict.new(),
@@ -370,7 +397,10 @@ fn handle(command: Command, state: State) -> Option(State) {
         }
         False, False, False -> {
           let id = int.to_string(query_id)
+          // PROD let #(relay_pid, relay_inbox) = start_relay(state.self)
+          // TEST_ONLY_BEGIN
           let #(relay_pid, relay_inbox) = start_relay(state.self, state.gate)
+          // TEST_ONLY_END
           let subscription =
             Subscription(
               query_id: query_id,
@@ -439,12 +469,18 @@ fn handle(command: Command, state: State) -> Option(State) {
     }
 
     DoClose(reply) -> {
-      let state = disconnect("client closed", state)
-      dict.each(state.subscriptions, fn(_id, subscription) {
-        retire(subscription.relay_pid)
-      })
-      process.send(reply, Nil)
-      None
+      case state.connection {
+        Some(Connection(inbox: Some(inbox), ready: True, ..)) -> {
+          // The connection process sends this after any byte batch already in
+          // flight has been acknowledged, so shutdown cannot deadlock the owner.
+          process.send(
+            inbox,
+            ConnShutdown(ws.close_frame(1000, ""), reply),
+          )
+          Some(state)
+        }
+        _ -> finish_close(reply, state)
+      }
     }
 
     RelayDelivery(id, generation, token, _event, reply) -> {
@@ -521,6 +557,12 @@ fn handle(command: Command, state: State) -> Option(State) {
       case current_connection(state, connection) {
         None -> Some(state)
         Some(_) -> Some(transport_reconnect(reason, state))
+      }
+
+    ConnShutdownDone(connection, reply) ->
+      case current_connection(state, connection) {
+        None -> finish_close(reply, state)
+        Some(_) -> finish_close(reply, state)
       }
 
     HandshakeExpired(connection) ->
@@ -695,12 +737,20 @@ fn connection_loop(
   inbox: Subject(ConnCommand),
 ) -> Nil {
   case drain_commands(socket, inbox) {
-    Error(Nil) -> convex_sys.close(socket)
-    Ok(Error(reason)) -> {
+    StopRequested -> convex_sys.close(socket)
+    CloseRequested(reason) -> {
       convex_sys.close(socket)
       process.send(owner, ConnDown(id, reason))
     }
-    Ok(Ok(Nil)) ->
+    ShutdownRequested(reply) -> {
+      convex_sys.close(socket)
+      process.send(owner, ConnShutdownDone(id, reply))
+    }
+    SendFailed(reason) -> {
+      convex_sys.close(socket)
+      process.send(owner, ConnDown(id, reason))
+    }
+    ContinueReading ->
       case convex_sys.recv(socket, 0, read_poll) {
         convex_sys.Received(bytes) -> {
           let acknowledged = process.new_subject()
@@ -731,19 +781,20 @@ fn connection_loop(
   }
 }
 
-/// Write every queued frame before the next read. `Error(Nil)` means the owner
-/// asked this connection to stop.
+/// Write every queued frame before the next read. A terminal outcome tells the
+/// connection loop whether it should stop quietly, report failure, or complete
+/// one side of the WebSocket closing handshake.
 fn drain_commands(
   socket: convex_sys.Socket,
   inbox: Subject(ConnCommand),
-) -> Result(Result(Nil, String), Nil) {
+) -> DrainOutcome {
   case process.receive(inbox, 0) {
-    Error(_) -> Ok(Ok(Nil))
-    Ok(ConnStop) -> Error(Nil)
+    Error(_) -> ContinueReading
+    Ok(ConnStop) -> StopRequested
     Ok(ConnSend(frame)) ->
       case convex_sys.send(socket, frame, 3000) {
         Ok(_) -> drain_commands(socket, inbox)
-        Error(reason) -> Ok(Error(reason))
+        Error(reason) -> SendFailed(reason)
       }
     Ok(ConnSendAndAcknowledge(frame, reply)) ->
       case convex_sys.send(socket, frame, 3000) {
@@ -753,10 +804,29 @@ fn drain_commands(
         }
         Error(reason) -> {
           process.send(reply, Error(reason))
-          Ok(Error(reason))
+          SendFailed(reason)
         }
       }
+    Ok(ConnReplyAndClose(frame, reason)) ->
+      case convex_sys.send(socket, frame, 1000) {
+        Ok(_) -> CloseRequested(reason)
+        Error(send_reason) -> SendFailed(send_reason)
+      }
+    Ok(ConnShutdown(frame, reply)) -> {
+      // `send_timeout_close` bounds a peer that never reads its final frame.
+      let _ = convex_sys.send(socket, frame, 1000)
+      ShutdownRequested(reply)
+    }
   }
+}
+
+fn finish_close(reply: Subject(Nil), state: State) -> Option(State) {
+  let state = disconnect("client closed", state)
+  dict.each(state.subscriptions, fn(_id, subscription) {
+    retire(subscription.relay_pid)
+  })
+  process.send(reply, Nil)
+  None
 }
 
 /// Retire the current connection and reset the per-connection sync state. The
@@ -976,7 +1046,21 @@ fn remove_then_idle_close(subscription: Subscription, state: State) -> State {
       )
       case process.receive(reply, 3000) {
         Ok(Ok(_)) ->
-          schedule_idle_close(State(..state, query_set: state.query_set + 1))
+          case list.length(state.retiring) >= max_retiring_queries {
+            True ->
+              disconnect(
+                "retiring query capacity reached",
+                State(..state, query_set: state.query_set + 1),
+              )
+            False ->
+              schedule_idle_close(
+                State(
+                  ..state,
+                  query_set: state.query_set + 1,
+                  retiring: [subscription.query_id, ..state.retiring],
+                ),
+              )
+          }
         Ok(Error(reason)) -> transport_reconnect(reason, state)
         Error(_) ->
           transport_reconnect("timed out sending final query removal", state)
@@ -1089,8 +1173,9 @@ fn store_decoder(connection: Int, decoder: ws.Decoder, state: State) -> State {
   }
 }
 
-/// Act on one WebSocket message. `Error(state)` means the connection is gone
-/// and the remaining buffered frames belong to it, so they are dropped.
+/// Act on one WebSocket message. `Error(state)` stops decoding the current byte
+/// batch. Protocol errors retire the connection immediately; a peer Close first
+/// queues the required Close reply, then the connection process retires it.
 fn handle_message(
   connection: Int,
   message: ws.Message,
@@ -1109,11 +1194,23 @@ fn handle_message(
       Ok(state)
     }
     ws.Pong(_) -> Ok(state)
-    ws.Close(code, reason) ->
-      Error(transport_reconnect(
-        "WebSocket close " <> int.to_string(code) <> ": " <> reason,
-        state,
-      ))
+    ws.Close(code, reason) -> {
+      let detail =
+        "WebSocket close " <> int.to_string(code) <> ": " <> reason
+      case current_connection(state, connection) {
+        Some(Connection(inbox: Some(inbox), ..)) -> {
+          // The connection process is waiting for this byte batch to be
+          // acknowledged. Queue the reply now; it writes immediately after the
+          // acknowledgement and reports ConnDown only once the socket is shut.
+          process.send(
+            inbox,
+            ConnReplyAndClose(ws.close_reply_frame(code, reason), detail),
+          )
+          Error(state)
+        }
+        _ -> Error(transport_reconnect(detail, state))
+      }
+    }
   }
 }
 
@@ -1362,11 +1459,7 @@ fn apply_change(change: Change, state: State) -> State {
               put_subscription(
                 state,
                 id,
-                enqueue(
-                  id,
-                  LiveValue(value, logs),
-                  Subscription(..subscription, last: Some(value)),
-                ),
+                enqueue_value(id, value, logs, subscription),
               )
           }
       }
@@ -1422,17 +1515,23 @@ fn observed_max(current: Option(String), candidate: String) -> Option(String) {
 // Delivery
 // ---------------------------------------------------------------------------
 
+// PROD fn start_relay(owner: Subject(Command)) -> #(Pid, Subject(RelayMessage)) {
+// TEST_ONLY_BEGIN
 fn start_relay(
   owner: Subject(Command),
   gate: Option(RelayGate),
 ) -> #(Pid, Subject(RelayMessage)) {
+// TEST_ONLY_END
   let handshake = process.new_subject()
   let pid =
     process.start(
       fn() {
         let inbox = process.new_subject()
         process.send(handshake, inbox)
+        // PROD relay_loop(owner, inbox)
+        // TEST_ONLY_BEGIN
         relay_loop(owner, inbox, gate)
+        // TEST_ONLY_END
       },
       False,
     )
@@ -1440,15 +1539,23 @@ fn start_relay(
   #(pid, inbox)
 }
 
+// PROD fn relay_loop(owner: Subject(Command), inbox: Subject(RelayMessage)) -> Nil {
+// TEST_ONLY_BEGIN
 fn relay_loop(
   owner: Subject(Command),
   inbox: Subject(RelayMessage),
   gate: Option(RelayGate),
 ) -> Nil {
+// TEST_ONLY_END
   case process.receive(inbox, 60_000) {
+    // PROD Error(_) -> relay_loop(owner, inbox)
+    // TEST_ONLY_BEGIN
     Error(_) -> relay_loop(owner, inbox, gate)
+    // TEST_ONLY_END
     Ok(RelayEvent(id, generation, token, event, sink)) -> {
+      // TEST_ONLY_BEGIN
       hold(gate, id, event)
+      // TEST_ONLY_END
       let reply = process.new_subject()
       process.send(owner, RelayDelivery(id, generation, token, event, reply))
       case wait_for_permission(reply) {
@@ -1457,7 +1564,10 @@ fn relay_loop(
           process.send(sink, SubscriptionEvent(id, event, acknowledged))
           wait_for_acknowledgement(acknowledged)
           process.send(owner, RelayReady(id, generation, token))
+          // PROD relay_loop(owner, inbox)
+          // TEST_ONLY_BEGIN
           relay_loop(owner, inbox, gate)
+          // TEST_ONLY_END
         }
         False -> Nil
       }
@@ -1479,6 +1589,7 @@ fn wait_for_acknowledgement(acknowledged: Subject(Nil)) -> Nil {
   }
 }
 
+// TEST_ONLY_BEGIN
 /// The deterministic tests pause a relay here, after it has taken an event but
 /// before it asks for permission. Production clients pass `None`.
 fn hold(gate: Option(RelayGate), id: String, event: LiveEvent) -> Nil {
@@ -1492,6 +1603,7 @@ fn hold(gate: Option(RelayGate), id: String, event: LiveEvent) -> Nil {
     }
   }
 }
+// TEST_ONLY_END
 
 /// Hand an event to the relay if it is idle, otherwise queue it under the
 /// count and byte bounds.
@@ -1502,9 +1614,16 @@ fn enqueue(
 ) -> Subscription {
   let bytes = event_bytes(event)
   case bytes > max_queue_bytes {
-    // One event larger than the whole budget can never be delivered without
-    // breaking the bound, so it is dropped rather than allowed through.
-    True -> subscription
+    // Never make an accepted transition disappear. Replace an event which
+    // cannot fit the delivery budget with a small observable protocol failure.
+    True ->
+      enqueue(
+        id,
+        LiveFailure(convex_error.protocol_error(
+          "Live event exceeds the delivery byte budget",
+        )),
+        subscription,
+      )
     False ->
       case subscription.relay_busy {
         False -> send_to_relay(id, event, bytes, subscription)
@@ -1518,6 +1637,23 @@ fn enqueue(
           |> trim(id, _)
           |> dispatch_if_idle(id, _)
       }
+  }
+}
+
+/// Record `last` only after proving the value can enter the bounded delivery
+/// path. Otherwise a reconnect would suppress the same value even though the
+/// subscriber never observed it.
+fn enqueue_value(
+  id: String,
+  value: Json,
+  logs: List(String),
+  subscription: Subscription,
+) -> Subscription {
+  let event = LiveValue(value, logs)
+  case event_bytes(event) > max_queue_bytes {
+    True -> enqueue(id, event, subscription)
+    False ->
+      enqueue(id, event, Subscription(..subscription, last: Some(value)))
   }
 }
 

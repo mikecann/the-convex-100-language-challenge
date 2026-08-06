@@ -44,7 +44,6 @@ run_near_command_case() {
         --memory 128m --memory-swap 128m \
         -e ADAPTER_LISTEN=0.0.0.0:8080 \
         -e CONVEX_URL=http://127.0.0.1:9 \
-        -e ADAPTER_TEST_SEND_BUFFER=4096 \
         -e ADAPTER_RESERVATION_DIAGNOSTIC=1 \
         "$runtime_image" >/dev/null
 
@@ -147,7 +146,6 @@ run_case() {
         --memory 128m --memory-swap 128m \
         -e ADAPTER_LISTEN=0.0.0.0:8080 \
         -e CONVEX_URL=http://fixture:8081 \
-        -e ADAPTER_TEST_SEND_BUFFER=4096 \
         -e ADAPTER_RESERVATION_DIAGNOSTIC=1 \
         "$runtime_image" >/dev/null
 

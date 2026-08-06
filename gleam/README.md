@@ -29,20 +29,20 @@ room's shared counter from `0` to `1`:
 4. receive the new value over Live,
 5. print a single verification line once HTTP and Live agree.
 
-The source and both minimal linux/amd64 runtime images have passed their first
-Docker build. The exact example has completed this `0 -> 1` journey against the
-approved local backend, and the language-local codec, Live fixture, adapter,
-and example tests pass. It has not passed the shared local and hosted
-black-box conformance runs, so no capability has been earned or claimed.
+A previous checkpoint built both minimal linux/amd64 runtime images and ran the
+exact example, but independent review rejected that source. The repaired source
+now needs a fresh Docker build, language-local tests, final-image checks, and
+local and hosted black-box conformance. No capability has been earned or
+claimed.
 
 ## What works
 
 | Capability | State | Notes |
 | --- | --- | --- |
-| HTTP queries, mutations, actions | implemented, Docker-tested | The exact example's query and mutation passed against the approved local backend; shared conformance is still pending. |
-| Bearer token lifecycle | implemented, Docker-tested | `convex.set_auth`, cleared by an empty string; unsafe header values are rejected. |
-| Live subscriptions | implemented, Docker-tested | The exact example and deterministic fixture exercise initial and later values, errors, remove, reconnect, and bounded delivery. |
-| Live reconnect and resend | implemented, Docker-tested | The session identifier is stable; the fixture proves five reconnects rebuild and rehydrate the active query set. |
+| HTTP queries, mutations, actions | implemented, fresh verification pending | The repaired HTTP stream and parser paths need a new exact-head Docker run. |
+| Bearer token lifecycle | implemented, fresh verification pending | `convex.set_auth`, cleared by an empty string; unsafe header values are rejected. |
+| Live subscriptions | implemented, fresh verification pending | Deterministic fixtures cover values, errors, delayed removal, close handshakes, reconnect, and bounded delivery. |
+| Live reconnect and resend | implemented, fresh verification pending | The session identifier stays stable and active queries are rebuilt after reconnect. |
 | Earned capability badges | none | Badges come only from shared local and hosted evidence runs. |
 
 ## The canonical example
@@ -238,17 +238,16 @@ The dedicated pressure probe builds the exact final `runtime` image plus two
 test-only sibling images. It keeps the fixture and controller out of the
 adapter's cgroup, runs `/usr/local/bin/convex-adapter` through its unchanged
 default entrypoint, and measures only that process tree. A first process proves
-a legal NDJSON command above 8 MiB but below the 9 MiB limit is rejected as an
-unknown operation and the same parser recovers. Two fresh processes receive a
+a legal NDJSON string command above 8 MiB but below the 9 MiB limit is rejected
+as an unknown operation, a near-limit numeric token is rejected without a giant
+integer allocation, and the same parser recovers. Two fresh processes receive a
 declared WebSocket frame above the conservative 7 MiB client limit but below 8
 MiB, report that bounded protocol error, and reconnect for legal large values.
 One resumes a physically stalled reader; the other remains stopped until the
-one-second send deadline closes it. The fresh Bruce Docker run measured peaks
-of 113,004,544, 107,626,496, and 118,751,232 bytes respectively, with no OOM
-and zero retained output reservations at every shutdown.
-The probe sets the adapter-only `ADAPTER_TEST_SEND_BUFFER` hook to 4 KiB so
-kernel autotuning cannot turn the stopped reader into a false non-blocking
-pass; public client connections never use the accepting-socket code path.
+one-second send deadline closes it. Those measurements must be refreshed for
+this repaired source. Accepted adapter-controller sockets use the adapter's
+normal fixed 64 KiB send-buffer request, so the proof needs no test-only hook in
+the final beam; public client connections never use the accepting-socket path.
 
 ## How it fits together
 
@@ -302,14 +301,14 @@ message if it cannot finish within three seconds.
 ## Limitations
 
 * The shared local and hosted black-box conformance runs have not yet happened.
-  That is why the manifest keeps its capability list empty despite the Docker
-  and approved-local-backend checks described above.
+  Fresh Docker and approved-local-backend checks are also pending for this
+  repaired source, so the manifest keeps its capability list empty.
 * `client/manifest.toml` records the exact Hex package versions and content
   hashes used by the Docker build. Both the Gleam builder and Alpine runtime
   bases are digest-pinned.
-* Gleam has no conditional compilation, so the relay pause point the
-  deterministic tests use is an inert option rather than test-only code
-  excluded from the build. `convex.new` never supplies one.
+* Gleam has no conditional compilation, so Docker creates distinct test and
+  production source projections. The relay pause point exists only in the test
+  build, and the production stage rejects it before creating final beams.
 * Live authentication, WebSocket mutations and actions, and tagged Convex
   values are deferred.
 * `TransitionChunk` assembly is deferred; receiving one is treated as protocol
@@ -318,3 +317,5 @@ message if it cannot finish within three seconds.
   undelivered events and 8 MiB of conservatively charged storage per
   subscription; one global 16-event and 12 MiB encoded output budget in the
   adapter; a 9 MiB NDJSON command limit; and a 7 MiB WebSocket message limit.
+  A value which cannot fit the relay budget produces an observable protocol
+  failure without changing the last delivered value.

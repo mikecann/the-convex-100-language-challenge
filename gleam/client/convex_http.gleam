@@ -223,32 +223,104 @@ pub fn read_head(
   buffer: BitArray,
   deadline: Int,
 ) -> Result(#(BitArray, BitArray), String) {
-  case split_head(buffer, <<>>) {
+  case split_head(buffer) {
     Ok(#(head, rest)) ->
       case bit_array.byte_size(head) > max_head_bytes {
         True -> Error("HTTP response head is too large")
         False -> Ok(#(head, rest))
       }
     Error(_) ->
-      case bit_array.byte_size(buffer) > max_head_bytes {
-        True -> Error("HTTP response head is too large")
-        False -> {
-          use chunk <- result.try(read_more(socket, deadline))
-          read_head(socket, <<buffer:bits, chunk:bits>>, deadline)
-        }
-      }
+      read_head_chunks(
+        socket,
+        case buffer {
+          <<>> -> []
+          _ -> [buffer]
+        },
+        bit_array.byte_size(buffer),
+        trailing_bytes(buffer, 3),
+        deadline,
+      )
   }
 }
 
-fn split_head(
-  input: BitArray,
-  seen: BitArray,
-) -> Result(#(BitArray, BitArray), Nil) {
-  case input {
-    <<"\r\n\r\n":utf8, rest:bits>> -> Ok(#(seen, rest))
-    <<byte, rest:bits>> -> split_head(rest, <<seen:bits, byte>>)
-    _ -> Error(Nil)
+fn read_head_chunks(
+  socket: Socket,
+  chunks: List(BitArray),
+  total: Int,
+  trailing: BitArray,
+  deadline: Int,
+) -> Result(#(BitArray, BitArray), String) {
+  case total > max_head_bytes {
+    True -> Error("HTTP response head is too large")
+    False -> {
+      use chunk <- result.try(read_more(socket, deadline))
+      let bridge = <<trailing:bits, chunk:bits>>
+      let next_total = total + bit_array.byte_size(chunk)
+      case convex_sys.find_sequence(bridge, <<"\r\n\r\n":utf8>>) {
+        Ok(local_index) -> {
+          let head_bytes = total - bit_array.byte_size(trailing) + local_index
+          split_complete_head([chunk, ..chunks], head_bytes)
+        }
+        Error(_) ->
+          read_head_chunks(
+            socket,
+            [chunk, ..chunks],
+            next_total,
+            trailing_bytes(bridge, 3),
+            deadline,
+          )
+      }
+    }
   }
+}
+
+fn split_head(input: BitArray) -> Result(#(BitArray, BitArray), Nil) {
+  use index <- result.try(convex_sys.find_sequence(
+    input,
+    <<"\r\n\r\n":utf8>>,
+  ))
+  split_binary(input, index, 4)
+}
+
+fn split_complete_head(
+  reversed_chunks: List(BitArray),
+  head_bytes: Int,
+) -> Result(#(BitArray, BitArray), String) {
+  case head_bytes > max_head_bytes {
+    True -> Error("HTTP response head is too large")
+    False -> {
+      let complete =
+        reversed_chunks
+        |> list.reverse
+        |> convex_sys.concat_binaries
+      split_binary(complete, head_bytes, 4)
+      |> result.replace_error("malformed HTTP response head")
+    }
+  }
+}
+
+fn split_binary(
+  input: BitArray,
+  prefix_bytes: Int,
+  separator_bytes: Int,
+) -> Result(#(BitArray, BitArray), Nil) {
+  use prefix <- result.try(bit_array.slice(input, 0, prefix_bytes))
+  use rest <- result.try(
+    bit_array.slice(
+      input,
+      prefix_bytes + separator_bytes,
+      bit_array.byte_size(input) - prefix_bytes - separator_bytes,
+    ),
+  )
+  Ok(#(prefix, rest))
+}
+
+fn trailing_bytes(input: BitArray, wanted: Int) -> BitArray {
+  let size = bit_array.byte_size(input)
+  let length = int.min(size, wanted)
+  input
+  |> bit_array.slice(size - length, length)
+  |> result.unwrap(<<>>)
 }
 
 /// Parse a status line and headers. Header names are lowercased once here so
@@ -557,21 +629,43 @@ fn ensure_bytes(
 ) -> Result(BitArray, String) {
   case bit_array.byte_size(buffer) >= length {
     True -> Ok(buffer)
-    False -> {
-      case
-        convex_sys.recv(
-          socket,
-          length - bit_array.byte_size(buffer),
-          remaining(deadline),
-        )
-      {
+    False ->
+      ensure_byte_chunks(
+        socket,
+        case buffer {
+          <<>> -> []
+          _ -> [buffer]
+        },
+        bit_array.byte_size(buffer),
+        length,
+        deadline,
+      )
+  }
+}
+
+fn ensure_byte_chunks(
+  socket: Socket,
+  chunks: List(BitArray),
+  total: Int,
+  length: Int,
+  deadline: Int,
+) -> Result(BitArray, String) {
+  case total >= length {
+    True -> Ok(convex_sys.concat_binaries(list.reverse(chunks)))
+    False ->
+      case convex_sys.recv(socket, length - total, remaining(deadline)) {
         convex_sys.Received(chunk) ->
-          ensure_bytes(socket, <<buffer:bits, chunk:bits>>, length, deadline)
+          ensure_byte_chunks(
+            socket,
+            [chunk, ..chunks],
+            total + bit_array.byte_size(chunk),
+            length,
+            deadline,
+          )
         convex_sys.RecvClosed -> Error("HTTP connection closed early")
         convex_sys.RecvTimeout -> Error("HTTP response timed out")
         convex_sys.RecvFailed(reason) -> Error(reason)
       }
-    }
   }
 }
 

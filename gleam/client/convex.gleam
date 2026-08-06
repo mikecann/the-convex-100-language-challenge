@@ -46,9 +46,13 @@ pub type CallResult {
 /// `https://example.convex.cloud`. No socket is opened yet; the Live owner
 /// connects the first time something is subscribed.
 pub fn new(url: String) -> Result(Client, ConvexError) {
+  // PROD start(url)
+  // TEST_ONLY_BEGIN
   start(url, None)
+  // TEST_ONLY_END
 }
 
+// TEST_ONLY_BEGIN
 /// Test-only entry point that installs a relay pause point.
 ///
 /// The deterministic Live tests use it to hold an event after the relay has
@@ -61,17 +65,24 @@ pub fn new_with_relay_gate(
 ) -> Result(Client, ConvexError) {
   start(url, Some(gate))
 }
+// TEST_ONLY_END
 
+// PROD fn start(url: String) -> Result(Client, ConvexError) {
+// TEST_ONLY_BEGIN
 fn start(
   url: String,
   gate: Option(convex_live.RelayGate),
 ) -> Result(Client, ConvexError) {
+// TEST_ONLY_END
   use parsed <- result.try(
     convex_http.parse_url(url)
     |> result.map_error(convex_error.protocol_error),
   )
   use live <- result.try(
+    // PROD convex_live.start(parsed, True)
+    // TEST_ONLY_BEGIN
     convex_live.start(parsed, True, gate)
+    // TEST_ONLY_END
     |> result.map_error(convex_error.transport_error),
   )
   Ok(Client(origin: url, url: parsed, token: None, live: live))

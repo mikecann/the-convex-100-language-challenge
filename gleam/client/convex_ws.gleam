@@ -27,9 +27,6 @@ const handshake_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 /// into a clear protocol error instead of unbounded growth.
 const max_message_bytes = 7_340_032
 
-/// Largest handshake response head, matching the HTTP client's own bound.
-const max_head_bytes = 65_536
-
 pub type Message {
   TextMessage(text: String)
   BinaryMessage(payload: BitArray)
@@ -424,6 +421,15 @@ pub fn close_frame(code: Int, reason: String) -> BitArray {
   encode(0x8, <<code:size(16)-big-int, reason:utf8>>)
 }
 
+/// Echo a peer's close payload. An empty peer close is represented internally
+/// by 1005, but that reserved sentinel must never be written on the wire.
+pub fn close_reply_frame(code: Int, reason: String) -> BitArray {
+  case code {
+    1005 -> encode(0x8, <<>>)
+    _ -> close_frame(code, reason)
+  }
+}
+
 fn encode(opcode: Int, payload: BitArray) -> BitArray {
   let length = bit_array.byte_size(payload)
   let key = convex_sys.random_bytes(4)
@@ -493,7 +499,7 @@ pub fn handshake(
     <<request:utf8>>,
     int.max(0, deadline - convex_sys.monotonic_ms()),
   ))
-  use #(head, rest) <- result.try(read_head(socket, <<>>, deadline))
+  use #(head, rest) <- result.try(convex_http.read_head(socket, <<>>, deadline))
   use _ <- result.try(validate_upgrade(head, key))
   Ok(rest)
 }
@@ -545,48 +551,4 @@ fn has_token(value: String, token: String) -> Bool {
   value
   |> string.split(",")
   |> list.any(fn(part) { string.lowercase(string.trim(part)) == token })
-}
-
-fn read_head(
-  socket: Socket,
-  buffer: BitArray,
-  deadline: Int,
-) -> Result(#(BitArray, BitArray), String) {
-  case split_head(buffer, <<>>) {
-    Ok(#(head, rest)) ->
-      case bit_array.byte_size(head) > max_head_bytes {
-        True -> Error("WebSocket upgrade response head is too large")
-        False -> Ok(#(head, rest))
-      }
-    Error(_) ->
-      case bit_array.byte_size(buffer) > max_head_bytes {
-        True -> Error("WebSocket upgrade response head is too large")
-        False ->
-          case
-            convex_sys.recv(
-              socket,
-              0,
-              int.max(0, deadline - convex_sys.monotonic_ms()),
-            )
-          {
-            convex_sys.Received(chunk) ->
-              read_head(socket, <<buffer:bits, chunk:bits>>, deadline)
-            convex_sys.RecvClosed ->
-              Error("WebSocket upgrade connection closed early")
-            convex_sys.RecvTimeout -> Error("WebSocket upgrade timed out")
-            convex_sys.RecvFailed(reason) -> Error(reason)
-          }
-      }
-  }
-}
-
-fn split_head(
-  input: BitArray,
-  seen: BitArray,
-) -> Result(#(BitArray, BitArray), Nil) {
-  case input {
-    <<"\r\n\r\n":utf8, rest:bits>> -> Ok(#(seen, rest))
-    <<byte, rest:bits>> -> split_head(rest, <<seen:bits, byte>>)
-    _ -> Error(Nil)
-  }
 }

@@ -12,6 +12,7 @@ import convex_http
 import convex_json.{
   JsonArray, JsonBool, JsonFloat, JsonInt, JsonNull, JsonObject, JsonString,
 } as json
+import convex_sys
 import convex_ws as ws
 import gleam/bit_array
 import gleam/int
@@ -132,6 +133,10 @@ fn json_rejections() -> Nil {
   check.ok("trailing commas are rejected", is_error(json.parse("[1,]")))
   check.ok("bare words are rejected", is_error(json.parse("nope")))
   check.ok(
+    "an overlong number is rejected without constructing a giant integer",
+    is_error(json.parse(string.repeat("1", 257))),
+  )
+  check.ok(
     "unescaped control characters are rejected",
     is_error(json.parse("\"a\nb\"")),
   )
@@ -217,6 +222,27 @@ fn http_parsing() -> Nil {
       Ok(_) -> False
     },
   )
+
+  // A near-limit head used to copy its growing prefix once per byte. Supplying
+  // the complete buffer proves the production splitter finds the delimiter and
+  // slices once without needing to read from this otherwise unused listener.
+  let assert Ok(unused_listener) = convex_sys.listen("127.0.0.1", 0)
+  let padding = string.repeat("x", 60_000)
+  let buffered =
+    bit_array.from_string(
+      "HTTP/1.1 200 OK\r\nx-padding: " <> padding <> "\r\n\r\nbody",
+    )
+  let assert Ok(#(large_head, remaining)) =
+    convex_http.read_head(unused_listener, buffered, 0)
+  check.ok(
+    "a near-limit buffered HTTP head splits at its delimiter",
+    bit_array.byte_size(large_head) > 60_000,
+  )
+  check.ok(
+    "bytes after the large head are retained",
+    remaining == <<"body":utf8>>,
+  )
+  convex_sys.close(unused_listener)
   check.ok(
     "a non-2xx success-shaped body is rejected",
     case

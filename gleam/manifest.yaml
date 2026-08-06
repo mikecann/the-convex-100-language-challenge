@@ -13,9 +13,9 @@ implementation:
     framing, and all Convex sync behaviour are written in Gleam; OTP supplies
     sockets, TLS, cryptography, and a few generic bounded binary and stream
     primitives through a small FFI module that contains no Convex logic.
-    The source, language-local tests, final image policy, and canonical
-    example have passed their first Docker checks. Shared local and hosted
-    conformance remain outstanding, so no capability badge is claimed.
+    The repaired source now awaits a fresh exact-head Docker rebuild and
+    independent review. Shared local and hosted conformance also remain
+    outstanding, so no capability badge is claimed.
 toolchain:
   name: Gleam
   version: 1.9.1
@@ -35,26 +35,24 @@ adapter:
     - debugDisconnect
 limitations:
   - >-
-    Docker compilation, language-local tests, final-image policy, TLS, and the
-    canonical example against the approved local backend have passed. Shared
-    local and hosted black-box conformance have not run, so capabilities remain
-    deliberately empty.
+    A previous rejected checkpoint passed Docker checks, but the repaired source
+    has not yet been rebuilt. Language-local Docker, final-image policy, TLS,
+    canonical example, and shared local and hosted black-box conformance all
+    need fresh exact-head evidence, so capabilities remain deliberately empty.
   - >-
-    A checked-in final-adapter pressure gate now exercises stopped TCP output,
-    near-limit NDJSON and WebSocket messages, bounded send failure, later-value
-    recovery, output-reservation cleanup, and adapter-only cgroup memory. A
-    fresh Bruce run measured 113004544 bytes for the near-9-MiB command,
-    107626496 bytes for stopped-reader recovery, and 118751232 bytes for the
-    deadline case, all without OOM or leaked output reservations.
+    The checked-in final-adapter pressure gate exercises stopped TCP output,
+    near-limit string and numeric NDJSON, near-limit WebSocket messages, bounded
+    send failure, later-value recovery, output-reservation cleanup, and
+    adapter-only cgroup memory. It must be rerun for this repaired source.
   - >-
-    Gleam has no conditional compilation, so the relay pause point used by the
-    deterministic Live tests is an ordinary option that convex.new never
-    supplies rather than test-only code excluded from the build. It is inert
-    unless a caller passes a gate to convex.new_with_relay_gate.
+    Gleam has no conditional compilation, so Docker projects the formatted
+    source into separate test and production builds. The deterministic relay
+    pause point is compiled only in the test build; production source and final
+    beams are checked to contain no relay-gate API.
   - >-
-    The test-only ADAPTER_TEST_SEND_BUFFER environment hook narrows only an
-    accepted adapter-controller socket for deterministic stopped-reader proof.
-    Public client HTTP and Live connections never use that accepting path.
+    Accepted adapter-controller sockets use a fixed 64 KiB send-buffer request
+    as normal adapter backpressure policy. Public client HTTP and Live
+    connections never use that accepting path.
   - >-
     Live authentication, WebSocket mutations and actions, and tagged Convex
     values are deferred.
@@ -66,7 +64,9 @@ limitations:
     encoded paths and arguments across them. Each subscription retains the
     newest 16 undelivered events within an 8 MiB conservatively charged byte
     bound, including the event its relay is holding. The relay waits for the
-    consumer to acknowledge that event before sending another one.
+    consumer to acknowledge that event before sending another one. A value too
+    large for that budget becomes an observable ProtocolError without changing
+    the subscription's last delivered value.
   - >-
     Controller output has one global 16-event and 12 MiB encoded-byte budget,
     including a blocked write; saturation closes the stalled controller

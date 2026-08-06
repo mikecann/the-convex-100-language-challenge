@@ -10,9 +10,18 @@ import convex_check as check
 import convex_error
 import convex_json.{JsonInt, JsonObject, JsonString} as json
 import convex_live.{LiveFailure}
+import convex_sys
 import gleam/option.{Some}
 
 pub fn main() -> Nil {
+  check.ok(
+    "adapter preserves the requested all-interface bind",
+    adapter.parse_listen("0.0.0.0:8080") == Ok(#("0.0.0.0", 8080)),
+  )
+  let assert Ok(all_interfaces) = convex_sys.listen("0.0.0.0", 0)
+  let assert Ok(bound_port) = convex_sys.listen_port(all_interfaces)
+  check.ok("the all-interface listener binds a real port", bound_port > 0)
+  convex_sys.close(all_interfaces)
   check.equal_string(
     "adapter serializes a successful result",
     json.to_string(

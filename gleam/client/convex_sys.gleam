@@ -66,10 +66,10 @@ pub fn recv(socket: Socket, length: Int, timeout: Int) -> RecvResult
 @external(erlang, "convex_ffi", "socket_close")
 pub fn close(socket: Socket) -> Nil
 
-/// Listen on loopback. Port 0 asks the kernel to choose, which keeps the
-/// fixture servers in the language-local tests from colliding.
+/// Listen on the requested numeric address. Port 0 asks the kernel to choose,
+/// which keeps the fixture servers in the language-local tests from colliding.
 @external(erlang, "convex_ffi", "listen")
-pub fn listen(port: Int) -> Result(Socket, String)
+pub fn listen(host: String, port: Int) -> Result(Socket, String)
 
 @external(erlang, "convex_ffi", "listen_port")
 pub fn listen_port(socket: Socket) -> Result(Int, String)
@@ -102,6 +102,10 @@ pub fn concat_binaries(chunks: List(BitArray)) -> BitArray
 
 @external(erlang, "convex_ffi", "split_newline")
 pub fn split_newline(data: BitArray) -> LineSplit
+
+/// Find a byte sequence without copying the prefix before it.
+@external(erlang, "convex_ffi", "find_sequence")
+pub fn find_sequence(data: BitArray, sequence: BitArray) -> Result(Int, Nil)
 
 @external(erlang, "convex_ffi", "scan_json_string")
 pub fn scan_json_string(data: BitArray) -> JsonStringScan

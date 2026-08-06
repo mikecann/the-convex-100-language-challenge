@@ -35,6 +35,11 @@ const max_depth = 64
 /// the nesting bound. Count structural values before recursive decoding too.
 const max_nodes = 65_536
 
+/// Convex JSON numbers are finite machine values. Scan a hostile long token
+/// linearly, then reject it before asking the runtime to allocate a giant
+/// arbitrary-precision integer.
+const max_number_bytes = 256
+
 /// Signed 64-bit range. Convex counters are teaching-sized integers; anything
 /// outside this range is rejected instead of silently wrapping or losing
 /// precision through a float.
@@ -395,7 +400,11 @@ fn is_number_byte(byte: Int) -> Bool {
 /// Numbers are collected as a token and then classified. A token with a
 /// fraction or exponent is a float; anything else stays an exact integer.
 fn parse_number(input: BitArray) -> Result(#(Json, BitArray), String) {
-  let #(token, rest) = take_number(input, <<>>)
+  let #(token, rest) = take_number(input)
+  use _ <- result.try(case bit_array.byte_size(token) <= max_number_bytes {
+    True -> Ok(Nil)
+    False -> Error("JSON number is too long")
+  })
   use _ <- result.try(case valid_number(token) {
     True -> Ok(Nil)
     False -> Error("invalid JSON number")
@@ -487,14 +496,22 @@ fn drop_digits(input: BitArray) -> BitArray {
   }
 }
 
-fn take_number(input: BitArray, acc: BitArray) -> #(BitArray, BitArray) {
+fn take_number(input: BitArray) -> #(BitArray, BitArray) {
+  let length = number_length(input, 0)
+  let assert Ok(token) = bit_array.slice(input, 0, length)
+  let assert Ok(rest) =
+    bit_array.slice(input, length, bit_array.byte_size(input) - length)
+  #(token, rest)
+}
+
+fn number_length(input: BitArray, length: Int) -> Int {
   case input {
     <<byte, rest:bits>> ->
       case is_number_byte(byte) {
-        True -> take_number(rest, <<acc:bits, byte>>)
-        False -> #(acc, input)
+        True -> number_length(rest, length + 1)
+        False -> length
       }
-    _ -> #(acc, input)
+    _ -> length
   }
 }
 

@@ -22,6 +22,7 @@ COPY client/tests/convex_check.gleam client/tests/convex_codec_test.gleam \
 COPY client/tests/conformance/adapter.gleam \
      client/tests/conformance/adapter_test.gleam \
      client/tests/conformance/adapter_pressure.erl ./src/
+COPY client/tests/conformance/production_sources.awk /tmp/production_sources.awk
 COPY examples/basics/main.gleam examples/basics/main_test.gleam ./src/
 
 # The toolchain in the image must be the one the adapter reports as its
@@ -90,6 +91,38 @@ RUN set -eu; \
 FROM build AS test
 CMD ["/bin/true"]
 
+# Gleam has no conditional compilation. Tests compile the explicit relay pause
+# point above, while final artifacts come from this clean production projection.
+# The projection removes test-only regions before recompiling from scratch, so
+# neither final image contains the pause API or its gate state.
+FROM build AS production-build
+RUN set -eu; \
+    for source in src/convex.gleam src/convex_live.gleam; do \
+      awk -f /tmp/production_sources.awk "$source" >"$source.production"; \
+      mv "$source.production" "$source"; \
+    done; \
+    rm -f \
+      src/convex_check.gleam src/convex_codec_test.gleam \
+      src/convex_live_socket_test.gleam src/adapter_test.gleam \
+      src/main_test.gleam src/adapter_pressure.erl; \
+    ! grep -Fq 'new_with_relay_gate' src/convex.gleam; \
+    ! grep -Fq 'RelayGate' src/convex_live.gleam; \
+    rm -rf build; \
+    gleam format src; \
+    gleam format --check src; \
+    gleam build --target erlang
+RUN set -eu; \
+    ebin=build/dev/erlang/convex/ebin; \
+    mkdir -p production-core-ebin production-example-ebin production-adapter-ebin; \
+    for module in convex convex_error convex_ffi convex_http convex_json \
+                  convex_live convex_sys convex_ws; do \
+      cp "$ebin/$module.beam" production-core-ebin/; \
+    done; \
+    cp "$ebin/main.beam" production-example-ebin/; \
+    cp "$ebin/adapter.beam" production-adapter-ebin/; \
+    erl -noshell -pa production-core-ebin \
+      -eval '{module, convex} = code:ensure_loaded(convex), false = erlang:function_exported(convex, new_with_relay_gate, 2), halt().'
+
 FROM --platform=linux/amd64 ${GLEAM_IMAGE} AS target-erlang-runtime
 
 FROM --platform=linux/amd64 alpine:3.22@sha256:7c8cb692ae09657cbc4a3f3cbd0e8d5a2690ba38386aaaf252dbb060bf5eb2e6 AS runtime-base
@@ -129,7 +162,7 @@ RUN set -eu; \
     rm -rf erts-*/src erts-*/include erts-*/lib erts-*/doc usr misc releases; \
     ln -s ../lib/erlang/bin/erl /usr/local/bin/erl
 
-COPY --from=build /app/core-ebin /opt/convex
+COPY --from=production-build /app/production-core-ebin /opt/convex
 # Only the two Gleam libraries this client depends on contribute bytecode.
 COPY --from=build /app/build/dev/erlang/gleam_stdlib/ebin /opt/convex/deps/gleam_stdlib/ebin
 COPY --from=build /app/build/dev/erlang/gleam_erlang/ebin /opt/convex/deps/gleam_erlang/ebin
@@ -179,7 +212,7 @@ RUN set -eu; \
     erl -noshell -pa /opt/convex -eval 'true = lists:prefix("x86_64", erlang:system_info(system_architecture)), {non_existing, non_existing} = {code:which(erl_compile), code:which(erl_compile_server)}, {ok, _} = application:ensure_all_started(ssl), <<_:8>> = crypto:strong_rand_bytes(1), {module, convex} = code:ensure_loaded(convex), {module, gleam@list} = code:ensure_loaded(gleam@list), {ok, Socket} = convex_ffi:connect(tls, <<"convex.cloud">>, 443, 10000, true), nil = convex_ffi:socket_close(Socket), halt().'
 
 FROM runtime-base AS example-runtime
-COPY --from=build /app/example-ebin /opt/convex
+COPY --from=production-build /app/production-example-ebin /opt/convex
 COPY --chmod=0555 examples/basics/entrypoint.sh /usr/local/bin/convex-example
 RUN set -eu; \
     test -f /opt/convex/main.beam; \
@@ -206,7 +239,7 @@ COPY --from=build /app/build/dev/erlang/convex/ebin/adapter_pressure.beam /opt/p
 ENTRYPOINT ["erl", "-noshell", "-pa", "/opt/pressure", "-s", "adapter_pressure", "controller_main", "-s", "init", "stop"]
 
 FROM runtime-base AS runtime
-COPY --from=build /app/adapter-ebin /opt/convex
+COPY --from=production-build /app/production-adapter-ebin /opt/convex
 COPY --chmod=0555 client/tests/conformance/entrypoint.sh /usr/local/bin/convex-adapter
 RUN set -eu; \
     test -f /opt/convex/adapter.beam; \
