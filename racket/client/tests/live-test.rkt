@@ -234,8 +234,8 @@
    (base64-encode (integer->integer-bytes value 8 #f #f) #"")
    #f))
 
-(define (version query-set timestamp-value)
-  (hasheq 'querySet query-set 'identity 0 'ts (timestamp timestamp-value)))
+(define (version query-set timestamp-value [identity 0])
+  (hasheq 'querySet query-set 'identity identity 'ts (timestamp timestamp-value)))
 
 (define (transition start ending modifications)
   (hasheq 'type "Transition"
@@ -310,6 +310,57 @@
      (with-handlers ([exn? void]) (convex-client-close! client))
      (stop-live-fixture! fixture))))
 
+(define (invalid-live-transition field value query-id)
+  (case field
+    [(querySet)
+     (transition (version 0 0)
+                 (version value 1)
+                 (list (updated query-id 99)))]
+    [(identity)
+     (transition (version 0 0)
+                 (version 1 1 value)
+                 (list (updated query-id 99)))]
+    [(queryId)
+     ;; Put a valid update before the malformed ID. The whole transition must
+     ;; still roll back without publishing the first update.
+     (transition (version 0 0)
+                 (version 1 1)
+                 (list (updated query-id 99)
+                       (updated value 100)))]))
+
+(define (check-invalid-live-id field value)
+  (with-client-fixture
+   (lambda (fixture client)
+     (define subscription
+       (convex-client-subscribe client "demo:state" (hasheq 'room "uint32")))
+     (define first (fixture-accept! fixture))
+     (define-values (_connect add)
+       (check-connect-and-add first 0 "InitialConnect" #f))
+     (define query-id (hash-ref add 'queryId))
+     (peer-send-json! first (invalid-live-transition field value query-id))
+     (define protocol-update
+       (subscription-next-update subscription #:timeout socket-timeout-seconds))
+     (define protocol-failure (convex-update-error protocol-update))
+     (check-true (exn:fail:convex:protocol? protocol-failure))
+     (check-true (string-contains? (exn-message protocol-failure) "uint32"))
+     ;; No update from before the malformed ID may escape the failed transition.
+     (check-no-update subscription)
+     (peer-close! first)
+
+     (define second (fixture-accept! fixture))
+     (define-values (_reconnect resent-add)
+       (check-connect-and-add second 1 (exn-message protocol-failure) #f))
+     (check-equal? (hash-ref resent-add 'queryId #f) query-id)
+     (peer-send-json!
+      second
+      (transition (version 0 0) (version 1 1)
+                  (list (updated query-id 7))))
+     (check-equal?
+      (convex-update-value
+       (subscription-next-update subscription #:timeout socket-timeout-seconds))
+      (hasheq 'count 7))
+     (subscription-close! subscription))))
+
 (define live-tests
   (test-suite
    "native Racket Convex Live owner"
@@ -326,6 +377,44 @@
     (check-equal? (newer-timestamp at-256 at-255) at-256)
     (check-exn exn:fail:convex:protocol?
                (lambda () (timestamp->uint64 (string-append at-256 "\n")))))
+
+   (test-case
+    "query-set, identity, and query IDs are bounded uint32 values"
+    (with-client-fixture
+     (lambda (fixture client)
+       (define subscription
+         (convex-client-subscribe client "demo:state" (hasheq 'room "uint32-max")))
+       (define connection (fixture-accept! fixture))
+       (define-values (_connect add)
+         (check-connect-and-add connection 0 "InitialConnect" #f))
+       (define query-id (hash-ref add 'queryId))
+       (define maximum (version #xffffffff 1 #xffffffff))
+       (peer-send-json!
+        connection
+        (transition (version 0 0)
+                    maximum
+                    (list (updated query-id 0)
+                          (updated #xffffffff 100))))
+       (check-equal?
+        (convex-update-value
+         (subscription-next-update subscription #:timeout socket-timeout-seconds))
+        (hasheq 'count 0))
+       (peer-send-json!
+        connection
+        (transition maximum
+                    (version #xffffffff 2 #xffffffff)
+                    (list (updated query-id 1))))
+       (check-equal?
+        (convex-update-value
+         (subscription-next-update subscription #:timeout socket-timeout-seconds))
+        (hasheq 'count 1))
+       (subscription-close! subscription))))
+
+   (test-case
+    "invalid uint32 IDs reject and atomically roll back before reconnect"
+    (for* ([field (in-list '(querySet identity queryId))]
+           [value (in-list (list #x100000000 -1 1.5 "1"))])
+      (check-invalid-live-id field value)))
 
    (test-case
     "Add and Remove are acknowledged barriers and updates recover after QueryFailed"

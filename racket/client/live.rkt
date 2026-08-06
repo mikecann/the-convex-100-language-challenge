@@ -29,6 +29,7 @@
          newer-timestamp)
 
 (define initial-timestamp "AAAAAAAAAAA=")
+(define maximum-live-uint32 #xffffffff)
 (define initial-backoff-ms 100.0)
 (define maximum-backoff-ms 15000.0)
 (define owner-response-timeout-seconds 3.0)
@@ -57,6 +58,15 @@
 
 (define (closed-error [message "Convex Live manager is closed"])
   (exn:fail:convex:closed message (current-continuation-marks)))
+
+(define (exact-live-uint32? value)
+  (and (exact-integer? value)
+       (<= 0 value maximum-live-uint32)))
+
+(define (require-live-uint32 value context)
+  (unless (exact-live-uint32? value)
+    (raise (protocol-error (format "~a must be an exact uint32" context))))
+  value)
 
 (define (make-mailbox budget)
   (mailbox (make-async-channel mailbox-capacity) (make-semaphore 1) budget #f))
@@ -540,9 +550,10 @@
     (unless (hash? value)
       (raise (protocol-error (format "~a is not an object" context))))
     (for ([key '(querySet identity ts)]) (require-field value key context))
-    (unless (and (exact-nonnegative-integer? (hash-ref value 'querySet))
-                 (exact-nonnegative-integer? (hash-ref value 'identity)))
-      (raise (protocol-error (format "~a counters are invalid" context))))
+    (require-live-uint32 (hash-ref value 'querySet)
+                         (format "~a querySet" context))
+    (require-live-uint32 (hash-ref value 'identity)
+                         (format "~a identity" context))
     (timestamp->uint64 (hash-ref value 'ts))
     value)
 
@@ -563,8 +574,7 @@
     (for ([modification (in-list modifications)])
       (define type (require-field modification 'type "Transition modification"))
       (define id (require-field modification 'queryId "Transition modification"))
-      (unless (exact-nonnegative-integer? id)
-        (raise (protocol-error "Transition queryId is invalid")))
+      (require-live-uint32 id "Transition queryId")
       (case (string->symbol type)
         [(QueryUpdated)
          (define value (require-field modification 'value "QueryUpdated"))

@@ -5,10 +5,24 @@
 
 ;; Convex's JSON format represents the demo counter as a number. Accept an
 ;; integral decimal such as 0.0, but normalize it before counter arithmetic.
+(define maximum-safe-count #x7fffffffffffffff)
+
 (define (verified-whole-count value operation)
-  (unless (integer? value)
-    (error operation "count was ~e, expected a whole number" value))
-  (if (exact? value) value (inexact->exact value)))
+  (define normalized
+    (cond
+      [(exact-integer? value) value]
+      [(and (inexact-real? value)
+            ;; `rational?` excludes +nan.0 and infinities on the pinned
+            ;; Racket base runtime while retaining ordinary decimal values.
+            (rational? value)
+            (integer? value))
+       (inexact->exact value)]
+      [else #f]))
+  (unless (and normalized (<= 0 normalized maximum-safe-count))
+    (error operation
+           "count was ~e, expected a finite whole number in 0..~a"
+           value maximum-safe-count))
+  normalized)
 
 (define (random-run-id)
   (apply string-append
@@ -106,4 +120,9 @@
   (check-equal? (verified-whole-count 0.0 'test) 0)
   (check-equal? (verified-whole-count 1.0 'test) 1)
   (check-equal? (verified-whole-count 2 'test) 2)
-  (check-exn exn:fail? (lambda () (verified-whole-count 1.5 'test))))
+  (check-equal? (verified-whole-count maximum-safe-count 'test)
+                maximum-safe-count)
+  (for ([invalid (in-list (list -1 1.5 "1" +inf.0 +nan.0
+                                (add1 maximum-safe-count)))])
+    (check-exn exn:fail?
+               (lambda () (verified-whole-count invalid 'test)))))
