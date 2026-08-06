@@ -4,5 +4,77 @@ displayName: "Gleam"
 rank: 50
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Gleam implementation of the Convex HTTP API and the pinned
+    /api/sync protocol. JSON, HTTP/1.1, the WebSocket handshake, WebSocket
+    framing, and all Convex sync behaviour are written in Gleam; OTP supplies
+    sockets, TLS, cryptography, and a few generic bounded binary and stream
+    primitives through a small FFI module that contains no Convex logic.
+    The source, language-local tests, final image policy, and canonical
+    example have passed their first Docker checks. Shared local and hosted
+    conformance remain outstanding, so no capability badge is claimed.
+toolchain:
+  name: Gleam
+  version: 1.9.1
+intendedCapabilities:
+  - http
+  - live
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    Docker compilation, language-local tests, final-image policy, TLS, and the
+    canonical example against the approved local backend have passed. Shared
+    local and hosted black-box conformance have not run, so capabilities remain
+    deliberately empty.
+  - >-
+    Gleam has no conditional compilation, so the relay pause point used by the
+    deterministic Live tests is an ordinary option that convex.new never
+    supplies rather than test-only code excluded from the build. It is inert
+    unless a caller passes a gate to convex.new_with_relay_gate.
+  - >-
+    The shared README projector has no fence mapping for .gleam, so the
+    canonical README block uses a plain-text fence. The website reads the same
+    source and selects syntax by language ID, but its generated preview has not
+    been inspected in this Docker-only verification.
+  - >-
+    Live authentication, WebSocket mutations and actions, and tagged Convex
+    values are deferred.
+  - >-
+    TransitionChunk assembly is deferred; receiving one is reported as
+    protocol drift and reconnects.
+  - >-
+    At most eight subscriptions may be active, with at most 8 MiB of retained
+    encoded paths and arguments across them. Each subscription retains the
+    newest 16 undelivered events within an 8 MiB conservatively charged byte
+    bound, including the event its relay is holding. The relay waits for the
+    consumer to acknowledge that event before sending another one.
+  - >-
+    Controller output has one global 16-event and 12 MiB encoded-byte budget,
+    including a blocked write; saturation closes the stalled controller
+    instead of retaining more events.
+  - >-
+    Stdin and TCP commands share a 9 MiB newline-delimited frame limit and
+    discard an incomplete fragment at end of input.
+  - >-
+    A single WebSocket message is bounded at 8 MiB; a larger frame is protocol
+    drift rather than something to buffer. A partial message has one absolute
+    three-second deadline, even if the peer keeps dribbling bytes.
+  - >-
+    The connection process acknowledges each received chunk before reading
+    another and polls its command mailbox between reads. A write can wait up
+    to 200 ms behind an idle read. Frame parsing state lives in the owner, so
+    that poll never restarts a partially read frame.
 capabilities: []
