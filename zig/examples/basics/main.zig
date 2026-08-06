@@ -57,7 +57,6 @@ pub fn main() !void {
     defer allocator.free(url);
     const room: []const u8 = if (std.os.argv.len > 1) std.mem.span(std.os.argv[1]) else "zig-basic-example";
     var client = try convex.Client.init(allocator, url);
-    defer client.deinit();
 
     // Configure the deployment and create the native Zig client.
     var query_arena = std.heap.ArenaAllocator.init(allocator);
@@ -71,10 +70,16 @@ pub fn main() !void {
 
     // Start Live before the mutation so the initial snapshot cannot be missed.
     var capture = convex.Capture.init(allocator);
-    defer capture.deinit();
     var output = convex.Output.init(allocator, std.io.getStdErr().writer().any(), std.io.getStdErr().handle, .none);
     output.capture = &capture;
-    defer output.deinit();
+    // Stop the Live owner before freeing either delivery target. This order is
+    // also safe when a later operation returns early, while a transition is
+    // still in flight on the owner's thread.
+    defer {
+        client.deinit();
+        output.deinit();
+        capture.deinit();
+    }
     try client.subscribe("example", "demo:state", query_args, &output);
     // Decode the actual initial Live value from the bounded mailbox.
     var live_arena = std.heap.ArenaAllocator.init(allocator);

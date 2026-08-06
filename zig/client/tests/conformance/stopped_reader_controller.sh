@@ -1,8 +1,19 @@
 #!/bin/sh
 set -eu
 
+adapter_host=${ADAPTER_HOST:-zig-memory-adapter}
 mkfifo /tmp/controller-input /tmp/controller-output
-nc zig-memory-adapter 32100 </tmp/controller-input >/tmp/controller-output &
+(
+  attempts=0
+  while [ "$attempts" -lt 100 ]; do
+    if nc "$adapter_host" 32100; then
+      exit 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.1
+  done
+  exit 1
+) </tmp/controller-input >/tmp/controller-output &
 nc_pid=$!
 exec 3>/tmp/controller-input
 exec 4</tmp/controller-output
@@ -20,13 +31,28 @@ events_file=/tmp/events
 if [ -d /evidence ]; then
   events_file=/evidence/events.ndjson
 fi
-cat <&4 >"$events_file" &
+# The reader must not inherit fd 3, the FIFO write end feeding netcat. If it
+# does, closing fd 3 in the controller never produces EOF for netcat: netcat
+# waits for input while this reader waits for netcat's output, and an otherwise
+# clean adapter close is misreported as a timeout.
+cat <&4 3>&- >"$events_file" &
 reader_pid=$!
 sleep 3
 printf '%s\n' '{"id":"close","op":"close"}' >&3
 exec 3>&-
-sleep 2
-kill "$nc_pid" 2>/dev/null || true
+attempts=0
+# A close queued while the owner is part-way through a maximum-size frame may
+# first consume the final runtime's five-second frame deadline, then the
+# output relay's one-second close grace. Ten seconds keeps that combined bound
+# strict while leaving room for linux/amd64 emulation to schedule both workers.
+while kill -0 "$nc_pid" 2>/dev/null && [ "$attempts" -lt 100 ]; do
+  attempts=$((attempts + 1))
+  sleep 0.1
+done
+if kill -0 "$nc_pid" 2>/dev/null; then
+  kill "$nc_pid" 2>/dev/null || true
+  exit 1
+fi
 wait "$nc_pid" 2>/dev/null || true
 exec 4<&-
 # BusyBox cat reports the forced FIFO teardown as an error on some releases.
@@ -41,14 +67,19 @@ encoded_bytes=$(wc -c <"$events_file" | tr -d ' ')
 sequence_count=$(wc -l </tmp/sequences | tr -d ' ')
 first_sequence=$(head -n 1 /tmp/sequences)
 last_sequence=$(tail -n 1 /tmp/sequences)
+printf 'stopped-reader observed events=%s bytes=%s first=%s last=%s\n' "$event_count" "$encoded_bytes" "$first_sequence" "$last_sequence" >&2
 test "$sequence_count" -eq "$event_count"
 test "$event_count" -le 16
-# Every delivered record was reserved, and reservations never exceed the eight
-# MiB budget, so the whole transcript stays inside it. With near-maximum values
-# the byte budget binds long before the event count does: at most four of these
-# records can be reserved at once, which is what proves the count limit alone is
-# not the memory limit.
-test "$encoded_bytes" -le 8388608
+# The drained transcript may contain one record already accepted by the TCP
+# buffers plus the records still covered by Zig's reservation budget. It is a
+# cumulative delivery bound, not a claim that all these bytes lived on Zig's
+# heap at once. The independent 128 MiB cgroup probe measures that separately.
+max_live_queue_bytes=$((8 * 1024 * 1024))
+max_adapter_record_bytes=$((2 * 1024 * 1024 + 64 * 1024 + 1))
+max_drained_transcript_bytes=$((max_live_queue_bytes + max_adapter_record_bytes))
+test "$encoded_bytes" -le "$max_drained_transcript_bytes"
+# With near-maximum records, the byte budget binds long before the sixteen
+# event count: four can stay reserved while one has reached the TCP buffers.
 test "$event_count" -le 5
 test "$last_sequence" -eq 39
 awk 'NR == 1 { previous = $1; next } $1 <= previous { exit 1 } { previous = $1 } END { if (NR == 0) exit 1 }' /tmp/sequences

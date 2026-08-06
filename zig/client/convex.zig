@@ -43,7 +43,12 @@ pub const FunctionError = struct {
 };
 
 const max_http_body = 2 * 1024 * 1024;
-const http_deadline_ms = 2000;
+// Hosted TLS and amd64 emulation can legitimately spend several seconds in
+// DNS, handshake, or the first response byte. Ten seconds is still a strict
+// absolute production deadline, but it does not turn ordinary scheduler
+// contention into a false transport failure. Fixtures use the same mechanism
+// with a shorter clock so their drip response cannot race the deadline.
+const http_deadline_ms = if (builtin.is_test) 2000 else 10_000;
 const max_websocket_message = 2 * 1024 * 1024;
 const max_live_subscriptions = 16;
 const max_live_queue_bytes = 8 * 1024 * 1024;
@@ -67,13 +72,13 @@ const close_grace_ms = 1000;
 // Tests use a shorter value to prove the same absolute-deadline mechanism
 // without adding five seconds to every hostile-peer fixture.
 const frame_deadline_ms = if (builtin.is_test) 250 else 5000;
-const handshake_deadline_ms = 2000;
+const handshake_deadline_ms = 10_000;
 const output_deadline_ms = 250;
 /// Absolute limits for the Live socket. `connect_deadline_ms` covers one whole
 /// bring-up (name lookup, TCP connect, TLS, the 101 upgrade, the first Connect
 /// frame, and the replayed Add frames); `socket_write_deadline_ms` covers one
 /// outbound frame, so a peer that drains a trickle cannot hold the sole owner.
-const connect_deadline_ms = 3000;
+const connect_deadline_ms = 10_000;
 const socket_write_deadline_ms = 250;
 const socket_send_buffer_bytes: c_int = 64 * 1024;
 const client_version = "zig-0.1.0";
@@ -448,10 +453,10 @@ fn connectHttpUntil(client: *std.http.Client, allocator: Allocator, uri: std.Uri
     if (protocol == .tls) {
         const tls_client = try allocator.create(std.crypto.tls.Client);
         errdefer allocator.destroy(tls_client);
-        tls_client.* = std.crypto.tls.Client.init(stream, .{
+        tls_client.* = try std.crypto.tls.Client.init(stream, .{
             .host = .{ .explicit = host },
             .ca = .{ .bundle = client.ca_bundle },
-        }) catch return error.TlsInitializationFailed;
+        });
         tls_client.allow_truncation_attacks = true;
         node.data.tls_client = tls_client;
     }
@@ -1516,7 +1521,7 @@ const LiveOwner = struct {
         };
         const path = try uri.path.toRawMaybeAlloc(uri_arena.allocator());
         websocketHandshake(self.manager.allocator, conn, host_raw, port, path) catch |err| {
-            if (err == error.Timeout) return error.LiveHandshakeTimeout;
+            if (deadline.timedOut() or err == error.Timeout) return error.LiveHandshakeTimeout;
             return if (err == error.InvalidResponse) error.LiveHandshakeInvalidResponse else err;
         };
         if (deadline.timedOut()) return error.Timeout;
@@ -1526,14 +1531,14 @@ const LiveOwner = struct {
         self.query_set_version = 0;
         self.remote_version = .{};
         self.sendConnect() catch |err| {
-            if (err == error.Timeout) return error.LiveConnectFrameTimeout;
+            if (deadline.timedOut() or err == error.Timeout) return error.LiveConnectFrameTimeout;
             return if (err == error.InvalidResponse) error.LiveConnectFrameInvalidResponse else err;
         };
         if (self.connection_count < std.math.maxInt(u32)) self.connection_count += 1;
         for (self.manager.active.items) |*query| {
             query.awaiting_rehydration = query.last_success;
             self.sendModify(.{query.id}, true) catch |err| {
-                if (err == error.Timeout) return error.LiveAddTimeout;
+                if (deadline.timedOut() or err == error.Timeout) return error.LiveAddTimeout;
                 return if (err == error.InvalidResponse) error.LiveAddInvalidResponse else err;
             };
         }
@@ -1922,13 +1927,37 @@ fn classifyWriteError(err: anyerror, deadline: *Deadline) anyerror {
 }
 
 fn socketReadable(conn: *std.http.Client.Connection, timeout_ms: u64) !bool {
-    if (conn.peek().len > 0) return true;
+    if (connectionHasBufferedCleartext(conn)) return true;
     var poll_fds = [_]std.posix.pollfd{.{
         .fd = conn.stream.handle,
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
     return try std.posix.poll(&poll_fds, @intCast(timeout_ms)) > 0;
+}
+
+/// `std.http.Client.Connection.peek` only exposes the HTTP connection buffer.
+/// After the 101 upgrade, Zig's TLS client may also hold decrypted application
+/// bytes in its own record buffer while the raw socket is no longer readable.
+/// Polling only the descriptor would then sleep forever over already available
+/// plaintext, so both buffers are part of the readiness decision.
+fn connectionHasBufferedCleartext(conn: *std.http.Client.Connection) bool {
+    if (conn.peek().len > 0) return true;
+    if (conn.protocol != .tls) return false;
+    return conn.tls_client.partial_cleartext_idx < conn.tls_client.partial_ciphertext_idx;
+}
+
+/// Read through the connection without erasing `WouldBlock`. Zig 0.14.1's
+/// `std.http.Client.Connection.readvDirectTls` deliberately collapses an
+/// underlying `WouldBlock` into `UnexpectedReadFailure`, which prevents a
+/// bounded WebSocket reader from distinguishing a 250 ms socket tick from a
+/// real TLS failure. Once the HTTP read buffer is empty, reading the pinned TLS
+/// client directly preserves that distinction and still consumes its buffered
+/// cleartext before touching the descriptor.
+fn readConnection(conn: *std.http.Client.Connection, buffer: []u8) !usize {
+    if (conn.peek().len > 0) return conn.read(buffer);
+    if (conn.protocol == .tls) return conn.tls_client.read(conn.stream, buffer);
+    return conn.stream.read(buffer);
 }
 
 fn readWebSocket(conn: *std.http.Client.Connection, allocator: Allocator) ![]u8 {
@@ -2015,7 +2044,7 @@ fn readExactUntil(conn: *std.http.Client.Connection, buffer: []u8, deadline: i64
     while (used < buffer.len) {
         const remaining = deadline - std.time.milliTimestamp();
         if (remaining <= 0) return error.Timeout;
-        if (conn.peek().len == 0) {
+        if (!connectionHasBufferedCleartext(conn)) {
             var poll_fds = [_]std.posix.pollfd{.{
                 .fd = conn.stream.handle,
                 .events = std.posix.POLL.IN,
@@ -2024,7 +2053,13 @@ fn readExactUntil(conn: *std.http.Client.Connection, buffer: []u8, deadline: i64
             const polled = try std.posix.poll(&poll_fds, @intCast(@min(remaining, socket_poll_ms)));
             if (polled == 0) continue;
         }
-        const amount = try conn.read(buffer[used..]);
+        const amount = readConnection(conn, buffer[used..]) catch |err| switch (err) {
+            // SO_RCVTIMEO deliberately wakes the owner every 250 ms. Preserve
+            // the partially decoded frame and keep checking the one absolute
+            // frame deadline instead of treating that wake-up as corruption.
+            error.WouldBlock, error.ConnectionTimedOut => continue,
+            else => return err,
+        };
         if (amount == 0) return error.WebSocketClosed;
         used += amount;
     }
@@ -2536,6 +2571,50 @@ fn testPlainConnection(stream: std.net.Stream) std.http.Client.Connection {
         .host = &.{},
         .port = 0,
     };
+}
+
+test "real TLS exposes coalesced WebSocket plaintext without another socket edge" {
+    const port_text = std.process.getEnvVarOwned(std.testing.allocator, "ZIG_TLS_FIXTURE_PORT") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer std.testing.allocator.free(port_text);
+    const port = try std.fmt.parseInt(u16, port_text, 10);
+    const url = try std.fmt.allocPrint(std.testing.allocator, "https://localhost:{d}/api/sync", .{port});
+    defer std.testing.allocator.free(url);
+    const uri = try std.Uri.parse(url);
+
+    var http_client: std.http.Client = .{ .allocator = std.testing.allocator };
+    defer http_client.deinit();
+    const ca_path = try std.process.getEnvVarOwned(std.testing.allocator, "ZIG_TLS_FIXTURE_CA");
+    defer std.testing.allocator.free(ca_path);
+    // Zig's certificate scanner intentionally uses only the platform trust
+    // locations. Load this fixture's one-day CA directly, then suppress the
+    // normal first-connect rescan so it is not immediately replaced.
+    try http_client.ca_bundle.addCertsFromFilePathAbsolute(std.testing.allocator, ca_path);
+    @atomicStore(bool, &http_client.next_https_rescan_certs, false, .release);
+    var deadline = try Deadline.init(5000);
+    try deadline.start();
+    defer deadline.finish();
+    const connection = try connectHttpUntil(&http_client, std.testing.allocator, uri, &deadline);
+    defer {
+        connection.closing = true;
+        http_client.connection_pool.release(std.testing.allocator, connection);
+    }
+    try configureSocketDeadlines(connection);
+    try websocketHandshake(std.testing.allocator, connection, "127.0.0.1", port, "/api/sync");
+
+    // The fixture writes both frames in the same TLS application record. The
+    // first one-byte handshake read therefore leaves plaintext inside Zig's
+    // TLS client even after the raw descriptor has no new readability edge.
+    try std.testing.expect(try socketReadable(connection, 1000));
+    const first = try readWebSocket(connection, std.testing.allocator);
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqualStrings("one", first);
+    try std.testing.expect(try socketReadable(connection, 1000));
+    const second = try readWebSocket(connection, std.testing.allocator);
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings("two", second);
 }
 
 fn testReadExact(stream: std.net.Stream, bytes: []u8) !void {

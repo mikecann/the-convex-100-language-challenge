@@ -3,8 +3,8 @@ set -eu
 
 source_file=examples/basics/main.zig
 readme=README.md
-begin='<!-- BEGIN CANONICAL EXAMPLE -->'
-end='<!-- END CANONICAL EXAMPLE -->'
+begin='<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.zig -->'
+end='<!-- END GENERATED EXAMPLE -->'
 
 extract() {
     awk -v begin="$begin" -v end="$end" '

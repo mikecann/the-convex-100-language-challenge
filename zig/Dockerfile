@@ -2,22 +2,67 @@
 ARG ALPINE_IMAGE=alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 ARG DEBIAN_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 
-FROM --platform=linux/amd64 ${ALPINE_IMAGE} AS test
+FROM --platform=linux/amd64 ${ALPINE_IMAGE} AS test-build
 WORKDIR /project
-RUN apk add --no-cache zig=0.14.1-r0 file=5.46-r2 binutils=2.44-r3
-COPY client ./client
+RUN apk add --no-cache zig=0.14.1-r0 file=5.46-r2 binutils=2.44-r3 openssl=3.5.7-r0
+# Keep the stopped-reader controller out of the expensive compile layers. It
+# is copied into the dedicated probe stage below, so shell-only fixture repairs
+# can be exercised against the exact same already-built adapter artifacts.
+COPY client/convex.zig ./client/convex.zig
+COPY client/tests/conformance/main.zig ./client/tests/conformance/main.zig
+COPY client/tests/conformance/memory_fixture.zig ./client/tests/conformance/memory_fixture.zig
+COPY client/tests/conformance/sync_readme_example.sh ./client/tests/conformance/sync_readme_example.sh
+COPY client/tests/tls_fixture.sh ./client/tests/tls_fixture.sh
 COPY examples ./examples
 COPY README.md ./README.md
 RUN zig version | grep -Fx '0.14.1'
 RUN zig fmt --check client examples
 RUN sh client/tests/conformance/sync_readme_example.sh --check
 RUN zig test client/convex.zig
+# Repeat only the real-TLS regression against a locally trusted certificate.
+# It proves Zig's TLS-internal plaintext buffer participates in readiness, so
+# coalesced frames do not stall waiting for a second raw-socket poll edge.
+RUN sh client/tests/tls_fixture.sh zig test client/convex.zig --test-filter 'real TLS'
 RUN zig test --dep convex -Mroot=examples/basics/main.zig -Mconvex=client/convex.zig
 RUN zig test --dep convex -Mroot=client/tests/conformance/main.zig -Mconvex=client/convex.zig
 RUN mkdir -p /out
 RUN zig build-exe -O ReleaseSafe -target x86_64-linux-musl --dep convex -Mroot=client/tests/conformance/main.zig -Mconvex=client/convex.zig -femit-bin=/out/convex-adapter
 RUN zig build-exe -O ReleaseSafe -target x86_64-linux-musl --dep convex -Mroot=examples/basics/main.zig -Mconvex=client/convex.zig -femit-bin=/out/convex-example
 RUN zig build-exe -O ReleaseSafe -target x86_64-linux-musl -Mroot=client/tests/conformance/memory_fixture.zig -femit-bin=/out/convex-memory-fixture
+
+FROM test-build AS stopped-reader-test
+COPY client/tests/conformance/stopped_reader_controller.sh ./client/tests/conformance/stopped_reader_controller.sh
+# Exercise the checked-in stopped-reader fixture against the real adapter in
+# the language-local test image. Root verification later repeats this with the
+# adapter in its own 128 MiB cgroup; this gate ensures the fixture cannot drift
+# into an unexecuted evidence prop between reviews.
+RUN set -eu; \
+    /out/convex-memory-fixture >/tmp/memory-fixture.log 2>&1 & fixture_pid=$!; \
+    CONVEX_URL=http://127.0.0.1:32101 ADAPTER_LISTEN=127.0.0.1:32100 \
+      /out/convex-adapter >/tmp/memory-adapter.log 2>&1 & adapter_pid=$!; \
+    cleanup() { kill "$fixture_pid" "$adapter_pid" 2>/dev/null || true; }; \
+    report() { \
+      status=$?; \
+      trap - EXIT INT TERM; \
+      if [ "$status" -ne 0 ]; then \
+        echo "stopped-reader fixture failed (status $status)" >&2; \
+        cat /tmp/memory-fixture.log >&2 || true; \
+        cat /tmp/memory-adapter.log >&2 || true; \
+        wc -c /tmp/events >&2 || true; \
+        tail -c 4096 /tmp/events >&2 || true; \
+      fi; \
+      cleanup; \
+      exit "$status"; \
+    }; \
+    trap report EXIT INT TERM; \
+    sleep 1; \
+    ADAPTER_HOST=127.0.0.1 sh client/tests/conformance/stopped_reader_controller.sh; \
+    wait "$adapter_pid"; \
+    wait "$fixture_pid"; \
+    trap - EXIT INT TERM; \
+    cleanup
+
+FROM stopped-reader-test AS test
 
 # The minimal runtime images below keep Debian's pinned ancestry but delete the
 # filesystem Debian ships, so the tool that performs the deletion must not
