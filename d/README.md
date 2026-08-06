@@ -148,7 +148,7 @@ For the final adapter's stopped-reader and memory proof, run this committed host
 ./d/client/tests/final_adapter_isolated_probe.sh
 ```
 
-It builds the exact D `test` and `runtime` targets, runs the adapter alone with a fresh 128 MiB cgroup, and starts the real Live fixture and TCP controller in a larger sibling cgroup sharing only the adapter network namespace. The controller's small receive buffer and the adapter's bounded test-only send-buffer hook create physical backpressure. The probe asserts retained sequences `1, 3..18` and `101, 103..105`, exact close, and adapter-only cgroup-v2 `memory.peak < 96 MiB`. It cleans up only its own named containers and never mounts the Docker socket.
+It builds the exact D `test` and final `runtime` targets, then runs the adapter alone from the runtime image's default `/usr/local/bin/convex-adapter` entrypoint with a fresh 128 MiB cgroup. The real Live fixture and TCP controller stay in a larger sibling cgroup sharing only the adapter network namespace. The controller's small receive buffer and the adapter's bounded test-only send-buffer hook create physical backpressure. The adapter's test-only memory-peak hook writes fresh cgroup-v2 evidence to the probe bind mount; it does not add fixture dependencies to the final runtime. The probe asserts retained sequences `1, 3..18` and `101, 103..105`, exact close, and adapter-only `memory.peak < 96 MiB`. It cleans up only its own named containers and never mounts the Docker socket.
 
 ## Protocol notes
 

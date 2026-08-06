@@ -501,6 +501,9 @@ else
     import std.process : environment;
 
     signal(SIGPIPE, SIG_IGN);
+    auto testMemoryPeakPath = beginTestMemoryPeak();
+    scope (exit)
+        endTestMemoryPeak(testMemoryPeakPath);
     auto listen = environment.get("ADAPTER_LISTEN", "");
     if (listen.length == 0)
     {
@@ -779,6 +782,42 @@ private bool isCloseCommand(string line)
     {
         return false;
     }
+}
+
+private string beginTestMemoryPeak()
+{
+    import std.file : write;
+    import std.process : environment;
+
+    auto path = environment.get("ADAPTER_TEST_MEMORY_PEAK_PATH", "");
+    if (path.length == 0)
+        return "";
+    auto mode = "fresh-container";
+    try
+    {
+        write("/sys/fs/cgroup/memory.peak", "0");
+        mode = "reset";
+    }
+    catch (Exception)
+    {
+    }
+    try
+        write(path ~ ".mode", mode ~ "\n");
+    catch (Exception error)
+        stderr.writefln("test memory peak mode could not be recorded: %s", error.msg);
+    return path;
+}
+
+private void endTestMemoryPeak(string path)
+{
+    if (path.length == 0)
+        return;
+    import std.file : readText, write;
+
+    try
+        write(path, readText("/sys/fs/cgroup/memory.peak"));
+    catch (Exception error)
+        stderr.writefln("test memory peak could not be recorded: %s", error.msg);
 }
 
 private JSONValue subscriptionEvent(string subscriptionId, LiveUpdate update)

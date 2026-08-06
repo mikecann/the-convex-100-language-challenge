@@ -28,14 +28,6 @@ cleanup()
         fi
         if test -n "$adapter_started"; then
             docker logs "$adapter_name" >&2 2>/dev/null || true
-            if test -e "$adapter_output_dir/adapter.stdout"; then
-                printf '%s\n' "adapter stdout:" >&2
-                cat "$adapter_output_dir/adapter.stdout" >&2
-            fi
-            if test -e "$adapter_output_dir/adapter.stderr"; then
-                printf '%s\n' "adapter stderr:" >&2
-                cat "$adapter_output_dir/adapter.stderr" >&2
-            fi
         fi
     fi
     if test -n "$controller_started"; then
@@ -70,6 +62,7 @@ docker buildx build \
 test "$(docker image inspect "$test_image" --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
 test "$(docker image inspect "$runtime_image" --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
 test "$(docker image inspect "$runtime_image" --format '{{.Config.User}}')" = 65532:65532
+test "$(docker image inspect "$runtime_image" --format '{{json .Config.Entrypoint}}')" = '["/usr/local/bin/convex-adapter"]'
 
 runtime_output=$(printf '%s\n' \
     '{"protocolVersion":1,"id":"hello","op":"hello"}' \
@@ -112,26 +105,9 @@ docker run -d \
     --env ADAPTER_LISTEN=127.0.0.1:18162 \
     --env ADAPTER_TEST_OUTPUT_DEADLINE_MS=20000 \
     --env ADAPTER_TEST_SOCKET_SNDBUF=4096 \
+    --env ADAPTER_TEST_MEMORY_PEAK_PATH=/probe-data/adapter-memory-peak \
     --env CONVEX_URL=http://127.0.0.1:18155 \
-    --entrypoint /bin/sh \
-    "$test_image" \
-    -eu -c '
-        peak_file=/sys/fs/cgroup/memory.peak
-        test -r "$peak_file"
-        if printf 0 > "$peak_file" 2>/dev/null; then
-            peak_mode=reset
-        else
-            peak_mode=fresh-container
-        fi
-        set +e
-        /out-adapter > /probe-data/adapter.stdout 2> /probe-data/adapter.stderr
-        adapter_status=$?
-        set -e
-        cat "$peak_file" > /probe-data/adapter-memory-peak
-        printf "%s\n" "$peak_mode" > /probe-data/adapter-memory-peak-mode
-        printf "%s\n" "$adapter_status" > /probe-data/adapter-exit-status
-        exit "$adapter_status"
-    '
+    "$runtime_image"
 
 adapter_memory=$(docker inspect "$adapter_name" --format '{{.HostConfig.Memory}}')
 adapter_id=$(docker inspect "$adapter_name" --format '{{.Id}}')
@@ -183,7 +159,7 @@ docker logs "$controller_name" >"$controller_log" 2>&1 || true
 
 adapter_status=$(docker wait "$adapter_name")
 peak_bytes=$(sed -n '1p' "$adapter_output_dir/adapter-memory-peak")
-peak_mode=$(sed -n '1p' "$adapter_output_dir/adapter-memory-peak-mode")
+peak_mode=$(sed -n '1p' "$adapter_output_dir/adapter-memory-peak.mode")
 controller_memory=$(docker inspect "$controller_name" --format '{{.HostConfig.Memory}}')
 controller_network=$(docker inspect "$controller_name" --format '{{.HostConfig.NetworkMode}}')
 
