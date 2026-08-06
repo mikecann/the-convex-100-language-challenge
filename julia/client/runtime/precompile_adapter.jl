@@ -369,6 +369,11 @@ close(pipe_output.out)
 # packaged branch itself and retain the first dynamic warning path diagnosed
 # from the previous stripped candidate.
 ConvexRuntime.adapter_main() == 0 || error("stdin adapter precompile failed")
+# Docker's launcher can expose stdin as an IOStream and stdout as a
+# PipeEndpoint. Retain both concrete stream combinations so the stripped
+# executable does not miss its real NDJSON entrypoint specialization.
+precompile(Adapter.run_adapter, (Base.IOStream, Base.PipeEndpoint))
+precompile(Adapter.run_adapter, (Base.IOStream, Base.IOStream))
 precompile(Adapter.run_adapter, (Base.PipeEndpoint, Base.PipeEndpoint))
 precompile(Base._depwarn, (Any, Any, Bool))
 
