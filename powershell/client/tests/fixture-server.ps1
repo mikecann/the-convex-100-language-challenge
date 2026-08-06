@@ -5,7 +5,9 @@ $ErrorActionPreference = 'Stop'
 $state = [hashtable]::Synchronized(@{
         Sync                  = [object]::new()
         Count                 = 0
-        Revision              = 0
+        # Start just before the byte boundary so the fixture proves that the
+        # client compares Convex's little-endian uint64 timestamps numerically.
+        Revision              = 253
         FailureTrigger        = 0
         CloseControlTriggered = $false
         Connections           = 0
@@ -46,7 +48,12 @@ $socketWorker = {
         [Threading.Monitor]::Enter($State.Sync)
         try {
             $State.Revision++
-            $timestamp = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes([string]$State.Revision))
+            [byte[]]$timestampBytes = [byte[]]::new(8)
+            [uint64]$revision = $State.Revision
+            for ($index = 0; $index -lt 8; $index++) {
+                $timestampBytes[$index] = [byte](($revision -shr (8 * $index)) -band 0xff)
+            }
+            $timestamp = [Convert]::ToBase64String($timestampBytes)
         }
         finally {
             [Threading.Monitor]::Exit($State.Sync)
@@ -141,6 +148,10 @@ $socketWorker = {
                                 else {
                                     ''
                                 }
+                                if ($mode -eq 'timestampBoundary') {
+                                    [Threading.Monitor]::Enter($State.Sync)
+                                    try { $State.Revision = 254 } finally { [Threading.Monitor]::Exit($State.Sync) }
+                                }
                                 if ($mode -eq 'closeControl') {
                                     [Threading.Monitor]::Enter($State.Sync)
                                     try {
@@ -185,6 +196,14 @@ $socketWorker = {
                                 if ($mode -eq 'invalidTail') {
                                     $modifications.Add(@{ type = 'UnknownModification'; queryId = $queryId })
                                 }
+                                if ($mode -eq 'invalidQueryId') {
+                                    foreach ($modification in $modifications) {
+                                        $modification['queryId'] = [uint64]4294967296
+                                    }
+                                }
+                                if ($mode -eq 'invalidTimestamp') {
+                                    $end['ts'] = 'not-base64'
+                                }
                                 if ($mode -eq 'stalledFrame') {
                                     $payload = @{
                                         type          = 'Transition'
@@ -209,6 +228,21 @@ $socketWorker = {
                                         modifications = @($modifications)
                                     } ($mode -eq 'fragmented')
                                     $owner.Version = $end
+                                    if ($mode -eq 'timestampBoundary') {
+                                        $boundaryEnd = New-Version ([int]$owner.Version.querySet)
+                                        Send-Json @{
+                                            type          = 'Transition'
+                                            startVersion  = $owner.Version
+                                            endVersion    = $boundaryEnd
+                                            modifications = @(@{
+                                                    type     = 'QueryUpdated'
+                                                    queryId  = $queryId
+                                                    value    = @{ count = (Current-Count); text = 'café 🦘' }
+                                                    logLines = @('timestamp boundary')
+                                                })
+                                        }
+                                        $owner.Version = $boundaryEnd
+                                    }
                                 }
                                 [Threading.Monitor]::Enter($State.Sync)
                                 try {

@@ -21,6 +21,16 @@ function Assert-Array {
     Assert-True ($Value -is [array]) $Message
 }
 
+function ConvertFrom-FixtureTimestamp([string] $Timestamp) {
+    $bytes = [Convert]::FromBase64String($Timestamp)
+    if ($bytes.Length -ne 8) { throw 'fixture timestamp did not contain eight bytes' }
+    [uint64]$value = 0
+    for ($index = 0; $index -lt 8; $index++) {
+        $value = $value -bor ([uint64]$bytes[$index] -shl (8 * $index))
+    }
+    $value
+}
+
 function Start-Fixture {
     param([int] $Port)
     $ready = "/tmp/powershell-fixture-$Port.ready"
@@ -61,6 +71,25 @@ try {
     Assert-Equal $echo.Value.unicode 'Καλημέρα 🦘' 'HTTP UTF-8 round trip'
     Assert-Array $echo.Logs 'single HTTP log must remain an array'
     Assert-Equal $echo.Logs.Count 1 'single HTTP log count'
+
+    # Convex timestamps are little-endian uint64 values. Cross 255 -> 256 on a
+    # real reconnect so raw-byte ordering cannot accidentally pass this suite.
+    $timestampBoundary = Add-ConvexSubscription $live 'timestamp-boundary' 'demo:state' @{
+        room = 'timestamp-boundary'
+        mode = 'timestampBoundary'
+    }
+    Assert-Equal (Receive-ConvexSubscription $live $timestampBoundary 5000).value.count 0 'timestamp boundary initial value'
+    Start-Sleep -Milliseconds 100
+    Disconnect-ConvexLiveForAdapter $live
+    $boundaryDeadline = [datetime]::UtcNow.AddSeconds(5)
+    do {
+        $boundaryMetadata = (Get-ConvexQuery $client 'fixture:metadata' @{}).Value
+        $boundaryConnects = @($boundaryMetadata.connectMessages | Where-Object { $_.lastCloseReason -eq 'DebugDisconnect' })
+        if ($boundaryConnects.Count -eq 0) { Start-Sleep -Milliseconds 20 }
+    } while ($boundaryConnects.Count -eq 0 -and [datetime]::UtcNow -lt $boundaryDeadline)
+    Assert-True ($boundaryConnects.Count -gt 0) 'timestamp boundary reconnect was not observed'
+    Assert-True ((ConvertFrom-FixtureTimestamp $boundaryConnects[-1].maxObservedTimestamp) -ge [uint64]256) 'little-endian timestamp max did not cross 255 -> 256'
+    Remove-ConvexSubscription $live 'timestamp-boundary'
 
     try {
         Get-ConvexQuery $client 'demo:fail' @{ code = 'EXPECTED' } | Out-Null
@@ -112,6 +141,22 @@ try {
     Assert-Equal $protocolFailure.error.name 'ProtocolError' 'transaction failure classification'
     Assert-True (-not $protocolFailure.ContainsKey('value')) 'invalid transition leaked a partial value'
     Remove-ConvexSubscription $live 'invalid-tail'
+
+    $invalidId = Add-ConvexSubscription $live 'invalid-query-id' 'demo:state' @{
+        room = 'invalid-query-id'
+        mode = 'invalidQueryId'
+    }
+    $invalidIdFailure = Receive-ConvexSubscription $live $invalidId 5000
+    Assert-Equal $invalidIdFailure.error.name 'ProtocolError' 'out-of-range query ID classification'
+    Remove-ConvexSubscription $live 'invalid-query-id'
+
+    $invalidTimestamp = Add-ConvexSubscription $live 'invalid-timestamp' 'demo:state' @{
+        room = 'invalid-timestamp'
+        mode = 'invalidTimestamp'
+    }
+    $invalidTimestampFailure = Receive-ConvexSubscription $live $invalidTimestamp 5000
+    Assert-Equal $invalidTimestampFailure.error.name 'ProtocolError' 'invalid timestamp classification'
+    Remove-ConvexSubscription $live 'invalid-timestamp'
 
     # A peer stalled halfway through a frame cannot prevent unsubscribe or close
     # because the owner retains the outstanding ReceiveAsync and polls commands.
@@ -226,14 +271,21 @@ try {
     Assert-True ($metadata.connections -ge 6) 'five reconnects did not create real sockets'
     Assert-True ($metadata.adds -ge 6) 'active Add was not resent after every reconnect'
     $connects = @($metadata.connectMessages)
-    $debugMessages = @($connects | Where-Object { $_.lastCloseReason -eq 'DebugDisconnect' })
+    $debugMessages = @(
+        $connects |
+            Where-Object { $_.lastCloseReason -eq 'DebugDisconnect' } |
+            Select-Object -Last 5
+    )
     Assert-True ($debugMessages.Count -ge 5) 'debug reconnect metadata omitted close reason'
     Assert-True ($debugMessages[-1].connectionCount -ge 5) 'connectionCount did not advance'
     Assert-True ($debugMessages[-1].ContainsKey('maxObservedTimestamp')) 'reconnect omitted maxObservedTimestamp'
+    $timestampValues = @($debugMessages | ForEach-Object {
+            ConvertFrom-FixtureTimestamp $_.maxObservedTimestamp
+        })
     for ($index = 1; $index -lt $debugMessages.Count; $index++) {
         Assert-Equal $debugMessages[$index].connectionCount ($debugMessages[$index - 1].connectionCount + 1) 'connectionCount was not monotonic'
-        $previousTimestamp = [int][Text.Encoding]::ASCII.GetString([Convert]::FromBase64String($debugMessages[$index - 1].maxObservedTimestamp))
-        $currentTimestamp = [int][Text.Encoding]::ASCII.GetString([Convert]::FromBase64String($debugMessages[$index].maxObservedTimestamp))
+        $previousTimestamp = ConvertFrom-FixtureTimestamp $debugMessages[$index - 1].maxObservedTimestamp
+        $currentTimestamp = ConvertFrom-FixtureTimestamp $debugMessages[$index].maxObservedTimestamp
         Assert-True ($currentTimestamp -gt $previousTimestamp) 'maxObservedTimestamp did not advance monotonically'
     }
 

@@ -200,21 +200,22 @@ function New-ConvexLiveState {
     $scheme = if ($uri.Scheme -eq 'https') { 'wss' } else { 'ws' }
     $endpoint = "${scheme}://$($uri.Authority)$($uri.AbsolutePath.TrimEnd('/'))/api/sync"
     [pscustomobject]@{
-        Endpoint             = $endpoint
-        Version              = $ClientVersion
-        Commands             = [System.Collections.Concurrent.BlockingCollection[object]]::new(128)
-        Subscriptions        = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new()
-        QueueGate            = [object]::new()
-        PendingCount         = 0
-        PendingBytes         = 0L
-        NextSequence         = 0L
-        Closed               = $false
-        Worker               = $null
-        NextQueryId          = 0
-        ConnectionCount      = 0
-        LastCloseReason      = 'InitialConnect'
-        MaxObservedTimestamp = $null
-        Owner                = [pscustomobject]@{
+        Endpoint                  = $endpoint
+        Version                   = $ClientVersion
+        Commands                  = [System.Collections.Concurrent.BlockingCollection[object]]::new(128)
+        Subscriptions             = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new()
+        QueueGate                 = [object]::new()
+        PendingCount              = 0
+        PendingBytes              = 0L
+        NextSequence              = 0L
+        Closed                    = $false
+        Worker                    = $null
+        NextQueryId               = 0
+        ConnectionCount           = 0
+        LastCloseReason           = 'InitialConnect'
+        MaxObservedTimestamp      = $null
+        MaxObservedTimestampValue = $null
+        Owner                     = [pscustomobject]@{
             Socket              = $null
             Version             = @{ querySet = 0; identity = 0; ts = 'AAAAAAAAAAA=' }
             QuerySet            = 0
@@ -241,8 +242,66 @@ $script:ConvexLiveWorker = {
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
 
+    function ConvertTo-ConvexUInt32($Value, [string] $Label) {
+        if ($Value -is [bool] -or $Value -isnot [ValueType]) {
+            throw (New-WorkerFailure 'ProtocolError' "$Label must be an unsigned 32-bit integer")
+        }
+        try {
+            $decimal = [decimal]$Value
+        }
+        catch {
+            throw (New-WorkerFailure 'ProtocolError' "$Label must be an unsigned 32-bit integer")
+        }
+        if (
+            $decimal -ne [math]::Truncate($decimal) -or
+            $decimal -lt 0 -or
+            $decimal -gt [decimal][uint32]::MaxValue
+        ) {
+            throw (New-WorkerFailure 'ProtocolError' "$Label must be an unsigned 32-bit integer")
+        }
+        [uint32]$decimal
+    }
+
+    function ConvertFrom-ConvexTimestamp([string] $Timestamp, [string] $Label) {
+        if ([string]::IsNullOrEmpty($Timestamp) -or $Timestamp.Length -ne 12) {
+            throw (New-WorkerFailure 'ProtocolError' "$Label must be canonical base64 for eight timestamp bytes")
+        }
+        try {
+            $bytes = [Convert]::FromBase64String($Timestamp)
+        }
+        catch {
+            throw (New-WorkerFailure 'ProtocolError' "$Label must be canonical base64 for eight timestamp bytes")
+        }
+        if ($bytes.Length -ne 8 -or [Convert]::ToBase64String($bytes) -cne $Timestamp) {
+            throw (New-WorkerFailure 'ProtocolError' "$Label must be canonical base64 for eight timestamp bytes")
+        }
+        [uint64]$value = 0
+        for ($index = 0; $index -lt 8; $index++) {
+            $value = $value -bor ([uint64]$bytes[$index] -shl (8 * $index))
+        }
+        $value
+    }
+
+    function ConvertTo-ConvexVersion($Value, [string] $Label) {
+        if ($Value -isnot [hashtable]) {
+            throw (New-WorkerFailure 'ProtocolError' "$Label must be an object")
+        }
+        foreach ($field in @('querySet', 'identity', 'ts')) {
+            if (-not $Value.ContainsKey($field)) {
+                throw (New-WorkerFailure 'ProtocolError' "$Label omitted $field")
+            }
+        }
+        $timestamp = [string]$Value['ts']
+        @{
+            querySet       = ConvertTo-ConvexUInt32 $Value['querySet'] "$Label querySet"
+            identity       = ConvertTo-ConvexUInt32 $Value['identity'] "$Label identity"
+            ts             = $timestamp
+            timestampValue = ConvertFrom-ConvexTimestamp $timestamp "$Label ts"
+        }
+    }
+
     function New-ZeroVersion {
-        @{ querySet = 0; identity = 0; ts = 'AAAAAAAAAAA=' }
+        ConvertTo-ConvexVersion @{ querySet = 0; identity = 0; ts = 'AAAAAAAAAAA=' } 'zero version'
     }
 
     function Test-SameVersion($Left, $Right) {
@@ -415,13 +474,17 @@ $script:ConvexLiveWorker = {
         if ($Changes.Count -eq 0) {
             return
         }
+        if ([uint64]$State.Owner.QuerySet -ge [uint64][uint32]::MaxValue) {
+            throw (New-WorkerFailure 'ProtocolError' 'Live query-set version exceeded uint32 range')
+        }
+        $newVersion = [uint32]([uint64]$State.Owner.QuerySet + 1)
         Send-Frame @{
             type          = 'ModifyQuerySet'
             baseVersion   = $State.Owner.QuerySet
-            newVersion    = $State.Owner.QuerySet + 1
+            newVersion    = $newVersion
             modifications = @($Changes)
         }
-        $State.Owner.QuerySet++
+        $State.Owner.QuerySet = $newVersion
     }
 
     function Connect-Socket {
@@ -449,7 +512,7 @@ $script:ConvexLiveWorker = {
         $connect = @{
             type            = 'Connect'
             sessionId       = [guid]::NewGuid().ToString()
-            connectionCount = $State.ConnectionCount
+            connectionCount = [uint32]$State.ConnectionCount
             lastCloseReason = $State.LastCloseReason
             clientTs        = 0
         }
@@ -469,22 +532,23 @@ $script:ConvexLiveWorker = {
         if ($Message['type'] -ne 'Transition') {
             throw (New-WorkerFailure 'ProtocolError' "unsupported Live message $($Message['type'])")
         }
-        if (
-            -not $Message.ContainsKey('startVersion') -or
-            -not $Message.ContainsKey('endVersion') -or
-            -not $Message.ContainsKey('modifications') -or
-            -not (Test-SameVersion $Message['startVersion'] $State.Owner.Version)
-        ) {
+        if (-not $Message.ContainsKey('startVersion') -or -not $Message.ContainsKey('endVersion')) {
+            throw (New-WorkerFailure 'ProtocolError' 'Live transition omitted a version')
+        }
+        $startVersion = ConvertTo-ConvexVersion $Message['startVersion'] 'startVersion'
+        if (-not (Test-SameVersion $startVersion $State.Owner.Version)) {
             throw (New-WorkerFailure 'ProtocolError' 'invalid or out-of-order Live transition')
         }
-        $endVersion = $Message['endVersion']
+        $endVersion = ConvertTo-ConvexVersion $Message['endVersion'] 'endVersion'
         if (
-            $endVersion -isnot [hashtable] -or
-            -not $endVersion.ContainsKey('querySet') -or
-            -not $endVersion.ContainsKey('identity') -or
-            -not $endVersion.ContainsKey('ts')
+            $endVersion['querySet'] -lt $startVersion['querySet'] -or
+            $endVersion['identity'] -lt $startVersion['identity'] -or
+            $endVersion['timestampValue'] -lt $startVersion['timestampValue']
         ) {
-            throw (New-WorkerFailure 'ProtocolError' 'Live transition has an invalid endVersion')
+            throw (New-WorkerFailure 'ProtocolError' 'Live transition version moved backwards')
+        }
+        if (-not $Message.ContainsKey('modifications') -or $Message['modifications'] -isnot [array]) {
+            throw (New-WorkerFailure 'ProtocolError' 'Live transition modifications must be an array')
         }
         $updates = [System.Collections.Generic.List[object]]::new()
         foreach ($modification in @($Message['modifications'])) {
@@ -498,12 +562,13 @@ $script:ConvexLiveWorker = {
             if (-not $modification.ContainsKey('queryId')) {
                 throw (New-WorkerFailure 'ProtocolError' "$kind omitted queryId")
             }
+            $queryId = ConvertTo-ConvexUInt32 $modification['queryId'] "$kind queryId"
             if ($kind -eq 'QueryRemoved') {
                 continue
             }
             $record = @(
                 $State.Subscriptions.Values |
-                    Where-Object { $_.QueryId -eq $modification['queryId'] } |
+                    Where-Object { [uint32]$_.QueryId -eq $queryId } |
                     Select-Object -First 1
             )
             if ($record.Count -eq 0) {
@@ -547,7 +612,13 @@ $script:ConvexLiveWorker = {
     function Commit-Transition($Candidate) {
         # No queue or version changes happen until every modification validates.
         $State.Owner.Version = $Candidate.EndVersion
-        $State.MaxObservedTimestamp = [string]$Candidate.EndVersion['ts']
+        if (
+            $null -eq $State.MaxObservedTimestampValue -or
+            $Candidate.EndVersion['timestampValue'] -gt $State.MaxObservedTimestampValue
+        ) {
+            $State.MaxObservedTimestamp = [string]$Candidate.EndVersion['ts']
+            $State.MaxObservedTimestampValue = [uint64]$Candidate.EndVersion['timestampValue']
+        }
         $State.Owner.BackoffMilliseconds = 100
         foreach ($candidateUpdate in $Candidate.Updates) {
             Offer-Update $candidateUpdate.Record $candidateUpdate.Update $candidateUpdate.ResetDedupe
@@ -768,8 +839,11 @@ function Add-ConvexSubscription {
         Throw-ConvexError (New-ConvexError -Name ClosedError -Message 'Live client is closed')
     }
     Start-ConvexLive $Live
-    $queryId = $Live.NextQueryId
-    $Live.NextQueryId++
+    if ([uint64]$Live.NextQueryId -gt [uint64][uint32]::MaxValue) {
+        Throw-ConvexError (New-ConvexError -Name ProtocolError -Message 'Live query ID exceeded uint32 range')
+    }
+    $queryId = [uint32]$Live.NextQueryId
+    $Live.NextQueryId = [uint64]$queryId + 1
     $recordArguments = @{
         Id           = $Id
         QueryId      = $queryId
