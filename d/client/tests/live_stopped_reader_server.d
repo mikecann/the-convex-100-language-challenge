@@ -1,17 +1,34 @@
-/** A deterministic Live fixture for the final adapter stopped-reader test. */
+/** A gated Live fixture for final-adapter retention and backpressure proof. */
 module live_stopped_reader_server;
 
+import core.thread : Thread;
+import core.time : msecs;
 import std.base64 : Base64;
 import std.conv : to;
+import std.datetime.stopwatch : StopWatch;
 import std.digest.sha : sha1Of;
+import std.file : exists, write;
 import std.json : parseJSON;
 import std.socket : InternetAddress, Socket, TcpSocket;
 import std.stdio : stderr;
 import std.string : indexOf, splitLines, startsWith, strip;
 
 enum port = 18155;
-enum nearMaximumValueBytes = 2_000_000;
-enum messageCount = 5;
+enum smallValueBytes = 128 * 1024;
+enum nearMaximumValueBytes = 1_750_000;
+enum countLastSequence = 18;
+enum byteFirstSequence = 101;
+enum byteLastSequence = 105;
+
+enum countStartGate = "/tmp/d-live-count-start";
+enum countFirstSent = "/tmp/d-live-count-first-sent";
+enum countBurstGate = "/tmp/d-live-count-burst";
+enum countDone = "/tmp/d-live-count-done";
+enum byteStartGate = "/tmp/d-live-byte-start";
+enum byteFirstSent = "/tmp/d-live-byte-first-sent";
+enum byteBurstGate = "/tmp/d-live-byte-burst";
+enum byteDone = "/tmp/d-live-byte-done";
+enum finishGate = "/tmp/d-live-finish";
 
 private void sendAll(Socket peer, const(ubyte)[] bytes)
 {
@@ -61,6 +78,19 @@ private ubyte[] receiveClientText(Socket peer)
     return payload;
 }
 
+private string receiveClientControl(Socket peer, ubyte expectedOpcode)
+{
+    auto header = receiveExact(peer, 2);
+    assert((header[0] & 0x0f) == expectedOpcode);
+    auto length = header[1] & 0x7f;
+    assert(length < 126 && (header[1] & 0x80) != 0);
+    auto mask = receiveExact(peer, 4);
+    auto payload = receiveExact(peer, cast(size_t) length);
+    foreach (index, ref octet; payload)
+        octet ^= mask[index % 4];
+    return cast(string) payload;
+}
+
 private void handshake(Socket peer)
 {
     ubyte[4096] chunk;
@@ -107,6 +137,15 @@ private void sendText(Socket peer, string text)
     sendAll(peer, frame);
 }
 
+private void sendControl(Socket peer, ubyte opcode, string payload)
+{
+    auto bytes = cast(const(ubyte)[]) payload;
+    assert(bytes.length <= 125);
+    ubyte[] frame = [cast(ubyte)(0x80 | opcode), cast(ubyte) bytes.length];
+    frame ~= bytes;
+    sendAll(peer, frame);
+}
+
 private string timestamp(ulong value)
 {
     ubyte[8] bytes;
@@ -121,12 +160,28 @@ private string versionJson(uint querySet, ulong value)
 }
 
 private string transition(uint startQuerySet, ulong startTs, uint endQuerySet,
-        ulong endTs, string payload)
+        ulong endTs, uint sequence, string payload)
 {
     return `{"type":"Transition","startVersion":` ~ versionJson(startQuerySet,
             startTs) ~ `,"endVersion":` ~ versionJson(endQuerySet,
-            endTs) ~ `,"modifications":[{"type":"QueryUpdated","queryId":0,"value":"`
-        ~ payload ~ `"}]}`;
+            endTs) ~ `,"modifications":[{"type":"QueryUpdated","queryId":0,"value":{"sequence":`
+        ~ sequence.to!string ~ `,"payload":"` ~ payload ~ `"}}]}`;
+}
+
+private void waitForGate(string path)
+{
+    StopWatch timer;
+    timer.start();
+    while (!exists(path))
+    {
+        assert(timer.peek.total!"msecs" < 5_000);
+        Thread.sleep(5.msecs);
+    }
+}
+
+private void mark(string path)
+{
+    write(path, "ready");
 }
 
 void main()
@@ -146,11 +201,46 @@ void main()
     auto add = parseJSON(cast(string) receiveClientText(peer));
     assert(add.object["type"].str == "ModifyQuerySet");
 
-    auto payload = new char[nearMaximumValueBytes];
-    payload[] = 'x';
-    foreach (value; 1 .. messageCount + 1)
-        sendText(peer, transition(value == 1 ? 0 : 1, value == 1 ? 0 : value - 1, 1,
-                value, payload.idup));
+    // The controller does not read after the acknowledgement. Make the first
+    // count event near the Live frame limit so it cannot all sit in TCP's
+    // receive buffers. Subsequent small values isolate the queue's count
+    // eviction from its independent encoded-byte budget.
+    auto firstCountPayload = new char[nearMaximumValueBytes];
+    firstCountPayload[] = 's';
+    auto smallPayload = new char[smallValueBytes];
+    smallPayload[] = 's';
+    waitForGate(countStartGate);
+    sendText(peer, transition(0, 0, 1, 1, 1, firstCountPayload.idup));
+    mark(countFirstSent);
+    waitForGate(countBurstGate);
+    foreach (uint sequence; 2 .. countLastSequence + 1)
+    {
+        sendText(peer, transition(1, sequence - 1, 1, sequence, sequence, smallPayload.idup));
+        /* The real owner must decode and commit each transition before the
+         * fixture writes another one, while the controller stays stopped. */
+        sendControl(peer, 9, "count-decoded");
+        assert(receiveClientControl(peer, 10) == "count-decoded");
+    }
+    mark(countDone);
 
-    stderr.writefln("sent %s Live messages of %s bytes", messageCount, nearMaximumValueBytes);
+    auto largePayload = new char[nearMaximumValueBytes];
+    largePayload[] = 'x';
+    waitForGate(byteStartGate);
+    sendText(peer, transition(1, countLastSequence, 1, byteFirstSequence,
+            byteFirstSequence, largePayload.idup));
+    mark(byteFirstSent);
+    waitForGate(byteBurstGate);
+    foreach (uint sequence; byteFirstSequence + 1 .. byteLastSequence + 1)
+    {
+        sendText(peer, transition(1, sequence - 1, 1, sequence, sequence, largePayload.idup));
+        sendControl(peer, 9, "bytes-decoded");
+        assert(receiveClientControl(peer, 10) == "bytes-decoded");
+    }
+    mark(byteDone);
+
+    waitForGate(finishGate);
+    /* The controller's close command shuts down the shared Live client, so
+     * final transport cleanup is an RFC6455 Close instead of query removal. */
+    assert(receiveClientControl(peer, 8).length == 0);
+    stderr.writefln("sent count and encoded-byte retention bursts through Live");
 }

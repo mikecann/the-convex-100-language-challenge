@@ -20,7 +20,7 @@ import core.time : MonoTime, msecs;
 import std.ascii : isDigit;
 import std.conv : to;
 import std.json : JSONType, JSONValue, parseJSON;
-import std.socket : InternetAddress, Socket, TcpSocket;
+import std.socket : InternetAddress, Socket, SocketOption, SocketOptionLevel, TcpSocket;
 import std.stdio : stderr;
 import std.string : indexOf, lastIndexOf;
 
@@ -30,6 +30,7 @@ enum maxInputQueueBytes = 4 * 1024 * 1024;
 enum maxInputQueueLines = 32;
 enum maxOutputLineBytes = 3 * 1024 * 1024;
 enum outputDeadlineMs = 500;
+enum maxTestOutputDeadlineMs = 20_000;
 enum maxSubscriptions = 16;
 
 /** The reader may see close while the command owner is waiting for a Live Add
@@ -244,6 +245,7 @@ private class Output
 {
     private int descriptor;
     private bool socketTransport;
+    private int deadlineMs;
     private Mutex mutex;
     private ulong[string] generations;
     private ulong[string] active;
@@ -251,8 +253,28 @@ private class Output
 
     this(int descriptor, bool socketTransport)
     {
+        import std.process : environment;
+
         this.descriptor = descriptor;
         this.socketTransport = socketTransport;
+        deadlineMs = outputDeadlineMs;
+        /* This test-only escape hatch holds an actual adapter write open long
+         * enough for the stopped-reader fixture to resume it. The default
+         * remains the production 500 ms bound, and invalid values cannot
+         * relax that bound. */
+        auto requested = environment.get("ADAPTER_TEST_OUTPUT_DEADLINE_MS", "");
+        if (requested.length > 0)
+        {
+            try
+            {
+                auto candidate = requested.to!int;
+                if (candidate >= outputDeadlineMs && candidate <= maxTestOutputDeadlineMs)
+                    deadlineMs = candidate;
+            }
+            catch (Exception)
+            {
+            }
+        }
         mutex = new Mutex();
         setNonblocking(descriptor);
     }
@@ -348,7 +370,7 @@ private class Output
          * byte is written. Other relays retain only their already bounded
          * LiveUpdate while waiting for this gate. */
         size_t offset;
-        auto deadline = monotonicMilliseconds() + outputDeadlineMs;
+        auto deadline = monotonicMilliseconds() + deadlineMs;
         while (offset < wire.length)
         {
             auto remaining = deadline - monotonicMilliseconds();
@@ -498,6 +520,23 @@ else
     listener.bind(new InternetAddress(host, to!ushort(portText)));
     listener.listen(1);
     auto peer = listener.accept();
+    /* The isolated stopped-reader fixture opts into a deliberately tiny TCP
+     * send buffer. It makes the real Output.writeLocked call stay blocked
+     * while the Live owner decodes the gated burst. Normal adapter TCP mode
+     * has no environment value and therefore keeps the OS default. */
+    auto requestedSendBuffer = environment.get("ADAPTER_TEST_SOCKET_SNDBUF", "");
+    if (requestedSendBuffer.length > 0)
+    {
+        try
+        {
+            auto candidate = requestedSendBuffer.to!int;
+            if (candidate >= 1_024 && candidate <= 65_536)
+                peer.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDBUF, candidate);
+        }
+        catch (Exception)
+        {
+        }
+    }
     auto descriptor = cast(int) peer.handle;
     setNonblocking(descriptor);
     serve(descriptor, new Output(descriptor, true));
