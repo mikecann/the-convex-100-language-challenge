@@ -1,0 +1,15 @@
+(library
+ (name convex)
+ (public_name convex_ocaml)
+ (modules convex)
+ (libraries unix threads yojson ssl))
+
+(executable
+ (name example_main)
+ (modules example_main)
+ (libraries convex unix threads yojson))
+
+(alias
+ (name runtest)
+ (deps
+  (glob_files tests/*.ml)))

@@ -1,0 +1,3 @@
+(lang dune 3.16)
+(name convex_ocaml)
+(generate_opam_files false)

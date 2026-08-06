@@ -1,23 +1,3 @@
-# Convex from OCaml
-
-This educational client shows an OCaml program querying a Convex deployment over HTTP, listening for a Live value, and applying a mutation that the Live subscription observes.
-
-It is unofficial teaching material, not a production SDK or a supported Convex package.
-
-## Start here
-
-Read the [canonical basic example](examples/basics/main.ml). It performs a query, starts Live before the write, checks the initial value, applies an idempotent mutation, and checks the resulting Live update.
-
-## What works
-
-| Capability | Status | Evidence boundary |
-| --- | --- | --- |
-| Native HTTP query, mutation, and action | In verification | Docker test plus the shared black-box HTTP suite |
-| Structured HTTP errors and bearer-token lifecycle | In verification | Adapter protocol and shared error/auth tests |
-| Native Live query updates and reconnects | In verification | One socket-owner worker and the shared five-reconnect suite |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.ml -->
-```text
 (* The example accepts the verifier's unique room as argv[1] so parallel runs
    never share mutable Convex demo state. *)
 let room = if Array.length Sys.argv > 1 then Sys.argv.(1) else "ocaml-example"
@@ -143,27 +123,3 @@ let () =
           Printf.printf "live updated count: %Ld\n%!" updated_count;
           Printf.printf "verified count: %Ld -> %Ld\n%!" current_count
             updated_count))
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-All OCaml builds run in the pinned `linux/amd64` Docker image. From the repository root:
-
-```sh
-./run test ocaml
-./run verify-example ocaml
-./run verify ocaml
-```
-
-The first command checks formatting, unit fixtures, and compilation. The example command executes the exact source projected above in its minimal runtime image. The shared verify command is the evidence gate for HTTP and Live capabilities.
-
-## Protocol notes
-
-The client implements the documented JSON Functions API directly with OCaml Unix sockets, and implements the pinned `/api/sync` profile directly with an OCaml WebSocket frame reader and writer. TLS uses `ocaml-ssl`; JSON uses `yojson`. The Live worker exclusively owns socket reads, writes, reconnects, and query-set versions. Updates use a bounded current-state queue with both count and byte limits.
-
-The adapter speaks NDJSON v1 over stdin/stdout or a single loopback TCP connection. `debugDisconnect` is compiled into the adapter surface only and is used to prove that active `Add` operations are replayed after five real reconnects.
-
-## Limitations
-
-Authentication is implemented for HTTP calls and can be replaced or cleared through the adapter. Live authentication, WebSocket mutations/actions, optimistic updates, tagged Convex values, and `TransitionChunk` assembly remain deliberately deferred until they have their own evidence.
