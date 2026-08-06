@@ -1,23 +1,3 @@
-# Convex from Vala
-
-This native Vala client calls Convex over documented JSON HTTP endpoints and keeps a query current through the repository's pinned Live WebSocket profile.
-
-It is educational and unofficial. It is not a production SDK and is not intended for package publication.
-
-## Start here
-
-Read [`examples/basics/main.vala`](examples/basics/main.vala). It queries a fresh counter, starts Live before changing it, applies one idempotent mutation, and proves that HTTP and Live agree on `0 -> 1`.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP queries, mutations, actions, and structured errors | Implemented, no earned badge |
-| Live initial values and updates used by the canonical example | Implemented, no earned badge |
-| Full HTTP and Live conformance | Not yet earned |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.vala -->
-```vala
 using GLib;
 using Json;
 using Convex;
@@ -146,32 +126,3 @@ int main (string[] args) {
     return 1;
   }
 }
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-```sh
-./run sync-examples
-./run validate
-./run test vala
-./run verify-example vala
-```
-
-`test` compiles and runs Vala's language-local adapter checks inside Docker. The final-image probes exercise the exact canonical example and adapter under the runtime policy. Root-owned shared conformance is still required before either capability can be earned.
-
-## Conformance and protocol notes
-
-The client implements Convex-specific HTTP envelopes and the pinned `/api/sync` query-set profile in Vala. libsoup supplies streaming HTTP with a two MiB body limit and one absolute operation deadline, while a GLib/GIO `SocketClient` and TLS connection carry the client-owned RFC6455 handshake, masking, incremental frame parser, control frames, and close deadlines. One GLib-main-context Live owner opens, reads, writes, retires, and reconnects the socket. It commits a complete Transition before publishing updates, validates query-set versions and uint32 bounds, tracks the little-endian timestamp numerically, reports structured failures, and suppresses unchanged rehydration.
-
-HTTP responses are parsed before they are classified, so a Convex function-error envelope keeps its `errorMessage`, `errorData`, and `logLines` on any status, while a malformed or non-envelope non-2xx body stays a transport failure. A body that never satisfied its declared `Content-Length` or chunked framing is a transport failure too, rather than the value its truncated bytes happen to spell. Complete keep-alive chunked responses are supported; chunked responses which also declare `Connection: close` are conservatively refused because libsoup 3.2 does not expose the terminal zero chunk to its decoded stream.
-
-Memory bounds measure what is retained rather than what was serialized. A parsed JSON-GLib tree costs about a hundred bytes per node, so a dense array can retain roughly fifty times its wire size while staying inside every byte-count limit. Untrusted JSON is therefore scanned before it is parsed and refused if its tree would exceed eight MiB retained or nest deeper than sixty-four levels, and delivery relays are generation-tagged and bounded to sixteen reserved queued or in-flight events and eight MiB of retained value, error, log, and runtime representation. Adapter output has a two MiB event cap, conservative in-flight byte accounting, and a one-second default absolute write deadline so a stopped controller cannot pin the process indefinitely.
-
-The test-only adapter accepts strict NDJSON v1 over stdin/stdout or one `ADAPTER_LISTEN` TCP controller. `debugDisconnect` is adapter-only and lets the shared harness prove real reconnections.
-
-## Limitations
-
-The language-local raw peers cover strict HTTP status and bounded streaming, function-error envelopes on non-2xx statuses, truncated `Content-Length` and unterminated chunked bodies, inactivity and continuous-drip deadlines, malformed-envelope recovery, strict RFC6455 upgrade validation, fragmented UTF-8 with control traffic, absolute partial-frame timeout and recovery, tree-shaped frame rejection and recovery, five reconnects with `Add` replay, stale relay barriers, and bounded close. They also exercise queued and in-flight count/byte reservations against both string-shaped and tree-shaped near-maximum values, but they do not replace fresh independent review or root-owned shared conformance.
-
-The retained-JSON bound is a real refusal, not a soft cap. A Convex value whose parsed tree would exceed eight MiB retained is reported as a `ProtocolError` rather than delivered, and a Live frame carrying one retires that connection and reconnects instead of being parsed. That is a deliberate trade: a wire-legal but node-dense payload is refused rather than allowed to exhaust the shared container limit. Live authentication lifecycle, optimistic updates, mutation and action messages over WebSocket, journals, and TransitionChunk assembly are deferred. The manifest deliberately declares no earned badges.
