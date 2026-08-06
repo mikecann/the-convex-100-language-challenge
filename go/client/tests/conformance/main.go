@@ -34,7 +34,7 @@ type command struct {
 type adapterError struct {
 	Name    string          `json:"name"`
 	Message string          `json:"message"`
-	Data    json.RawMessage `json:"data"`
+	Data    json.RawMessage `json:"data,omitempty"`
 }
 
 type event struct {
@@ -61,16 +61,14 @@ type adapterSubscription struct {
 
 func failureEvent(id string, subscriptionID string, err error) event {
 	name := "Error"
-	data := json.RawMessage(`null`)
+	var data json.RawMessage
 	var functionErr *convex.FunctionError
 	var protocolErr *convex.ProtocolError
 	var transportErr *convex.TransportError
 	switch {
 	case errors.As(err, &functionErr):
 		name = "FunctionError"
-		if functionErr.Data != nil {
-			data = functionErr.Data
-		}
+		data = functionErr.Data
 	case errors.As(err, &protocolErr):
 		name = "ProtocolError"
 	case errors.As(err, &transportErr):
@@ -87,6 +85,10 @@ func failureEvent(id string, subscriptionID string, err error) event {
 			Data:    data,
 		},
 	}
+	return finishFailureEvent(failure, subscriptionID, functionErr)
+}
+
+func finishFailureEvent(failure event, subscriptionID string, functionErr *convex.FunctionError) event {
 	if subscriptionID != "" {
 		failure.ID = ""
 		failure.Type = "subscription"
