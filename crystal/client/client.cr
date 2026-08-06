@@ -251,50 +251,29 @@ module Convex
   # its connection, never resumed as though its next byte were a new header.
   alias LiveIO = TCPSocket | OpenSSL::SSL::Socket::Client
 
-  # Count bytes returned to the frame parser, including bytes already buffered
-  # inside OpenSSL. Raw descriptor readiness cannot see those bytes, which can
-  # otherwise strand a WebSocket message read alongside the HTTP 101 response.
-  class CountingLiveIO < IO
-    getter bytes_read = 0
-
-    def initialize(@inner : LiveIO)
-    end
-
-    def reset_bytes_read
-      @bytes_read = 0
-    end
-
-    def read(slice : Bytes) : Int32
-      count = @inner.read(slice)
-      @bytes_read += count
-      count
-    end
-
-    def write(slice : Bytes) : Nil
-      @inner.write(slice)
-    end
-
-    def flush
-      @inner.flush
-    end
-
-    def close
-      @inner.close
-    end
-  end
+  record IncomingFrame, opcode : UInt8, final : Bool, payload_offset : Int32, payload_size : Int32, total_size : Int32
 
   class OwnerWebSocket
-    CONNECT_DEADLINE    = 5.seconds
-    HALF_FRAME_DEADLINE = 250.milliseconds
-    MAX_MESSAGE_BYTES   = 2 * 1024 * 1024
-    MAX_FRAMES_PER_POLL = 8
+    CONNECT_DEADLINE     = 5.seconds
+    IDLE_READ_SLICE      = 25.milliseconds
+    FRAME_DEADLINE       = 5.seconds
+    WRITE_DEADLINE       = 250.milliseconds
+    MAX_MESSAGE_BYTES    = 2 * 1024 * 1024
+    MAX_FRAME_WIRE_BYTES = MAX_MESSAGE_BYTES + 10
+    MAX_FRAMES_PER_POLL  = 8
+    @frame_started_at : Time::Span?
 
     def initialize(@io : LiveIO, @tcp : TCPSocket)
-      @counting_io = CountingLiveIO.new(@io)
-      @protocol = HTTP::WebSocket::Protocol.new(@counting_io, masked: true)
-      @buffer = Bytes.new(16 * 1024)
+      # Crystal's protocol reader does not retain a partially consumed frame if
+      # a socket timeout unwinds its call stack. Keep an incremental wire buffer
+      # here so short idle polls can return control to the owner command loop
+      # without losing the true frame boundary.
+      @writer = HTTP::WebSocket::Protocol.new(@io, masked: true)
+      @frame_buffer = Bytes.new(MAX_FRAME_WIRE_BYTES)
+      @frame_size = 0
+      @frame_started_at = nil
       @message = IO::Memory.new
-      @message_opcode = HTTP::WebSocket::Protocol::Opcode::CONTINUATION
+      @message_in_progress = false
     end
 
     def self.connect(uri : URI, client_version : String) : OwnerWebSocket
@@ -329,14 +308,17 @@ module Convex
         HTTP::Request.new("GET", path, headers).to_io(io)
         io.flush
         response = HTTP::Client::Response.from_io(io, ignore_body: true)
-        unless response.status.switching_protocols? && response.headers["Sec-WebSocket-Accept"]? == HTTP::WebSocket::Protocol.key_challenge(key)
+        unless response.status.switching_protocols? &&
+               header_has_token?(response.headers, "Upgrade", "websocket") &&
+               header_has_token?(response.headers, "Connection", "upgrade") &&
+               response.headers["Sec-WebSocket-Accept"]? == HTTP::WebSocket::Protocol.key_challenge(key)
           raise TransportError.new("Live WebSocket handshake was denied", "live dial")
         end
-        tcp.read_timeout = HALF_FRAME_DEADLINE
-        tcp.write_timeout = HALF_FRAME_DEADLINE
+        tcp.read_timeout = IDLE_READ_SLICE
+        tcp.write_timeout = WRITE_DEADLINE
         if secured = secured_socket
-          secured.read_timeout = HALF_FRAME_DEADLINE
-          secured.write_timeout = HALF_FRAME_DEADLINE
+          secured.read_timeout = IDLE_READ_SLICE
+          secured.write_timeout = WRITE_DEADLINE
         end
         OwnerWebSocket.new(io, tcp)
       rescue ex
@@ -345,56 +327,42 @@ module Convex
       end
     end
 
-    # Returns at most one complete UTF-8 text message. Ping and pong frames are
-    # handled immediately by this same owner. A timeout before the first byte is
-    # ordinary idleness; a timeout during Protocol#receive retires the socket.
+    private def self.header_has_token?(headers : HTTP::Headers, name : String, expected : String) : Bool
+      value = headers[name]?
+      return false unless value
+      value.split(',').any? { |token| token.strip.downcase == expected }
+    end
+
+    # Returns at most one complete UTF-8 text message. A short read timeout is
+    # ordinary idleness, even after part of a frame has arrived. The frame bytes
+    # remain buffered until the absolute deadline expires, at which point the
+    # owner abandons the connection and its parser state together.
     def poll : String?
-      @counting_io.reset_bytes_read
       frames = 0
       loop do
-        frames += 1
-        info = @protocol.receive(@buffer)
-        payload = @buffer[0, info.size]
-        case info.opcode
-        when .ping?
-          @protocol.pong(payload)
+        if frame = next_frame?
+          frames += 1
+          message = handle_frame(frame)
+          consume_frame(frame.total_size)
+          return message if message
           return nil if frames >= MAX_FRAMES_PER_POLL
           next
-        when .pong?
-          return nil if frames >= MAX_FRAMES_PER_POLL
-          next
-        when .close?
-          raise TransportError.new("Live peer closed the WebSocket", "live read")
-        when .text?, .continuation?
-          if info.opcode.text? && @message.size == 0
-            @message_opcode = info.opcode
-          elsif @message_opcode.continuation?
-            raise ProtocolError.new("unexpected Live continuation", "live read")
-          end
-          raise ProtocolError.new("Live frame exceeds byte budget", "live read") if @message.size + payload.size > MAX_MESSAGE_BYTES
-          @message.write(payload)
-          next unless info.final
-          text = @message.to_s
-          @message.clear
-          @message_opcode = HTTP::WebSocket::Protocol::Opcode::CONTINUATION
-          raise ProtocolError.new("Live text frame is not UTF-8", "live read") unless text.valid_encoding?
-          return text
-        when .binary?
-          raise ProtocolError.new("binary Live frames are unsupported", "live read")
-        else
-          raise ProtocolError.new("unsupported Live frame", "live read")
         end
+
+        enforce_frame_deadline
+        read_frame_bytes
+        # One read per poll keeps a peer that continuously dribbles a large
+        # frame from monopolising the owner before close/unsubscribe commands.
+        enforce_frame_deadline
+        return nil
       end
     rescue ex : IO::TimeoutError
-      # No frame bytes means an idle connection. Any consumed byte, or an
-      # unfinished fragmented message, means parser state is now ambiguous and
-      # the owner must abandon the whole connection before reconnecting.
-      return nil if @counting_io.bytes_read == 0 && @message.size == 0
-      raise TransportError.new("Live half-frame deadline exceeded", "live read")
+      enforce_frame_deadline
+      nil
     end
 
     def send_json(value)
-      @protocol.send(value.to_json)
+      @writer.send(value.to_json)
     end
 
     def close
@@ -402,6 +370,116 @@ module Convex
       # an idle or flooding peer and violate the owner's close deadline.
       @tcp.close rescue nil
       @io.close rescue nil
+    end
+
+    private def read_frame_bytes
+      raise ProtocolError.new("Live frame exceeds byte budget", "live read") if @frame_size >= @frame_buffer.size
+      count = @io.read(@frame_buffer[@frame_size, @frame_buffer.size - @frame_size])
+      raise IO::EOFError.new("Live peer closed the WebSocket") if count == 0
+      @frame_started_at ||= Time.monotonic
+      @frame_size += count
+    end
+
+    private def enforce_frame_deadline
+      return unless started = @frame_started_at
+      if Time.monotonic - started >= FRAME_DEADLINE
+        raise TransportError.new("Live half-frame deadline exceeded", "live read")
+      end
+    end
+
+    private def next_frame? : IncomingFrame?
+      return nil if @frame_size < 2
+      first = @frame_buffer[0]
+      second = @frame_buffer[1]
+      raise ProtocolError.new("Live frame uses unsupported RSV bits", "live read") unless first & 0x70_u8 == 0
+      raise ProtocolError.new("Live server frame must not be masked", "live read") unless second & 0x80_u8 == 0
+
+      opcode = first & 0x0f_u8
+      final = first & 0x80_u8 != 0
+      control = opcode >= 0x08_u8
+      unless {0x00_u8, 0x01_u8, 0x02_u8, 0x08_u8, 0x09_u8, 0x0a_u8}.includes?(opcode)
+        raise ProtocolError.new("unsupported Live frame opcode", "live read")
+      end
+
+      length_code = (second & 0x7f_u8).to_i
+      header_size = 2
+      payload_size = case length_code
+                     when 126
+                       return nil if @frame_size < 4
+                       header_size = 4
+                       (@frame_buffer[2].to_i << 8) | @frame_buffer[3].to_i
+                     when 127
+                       return nil if @frame_size < 10
+                       header_size = 10
+                       length = 0_u64
+                       8.times { |index| length = (length << 8) | @frame_buffer[2 + index].to_u64 }
+                       raise ProtocolError.new("Live frame exceeds byte budget", "live read") if length > MAX_MESSAGE_BYTES.to_u64
+                       length.to_i
+                     else
+                       length_code
+                     end
+
+      if control && (!final || payload_size > 125)
+        raise ProtocolError.new("invalid Live control frame", "live read")
+      end
+      raise ProtocolError.new("Live frame exceeds byte budget", "live read") if payload_size > MAX_MESSAGE_BYTES
+      total_size = header_size + payload_size
+      return nil if @frame_size < total_size
+      IncomingFrame.new(opcode, final, header_size, payload_size, total_size)
+    end
+
+    private def handle_frame(frame : IncomingFrame) : String?
+      payload = @frame_buffer[frame.payload_offset, frame.payload_size]
+      case frame.opcode
+      when 0x09_u8
+        @writer.pong(payload)
+        nil
+      when 0x0a_u8
+        nil
+      when 0x08_u8
+        raise TransportError.new("Live peer closed the WebSocket", "live read")
+      when 0x02_u8
+        raise ProtocolError.new("binary Live frames are unsupported", "live read")
+      when 0x01_u8
+        raise ProtocolError.new("new Live text frame interrupted a fragmented message", "live read") if @message_in_progress
+        append_message(payload)
+        if frame.final
+          finish_message
+        else
+          @message_in_progress = true
+          nil
+        end
+      when 0x00_u8
+        raise ProtocolError.new("unexpected Live continuation", "live read") unless @message_in_progress
+        append_message(payload)
+        if frame.final
+          @message_in_progress = false
+          finish_message
+        end
+      else
+        raise ProtocolError.new("unsupported Live frame", "live read")
+      end
+    end
+
+    private def append_message(payload : Bytes)
+      if @message.size + payload.size > MAX_MESSAGE_BYTES
+        raise ProtocolError.new("Live message exceeds byte budget", "live read")
+      end
+      @message.write(payload)
+    end
+
+    private def finish_message : String
+      text = @message.to_s
+      @message.clear
+      raise ProtocolError.new("Live text frame is not UTF-8", "live read") unless text.valid_encoding?
+      text
+    end
+
+    private def consume_frame(size : Int32)
+      remaining = @frame_size - size
+      remaining.times { |index| @frame_buffer[index] = @frame_buffer[size + index] }
+      @frame_size = remaining
+      @frame_started_at = remaining > 0 ? Time.monotonic : nil
     end
   end
 
@@ -784,7 +862,8 @@ module Convex
   end
 
   class Client
-    VERSION = "crystal-0.1.0"
+    VERSION                 = "crystal-0.1.0"
+    MAX_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024
     @url : URI
     @bearer_token : String?
     @live : LiveManager?
@@ -835,9 +914,16 @@ module Convex
       headers = HTTP::Headers{"Content-Type" => "application/json", "Accept" => "application/json", "Convex-Client" => VERSION}
       token = @mutex.synchronize { raise ClosedError.new("client is closed") if @closed; @bearer_token }
       headers["Authorization"] = "Bearer #{token}" if token && !token.empty?
-      response = HTTP::Client.post(@url.resolve("/api/#{operation}"), headers: headers, body: body)
-      raise TransportError.new("HTTP response too large", operation) if response.body.bytesize > 2 * 1024 * 1024
-      decoded = JSON.parse(response.body)
+      response_body = HTTP::Client.post(@url.resolve("/api/#{operation}"), headers: headers, body: body) do |response|
+        status_code = response.status_code
+        unless status_code >= 200 && status_code <= 299
+          # A proxy or backend error must not become a successful Convex result
+          # merely because its body happens to have {"status":"success"}.
+          raise TransportError.new("HTTP request failed with status #{status_code}", operation)
+        end
+        read_http_body(response.body_io, operation)
+      end
+      decoded = JSON.parse(response_body)
       case decoded["status"].as_s
       when "success"
         Result.new(decoded["value"], decoded["logLines"]?.try(&.as_a.map(&.as_s)) || [] of String)
@@ -851,6 +937,22 @@ module Convex
       raise ex
     rescue ex
       raise TransportError.new(ex.message || "HTTP request failed", operation)
+    end
+
+    private def read_http_body(input : IO, operation : String) : String
+      output = IO::Memory.new
+      buffer = Bytes.new(16 * 1024)
+      total = 0
+      loop do
+        count = input.read(buffer)
+        break if count == 0
+        total += count
+        # Check before copying into the retained output. Chunked and compressed
+        # responses therefore cannot allocate an unbounded body first.
+        raise TransportError.new("HTTP response too large", operation) if total > MAX_HTTP_RESPONSE_BYTES
+        output.write(buffer[0, count])
+      end
+      output.to_s
     end
   end
 end

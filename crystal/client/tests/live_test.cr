@@ -20,14 +20,14 @@ end
 class SyncConnection
   getter socket : TCPSocket
 
-  def initialize(@socket)
+  def initialize(@socket, upgrade : String? = "websocket", connection : String? = "Upgrade")
     @socket.read_timeout = 2.seconds
     parsed = HTTP::Request.from_io(@socket) || raise "missing WebSocket upgrade"
     request = parsed.as?(HTTP::Request) || raise "invalid WebSocket upgrade: #{parsed}"
     key = request.headers["Sec-WebSocket-Key"]
     @socket << "HTTP/1.1 101 Switching Protocols\r\n"
-    @socket << "Connection: Upgrade\r\n"
-    @socket << "Upgrade: websocket\r\n"
+    @socket << "Connection: #{connection}\r\n" if connection
+    @socket << "Upgrade: #{upgrade}\r\n" if upgrade
     @socket << "Sec-WebSocket-Accept: #{HTTP::WebSocket::Protocol.key_challenge(key)}\r\n\r\n"
     @socket.flush
     @protocol = HTTP::WebSocket::Protocol.new(@socket)
@@ -72,6 +72,45 @@ class SyncConnection
     @socket.flush
   end
 
+  def send_dribbling_frame
+    @socket.write(Bytes[0x81_u8, 126_u8, 0_u8, 100_u8])
+    @socket.flush
+    100.times do
+      sleep 100.milliseconds
+      @socket.write(Bytes['x'.ord.to_u8])
+      @socket.flush
+    end
+  end
+
+  # Send one valid frame with gaps longer than the old 250 ms socket timeout.
+  # The client must preserve its incremental parser state until the absolute
+  # frame deadline rather than retiring a healthy hosted-style connection.
+  def send_slow_json(value)
+    payload = value.to_json.to_slice
+    header_size = payload.size <= 125 ? 2 : 4
+    raise "slow fixture payload is unexpectedly large" if payload.size > UInt16::MAX
+    frame = Bytes.new(header_size + payload.size)
+    frame[0] = 0x81_u8
+    if header_size == 2
+      frame[1] = payload.size.to_u8
+    else
+      frame[1] = 126_u8
+      frame[2] = ((payload.size >> 8) & 0xff).to_u8
+      frame[3] = (payload.size & 0xff).to_u8
+    end
+    payload.each_with_index { |byte, index| frame[header_size + index] = byte }
+    first = header_size + 3
+    second = first + (frame.size - first) // 2
+    @socket.write(frame[0, first])
+    @socket.flush
+    sleep 350.milliseconds
+    @socket.write(frame[first, second - first])
+    @socket.flush
+    sleep 350.milliseconds
+    @socket.write(frame[second, frame.size - second])
+    @socket.flush
+  end
+
   def ping
     @protocol.ping("flood")
   end
@@ -107,12 +146,29 @@ class SyncFixture
     @url = "http://127.0.0.1:#{@server.local_address.port}"
   end
 
-  def accept : SyncConnection
-    SyncConnection.new(@server.accept)
+  def accept(upgrade : String? = "websocket", connection : String? = "Upgrade") : SyncConnection
+    SyncConnection.new(@server.accept, upgrade, connection)
   end
 
   def close
     @server.close rescue nil
+  end
+end
+
+def assert_handshake_rejected(upgrade : String?, connection : String?)
+  fixture = SyncFixture.new
+  spawn do
+    peer = fixture.accept(upgrade, connection)
+    peer.close
+  rescue
+  end
+  begin
+    socket = Convex::OwnerWebSocket.connect(URI.parse(fixture.url), "crystal-handshake-test")
+    socket.close
+    raise "invalid WebSocket upgrade was accepted"
+  rescue Convex::TransportError
+  ensure
+    fixture.close
   end
 end
 
@@ -141,6 +197,20 @@ begin
   raise "short timestamp was accepted"
 rescue Convex::ProtocolError
 end
+
+# Upgrade values are case-insensitive tokens, and Connection may contain a
+# comma-separated token list. Missing either required token must fail the 101.
+fixture = SyncFixture.new
+spawn do
+  peer = fixture.accept("WebSocket", "keep-alive, uPgRaDe")
+  peer.close
+rescue
+end
+socket = Convex::OwnerWebSocket.connect(URI.parse(fixture.url), "crystal-handshake-test")
+socket.close
+fixture.close
+assert_handshake_rejected("h2c", "Upgrade")
+assert_handshake_rejected("websocket", "keep-alive")
 
 # Add, initial/external updates, QueryFailed recovery, and Remove all travel
 # through the real owner and a loopback WebSocket rather than mocked methods.
@@ -178,6 +248,21 @@ advance.send(nil)
 assert(count(subscription.next(2.seconds)) == 2, "QueryFailed did not recover on the same subscription")
 subscription.close
 assert(remove_seen.receive, "Remove was not sent")
+client.close
+fixture.close
+
+# A real frame split by ordinary network latency must survive gaps above 250 ms.
+fixture = SyncFixture.new
+spawn do
+  connection = fixture.accept
+  read_add(connection)
+  connection.send_slow_json({"type" => "Transition", "startVersion" => version(0, 0), "endVersion" => version(1), "modifications" => [{"type" => "QueryUpdated", "queryId" => 0, "value" => {"count" => 12}, "logLines" => [] of String}]})
+rescue ex
+  STDERR.puts "fixture slow-frame delivery failed: #{ex.message}"
+end
+client = Convex::Client.new(fixture.url)
+subscription = client.subscribe("demo:state", {"room" => JSON::Any.new("slow-frame")})
+assert(count(subscription.next(3.seconds)) == 12, "slow valid frame crossed the absolute deadline")
 client.close
 fixture.close
 
@@ -246,7 +331,7 @@ client.close
 fixture.close
 
 # Fragmented UTF-8 with an interleaved ping must assemble into one valid JSON
-# message. Crystal's protocol reports continuations using the original opcode.
+# message while the owner preserves message state across complete frames.
 fixture = SyncFixture.new
 spawn do
   connection = fixture.accept
@@ -267,7 +352,10 @@ fixture = SyncFixture.new
 spawn do
   first = fixture.accept
   read_add(first)
-  first.send_half_frame
+  spawn do
+    first.send_dribbling_frame
+  rescue IO::Error
+  end
   second = fixture.accept
   read_add(second)
   second.send_transition(0, 1, [{"type" => "QueryUpdated", "queryId" => 0, "value" => {"count" => 9}, "logLines" => [] of String}], 0)
@@ -276,9 +364,12 @@ rescue ex
 end
 client = Convex::Client.new(fixture.url)
 subscription = client.subscribe("demo:state", {"room" => JSON::Any.new("half-recovery")})
-transport = subscription.next(2.seconds).error
+deadline_started = Time.monotonic
+transport = subscription.next(7.seconds).error
 assert(transport.is_a?(Convex::TransportError), "partial frame did not publish TransportError")
-assert(count(subscription.next(2.seconds)) == 9, "partial-frame reconnect did not recover")
+deadline_elapsed = Time.monotonic - deadline_started
+assert(deadline_elapsed >= 4.seconds && deadline_elapsed < 7.seconds, "partial frame did not use one bounded absolute deadline: #{deadline_elapsed}")
+assert(count(subscription.next(3.seconds)) == 9, "partial-frame reconnect did not recover")
 client.close
 fixture.close
 

@@ -86,6 +86,94 @@ class SubscriptionRelay
   end
 end
 
+def protocol_error(message : String) : Convex::ProtocolError
+  Convex::ProtocolError.new(message)
+end
+
+def command_object(value : JSON::Any) : Hash(String, JSON::Any)
+  value.as_h
+rescue TypeCastError
+  raise protocol_error("adapter command must be an object")
+end
+
+def command_string(command : Hash(String, JSON::Any), key : String) : String
+  value = command[key]? || raise protocol_error("adapter command is missing #{key}")
+  value.as_s
+rescue TypeCastError
+  raise protocol_error("adapter command #{key} must be a string")
+end
+
+def command_identifier(command : Hash(String, JSON::Any), key : String) : String
+  value = command_string(command, key)
+  if value.strip.empty? || value.size > 128
+    raise protocol_error("adapter command #{key} must be nonblank and at most 128 characters")
+  end
+  value
+end
+
+def command_args(command : Hash(String, JSON::Any), required : Bool = true) : Hash(String, JSON::Any)
+  value = command["args"]?
+  return {} of String => JSON::Any if !value && !required
+  raise protocol_error("adapter command is missing args") unless value
+  value.not_nil!.as_h
+rescue TypeCastError
+  raise protocol_error("adapter command args must be an object")
+end
+
+def command_path(command : Hash(String, JSON::Any), required : Bool = true) : String?
+  value = command["path"]?
+  return nil if !value && !required
+  raise protocol_error("adapter command is missing path") unless value
+  path = value.not_nil!.as_s
+  raise protocol_error("adapter command path must be nonblank and at least 3 characters") if path.strip.empty? || path.size < 3
+  path
+rescue TypeCastError
+  raise protocol_error("adapter command path must be a string")
+end
+
+def validate_command_keys(command : Hash(String, JSON::Any), allowed : Array(String), required : Array(String))
+  if missing = required.find { |key| !command.has_key?(key) }
+    raise protocol_error("adapter command is missing #{missing}")
+  end
+  if unexpected = command.keys.find { |key| !allowed.includes?(key) }
+    raise protocol_error("adapter command has unexpected property #{unexpected}")
+  end
+end
+
+def validate_command(command : Hash(String, JSON::Any), operation : String)
+  case operation
+  when "hello"
+    validate_command_keys(command, ["protocolVersion", "id", "op"], ["protocolVersion", "id", "op"])
+    version = command["protocolVersion"]
+    unless version.raw.is_a?(Int64) && version.as_i == PROTOCOL
+      raise protocol_error("unsupported adapter protocol")
+    end
+  when "query", "mutation", "action"
+    validate_command_keys(command, ["id", "op", "path", "args"], ["id", "op", "path", "args"])
+    command_path(command)
+    command_args(command)
+  when "subscribe"
+    validate_command_keys(command, ["id", "op", "subscriptionId", "path", "args"], ["id", "op", "subscriptionId", "path", "args"])
+    command_identifier(command, "subscriptionId")
+    command_path(command)
+    command_args(command)
+  when "unsubscribe"
+    # The shared schema permits optional path/args on the combined subscribe
+    # shape. Validate their types if present instead of silently narrowing them.
+    validate_command_keys(command, ["id", "op", "subscriptionId", "path", "args"], ["id", "op", "subscriptionId"])
+    command_identifier(command, "subscriptionId")
+    command_path(command, required: false) if command["path"]?
+    command_args(command, required: false) if command["args"]?
+  when "setAuth"
+    validate_command_keys(command, ["id", "op", "token"], ["id", "op", "token"])
+    command_string(command, "token")
+  when "close", "debugDisconnect"
+    validate_command_keys(command, ["id", "op"], ["id", "op"])
+  else
+    raise protocol_error("unknown adapter operation")
+  end
+end
+
 def run_adapter(input : IO, output : IO)
   client = Convex::Client.new(ENV.fetch("CONVEX_URL"), ENV["CONVEX_AUTH_TOKEN"]?)
   subscriptions = {} of String => {Convex::Subscription, SubscriptionRelay}
@@ -93,16 +181,22 @@ def run_adapter(input : IO, output : IO)
   input.each_line do |line|
     id : String? = nil
     begin
-      command = JSON.parse(line)
-      id = command["id"].as_s
+      parsed = begin
+        JSON.parse(line)
+      rescue JSON::ParseException
+        raise protocol_error("invalid adapter JSON")
+      end
+      command = command_object(parsed)
+      id = command_identifier(command, "id")
       command_id = id.not_nil!
-      case command["op"].as_s
+      operation = command_string(command, "op")
+      validate_command(command, operation)
+      case operation
       when "hello"
-        raise Convex::ProtocolError.new("unsupported adapter protocol") unless command["protocolVersion"].as_i == PROTOCOL
         emit_event(output, writer, {"protocolVersion" => json(PROTOCOL), "id" => json(command_id), "type" => json("ready"), "language" => json("crystal"), "implementation" => json("native-crystal-#{Crystal::VERSION}"), "runtime" => json("crystal-#{Crystal::VERSION}")})
       when "query", "mutation", "action"
-        args = command["args"]?.try(&.as_h) || {} of String => JSON::Any
-        result = case command["op"].as_s
+        args = command_args(command)
+        result = case operation
                  when "query"    then client.query(command["path"].as_s, args)
                  when "mutation" then client.mutation(command["path"].as_s, args)
                  else                 client.action(command["path"].as_s, args)
@@ -114,13 +208,13 @@ def run_adapter(input : IO, output : IO)
         client.set_auth(command["token"].as_s)
         emit_event(output, writer, {"id" => json(command_id), "type" => json("ack")})
       when "subscribe"
-        sid = command["subscriptionId"].as_s
+        sid = command_identifier(command, "subscriptionId")
         if previous = subscriptions.delete(sid)
           previous[1].invalidate
           previous[0].close
         end
         raise Convex::ProtocolError.new("adapter subscription count exceeds output budget") if subscriptions.size >= MAX_SUBSCRIPTIONS
-        sub = client.subscribe(command["path"].as_s, command["args"]?.try(&.as_h) || {} of String => JSON::Any)
+        sub = client.subscribe(command_path(command).not_nil!, command_args(command))
         relay = SubscriptionRelay.new
         subscriptions[sid] = {sub, relay}
         emit_event(output, writer, {"id" => json(command_id), "type" => json("ack")})
@@ -138,7 +232,7 @@ def run_adapter(input : IO, output : IO)
         rescue Convex::ClosedError
         end
       when "unsubscribe"
-        sid = command["subscriptionId"].as_s
+        sid = command_identifier(command, "subscriptionId")
         if previous = subscriptions.delete(sid)
           previous[1].invalidate
           previous[0].close

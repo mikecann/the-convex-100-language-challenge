@@ -14,6 +14,8 @@ RUN apk add --no-cache \
 ADD --checksum=sha256:3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4 \
     https://busybox.net/downloads/busybox-1.37.0.tar.bz2 /tmp/busybox.tar.bz2
 WORKDIR /src
+# A single GCC job keeps this source build reproducible under linux/amd64
+# emulation on arm64 publication runners without changing the applet set.
 RUN tar -xjf /tmp/busybox.tar.bz2 && \
     cd busybox-1.37.0 && \
     printf '%s\n' \
@@ -37,7 +39,7 @@ RUN tar -xjf /tmp/busybox.tar.bz2 && \
       sed -i "s/^# $name is not set$/$setting/" .config; \
     done < /tmp/minimal.config && \
     make oldconfig </dev/null >/dev/null && \
-    make -j2 busybox && \
+    make -j1 busybox && \
     mkdir -p /out && \
     cp busybox /out/busybox
 RUN cd busybox-1.37.0 && \
