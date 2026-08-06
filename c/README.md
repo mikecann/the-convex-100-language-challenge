@@ -18,7 +18,7 @@ This is educational and unofficial, not a production Convex SDK.
 | Remove, reconnect, query-error recovery and bounded delivery | Implemented, awaiting shared evidence |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.c -->
-```text
+```c
 #include "convex.h"
 #include <curl/curl.h>
 #include <stdio.h>

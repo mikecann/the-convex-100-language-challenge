@@ -71,15 +71,12 @@ function readOptionalResult(directory, languageId) {
 }
 
 const syntaxAliases = {
-  "assembly-x86-64": "nasm",
+  "assembly-x86-64": "asm",
   "c-sharp": "csharp",
   "delphi-object-pascal": "pascal",
   "f-sharp": "fsharp",
   fortran: "fortran-free-form",
-  freebasic: "basic",
   "objective-c": "objective-c",
-  "standard-ml": "sml",
-  "visual-basic-net": "vb",
   "visual-basic-dotnet": "vb",
   "wolfram-language": "wolfram",
 };
@@ -88,9 +85,7 @@ const extensionAliases = {
   clj: "clojure",
   cs: "csharp",
   dart: "dart",
-  e: "eiffel",
   erl: "erlang",
-  factor: "factor",
   fs: "fsharp",
   fsx: "fsharp",
   f90: "fortran-free-form",
@@ -105,17 +100,27 @@ const extensionAliases = {
   mli: "ocaml",
   pl: "perl",
   ps1: "powershell",
-  ps1: "powershell",
   py: "python",
   r: "r",
   rb: "ruby",
   rs: "rust",
   scala: "scala",
   sh: "bash",
-  sml: "sml",
   ts: "typescript",
   zig: "zig",
 };
+
+// Aliases are promises that the bundled highlighter can actually keep. Fail
+// the site build if a future edit invents a plausible-looking identifier that
+// Shiki silently degrades to plain text.
+for (const [source, target] of [
+  ...Object.entries(syntaxAliases),
+  ...Object.entries(extensionAliases),
+]) {
+  if (!(target in bundledLanguages)) {
+    throw new Error(`syntax alias ${source} resolves to unavailable Shiki language ${target}`);
+  }
+}
 
 function syntaxFor(languageId, file) {
   const extension = path.extname(file).slice(1).toLowerCase();

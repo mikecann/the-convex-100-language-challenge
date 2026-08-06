@@ -11,8 +11,9 @@ const fenceLanguages = {
   ".agda": "agda",
   ".asm": "nasm",
   ".awk": "awk",
-  ".bas": "basic",
+  ".bas": "freebasic",
   ".bmx": "blitzmax",
+  ".c": "c",
   ".cbl": "cobol",
   ".cc": "cpp",
   ".chpl": "chapel",
@@ -51,7 +52,7 @@ const fenceLanguages = {
   ".lua": "lua",
   ".ml": "ocaml",
   ".mli": "ocaml",
-  ".moon": "moonbit",
+  ".mbt": "moonbit",
   ".nim": "nim",
   ".odin": "odin",
   ".pas": "pascal",
@@ -85,6 +86,10 @@ const fenceLanguages = {
   ".zig": "zig",
 };
 
+export function fenceLanguageFor(sourcePath) {
+  return fenceLanguages[path.extname(sourcePath).toLowerCase()] ?? "text";
+}
+
 function renderExampleBlock(languageDirectory, relativeSource) {
   const sourcePath = path.resolve(languageDirectory, relativeSource);
   if (!sourcePath.startsWith(`${languageDirectory}${path.sep}`)) {
@@ -95,7 +100,7 @@ function renderExampleBlock(languageDirectory, relativeSource) {
   }
 
   const source = fs.readFileSync(sourcePath, "utf8").trimEnd();
-  const fence = fenceLanguages[path.extname(sourcePath).toLowerCase()] ?? "text";
+  const fence = fenceLanguageFor(sourcePath);
   return `${beginPrefix}${relativeSource} -->\n\`\`\`${fence}\n${source}\n\`\`\`\n${endMarker}`;
 }
 

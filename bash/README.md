@@ -24,7 +24,7 @@ increments with an idempotency key, and proves the update arrived reactively.
 ## Basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.sh -->
-```text
+```bash
 #!/usr/bin/env bash
 set -euo pipefail
 

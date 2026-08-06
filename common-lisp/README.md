@@ -18,7 +18,7 @@ Read [`examples/basics/main.lisp`](examples/basics/main.lisp). It queries a fres
 | Remove, five reconnects, generation barriers, and bounded delivery | Implemented, awaiting shared evidence |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.lisp -->
-```text
+```common-lisp
 (in-package #:convex)
 
 (defun example-count (value operation)

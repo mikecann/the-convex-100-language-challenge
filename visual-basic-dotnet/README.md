@@ -20,7 +20,7 @@ image.
 | Authentication | HTTP bearer tokens only |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Program.vb -->
-```text
+```vbnet
 Imports System.Text.Json.Nodes
 Imports ConvexVisualBasic
 
