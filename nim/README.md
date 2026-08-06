@@ -14,7 +14,7 @@ Read the [canonical basic example](examples/basics/main.nim). It accepts a uniqu
 | --- | --- | --- |
 | HTTP query, mutation, action | Implemented in the client | Native `std/httpclient`, strict Convex response decoding, and structured errors |
 | HTTP bearer authentication | Implemented in the client | `setAuth` and `CONVEX_AUTH_TOKEN` set or replace the Authorization header |
-| Live subscriptions | Partial, unearned | Native initial and mutation updates work, and five hosted `debugDisconnect` acknowledgements complete; the reconnect-plus-mutation probe still fails to deliver the post-reconnect Live update, so shared evidence is not claimed |
+| Live subscriptions | Implemented in the client, shared badge pending | One socket owner, active Add replay, five reconnect barriers, unchanged rehydration suppression, strict timestamp ordering, and a bounded relay mailbox; shared evidence is not claimed |
 
 The capability list in `manifest.yaml` remains empty until the root-owned shared verifier records evidence for this exact source commit. This checkpoint is not a complete Live handoff: reconnect replay needs further repair and deterministic adversarial fixtures are still pending.
 
@@ -97,16 +97,16 @@ Run these on Bruce, not on a development Mac:
 ./run verify-example nim
 ```
 
-The `test` target type-checks the Nim sources and focused JSON/timestamp regression source, compiles the exact example and NDJSON adapter, and exercises the adapter hello path. `verify-example` runs the exact canonical source from its minimal amd64 image against a unique room. Root-owned `verify`, `verify-hosted`, and `verify-all` add the shared black-box evidence later.
+The `test` target runs the focused JSON/timestamp regressions, compiles the exact example, NDJSON adapter, and deterministic five-reconnect real-socket test, and exercises the adapter hello path. Run the compiled reconnect test from the test image with `CONVEX_URL` to prove the hosted five-barrier sequence. `verify-example` runs the exact canonical source from its minimal amd64 image against a unique room. Root-owned `verify`, `verify-hosted`, and `verify-all` add the shared black-box evidence later.
 
 The build pins Nim 2.2.4, treeform/ws 0.6.0, the dependency archive checksum, and the Debian runtime image digest. A small checked-in build script patches treeform/ws to send the Convex client header and to handle Ping/Pong/Close control frames between fragmented data frames. TLS verification uses the runtime CA bundle.
 
 ## Adapter and protocol notes
 
-The test-only adapter speaks NDJSON protocol v1 over stdin/stdout or one TCP controller connection. It omits absent optional fields, reports structured `FunctionError`, `ProtocolError`, and `TransportError` values, and reserves `debugDisconnect` for the adapter build. Live state is owned by one worker, while four two-megabyte newest-value slots bound each subscription's queued data.
+The test-only adapter speaks NDJSON protocol v1 over stdin/stdout or one TCP controller connection. It omits absent optional fields, reports structured `FunctionError`, `ProtocolError`, and `TransportError` values, and reserves `debugDisconnect` for the adapter build. Live state is owned by one worker, while four two-megabyte shared-memory slots bound each subscription's queued data; a full single-producer/single-consumer mailbox drops a new frame rather than overwriting a frame being read.
 
 The Live implementation validates state versions and little-endian uint64 timestamps, replays active Add operations after reconnect, suppresses unchanged rehydration, and retires a connection when a bounded read slice expires so a partial frame is never reused.
 
 ## Limitations
 
-This branch does not run the root shared conformance pilots or award badges. Live authentication, WebSocket mutations/actions, and `TransitionChunk` assembly are deferred. The pinned third-party WebSocket transport is patched in the Docker build, and reconnect replay currently needs repair because the hosted reconnect-plus-mutation probe did not produce the changed Live value. The language-local deterministic adversarial fixture suite for all reconnect, stale-relay, frame-deadline, and stopped-reader cases still needs independent reviewer execution.
+This branch does not run the root shared conformance pilots or award badges. Live authentication, WebSocket mutations/actions, and `TransitionChunk` assembly are deferred. The pinned third-party WebSocket transport is patched in the Docker build. Deterministic local coverage now includes the real-socket five-reconnect barrier and final mutation; fragmented-frame, stale-barrier, QueryFailed recovery, and stopped-reader fixtures still need independent reviewer execution.

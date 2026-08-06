@@ -45,6 +45,29 @@ type
     errorData*: string
     logs*: string
 
+  SharedText = object
+    data: ptr UncheckedArray[char]
+    len: int
+
+  LiveFrame* = object
+    ## Only shared-heap pointers cross a Nim thread boundary.  Managed strings
+    ## in a Channel value can be reclaimed by the producer before a third relay
+    ## thread receives them, which was the reconnect crash this frame fixes.
+    value: SharedText
+    errorName: SharedText
+    errorMessage: SharedText
+    errorData: SharedText
+    logs: SharedText
+    isError: bool
+
+  LiveMailbox* = object
+    ## A single-producer/single-consumer ring avoids Nim Channel's third-thread
+    ## receive race.  When full, the producer drops the incoming newest frame
+    ## rather than mutating a slot the consumer may currently be reading.
+    writeIndex: Atomic[uint64]
+    readIndex: Atomic[uint64]
+    slots: array[liveQueueSlots, LiveFrame]
+
   LiveManager = ref object
     commands: ptr Channel[LiveCommand]
     stopped: ptr Atomic[bool]
@@ -55,13 +78,13 @@ type
     worker: Thread[LiveWorkerArgs]
 
   LiveSubscription* = ref object
-    updates*: ptr Channel[LiveUpdate]
+    updates*: ptr LiveMailbox
     manager: LiveManager
     queryId: uint32
     closed*: ptr Atomic[bool]
 
   LiveState = ref object
-    updates: ptr Channel[LiveUpdate]
+    updates: ptr LiveMailbox
     closed: ptr Atomic[bool]
     path: string
     args: string
@@ -75,7 +98,7 @@ type
     path: string
     args: string
     queryId: uint32
-    updates: ptr Channel[LiveUpdate]
+    updates: ptr LiveMailbox
     closed: ptr Atomic[bool]
     response: ptr Channel[LiveResponse]
 
@@ -105,6 +128,75 @@ proc sharedChannel[T](capacity: int): ptr Channel[T] =
 proc sharedAtomicBool(initial: bool): ptr Atomic[bool] =
   result = cast[ptr Atomic[bool]](allocShared0(sizeof(Atomic[bool])))
   result[].store(initial)
+
+proc releaseLiveFrame*(frame: var LiveFrame)
+
+proc sharedMailbox(): ptr LiveMailbox =
+  result = cast[ptr LiveMailbox](allocShared0(sizeof(LiveMailbox)))
+  result[].writeIndex.store(0)
+  result[].readIndex.store(0)
+
+proc sendLiveFrame*(mailbox: ptr LiveMailbox; frame: LiveFrame) =
+  let writeIndex = mailbox[].writeIndex.load
+  let readIndex = mailbox[].readIndex.load
+  if writeIndex - readIndex >= uint64(liveQueueSlots):
+    var dropped = frame
+    releaseLiveFrame(dropped)
+    return
+  mailbox[].slots[int(writeIndex mod uint64(liveQueueSlots))] = frame
+  mailbox[].writeIndex.store(writeIndex + 1)
+
+proc recvLiveFrame*(mailbox: ptr LiveMailbox): LiveFrame =
+  while true:
+    let readIndex = mailbox[].readIndex.load
+    if readIndex < mailbox[].writeIndex.load:
+      result = mailbox[].slots[int(readIndex mod uint64(liveQueueSlots))]
+      mailbox[].readIndex.store(readIndex + 1)
+      return
+    sleep(1)
+
+proc sharedText(value: string): SharedText =
+  result.len = value.len
+  if value.len > 0:
+    result.data = cast[ptr UncheckedArray[char]](allocShared0(value.len))
+    copyMem(result.data, value.cstring, value.len)
+
+proc releaseSharedText(value: var SharedText) =
+  if not value.data.isNil:
+    deallocShared(value.data)
+    value.data = nil
+    value.len = 0
+
+proc sharedTextString(value: SharedText): string =
+  if value.len == 0:
+    return ""
+  result = newString(value.len)
+  copyMem(result[0].addr, value.data, value.len)
+
+proc makeLiveFrame*(update: LiveUpdate): LiveFrame =
+  result = LiveFrame(
+    value: sharedText(update.value),
+    errorName: sharedText(update.errorName),
+    errorMessage: sharedText(update.errorMessage),
+    errorData: sharedText(update.errorData),
+    logs: sharedText(update.logs),
+    isError: update.isError)
+
+proc releaseLiveFrame*(frame: var LiveFrame) =
+  releaseSharedText(frame.value)
+  releaseSharedText(frame.errorName)
+  releaseSharedText(frame.errorMessage)
+  releaseSharedText(frame.errorData)
+  releaseSharedText(frame.logs)
+
+proc liveUpdateFromFrame*(frame: LiveFrame): LiveUpdate =
+  result = LiveUpdate(
+    value: sharedTextString(frame.value),
+    isError: frame.isError,
+    errorName: sharedTextString(frame.errorName),
+    errorMessage: sharedTextString(frame.errorMessage),
+    errorData: sharedTextString(frame.errorData),
+    logs: sharedTextString(frame.logs))
 
 proc jsonObjectArgs(args: JsonNode): JsonNode =
   if args.isNil:
@@ -304,21 +396,16 @@ proc nextLivePacket(socket: WebSocket; pending: var Future[string]): tuple[
 
 proc deliver(state: LiveState; update: LiveUpdate) =
   ## Four slots and a 2 MiB per-value ceiling bound queued Live data to about
-  ## 8 MiB, including the encoded message bytes.  A slow consumer observes the
-  ## newest current value, not an unbounded history of stale values.
+  ## 8 MiB, including the encoded message bytes.  A slow consumer never grows
+  ## an unbounded history of stale values; a full mailbox drops the new frame.
   if update.value.len > maxLiveValueBytes:
     return
-  if not state.updates[].trySend(update):
-    discard state.updates[].tryRecv()
-    discard state.updates[].trySend(update)
+  sendLiveFrame(state.updates, makeLiveFrame(update))
 
 proc wakeClosed(state: LiveState) =
   ## Wake an adapter relay without closing the shared channel under a blocked
   ## receiver.  The relay checks the atomic flag before decoding this marker.
-  let marker = LiveUpdate(isError: true, errorName: "__closed__")
-  if not state.updates[].trySend(marker):
-    discard state.updates[].tryRecv()
-    discard state.updates[].trySend(marker)
+  deliver(state, LiveUpdate(isError: true, errorName: "__closed__"))
 
 proc respond(command: LiveCommand; ok: bool; message = "") =
   if not command.response.isNil:
@@ -336,6 +423,7 @@ proc liveWorker(args: LiveWorkerArgs) {.thread.} =
   var lastCloseReason = "InitialConnect"
   var retryDelay = reconnectInitialSeconds
   var reconnectAt = epochTime()
+  var pendingDebugResponse: ptr Channel[LiveResponse]
 
   proc retire(reason: string; schedule: bool) =
     closeLiveSocket(socket)
@@ -389,6 +477,9 @@ proc liveWorker(args: LiveWorkerArgs) {.thread.} =
           "modifications": modifications
         })
         querySetVersion = 1
+      if not pendingDebugResponse.isNil:
+        pendingDebugResponse[].send(LiveResponse(ok: true))
+        pendingDebugResponse = nil
       result = true
     except CatchableError as error:
       retire(error.msg, true)
@@ -511,10 +602,17 @@ proc liveWorker(args: LiveWorkerArgs) {.thread.} =
         else:
           retire("DebugDisconnect", true)
           reconnectAt = epochTime()
-          respond(command, true)
+          ## Keep the adapter command blocked until the replacement handshake
+          ## and every active Add have been sent.  The next controller command
+          ## can then be an external mutation without a timing race.
+          pendingDebugResponse = command.response
       of "close":
         manager.stopped[].store(true)
         retire("ClientClosed", false)
+        if not pendingDebugResponse.isNil:
+          pendingDebugResponse[].send(LiveResponse(ok: false,
+            message: "client closed during reconnect"))
+          pendingDebugResponse = nil
         for state in active.values:
           state.closed[].store(true)
           wakeClosed(state)
@@ -605,7 +703,7 @@ proc subscribe*(client: Client; path: string; args: JsonNode): LiveSubscription 
   if client.live.isNil:
     client.live = newLiveManager(client)
   new(result)
-  result.updates = sharedChannel[LiveUpdate](liveQueueSlots)
+  result.updates = sharedMailbox()
   result.closed = sharedAtomicBool(false)
   result.manager = client.live
   result.queryId = client.nextQueryId
@@ -622,7 +720,9 @@ proc subscribe*(client: Client; path: string; args: JsonNode): LiveSubscription 
 proc nextUpdate*(subscription: LiveSubscription): LiveUpdate =
   if subscription.isNil or subscription.closed[].load:
     raise newException(ConvexError, "subscription is closed")
-  return subscription.updates[].recv()
+  var frame = recvLiveFrame(subscription.updates)
+  result = liveUpdateFromFrame(frame)
+  releaseLiveFrame(frame)
 
 proc close*(subscription: LiveSubscription) =
   if subscription.isNil or subscription.closed[].exchange(true):
