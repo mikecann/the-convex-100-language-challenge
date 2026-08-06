@@ -1873,12 +1873,13 @@ fn websocketHandshake(allocator: Allocator, conn: *std.http.Client.Connection, h
     try validateWebSocketResponse(response[0..used], &expected_accept);
 }
 
-fn writeWebSocket(conn: *std.http.Client.Connection, payload: []const u8, allocator: Allocator, opcode: enum { text, continuation, pong }) !void {
+fn writeWebSocket(conn: *std.http.Client.Connection, payload: []const u8, allocator: Allocator, opcode: enum { text, continuation, close, pong }) !void {
     if (payload.len > max_websocket_message) return error.MessageTooBig;
     var header: [14]u8 = undefined;
     header[0] = switch (opcode) {
         .text => 0x81,
         .continuation => 0x80,
+        .close => 0x88,
         .pong => 0x8a,
     };
     var header_len: usize = 2;
@@ -2010,6 +2011,11 @@ fn readWebSocket(conn: *std.http.Client.Connection, allocator: Allocator) ![]u8 
                 if (code < 1000 or code >= 5000 or code == 1004 or code == 1005 or code == 1006 or code == 1015 or (code >= 1016 and code < 3000)) return error.ProtocolFailure;
                 if (!std.unicode.utf8ValidateSlice(payload[2..])) return error.ProtocolFailure;
             }
+            // A valid peer Close gets exactly one masked reply before the owner
+            // retires the TCP connection. `writeWebSocket` gives the complete
+            // reply one absolute deadline, so a peer that stops reading cannot
+            // turn the close handshake into an unbounded owner stall.
+            try writeWebSocket(conn, payload, allocator, .close);
             return error.WebSocketClosed;
         }
         if (opcode == 9) {
@@ -3593,13 +3599,15 @@ test "same-ID replacement succeeds at the sixteen-subscription ceiling with a pa
     try client.close();
 }
 
-const CloseMode = enum { idle, flood, half_frame };
+const CloseMode = enum { idle, flood, half_frame, peer_close };
 
 const CloseFixture = struct {
     listener: *std.net.Server,
     mode: CloseMode,
     ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     peer_closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    close_reply_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    close_reply_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     fn run(self: *CloseFixture) void {
         const connection = acceptWithin(self.listener, fixture_accept_timeout_ms) catch @panic("close fixture accept failed");
@@ -3624,13 +3632,32 @@ const CloseFixture = struct {
                 var discard: [256]u8 = undefined;
                 while (connection.stream.read(&discard) catch 0 > 0) {}
             },
+            .peer_close => {
+                const close_payload = [_]u8{ 0x03, 0xe8, 'b', 'y', 'e' };
+                testWriteFrame(connection.stream, true, 8, &close_payload) catch @panic("peer Close write failed");
+                var poll_fds = [_]std.posix.pollfd{.{ .fd = connection.stream.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+                if ((std.posix.poll(&poll_fds, 2000) catch 0) == 0) @panic("masked Close reply timed out");
+                const reply = testReadClientFrame(std.heap.page_allocator, connection.stream) catch @panic("masked Close reply read failed");
+                defer std.heap.page_allocator.free(reply.payload);
+                if (reply.opcode != 8 or !std.mem.eql(u8, reply.payload, &close_payload)) @panic("invalid masked Close reply");
+                _ = self.close_reply_count.fetchAdd(1, .acq_rel);
+                self.close_reply_received.store(true, .release);
+
+                // The owner must retire the same TCP connection immediately
+                // after its one reply. Any further byte is a duplicate frame;
+                // silence is also a failure because retirement is bounded.
+                poll_fds[0].revents = 0;
+                if ((std.posix.poll(&poll_fds, 2000) catch 0) == 0) @panic("connection remained open after Close reply");
+                var extra: [1]u8 = undefined;
+                if ((connection.stream.read(&extra) catch @panic("post-Close read failed")) != 0) @panic("duplicate frame after Close reply");
+            },
         }
         self.peer_closed.store(true, .release);
     }
 };
 
-test "close is bounded for idle, flooding, and half-frame peers" {
-    for ([_]CloseMode{ .idle, .flood, .half_frame }) |mode| {
+test "close is bounded and a valid peer Close gets one masked reply" {
+    for ([_]CloseMode{ .idle, .flood, .half_frame, .peer_close }) |mode| {
         var listener = try testListener();
         defer listener.deinit();
         var fixture = CloseFixture{ .listener = &listener, .mode = mode };
@@ -3650,11 +3677,13 @@ test "close is bounded for idle, flooding, and half-frame peers" {
             std.time.sleep(std.time.ns_per_ms);
         }
         if (mode == .half_frame) std.time.sleep(20 * std.time.ns_per_ms);
+        if (mode == .peer_close) try waitForFlag(&fixture.close_reply_received, fixture_rendezvous_ns);
         const started = std.time.milliTimestamp();
         try client.close();
         try std.testing.expect(std.time.milliTimestamp() - started < 1000);
         thread.join();
         try std.testing.expect(fixture.peer_closed.load(.acquire));
+        try std.testing.expectEqual(@as(u32, if (mode == .peer_close) 1 else 0), fixture.close_reply_count.load(.acquire));
         args.object.deinit();
         output.deinit();
         capture.deinit();

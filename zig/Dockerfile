@@ -32,35 +32,12 @@ RUN zig build-exe -O ReleaseSafe -target x86_64-linux-musl -Mroot=client/tests/c
 
 FROM test-build AS stopped-reader-test
 COPY client/tests/conformance/stopped_reader_controller.sh ./client/tests/conformance/stopped_reader_controller.sh
+COPY client/tests/conformance/stopped_reader_docker_test.sh ./client/tests/conformance/stopped_reader_docker_test.sh
 # Exercise the checked-in stopped-reader fixture against the real adapter in
 # the language-local test image. Root verification later repeats this with the
 # adapter in its own 128 MiB cgroup; this gate ensures the fixture cannot drift
 # into an unexecuted evidence prop between reviews.
-RUN set -eu; \
-    /out/convex-memory-fixture >/tmp/memory-fixture.log 2>&1 & fixture_pid=$!; \
-    CONVEX_URL=http://127.0.0.1:32101 ADAPTER_LISTEN=127.0.0.1:32100 \
-      /out/convex-adapter >/tmp/memory-adapter.log 2>&1 & adapter_pid=$!; \
-    cleanup() { kill "$fixture_pid" "$adapter_pid" 2>/dev/null || true; }; \
-    report() { \
-      status=$?; \
-      trap - EXIT INT TERM; \
-      if [ "$status" -ne 0 ]; then \
-        echo "stopped-reader fixture failed (status $status)" >&2; \
-        cat /tmp/memory-fixture.log >&2 || true; \
-        cat /tmp/memory-adapter.log >&2 || true; \
-        wc -c /tmp/events >&2 || true; \
-        tail -c 4096 /tmp/events >&2 || true; \
-      fi; \
-      cleanup; \
-      exit "$status"; \
-    }; \
-    trap report EXIT INT TERM; \
-    sleep 1; \
-    ADAPTER_HOST=127.0.0.1 sh client/tests/conformance/stopped_reader_controller.sh; \
-    wait "$adapter_pid"; \
-    wait "$fixture_pid"; \
-    trap - EXIT INT TERM; \
-    cleanup
+RUN sh client/tests/conformance/stopped_reader_docker_test.sh
 
 FROM stopped-reader-test AS test
 
