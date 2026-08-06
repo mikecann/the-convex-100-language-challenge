@@ -11,20 +11,14 @@ RUN clang-format --dry-run --Werror fixed_launcher.c && touch /c-format.ok
 
 FROM ${JULIA_IMAGE} AS deps
 WORKDIR /work
-COPY client/Project.toml client/Manifest.toml ./client/
-COPY client/formatter/Project.toml client/formatter/Manifest.toml ./client/formatter/
+COPY client ./client
+COPY examples ./examples
 
 # Dependencies are restricted to these exact direct versions in Project.toml.
 # They provide ordinary HTTP/TLS/JSON/WebSocket transport only; all Convex
 # request, transition, reconnect, and adapter behaviour remains Julia source.
-# Julia's amd64 image runs under QEMU on Bruce. Source-mode Pkg avoids a
-# Julia 1.11 cache bug that reports "Cannot locate source for Core" while
-# precompiling LibCURL/Pkg. The locked Manifest still makes this deterministic.
-RUN julia --compiled-modules=no --project=client -e 'using Pkg; Pkg.instantiate(; update_registry=false)'
-RUN julia --compiled-modules=no --project=client/formatter -e 'using Pkg; Pkg.instantiate(; update_registry=false)'
-
-COPY client ./client
-COPY examples ./examples
+RUN julia --project=client -e 'using Pkg; Pkg.instantiate(; update_registry=false); Pkg.precompile()'
+RUN julia --project=client/formatter -e 'using Pkg; Pkg.instantiate(; update_registry=false); Pkg.precompile()'
 
 FROM deps AS test
 COPY --from=c-format /c-format.ok /tmp/c-format.ok
@@ -32,13 +26,13 @@ RUN test "$(uname -m)" = x86_64 && julia -e '@assert Sys.ARCH === :x86_64'
 RUN julia --project=client/formatter -e 'using JuliaFormatter; for path in ARGS; source = read(path, String); source == format_text(source) || error("not formatted: " * path); end' \
     client/Convex.jl client/tests/runtests.jl client/tests/conformance/adapter.jl \
     client/runtime/ConvexRuntime.jl client/runtime/precompile_adapter.jl examples/basics/main.jl
-RUN julia --compiled-modules=no --project=client -e 'for path in ARGS; Meta.parseall(read(path, String); filename=path); end' \
+RUN julia --project=client -e 'for path in ARGS; Meta.parseall(read(path, String); filename=path); end' \
     client/Convex.jl client/tests/runtests.jl client/tests/conformance/adapter.jl \
     client/runtime/ConvexRuntime.jl client/runtime/precompile_adapter.jl examples/basics/main.jl
-RUN julia --compiled-modules=no --project=client -e 'include("examples/basics/main.jl"); @assert hasmethod(run_example, Tuple{String})'
-RUN julia --compiled-modules=no --project=client -e 'using Test; include("client/tests/runtests.jl")'
+RUN julia --project=client -e 'include("examples/basics/main.jl"); @assert hasmethod(run_example, Tuple{String})'
+RUN julia --project=client -e 'using Test; include("client/tests/runtests.jl")'
 RUN printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | \
-    julia --compiled-modules=no --project=client client/tests/conformance/adapter.jl >/tmp/adapter.ndjson && \
+    julia --project=client client/tests/conformance/adapter.jl >/tmp/adapter.ndjson && \
     grep -Fq '"language":"julia"' /tmp/adapter.ndjson && grep -Fq '"type":"closed"' /tmp/adapter.ndjson
 CMD ["julia", "--project=client", "-e", "exit(0)"]
 

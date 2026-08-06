@@ -9,10 +9,6 @@ using .Convex
 include(joinpath(@__DIR__, "conformance", "adapter.jl"))
 
 const TEST_TIMEOUT = 6.0
-# QEMU executes the genuine amd64 Julia test image on Bruce. Keep owner
-# command tests comfortably below their bounded production deadline while
-# allowing the first source-mode call to finish scheduling under emulation.
-const OWNER_TEST_TIMEOUT = 1.0
 
 # Static test-only identity for the loopback WSS fixture. The matching private
 # key never leaves this deterministic local test and is not a deployment secret.
@@ -505,14 +501,14 @@ end
     put!(full.commands, :occupied)
     started = time()
     error = try
-        Convex.manager_command(full, (:debug_disconnect,); timeout = OWNER_TEST_TIMEOUT)
+        Convex.manager_command(full, (:debug_disconnect,); timeout = 0.03)
         nothing
     catch caught
         caught
     end
     @test error isa ConvexError
     @test error.kind == :transport
-    @test time() - started < 4.0
+    @test time() - started < 0.5
     @test Base.n_avail(full.commands) == 1
     @test take!(full.commands) === :occupied
 
@@ -520,11 +516,7 @@ end
     put!(contended.commands, :occupied)
     callers = [
         @async try
-            Convex.manager_command(
-                contended,
-                (:debug_disconnect,);
-                timeout = OWNER_TEST_TIMEOUT,
-            )
+            Convex.manager_command(contended, (:debug_disconnect,); timeout = 0.03)
         catch caught
             caught
         end for _ = 1:2
@@ -538,13 +530,13 @@ end
     for command in ((:debug_disconnect,), (:unsubscribe, 7, 1))
         claimed = fake_manager()
         caller = @async try
-            Convex.manager_command(claimed, command; timeout = OWNER_TEST_TIMEOUT)
+            Convex.manager_command(claimed, command; timeout = 0.03)
         catch caught
             caught
         end
         envelope = take_deadline(claimed.commands; message = "claimed owner command")
         @test Convex.claim_command!(envelope)
-        sleep(0.1)
+        sleep(0.05)
         @test !istaskdone(caller)
         @test Convex.respond_command!(envelope, nothing)
         @test fetch(caller) === nothing
