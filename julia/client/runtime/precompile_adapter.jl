@@ -195,6 +195,7 @@ wait(live_server)
 # adapter-only Subscribe specialization that Dict-literal client calls miss.
 adapter_live_listener = listen(ip"127.0.0.1", 0)
 adapter_live_port = getsockname(adapter_live_listener)[2]
+adapter_live_transition_sent = Channel{Nothing}(1)
 adapter_live_server = @async begin
     socket = accept(adapter_live_listener)
     close(adapter_live_listener)
@@ -224,6 +225,9 @@ adapter_live_server = @async begin
         )
         write(socket, server_frame(0x01, Vector{UInt8}(JSON3.write(transition))))
         flush(socket)
+        # Wait until the complete Transition frame is flushed before the
+        # adapter's scripted unsubscribe is allowed to retire this socket.
+        put!(adapter_live_transition_sent, nothing)
         remove = read_client_json(socket)
         remove["modifications"][1]["type"] == "Remove" ||
             error("adapter live expected Remove")
@@ -234,21 +238,34 @@ end
 
 old_adapter_live_url = get(ENV, "CONVEX_URL", nothing)
 ENV["CONVEX_URL"] = "http://127.0.0.1:$(adapter_live_port)"
-adapter_live_input = IOBuffer(
-    "{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}\n" *
-    "{\"id\":\"sub\",\"op\":\"subscribe\",\"subscriptionId\":\"s1\"," *
-    "\"path\":\"demo:state\"," *
-    "\"args\":{\"room\":\"adapter-precompile\",\"nested\":{\"k\":\"v\"},\"n\":1,\"ok\":true}}\n" *
-    "{\"id\":\"unsub\",\"op\":\"unsubscribe\",\"subscriptionId\":\"s1\"}\n" *
-    "{\"id\":\"close\",\"op\":\"close\"}\n",
-)
+adapter_live_input = Pipe()
+Base.link_pipe!(adapter_live_input; reader_supports_async = true, writer_supports_async = true)
 adapter_live_output = IOBuffer()
+adapter_live_task = @async Adapter.run_adapter(adapter_live_input.out, adapter_live_output)
 try
-    Adapter.run_adapter(adapter_live_input, adapter_live_output)
+    write(
+        adapter_live_input.in,
+        "{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}\n" *
+        "{\"id\":\"sub\",\"op\":\"subscribe\",\"subscriptionId\":\"s1\"," *
+        "\"path\":\"demo:state\"," *
+        "\"args\":{\"room\":\"adapter-precompile\",\"nested\":{\"k\":\"v\"},\"n\":1,\"ok\":true}}\n",
+    )
+    flush(adapter_live_input.in)
+    take!(adapter_live_transition_sent)
+    write(
+        adapter_live_input.in,
+        "{\"id\":\"unsub\",\"op\":\"unsubscribe\",\"subscriptionId\":\"s1\"}\n" *
+        "{\"id\":\"close\",\"op\":\"close\"}\n",
+    )
+    flush(adapter_live_input.in)
+    close(adapter_live_input.in)
+    wait(adapter_live_task)
 finally
+    isopen(adapter_live_input.in) && close(adapter_live_input.in)
     isnothing(old_adapter_live_url) ? delete!(ENV, "CONVEX_URL") :
     (ENV["CONVEX_URL"] = old_adapter_live_url)
 end
+close(adapter_live_input.out)
 wait(adapter_live_server)
 adapter_live_text = String(take!(adapter_live_output))
 occursin("\"type\":\"ready\"", adapter_live_text) || error("adapter live omitted ready")

@@ -2118,7 +2118,10 @@ end
 function wire_int(value, label::AbstractString)
     value isa Integer ||
         throw(ConvexError(:protocol, "$(label) must be an integer", nothing, String[]))
-    0 <= value <= typemax(Int) ||
+    # Convex's sync queryId, querySet, and identity fields are unsigned 32-bit
+    # wire values. Keep the bound explicit even on 64-bit Julia so a large
+    # JSON integer cannot become a locally valid but protocol-invalid key.
+    0 <= value <= typemax(UInt32) ||
         throw(ConvexError(:protocol, "$(label) is out of range", nothing, String[]))
     return Int(value)
 end

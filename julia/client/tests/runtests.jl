@@ -422,6 +422,10 @@ end
     @test Convex.timestamp_value("AQAAAAAAAAA=") == UInt64(1)
     @test_throws ConvexError Convex.timestamp_value("AQ==")
     @test_throws ConvexError Convex.timestamp_value("AQAAAAAAAAA")
+    @test Convex.wire_int(typemax(UInt32), "queryId") == Int(typemax(UInt32))
+    @test_throws ConvexError Convex.wire_int(UInt64(typemax(UInt32)) + 1, "queryId")
+    @test_throws ConvexError Convex.wire_int(-1, "queryId")
+    @test_throws ConvexError Convex.wire_int(1.0, "queryId")
 
     budget = Convex.QueueBudget()
     first = Convex.Subscription(nothing, 7, 1, Convex.QueuedUpdate[], budget, false)
