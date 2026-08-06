@@ -4,5 +4,31 @@ displayName: "D"
 rank: 43
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native D HTTP client and pinned Convex sync-profile implementation. Badges remain unearned until root-owned local and hosted conformance evidence succeeds.
+toolchain:
+  name: LDC
+  version: 1.40.0
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, optimistic updates, mutations over WebSocket, and TransitionChunk assembly are deferred.
+  - Values are limited to the JSON-safe value set covered by the documented HTTP format.
+  - Each subscription retains the newest 16 updates. All subscriptions share an 8 MiB encoded-byte budget and evict the globally oldest intermediate update under pressure.
+  - The adapter caps active subscriptions at 16, buffers at most 32 commands or 4 MiB of decoded input, and gives its single encoded in-flight NDJSON write a 500 ms deadline, closing a stalled controller instead of retaining output indefinitely.
+  - Capability badges are intentionally empty until shared local and hosted conformance pass.
 capabilities: []
