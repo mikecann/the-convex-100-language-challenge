@@ -179,6 +179,28 @@ the old generation, and the output worker checks that generation immediately
 before writing. A stopped reader therefore retains bounded recent state without
 letting an old relay cross its acknowledgement.
 
+Each adapter event is one NDJSON record: its JSON text and the newline that
+ends it are reserved and written together under a single deadline. A record
+abandoned after its first byte makes the stream terminal, so a truncated line
+is never followed by another event. One record may carry a whole two MiB sync
+message plus a 64 KiB envelope allowance, which is how a near-maximum Convex
+value reaches the controller while the count and byte budgets still keep the
+process far below the shared 128 MiB limit.
+
+Every network wait is an absolute deadline rather than a per-syscall timer, so
+a peer that trickles bytes cannot extend it. One deadline covers a whole Live
+bring-up — name lookup, connect, TLS, the 101 upgrade, and the first Connect
+frame — and `close` cancels it instead of waiting it out, which is why control
+commands stay bounded against a silent peer. Name lookups cannot be
+interrupted, so they run on their own thread; the caller leaves with its own
+copy of the addresses, and a lookup it has stopped waiting for owns and frees
+everything it produced from process-lifetime memory rather than from the
+caller's allocator, which it may outlive.
+
+Once connected, every complete incoming WebSocket message has one absolute
+five-second deadline. Progress cannot restart that clock, but a healthy hosted
+deployment still has enough time to publish the initial transition.
+
 The Live profile is the unversioned `convex-rs` 0.10.4 sync shape at commit
 `6f1df8a8ba1665084ec001e307ca841ca17074d7`. It is a protocol experiment, not
 an official compatibility promise.
@@ -187,8 +209,14 @@ an official compatibility promise.
 
 Live authentication, optimistic updates, WebSocket mutations/actions, and
 `TransitionChunk` assembly remain deferred. The language-local fixtures cover
-fragmented UTF-8 data, interleaved control frames, partial-frame deadlines,
+fragmented UTF-8 data, interleaved control frames, non-minimal frame lengths,
+malformed Close frames, partial-frame deadlines, a stalled name lookup, a
+silent upgrade peer, a peer that drains part of a frame and then stops,
 structured recovery, five reconnects, stale-generation barriers, bounded close,
-and stopped-reader memory. Only the JSON-safe subset is decoded. Capability
+an abandoned partial record, near-maximum values, and stopped-reader memory.
+Rejected HTTP replies — oversized chunked bodies, success-shaped bodies behind
+a failing status, malformed JSON, and failures without an `errorMessage` — are
+protocol failures the client recovers from, never invented function errors.
+Only the JSON-safe subset is decoded. Capability
 badges stay empty until the shared evaluator records clean local and hosted
 evidence from the reviewed commit.

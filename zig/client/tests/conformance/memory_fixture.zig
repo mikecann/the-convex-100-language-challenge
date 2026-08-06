@@ -95,7 +95,10 @@ pub fn main() !void {
     const add = try readClientFrame(allocator, connection.stream);
     defer allocator.free(add);
 
-    const blob = try allocator.alloc(u8, 900 * 1024);
+    // Near-maximum values, not comfortable ones. One Convex value may fill
+    // almost an entire two MiB sync message, so the stopped-reader probe has to
+    // push those through the real adapter to say anything about its memory.
+    const blob = try allocator.alloc(u8, 2 * 1024 * 1024 - 16 * 1024);
     defer allocator.free(blob);
     @memset(blob, 'x');
     var sequence: u32 = 0;

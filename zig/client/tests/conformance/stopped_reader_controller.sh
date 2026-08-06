@@ -43,7 +43,13 @@ first_sequence=$(head -n 1 /tmp/sequences)
 last_sequence=$(tail -n 1 /tmp/sequences)
 test "$sequence_count" -eq "$event_count"
 test "$event_count" -le 16
+# Every delivered record was reserved, and reservations never exceed the eight
+# MiB budget, so the whole transcript stays inside it. With near-maximum values
+# the byte budget binds long before the event count does: at most four of these
+# records can be reserved at once, which is what proves the count limit alone is
+# not the memory limit.
 test "$encoded_bytes" -le 8388608
+test "$event_count" -le 5
 test "$last_sequence" -eq 39
 awk 'NR == 1 { previous = $1; next } $1 <= previous { exit 1 } { previous = $1 } END { if (NR == 0) exit 1 }' /tmp/sequences
 if [ -d /evidence ]; then
