@@ -64,6 +64,36 @@ private static void adapter_output_deadline_is_absolute () {
   Posix.close (descriptors[0]);
 }
 
+private static void adapter_input_is_incrementally_bounded () {
+  var source = new ByteArray ();
+  uint8[] block = new uint8[8192];
+  for (int index = 0; index < block.length; index++) block[index] = (uint8) 'x';
+  for (int index = 0; index < 256; index++) source.append (block);
+  // Byte 2 MiB + 1 crosses the limit. The newline then proves the parser can
+  // discard that command and recover without retaining its oversized bytes.
+  source.append ({ (uint8) 'x', (uint8) '\n' });
+  string recovery = "{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}\n" +
+                    "{\"id\":\"close\",\"op\":\"close\"}\n";
+  source.append (recovery.data);
+  uint8[] bytes = new uint8[source.len];
+  for (int index = 0; index < bytes.length; index++) bytes[index] = source.data[index];
+
+  var loop = new MainLoop ();
+  var adapter = new Adapter (loop);
+  adapter.set_output_for_test (new MemoryOutputStream.resizable ());
+  var events = new ArrayList<string> ();
+  adapter.emitted_for_test.connect ((event) => { events.add (event); });
+  adapter.read_commands.begin (new MemoryInputStream.from_data ((owned) bytes));
+  loop.run ();
+
+  assert (events.size == 3);
+  var oversized = Convex.parse_json (events.get (0)).get_object ();
+  assert (oversized.get_string_member ("type") == "error");
+  assert (!oversized.has_member ("id"));
+  assert (oversized.get_object_member ("error").get_string_member ("message") == "adapter command exceeds 2 MiB");
+  require_adapter_event (events, "close", "closed");
+}
+
 private static void adapter_commands_enforce_the_exact_schema () {
   try {
     Environment.set_variable ("CONVEX_URL", "http://127.0.0.1:1", true);
@@ -182,6 +212,7 @@ private static void adapter_same_id_replacement_is_a_dequeue_barrier () {
 int main (string[] args) {
   Test.init (ref args);
   Test.add_func ("/convex/adapter/output/absolute-deadline", adapter_output_deadline_is_absolute);
+  Test.add_func ("/convex/adapter/input/incremental-bound", adapter_input_is_incrementally_bounded);
   Test.add_func ("/convex/adapter/schema/strict-commands", adapter_commands_enforce_the_exact_schema);
   Test.add_func ("/convex/adapter/live/raw-peer/debug-disconnect-ack", adapter_debug_disconnect_replays_add_after_ack);
   Test.add_func ("/convex/adapter/live/raw-peer/same-id-dequeue-barrier", adapter_same_id_replacement_is_a_dequeue_barrier);

@@ -192,7 +192,15 @@ namespace Convex {
 
     internal void publish (Json.Node? value, FunctionError? error) {
       if (!active) return;
-      var signature = error != null ? "E:" + error.name + ":" + error.message + ":" + (error.data != null ? node_text (error.data) : "") : "V:" + node_text (value);
+      string signature;
+      if (error != null) {
+        string encoded_logs = "";
+        foreach (var log in error.logs) encoded_logs += ":" + json_string (log);
+        signature = "E:" + error.name + ":" + error.message + ":" +
+                    (error.data != null ? node_text (error.data) : "") + ":L" + encoded_logs;
+      } else {
+        signature = "V:" + node_text (value);
+      }
       if (signature == last_signature && suppress_next_unchanged) {
         suppress_next_unchanged = false;
         return;

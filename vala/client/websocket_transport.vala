@@ -243,11 +243,15 @@ namespace Convex {
     private async void read_loop () {
       uint8[] chunk = new uint8[8192];
       try {
-        while (!failed_state && open_state) {
+        while (!failed_state && open_state && !closing_state) {
           ssize_t received = yield input.read_async (chunk, Priority.DEFAULT, lifetime);
           if (received == 0) throw new IOError.CLOSED ("Live peer closed the transport");
-          if (incoming.len == 0) arm_frame_timeout ();
+          bool started_frame = incoming.len == 0;
           incoming.append (chunk[0 : (int) received]);
+          // Arm only after the first bytes exist. arm_frame_timeout() rejects
+          // an empty parser buffer, so calling it before append silently left
+          // a later partial frame unbounded after a prior frame had drained.
+          if (started_frame) arm_frame_timeout ();
           process_frames ();
         }
       } catch (Error error) {
@@ -295,6 +299,14 @@ namespace Convex {
         clear_frame_timeout ();
         handle_frame (fin, opcode, payload);
         if (failed_state) return;
+        if (closing_state) {
+          // A Close frame ends this peer's data stream immediately. Discard
+          // bytes which followed it in the same TCP read and let the bounded
+          // close reply retire the transport before LiveOwner reconnects.
+          incoming.set_size (0);
+          clear_frame_timeout ();
+          return;
+        }
         if (incoming.len > 0) arm_frame_timeout ();
       }
     }

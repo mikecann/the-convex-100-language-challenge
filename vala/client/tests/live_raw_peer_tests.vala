@@ -98,26 +98,34 @@ private class RawFrame : GLib.Object {
   }
 }
 
-private static void raw_write_frame (OutputStream output, bool fin, uint8 opcode, uint8[] payload) throws Error {
+private static uint8[] raw_frame_bytes (bool fin, uint8 opcode, uint8[] payload) {
   assert ((opcode & 0x08) == 0 || (fin && payload.length <= 125));
-  uint8[] header;
+  var frame = new ByteArray ();
   if (payload.length < 126) {
-    header = { (uint8) ((fin ? 0x80 : 0) | opcode), (uint8) payload.length };
+    frame.append ({ (uint8) ((fin ? 0x80 : 0) | opcode), (uint8) payload.length });
   } else if (payload.length <= uint16.MAX) {
-    header = new uint8[4];
+    uint8[] header = new uint8[4];
     header[0] = (uint8) ((fin ? 0x80 : 0) | opcode);
     header[1] = 126;
     uint8[] length = raw_be16 (payload.length);
     header[2] = length[0]; header[3] = length[1];
+    frame.append (header);
   } else {
-    header = new uint8[10];
+    uint8[] header = new uint8[10];
     header[0] = (uint8) ((fin ? 0x80 : 0) | opcode);
     header[1] = 127;
     uint8[] length = raw_be64 (payload.length);
     for (int index = 0; index < length.length; index++) header[index + 2] = length[index];
+    frame.append (header);
   }
-  raw_write_all (output, header);
-  if (payload.length > 0) raw_write_all (output, payload);
+  if (payload.length > 0) frame.append (payload);
+  uint8[] answer = new uint8[frame.len];
+  for (int index = 0; index < answer.length; index++) answer[index] = frame.data[index];
+  return answer;
+}
+
+private static void raw_write_frame (OutputStream output, bool fin, uint8 opcode, uint8[] payload) throws Error {
+  raw_write_all (output, raw_frame_bytes (fin, opcode, payload));
 }
 
 private static void raw_write_text (OutputStream output, string text) throws Error {
@@ -218,6 +226,7 @@ private class RawPeer : GLib.Object {
   private uint64 timestamp = 0;
   private string? replay_args;
   private uint replay_query_id = uint.MAX;
+  private bool initial_delivery_completed = false;
 
   public uint16 port { get; private set; }
   public uint connections { get { lock (state_lock) { return received_connections; } } }
@@ -225,6 +234,13 @@ private class RawPeer : GLib.Object {
   public bool closed_by_client { get { lock (state_lock) { return peer_closed; } } }
   public int64 closed_elapsed_us { get { lock (state_lock) { return peer_closed_at; } } }
   public string? failure_message { get { lock (state_lock) { return failure; } } }
+
+  public void release_after_initial_delivery () {
+    lock (state_lock) {
+      initial_delivery_completed = true;
+      state_changed.broadcast ();
+    }
+  }
 
   public RawPeer (int mode) throws Error {
     this.mode = mode;
@@ -271,6 +287,18 @@ private class RawPeer : GLib.Object {
 
   private void observe_close (int64 started) {
     lock (state_lock) { peer_closed = true; peer_closed_at = get_monotonic_time () - started; state_changed.broadcast (); }
+  }
+
+  private void wait_for_initial_delivery () throws Error {
+    int64 deadline = get_monotonic_time () + 5 * 1000 * 1000;
+    for (;;) {
+      lock (state_lock) {
+        if (initial_delivery_completed) return;
+        if (stopping) throw new IOError.CLOSED ("fixture stopped before initial delivery barrier");
+      }
+      if (get_monotonic_time () >= deadline) throw new IOError.TIMED_OUT ("initial delivery barrier timed out");
+      Thread.usleep (1000);
+    }
   }
 
   private DataInputStream handshake (SocketConnection connection, int failure_kind = 0) throws Error {
@@ -395,6 +423,7 @@ private class RawPeer : GLib.Object {
     else if (mode == 8) serve_idle_then_update (false);
     else if (mode == 9) serve_idle_then_update (true);
     else if (mode == 10) serve_handshake_validation ();
+    else if (mode == 11) serve_close_with_buffered_transition ();
     else serve_stalled_close ();
   }
 
@@ -429,6 +458,10 @@ private class RawPeer : GLib.Object {
     observe_connection ();
     uint query_id = accept_add (input, connection.output_stream, 0, "InitialConnect");
     raw_write_text (connection.output_stream, raw_transition (0, 1, 0, ++timestamp, query_id, raw_update (query_id, 0)));
+    // The test releases this only from the delivered-value callback. That
+    // proves the parser drained the prior frame before the later header/prefix
+    // begins a genuinely new absolute frame deadline.
+    wait_for_initial_delivery ();
     string partial = raw_transition (1, 1, timestamp, timestamp + 1, query_id, raw_update (query_id, 99));
     uint8[] bytes = partial.data;
     // Declare a complete text message but stop inside it. A timeout must
@@ -443,6 +476,40 @@ private class RawPeer : GLib.Object {
     var recovery_input = handshake (recovery_connection);
     observe_connection ();
     uint recovery_query_id = accept_add (recovery_input, recovery_connection.output_stream, 1, "Live frame timed out");
+    raw_write_text (recovery_connection.output_stream, raw_transition (0, 1, 0, ++timestamp, recovery_query_id, raw_update (recovery_query_id, 2)));
+    wait_for_close (recovery_input, recovery_connection.output_stream, get_monotonic_time ());
+  }
+
+  private void serve_close_with_buffered_transition () throws Error {
+    GLib.Object? source;
+    var connection = listener.accept (out source, null);
+    var input = handshake (connection);
+    observe_connection ();
+    uint query_id = accept_add (input, connection.output_stream, 0, "InitialConnect");
+    raw_write_text (connection.output_stream, raw_transition (0, 1, 0, ++timestamp, query_id, raw_update (query_id, 0)));
+    wait_for_initial_delivery ();
+
+    var close_builder = new ByteArray ();
+    close_builder.append ({ 0x03, 0xe8 });
+    close_builder.append ("fixture close".data);
+    uint8[] close_payload = new uint8[close_builder.len];
+    for (int index = 0; index < close_payload.length; index++) close_payload[index] = close_builder.data[index];
+    string stale = raw_transition (1, 1, timestamp, timestamp + 1, query_id, raw_update (query_id, 99));
+    var combined = new ByteArray ();
+    combined.append (raw_frame_bytes (true, 0x8, close_payload));
+    combined.append (raw_frame_bytes (true, 0x1, stale.data));
+    // One kernel write makes the Close and stale Transition available in the
+    // same parser buffer. The client must stop at Close, not publish count 99.
+    uint8[] wire = new uint8[combined.len];
+    for (int index = 0; index < wire.length; index++) wire[index] = combined.data[index];
+    raw_write_all (connection.output_stream, wire);
+    wait_for_close (input, connection.output_stream, get_monotonic_time ());
+    if (should_stop ()) return;
+
+    var recovery_connection = listener.accept (out source, null);
+    var recovery_input = handshake (recovery_connection);
+    observe_connection ();
+    uint recovery_query_id = accept_add (recovery_input, recovery_connection.output_stream, 1, "WebSocket close 1000: fixture close");
     raw_write_text (recovery_connection.output_stream, raw_transition (0, 1, 0, ++timestamp, recovery_query_id, raw_update (recovery_query_id, 2)));
     wait_for_close (recovery_input, recovery_connection.output_stream, get_monotonic_time ());
   }
@@ -637,7 +704,10 @@ private static void raw_partial_frame_times_out_and_abandons_connection () {
     bool false_partial_value = false;
     subscription.updated.connect ((value, failure) => {
       if (failure != null && failure.name == "TransportError") transport_error = true;
-      if (value != null && value.get_object ().get_int_member ("count") == 0) initial = true;
+      if (value != null && value.get_object ().get_int_member ("count") == 0) {
+        initial = true;
+        peer.release_after_initial_delivery ();
+      }
       if (value != null && value.get_object ().get_int_member ("count") == 2) recovered = true;
       if (value != null && value.get_object ().get_int_member ("count") == 99) false_partial_value = true;
     });
@@ -645,12 +715,44 @@ private static void raw_partial_frame_times_out_and_abandons_connection () {
     spin_until (() => transport_error && peer.closed_by_client, 8 * 1000 * 1000, "partial frame timeout and close");
     assert (peer.closed_elapsed_us >= 4 * 1000 * 1000);
     assert (peer.closed_elapsed_us <= 7 * 1000 * 1000);
-    spin_until (() => recovered && peer.connections == 2, 5 * 1000 * 1000, "recovery after abandoned partial frame");
+    spin_until (() => recovered && peer.connections == 2 && peer.adds == 2, 5 * 1000 * 1000, "recovery after abandoned partial frame");
     assert (!false_partial_value);
     client.close ();
     peer.stop ();
   } catch (Error error) {
     stderr.printf ("raw partial timeout test failed: %s\n", error.message);
+    assert_not_reached ();
+  }
+}
+
+private static void raw_close_discards_buffered_transition_and_recovers () {
+  try {
+    var peer = new RawPeer (11);
+    peer.start ();
+    var client = new Client ("http://127.0.0.1:" + peer.port.to_string ());
+    var subscription = client.subscribe ("demo:state", raw_object ("close-buffer"));
+    bool initial = false;
+    bool transport_error = false;
+    bool stale = false;
+    bool recovered = false;
+    subscription.updated.connect ((value, failure) => {
+      if (failure != null && failure.name == "TransportError") transport_error = true;
+      if (value == null) return;
+      int64 count = value.get_object ().get_int_member ("count");
+      if (count == 0) {
+        initial = true;
+        peer.release_after_initial_delivery ();
+      } else if (count == 99) stale = true;
+      else if (count == 2) recovered = true;
+    });
+    spin_until (() => initial, 5 * 1000 * 1000, "close fixture initial value");
+    spin_until (() => transport_error && peer.connections == 2 && peer.adds == 2, 5 * 1000 * 1000, "Close retirement and Add replay");
+    spin_until (() => recovered, 5 * 1000 * 1000, "fresh value after Close reconnect");
+    assert (!stale);
+    client.close ();
+    peer.stop ();
+  } catch (Error error) {
+    stderr.printf ("raw buffered Close test failed: %s\n", error.message);
     assert_not_reached ();
   }
 }
@@ -781,6 +883,7 @@ int main (string[] args) {
   Test.init (ref args);
   Test.add_func ("/convex/live/raw-peer/reconnect-fragment-recovery", raw_reconnect_fragment_and_recovery);
   Test.add_func ("/convex/live/raw-peer/partial-frame-timeout", raw_partial_frame_times_out_and_abandons_connection);
+  Test.add_func ("/convex/live/raw-peer/close-discards-buffered-transition", raw_close_discards_buffered_transition_and_recovers);
   Test.add_func ("/convex/live/raw-peer/protocol-recovery", raw_protocol_error_recovers_on_a_new_connection);
   Test.add_func ("/convex/live/raw-peer/bounded-close", raw_close_stays_bounded_with_idle_flood_and_half_frame);
   Test.add_func ("/convex/live/raw-peer/idle-and-control-deadline", raw_idle_and_control_traffic_do_not_start_frame_deadline);

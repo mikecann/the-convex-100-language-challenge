@@ -46,6 +46,26 @@ private static void subscriptions_only_suppress_rehydration () {
   assert (deliveries == 3);
 }
 
+private static void rehydration_compares_error_logs () {
+  var args = new Json.Node (NodeType.OBJECT);
+  args.set_object (new Json.Object ());
+  var subscription = new Subscription (6, "demo:state", args);
+  var observed_logs = new Gee.ArrayList<string> ();
+  subscription.updated.connect ((value, failure) => {
+    if (failure != null) observed_logs.add (failure.logs[0]);
+  });
+  subscription.publish (null, new FunctionError ("FunctionError", "same failure", null, { "first log" }));
+  while (MainContext.default ().pending ()) MainContext.default ().iteration (false);
+  subscription.prepare_rehydration ();
+  // The error fields are otherwise identical. A changed log is observable
+  // server output and must not be mistaken for an unchanged rehydration.
+  subscription.publish (null, new FunctionError ("FunctionError", "same failure", null, { "second log" }));
+  while (MainContext.default ().pending ()) MainContext.default ().iteration (false);
+  assert (observed_logs.size == 2);
+  assert (observed_logs.get (0) == "first log");
+  assert (observed_logs.get (1) == "second log");
+}
+
 
 private static void uint32_numbers_are_strict () {
   var maximum = new Json.Node (NodeType.VALUE);
@@ -185,6 +205,7 @@ int main (string[] args) {
   Test.add_func ("/convex/timestamp/little-endian", timestamp_is_little_endian_uint64);
   Test.add_func ("/convex/timestamp/length", timestamp_requires_eight_bytes);
   Test.add_func ("/convex/subscription/rehydration-suppression", subscriptions_only_suppress_rehydration);
+  Test.add_func ("/convex/subscription/rehydration-error-logs", rehydration_compares_error_logs);
   Test.add_func ("/convex/protocol/uint32-bounds", uint32_numbers_are_strict);
   Test.add_func ("/convex/live/stopped-reader-budget", stopped_reader_budget_is_bounded);
   Test.add_func ("/convex/live/in-flight-refill", in_flight_reservation_refills_after_publish);

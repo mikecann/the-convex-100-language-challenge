@@ -15,6 +15,7 @@ class Adapter : GLib.Object {
   private const size_t MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
   private const uint MAX_OUTPUT_EVENTS = 64;
   private const size_t OUTPUT_RUNTIME_OVERHEAD = 256;
+  private const size_t MAX_COMMAND_BYTES = 2 * 1024 * 1024;
   // The project targets Linux/amd64. Keep the controller socket's kernel
   // buffering much smaller than one maximum event so a stopped reader reaches
   // the userspace absolute-deadline path instead of being hidden by autotune.
@@ -251,16 +252,61 @@ class Adapter : GLib.Object {
     }
   }
 
-  public bool on_stdin (IOChannel channel, IOCondition condition) {
-    if ((condition & IOCondition.IN) == 0) return !closed;
-    string? line; size_t length; size_t terminal;
+  private bool append_command_bytes (ByteArray command, uint8[] bytes) {
+    if ((size_t) bytes.length > MAX_COMMAND_BYTES - command.len) {
+      // Reject at the first chunk containing byte 2 MiB + 1. The fixed read
+      // buffer is the only allocation beyond the bounded command itself.
+      error ("", "ProtocolError", "adapter command exceeds 2 MiB");
+      command.set_size (0);
+      return false;
+    }
+    if (bytes.length > 0) command.append (bytes);
+    return true;
+  }
+
+  private void handle_command_bytes (ByteArray command) {
+    int length = (int) command.len;
+    if (length > 0 && command.data[length - 1] == '\r') length--;
+    uint8[] terminated = new uint8[length + 1];
+    for (int index = 0; index < length; index++) terminated[index] = command.data[index];
+    handle ((string) terminated);
+  }
+
+  // stdin and TCP deliberately share this parser so neither transport can
+  // allocate an unbounded line before applying the NDJSON command limit.
+  internal async void read_commands (InputStream input) {
+    uint8[] chunk = new uint8[8192];
+    var command = new ByteArray ();
+    bool discarding_oversized = false;
     try {
-      if (channel.read_line (out line, out length, out terminal) == IOStatus.NORMAL && line != null) {
-        if (length > 2 * 1024 * 1024) { error ("", "ProtocolError", "adapter command exceeds 2 MiB"); return false; }
-        handle (line);
+      while (!closed) {
+        ssize_t received = yield input.read_async (chunk, Priority.DEFAULT, null);
+        if (received == 0) {
+          if (!discarding_oversized && command.len > 0) handle_command_bytes (command);
+          break;
+        }
+        int segment_start = 0;
+        for (int index = 0; index < received; index++) {
+          if (chunk[index] != '\n') continue;
+          if (!discarding_oversized &&
+              append_command_bytes (command, chunk[segment_start : index])) {
+            handle_command_bytes (command);
+          }
+          command.set_size (0);
+          discarding_oversized = false;
+          segment_start = index + 1;
+          if (closed) break;
+        }
+        if (closed) break;
+        if (segment_start < received && !discarding_oversized &&
+            !append_command_bytes (command, chunk[segment_start: (int) received])) {
+          discarding_oversized = true;
+        }
       }
-    } catch (Error error) { stderr.printf ("adapter input failed: %s\n", error.message); return false; }
-    return !closed;
+    } catch (Error input_error) {
+      stderr.printf ("adapter input failed: %s\n", input_error.message);
+    }
+    if (!closed) loop.quit ();
   }
 
   public async void read_tcp (SocketConnection connection) {
@@ -271,17 +317,7 @@ class Adapter : GLib.Object {
       return;
     }
     protocol_output = connection.output_stream;
-    var input = new DataInputStream (connection.input_stream);
-    try {
-      while (!closed) {
-        size_t length = 0;
-        string? line = yield input.read_line_utf8_async (Priority.DEFAULT, null, out length);
-        if (line == null) break;
-        if (length > 2 * 1024 * 1024) { error ("", "ProtocolError", "adapter command exceeds 2 MiB"); break; }
-        handle (line);
-      }
-    } catch (Error error) { stderr.printf ("adapter TCP input failed: %s\n", error.message); }
-    if (!closed) loop.quit ();
+    yield read_commands (connection.input_stream);
   }
 }
 
@@ -292,8 +328,7 @@ int main (string[] args) {
   var adapter = new Adapter (loop);
   var listen = Environment.get_variable ("ADAPTER_LISTEN");
   if (listen == null || listen.length == 0) {
-    var channel = new IOChannel.unix_new (0);
-    channel.add_watch (IOCondition.IN | IOCondition.HUP, adapter.on_stdin);
+    adapter.read_commands.begin (new UnixInputStream (0, false));
   } else {
     var parts = listen.split (":");
     if (parts.length != 2) { stderr.printf ("invalid ADAPTER_LISTEN\n"); return 1; }
