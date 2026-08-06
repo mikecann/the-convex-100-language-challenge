@@ -22,12 +22,13 @@ let error_json error =
   in
   `Assoc (List.rev fields)
 
-let emit_error output ?(id = "") ?subscription_id error =
+let emit_error output ?id ?subscription_id error =
   let fields =
-    match subscription_id with
-    | Some value ->
+    match (subscription_id, id) with
+    | Some value, _ ->
         [ ("type", `String "subscription"); ("subscriptionId", `String value) ]
-    | None -> [ ("type", `String "error"); ("id", `String id) ]
+    | None, Some value -> [ ("type", `String "error"); ("id", `String value) ]
+    | None, None -> [ ("type", `String "error") ]
   in
   let fields = ("error", error_json error) :: fields in
   let logs = Convex.error_logs error in
@@ -120,12 +121,189 @@ let ensure_client client =
               client := Some value;
               Ok value))
 
-let member name = function
-  | `Assoc fields -> List.assoc_opt name fields
-  | _ -> None
+type command =
+  | Hello of string
+  | Call of { id : string; operation : string; path : string; args : J.t }
+  | Set_auth of { id : string; token : string }
+  | Subscribe of {
+      id : string;
+      subscription_id : string;
+      path : string;
+      args : J.t;
+    }
+  | Unsubscribe of { id : string; subscription_id : string }
+  | Debug_disconnect of string
+  | Close of string
 
-let string_field name json =
-  match member name json with Some (`String value) -> Some value | _ -> None
+let valid_id value =
+  let length = String.length value in
+  length >= 1 && length <= 128
+
+let occurrences name fields =
+  List.filter_map
+    (fun (key, value) -> if key = name then Some value else None)
+    fields
+
+let command_id fields =
+  match occurrences "id" fields with
+  | [ `String value ] when valid_id value -> Ok value
+  | [] -> Error "adapter command omitted id"
+  | [ `String _ ] -> Error "adapter command id must contain 1 to 128 bytes"
+  | [ _ ] -> Error "adapter command id must be a string"
+  | _ -> Error "adapter command contains duplicate id fields"
+
+let field name fields =
+  match occurrences name fields with
+  | [ value ] -> Ok value
+  | [] -> Error ("adapter command omitted " ^ name)
+  | _ -> Error ("adapter command contains duplicate " ^ name ^ " fields")
+
+let optional_field name fields =
+  match occurrences name fields with
+  | [ value ] -> Ok (Some value)
+  | [] -> Ok None
+  | _ -> Error ("adapter command contains duplicate " ^ name ^ " fields")
+
+let no_extra_fields allowed fields =
+  match List.find_opt (fun (name, _) -> not (List.mem name allowed)) fields with
+  | Some (name, _) -> Error ("adapter command has unexpected field " ^ name)
+  | None -> Ok ()
+
+let string_value name = function
+  | `String value -> Ok value
+  | _ -> Error ("adapter command " ^ name ^ " must be a string")
+
+let id_value name = function
+  | `String value when valid_id value -> Ok value
+  | `String _ ->
+      Error ("adapter command " ^ name ^ " must contain 1 to 128 bytes")
+  | _ -> Error ("adapter command " ^ name ^ " must be a string")
+
+let object_value name = function
+  | `Assoc _ as value -> Ok value
+  | _ -> Error ("adapter command " ^ name ^ " must be an object")
+
+let parse_command json =
+  match json with
+  | `Assoc fields -> (
+      match command_id fields with
+      | Error message -> Error (None, message)
+      | Ok id -> (
+          let fail message = Error (Some id, message) in
+          match field "op" fields with
+          | Error message -> fail message
+          | Ok op_json -> (
+              match string_value "op" op_json with
+              | Error message -> fail message
+              | Ok op -> (
+                  let finish allowed build =
+                    match no_extra_fields allowed fields with
+                    | Error message -> fail message
+                    | Ok () -> build ()
+                  in
+                  match op with
+                  | "hello" ->
+                      finish [ "protocolVersion"; "id"; "op" ] (fun () ->
+                          match field "protocolVersion" fields with
+                          | Ok (`Int 1) -> Ok (Hello id)
+                          | Ok _ -> fail "unsupported adapter protocol version"
+                          | Error message -> fail message)
+                  | "query" | "mutation" | "action" ->
+                      finish [ "id"; "op"; "path"; "args" ] (fun () ->
+                          match (field "path" fields, field "args" fields) with
+                          | Error message, _ | _, Error message -> fail message
+                          | Ok path_json, Ok args_json -> (
+                              match
+                                ( string_value "path" path_json,
+                                  object_value "args" args_json )
+                              with
+                              | Error message, _ | _, Error message ->
+                                  fail message
+                              | Ok path, Ok _ when String.length path < 3 ->
+                                  fail
+                                    "adapter command path must contain at \
+                                     least 3 bytes"
+                              | Ok path, Ok args ->
+                                  Ok (Call { id; operation = op; path; args })))
+                  | "setAuth" ->
+                      finish [ "id"; "op"; "token" ] (fun () ->
+                          match field "token" fields with
+                          | Error message -> fail message
+                          | Ok token_json -> (
+                              match string_value "token" token_json with
+                              | Error message -> fail message
+                              | Ok token -> Ok (Set_auth { id; token })))
+                  | "subscribe" ->
+                      finish [ "id"; "op"; "subscriptionId"; "path"; "args" ]
+                        (fun () ->
+                          match
+                            ( field "subscriptionId" fields,
+                              optional_field "path" fields,
+                              optional_field "args" fields )
+                          with
+                          | Error message, _, _
+                          | _, Error message, _
+                          | _, _, Error message ->
+                              fail message
+                          | Ok subscription_json, Ok path_json, Ok args_json
+                            -> (
+                              match
+                                ( id_value "subscriptionId" subscription_json,
+                                  (match path_json with
+                                  | None -> Ok ""
+                                  | Some value -> string_value "path" value),
+                                  match args_json with
+                                  | None -> Ok (`Assoc [])
+                                  | Some value -> object_value "args" value )
+                              with
+                              | Error message, _, _
+                              | _, Error message, _
+                              | _, _, Error message ->
+                                  fail message
+                              | Ok subscription_id, Ok path, Ok args ->
+                                  Ok
+                                    (Subscribe
+                                       { id; subscription_id; path; args })))
+                  | "unsubscribe" ->
+                      finish [ "id"; "op"; "subscriptionId"; "path"; "args" ]
+                        (fun () ->
+                          match
+                            ( field "subscriptionId" fields,
+                              optional_field "path" fields,
+                              optional_field "args" fields )
+                          with
+                          | Error message, _, _
+                          | _, Error message, _
+                          | _, _, Error message ->
+                              fail message
+                          | Ok subscription_json, Ok path_json, Ok args_json
+                            -> (
+                              match
+                                ( id_value "subscriptionId" subscription_json,
+                                  (match path_json with
+                                  | None -> Ok ()
+                                  | Some value ->
+                                      Result.map
+                                        (fun _ -> ())
+                                        (string_value "path" value)),
+                                  match args_json with
+                                  | None -> Ok ()
+                                  | Some value ->
+                                      Result.map
+                                        (fun _ -> ())
+                                        (object_value "args" value) )
+                              with
+                              | Error message, _, _
+                              | _, Error message, _
+                              | _, _, Error message ->
+                                  fail message
+                              | Ok subscription_id, Ok (), Ok () ->
+                                  Ok (Unsubscribe { id; subscription_id })))
+                  | "debugDisconnect" ->
+                      finish [ "id"; "op" ] (fun () -> Ok (Debug_disconnect id))
+                  | "close" -> finish [ "id"; "op" ] (fun () -> Ok (Close id))
+                  | _ -> fail "unknown adapter operation"))))
+  | _ -> Error (None, "adapter command must be a JSON object")
 
 let serve input output =
   let client = ref None in
@@ -135,56 +313,33 @@ let serve input output =
     match input_line input with
     | exception End_of_file -> running := false
     | line -> (
-        let command = try Some (J.from_string line) with _ -> None in
-        match command with
+        let json = try Some (J.from_string line) with _ -> None in
+        match json with
         | None ->
             emit_error output
               (Convex.Protocol_error "malformed adapter command")
         | Some json -> (
-            let id =
-              match string_field "id" json with
-              | Some value -> value
-              | None -> ""
-            in
-            let op =
-              match string_field "op" json with
-              | Some value -> value
-              | None -> ""
-            in
-            match op with
-            | "hello" ->
-                if member "protocolVersion" json <> Some (`Int 1) then
-                  emit_error output ~id
-                    (Convex.Protocol_error
-                       "unsupported adapter protocol version")
-                else
-                  emit output
-                    (`Assoc
-                       [
-                         ("protocolVersion", `Int 1);
-                         ("id", `String id);
-                         ("type", `String "ready");
-                         ("language", `String "ocaml");
-                         ( "implementation",
-                           `String "native-ocaml-unix-ssl-yojson-websocket" );
-                         ("runtime", `String Sys.ocaml_version);
-                       ])
-            | "query" | "mutation" | "action" -> (
+            match parse_command json with
+            | Error (id, message) ->
+                emit_error output ?id (Convex.Protocol_error message)
+            | Ok (Hello id) ->
+                emit output
+                  (`Assoc
+                     [
+                       ("protocolVersion", `Int 1);
+                       ("id", `String id);
+                       ("type", `String "ready");
+                       ("language", `String "ocaml");
+                       ( "implementation",
+                         `String "native-ocaml-unix-ssl-yojson-websocket" );
+                       ("runtime", `String Sys.ocaml_version);
+                     ])
+            | Ok (Call { id; operation; path; args }) -> (
                 match ensure_client client with
                 | Error error -> emit_error output ~id error
                 | Ok active -> (
-                    let path =
-                      match string_field "path" json with
-                      | Some value -> value
-                      | None -> ""
-                    in
-                    let args =
-                      match member "args" json with
-                      | Some value -> value
-                      | None -> `Assoc []
-                    in
                     let result =
-                      match op with
+                      match operation with
                       | "query" -> Convex.query active path args
                       | "mutation" -> Convex.mutation active path args
                       | _ -> Convex.action active path args
@@ -210,42 +365,22 @@ let serve input output =
                             :: fields
                         in
                         emit output (`Assoc fields)))
-            | "setAuth" -> (
+            | Ok (Set_auth { id; token }) -> (
                 match ensure_client client with
                 | Error error -> emit_error output ~id error
                 | Ok active -> (
-                    match string_field "token" json with
-                    | Some token -> (
-                        match Convex.set_auth active token with
-                        | Ok () -> ack output id
-                        | Error error -> emit_error output ~id error)
-                    | None ->
-                        emit_error output ~id
-                          (Convex.Protocol_error "setAuth requires token")))
-            | "subscribe" -> (
+                    match Convex.set_auth active token with
+                    | Ok () -> ack output id
+                    | Error error -> emit_error output ~id error))
+            | Ok (Subscribe { id; subscription_id; path; args }) -> (
                 match ensure_client client with
                 | Error error -> emit_error output ~id error
                 | Ok active -> (
-                    let subscription_id =
-                      match string_field "subscriptionId" json with
-                      | Some value -> value
-                      | None -> ""
-                    in
                     (match Hashtbl.find_opt relays subscription_id with
                     | Some old ->
                         stop_relay old;
                         Hashtbl.remove relays subscription_id
                     | None -> ());
-                    let path =
-                      match string_field "path" json with
-                      | Some value -> value
-                      | None -> ""
-                    in
-                    let args =
-                      match member "args" json with
-                      | Some value -> value
-                      | None -> `Assoc []
-                    in
                     match Convex.subscribe active path args with
                     | Error error -> emit_error output ~id error
                     | Ok subscription ->
@@ -262,26 +397,21 @@ let serve input output =
                         Hashtbl.replace relays subscription_id relay;
                         start_relay output relay;
                         ack output id))
-            | "unsubscribe" ->
-                let subscription_id =
-                  match string_field "subscriptionId" json with
-                  | Some value -> value
-                  | None -> ""
-                in
+            | Ok (Unsubscribe { id; subscription_id }) ->
                 (match Hashtbl.find_opt relays subscription_id with
                 | Some relay ->
                     stop_relay relay;
                     Hashtbl.remove relays subscription_id
                 | None -> ());
                 ack output id
-            | "debugDisconnect" -> (
+            | Ok (Debug_disconnect id) -> (
                 match ensure_client client with
                 | Error error -> emit_error output ~id error
                 | Ok active -> (
                     match Convex.debug_disconnect active with
                     | Ok () -> ack output id
                     | Error error -> emit_error output ~id error))
-            | "close" ->
+            | Ok (Close id) ->
                 Hashtbl.iter (fun _ relay -> stop_relay relay) relays;
                 Hashtbl.clear relays;
                 (match !client with
@@ -289,10 +419,7 @@ let serve input output =
                 | None -> ());
                 emit output
                   (`Assoc [ ("id", `String id); ("type", `String "closed") ]);
-                running := false
-            | _ ->
-                emit_error output ~id
-                  (Convex.Protocol_error "unknown adapter operation")))
+                running := false))
   done
 
 let () =

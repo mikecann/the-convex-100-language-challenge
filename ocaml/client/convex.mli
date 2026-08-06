@@ -8,6 +8,7 @@ type error =
       logs : string list;
     }
   | Protocol_error of string
+  | Http_error of { operation : string; status_code : int; message : string }
   | Transport_error of { operation : string; message : string }
   | Closed
 

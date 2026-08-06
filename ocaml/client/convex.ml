@@ -16,18 +16,23 @@ type error =
       logs : string list;
     }
   | Protocol_error of string
+  | Http_error of { operation : string; status_code : int; message : string }
   | Transport_error of { operation : string; message : string }
   | Closed
 
 let error_name = function
   | Function_error _ -> "FunctionError"
   | Protocol_error _ -> "ProtocolError"
+  | Http_error _ -> "HttpError"
   | Transport_error _ -> "TransportError"
   | Closed -> "Closed"
 
 let error_message = function
   | Function_error { message; _ } -> message
   | Protocol_error message -> message
+  | Http_error { operation; status_code; message } ->
+      "HTTP " ^ operation ^ " returned " ^ string_of_int status_code ^ ": "
+      ^ message
   | Transport_error { operation; message } -> operation ^ ": " ^ message
   | Closed -> "client is closed"
 
@@ -65,6 +70,17 @@ let list_string_member name json =
       collect [] values
   | Some `Null | None -> Ok []
   | _ -> Error (Protocol_error ("field " ^ name ^ " must be an array"))
+
+let response_logs json =
+  match list_string_member "logLines" json with
+  | Ok logs -> Ok logs
+  | Error error -> Error error
+
+let response_string name json =
+  match member name json with
+  | Some (`String value) -> Ok value
+  | None -> Error (Protocol_error ("response omitted " ^ name))
+  | Some _ -> Error (Protocol_error ("field " ^ name ^ " must be a string"))
 
 (* Small URL parser sufficient for deployment URLs.  The root project passes
    URLs without credentials; rejecting credentials prevents accidental token
@@ -333,51 +349,81 @@ let http_call endpoint ~client_version ~auth_token operation path args =
           in
           write_string channel request;
           let status_code, response_body = read_http_response channel in
-          let response =
-            try J.from_string response_body
-            with _ ->
-              raise
-                (Failure
-                   ("HTTP " ^ string_of_int status_code ^ " returned non-JSON"))
-          in
-          match string_member "status" response with
-          | Some "success" -> (
-              match member "value" response with
-              | None -> Error (Protocol_error "success response omitted value")
-              | Some value ->
-                  let logs =
-                    match list_string_member "logLines" response with
-                    | Ok values -> values
-                    | Error _ -> []
-                  in
-                  Ok { value; logs })
-          | Some "error" ->
-              let message =
-                match string_member "errorMessage" response with
-                | Some value -> value
-                | None -> "Convex function failed"
-              in
-              let data =
-                match member "errorData" response with
-                | Some `Null | None -> None
-                | Some value -> Some value
-              in
-              let logs =
-                match list_string_member "logLines" response with
-                | Ok values -> values
-                | Error _ -> []
-              in
-              Error (Function_error { operation; message; data; logs })
-          | Some status ->
+          let successful_status = status_code >= 200 && status_code < 300 in
+          match try Ok (J.from_string response_body) with _ -> Error () with
+          | Error () when not successful_status ->
+              Error
+                (Http_error
+                   {
+                     operation;
+                     status_code;
+                     message = "response body was not valid JSON";
+                   })
+          | Error () ->
               Error
                 (Protocol_error
                    ("HTTP " ^ string_of_int status_code
-                  ^ " response has unknown status " ^ status))
-          | None ->
+                  ^ " response body was not valid JSON"))
+          | Ok (`Assoc _ as response) -> (
+              match response_string "status" response with
+              | Error error -> Error error
+              | Ok "error" -> (
+                  (* Convex function failures use a non-2xx status such as 560.
+                     Preserve their structured data, but never let a success
+                     envelope override an unsuccessful HTTP status. *)
+                  match
+                    ( response_string "errorMessage" response,
+                      response_logs response )
+                  with
+                  | Error error, _ | _, Error error -> Error error
+                  | Ok message, Ok logs ->
+                      let data =
+                        match member "errorData" response with
+                        | Some `Null | None -> None
+                        | Some value -> Some value
+                      in
+                      Error (Function_error { operation; message; data; logs }))
+              | Ok "success" when not successful_status ->
+                  Error
+                    (Http_error
+                       {
+                         operation;
+                         status_code;
+                         message =
+                           "unsuccessful HTTP status carried a success response";
+                       })
+              | Ok "success" -> (
+                  match (member "value" response, response_logs response) with
+                  | None, _ ->
+                      Error (Protocol_error "success response omitted value")
+                  | _, Error error -> Error error
+                  | Some value, Ok logs -> Ok { value; logs })
+              | Ok status when not successful_status ->
+                  Error
+                    (Http_error
+                       {
+                         operation;
+                         status_code;
+                         message = "response had Convex status " ^ status;
+                       })
+              | Ok status ->
+                  Error
+                    (Protocol_error
+                       ("HTTP " ^ string_of_int status_code
+                      ^ " response has unknown status " ^ status)))
+          | Ok _ when not successful_status ->
+              Error
+                (Http_error
+                   {
+                     operation;
+                     status_code;
+                     message = "response body was not a JSON object";
+                   })
+          | Ok _ ->
               Error
                 (Protocol_error
                    ("HTTP " ^ string_of_int status_code
-                  ^ " response omitted status"))))
+                  ^ " response body must be a JSON object"))))
 
 let base64_chars =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"

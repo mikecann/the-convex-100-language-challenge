@@ -2,3 +2,14 @@
  (name main)
  (modules main)
  (libraries convex unix threads yojson))
+
+(executable
+ (name adapter_tests)
+ (modules adapter_tests)
+ (libraries unix threads yojson))
+
+(rule
+ (alias runtest)
+ (deps main.exe)
+ (action
+  (run ./adapter_tests.exe ./main.exe)))
