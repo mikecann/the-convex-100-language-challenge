@@ -4,5 +4,31 @@ displayName: "Tcl"
 rank: 46
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Tcl client using Tcllib HTTP, JSON, and TLS transport with a Tcl-owned RFC 6455 parser. Convex envelopes and the pinned sync state machine are Tcl.
+toolchain:
+  name: Tcl
+  version: 8.6.13
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, optimistic updates, WebSocket mutations/actions, journals, and TransitionChunk assembly are deferred.
+  - The educational API covers Convex's JSON-safe values. Full tagged Convex values, including Int64 and bytes, are deferred.
+  - Capability badges remain empty until the root-owned local and hosted conformance gates pass.
+  - Adapter output uses a newest-16 queue with a 6 MiB global byte budget, including NDJSON newlines and conservative Tcl/channel overhead. It reserves four event slots and 64 KiB for control events, and retains accepted writes until Tcl drains them without duplication.
+  - Language-local loopback tests cover five real reconnects, strict uint32 state and query IDs, QueryFailed shape and rollback, structured Live recovery, ownership barriers, fragmented and timed-out partial frames, and genuine stopped-reader pending-output, memory, ordering, and close bounds. Root-owned local and hosted conformance remain required before capabilities can be awarded.
 capabilities: []
