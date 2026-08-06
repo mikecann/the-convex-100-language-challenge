@@ -1,6 +1,7 @@
 package convex
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -108,6 +109,11 @@ type liveSubscription struct {
 	path    string
 	args    json.RawMessage
 	updates chan Update
+}
+
+type deliveredUpdate struct {
+	value   json.RawMessage
+	success bool
 }
 
 type subscribeCommand struct {
@@ -238,6 +244,7 @@ func (m *liveManager) run() {
 	querySetVersion := uint32(0)
 	remoteVersion := zeroStateVersion()
 	maxObservedTimestamp := ""
+	lastDelivered := make(map[uint32]deliveredUpdate)
 	connectionCount := uint32(0)
 	lastCloseReason := "InitialConnect"
 	nextBackoff := initialReconnectBackoff
@@ -425,6 +432,10 @@ func (m *liveManager) run() {
 					LogLines: append([]string(nil), modification.LogLines...),
 				}
 				remoteResults[modification.QueryID] = update
+				if previous, ok := lastDelivered[modification.QueryID]; ok && previous.success &&
+					bytes.Equal(previous.value, update.Value) {
+					continue
+				}
 				changed[modification.QueryID] = update
 			case "QueryFailed":
 				queryError := &FunctionError{
@@ -438,6 +449,7 @@ func (m *liveManager) run() {
 				changed[modification.QueryID] = update
 			case "QueryRemoved":
 				delete(remoteResults, modification.QueryID)
+				delete(lastDelivered, modification.QueryID)
 			default:
 				return &ProtocolError{Message: "unknown Transition modification " + modification.Type}
 			}
@@ -445,7 +457,20 @@ func (m *liveManager) run() {
 
 		// Commit the complete transition before notifying any subscriber.
 		remoteVersion = transition.EndVersion
-		maxObservedTimestamp = transition.EndVersion.TS
+		if _, err := decodeTimestamp(transition.EndVersion.TS); err != nil {
+			return &ProtocolError{Message: "invalid Transition end timestamp: " + err.Error()}
+		}
+		if maxObservedTimestamp == "" {
+			maxObservedTimestamp = transition.EndVersion.TS
+		} else {
+			comparison, err := compareTimestamps(transition.EndVersion.TS, maxObservedTimestamp)
+			if err != nil {
+				return &ProtocolError{Message: "invalid Transition end timestamp: " + err.Error()}
+			}
+			if comparison > 0 {
+				maxObservedTimestamp = transition.EndVersion.TS
+			}
+		}
 		ids := make([]int, 0, len(changed))
 		for id := range changed {
 			ids = append(ids, int(id))
@@ -454,7 +479,12 @@ func (m *liveManager) run() {
 		for _, numericID := range ids {
 			id := uint32(numericID)
 			if sub, ok := active[id]; ok {
-				deliver(sub, changed[id])
+				update := changed[id]
+				deliver(sub, update)
+				lastDelivered[id] = deliveredUpdate{
+					value:   cloneRaw(update.Value),
+					success: update.Err == nil,
+				}
 			}
 		}
 		return nil
@@ -558,9 +588,11 @@ func (m *liveManager) run() {
 					cmd.resp <- errors.New("Live WebSocket is not connected")
 					continue
 				}
-				// Break only the transport. The reader must observe the failure and
-				// drive the same reconnect path as a real network disconnect.
-				cmd.resp <- conn.CloseNow()
+				// Retire the socket and schedule reconnect on the owner before
+				// acknowledging. This makes the adapter barrier deterministic and
+				// prevents a stale reader event from racing the acknowledgement.
+				closeConnection("DebugDisconnect", true)
+				cmd.resp <- nil
 
 			}
 

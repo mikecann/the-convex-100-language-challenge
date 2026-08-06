@@ -7,7 +7,7 @@ implementation:
   status: attempting
   provenance: native
   version: 0.1.0
-  notes: Native documented JSON HTTP client and pinned-profile WebSocket client. Local black-box evidence passes; trusted-main publication remains separate.
+  notes: Native documented JSON HTTP client and pinned-profile WebSocket client. Shared black-box verification is pending for this exact source head; capabilities remain unearned.
 toolchain:
   name: Go
   version: 1.25.6
