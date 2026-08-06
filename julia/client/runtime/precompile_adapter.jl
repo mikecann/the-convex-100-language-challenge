@@ -256,7 +256,8 @@ adapter_live_output_reader = @async begin
     while !eof(adapter_live_output_pipe.out)
         line = readline(adapter_live_output_pipe.out)
         write(adapter_live_output_text, line, '\n')
-        occursin("\"type\":\"update\"", line) && put!(adapter_live_update_seen, nothing)
+        occursin("\"type\":\"subscription\"", line) &&
+        put!(adapter_live_update_seen, nothing)
     end
 end
 adapter_live_task =
@@ -295,7 +296,8 @@ adapter_live_text = String(take!(adapter_live_output_text))
 occursin("\"type\":\"ready\"", adapter_live_text) || error("adapter live omitted ready")
 occursin("\"type\":\"ack\"", adapter_live_text) ||
     error("adapter live omitted subscribe ack")
-occursin("\"type\":\"update\"", adapter_live_text) || error("adapter live omitted update")
+occursin("\"type\":\"subscription\"", adapter_live_text) ||
+    error("adapter live omitted subscription")
 occursin("\"type\":\"closed\"", adapter_live_text) || error("adapter live omitted close")
 
 function connect_with_deadline(port; timeout = 5.0)
