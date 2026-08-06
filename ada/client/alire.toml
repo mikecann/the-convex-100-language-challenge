@@ -1,0 +1,13 @@
+name = "convex_ada"
+description = "Educational native Ada client for Convex"
+version = "0.1.0"
+licenses = "Apache-2.0"
+project-files = ["convex_ada.gpr"]
+executables = ["convex_adapter", "convex_example", "convex_tests", "convex_socket_tests"]
+
+[[depends-on]]
+aws = "=25.2.0"
+gnat = "=15.3.1"
+gnatcoll = "=25.0.0"
+libgpr = "=25.0.0"
+xmlada = "=25.0.0"

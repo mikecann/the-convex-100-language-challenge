@@ -4,6 +4,31 @@ displayName: "Ada"
 rank: 26
 selectionTier: ranked
 implementation:
-  status: planned
-  notes: Blocked during native transport toolchain investigation. AWS 1f709a218bd9a6d20f055a94e56d5e72fb585477 exposes maintained Ada HTTPS and RFC6455 clients, but its pinned build requires gnatcoll_core, absent from Debian Bookworm's GNATCOLL package. Do not claim HTTP or Live until a pinned Docker-only GNATCOLL Core plus AWS build is reproducible and its final runtime passes policy.
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Ada implementation using pinned AWS/OpenSSL for HTTP and TLS, plus an Ada RFC 6455 and Convex sync-profile implementation. Badges remain unearned until root-owned conformance succeeds.
+toolchain:
+  name: GNAT
+  version: 15.3.1
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, optimistic updates, WebSocket mutations, WebSocket actions, and TransitionChunk assembly are deferred.
+  - The educational client supports Convex's JSON-safe value subset; tagged Convex value conversions are deferred.
+  - Active Live subscriptions are bounded to 64 and 8 MiB of conservatively charged paths and arguments. One manager-wide queue retains the newest 16 deliveries within a conservative 20 MiB encoded and runtime-overhead budget, including an in-flight adapter write.
+  - HTTP responses are capped at 2 MiB and WebSocket messages at 4 MiB. Parsed response trees are capped at depth 128 and 65,536 structural nodes; adapter commands use depth 128, 8,192 structural nodes, and an eight-command input queue.
+  - Capability badges are intentionally empty until shared local and hosted conformance pass.
 capabilities: []
