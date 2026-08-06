@@ -96,6 +96,13 @@ namespace Convex {
     private uint relay_generation = 1;
     private uint delivery_source = 0;
     private size_t pending_bytes = 0;
+    // Reconnect snapshots are allowed to repeat the last value once. Later
+    // same-value server transitions are still observable events.
+    private bool suppress_next_unchanged = false;
+    // This internal hook exists solely for a deterministic adapter regression:
+    // it pauses after dequeue so unsubscribe/replacement can prove its ACK
+    // barrier before the relay would otherwise publish a stale event.
+    internal static DeliveryHook? before_delivery_for_test;
     public signal void updated (Json.Node? value, FunctionError? error);
 
     internal Subscription (uint query_id, string path, Json.Node args) {
@@ -117,6 +124,10 @@ namespace Convex {
       pending_bytes = 0;
     }
 
+    internal void prepare_rehydration () {
+      suppress_next_unchanged = last_signature != null;
+    }
+
     private void schedule_delivery () {
       if (delivery_source != 0 || queue.is_empty || !active) return;
       uint generation = relay_generation;
@@ -129,6 +140,7 @@ namespace Convex {
         }
         var next = queue.poll ();
         pending_bytes -= next.encoded_bytes;
+        if (before_delivery_for_test != null) before_delivery_for_test (this);
         if (next.generation == relay_generation) updated (next.value, next.error);
         if (active && generation == relay_generation && !queue.is_empty) schedule_delivery ();
         return false;
@@ -138,7 +150,11 @@ namespace Convex {
     internal void publish (Json.Node? value, FunctionError? error) {
       if (!active) return;
       var signature = error != null ? "E:" + error.name + ":" + error.message + ":" + (error.data != null ? node_text (error.data) : "") : "V:" + node_text (value);
-      if (signature == last_signature) return;
+      if (signature == last_signature && suppress_next_unchanged) {
+        suppress_next_unchanged = false;
+        return;
+      }
+      suppress_next_unchanged = false;
       last_signature = signature;
       size_t encoded_bytes = value != null ? node_text (value).length : 64;
       if (error != null) encoded_bytes += error.name.length + error.message.length + (error.data != null ? node_text (error.data).length : 0);
@@ -160,6 +176,8 @@ namespace Convex {
       schedule_delivery ();
     }
   }
+
+  internal delegate void DeliveryHook (Subscription subscription);
 
   internal class Update : GLib.Object {
     public Json.Node? value; public FunctionError? error; public uint generation; public size_t encoded_bytes;
@@ -190,6 +208,8 @@ namespace Convex {
     private bool closing = false;
     private uint reconnect_backoff_ms = 100;
     private uint reconnect_source = 0;
+    private uint frame_timeout_source = 0;
+    private const uint LIVE_FRAME_TIMEOUT_MS = 5000;
 
     internal LiveOwner (Client client) { this.client = client; }
 
@@ -223,6 +243,7 @@ namespace Convex {
     internal void close () {
       closing = true;
       if (reconnect_source != 0) { Source.remove (reconnect_source); reconnect_source = 0; }
+      if (frame_timeout_source != 0) { Source.remove (frame_timeout_source); frame_timeout_source = 0; }
       foreach (var subscription in active.values) subscription.invalidate ();
       active.clear ();
       if (socket != null) socket.close (1000, "client closed");
@@ -255,6 +276,7 @@ namespace Convex {
         remote_query_set = 0; remote_identity = 0; remote_timestamp = "AAAAAAAAAAA=";
         reconnect_backoff_ms = 100;
         socket.set_max_incoming_payload_size (2 * 1024 * 1024);
+        arm_frame_timeout (generation);
         socket.message.connect ((type, payload) => {
           if (socket == next && socket_generation == generation) on_message (type, payload);
         });
@@ -266,10 +288,13 @@ namespace Convex {
         });
         string observed_timestamp = saw_timestamp ? ",\"maxObservedTimestamp\":" + json_string (max_timestamp) : "";
         send_text ("{\"type\":\"Connect\",\"sessionId\":" + json_string (Uuid.string_random ()) +
-          ",\"connectionCount\":" + connection_count.to_string () + ",\"lastCloseReason\":" +
-          json_string (last_close_reason) + observed_timestamp + ",\"clientTs\":0}");
+                   ",\"connectionCount\":" + connection_count.to_string () + ",\"lastCloseReason\":" +
+                   json_string (last_close_reason) + observed_timestamp + ",\"clientTs\":0}");
         var all = new ArrayList<Subscription> ();
-        foreach (var sub in active.values) all.add (sub);
+        foreach (var sub in active.values) {
+          if (connection_count > 0) sub.prepare_rehydration ();
+          all.add (sub);
+        }
         if (all.size > 0) {
           Subscription[] subscriptions = new Subscription[all.size];
           for (int i = 0; i < all.size; i++) subscriptions[i] = all.get (i);
@@ -289,14 +314,14 @@ namespace Convex {
       if (socket == null || socket.state != WebsocketState.OPEN) return;
       var parts = new ArrayList<string> ();
       foreach (var sub in adds) parts.add ("{\"type\":\"Add\",\"queryId\":" + sub.query_id.to_string () +
-        ",\"udfPath\":" + json_string (sub.path) + ",\"args\":[" + node_text (sub.args) + "]}");
+                                           ",\"udfPath\":" + json_string (sub.path) + ",\"args\":[" + node_text (sub.args) + "]}");
       foreach (var id in removes) parts.add ("{\"type\":\"Remove\",\"queryId\":" + id.to_string () + "}");
       if (parts.size == 0) return;
       var next = query_set_version + 1;
       string joined = "";
       foreach (var part in parts) joined += (joined.length == 0 ? "" : ",") + part;
       send_text ("{\"type\":\"ModifyQuerySet\",\"baseVersion\":" + query_set_version.to_string () +
-        ",\"newVersion\":" + next.to_string () + ",\"modifications\":[" + joined + "]}");
+                 ",\"newVersion\":" + next.to_string () + ",\"modifications\":[" + joined + "]}");
       query_set_version = next;
     }
 
@@ -304,6 +329,7 @@ namespace Convex {
       if (socket == null && !connecting) return;
       var retired = socket;
       socket = null; connecting = false; query_set_version = 0;
+      if (frame_timeout_source != 0) { Source.remove (frame_timeout_source); frame_timeout_source = 0; }
       socket_generation++;
       remote_query_set = 0; remote_identity = 0; remote_timestamp = "AAAAAAAAAAA=";
       connection_count++; last_close_reason = reason;
@@ -315,6 +341,7 @@ namespace Convex {
     }
 
     private void on_message (int type, Bytes payload) {
+      if (socket != null) arm_frame_timeout (socket_generation);
       if (type != WebsocketDataType.TEXT) { protocol_failure ("binary Live frame"); return; }
       unowned uint8[] data = payload.get_data ();
       try { handle_transition (parse_json ((string) data)); }
@@ -358,6 +385,20 @@ namespace Convex {
     private void protocol_failure (string message) {
       foreach (var sub in active.values) sub.publish (null, new FunctionError ("ProtocolError", message));
       retire_and_reconnect (message);
+    }
+
+    // libsoup only emits a completed WebSocket message. If a peer stalls in a
+    // partial frame, abandon that connection instead of retaining parser state
+    // indefinitely or treating the next connection as its continuation.
+    private void arm_frame_timeout (uint generation) {
+      if (frame_timeout_source != 0) Source.remove (frame_timeout_source);
+      frame_timeout_source = Timeout.add (LIVE_FRAME_TIMEOUT_MS, () => {
+        frame_timeout_source = 0;
+        if (!closing && socket != null && socket_generation == generation) {
+          transport_failure ("Live frame timed out");
+        }
+        return false;
+      });
     }
 
     private void transport_failure (string message) {

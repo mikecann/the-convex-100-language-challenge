@@ -13,6 +13,9 @@ class Adapter : GLib.Object {
   private uint output_in_flight_events = 0;
   private const size_t MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
   private const uint MAX_OUTPUT_EVENTS = 64;
+  // Language-local tests attach here to assert the exact NDJSON event that is
+  // written. This never changes adapter stdout or the production client API.
+  internal signal void emitted_for_test (string event);
 
   public Adapter (MainLoop loop) { this.loop = loop; }
 
@@ -26,6 +29,7 @@ class Adapter : GLib.Object {
     }
     output_in_flight_events++;
     output_in_flight_bytes += encoded_bytes;
+    emitted_for_test (event);
     try {
       if (tcp_output != null) {
         size_t written;
@@ -102,7 +106,13 @@ class Adapter : GLib.Object {
         if (prior != null) get_client ().unsubscribe (prior);
         var subscription = get_client ().subscribe (object.get_string_member ("path"), object.get_member ("args"));
         subscriptions.insert (subscription_id, subscription);
-        subscription.updated.connect ((value, failure) => { on_subscription (subscription_id, value, failure); });
+        subscription.updated.connect ((value, failure) => {
+          // A same-ID replacement must not let the retired relay publish into
+          // the new subscription after its acknowledgement barrier.
+          if (subscriptions.lookup (subscription_id) == subscription) {
+            on_subscription (subscription_id, value, failure);
+          }
+        });
         emit ("{\"id\":" + Convex.json_string (id) + ",\"type\":\"ack\"}");
       } else if (op == "unsubscribe") {
         var subscription_id = object.has_member ("subscriptionId") ? object.get_string_member ("subscriptionId") : "";
@@ -206,6 +216,8 @@ class Adapter : GLib.Object {
   }
 }
 
+#if ADAPTER_TEST
+#else
 int main (string[] args) {
   var loop = new MainLoop ();
   var adapter = new Adapter (loop);
@@ -229,3 +241,4 @@ int main (string[] args) {
   loop.run ();
   return 0;
 }
+#endif

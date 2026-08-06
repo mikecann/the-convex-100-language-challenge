@@ -9,12 +9,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgee-0.8-dev=0.20.6-1 \
     libjson-glib-dev=1.6.6-1 \
     libsoup-3.0-dev=3.2.3-0+deb12u2 \
+    uncrustify=0.72.0+dfsg1-2 \
     valac=0.56.3-1 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY client ./client
 COPY examples ./examples
 RUN test "$(uname -m)" = x86_64 && test "$(valac --version)" = "Vala 0.56.3"
+RUN find client examples -type f -name '*.vala' -print0 | sort -z | xargs -0 uncrustify -l VALA -c client/uncrustify.cfg --check
 RUN mkdir -p /out
 RUN valac --pkg gee-0.8 --pkg gio-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
     --target-glib=2.74 \
@@ -26,6 +28,18 @@ RUN valac --pkg gee-0.8 --pkg gio-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
     --target-glib=2.74 \
     -o /out/convex-client-tests client/convex.vala client/tests/client_tests.vala \
     && /out/convex-client-tests
+RUN valac --pkg gee-0.8 --pkg gio-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
+    --target-glib=2.74 \
+    -o /out/convex-live-raw-peer-tests client/convex.vala client/tests/live_raw_peer_tests.vala \
+    && /out/convex-live-raw-peer-tests
+RUN valac -D ADAPTER_TEST --pkg gee-0.8 --pkg gio-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
+    --target-glib=2.74 \
+    -o /out/convex-adapter-live-raw-peer-tests client/convex.vala client/tests/conformance/adapter.vala \
+    client/tests/live_raw_peer_tests.vala client/tests/conformance/adapter_live_raw_peer_tests.vala \
+    && /out/convex-adapter-live-raw-peer-tests
+RUN valac -D ADAPTER_STRESS_PEER --pkg gee-0.8 --pkg gio-2.0 --pkg json-glib-1.0 --pkg libsoup-3.0 \
+    --target-glib=2.74 \
+    -o /out/convex-adapter-stress-peer client/convex.vala client/tests/live_raw_peer_tests.vala
 RUN printf '%s\n' \
     '{"protocolVersion":1,"id":"hello","op":"hello"}' \
     '{"id":"close","op":"close"}' | /out/convex-adapter > /tmp/events \
@@ -42,9 +56,23 @@ RUN ADAPTER_LISTEN=127.0.0.1:18080 /out/convex-adapter >/tmp/tcp.out 2>/tmp/tcp.
 
 FROM test AS rootfs
 RUN set -eu; root=/rootfs; mkdir -p "$root"; \
-    for program in /bin/dash /usr/bin/id /usr/bin/cat /usr/bin/cut /usr/bin/head /usr/bin/tail /usr/bin/tr /usr/bin/sort /usr/bin/uniq /usr/bin/wc /usr/bin/uname /usr/bin/grep /usr/bin/sed /usr/bin/mawk /out/convex-adapter /out/convex-example /usr/lib/x86_64-linux-gnu/gio/modules/libgiognutls.so; do cp --parents "$program" "$root"; done; \
-    libraries="$({ ldd /bin/dash /usr/bin/id /usr/bin/cat /usr/bin/cut /usr/bin/head /usr/bin/tail /usr/bin/tr /usr/bin/sort /usr/bin/uniq /usr/bin/wc /usr/bin/uname /usr/bin/grep /usr/bin/sed /usr/bin/mawk /out/convex-adapter /out/convex-example /usr/lib/x86_64-linux-gnu/gio/modules/libgiognutls.so; } | awk '$3 ~ /^\// {print $3} $1 ~ /^\// {path=$1; sub(/:$/, "", path); print path}' | sort -u)"; \
-    for library in $libraries; do cp -L --parents "$library" "$root"; done; \
+    for program in /lib64/ld-linux-x86-64.so.2 /bin/dash /usr/bin/id /usr/bin/cat /usr/bin/cut /usr/bin/head /usr/bin/tail /usr/bin/tr /usr/bin/sort /usr/bin/uniq /usr/bin/wc /usr/bin/uname /usr/bin/grep /usr/bin/sed /usr/bin/mawk /out/convex-adapter /out/convex-example /usr/lib/x86_64-linux-gnu/libgee-0.8.so.2 /usr/lib/x86_64-linux-gnu/gio/modules/libgiognutls.so; do cp --parents "$program" "$root"; done; \
+    queue=/tmp/runtime-closure; : > "$queue"; \
+    for program in /lib64/ld-linux-x86-64.so.2 /bin/dash /usr/bin/id /usr/bin/cat /usr/bin/cut /usr/bin/head /usr/bin/tail /usr/bin/tr /usr/bin/sort /usr/bin/uniq /usr/bin/wc /usr/bin/uname /usr/bin/grep /usr/bin/sed /usr/bin/mawk /out/convex-adapter /out/convex-example /usr/lib/x86_64-linux-gnu/gio/modules/libgiognutls.so; do echo "$program" >> "$queue"; done; \
+    while :; do cp "$queue" "$queue.before"; while IFS= read -r object; do \
+      readelf -d "$object" 2>/dev/null | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' | while IFS= read -r soname; do \
+        resolved=; for directory in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib; do if test -e "$directory/$soname"; then resolved="$directory/$soname"; break; fi; done; \
+        test -n "$resolved" || { echo "unresolved runtime dependency $soname from $object" >&2; exit 1; }; \
+        grep -Fqx "$resolved" "$queue" || echo "$resolved" >> "$queue"; \
+      done; \
+    done < "$queue.before"; cmp -s "$queue" "$queue.before" && break; done; \
+    while IFS= read -r library; do target="$(readlink -f "$library")"; cp -P --parents "$library" "$root"; test "$target" = "$library" || cp --parents "$target" "$root"; done < "$queue"; \
+    # Keep real copies in both loader search directories. The final base has
+    # a real /lib from its pruner, so a top-level merged-usr symlink cannot be
+    # copied over it; duplicating this small closure is deterministic.
+    if test -d "$root/lib/x86_64-linux-gnu"; then mkdir -p "$root/usr/lib"; cp -a "$root/lib/x86_64-linux-gnu" "$root/usr/lib/"; fi; \
+    test -e "$root/lib64/ld-linux-x86-64.so.2"; \
+    while IFS= read -r library; do target="$(readlink -f "$library")"; test -e "$root$target" || { echo "missing final closure target $target" >&2; exit 1; }; done < "$queue"; \
     mkdir -p "$root/usr/local/bin" "$root/bin" "$root/usr/bin" "$root/etc/ssl/certs" "$root/etc" "$root/usr/share/glib-2.0/schemas"; \
     mv "$root/out/convex-adapter" "$root/usr/local/bin/convex-adapter"; mv "$root/out/convex-example" "$root/usr/local/bin/convex-example"; rmdir "$root/out"; \
     ln -s dash "$root/bin/sh"; ln -s mawk "$root/usr/bin/awk"; \

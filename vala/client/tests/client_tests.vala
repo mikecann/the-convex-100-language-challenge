@@ -29,17 +29,21 @@ private static Json.Node number_node (int value) {
   return node;
 }
 
-private static void subscriptions_suppress_duplicate_values () {
+private static void subscriptions_only_suppress_rehydration () {
   var args = new Json.Node (NodeType.OBJECT);
   args.set_object (new Json.Object ());
   var subscription = new Subscription (1, "demo:state", args);
   int deliveries = 0;
   subscription.updated.connect ((value, failure) => { deliveries++; });
   subscription.publish (number_node (1), null);
+  subscription.prepare_rehydration ();
   subscription.publish (number_node (1), null);
   subscription.publish (number_node (2), null);
+  subscription.publish (number_node (2), null);
   while (MainContext.default ().pending ()) MainContext.default ().iteration (false);
-  assert (deliveries == 2);
+  // The reconnect snapshot is suppressed once, but a later same-value
+  // transition is real server work and must cross the relay.
+  assert (deliveries == 3);
 }
 
 
@@ -112,7 +116,7 @@ int main (string[] args) {
   Test.init (ref args);
   Test.add_func ("/convex/timestamp/little-endian", timestamp_is_little_endian_uint64);
   Test.add_func ("/convex/timestamp/length", timestamp_requires_eight_bytes);
-  Test.add_func ("/convex/subscription/deduplicate", subscriptions_suppress_duplicate_values);
+  Test.add_func ("/convex/subscription/rehydration-suppression", subscriptions_only_suppress_rehydration);
   Test.add_func ("/convex/protocol/uint32-bounds", uint32_numbers_are_strict);
   Test.add_func ("/convex/live/stopped-reader-budget", stopped_reader_budget_is_bounded);
   Test.add_func ("/convex/live/invalidation-barrier", invalidation_is_a_delivery_barrier);
