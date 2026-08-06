@@ -802,7 +802,7 @@ function Start-ConvexLive {
 function New-ConvexSubscriptionRecord {
     param(
         [string] $Id,
-        [int] $QueryId,
+        [uint32] $QueryId,
         [string] $Path,
         [hashtable] $FunctionArgs
     )

@@ -66,11 +66,35 @@ function Stop-Fixture {
 $fixture = Start-Fixture 43137
 $client = New-ConvexClient $fixture.Url
 $live = New-ConvexLiveState $fixture.Url
+$queryIdLive = $null
 try {
     $echo = Get-ConvexQuery $client 'demo:echo' @{ value = @{ unicode = 'Καλημέρα 🦘' } }
     Assert-Equal $echo.Value.unicode 'Καλημέρα 🦘' 'HTTP UTF-8 round trip'
     Assert-Array $echo.Logs 'single HTTP log must remain an array'
     Assert-Equal $echo.Logs.Count 1 'single HTTP log count'
+
+    # Allocate the maximum protocol query ID through the public subscription
+    # path. The record, map lookup, and Add message must retain uint32 rather
+    # than narrowing it to Int32. The following allocation must fail before it
+    # mutates either allocator state or the subscription map.
+    $queryIdLive = New-ConvexLiveState $fixture.Url
+    $queryIdLive.NextQueryId = [uint64][uint32]::MaxValue
+    $maximumIdSubscription = Add-ConvexSubscription $queryIdLive 'maximum-query-id' 'demo:state' @{ room = 'maximum-query-id' }
+    Assert-Equal $maximumIdSubscription.QueryId ([uint32]::MaxValue) 'maximum uint32 query ID was not retained by the record'
+    Assert-Equal $maximumIdSubscription.QueryId.GetType().FullName 'System.UInt32' 'subscription record narrowed query ID type'
+    Assert-Equal $queryIdLive.NextQueryId ([uint64][uint32]::MaxValue + 1) 'maximum query ID did not advance allocator'
+    Assert-Equal (Receive-ConvexSubscription $queryIdLive $maximumIdSubscription 5000).value.count 0 'maximum query ID subscription did not receive its initial value'
+    try {
+        Add-ConvexSubscription $queryIdLive 'overflow-query-id' 'demo:state' @{ room = 'overflow-query-id' } | Out-Null
+        throw 'query ID overflow was not rejected'
+    }
+    catch {
+        $queryIdFailure = Get-ConvexError $_.Exception
+        Assert-Equal $queryIdFailure.Name 'ProtocolError' 'query ID overflow classification'
+    }
+    Assert-Equal $queryIdLive.NextQueryId ([uint64][uint32]::MaxValue + 1) 'rejected query ID advanced allocator state'
+    Assert-True (-not $queryIdLive.Subscriptions.ContainsKey('overflow-query-id')) 'rejected query ID entered subscription map'
+    Remove-ConvexSubscription $queryIdLive 'maximum-query-id'
 
     # Convex timestamps are little-endian uint64 values. Cross 255 -> 256 on a
     # real reconnect so raw-byte ordering cannot accidentally pass this suite.
@@ -386,6 +410,9 @@ try {
     Write-Output 'PASS PowerShell HTTP and adversarial Live fixtures'
 }
 finally {
+    if ($null -ne $queryIdLive -and -not $queryIdLive.Closed) {
+        Close-ConvexLive $queryIdLive
+    }
     if (-not $live.Closed) {
         Close-ConvexLive $live
     }

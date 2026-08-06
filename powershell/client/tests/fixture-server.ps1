@@ -127,19 +127,19 @@ $socketWorker = {
                         $State.ConnectMessages.Enqueue($message)
                     }
                     elseif ($message['type'] -eq 'ModifyQuerySet') {
-                        [int[]]$addBatch = @(
+                        [uint32[]]$addBatch = @(
                             $message['modifications'] |
                                 Where-Object { $_['type'] -eq 'Add' } |
-                                ForEach-Object { [int]$_['queryId'] }
+                                ForEach-Object { [uint32]$_['queryId'] }
                         )
                         if ($addBatch.Count -gt 0) {
-                            $State.AddBatches.Enqueue([int[]]$addBatch)
+                            $State.AddBatches.Enqueue([uint32[]]$addBatch)
                         }
                         foreach ($change in @($message['modifications'])) {
                             if ($change['type'] -eq 'Add') {
                                 [Threading.Monitor]::Enter($State.Sync)
                                 try { $State.Adds++ } finally { [Threading.Monitor]::Exit($State.Sync) }
-                                $queryId = [int]$change['queryId']
+                                $queryId = [uint32]$change['queryId']
                                 $queryPath = [string]$change['udfPath']
                                 $arguments = if (@($change['args']).Count) { @($change['args'])[0] } else { @{} }
                                 $mode = if ($arguments -is [hashtable] -and $arguments.ContainsKey('mode')) {
