@@ -158,7 +158,7 @@ package body Convex.Live is
    begin
       JSON.Append (Args, Sub.Args);
       Result.Set_Field ("type", "Add");
-      Result.Set_Field ("queryId", Integer (Sub.Id));
+      Result.Set_Field ("queryId", JSON.Create (Long_Long_Integer (Sub.Id)));
       Result.Set_Field ("udfPath", US.To_String (Sub.Path));
       Result.Set_Field ("args", Args);
       return Result;
@@ -172,14 +172,14 @@ package body Convex.Live is
       Stopping          : Boolean := False;
       Next_Id           : Natural := 1;
       Next_Generation   : Natural := 1;
-      Query_Set_Version : Natural := 0;
-      Remote_Query_Set  : Natural := 0;
-      Remote_Identity   : Natural := 0;
+      Query_Set_Version : Interfaces.Unsigned_32 := 0;
+      Remote_Query_Set  : Interfaces.Unsigned_32 := 0;
+      Remote_Identity   : Interfaces.Unsigned_32 := 0;
       Remote_Timestamp  : US.Unbounded_String :=
         US.To_Unbounded_String (Initial_Timestamp);
       Max_Timestamp     : Interfaces.Unsigned_64 := 0;
       Has_Max_Timestamp : Boolean := False;
-      Connection_Count  : Natural := 0;
+      Connection_Count  : Interfaces.Unsigned_32 := 0;
       Last_Close_Reason : US.Unbounded_String :=
         US.To_Unbounded_String ("InitialConnect");
       Backoff           : Duration := 0.1;
@@ -217,10 +217,12 @@ package body Convex.Live is
          return 0;
       end Find_Sub;
 
-      function Find_Id (Id : Natural) return Natural is
+      function Find_Id (Id : Interfaces.Unsigned_32) return Natural is
       begin
          for I in Subs'Range loop
-            if Subs (I).Active and then Subs (I).Id = Id then
+            if Subs (I).Active
+              and then Interfaces.Unsigned_32 (Subs (I).Id) = Id
+            then
                return I;
             end if;
          end loop;
@@ -345,13 +347,15 @@ package body Convex.Live is
       begin
          if Convex_WebSocket.Is_Open (Socket) then
             Convex_WebSocket.Shutdown (Socket);
-            Connection_Count :=
-              Natural'Min (Natural'Last, Connection_Count + 1);
+            if Connection_Count < Interfaces.Unsigned_32'Last then
+               Connection_Count := Connection_Count + 1;
+            end if;
          elsif Count_Failed_Attempt then
             -- A refused TCP connection or failed TLS/upgrade is still a
             -- connection attempt and must be visible on the next Connect.
-            Connection_Count :=
-              Natural'Min (Natural'Last, Connection_Count + 1);
+            if Connection_Count < Interfaces.Unsigned_32'Last then
+               Connection_Count := Connection_Count + 1;
+            end if;
          end if;
          Query_Set_Version := 0;
          Remote_Query_Set := 0;
@@ -367,13 +371,16 @@ package body Convex.Live is
       end Disconnect;
 
       procedure Send_Modifications
-        (Base, New_Version : Natural; Modifications : JSON.JSON_Array)
+        (Base, New_Version : Interfaces.Unsigned_32;
+         Modifications     : JSON.JSON_Array)
       is
          Message : constant JSON.JSON_Value := JSON.Create_Object;
       begin
          Message.Set_Field ("type", "ModifyQuerySet");
-         Message.Set_Field ("baseVersion", Integer (Base));
-         Message.Set_Field ("newVersion", Integer (New_Version));
+         Message.Set_Field
+           ("baseVersion", JSON.Create (Long_Long_Integer (Base)));
+         Message.Set_Field
+           ("newVersion", JSON.Create (Long_Long_Integer (New_Version)));
          Message.Set_Field ("modifications", Modifications);
          Convex_WebSocket.Send_Text (Socket, JSON.Write (Message));
          Query_Set_Version := New_Version;
@@ -387,7 +394,8 @@ package body Convex.Live is
          Connect_Message.Set_Field ("type", "Connect");
          Connect_Message.Set_Field ("sessionId", Session_Id);
          Connect_Message.Set_Field
-           ("connectionCount", Integer (Connection_Count));
+           ("connectionCount",
+            JSON.Create (Long_Long_Integer (Connection_Count)));
          Connect_Message.Set_Field
            ("lastCloseReason", US.To_String (Last_Close_Reason));
          Connect_Message.Set_Field ("clientTs", Integer (0));
@@ -416,21 +424,16 @@ package body Convex.Live is
                Count_Failed_Attempt => True);
       end Establish;
 
-      function Natural_Field
-        (Object : JSON.JSON_Value; Name : String) return Natural
+      function UInt32_Field
+        (Object : JSON.JSON_Value; Name : String) return Interfaces.Unsigned_32
       is
-         Value  : constant JSON.JSON_Value := Object.Get (Name);
-         Number : Long_Long_Integer;
+         Result : Interfaces.Unsigned_32;
       begin
-         if Value.Kind /= JSON.JSON_Int_Type then
-            raise Constraint_Error with Name & " must be an integer";
+         if not Convex_WebSocket.Decode_UInt32 (Object.Get (Name), Result) then
+            raise Constraint_Error with Name & " must be an exact uint32";
          end if;
-         Number := Value.Get;
-         if Number < 0 or else Number > Long_Long_Integer (Natural'Last) then
-            raise Constraint_Error with Name & " is out of range";
-         end if;
-         return Natural (Number);
-      end Natural_Field;
+         return Result;
+      end UInt32_Field;
 
       function String_Field
         (Object : JSON.JSON_Value; Name : String) return String
@@ -470,7 +473,7 @@ package body Convex.Live is
 
       procedure Validate_Version
         (Value       : JSON.JSON_Value;
-         Q, Identity : out Natural;
+         Q, Identity : out Interfaces.Unsigned_32;
          Timestamp   : out US.Unbounded_String)
       is
          Numeric : Interfaces.Unsigned_64;
@@ -479,8 +482,8 @@ package body Convex.Live is
          if Value.Kind /= JSON.JSON_Object_Type then
             raise Constraint_Error with "state version must be an object";
          end if;
-         Q := Natural_Field (Value, "querySet");
-         Identity := Natural_Field (Value, "identity");
+         Q := UInt32_Field (Value, "querySet");
+         Identity := UInt32_Field (Value, "identity");
          if not Convex_WebSocket.Decode_Timestamp (Text, Numeric) then
             raise Constraint_Error
               with "state timestamp is not canonical little-endian uint64";
@@ -489,7 +492,7 @@ package body Convex.Live is
       end Validate_Version;
 
       procedure Handle_Transition (Root : JSON.JSON_Value) is
-         Start_Q, Start_I, End_Q, End_I : Natural;
+         Start_Q, Start_I, End_Q, End_I : Interfaces.Unsigned_32;
          Start_TS, End_TS               : US.Unbounded_String;
          Numeric_TS                     : Interfaces.Unsigned_64;
          Mods                           : JSON.JSON_Array;
@@ -516,8 +519,8 @@ package body Convex.Live is
                Modification : constant JSON.JSON_Value := JSON.Get (Mods, I);
                Kind         : constant String :=
                  String_Field (Modification, "type");
-               Query_Id     : constant Natural :=
-                 Natural_Field (Modification, "queryId");
+               Query_Id     : constant Interfaces.Unsigned_32 :=
+                 UInt32_Field (Modification, "queryId");
                Index        : constant Natural := Find_Id (Query_Id);
             begin
                if Index = 0 and then Kind /= "QueryRemoved" then
@@ -785,7 +788,8 @@ package body Convex.Live is
                              JSON.Create_Object;
                         begin
                            Remove_Item.Set_Field ("type", "Remove");
-                           Remove_Item.Set_Field ("queryId", Integer (Id));
+                           Remove_Item.Set_Field
+                             ("queryId", JSON.Create (Long_Long_Integer (Id)));
                            JSON.Append (Modifications, Remove_Item);
                            Send_Modifications
                              (Query_Set_Version,
@@ -879,8 +883,9 @@ package body Convex.Live is
                   Queue_First := 1;
                   Queue_Count := 0;
                   Queue_Bytes := 0;
-                  Connection_Count :=
-                    Natural'Min (Natural'Last, Connection_Count + 1);
+                  if Connection_Count < Interfaces.Unsigned_32'Last then
+                     Connection_Count := Connection_Count + 1;
+                  end if;
                   Query_Set_Version := 0;
                   Remote_Query_Set := 0;
                   Remote_Identity := 0;

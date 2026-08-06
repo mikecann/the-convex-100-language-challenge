@@ -26,7 +26,6 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - The remote linux/amd64 Docker test is currently blocked before linking by repeatable GNAT internal compiler segmentation faults in the AWS/GNATCOLL dependency closure under the approved arm64 Colima runner; no capability badge is awarded from source compilation alone.
   - Live authentication, optimistic updates, WebSocket mutations, WebSocket actions, and TransitionChunk assembly are deferred.
   - The educational client supports Convex's JSON-safe value subset; tagged Convex value conversions are deferred.
   - Active Live subscriptions are bounded to 64 and 8 MiB of conservatively charged paths and arguments. One manager-wide queue retains the newest 16 deliveries within a conservative 20 MiB encoded and runtime-overhead budget, including an in-flight adapter write.

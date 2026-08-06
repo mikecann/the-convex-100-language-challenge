@@ -71,7 +71,14 @@ RUN /root/.alire/bin/gnatformat --no-project --check --charset utf-8 \
 # build deterministic and below the remote runner's 10 GiB VM limit. The
 # dependency build also avoids optimizer memory spikes in GNAT 14; the final
 # runtime is still built from these complete native objects.
-RUN alr exec -- gprbuild -j1 -XGNATCOLL_BUILD_MODE=DEBUG -P convex_ada_subset.gpr \
+RUN mkdir -p obj \
+    && alr exec -- gcc -c /opt/gnatcoll/minimal/src/gnatcoll_support.c \
+         -o obj/gnatcoll_minimal_support.o \
+    && alr exec -- gcc -c /opt/gnatcoll/core/src/os/unix/libc-wrappers.c \
+         -o obj/gnatcoll_libc_wrappers.o \
+    && alr exec -- gcc -c /opt/aws/config/ssl/openssl/wrappers.c \
+         -o obj/aws_openssl_wrappers.o \
+    && alr exec -- gprbuild -c -j1 -XGNATCOLL_BUILD_MODE=DEBUG -P convex_ada_subset.gpr \
       convex.adb convex-live.adb convex_websocket.adb \
       -cargs:Ada -O0 -fno-inline \
     && alr exec -- gprbuild -j1 -XGNATCOLL_BUILD_MODE=DEBUG -P convex_ada_subset.gpr -cargs:Ada -O0 -fno-inline
@@ -96,8 +103,8 @@ RUN set -eu; \
       | sort -u \
       | while IFS= read -r library; do cp -L "$library" "/out/lib/$(basename "$library")"; done; \
     chmod 0555 /out/convex-adapter /out/convex-example; \
-    test -f /out/lib/libgnat-14.so; \
-    test -f /out/lib/libgnarl-14.so; \
+    ! ldd bin/convex_adapter | grep -Eq 'libgnat|libgnarl'; \
+    ! ldd bin/convex_example | grep -Eq 'libgnat|libgnarl'; \
     test -f /out/lib/ld-linux-x86-64.so.2
 CMD ["/bin/sh", "-c", "true"]
 

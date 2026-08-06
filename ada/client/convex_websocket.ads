@@ -1,6 +1,7 @@
 with Ada.Streams;
 with Ada.Strings.Unbounded;
 with AWS.Net;
+with GNATCOLL.JSON;
 with Interfaces;
 
 package Convex_WebSocket is
@@ -34,6 +35,9 @@ package Convex_WebSocket is
    function Decode_Timestamp
      (Text : String; Value : out Interfaces.Unsigned_64) return Boolean;
    function Encode_Timestamp (Value : Interfaces.Unsigned_64) return String;
+   function Decode_UInt32
+     (Value : GNATCOLL.JSON.JSON_Value; Result : out Interfaces.Unsigned_32)
+      return Boolean;
    function Valid_UTF8 (Text : String) return Boolean;
 
 private

@@ -38,6 +38,18 @@ project Convex_Ada_Subset is
       for Default_Switches ("Ada") use ("-Es");
    end Binder;
 
+   package Linker is
+      --  The full upstream projects normally add these C shims and system
+      --  libraries.  This reduced project keeps that native closure explicit.
+      for Default_Switches ("Ada") use
+        ("/project/client/obj/gnatcoll_minimal_support.o",
+         "/project/client/obj/gnatcoll_libc_wrappers.o",
+         "/project/client/obj/aws_openssl_wrappers.o",
+         "-lssl",
+         "-lcrypto",
+         "/lib/x86_64-linux-gnu/libz.so.1");
+   end Linker;
+
    package Naming is
       for Implementation ("GNATCOLL.OS.Random")
         use "gnatcoll-os-random__unix.adb";
@@ -77,5 +89,7 @@ project Convex_Ada_Subset is
         use "templates_parser-configuration__aws.ads";
       for Implementation ("Templates_Parser.Input")
         use "templates_parser-input__aws.adb";
+      for Implementation ("Templates_Parser_Tasking")
+        use "templates_parser_tasking__standard_tasking.adb";
    end Naming;
 end Convex_Ada_Subset;

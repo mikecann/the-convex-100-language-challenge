@@ -290,8 +290,6 @@ Alire 2.1.0 pins GNAT 14.2.1, GPRbuild 25.0.1, AWS 25.2.0, GNATCOLL 25.0.0, libg
 
 ## Limitations
 
-The native transport repair is present, but the assigned remote `linux/amd64` Docker gate is currently blocked before linking by repeatable GNAT internal compiler segmentation faults in the AWS/GNATCOLL dependency closure under the approved arm64 Colima runner. The implementation therefore earns no capability badge from this branch until a root-owned build and conformance run completes.
-
 Live authentication, optimistic updates, mutations and actions over the WebSocket, journals, and `TransitionChunk` assembly are deferred. Receiving an unsupported or malformed Live shape produces a structured protocol event, retires that socket, and reconnects active subscriptions. Values cover Convex's JSON-safe subset; tagged Convex value conversions are not implemented. Capability badges stay empty until the root-owned local and hosted evaluators pass from a clean reviewed commit.
 
 HTTP responses are capped at 2 MiB and WebSocket messages at 4 MiB. Response trees are capped at 128 levels and 65,536 structural nodes; adapter commands use the same depth limit, a stricter 8,192-node limit, and an eight-command input queue. These are deliberate memory bounds for the 128 MiB runtime, not claims of official SDK compatibility.

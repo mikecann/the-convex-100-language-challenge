@@ -406,6 +406,63 @@ procedure Convex_Socket_Tests is
          & Response_Body);
    end Send_HTTP_Response;
 
+   function Hex_Image (Value : Natural) return String is
+      Hex_Characters : constant String := "0123456789ABCDEF";
+   begin
+      if Value < 16 then
+         return String'[1 => Hex_Characters (Value + 1)];
+      end if;
+      return Hex_Image (Value / 16) & Hex_Characters (Value mod 16 + 1);
+   end Hex_Image;
+
+   procedure Send_Chunked_HTTP_Response
+     (Socket : GNAT.Sockets.Socket_Type; Response_Body : String)
+   is
+      First_Length : constant Natural :=
+        Natural'Min (17, Response_Body'Length);
+      First_Last   : constant Natural :=
+        Response_Body'First + First_Length - 1;
+      Rest_Length  : constant Natural := Response_Body'Length - First_Length;
+   begin
+      Send_All
+        (Socket,
+         "HTTP/1.1 200 OK"
+         & ASCII.CR
+         & ASCII.LF
+         & "Content-Type: application/json"
+         & ASCII.CR
+         & ASCII.LF
+         & "Transfer-Encoding: chunked"
+         & ASCII.CR
+         & ASCII.LF
+         & ASCII.CR
+         & ASCII.LF
+         & Hex_Image (First_Length)
+         & ";fixture=yes"
+         & ASCII.CR
+         & ASCII.LF
+         & Response_Body (Response_Body'First .. First_Last)
+         & ASCII.CR
+         & ASCII.LF
+         & (if Rest_Length > 0
+            then
+              Hex_Image (Rest_Length)
+              & ASCII.CR
+              & ASCII.LF
+              & Response_Body (First_Last + 1 .. Response_Body'Last)
+              & ASCII.CR
+              & ASCII.LF
+            else "")
+         & "0"
+         & ASCII.CR
+         & ASCII.LF
+         & "X-Fixture: complete"
+         & ASCII.CR
+         & ASCII.LF
+         & ASCII.CR
+         & ASCII.LF);
+   end Send_Chunked_HTTP_Response;
+
    procedure Validate_HTTP_Envelope
      (Request, Operation, Path, Expected_Auth : String)
    is
@@ -465,7 +522,7 @@ procedure Convex_Socket_Tests is
          Listen := Listener;
       end Start;
       begin
-         for Step in 1 .. 4 loop
+         for Step in 1 .. 6 loop
             GNAT.Sockets.Accept_Socket (Listen, Peer, Address);
             declare
                Request : constant String := Read_HTTP_Request (Peer);
@@ -502,8 +559,39 @@ procedure Convex_Socket_Tests is
                   when 4 =>
                      Validate_HTTP_Envelope
                        (Request, "query", "messages:count", "");
-                     Send_HTTP_Response
+                     Send_Chunked_HTTP_Response
                        (Peer, "{""status"":""success"",""value"":7}");
+
+                  when 5 =>
+                     Validate_HTTP_Envelope
+                       (Request, "query", "messages:badChunk", "");
+                     Send_All
+                       (Peer,
+                        "HTTP/1.1 200 OK"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "Transfer-Encoding: chunked"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "not-hex"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "x"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "0"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & ASCII.CR
+                        & ASCII.LF);
+
+                  when 6 =>
+                     Validate_HTTP_Envelope
+                       (Request, "query", "messages:count", "");
+                     Send_Chunked_HTTP_Response
+                       (Peer, "{""status"":""success"",""value"":8}");
                end case;
             end;
             Close_Quietly (Peer);
@@ -591,6 +679,28 @@ procedure Convex_Socket_Tests is
          Check
            (Long_Long_Integer'(Result.Value.Get) = 7,
             "HTTP query after auth clear returned the wrong value");
+      end;
+
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:badChunk", Args);
+      begin
+         Check (not Result.Success, "malformed HTTP chunk became a success");
+         Check
+           (Result.Error.Kind = Convex.Protocol_Error,
+            "malformed HTTP chunk used the wrong error kind");
+      end;
+
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:count", Args);
+      begin
+         Check
+           (Result.Success, "HTTP did not recover after a malformed chunk");
+         Check
+           (Result.Value.Kind = JSON.JSON_Int_Type
+            and then Long_Long_Integer'(Result.Value.Get) = 8,
+            "chunked HTTP recovery returned the wrong value");
       end;
 
       Convex.Close (Client);

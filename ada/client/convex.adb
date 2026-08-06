@@ -80,7 +80,117 @@ package body Convex is
       Body_Start  : Natural := 0;
       Body_Length : Natural := 0;
       Has_Length  : Boolean := False;
+      Chunked     : Boolean := False;
       Header_Done : Boolean := False;
+      Peer_Closed : Boolean := False;
+
+      function Chunk_Size (Line : String) return Natural is
+         Extension : constant Natural := Ada.Strings.Fixed.Index (Line, ";");
+         Last      : constant Natural :=
+           (if Extension = 0 then Line'Last else Extension - 1);
+         Result    : Natural := 0;
+         Digit     : Natural;
+      begin
+         if Last < Line'First then
+            raise Constraint_Error with "empty HTTP chunk size";
+         end if;
+         for I in Line'First .. Last loop
+            Digit :=
+              (case Line (I) is
+                 when '0' .. '9' =>
+                   Character'Pos (Line (I)) - Character'Pos ('0'),
+                 when 'a' .. 'f' =>
+                   Character'Pos (Line (I)) - Character'Pos ('a') + 10,
+                 when 'A' .. 'F' =>
+                   Character'Pos (Line (I)) - Character'Pos ('A') + 10,
+                 when others     =>
+                   raise Constraint_Error with "invalid HTTP chunk size");
+            if Result > (Max_Response_Bytes - Digit) / 16 then
+               raise Response_Too_Large with "HTTP chunk exceeds 2 MiB";
+            end if;
+            Result := Result * 16 + Digit;
+         end loop;
+         return Result;
+      end Chunk_Size;
+
+      function Chunks_Complete (Text : String) return Boolean is
+         Cursor : Natural := Body_Start;
+         Total  : Natural := 0;
+      begin
+         loop
+            if Cursor > Text'Last then
+               return False;
+            end if;
+            declare
+               Line_End : constant Natural :=
+                 Ada.Strings.Fixed.Index (Text, ASCII.CR & ASCII.LF, Cursor);
+            begin
+               if Line_End = 0 then
+                  return False;
+               elsif Line_End - Cursor > 8 * 1_024 then
+                  raise Constraint_Error with "HTTP chunk line exceeds 8 KiB";
+               end if;
+               declare
+                  Size : constant Natural :=
+                    Chunk_Size (Text (Cursor .. Line_End - 1));
+               begin
+                  Cursor := Line_End + 2;
+                  if Size = 0 then
+                     if Cursor + 1 > Text'Last then
+                        return False;
+                     elsif Text (Cursor .. Cursor + 1) = ASCII.CR & ASCII.LF
+                     then
+                        return True;
+                     else
+                        return
+                          Ada.Strings.Fixed.Index
+                            (Text,
+                             ASCII.CR & ASCII.LF & ASCII.CR & ASCII.LF,
+                             Cursor)
+                          > 0;
+                     end if;
+                  end if;
+                  if Total > Max_Response_Bytes - Size then
+                     raise Response_Too_Large
+                       with "chunked HTTP body exceeds 2 MiB";
+                  end if;
+                  Total := Total + Size;
+                  if Cursor > Text'Last or else Size > Text'Last - Cursor + 1
+                  then
+                     return False;
+                  end if;
+                  Cursor := Cursor + Size;
+                  if Cursor + 1 > Text'Last then
+                     return False;
+                  elsif Text (Cursor .. Cursor + 1) /= ASCII.CR & ASCII.LF then
+                     raise Constraint_Error
+                       with "HTTP chunk omitted its terminator";
+                  end if;
+                  Cursor := Cursor + 2;
+               end;
+            end;
+         end loop;
+      end Chunks_Complete;
+
+      function Decode_Chunks (Text : String) return US.Unbounded_String is
+         Cursor : Natural := Body_Start;
+         Result : US.Unbounded_String;
+      begin
+         loop
+            declare
+               Line_End : constant Natural :=
+                 Ada.Strings.Fixed.Index (Text, ASCII.CR & ASCII.LF, Cursor);
+               Size     : constant Natural :=
+                 Chunk_Size (Text (Cursor .. Line_End - 1));
+            begin
+               Cursor := Line_End + 2;
+               exit when Size = 0;
+               US.Append (Result, Text (Cursor .. Cursor + Size - 1));
+               Cursor := Cursor + Size + 2;
+            end;
+         end loop;
+         return Result;
+      end Decode_Chunks;
 
       procedure Send_Text (Text : String) is
          Buffer : Ada.Streams.Stream_Element_Array (1 .. 16 * 1024);
@@ -214,20 +324,28 @@ package body Convex is
             if not Events (AWS.Net.Input) then
                raise AWS.Net.Socket_Error with "HTTP response timed out";
             end if;
-            Socket.all.Receive (Buffer, Last);
-            exit when Last < Buffer'First;
-            declare
-               Length : constant Natural := Natural (Last - Buffer'First + 1);
             begin
-               if US.Length (Raw) + Length > Max_Response_Bytes + 64 * 1024
-               then
-                  raise Response_Too_Large
-                    with "response exceeds bounded headers and 2 MiB body";
-               end if;
-               for I in Buffer'First .. Last loop
-                  US.Append (Raw, Character'Val (Buffer (I)));
-               end loop;
+               Socket.all.Receive (Buffer, Last);
+            exception
+               when AWS.Net.Socket_Error =>
+                  Peer_Closed := True;
+                  Last := Buffer'First - 1;
             end;
+            if not Peer_Closed then
+               declare
+                  Length : constant Natural :=
+                    Natural (Last - Buffer'First + 1);
+               begin
+                  if US.Length (Raw) + Length > Max_Response_Bytes + 64 * 1024
+                  then
+                     raise Response_Too_Large
+                       with "response exceeds bounded headers and 2 MiB body";
+                  end if;
+                  for I in Buffer'First .. Last loop
+                     US.Append (Raw, Character'Val (Buffer (I)));
+                  end loop;
+               end;
+            end if;
          end;
          declare
             Text   : constant String := US.To_String (Raw);
@@ -241,16 +359,21 @@ package body Convex is
                     with "HTTP response headers exceed 64 KiB";
                end if;
                declare
-                  Headers     : constant String :=
+                  Headers       : constant String :=
                     Text (Text'First .. End_At + 1);
-                  Status_End  : constant Natural :=
+                  Status_End    : constant Natural :=
                     Ada.Strings.Fixed.Index (Headers, ASCII.CR & ASCII.LF);
-                  Status_Line : constant String :=
+                  Status_Line   : constant String :=
                     Headers (Headers'First .. Status_End - 1);
-                  Length_Text : constant String :=
+                  Length_Text   : constant String :=
                     Ada.Strings.Fixed.Trim
                       (Header_Value (Headers, "Content-Length"),
                        Ada.Strings.Both);
+                  Transfer_Text : constant String :=
+                    Ada.Characters.Handling.To_Lower
+                      (Ada.Strings.Fixed.Trim
+                         (Header_Value (Headers, "Transfer-Encoding"),
+                          Ada.Strings.Both));
                begin
                   if Status_Line'Length < 10
                     or else Status_Line
@@ -261,7 +384,17 @@ package body Convex is
                      raise AWS.Net.Socket_Error
                        with "HTTP response status was not successful";
                   end if;
-                  if Length_Text'Length > 0 then
+                  if Length_Text'Length > 0 and then Transfer_Text'Length > 0
+                  then
+                     raise Constraint_Error
+                       with "HTTP response mixed length and transfer encoding";
+                  elsif Transfer_Text'Length > 0 then
+                     if Transfer_Text /= "chunked" then
+                        raise Constraint_Error
+                          with "unsupported HTTP transfer encoding";
+                     end if;
+                     Chunked := True;
+                  elsif Length_Text'Length > 0 then
                      Body_Length := Natural'Value (Length_Text);
                      if Body_Length > Max_Response_Bytes then
                         raise Response_Too_Large
@@ -275,8 +408,25 @@ package body Convex is
             end if;
             exit when
               Header_Done
-              and then Has_Length
-              and then Text'Length - Body_Start + 1 >= Body_Length;
+              and then (if Chunked
+                        then Chunks_Complete (Text)
+                        elsif Has_Length
+                        then Text'Length - Body_Start + 1 >= Body_Length
+                        else Peer_Closed);
+            if Peer_Closed then
+               if not Header_Done then
+                  raise AWS.Net.Socket_Error
+                    with "HTTP response omitted headers";
+               elsif Chunked then
+                  raise AWS.Net.Socket_Error
+                    with "chunked HTTP response ended early";
+               elsif Has_Length then
+                  raise AWS.Net.Socket_Error
+                    with "HTTP response ended before Content-Length";
+               else
+                  exit;
+               end if;
+            end if;
          end;
       end loop;
       declare
@@ -289,17 +439,17 @@ package body Convex is
             raise AWS.Net.Socket_Error
               with "HTTP response ended before Content-Length";
          end if;
-         declare
-            Body_Last : constant Natural :=
-              (if Has_Length then Body_Start + Body_Length - 1 else Text'Last);
-         begin
-            if Body_Length = 0 then
-               Payload := US.Null_Unbounded_String;
-            elsif Body_Start <= Body_Last then
-               Payload :=
-                 US.To_Unbounded_String (Text (Body_Start .. Body_Last));
-            end if;
-         end;
+         if Chunked then
+            Payload := Decode_Chunks (Text);
+         elsif Has_Length and then Body_Length = 0 then
+            Payload := US.Null_Unbounded_String;
+         elsif Has_Length then
+            Payload :=
+              US.To_Unbounded_String
+                (Text (Body_Start .. Body_Start + Body_Length - 1));
+         elsif Body_Start <= Text'Last then
+            Payload := US.To_Unbounded_String (Text (Body_Start .. Text'Last));
+         end if;
       end;
       Close_Socket;
    exception

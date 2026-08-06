@@ -137,6 +137,27 @@ package body Convex_WebSocket is
       return Encode_Base64 (Bytes);
    end Encode_Timestamp;
 
+   function Decode_UInt32
+     (Value : GNATCOLL.JSON.JSON_Value; Result : out Interfaces.Unsigned_32)
+      return Boolean
+   is
+      Number : Long_Long_Integer;
+      use type GNATCOLL.JSON.JSON_Value_Type;
+   begin
+      Result := 0;
+      if Value.Kind /= GNATCOLL.JSON.JSON_Int_Type then
+         return False;
+      end if;
+      Number := Value.Get;
+      if Number < 0
+        or else Number > Long_Long_Integer (Interfaces.Unsigned_32'Last)
+      then
+         return False;
+      end if;
+      Result := Interfaces.Unsigned_32 (Number);
+      return True;
+   end Decode_UInt32;
+
    function Valid_UTF8 (Text : String) return Boolean is
       I             : Integer := Text'First;
       B, B2, B3, B4 : Natural;

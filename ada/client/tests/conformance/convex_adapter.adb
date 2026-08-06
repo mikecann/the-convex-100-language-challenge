@@ -214,7 +214,6 @@ procedure Convex_Adapter is
    Live_Manager  : Convex.Live.Manager;
    Subscriptions : Adapter_Sub_Array;
    Reader        : Reader_Access;
-   pragma Unreferenced (Reader);
    Finished      : Boolean := False;
 
    function Error_Object (Error : Convex.Error_Info) return JSON.JSON_Value is
@@ -403,7 +402,7 @@ procedure Convex_Adapter is
                   Event.Set_Field ("language", "ada");
                   Event.Set_Field
                     ("implementation", "native-aws-net-rfc6455-0.1.0");
-                  Event.Set_Field ("runtime", "GNAT 15.3.1");
+                  Event.Set_Field ("runtime", "GNAT 14.2.1");
                   Write_Line (JSON.Write (Event));
                end;
             elsif Op = "query" or else Op = "mutation" or else Op = "action"
@@ -629,6 +628,11 @@ begin
          end if;
       end;
    end loop;
+
+   --  A close command owns the adapter shutdown, so it must also retire the
+   --  input task.  Closing the controller socket from this task does not
+   --  reliably wake a reader blocked in recv on every runtime and kernel.
+   abort Reader.all;
 
    if not Finished then
       Convex.Live.Close (Live_Manager);
