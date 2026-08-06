@@ -167,7 +167,10 @@ proc ::httpfixture::readable {channel} {
     if {[string first "\r\n\r\n" [dict get $buffers $channel]] < 0} { return }
     set body [lindex $responses 0]
     set responses [lrange $responses 1 end]
-    set response "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: [string bytelength $body]\r\nConnection: close\r\n\r\n$body"
+    # Send the exact UTF-8 bytes advertised by Content-Length. This catches
+    # response parsers that only work for ASCII or discard nested/log subtrees.
+    set wire [encoding convertto utf-8 $body]
+    set response "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: [string bytelength $wire]\r\nConnection: close\r\n\r\n$wire"
     puts -nonewline $channel $response
     flush $channel
     fileevent $channel readable {}
@@ -182,12 +185,18 @@ proc ::httpfixture::stop {} {
 }
 set httpPort [::httpfixture::start [list \
     {{"status":"success","value":{"ok":true},"logLines":[]}} \
+    {{"status":"success","value":{"unicode":"Hello, 世界 👋","nested":{"booleans":[true,false],"number":42.5,"nil":null}},"logLines":["[LOG] 'demo:echo received a JSON-safe value'"]}} \
+    {{"status":"success","value":["Καλημέρα","مرحبا","kia ora","🟨🟩🟦"],"logLines":["utf8 response log 世界 👋"]}} \
     {{"status":"error","errorMessage":"fixture HTTP failure","errorData":{"code":"HTTP_FIXTURE"},"logLines":["fixture HTTP log"]}} \
     "\{malformed"]]
 set ::env(CONVEX_URL) "http://127.0.0.1:$httpPort"
 set ::adapter::client ""
 set httpSuccess [adapter_command {{"id":"http-success","op":"query","path":"demo:state","args":{}}}]
 assert {$httpSuccess eq {{"id":"http-success","type":"result","value":{"ok":true}}}} "HTTP success envelope serialization changed"
+set httpNested [adapter_command {{"id":"http-nested","op":"query","path":"demo:echo","args":{"value":{}}}}]
+assert {$httpNested eq {{"id":"http-nested","type":"result","value":{"unicode":"Hello, 世界 👋","nested":{"booleans":[true,false],"number":42.5,"nil":null}},"logs":["[LOG] 'demo:echo received a JSON-safe value'"]}}} "nested HTTP value or logLines were not preserved"
+set httpUtf8 [adapter_command {{"id":"http-utf8","op":"query","path":"demo:echo","args":{"value":{}}}}]
+assert {$httpUtf8 eq {{"id":"http-utf8","type":"result","value":["Καλημέρα","مرحبا","kia ora","🟨🟩🟦"],"logs":["utf8 response log 世界 👋"]}}} "UTF-8 HTTP value or logs were not preserved"
 set httpFunction [adapter_command {{"id":"http-function","op":"query","path":"demo:state","args":{}}}]
 assert {$httpFunction eq {{"type":"error","id":"http-function","error":{"name":"FunctionError","message":"fixture HTTP failure","data":{"code":"HTTP_FIXTURE"}},"logs":["fixture HTTP log"]}}} "HTTP FunctionError envelope serialization changed"
 set httpProtocol [adapter_command {{"id":"http-protocol","op":"query","path":"demo:state","args":{}}}]

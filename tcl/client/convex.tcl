@@ -227,16 +227,31 @@ proc ::convex::http_call {id operation path argsRaw} {
     try {
         set raw [::http::data $token]
         if {[string bytelength $raw] > $maximumResponseBytes} { throw TransportError "response exceeds byte limit" }
-        if {[catch {set bodyDict [decode $raw]} problem]} { throw ProtocolError "invalid HTTP JSON: $problem" }
-        if {![dict exists $bodyDict status]} { throw ProtocolError "HTTP response omitted status" }
-        set status [dict get $bodyDict status]
+        # Keep the envelope classifier on raw JSON subtrees. Decoding the
+        # complete response into Tcl's deliberately untyped dict representation
+        # lets nested values and log strings participate in list parsing before
+        # the required status field is checked. The field scanner validates the
+        # envelope shape while leaving value, errorData, and logLines exact.
+        if {[catch {set statusRaw [field $raw status 0]} problem] || $statusRaw eq ""} {
+            throw ProtocolError "HTTP response omitted status"
+        }
+        if {[catch {set status [json_string $statusRaw "HTTP response status"]} problem]} {
+            throw ProtocolError $problem
+        }
         if {$status eq "success"} {
             set logsRaw [field $raw logLines 0]
             if {$logsRaw eq ""} { set logsRaw "\[\]" }
             return [dict create value [field $raw value] logs $logsRaw]
         }
         if {$status eq "error"} {
-            set message [expr {[dict exists $bodyDict errorMessage] ? [dict get $bodyDict errorMessage] : "Convex function failed"}]
+            set messageRaw [field $raw errorMessage 0]
+            if {$messageRaw eq ""} {
+                set message "Convex function failed"
+            } else {
+                if {[catch {set message [json_string $messageRaw "HTTP errorMessage"]} problem]} {
+                    throw ProtocolError $problem
+                }
+            }
             set data [field $raw errorData 0]
             set logs [field $raw logLines 0]
             if {$data eq ""} { set data null }
