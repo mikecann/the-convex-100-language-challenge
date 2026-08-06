@@ -67,11 +67,13 @@ private void expectEvent(Socket peer, ref ubyte[] pending, uint expectedSequence
 
 private void expect(Socket peer, ref ubyte[] pending, string expected)
 {
-    enforce(readLine(peer, pending) == expected);
+    auto actual = readLine(peer, pending);
+    enforce(actual == expected, "expected " ~ expected ~ ", got " ~ actual);
 }
 
 void main()
 {
+    waitForFile("/tmp/d-live-server-ready");
     auto peer = new TcpSocket();
     peer.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVBUF, 4_096);
     scope (exit)
@@ -103,6 +105,5 @@ void main()
         expectEvent(peer, pending, sequence, 'x', 1_750_000);
 
     sendAll(peer, cast(const(ubyte)[])(`{"id":"close","op":"close"}` ~ "\n"));
-    write("/tmp/d-live-finish", "ready");
     expect(peer, pending, `{"id":"close","type":"closed"}`);
 }

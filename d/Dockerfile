@@ -27,6 +27,7 @@ RUN set -eu; \
       "$formatter" "$source" > /tmp/formatted.d; \
       cmp -s "$source" /tmp/formatted.d || { echo "dfmt check failed: $source" >&2; exit 1; }; \
     done; \
+    sh -n client/tests/final_adapter_isolated_probe.sh; \
     ldc2 -wi -w -d-version=ConvexAdapter -of=/out-client-test -Iclient -unittest client/convex.d client/tests/client_test.d client/tests/transport_test.d client/tests/live_test.d -L-lcurl -L-lcrypto \
     && /out-client-test \
     && ldc2 -wi -w -d-version=ConvexAdapter -d-version=AdapterUnitTest -unittest -of=/out-adapter-test -Iclient client/convex.d client/tests/conformance/main.d -L-lcurl -L-lcrypto \

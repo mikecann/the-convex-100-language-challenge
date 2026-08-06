@@ -14,6 +14,7 @@ import std.stdio : stderr;
 import std.string : indexOf, splitLines, startsWith, strip;
 
 enum port = 18155;
+enum serverReadyGate = "/tmp/d-live-server-ready";
 enum smallValueBytes = 128 * 1024;
 enum nearMaximumValueBytes = 1_750_000;
 enum countLastSequence = 18;
@@ -28,7 +29,6 @@ enum byteStartGate = "/tmp/d-live-byte-start";
 enum byteFirstSent = "/tmp/d-live-byte-first-sent";
 enum byteBurstGate = "/tmp/d-live-byte-burst";
 enum byteDone = "/tmp/d-live-byte-done";
-enum finishGate = "/tmp/d-live-finish";
 
 private void sendAll(Socket peer, const(ubyte)[] bytes)
 {
@@ -174,7 +174,7 @@ private void waitForGate(string path)
     timer.start();
     while (!exists(path))
     {
-        assert(timer.peek.total!"msecs" < 5_000);
+        assert(timer.peek.total!"msecs" < 5_000, "fixture gate timed out: " ~ path);
         Thread.sleep(5.msecs);
     }
 }
@@ -191,6 +191,7 @@ void main()
         listener.close();
     listener.bind(new InternetAddress("127.0.0.1", port));
     listener.listen(1);
+    mark(serverReadyGate);
     auto peer = listener.accept();
     scope (exit)
         peer.close();
@@ -238,9 +239,9 @@ void main()
     }
     mark(byteDone);
 
-    waitForGate(finishGate);
     /* The controller's close command shuts down the shared Live client, so
      * final transport cleanup is an RFC6455 Close instead of query removal. */
     assert(receiveClientControl(peer, 8).length == 0);
+    sendControl(peer, 8, "");
     stderr.writefln("sent count and encoded-byte retention bursts through Live");
 }

@@ -142,6 +142,14 @@ unittest
 
 `./run test d` compiles the checked-in client, adapter, and exact example, then runs HTTP and real-WebSocket D tests inside pinned `linux/amd64` Docker. `./run build d` produces the restricted final adapter image and audits its runtime policy. The root-owned `verify-example`, `verify`, and `verify-hosted` gates remain the only way to award HTTP or Live capability badges.
 
+For the final adapter's stopped-reader and memory proof, run this committed host-side orchestration from the repository root:
+
+```sh
+./d/client/tests/final_adapter_isolated_probe.sh
+```
+
+It builds the exact D `test` and `runtime` targets, runs the adapter alone with a fresh 128 MiB cgroup, and starts the real Live fixture and TCP controller in a larger sibling cgroup sharing only the adapter network namespace. The controller's small receive buffer and the adapter's bounded test-only send-buffer hook create physical backpressure. The probe asserts retained sequences `1, 3..18` and `101, 103..105`, exact close, and adapter-only cgroup-v2 `memory.peak < 96 MiB`. It cleans up only its own named containers and never mounts the Docker socket.
+
 ## Protocol notes
 
 The public client owns Convex's HTTP envelopes and the pinned `convex-rs-0.10.4-unversioned-sync` profile at `/api/sync`. Phobos and libcurl provide JSON, HTTP, TLS, and the WebSocket upgrade. A stateful D RFC6455 parser then enforces masking, opcodes, canonical lengths, fragmentation, control frames, UTF-8, and a 2 MiB message cap.
