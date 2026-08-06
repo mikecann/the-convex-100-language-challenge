@@ -257,7 +257,7 @@ adapter_live_output_reader = @async begin
         line = readline(adapter_live_output_pipe.out)
         write(adapter_live_output_text, line, '\n')
         occursin("\"type\":\"subscription\"", line) &&
-        put!(adapter_live_update_seen, nothing)
+            put!(adapter_live_update_seen, nothing)
     end
 end
 adapter_live_task =
