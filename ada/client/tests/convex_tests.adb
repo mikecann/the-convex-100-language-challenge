@@ -1,6 +1,7 @@
 with Ada.Streams;
 with Ada.Text_IO;
 with Convex_WebSocket;
+with Convex_URL;
 with GNATCOLL.JSON;
 with Interfaces;
 
@@ -18,6 +19,15 @@ procedure Convex_Tests is
    Value : Interfaces.Unsigned_64;
    U32   : Interfaces.Unsigned_32;
 begin
+   declare
+      URL : constant Convex_URL.Object :=
+        Convex_URL.Parse ("http://[::1]:8080/api");
+   begin
+      Check
+        (Convex_URL.Host_Header (URL) & Convex_URL.Port_Suffix (URL)
+         = "[::1]:8080",
+         "custom-port IPv6 Host header");
+   end;
    Check
      (Convex_WebSocket.Encode_Base64
         (Ada.Streams.Stream_Element_Array'

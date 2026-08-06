@@ -9,6 +9,7 @@ with Convex;
 with Convex.Live;
 with Convex.Live.Testing;
 with Convex_WebSocket;
+with Convex_Adapter_Output;
 with GNAT.Sockets;
 with GNATCOLL.JSON;
 
@@ -19,7 +20,7 @@ procedure Convex_Adapter is
    use type GNAT.Sockets.Socket_Type;
    use type Ada.Streams.Stream_Element_Offset;
 
-   Max_Line_Bytes   : constant := 2 * 1024 * 1024;
+   Max_Line_Bytes   : constant := Convex_Adapter_Output.Max_Line_Bytes;
    -- Keep controller input bounded independently of the 2 MiB line cap. The
    -- shared controller is request/response oriented, so eight pending commands
    -- leave useful burst tolerance without consuming the 128 MiB runtime limit.
@@ -65,47 +66,18 @@ procedure Convex_Adapter is
    Listener   : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
    Controller : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
 
-   procedure Socket_Write (Text : String) is
-      Data   : Ada.Streams.Stream_Element_Array (1 .. 16 * 1024);
-      Last   : Ada.Streams.Stream_Element_Offset;
-      Cursor : Natural := 0;
-   begin
-      while Cursor < Text'Length loop
-         declare
-            Length : constant Natural :=
-              Natural'Min (Data'Length, Text'Length - Cursor);
-            Sent   : Natural := 0;
-         begin
-            for Offset in 0 .. Length - 1 loop
-               Data (Ada.Streams.Stream_Element_Offset (Offset + 1)) :=
-                 Ada.Streams.Stream_Element
-                   (Character'Pos (Text (Text'First + Cursor + Offset)));
-            end loop;
-            while Sent < Length loop
-               GNAT.Sockets.Send_Socket
-                 (Controller,
-                  Data
-                    (Ada.Streams.Stream_Element_Offset (Sent + 1)
-                     .. Ada.Streams.Stream_Element_Offset (Length)),
-                  Last);
-               if Last < Ada.Streams.Stream_Element_Offset (Sent + 1) then
-                  raise GNAT.Sockets.Socket_Error
-                    with "adapter TCP peer closed";
-               end if;
-               Sent := Natural (Last);
-            end loop;
-            Cursor := Cursor + Length;
-         end;
-      end loop;
-   end Socket_Write;
+   Output_Backpressure : exception;
 
-   procedure Write_Line (Line : String) is
+   procedure Write_Line
+     (Line : String; Subscription_Id : String := ""; Generation : Natural := 0)
+   is
+      Accepted : Boolean;
    begin
-      if Use_TCP then
-         Socket_Write (Line & ASCII.LF);
-      else
-         Ada.Text_IO.Put_Line (Line);
-         Ada.Text_IO.Flush;
+      Convex_Adapter_Output.Try_Emit
+        (Line, Accepted, Subscription_Id, Generation);
+      if not Accepted then
+         raise Output_Backpressure
+           with "adapter output count or byte budget exhausted";
       end if;
    end Write_Line;
 
@@ -204,17 +176,34 @@ procedure Convex_Adapter is
    end Reader_Task;
 
    type Adapter_Sub is record
-      Active : Boolean := False;
-      Name   : US.Unbounded_String;
-      Value  : Convex.Live.Subscription;
+      Active           : Boolean := False;
+      Name             : US.Unbounded_String;
+      Relay_Generation : Natural := 0;
+      Value            : Convex.Live.Subscription;
    end record;
    type Adapter_Sub_Array is array (Positive range 1 .. 64) of Adapter_Sub;
 
-   Client        : Convex.Client;
-   Live_Manager  : Convex.Live.Manager;
-   Subscriptions : Adapter_Sub_Array;
-   Reader        : Reader_Access;
-   Finished      : Boolean := False;
+   Client                : Convex.Client;
+   Live_Manager          : Convex.Live.Manager;
+   Subscriptions         : Adapter_Sub_Array;
+   Reader                : Reader_Access;
+   Finished              : Boolean := False;
+   Next_Relay_Generation : Natural := 1;
+
+   procedure Retire_Subscription (Slot : Positive) is
+      Success : Boolean;
+   begin
+      Convex.Live.Unsubscribe (Live_Manager, Subscriptions (Slot).Value);
+      Subscriptions (Slot).Active := False;
+      Convex_Adapter_Output.Retire
+        (US.To_String (Subscriptions (Slot).Name),
+         Subscriptions (Slot).Relay_Generation,
+         Success);
+      if not Success then
+         raise Output_Backpressure
+           with "adapter output retirement exceeded its deadline";
+      end if;
+   end Retire_Subscription;
 
    function Error_Object (Error : Convex.Error_Info) return JSON.JSON_Value is
       Result : constant JSON.JSON_Value := JSON.Create_Object;
@@ -449,9 +438,7 @@ procedure Convex_Adapter is
                   Sub      : Convex.Live.Subscription;
                begin
                   if Existing > 0 then
-                     Convex.Live.Unsubscribe
-                       (Live_Manager, Subscriptions (Existing).Value);
-                     Subscriptions (Existing).Active := False;
+                     Retire_Subscription (Existing);
                   end if;
                   Slot := Free_Sub;
                   if Slot = 0 then
@@ -470,9 +457,11 @@ procedure Convex_Adapter is
                      return;
                   end if;
                   Subscriptions (Slot) :=
-                    (Active => True,
-                     Name   => US.To_Unbounded_String (Name),
-                     Value  => Sub);
+                    (Active           => True,
+                     Name             => US.To_Unbounded_String (Name),
+                     Relay_Generation => Next_Relay_Generation,
+                     Value            => Sub);
+                  Next_Relay_Generation := Next_Relay_Generation + 1;
                   Ack (Id);
                end;
             elsif Op = "unsubscribe" then
@@ -483,9 +472,7 @@ procedure Convex_Adapter is
                   Slot : constant Natural := Find_Sub (Name);
                begin
                   if Slot > 0 then
-                     Convex.Live.Unsubscribe
-                       (Live_Manager, Subscriptions (Slot).Value);
-                     Subscriptions (Slot).Active := False;
+                     Retire_Subscription (Slot);
                   end if;
                   Ack (Id);
                end;
@@ -508,6 +495,18 @@ procedure Convex_Adapter is
                for Sub of Subscriptions loop
                   if Sub.Active then
                      Convex.Live.Unsubscribe (Live_Manager, Sub.Value);
+                     declare
+                        Retired : Boolean;
+                     begin
+                        Convex_Adapter_Output.Retire
+                          (US.To_String (Sub.Name),
+                           Sub.Relay_Generation,
+                           Retired);
+                        if not Retired then
+                           raise Output_Backpressure
+                             with "adapter close output retirement timed out";
+                        end if;
+                     end;
                   end if;
                   Sub.Active := False;
                end loop;
@@ -520,6 +519,22 @@ procedure Convex_Adapter is
                   Event.Set_Field ("type", "closed");
                   Write_Line (JSON.Write (Event));
                end;
+               declare
+                  Drained : Boolean;
+               begin
+                  Convex_Adapter_Output.Wait_Idle (Drained);
+                  if not Drained then
+                     raise Output_Backpressure
+                       with "adapter close output did not drain";
+                  end if;
+                  if Use_TCP then
+                     --  Order the final closed line before FIN. A full close
+                     --  immediately after the writer releases its reservation
+                     --  can otherwise race the controller's final read.
+                     GNAT.Sockets.Shutdown_Socket
+                       (Controller, GNAT.Sockets.Shut_Write);
+                  end if;
+               end;
                Finished := True;
             else
                Emit_Error (Id, "unknown adapter operation " & Op);
@@ -527,6 +542,8 @@ procedure Convex_Adapter is
          end;
       end;
    exception
+      when Output_Backpressure =>
+         raise;
       when E : others =>
          Emit_Error
            (US.To_String (Command_Id), Ada.Exceptions.Exception_Message (E));
@@ -559,7 +576,10 @@ procedure Convex_Adapter is
                            Event.Set_Field ("logs", Item.Error.Logs);
                         end if;
                      end if;
-                     Write_Line (JSON.Write (Event));
+                     Write_Line
+                       (JSON.Write (Event),
+                        US.To_String (Subscriptions (I).Name),
+                        Subscriptions (I).Relay_Generation);
                      Convex.Live.Release (Live_Manager, Item);
                      return;
                   exception
@@ -593,6 +613,16 @@ procedure Convex_Adapter is
       GNAT.Sockets.Bind_Socket (Listener, Address);
       GNAT.Sockets.Listen_Socket (Listener, 1);
       GNAT.Sockets.Accept_Socket (Listener, Controller, Address);
+      --  A small kernel send buffer makes a stopped controller observable
+      --  before application output can hide in multi-megabyte socket buffers.
+      GNAT.Sockets.Set_Socket_Option
+        (Controller,
+         GNAT.Sockets.Socket_Level,
+         (Name => GNAT.Sockets.Send_Buffer, Size => 64 * 1024));
+      GNAT.Sockets.Set_Socket_Option
+        (Controller,
+         GNAT.Sockets.Socket_Level,
+         (Name => GNAT.Sockets.Linger, Enabled => True, Seconds => 1));
       GNAT.Sockets.Close_Socket (Listener);
    end Setup_TCP;
 
@@ -606,6 +636,7 @@ begin
    if Use_TCP then
       Setup_TCP (Ada.Environment_Variables.Value ("ADAPTER_LISTEN"));
    end if;
+   Convex_Adapter_Output.Start (Use_TCP, Controller);
    Convex.Open (Client, Ada.Environment_Variables.Value ("CONVEX_URL"));
    Convex.Live.Open
      (Live_Manager, Ada.Environment_Variables.Value ("CONVEX_URL"));
@@ -613,9 +644,28 @@ begin
 
    while not Finished loop
       declare
-         Found : Boolean;
-         Line  : US.Unbounded_String;
+         Found              : Boolean;
+         Line               : US.Unbounded_String;
+         Output_Failed      : Boolean;
+         Output_Message     : US.Unbounded_String;
+         Output_Events      : Natural;
+         Output_Bytes       : Natural;
+         Peak_Output_Events : Natural;
+         Peak_Output_Bytes  : Natural;
       begin
+         Convex_Adapter_Output.Status
+           (Output_Failed, Output_Message, Output_Events, Output_Bytes);
+         if Output_Failed then
+            Convex_Adapter_Output.Evidence
+              (Peak_Output_Events, Peak_Output_Bytes);
+            raise Output_Backpressure
+              with
+                US.To_String (Output_Message)
+                & " peakEvents="
+                & Natural'Image (Peak_Output_Events)
+                & " peakBytes="
+                & Natural'Image (Peak_Output_Bytes);
+         end if;
          Commands.Try_Pop (Found, Line);
          if Found then
             if US.To_String (Line) = "!eof" then
@@ -638,6 +688,7 @@ begin
       Convex.Live.Close (Live_Manager);
       Convex.Close (Client);
    end if;
+   Convex_Adapter_Output.Stop;
    if Use_TCP and then Controller /= GNAT.Sockets.No_Socket then
       GNAT.Sockets.Close_Socket (Controller);
    end if;
@@ -658,6 +709,7 @@ exception
          when others =>
             null;
       end;
+      Convex_Adapter_Output.Stop;
       if Use_TCP and then Controller /= GNAT.Sockets.No_Socket then
          GNAT.Sockets.Close_Socket (Controller);
       end if;

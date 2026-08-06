@@ -722,6 +722,165 @@ procedure Convex_Socket_Tests is
          raise;
    end Run_HTTP;
 
+   task type HTTP_Edge_Server is
+      entry Start (Listener : GNAT.Sockets.Socket_Type);
+      entry Finish (Success : out Boolean; Message : out US.Unbounded_String);
+   end HTTP_Edge_Server;
+
+   task body HTTP_Edge_Server is
+      Listen  : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Peer    : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Passed  : Boolean := False;
+      Error   : US.Unbounded_String;
+      Address : GNAT.Sockets.Sock_Addr_Type;
+   begin
+      accept Start (Listener : GNAT.Sockets.Socket_Type) do
+         Listen := Listener;
+      end Start;
+      begin
+         for Step in 1 .. 4 loop
+            GNAT.Sockets.Accept_Socket (Listen, Peer, Address);
+            declare
+               Request : constant String := Read_HTTP_Request (Peer);
+               pragma Unreferenced (Request);
+            begin
+               case Step is
+                  when 1 .. 3 =>
+                     Send_All
+                       (Peer,
+                        (case Step is
+                           when 1      => "HTTP/1.1 2000 OK",
+                           when 2      => "HTTP/1.1 20 OK",
+                           when 3      => "HTTP/1.1 2A0 OK",
+                           when others => raise Program_Error)
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "Content-Length: 0"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "Connection: close"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & ASCII.CR
+                        & ASCII.LF);
+
+                  when 4      =>
+                     declare
+                        Response_Text : constant String :=
+                          "{""status"":""success"",""value"":9}";
+                        Part          : constant Natural :=
+                          Response_Text'Length / 6;
+                        First         : Natural := Response_Text'First;
+                     begin
+                        Send_All
+                          (Peer,
+                           "HTTP/1.1 200 OK"
+                           & ASCII.CR
+                           & ASCII.LF
+                           & "Content-Length: "
+                           & Image (Response_Text'Length)
+                           & ASCII.CR
+                           & ASCII.LF
+                           & "Connection: close"
+                           & ASCII.CR
+                           & ASCII.LF
+                           & ASCII.CR
+                           & ASCII.LF);
+                        --  Every partial read arrives well inside five seconds,
+                        --  but the full response exceeds one five-second
+                        --  operation deadline. An inactivity timeout would
+                        --  incorrectly permit this response forever.
+                        begin
+                           for Piece in 1 .. 6 loop
+                              declare
+                                 Last : constant Natural :=
+                                   (if Piece = 6
+                                    then Response_Text'Last
+                                    else First + Part - 1);
+                              begin
+                                 Send_All
+                                   (Peer, Response_Text (First .. Last));
+                                 First := Last + 1;
+                                 if Piece < 6 then
+                                    delay 1.1;
+                                 end if;
+                              end;
+                           end loop;
+                        exception
+                           when GNAT.Sockets.Socket_Error =>
+                              null;
+                        end;
+                     end;
+               end case;
+            end;
+            Close_Quietly (Peer);
+         end loop;
+         Passed := True;
+      exception
+         when E : others =>
+            Error :=
+              US.To_Unbounded_String
+                (Ada.Exceptions.Exception_Information (E));
+      end;
+      Close_Quietly (Peer);
+      Close_Quietly (Listen);
+      accept Finish
+        (Success : out Boolean; Message : out US.Unbounded_String)
+      do
+         Success := Passed;
+         Message := Error;
+      end Finish;
+   end HTTP_Edge_Server;
+
+   procedure Run_HTTP_Edges is
+      Listener : GNAT.Sockets.Socket_Type;
+      Port     : GNAT.Sockets.Port_Type;
+      Server   : HTTP_Edge_Server;
+      Client   : Convex.Client;
+      Args     : constant JSON.JSON_Value := JSON.Create_Object;
+      Success  : Boolean;
+      Message  : US.Unbounded_String;
+      Started  : Ada.Real_Time.Time;
+      Elapsed  : Duration;
+   begin
+      Open_Listener (Listener, Port);
+      Server.Start (Listener);
+      Convex.Open (Client, URL (Port));
+      for Attempt in 1 .. 3 loop
+         declare
+            Result : constant Convex.Call_Result :=
+              Convex.Query (Client, "messages:status", Args);
+         begin
+            Check
+              (not Result.Success
+               and then Result.Error.Kind = Convex.Protocol_Error,
+               "malformed HTTP status syntax was accepted");
+         end;
+      end loop;
+      Started := Ada.Real_Time.Clock;
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:slow", Args);
+      begin
+         Elapsed := Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - Started);
+         Check
+           (not Result.Success
+            and then Result.Error.Kind = Convex.Transport_Error,
+            "slow-drip HTTP response did not hit the absolute deadline");
+         Check
+           (Elapsed >= 4.5 and then Elapsed < 5.8,
+            "HTTP response deadline was not one five-second operation budget");
+      end;
+      Convex.Close (Client);
+      Server.Finish (Success, Message);
+      Check (Success, "HTTP edge fixture failed: " & US.To_String (Message));
+   exception
+      when others =>
+         Convex.Close (Client);
+         abort Server;
+         raise;
+   end Run_HTTP_Edges;
+
    type Transport_Scenario is
      (Valid_Text,
       Fragmented_UTF8,
@@ -1248,6 +1407,124 @@ procedure Convex_Socket_Tests is
       end Finish;
    end Reconnect_Server;
 
+   type Reconnect_Failure is
+     (Peer_Close_Failure, Protocol_Failure, Transport_Failure);
+
+   task type Failure_Reconnect_Server is
+      entry Start
+        (Listener : GNAT.Sockets.Socket_Type; Mode : Reconnect_Failure);
+      entry Finish (Success : out Boolean; Message : out US.Unbounded_String);
+   end Failure_Reconnect_Server;
+
+   task body Failure_Reconnect_Server is
+      Listen : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Peer   : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Kind   : Reconnect_Failure := Peer_Close_Failure;
+      Passed : Boolean := False;
+      Error  : US.Unbounded_String;
+   begin
+      accept Start
+        (Listener : GNAT.Sockets.Socket_Type; Mode : Reconnect_Failure)
+      do
+         Listen := Listener;
+         Kind := Mode;
+      end Start;
+      begin
+         Upgrade (Listen, Peer);
+         declare
+            Connect : constant JSON.JSON_Value :=
+              Read_Object (Read_Client_Text (Peer));
+         begin
+            Check
+              (String_Field (Connect, "type") = "Connect"
+               and then Integer_Field (Connect, "connectionCount") = 0,
+               "failure reconnect fixture expected initial Connect");
+         end;
+         Validate_Add (Read_Client_Text (Peer));
+         Send_Frame
+           (Peer, 16#81#, Updated_Transition (0, 1, Initial_TS, One_TS, 0));
+         case Kind is
+            when Peer_Close_Failure =>
+               Send_Frame (Peer, 16#88#, Byte (3) & Byte (232) & "peer-close");
+               Wait_For_Close (Peer);
+               Close_Quietly (Peer);
+
+            when Protocol_Failure   =>
+               Send_All
+                 (Peer,
+                  Byte (16#81#)
+                  & Byte (16#80#)
+                  & Byte (0)
+                  & Byte (0)
+                  & Byte (0)
+                  & Byte (0));
+               Wait_For_Close (Peer);
+               Close_Quietly (Peer);
+
+            when Transport_Failure  =>
+               GNAT.Sockets.Set_Socket_Option
+                 (Peer,
+                  GNAT.Sockets.Socket_Level,
+                  (Name    => GNAT.Sockets.Linger,
+                   Enabled => True,
+                   Seconds => 0));
+               Close_Quietly (Peer);
+         end case;
+
+         Upgrade (Listen, Peer);
+         declare
+            Connect : constant JSON.JSON_Value :=
+              Read_Object (Read_Client_Text (Peer));
+            Reason  : constant String :=
+              String_Field (Connect, "lastCloseReason");
+         begin
+            Check
+              (String_Field (Connect, "type") = "Connect",
+               "failure reconnect fixture expected second Connect");
+            Check
+              (Integer_Field (Connect, "connectionCount") = 1,
+               "non-debug failure left connectionCount stale");
+            Check
+              (String_Field (Connect, "maxObservedTimestamp") = One_TS,
+               "failure reconnect lost maxObservedTimestamp");
+            case Kind is
+               when Peer_Close_Failure =>
+                  Check
+                    (Reason = "peer-close",
+                     "peer-close reconnect lost lastCloseReason");
+
+               when Protocol_Failure   =>
+                  Check
+                    (Ada.Strings.Fixed.Index (Reason, "protocol: ") = 1,
+                     "protocol reconnect lost lastCloseReason");
+
+               when Transport_Failure  =>
+                  Check
+                    (Reason'Length > 0 and then Reason /= "InitialConnect",
+                     "transport reconnect lost lastCloseReason");
+            end case;
+         end;
+         Validate_Add (Read_Client_Text (Peer));
+         Send_Frame
+           (Peer, 16#81#, Updated_Transition (0, 1, Initial_TS, Two_TS, 1));
+         Validate_Remove (Read_Client_Text (Peer));
+         Passed := True;
+      exception
+         when E : others =>
+            Error :=
+              US.To_Unbounded_String
+                (Ada.Exceptions.Exception_Information (E));
+      end;
+      Close_Quietly (Peer);
+      Close_Quietly (Listen);
+      accept Finish
+        (Success : out Boolean; Message : out US.Unbounded_String)
+      do
+         Success := Passed;
+         Message := Error;
+      end Finish;
+   end Failure_Reconnect_Server;
+
    task type Backpressure_Server is
       entry Start (Listener : GNAT.Sockets.Socket_Type);
       entry Count_Ready;
@@ -1707,6 +1984,58 @@ procedure Convex_Socket_Tests is
          raise;
    end Run_Reconnects;
 
+   procedure Run_Failure_Reconnect (Mode : Reconnect_Failure) is
+      Listener : GNAT.Sockets.Socket_Type;
+      Port     : GNAT.Sockets.Port_Type;
+      Server   : Failure_Reconnect_Server;
+      Manager  : Convex.Live.Manager;
+      Sub      : Convex.Live.Subscription;
+      Args     : constant JSON.JSON_Value := JSON.Create_Object;
+      Item     : Convex.Live.Update;
+      Success  : Boolean;
+      Message  : US.Unbounded_String;
+   begin
+      Open_Listener (Listener, Port);
+      Server.Start (Listener, Mode);
+      Convex.Live.Open (Manager, URL (Port));
+      Convex.Live.Subscribe
+        (Manager, "messages:count", Args, Sub, Success, Message);
+      Check
+        (Success,
+         "failure reconnect subscribe failed: " & US.To_String (Message));
+
+      Wait_Update (Manager, Sub, Item);
+      Check_Integer_Update (Item, 0);
+      Convex.Live.Release (Manager, Item);
+
+      Wait_Update (Manager, Sub, Item, Timeout => 4.0);
+      Check
+        (Item.Has_Error and then not Item.Has_Value,
+         "non-debug failure did not publish a structured error");
+      Check
+        (Item.Error.Kind
+         = (if Mode = Protocol_Failure
+            then Convex.Protocol_Error
+            else Convex.Transport_Error),
+         "non-debug failure published the wrong error kind");
+      Convex.Live.Release (Manager, Item);
+
+      Wait_Update (Manager, Sub, Item, Timeout => 4.0);
+      Check_Integer_Update (Item, 1);
+      Convex.Live.Release (Manager, Item);
+      Convex.Live.Unsubscribe (Manager, Sub);
+      Convex.Live.Close (Manager);
+      Server.Finish (Success, Message);
+      Check
+        (Success,
+         "failure reconnect fixture failed: " & US.To_String (Message));
+   exception
+      when others =>
+         Convex.Live.Close (Manager);
+         abort Server;
+         raise;
+   end Run_Failure_Reconnect;
+
 begin
    Ada.Text_IO.Put_Line
      ("socket: fragmentation, malformed frames, and recovery");
@@ -1733,9 +2062,15 @@ begin
 
    Ada.Text_IO.Put_Line ("http: envelopes, auth lifecycle, logs, and errors");
    Run_HTTP;
+   Ada.Text_IO.Put_Line ("http: strict status and absolute response deadline");
+   Run_HTTP_Edges;
 
    Ada.Text_IO.Put_Line ("live: recovery, reconnects, and bounded lifecycle");
    Run_Live_Flow;
+   Ada.Text_IO.Put_Line ("live: peer, protocol, and transport reconnects");
+   for Mode in Reconnect_Failure loop
+      Run_Failure_Reconnect (Mode);
+   end loop;
    Ada.Text_IO.Put_Line ("live: five reconnects");
    Run_Reconnects;
    Ada.Text_IO.Put_Line ("live: count and byte backpressure");

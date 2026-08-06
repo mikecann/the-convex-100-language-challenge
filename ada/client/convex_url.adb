@@ -57,11 +57,11 @@ package body Convex_URL is
          if Host_Last < Host_First then
             raise Constraint_Error with "invalid IPv6 host";
          end if;
-         if Host_Last + 1 <= Authority_Last then
-            if Text (Host_Last + 1) /= ':' then
+         if Closing_Bracket < Authority_Last then
+            if Text (Closing_Bracket + 1) /= ':' then
                raise Constraint_Error with "invalid host and port";
             end if;
-            Port_First := Host_Last + 2;
+            Port_First := Closing_Bracket + 2;
          end if;
       else
          Host_First := Authority_First;
@@ -131,8 +131,6 @@ package body Convex_URL is
         or else (not Value.Is_Secure and then Value.Port_No = 80)
       then
          return "";
-      elsif Value.Is_IPv6 then
-         return "]:" & Port_Text;
       else
          return ":" & Port_Text;
       end if;

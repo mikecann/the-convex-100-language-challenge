@@ -1,4 +1,5 @@
 with Ada.Exceptions;
+with Ada.Real_Time;
 with Ada.Streams;
 with Ada.Strings.Fixed;
 with Ada.Characters.Handling;
@@ -9,6 +10,7 @@ with AWS.Net.SSL;
 package body Convex is
    use type JSON.JSON_Value_Type;
    use type Ada.Streams.Stream_Element_Offset;
+   use type Ada.Real_Time.Time;
    use type AWS.Net.Socket_Access;
 
    Max_Response_Bytes : constant := 2 * 1024 * 1024;
@@ -71,18 +73,19 @@ package body Convex is
       Auth    : String;
       Payload : out US.Unbounded_String)
    is
-      Parsed      : Convex_URL.Object;
-      Port        : Positive;
-      Secure      : Boolean;
-      Path        : US.Unbounded_String;
-      Socket      : AWS.Net.Socket_Access := null;
-      Raw         : US.Unbounded_String;
-      Body_Start  : Natural := 0;
-      Body_Length : Natural := 0;
-      Has_Length  : Boolean := False;
-      Chunked     : Boolean := False;
-      Header_Done : Boolean := False;
-      Peer_Closed : Boolean := False;
+      Parsed            : Convex_URL.Object;
+      Port              : Positive;
+      Secure            : Boolean;
+      Path              : US.Unbounded_String;
+      Socket            : AWS.Net.Socket_Access := null;
+      Raw               : US.Unbounded_String;
+      Body_Start        : Natural := 0;
+      Body_Length       : Natural := 0;
+      Has_Length        : Boolean := False;
+      Chunked           : Boolean := False;
+      Header_Done       : Boolean := False;
+      Peer_Closed       : Boolean := False;
+      Response_Deadline : Ada.Real_Time.Time;
 
       function Chunk_Size (Line : String) return Natural is
          Extension : constant Natural := Ada.Strings.Fixed.Index (Line, ";");
@@ -310,17 +313,25 @@ package body Convex is
          & ASCII.CR
          & ASCII.LF
          & Data);
+      --  Partial reads must not extend the operation forever. Every poll below
+      --  consumes the same absolute five-second response budget.
+      Response_Deadline :=
+        Ada.Real_Time.Clock + Ada.Real_Time.To_Time_Span (5.0);
       loop
          declare
             Events : AWS.Net.Event_Set := [others => False];
             Buffer : Ada.Streams.Stream_Element_Array (1 .. 16 * 1024);
             Last   : Ada.Streams.Stream_Element_Offset;
          begin
+            if Ada.Real_Time.Clock >= Response_Deadline then
+               raise AWS.Net.Socket_Error with "HTTP response timed out";
+            end if;
             Events :=
               AWS.Net.Poll
                 (Socket.all,
                  [AWS.Net.Input => True, AWS.Net.Output => False],
-                 5.0);
+                 Ada.Real_Time.To_Duration
+                   (Response_Deadline - Ada.Real_Time.Clock));
             if not Events (AWS.Net.Input) then
                raise AWS.Net.Socket_Error with "HTTP response timed out";
             end if;
@@ -375,12 +386,23 @@ package body Convex is
                          (Header_Value (Headers, "Transfer-Encoding"),
                           Ada.Strings.Both));
                begin
-                  if Status_Line'Length < 10
+                  if Status_Line'Length < 12
                     or else Status_Line
                               (Status_Line'First .. Status_Line'First + 8)
                             /= "HTTP/1.1 "
-                    or else Status_Line (Status_Line'First + 9) not in '2'
+                    or else Status_Line (Status_Line'First + 9)
+                            not in '0' .. '9'
+                    or else Status_Line (Status_Line'First + 10)
+                            not in '0' .. '9'
+                    or else Status_Line (Status_Line'First + 11)
+                            not in '0' .. '9'
+                    or else (Status_Line'Length > 12
+                             and then Status_Line (Status_Line'First + 12)
+                                      /= ' ')
                   then
+                     raise Constraint_Error
+                       with "invalid HTTP response status";
+                  elsif Status_Line (Status_Line'First + 9) /= '2' then
                      raise AWS.Net.Socket_Error
                        with "HTTP response status was not successful";
                   end if;

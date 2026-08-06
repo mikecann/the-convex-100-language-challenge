@@ -83,6 +83,7 @@ RUN mkdir -p obj \
       -cargs:Ada -O0 -fno-inline \
     && alr exec -- gprbuild -j1 -XGNATCOLL_BUILD_MODE=DEBUG -P convex_ada_subset.gpr -cargs:Ada -O0 -fno-inline
 RUN ./bin/convex_tests \
+    && ./bin/convex_adapter_output_tests \
     && if test -x ./bin/convex_socket_tests; then ./bin/convex_socket_tests; fi \
     && printf '%s\n' \
          '{"protocolVersion":1,"id":"hello","op":"hello"}' \

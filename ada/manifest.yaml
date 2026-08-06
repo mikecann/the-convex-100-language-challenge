@@ -28,7 +28,7 @@ adapter:
 limitations:
   - Live authentication, optimistic updates, WebSocket mutations, WebSocket actions, and TransitionChunk assembly are deferred.
   - The educational client supports Convex's JSON-safe value subset; tagged Convex value conversions are deferred.
-  - Active Live subscriptions are bounded to 64 and 8 MiB of conservatively charged paths and arguments. One manager-wide queue retains the newest 16 deliveries within a conservative 20 MiB encoded and runtime-overhead budget, including an in-flight adapter write.
+  - Active Live subscriptions are bounded to 64 and 8 MiB of conservatively charged paths and arguments. The manager queue and the adapter's single output-owner queue each retain at most 16 events within separate conservative 20 MiB encoded and runtime-overhead budgets, including each in-flight event. Adapter writes have one absolute three-second deadline and subscription retirement barriers are bounded.
   - HTTP responses are capped at 2 MiB and WebSocket messages at 4 MiB. Parsed response trees are capped at depth 128 and 65,536 structural nodes; adapter commands use depth 128, 8,192 structural nodes, and an eight-command input queue.
   - Capability badges are intentionally empty until shared local and hosted conformance pass.
 capabilities: []

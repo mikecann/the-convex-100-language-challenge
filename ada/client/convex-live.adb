@@ -180,6 +180,7 @@ package body Convex.Live is
       Max_Timestamp     : Interfaces.Unsigned_64 := 0;
       Has_Max_Timestamp : Boolean := False;
       Connection_Count  : Interfaces.Unsigned_32 := 0;
+      Connection_Active : Boolean := False;
       Last_Close_Reason : US.Unbounded_String :=
         US.To_Unbounded_String ("InitialConnect");
       Backoff           : Duration := 0.1;
@@ -347,16 +348,16 @@ package body Convex.Live is
       begin
          if Convex_WebSocket.Is_Open (Socket) then
             Convex_WebSocket.Shutdown (Socket);
-            if Connection_Count < Interfaces.Unsigned_32'Last then
-               Connection_Count := Connection_Count + 1;
-            end if;
-         elsif Count_Failed_Attempt then
-            -- A refused TCP connection or failed TLS/upgrade is still a
-            -- connection attempt and must be visible on the next Connect.
+         end if;
+         --  Poll closes the native socket before returning peer, protocol, or
+         --  transport failures. Track the logical successful connection so
+         --  those reconnects still advance connectionCount exactly once.
+         if Connection_Active or else Count_Failed_Attempt then
             if Connection_Count < Interfaces.Unsigned_32'Last then
                Connection_Count := Connection_Count + 1;
             end if;
          end if;
+         Connection_Active := False;
          Query_Set_Version := 0;
          Remote_Query_Set := 0;
          Remote_Identity := 0;
@@ -391,6 +392,7 @@ package body Convex.Live is
          Adds            : JSON.JSON_Array := JSON.Empty_Array;
       begin
          Convex_WebSocket.Open (Socket, US.To_String (URL));
+         Connection_Active := True;
          Connect_Message.Set_Field ("type", "Connect");
          Connect_Message.Set_Field ("sessionId", Session_Id);
          Connect_Message.Set_Field
@@ -886,6 +888,7 @@ package body Convex.Live is
                   if Connection_Count < Interfaces.Unsigned_32'Last then
                      Connection_Count := Connection_Count + 1;
                   end if;
+                  Connection_Active := False;
                   Query_Set_Version := 0;
                   Remote_Query_Set := 0;
                   Remote_Identity := 0;
@@ -907,6 +910,7 @@ package body Convex.Live is
             accept Stop do
                Stopping := True;
                Convex_WebSocket.Shutdown (Socket);
+               Connection_Active := False;
                Queue := [others => <>];
                Subs := [others => <>];
                Queue_Count := 0;

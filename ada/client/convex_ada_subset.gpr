@@ -25,6 +25,9 @@ project Convex_Ada_Subset is
    for Exec_Dir use "bin";
    for Main use
      ("convex_adapter.adb",
+      "convex_adapter_fixture.adb",
+      "convex_adapter_output_tests.adb",
+      "convex_adapter_stopped_reader.adb",
       "convex_example.adb",
       "convex_tests.adb",
       "convex_socket_tests.adb");
