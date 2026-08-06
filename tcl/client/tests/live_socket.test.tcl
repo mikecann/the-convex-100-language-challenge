@@ -145,11 +145,14 @@ namespace eval ::httpfixture {
     variable server ""
     variable responses {}
     variable buffers {}
+    variable lastRequestBody ""
 }
 proc ::httpfixture::start {items} {
     variable server
     variable responses
+    variable lastRequestBody
     set responses $items
+    set lastRequestBody ""
     set server [socket -server ::httpfixture::accept -myaddr 127.0.0.1 0]
     return [lindex [fconfigure $server -sockname] end]
 }
@@ -162,9 +165,20 @@ proc ::httpfixture::accept {channel host port} {
 proc ::httpfixture::readable {channel} {
     variable buffers
     variable responses
+    variable lastRequestBody
     append request [read $channel]
     dict append buffers $channel $request
-    if {[string first "\r\n\r\n" [dict get $buffers $channel]] < 0} { return }
+    set requestBytes [dict get $buffers $channel]
+    set headerEnd [string first "\r\n\r\n" $requestBytes]
+    if {$headerEnd < 0} { return }
+    set contentLength 0
+    regexp -nocase {\r\nContent-Length:[ \t]*([0-9]+)} [string range $requestBytes 0 $headerEnd] -> contentLength
+    set bodyStart [expr {$headerEnd + 4}]
+    if {[string bytelength $requestBytes] - $bodyStart < $contentLength} { return }
+    set wireBody [string range $requestBytes $bodyStart [expr {$bodyStart + $contentLength - 1}]]
+    if {[catch {set lastRequestBody [encoding convertfrom utf-8 $wireBody]} problem]} {
+        error "HTTP fixture received invalid UTF-8 request body: $problem"
+    }
     set body [lindex $responses 0]
     set responses [lrange $responses 1 end]
     # Send the exact UTF-8 bytes advertised by Content-Length. This catches
@@ -193,10 +207,14 @@ set ::env(CONVEX_URL) "http://127.0.0.1:$httpPort"
 set ::adapter::client ""
 set httpSuccess [adapter_command {{"id":"http-success","op":"query","path":"demo:state","args":{}}}]
 assert {$httpSuccess eq {{"id":"http-success","type":"result","value":{"ok":true}}}} "HTTP success envelope serialization changed"
-set httpNested [adapter_command {{"id":"http-nested","op":"query","path":"demo:echo","args":{"value":{}}}}]
+set httpNested [adapter_command {{"id":"http-nested","op":"query","path":"demo:echo","args":{"value":{"unicode":"Hello, 世界 👋","nested":{"booleans":[true,false],"number":42.5,"nil":null}}}}}]
 assert {$httpNested eq {{"id":"http-nested","type":"result","value":{"unicode":"Hello, 世界 👋","nested":{"booleans":[true,false],"number":42.5,"nil":null}},"logs":["[LOG] 'demo:echo received a JSON-safe value'"]}}} "nested HTTP value or logLines were not preserved"
-set httpUtf8 [adapter_command {{"id":"http-utf8","op":"query","path":"demo:echo","args":{"value":{}}}}]
+set nestedRequest [::convex::decode [::convex::field $::httpfixture::lastRequestBody args]]
+assert {[dict get [dict get $nestedRequest value] unicode] eq "Hello, 世界 👋"} "UTF-8 nested HTTP request was not preserved"
+set httpUtf8 [adapter_command {{"id":"http-utf8","op":"query","path":"demo:echo","args":{"value":["Καλημέρα","مرحبا","kia ora","🟨🟩🟦"]}}}]
 assert {$httpUtf8 eq {{"id":"http-utf8","type":"result","value":["Καλημέρα","مرحبا","kia ora","🟨🟩🟦"],"logs":["utf8 response log 世界 👋"]}}} "UTF-8 HTTP value or logs were not preserved"
+set utf8Request [::convex::decode [::convex::field $::httpfixture::lastRequestBody args]]
+assert {[lindex [dict get $utf8Request value] 3] eq "🟨🟩🟦"} "UTF-8 array HTTP request was not preserved"
 set httpFunction [adapter_command {{"id":"http-function","op":"query","path":"demo:state","args":{}}}]
 assert {$httpFunction eq {{"type":"error","id":"http-function","error":{"name":"FunctionError","message":"fixture HTTP failure","data":{"code":"HTTP_FIXTURE"}},"logs":["fixture HTTP log"]}}} "HTTP FunctionError envelope serialization changed"
 set httpProtocol [adapter_command {{"id":"http-protocol","op":"query","path":"demo:state","args":{}}}]

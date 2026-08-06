@@ -218,7 +218,11 @@ proc ::convex::http_call {id operation path argsRaw} {
     if {![regexp {^[ \t\r\n]*\{} $argsRaw]} { throw ProtocolError "Convex arguments must be a JSON object" }
     if {[catch {set parsedArgs [decode $argsRaw]} problem]} { throw ProtocolError "invalid Convex arguments: $problem" }
     if {[llength $parsedArgs] % 2} { throw ProtocolError "Convex arguments must be a JSON object" }
-    set body [object [list path [quote $path] args $argsRaw format [quote json]]]
+    # http::Write sends -query on a binary socket but computes its
+    # Content-Length with Tcl's string length. Convert the JSON envelope
+    # to UTF-8 bytes first, so character count and transmitted byte count
+    # remain identical for non-ASCII arguments.
+    set body [encoding convertto utf-8 [object [list path [quote $path] args $argsRaw format [quote json]]]]
     set headers [list Content-Type application/json Accept application/json Convex-Client [dict get $client version]]
     if {[dict get $client auth] ne ""} { lappend headers Authorization "Bearer [dict get $client auth]" }
     if {[catch {set token [::http::geturl "[dict get $client url]/api/$operation" -method POST -headers $headers -query $body -timeout 10000]} problem]} {
