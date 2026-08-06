@@ -238,12 +238,17 @@
   (thread relay-thread relay-thread-set!))
 
 (define-record-type <adapter-state>
-  (%make-adapter-state client client-lock publication-lock relays generations
-                       minimum-live-generation output closed? hello?)
+  (%make-adapter-state client client-lock publication-lock relay-dequeue-lock
+                       relays generations minimum-live-generation output
+                       closed? hello?)
   adapter-state?
   (client adapter-client adapter-client-set!)
   (client-lock adapter-client-lock)
   (publication-lock adapter-publication-lock)
+  ;; Only one relay may hold a dequeued manager value before it is charged to
+  ;; the encoded output queue. This closes the otherwise-unaccounted window in
+  ;; which 64 relay threads could each retain a near-maximum update.
+  (relay-dequeue-lock adapter-relay-dequeue-lock)
   (relays adapter-relays)
   (generations adapter-generations)
   (minimum-live-generation adapter-minimum-live-generation
@@ -255,6 +260,7 @@
 (define (make-adapter-state output)
   (%make-adapter-state #f (make-mutex 'adapter-client)
                        (make-mutex 'adapter-publication)
+                       (make-mutex 'adapter-relay-dequeue)
                        (make-hash-table string=? string-hash)
                        (make-hash-table string=? string-hash)
                        0 output #f #f))
@@ -325,26 +331,42 @@
                       "value" (update-value update))
                 (if (pair? logs) (list "logs" logs) '()))))))
 
+(cond-expand
+  (adapter-test-hooks
+   ;; Tests replace this private hook to stop a relay in the exact interval
+   ;; after dequeue and before the acknowledgement publication lock.
+   (define relay-after-dequeue-test-hook
+     (lambda (subscription-id record update) #f)))
+  (else
+   (define (relay-after-dequeue-test-hook subscription-id record update) #f)))
+
 (define (relay-loop state subscription-id record)
   (let loop ()
     (when (and (relay-active? record) (not (adapter-closed? state)))
-      (let ((update (subscription-next (relay-subscription record) 0.25)))
-        (when update
-          ;; The owner stamps this update before queueing it. Rechecking both
-          ;; generations under the publication lock closes replacement,
-          ;; unsubscribe, and debug-disconnect races after dequeue.
-          (call-with-publication-lock
-           state
-           (lambda ()
-             (when (and (relay-active? record)
-                        (= (relay-generation record)
-                           (hash-table-ref/default
-                            (adapter-generations state) subscription-id -1))
-                        (>= (update-generation update)
-                            (adapter-minimum-live-generation state)))
-               (output-publish! (adapter-output state)
-                                (relay-event subscription-id update)
-                                droppable?: #t))))))
+      (let ((dequeue-lock (adapter-relay-dequeue-lock state)))
+        (mutex-lock! dequeue-lock)
+        (handle-exceptions condition
+          (begin (mutex-unlock! dequeue-lock) (raise condition))
+          (let ((update (subscription-next (relay-subscription record) 0.05)))
+            (when update
+              (relay-after-dequeue-test-hook subscription-id record update)
+              ;; The owner stamps this update before queueing it. Rechecking
+              ;; both generations under the publication lock closes
+              ;; replacement, unsubscribe, and debug-disconnect races after
+              ;; dequeue.
+              (call-with-publication-lock
+               state
+               (lambda ()
+                 (when (and (relay-active? record)
+                            (= (relay-generation record)
+                               (hash-table-ref/default
+                                (adapter-generations state) subscription-id -1))
+                            (>= (update-generation update)
+                                (adapter-minimum-live-generation state)))
+                   (output-publish! (adapter-output state)
+                                    (relay-event subscription-id update)
+                                    droppable?: #t)))))
+            (mutex-unlock! dequeue-lock))))
       (loop))))
 
 (define (start-relay! state subscription-id record)
@@ -372,10 +394,55 @@
       (error 'adapter "subscriptionId must contain 1 to 128 characters"))
     id))
 
+(define (adapter-key-name key)
+  (if (symbol? key) (symbol->string key) key))
+
+(define (validate-command-shape! command operation)
+  (let-values (((allowed required)
+                (cond
+                  ((string=? operation "hello")
+                   (values '("protocolVersion" "id" "op")
+                           '("protocolVersion" "id" "op")))
+                  ((member operation '("query" "mutation" "action") string=?)
+                   (values '("id" "op" "path" "args")
+                           '("id" "op" "path" "args")))
+                  ((member operation '("subscribe" "unsubscribe") string=?)
+                   (values '("id" "op" "subscriptionId" "path" "args")
+                           '("id" "op" "subscriptionId")))
+                  ((string=? operation "setAuth")
+                   (values '("id" "op" "token") '("id" "op" "token")))
+                  ((member operation '("close" "debugDisconnect") string=?)
+                   (values '("id" "op") '("id" "op")))
+                  (else (error 'adapter "unknown adapter operation")))))
+    (let ((seen '()))
+      (for-each
+       (lambda (entry)
+         (let ((key (adapter-key-name (car entry))))
+           (unless (member key allowed string=?)
+             (error 'adapter "adapter command contains an unknown field" key))
+           (when (member key seen string=?)
+             (error 'adapter "adapter command contains a duplicate field" key))
+           (set! seen (cons key seen))))
+       (vector->list command)))
+    (for-each
+     (lambda (key)
+       (unless (json-has? command key)
+         (error 'adapter "adapter command is missing a required field" key)))
+     required)
+    (when (and (json-has? command "args")
+               (not (json-object? (json-get command "args"))))
+      (error 'adapter "args must be a JSON object"))
+    (when (and (json-has? command "path")
+               (not (string? (json-get command "path"))))
+      (error 'adapter "path must be a string"))
+    (when (and (member operation '("query" "mutation" "action") string=?)
+               (< (string-length (json-get command "path")) 3))
+      (error 'adapter "path must contain at least three characters"))))
+
 (define (run-call state command id operation)
   (let* ((client (ensure-adapter-client state))
          (path (json-get command "path" #f))
-         (args (json-get command "args" (json-object)))
+         (args (json-get command "args"))
          (result
            (cond
              ((string=? operation "query") (client-query client path args))
@@ -400,7 +467,9 @@
       (error 'adapter "hello must be the first adapter command"))
     (handle-exceptions condition
       (publish-response! state (error-event condition id: id))
-      (cond
+      (begin
+       (validate-command-shape! command operation)
+       (cond
         ((string=? operation "hello")
          (when (adapter-hello? state)
            (error 'adapter "hello may only be sent once"))
@@ -416,7 +485,7 @@
         ((member operation '("query" "mutation" "action") string=?)
          (run-call state command id operation))
         ((string=? operation "setAuth")
-         (let ((token (json-get command "token" "")))
+         (let ((token (json-get command "token")))
            (unless (string? token) (error 'adapter "token must be a string"))
            (client-set-auth! (ensure-adapter-client state) token)
            (publish-response! state (event "id" id "type" "ack"))))
@@ -465,7 +534,7 @@
         ((string=? operation "close")
          (adapter-closed-set! state #t)
          (publish-response! state (event "id" id "type" "closed")))
-        (else (error 'adapter "unknown adapter operation"))))))
+        (else (error 'adapter "unknown adapter operation")))))))
 
 (define (cleanup-adapter! state)
   (let ((records '()))

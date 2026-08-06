@@ -5,6 +5,7 @@
         (chicken port)
         (chicken string)
         (chicken tcp)
+        (chicken time)
         srfi-1
         srfi-13
         srfi-18
@@ -158,5 +159,43 @@
   (check #t "header injection rejected")
   (client-set-auth! client "bad\r\ntoken")
   (error 'http-test "header injection was accepted"))
+
+(handle-exceptions error
+  (check #t "client version header injection rejected")
+  (make-client "http://127.0.0.1" client-version: "bad\r\nversion")
+  (error 'http-test "client version header injection was accepted"))
+
+;; A peer that accepts TCP and never speaks TLS must not hold an HTTP call for
+;; openssl's 120-second default handshake deadline.
+(let* ((stall-listener (tcp-listen 0 1 "127.0.0.1"))
+       (stall-port (tcp-listener-port stall-listener))
+       (stall-server
+         (thread-start!
+          (make-thread
+           (lambda ()
+             (call-with-values
+               (lambda () (tcp-accept stall-listener))
+               (lambda (input output)
+                 (tcp-close stall-listener)
+                 (thread-sleep! 4.0)
+                 (tcp-abandon-port output))))
+           'http-tls-stall)))
+       (stall-client
+         (make-client
+          (string-append "https://127.0.0.1:"
+                         (number->string stall-port))))
+       (started (current-milliseconds)))
+  (handle-exceptions error
+    (begin
+      (check (convex-error? error) "TLS stall is a structured failure")
+      (check (string=? (convex-error-name error) "TransportError")
+             "TLS stall is a TransportError"))
+    (client-query stall-client "demo:state")
+    (error 'http-test "stalled TLS handshake unexpectedly succeeded"))
+  (check (< (- (current-milliseconds) started) 3500)
+         "HTTP TLS handshake deadline is bounded")
+  (client-close! stall-client)
+  (check (not (eq? (thread-join! stall-server 5.0 'timed-out) 'timed-out))
+         "TLS stall fixture terminates"))
 
 (print "http-test: " checks " checks")

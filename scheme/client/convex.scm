@@ -163,13 +163,61 @@
       (walk value 0)
       value))
 
+  ;; The json egg builds a complete value before returning it. Check the two
+  ;; structural budgets lexically first so hostile nesting cannot exhaust the
+  ;; 128 MiB runtime before validate-json-shape gets a value to inspect. This
+  ;; scanner deliberately understands strings and escapes, so brackets and
+  ;; commas inside JSON strings never affect the accounting.
+  (define (preflight-json-shape text)
+    (let ((length (string-length text)))
+      (let loop ((index 0) (depth 0) (nodes 1)
+                 (inside-string? #f) (escaped? #f))
+        (when (> depth +max-json-depth+)
+          (error 'json-decode "JSON exceeds nesting limit"))
+        (when (> nodes +max-json-nodes+)
+          (error 'json-decode "JSON exceeds structural node limit"))
+        (when (< index length)
+          (let ((character (string-ref text index)))
+            (cond
+              (inside-string?
+               (cond
+                 (escaped?
+                  (loop (+ index 1) depth nodes #t #f))
+                 ((char=? character #\\)
+                  (loop (+ index 1) depth nodes #t #t))
+                 ((char=? character #\")
+                  (loop (+ index 1) depth nodes #f #f))
+                 (else
+                  (loop (+ index 1) depth nodes #t #f))))
+              ((char=? character #\")
+               (loop (+ index 1) depth nodes #t #f))
+              ((or (char=? character #\{) (char=? character #\[))
+               (loop (+ index 1) (+ depth 1) (+ nodes 1) #f #f))
+              ((or (char=? character #\}) (char=? character #\]))
+               (loop (+ index 1) (max 0 (- depth 1)) nodes #f #f))
+              ((char=? character #\,)
+               ;; Each comma introduces at least one additional array item or
+               ;; object member, so it is a conservative pre-allocation bound.
+               (loop (+ index 1) depth (+ nodes 1) #f #f))
+              (else
+               (loop (+ index 1) depth nodes #f #f))))))))
+
   (define (json-decode text)
     (unless (string? text) (error 'json-decode "JSON input must be a string"))
     (when (> (string-length text) +max-json-bytes+)
       (error 'json-decode "JSON exceeds byte limit"))
     (unless (utf8-valid? text) (error 'json-decode "JSON is not valid UTF-8"))
-    (validate-json-shape
-     (call-with-input-string text (lambda (port) (json-read port)))))
+    (preflight-json-shape text)
+    (call-with-input-string
+     text
+     (lambda (port)
+       (let ((value (json-read port)))
+         (let trailing-loop ((character (read-char port)))
+           (cond
+             ((eof-object? character) (validate-json-shape value))
+             ((char-whitespace? character)
+              (trailing-loop (read-char port)))
+             (else (error 'json-decode "JSON has trailing data"))))))))
 
   (define-record-type <convex-error>
     (%make-convex-error name message data logs operation)
@@ -276,6 +324,9 @@
                        (auth-token "") (client-version "scheme-0.1.0"))
     (unless (and (string? auth-token) (safe-header-value? auth-token))
       (error 'make-client "auth token must be a newline-free string"))
+    (unless (and (safe-header-value? client-version)
+                 (> (string-length client-version) 0))
+      (error 'make-client "client version must be a non-empty newline-free string"))
     (%make-client (validate-deployment-url deployment-url)
                   client-version auth-token #f #f (make-mutex 'convex-client)))
 
@@ -363,7 +414,9 @@
                                     (max-retry-attempts 0)
                                     (tcp-connect-timeout 5000)
                                     (tcp-read-timeout 10000)
-                                    (tcp-write-timeout 5000))
+                                    (tcp-write-timeout 5000)
+                                    (ssl-handshake-timeout 2000)
+                                    (ssl-shutdown-timeout 500))
                        (call-with-input-request*
                         request body
                         (lambda (port response)
@@ -878,6 +931,18 @@
   (define (timeout-condition? condition)
     (and (condition? condition) ((condition-predicate 'timeout) condition)))
 
+  (define (condition-kind? condition kind)
+    (and (condition? condition) ((condition-predicate kind) condition)))
+
+  (define (transport-condition? condition)
+    (or (timeout-condition? condition)
+        (condition-kind? condition 'i/o)
+        ;; ws-client represents an EOF as websocket + exn. Its protocol
+        ;; failures instead carry the distinct fail component.
+        (and (condition-kind? condition 'websocket)
+             (condition-kind? condition 'exn)
+             (not (condition-kind? condition 'fail)))))
+
   (define (close-frame-valid? frame)
     (let* ((length (frame-payload-length frame))
            (data (frame-payload-data frame)))
@@ -932,12 +997,16 @@
 
       (define (disconnect-socket! #!optional (graceful #f))
         (when socket
-          (when graceful
-            (handle-exceptions condition #f (ws-close socket 'normal-closure)))
-          ;; ws-client's public close sends a close frame but intentionally
-          ;; leaves the TCP ports open. Our pinned language-local patch adds
-          ;; this hard retirement primitive so barriers are real.
-          (handle-exceptions condition #f (ws-disconnect! socket))
+          (parameterize ((ssl-shutdown-timeout 500)
+                         (tcp-write-timeout 500))
+            (when graceful
+              (handle-exceptions condition #f
+                (ws-close socket 'normal-closure)))
+            ;; ws-client's public close sends a close frame but intentionally
+            ;; leaves the TCP ports open. Our pinned language-local patch adds
+            ;; this hard retirement primitive so barriers are real, including
+            ;; when a TLS peer withholds close_notify.
+            (handle-exceptions condition #f (ws-disconnect! socket)))
           (set! socket #f)
           (live-generation-set! manager (+ (live-generation manager) 1))
           (live-connection-count-set!
@@ -952,6 +1021,29 @@
         (if (and reconnect? (pair? (sorted-active-subscriptions manager)))
             (schedule-reconnect! backoff)
             (set! next-connect-at #f)))
+
+      (define (publish-recoverable-error! name message)
+        (let ((generation (live-generation manager)))
+          (enqueue-updates-atomically!
+           manager
+           (map (lambda (subscription)
+                  (cons subscription
+                        (%make-update
+                         json-null '()
+                         (make-convex-error name message json-null '() "query")
+                         generation)))
+                (sorted-active-subscriptions manager)))))
+
+      (define (retire-with-condition! condition)
+        (let* ((message (condition-message condition))
+               (name (if (transport-condition? condition)
+                         "TransportError" "ProtocolError")))
+          ;; Publish before incrementing the transport generation. Consumers
+          ;; receive a typed failure and the still-active query is then
+          ;; rehydrated on a fresh connection.
+          (handle-exceptions publish-condition #f
+            (publish-recoverable-error! name message))
+          (retire! message #t)))
 
       (define (connect-message)
         (apply json-object
@@ -980,6 +1072,8 @@
               ((tcp-connect-timeout 2000)
                (tcp-read-timeout 1000)
                (tcp-write-timeout 1000)
+               (ssl-handshake-timeout 2000)
+               (ssl-shutdown-timeout 500)
                (ws-extra-headers
                 `((convex-client #(,(live-client-version manager) raw)))))
             (let ((candidate (ws-connect (live-url (live-deployment-url manager)))))
@@ -1056,7 +1150,9 @@
                   (send-modification! 'add subscription)
                   (unless (connect-now!)
                     (error 'process-subscribe-command!
-                           "Live WebSocket connection failed")))
+                           (string-append
+                            "Live WebSocket connection failed: "
+                            (live-last-close-reason manager)))))
               (complete-owner-response! response subscription)))))
 
       (define (process-unsubscribe-command! subscription response)
@@ -1239,6 +1335,8 @@
             ((connection-close)
              (unless (close-frame-valid? frame)
                (error 'process-frame! "invalid WebSocket close payload"))
+             (publish-recoverable-error!
+              "TransportError" "Live server closed the WebSocket")
              (retire! "ServerClosed" #t #t))
             ((binary)
              (error 'process-frame! "binary Live messages are unsupported"))
@@ -1272,9 +1370,15 @@
             (socket
              (if (ws-data-ready? socket)
                  (handle-exceptions condition
-                   (unless (timeout-condition? condition)
-                     (retire! (condition-message condition) #t))
-                   (process-frame! (recv-frame socket)))
+                   ;; ws-data-ready? guarantees that recv-frame consumed at
+                   ;; least one byte before a later read could time out. Any
+                   ;; failure therefore retires the connection. Restarting the
+                   ;; stateless parser on this socket could treat payload data
+                   ;; as a fresh RFC6455 header.
+                   (retire-with-condition! condition)
+                   (process-frame!
+                    (parameterize ((tcp-read-timeout 1000))
+                      (recv-frame socket))))
                  (thread-sleep! 0.01)))
             ((and (pair? (sorted-active-subscriptions manager))
                   (or (not next-connect-at)

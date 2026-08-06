@@ -182,8 +182,16 @@
 
 (define (timestamp number)
   (let ((raw (make-string 8 #\nul)))
-    (string-set! raw 0 (integer->char number))
+    (let loop ((index 0) (remaining number))
+      (when (< index 8)
+        (string-set! raw index (integer->char (modulo remaining 256)))
+        (loop (+ index 1) (quotient remaining 256))))
     (base64-encode raw)))
+
+(check (string=? (timestamp 255) "/wAAAAAAAAA=")
+       "timestamp 255 has canonical little-endian encoding")
+(check (string=? (timestamp 256) "AAEAAAAAAAA=")
+       "timestamp 256 carries into the next little-endian byte")
 
 (define zero-version
   (json-object "querySet" 0 "identity" 0 "ts" (timestamp 0)))
@@ -325,25 +333,42 @@
            (close-input-port input)
            (close-output-port output)))
 
-        ;; Recovery from the malformed frame. The controller then performs its
-        ;; remaining four explicit disconnect/reconnect cycles.
+        ;; Recovery from the malformed frame. Stall halfway through the next
+        ;; frame so the one owner must abandon the partial parser state and
+        ;; publish a TransportError rather than resuming at a false boundary.
         (call-with-values
          (lambda () (accept-live listener 4 8))
          (lambda (input output query-id)
-           (send-transition output 0 9 query-id (updated query-id 6))
+           (send-transition output 0 255 query-id (updated query-id 6))
+           (write-byte #x81 output)
+           (write-byte 10 output)
+           (write-u8vector #u8(123 34) output)
+           (flush-output output)
+           (thread-sleep! 1.3)
            (wait-for-disconnect input)
            (close-input-port input)
            (close-output-port output)))
 
-        (let reconnect-loop ((connection-count 5) (timestamp-number 10)
-                             (count 7))
+        ;; Automatic recovery from the stalled half-frame crosses the 255 ->
+        ;; 256 timestamp boundary. The controller then performs its remaining
+        ;; four explicit disconnect/reconnect cycles.
+        (call-with-values
+         (lambda () (accept-live listener 5 255))
+         (lambda (input output query-id)
+           (send-transition output 0 256 query-id (updated query-id 7))
+           (wait-for-disconnect input)
+           (close-input-port input)
+           (close-output-port output)))
+
+        (let reconnect-loop ((connection-count 6) (timestamp-number 257)
+                             (count 8))
           (call-with-values
            (lambda ()
              (accept-live listener connection-count (- timestamp-number 1)))
            (lambda (input output query-id)
              (send-transition output 0 timestamp-number query-id
                               (updated query-id count))
-             (if (< connection-count 8)
+             (if (< connection-count 9)
                  (begin
                    (wait-for-disconnect input)
                    (close-input-port input)
@@ -383,6 +408,14 @@
     (unless update (error 'live-test (string-append "timed out: " label)))
     update))
 
+(define (next-error expected-name label)
+  (let* ((update (next-update label))
+         (error (update-error update)))
+    (check (convex-error? error) (string-append label " is structured"))
+    (check (string=? (convex-error-name error) expected-name)
+           (string-append label " has expected name"))
+    update))
+
 (check (= (json-get (update-value (next-update "initial")) "count") 0)
        "initial Live value")
 (check (= (json-get (update-value (next-update "update")) "count") 1)
@@ -396,6 +429,7 @@
          "QueryFailed data"))
 (check (= (json-get (update-value (next-update "recovery")) "count") 2)
        "QueryFailed recovery")
+(next-error "ProtocolError" "malformed transaction")
 (let ((fragmented (next-update "fragmented UTF-8")))
   (check (= (json-get (update-value fragmented) "count") 3)
          "fragmented update")
@@ -407,12 +441,17 @@
 (client-debug-disconnect! client)
 (check (= (json-get (update-value (next-update "first debug reconnect")) "count") 4)
        "unchanged hydration suppressed")
+(next-error "ProtocolError" "invalid UTF-8")
 (check (= (json-get (update-value (next-update "invalid UTF-8 recovery")) "count") 5)
        "invalid UTF-8 recovery")
+(next-error "ProtocolError" "malformed frame")
 (check (= (json-get (update-value (next-update "malformed frame recovery")) "count") 6)
        "malformed frame recovery")
+(next-error "TransportError" "stalled half-frame")
+(check (= (json-get (update-value (next-update "half-frame recovery")) "count") 7)
+       "stalled half-frame recovery")
 
-(let debug-loop ((expected 7) (remaining 4))
+(let debug-loop ((expected 8) (remaining 4))
   (when (> remaining 0)
     (client-debug-disconnect! client)
     (check (= (json-get (update-value (next-update "debug reconnect")) "count")
@@ -432,5 +471,65 @@
 
 (let ((joined (thread-join! server 5 'timed-out)))
   (check (not (eq? joined 'timed-out)) "Live fixture terminated"))
+
+;; A TCP peer that never completes TLS must not monopolise the one Live owner
+;; for openssl's 120-second default. Close is queued behind the handshake, so
+;; this also proves the public lifecycle remains bounded while connecting.
+(let* ((stall-listener (tcp-listen 0 1 "127.0.0.1"))
+       (stall-port (tcp-listener-port stall-listener))
+       (accepted-lock (make-mutex 'live-tls-stall))
+       (accepted-condition (make-condition-variable 'live-tls-stall))
+       (accepted? #f)
+       (stall-server
+         (thread-start!
+          (make-thread
+           (lambda ()
+             (call-with-values
+               (lambda () (tcp-accept stall-listener))
+               (lambda (input output)
+                 (tcp-close stall-listener)
+                 (mutex-lock! accepted-lock)
+                 (set! accepted? #t)
+                 (condition-variable-broadcast! accepted-condition)
+                 (mutex-unlock! accepted-lock)
+                 (thread-sleep! 4.0)
+                 (tcp-abandon-port output))))
+           'live-tls-stall-server)))
+       (stall-client
+         (make-client
+          (string-append "https://127.0.0.1:"
+                         (number->string stall-port))))
+       (subscribe-error #f)
+       (subscriber
+         (thread-start!
+          (make-thread
+           (lambda ()
+             (handle-exceptions error
+               (set! subscribe-error error)
+               (client-subscribe stall-client "demo:state" (json-object))))
+           'live-tls-stall-subscriber))))
+  (mutex-lock! accepted-lock)
+  (let wait ((remaining 3.0))
+    (cond
+      (accepted? (mutex-unlock! accepted-lock))
+      ((<= remaining 0)
+       (mutex-unlock! accepted-lock)
+       (error 'live-test "Live TLS fixture was never accepted"))
+      (else
+       (let ((started (time->seconds (current-time))))
+         (mutex-unlock! accepted-lock accepted-condition remaining)
+         (wait (- remaining
+                  (- (time->seconds (current-time)) started)))))))
+  (let ((started (time->seconds (current-time))))
+    (client-close! stall-client 4.0)
+    (check (< (- (time->seconds (current-time)) started) 3.5)
+           "Live TLS handshake and queued close are bounded"))
+  (check (not (eq? (thread-join! subscriber 1.0 'timed-out) 'timed-out))
+         "stalled Live subscribe terminates")
+  (check (and (convex-error? subscribe-error)
+              (string=? (convex-error-name subscribe-error) "TransportError"))
+         "stalled Live subscribe is a structured TransportError")
+  (check (not (eq? (thread-join! stall-server 5.0 'timed-out) 'timed-out))
+         "Live TLS stall fixture terminates"))
 
 (print "live-test: " checks " checks")

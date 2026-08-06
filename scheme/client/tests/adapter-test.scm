@@ -29,26 +29,50 @@
           "{\n"
           bad-utf8 "\n"
           "{\"id\":\"early\",\"op\":\"query\",\"path\":\"demo:get\"}\n"
+          "{\"id\":\"trailing\",\"op\":\"hello\",\"protocolVersion\":1} trailing\n"
           "{\"id\":\"hello\",\"op\":\"hello\",\"protocolVersion\":1}\n"
+          "{\"id\":\"missing-args\",\"op\":\"query\",\"path\":\"demo:get\"}\n"
+          "{\"id\":\"missing-token\",\"op\":\"setAuth\"}\n"
+          "{\"id\":\"extra\",\"op\":\"setAuth\",\"token\":\"\",\"extra\":true}\n"
           "{\"id\":\"unknown\",\"op\":\"wat\"}\n"
           "{\"id\":\"close\",\"op\":\"close\"}\n"))
        (events (run-memory-adapter input)))
-  (check (= (length events) 7) "every NDJSON record produced one event")
+  (check (= (length events) 11) "every NDJSON record produced one event")
   (check (every (lambda (item) (json-object? item)) events)
          "adapter output remained NDJSON objects")
   (check (every (lambda (item) (string? (json-get item "type" #f))) events)
          "every adapter event has a type")
   (check (every (lambda (item) (string=? (json-get item "type") "error"))
-                (take events 4))
-         "empty, malformed, UTF-8, and pre-hello commands recover")
-  (check (string=? (json-get (list-ref events 4) "type") "ready")
+                (take events 5))
+         "empty, malformed, UTF-8, pre-hello, and trailing data recover")
+  (check (string=? (json-get (list-ref events 5) "type") "ready")
          "hello emits ready after malformed input")
-  (check (string=? (json-get (list-ref events 5) "id") "unknown")
+  (check (every (lambda (item) (string=? (json-get item "type") "error"))
+                (take (drop events 6) 4))
+         "missing fields, extra fields, and unknown operations are rejected")
+  (check (string=? (json-get (list-ref events 6) "id") "missing-args")
          "well-formed command errors retain their id")
-  (check (string=? (json-get (list-ref events 6) "type") "closed")
+  (check (string=? (json-get (list-ref events 10) "type") "closed")
          "close emits closed")
   (check (not (json-has? (car events) "id"))
          "malformed input does not invent an id"))
+
+;; Reject hostile structure before the json egg allocates the nested value.
+;; This exact 400 KiB shape previously OOM-killed the final 128 MiB image.
+(let* ((nesting 200000)
+       (deep-json (string-append (make-string nesting #\[)
+                                 (make-string nesting #\])))
+       (events
+         (run-memory-adapter
+          (string-append
+           deep-json "\n"
+           "{\"id\":\"hello\",\"op\":\"hello\",\"protocolVersion\":1}\n"
+           "{\"id\":\"close\",\"op\":\"close\"}\n"))))
+  (check (= (length events) 3) "deep JSON is rejected without killing adapter")
+  (check (string=? (json-get (car events) "type") "error")
+         "pre-parse nesting limit emits structured error")
+  (check (string=? (json-get (cadr events) "type") "ready")
+         "adapter recovers after hostile nesting"))
 
 (let* ((too-long (make-string (+ +adapter-line-limit+ 8) #\x))
        (events

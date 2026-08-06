@@ -63,7 +63,8 @@ RUN cd client/tests \
        CHICKEN_REPOSITORY_PATH=/build:/var/lib/chicken/11 \
        /build/adapter-test
 RUN cd client/tests \
-    && csc -O2 -d1 -I /build -o /build/adapter-live-test \
+    && csc -O2 -d1 -feature adapter-test-hooks -I /build \
+       -o /build/adapter-live-test \
        adapter-live-test.scm \
     && ADAPTER_LIBRARY_ONLY=1 \
        CHICKEN_REPOSITORY_PATH=/build:/var/lib/chicken/11 \

@@ -152,7 +152,10 @@
 
 (define (timestamp number)
   (let ((raw (make-string 8 #\nul)))
-    (string-set! raw 0 (integer->char number))
+    (let loop ((index 0) (remaining number))
+      (when (< index 8)
+        (string-set! raw index (integer->char (modulo remaining 256)))
+        (loop (+ index 1) (quotient remaining 256))))
     (base64-encode raw)))
 
 (define (version query-set timestamp-number)
@@ -179,6 +182,75 @@
  "CONVEX_URL"
  (string-append "http://127.0.0.1:" (number->string live-port)))
 
+;; The test-only compiled hook gives the controller a deterministic stop point
+;; after a relay dequeues a value and before it takes the publication lock.
+(define pause-lock (make-mutex 'adapter-live-pause))
+(define pause-condition (make-condition-variable 'adapter-live-pause))
+(define pause-target #f)
+(define relay-paused? #f)
+(define release-relay? #f)
+
+(set! relay-after-dequeue-test-hook
+      (lambda (subscription-id record update)
+        (let ((value (update-value update)))
+          (when (and pause-target (json-object? value)
+                     (= (json-get value "count" -1) pause-target))
+            (mutex-lock! pause-lock)
+            (set! relay-paused? #t)
+            (condition-variable-broadcast! pause-condition)
+            (let wait ()
+              (unless release-relay?
+                (mutex-unlock! pause-lock pause-condition 5.0)
+                (wait)))
+            (mutex-unlock! pause-lock)))))
+
+(define (arm-relay-pause! count)
+  (mutex-lock! pause-lock)
+  (set! pause-target count)
+  (set! relay-paused? #f)
+  (set! release-relay? #f)
+  (mutex-unlock! pause-lock))
+
+(define (wait-relay-paused!)
+  (mutex-lock! pause-lock)
+  (let wait ((remaining 5.0))
+    (cond
+      (relay-paused? (mutex-unlock! pause-lock) #t)
+      ((<= remaining 0)
+       (mutex-unlock! pause-lock)
+       (error 'adapter-live-test "relay did not pause after dequeue"))
+      (else
+       (let ((started (current-seconds)))
+         (mutex-unlock! pause-lock pause-condition remaining)
+         (wait (- remaining (- (current-seconds) started))))))))
+
+(define (release-relay!)
+  (mutex-lock! pause-lock)
+  (set! release-relay? #t)
+  (set! pause-target #f)
+  (condition-variable-broadcast! pause-condition)
+  (mutex-unlock! pause-lock))
+
+(define fixture-action-lock (make-mutex 'adapter-live-fixture-action))
+(define fixture-action-condition
+  (make-condition-variable 'adapter-live-fixture-action))
+(define fixture-action #f)
+
+(define (request-fixture-action! action)
+  (mutex-lock! fixture-action-lock)
+  (set! fixture-action action)
+  (condition-variable-broadcast! fixture-action-condition)
+  (mutex-unlock! fixture-action-lock))
+
+(define (wait-fixture-action! expected)
+  (mutex-lock! fixture-action-lock)
+  (let wait ()
+    (if (eq? fixture-action expected)
+        (begin (set! fixture-action #f) (mutex-unlock! fixture-action-lock))
+        (begin
+          (mutex-unlock! fixture-action-lock fixture-action-condition 5.0)
+          (wait)))))
+
 (define live-fixture-done? #f)
 (define live-fixture
   (thread-start!
@@ -198,8 +270,14 @@
               (send-transition! output 0 0 1 1
                                 (list (updated first-query-id 0)))
 
+              ;; Put a real old-generation update into the relay, then wait
+              ;; while the controller holds it after dequeue.
+              (wait-fixture-action! 'replacement-race)
+              (send-transition! output 1 1 1 2
+                                (list (updated first-query-id 999)))
+
               ;; Same-ID replacement must Remove the old query before Add and
-              ;; must ignore a late value for that retired query.
+              ;; must ignore the already-dequeued value for that retired query.
               (let* ((remove-message
                        (read-client-json input "ModifyQuerySet"))
                      (remove (car (json-get remove-message "modifications")))
@@ -211,9 +289,8 @@
                 (check (string=? (json-get add "type") "Add")
                        "replacement sends Add second")
                 (send-transition!
-                 output 1 1 3 2
-                 (list (updated first-query-id 999)
-                       (updated second-query-id 1)))
+                 output 1 2 3 3
+                 (list (updated second-query-id 1)))
 
                 ;; debugDisconnect hard-retires this transport before ACK.
                 (wait-disconnect input)
@@ -237,6 +314,9 @@
                                         (list (updated query-id 1)))
                       (send-transition! next-output 1 3 1 4
                                         (list (updated query-id 2)))
+                      (wait-fixture-action! 'unsubscribe-race)
+                      (send-transition! next-output 1 4 1 5
+                                        (list (updated query-id 777)))
                       (let* ((last-remove-message
                                (read-client-json next-input "ModifyQuerySet"))
                              (last-remove
@@ -244,10 +324,6 @@
                                               "modifications"))))
                         (check (string=? (json-get last-remove "type") "Remove")
                                "unsubscribe reaches owner before ACK"))
-                      ;; The owner has removed the query. This valid late
-                      ;; transition must not become a ghost adapter event.
-                      (send-transition! next-output 1 4 2 5
-                                        (list (updated query-id 777)))
                       (thread-sleep! 0.1)
                       (tcp-abandon-port next-output))))))))
         (tcp-close live-listener)
@@ -296,12 +372,16 @@
       (check (= (json-get (json-get (read-event input) "value") "count") 0)
              "initial adapter Live value")
 
+      (arm-relay-pause! 999)
+      (request-fixture-action! 'replacement-race)
+      (check (wait-relay-paused!) "replacement relay paused after dequeue")
       (send-command! output
                      "{\"id\":\"sub-b\",\"op\":\"subscribe\",\"subscriptionId\":\"same\",\"path\":\"demo:state\",\"args\":{\"room\":\"b\"}}")
       (check (string=? (json-get (read-event input) "id") "sub-b")
              "replacement ACK precedes new generation")
+      (release-relay!)
       (check (= (json-get (json-get (read-event input) "value") "count") 1)
-             "replacement drops late old generation")
+             "replacement drops dequeued old generation")
 
       (send-command! output
                      "{\"id\":\"debug\",\"op\":\"debugDisconnect\"}")
@@ -310,10 +390,14 @@
       (check (= (json-get (json-get (read-event input) "value") "count") 2)
              "unchanged reconnect hydration suppressed")
 
+      (arm-relay-pause! 777)
+      (request-fixture-action! 'unsubscribe-race)
+      (check (wait-relay-paused!) "unsubscribe relay paused after dequeue")
       (send-command! output
                      "{\"id\":\"unsub\",\"op\":\"unsubscribe\",\"subscriptionId\":\"same\"}")
       (check (string=? (json-get (read-event input) "id") "unsub")
              "unsubscribe barrier ACK")
+      (release-relay!)
       (thread-sleep! 0.2)
       (send-command! output "{\"id\":\"close\",\"op\":\"close\"}")
       (let ((next (read-event input)))
