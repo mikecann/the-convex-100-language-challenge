@@ -225,7 +225,7 @@ proc ::convex::http_call {id operation path argsRaw} {
     set body [encoding convertto utf-8 [object [list path [quote $path] args $argsRaw format [quote json]]]]
     set headers [list Content-Type application/json Accept application/json Convex-Client [dict get $client version]]
     if {[dict get $client auth] ne ""} { lappend headers Authorization "Bearer [dict get $client auth]" }
-    if {[catch {set token [::http::geturl "[dict get $client url]/api/$operation" -method POST -headers $headers -query $body -timeout 10000]} problem]} {
+    if {[catch {set token [::http::geturl "[dict get $client url]/api/$operation" -method POST -headers $headers -query $body -timeout 10000 -binary 1]} problem]} {
         throw TransportError $problem
     }
     try {
