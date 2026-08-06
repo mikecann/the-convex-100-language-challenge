@@ -375,6 +375,13 @@ ConvexRuntime.adapter_main() == 0 || error("stdin adapter precompile failed")
 precompile(Adapter.run_adapter, (Base.IOStream, Base.PipeEndpoint))
 precompile(Adapter.run_adapter, (Base.IOStream, Base.IOStream))
 precompile(Adapter.run_adapter, (Base.PipeEndpoint, Base.PipeEndpoint))
+# A hosted WSS failure reaches the adapter's structured error event path after
+# the owner has reported the transport error. Retain both id shapes used by
+# command and subscription failures so the stripped runtime can report that
+# error instead of terminating with a MissingCodeError.
+precompile(Adapter.failure, (Adapter.OutputPump, String, ConvexError))
+precompile(Adapter.failure, (Adapter.OutputPump, Nothing, ConvexError))
+precompile(Adapter.serialise_error, (ConvexError,))
 precompile(Base._depwarn, (Any, Any, Bool))
 
 function fixture_transition(
