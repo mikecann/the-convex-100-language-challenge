@@ -169,9 +169,9 @@ protocol is not documented as stable, so hosted verification remains required.
   Adapter output uses generation ownership at dequeue and immediately before
   channel acceptance, so an unsubscribe or same-ID replacement cannot let an
   old queued relay cross its acknowledgement. Accepted bytes remain ordered,
-  nonduplicated, and budgeted until Tcl drains them. A bounded timer retries
-  genuine channel backpressure without starving controller or Live reads, and
-  a real nonblocking-pipe fixture exercises the accepted EAGAIN catch path. The
+  nonduplicated, and budgeted until Tcl drains them. A bounded timer observes
+  real pending channel output without starving controller or Live reads, and a
+  real nonblocking-pipe fixture exercises that accepted-byte boundary. The
   newest-16 queue reserves four event slots and 64 KiB for control events, and
   charges each NDJSON newline plus conservative Tcl and channel overhead. Close
   waits up to two seconds for the terminal response to drain, then fails

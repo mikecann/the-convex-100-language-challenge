@@ -293,14 +293,14 @@ proc ::convex::ws_flush {id} {
     if {$socket eq "" || [dict get $client wsOut] eq ""} { return }
     set bytes [dict get $client wsOut]
     if {[catch {puts -nonewline $socket $bytes} error]} {
-        if {![string match {*would block*} [string tolower $error]]} { retire $id "TransportError: $error" }
+        retire $id "TransportError: $error"
         return
     }
-    # Once puts succeeds Tcl owns the complete record, even when flush reports
-    # EAGAIN. Clear the source buffer now so a writable retry cannot duplicate
-    # an already accepted WebSocket frame.
+    # Once puts succeeds Tcl owns the complete record, including any bytes held
+    # in its nonblocking channel buffer. Clear the source buffer now so a
+    # writable retry cannot duplicate an already accepted WebSocket frame.
     put $id wsOut ""
-    if {[catch {flush $socket} error] && ![string match {*would block*} [string tolower $error]]} {
+    if {[catch {flush $socket} error]} {
         retire $id "TransportError: $error"
     }
 }

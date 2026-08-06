@@ -188,98 +188,102 @@ if {$closeFailed} {
 puts "Tcl real stopped-reader test passed: RSS ${rss} KiB, close ${elapsed} ms, deliveryFailure=$closeFailed"
 
 # Exercise the adapter queue in this process against a genuine nonblocking OS
-# pipe. Tcl 8.6 normally converts the pipe's EAGAIN into buffered channel bytes,
-# so this test-only hook first performs the real flush, verifies those undrained
-# bytes, then surfaces POSIX EAGAIN through the production catch branch. It does
-# not mutate readiness, accepted ownership, or queue state.
+# pipe. Tcl accepts a complete puts into its channel layer and reports stopped
+# reader pressure as pending output after flush. This is the real ownership
+# boundary used by the production adapter, with no fabricated channel error.
 set ::env(ADAPTER_TEST_ONLY) 1
 source $adapter
 unset ::env(ADAPTER_TEST_ONLY)
-lassign [chan pipe] eagainRead eagainWrite
-fconfigure $eagainRead -blocking 0 -buffering none -translation binary -encoding utf-8
-fconfigure $eagainWrite -blocking 0 -buffering none -translation binary -encoding utf-8
-set ::adapter::output $eagainWrite
+lassign [chan pipe] pendingRead pendingWrite
+fconfigure $pendingRead -blocking 0 -buffering none -translation binary -encoding utf-8
+fconfigure $pendingWrite -blocking 0 -buffering none -translation binary -encoding utf-8
+set ::adapter::output $pendingWrite
 set ::adapter::queue {}
 set ::adapter::queueBytes 0
 set ::adapter::subscriptions [dict create same 1]
 set ::adapter::generations [dict create same 1]
 set ::adapter::acceptedWriteCount 0
 set ::adapter::acceptedBackpressureCount 0
-set ::adapter::acceptedWouldBlockCount 0
 set ::adapter::observeBackpressure 1
 set ::adapter::lastBackpressuredRaw ""
-proc eagain_flush {channel} {
-    ::flush $channel
-    if {[chan pending output $channel] == 0} { return }
-    return -code error -errorcode {POSIX EAGAIN {resource temporarily unavailable}} \
-        "error flushing channel: resource temporarily unavailable"
-}
-set ::adapter::outputFlushHook eagain_flush
-set eagainBlob [string repeat z [expr {64 * 1024}]]
-for {set index 0} {$index < 12 && $::adapter::acceptedWouldBlockCount == 0} {incr index} {
-    set raw [::convex::object [list type [::convex::quote subscription] subscriptionId [::convex::quote same] value [::convex::object [list sequence $index blob [::convex::quote $eagainBlob]]]]]
+set pendingBlob [string repeat z [expr {64 * 1024}]]
+for {set index 0} {$index < 12 && $::adapter::acceptedBackpressureCount == 0} {incr index} {
+    set raw [::convex::object [list type [::convex::quote subscription] subscriptionId [::convex::quote same] value [::convex::object [list sequence $index blob [::convex::quote $pendingBlob]]]]]
     ::adapter::emit $raw 1 [list same 1]
 }
 assert {$::adapter::acceptedWriteCount > 0} "real pipe accepted no adapter record"
 assert {$::adapter::acceptedBackpressureCount > 0} "real pipe did not expose accepted output backpressure"
-assert {$::adapter::acceptedWouldBlockCount > 0} "real pipe did not enter the accepted EAGAIN catch branch"
+set pendingBytes [chan pending output $pendingWrite]
+assert {$pendingBytes > 0} "real stopped reader left no bytes in Tcl's channel buffer"
 set acceptedLine [string trimright $::adapter::lastBackpressuredRaw "\n"]
+set acceptedCost [::adapter::entry_cost $acceptedLine]
+assert {[llength $::adapter::queue] == 1 && [lindex [lindex $::adapter::queue 0] 3] eq "accepted"} "accepted output ownership was not retained"
+assert {$::adapter::queueBytes == $acceptedCost} "accepted output byte accounting was not exact"
+assert {$pendingBytes <= [string bytelength $::adapter::lastBackpressuredRaw]} "pending channel bytes exceeded the accepted record"
+assert {$::adapter::queueBytes <= $::adapter::maxBytes - $::adapter::controlReserve} "accepted delivery exceeded its reserved data budget"
 set markerLine {{"id":"accepted-marker","type":"ack"}}
 set tailLine {{"type":"subscription","subscriptionId":"same","value":{"tail":true}}}
 ::adapter::emit $markerLine
 ::adapter::emit $tailLine 1 [list same 1]
+set queuedCost [expr {$acceptedCost + [::adapter::entry_cost $markerLine] + [::adapter::entry_cost $tailLine]}]
+assert {$::adapter::queueBytes == $queuedCost} "accepted and queued records were not fully byte-accounted"
+assert {$::adapter::queueBytes <= $::adapter::maxBytes} "reserved control output exceeded the global byte budget"
 
-set ::eagainBuffer ""
-set ::eagainLines {}
-proc eagain_readable {} {
-    append ::eagainBuffer [read $::eagainRead]
-    while {[set newline [string first "\n" $::eagainBuffer]] >= 0} {
-        lappend ::eagainLines [string range $::eagainBuffer 0 [expr {$newline - 1}]]
-        set ::eagainBuffer [string range $::eagainBuffer [expr {$newline + 1}] end]
+set ::pendingBuffer ""
+set ::pendingLines {}
+proc pending_readable {} {
+    append ::pendingBuffer [read $::pendingRead]
+    while {[set newline [string first "\n" $::pendingBuffer]] >= 0} {
+        lappend ::pendingLines [string range $::pendingBuffer 0 [expr {$newline - 1}]]
+        set ::pendingBuffer [string range $::pendingBuffer [expr {$newline + 1}] end]
     }
     ::livefixture::signal
 }
-fileevent $eagainRead readable eagain_readable
-wait_for {[llength $::adapter::queue] == 0 && [lsearch -exact $::eagainLines $markerLine] >= 0 && [lsearch -exact $::eagainLines $tailLine] >= 0} "accepted output did not drain without starvation" 5000
-set acceptedPositions [lsearch -all -exact $::eagainLines $acceptedLine]
-set markerPositions [lsearch -all -exact $::eagainLines $markerLine]
-set tailPositions [lsearch -all -exact $::eagainLines $tailLine]
+fileevent $pendingRead readable pending_readable
+wait_for {[llength $::adapter::queue] == 0 && [lsearch -exact $::pendingLines $markerLine] >= 0 && [lsearch -exact $::pendingLines $tailLine] >= 0} "accepted output did not drain without starvation" 5000
+assert {$::adapter::queueBytes == 0} "drained adapter queue retained byte accounting"
+set acceptedPositions [lsearch -all -exact $::pendingLines $acceptedLine]
+set markerPositions [lsearch -all -exact $::pendingLines $markerLine]
+set tailPositions [lsearch -all -exact $::pendingLines $tailLine]
 assert {[llength $acceptedPositions] == 1} "accepted NDJSON record was duplicated"
 assert {[llength $markerPositions] == 1 && [llength $tailPositions] == 1} "queued records were duplicated or lost"
 assert {[lindex $acceptedPositions 0] < [lindex $markerPositions 0] && [lindex $markerPositions 0] < [lindex $tailPositions 0]} "accepted and queued records drained out of order"
 
 # Fill the same real pipe again, keep its reader stopped, and prove terminal
 # output fails on the adapter deadline instead of hanging behind accepted bytes.
-fileevent $eagainRead readable {}
-append ::eagainBuffer [read $eagainRead]
+fileevent $pendingRead readable {}
+append ::pendingBuffer [read $pendingRead]
 set ::adapter::queue {}
 set ::adapter::queueBytes 0
 set ::adapter::acceptedBackpressureCount 0
-set ::adapter::acceptedWouldBlockCount 0
 set ::adapter::lastBackpressuredRaw ""
-for {set index 0} {$index < 12 && $::adapter::acceptedWouldBlockCount == 0} {incr index} {
-    set raw [::convex::object [list type [::convex::quote subscription] subscriptionId [::convex::quote same] value [::convex::object [list closeSequence $index blob [::convex::quote $eagainBlob]]]]]
+for {set index 0} {$index < 12 && $::adapter::acceptedBackpressureCount == 0} {incr index} {
+    set raw [::convex::object [list type [::convex::quote subscription] subscriptionId [::convex::quote same] value [::convex::object [list closeSequence $index blob [::convex::quote $pendingBlob]]]]]
     ::adapter::emit $raw 1 [list same 1]
 }
 assert {$::adapter::acceptedBackpressureCount > 0} "real close pipe did not become backpressured"
-assert {$::adapter::acceptedWouldBlockCount > 0} "real close pipe did not enter the accepted EAGAIN catch branch"
+assert {[chan pending output $pendingWrite] > 0} "real close pipe had no pending output"
+set closeAcceptedLine [string trimright $::adapter::lastBackpressuredRaw "\n"]
+set closeAcceptedCost [::adapter::entry_cost $closeAcceptedLine]
+assert {$::adapter::queueBytes == $closeAcceptedCost} "close-path accepted bytes were not exactly accounted"
 set closedLine {{"id":"real-close","type":"closed"}}
 ::adapter::emit $closedLine
-proc eagain_exit {code} { set ::eagainExit $code; ::livefixture::signal }
-set ::adapter::exitHook eagain_exit
-set ::eagainExit ""
+assert {$::adapter::queueBytes == $closeAcceptedCost + [::adapter::entry_cost $closedLine]} "terminal control bytes were not retained behind accepted output"
+assert {$::adapter::queueBytes <= $::adapter::maxBytes} "terminal output exceeded the global byte budget"
+proc pending_exit {code} { set ::pendingExit $code; ::livefixture::signal }
+set ::adapter::exitHook pending_exit
+set ::pendingExit ""
 set realCloseStarted [clock milliseconds]
 set ::adapter::closeDeadline [expr {$realCloseStarted + 350}]
 ::adapter::finish_close
-wait_for {$::eagainExit ne ""} "real backpressured close ignored its deadline" 1200
+wait_for {$::pendingExit ne ""} "real backpressured close ignored its deadline" 1200
 set realCloseElapsed [expr {[clock milliseconds] - $realCloseStarted}]
-assert {$::eagainExit == 1} "real backpressured close did not fail"
+assert {$::pendingExit == 1} "real backpressured close did not fail"
 assert {$realCloseElapsed >= 300 && $realCloseElapsed < 1000} "real backpressured close finished at ${realCloseElapsed}ms"
 if {$::adapter::flushTimer ne ""} { after cancel $::adapter::flushTimer; set ::adapter::flushTimer "" }
-fileevent $eagainWrite writable {}
-close $eagainRead
-close $eagainWrite
+fileevent $pendingWrite writable {}
+close $pendingRead
+close $pendingWrite
 set ::adapter::exitHook ""
 set ::adapter::observeBackpressure 0
-set ::adapter::outputFlushHook ""
-puts "Tcl genuine accepted-byte EAGAIN test passed: close ${realCloseElapsed} ms"
+puts "Tcl genuine accepted-byte pending-output test passed: close ${realCloseElapsed} ms"
