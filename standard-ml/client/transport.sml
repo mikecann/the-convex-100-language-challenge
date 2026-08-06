@@ -7,6 +7,200 @@
    means no foreign call ever blocks, which matters because a blocked foreign
    call would stall Poly/ML's garbage collector for every other thread. *)
 
+structure Resolver =
+struct
+  (* Name resolution is the one operation the Basis Library cannot bound:
+     NetHostDB.getByName blocks inside the C resolver until it answers, and no
+     deadline reaches it. The Live owner opens sockets, so an unbounded lookup
+     there would stall close and unsubscribe behind it.
+
+     Three things keep that from happening. A literal address is converted
+     directly and never reaches the resolver at all, which is the only case the
+     deterministic fixtures use. A real name is looked up on its own thread, so
+     the caller waits only until its own absolute deadline. The answer is then
+     cached, so later connections to the same deployment never wait again.
+
+     The cache is bounded in both directions. Entries expire, so a deployment
+     that moves is followed rather than pinned for the life of the process, and
+     a failure is remembered only briefly so a transient outage does not become
+     a sticky one. The number of entries is bounded too, so a client pointed at
+     many names cannot grow this table without limit. Every name keeps all the
+     addresses the resolver returned, in order, so a connection can fail over to
+     the next one and a reconnect can prefer the one that last worked. *)
+  type address = NetHostDB.in_addr
+
+  (* A resolved name is trusted for this long, and a failure for much less. *)
+  val positiveTtlSeconds = 60.0
+  val negativeTtlSeconds = 5.0
+
+  (* More than any deployment this demonstration talks to, and small enough that
+     the linear scans below stay trivial. *)
+  val maxEntries = 64
+
+  (* Enough for a round-robin record; the rest are dropped rather than retained.
+     A name that answers with hundreds of addresses is not a Convex
+     deployment. *)
+  val maxAddresses = 8
+
+  type entry = {addresses: address list, expires: Time.time}
+
+  (* gethostbyname is not reentrant, so only one lookup thread runs at a time. *)
+  val lookupMutex = Thread.Mutex.mutex ()
+  val stateMutex = Thread.Mutex.mutex ()
+  (* Newest first, so eviction can drop the tail. *)
+  val cache : (string * entry) list ref = ref []
+  val pending : (string * Latch.t) list ref = ref []
+
+  fun resolverFail message = ConvexError.fail ("TransportError", message)
+
+  (* NetHostDB.in_addr carries no equality, so addresses are compared by their
+     printed form. *)
+  fun sameAddress (left, right) = NetHostDB.toString left = NetHostDB.toString right
+
+  (* Only a dotted-quad is treated as a literal. Anything else is a name, even
+     when the platform's own converter would accept it. *)
+  fun isLiteral host =
+    let
+      val parts = String.tokens (fn character => character = #".") host
+      fun octet text =
+        String.size text > 0 andalso String.size text <= 3
+        andalso CharVector.all Char.isDigit text
+        andalso (case Int.fromString text of SOME value => value <= 255 | NONE => false)
+    in
+      List.length parts = 4 andalso List.all octet parts
+    end
+
+  (* ---- pure cache rules ---------------------------------------------- *)
+
+  (* Separated from the shared state so the eviction, expiry, negative, and
+     rotation rules can be tested directly with explicit times rather than by
+     waiting a minute for a real entry to age out. *)
+  fun live ({expires, ...} : entry, now) = Time.< (now, expires)
+
+  fun bound entries =
+    if List.length entries <= maxEntries then entries else List.take (entries, maxEntries)
+
+  fun clip addresses =
+    if List.length addresses <= maxAddresses then addresses
+    else List.take (addresses, maxAddresses)
+
+  fun replace (entries, host, entry) =
+    bound ((host, entry) :: List.filter (fn (name, _) => name <> host) entries)
+
+  fun lookupIn (entries, host, now) =
+    case List.find (fn (name, _) => name = host) entries of
+        SOME (_, entry) => if live (entry, now) then SOME entry else NONE
+      | NONE => NONE
+
+  (* The address that just worked moves to the front, so the next connection to
+     the same deployment starts where the last one succeeded instead of walking
+     a dead address again. *)
+  fun promoteIn (addresses, address) =
+    address :: List.filter (fn item => not (sameAddress (item, address))) addresses
+
+  (* ---- shared state --------------------------------------------------- *)
+
+  fun cached host =
+    Guard.critical (stateMutex, fn () => lookupIn (!cache, host, Clock.now ()))
+
+  fun remember (host, addresses) =
+    let
+      val seconds = if List.null addresses then negativeTtlSeconds else positiveTtlSeconds
+      val entry = {addresses = clip addresses, expires = Clock.deadlineIn seconds} : entry
+    in
+      Guard.critical (stateMutex, fn () => cache := replace (!cache, host, entry))
+    end
+
+  fun promote (host, address) =
+    Guard.critical
+      (stateMutex,
+       fn () =>
+         case List.find (fn (name, _) => name = host) (!cache) of
+             SOME (_, {addresses, expires}) =>
+               cache :=
+                 replace (!cache, host,
+                          {addresses = promoteIn (addresses, address), expires = expires})
+           | NONE => ())
+
+  (* Every cached address failed, so the entry is worse than useless: drop it and
+     let the next attempt ask the resolver again. *)
+  fun forget host =
+    Guard.critical
+      (stateMutex, fn () => cache := List.filter (fn (name, _) => name <> host) (!cache))
+
+  (* Returns the latch to wait on and whether this caller owns the lookup, so a
+     second caller for the same host joins the first attempt rather than
+     starting a competing one. *)
+  fun claim host =
+    Guard.critical
+      (stateMutex,
+       fn () =>
+         case List.find (fn (name, _) => name = host) (!pending) of
+             SOME (_, latch) => (latch, false)
+           | NONE =>
+               let
+                 val latch = Latch.new ()
+               in
+                 pending := (host, latch) :: !pending;
+                 (latch, true)
+               end)
+
+  fun retire host =
+    Guard.critical
+      (stateMutex, fn () => pending := List.filter (fn (name, _) => name <> host) (!pending))
+
+  (* A lookup that answers with nothing, or raises, is remembered as a negative
+     entry. That is what stops a name that is down from starting a fresh
+     resolver thread for every reconnect. *)
+  fun lookup (host, latch) =
+    ignore
+      (Thread.Thread.fork
+         (fn () =>
+            ((Guard.critical
+                (lookupMutex,
+                 fn () =>
+                   case NetHostDB.getByName host of
+                       SOME found => remember (host, NetHostDB.addrs found)
+                     | NONE => remember (host, []))
+              handle _ => (remember (host, []) handle _ => ()));
+             retire host;
+             Latch.release latch),
+          []))
+
+  fun addresses (host, deadline) =
+    if isLiteral host then
+      (case NetHostDB.fromString host of
+           SOME literal => [literal]
+         | NONE => resolverFail ("could not read the address " ^ host))
+    else
+      let
+        fun answer entry =
+          if List.null (#addresses (entry : entry)) then
+            resolverFail ("could not resolve host " ^ host)
+          else #addresses entry
+      in
+        case cached host of
+            SOME entry => answer entry
+          | NONE =>
+              let
+                val (latch, owner) = claim host
+                val _ = if owner then lookup (host, latch) else ()
+                val answered = Latch.await (latch, deadline)
+              in
+                case cached host of
+                    SOME entry => answer entry
+                  | NONE =>
+                      if answered then resolverFail ("could not resolve host " ^ host)
+                      else resolverFail ("name resolution for " ^ host ^ " passed its deadline")
+              end
+      end
+
+  fun address (host, deadline) =
+    case addresses (host, deadline) of
+        first :: _ => first
+      | [] => resolverFail ("could not resolve host " ^ host)
+end
+
 structure Transport =
 struct
   (* Raised when a deadline passes. Callers distinguish this from end of stream
@@ -161,62 +355,85 @@ struct
          true)
     end
 
-  fun looksLikeIpv4 host =
-    let
-      val parts = String.tokens (fn character => character = #".") host
-      fun octet text =
-        String.size text > 0 andalso String.size text <= 3
-        andalso CharVector.all Char.isDigit text
-        andalso (case Int.fromString text of SOME value => value <= 255 | NONE => false)
-    in
-      List.length parts = 4 andalso List.all octet parts
-    end
-
   fun startTls (socket, host, deadline) =
     let
       val api = Ssl.api ()
       val {ctxNew, ctxSetDefaultVerifyPaths, ctxSetVerify, sslNew, sslSetBio,
            sslSetConnectState, sslCtrl, sslSet1Host, sslGet0Param, paramSet1IpAsc,
            sslDoHandshake, sslGetError, sslGetVerifyResult, bioNewMem, bioCtrl,
-           ctxFree, sslFree, ...} = api
-      val ctx = ctxNew ()
-      val _ = if Ssl.isNull ctx then transportFail "could not create a TLS context" else ()
-      fun abandon message =
-        (ctxFree ctx; transportFail message)
+           bioFree, ctxFree, sslFree, ...} = api
+      (* Every OpenSSL object this function creates is held in a slot, so one
+         cleanup path frees exactly what exists however the attempt fails. A
+         slot is emptied as it is freed, which is also how ownership is handed
+         over: once SSL_set_bio has run, the session frees both buffers, so
+         their slots are emptied without freeing them here. *)
+      val ctxSlot = ref Ssl.null
+      val sslSlot = ref Ssl.null
+      val rbioSlot = ref Ssl.null
+      val wbioSlot = ref Ssl.null
+      fun discard (slot, free) =
+        if Ssl.isNull (!slot) then ()
+        else
+          let
+            val pointer = !slot
+          in
+            slot := Ssl.null;
+            (free pointer handle _ => ())
+          end
+      fun releaseAll () =
+        (discard (sslSlot, sslFree);
+         discard (rbioSlot, bioFree);
+         discard (wbioSlot, bioFree);
+         discard (ctxSlot, ctxFree))
+      fun abandon message = (releaseAll (); transportFail message)
+      (* Anything that can raise after an object exists runs through here, so a
+         deadline or a peer that disappears frees the session as reliably as a
+         rejected certificate does. *)
+      fun guarded body = body () handle exn => (releaseAll (); raise exn)
+      val _ = ctxSlot := ctxNew ()
       val _ =
-        if ctxSetDefaultVerifyPaths ctx <> 1 then
+        if Ssl.isNull (!ctxSlot) then transportFail "could not create a TLS context" else ()
+      val _ =
+        if ctxSetDefaultVerifyPaths (!ctxSlot) <> 1 then
           abandon "could not load the trusted certificate roots"
         else ()
-      val _ = ctxSetVerify (ctx, Ssl.VERIFY_PEER, Ssl.null)
-      val ssl = sslNew ctx
-      val _ = if Ssl.isNull ssl then abandon "could not create a TLS session" else ()
-      val rbio = bioNewMem ()
-      val wbio = bioNewMem ()
+      val _ = ctxSetVerify (!ctxSlot, Ssl.VERIFY_PEER, Ssl.null)
+      val _ = sslSlot := sslNew (!ctxSlot)
+      val _ = if Ssl.isNull (!sslSlot) then abandon "could not create a TLS session" else ()
+      val _ = rbioSlot := bioNewMem ()
+      val _ = wbioSlot := bioNewMem ()
       val _ =
-        if Ssl.isNull rbio orelse Ssl.isNull wbio then
-          (sslFree ssl; abandon "could not create TLS memory buffers")
+        if Ssl.isNull (!rbioSlot) orelse Ssl.isNull (!wbioSlot) then
+          abandon "could not create TLS memory buffers"
         else ()
+      val ssl = !sslSlot
+      val rbio = !rbioSlot
+      val wbio = !wbioSlot
       (* Report "retry later" instead of end of stream when a memory buffer is
          empty, so an empty read means "pump more bytes", not "connection over". *)
       val _ = bioCtrl (rbio, Ssl.C_SET_BUF_MEM_EOF_RETURN, ~1, Ssl.null)
       val _ = bioCtrl (wbio, Ssl.C_SET_BUF_MEM_EOF_RETURN, ~1, Ssl.null)
       (* SSL_set_bio hands both buffers to the session, which frees them. *)
       val _ = sslSetBio (ssl, rbio, wbio)
+      val _ = (rbioSlot := Ssl.null; wbioSlot := Ssl.null)
       val _ = sslSetConnectState ssl
       (* Verify the name the caller actually asked for. A certificate that is
          merely well formed and trusted is not enough. *)
       val _ =
-        if looksLikeIpv4 host then
-          (if paramSet1IpAsc (sslGet0Param ssl, host) <> 1 then
-             (sslFree ssl; abandon "could not pin the requested IP address")
-           else ())
-        else
-          (if sslSet1Host (ssl, host) <> 1 then
-             (sslFree ssl; abandon "could not pin the requested host name")
-           else
-             (* SNI is meaningless for an IP literal, so it is only sent here. *)
-             ignore (sslCtrl (ssl, Ssl.CTRL_SET_TLSEXT_HOSTNAME,
-                              Ssl.TLSEXT_NAMETYPE_host_name, host)))
+        guarded
+          (fn () =>
+             if Resolver.isLiteral host then
+               (if paramSet1IpAsc (sslGet0Param ssl, host) <> 1 then
+                  abandon "could not pin the requested IP address"
+                else ())
+             else
+               (if sslSet1Host (ssl, host) <> 1 then
+                  abandon "could not pin the requested host name"
+                else
+                  (* SNI is meaningless for an IP literal, so it is only sent
+                     here. *)
+                  ignore (sslCtrl (ssl, Ssl.CTRL_SET_TLSEXT_HOSTNAME,
+                                   Ssl.TLSEXT_NAMETYPE_host_name, host))))
       fun handshake () =
         let
           val result = sslDoHandshake ssl
@@ -237,41 +454,68 @@ struct
                   ("TLS handshake failed: " ^ Ssl.lastErrorText ())
             end
         end
-      val _ =
-        handshake ()
-        handle exn => (sslFree ssl; ctxFree ctx; raise exn)
-      val _ = flushOutgoing (socket, wbio, deadline)
-      val verified = sslGetVerifyResult ssl
+      val _ = guarded handshake
+      val _ = guarded (fn () => flushOutgoing (socket, wbio, deadline))
+      val verified = guarded (fn () => sslGetVerifyResult ssl)
       val _ =
         if verified <> 0 then
-          (sslFree ssl;
-           ctxFree ctx;
-           transportFail ("TLS certificate was rejected with code " ^ Int.toString verified))
+          abandon ("TLS certificate was rejected with code " ^ Int.toString verified)
         else ()
     in
-      Secure {ctx = ctx, ssl = ssl, rbio = rbio, wbio = wbio}
+      Secure {ctx = !ctxSlot, ssl = ssl, rbio = rbio, wbio = wbio}
     end
 
   (* ---- public transport -------------------------------------------- *)
 
-  fun resolve host =
-    case NetHostDB.getByName host of
-        SOME entry => NetHostDB.addr entry
-      | NONE => transportFail ("could not resolve host " ^ host)
+  (* Listening sockets and the deterministic fixtures name a literal loopback
+     address, which never reaches the resolver; the deadline is a backstop for
+     anything else that ever calls this without one of its own. *)
+  fun resolve host = Resolver.address (host, Clock.deadlineIn 5.0)
 
-  fun connect {host, port, secure, deadline} : t =
+  (* One TCP attempt against one address, inside the caller's own deadline. *)
+  fun connectTo (host, address, port, deadline) =
     let
-      val address = INetSock.toAddr (resolve host, port)
       val socket = INetSock.TCP.socket ()
       val _ =
-        (if Socket.connectNB (socket, address) then ()
+        (if Socket.connectNB (socket, INetSock.toAddr (address, port)) then ()
          else waitWritable (socket, deadline))
         handle Timeout => (Socket.close socket; transportFail "TCP connect timed out")
              | exn => (Socket.close socket; raise exn)
-      val _ =
-        if Socket.Ctl.getERROR socket then
-          (Socket.close socket; transportFail ("could not connect to " ^ host))
-        else ()
+    in
+      if Socket.Ctl.getERROR socket then
+        (Socket.close socket; transportFail ("could not connect to " ^ host))
+      else socket
+    end
+
+  fun connect {host, port, secure, deadline} : t =
+    let
+      (* Resolution shares the caller's connect deadline rather than sitting
+         outside it. *)
+      val candidates = Resolver.addresses (host, deadline)
+      (* A name may answer with several addresses. Trying the next one after a
+         refusal is what makes a rotated deployment reconnect instead of failing
+         for as long as one stale address is first in the record. Failover stays
+         inside the caller's single deadline: it never grants itself a fresh
+         one, so a list of dead addresses cannot outlast the caller's budget. *)
+      fun attempt (remaining, lastFailure) =
+        case remaining of
+            [] =>
+              (Resolver.forget host;
+               case lastFailure of
+                   SOME failure => raise failure
+                 | NONE => transportFail ("could not connect to " ^ host))
+          | address :: rest =>
+              (let
+                 val socket = connectTo (host, address, port, deadline)
+               in
+                 Resolver.promote (host, address);
+                 socket
+               end)
+              handle failure =>
+                if List.null rest orelse Clock.expired deadline then
+                  (Resolver.forget host; raise failure)
+                else attempt (rest, SOME failure)
+      val socket = attempt (candidates, NONE)
       val security =
         if secure then
           startTls (socket, host, deadline)
@@ -430,6 +674,26 @@ struct
       end
     else if fill (reader, deadline) then byte (reader, deadline)
     else NONE
+
+  (* Hand back whatever is already buffered, in one piece. An unframed body is
+     otherwise assembled one byte at a time, which is the shape that turns a
+     large response into a large multiple of itself. Returns "" only at a clean
+     end of stream, and raises Transport.Timeout at the deadline. *)
+  fun chunk (reader as {buffer, offset, ...} : t, limit, deadline) =
+    let
+      val have = buffered reader
+    in
+      if have > 0 then
+        let
+          val take = Int.min (have, limit)
+          val text = String.substring (!buffer, !offset, take)
+        in
+          offset := !offset + take;
+          text
+        end
+      else if fill (reader, deadline) then chunk (reader, limit, deadline)
+      else ""
+    end
 
   (* A short read is never silently accepted: a TCP segment boundary must not
      move the frame parser to a byte that is not a frame header. *)

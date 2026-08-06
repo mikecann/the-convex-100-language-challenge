@@ -82,37 +82,51 @@ struct
 
   (* ---- writing ----------------------------------------------------- *)
 
+  val hexDigits = "0123456789abcdef"
+
+  (* Everything outside this set has a two-character or six-character spelling;
+     everything inside it is copied through untouched. *)
+  fun plainChar character =
+    character <> #"\"" andalso character <> #"\\" andalso Char.ord character >= 0x20
+
+  (* Unescaped runs are copied in one piece. Appending a near-maximum string one
+     character at a time is exactly how a large value turns into a large
+     multiple of itself. *)
   fun escape (text, buffer) =
     let
-      fun push chunk = Buffer.add (buffer, chunk)
-      fun loop index =
-        if index >= String.size text then ()
+      val size = String.size text
+      fun flush (start, index) =
+        if index > start then Buffer.add (buffer, String.substring (text, start, index - start))
+        else ()
+      fun special (character, code) =
+        case character of
+            #"\"" => Buffer.add (buffer, "\\\"")
+          | #"\\" => Buffer.add (buffer, "\\\\")
+          | #"\n" => Buffer.add (buffer, "\\n")
+          | #"\r" => Buffer.add (buffer, "\\r")
+          | #"\t" => Buffer.add (buffer, "\\t")
+          | #"\b" => Buffer.add (buffer, "\\b")
+          | #"\f" => Buffer.add (buffer, "\\f")
+          | _ =>
+              (Buffer.add (buffer, "\\u00");
+               Buffer.addChar (buffer, String.sub (hexDigits, code div 16));
+               Buffer.addChar (buffer, String.sub (hexDigits, code mod 16)))
+      fun loop (start, index) =
+        if index >= size then flush (start, index)
         else
           let
             val character = String.sub (text, index)
-            val code = Char.ord character
           in
-            (case character of
-                 #"\"" => push "\\\""
-               | #"\\" => push "\\\\"
-               | #"\n" => push "\\n"
-               | #"\r" => push "\\r"
-               | #"\t" => push "\\t"
-               | #"\b" => push "\\b"
-               | #"\f" => push "\\f"
-               | _ =>
-                   if code < 0x20 then
-                     push (String.concat
-                             ["\\u00",
-                              String.str (String.sub ("0123456789abcdef", code div 16)),
-                              String.str (String.sub ("0123456789abcdef", code mod 16))])
-                   else push (String.str character));
-            loop (index + 1)
+            if plainChar character then loop (start, index + 1)
+            else
+              (flush (start, index);
+               special (character, Char.ord character);
+               loop (index + 1, index + 1))
           end
     in
-      push "\"";
-      loop 0;
-      push "\""
+      Buffer.addChar (buffer, #"\"");
+      loop (0, 0);
+      Buffer.addChar (buffer, #"\"")
     end
 
   (* Standard ML writes negatives with a tilde and may use an uppercase
@@ -175,7 +189,31 @@ struct
       Buffer.contents buffer
     end
 
-  fun byteLength value = String.size (encode value)
+  (* One encoded NDJSON record, built in one buffer. Appending the terminator to
+     a finished string would copy a near-maximum event a second time for the sake
+     of a single byte. *)
+  fun encodeLine value =
+    let
+      val buffer = Buffer.new ()
+    in
+      writeValue (value, buffer);
+      Buffer.addChar (buffer, #"\n");
+      Buffer.contents buffer
+    end
+
+  (* The exact encoded length and a fixed-size fingerprint of the exact encoded
+     bytes, without those bytes ever existing. A caller that has to charge a
+     value and notice whether it has changed uses this rather than encoding it
+     once to measure it and again to compare it. *)
+  fun measure value =
+    let
+      val buffer = Buffer.measure ()
+    in
+      writeValue (value, buffer);
+      {size = Buffer.size buffer, fingerprint = Buffer.mark buffer}
+    end
+
+  fun byteLength value = #size (measure value)
 
   (* ---- reading ----------------------------------------------------- *)
 
@@ -282,18 +320,24 @@ struct
                      end
                  | _ => fail "JSON has an unknown escape")
 
+      (* Runs of ordinary characters are taken as one substring rather than one
+         byte at a time, for the same reason the writer copies runs. *)
       fun readString () =
         let
           val buffer = Buffer.new ()
+          fun run start =
+            if !position < size andalso plainChar (String.sub (text, !position)) then
+              (advance (); run start)
+            else if !position > start then
+              Buffer.add (buffer, String.substring (text, start, !position - start))
+            else ()
           fun loop () =
-            case peek () of
-                NONE => fail "JSON string is unterminated"
-              | SOME #"\"" => (advance (); Buffer.contents buffer)
-              | SOME #"\\" => (advance (); readEscape buffer; loop ())
-              | SOME character =>
-                  if Char.ord character < 0x20 then
-                    fail "JSON string contains a raw control character"
-                  else (advance (); Buffer.addChar (buffer, character); loop ())
+            (run (!position);
+             case peek () of
+                 NONE => fail "JSON string is unterminated"
+               | SOME #"\"" => (advance (); Buffer.contents buffer)
+               | SOME #"\\" => (advance (); readEscape buffer; loop ())
+               | SOME _ => fail "JSON string contains a raw control character")
         in
           expect #"\"";
           loop ()

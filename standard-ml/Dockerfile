@@ -115,11 +115,17 @@ COPY examples ./examples
 
 RUN mkdir -p /build /out
 
-# Layer 1: encodings. Strict JSON, SHA-1, base64, the Convex sync timestamp
+# Layer 1: the style and lint gate. Poly/ML ships no formatter, so this is the
+# repository's mechanical stand-in for one: encoding, width, termination,
+# comment nesting, and forbidden constructs across every checked-in Standard ML
+# source. It runs before anything is compiled for behaviour.
+RUN polyc-retry -o /build/style-test client/tests/style-test.sml && /build/style-test
+
+# Layer 2: encodings. Strict JSON, SHA-1, base64, the Convex sync timestamp
 # spelling, and deployment URL parsing.
 RUN polyc-retry -o /build/json-test client/tests/json-test.sml && /build/json-test
 
-# Layer 2: real TLS. A private authority issues a certificate for `localhost`
+# Layer 3: real TLS. A private authority issues a certificate for `localhost`
 # only, so the name check is exercised in both directions against a real
 # OpenSSL server.
 RUN set -eu; \
@@ -140,20 +146,20 @@ RUN set -eu; \
     sleep 2; \
     SSL_CERT_FILE=/tmp/tls/ca.crt TLS_TEST_PORT=19600 /build/tls-test
 
-# Layer 3: real HTTP over kernel sockets, including the bearer-token lifecycle,
+# Layer 4: real HTTP over kernel sockets, including the bearer-token lifecycle,
 # a structured function error, a non-Convex body, and the connect deadline.
 RUN polyc-retry -o /build/http-test client/tests/http-test.sml && /build/http-test
 
-# Layer 4: Live acceptance against a raw WebSocket fixture - malformed
+# Layer 5: Live acceptance against a raw WebSocket fixture - malformed
 # envelopes, fragmentation, deadlines, QueryFailed recovery, and five genuine
 # reconnect and hydration cycles.
 RUN polyc-retry -o /build/live-test client/tests/live-test.sml && /build/live-test
 
-# Layer 5: the adapter protocol - strict command schemas, malformed envelopes,
+# Layer 6: the adapter protocol - strict command schemas, malformed envelopes,
 # the bounded stopped-reader output budget, and the TCP transport.
 RUN polyc-retry -o /build/adapter-test client/tests/adapter-test.sml && /build/adapter-test
 
-# Layer 6: the adapter driving real Live traffic, including stale relay
+# Layer 7: the adapter driving real Live traffic, including stale relay
 # rejection. The Standard ML Basis Library can read the environment but not
 # modify it, so the fixture URL is supplied here.
 RUN polyc-retry -o /build/adapter-live-test client/tests/adapter-live-test.sml \
@@ -218,18 +224,45 @@ RUN code=0; \
     && test ! -s /tmp/example.out \
     && grep -Fq 'CONVEX_URL is required' /tmp/example.err
 
-# Layer 7: execute the exact shipped example binary against a fixture that
+# Layer 8: execute the exact shipped example binary against a fixture that
 # answers with Convex's integral decimal spelling, and prove a fractional count
 # is refused with no stdout at all.
 RUN polyc-retry -o /build/main-test examples/basics/main-test.sml \
     && EXAMPLE_BINARY=/out/convex-example /build/main-test
 
-# Runtime audit: the real bounded writer runs while nothing reads stdout.
+# Layer 9: the bounded-writer runtime audit. The real adapter sink runs while
+# nothing reads stdout, so the queue and an in-flight write are both under
+# pressure. That fault injection is compiled only into this test-only build.
 RUN set -eu; \
-    ADAPTER_FLOOD_TEST=1 /out/convex-adapter 2>/tmp/flood.err | ( sleep 4; cat >/dev/null ); \
+    polyc-retry -o /build/convex-adapter-flood client/tests/flood-adapter.sml; \
+    /build/convex-adapter-flood 2>/tmp/flood.err | ( sleep 4; cat >/dev/null ); \
     grep -Fq 'adapter flood queue ready' /tmp/flood.err
 
-CMD ["/bin/sh", "-c", "echo 'standard-ml: format, unit, Live, adapter, TLS, and example tests all ran during the build'"]
+# The shipped adapter must carry no trace of that audit: not the retired
+# environment switch, not its diagnostics, and no behaviour that responds to
+# either. The strings would be in the exported heap if they were compiled in.
+RUN set -eu; \
+    if grep -aq 'ADAPTER_FLOOD_TEST' /out/convex-adapter; then \
+      printf '%s\n' 'The shipped adapter still names the flood-test switch' >&2; \
+      exit 1; \
+    fi; \
+    if grep -aq 'adapter flood queue ready' /out/convex-adapter; then \
+      printf '%s\n' 'The shipped adapter still carries the flood-audit diagnostics' >&2; \
+      exit 1; \
+    fi; \
+    printf '%s\n' \
+      '{"protocolVersion":1,"id":"hello","op":"hello"}' \
+      '{"id":"close","op":"close"}' \
+    | ADAPTER_FLOOD_TEST=1 /out/convex-adapter \
+      >/tmp/flood-probe.out 2>/tmp/flood-probe.err; \
+    grep -Fq '"type":"ready"' /tmp/flood-probe.out; \
+    grep -Fq '"type":"closed"' /tmp/flood-probe.out; \
+    if grep -Fq 'adapter flood queue ready' /tmp/flood-probe.err; then \
+      printf '%s\n' 'The shipped adapter still answers the flood-test switch' >&2; \
+      exit 1; \
+    fi
+
+CMD ["/bin/sh", "-c", "echo 'standard-ml: style, unit, Live, adapter, TLS, and example tests all ran during the build'"]
 
 # Start from the pinned non-scratch image, remove its broad filesystem with a
 # temporary static helper, then copy back only the declared runtime closure.
@@ -358,6 +391,19 @@ FROM runtime-base AS example-runtime
 COPY --from=test /out/convex-example /usr/local/bin/convex-example
 RUN test -x /usr/local/bin/convex-example \
     && test ! -e /usr/local/bin/convex-adapter
+# Execute the exact published entrypoint from this exact image, rather than
+# inferring that it works because the build stage ran the same bytes with a
+# different library path, user, and filesystem. Without configuration it must
+# exit 1 with an empty stdout, because stdout is the universal happy-path
+# transcript, and say why on stderr. Nothing is written to disk: this stage runs
+# as 65532 over a filesystem that has already had /tmp removed.
+RUN set -eu; \
+    code=0; \
+    out=$(/usr/local/bin/convex-example 2>/dev/null) || code=$?; \
+    test "$code" -eq 1; \
+    test -z "$out"; \
+    err=$(/usr/local/bin/convex-example 2>&1 >/dev/null || true); \
+    printf '%s\n' "$err" | grep -Fq 'CONVEX_URL is required'
 ENTRYPOINT ["/usr/local/bin/convex-example"]
 
 # Keep the adapter last: `./run build standard-ml` uses the default target.

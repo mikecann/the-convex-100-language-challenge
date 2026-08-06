@@ -33,7 +33,29 @@ struct
   val outputCountLimit = 16
   val outputByteLimit = 6 * 1024 * 1024
 
+  (* Why this process ended, carried out as the exit status. A controller that
+     sees only "non-zero" cannot tell a session that finished from one whose
+     output never reached it, and a controller that sees 0 for a stalled writer
+     is being told a stall was a clean run. *)
+  datatype outcome = Ended | InputFailed | OutputFailed | StartFailed
+
+  fun statusOf outcome =
+    case outcome of
+        Ended => 0
+      | StartFailed => 1
+      | InputFailed => 2
+      | OutputFailed => 3
+
   fun adapterFail message = ConvexError.fail ("ProtocolError", message)
+
+  (* Text that came from the controller is quoted back only in a bounded form.
+     Echoing a near-maximum field name verbatim would let one hostile line turn
+     into a near-maximum event. *)
+  val maxEcho = 64
+
+  fun echo text =
+    if String.size text <= maxEcho then text
+    else String.substring (text, 0, maxEcho) ^ "..."
 
   fun describe exn =
     case exn of
@@ -106,6 +128,8 @@ struct
     List.length (!queue) + (if !inFlight > 0 then 1 else 0)
 
   fun sinkBytes (Sink {queuedBytes, inFlight, ...}) = !queuedBytes + !inFlight
+
+  fun sinkFailed (Sink {failed, ...}) = !failed
 
   fun dropFirstDroppable (Sink {queue, queuedBytes, ...}) =
     let
@@ -189,8 +213,7 @@ struct
   fun publish (sink as Sink {mutex, cond, encoder, queue, queuedBytes, closed, failed, ...},
                value, droppable, seconds) =
     let
-      val text =
-        Guard.critical (encoder, fn () => Json.encode value ^ "\n")
+      val text = Guard.critical (encoder, fn () => Json.encodeLine value)
       val size = String.size text
       val deadline = Clock.deadlineIn seconds
       val _ =
@@ -221,6 +244,11 @@ struct
       accepted
     end
 
+  (* A draining close waits long enough for a controller that is still reading
+     to take the last event. That is what makes bytes still held afterwards mean
+     "never delivered" rather than "not delivered yet". *)
+  val outputDrainSeconds = 5.0
+
   fun closeSink (Sink {mutex, cond, queue, queuedBytes, closed, finished, ...}, drain) =
     (Guard.critical
        (mutex,
@@ -228,7 +256,7 @@ struct
           (if drain then () else (queue := []; queuedBytes := 0);
            closed := true;
            Thread.ConditionVar.broadcast cond));
-     ignore (Latch.awaitSeconds (finished, 1.0)))
+     ignore (Latch.awaitSeconds (finished, if drain then outputDrainSeconds else 1.0)))
 
   (* ---- adapter state -------------------------------------------------- *)
 
@@ -422,9 +450,9 @@ struct
       fun check (seen, []) = ()
         | check (seen, (key, _) :: rest) =
             (if List.exists (fn name => name = key) allowed then ()
-             else adapterFail ("adapter command contains an unknown field " ^ key);
+             else adapterFail ("adapter command contains an unknown field " ^ echo key);
              if List.exists (fn name => name = key) seen then
-               adapterFail ("adapter command contains a duplicate field " ^ key)
+               adapterFail ("adapter command contains a duplicate field " ^ echo key)
              else ();
              check (key :: seen, rest))
       val _ = check ([], entries)
@@ -623,12 +651,17 @@ struct
     handle exn => respond (state, errorEvent (failureOf exn, NONE, NONE))
 
   (* Reads NDJSON one byte at a time so an overlong line can be drained exactly
-     once instead of buffered. *)
+     once instead of buffered. Bytes accumulate in a block rather than a list of
+     one-character strings, so a near-maximum line costs about its own size.
+
+     Returns why the session ended, which is what the exit status is built
+     from. *)
   fun runLoop (readByte, emit) =
     let
       val sink = newSink emit
       val state = newState sink
       val State {closed, ...} = state
+      val failure : exn option ref = ref NONE
       fun loop (buffer, count, discarding) =
         if !closed then ()
         else
@@ -657,9 +690,15 @@ struct
                 else (Buffer.addChar (buffer, character); loop (buffer, count + 1, false))
     in
       (loop (Buffer.new (), 0, false)
-       handle exn => note ("adapter failed: " ^ describe exn));
+       handle exn => (note ("adapter failed: " ^ describe exn); failure := SOME exn));
       cleanup state;
-      closeSink (sink, true)
+      closeSink (sink, true);
+      (* Bytes still held after a draining close mean the controller never
+         received them, whatever the input loop believed. That outranks an input
+         failure, because a stalled writer is usually what caused it. *)
+      if sinkFailed sink orelse sinkBytes sink > 0 then OutputFailed
+      else if Option.isSome (!failure) then InputFailed
+      else Ended
     end
 
   (* ---- entry points ------------------------------------------------------ *)
@@ -683,6 +722,39 @@ struct
               | NONE => adapterFail "ADAPTER_LISTEN must contain a valid host and port"
           end
 
+  (* The whole TCP connection shares one write budget rather than granting a
+     fresh deadline to each event. A controller that stops reading would
+     otherwise hold this process open indefinitely, one deadline at a time. The
+     budget is spent by a write that fails as well as one that succeeds, so it
+     can never be renewed by failing repeatedly.
+
+     Every write charges its full elapsed time, including the microseconds a
+     healthy one costs. The allowance is set far above what a healthy run can
+     accumulate - a controller that keeps reading spends milliseconds in total
+     across a whole conformance session - while a controller that stops reading
+     exhausts it inside a single stalled write. *)
+  val outputStallAllowance = 30.0
+
+  fun boundedEmitter (channel, allowance) =
+    let
+      val remaining = ref allowance
+    in
+      fn text =>
+        let
+          val started = Clock.now ()
+          fun spend () = remaining := !remaining - Time.toReal (Time.- (Clock.now (), started))
+          val _ =
+            if !remaining <= 0.0 then
+              ConvexError.fail
+                ("TransportError", "adapter output exhausted its connection write budget")
+            else ()
+        in
+          (Transport.writeAll (channel, text, Clock.deadlineIn (!remaining))
+           handle exn => (spend (); raise exn));
+          spend ()
+        end
+    end
+
   fun serveTcp listen =
     let
       val (host, port) = parseListen listen
@@ -696,50 +768,33 @@ struct
       val channel = Transport.ofSocket accepted
       val reader = Reader.new channel
       (* The shared controller owns the pace of this connection, so reads wait
-         indefinitely while writes stay bounded. *)
+         indefinitely while writes stay inside one cumulative budget. *)
       fun readByte () = Reader.byte (reader, Clock.deadlineIn 3600.0)
-      fun emit text = Transport.writeAll (channel, text, Clock.deadlineIn 0.5)
+      val emit = boundedEmitter (channel, outputStallAllowance)
+      val outcome = runLoop (readByte, emit)
     in
-      runLoop (readByte, emit);
       (* Do not linger on a controller that has already gone away. *)
-      Transport.close channel
+      Transport.close channel;
+      outcome
     end
 
-  (* Runtime audit hook: the real bounded writer is exercised while the caller
-     deliberately never reads stdout. *)
-  fun floodTest () =
-    let
-      val sink = newSink (fn text => (TextIO.output (TextIO.stdOut, text);
-                                      TextIO.flushOut TextIO.stdOut))
-      val large = CharVector.tabulate (350000, fn _ => #"x")
-      fun loop index =
-        if index >= 40 then ()
-        else
-          (ignore
-             (publish
-                (sink,
-                 Json.Object
-                   [("type", Json.String "subscription"),
-                    ("subscriptionId", Json.String "memory"),
-                    ("value",
-                     Json.Object
-                       [("index", Json.Int (IntInf.fromInt index)), ("text", Json.String large)])],
-                 true, 5.0));
-           loop (index + 1))
-    in
-      loop 0;
-      note "adapter flood queue ready";
-      Clock.sleep 3.0;
-      closeSink (sink, false)
-    end
+  (* Always leave through here, with a status that names the cause. Falling off
+     the end of main would report a stalled writer as a clean run, and would do
+     it while a writer thread is still blocked inside a write that will never
+     complete. stdout is only flushed on the clean path, because on the others
+     it is the thing that is blocked. *)
+  fun finish outcome =
+    (TextIO.flushOut TextIO.stdErr handle _ => ();
+     (case outcome of Ended => (TextIO.flushOut TextIO.stdOut handle _ => ()) | _ => ());
+     Posix.Process.exit (Word8.fromInt (statusOf outcome)))
 
-  fun main () =
-    (case OS.Process.getEnv "ADAPTER_FLOOD_TEST" of
-         SOME _ => floodTest ()
-       | NONE =>
-           (case OS.Process.getEnv "ADAPTER_LISTEN" of
-                SOME listen => if listen = "" then runLoop (standardStreams ()) else serveTcp listen
-              | NONE => runLoop (standardStreams ())))
-    handle exn =>
-      (note ("adapter failed: " ^ describe exn); OS.Process.exit OS.Process.failure)
+  (* There is deliberately no environment switch and no argument switch here.
+     Nothing the shipped adapter reads at run time can select test behaviour;
+     the memory gate drives this exact binary through the ordinary protocol. *)
+  fun main () : unit =
+    finish
+      ((case OS.Process.getEnv "ADAPTER_LISTEN" of
+            SOME listen => if listen = "" then runLoop (standardStreams ()) else serveTcp listen
+          | NONE => runLoop (standardStreams ()))
+       handle exn => (note ("adapter failed: " ^ describe exn); StartFailed))
 end

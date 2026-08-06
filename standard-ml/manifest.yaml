@@ -31,18 +31,28 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - Language-local Docker tests, both minimal runtime images, and real TLS have
-    been executed; shared local and hosted black-box conformance have not, so
-    every capability remains unearned.
+  - No Docker build has been run over this source since the review repairs, so
+    no gate here is backed by a run; shared local and hosted black-box
+    conformance have never been run at all. Every capability remains unearned.
+  - Poly/ML ships no formatter, so the test image runs a Standard ML style and
+    lint gate over every checked-in source in this directory instead of
+    claiming a format step that does not exist.
   - Building linux/amd64 under emulation on an arm64 host occasionally faults
     inside the C toolchain. polyc retries only that exact signature; a fault in
     the busybox prune step needs the image build repeating.
   - Live authentication, optimistic updates, WebSocket mutations, WebSocket
     actions, journals, and TransitionChunk assembly are deferred.
-  - HTTP uses a bounded single-request connection-close exchange; chunked and
-    persistent response framing are deferred and rejected explicitly.
+  - HTTP uses a bounded single-request connection-close exchange; any transfer
+    coding, a repeated or conflicting framing header, and a Content-Length that
+    is not a plain decimal are all rejected rather than resolved in the
+    server's favour.
   - Only IPv4 deployment addresses resolve; bracketed IPv6 URLs are rejected
-    rather than half-supported.
+    rather than half-supported. A literal address is converted without a
+    lookup, and a name is resolved on its own thread and then cached, so no
+    caller waits on the resolver beyond its own deadline.
+  - A Live subscribe retries its first connection inside one absolute caller
+    budget. A caller that stops waiting has its acknowledgement cancelled and
+    the query withdrawn with a real Remove.
   - Live values cover Convex's JSON-safe subset; tagged Convex value conversions
     are deferred.
   - JSON input is limited to 2 MiB, 128 nesting levels, and 8192 structural
@@ -51,5 +61,10 @@ limitations:
   - One manager-wide queue retains the newest 16 deliveries within a
     conservative 20 MiB exact-encoded and runtime-overhead budget.
   - Adapter output independently retains the newest 16 encoded events within
-    6 MiB, including an in-flight write.
+    6 MiB, including an in-flight write. On the TCP transport the whole
+    connection shares one cumulative 30-second write budget, spent by failed
+    writes as well as successful ones.
+  - The bounded-writer audit is a separate test-only executable. Nothing
+    selects it at run time and the build asserts it is absent from the shipped
+    adapter.
 capabilities: []

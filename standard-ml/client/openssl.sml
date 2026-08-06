@@ -53,6 +53,7 @@ struct
      sslShutdown: ptr -> int,
      sslGetVerifyResult: ptr -> int,
      bioNewMem: unit -> ptr,
+     bioFree: ptr -> unit,
      bioWrite: ptr * ptr * int -> int,
      bioRead: ptr * ptr * int -> int,
      bioCtrl: ptr * int * int * ptr -> int,
@@ -60,6 +61,12 @@ struct
      errErrorString: int * ptr * int -> unit}
 
   val loaded : api option ref = ref NONE
+
+  (* The transport calls into this binding from the Live owner, from the adapter
+     relays, and from any caller making an HTTP request, so the one-time load
+     below has to be serialised. Two threads racing here would otherwise open
+     the libraries twice and publish two different sets of call stubs. *)
+  val loadMutex = Thread.Mutex.mutex ()
 
   fun build () : api =
     let
@@ -72,6 +79,7 @@ struct
       val ctxNewRaw = buildCall1 (sslSymbol "SSL_CTX_new", cPointer, cPointer)
       val bioSMem = buildCall0 (cryptoSymbol "BIO_s_mem", (), cPointer)
       val bioNewRaw = buildCall1 (cryptoSymbol "BIO_new", cPointer, cPointer)
+      val bioFreeRaw = buildCall1 (cryptoSymbol "BIO_free", cPointer, cInt)
     in
       {ctxNew = fn () => ctxNewRaw (clientMethod ()),
        ctxFree = buildCall1 (sslSymbol "SSL_CTX_free", cPointer, cVoid),
@@ -100,6 +108,9 @@ struct
        sslGetVerifyResult =
          buildCall1 (sslSymbol "SSL_get_verify_result", cPointer, cLong),
        bioNewMem = fn () => bioNewRaw (bioSMem ()),
+       (* Needed only for a buffer created before SSL_set_bio took ownership of
+          it; after that the session frees both. *)
+       bioFree = fn bio => ignore (bioFreeRaw bio),
        bioWrite = buildCall3 (cryptoSymbol "BIO_write", (cPointer, cPointer, cInt), cInt),
        bioRead = buildCall3 (cryptoSymbol "BIO_read", (cPointer, cPointer, cInt), cInt),
        bioCtrl =
@@ -110,21 +121,27 @@ struct
            (cryptoSymbol "ERR_error_string_n", (cLong, cPointer, cInt), cVoid)}
     end
 
-  (* Load once, on first use, and reuse afterwards. *)
+  (* Load once, on first use, and reuse afterwards. The lock is uncontended
+     after that first call, which is why every later byte-pump call can afford
+     to go through here rather than caching a copy of the record. *)
   fun api () =
-    case !loaded of
-        SOME existing => existing
-      | NONE =>
-          let
-            val fresh =
-              build ()
-              handle exn =>
-                ConvexError.fail
-                  ("TransportError", "OpenSSL is unavailable: " ^ General.exnMessage exn)
-          in
-            loaded := SOME fresh;
-            fresh
-          end
+    Guard.critical
+      (loadMutex,
+       fn () =>
+         case !loaded of
+             SOME existing => existing
+           | NONE =>
+               let
+                 val fresh =
+                   build ()
+                   handle exn =>
+                     ConvexError.fail
+                       ("TransportError",
+                        "OpenSSL is unavailable: " ^ General.exnMessage exn)
+               in
+                 loaded := SOME fresh;
+                 fresh
+               end)
 
   fun isNull pointer = pointer = null
 

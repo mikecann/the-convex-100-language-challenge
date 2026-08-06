@@ -13,6 +13,7 @@ use "client/tests/conformance/adapter.sml";
 structure AdapterTest =
 struct
   val tcpPort = 19300
+  val stalledPort = 19302
 
   fun events text =
     List.map Json.decode
@@ -20,18 +21,20 @@ struct
          (String.tokens (fn character => character = #"\n") text))
 
   (* Feed a whole NDJSON script through the real loop and collect what it
-     emitted. *)
-  fun runMemory input =
+     emitted, along with the outcome the process would exit with. *)
+  fun driveMemory input =
     let
       val position = ref 0
       fun readByte () =
         if !position >= String.size input then NONE
         else (position := !position + 1; SOME (String.sub (input, !position - 1)))
       val output = Buffer.new ()
+      val outcome = Adapter.runLoop (readByte, fn text => Buffer.add (output, text))
     in
-      Adapter.runLoop (readByte, fn text => Buffer.add (output, text));
-      events (Buffer.contents output)
+      {events = events (Buffer.contents output), outcome = outcome}
     end
+
+  fun runMemory input = #events (driveMemory input)
 
   fun typeOf event = Json.asString (Json.getOr (event, "type", Json.Null))
 
@@ -53,9 +56,13 @@ struct
 
   fun envelopes () =
     let
-      val emitted = runMemory script
+      val {events = emitted, outcome} = driveMemory script
       fun at index = List.nth (emitted, index)
     in
+      (* The exit status names the cause. A session the controller ended is the
+         only one that may report success. *)
+      Check.that ("a completed session ends cleanly", outcome = Adapter.Ended);
+      Check.that ("a clean session exits zero", Adapter.statusOf outcome = 0);
       Check.that ("every NDJSON record produced one event", List.length emitted = 11);
       Check.that ("every event is an object", List.all Json.isObject emitted);
       Check.that
@@ -188,9 +195,12 @@ struct
                val {channel, reader} = Fixture.acceptPeer listener
              in
                Socket.close listener;
-               Adapter.runLoop
-                 (fn () => Reader.byte (reader, Clock.deadlineIn 10.0),
-                  fn text => Transport.writeAll (channel, text, Clock.deadlineIn 2.0));
+               Check.that
+                 ("a TCP session the controller ends is clean",
+                  Adapter.runLoop
+                    (fn () => Reader.byte (reader, Clock.deadlineIn 10.0),
+                     fn text => Transport.writeAll (channel, text, Clock.deadlineIn 2.0))
+                  = Adapter.Ended);
                Transport.close channel
              end)
       val channel =
@@ -214,6 +224,87 @@ struct
       Fixture.join (server, 5.0, "the TCP adapter")
     end
 
+  (* An actual stopped reader on an actual socket. The peer accepts the
+     connection and never reads a byte, so the kernel buffers fill and writes
+     block for real. The whole connection shares one budget: it is spent by the
+     write that stalls, and a later write must fail immediately instead of
+     starting a fresh deadline of its own. *)
+  fun stoppedReaderOutput () =
+    let
+      val allowance = 1.0
+      val listener = Fixture.listenOn stalledPort
+      (* Small buffers on both sides so the stall is quick and certain. *)
+      val _ = Socket.Ctl.setRCVBUF (listener, 2048)
+      val release = Latch.new ()
+      val peer =
+        Fixture.spawn
+          (fn () =>
+             let
+               val (accepted, _) = Socket.accept listener
+             in
+               Socket.close listener;
+               (* Never read. Hold the connection open until the test is done,
+                  so the writer stalls rather than seeing a reset. *)
+               ignore (Latch.awaitSeconds (release, 30.0));
+               Socket.close accepted
+             end)
+      val channel =
+        Transport.connect
+          {host = "127.0.0.1", port = stalledPort, secure = false,
+           deadline = Clock.deadlineIn 3.0}
+      val _ = Socket.Ctl.setSNDBUF (#socket channel, 2048)
+      val emit = Adapter.boundedEmitter (channel, allowance)
+      val block = CharVector.tabulate (65536, fn _ => #"x")
+      val started = Clock.now ()
+      fun push index =
+        if index >= 200 then false
+        else (emit block; push (index + 1))
+      val stalled =
+        push 0 handle ConvexError.Error {name, ...} => name = "TransportError"
+      val stalledSeconds = Time.toReal (Time.- (Clock.now (), started))
+      val resumed = Clock.now ()
+      val exhausted =
+        (emit block; false) handle ConvexError.Error {name, ...} => name = "TransportError"
+      val exhaustedSeconds = Time.toReal (Time.- (Clock.now (), resumed))
+    in
+      Check.that ("a stopped reader stops the adapter's TCP output", stalled);
+      Check.that
+        ("the whole connection shares one cumulative output budget",
+         stalledSeconds < allowance + 1.5);
+      Check.that ("an exhausted output budget is not renewed per write", exhausted);
+      Check.that
+        ("an exhausted output budget fails without stalling again",
+         exhaustedSeconds < 0.5);
+      Latch.release release;
+      Transport.close channel;
+      Fixture.join (peer, 10.0, "the stopped reader")
+    end
+
+  (* A stopped reader has to be reported as a stopped reader. The writer here
+     never completes its first write, so the session ends holding events the
+     controller never received. The Docker memory gate asserts this exact status
+     from the exact shipped binary; this proves which code path produces it. *)
+  fun stoppedReaderOutcome () =
+    let
+      val never = Latch.new ()
+      val commands =
+        "{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}\n"
+        ^ "{\"id\":\"close\",\"op\":\"close\"}\n"
+      val position = ref 0
+      fun readByte () =
+        if !position >= String.size commands then NONE
+        else (position := !position + 1; SOME (String.sub (commands, !position - 1)))
+      val outcome =
+        Adapter.runLoop (readByte, fn _ => ignore (Latch.awaitSeconds (never, 30.0)))
+    in
+      Check.that
+        ("output nobody received is an output failure, not a clean run",
+         outcome = Adapter.OutputFailed);
+      Check.that
+        ("an undelivered output has its own exit status", Adapter.statusOf outcome = 3);
+      Latch.release never
+    end
+
   (* The shared harness selects the TCP transport with ADAPTER_LISTEN, so a
      malformed address must be rejected rather than silently ignored. *)
   fun listenAddress () =
@@ -228,7 +319,8 @@ struct
         fn () => Adapter.parseListen "127.0.0.1:70000"))
 
   fun run () =
-    (envelopes (); hostileInput (); boundedOutput (); listenAddress (); tcpMode ())
+    (envelopes (); hostileInput (); boundedOutput (); stoppedReaderOutput ();
+     stoppedReaderOutcome (); listenAddress (); tcpMode ())
 end
 
 fun main () = Check.run ("adapter-test", AdapterTest.run)

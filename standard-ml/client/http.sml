@@ -90,12 +90,40 @@ struct
          body]
     end
 
+  fun malformedStatus () =
+    ConvexError.fail ("ProtocolError", "HTTP status line is malformed")
+
+  (* Only the two versions this client can speak, and only a real three-digit
+     status. A lenient status line is the first step towards reading two
+     responses as one, so every part of it is checked rather than scanned. *)
   fun parseStatus line =
-    if String.size line >= 12 andalso Text.startsWith ("HTTP/", line) then
-      case Int.fromString (String.substring (line, 9, 3)) of
-          SOME status => status
-        | NONE => ConvexError.fail ("ProtocolError", "HTTP status line is malformed")
-    else ConvexError.fail ("ProtocolError", "HTTP status line is malformed")
+    let
+      val _ =
+        if Text.startsWith ("HTTP/1.1 ", line) orelse Text.startsWith ("HTTP/1.0 ", line) then ()
+        else malformedStatus ()
+      val _ = if String.size line >= 12 then () else malformedStatus ()
+      val digits = String.substring (line, 9, 3)
+      val _ = if CharVector.all Char.isDigit digits then () else malformedStatus ()
+      (* The reason phrase is optional, but when it is present a space has to
+         separate it from the status code. *)
+      val _ =
+        if String.size line = 12 orelse String.sub (line, 12) = #" " then ()
+        else malformedStatus ()
+      val status = case Int.fromString digits of SOME value => value | NONE => malformedStatus ()
+    in
+      if status >= 100 andalso status <= 599 then status
+      else ConvexError.fail ("ProtocolError", "HTTP status code is outside 100 to 599")
+    end
+
+  (* RFC 9110 token characters. A header name outside this set - or separated
+     from its colon by a space - is how a smuggled second framing header gets
+     past a lenient parser. *)
+  fun tokenChar character =
+    Char.isAlphaNum character
+    orelse
+      List.exists (fn allowed => allowed = character)
+        [#"!", #"#", #"$", #"%", #"&", #"'", #"*", #"+", #"-", #".", #"^", #"_",
+         #"`", #"|", #"~"]
 
   fun readHeaders (reader, deadline) =
     let
@@ -107,45 +135,110 @@ struct
               NONE => ConvexError.fail ("ProtocolError", "HTTP headers ended unexpectedly")
             | SOME "" => List.rev headers
             | SOME line =>
-                (case Text.indexFrom (line, #":", 0) of
-                     NONE => ConvexError.fail ("ProtocolError", "HTTP header is malformed")
-                   | SOME index =>
-                       loop
-                         ((Text.lower (String.substring (line, 0, index)),
-                           Text.trim (String.extract (line, index + 1, NONE)))
-                          :: headers,
-                          count + 1))
+                let
+                  (* Obsolete line folding is rejected outright: a continuation
+                     line can otherwise smuggle a value into the header above
+                     it. *)
+                  val _ =
+                    if Char.isSpace (String.sub (line, 0)) then
+                      ConvexError.fail ("ProtocolError", "HTTP response folds a header line")
+                    else ()
+                  val index =
+                    case Text.indexFrom (line, #":", 0) of
+                        SOME found => found
+                      | NONE => ConvexError.fail ("ProtocolError", "HTTP header is malformed")
+                  val name = String.substring (line, 0, index)
+                  val _ =
+                    if index > 0 andalso CharVector.all tokenChar name then ()
+                    else ConvexError.fail ("ProtocolError", "HTTP header name is malformed")
+                in
+                  loop
+                    ((Text.lower name, Text.trim (String.extract (line, index + 1, NONE)))
+                     :: headers,
+                     count + 1)
+                end
     in
       loop ([], 0)
     end
 
-  fun header (headers, name) =
-    Option.map #2 (List.find (fn (key, _) => key = name) headers)
+  fun headerValues (headers : (string * string) list, name) =
+    List.map #2 (List.filter (fn (key, _) => key = name) headers)
+
+  (* A repeated framing header is rejected even when both copies agree: the
+     client has no way to tell an origin server's duplicate from an
+     intermediary's injected one. *)
+  fun singleHeader (headers, name) =
+    case headerValues (headers, name) of
+        [] => NONE
+      | [only] => SOME only
+      | _ =>
+          ConvexError.fail
+            ("ProtocolError", "HTTP response repeats the " ^ name ^ " header")
+
+  (* Digits and nothing else. Int.fromString would happily accept leading
+     whitespace, a sign, or trailing rubbish, and each of those is a different
+     length to a different parser. *)
+  fun contentLength text =
+    let
+      val _ =
+        if text <> "" andalso String.size text <= 18 andalso CharVector.all Char.isDigit text then
+          ()
+        else ConvexError.fail ("ProtocolError", "HTTP Content-Length is malformed")
+    in
+      case Int.fromString text of
+          SOME value => value
+        | NONE => ConvexError.fail ("ProtocolError", "HTTP Content-Length is malformed")
+    end
 
   fun readBody (reader, headers, deadline) =
     let
+      val encoding = singleHeader (headers, "transfer-encoding")
+      val declared = singleHeader (headers, "content-length")
+      (* Carrying both is the classic request-smuggling shape. Neither header
+         wins here; the response is refused. *)
       val _ =
-        case header (headers, "transfer-encoding") of
-            SOME encoding =>
-              if Text.lower encoding = "identity" then ()
-              else
-                ConvexError.fail
-                  ("ProtocolError", "chunked HTTP response framing is not supported")
+        case (encoding, declared) of
+            (SOME _, SOME _) =>
+              ConvexError.fail
+                ("ProtocolError",
+                 "HTTP response carries both Transfer-Encoding and Content-Length")
+          | _ => ()
+      (* This client asks for one request per connection, so no transfer coding
+         is expected at all; chunked in particular is deferred rather than
+         mis-parsed. *)
+      val _ =
+        case encoding of
+            SOME value =>
+              ConvexError.fail
+                ("ProtocolError",
+                 "unsupported HTTP transfer coding " ^ Text.lower (Text.trim value))
           | NONE => ()
-      val output = Buffer.new ()
+      (* A connection-close response carries no declared length, so it is read
+         in whole buffered chunks up to the same 2 MiB ceiling rather than one
+         byte at a time. *)
       fun drain () =
-        if Buffer.size output > maxBody then
-          ConvexError.fail ("TransportError", "HTTP response exceeds 2097152 bytes")
-        else
-          case Reader.byte (reader, deadline) of
-              NONE => Buffer.contents output
-            | SOME character => (Buffer.addChar (output, character); drain ())
-    in
-      case Option.mapPartial Int.fromString (header (headers, "content-length")) of
-          SOME length =>
-            if length < 0 orelse length > maxBody then
+        let
+          val output = Buffer.new ()
+          fun loop () =
+            if Buffer.size output > maxBody then
               ConvexError.fail ("TransportError", "HTTP response exceeds 2097152 bytes")
-            else Reader.exact (reader, length, deadline)
+            else
+              case Reader.chunk (reader, Transport.chunkSize, deadline) of
+                  "" => Buffer.contents output
+                | text => (Buffer.add (output, text); loop ())
+        in
+          loop ()
+        end
+    in
+      case declared of
+          SOME text =>
+            let
+              val length = contentLength text
+            in
+              if length > maxBody then
+                ConvexError.fail ("TransportError", "HTTP response exceeds 2097152 bytes")
+              else Reader.exact (reader, length, deadline)
+            end
         | NONE => drain ()
     end
 

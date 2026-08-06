@@ -204,9 +204,12 @@ struct
                val {channel, reader} = Fixture.acceptPeer controlListener
              in
                Socket.close controlListener;
-               Adapter.runLoop
-                 (fn () => Reader.byte (reader, Clock.deadlineIn 60.0),
-                  fn text => Transport.writeAll (channel, text, Clock.deadlineIn 3.0));
+               Check.that
+                 ("the adapter ends the Live session cleanly",
+                  Adapter.runLoop
+                    (fn () => Reader.byte (reader, Clock.deadlineIn 60.0),
+                     fn text => Transport.writeAll (channel, text, Clock.deadlineIn 3.0))
+                  = Adapter.Ended);
                Transport.close channel
              end)
       val channel =

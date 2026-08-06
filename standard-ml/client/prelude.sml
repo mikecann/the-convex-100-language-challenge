@@ -3,6 +3,21 @@
    byte-string, deadline, and thread-handshake primitives once instead of
    letting each layer invent its own. *)
 
+structure Guard =
+struct
+  (* Run a body under a mutex and always unlock, even when the body raises.
+     Every critical section in this client goes through here so a structured
+     Convex failure can never leave a lock held. *)
+  fun critical (mutex, body) =
+    let
+      val _ = Thread.Mutex.lock mutex
+      val result = body () handle exn => (Thread.Mutex.unlock mutex; raise exn)
+    in
+      Thread.Mutex.unlock mutex;
+      result
+    end
+end
+
 structure Clock =
 struct
   (* Every bounded operation in this client is expressed as an absolute
@@ -36,9 +51,7 @@ struct
         if expired deadline then ()
         else (Thread.ConditionVar.waitUntil (cond, mutex, deadline); loop ())
     in
-      Thread.Mutex.lock mutex;
-      loop ();
-      Thread.Mutex.unlock mutex
+      Guard.critical (mutex, loop)
     end
 end
 
@@ -57,41 +70,24 @@ struct
      released = ref false}
 
   fun release ({mutex, cond, released} : t) =
-    (Thread.Mutex.lock mutex;
-     released := true;
-     Thread.ConditionVar.broadcast cond;
-     Thread.Mutex.unlock mutex)
+    Guard.critical
+      (mutex, fn () => (released := true; Thread.ConditionVar.broadcast cond))
 
-  (* Returns false when the deadline passed before the latch was released. *)
+  (* Returns false when the deadline passed before the latch was released.
+     A latch is what every shutdown path waits on, so the lock is released even
+     when the wait itself raises; otherwise one interrupted waiter would hold
+     the latch shut for every other thread. *)
   fun await ({mutex, cond, released} : t, deadline) =
     let
       fun loop () =
         if !released then true
         else if Clock.expired deadline then false
         else (Thread.ConditionVar.waitUntil (cond, mutex, deadline); loop ())
-      val _ = Thread.Mutex.lock mutex
-      val result = loop ()
     in
-      Thread.Mutex.unlock mutex;
-      result
+      Guard.critical (mutex, loop)
     end
 
   fun awaitSeconds (latch, seconds) = await (latch, Clock.deadlineIn seconds)
-end
-
-structure Guard =
-struct
-  (* Run a body under a mutex and always unlock, even when the body raises.
-     Every critical section in this client goes through here so a structured
-     Convex failure can never leave a lock held. *)
-  fun critical (mutex, body) =
-    let
-      val _ = Thread.Mutex.lock mutex
-      val result = body () handle exn => (Thread.Mutex.unlock mutex; raise exn)
-    in
-      Thread.Mutex.unlock mutex;
-      result
-    end
 end
 
 structure Text =
@@ -215,45 +211,136 @@ struct
   (* Live uses this fingerprint to notice that a rehydrated value is unchanged
      without retaining a second copy of the value itself. Poly/ML's word is 63
      bits, so the 64-bit FNV-1a offset basis does not fit; two independent
-     in-range FNV-1a passes are combined instead. *)
+     in-range FNV-1a passes are combined instead.
+
+     The two passes advance together, one byte at a time, so a value can be
+     fingerprinted as it is written rather than after it exists. That is what
+     lets a near-maximum update be charged and compared without its encoded form
+     ever being built. *)
+  type mark = word * word
+
+  val fingerprintStart : mark = (0wx811c9dc5, 0wx9e3779b1)
+
+  fun fingerprintStep ((low, high) : mark, value) : mark =
+    (Word.* (Word.xorb (low, value), 0wx01000193),
+     Word.* (Word.xorb (high, value), 0wx1000193b))
+
+  fun fingerprintSeal ((low, high) : mark) =
+    Word.orb
+      (Word.<< (Word.andb (high, 0wx7fffffff), 0w31), Word.andb (low, 0wx7fffffff))
+
   fun fingerprint text =
     let
       val size = String.size text
-      fun fold (basis, prime) =
-        let
-          fun loop (index, hash) =
-            if index >= size then hash
-            else
-              loop
-                (index + 1,
-                 Word.* (Word.xorb (hash, Word.fromInt (Char.ord (String.sub (text, index)))),
-                         prime))
-        in
-          loop (0, basis)
-        end
-      val low = Word.andb (fold (0wx811c9dc5, 0wx01000193), 0wx7fffffff)
-      val high = Word.andb (fold (0wx9e3779b1, 0wx1000193b), 0wx7fffffff)
+      fun loop (index, state) =
+        if index >= size then state
+        else
+          loop
+            (index + 1,
+             fingerprintStep (state, Word.fromInt (Char.ord (String.sub (text, index)))))
     in
-      Word.orb (Word.<< (high, 0w31), low)
+      fingerprintSeal (loop (0, fingerprintStart))
     end
 end
 
 structure Buffer =
 struct
   (* Appending to an immutable string is quadratic, so accumulate reversed
-     chunks and concatenate once. *)
-  type t = {chunks: string list ref, size: int ref}
+     chunks and concatenate once.
 
-  fun new () : t = {chunks = ref [], size = ref 0}
+     Bytes arriving one at a time get their own treatment. A list of
+     one-character strings costs a cons cell and a string header per byte, which
+     on this runtime turns a two-megabyte NDJSON line or HTTP body into tens of
+     megabytes of live data. Single bytes are therefore written into a mutable
+     block and only sealed into a string when that block fills, so a large
+     message costs about its own size. The block doubles as it is reused, so a
+     header line stays cheap while a body reaches a handful of chunks rather
+     than thousands.
 
-  fun add ({chunks, size} : t, text) =
-    (chunks := text :: !chunks; size := !size + String.size text)
+     A buffer can also measure instead of collect. In that mode nothing is
+     retained at all: a writer walks a value exactly as it would to build the
+     string, and the buffer keeps only the running length and fingerprint. That
+     is how a near-maximum update is charged and compared against the last one
+     published without its encoded form ever existing. *)
+  val initialBlock = 256
+  val maximumBlock = 65536
 
-  fun addChar (buffer, character) = add (buffer, String.str character)
+  (* Below this, copying into the block beats retaining a separate chunk. *)
+  val chunkThreshold = 64
+
+  type t =
+    {chunks: string list ref,
+     block: CharArray.array ref,
+     used: int ref,
+     size: int ref,
+     (* Present exactly when this buffer measures rather than collects. *)
+     digest: Text.mark ref option}
+
+  fun new () : t =
+    {chunks = ref [],
+     block = ref (CharArray.array (initialBlock, #"\000")),
+     used = ref 0,
+     size = ref 0,
+     digest = NONE}
+
+  (* Retains nothing. The block is never touched, so it is never allocated. *)
+  fun measure () : t =
+    {chunks = ref [],
+     block = ref (CharArray.array (0, #"\000")),
+     used = ref 0,
+     size = ref 0,
+     digest = SOME (ref Text.fingerprintStart)}
+
+  (* Sealing copies, so the block itself is safe to reuse immediately. *)
+  fun seal ({chunks, block, used, ...} : t) =
+    if !used = 0 then ()
+    else
+      let
+        val filled = CharArraySlice.vector (CharArraySlice.slice (!block, 0, SOME (!used)))
+        val length = CharArray.length (!block)
+      in
+        chunks := filled :: !chunks;
+        used := 0;
+        if length < maximumBlock then
+          block := CharArray.array (Int.min (maximumBlock, length * 2), #"\000")
+        else ()
+      end
+
+  fun addChar (buffer as {block, used, size, digest, ...} : t, character) =
+    case digest of
+        SOME state =>
+          (state := Text.fingerprintStep (!state, Word.fromInt (Char.ord character));
+           size := !size + 1)
+      | NONE =>
+          (if !used >= CharArray.length (!block) then seal buffer else ();
+           CharArray.update (!block, !used, character);
+           used := !used + 1;
+           size := !size + 1)
+
+  fun add (buffer as {chunks, size, digest, ...} : t, text) =
+    if String.size text = 0 then ()
+    else
+      case digest of
+          SOME _ => CharVector.app (fn character => addChar (buffer, character)) text
+        | NONE =>
+            if String.size text < chunkThreshold then
+              CharVector.app (fn character => addChar (buffer, character)) text
+            else
+              (seal buffer;
+               chunks := text :: !chunks;
+               size := !size + String.size text)
 
   fun size ({size = total, ...} : t) = !total
 
-  fun contents ({chunks, ...} : t) = String.concat (List.rev (!chunks))
+  (* Only a measuring buffer carries one; a collecting buffer has its contents
+     instead, which is the thing a fingerprint exists to avoid keeping. *)
+  fun mark ({digest, ...} : t) =
+    case digest of
+        SOME state => Text.fingerprintSeal (!state)
+      | NONE => raise Fail "this buffer collects rather than measures"
+
+  fun contents (buffer as {chunks, ...} : t) =
+    (seal buffer; String.concat (List.rev (!chunks)))
 end
 
 structure Bytes =

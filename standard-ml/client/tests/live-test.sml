@@ -18,6 +18,8 @@ structure LiveTest =
 struct
   val servicePort = 19200
   val stallPort = 19201
+  val slowPort = 19202
+  val orphanPort = 19203
 
   (* U+96EA, three UTF-8 bytes. Written as escapes because a Standard ML string
      literal may only contain printable ASCII. *)
@@ -332,6 +334,116 @@ struct
          not (Option.isSome (Convex.next (subscription, 0.1))))
     end
 
+  (* A deployment that is slow to come up, not one that is down. The first two
+     attempts are answered with a closed socket and only the third completes the
+     handshake, so a subscribe that gave up after one attempt would fail here.
+     The whole retry sequence has to fit inside the single budget the caller
+     granted, and the connection that finally succeeds must be the client's
+     first: attempts that never produced a socket are not connections. *)
+  fun slowConnectChecks () =
+    let
+      val listener = Fixture.listenOn slowPort
+      val refusals = 2
+      val server =
+        Fixture.spawn
+          (fn () =>
+             let
+               fun refuse remaining =
+                 if remaining <= 0 then ()
+                 else
+                   let
+                     val peer = Fixture.acceptPeer listener
+                   in
+                     (* Read the upgrade request, then go away without
+                        answering it. *)
+                     ignore (Fixture.readRequest peer);
+                     Fixture.closePeer peer;
+                     refuse (remaining - 1)
+                   end
+               val _ = refuse refusals
+               val (peer, queryId) = acceptLive (listener, 0, NONE)
+             in
+               Socket.close listener;
+               sendTransition (peer, 0, 1, updated (queryId, 42, NONE));
+               ignore (Fixture.waitForDisconnect peer);
+               Fixture.closePeer peer
+             end)
+      val client = Convex.client (Fixture.urlFor slowPort)
+      val started = Clock.now ()
+      val subscription =
+        Convex.subscribe
+          (client, "demo:state", Json.Object [("room", Json.String "standard-ml-slow")])
+      val elapsed = Time.toReal (Time.- (Clock.now (), started))
+    in
+      Check.that ("a slow deployment is retried until it answers", elapsed < 4.0);
+      expectCount (subscription, 42, "the retried connection delivers its first value");
+      Convex.close client;
+      Fixture.join (server, 20.0, "the slow connect fixture")
+    end
+
+  (* A caller that stops waiting must not leave a subscription behind. The
+     acknowledgement is cancelled here in exactly the way awaitReply cancels it
+     when a caller's own wait expires; the owner then has to withdraw the query
+     it had just added rather than publish an acknowledgement nobody holds. *)
+  fun orphanChecks () =
+    let
+      val listener = Fixture.listenOn orphanPort
+      val proceed = Latch.new ()
+      val sawRemove = Latch.new ()
+      val server =
+        Fixture.spawn
+          (fn () =>
+             let
+               (* Nothing is accepted until the acknowledgement has been
+                  cancelled, so the owner is still inside its handshake when the
+                  caller gives up. *)
+               val _ = Check.that ("the orphan window opened", Latch.awaitSeconds (proceed, 10.0))
+               val peer = Fixture.acceptPeer listener
+               val _ = Fixture.handshake peer
+               val _ = Socket.close listener
+               val _ = Fixture.readClientJson (peer, "Connect")
+               fun modification message =
+                 case Json.asList (Json.getOr (message, "modifications", Json.Null)) of
+                     SOME (first :: _) => first
+                   | _ => raise Fail "the owner sent no modifications"
+               val add = modification (Fixture.readClientJson (peer, "ModifyQuerySet"))
+               val remove = modification (Fixture.readClientJson (peer, "ModifyQuerySet"))
+             in
+               Check.that
+                 ("the cancelled subscribe still added its query",
+                  Json.asString (Json.getOr (add, "type", Json.Null)) = SOME "Add");
+               Check.that
+                 ("the cancelled subscribe is withdrawn with a real Remove",
+                  Json.asString (Json.getOr (remove, "type", Json.Null)) = SOME "Remove");
+               Check.that
+                 ("the withdrawal names the query that was added",
+                  Json.asInt (Json.getOr (remove, "queryId", Json.Null))
+                  = Json.asInt (Json.getOr (add, "queryId", Json.Null)));
+               Latch.release sawRemove;
+               ignore (Fixture.waitForDisconnect peer);
+               Fixture.closePeer peer
+             end)
+      val manager = Live.newManager (Url.parse (Fixture.urlFor orphanPort), "standard-ml-0.1.0")
+      val reply =
+        Live.enqueueCommand
+          (manager, Live.SubscribeKind, NONE,
+           SOME ("demo:state", Json.Object [("room", Json.String "standard-ml-orphan")]), 4.0)
+      val Live.Reply {cancelled, ...} = reply
+    in
+      (* The owner is blocked in its handshake by now, so the cancellation lands
+         before the acknowledgement can. *)
+      Clock.sleep 0.3;
+      cancelled := true;
+      Latch.release proceed;
+      Check.that ("the withdrawal reached the fixture", Latch.awaitSeconds (sawRemove, 10.0));
+      Clock.sleep 0.5;
+      Check.that
+        ("no subscription survives a cancelled acknowledgement",
+         List.null (Live.sortedSubscriptions manager));
+      Live.close (manager, 5.0);
+      Fixture.join (server, 20.0, "the orphan fixture")
+    end
+
   (* A peer that accepts TCP and never speaks TLS must not monopolise the one
      Live owner. Close is queued behind the handshake, so this also proves the
      public lifecycle stays bounded while connecting. *)
@@ -389,6 +501,8 @@ struct
             Time.toReal (Time.- (Clock.now (), started)) < 2.5)
        end);
       Fixture.join (server, 15.0, "the Live fixture");
+      slowConnectChecks ();
+      orphanChecks ();
       stallChecks ()
     end
 end

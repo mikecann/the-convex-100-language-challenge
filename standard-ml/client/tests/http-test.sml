@@ -13,6 +13,7 @@ structure HttpTest =
 struct
   val servicePort = 19100
   val stallPort = 19101
+  val framingPort = 19102
 
   (* U+96EA, three UTF-8 bytes, as escapes: a Standard ML string literal may
      only contain printable ASCII. *)
@@ -145,6 +146,119 @@ struct
           Convex.make
             {url = "http://127.0.0.1:1", authToken = "", version = "bad\r\nversion"}))
 
+  (* Response framing a client may not resolve in the server's favour. Each
+     entry is a complete raw response; the client must refuse it as protocol
+     drift, and the final entry proves the connection after a refusal is still
+     usable, so one bad response never strands the client. *)
+  val framingScript =
+    [("a status line without a version",
+      "200 OK\r\nContent-Length: 2\r\n\r\n{}"),
+     ("a status line with a non-numeric code",
+      "HTTP/1.1 2O0 OK\r\nContent-Length: 2\r\n\r\n{}"),
+     ("a status line with a code outside the assigned range",
+      "HTTP/1.1 099 Nope\r\nContent-Length: 2\r\n\r\n{}"),
+     ("a status line that runs the code into the reason phrase",
+      "HTTP/1.1 200OK\r\nContent-Length: 2\r\n\r\n{}"),
+     ("a repeated Content-Length",
+      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{}"),
+     ("a conflicting Content-Length",
+      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 40\r\n\r\n{}"),
+     ("a Content-Length that is not a plain decimal",
+      "HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\n{}"),
+     ("a Content-Length with trailing rubbish",
+      "HTTP/1.1 200 OK\r\nContent-Length: 2junk\r\n\r\n{}"),
+     ("a chunked transfer coding",
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n"),
+     ("a repeated Transfer-Encoding",
+      "HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\nTransfer-Encoding: chunked\r\n\r\n{}"),
+     ("both framing headers at once",
+      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n{}"),
+     ("a header name with a space before its colon",
+      "HTTP/1.1 200 OK\r\nContent-Length : 2\r\n\r\n{}"),
+     ("an obsolete folded header line",
+      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\tjunk\r\n\r\n{}")]
+
+  fun framingServer listener =
+    (List.app
+       (fn (_, response) =>
+          let
+            val peer = Fixture.acceptPeer listener
+          in
+            ignore (Fixture.readRequest peer);
+            Fixture.send (peer, response);
+            Fixture.closePeer peer
+          end)
+       framingScript;
+     (let
+        val peer = Fixture.acceptPeer listener
+      in
+        ignore (Fixture.readRequest peer);
+        Fixture.respond (peer, "{\"status\":\"success\",\"value\":7,\"logLines\":[]}");
+        Fixture.closePeer peer
+      end);
+     Socket.close listener)
+
+  fun framingChecks () =
+    let
+      val listener = Fixture.listenOn framingPort
+      val server = Fixture.spawn (fn () => framingServer listener)
+      val client = Convex.client (Fixture.urlFor framingPort)
+    in
+      List.app
+        (fn (label, _) =>
+           Check.failureNamed
+             (label ^ " is refused as protocol drift", "ProtocolError",
+              fn () => Convex.query (client, "demo:state", Json.Object [])))
+        framingScript;
+      (* Recovery: a refused response closes only its own connection. *)
+      Check.that
+        ("a well-framed response after a refused one still works",
+         Json.asInt (#value (Convex.query (client, "demo:state", Json.Object []))) = SOME 7);
+      Convex.close client;
+      Fixture.join (server, 20.0, "the HTTP framing fixture")
+    end
+
+  (* Name resolution is the one blocking call the Basis Library gives no
+     deadline, so these prove the three properties the Live owner depends on:
+     a literal address never reaches the resolver, a caller is released at its
+     own deadline however long the resolver takes, and an answer is reused. *)
+  fun resolverChecks () =
+    let
+      fun elapsed body =
+        let
+          val started = Clock.now ()
+          val outcome = (body (); true) handle _ => false
+        in
+          (outcome, Time.toReal (Time.- (Clock.now (), started)))
+        end
+      (* An expired deadline is the strongest form of the question: a literal
+         address must still convert, because no lookup is involved at all. *)
+      val (literal, literalSeconds) =
+        elapsed (fn () => ignore (Resolver.address ("127.0.0.1", Clock.deadlineIn 0.0)))
+      (* The same expired deadline against a name must come straight back
+         instead of waiting for the resolver thread it just started. *)
+      val (named, namedSeconds) =
+        elapsed
+          (fn () => ignore (Resolver.address ("standard-ml-unresolvable.invalid",
+                                              Clock.deadlineIn 0.0)))
+      val _ = ignore (Resolver.address ("localhost", Clock.deadlineIn 5.0))
+      (* Cached, so a reconnecting owner never re-enters the resolver. *)
+      val (repeated, repeatedSeconds) =
+        elapsed (fn () => ignore (Resolver.address ("localhost", Clock.deadlineIn 0.0)))
+    in
+      Check.that ("a literal address resolves without a lookup", literal);
+      Check.that ("a literal address never waits", literalSeconds < 0.5);
+      Check.that ("an unanswered lookup releases its caller", not named);
+      Check.that ("an unanswered lookup releases it at the deadline", namedSeconds < 0.5);
+      Check.that ("a resolved name is reused", repeated);
+      Check.that ("a reused name never waits again", repeatedSeconds < 0.5);
+      Check.failureNamed
+        ("an unresolvable name is a structured transport failure", "TransportError",
+         fn () =>
+           ignore
+             (Resolver.address ("standard-ml-unresolvable.invalid", Clock.deadlineIn 5.0)))
+    end
+
   (* A peer that completes TCP and then says nothing must not hold a caller for
      OpenSSL's own default handshake timeout. *)
   fun stallChecks () =
@@ -182,6 +296,8 @@ struct
       Fixture.join (server, 10.0, "HTTP fixture");
       wireChecks ();
       injectionChecks ();
+      framingChecks ();
+      resolverChecks ();
       stallChecks ()
     end
 end

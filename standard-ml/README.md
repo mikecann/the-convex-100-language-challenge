@@ -10,16 +10,21 @@ Read [`examples/basics/main.sml`](examples/basics/main.sml). It queries a fresh 
 
 ## What works
 
-Everything below is exercised by language-local Docker tests. None of it has been through shared conformance against a Convex deployment, so no capability has been earned.
+Everything below is described by the language-local Docker tests that cover it. None of it has been through shared conformance against a Convex deployment, so no capability has been earned. The table describes what each gate checks, not a verdict from a run: the Docker suite has changed since it was last executed end to end, and it needs a fresh no-cache rebuild.
 
-| Capability | Status |
+| Capability | What proves it |
 | --- | --- |
-| HTTP queries, mutations, and actions | Passing against local fixtures |
-| Bearer authentication and structured function errors | Passing against local fixtures |
-| Live initial values, updates, and query-error recovery | Passing against raw WebSocket fixtures |
-| Remove, five reconnects, generation barriers, and bounded delivery | Passing against raw WebSocket fixtures |
-| Real TLS, including host and address name checking | Passing against a local OpenSSL server |
-| Minimal `linux/amd64` runtime and example images | Built, policy asserted, entrypoints executed |
+| HTTP queries, mutations, and actions | Local fixtures over real kernel sockets |
+| Bearer authentication and structured function errors | Local fixtures over real kernel sockets |
+| Strict response framing, and recovery after a refused response | A fixture that serves thirteen malformed framings in turn |
+| Live initial values, updates, and query-error recovery | Raw WebSocket fixtures |
+| Remove, five reconnects, generation barriers, and bounded delivery | Raw WebSocket fixtures |
+| A first connection retried inside one caller budget | A fixture that refuses twice and then answers |
+| No subscription left behind by an abandoned acknowledgement | A fixture that watches for the withdrawing Remove |
+| Real TLS, including host and address name checking | A local OpenSSL server with a private authority |
+| Bounded name resolution, independent of the resolver | Literal, uncached, and cached lookups against an expired deadline |
+| Deterministic style and lint rules | Every checked-in Standard ML source in this directory |
+| Minimal `linux/amd64` runtime and example images | Policy assertions plus both exact entrypoints executed in their own final image |
 | Shared local and hosted conformance | Not attempted |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.sml -->
@@ -170,25 +175,35 @@ end
 ./run verify-all standard-ml
 ```
 
-`test` builds the pinned Poly/ML toolchain, then runs encoding, real-TLS, real-HTTP, raw-WebSocket Live, adapter-protocol, adapter-driven-Live, and canonical-example tests, and saves the adapter and example as native `linux/amd64` executables. `verify-example` runs the example from its minimal image against a unique room. The remaining shared commands add local and hosted black-box conformance. Only the root result evaluator can award HTTP or Live badges, so this language branch does not claim them.
+`test` builds the pinned Poly/ML toolchain, then runs the style and lint gate, encoding, real-TLS, real-HTTP, raw-WebSocket Live, adapter-protocol, adapter-driven-Live, canonical-example, and bounded-writer tests, and saves the adapter and example as native `linux/amd64` executables. `verify-example` runs the example from its minimal image against a unique room. The remaining shared commands add local and hosted black-box conformance. Only the root result evaluator can award HTTP or Live badges, so this language branch does not claim them.
 
-`./run test standard-ml` and `./run build standard-ml` have both been run and pass; a clean no-cache test build reports 243 checks across the seven suites. `verify-example`, `verify`, `verify-hosted`, and `verify-all` have not been run.
+Poly/ML ships no formatter, and Standard ML has no de facto equivalent of `gofmt`, so the first `test` layer is a style and lint gate written in Standard ML instead: it reads every checked-in source in this directory and enforces printable-ASCII encoding, a 100-column width, no trailing whitespace, exactly one terminating newline, balanced comment nesting, a documentation comment at the top of each file, and a short list of forbidden constructs. It is a mechanical gate a reviewer can read in full, not a claim to have run a formatter.
+
+An earlier no-cache Docker pass over commit `23a44a3` reported 243 checks across seven suites. That pass predates the repairs in this branch: suites have been added and existing ones extended, so it no longer describes this source. `./run test standard-ml`, `./run build standard-ml`, `verify-example`, `verify`, `verify-hosted`, and `verify-all` all need running again from this tip before any of them can be cited as evidence.
 
 ## Conformance and protocol notes
 
 The client implements Convex's documented JSON HTTP endpoints and the repository's pinned unversioned `/api/sync` profile directly in Standard ML. JSON parsing and printing, SHA-1, base64, HTTP/1.1 request and response handling, and RFC 6455 framing are all Standard ML code over the Basis Library's `Socket` and Poly/ML's `Thread`. No request invokes another Convex client, the Convex CLI, `curl`, Node.js, or Python.
 
-TLS is the one borrowed facility, because the Basis Library has none. OpenSSL is bound through Poly/ML's `Foreign` structure in a single file and is driven through a pair of memory BIOs: OpenSSL only ever transforms buffers, and Standard ML decides when to wait and for how long. That keeps every deadline enforceable and means no foreign call performs I/O or stalls the garbage collector. Certificates are verified against the trusted roots *and* against the name the caller asked for, using `SSL_set1_host` for names and `X509_VERIFY_PARAM_set1_ip_asc` for literal addresses.
+HTTP response framing is read strictly rather than generously. The status line must carry a version this client speaks and a three-digit status inside the assigned range; header names must be real tokens, and obsolete line folding is refused. A repeated `Content-Length` or `Transfer-Encoding`, a response carrying both, and a `Content-Length` that is not a plain decimal are all rejected, because each of those is a length two parsers can disagree about. A refused response closes only its own connection: the next call opens a fresh one and succeeds.
+
+TLS is the one borrowed facility, because the Basis Library has none. OpenSSL is bound through Poly/ML's `Foreign` structure in a single file and is driven through a pair of memory BIOs: OpenSSL only ever transforms buffers, and Standard ML decides when to wait and for how long. That keeps every deadline enforceable and means no foreign call performs I/O or stalls the garbage collector. Certificates are verified against the trusted roots *and* against the name the caller asked for, using `SSL_set1_host` for names and `X509_VERIFY_PARAM_set1_ip_asc` for literal addresses. Those objects live in the C heap where the collector cannot reach them, so every failure path frees exactly what it created, and the library handles themselves are loaded once under a lock.
+
+Name resolution is the one call the Basis Library gives no deadline: `NetHostDB.getByName` blocks inside the C resolver. A literal address is converted without a lookup at all, and a real name is looked up on its own thread, so a caller waits only until its own absolute deadline and the answer is cached for every later connection. That is what keeps Live close and unsubscribe bounded while a connection is being opened.
 
 One owner thread exclusively opens, reads, writes, retires, and reconnects the Live socket. Callers queue Add, Remove, reconnect, and close commands to that owner and wait for acknowledgements. Complete transitions are validated, coalesced per query, and committed atomically, so a transition whose second member is malformed publishes nothing at all. Unchanged reconnect hydration is suppressed with a fixed-size fingerprint rather than a retained copy of the value. Every delivered update carries its socket generation, which lets the adapter reject an update dequeued before a replacement, unsubscribe, or reconnect barrier.
 
-Once any byte of a frame has been consumed, the frame deadline applies and a timeout abandons that connection rather than resuming the parser at a byte that is not a frame header. Reconnect backoff starts at 100 ms, caps at 15 seconds, and resets after a valid connection or transition. `connectionCount`, `lastCloseReason`, and `maxObservedTimestamp` are carried across reconnects.
+Every command carries one absolute budget, fixed when its caller queued it, so a retrying owner can never restart the caller's clock. A subscribe that arrives before the socket is up is registered and then resolved in the owner's ordinary loop: the connection is retried inside that single budget, and close and unsubscribe are still answered while it retries. If the caller stops waiting first, the acknowledgement is cancelled under the same lock the owner would settle under, and the owner withdraws the query with a real `Remove` rather than leaving a subscription nobody holds.
+
+Once any byte of a frame has been consumed, the frame deadline applies and a timeout abandons that connection rather than resuming the parser at a byte that is not a frame header. Reconnect backoff starts at 100 ms, caps at 15 seconds, and resets after a valid connection or transition. `connectionCount`, `lastCloseReason`, and `maxObservedTimestamp` are carried across reconnects. A connection is counted exactly once, when a socket that genuinely existed is retired, so retried handshakes that never produced one do not inflate the count the server sees.
 
 The manager retains the newest 16 updates within a conservative 20 MiB budget that charges four times the exact encoded length plus a fixed record allowance. Active subscriptions have a separate 64-entry and 8 MiB budget. JSON decoding stops at 2 MiB, 128 levels, or 8,192 structural nodes before malformed or dense input can exhaust the runtime.
 
-The adapter speaks bounded UTF-8 NDJSON protocol v1 over stdin and stdout or one `ADAPTER_LISTEN` TCP connection. Its independent output queue retains at most the newest 16 encoded events within 6 MiB, including a write already in flight. Subscription values may be coalesced under pressure, while acknowledgements and errors wait for bounded room or fail the connection. `debugDisconnect` is adapter-only: it lives in `Convex.Internal`, not in the client surface the example teaches.
+The adapter speaks bounded UTF-8 NDJSON protocol v1 over stdin and stdout or one `ADAPTER_LISTEN` TCP connection. Its independent output queue retains at most the newest 16 encoded events within 6 MiB, including a write already in flight. Subscription values may be coalesced under pressure, while acknowledgements and errors wait for bounded room or fail the connection. On the TCP transport the whole connection shares one cumulative 30-second write budget, spent by a write that fails as well as one that succeeds, so a controller that stops reading cannot hold the process open one deadline at a time. A controller that keeps reading spends milliseconds of that budget across a whole session; one that stops exhausts it inside a single stalled write. `debugDisconnect` is adapter-only: it lives in `Convex.Internal`, not in the client surface the example teaches.
 
-The final images contain the native executable, the Poly/ML runtime library, OpenSSL 3, certificate roots, `/bin/sh`, and the individual POSIX tools the shared verifier requires. They contain no Poly/ML compiler or frontend, no C compiler, no package or network tools, no delegated runtimes, and no multicall binary, and run as `65532:65532` under the repository's read-only, capability-drop, no-new-privileges, 128 MiB policy. The completed no-cache Docker run exercised those policy checks and both exact entrypoints; shared local and hosted conformance still remain for the root integration pass.
+The bounded-writer audit needs a caller that never reads stdout, which no in-process test can arrange, so it is a separate test-only executable built from `client/tests/flood-adapter.sml`. Nothing selects it at run time, and the build asserts that the shipped adapter carries neither that behaviour nor any string belonging to it.
+
+The final images contain the native executable, the Poly/ML runtime library, OpenSSL 3, certificate roots, `/bin/sh`, and the individual POSIX tools the shared verifier requires. They contain no Poly/ML compiler or frontend, no C compiler, no package or network tools, no delegated runtimes, and no multicall binary, and run as `65532:65532` under the repository's read-only, capability-drop, no-new-privileges, 128 MiB policy. Each runtime image executes its own exact entrypoint during the build: the adapter answers a hello and close exchange, and the example is run unconfigured and must exit 1 with an empty stdout, from that image, as that user, over that filesystem. The example assertion is new in this branch, and no Docker build has yet been run over this source at all, so none of these statements is backed by a run from this tip. Shared local and hosted conformance remain for the root integration pass.
 
 ## Limitations
 
