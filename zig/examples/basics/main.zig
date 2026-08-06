@@ -4,7 +4,16 @@ const convex = @import("convex");
 fn wholeCounter(value: convex.JsonValue) !i64 {
     return switch (value) {
         .integer => |integer| integer,
-        .float => |float| if (std.math.isFinite(float) and @trunc(float) == float and float >= std.math.minInt(i64) and float <= std.math.maxInt(i64)) @intFromFloat(float) else error.InvalidResponse,
+        // Comparing with maxInt(i64) is unsafe here because converting that
+        // boundary to f64 rounds it up to 2^63. Use an exclusive upper bound
+        // so 9223372036854775808.0 can never reach @intFromFloat.
+        .float => |float| if (std.math.isFinite(float) and
+            @trunc(float) == float and
+            float >= -9223372036854775808.0 and
+            float < 9223372036854775808.0)
+            @intFromFloat(float)
+        else
+            error.InvalidResponse,
         else => blk: {
             break :blk error.InvalidResponse;
         },
@@ -12,7 +21,26 @@ fn wholeCounter(value: convex.JsonValue) !i64 {
 }
 
 fn countOf(value: convex.JsonValue) !i64 {
-    return wholeCounter(value.object.get("count") orelse return error.InvalidResponse);
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidResponse,
+    };
+    return wholeCounter(object.get("count") orelse return error.InvalidResponse);
+}
+
+test "whole counters accept integral decimals without f64 boundary rounding" {
+    try std.testing.expectEqual(@as(i64, 0), try wholeCounter(.{ .float = 0.0 }));
+    try std.testing.expectEqual(@as(i64, 1), try wholeCounter(.{ .float = 1.0 }));
+    try std.testing.expectEqual(std.math.minInt(i64), try wholeCounter(.{ .float = -9223372036854775808.0 }));
+    try std.testing.expectEqual(@as(i64, 9223372036854774784), try wholeCounter(.{ .float = 9223372036854774784.0 }));
+    try std.testing.expectError(error.InvalidResponse, wholeCounter(.{ .float = 1.5 }));
+    try std.testing.expectError(error.InvalidResponse, wholeCounter(.{ .string = "1" }));
+    try std.testing.expectError(error.InvalidResponse, wholeCounter(.{ .float = std.math.inf(f64) }));
+    try std.testing.expectError(error.InvalidResponse, wholeCounter(.{ .float = std.math.nan(f64) }));
+    try std.testing.expectError(error.InvalidResponse, wholeCounter(.{ .float = 9223372036854775808.0 }));
+    var overflow = try std.json.parseFromSlice(convex.JsonValue, std.testing.allocator, "9223372036854775808.0", .{});
+    defer overflow.deinit();
+    try std.testing.expectError(error.InvalidResponse, wholeCounter(overflow.value));
 }
 
 fn makeArgs(allocator: std.mem.Allocator, room: []const u8) !convex.JsonValue {
@@ -63,9 +91,13 @@ pub fn main() !void {
     // Use a stable idempotency key so retrying this demonstration is safe.
     const mutation = try client.call(mutation_arena.allocator(), "mutation", "demo:increment", mutation_args);
     const mutation_value = mutation.value orelse return error.InvalidResponse;
-    const applied = mutation_value.object.get("applied") orelse return error.InvalidResponse;
+    const mutation_object = switch (mutation_value) {
+        .object => |object| object,
+        else => return error.InvalidResponse,
+    };
+    const applied = mutation_object.get("applied") orelse return error.InvalidResponse;
     if (applied != .bool or !applied.bool) return error.InvalidResponse;
-    const after = try countOf(mutation_value.object.get("state") orelse return error.InvalidResponse);
+    const after = try countOf(mutation_object.get("state") orelse return error.InvalidResponse);
     if (after != before + 1) return error.InvalidResponse;
     try std.io.getStdOut().writer().writeAll("mutation applied: true\n");
     try std.io.getStdOut().writer().print("mutation count: {d}\n", .{after});

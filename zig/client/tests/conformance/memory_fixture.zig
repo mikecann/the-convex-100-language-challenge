@@ -12,19 +12,25 @@ fn readExact(stream: std.net.Stream, bytes: []u8) !void {
     }
 }
 
-fn readHandshake(stream: std.net.Stream) !void {
-    var tail: [4]u8 = .{ 0, 0, 0, 0 };
-    var count: usize = 0;
-    while (count < 8192) : (count += 1) {
-        var byte: [1]u8 = undefined;
-        try readExact(stream, &byte);
-        tail[0] = tail[1];
-        tail[1] = tail[2];
-        tail[2] = tail[3];
-        tail[3] = byte[0];
-        if (std.mem.eql(u8, &tail, "\r\n\r\n")) return;
+fn readHandshake(stream: std.net.Stream, buffer: []u8) ![]const u8 {
+    var used: usize = 0;
+    while (used < buffer.len) {
+        try readExact(stream, buffer[used .. used + 1]);
+        used += 1;
+        if (used >= 4 and std.mem.eql(u8, buffer[used - 4 .. used], "\r\n\r\n")) return buffer[0..used];
     }
     return error.ProtocolFailure;
+}
+
+fn websocketAccept(key: []const u8) [28]u8 {
+    var sha1 = std.crypto.hash.Sha1.init(.{});
+    sha1.update(key);
+    sha1.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    var digest: [20]u8 = undefined;
+    sha1.final(&digest);
+    var encoded: [28]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&encoded, &digest);
+    return encoded;
 }
 
 fn readClientFrame(allocator: std.mem.Allocator, stream: std.net.Stream) ![]u8 {
@@ -75,8 +81,15 @@ pub fn main() !void {
     defer server.deinit();
     const connection = try server.accept();
     defer connection.stream.close();
-    try readHandshake(connection.stream);
-    try connection.stream.writer().writeAll("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: test\r\n\r\n");
+    var handshake_buffer: [8192]u8 = undefined;
+    const request = try readHandshake(connection.stream, &handshake_buffer);
+    const key_prefix = "Sec-WebSocket-Key:";
+    const key_start = std.mem.indexOf(u8, request, key_prefix) orelse return error.ProtocolFailure;
+    const value_start = key_start + key_prefix.len;
+    const value_end = std.mem.indexOfPos(u8, request, value_start, "\r\n") orelse return error.ProtocolFailure;
+    const key = std.mem.trim(u8, request[value_start..value_end], " \t");
+    const accept = websocketAccept(key);
+    try connection.stream.writer().print("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{accept});
     const connect = try readClientFrame(allocator, connection.stream);
     defer allocator.free(connect);
     const add = try readClientFrame(allocator, connection.stream);

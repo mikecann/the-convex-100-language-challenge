@@ -7,9 +7,13 @@ WORKDIR /project
 RUN apk add --no-cache zig=0.14.1-r0 file=5.46-r2 binutils=2.44-r3
 COPY client ./client
 COPY examples ./examples
+COPY README.md ./README.md
 RUN zig version | grep -Fx '0.14.1'
 RUN zig fmt --check client examples
+RUN sh client/tests/conformance/sync_readme_example.sh --check
 RUN zig test client/convex.zig
+RUN zig test --dep convex -Mroot=examples/basics/main.zig -Mconvex=client/convex.zig
+RUN zig test --dep convex -Mroot=client/tests/conformance/main.zig -Mconvex=client/convex.zig
 RUN mkdir -p /out
 RUN zig build-exe -O ReleaseSafe -target x86_64-linux-musl --dep convex -Mroot=client/tests/conformance/main.zig -Mconvex=client/convex.zig -femit-bin=/out/convex-adapter
 RUN zig build-exe -O ReleaseSafe -target x86_64-linux-musl --dep convex -Mroot=examples/basics/main.zig -Mconvex=client/convex.zig -femit-bin=/out/convex-example
@@ -19,6 +23,7 @@ RUN test "$(uname -m)" = x86_64 \
     && file /out/convex-example | grep -Eq 'ELF 64-bit.*x86-64.*(statically linked|static-pie linked)' \
     && file /out/convex-memory-fixture | grep -Eq 'ELF 64-bit.*x86-64.*(statically linked|static-pie linked)' \
     && readelf -h /out/convex-adapter | grep -Eq 'Machine:.*Advanced Micro Devices X86-64'
+ENV CONVEX_URL=http://127.0.0.1:9
 CMD ["/bin/sh", "-ec", "/out/convex-adapter <<'EOF'\n{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}\n{\"id\":\"close\",\"op\":\"close\"}\nEOF"]
 
 FROM --platform=linux/amd64 ${ALPINE_IMAGE} AS certificates
