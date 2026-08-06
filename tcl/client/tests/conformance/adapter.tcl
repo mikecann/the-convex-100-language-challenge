@@ -30,8 +30,10 @@ proc ::adapter::drop_oldest_delivery {} {
     variable queueBytes
     set position 0
     foreach item $queue {
-        lassign $item raw droppable tag
-        if {$droppable} {
+        lassign $item raw droppable tag written
+        # Bytes accepted into a nonblocking Tcl channel are still in flight.
+        # They cannot be dropped from the bounded accounting until drained.
+        if {$droppable && !$written} {
             set queue [lreplace $queue $position $position]
             incr queueBytes -[string bytelength $raw]
             return 1
@@ -54,7 +56,7 @@ proc ::adapter::emit {raw {droppable 0} {tag ""}} {
             error "adapter output remained backpressured for a control event"
         }
     }
-    lappend queue [list "$raw\n" $droppable $tag]
+    lappend queue [list "$raw\n" $droppable $tag 0]
     incr queueBytes [string bytelength "$raw\n"]
     flush
 }
@@ -64,7 +66,17 @@ proc ::adapter::flush {} {
     variable queue
     variable queueBytes
     while {[llength $queue]} {
-        lassign [lindex $queue 0] raw droppable tag
+        lassign [lindex $queue 0] raw droppable tag written
+        if {$written} {
+            if {[catch {set pending [chan pending output $output]} error]} { exit 1 }
+            if {$pending > 0} {
+                fileevent $output writable ::adapter::flush
+                return
+            }
+            set queue [lrange $queue 1 end]
+            incr queueBytes -[string bytelength $raw]
+            continue
+        }
         if {[catch {puts -nonewline $output $raw; ::flush $output} error]} {
             if {[string match {*would block*} [string tolower $error]]} {
                 fileevent $output writable ::adapter::flush
@@ -72,8 +84,16 @@ proc ::adapter::flush {} {
             }
             exit 1
         }
-        set queue [lrange $queue 1 end]
-        incr queueBytes -[string bytelength $raw]
+        # Retain the record until Tcl reports that the channel has drained it.
+        lset queue 0 3 1
+        if {[catch {set pending [chan pending output $output]} error]} { exit 1 }
+        if {$pending == 0} {
+            set queue [lrange $queue 1 end]
+            incr queueBytes -[string bytelength $raw]
+        } else {
+            fileevent $output writable ::adapter::flush
+            return
+        }
     }
     fileevent $output writable {}
 }
@@ -83,8 +103,8 @@ proc ::adapter::remove_queued_subscription {subscriptionId} {
     variable queueBytes
     set retained {}
     foreach item $queue {
-        lassign $item raw droppable tag
-        if {$tag eq $subscriptionId} {
+        lassign $item raw droppable tag written
+        if {$tag eq $subscriptionId && !$written} {
             incr queueBytes -[string bytelength $raw]
         } else {
             lappend retained $item

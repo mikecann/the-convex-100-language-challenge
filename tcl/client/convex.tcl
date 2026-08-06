@@ -331,6 +331,9 @@ proc ::convex::schedule_reconnect {id reason} {
 proc ::convex::open_live {id} {
     set client [state $id]
     if {[dict get $client closed] || [dict size [dict get $client subscriptions]] == 0 || [dict get $client socket] ne "" || [dict get $client connecting]} { return }
+    # This callback consumed the timer that scheduled it. Clearing the handle
+    # makes later transport failures schedule exactly one replacement timer.
+    put $id reconnectTimer ""
     put $id connecting 1
     if {[catch {lassign [ws_parts [sync_url [dict get $client url]]] scheme host port path} failure]} {
         retire $id $failure
@@ -525,7 +528,10 @@ proc ::convex::close {id} {
     set client [state $id]
     if {[dict get $client closed]} { return }
     put $id closed 1
-    if {[dict get $client reconnectTimer] ne ""} { after cancel [dict get $client reconnectTimer] }
+    if {[dict get $client reconnectTimer] ne ""} {
+        after cancel [dict get $client reconnectTimer]
+        put $id reconnectTimer ""
+    }
     if {[dict get $client socket] ne ""} { retire $id client-closed 0 }
     put $id subscriptions {}
 }
