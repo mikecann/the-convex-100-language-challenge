@@ -135,8 +135,19 @@ class Adapter : GLib.Object {
 
   public void handle (string line) {
     Json.Node command;
-    try { command = Convex.parse_json (line); }
-    catch (Error parse_error) { error ("", "ProtocolError", "malformed adapter command"); return; }
+    // parse_json also rejects a command with no JSON value at all and one
+    // whose parsed tree would exceed the bounded retained budget. Those carry
+    // a specific reason; a syntax error stays the generic malformed report.
+    try {
+      command = Convex.parse_json (line, "adapter command");
+    } catch (Error parse_error) {
+      // Vala's error-code `is` expression is valid as a condition, but this
+      // compiler version cannot parse it directly as a ternary condition.
+      string reason = "malformed adapter command";
+      if (parse_error is ClientError.PROTOCOL) reason = parse_error.message;
+      error ("", "ProtocolError", reason);
+      return;
+    }
     if (command.get_node_type () != NodeType.OBJECT) { error ("", "ProtocolError", "malformed adapter command"); return; }
     var object = command.get_object ();
     var id = "";

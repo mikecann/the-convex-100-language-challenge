@@ -23,12 +23,18 @@ static Json.Node object_node (string room, string? language = null, string? run_
 
 // Convex may encode an integral JSON number as either 1 or 1.0. Accept both
 // forms while rejecting fractional, non-finite, negative, or overflowing data.
-static int64 count_from (Json.Node value, string operation) throws Error {
-  if (value.get_node_type () != NodeType.OBJECT) {
+static int64 count_from (Json.Node? value, string operation) throws Error {
+  if (value == null || value.get_node_type () != NodeType.OBJECT) {
     throw new ClientError.PROTOCOL (operation + " did not return an object");
   }
+  // JSON-GLib returns NULL for an absent member, and dereferencing that is a
+  // crash rather than a readable failure, so check before reading the count.
+  if (!value.get_object ().has_member ("count")) {
+    throw new ClientError.PROTOCOL (operation + " returned an object without a count");
+  }
   var count_node = value.get_object ().get_member ("count");
-  if (count_node.get_value_type () != typeof (int64) && count_node.get_value_type () != typeof (double)) {
+  if (count_node.get_node_type () != NodeType.VALUE ||
+      (count_node.get_value_type () != typeof (int64) && count_node.get_value_type () != typeof (double))) {
     throw new ClientError.PROTOCOL (operation + " returned a non-numeric count");
   }
   var count = count_node.get_double ();
@@ -71,6 +77,13 @@ int main (string[] args) {
           stdout.printf ("live initial count: %" + int64.FORMAT + "\n", observed);
           // This UUID is the mutation idempotency key, so retries cannot increment twice.
           var mutation = client.mutation ("demo:increment", object_node (room, "Vala", Uuid.string_random ())).value;
+          // The same absent-member rule applies to the mutation envelope: read
+          // applied and state only once both are present and correctly typed.
+          if (mutation.get_node_type () != NodeType.OBJECT ||
+              !mutation.get_object ().has_member ("applied") || !mutation.get_object ().has_member ("state") ||
+              mutation.get_object ().get_member ("applied").get_value_type () != typeof (bool)) {
+            throw new ClientError.PROTOCOL ("mutation did not return applied and state");
+          }
           if (!mutation.get_object ().get_boolean_member ("applied")) {
             throw new ClientError.PROTOCOL ("mutation was not applied");
           }

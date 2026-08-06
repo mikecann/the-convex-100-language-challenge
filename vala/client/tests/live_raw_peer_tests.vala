@@ -55,6 +55,17 @@ private static string raw_update (uint query_id, uint count, string? label = nul
   return "{\"type\":\"QueryUpdated\",\"queryId\":" + query_id.to_string () + ",\"value\":" + value + ",\"logLines\":[]}";
 }
 
+/* A dense array is the shape that separates wire size from retained size: two
+ * bytes per element on the wire, a whole JsonNode per element in memory. This
+ * is the fixture shape the earlier serialized-length budget could not see. */
+private static string raw_dense_update (uint query_id, int elements) {
+  var value = new StringBuilder ();
+  value.append_c ('[');
+  for (int index = 0; index < elements; index++) value.append (index == 0 ? "0" : ",0");
+  value.append_c (']');
+  return "{\"type\":\"QueryUpdated\",\"queryId\":" + query_id.to_string () + ",\"value\":" + value.str + ",\"logLines\":[]}";
+}
+
 private static string raw_failure (uint query_id) {
   return "{\"type\":\"QueryFailed\",\"queryId\":" + query_id.to_string () +
          ",\"errorMessage\":\"fixture failure\",\"errorData\":{\"code\":\"FIXTURE\"},\"logLines\":[\"fixture\"]}";
@@ -424,6 +435,7 @@ private class RawPeer : GLib.Object {
     else if (mode == 9) serve_idle_then_update (true);
     else if (mode == 10) serve_handshake_validation ();
     else if (mode == 11) serve_close_with_buffered_transition ();
+    else if (mode == 12) serve_dense_tree_rejection ();
     else serve_stalled_close ();
   }
 
@@ -514,6 +526,30 @@ private class RawPeer : GLib.Object {
     wait_for_close (recovery_input, recovery_connection.output_stream, get_monotonic_time ());
   }
 
+  private void serve_dense_tree_rejection () throws Error {
+    GLib.Object? source;
+    var connection = listener.accept (out source, null);
+    var input = handshake (connection);
+    observe_connection ();
+    uint query_id = accept_add (input, connection.output_stream, 0, "InitialConnect");
+    raw_write_text (connection.output_stream, raw_transition (0, 1, 0, ++timestamp, query_id, raw_update (query_id, 0)));
+    wait_for_initial_delivery ();
+    // Roughly 400 KB on the wire: inside the 2 MiB frame cap and inside the
+    // old serialized-length delivery budget, but over 25 MiB of retained
+    // JSON-GLib nodes. The client must refuse it before parsing rather than
+    // queueing it, and must still recover on the next connection.
+    raw_write_text (connection.output_stream,
+                    raw_transition (1, 1, timestamp, timestamp + 1, query_id, raw_dense_update (query_id, 200000)));
+    wait_for_close (input, connection.output_stream, get_monotonic_time ());
+    if (should_stop ()) return;
+    var recovery_connection = listener.accept (out source, null);
+    var recovery_input = handshake (recovery_connection);
+    observe_connection ();
+    uint recovery_query_id = accept_add (recovery_input, recovery_connection.output_stream, 1, "");
+    raw_write_text (recovery_connection.output_stream, raw_transition (0, 1, 0, ++timestamp, recovery_query_id, raw_update (recovery_query_id, 2)));
+    wait_for_close (recovery_input, recovery_connection.output_stream, get_monotonic_time ());
+  }
+
   private void serve_stalled_close () throws Error {
     GLib.Object? source;
     var connection = listener.accept (out source, null);
@@ -577,8 +613,16 @@ private class RawPeer : GLib.Object {
     // corresponding controller write. A blast would be collapsed by the
     // deliberately bounded client queue before it could exercise backpressure.
     Thread.usleep (25 * 1000);
+    // Alternate the two independent maxima. A 1.5 MiB string is near the wire
+    // cap but costs one node; a 60 000-element array is near the retained cap
+    // on 60 001 nodes and barely registers on the wire. Only the second shape
+    // exercises the memory bound, which is why a string-only stress fixture
+    // let the real adapter reach the shared 128 MiB limit.
     for (uint count = 1; count < 64; count++) {
-      raw_write_text (connection.output_stream, raw_transition (1, 1, timestamp, ++timestamp, query_id, raw_update (query_id, count, text.str)));
+      string modification;
+      if (count % 2 == 1) modification = raw_dense_update (query_id, 60000);
+      else modification = raw_update (query_id, count, text.str);
+      raw_write_text (connection.output_stream, raw_transition (1, 1, timestamp, ++timestamp, query_id, modification));
       Thread.usleep (25 * 1000);
     }
     // The caller deliberately stops reading adapter stdout. Keep the peer
@@ -757,6 +801,42 @@ private static void raw_close_discards_buffered_transition_and_recovers () {
   }
 }
 
+private static void raw_dense_tree_frame_is_rejected_before_it_is_parsed () {
+  try {
+    var peer = new RawPeer (12);
+    peer.start ();
+    var client = new Client ("http://127.0.0.1:" + peer.port.to_string ());
+    var subscription = client.subscribe ("demo:state", raw_object ("dense-tree"));
+    bool initial = false;
+    bool protocol_error = false;
+    bool recovered = false;
+    bool published_tree = false;
+    subscription.updated.connect ((value, failure) => {
+      if (failure != null && failure.name == "ProtocolError") protocol_error = true;
+      if (value == null) return;
+      if (value.get_node_type () != NodeType.OBJECT) { published_tree = true; return; }
+      int64 count = value.get_object ().get_int_member ("count");
+      if (count == 0) {
+        initial = true;
+        peer.release_after_initial_delivery ();
+      } else if (count == 2) recovered = true;
+    });
+    spin_until (() => initial, 5 * 1000 * 1000, "dense-tree fixture initial value");
+    spin_until (() => protocol_error, 5 * 1000 * 1000, "retained JSON budget rejection");
+    spin_until (() => recovered && peer.connections == 2 && peer.adds == 2, 8 * 1000 * 1000,
+                "recovery after a rejected dense frame");
+    // The oversized tree must never reach a subscriber, and the subscription
+    // must not be stranded by the frame that carried it.
+    assert (!published_tree);
+    assert (peer.failure_message == null);
+    client.close ();
+    peer.stop ();
+  } catch (Error error) {
+    stderr.printf ("raw dense-tree rejection test failed: %s\n", error.message);
+    assert_not_reached ();
+  }
+}
+
 private static void raw_protocol_error_recovers_on_a_new_connection () {
   try {
     var peer = new RawPeer (7);
@@ -884,6 +964,7 @@ int main (string[] args) {
   Test.add_func ("/convex/live/raw-peer/reconnect-fragment-recovery", raw_reconnect_fragment_and_recovery);
   Test.add_func ("/convex/live/raw-peer/partial-frame-timeout", raw_partial_frame_times_out_and_abandons_connection);
   Test.add_func ("/convex/live/raw-peer/close-discards-buffered-transition", raw_close_discards_buffered_transition_and_recovers);
+  Test.add_func ("/convex/live/raw-peer/dense-tree-rejection", raw_dense_tree_frame_is_rejected_before_it_is_parsed);
   Test.add_func ("/convex/live/raw-peer/protocol-recovery", raw_protocol_error_recovers_on_a_new_connection);
   Test.add_func ("/convex/live/raw-peer/bounded-close", raw_close_stays_bounded_with_idle_flood_and_half_frame);
   Test.add_func ("/convex/live/raw-peer/idle-and-control-deadline", raw_idle_and_control_traffic_do_not_start_frame_deadline);

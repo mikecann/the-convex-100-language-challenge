@@ -43,12 +43,18 @@ static Json.Node object_node (string room, string? language = null, string? run_
 
 // Convex may encode an integral JSON number as either 1 or 1.0. Accept both
 // forms while rejecting fractional, non-finite, negative, or overflowing data.
-static int64 count_from (Json.Node value, string operation) throws Error {
-  if (value.get_node_type () != NodeType.OBJECT) {
+static int64 count_from (Json.Node? value, string operation) throws Error {
+  if (value == null || value.get_node_type () != NodeType.OBJECT) {
     throw new ClientError.PROTOCOL (operation + " did not return an object");
   }
+  // JSON-GLib returns NULL for an absent member, and dereferencing that is a
+  // crash rather than a readable failure, so check before reading the count.
+  if (!value.get_object ().has_member ("count")) {
+    throw new ClientError.PROTOCOL (operation + " returned an object without a count");
+  }
   var count_node = value.get_object ().get_member ("count");
-  if (count_node.get_value_type () != typeof (int64) && count_node.get_value_type () != typeof (double)) {
+  if (count_node.get_node_type () != NodeType.VALUE ||
+      (count_node.get_value_type () != typeof (int64) && count_node.get_value_type () != typeof (double))) {
     throw new ClientError.PROTOCOL (operation + " returned a non-numeric count");
   }
   var count = count_node.get_double ();
@@ -91,6 +97,13 @@ int main (string[] args) {
           stdout.printf ("live initial count: %" + int64.FORMAT + "\n", observed);
           // This UUID is the mutation idempotency key, so retries cannot increment twice.
           var mutation = client.mutation ("demo:increment", object_node (room, "Vala", Uuid.string_random ())).value;
+          // The same absent-member rule applies to the mutation envelope: read
+          // applied and state only once both are present and correctly typed.
+          if (mutation.get_node_type () != NodeType.OBJECT ||
+              !mutation.get_object ().has_member ("applied") || !mutation.get_object ().has_member ("state") ||
+              mutation.get_object ().get_member ("applied").get_value_type () != typeof (bool)) {
+            throw new ClientError.PROTOCOL ("mutation did not return applied and state");
+          }
           if (!mutation.get_object ().get_boolean_member ("applied")) {
             throw new ClientError.PROTOCOL ("mutation was not applied");
           }
@@ -149,10 +162,16 @@ int main (string[] args) {
 
 ## Conformance and protocol notes
 
-The client implements Convex-specific HTTP envelopes and the pinned `/api/sync` query-set profile in Vala. libsoup supplies status-first streaming HTTP with a two MiB body limit and one absolute operation deadline, while a GLib/GIO `SocketClient` and TLS connection carry the client-owned RFC6455 handshake, masking, incremental frame parser, control frames, and close deadlines. One GLib-main-context Live owner opens, reads, writes, retires, and reconnects the socket. It commits a complete Transition before publishing updates, validates query-set versions and uint32 bounds, tracks the little-endian timestamp numerically, reports structured failures, and suppresses unchanged rehydration. Delivery relays are generation-tagged and bounded to sixteen reserved queued or in-flight events and eight MiB including encoded error logs and runtime overhead. Adapter output has a two MiB event cap, conservative in-flight byte accounting, and a one-second default absolute write deadline so a stopped controller cannot pin the process indefinitely.
+The client implements Convex-specific HTTP envelopes and the pinned `/api/sync` query-set profile in Vala. libsoup supplies streaming HTTP with a two MiB body limit and one absolute operation deadline, while a GLib/GIO `SocketClient` and TLS connection carry the client-owned RFC6455 handshake, masking, incremental frame parser, control frames, and close deadlines. One GLib-main-context Live owner opens, reads, writes, retires, and reconnects the socket. It commits a complete Transition before publishing updates, validates query-set versions and uint32 bounds, tracks the little-endian timestamp numerically, reports structured failures, and suppresses unchanged rehydration.
+
+HTTP responses are parsed before they are classified, so a Convex function-error envelope keeps its `errorMessage`, `errorData`, and `logLines` on any status, while a malformed or non-envelope non-2xx body stays a transport failure. A body that never satisfied its declared `Content-Length` or chunked framing is a transport failure too, rather than the value its truncated bytes happen to spell. Complete keep-alive chunked responses are supported; chunked responses which also declare `Connection: close` are conservatively refused because libsoup 3.2 does not expose the terminal zero chunk to its decoded stream.
+
+Memory bounds measure what is retained rather than what was serialized. A parsed JSON-GLib tree costs about a hundred bytes per node, so a dense array can retain roughly fifty times its wire size while staying inside every byte-count limit. Untrusted JSON is therefore scanned before it is parsed and refused if its tree would exceed eight MiB retained or nest deeper than sixty-four levels, and delivery relays are generation-tagged and bounded to sixteen reserved queued or in-flight events and eight MiB of retained value, error, log, and runtime representation. Adapter output has a two MiB event cap, conservative in-flight byte accounting, and a one-second default absolute write deadline so a stopped controller cannot pin the process indefinitely.
 
 The test-only adapter accepts strict NDJSON v1 over stdin/stdout or one `ADAPTER_LISTEN` TCP controller. `debugDisconnect` is adapter-only and lets the shared harness prove real reconnections.
 
 ## Limitations
 
-The language-local raw peers cover strict HTTP status and bounded streaming, inactivity and continuous-drip deadlines, malformed-envelope recovery, strict RFC6455 upgrade validation, fragmented UTF-8 with control traffic, absolute partial-frame timeout and recovery, five reconnects with `Add` replay, stale relay barriers, and bounded close. They also exercise queued and in-flight count/byte reservations, but they do not replace fresh independent review or root-owned shared conformance. Live authentication lifecycle, optimistic updates, mutation and action messages over WebSocket, journals, and TransitionChunk assembly are deferred. The manifest deliberately declares no earned badges.
+The language-local raw peers cover strict HTTP status and bounded streaming, function-error envelopes on non-2xx statuses, truncated `Content-Length` and unterminated chunked bodies, inactivity and continuous-drip deadlines, malformed-envelope recovery, strict RFC6455 upgrade validation, fragmented UTF-8 with control traffic, absolute partial-frame timeout and recovery, tree-shaped frame rejection and recovery, five reconnects with `Add` replay, stale relay barriers, and bounded close. They also exercise queued and in-flight count/byte reservations against both string-shaped and tree-shaped near-maximum values, but they do not replace fresh independent review or root-owned shared conformance.
+
+The retained-JSON bound is a real refusal, not a soft cap. A Convex value whose parsed tree would exceed eight MiB retained is reported as a `ProtocolError` rather than delivered, and a Live frame carrying one retires that connection and reconnects instead of being parsed. That is a deliberate trade: a wire-legal but node-dense payload is refused rather than allowed to exhaust the shared container limit. Live authentication lifecycle, optimistic updates, mutation and action messages over WebSocket, journals, and TransitionChunk assembly are deferred. The manifest deliberately declares no earned badges.

@@ -16,8 +16,21 @@ internal enum RawHttpMode {
   LOGS_NOT_ARRAY,
   ERROR_MISSING_MESSAGE,
   FUNCTION_ERROR,
+  FUNCTION_ERROR_560,
+  FUNCTION_ERROR_500,
+  FUNCTION_ERROR_400,
+  NON_ENVELOPE_400,
+  ERROR_BAD_LOGS_400,
+  TRUNCATED_CONTENT_LENGTH,
+  TRUNCATED_CHUNKED,
+  COMPLETE_CHUNKED,
+  EMPTY_BODY,
   SUCCESS
 }
+
+// One byte-identical Convex function-error envelope, replayed on 2xx and on
+// several non-2xx statuses so classification cannot depend on the status line.
+internal const string RAW_HTTP_FUNCTION_ENVELOPE = "{\"status\":\"error\",\"errorMessage\":\"Uncaught ConvexError: boom\",\"errorData\":{\"code\":\"BOOM\"},\"logLines\":[\"peer log\"]}";
 
 /* A real HTTP/1.1 peer keeps status, framing, and deadline tests independent
  * from libsoup's server-side behavior. Every response closes its connection so
@@ -174,6 +187,39 @@ internal class RawHttpPeer : GLib.Object {
       write_fixed (output, "HTTP/1.1 200 OK", "{\"status\":\"error\",\"logLines\":[]}");
     } else if (mode == RawHttpMode.FUNCTION_ERROR) {
       write_fixed (output, "HTTP/1.1 200 OK", "{\"status\":\"error\",\"errorMessage\":\"fixture function failure\",\"logLines\":[\"fixture\"]}");
+    } else if (mode == RawHttpMode.FUNCTION_ERROR_560) {
+      write_fixed (output, "HTTP/1.1 560 Convex Error", RAW_HTTP_FUNCTION_ENVELOPE);
+    } else if (mode == RawHttpMode.FUNCTION_ERROR_500) {
+      write_fixed (output, "HTTP/1.1 500 Internal Server Error", RAW_HTTP_FUNCTION_ENVELOPE);
+    } else if (mode == RawHttpMode.FUNCTION_ERROR_400) {
+      write_fixed (output, "HTTP/1.1 400 Bad Request", RAW_HTTP_FUNCTION_ENVELOPE);
+    } else if (mode == RawHttpMode.NON_ENVELOPE_400) {
+      // A non-2xx body that is not a Convex envelope stays a transport fault.
+      write_fixed (output, "HTTP/1.1 400 Bad Request", "<html>gateway said no</html>");
+    } else if (mode == RawHttpMode.ERROR_BAD_LOGS_400) {
+      // Envelope-shaped but not a valid envelope: logLines is not an array, so
+      // this must not be promoted into a structured function failure either.
+      write_fixed (output, "HTTP/1.1 400 Bad Request", "{\"status\":\"error\",\"errorMessage\":\"boom\",\"logLines\":{}}");
+    } else if (mode == RawHttpMode.TRUNCATED_CONTENT_LENGTH) {
+      // Declares 500 bytes and sends 43 valid JSON bytes before EOF. Treating
+      // that as a complete body turns a broken response into a value of 7.
+      string body = "{\"status\":\"success\",\"value\":7,\"logLines\":[]}";
+      write_all (output, ("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\n" +
+                          "Connection: close\r\n\r\n" + body).data);
+    } else if (mode == RawHttpMode.TRUNCATED_CHUNKED) {
+      // One complete chunk and no terminating zero-length chunk.
+      string body = "{\"status\":\"success\",\"value\":7,\"logLines\":[]}";
+      write_all (output, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".data);
+      write_all (output, ("%x\r\n".printf (body.length) + body + "\r\n").data);
+    } else if (mode == RawHttpMode.COMPLETE_CHUNKED) {
+      // A zero chunk makes this complete, and the response does not ask the
+      // client to use connection retirement as an ambiguous framing signal.
+      string body = "{\"status\":\"success\",\"value\":7,\"logLines\":[]}";
+      write_all (output, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n".data);
+      write_all (output, ("%x\r\n".printf (body.length) + body + "\r\n0\r\n\r\n").data);
+    } else if (mode == RawHttpMode.EMPTY_BODY) {
+      // JSON-GLib accepts this and leaves a NULL root behind.
+      write_all (output, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".data);
     } else {
       write_fixed (output, "HTTP/1.1 200 OK", "{\"status\":\"success\",\"value\":7,\"logLines\":[]}");
     }
@@ -226,6 +272,12 @@ int main (string[] args) {
       RawHttpMode.LOGS_NOT_ARRAY,
       RawHttpMode.ERROR_MISSING_MESSAGE,
       RawHttpMode.FUNCTION_ERROR,
+      RawHttpMode.FUNCTION_ERROR_560,
+      RawHttpMode.NON_ENVELOPE_400,
+      RawHttpMode.TRUNCATED_CONTENT_LENGTH,
+      RawHttpMode.TRUNCATED_CHUNKED,
+      RawHttpMode.COMPLETE_CHUNKED,
+      RawHttpMode.EMPTY_BODY,
       RawHttpMode.SUCCESS
     };
     var peer = new RawHttpPeer (modes);
@@ -290,6 +342,69 @@ private static void status_and_bounded_stream_failures_recover () {
   }
 }
 
+private static void require_preserved_function_envelope (Client client) {
+  bool rejected = false;
+  try {
+    client.query ("demo:state", http_args ());
+  } catch (Error error) {
+    rejected = error is ClientError.FUNCTION;
+  }
+  assert (rejected);
+  var failure = client.last_function_error;
+  assert (failure != null);
+  assert (failure.name == "FunctionError");
+  assert (failure.message == "Uncaught ConvexError: boom");
+  assert (failure.data != null);
+  assert (failure.data.get_object ().get_string_member ("code") == "BOOM");
+  assert (failure.logs.length == 1);
+  assert (failure.logs[0] == "peer log");
+}
+
+private static void non_2xx_envelopes_and_truncated_framing_are_classified () {
+  RawHttpMode[] modes = {
+    RawHttpMode.FUNCTION_ERROR_560, RawHttpMode.SUCCESS,
+    RawHttpMode.FUNCTION_ERROR_500, RawHttpMode.SUCCESS,
+    RawHttpMode.FUNCTION_ERROR_400, RawHttpMode.SUCCESS,
+    RawHttpMode.NON_ENVELOPE_400, RawHttpMode.SUCCESS,
+    RawHttpMode.ERROR_BAD_LOGS_400, RawHttpMode.SUCCESS,
+    RawHttpMode.TRUNCATED_CONTENT_LENGTH, RawHttpMode.SUCCESS,
+    RawHttpMode.TRUNCATED_CHUNKED, RawHttpMode.COMPLETE_CHUNKED,
+    RawHttpMode.EMPTY_BODY, RawHttpMode.SUCCESS
+  };
+  try {
+    var peer = new RawHttpPeer (modes);
+    peer.start ();
+    var client = new Client ("http://127.0.0.1:" + peer.port.to_string ());
+    // A real Convex function failure keeps its message, data, and logs on any
+    // status. Each case is followed by a clean call on a fresh connection.
+    for (int index = 0; index < 3; index++) {
+      require_preserved_function_envelope (client);
+      assert (client.query ("demo:state", http_args ()).value.get_int () == 7);
+    }
+    // Malformed and merely envelope-shaped non-2xx bodies stay transport
+    // failures rather than being promoted into a structured function error.
+    for (int index = 0; index < 2; index++) {
+      require_http_failure (client, true);
+      assert (client.query ("demo:state", http_args ()).value.get_int () == 7);
+    }
+    // A body that never satisfied its declared framing is a transport failure,
+    // not the successful value 7 that its bytes happen to spell.
+    for (int index = 0; index < 2; index++) {
+      require_http_failure (client, true);
+      assert (client.query ("demo:state", http_args ()).value.get_int () == 7);
+    }
+    // An empty 200 body leaves JSON-GLib's root NULL and must be a protocol
+    // failure rather than a critical.
+    require_http_failure (client, false);
+    assert (client.query ("demo:state", http_args ()).value.get_int () == 7);
+    client.close ();
+    peer.stop ();
+  } catch (Error error) {
+    stderr.printf ("raw HTTP envelope and framing test failed: %s\n", error.message);
+    assert_not_reached ();
+  }
+}
+
 private static void malformed_shapes_recover () {
   RawHttpMode[] modes = {
     RawHttpMode.MALFORMED_JSON,
@@ -317,6 +432,7 @@ private static void malformed_shapes_recover () {
 int main (string[] args) {
   Test.init (ref args);
   Test.add_func ("/convex/http/raw-peer/status-bounds-deadline-recovery", status_and_bounded_stream_failures_recover);
+  Test.add_func ("/convex/http/raw-peer/envelope-and-framing", non_2xx_envelopes_and_truncated_framing_are_classified);
   Test.add_func ("/convex/http/raw-peer/malformed-shape-recovery", malformed_shapes_recover);
   return Test.run ();
 }

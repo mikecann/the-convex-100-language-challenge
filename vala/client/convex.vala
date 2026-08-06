@@ -27,16 +27,116 @@ namespace Convex {
     }
   }
 
+  // A parsed JSON-GLib document is not its serialized text. Every value,
+  // array element, and object member becomes a separately allocated JsonNode
+  // with container bookkeeping, which costs on the order of a hundred bytes
+  // per node on an LP64 target. A dense tree therefore retains roughly fifty
+  // times its wire size, so every budget below charges the retained runtime
+  // representation rather than the encoded length.
+  internal const size_t JSON_NODE_RETAINED_BYTES = 128;
+  internal const size_t MAX_RETAINED_JSON_BYTES = 8 * 1024 * 1024;
+  internal const size_t MAX_RETAINED_JSON_UNITS = MAX_RETAINED_JSON_BYTES / JSON_NODE_RETAINED_BYTES;
+  // JSON-GLib's parser and the walk below are both recursive, so a deeply
+  // nested document is a C stack hazard rather than a heap one.
+  internal const int MAX_JSON_DEPTH = 64;
+
   internal string node_text (Json.Node node) {
     var generator = new Generator ();
     generator.set_root (node);
     return generator.to_data (null);
   }
 
-  internal Json.Node parse_json (string source) throws Error {
+  /* Untrusted JSON has to be bounded before JSON-GLib allocates a tree for
+   * it: once the parser has run the memory is already committed and a
+   * frame-sized dense array can retain tens of megabytes. This scans the raw
+   * text without allocating, counting the structural positions that must each
+   * become a retained node, and rejects a document whose tree could exceed the
+   * budget or whose nesting could exhaust the parser's stack. */
+  internal void check_json_budget (string source, string subject) throws ClientError {
+    int length = source.length;
+    size_t units = 1;
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (int index = 0; index < length; index++) {
+      char current = source[index];
+      if (in_string) {
+        // Separators inside a string are literal text on a single node, so an
+        // escaped quote must not be mistaken for the end of that string.
+        if (escaped) escaped = false;
+        else if (current == '\\') escaped = true;
+        else if (current == '"') in_string = false;
+        continue;
+      }
+      if (current == '"') {
+        in_string = true;
+      } else if (current == '[' || current == '{') {
+        depth++;
+        if (depth > MAX_JSON_DEPTH) {
+          throw new ClientError.PROTOCOL (subject + " nests deeper than the bounded JSON depth");
+        }
+      } else if (current == ']' || current == '}') {
+        if (depth > 0) depth--;
+      } else if (current == ',') {
+        // Every separator introduces one more array element or member value.
+        units++;
+      } else if (current == ':') {
+        // An object member retains its name string as well as its value node.
+        units += 2;
+      }
+      if (units > MAX_RETAINED_JSON_UNITS) {
+        throw new ClientError.PROTOCOL (subject + " exceeds the bounded retained JSON budget");
+      }
+    }
+    if ((size_t) length > MAX_RETAINED_JSON_BYTES - units * JSON_NODE_RETAINED_BYTES) {
+      throw new ClientError.PROTOCOL (subject + " exceeds the bounded retained JSON budget");
+    }
+  }
+
+  /* The charge a queued or in-flight value actually costs while it is held.
+   * Walking the parsed tree is the only honest measurement; the serialized
+   * text of the same value understates a tree-shaped payload badly. */
+  internal size_t retained_node_bytes (Json.Node? node, int depth = 0) {
+    if (node == null) return 0;
+    size_t total = JSON_NODE_RETAINED_BYTES;
+    // Callers reach this only through a depth-checked document. The guard is
+    // here so a hand-built node can never recurse without a bound either.
+    if (depth >= MAX_JSON_DEPTH) return total;
+    var kind = node.get_node_type ();
+    if (kind == NodeType.OBJECT) {
+      unowned Json.Object? object = node.get_object ();
+      if (object != null) {
+        foreach (unowned string member in object.get_members ()) {
+          total += JSON_NODE_RETAINED_BYTES + member.length;
+          total += retained_node_bytes (object.get_member (member), depth + 1);
+        }
+      }
+    } else if (kind == NodeType.ARRAY) {
+      unowned Json.Array? array = node.get_array ();
+      if (array != null) {
+        for (uint index = 0; index < array.get_length (); index++) {
+          total += retained_node_bytes (array.get_element (index), depth + 1);
+        }
+      }
+    } else if (kind == NodeType.VALUE && node.get_value_type () == typeof (string)) {
+      unowned string? text = node.get_string ();
+      if (text != null) total += text.length;
+    }
+    return total;
+  }
+
+  internal Json.Node parse_json (string source, string subject = "JSON document") throws Error {
+    check_json_budget (source, subject);
     var parser = new Parser ();
     parser.load_from_data (source, -1);
-    return parser.get_root ().copy ();
+    unowned Json.Node? root = parser.get_root ();
+    // JSON-GLib accepts input carrying no value at all and reports a NULL
+    // root. Copying or inspecting that node raises a GLib critical, and
+    // json_node_get_node_type(NULL) returns JSON_NODE_OBJECT from its
+    // g_return_val_if_fail fallback, so a later type guard cannot catch it.
+    // Under G_DEBUG=fatal-criticals the process would stop answering at all.
+    if (root == null) throw new ClientError.PROTOCOL (subject + " contains no JSON value");
+    return root.copy ();
   }
 
   internal string required_string_member (Json.Object object, string field) throws ClientError {
@@ -123,12 +223,19 @@ namespace Convex {
     internal string? last_signature;
     internal ArrayQueue<Update> queue = new ArrayQueue<Update> ();
     private const int MAX_PENDING_UPDATES = 16;
+    // The same eight MiB as the retained-JSON document budget: one accepted
+    // frame's value can always be held, and never more than one.
     private const size_t MAX_PENDING_BYTES = 8 * 1024 * 1024;
     private const size_t DELIVERY_RUNTIME_OVERHEAD = 256;
     private uint relay_generation = 1;
     private uint delivery_source = 0;
     private size_t pending_bytes = 0;
     private uint reserved_updates = 0;
+    // The dequeued update stays charged while its consumer runs. Holding it
+    // here rather than inferring the release from the counters makes the
+    // reservation released exactly once on every path, including a callback
+    // that revokes the relay or republishes into it.
+    private Update? in_flight;
     // Reconnect snapshots are allowed to repeat the last value once. Later
     // same-value server transitions are still observable events.
     private bool suppress_next_unchanged = false;
@@ -153,9 +260,36 @@ namespace Convex {
         Source.remove (delivery_source);
         delivery_source = 0;
       }
+      release_everything ();
+    }
+
+    // Revocation and generation changes drop the queue and any in-flight
+    // reservation together, so a later release cannot double-subtract.
+    private void release_everything () {
       while (!queue.is_empty) queue.poll ();
+      in_flight = null;
       pending_bytes = 0;
       reserved_updates = 0;
+    }
+
+    private void release_reservation (Update update) {
+      pending_bytes = pending_bytes >= update.encoded_bytes ? pending_bytes - update.encoded_bytes : 0;
+      if (reserved_updates > 0) reserved_updates--;
+    }
+
+    // Every queued update leaves the queue through here, so discarding one
+    // always gives its count and bytes back rather than stranding them.
+    private void drop_queued () {
+      while (!queue.is_empty) {
+        release_reservation (queue.poll ());
+      }
+    }
+
+    private void release_in_flight () {
+      if (in_flight == null) return;
+      var released = in_flight;
+      in_flight = null;
+      release_reservation (released);
     }
 
     internal void prepare_rehydration () {
@@ -168,57 +302,66 @@ namespace Convex {
       delivery_source = Idle.add (() => {
         delivery_source = 0;
         if (!active || generation != relay_generation) {
-          while (!queue.is_empty) queue.poll ();
-          pending_bytes = 0;
-          reserved_updates = 0;
+          release_everything ();
           return false;
         }
-        var next = queue.poll ();
+        // The reservation stays charged while the consumer runs. A callback
+        // may block on output, republish, or revoke the relay; releasing it
+        // any earlier would hide in-flight memory from the budget.
+        in_flight = queue.poll ();
         if (before_delivery_for_test != null) before_delivery_for_test (this);
-        // This reservation remains charged while the consumer runs. A
-        // callback may block on output, replace itself, or revoke the relay;
-        // releasing it before that point would hide in-flight memory.
-        if (next.generation == relay_generation && active) {
-          updated (next.value, next.error);
-          if (active && generation == relay_generation && pending_bytes >= next.encoded_bytes) {
-            pending_bytes -= next.encoded_bytes;
-            if (reserved_updates > 0) reserved_updates--;
-          }
+        // Re-read the reservation: the hook above may already have revoked it.
+        var current = in_flight;
+        if (current != null && current.generation == relay_generation && active) {
+          updated (current.value, current.error);
         }
+        release_in_flight ();
         if (active && generation == relay_generation && !queue.is_empty) schedule_delivery ();
         return false;
       });
     }
 
+    // Quote every field. Raw concatenation let (name "A", message "B:C")
+    // collide with (name "A:B", message "C") and suppress a genuinely
+    // different error after a reconnect.
+    private string delivery_signature (Json.Node? value, FunctionError? error) {
+      if (error == null) return "V:" + node_text (value);
+      string encoded_logs = "";
+      foreach (var log in error.logs) encoded_logs += ":" + json_string (log);
+      return "E:" + json_string (error.name) + ":" + json_string (error.message) + ":" +
+             (error.data != null ? json_string (node_text (error.data)) : "") + ":L" + encoded_logs;
+    }
+
     internal void publish (Json.Node? value, FunctionError? error) {
       if (!active) return;
-      string signature;
-      if (error != null) {
-        string encoded_logs = "";
-        foreach (var log in error.logs) encoded_logs += ":" + json_string (log);
-        signature = "E:" + error.name + ":" + error.message + ":" +
-                    (error.data != null ? node_text (error.data) : "") + ":L" + encoded_logs;
-      } else {
-        signature = "V:" + node_text (value);
-      }
+      string signature = delivery_signature (value, error);
       if (signature == last_signature && suppress_next_unchanged) {
         suppress_next_unchanged = false;
         return;
       }
       suppress_next_unchanged = false;
       size_t encoded_bytes = delivery_encoded_bytes (value, error);
+      // Keep the replacement error owned until the queued Update has taken its
+      // own reference. A block-local object is released at the closing brace,
+      // while the nullable parameter below is deliberately unowned.
+      FunctionError? bounded_error = null;
       while ((reserved_updates >= MAX_PENDING_UPDATES || encoded_bytes > MAX_PENDING_BYTES - pending_bytes) && !queue.is_empty) {
-        var discarded = queue.poll ();
-        pending_bytes -= discarded.encoded_bytes;
-        reserved_updates--;
+        release_reservation (queue.poll ());
       }
       if (encoded_bytes > MAX_PENDING_BYTES) {
-        while (!queue.is_empty) queue.poll ();
-        var bounded = new FunctionError ("ProtocolError", "Live update exceeds the bounded delivery byte budget");
-        encoded_bytes = delivery_encoded_bytes (null, bounded);
+        // A tree-shaped value can exceed the whole budget on its own now that
+        // the charge is the retained representation, so this path is real.
+        // Clearing the queue has to give those reservations back as well.
+        drop_queued ();
+        bounded_error = new FunctionError ("ProtocolError", "Live update exceeds the bounded delivery byte budget");
+        encoded_bytes = delivery_encoded_bytes (null, bounded_error);
         if (encoded_bytes > MAX_PENDING_BYTES - pending_bytes || reserved_updates >= MAX_PENDING_UPDATES) return;
         value = null;
-        error = bounded;
+        error = bounded_error;
+        // Record what is actually delivered. Keeping the refused value's
+        // signature would let a later rehydration compare against an event
+        // no subscriber ever saw.
+        signature = delivery_signature (value, error);
       }
       // An already-running callback cannot be evicted. Drop this later update
       // if its count or byte reservation cannot fit until that callback
@@ -232,14 +375,16 @@ namespace Convex {
     }
 
     private size_t delivery_encoded_bytes (Json.Node? value, FunctionError? error) {
-      // The fixed allowance covers the complete adapter envelope, a maximum
-      // subscription ID, queue nodes, signal arguments, and allocator slack.
+      // What is queued is a parsed JSON-GLib tree, not its serialized text, so
+      // this charges the retained representation. The fixed allowance covers
+      // the adapter envelope, a maximum subscription ID, the queue node,
+      // signal arguments, and allocator slack.
       size_t bytes = DELIVERY_RUNTIME_OVERHEAD;
-      if (value != null) bytes += node_text (value).length;
+      bytes += retained_node_bytes (value);
       if (error != null) {
         bytes += json_string (error.name).length + json_string (error.message).length;
-        if (error.data != null) bytes += node_text (error.data).length;
-        foreach (var log in error.logs) bytes += json_string (log).length + 1;
+        bytes += retained_node_bytes (error.data);
+        foreach (var log in error.logs) bytes += JSON_NODE_RETAINED_BYTES + json_string (log).length + 1;
       }
       return bytes;
     }
@@ -406,7 +551,10 @@ namespace Convex {
     }
 
     private void on_message (string text) {
-      try { handle_transition (parse_json (text)); }
+      // parse_json bounds the retained tree before JSON-GLib allocates it. A
+      // frame-sized dense array is inside the 2 MiB wire cap yet would retain
+      // tens of megabytes, so this is the only place that bound can hold.
+      try { handle_transition (parse_json (text, "Live frame")); }
       catch (Error error) { protocol_failure (error.message); }
     }
 
@@ -562,6 +710,11 @@ namespace Convex {
       if (path.length == 0 || args.get_node_type () != NodeType.OBJECT) throw new ClientError.PROTOCOL ("Convex arguments must be a JSON object");
       var body = "{\"path\":" + json_string (path) + ",\"args\":" + node_text (args) + ",\"format\":\"json\"}";
       var message = new Message ("POST", url + "/api/" + operation);
+      bool response_body_complete = false;
+      // libsoup emits got-body only after the complete framed response body has
+      // arrived. A raw stream can otherwise return EOF for a truncated
+      // Content-Length or unterminated chunked body without throwing.
+      message.got_body.connect (() => { response_body_complete = true; });
       message.request_headers.append ("Accept", "application/json"); message.request_headers.append ("Convex-Client", "vala-0.1.0");
       if (token != null) message.request_headers.append ("Authorization", "Bearer " + token);
       message.set_request_body_from_bytes ("application/json", new Bytes (body.data));
@@ -575,11 +728,10 @@ namespace Convex {
       uint8[] chunk = new uint8[8192];
       try {
         stream = session.send (message, cancellation);
-        // HTTP status is transport truth. Never allow a success-shaped Convex
-        // JSON body on a non-2xx response to become a successful result.
-        if (message.status_code < 200 || message.status_code >= 300) {
-          throw new ClientError.TRANSPORT ("HTTP status " + message.status_code.to_string ());
-        }
+        // The body is read on every status. A Convex deployment may report a
+        // function failure with a non-2xx status, and that envelope carries
+        // errorMessage, errorData, and logLines which must not be flattened
+        // into a bare transport failure. Classification happens after parsing.
         for (;;) {
           ssize_t received = stream.read (chunk, cancellation);
           if (received == 0) break;
@@ -587,6 +739,27 @@ namespace Convex {
             throw new ClientError.TRANSPORT ("HTTP response exceeds 2 MiB");
           }
           response.append (chunk[0 : (int) received]);
+        }
+        // Closing the response stream is where libsoup reports a body that
+        // never satisfied its declared Content-Length or chunked framing.
+        // Discarding that error turns a truncated response into a successful
+        // value, so it is surfaced as a transport failure instead.
+        InputStream? framing = stream;
+        stream = null;
+        if (framing != null) framing.close (cancellation);
+        if (!response_body_complete) throw new ClientError.TRANSPORT ("HTTP response body was truncated");
+        if (message.response_headers.get_encoding () == Soup.Encoding.CONTENT_LENGTH &&
+            message.response_headers.get_content_length () != (int64) response.len) {
+          throw new ClientError.TRANSPORT ("HTTP response did not satisfy Content-Length");
+        }
+        // libsoup 3.2 treats a connection-close EOF as the end of a chunked
+        // body even when the mandatory zero chunk never arrived. Its decoded
+        // stream does not expose that framing byte, so conservatively reject
+        // chunked responses which also retire the connection. Normal complete
+        // keep-alive chunked responses remain supported and tested.
+        if (message.response_headers.get_encoding () == Soup.Encoding.CHUNKED &&
+            message.response_headers.header_contains ("Connection", "close")) {
+          throw new ClientError.TRANSPORT ("connection-close chunked response cannot prove complete framing");
         }
         if (deadline.stop ()) throw new ClientError.TRANSPORT ("HTTP request exceeded its absolute deadline");
       } catch (ClientError error) {
@@ -596,18 +769,33 @@ namespace Convex {
         throw new ClientError.TRANSPORT (error.message);
       } finally {
         deadline.stop ();
+        // Only an abandoned stream is still set here; the framing close above
+        // clears it so a body error is never reported twice or swallowed.
         if (stream != null) {
           try { stream.close (cancellation); } catch (Error error) {}
         }
       }
       uint8[] terminated = new uint8[response.len + 1];
       for (int index = 0; index < response.len; index++) terminated[index] = response.data[index];
-      Json.Node decoded;
+      Json.Node? decoded = null;
+      string? decode_failure = null;
       try {
-        decoded = parse_json ((string) terminated);
+        decoded = parse_json ((string) terminated, "Convex HTTP response");
       } catch (Error error) {
-        throw new ClientError.PROTOCOL ("malformed Convex HTTP response: " + error.message);
+        decode_failure = error.message;
       }
+      // A complete function-error envelope is authoritative on any status.
+      var envelope_error = function_error_envelope (decoded);
+      if (envelope_error != null) {
+        last_function_error = envelope_error;
+        throw new ClientError.FUNCTION (envelope_error.message);
+      }
+      // Anything else on a non-2xx stays a transport failure, including a
+      // success-shaped body and a body which is not a Convex envelope at all.
+      if (message.status_code < 200 || message.status_code >= 300) {
+        throw new ClientError.TRANSPORT ("HTTP status " + message.status_code.to_string ());
+      }
+      if (decoded == null) throw new ClientError.PROTOCOL ("malformed Convex HTTP response: " + (decode_failure ?? "no JSON value"));
       if (decoded.get_node_type () != NodeType.OBJECT) throw new ClientError.PROTOCOL ("HTTP response is not an object");
       var object = decoded.get_object (); var logs = logs_from (object); var status = required_string_member (object, "status");
       if (status == "success") { if (!object.has_member ("value")) throw new ClientError.PROTOCOL ("success response omitted value"); return new Result (object.get_member ("value").copy (), logs); }
@@ -617,6 +805,24 @@ namespace Convex {
         throw new ClientError.FUNCTION (last_function_error.message);
       }
       throw new ClientError.PROTOCOL ("unknown Convex HTTP status");
+    }
+
+    /* A Convex function failure is only recognised from a complete envelope:
+     * status "error", a string errorMessage, and well-formed logLines. A body
+     * which merely resembles one falls back to the caller's status handling,
+     * so malformed input can never be promoted into a FunctionError. */
+    private FunctionError? function_error_envelope (Json.Node? decoded) {
+      if (decoded == null || decoded.get_node_type () != NodeType.OBJECT) return null;
+      var object = decoded.get_object ();
+      try {
+        if (required_string_member (object, "status") != "error") return null;
+        var logs = logs_from (object);
+        var failure_message = required_string_member (object, "errorMessage");
+        Json.Node? data = object.has_member ("errorData") ? object.get_member ("errorData").copy () : null;
+        return new FunctionError ("FunctionError", failure_message, data, logs);
+      } catch (ClientError error) {
+        return null;
+      }
     }
   }
 }
