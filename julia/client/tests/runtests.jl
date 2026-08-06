@@ -10,6 +10,14 @@ include(joinpath(@__DIR__, "conformance", "adapter.jl"))
 
 const TEST_TIMEOUT = 6.0
 
+@testset "unknown Live transport errors stay structured" begin
+    error = Convex.typed_error(ErrorException("unretained transport detail"), :transport)
+    @test error isa Convex.ConvexError
+    @test error.kind == :transport
+    @test error.message == "Live transport failure"
+    @test error.logs == String[]
+end
+
 # Static test-only identity for the loopback WSS fixture. The matching private
 # key never leaves this deterministic local test and is not a deployment secret.
 const TEST_TLS_CERT = """-----BEGIN CERTIFICATE-----

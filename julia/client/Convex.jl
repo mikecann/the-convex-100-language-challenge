@@ -2046,7 +2046,13 @@ function typed_error(error, kind)
         nested = getproperty(error, :error)
         nested isa ConvexError && return nested
     end
-    return ConvexError(kind, sprint(showerror, error), nothing, String[])
+    # PackageCompiler's stripped image may first see a concrete HTTP.jl or
+    # OpenSSL exception only on the hosted WSS path. Rendering that unknown
+    # exception can itself require a missing showerror specialization, which
+    # used to terminate the sole Live owner and leave callers with only
+    # "Live worker stopped". Keep the transport failure structured and
+    # deterministic even when the original exception was not retained.
+    return ConvexError(kind, "Live transport failure", nothing, String[])
 end
 jsonhas(object, key) = haskey(object, Symbol(key)) || haskey(object, key)
 jsonget(object, key, default) =
