@@ -382,6 +382,12 @@ precompile(Adapter.run_adapter, (Base.PipeEndpoint, Base.PipeEndpoint))
 precompile(Adapter.failure, (Adapter.OutputPump, String, Client.ConvexError))
 precompile(Adapter.failure, (Adapter.OutputPump, Nothing, Client.ConvexError))
 precompile(Adapter.serialise_error, (Client.ConvexError,))
+# Keep HTTP.jl's generic WebSocket wrapper and its GET upgrade dispatch in the
+# stripped image. The deterministic WSS fixture exercises the same API, but
+# PackageCompiler can otherwise leave this generic path to first use in the
+# final application.
+precompile(Client.HTTP.WebSockets.open, (Function, String))
+precompile(Client.HTTP.open, (Function, String, String, Vector{Pair{String,String}}))
 precompile(Base._depwarn, (Any, Any, Bool))
 
 function fixture_transition(
