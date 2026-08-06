@@ -9,10 +9,23 @@ class Adapter : GLib.Object {
   private OutputStream? tcp_output;
   private MainLoop loop;
   private bool closed = false;
+  private size_t output_in_flight_bytes = 0;
+  private uint output_in_flight_events = 0;
+  private const size_t MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
+  private const uint MAX_OUTPUT_EVENTS = 64;
 
   public Adapter (MainLoop loop) { this.loop = loop; }
 
   private void emit (string event) {
+    size_t encoded_bytes = event.length + 1;
+    if (encoded_bytes > 2 * 1024 * 1024) { stderr.printf ("adapter event exceeds 2 MiB\n"); loop.quit (); return; }
+    if (output_in_flight_events >= MAX_OUTPUT_EVENTS || output_in_flight_bytes + encoded_bytes > MAX_OUTPUT_BYTES) {
+      stderr.printf ("adapter output budget exhausted\n");
+      loop.quit ();
+      return;
+    }
+    output_in_flight_events++;
+    output_in_flight_bytes += encoded_bytes;
     try {
       if (tcp_output != null) {
         size_t written;
@@ -22,6 +35,8 @@ class Adapter : GLib.Object {
         stdout.flush ();
       }
     } catch (Error error) { stderr.printf ("adapter output failed: %s\n", error.message); }
+    output_in_flight_events--;
+    output_in_flight_bytes -= encoded_bytes;
   }
 
   private void error (string id, string name, string message, Json.Node? data = null, string? subscription_id = null, string[] logs = {}) {
@@ -68,7 +83,7 @@ class Adapter : GLib.Object {
       id = object.get_string_member ("id");
       var op = object.get_string_member ("op");
       if (op == "hello") {
-        if (!object.has_member ("protocolVersion") || object.get_int_member ("protocolVersion") != 1) throw new ClientError.PROTOCOL ("unsupported adapter protocol version");
+        if (!object.has_member ("protocolVersion") || Convex.uint32_member (object, "protocolVersion") != 1) throw new ClientError.PROTOCOL ("unsupported adapter protocol version");
         emit ("{\"protocolVersion\":1,\"id\":" + Convex.json_string (id) + ",\"type\":\"ready\",\"language\":\"vala\",\"implementation\":\"native-vala-libsoup3\",\"runtime\":" + Convex.json_string (Environment.get_variable ("VALA_RUNTIME") ?? "glib") + "}");
       } else if (op == "query" || op == "mutation" || op == "action") {
         if (!object.has_member ("path") || !object.has_member ("args")) throw new ClientError.PROTOCOL ("call requires path and args");
@@ -114,11 +129,18 @@ class Adapter : GLib.Object {
 
   // The harness relies on a strict protocol. Rejecting unknown fields makes
   // client-side typos visible instead of silently treating them as success.
+  private string required_string (Json.Object object, string field, size_t minimum = 0) throws ClientError {
+    if (!object.has_member (field) || object.get_member (field).get_value_type () != typeof (string)) {
+      throw new ClientError.PROTOCOL (field + " must be a string");
+    }
+    var value = object.get_string_member (field);
+    if (value.length < minimum || value.length > 128) throw new ClientError.PROTOCOL (field + " has invalid length");
+    return value;
+  }
+
   private void validate_envelope (Json.Object object) throws ClientError {
-    if (!object.has_member ("id") || !object.has_member ("op")) throw new ClientError.PROTOCOL ("adapter command needs id and op");
-    var id = object.get_string_member ("id");
-    var op = object.get_string_member ("op");
-    if (id.length == 0 || op.length == 0) throw new ClientError.PROTOCOL ("adapter command id and op must be non-empty strings");
+    var id = required_string (object, "id", 1);
+    var op = required_string (object, "op", 1);
     string[] permitted;
     if (op == "hello") permitted = { "id", "op", "protocolVersion" };
     else if (op == "query" || op == "mutation" || op == "action") permitted = { "id", "op", "path", "args" };
@@ -127,26 +149,32 @@ class Adapter : GLib.Object {
     else if (op == "unsubscribe") permitted = { "id", "op", "subscriptionId" };
     else if (op == "debugDisconnect" || op == "close") permitted = { "id", "op" };
     else throw new ClientError.PROTOCOL ("unknown adapter operation");
+
     foreach (unowned string member in object.get_members ()) {
       bool allowed = false;
       foreach (var name in permitted) if (member == name) { allowed = true; break; }
       if (!allowed) throw new ClientError.PROTOCOL ("unknown adapter field " + member);
     }
-    if (op == "hello" && !object.has_member ("protocolVersion")) {
-      throw new ClientError.PROTOCOL ("hello requires protocolVersion");
-    }
-    if ((op == "query" || op == "mutation" || op == "action") &&
-        (!object.has_member ("path") || !object.has_member ("args"))) {
-      throw new ClientError.PROTOCOL ("call requires path and args");
-    }
-    if (op == "setAuth" && !object.has_member ("token")) {
-      throw new ClientError.PROTOCOL ("setAuth requires token");
-    }
-    if (op == "subscribe" && (!object.has_member ("subscriptionId") || !object.has_member ("path") || !object.has_member ("args"))) {
-      throw new ClientError.PROTOCOL ("subscribe requires subscriptionId, path, and args");
-    }
-    if (op == "unsubscribe" && !object.has_member ("subscriptionId")) {
-      throw new ClientError.PROTOCOL ("unsubscribe requires subscriptionId");
+
+    if (op == "hello") {
+      if (!object.has_member ("protocolVersion") || Convex.uint32_member (object, "protocolVersion") != 1) {
+        throw new ClientError.PROTOCOL ("unsupported adapter protocol version");
+      }
+    } else if (op == "query" || op == "mutation" || op == "action") {
+      if (required_string (object, "path", 3).length < 3 || !object.has_member ("args") ||
+          object.get_member ("args").get_node_type () != NodeType.OBJECT) {
+        throw new ClientError.PROTOCOL ("call needs a path and object args");
+      }
+    } else if (op == "setAuth") {
+      required_string (object, "token");
+    } else if (op == "subscribe") {
+      required_string (object, "subscriptionId", 1);
+      required_string (object, "path", 1);
+      if (!object.has_member ("args") || object.get_member ("args").get_node_type () != NodeType.OBJECT) {
+        throw new ClientError.PROTOCOL ("subscribe needs object args");
+      }
+    } else if (op == "unsubscribe") {
+      required_string (object, "subscriptionId", 1);
     }
   }
 
@@ -154,7 +182,10 @@ class Adapter : GLib.Object {
     if ((condition & IOCondition.IN) == 0) return !closed;
     string? line; size_t length; size_t terminal;
     try {
-      if (channel.read_line (out line, out length, out terminal) == IOStatus.NORMAL && line != null) handle (line);
+      if (channel.read_line (out line, out length, out terminal) == IOStatus.NORMAL && line != null) {
+        if (length > 2 * 1024 * 1024) { error ("", "ProtocolError", "adapter command exceeds 2 MiB"); return false; }
+        handle (line);
+      }
     } catch (Error error) { stderr.printf ("adapter input failed: %s\n", error.message); return false; }
     return !closed;
   }
@@ -167,6 +198,7 @@ class Adapter : GLib.Object {
         size_t length = 0;
         string? line = yield input.read_line_utf8_async (Priority.DEFAULT, null, out length);
         if (line == null) break;
+        if (length > 2 * 1024 * 1024) { error ("", "ProtocolError", "adapter command exceeds 2 MiB"); break; }
         handle (line);
       }
     } catch (Error error) { stderr.printf ("adapter TCP input failed: %s\n", error.message); }

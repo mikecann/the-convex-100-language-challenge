@@ -23,9 +23,16 @@ static int64 count_from (Json.Node value, string operation) throws Error {
   if (value.get_node_type () != NodeType.OBJECT) {
     throw new ClientError.PROTOCOL (operation + " did not return an object");
   }
-  var count = value.get_object ().get_member ("count").get_double ();
+  var count_node = value.get_object ().get_member ("count");
+  if (count_node.get_value_type () != typeof (int64) && count_node.get_value_type () != typeof (double)) {
+    throw new ClientError.PROTOCOL (operation + " returned a non-numeric count");
+  }
+  var count = count_node.get_double ();
+  if (count != count || count < 0 || count >= 9223372036854775808.0) {
+    throw new ClientError.PROTOCOL (operation + " returned an out-of-range count");
+  }
   int64 integral = (int64) count;
-  if (count < 0 || count > int64.MAX || (double) integral != count) {
+  if ((double) integral != count) {
     throw new ClientError.PROTOCOL (operation + " returned a non-integral count");
   }
   return integral;

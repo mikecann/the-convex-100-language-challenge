@@ -43,9 +43,16 @@ static int64 count_from (Json.Node value, string operation) throws Error {
   if (value.get_node_type () != NodeType.OBJECT) {
     throw new ClientError.PROTOCOL (operation + " did not return an object");
   }
-  var count = value.get_object ().get_member ("count").get_double ();
+  var count_node = value.get_object ().get_member ("count");
+  if (count_node.get_value_type () != typeof (int64) && count_node.get_value_type () != typeof (double)) {
+    throw new ClientError.PROTOCOL (operation + " returned a non-numeric count");
+  }
+  var count = count_node.get_double ();
+  if (count != count || count < 0 || count >= 9223372036854775808.0) {
+    throw new ClientError.PROTOCOL (operation + " returned an out-of-range count");
+  }
   int64 integral = (int64) count;
-  if (count < 0 || count > int64.MAX || (double) integral != count) {
+  if ((double) integral != count) {
     throw new ClientError.PROTOCOL (operation + " returned a non-integral count");
   }
   return integral;
@@ -136,10 +143,10 @@ int main (string[] args) {
 
 ## Conformance and protocol notes
 
-The client implements Convex-specific HTTP envelopes and an attempted pinned `/api/sync` query-set profile in Vala. libsoup supplies ordinary TLS, HTTP, and RFC6455 transport only. One GLib-main-context Live owner opens, reads, writes, retires, and reconnects the socket. It commits a complete Transition before publishing updates, validates query-set versions, tracks the little-endian timestamp numerically, and suppresses unchanged rehydration.
+The client implements Convex-specific HTTP envelopes and an attempted pinned `/api/sync` query-set profile in Vala. libsoup supplies ordinary TLS, HTTP, and RFC6455 transport only. One GLib-main-context Live owner opens, reads, writes, retires, and reconnects the socket. It commits a complete Transition before publishing updates, validates query-set versions and uint32 bounds, tracks the little-endian timestamp numerically, reports transport failures as structured events, and suppresses unchanged rehydration. Delivery relays are generation-tagged and bounded to sixteen events and eight MiB; adapter output has a two MiB event cap and eight MiB in-flight budget.
 
 The test-only adapter accepts strict NDJSON v1 over stdin/stdout or one `ADAPTER_LISTEN` TCP controller. `debugDisconnect` is adapter-only and lets the shared harness prove real reconnections.
 
 ## Limitations
 
-The basic Live path lacks the deterministic real-socket coverage, bounded asynchronous output, and full recovery behaviour required for a Live badge. Live authentication lifecycle, optimistic updates, mutation and action messages over WebSocket, journals, and TransitionChunk assembly are also deferred. The manifest deliberately declares no earned badges until root-owned local and hosted evidence passes from a clean reviewed commit.
+The basic Live path still lacks deterministic raw-peer coverage for fragmented frames, stalled-frame deadlines, five reconnects, and full recovery behaviour required for a Live badge. The new local tests cover relay invalidation, deduplication, numeric bounds, and the stopped-reader relay budget, but do not replace root-owned shared conformance. Live authentication lifecycle, optimistic updates, mutation and action messages over WebSocket, journals, and TransitionChunk assembly are also deferred. The manifest deliberately declares no earned badges until root-owned local and hosted evidence passes from a clean reviewed commit.

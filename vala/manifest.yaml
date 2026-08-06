@@ -28,5 +28,6 @@ adapter:
 limitations:
   - Live authentication, optimistic updates, WebSocket mutations, and WebSocket actions are deferred.
   - TransitionChunk assembly is rejected as protocol drift and reconnects the shared Live owner.
+  - Each Live relay is bounded to 16 queued events and 8 MiB of encoded value/error data; invalidation is an adapter acknowledgement barrier.
   - Values use Convex's JSON-safe subset and are exposed as JSON-GLib nodes.
 capabilities: []

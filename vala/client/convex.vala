@@ -46,6 +46,26 @@ namespace Convex {
     return text.substring (1, text.length - 2);
   }
 
+  internal uint uint32_number (Json.Node node, string field) throws ClientError {
+    if (node.get_node_type () != NodeType.VALUE) {
+      throw new ClientError.PROTOCOL (field + " is not numeric");
+    }
+    var value_type = node.get_value_type ();
+    if (value_type != typeof (int64) && value_type != typeof (double)) {
+      throw new ClientError.PROTOCOL (field + " is not numeric");
+    }
+    double number = node.get_double ();
+    if (number != number || number < 0 || number > uint.MAX || number != (double) ((uint) number)) {
+      throw new ClientError.PROTOCOL (field + " is outside uint32 range");
+    }
+    return (uint) number;
+  }
+
+  internal uint uint32_member (Json.Object object, string field) throws ClientError {
+    if (!object.has_member (field)) throw new ClientError.PROTOCOL ("missing " + field);
+    return uint32_number (object.get_member (field), field);
+  }
+
   internal string[] logs_from (Json.Object? object) {
     if (object == null || !object.has_member ("logLines")) return {};
     var array = object.get_array_member ("logLines");
@@ -71,28 +91,81 @@ namespace Convex {
     internal bool active = true;
     internal string? last_signature;
     internal ArrayQueue<Update> queue = new ArrayQueue<Update> ();
+    private const int MAX_PENDING_UPDATES = 16;
+    private const size_t MAX_PENDING_BYTES = 8 * 1024 * 1024;
+    private uint relay_generation = 1;
+    private uint delivery_source = 0;
+    private size_t pending_bytes = 0;
     public signal void updated (Json.Node? value, FunctionError? error);
 
     internal Subscription (uint query_id, string path, Json.Node args) {
       this.query_id = query_id; this.path = path; this.args = args;
     }
 
+    internal size_t pending_count () { return queue.size; }
+    internal size_t pending_byte_count () { return pending_bytes; }
+
+    internal void invalidate () {
+      if (!active) return;
+      active = false;
+      relay_generation++;
+      if (delivery_source != 0) {
+        Source.remove (delivery_source);
+        delivery_source = 0;
+      }
+      while (!queue.is_empty) queue.poll ();
+      pending_bytes = 0;
+    }
+
+    private void schedule_delivery () {
+      if (delivery_source != 0 || queue.is_empty || !active) return;
+      uint generation = relay_generation;
+      delivery_source = Idle.add (() => {
+        delivery_source = 0;
+        if (!active || generation != relay_generation) {
+          while (!queue.is_empty) queue.poll ();
+          pending_bytes = 0;
+          return false;
+        }
+        var next = queue.poll ();
+        pending_bytes -= next.encoded_bytes;
+        if (next.generation == relay_generation) updated (next.value, next.error);
+        if (active && generation == relay_generation && !queue.is_empty) schedule_delivery ();
+        return false;
+      });
+    }
+
     internal void publish (Json.Node? value, FunctionError? error) {
       if (!active) return;
-      var signature = error != null ? "E:" + error.name + ":" + error.message : "V:" + node_text (value);
+      var signature = error != null ? "E:" + error.name + ":" + error.message + ":" + (error.data != null ? node_text (error.data) : "") : "V:" + node_text (value);
       if (signature == last_signature) return;
       last_signature = signature;
-      // Reactive values supersede old values. Retain only the newest sixteen.
-      while (queue.size >= 16) queue.poll ();
-      queue.offer (new Update (value, error));
-      var next = queue.poll ();
-      updated (next.value, next.error);
+      size_t encoded_bytes = value != null ? node_text (value).length : 64;
+      if (error != null) encoded_bytes += error.name.length + error.message.length + (error.data != null ? node_text (error.data).length : 0);
+      while ((queue.size >= MAX_PENDING_UPDATES || pending_bytes + encoded_bytes > MAX_PENDING_BYTES) && !queue.is_empty) {
+        var discarded = queue.poll ();
+        pending_bytes -= discarded.encoded_bytes;
+      }
+      if (encoded_bytes > MAX_PENDING_BYTES) {
+        while (!queue.is_empty) queue.poll ();
+        pending_bytes = 0;
+        var bounded = new FunctionError ("ProtocolError", "Live update exceeds the bounded delivery byte budget");
+        encoded_bytes = bounded.message.length + bounded.name.length + 64;
+        queue.offer (new Update (null, bounded, relay_generation, encoded_bytes));
+        pending_bytes = encoded_bytes;
+      } else {
+        queue.offer (new Update (value, error, relay_generation, encoded_bytes));
+        pending_bytes += encoded_bytes;
+      }
+      schedule_delivery ();
     }
   }
 
   internal class Update : GLib.Object {
-    public Json.Node? value; public FunctionError? error;
-    public Update (Json.Node? value, FunctionError? error) { this.value = value; this.error = error; }
+    public Json.Node? value; public FunctionError? error; public uint generation; public size_t encoded_bytes;
+    public Update (Json.Node? value, FunctionError? error, uint generation, size_t encoded_bytes) {
+      this.value = value; this.error = error; this.generation = generation; this.encoded_bytes = encoded_bytes;
+    }
   }
 
   internal class LiveOwner : GLib.Object {
@@ -120,7 +193,8 @@ namespace Convex {
 
     internal LiveOwner (Client client) { this.client = client; }
 
-    internal Subscription add (string path, Json.Node args) {
+    internal Subscription add (string path, Json.Node args) throws ClientError {
+      if (next_query_id == uint.MAX) throw new ClientError.PROTOCOL ("query id space exhausted");
       var subscription = new Subscription (next_query_id++, path, args.copy ());
       active.set (subscription.query_id, subscription);
       ensure_connected ();
@@ -131,7 +205,7 @@ namespace Convex {
     internal void remove (Subscription subscription) {
       if (!subscription.active) return;
       // Invalidate before emitting an acknowledgement from the adapter.
-      subscription.active = false;
+      subscription.invalidate ();
       active.unset (subscription.query_id);
       if (socket != null && socket.state == WebsocketState.OPEN) send_modify ({}, { subscription.query_id });
       if (active.size == 0 && reconnect_source != 0) { Source.remove (reconnect_source); reconnect_source = 0; }
@@ -149,7 +223,7 @@ namespace Convex {
     internal void close () {
       closing = true;
       if (reconnect_source != 0) { Source.remove (reconnect_source); reconnect_source = 0; }
-      foreach (var subscription in active.values) subscription.active = false;
+      foreach (var subscription in active.values) subscription.invalidate ();
       active.clear ();
       if (socket != null) socket.close (1000, "client closed");
       socket = null;
@@ -185,10 +259,10 @@ namespace Convex {
           if (socket == next && socket_generation == generation) on_message (type, payload);
         });
         socket.error.connect ((error) => {
-          if (socket == next && socket_generation == generation) retire_and_reconnect (error.message);
+          if (socket == next && socket_generation == generation) transport_failure (error.message);
         });
         socket.closed.connect (() => {
-          if (socket == next && socket_generation == generation) retire_and_reconnect ("socket closed");
+          if (socket == next && socket_generation == generation) transport_failure ("socket closed");
         });
         string observed_timestamp = saw_timestamp ? ",\"maxObservedTimestamp\":" + json_string (max_timestamp) : "";
         send_text ("{\"type\":\"Connect\",\"sessionId\":" + json_string (Uuid.string_random ()) +
@@ -202,7 +276,7 @@ namespace Convex {
           send_modify (subscriptions, {});
         }
       } catch (Error error) {
-        retire_and_reconnect (error.message);
+        transport_failure (error.message);
       } finally { connecting = false; }
     }
 
@@ -254,14 +328,14 @@ namespace Convex {
       if (type == "Ping" || type == "MutationResponse" || type == "ActionResponse") return;
       if (type != "Transition") throw new ClientError.PROTOCOL ("unexpected Live message " + type);
       var start = root.get_object_member ("startVersion");
-      if ((uint) start.get_int_member ("querySet") != remote_query_set ||
-          (uint) start.get_int_member ("identity") != remote_identity ||
+      if (uint32_member (start, "querySet") != remote_query_set ||
+          uint32_member (start, "identity") != remote_identity ||
           start.get_string_member ("ts") != remote_timestamp) throw new ClientError.PROTOCOL ("Transition start version mismatch");
       var pending = new ArrayList<UpdatePublication> ();
       var modifications = root.get_array_member ("modifications");
       for (uint i = 0; i < modifications.get_length (); i++) {
         var modification = modifications.get_object_element (i);
-        uint id = (uint) modification.get_int_member ("queryId");
+        uint id = uint32_member (modification, "queryId");
         var sub = active.get (id); if (sub == null) continue;
         var kind = modification.get_string_member ("type");
         if (kind == "QueryUpdated") pending.add (new UpdatePublication (sub, modification.get_member ("value").copy (), null));
@@ -276,13 +350,18 @@ namespace Convex {
       if (end_number < max_timestamp_number) throw new ClientError.PROTOCOL ("timestamp moved backwards");
       max_timestamp = end_timestamp; max_timestamp_number = end_number;
       saw_timestamp = true;
-      remote_timestamp = end_timestamp; remote_query_set = (uint) end.get_int_member ("querySet"); remote_identity = (uint) end.get_int_member ("identity");
+      remote_timestamp = end_timestamp; remote_query_set = uint32_member (end, "querySet"); remote_identity = uint32_member (end, "identity");
       // All state is committed before any callback can observe the transition.
       foreach (var update in pending) update.subscription.publish (update.value, update.error);
     }
 
     private void protocol_failure (string message) {
       foreach (var sub in active.values) sub.publish (null, new FunctionError ("ProtocolError", message));
+      retire_and_reconnect (message);
+    }
+
+    private void transport_failure (string message) {
+      foreach (var sub in active.values) sub.publish (null, new FunctionError ("TransportError", message));
       retire_and_reconnect (message);
     }
   }
