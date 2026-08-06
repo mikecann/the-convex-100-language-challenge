@@ -184,29 +184,38 @@ pub const Client = struct {
         var response_body = std.ArrayList(u8).init(allocator);
         defer response_body.deinit();
         var headers = [_]std.http.Header{
-            .{ .name = "content-type", .value = "application/json" },
             .{ .name = "accept", .value = "application/json" },
             .{ .name = "convex-client", .value = client_version },
         };
-        var privileged: [1]std.http.Header = undefined;
-        var privileged_headers: []const std.http.Header = &.{};
+        var request_headers = std.http.Client.Request.Headers{
+            .authorization = .omit,
+            // Hosted edges may negotiate compression by default. Convex's
+            // JSON bodies are small enough that deterministic identity bytes
+            // are preferable, while std.http still decodes an unexpected
+            // supported Content-Encoding response correctly.
+            .accept_encoding = .{ .override = "identity" },
+            .content_type = .{ .override = "application/json" },
+        };
+        var authorization: ?[]u8 = null;
+        defer if (authorization) |value| allocator.free(value);
         if (self.auth_token) |token| {
-            const value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
-            privileged[0] = .{ .name = "authorization", .value = value };
-            privileged_headers = &privileged;
-            defer allocator.free(value);
+            authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+            // Zig 0.14.1 stores privileged_headers but Request.send never
+            // writes them. The standard override is emitted, and keeping
+            // redirects unhandled below prevents forwarding this credential.
+            request_headers.authorization = .{ .override = authorization.? };
         }
         const result = std.http.Client.fetch(&self.http, .{
             .location = .{ .url = endpoint },
             .method = .POST,
             .payload = payload,
-            .headers = .{ .content_type = .{ .override = "application/json" } },
+            .redirect_behavior = .unhandled,
+            .headers = request_headers,
             .extra_headers = &headers,
-            .privileged_headers = privileged_headers,
             .response_storage = .{ .dynamic = &response_body },
             .max_append_size = max_http_body,
         }) catch return error.TransportFailure;
-        _ = result;
+        if (result.status != .ok) return error.InvalidResponse;
 
         const parsed = std.json.parseFromSlice(JsonValue, allocator, response_body.items, .{}) catch return error.InvalidResponse;
         const response = try httpObject(parsed.value);
@@ -1363,16 +1372,149 @@ const HttpFixture = struct {
         const connection = self.listener.accept() catch @panic("HTTP fixture accept failed");
         defer connection.stream.close();
         var request: [8192]u8 = undefined;
-        var used: usize = 0;
-        while (used < request.len) {
-            const amount = connection.stream.read(request[used..]) catch @panic("HTTP request read failed");
-            if (amount == 0) @panic("HTTP request ended before headers");
-            used += amount;
-            if (std.mem.indexOf(u8, request[0..used], "\r\n\r\n") != null) break;
-        }
+        _ = readHttpHeaders(connection.stream, &request) catch @panic("HTTP request read failed");
         connection.stream.writer().print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ self.body.len, self.body }) catch @panic("HTTP response write failed");
     }
 };
+
+fn readHttpHeaders(stream: std.net.Stream, buffer: []u8) ![]const u8 {
+    var used: usize = 0;
+    while (used < buffer.len) {
+        const amount = try stream.read(buffer[used..]);
+        if (amount == 0) return error.EndOfStream;
+        used += amount;
+        if (std.mem.indexOf(u8, buffer[0..used], "\r\n\r\n")) |end| return buffer[0 .. end + 4];
+    }
+    return error.MessageTooBig;
+}
+
+fn httpHeaderCount(headers: []const u8, name: []const u8, expected_value: ?[]const u8) usize {
+    var count: usize = 0;
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const separator = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..separator], " \t"), name)) continue;
+        const value = std.mem.trim(u8, line[separator + 1 ..], " \t");
+        if (expected_value == null or std.ascii.eqlIgnoreCase(value, expected_value.?)) count += 1;
+    }
+    return count;
+}
+
+const HostedBoundaryReply = enum { chunked, unexpected_gzip, bad_status };
+
+const HostedBoundaryFixture = struct {
+    listener: *std.net.Server,
+    reply: HostedBoundaryReply,
+
+    fn run(self: *HostedBoundaryFixture) void {
+        const connection = self.listener.accept() catch @panic("hosted boundary accept failed");
+        defer connection.stream.close();
+        var request: [8192]u8 = undefined;
+        const headers = readHttpHeaders(connection.stream, &request) catch @panic("hosted boundary request failed");
+        if (httpHeaderCount(headers, "content-type", "application/json") != 1) @panic("content-type must be emitted exactly once");
+        if (httpHeaderCount(headers, "accept-encoding", "identity") != 1) @panic("hosted request must ask for identity encoding");
+        if (httpHeaderCount(headers, "authorization", null) != 0) @panic("anonymous request unexpectedly carried authorization");
+
+        const body = "{\"status\":\"success\",\"value\":{\"count\":0.0}}";
+        switch (self.reply) {
+            .chunked => {
+                const split = 19;
+                connection.stream.writer().print(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{x}\r\n{s}\r\n{x}\r\n{s}\r\n0\r\n\r\n",
+                    .{ split, body[0..split], body.len - split, body[split..] },
+                ) catch @panic("chunked hosted response failed");
+            },
+            .unexpected_gzip => {
+                const gzip_body = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xab\x56\x2a\x2e\x49\x2c\x29\x2d\x56\xb2\x52\x2a\x2e\x4d\x4e\x4e\x2d\x2e\x56\xd2\x51\x2a\x4b\xcc\x29\x4d\x55\xb2\xaa\x56\x4a\xce\x2f\xcd\x2b\x51\xb2\x32\xd0\x33\xa8\xad\x05\x00\x48\x20\x9c\xda\x2a\x00\x00\x00";
+                connection.stream.writer().print(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+                    .{gzip_body.len},
+                ) catch @panic("gzip hosted headers failed");
+                connection.stream.writer().writeAll(gzip_body) catch @panic("gzip hosted body failed");
+            },
+            .bad_status => connection.stream.writer().writeAll(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\nContent-Length: 11\r\nConnection: close\r\n\r\nunavailable",
+            ) catch @panic("hosted status response failed"),
+        }
+    }
+};
+
+test "hosted HTTP boundary is deterministic across transfer, encoding, storage, and status" {
+    for ([_]HostedBoundaryReply{ .chunked, .unexpected_gzip, .bad_status }) |reply| {
+        var listener = try testListener();
+        defer listener.deinit();
+        var fixture = HostedBoundaryFixture{ .listener = &listener, .reply = reply };
+        const thread = try std.Thread.spawn(.{}, HostedBoundaryFixture.run, .{&fixture});
+        const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{listener.listen_address.getPort()});
+        defer std.testing.allocator.free(url);
+        var client = try Client.init(std.testing.allocator, url);
+        defer client.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const args = JsonValue{ .object = std.json.ObjectMap.init(arena.allocator()) };
+        if (reply == .bad_status) {
+            try std.testing.expectError(error.InvalidResponse, client.call(arena.allocator(), "query", "demo:state", args));
+        } else {
+            const result = try client.call(arena.allocator(), "query", "demo:state", args);
+            const value = try httpObject(result.value orelse return error.InvalidResponse);
+            try std.testing.expectEqual(@as(f64, 0.0), value.get("count").?.float);
+        }
+        thread.join();
+    }
+}
+
+const AuthLifecycleFixture = struct {
+    listener: *std.net.Server,
+
+    fn run(self: *AuthLifecycleFixture) void {
+        const replies = [_][]const u8{
+            "{\"status\":\"error\",\"errorMessage\":\"Invalid authentication token\",\"errorData\":{\"code\":\"InvalidAuth\"}}",
+            "{\"status\":\"success\",\"value\":{\"count\":0.0}}",
+        };
+        for (replies, 0..) |body, index| {
+            const connection = self.listener.accept() catch @panic("auth lifecycle accept failed");
+            defer connection.stream.close();
+            var request: [8192]u8 = undefined;
+            const headers = readHttpHeaders(connection.stream, &request) catch @panic("auth lifecycle request failed");
+            if (index == 0) {
+                if (httpHeaderCount(headers, "authorization", "Bearer invalid-token-one") != 1) @panic("bearer token was not emitted");
+            } else if (httpHeaderCount(headers, "authorization", null) != 0) {
+                @panic("cleared bearer token was still emitted");
+            }
+            connection.stream.writer().print(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+                .{ body.len, body },
+            ) catch @panic("auth lifecycle response failed");
+        }
+    }
+};
+
+test "invalid bearer token is sent and clearing it restores anonymous calls" {
+    var listener = try testListener();
+    defer listener.deinit();
+    var fixture = AuthLifecycleFixture{ .listener = &listener };
+    const thread = try std.Thread.spawn(.{}, AuthLifecycleFixture.run, .{&fixture});
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{listener.listen_address.getPort()});
+    defer std.testing.allocator.free(url);
+    var client = try Client.init(std.testing.allocator, url);
+    defer client.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const args = JsonValue{ .object = std.json.ObjectMap.init(arena.allocator()) };
+
+    try client.setAuth("invalid-token-one");
+    const denied = try client.call(arena.allocator(), "query", "demo:state", args);
+    try std.testing.expect(denied.function_error != null);
+    try std.testing.expectEqualStrings("Invalid authentication token", denied.function_error.?.message);
+
+    try client.setAuth("");
+    const recovered = try client.call(arena.allocator(), "query", "demo:state", args);
+    const value = try httpObject(recovered.value orelse return error.InvalidResponse);
+    try std.testing.expectEqual(@as(f64, 0.0), value.get("count").?.float);
+    thread.join();
+}
 
 test "HTTP peer JSON shapes are validated before union access" {
     const malformed = [_][]const u8{
