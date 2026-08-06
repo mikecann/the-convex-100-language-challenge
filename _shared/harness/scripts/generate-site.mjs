@@ -71,18 +71,26 @@ function readOptionalResult(directory, languageId) {
 }
 
 const syntaxAliases = {
+  "assembly-x86-64": "nasm",
   "c-sharp": "csharp",
+  "delphi-object-pascal": "pascal",
   "f-sharp": "fsharp",
   fortran: "fortran-free-form",
+  freebasic: "basic",
   "objective-c": "objective-c",
+  "standard-ml": "sml",
   "visual-basic-net": "vb",
+  "visual-basic-dotnet": "vb",
+  "wolfram-language": "wolfram",
 };
 
 const extensionAliases = {
   clj: "clojure",
   cs: "csharp",
   dart: "dart",
+  e: "eiffel",
   erl: "erlang",
+  factor: "factor",
   fs: "fsharp",
   fsx: "fsharp",
   f90: "fortran-free-form",
@@ -90,11 +98,13 @@ const extensionAliases = {
   hs: "haskell",
   hpp: "cpp",
   kts: "kotlin",
+  lean: "lean",
   lua: "lua",
   m: "objective-c",
   ml: "ocaml",
   mli: "ocaml",
   pl: "perl",
+  ps1: "powershell",
   ps1: "powershell",
   py: "python",
   r: "r",
@@ -102,7 +112,9 @@ const extensionAliases = {
   rs: "rust",
   scala: "scala",
   sh: "bash",
+  sml: "sml",
   ts: "typescript",
+  zig: "zig",
 };
 
 function syntaxFor(languageId, file) {

@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AdapterProcess } from "./adapter-process.mjs";
+import { projectReadmeExamples } from "./example-readme.mjs";
 import {
   earnedCapabilitiesFor,
   requiredHTTPTests,
@@ -11,6 +15,25 @@ import { targetRuntimeError } from "./target-runtime-policy.mjs";
 const broken = fileURLToPath(new URL("./broken-adapter.mjs", import.meta.url));
 const hello = { protocolVersion: 1, id: "hello", op: "hello" };
 const query = { id: "query", op: "query", path: "demo:state", args: {} };
+
+function checkExampleFence(extension, expectedFence) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "convex-example-fence-"));
+  try {
+    const source = `examples/basics/main${extension}`;
+    fs.mkdirSync(path.join(directory, "examples", "basics"), { recursive: true });
+    fs.writeFileSync(path.join(directory, source), "example source\n");
+    fs.writeFileSync(
+      path.join(directory, "README.md"),
+      `<!-- BEGIN GENERATED EXAMPLE: ${source} -->\n\`\`\`text\nstale\n\`\`\`\n<!-- END GENERATED EXAMPLE -->\n`,
+    );
+
+    const projection = projectReadmeExamples(path.join(directory, "README.md"));
+    assert.deepEqual(projection.errors, []);
+    assert.ok(projection.projected.includes(`\n\`\`\`${expectedFence}\nexample source\n`));
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
 
 async function checkWrongValue() {
   const adapter = new AdapterProcess(process.execPath, [broken, "wrong"]).start();
@@ -37,6 +60,14 @@ async function checkDirtyExit() {
 await checkWrongValue();
 await checkHang();
 await checkDirtyExit();
+
+// New languages must keep projecting their real example source without losing
+// the syntax name that GitHub and the generated site use for highlighting.
+checkExampleFence(".zig", "zig");
+checkExampleFence(".e", "eiffel");
+checkExampleFence(".factor", "factor");
+checkExampleFence(".sml", "sml");
+checkExampleFence(".lean", "lean");
 
 // A synthetic second language catches accidental Go-specific names in the
 // capability evaluator before real language work starts.
