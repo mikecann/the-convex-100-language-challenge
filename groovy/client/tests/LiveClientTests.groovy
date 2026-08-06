@@ -19,6 +19,7 @@ final class LiveClientTests {
     reconnectsFiveTimesWithMetadataAndDedupe()
     failedHandshakeBackoffDoubles()
     peerCloseReasonCarriesToReconnect()
+    maxObservedTimestampUsesLittleEndianNumericOrder()
     closeIsBoundedDuringStalledHandshake()
     closeIsBoundedWhilePeerContinuouslySends()
     globalDeliveryBudgetCaps130StoppedSubscriptions()
@@ -354,6 +355,16 @@ final class LiveClientTests {
     assert connect.lastCloseReason.contains('ServerClosed:1001:maintenance')
     live.close()
     finish(listener, server, failure)
+  }
+
+  private static void maxObservedTimestampUsesLittleEndianNumericOrder() {
+    byte[] one = [1, 0, 0, 0, 0, 0, 0, 0] as byte[]
+    byte[] twoHundredFiftySix = [0, 1, 0, 0, 0, 0, 0, 0] as byte[]
+    String smaller = Base64.encoder.encodeToString(one)
+    String larger = Base64.encoder.encodeToString(twoHundredFiftySix)
+
+    assert LiveClient.maxTimestamp(smaller, larger) == larger
+    assert LiveClient.maxTimestamp(larger, smaller) == larger
   }
 
   private static void closeIsBoundedDuringStalledHandshake() {

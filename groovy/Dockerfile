@@ -36,9 +36,10 @@ RUN cd out/runtime \
       org.codehaus.groovy.tools.FileSystemCompiler --version
 
 FROM build AS test
-# Keep the adversarial stopped-reader and 130-subscription proof inside the
-# same 128 MiB JVM envelope as the final adapter and example images.
-ENV JAVA_TOOL_OPTIONS="-XX:MaxRAM=96m -Xms8m -Xmx24m -Xss256k -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -XX:MaxMetaspaceSize=24m -XX:CompressedClassSpaceSize=16m -XX:MaxDirectMemorySize=8m -XX:ReservedCodeCacheSize=4m"
+# The test image exercises near-maximum protocol values, so it needs a larger
+# test-only heap. The final images below keep their separate 128 MiB runtime
+# envelope and are probed independently.
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAM=256m -Xms16m -Xmx128m -Xss512k -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -XX:MaxMetaspaceSize=64m -XX:CompressedClassSpaceSize=32m -XX:MaxDirectMemorySize=16m -XX:ReservedCodeCacheSize=8m"
 # This repository-local lint gate rejects compressed multi-statement teaching
 # source, tabs, trailing whitespace, and accidental overlong lines.
 RUN java -ea -cp 'out/tests:out/client:out/adapter:out/example:/opt/groovy/lib/*' \

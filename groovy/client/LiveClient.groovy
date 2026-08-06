@@ -17,6 +17,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.Base64
 
 /**
  * Native implementation of the pinned unversioned Convex sync profile.
@@ -37,6 +38,7 @@ final class LiveClient implements AutoCloseable {
   // waiting for consumers, leaving generous JVM headroom below 128 MiB.
   static final int MAX_BUFFERED_EVENTS = 128
   static final int MAX_BUFFERED_BYTES = 12 * 1024 * 1024
+  static final long MAX_UINT32 = 0xFFFFFFFFL
 
   private static final Duration HANDSHAKE_TIMEOUT = Duration.ofSeconds(5)
   private static final Duration WRITE_TIMEOUT = Duration.ofSeconds(2)
@@ -45,14 +47,14 @@ final class LiveClient implements AutoCloseable {
   private final URI endpoint
   private final HttpClient http
   private final ScheduledExecutorService owner
-  private final LinkedHashMap<Integer, Subscription> subscriptions = [:]
+  private final LinkedHashMap<Long, Subscription> subscriptions = [:]
   private final DeliveryBudget deliveryBudget = new DeliveryBudget(
     MAX_BUFFERED_EVENTS,
     MAX_BUFFERED_BYTES,
   )
   private final IncomingBuffer incoming = new IncomingBuffer(deliveryBudget)
 
-  private int nextId = 0
+  private long nextId = 0
   private int querySetVersion = 0
   private int connectionCount = 0
   private long reconnectBackoffMs = INITIAL_BACKOFF_MS
@@ -98,6 +100,9 @@ final class LiveClient implements AutoCloseable {
 
     onOwner {
       ensureOpen()
+      if (nextId > MAX_UINT32) {
+        throw new IllegalStateException('Live query ID space is exhausted')
+      }
       Subscription subscription = new Subscription(
         this,
         nextId++,
@@ -439,14 +444,14 @@ final class LiveClient implements AutoCloseable {
       throw new ConvexClient.ProtocolException('Transition modifications must be an array')
     }
 
-    LinkedHashMap<Integer, Update> planned = [:]
-    Set<Integer> seen = [] as Set
+    LinkedHashMap<Long, Update> planned = [:]
+    Set<Long> seen = [] as Set
     message.modifications.each { Object candidate ->
       if (!(candidate instanceof Map)) {
         throw new ConvexClient.ProtocolException('Transition modification must be an object')
       }
       Map modification = (Map) candidate
-      int queryId = requireQueryId(modification.queryId)
+      long queryId = requireQueryId(modification.queryId)
       if (!seen.add(queryId)) {
         throw new ConvexClient.ProtocolException('Transition repeated a queryId')
       }
@@ -507,9 +512,9 @@ final class LiveClient implements AutoCloseable {
 
     // Commit only after every version and modification has passed validation.
     remoteVersion = deepCopy(endVersion)
-    maxObservedTimestamp = endVersion.ts
+    maxObservedTimestamp = maxTimestamp(maxObservedTimestamp, endVersion.ts)
     reconnectBackoffMs = INITIAL_BACKOFF_MS
-    planned.each { Integer queryId, Update update ->
+    planned.each { Long queryId, Update update ->
       subscriptions[queryId]?.offerTransition(update)
     }
   }
@@ -530,8 +535,24 @@ final class LiveClient implements AutoCloseable {
     [querySet: querySet, identity: identity, ts: version.ts]
   }
 
-  private static int requireQueryId(Object candidate) {
-    requireNonnegativeInteger(candidate, 'queryId')
+  private static long requireQueryId(Object candidate) {
+    if (!(candidate instanceof Number)) {
+      throw new ConvexClient.ProtocolException('queryId must be an integer')
+    }
+    BigDecimal decimal
+    try {
+      decimal = new BigDecimal(candidate.toString())
+    } catch (NumberFormatException error) {
+      throw new ConvexClient.ProtocolException('queryId must be an integer')
+    }
+    if (decimal.stripTrailingZeros().scale() > 0 ||
+      decimal < 0 ||
+      decimal > MAX_UINT32) {
+      throw new ConvexClient.ProtocolException(
+        'queryId must be an in-range uint32 integer',
+      )
+    }
+    decimal.longValueExact()
   }
 
   private static int requireNonnegativeInteger(Object candidate, String field) {
@@ -573,6 +594,33 @@ final class LiveClient implements AutoCloseable {
       throw new ConvexClient.ProtocolException("${field} must be an in-range integer")
     }
     decimal.longValueExact()
+  }
+
+  /** Compare actual sync timestamps as unsigned little-endian byte numbers. */
+  static String maxTimestamp(String current, String candidate) {
+    if (current == null) {
+      return candidate
+    }
+    try {
+      byte[] left = Base64.decoder.decode(current)
+      byte[] right = Base64.decoder.decode(candidate)
+      if (left.length != right.length) {
+        return candidate
+      }
+      for (int index = left.length - 1; index >= 0; index--) {
+        int leftByte = Byte.toUnsignedInt(left[index])
+        int rightByte = Byte.toUnsignedInt(right[index])
+        if (rightByte != leftByte) {
+          return rightByte > leftByte ? candidate : current
+        }
+      }
+      return current
+    } catch (IllegalArgumentException ignored) {
+      // Local fixtures use readable labels instead of protocol timestamps.
+      // Preserve their latest transition while real base64 timestamps use
+      // numeric little-endian ordering above.
+      return candidate
+    }
   }
 
   private static String requireString(Map source, String field) {
@@ -769,7 +817,7 @@ final class LiveClient implements AutoCloseable {
     static final int MAX_ENCODED_BYTES = 2 * 1024 * 1024
 
     private final LiveClient manager
-    final int queryId
+    final long queryId
     final String path
     final Map args
     private final ArrayDeque<Update> updates = new ArrayDeque<>()
@@ -780,9 +828,9 @@ final class LiveClient implements AutoCloseable {
     private boolean hydrationPending = false
     private String lastValue
 
-    Subscription(LiveClient manager, int queryId, String path, Map args) {
+    Subscription(LiveClient manager, Number queryId, String path, Map args) {
       this.manager = manager
-      this.queryId = queryId
+      this.queryId = queryId.longValue()
       this.path = path
       this.args = args
       budget = manager?.deliveryBudget ?: new DeliveryBudget(
