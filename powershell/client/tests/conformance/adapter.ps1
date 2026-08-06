@@ -5,6 +5,12 @@ $ErrorActionPreference = 'Stop'
 
 $script:AdapterMaximumCommandBytes = 64KB
 $script:AdapterReadChunkBytes = 4096
+$script:AdapterMaximumEncodedEventBytes = 8MB + 64KB
+$script:AdapterOutputBudgetBytes = 18MB
+$script:AdapterWriteChunkBytes = 16KB
+$script:AdapterWriteDeadlineMilliseconds = 1000
+$script:AdapterJsonOptions = [Text.Json.JsonSerializerOptions]::new()
+$script:AdapterJsonOptions.MaxDepth = 64
 
 function New-AdapterProtocolException {
     param([string] $Message)
@@ -16,24 +22,152 @@ function New-AdapterProtocolException {
 
 function Write-AdapterEvent {
     param($Writer, [hashtable] $Event)
-    $json = $Event | ConvertTo-Json -Depth 64 -Compress
+    if ($Writer.PSObject.Properties['Failed'] -and $Writer.Failed) {
+        throw [IO.IOException]::new([string]$Writer.FailureMessage)
+    }
     if ($Writer.PSObject.Properties['TcpStream']) {
-        $bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes("$json`n")
-        $writeTask = $Writer.TcpStream.WriteAsync(
-            $bytes,
-            0,
-            $bytes.Length,
-            [Threading.CancellationToken]::None
-        )
-        if (-not $writeTask.Wait(1000)) {
-            # Cancellation alone is not a portable way to interrupt a blocked
-            # socket write. Retiring the one controller socket is deterministic.
-            $Writer.TcpClient.Dispose()
-            throw [IO.IOException]::new('adapter controller stopped reading')
+        # HTTP decoding temporarily owns the raw response bytes and JSON text.
+        # They are dead once the event graph reaches this function. Reclaim
+        # them before the bounded streaming serializer starts.
+        [GC]::Collect(2, [GCCollectionMode]::Optimized, $true, $true)
+
+        # Reserve the complete allowance before serialization. This charge
+        # covers the retained event graph, bounded pipe segments, one network
+        # chunk, and serializer/task overhead without an event-sized byte array.
+        # A second event can never accumulate behind the one synchronous writer.
+        $reservation = [long]$script:AdapterOutputBudgetBytes
+        [Threading.Monitor]::Enter($Writer.OutputGate)
+        try {
+            if (($Writer.ReservedBytes + $reservation) -gt $script:AdapterOutputBudgetBytes) {
+                throw [IO.IOException]::new('adapter encoded-output byte budget exhausted')
+            }
+            $Writer.ReservedBytes += $reservation
         }
-        $writeTask.GetAwaiter().GetResult() | Out-Null
+        finally {
+            [Threading.Monitor]::Exit($Writer.OutputGate)
+        }
+
+        $failure = $null
+        $timer = [Diagnostics.Stopwatch]::StartNew()
+        $pipe = $null
+        $serializerStream = $null
+        $readerStream = $null
+        $serializeCancellation = $null
+        $writerCompleted = $false
+        try {
+            $pipe = [IO.Pipelines.Pipe]::new()
+            $serializerStream = $pipe.Writer.AsStream($true)
+            $readerStream = $pipe.Reader.AsStream($true)
+            $serializeCancellation = [Threading.CancellationTokenSource]::new()
+            $eventType = $Event.GetType()
+            $serializeTask = [Text.Json.JsonSerializer]::SerializeAsync(
+                $serializerStream,
+                $Event,
+                $eventType,
+                $script:AdapterJsonOptions,
+                $serializeCancellation.Token
+            )
+            [byte[]]$chunk = [byte[]]::new($script:AdapterWriteChunkBytes)
+            $encodedBytes = 0L
+            $readTask = $readerStream.ReadAsync($chunk, 0, $chunk.Length)
+            while ($true) {
+                if (-not $readTask.Wait(20)) {
+                    if ($serializeTask.IsCompleted -and -not $writerCompleted) {
+                        $serializeTask.GetAwaiter().GetResult() | Out-Null
+                        $pipe.Writer.Complete()
+                        $writerCompleted = $true
+                    }
+                    if ($timer.ElapsedMilliseconds -ge $script:AdapterWriteDeadlineMilliseconds) {
+                        throw [TimeoutException]::new('adapter controller write deadline expired')
+                    }
+                    continue
+                }
+                $count = $readTask.GetAwaiter().GetResult()
+                if ($count -eq 0) {
+                    break
+                }
+                $encodedBytes += $count
+                if (($encodedBytes + 1L) -gt $script:AdapterMaximumEncodedEventBytes) {
+                    throw [IO.IOException]::new('adapter event exceeds the 8 MiB encoded-output limit')
+                }
+                $remaining = $script:AdapterWriteDeadlineMilliseconds - [int]$timer.ElapsedMilliseconds
+                if ($remaining -le 0) {
+                    throw [TimeoutException]::new('adapter controller write deadline expired')
+                }
+                $writeTask = $Writer.TcpStream.WriteAsync(
+                    $chunk,
+                    0,
+                    $count,
+                    [Threading.CancellationToken]::None
+                )
+                if (-not $writeTask.Wait($remaining)) {
+                    throw [TimeoutException]::new('adapter controller write deadline expired')
+                }
+                $writeTask.GetAwaiter().GetResult() | Out-Null
+                $readTask = $readerStream.ReadAsync($chunk, 0, $chunk.Length)
+                if ($serializeTask.IsCompleted -and -not $writerCompleted) {
+                    $serializeTask.GetAwaiter().GetResult() | Out-Null
+                    $pipe.Writer.Complete()
+                    $writerCompleted = $true
+                }
+            }
+            $serializeTask.GetAwaiter().GetResult() | Out-Null
+            $remaining = $script:AdapterWriteDeadlineMilliseconds - [int]$timer.ElapsedMilliseconds
+            if ($remaining -le 0) {
+                throw [TimeoutException]::new('adapter controller write deadline expired')
+            }
+            [byte[]]$newline = @(10)
+            $newlineTask = $Writer.TcpStream.WriteAsync(
+                $newline,
+                0,
+                1,
+                [Threading.CancellationToken]::None
+            )
+            if (-not $newlineTask.Wait($remaining)) {
+                throw [TimeoutException]::new('adapter controller write deadline expired')
+            }
+            $newlineTask.GetAwaiter().GetResult() | Out-Null
+        }
+        catch {
+            $failure = $_.Exception
+            if ($null -ne $serializeCancellation) { $serializeCancellation.Cancel() }
+            if ($null -ne $pipe) {
+                $pipe.Reader.CancelPendingRead()
+                $pipe.Writer.CancelPendingFlush()
+            }
+            # Disposing the sole controller socket abandons any partial NDJSON
+            # line and interrupts the outstanding kernel write deterministically.
+            $Writer.TcpClient.Dispose()
+        }
+        finally {
+            $timer.Stop()
+            if ($null -ne $pipe -and -not $writerCompleted) {
+                try { $pipe.Writer.Complete() } catch {}
+            }
+            if ($null -ne $pipe) { try { $pipe.Reader.Complete() } catch {} }
+            if ($null -ne $serializerStream) { try { $serializerStream.Dispose() } catch {} }
+            if ($null -ne $readerStream) { try { $readerStream.Dispose() } catch {} }
+            if ($null -ne $serializeCancellation) { $serializeCancellation.Dispose() }
+            [Threading.Monitor]::Enter($Writer.OutputGate)
+            try {
+                $Writer.ReservedBytes -= $reservation
+                if ($Writer.ReservedBytes -ne 0L) {
+                    throw [InvalidOperationException]::new('adapter output reservation was not released exactly')
+                }
+            }
+            finally {
+                [Threading.Monitor]::Exit($Writer.OutputGate)
+            }
+        }
+        if ($null -ne $failure) {
+            $Writer.Failed = $true
+            $Writer.FailureMessage = "adapter controller output failed within $($script:AdapterWriteDeadlineMilliseconds) ms; reserved output bytes after release: $($Writer.ReservedBytes)"
+            [Console]::Error.WriteLine($Writer.FailureMessage)
+            throw [IO.IOException]::new($Writer.FailureMessage, $failure)
+        }
     }
     else {
+        $json = $Event | ConvertTo-Json -Depth 64 -Compress
         $Writer.WriteLine($json)
         $Writer.Flush()
     }
@@ -407,8 +541,19 @@ if ($env:ADAPTER_LISTEN) {
     try {
         $tcp = $listener.AcceptTcpClient()
         $tcp.NoDelay = $true
+        # A small send buffer makes a stopped controller visible to the
+        # application deadline before multiple near-limit events enter kernel
+        # buffering outside the managed byte reservation.
+        $tcp.SendBufferSize = $script:AdapterWriteChunkBytes
         $stream = $tcp.GetStream()
-        $writer = [pscustomobject]@{ TcpStream = $stream; TcpClient = $tcp }
+        $writer = [pscustomobject]@{
+            TcpStream      = $stream
+            TcpClient      = $tcp
+            OutputGate     = [object]::new()
+            ReservedBytes  = 0L
+            Failed         = $false
+            FailureMessage = ''
+        }
         Run-Adapter -InputStream $stream -Writer $writer -Url $env:CONVEX_URL
     }
     finally {

@@ -275,8 +275,8 @@ try {
     $blockedTcp.ReceiveBufferSize = 1024
     $blockedStream = $blockedTcp.GetStream()
     try {
-        for ($index = 0; $index -lt 10; $index++) {
-            $command = @{ id = "blocked-$index"; op = 'query'; path = 'fixture:huge'; args = @{} } |
+        for ($index = 0; $index -lt 64; $index++) {
+            $command = @{ id = "blocked-$index"; op = 'query'; path = 'fixture:backpressure'; args = @{} } |
                 ConvertTo-Json -Compress
             $bytes = [Text.Encoding]::UTF8.GetBytes("$command`n")
             $blockedStream.Write($bytes, 0, $bytes.Length)
@@ -286,8 +286,14 @@ try {
         # Either side may observe the deadline first. Process termination below is
         # the invariant, not which kernel buffer reports the broken connection.
     }
-    Assert-True ($blockedAdapter.WaitForExit(8000)) 'stopped-reader adapter exceeded its write/cleanup deadline'
+    if (-not $blockedAdapter.WaitForExit(8000)) {
+        $blockedAdapter.Kill($true)
+        $blockedAdapter.WaitForExit()
+        throw "stopped-reader adapter exceeded its write/cleanup deadline: $($blockedAdapter.StandardError.ReadToEnd())"
+    }
     Assert-True ($blockedAdapter.ExitCode -ne 0) 'stopped-reader adapter silently retained output'
+    $blockedError = $blockedAdapter.StandardError.ReadToEnd()
+    Assert-True ($blockedError.Contains('reserved output bytes after release: 0')) "stopped-reader adapter did not release its output reservation exactly: $blockedError"
     $blockedTcp.Dispose()
 
     Write-Output 'PASS PowerShell adapter NDJSON, EOF, TCP, and backpressure fixtures'

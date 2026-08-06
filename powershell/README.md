@@ -84,7 +84,7 @@ The first command formats/parses and runs deterministic client and adapter check
 
 ## Conformance and protocol notes
 
-`/usr/local/bin/convex-adapter` implements NDJSON protocol v1 through stdin/stdout or `ADAPTER_LISTEN`. Its one owner runspace alone reads, writes, reconnects, and advances `/api/sync` versions. Subscription relays check the active generation under a lock. Delivery keeps the newest 16 events per subscription inside a global 64-event and 8 MiB encoded-output budget, including accounting overhead.
+`/usr/local/bin/convex-adapter` implements NDJSON protocol v1 through stdin/stdout or `ADAPTER_LISTEN`. Its one owner runspace alone reads, writes, reconnects, and advances `/api/sync` versions. Subscription relays check the active generation under a lock. Live delivery keeps the newest 16 events per subscription inside a global 64-event and 8 MiB queue budget. TCP output permits one encoded event at a time within a separate 18 MiB reservation that charges the UTF-8 bytes, retained event graph, and runtime overhead. A controller write has one cumulative one-second deadline; timeout retires the connection after releasing the reservation exactly.
 
 ## Limitations
 

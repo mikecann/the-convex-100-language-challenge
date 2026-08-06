@@ -24,6 +24,49 @@ function ConvertFrom-ConvexJson {
     $Text | ConvertFrom-Json -AsHashtable -Depth $script:ConvexJsonDepth
 }
 
+function ConvertFrom-ConvexJsonElement {
+    param([Parameter(Mandatory)][Text.Json.JsonElement] $Element)
+    switch ($Element.ValueKind.ToString()) {
+        'Object' {
+            $value = @{}
+            foreach ($property in $Element.EnumerateObject()) {
+                $value[$property.Name] = ConvertFrom-ConvexJsonElement $property.Value
+            }
+            return $value
+        }
+        'Array' {
+            $items = [Collections.Generic.List[object]]::new()
+            foreach ($item in $Element.EnumerateArray()) {
+                $items.Add((ConvertFrom-ConvexJsonElement $item))
+            }
+            return , ([object[]]$items.ToArray())
+        }
+        'String' { return $Element.GetString() }
+        'Number' {
+            [int64]$integer = 0
+            if ($Element.TryGetInt64([ref]$integer)) { return $integer }
+            [decimal]$decimal = 0
+            if ($Element.TryGetDecimal([ref]$decimal)) { return $decimal }
+            return $Element.GetDouble()
+        }
+        'True' { return $true }
+        'False' { return $false }
+        'Null' { return $null }
+        default { throw "unsupported JSON value kind $($Element.ValueKind)" }
+    }
+}
+
+function ConvertFrom-ConvexJsonBytes {
+    param([Parameter(Mandatory)][byte[]] $Bytes)
+    $document = [Text.Json.JsonDocument]::Parse([ReadOnlyMemory[byte]]::new($Bytes))
+    try {
+        ConvertFrom-ConvexJsonElement $document.RootElement
+    }
+    finally {
+        $document.Dispose()
+    }
+}
+
 function New-ConvexError {
     param(
         [ValidateSet('FunctionError', 'ProtocolError', 'TransportError', 'ClosedError')][string] $Name,
@@ -136,7 +179,10 @@ function Invoke-ConvexFunction {
                 New-ConvexError -Name TransportError -Message 'Convex HTTP response exceeds 8 MiB' -Operation $Operation
             )
         }
-        $decoded = ConvertFrom-ConvexJson ([System.Text.Encoding]::UTF8.GetString($bytes))
+        # Parse UTF-8 directly. Converting an 8 MiB response to one giant
+        # UTF-16 string first would duplicate the payload inside the final
+        # adapter's 128 MiB cgroup before the result can be emitted.
+        $decoded = ConvertFrom-ConvexJsonBytes $bytes
     }
     catch {
         Throw-ConvexError (Get-ConvexError $_.Exception $Operation)

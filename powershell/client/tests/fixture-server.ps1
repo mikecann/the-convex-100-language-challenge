@@ -1,4 +1,9 @@
-param([int] $Port = 43137, [string] $ReadyFile = '/tmp/powershell-fixture-ready')
+param(
+    [int] $Port = 43137,
+    [string] $ReadyFile = '/tmp/powershell-fixture-ready',
+    [string] $BindHost = '127.0.0.1',
+    [string] $NearMaximumServedFile = ''
+)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -337,7 +342,7 @@ function Write-JsonResponse($Response, $Value) {
 }
 
 $listener = [Net.HttpListener]::new()
-$listener.Prefixes.Add("http://127.0.0.1:$Port/")
+$listener.Prefixes.Add("http://${BindHost}:$Port/")
 $listener.Start()
 [IO.File]::WriteAllText($ReadyFile, 'ready', [Text.UTF8Encoding]::new($false))
 try {
@@ -404,6 +409,25 @@ try {
             Write-JsonResponse $context.Response @{
                 status = 'success'
                 value  = @{ blob = ('z' * (6MB)) }
+            }
+            continue
+        }
+        if ($path -eq 'fixture:backpressure') {
+            Write-JsonResponse $context.Response @{
+                status = 'success'
+                value  = @{ blob = ('b' * (512KB)) }
+            }
+            continue
+        }
+        if ($path -eq 'fixture:nearMaximum') {
+            if ($NearMaximumServedFile) {
+                [IO.File]::WriteAllText($NearMaximumServedFile, 'served', [Text.UTF8Encoding]::new($false))
+            }
+            Write-JsonResponse $context.Response @{
+                status = 'success'
+                # Stay just below the client's 8 MiB HTTP boundary so the
+                # final-adapter proof exercises a near-maximum valid result.
+                value  = @{ blob = ('z' * (7MB + 512KB)) }
             }
             continue
         }

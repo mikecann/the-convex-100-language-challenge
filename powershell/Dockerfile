@@ -28,6 +28,12 @@ RUN actual=$(printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"
     printf '%s\n' "$actual" | grep -F '"id":"close"' | grep -F '"type":"closed"'
 CMD ["pwsh", "-NoLogo", "-NoProfile", "-Command", "exit 0"]
 
+# Host-side stopped-reader verification uses this image as a separately capped
+# controller and HTTP fixture. The adapter itself still comes from the final
+# runtime target and runs in its own 128 MiB cgroup.
+FROM formatter AS stopped-reader-controller
+ENTRYPOINT ["pwsh", "-NoLogo", "-NoProfile", "-File", "client/tests/conformance/stopped-reader-controller.ps1"]
+
 FROM ${POWERSHELL_IMAGE} AS runtime-rootfs
 # Copy an explicit glibc/PowerShell runtime closure. The compiler assemblies,
 # package modules, interactive shell tooling, and every OS package frontend are
