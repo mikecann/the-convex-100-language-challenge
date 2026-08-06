@@ -27,7 +27,7 @@ rm -f /tmp/racket-barrier.state
   >/tmp/racket-barrier-server.log 2>&1 &
 server_pid=$!
 
-while ! grep -Fxq READY /tmp/racket-barrier-server.log; do
+while ! grep -s -Fxq READY /tmp/racket-barrier-server.log; do
   if ! kill -0 "$server_pid" >/dev/null 2>&1; then
     cat /tmp/racket-barrier-server.log >&2
     exit 1
@@ -82,7 +82,7 @@ printf '%s\n' "PASS compiled adapter unsubscribe and replacement barriers"
   >/tmp/racket-backpressure-server.log 2>&1 &
 server_pid=$!
 
-while ! grep -Fxq READY /tmp/racket-backpressure-server.log; do
+while ! grep -s -Fxq READY /tmp/racket-backpressure-server.log; do
   if ! kill -0 "$server_pid" >/dev/null 2>&1; then
     cat /tmp/racket-backpressure-server.log >&2
     exit 1
