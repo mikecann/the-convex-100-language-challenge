@@ -454,8 +454,126 @@ let test_serialized_subscription_error executable =
   finish process;
   Thread.join fixture
 
+(* A stalled expectation would otherwise hang the Docker build rather than
+   fail it, so every blocking read below runs under a hard deadline. *)
+let watchdog seconds pid =
+  let disarmed = ref false in
+  let thread =
+    Thread.create
+      (fun () ->
+        let rec wait remaining =
+          if remaining > 0.0 && not !disarmed then (
+            Thread.delay 0.05;
+            wait (remaining -. 0.05))
+        in
+        wait seconds;
+        if not !disarmed then try Unix.kill pid Sys.sigkill with _ -> ())
+      ()
+  in
+  fun () ->
+    disarmed := true;
+    Thread.join thread
+
+let live_transition =
+  {|{"type":"Transition","startVersion":{"querySet":0,"identity":0,"ts":"AAAAAAAAAAA="},"endVersion":{"querySet":1,"identity":0,"ts":"AQAAAAAAAAA="},"modifications":[{"type":"QueryUpdated","queryId":0,"value":{"count":0}}]}|}
+
+(* Two connections in sequence. The first delivers a value and then breaks the
+   protocol; the second replays the query set and repeats the identical value.
+   That repeat is the interesting part: the client suppresses an unchanged
+   rehydration, so it must treat the error it already published as the
+   subscriber's current state or the subscription stays stranded. *)
+let start_recovering_live_fixture () =
+  let listener = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Unix.setsockopt listener Unix.SO_REUSEADDR true;
+  Unix.bind listener (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+  Unix.listen listener 2;
+  let port =
+    match Unix.getsockname listener with
+    | Unix.ADDR_INET (_, port) -> port
+    | Unix.ADDR_UNIX _ -> assert false
+  in
+  let thread =
+    Thread.create
+      (fun () ->
+        Fun.protect
+          ~finally:(fun () -> Unix.close listener)
+          (fun () ->
+            let serve break_protocol =
+              let socket, _ = Unix.accept listener in
+              let input = Unix.in_channel_of_descr socket in
+              let output = Unix.out_channel_of_descr socket in
+              Fun.protect
+                ~finally:(fun () ->
+                  close_in_noerr input;
+                  close_out_noerr output)
+                (fun () ->
+                  let rec headers () =
+                    if input_line input <> "\r" then headers ()
+                  in
+                  headers ();
+                  output_string output
+                    "HTTP/1.1 101 Switching Protocols\r\n\
+                     Upgrade: websocket\r\n\
+                     Connection: Upgrade\r\n\
+                     \r\n";
+                  flush output;
+                  (* Connect, then ModifyQuerySet carrying the Add. *)
+                  ignore (read_websocket_frame input);
+                  ignore (read_websocket_frame input);
+                  write_websocket_text output live_transition;
+                  if break_protocol then
+                    write_websocket_text output "{ this is not JSON"
+                  else Thread.delay 1.5)
+            in
+            serve true;
+            serve false))
+      ()
+  in
+  (port, thread)
+
+let test_serialized_subscription_recovery executable =
+  let port, fixture = start_recovering_live_fixture () in
+  let process =
+    start_adapter executable (Printf.sprintf "http://127.0.0.1:%d" port)
+  in
+  let disarm = watchdog 30.0 process.pid in
+  send process
+    {|{"id":"subscribe-repair","op":"subscribe","subscriptionId":"room-repair","path":"tests:live","args":{}}|};
+  let ack = receive process in
+  require_string "type" "ack" ack;
+  require_string "id" "subscribe-repair" ack;
+  let initial = receive process in
+  require_string "type" "subscription" initial;
+  require_string "subscriptionId" "room-repair" initial;
+  require
+    (member "value" initial = Some (`Assoc [ ("count", `Int 0) ]))
+    ("initial live value was " ^ J.to_string initial);
+  let failure = receive process in
+  require_string "type" "subscription" failure;
+  require_string "subscriptionId" "room-repair" failure;
+  (match member "error" failure with
+  | Some body -> require_string "name" "ProtocolError" body
+  | None -> fail ("protocol error event was " ^ J.to_string failure));
+  let repaired = receive process in
+  require_string "type" "subscription" repaired;
+  require_string "subscriptionId" "room-repair" repaired;
+  require
+    (member "error" repaired = None)
+    ("recovered event still carried an error: " ^ J.to_string repaired);
+  require
+    (member "value" repaired = Some (`Assoc [ ("count", `Int 0) ]))
+    ("recovered live value was " ^ J.to_string repaired);
+  send process {|{"id":"close-repair","op":"close"}|};
+  let closed = receive process in
+  require_string "type" "closed" closed;
+  require_string "id" "close-repair" closed;
+  finish process;
+  disarm ();
+  Thread.join fixture
+
 let () =
   if Array.length Sys.argv <> 2 then fail "adapter_tests requires main.exe";
   test_serialized_http_and_validation Sys.argv.(1);
   test_serialized_subscription_error Sys.argv.(1);
+  test_serialized_subscription_recovery Sys.argv.(1);
   print_endline "PASS OCaml serialized adapter fixtures"

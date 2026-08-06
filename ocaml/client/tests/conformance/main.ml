@@ -440,8 +440,12 @@ let () =
       let socket = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
       Unix.setsockopt socket Unix.SO_REUSEADDR true;
       let inet =
-        if host = "localhost" then Unix.inet_addr_loopback
-        else Unix.inet_addr_of_string host
+        match host with
+        | "localhost" -> Unix.inet_addr_loopback
+        (* An omitted host means "every interface", which is what the shared
+           controller asks for when it forwards a port into the container. *)
+        | "" | "*" -> Unix.inet_addr_any
+        | value -> Unix.inet_addr_of_string value
       in
       Unix.bind socket (Unix.ADDR_INET (inet, port));
       Unix.listen socket 1;

@@ -132,7 +132,7 @@ let response_string name json =
    leakage into the Host header. *)
 type endpoint = { scheme : string; host : string; port : int; path : string }
 
-let parse_endpoint raw =
+let parse_url raw =
   try
     let colon = String.index raw ':' in
     let scheme = String.lowercase_ascii (String.sub raw 0 colon) in
@@ -187,6 +187,17 @@ let parse_endpoint raw =
   with Not_found | Invalid_argument _ | Failure _ ->
     Error (Protocol_error "invalid Convex deployment URL")
 
+(* The host and path reach the request line and the Host header verbatim, so a
+   space or control character in the URL would split the HTTP request. *)
+let printable_ascii raw =
+  let printable char = Char.code char > 0x20 && Char.code char < 0x7f in
+  String.for_all printable raw
+
+let parse_endpoint raw =
+  if not (printable_ascii raw) then
+    Error (Protocol_error "Convex URL must not contain control characters")
+  else parse_url raw
+
 type channel = {
   fd : Unix.file_descr;
   ssl : Ssl.socket option;
@@ -237,6 +248,9 @@ let read_some_until ?interrupt channel bytes offset length deadline =
       | None -> Unix.read channel.fd bytes offset length
       | Some ssl -> Ssl.read ssl bytes offset length
     with
+    (* A clean TLS close_notify is end of stream, not a transport failure.
+       Report it exactly like a plain-socket EOF. *)
+    | Ssl.Read_error Ssl.Error_zero_return -> raise Channel_closed
     | Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _)
     | Ssl.Read_error Ssl.Error_want_read ->
         wait_readable_until ?interrupt channel.fd deadline;
@@ -320,11 +334,7 @@ let write_string_until ?interrupt channel string deadline =
   let bytes = Bytes.of_string string in
   write_all_until ?interrupt channel bytes 0 (Bytes.length bytes) deadline
 
-let write_string ?interrupt channel string =
-  let bytes = Bytes.of_string string in
-  write_all ?interrupt channel bytes 0 (Bytes.length bytes)
-
-let resolve_tcp_until host port deadline =
+let resolve_tcp_until ?interrupt host port deadline =
   let ready_read, ready_write = Unix.pipe () in
   let mutex = Mutex.create () in
   let result = ref None in
@@ -348,7 +358,7 @@ let resolve_tcp_until host port deadline =
   Fun.protect
     ~finally:(fun () -> Unix.close ready_read)
     (fun () ->
-      wait_readable_until ready_read deadline;
+      wait_readable_until ?interrupt ready_read deadline;
       ignore (Unix.read ready_read (Bytes.create 1) 0 1);
       Mutex.lock mutex;
       let resolved = !result in
@@ -358,7 +368,7 @@ let resolve_tcp_until host port deadline =
       | Some (Error error) -> raise error
       | None -> raise Channel_closed)
 
-let connect_address_until address deadline =
+let connect_address_until ?interrupt address deadline =
   ignore (remaining_until deadline);
   let fd =
     Unix.socket address.Unix.ai_family address.Unix.ai_socktype
@@ -371,7 +381,7 @@ let connect_address_until address deadline =
      | Unix.Unix_error
          ((Unix.EINPROGRESS | Unix.EAGAIN | Unix.EWOULDBLOCK), _, _)
      -> (
-       wait_writable_until fd deadline;
+       wait_writable_until ?interrupt fd deadline;
        match Unix.getsockopt_error fd with
        | None -> ()
        | Some error -> raise (Unix.Unix_error (error, "connect", ""))));
@@ -380,84 +390,71 @@ let connect_address_until address deadline =
     Unix.close fd;
     raise error
 
-let connect_tcp ?deadline host port =
-  let addresses =
-    match deadline with
-    | Some value -> resolve_tcp_until host port value
-    | None ->
-        Unix.getaddrinfo host (string_of_int port)
-          [ Unix.AI_SOCKTYPE Unix.SOCK_STREAM ]
-  in
+(* Every connection attempt is bounded, so DNS, connect, and the TLS handshake
+   can never outlive the operation that asked for them. *)
+let connect_tcp ?interrupt ~deadline host port =
+  let addresses = resolve_tcp_until ?interrupt host port deadline in
   let rec try_addresses = function
     | [] ->
         raise
           (Failure ("could not connect to " ^ host ^ ":" ^ string_of_int port))
     | address :: rest -> (
-        try
-          match deadline with
-          | Some value -> connect_address_until address value
-          | None -> (
-              let fd =
-                Unix.socket address.Unix.ai_family address.Unix.ai_socktype
-                  address.Unix.ai_protocol
-              in
-              try
-                Unix.connect fd address.Unix.ai_addr;
-                fd
-              with error ->
-                Unix.close fd;
-                raise error)
-        with
-        | Read_timeout -> raise Read_timeout
-        | Unix.Unix_error _ -> try_addresses rest)
+        try connect_address_until ?interrupt address deadline
+        with Unix.Unix_error _ -> try_addresses rest)
   in
   try_addresses addresses
 
-let tls_connect_until ssl fd deadline =
+let tls_connect_until ?interrupt ssl fd deadline =
   let rec connect () =
     ignore (remaining_until deadline);
     try Ssl.connect ssl with
     | Ssl.Connection_error Ssl.Error_want_read ->
-        wait_readable_until fd deadline;
+        wait_readable_until ?interrupt fd deadline;
         connect ()
     | Ssl.Connection_error (Ssl.Error_want_write | Ssl.Error_want_connect) ->
-        wait_writable_until fd deadline;
+        wait_writable_until ?interrupt fd deadline;
         connect ()
   in
   connect ()
 
-let open_channel ?deadline endpoint =
-  let fd = connect_tcp ?deadline endpoint.host endpoint.port in
-  let nonblocking = Option.is_some deadline in
+let open_channel ?interrupt ~deadline endpoint =
+  let fd = connect_tcp ?interrupt ~deadline endpoint.host endpoint.port in
   match endpoint.scheme with
-  | "http" -> { fd; ssl = None; closed = false; nonblocking }
+  | "http" -> { fd; ssl = None; closed = false; nonblocking = true }
   | "https" -> (
       try
         Ssl.init ();
         let context = Ssl.create_context Ssl.TLSv1_2 Ssl.Client_context in
         Ssl.set_verify context [ Ssl.Verify_peer ] None;
+        (* Prefer the distribution CA bundle and fall back to OpenSSL's own
+           search paths. With neither store the peer stays untrusted, so a
+           missing bundle fails the connection instead of skipping checks. *)
         (try
            Ssl.load_verify_locations context
              "/etc/ssl/certs/ca-certificates.crt" ""
-         with _ -> ());
+         with _ -> ignore (Ssl.set_default_verify_paths context));
         let ssl = Ssl.embed_socket fd context in
+        (* Verify_peer only proves the chain is trusted by someone. Binding the
+           expected name makes OpenSSL also reject a valid certificate that was
+           issued for a different host. *)
+        Ssl.set_host ssl endpoint.host;
         (try Ssl.set_client_SNI_hostname ssl endpoint.host with _ -> ());
-        (match deadline with
-        | Some value -> tls_connect_until ssl fd value
-        | None -> Ssl.connect ssl);
-        { fd; ssl = Some ssl; closed = false; nonblocking }
+        tls_connect_until ?interrupt ssl fd deadline;
+        { fd; ssl = Some ssl; closed = false; nonblocking = true }
       with error ->
         Unix.close fd;
         raise error)
   | _ -> assert false
 
-(* Legacy callers such as Live use a duration for each protocol operation.
-   HTTP uses the [_until] variants below with one operation-wide deadline. *)
-let read_line_until channel deadline =
+(* Live gives each protocol operation its own duration. HTTP threads a single
+   operation-wide deadline through every [_until] call below, so DNS, connect,
+   TLS, the request, the status line, the headers, the body, and any trailers
+   all share one budget instead of restarting the clock per step. *)
+let read_line_until ?interrupt channel deadline =
   let buffer = Buffer.create 80 in
   let one = Bytes.create 1 in
   let rec loop () =
-    let count = read_some_until channel one 0 1 deadline in
+    let count = read_some_until ?interrupt channel one 0 1 deadline in
     if count <> 1 then raise Channel_closed;
     Buffer.add_char buffer (Bytes.get one 0);
     let length = Buffer.length buffer in
@@ -472,8 +469,42 @@ let read_line_until channel deadline =
   in
   loop ()
 
-let read_http_response_until channel deadline =
-  let status_line = read_line_until channel deadline in
+let max_http_body = 2 * 1024 * 1024
+let max_http_header_lines = 128
+let max_http_trailer_lines = 64
+
+(* Content-Length is a plain decimal count. [int_of_string] would also accept
+   "0x20", "1_0", and "+5", so the digits are checked before conversion. *)
+let parse_content_length value =
+  let digit char = char >= '0' && char <= '9' in
+  if value = "" || not (String.for_all digit value) then
+    raise (Http_protocol "invalid HTTP Content-Length header")
+  else
+    try int_of_string value
+    with _ -> raise (Http_protocol "invalid HTTP Content-Length header")
+
+let parse_chunk_size line =
+  let text = String.trim (String.sub line 0 (String.length line - 2)) in
+  let text =
+    match String.index_opt text ';' with
+    | Some index -> String.sub text 0 index
+    | None -> text
+  in
+  let text = String.trim text in
+  let hex char =
+    (char >= '0' && char <= '9')
+    || (char >= 'a' && char <= 'f')
+    || (char >= 'A' && char <= 'F')
+  in
+  (* Eight hex digits cover every chunk this client accepts and stay far below
+     the OCaml int range. A longer literal would wrap silently to a small
+     positive size and leave the parser reading the next chunk's bytes. *)
+  if text = "" || String.length text > 8 || not (String.for_all hex text) then
+    raise (Http_protocol "invalid HTTP chunk size")
+  else int_of_string ("0x" ^ text)
+
+let read_http_response_until ?interrupt channel deadline =
+  let status_line = read_line_until ?interrupt channel deadline in
   let status_code =
     try
       if
@@ -490,87 +521,110 @@ let read_http_response_until channel deadline =
         separator = '\r'
         && (String.length status_line <> 14 || status_line.[13] <> '\n')
       then raise Exit;
-      int_of_string code
+      let value = int_of_string code in
+      (* The checks above already require exactly three digits. A 0xx code
+         still names no status that any HTTP version defines. *)
+      if value < 100 then raise Exit else value
     with _ -> raise (Http_protocol "invalid HTTP status line")
   in
-  let rec headers content_length chunked =
-    let line = read_line_until channel deadline in
-    if line = "\r\n" then (content_length, chunked)
+  let rec headers remaining content_length chunked =
+    if remaining <= 0 then
+      raise (Http_protocol "HTTP response has too many header lines")
     else
-      match String.index_opt line ':' with
-      | None -> headers content_length chunked
-      | Some colon ->
-          let key = String.lowercase_ascii (String.sub line 0 colon) in
-          let value =
-            String.trim
-              (String.sub line (colon + 1) (String.length line - colon - 3))
-          in
-          if key = "content-length" then
-            let length =
-              try int_of_string value
-              with _ ->
-                raise (Http_protocol "invalid HTTP Content-Length header")
+      let line = read_line_until ?interrupt channel deadline in
+      if line = "\r\n" then (content_length, chunked)
+      else
+        match String.index_opt line ':' with
+        | None -> headers (remaining - 1) content_length chunked
+        | Some colon ->
+            let key = String.lowercase_ascii (String.sub line 0 colon) in
+            let value =
+              String.trim
+                (String.sub line (colon + 1) (String.length line - colon - 3))
             in
-            if length < 0 then
-              raise (Http_protocol "invalid HTTP Content-Length header")
-            else headers (Some length) chunked
-          else if
-            key = "transfer-encoding"
-            && String.lowercase_ascii value = "chunked"
-          then headers content_length true
-          else headers content_length chunked
+            if key = "content-length" then (
+              let length = parse_content_length value in
+              match content_length with
+              | Some previous when previous <> length ->
+                  raise
+                    (Http_protocol "conflicting HTTP Content-Length headers")
+              | _ -> headers (remaining - 1) (Some length) chunked)
+            else if key = "transfer-encoding" then (
+              match String.lowercase_ascii value with
+              | "chunked" -> headers (remaining - 1) content_length true
+              | "identity" -> headers (remaining - 1) content_length chunked
+              | _ -> raise (Http_protocol "unsupported HTTP Transfer-Encoding"))
+            else headers (remaining - 1) content_length chunked
   in
-  let content_length, chunked = headers None false in
+  let content_length, chunked = headers max_http_header_lines None false in
+  (* A response carrying both framings is unrecoverable rather than merely
+     redundant: the two lengths can disagree, and picking either one is how a
+     client gets talked into reading the next response as this one's body. *)
+  if chunked && content_length <> None then
+    raise
+      (Http_protocol
+         "HTTP response used both Content-Length and chunked encoding");
   let read_body () =
     match (content_length, chunked) with
-    | Some length, _ when length <= 2 * 1024 * 1024 ->
-        Bytes.to_string (read_exact_until channel length deadline)
+    | Some length, _ when length <= max_http_body ->
+        Bytes.to_string (read_exact_until ?interrupt channel length deadline)
     | Some _, _ -> raise (Http_protocol "HTTP response exceeds 2097152 bytes")
     | None, true ->
         let output = Buffer.create 256 in
         let rec chunks () =
-          let line = read_line_until channel deadline in
           let size =
-            try
-              let text =
-                String.trim (String.sub line 0 (String.length line - 2))
-              in
-              let text =
-                match String.index_opt text ';' with
-                | Some index -> String.sub text 0 index
-                | None -> text
-              in
-              int_of_string ("0x" ^ text)
-            with _ -> raise (Http_protocol "invalid HTTP chunk size")
+            parse_chunk_size (read_line_until ?interrupt channel deadline)
           in
-          if size < 0 then raise (Http_protocol "invalid HTTP chunk size")
-          else if size = 0 then
-            let rec trailers () =
-              if read_line_until channel deadline <> "\r\n" then trailers ()
+          if size = 0 then
+            let rec trailers remaining =
+              if remaining <= 0 then
+                raise (Http_protocol "HTTP response has too many trailers")
+              else
+                let line = read_line_until ?interrupt channel deadline in
+                if line <> "\r\n" then trailers (remaining - 1)
             in
-            trailers ()
+            trailers max_http_trailer_lines
           else (
-            if Buffer.length output + size > 2 * 1024 * 1024 then
+            if Buffer.length output + size > max_http_body then
               raise (Http_protocol "HTTP response exceeds 2097152 bytes");
             Buffer.add_string output
-              (Bytes.to_string (read_exact_until channel size deadline));
-            if read_line_until channel deadline <> "\r\n" then
+              (Bytes.to_string
+                 (read_exact_until ?interrupt channel size deadline));
+            if read_line_until ?interrupt channel deadline <> "\r\n" then
               raise (Http_protocol "invalid HTTP chunk terminator");
             chunks ())
         in
         chunks ();
         Buffer.contents output
-    | None, false -> ""
+    | None, false
+      when status_code < 200 || status_code = 204 || status_code = 304 ->
+        (* These statuses never carry a body. Returning at once also keeps the
+           101 upgrade from waiting for a close that never comes. *)
+        ""
+    | None, false ->
+        (* The request asked for Connection: close, so an unframed body runs to
+           end of stream. Cap it exactly like the framed cases. *)
+        let output = Buffer.create 256 in
+        let block = Bytes.create 8192 in
+        let rec drain () =
+          match read_some_until ?interrupt channel block 0 8192 deadline with
+          | count ->
+              if Buffer.length output + count > max_http_body then
+                raise (Http_protocol "HTTP response exceeds 2097152 bytes");
+              Buffer.add_subbytes output block 0 count;
+              drain ()
+          | exception Channel_closed -> ()
+        in
+        drain ();
+        Buffer.contents output
   in
   (status_code, read_body ())
-
-let read_http_response channel =
-  read_http_response_until channel (deadline_after 30.0)
 
 let http_call endpoint ~client_version ~auth_token ~timeout operation path args
     =
   protect_error ("HTTP " ^ operation) (fun () ->
-      if path = "" then raise (Failure "Convex function path is required");
+      if path = "" then
+        raise (Http_protocol "Convex function path is required");
       let deadline = deadline_after timeout in
       let channel = open_channel ~deadline endpoint in
       Fun.protect
@@ -787,8 +841,12 @@ let ws_write_frame ws opcode payload =
   write_all ~interrupt:ws.interrupt ws.channel header 0 (Bytes.length header);
   write_all ~interrupt:ws.interrupt ws.channel body 0 length
 
+(* One deadline covers the whole frame. A peer that dribbles a byte at a time
+   cannot keep resetting the clock, and a timeout mid-frame is fatal to the
+   connection rather than something the caller may retry at a false boundary. *)
 let ws_read_frame ws timeout =
-  let header = read_exact ~interrupt:ws.interrupt ws.channel 2 timeout in
+  let deadline = deadline_after timeout in
+  let header = read_exact_until ~interrupt:ws.interrupt ws.channel 2 deadline in
   let first, second =
     (Char.code (Bytes.get header 0), Char.code (Bytes.get header 1))
   in
@@ -799,11 +857,15 @@ let ws_read_frame ws timeout =
   let length =
     if short_length < 126 then Int64.of_int short_length
     else if short_length = 126 then
-      let bytes = read_exact ~interrupt:ws.interrupt ws.channel 2 timeout in
+      let bytes =
+        read_exact_until ~interrupt:ws.interrupt ws.channel 2 deadline
+      in
       Int64.of_int
         ((Char.code (Bytes.get bytes 0) lsl 8) lor Char.code (Bytes.get bytes 1))
     else
-      let bytes = read_exact ~interrupt:ws.interrupt ws.channel 8 timeout in
+      let bytes =
+        read_exact_until ~interrupt:ws.interrupt ws.channel 8 deadline
+      in
       let value = ref 0L in
       for index = 0 to 7 do
         value :=
@@ -819,11 +881,12 @@ let ws_read_frame ws timeout =
     raise (Websocket_protocol "WebSocket message exceeds 2097152 bytes");
   let mask =
     if masked then
-      Some (read_exact ~interrupt:ws.interrupt ws.channel 4 timeout)
+      Some (read_exact_until ~interrupt:ws.interrupt ws.channel 4 deadline)
     else None
   in
   let payload =
-    read_exact ~interrupt:ws.interrupt ws.channel (Int64.to_int length) timeout
+    read_exact_until ~interrupt:ws.interrupt ws.channel (Int64.to_int length)
+      deadline
   in
   (match mask with
   | Some mask ->
@@ -866,8 +929,15 @@ let ws_read_message ws =
   in
   loop ()
 
+let live_handshake_timeout = 30.0
+
+(* The socket owner runs the handshake inline, so an unbounded connect would
+   also block close, unsubscribe, and debugDisconnect. One deadline bounds DNS,
+   connect, TLS, and the upgrade exchange, and the wake pipe abandons the
+   attempt as soon as a controller command arrives. *)
 let websocket_connect endpoint ~client_version ~auth_token ~interrupt =
-  let channel = open_channel endpoint in
+  let deadline = deadline_after live_handshake_timeout in
+  let channel = open_channel ~interrupt ~deadline endpoint in
   try
     let key = base64_encode (random_bytes 16) in
     let request =
@@ -881,13 +951,11 @@ let websocket_connect endpoint ~client_version ~auth_token ~interrupt =
         | _ -> "")
       ^ "\r\n"
     in
-    write_string channel request;
-    let status, _ = read_http_response channel in
+    write_string_until ~interrupt channel request deadline;
+    let status, _ = read_http_response_until ~interrupt channel deadline in
     if status <> 101 then
       raise
         (Failure ("WebSocket handshake returned HTTP " ^ string_of_int status));
-    Unix.set_nonblock channel.fd;
-    channel.nonblocking <- true;
     {
       channel;
       interrupt;
@@ -946,7 +1014,7 @@ let enqueue state update =
   Mutex.unlock state.mutex
 
 let dequeue state timeout =
-  let deadline = Unix.gettimeofday () +. timeout in
+  let deadline = monotonic_now () +. timeout in
   let rec loop () =
     Mutex.lock state.mutex;
     match state.queue with
@@ -960,7 +1028,7 @@ let dequeue state timeout =
         None
     | [] ->
         Mutex.unlock state.mutex;
-        if timeout >= 0.0 && Unix.gettimeofday () >= deadline then None
+        if timeout >= 0.0 && monotonic_now () >= deadline then None
         else (
           Thread.delay 0.02;
           loop ())
@@ -983,8 +1051,18 @@ type live_manager = {
   wake_write : Unix.file_descr;
   mutable closed : bool;
   mutable next_qid : int;
-  owner : Thread.t;
+  (* Filled in once [Thread.create] returns. The owner never reads it, so the
+     manager the worker captured and the manager the client holds must stay the
+     same record: copying it would strand every later [auth_token] change. *)
+  mutable owner : Thread.t option;
 }
+
+(* [auth_token] crosses from the caller's thread to the socket owner. *)
+let manager_auth (manager : live_manager) =
+  Mutex.lock manager.command_mutex;
+  let token = manager.auth_token in
+  Mutex.unlock manager.command_mutex;
+  token
 
 type client = {
   endpoint : endpoint;
@@ -1023,6 +1101,14 @@ let zero_version () =
     ]
 
 let equal_json left right = J.equal left right
+
+(* [J.equal] rather than structural equality: the server may re-encode an
+   unchanged value differently, and only a JSON-aware comparison notices. *)
+let same_value left right =
+  match (left, right) with
+  | Some left, Some right -> equal_json left right
+  | None, None -> true
+  | Some _, None | None, Some _ -> false
 
 let assoc name json =
   match member name json with
@@ -1099,9 +1185,7 @@ let live_owner (manager : live_manager) =
   let reconnect_at = ref None in
   let backoff = ref 0.1 in
   let retired_for_disconnect = ref false in
-  let set_reconnect delay =
-    reconnect_at := Some (Unix.gettimeofday () +. delay)
-  in
+  let set_reconnect delay = reconnect_at := Some (monotonic_now () +. delay) in
   let close_connection reason schedule =
     (match !connection with
     | Some ws ->
@@ -1123,18 +1207,39 @@ let live_owner (manager : live_manager) =
     | None -> ()
   in
   let protocol_failure error =
+    let logs = error_logs error in
+    let update = { value = None; error = Some error; logs } in
     Hashtbl.iter
-      (fun qid _ ->
-        deliver qid
-          { value = None; error = Some error; logs = error_logs error })
+      (fun qid (_ : subscription_state) ->
+        (* Record the failure as the delivered state. Without this the next
+           connection rehydrates the same value the subscriber last saw before
+           the error, the unchanged-value suppression drops it, and an
+           otherwise healthy subscription is stranded on the error. *)
+        Hashtbl.replace last_delivered qid update;
+        deliver qid update)
       active
+  in
+  let queued_disconnect () =
+    Mutex.lock manager.command_mutex;
+    let found =
+      Queue.fold
+        (fun found command ->
+          found
+          ||
+          match command with
+          | Disconnect _ -> true
+          | Add _ | Remove _ | Stop -> false)
+        false manager.commands
+    in
+    Mutex.unlock manager.command_mutex;
+    found
   in
   let connect () =
     try
       let ws =
         websocket_connect manager.endpoint
-          ~client_version:manager.client_version ~auth_token:manager.auth_token
-          ~interrupt:manager.wake_read
+          ~client_version:manager.client_version
+          ~auth_token:(manager_auth manager) ~interrupt:manager.wake_read
       in
       connection := Some ws;
       remote_version := zero_version ();
@@ -1169,10 +1274,22 @@ let live_owner (manager : live_manager) =
         json_send ws (modify_message 0 1 (List.map add_modification states));
         query_set_version := 1);
       reconnect_at := None
-    with error ->
-      last_close_reason := Printexc.to_string error;
-      incr connection_count;
-      close_connection !last_close_reason true
+    with
+    | Read_interrupted ->
+        (* A controller command arrived mid-handshake. Retire this attempt so
+           the command loop runs, and record the reason the same way the read
+           path does so a queued debugDisconnect still sees a retired socket. *)
+        retired_for_disconnect := queued_disconnect ();
+        if !connection = None then incr connection_count;
+        close_connection
+          (if !retired_for_disconnect then "DebugDisconnect"
+           else "ControllerCommand")
+          true
+    | error ->
+        (* Count this connection exactly once. [close_connection] already
+           counts an attempt that got as far as a live socket. *)
+        if !connection = None then incr connection_count;
+        close_connection (Printexc.to_string error) true
   in
   let send_modify modification =
     match !connection with
@@ -1217,9 +1334,12 @@ let live_owner (manager : live_manager) =
             Hashtbl.replace last_delivered qid update;
             if Hashtbl.mem awaiting qid then (
               Hashtbl.remove awaiting qid;
+              (* Suppress a rehydration that repeats what the subscriber
+                 already has: a reconnect must not replay it as a change. *)
               match previous with
               | Some previous
-                when previous.value = update.value && previous.error = None ->
+                when previous.error = None
+                     && same_value previous.value update.value ->
                   ()
               | _ -> Hashtbl.replace changed qid update)
             else Hashtbl.replace changed qid update
@@ -1314,32 +1434,23 @@ let live_owner (manager : live_manager) =
     Mutex.unlock manager.command_mutex;
     List.rev !commands
   in
-  let queued_disconnect () =
-    Mutex.lock manager.command_mutex;
-    let found =
-      Queue.fold
-        (fun found command ->
-          found
-          ||
-          match command with
-          | Disconnect _ -> true
-          | Add _ | Remove _ | Stop -> false)
-        false manager.commands
-    in
-    Mutex.unlock manager.command_mutex;
-    found
-  in
   let rec loop () =
     let timeout =
       match !reconnect_at with
       | None -> 30.0
-      | Some at -> max 0.0 (at -. Unix.gettimeofday ())
+      | Some at -> max 0.0 (at -. monotonic_now ())
     in
     let descriptors =
       manager.wake_read
       :: (match !connection with Some ws -> [ ws.channel.fd ] | None -> [])
     in
-    let ready, _, _ = Unix.select descriptors [] [] timeout in
+    (* An uncaught EINTR here would kill the only thread that owns the socket,
+       and every later close, unsubscribe, and relay join would wait forever. *)
+    let rec select () =
+      try Unix.select descriptors [] [] timeout
+      with Unix.Unix_error (Unix.EINTR, _, _) -> select ()
+    in
+    let ready, _, _ = select () in
     if List.mem manager.wake_read ready then (
       ignore
         (try Unix.read manager.wake_read (Bytes.create 64) 0 64 with _ -> 0);
@@ -1389,8 +1500,7 @@ let live_owner (manager : live_manager) =
       if manager.closed then () else loop ())
     else (
       (match !reconnect_at with
-      | Some at when at <= Unix.gettimeofday () && !connection = None ->
-          connect ()
+      | Some at when at <= monotonic_now () && !connection = None -> connect ()
       | _ -> ());
       match !connection with
       | Some ws when List.mem ws.channel.fd ready ->
@@ -1434,11 +1544,10 @@ let create ?(http_timeout = 30.0) raw_url =
             wake_write;
             closed = false;
             next_qid = 0;
-            owner = Obj.magic 0;
+            owner = None;
           }
         in
-        let owner = Thread.create (fun () -> live_owner manager) () in
-        let manager = { manager with owner } in
+        manager.owner <- Some (Thread.create (fun () -> live_owner manager) ());
         Ok
           {
             endpoint;
@@ -1458,15 +1567,24 @@ let with_client (client : client) _operation f =
   if closed then Error Closed else f token
 
 let set_auth client token =
-  Mutex.lock client.mutex;
-  if client.closed then (
-    Mutex.unlock client.mutex;
-    Error Closed)
-  else (
-    client.auth_token <- (if token = "" then None else Some token);
-    client.live.auth_token <- (if token = "" then None else Some token);
-    Mutex.unlock client.mutex;
-    Ok ())
+  (* The token is interpolated into an Authorization header on both transports,
+     so a bare CR or LF would let a caller append headers of their own. *)
+  let control char = Char.code char < 0x20 || Char.code char = 0x7f in
+  if String.exists control token then
+    Error (Protocol_error "auth token must not contain control characters")
+  else
+    let value = if token = "" then None else Some token in
+    Mutex.lock client.mutex;
+    if client.closed then (
+      Mutex.unlock client.mutex;
+      Error Closed)
+    else (
+      client.auth_token <- value;
+      Mutex.lock client.live.command_mutex;
+      client.live.auth_token <- value;
+      Mutex.unlock client.live.command_mutex;
+      Mutex.unlock client.mutex;
+      Ok ())
 
 let call client operation path args =
   with_client client operation (fun token ->
@@ -1515,11 +1633,11 @@ let debug_disconnect client =
   with_client client "live disconnect" (fun _ ->
       let result = ref None in
       command client.live (Disconnect result);
-      let deadline = Unix.gettimeofday () +. 10.0 in
+      let deadline = monotonic_now () +. 10.0 in
       let rec wait () =
         match !result with
         | Some value -> value
-        | None when Unix.gettimeofday () < deadline ->
+        | None when monotonic_now () < deadline ->
             Thread.delay 0.01;
             wait ()
         | None ->
@@ -1538,7 +1656,9 @@ let close client =
     client.closed <- true;
     command client.live Stop;
     Mutex.unlock client.mutex;
-    Thread.join client.live.owner;
+    (match client.live.owner with
+    | Some owner -> Thread.join owner
+    | None -> ());
     close_channel
       {
         fd = client.live.wake_read;

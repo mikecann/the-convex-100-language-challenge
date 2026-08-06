@@ -26,7 +26,8 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - Live authentication, optimistic updates, WebSocket mutations, and WebSocket actions are deferred.
+  - Live authentication is deferred. The socket handshake carries whatever bearer token setAuth last stored, but token refresh, the sync-protocol Authenticate message, and AuthError recovery are unimplemented and unverified.
+  - Optimistic updates, WebSocket mutations, and WebSocket actions are deferred.
   - Live values cover the JSON-safe subset; tagged Convex value types and TransitionChunk assembly are deferred as explicit protocol errors.
   - Each subscription retains at most 16 updates and 4 MiB of encoded values, dropping the oldest state when a consumer is slow.
 capabilities: []

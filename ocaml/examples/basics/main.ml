@@ -3,12 +3,13 @@
 let room = if Array.length Sys.argv > 1 then Sys.argv.(1) else "ocaml-example"
 let expect condition message = if not condition then failwith message
 
+(* Convex sends JSON numbers, so an integral count can arrive as 0 or as 0.0.
+   This accepts either and refuses anything fractional, quoted, or out of
+   range rather than silently rounding it into an int64. *)
 let get_count json =
-  match Yojson.Safe.Util.member "count" json with
-  | value -> (
-      match Convex.parse_integral_int64 value with
-      | Ok count -> count
-      | Error message -> failwith ("decode count: " ^ message))
+  match Convex.parse_integral_int64 (Yojson.Safe.Util.member "count" json) with
+  | Ok count -> count
+  | Error message -> failwith ("decode count: " ^ message)
 
 let state_count (result : Convex.result) = get_count result.value
 
@@ -64,11 +65,7 @@ let () =
         (fun () ->
           (* Read the initial Live value and prove it agrees with HTTP. *)
           let initial = next_update "initial Live value" in
-          let initial_count =
-            Convex.parse_integral_int64
-              (Yojson.Safe.Util.member "count" initial)
-            |> Result.get_ok
-          in
+          let initial_count = get_count initial in
           expect
             (initial_count = current_count)
             "initial Live value disagreed with HTTP";
@@ -100,11 +97,7 @@ let () =
           expect applied "mutation was not applied";
           Printf.printf "mutation applied: %b\n%!" applied;
           let mutation_state = Yojson.Safe.Util.member "state" mutation.value in
-          let mutation_count =
-            Convex.parse_integral_int64
-              (Yojson.Safe.Util.member "count" mutation_state)
-            |> Result.get_ok
-          in
+          let mutation_count = get_count mutation_state in
           expect
             (mutation_count = Int64.add current_count 1L)
             "mutation returned an unexpected count";
@@ -112,11 +105,7 @@ let () =
 
           (* Live should now deliver the mutation result without another query. *)
           let updated = next_update "updated Live value" in
-          let updated_count =
-            Convex.parse_integral_int64
-              (Yojson.Safe.Util.member "count" updated)
-            |> Result.get_ok
-          in
+          let updated_count = get_count updated in
           expect
             (updated_count = mutation_count)
             "Live update disagreed with mutation";

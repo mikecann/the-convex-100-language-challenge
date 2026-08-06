@@ -235,6 +235,114 @@ let test_malformed_status_recovery () =
           fail ("status recovery returned " ^ J.to_string result.value)
       | Error error -> fail (Convex.error_message error))
 
+(* Response framing is the client's trust boundary with the deployment: a
+   length it reads wrongly is a length an intermediary chose for it. Each case
+   below is followed by a normal request to prove the client is still usable. *)
+let test_http_framing () =
+  let chunked_body = {|{"status":"success","value":{"framing":"chunked"}}|} in
+  let split = String.length chunked_body / 2 in
+  let head = String.sub chunked_body 0 split in
+  let tail =
+    String.sub chunked_body split (String.length chunked_body - split)
+  in
+  let chunked =
+    Printf.sprintf
+      "HTTP/1.1 200 OK\r\n\
+       Transfer-Encoding: chunked\r\n\
+       \r\n\
+       %x\r\n\
+       %s\r\n\
+       %x\r\n\
+       %s\r\n\
+       0\r\n\
+       X-Trailer: seen\r\n\
+       \r\n"
+      (String.length head) head (String.length tail) tail
+  in
+  let unframed_body = {|{"status":"success","value":{"framing":"eof"}}|} in
+  (* No Content-Length and no chunked encoding: the body ends at end of
+     stream, which is exactly what Connection: close asks for. *)
+  let unframed =
+    "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" ^ unframed_body
+  in
+  let both_framings =
+    "HTTP/1.1 200 OK\r\n\
+     Content-Length: 2\r\n\
+     Transfer-Encoding: chunked\r\n\
+     \r\n"
+  in
+  let conflicting_lengths =
+    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nok"
+  in
+  let hex_length =
+    "HTTP/1.1 200 OK\r\nContent-Length: 0x10\r\n\r\nnot sixteen bytes"
+  in
+  let low_status = "HTTP/1.1 099 Low\r\nContent-Length: 0\r\n\r\n" in
+  with_scripted_http ~scheme:"http" ~timeout:2.0
+    [
+      Plain_chunks ([ chunked ], 0.0);
+      Plain_chunks ([ unframed ], 0.0);
+      Plain_chunks ([ both_framings ], 0.0);
+      Plain_chunks ([ conflicting_lengths ], 0.0);
+      Plain_chunks ([ hex_length ], 0.0);
+      Plain_chunks ([ low_status ], 0.0);
+    ]
+    (fun client ->
+      (match Convex.query client "tests:chunked" (`Assoc []) with
+      | Ok { value = `Assoc [ ("framing", `String "chunked") ]; logs = [] } ->
+          ()
+      | Ok result ->
+          fail ("chunked body decoded to " ^ J.to_string result.value)
+      | Error error -> fail (Convex.error_message error));
+      (match Convex.query client "tests:unframed" (`Assoc []) with
+      | Ok { value = `Assoc [ ("framing", `String "eof") ]; logs = [] } -> ()
+      | Ok result ->
+          fail ("unframed body decoded to " ^ J.to_string result.value)
+      | Error error -> fail (Convex.error_message error));
+      Convex.query client "tests:both-framings" (`Assoc [])
+      |> expect_protocol_error
+           "HTTP response used both Content-Length and chunked encoding";
+      Convex.query client "tests:conflicting-lengths" (`Assoc [])
+      |> expect_protocol_error "conflicting HTTP Content-Length headers";
+      Convex.query client "tests:hex-length" (`Assoc [])
+      |> expect_protocol_error "invalid HTTP Content-Length header";
+      Convex.query client "tests:low-status" (`Assoc [])
+      |> expect_protocol_error "invalid HTTP status line")
+
+(* The URL and the auth token both reach request headers verbatim. *)
+let test_header_injection () =
+  (match Convex.create "http://example.invalid/\r\nX-Injected: 1" with
+  | Error (Convex.Protocol_error message)
+    when message = "Convex URL must not contain control characters" ->
+      ()
+  | Error error ->
+      fail ("unexpected URL rejection: " ^ Convex.error_message error)
+  | Ok client ->
+      Convex.close client;
+      fail "a deployment URL carrying CRLF must be rejected");
+  (* Port 1 is never listening, and no request is sent by any case here. *)
+  let client =
+    match Convex.create "http://127.0.0.1:1" with
+    | Ok value -> value
+    | Error error -> fail (Convex.error_message error)
+  in
+  Fun.protect
+    ~finally:(fun () -> Convex.close client)
+    (fun () ->
+      (match Convex.set_auth client "token\r\nX-Injected: 1" with
+      | Error (Convex.Protocol_error message)
+        when message = "auth token must not contain control characters" ->
+          ()
+      | Error error ->
+          fail ("unexpected token rejection: " ^ Convex.error_message error)
+      | Ok () -> fail "an auth token carrying CRLF must be rejected");
+      (match Convex.set_auth client "ordinary.token.value" with
+      | Ok () -> ()
+      | Error error ->
+          fail ("ordinary token rejected: " ^ Convex.error_message error));
+      Convex.query client "" (`Assoc [])
+      |> expect_protocol_error "Convex function path is required")
+
 let test_bounded_connect () =
   (* Fill a zero-backlog loopback listener without accepting. Linux then leaves
      later connects pending or rejects them immediately. Both paths must remain
@@ -332,6 +440,8 @@ let () =
     (Convex.parse_integral_int64 (`Intlit "9223372036854775808"));
   test_http_absolute_deadlines ();
   test_malformed_status_recovery ();
+  test_http_framing ();
+  test_header_injection ();
   test_bounded_connect ();
   with_http_response 200
     {|{"status":"success","value":{"ok":true},"logLines":["fixture"]}|}
