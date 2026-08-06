@@ -82,6 +82,213 @@ let expect_protocol_error expected = function
        ^ Convex.error_message error)
   | Ok _ -> fail "expected ProtocolError, got success"
 
+type scripted_http_action =
+  | Plain_chunks of string list * float
+  | Stall_tls of float
+
+let with_scripted_http ~scheme ~timeout actions check =
+  let listener = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Unix.setsockopt listener Unix.SO_REUSEADDR true;
+  Unix.bind listener (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+  Unix.listen listener 4;
+  let port =
+    match Unix.getsockname listener with
+    | Unix.ADDR_INET (_, port) -> port
+    | Unix.ADDR_UNIX _ -> assert false
+  in
+  let server =
+    Thread.create
+      (fun () ->
+        Fun.protect
+          ~finally:(fun () -> Unix.close listener)
+          (fun () ->
+            List.iter
+              (fun action ->
+                let socket, _ = Unix.accept listener in
+                let input = Unix.in_channel_of_descr socket in
+                let output = Unix.out_channel_of_descr socket in
+                Fun.protect
+                  ~finally:(fun () ->
+                    close_in_noerr input;
+                    close_out_noerr output)
+                  (fun () ->
+                    match action with
+                    | Stall_tls seconds -> Thread.delay seconds
+                    | Plain_chunks (chunks, delay) -> (
+                        ignore (read_http_request input);
+                        try
+                          List.iter
+                            (fun chunk ->
+                              output_string output chunk;
+                              flush output;
+                              if delay > 0.0 then Thread.delay delay)
+                            chunks
+                        with Sys_error _ | Unix.Unix_error _ -> ())))
+              actions))
+      ()
+  in
+  let client =
+    match
+      Convex.create ~http_timeout:timeout
+        (Printf.sprintf "%s://127.0.0.1:%d" scheme port)
+    with
+    | Ok value -> value
+    | Error error -> fail (Convex.error_message error)
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      Convex.close client;
+      Thread.join server)
+    (fun () -> check client)
+
+let expect_transport_timeout = function
+  | Error
+      (Convex.Transport_error
+         {
+           operation = "HTTP query";
+           message = "timed out while waiting for the response";
+         }) ->
+      ()
+  | Error error ->
+      fail
+        ("expected HTTP timeout TransportError, got " ^ Convex.error_name error
+       ^ ": " ^ Convex.error_message error)
+  | Ok _ -> fail "slow HTTP fixture unexpectedly returned success"
+
+let test_http_absolute_deadlines () =
+  let timeout = 0.2 in
+  let response_headers =
+    "HTTP/1.1 200 OK\r\n\
+     Content-Type: application/json\r\n\
+     Content-Length: 4\r\n\
+     \r\n"
+  in
+  let cases =
+    [
+      ( "status",
+        [ "H"; "T"; "T"; "P/1.1 200 OK\r\nContent-Length: 4\r\n\r\nnull" ] );
+      ( "header",
+        [ "HTTP/1.1 200 OK\r\n"; "C"; "o"; "ntent-Length: 4\r\n\r\nnull" ] );
+      ("body", [ response_headers; "n"; "u"; "ll" ]);
+    ]
+  in
+  List.iter
+    (fun (phase, chunks) ->
+      with_scripted_http ~scheme:"http" ~timeout
+        [ Plain_chunks (chunks, 0.075) ]
+        (fun client ->
+          match Convex.query client ("tests:slow-" ^ phase) (`Assoc []) with
+          | result -> expect_transport_timeout result))
+    cases;
+  let recovery_body =
+    {|{"status":"success","value":{"recovered":"deadline"}}|}
+  in
+  let recovery_response =
+    Printf.sprintf "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s"
+      (String.length recovery_body)
+      recovery_body
+  in
+  with_scripted_http ~scheme:"http" ~timeout
+    [
+      Plain_chunks ([ response_headers; "n"; "u"; "ll" ], 0.075);
+      Plain_chunks ([ recovery_response ], 0.0);
+    ]
+    (fun client ->
+      Convex.query client "tests:slow-then-recover" (`Assoc [])
+      |> expect_transport_timeout;
+      match Convex.query client "tests:after-deadline" (`Assoc []) with
+      | Ok { value = `Assoc [ ("recovered", `String "deadline") ]; logs = [] }
+        ->
+          ()
+      | Ok result ->
+          fail ("deadline recovery returned " ^ J.to_string result.value)
+      | Error error -> fail (Convex.error_message error));
+  with_scripted_http ~scheme:"https" ~timeout [ Stall_tls 0.35 ] (fun client ->
+      expect_transport_timeout
+        (Convex.query client "tests:stalled-tls" (`Assoc [])))
+
+let test_malformed_status_recovery () =
+  let body = {|{"status":"success","value":{"recovered":true}}|} in
+  let valid =
+    Printf.sprintf
+      "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s"
+      (String.length body) body
+  in
+  let malformed suffix =
+    "HTTP/1.1 " ^ suffix
+    ^ " Bad\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+  in
+  with_scripted_http ~scheme:"http" ~timeout:1.0
+    [
+      Plain_chunks ([ malformed "2000" ], 0.0);
+      Plain_chunks ([ malformed "200X" ], 0.0);
+      Plain_chunks ([ valid ], 0.0);
+    ]
+    (fun client ->
+      Convex.query client "tests:status-2000" (`Assoc [])
+      |> expect_protocol_error "invalid HTTP status line";
+      Convex.query client "tests:status-200X" (`Assoc [])
+      |> expect_protocol_error "invalid HTTP status line";
+      match Convex.query client "tests:recovered" (`Assoc []) with
+      | Ok { value = `Assoc [ ("recovered", `Bool true) ]; logs = [] } -> ()
+      | Ok result ->
+          fail ("status recovery returned " ^ J.to_string result.value)
+      | Error error -> fail (Convex.error_message error))
+
+let test_bounded_connect () =
+  (* Fill a zero-backlog loopback listener without accepting. Linux then leaves
+     later connects pending or rejects them immediately. Both paths must remain
+     bounded, and the fixture never depends on an external network. *)
+  let listener = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Unix.setsockopt listener Unix.SO_REUSEADDR true;
+  Unix.bind listener (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+  Unix.listen listener 0;
+  let address, port =
+    match Unix.getsockname listener with
+    | Unix.ADDR_INET (_, port) as address -> (address, port)
+    | Unix.ADDR_UNIX _ -> assert false
+  in
+  let fillers =
+    List.init 8 (fun _ ->
+        let socket = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+        Unix.set_nonblock socket;
+        (try Unix.connect socket address
+         with
+         | Unix.Unix_error
+             ( ( Unix.EINPROGRESS | Unix.EAGAIN | Unix.EWOULDBLOCK
+               | Unix.ECONNREFUSED ),
+               _,
+               _ )
+         ->
+           ());
+        socket)
+  in
+  let client =
+    match
+      Convex.create ~http_timeout:0.2
+        (Printf.sprintf "http://127.0.0.1:%d" port)
+    with
+    | Ok value -> value
+    | Error error -> fail (Convex.error_message error)
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      Convex.close client;
+      List.iter Unix.close fillers;
+      Unix.close listener)
+    (fun () ->
+      let started = Unix.gettimeofday () in
+      let result = Convex.query client "tests:connect" (`Assoc []) in
+      let elapsed = Unix.gettimeofday () -. started in
+      if elapsed >= 1.0 then
+        fail (Printf.sprintf "bounded connect took %.3f seconds" elapsed);
+      match result with
+      | Error (Convex.Transport_error { operation = "HTTP query"; _ }) -> ()
+      | Error error ->
+          fail
+            ("expected connect TransportError, got " ^ Convex.error_name error)
+      | Ok _ -> fail "saturated listener unexpectedly returned an HTTP result")
+
 let test_transport_error () =
   (* Reserve an ephemeral loopback port, then release it before the request.
      The immediate connection attempt deterministically reaches no listener. *)
@@ -123,6 +330,9 @@ let () =
     (Convex.parse_integral_int64 (`String "1"));
   expect_error "count is outside the int64 range"
     (Convex.parse_integral_int64 (`Intlit "9223372036854775808"));
+  test_http_absolute_deadlines ();
+  test_malformed_status_recovery ();
+  test_bounded_connect ();
   with_http_response 200
     {|{"status":"success","value":{"ok":true},"logLines":["fixture"]}|}
     (function

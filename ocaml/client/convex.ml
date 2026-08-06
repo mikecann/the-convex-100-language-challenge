@@ -46,6 +46,16 @@ exception Http_protocol of string
 exception Websocket_closed of string
 exception Websocket_protocol of string
 
+(* OCaml 5.2's Unix module does not expose clock_gettime. This tiny libc stub
+   gives every HTTP operation a clock that cannot jump when wall time changes. *)
+external monotonic_now : unit -> float = "convex_monotonic_now"
+
+let deadline_after seconds = monotonic_now () +. seconds
+
+let remaining_until deadline =
+  let remaining = deadline -. monotonic_now () in
+  if remaining <= 0.0 then raise Read_timeout else remaining
+
 let protect_error operation f =
   try f () with
   | Http_protocol message -> Error (Protocol_error message)
@@ -192,32 +202,36 @@ let close_channel channel =
     | None -> ());
     try Unix.close channel.fd with _ -> ())
 
-let wait_for_io ?interrupt ~readable ~writable fd timeout =
+let wait_for_io_until ?interrupt ~readable ~writable fd deadline =
   let reads = if readable then [ fd ] else [] in
   let reads =
     match interrupt with Some value -> value :: reads | None -> reads
   in
   let writes = if writable then [ fd ] else [] in
-  let ready_reads, ready_writes, _ = Unix.select reads writes [] timeout in
+  let rec select () =
+    try Unix.select reads writes [] (remaining_until deadline)
+    with Unix.Unix_error (Unix.EINTR, _, _) -> select ()
+  in
+  let ready_reads, ready_writes, _ = select () in
   (match interrupt with
   | Some value when List.mem value ready_reads -> raise Read_interrupted
   | _ -> ());
+  ignore (remaining_until deadline);
   if
     ((not readable) || not (List.mem fd ready_reads))
     && ((not writable) || not (List.mem fd ready_writes))
   then raise Read_timeout
 
-let wait_readable ?interrupt fd timeout =
-  wait_for_io ?interrupt ~readable:true ~writable:false fd timeout
+let wait_readable_until ?interrupt fd deadline =
+  wait_for_io_until ?interrupt ~readable:true ~writable:false fd deadline
 
-let wait_writable ?interrupt fd timeout =
-  wait_for_io ?interrupt ~readable:false ~writable:true fd timeout
+let wait_writable_until ?interrupt fd deadline =
+  wait_for_io_until ?interrupt ~readable:false ~writable:true fd deadline
 
-let read_some ?interrupt channel bytes offset length timeout =
+let read_some_until ?interrupt channel bytes offset length deadline =
   if channel.closed then raise Channel_closed;
-  let deadline = Unix.gettimeofday () +. timeout in
-  let remaining () = max 0.0 (deadline -. Unix.gettimeofday ()) in
   let rec read_nonblocking () =
+    ignore (remaining_until deadline);
     try
       match channel.ssl with
       | None -> Unix.read channel.fd bytes offset length
@@ -225,21 +239,37 @@ let read_some ?interrupt channel bytes offset length timeout =
     with
     | Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _)
     | Ssl.Read_error Ssl.Error_want_read ->
-        wait_readable ?interrupt channel.fd (remaining ());
+        wait_readable_until ?interrupt channel.fd deadline;
         read_nonblocking ()
     | Ssl.Read_error Ssl.Error_want_write ->
-        wait_writable ?interrupt channel.fd (remaining ());
+        wait_writable_until ?interrupt channel.fd deadline;
         read_nonblocking ()
   in
   let count =
     if channel.nonblocking then read_nonblocking ()
     else (
-      wait_readable ?interrupt channel.fd timeout;
+      wait_readable_until ?interrupt channel.fd deadline;
       match channel.ssl with
       | None -> Unix.read channel.fd bytes offset length
       | Some ssl -> Ssl.read ssl bytes offset length)
   in
   if count = 0 then raise Channel_closed else count
+
+let read_some ?interrupt channel bytes offset length timeout =
+  read_some_until ?interrupt channel bytes offset length
+    (deadline_after timeout)
+
+let read_exact_until ?interrupt channel length deadline =
+  let bytes = Bytes.create length in
+  let rec loop offset =
+    if offset = length then bytes
+    else
+      loop
+        (offset
+        + read_some_until ?interrupt channel bytes offset (length - offset)
+            deadline)
+  in
+  loop 0
 
 let read_exact ?interrupt channel length timeout =
   let bytes = Bytes.create length in
@@ -252,11 +282,10 @@ let read_exact ?interrupt channel length timeout =
   in
   loop 0
 
-let write_all ?interrupt channel bytes offset length =
+let write_all_until ?interrupt channel bytes offset length deadline =
   if channel.closed then raise Channel_closed;
-  let deadline = Unix.gettimeofday () +. 30.0 in
-  let remaining () = max 0.0 (deadline -. Unix.gettimeofday ()) in
   let rec write_nonblocking position remaining_length =
+    ignore (remaining_until deadline);
     try
       match channel.ssl with
       | None -> Unix.write channel.fd bytes position remaining_length
@@ -264,10 +293,10 @@ let write_all ?interrupt channel bytes offset length =
     with
     | Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _)
     | Ssl.Write_error Ssl.Error_want_write ->
-        wait_writable ?interrupt channel.fd (remaining ());
+        wait_writable_until ?interrupt channel.fd deadline;
         write_nonblocking position remaining_length
     | Ssl.Write_error Ssl.Error_want_read ->
-        wait_readable ?interrupt channel.fd (remaining ());
+        wait_readable_until ?interrupt channel.fd deadline;
         write_nonblocking position remaining_length
   in
   let rec loop position remaining =
@@ -284,37 +313,124 @@ let write_all ?interrupt channel bytes offset length =
   in
   loop offset length
 
+let write_all ?interrupt channel bytes offset length =
+  write_all_until ?interrupt channel bytes offset length (deadline_after 30.0)
+
+let write_string_until ?interrupt channel string deadline =
+  let bytes = Bytes.of_string string in
+  write_all_until ?interrupt channel bytes 0 (Bytes.length bytes) deadline
+
 let write_string ?interrupt channel string =
   let bytes = Bytes.of_string string in
   write_all ?interrupt channel bytes 0 (Bytes.length bytes)
 
-let connect_tcp host port =
+let resolve_tcp_until host port deadline =
+  let ready_read, ready_write = Unix.pipe () in
+  let mutex = Mutex.create () in
+  let result = ref None in
+  ignore
+    (Thread.create
+       (fun () ->
+         let resolved =
+           try
+             Ok
+               (Unix.getaddrinfo host (string_of_int port)
+                  [ Unix.AI_SOCKTYPE Unix.SOCK_STREAM ])
+           with error -> Error error
+         in
+         Mutex.lock mutex;
+         result := Some resolved;
+         Mutex.unlock mutex;
+         (try ignore (Unix.write ready_write (Bytes.of_string "x") 0 1)
+          with _ -> ());
+         Unix.close ready_write)
+       ());
+  Fun.protect
+    ~finally:(fun () -> Unix.close ready_read)
+    (fun () ->
+      wait_readable_until ready_read deadline;
+      ignore (Unix.read ready_read (Bytes.create 1) 0 1);
+      Mutex.lock mutex;
+      let resolved = !result in
+      Mutex.unlock mutex;
+      match resolved with
+      | Some (Ok addresses) -> addresses
+      | Some (Error error) -> raise error
+      | None -> raise Channel_closed)
+
+let connect_address_until address deadline =
+  ignore (remaining_until deadline);
+  let fd =
+    Unix.socket address.Unix.ai_family address.Unix.ai_socktype
+      address.Unix.ai_protocol
+  in
+  Unix.set_nonblock fd;
+  try
+    (try Unix.connect fd address.Unix.ai_addr
+     with
+     | Unix.Unix_error
+         ((Unix.EINPROGRESS | Unix.EAGAIN | Unix.EWOULDBLOCK), _, _)
+     -> (
+       wait_writable_until fd deadline;
+       match Unix.getsockopt_error fd with
+       | None -> ()
+       | Some error -> raise (Unix.Unix_error (error, "connect", ""))));
+    fd
+  with error ->
+    Unix.close fd;
+    raise error
+
+let connect_tcp ?deadline host port =
   let addresses =
-    Unix.getaddrinfo host (string_of_int port)
-      [ Unix.AI_SOCKTYPE Unix.SOCK_STREAM ]
+    match deadline with
+    | Some value -> resolve_tcp_until host port value
+    | None ->
+        Unix.getaddrinfo host (string_of_int port)
+          [ Unix.AI_SOCKTYPE Unix.SOCK_STREAM ]
   in
   let rec try_addresses = function
     | [] ->
         raise
           (Failure ("could not connect to " ^ host ^ ":" ^ string_of_int port))
     | address :: rest -> (
-        let fd =
-          Unix.socket address.Unix.ai_family address.Unix.ai_socktype
-            address.Unix.ai_protocol
-        in
         try
-          Unix.connect fd address.Unix.ai_addr;
-          fd
-        with Unix.Unix_error _ ->
-          Unix.close fd;
-          try_addresses rest)
+          match deadline with
+          | Some value -> connect_address_until address value
+          | None -> (
+              let fd =
+                Unix.socket address.Unix.ai_family address.Unix.ai_socktype
+                  address.Unix.ai_protocol
+              in
+              try
+                Unix.connect fd address.Unix.ai_addr;
+                fd
+              with error ->
+                Unix.close fd;
+                raise error)
+        with
+        | Read_timeout -> raise Read_timeout
+        | Unix.Unix_error _ -> try_addresses rest)
   in
   try_addresses addresses
 
-let open_channel endpoint =
-  let fd = connect_tcp endpoint.host endpoint.port in
+let tls_connect_until ssl fd deadline =
+  let rec connect () =
+    ignore (remaining_until deadline);
+    try Ssl.connect ssl with
+    | Ssl.Connection_error Ssl.Error_want_read ->
+        wait_readable_until fd deadline;
+        connect ()
+    | Ssl.Connection_error (Ssl.Error_want_write | Ssl.Error_want_connect) ->
+        wait_writable_until fd deadline;
+        connect ()
+  in
+  connect ()
+
+let open_channel ?deadline endpoint =
+  let fd = connect_tcp ?deadline endpoint.host endpoint.port in
+  let nonblocking = Option.is_some deadline in
   match endpoint.scheme with
-  | "http" -> { fd; ssl = None; closed = false; nonblocking = false }
+  | "http" -> { fd; ssl = None; closed = false; nonblocking }
   | "https" -> (
       try
         Ssl.init ();
@@ -326,18 +442,22 @@ let open_channel endpoint =
          with _ -> ());
         let ssl = Ssl.embed_socket fd context in
         (try Ssl.set_client_SNI_hostname ssl endpoint.host with _ -> ());
-        Ssl.connect ssl;
-        { fd; ssl = Some ssl; closed = false; nonblocking = false }
+        (match deadline with
+        | Some value -> tls_connect_until ssl fd value
+        | None -> Ssl.connect ssl);
+        { fd; ssl = Some ssl; closed = false; nonblocking }
       with error ->
         Unix.close fd;
         raise error)
   | _ -> assert false
 
-let read_line channel timeout =
+(* Legacy callers such as Live use a duration for each protocol operation.
+   HTTP uses the [_until] variants below with one operation-wide deadline. *)
+let read_line_until channel deadline =
   let buffer = Buffer.create 80 in
   let one = Bytes.create 1 in
   let rec loop () =
-    let count = read_some channel one 0 1 timeout in
+    let count = read_some_until channel one 0 1 deadline in
     if count <> 1 then raise Channel_closed;
     Buffer.add_char buffer (Bytes.get one 0);
     let length = Buffer.length buffer in
@@ -352,23 +472,29 @@ let read_line channel timeout =
   in
   loop ()
 
-let read_http_response channel =
-  let status_line = read_line channel 30.0 in
+let read_http_response_until channel deadline =
+  let status_line = read_line_until channel deadline in
   let status_code =
     try
       if
-        String.length status_line < 12
+        String.length status_line < 14
         || String.sub status_line 0 5 <> "HTTP/"
         || status_line.[8] <> ' '
       then raise Exit;
       let code = String.sub status_line 9 3 in
       if String.exists (fun char -> char < '0' || char > '9') code then
         raise Exit;
+      let separator = status_line.[12] in
+      if separator <> ' ' && separator <> '\r' then raise Exit;
+      if
+        separator = '\r'
+        && (String.length status_line <> 14 || status_line.[13] <> '\n')
+      then raise Exit;
       int_of_string code
     with _ -> raise (Http_protocol "invalid HTTP status line")
   in
   let rec headers content_length chunked =
-    let line = read_line channel 30.0 in
+    let line = read_line_until channel deadline in
     if line = "\r\n" then (content_length, chunked)
     else
       match String.index_opt line ':' with
@@ -398,12 +524,12 @@ let read_http_response channel =
   let read_body () =
     match (content_length, chunked) with
     | Some length, _ when length <= 2 * 1024 * 1024 ->
-        Bytes.to_string (read_exact channel length 30.0)
+        Bytes.to_string (read_exact_until channel length deadline)
     | Some _, _ -> raise (Http_protocol "HTTP response exceeds 2097152 bytes")
     | None, true ->
         let output = Buffer.create 256 in
         let rec chunks () =
-          let line = read_line channel 30.0 in
+          let line = read_line_until channel deadline in
           let size =
             try
               let text =
@@ -420,15 +546,15 @@ let read_http_response channel =
           if size < 0 then raise (Http_protocol "invalid HTTP chunk size")
           else if size = 0 then
             let rec trailers () =
-              if read_line channel 30.0 <> "\r\n" then trailers ()
+              if read_line_until channel deadline <> "\r\n" then trailers ()
             in
             trailers ()
           else (
             if Buffer.length output + size > 2 * 1024 * 1024 then
               raise (Http_protocol "HTTP response exceeds 2097152 bytes");
             Buffer.add_string output
-              (Bytes.to_string (read_exact channel size 30.0));
-            if read_line channel 30.0 <> "\r\n" then
+              (Bytes.to_string (read_exact_until channel size deadline));
+            if read_line_until channel deadline <> "\r\n" then
               raise (Http_protocol "invalid HTTP chunk terminator");
             chunks ())
         in
@@ -438,10 +564,15 @@ let read_http_response channel =
   in
   (status_code, read_body ())
 
-let http_call endpoint ~client_version ~auth_token operation path args =
+let read_http_response channel =
+  read_http_response_until channel (deadline_after 30.0)
+
+let http_call endpoint ~client_version ~auth_token ~timeout operation path args
+    =
   protect_error ("HTTP " ^ operation) (fun () ->
       if path = "" then raise (Failure "Convex function path is required");
-      let channel = open_channel endpoint in
+      let deadline = deadline_after timeout in
+      let channel = open_channel ~deadline endpoint in
       Fun.protect
         ~finally:(fun () -> close_channel channel)
         (fun () ->
@@ -467,8 +598,10 @@ let http_call endpoint ~client_version ~auth_token operation path args =
             ^ string_of_int (String.length body)
             ^ "\r\nConnection: close\r\n\r\n" ^ body
           in
-          write_string channel request;
-          let status_code, response_body = read_http_response channel in
+          write_string_until channel request deadline;
+          let status_code, response_body =
+            read_http_response_until channel deadline
+          in
           let successful_status = status_code >= 200 && status_code < 300 in
           match try Ok (J.from_string response_body) with _ -> Error () with
           | Error () when not successful_status ->
@@ -856,6 +989,7 @@ type live_manager = {
 type client = {
   endpoint : endpoint;
   client_version : string;
+  http_timeout : float;
   mutex : Mutex.t;
   mutable auth_token : string option;
   mutable closed : bool;
@@ -1276,36 +1410,45 @@ let live_owner (manager : live_manager) =
   in
   loop ()
 
-let create raw_url =
-  match parse_endpoint raw_url with
-  | Error error -> Error error
-  | Ok endpoint ->
-      let wake_read, wake_write = Unix.pipe () in
-      let manager : live_manager =
-        {
-          endpoint;
-          client_version = "ocaml-0.1.0";
-          auth_token = None;
-          commands = Queue.create ();
-          command_mutex = Mutex.create ();
-          wake_read;
-          wake_write;
-          closed = false;
-          next_qid = 0;
-          owner = Obj.magic 0;
-        }
-      in
-      let owner = Thread.create (fun () -> live_owner manager) () in
-      let manager = { manager with owner } in
-      Ok
-        {
-          endpoint;
-          client_version = "ocaml-0.1.0";
-          mutex = Mutex.create ();
-          auth_token = None;
-          closed = false;
-          live = manager;
-        }
+let create ?(http_timeout = 30.0) raw_url =
+  let invalid_timeout =
+    match classify_float http_timeout with
+    | FP_nan | FP_infinite -> true
+    | FP_normal | FP_subnormal | FP_zero -> http_timeout <= 0.0
+  in
+  if invalid_timeout then
+    Error (Protocol_error "HTTP timeout must be finite and positive")
+  else
+    match parse_endpoint raw_url with
+    | Error error -> Error error
+    | Ok endpoint ->
+        let wake_read, wake_write = Unix.pipe () in
+        let manager : live_manager =
+          {
+            endpoint;
+            client_version = "ocaml-0.1.0";
+            auth_token = None;
+            commands = Queue.create ();
+            command_mutex = Mutex.create ();
+            wake_read;
+            wake_write;
+            closed = false;
+            next_qid = 0;
+            owner = Obj.magic 0;
+          }
+        in
+        let owner = Thread.create (fun () -> live_owner manager) () in
+        let manager = { manager with owner } in
+        Ok
+          {
+            endpoint;
+            client_version = "ocaml-0.1.0";
+            http_timeout;
+            mutex = Mutex.create ();
+            auth_token = None;
+            closed = false;
+            live = manager;
+          }
 
 let with_client (client : client) _operation f =
   Mutex.lock client.mutex;
@@ -1328,7 +1471,7 @@ let set_auth client token =
 let call client operation path args =
   with_client client operation (fun token ->
       http_call client.endpoint ~client_version:client.client_version
-        ~auth_token:token operation path args)
+        ~auth_token:token ~timeout:client.http_timeout operation path args)
 
 let query client path args = call client "query" path args
 let mutation client path args = call client "mutation" path args

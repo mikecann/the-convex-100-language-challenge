@@ -104,7 +104,11 @@ let read_http_request channel =
   headers ();
   really_input_string channel !content_length
 
-type http_action = Respond of int * string | Close_early | Timeout
+type http_action =
+  | Respond of int * string
+  | Raw_response of string
+  | Close_early
+  | Timeout
 
 let start_http_fixture actions =
   let listener = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
@@ -139,6 +143,9 @@ let start_http_fixture actions =
                        %s"
                       status (String.length body) body;
                     flush output
+                | Raw_response response ->
+                    output_string output response;
+                    flush output
                 | Close_early -> ()
                 | Timeout -> Thread.delay 30.25);
                 close_in_noerr input;
@@ -170,6 +177,13 @@ let test_serialized_http_and_validation executable =
   let valid_after_timeout =
     {|{"status":"success","value":{"recovered":"timeout"},"logLines":[]}|}
   in
+  let valid_after_status =
+    {|{"status":"success","value":{"recovered":"status"},"logLines":[]}|}
+  in
+  let malformed_status suffix =
+    "HTTP/1.1 " ^ suffix
+    ^ " Bad\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+  in
   let port, fixture =
     start_http_fixture
       [
@@ -185,6 +199,9 @@ let test_serialized_http_and_validation executable =
         Respond (200, valid_after_close);
         Timeout;
         Respond (200, valid_after_timeout);
+        Raw_response (malformed_status "2000");
+        Raw_response (malformed_status "200X");
+        Respond (200, valid_after_status);
       ]
   in
   let process =
@@ -209,10 +226,13 @@ let test_serialized_http_and_validation executable =
       {|{"id":"query-after-close","op":"query","path":"tests:afterClose","args":{}}|};
       {|{"id":"query-timeout","op":"query","path":"tests:timeout","args":{}}|};
       {|{"id":"query-after-timeout","op":"query","path":"tests:afterTimeout","args":{}}|};
+      {|{"id":"query-status-2000","op":"query","path":"tests:status2000","args":{}}|};
+      {|{"id":"query-status-200X","op":"query","path":"tests:status200X","args":{}}|};
+      {|{"id":"query-status-recovered","op":"query","path":"tests:statusRecovered","args":{}}|};
       {|{"id":"close-1","op":"close"}|};
     ];
   close_out process.input;
-  let events = List.init 18 (fun _ -> receive process) in
+  let events = List.init 21 (fun _ -> receive process) in
   let ( malformed,
         missing_id,
         wrong_id,
@@ -230,10 +250,13 @@ let test_serialized_http_and_validation executable =
         after_close_result,
         timeout_error,
         after_timeout_result,
+        malformed_status_long,
+        malformed_status_suffix,
+        status_recovery_result,
         closed ) =
     match events with
-    | [ a; b; c; d; e; f; g; h; i; j; k; l; m; n; o; p; q; r ] ->
-        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r)
+    | [ a; b; c; d; e; f; g; h; i; j; k; l; m; n; o; p; q; r; s; t; u ] ->
+        (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u)
     | _ -> assert false
   in
   require_error "ProtocolError" "malformed adapter command" malformed;
@@ -298,6 +321,17 @@ let test_serialized_http_and_validation executable =
     = Some (`Assoc [ ("recovered", `String "timeout") ]))
     ("adapter did not recover after timeout: "
     ^ J.to_string after_timeout_result);
+  require_error ~id:"query-status-2000" "ProtocolError"
+    "invalid HTTP status line" malformed_status_long;
+  require_error ~id:"query-status-200X" "ProtocolError"
+    "invalid HTTP status line" malformed_status_suffix;
+  require_string "type" "result" status_recovery_result;
+  require_string "id" "query-status-recovered" status_recovery_result;
+  require
+    (member "value" status_recovery_result
+    = Some (`Assoc [ ("recovered", `String "status") ]))
+    ("adapter did not recover after malformed status: "
+    ^ J.to_string status_recovery_result);
   require_string "type" "closed" closed;
   require_string "id" "close-1" closed;
   close_in_noerr process.output;

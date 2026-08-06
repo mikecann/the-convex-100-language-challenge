@@ -26,7 +26,7 @@ type update = {
 type client
 type subscription
 
-val create : string -> (client, error) Stdlib.result
+val create : ?http_timeout:float -> string -> (client, error) Stdlib.result
 val set_auth : client -> string -> (unit, error) Stdlib.result
 val query : client -> string -> Yojson.Safe.t -> (result, error) Stdlib.result
 

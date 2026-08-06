@@ -2,6 +2,9 @@
  (name convex)
  (public_name convex_ocaml)
  (modules convex)
+ (foreign_stubs
+  (language c)
+  (names monotonic_stubs))
  (libraries unix threads yojson ssl))
 
 (executable
