@@ -102,6 +102,11 @@ type liveManager struct {
 	closeSignal   chan struct{}
 	closeOnce     sync.Once
 	done          chan struct{}
+	hooks         *liveManagerHooks
+}
+
+type liveManagerHooks struct {
+	reconnectScheduled func(time.Duration)
 }
 
 type liveSubscription struct {
@@ -144,6 +149,14 @@ type socketEvent struct {
 }
 
 func newLiveManager(deploymentURL, clientVersion string) (*liveManager, error) {
+	return newLiveManagerWithHooks(deploymentURL, clientVersion, nil)
+}
+
+func newLiveManagerWithHooks(
+	deploymentURL string,
+	clientVersion string,
+	hooks *liveManagerHooks,
+) (*liveManager, error) {
 	u, err := url.Parse(deploymentURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse Convex deployment URL for Live: %w", err)
@@ -165,6 +178,7 @@ func newLiveManager(deploymentURL, clientVersion string) (*liveManager, error) {
 		commands:      make(chan any),
 		closeSignal:   make(chan struct{}),
 		done:          make(chan struct{}),
+		hooks:         hooks,
 	}
 	go m.run()
 	return m, nil
@@ -245,6 +259,7 @@ func (m *liveManager) run() {
 	remoteVersion := zeroStateVersion()
 	maxObservedTimestamp := ""
 	lastDelivered := make(map[uint32]deliveredUpdate)
+	awaitingRehydration := make(map[uint32]bool)
 	connectionCount := uint32(0)
 	lastCloseReason := "InitialConnect"
 	nextBackoff := initialReconnectBackoff
@@ -265,6 +280,9 @@ func (m *liveManager) run() {
 		}
 		reconnectTimer = time.NewTimer(delay)
 		reconnect = reconnectTimer.C
+		if m.hooks != nil && m.hooks.reconnectScheduled != nil {
+			m.hooks.reconnectScheduled(delay)
+		}
 	}
 	stopReconnect := func() {
 		if reconnectTimer != nil {
@@ -361,6 +379,9 @@ func (m *liveManager) run() {
 		modifications := make([]wireQueryModification, 0, len(ids))
 		for _, numericID := range ids {
 			sub := active[uint32(numericID)]
+			if _, ok := lastDelivered[sub.queryID]; ok {
+				awaitingRehydration[sub.queryID] = true
+			}
 			modifications = append(modifications, wireQueryModification{
 				Type:    "Add",
 				QueryID: sub.queryID,
@@ -405,8 +426,9 @@ func (m *liveManager) run() {
 	}
 
 	publishProtocolError := func(err error) {
-		for _, sub := range active {
+		for id, sub := range active {
 			deliver(sub, Update{Err: err})
+			lastDelivered[id] = deliveredUpdate{success: false}
 		}
 	}
 
@@ -432,12 +454,16 @@ func (m *liveManager) run() {
 					LogLines: append([]string(nil), modification.LogLines...),
 				}
 				remoteResults[modification.QueryID] = update
-				if previous, ok := lastDelivered[modification.QueryID]; ok && previous.success &&
-					bytes.Equal(previous.value, update.Value) {
-					continue
+				if awaitingRehydration[modification.QueryID] {
+					delete(awaitingRehydration, modification.QueryID)
+					if previous, ok := lastDelivered[modification.QueryID]; ok && previous.success &&
+						bytes.Equal(previous.value, update.Value) {
+						continue
+					}
 				}
 				changed[modification.QueryID] = update
 			case "QueryFailed":
+				delete(awaitingRehydration, modification.QueryID)
 				queryError := &FunctionError{
 					Operation: "query",
 					Message:   modification.ErrorMessage,
@@ -450,6 +476,7 @@ func (m *liveManager) run() {
 			case "QueryRemoved":
 				delete(remoteResults, modification.QueryID)
 				delete(lastDelivered, modification.QueryID)
+				delete(awaitingRehydration, modification.QueryID)
 			default:
 				return &ProtocolError{Message: "unknown Transition modification " + modification.Type}
 			}
@@ -561,6 +588,8 @@ func (m *liveManager) run() {
 				}
 				delete(active, cmd.queryID)
 				delete(remoteResults, cmd.queryID)
+				delete(lastDelivered, cmd.queryID)
+				delete(awaitingRehydration, cmd.queryID)
 				close(sub.updates)
 				if conn != nil {
 					message := wireModifyQuerySet{
@@ -620,7 +649,6 @@ func (m *liveManager) run() {
 				continue
 			}
 			lastServerResponse = time.Now()
-			nextBackoff = initialReconnectBackoff
 			var envelope wireEnvelope
 			if err := json.Unmarshal(event.raw, &envelope); err != nil {
 				protocolErr := &ProtocolError{Message: "decode server message: " + err.Error()}
@@ -633,9 +661,12 @@ func (m *liveManager) run() {
 				if err := handleTransition(event.raw); err != nil {
 					publishProtocolError(err)
 					closeConnection(err.Error(), true)
+				} else {
+					nextBackoff = initialReconnectBackoff
 				}
 			case "Ping", "MutationResponse", "ActionResponse":
 				// The pilot does not send WebSocket mutations or actions.
+				nextBackoff = initialReconnectBackoff
 			case "FatalError", "AuthError":
 				var serverErr wireServerError
 				if err := json.Unmarshal(event.raw, &serverErr); err != nil {

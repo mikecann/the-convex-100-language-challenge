@@ -54,21 +54,35 @@ FROM dependencies AS test
 COPY client/*.go ./
 COPY client/tests ./tests
 COPY examples ./examples
+RUN test "$(uname -m)" = x86_64 && \
+    test "$(go env GOHOSTARCH)" = amd64 && \
+    test "$(go env GOARCH)" = amd64
 RUN test -z "$(gofmt -l .)"
 RUN go test -race ./...
 RUN go test -race -tags convexadapter ./...
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+      go build -trimpath -ldflags="-s -w -buildid=" \
+      -o /tmp/convex-go-example ./examples/basics && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+      go build -tags convexadapter -trimpath -ldflags="-s -w -buildid=" \
+      -o /tmp/convex-go-adapter ./tests/conformance && \
+    test "$(od -An -t x1 -j 18 -N 2 /tmp/convex-go-example | tr -d ' \n')" = 3e00 && \
+    test "$(od -An -t x1 -j 18 -N 2 /tmp/convex-go-adapter | tr -d ' \n')" = 3e00 && \
+    rm -f /tmp/convex-go-example /tmp/convex-go-adapter
 
 FROM test AS example-build
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath \
     -ldflags="-s -w -buildid=" \
-    -o /out/convex-go-example ./examples/basics
+    -o /out/convex-go-example ./examples/basics && \
+    test "$(od -An -t x1 -j 18 -N 2 /out/convex-go-example | tr -d ' \n')" = 3e00
 
 FROM test AS build
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -tags convexadapter -trimpath \
     -ldflags="-s -w -buildid=" \
-    -o /out/convex-go-adapter ./tests/conformance
+    -o /out/convex-go-adapter ./tests/conformance && \
+    test "$(od -An -t x1 -j 18 -N 2 /out/convex-go-adapter | tr -d ' \n')" = 3e00
 
 FROM example-build AS runtime-rootfs
 RUN mkdir -p /runtime/etc/ssl/certs /runtime/usr/local/bin && \
