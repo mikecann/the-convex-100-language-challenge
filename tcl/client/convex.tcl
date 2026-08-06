@@ -304,6 +304,17 @@ proc ::convex::retire {id reason {reconnect 1}} {
     set client [state $id]
     set socket [dict get $client socket]
     if {$reason ne "client-closed" && $reason ne "DebugDisconnect"} { puts stderr "Convex Live retired connection: $reason" }
+    # A parser failure and an unexpected peer close are subscription failures,
+    # not invisible diagnostics. Keep the subscriptions active so the same
+    # callback receives a later valid value after reconnect.
+    if {![dict get $client closed] && $reason ne "DebugDisconnect" && $reason ne "client-closed"} {
+        set name [expr {[string match {ProtocolError:*} $reason] ? "ProtocolError" : "TransportError"}]
+        set message [expr {[string match "${name}:*" $reason] ? [string range $reason [expr {[string length $name] + 2}] end] : $reason}]
+        set payload [object [list name [quote $name] message [quote $message] data null]]
+        dict for {queryId sub} [dict get $client subscriptions] {
+            catch {uplevel #0 [list {*}[dict get $sub callback] error $payload "\[\]"]}
+        }
+    }
     if {$socket ne ""} {
         catch {fileevent $socket readable {}}
         catch {fileevent $socket writable {}}
@@ -375,13 +386,13 @@ proc ::convex::ws_writable {id socket} {
 
 proc ::convex::ws_readable {id socket} {
     if {[dict get [state $id] socket] ne $socket} { return }
-    if {[catch {set bytes [read $socket]} error]} { retire $id $error; return }
+    if {[catch {set bytes [read $socket]} error]} { retire $id "TransportError: $error"; return }
     if {$bytes ne ""} { put $id wsBuffer "[dict get [state $id] wsBuffer]$bytes" }
-    if {[eof $socket]} { retire $id peer-closed; return }
+    if {[eof $socket]} { retire $id "TransportError: peer closed"; return }
     if {[catch {
         if {[dict get [state $id] wsStage] eq "handshake"} { ws_handshake $id }
         if {[dict get [state $id] wsStage] eq "open"} { ws_frames $id }
-    } error]} { retire $id $error }
+    } error]} { retire $id "ProtocolError: $error" }
 }
 
 proc ::convex::ws_handshake {id} {

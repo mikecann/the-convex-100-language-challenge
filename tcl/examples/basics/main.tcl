@@ -59,6 +59,10 @@ try {
 
     # A unique runId is the mutation's idempotency key, so retrying this logical
     # request would not double-increment the room.
+    # Arm the Live callback before the synchronous mutation returns. Otherwise
+    # a fast server can deliver the update in the tiny gap below and leave the
+    # example waiting for an event it already ignored.
+    set waiting updated
     set mutation [::convex::mutation $client demo:increment [::convex::object [list room [::convex::quote $room] language [::convex::quote tcl] runId [::convex::quote [format %x [clock microseconds]]]]]]
     set mutationValue [::convex::decode [dict get $mutation value]]
     if {![dict get $mutationValue applied]} { error "mutation was not applied" }
@@ -68,7 +72,6 @@ try {
     puts "mutation count: $mutationCount"
 
     # Wait for the changed value from Live rather than issuing another query.
-    set waiting updated
     vwait complete
     set updatedCount [whole_count $updatedRaw "updated Live value"]
     if {$updatedCount != 1} { error "updated Live count was $updatedCount, expected 1" }

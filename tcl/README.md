@@ -88,6 +88,10 @@ try {
 
     # A unique runId is the mutation's idempotency key, so retrying this logical
     # request would not double-increment the room.
+    # Arm the Live callback before the synchronous mutation returns. Otherwise
+    # a fast server can deliver the update in the tiny gap below and leave the
+    # example waiting for an event it already ignored.
+    set waiting updated
     set mutation [::convex::mutation $client demo:increment [::convex::object [list room [::convex::quote $room] language [::convex::quote tcl] runId [::convex::quote [format %x [clock microseconds]]]]]]
     set mutationValue [::convex::decode [dict get $mutation value]]
     if {![dict get $mutationValue applied]} { error "mutation was not applied" }
@@ -97,7 +101,6 @@ try {
     puts "mutation count: $mutationCount"
 
     # Wait for the changed value from Live rather than issuing another query.
-    set waiting updated
     vwait complete
     set updatedCount [whole_count $updatedRaw "updated Live value"]
     if {$updatedCount != 1} { error "updated Live count was $updatedCount, expected 1" }
@@ -146,7 +149,12 @@ protocol is not documented as stable, so hosted verification remains required.
 - Mutations and actions use HTTP. Optimistic updates, journals, mutation replay,
   and WebSocket writes are deferred.
 - Language-local tests cover parsing, framing, number boundaries, and adapter
-  protocol serialization. Adapter output retains events until Tcl reports that
-  accepted channel bytes have drained, with both event count and encoded-byte
-  budgets enforced. Shared conformance remains the gate for hosted protocol
-  behaviour, reconnects, and full Live lifecycle acceptance.
+  protocol serialization. Adapter output uses generation ownership at dequeue
+  and immediately before channel acceptance, so an unsubscribe or same-ID
+  replacement cannot let an old queued relay cross its acknowledgement.
+  Accepted bytes remain ordered and budgeted until Tcl drains them. The
+  newest-16 delivery queue reserves 64 KiB for control events and charges each
+  entry's NDJSON newline plus conservative Tcl/channel overhead. Close waits
+  up to two seconds for the terminal response to drain, then fails boundedly.
+  Shared conformance remains the gate for hosted protocol behaviour, five real
+  reconnects, and full Live lifecycle acceptance.

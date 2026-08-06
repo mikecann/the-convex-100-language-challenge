@@ -29,6 +29,6 @@ limitations:
   - Live authentication, optimistic updates, WebSocket mutations/actions, journals, and TransitionChunk assembly are deferred.
   - The educational API covers Convex's JSON-safe values. Full tagged Convex values, including Int64 and bytes, are deferred.
   - Capability badges remain empty until the root-owned local and hosted conformance gates pass.
-  - Adapter output uses a newest-16 queue with a 6 MiB byte budget and retains events until Tcl reports that accepted channel bytes have drained.
-  - Shared conformance remains required for five reconnects, QueryFailed recovery against Convex, and the final runtime policy.
+  - Adapter output uses a newest-16 queue with a 6 MiB global byte budget, including NDJSON newlines and conservative Tcl/channel overhead. It reserves 64 KiB for control events and retains accepted writes until Tcl drains them.
+  - Shared conformance remains required for five reconnects, Convex-side error recovery, stalled-reader close behaviour, and the final runtime policy.
 capabilities: []
