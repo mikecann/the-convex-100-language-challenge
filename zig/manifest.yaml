@@ -4,5 +4,28 @@ displayName: "Zig"
 rank: 37
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Zig implementation using std.http.Client, std.json, and a small in-language WebSocket frame/owner layer.
+toolchain:
+  name: Zig
+  version: 0.14.1
+intendedCapabilities:
+  - http
+  - live
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live uses the pinned JSON-safe query profile; authentication, optimistic writes, WebSocket mutations/actions, and TransitionChunk assembly are deferred.
+  - Live delivery keeps at most sixteen active queries and rejects an encoded output event above one MiB or a global eight MiB output budget.
 capabilities: []
