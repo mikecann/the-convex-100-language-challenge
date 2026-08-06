@@ -18,6 +18,7 @@
 (def ^:private max-owner-events 64)
 (def ^:private max-pending-sends 64)
 (def ^:private max-live-message-bytes (* 2 1024 1024))
+(def ^:private max-wire-u32 4294967295)
 (def ^:private initial-timestamp "AAAAAAAAAAA=")
 (def ^:private initial-backoff-ms 100)
 (def ^:private max-backoff-ms 15000)
@@ -350,12 +351,15 @@
             BigInteger/ZERO
             (range 8))))
 
+(defn- wire-u32? [value]
+  ;; Sync protocol version and query identifiers are uint32 on the wire. Keep
+  ;; JSON decimals, negatives, and values beyond the wire width out of state.
+  (and (integer? value) (<= 0 value max-wire-u32)))
+
 (defn- valid-version [value]
   (when-not (and (map? value)
-                 (contains? value "querySet") (integer? (get value "querySet"))
-                 (not (neg? (get value "querySet")))
-                 (contains? value "identity") (integer? (get value "identity"))
-                 (not (neg? (get value "identity")))
+                 (contains? value "querySet") (wire-u32? (get value "querySet"))
+                 (contains? value "identity") (wire-u32? (get value "identity"))
                  (contains? value "ts") (string? (get value "ts")))
     (throw (failure :protocol "Live state version is malformed")))
   [value (decode-timestamp (get value "ts"))])
@@ -374,7 +378,7 @@
   (let [id (get item "queryId")
         type (get item "type")
         logs (modification-logs item)]
-    (when-not (and (contains? item "queryId") (integer? id) (not (neg? id)))
+    (when-not (and (contains? item "queryId") (wire-u32? id))
       (throw (failure :protocol "Transition modification has invalid queryId")))
     (when-not (and (contains? item "type") (string? type) (seq type))
       (throw (failure :protocol "Transition modification omitted type")))

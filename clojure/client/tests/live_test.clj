@@ -31,6 +31,11 @@
     (let [update (convex/next-update subscription 12000)]
       (if (:error update) update (:value update)))))
 
+(def ^:private max-wire-u32 4294967295)
+
+(defn- wire-version [query-set identity timestamp]
+  {"querySet" query-set "identity" identity "ts" (ws/timestamp timestamp)})
+
 (deftest fixture-thread-failures-return-to-the-test-thread
   (let [fixture (ws/fixture (fn [_ _] (throw (AssertionError. "fixture failure propagated"))))
         live (convex/live-client (ws/url fixture))]
@@ -176,6 +181,59 @@
              (#'convex/decode-timestamp timestamp)
              :accepted
              (catch clojure.lang.ExceptionInfo error (:kind (ex-data error))))))))
+
+(deftest wire-u32-fields-accept-the-maximum-and-reject-out-of-range-values
+  (let [start (wire-version 0 0 0)
+        initial-state {:remote-version start
+                       :max-ts-value nil
+                       :subscriptions {}
+                       :backoff 999}
+        live (convex/map->LiveClient {:state (atom initial-state)})
+        accepted (ws/transition start
+                                (wire-version max-wire-u32 max-wire-u32 1)
+                                (ws/updated max-wire-u32 {"count" 1}))]
+    ;; The upper wire value is valid for every uint32 field and commits as one
+    ;; transaction, including a modification whose queryId is also maximal.
+    (is (= :accepted
+           (try
+             (#'convex/apply-transition! live accepted)
+             :accepted
+             (catch clojure.lang.ExceptionInfo error
+               (:kind (ex-data error))))))
+    (is (= max-wire-u32 (get-in @(:state live) [:remote-version "querySet"])))
+    (is (= max-wire-u32 (get-in @(:state live) [:remote-version "identity"])))
+    (is (= 1 (get-in @(:state live) [:max-ts-value])))
+
+    (doseq [[label end modification]
+            [["querySet above uint32" (wire-version (inc max-wire-u32) 0 1)
+              (ws/updated 0 {"count" 9})]
+             ["querySet negative" (wire-version -1 0 1)
+              (ws/updated 0 {"count" 9})]
+             ["querySet fractional" (wire-version 1.5 0 1)
+              (ws/updated 0 {"count" 9})]
+             ["identity above uint32" (wire-version 0 (inc max-wire-u32) 1)
+              (ws/updated 0 {"count" 9})]
+             ["identity negative" (wire-version 0 -1 1)
+              (ws/updated 0 {"count" 9})]
+             ["identity fractional" (wire-version 0 1.5 1)
+              (ws/updated 0 {"count" 9})]
+             ["queryId above uint32" (wire-version 0 0 1)
+              (ws/updated (inc max-wire-u32) {"count" 9})]
+             ["queryId negative" (wire-version 0 0 1)
+              (ws/updated -1 {"count" 9})]
+             ["queryId fractional" (wire-version 0 0 1)
+              (ws/updated 1.5 {"count" 9})]]]
+      (reset! (:state live) initial-state)
+      (let [result (try
+                     (#'convex/apply-transition!
+                      live (ws/transition start end modification))
+                     :accepted
+                     (catch clojure.lang.ExceptionInfo error
+                       (:kind (ex-data error))))]
+        (is (= :protocol result) label)
+        ;; Validation happens before the single state commit, so no malformed
+        ;; version or query identifier can advance the remote state.
+        (is (= initial-state @(:state live)) label)))))
 
 (deftest malformed-wire-timestamps-fail-structurally-and-live-recovers
   (let [malformed ["fixture-ts-1" "AAAAAAAAAA=="]
