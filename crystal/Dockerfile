@@ -58,7 +58,7 @@ RUN test "$(uname -m)" = x86_64
 RUN crystal build --release --static --no-debug examples/basics/main.cr -o /tmp/convex-example
 RUN crystal build --release --static --no-debug -Dexample_count_test examples/basics/count_test.cr -o /tmp/crystal-example-count-test
 RUN crystal build --release --static --no-debug client/tests/conformance/adapter.cr -o /tmp/convex-adapter
-RUN crystal build --release --static --no-debug client/tests/live_test.cr -o /tmp/crystal-live-test
+RUN crystal build --release --static --no-debug -Dlive_test client/tests/live_test.cr -o /tmp/crystal-live-test
 RUN crystal build --release --static --no-debug -Dadapter_test client/tests/adapter_test.cr -o /tmp/crystal-adapter-test
 RUN /tmp/crystal-live-test
 RUN /tmp/crystal-adapter-test

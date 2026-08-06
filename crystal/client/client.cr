@@ -242,6 +242,15 @@ module Convex
       @manager.unsubscribe(@id)
     rescue ClosedError
     end
+
+    {% if flag?(:live_test) %}
+      # The raw-peer fixture pauses the owner immediately before a Remove write
+      # so it can make that exact send fail without racing the read poll.
+      def close_with_remove_pause(entered : Channel(Nil), resume : Channel(Nil), failed : Channel(Nil))
+        @manager.unsubscribe_with_remove_pause(@id, entered, resume, failed)
+      rescue ClosedError
+      end
+    {% end %}
   end
 
   # HTTP::WebSocket#run owns its own callback loop, which made the first Crystal
@@ -484,6 +493,14 @@ module Convex
   end
 
   record StateVersion, query_set : UInt32, identity : UInt32, timestamp : String, timestamp_number : UInt64
+  record ReconnectState,
+    socket : OwnerWebSocket?,
+    query_set_version : UInt32,
+    remote_version : StateVersion,
+    connection_count : UInt32,
+    last_close_reason : String,
+    reconnect_at : Time::Span?,
+    backoff : Time::Span
 
   class LiveState
     property last_update : UpdateFingerprint?
@@ -513,7 +530,15 @@ module Convex
     getter id : Int32
     getter response : Channel(Nil | Error)
 
-    def initialize(@id, @response); end
+    {% if flag?(:live_test) %}
+      getter remove_entered : Channel(Nil)?
+      getter remove_resume : Channel(Nil)?
+      getter remove_failed : Channel(Nil)?
+
+      def initialize(@id, @response, @remove_entered = nil, @remove_resume = nil, @remove_failed = nil); end
+    {% else %}
+      def initialize(@id, @response); end
+    {% end %}
   end
 
   class DisconnectCommand < LiveCommand
@@ -560,6 +585,17 @@ module Convex
     rescue Channel::ClosedError
       raise ClosedError.new("Live manager is closed", "live")
     end
+
+    {% if flag?(:live_test) %}
+      def unsubscribe_with_remove_pause(id : Int32, entered : Channel(Nil), resume : Channel(Nil), failed : Channel(Nil))
+        response = Channel(Nil | Error).new(1)
+        @commands.send(UnsubscribeCommand.new(id, response, entered, resume, failed))
+        result = response.receive
+        raise result if result.is_a?(Error)
+      rescue Channel::ClosedError
+        raise ClosedError.new("Live manager is closed", "live")
+      end
+    {% end %}
 
     def debug_disconnect
       response = Channel(Nil | Error).new(1)
@@ -611,15 +647,14 @@ module Convex
                 query_set_version = add(socket.not_nil!, query_set_version, id, active[id])
               rescue ex
                 publish_transport(active, ex)
-                socket.try &.close
-                socket = nil
-                connection_count += 1
-                last_close_reason = ex.message || "write failed"
-                reset_remote(active)
-                remote_version = zero_version
-                query_set_version = 0_u32
-                reconnect_at = Time.monotonic + backoff
-                backoff = next_backoff(backoff)
+                reconnect = enter_reconnect(socket, active, connection_count, ex.message || "write failed", backoff)
+                socket = reconnect.socket
+                query_set_version = reconnect.query_set_version
+                remote_version = reconnect.remote_version
+                connection_count = reconnect.connection_count
+                last_close_reason = reconnect.last_close_reason
+                reconnect_at = reconnect.reconnect_at
+                backoff = reconnect.backoff
               end
             else
               reconnect_at ||= Time.monotonic
@@ -630,18 +665,27 @@ module Convex
             # close and cannot publish a dequeued old update after that ack.
             state.try &.subscription.finish
             if socket && state
+              {% if flag?(:live_test) %}
+                if entered = command.remove_entered
+                  entered.send(nil)
+                  command.remove_resume.not_nil!.receive
+                end
+              {% end %}
               begin
                 query_set_version = remove(socket.not_nil!, query_set_version, command.id)
               rescue ex
                 publish_transport(active, ex)
-                socket.try &.close
-                socket = nil
-                connection_count += 1
-                last_close_reason = ex.message || "write failed"
-                remote_version = zero_version
-                query_set_version = 0_u32
-                reconnect_at = active.empty? ? nil : Time.monotonic + backoff
-                backoff = next_backoff(backoff)
+                reconnect = enter_reconnect(socket, active, connection_count, ex.message || "write failed", backoff)
+                socket = reconnect.socket
+                query_set_version = reconnect.query_set_version
+                remote_version = reconnect.remote_version
+                connection_count = reconnect.connection_count
+                last_close_reason = reconnect.last_close_reason
+                reconnect_at = reconnect.reconnect_at
+                backoff = reconnect.backoff
+                {% if flag?(:live_test) %}
+                  command.remove_failed.try &.send(nil)
+                {% end %}
               end
             end
             reconnect_at = nil if active.empty?
@@ -650,14 +694,14 @@ module Convex
             if socket
               # The acknowledgement is sent only after the old connection has
               # been closed, all remote state retired, and a reconnect is set.
-              socket.not_nil!.close
-              socket = nil
-              connection_count += 1
-              last_close_reason = "DebugDisconnect"
-              remote_version = zero_version
-              query_set_version = 0_u32
-              active.each_value { |state| state.rehydrating = true }
-              reconnect_at = active.empty? ? nil : Time.monotonic
+              reconnect = enter_reconnect(socket, active, connection_count, "DebugDisconnect", backoff, immediate: true, advance_backoff: false)
+              socket = reconnect.socket
+              query_set_version = reconnect.query_set_version
+              remote_version = reconnect.remote_version
+              connection_count = reconnect.connection_count
+              last_close_reason = reconnect.last_close_reason
+              reconnect_at = reconnect.reconnect_at
+              backoff = reconnect.backoff
               command.response.send(nil)
             else
               command.response.send(TransportError.new("Live WebSocket is not connected", "live"))
@@ -681,12 +725,14 @@ module Convex
               remote_version = zero_version
               reconnect_at = nil
             rescue ex
-              socket.try &.close
-              socket = nil
-              last_close_reason = ex.message || "Live dial failed"
-              connection_count += 1
-              reconnect_at = Time.monotonic + backoff
-              backoff = next_backoff(backoff)
+              reconnect = enter_reconnect(socket, active, connection_count, ex.message || "Live dial failed", backoff)
+              socket = reconnect.socket
+              query_set_version = reconnect.query_set_version
+              remote_version = reconnect.remote_version
+              connection_count = reconnect.connection_count
+              last_close_reason = reconnect.last_close_reason
+              reconnect_at = reconnect.reconnect_at
+              backoff = reconnect.backoff
             end
           end
 
@@ -704,27 +750,25 @@ module Convex
               Fiber.yield
             rescue ex : Error
               publish_protocol(active, ex)
-              current.close
-              socket = nil
-              connection_count += 1
-              last_close_reason = ex.message || "Live transport failed"
-              remote_version = zero_version
-              query_set_version = 0_u32
-              active.each_value { |state| state.rehydrating = true }
-              reconnect_at = active.empty? ? nil : Time.monotonic + backoff
-              backoff = next_backoff(backoff)
+              reconnect = enter_reconnect(socket, active, connection_count, ex.message || "Live transport failed", backoff)
+              socket = reconnect.socket
+              query_set_version = reconnect.query_set_version
+              remote_version = reconnect.remote_version
+              connection_count = reconnect.connection_count
+              last_close_reason = reconnect.last_close_reason
+              reconnect_at = reconnect.reconnect_at
+              backoff = reconnect.backoff
             rescue ex
               error = TransportError.new(ex.message || "Live transport failed", "live read")
               publish_transport(active, error)
-              current.close
-              socket = nil
-              connection_count += 1
-              last_close_reason = error.message || "Live transport failed"
-              remote_version = zero_version
-              query_set_version = 0_u32
-              active.each_value { |state| state.rehydrating = true }
-              reconnect_at = active.empty? ? nil : Time.monotonic + backoff
-              backoff = next_backoff(backoff)
+              reconnect = enter_reconnect(socket, active, connection_count, error.message || "Live transport failed", backoff)
+              socket = reconnect.socket
+              query_set_version = reconnect.query_set_version
+              remote_version = reconnect.remote_version
+              connection_count = reconnect.connection_count
+              last_close_reason = reconnect.last_close_reason
+              reconnect_at = reconnect.reconnect_at
+              backoff = reconnect.backoff
             end
           else
             sleep 5.milliseconds
@@ -780,6 +824,19 @@ module Convex
     private def next_backoff(backoff : Time::Span)
       doubled = backoff * 2
       doubled > MAX_BACKOFF ? MAX_BACKOFF : doubled
+    end
+
+    # Every path that can replay the active query set comes through here. The
+    # remote versions and parser transport retire as one state transition, and
+    # every surviving query is marked before a replacement socket can replay
+    # its Add. That keeps unchanged rehydration suppression independent of
+    # which read, write, dial, or debug path initiated the reconnect.
+    private def enter_reconnect(socket : OwnerWebSocket?, active : Hash(Int32, LiveState), connection_count : UInt32, reason : String, backoff : Time::Span, immediate = false, advance_backoff = true) : ReconnectState
+      socket.try &.close
+      active.each_value { |state| state.rehydrating = true }
+      reconnect_at = active.empty? ? nil : Time.monotonic + (immediate ? 0.seconds : backoff)
+      next_delay = advance_backoff ? next_backoff(backoff) : backoff
+      ReconnectState.new(nil, 0_u32, zero_version, connection_count + 1, reason, reconnect_at, next_delay)
     end
 
     private def parse_version(value : JSON::Any) : StateVersion
@@ -855,10 +912,6 @@ module Convex
       transport = error.as?(TransportError) || TransportError.new(error.message || "Live transport failed", "live")
       active.each_value { |state| state.subscription.deliver(Update.new(nil, transport)) }
     end
-
-    private def reset_remote(active)
-      active.each_value { |state| state.rehydrating = true }
-    end
   end
 
   class Client
@@ -914,29 +967,72 @@ module Convex
       headers = HTTP::Headers{"Content-Type" => "application/json", "Accept" => "application/json", "Convex-Client" => VERSION}
       token = @mutex.synchronize { raise ClosedError.new("client is closed") if @closed; @bearer_token }
       headers["Authorization"] = "Bearer #{token}" if token && !token.empty?
-      response_body = HTTP::Client.post(@url.resolve("/api/#{operation}"), headers: headers, body: body) do |response|
-        status_code = response.status_code
-        unless status_code >= 200 && status_code <= 299
-          # A proxy or backend error must not become a successful Convex result
-          # merely because its body happens to have {"status":"success"}.
-          raise TransportError.new("HTTP request failed with status #{status_code}", operation)
+      response_body = begin
+        HTTP::Client.post(@url.resolve("/api/#{operation}"), headers: headers, body: body) do |response|
+          status_code = response.status_code
+          unless status_code >= 200 && status_code <= 299
+            # A proxy or backend error must not become a successful Convex result
+            # merely because its body happens to have {"status":"success"}.
+            raise TransportError.new("HTTP request failed with status #{status_code}", operation)
+          end
+          read_http_body(response.body_io, operation)
         end
-        read_http_body(response.body_io, operation)
+      rescue ex : Error
+        raise ex
+      rescue ex
+        # Only connection, TLS, deadline, and body-read failures cross this
+        # boundary. Application JSON is decoded below as protocol data.
+        raise TransportError.new(ex.message || "HTTP request failed", operation)
       end
-      decoded = JSON.parse(response_body)
-      case decoded["status"].as_s
+      decode_http_response(response_body, operation)
+    end
+
+    private def decode_http_response(response_body : String, operation : String) : Result
+      decoded = begin
+        JSON.parse(response_body)
+      rescue JSON::ParseException
+        raise ProtocolError.new("invalid Convex response JSON", operation)
+      end
+      envelope = begin
+        decoded.as_h
+      rescue TypeCastError
+        raise ProtocolError.new("Convex response must be an object", operation)
+      end
+      status = response_string(envelope, "status", operation)
+      logs = response_logs(envelope, operation)
+      case status
       when "success"
-        Result.new(decoded["value"], decoded["logLines"]?.try(&.as_a.map(&.as_s)) || [] of String)
+        raise ProtocolError.new("Convex success response is missing value", operation) unless envelope.has_key?("value")
+        Result.new(envelope["value"], logs)
       when "error"
-        logs = decoded["logLines"]?.try(&.as_a.map(&.as_s)) || [] of String
-        raise FunctionError.new(decoded["errorMessage"].as_s, operation, decoded["errorData"]?, logs)
+        message = response_string(envelope, "errorMessage", operation)
+        raise FunctionError.new(message, operation, envelope["errorData"]?, logs)
       else
         raise ProtocolError.new("unknown Convex response status", operation)
       end
     rescue ex : Error
       raise ex
     rescue ex
-      raise TransportError.new(ex.message || "HTTP request failed", operation)
+      # Any unanticipated JSON shape failure is still a protocol violation.
+      # It must never be flattened into a transport failure after HTTP passed.
+      raise ProtocolError.new("invalid Convex response envelope: #{ex.message}", operation)
+    end
+
+    private def response_string(envelope : Hash(String, JSON::Any), field : String, operation : String) : String
+      value = envelope[field]? || raise ProtocolError.new("Convex response is missing #{field}", operation)
+      value.as_s
+    rescue ex : ProtocolError
+      raise ex
+    rescue TypeCastError
+      raise ProtocolError.new("Convex response #{field} must be a string", operation)
+    end
+
+    private def response_logs(envelope : Hash(String, JSON::Any), operation : String) : Array(String)
+      value = envelope["logLines"]?
+      return [] of String unless value
+      value.as_a.map(&.as_s)
+    rescue TypeCastError
+      raise ProtocolError.new("Convex response logLines must be an array of strings", operation)
     end
 
     private def read_http_body(input : IO, operation : String) : String

@@ -63,6 +63,22 @@ server = HTTP::Server.new do |context|
     context.response.flush
     sleep 350.milliseconds
     context.response.print(%({"count":2},"logLines":[]}))
+  when "demo:malformed-json"
+    context.response.print(%({"status":))
+  when "demo:non-object"
+    context.response.print(%(["success"]))
+  when "demo:missing-status"
+    context.response.print(%({"value":{"count":3},"logLines":[]}))
+  when "demo:wrong-status-type"
+    context.response.print(%({"status":1,"value":{"count":4},"logLines":[]}))
+  when "demo:missing-value"
+    context.response.print(%({"status":"success","logLines":[]}))
+  when "demo:wrong-logs-type"
+    context.response.print(%({"status":"success","value":{"count":5},"logLines":"not-an-array"}))
+  when "demo:missing-error-message"
+    context.response.print(%({"status":"error","errorData":{"code":"MISSING"},"logLines":[]}))
+  when "demo:wrong-error-message-type"
+    context.response.print(%({"status":"error","errorMessage":false,"errorData":{"code":"WRONG_TYPE"},"logLines":[]}))
   else
     context.response.print({"status" => "error", "errorMessage" => "failed", "errorData" => {"code" => "BROKEN"}, "logLines" => ["server-log"]}.to_json)
   end
@@ -87,13 +103,31 @@ end
 assert(http_client.query("demo:success").value["count"].as_i == 1, "HTTP client did not recover after oversized body")
 assert(http_client.query("demo:slow").value["count"].as_i == 2, "slow chunked HTTP response failed")
 assert(http_client.query("demo:success").value["count"].as_i == 1, "HTTP client did not recover after slow response")
+
+{
+  "demo:malformed-json"           => "invalid Convex response JSON",
+  "demo:non-object"               => "Convex response must be an object",
+  "demo:missing-status"           => "Convex response is missing status",
+  "demo:wrong-status-type"        => "Convex response status must be a string",
+  "demo:missing-value"            => "Convex success response is missing value",
+  "demo:wrong-logs-type"          => "Convex response logLines must be an array of strings",
+  "demo:missing-error-message"    => "Convex response is missing errorMessage",
+  "demo:wrong-error-message-type" => "Convex response errorMessage must be a string",
+}.each do |path, expected_message|
+  begin
+    http_client.query(path)
+    raise "invalid HTTP protocol envelope was accepted: #{path}"
+  rescue ex : Convex::ProtocolError
+    assert(ex.message == expected_message, "HTTP protocol error taxonomy was not exact for #{path}: #{ex.message}")
+  end
+  assert(http_client.query("demo:success").value["count"].as_i == 1, "HTTP client did not recover after protocol error #{path}")
+end
 http_client.close
 
 input = IO::Memory.new(%({"protocolVersion":1,"id":"hello","op":"hello"}\n{"id":"result","op":"query","path":"demo:success","args":{}}\n{"id":"function","op":"query","path":"demo:failure","args":{}}\n{"id":"bad","op":"unknown"}\n{"id":"close","op":"close"}\n))
 output = IO::Memory.new
 ENV["CONVEX_URL"] = "http://127.0.0.1:#{address.port}"
 run_adapter(input, output)
-server.close
 expected = %(\
 {"protocolVersion":1,"id":"hello","type":"ready","language":"crystal","implementation":"native-crystal-#{Crystal::VERSION}","runtime":"crystal-#{Crystal::VERSION}"}
 {"id":"result","type":"result","value":{"count":1}}
@@ -102,6 +136,40 @@ expected = %(\
 {"id":"close","type":"closed"}
 )
 assert(output.to_s == expected, "adapter success/error/close envelopes were not exact:\n#{output}")
+
+# Run every successful-HTTP but invalid-protocol body through the real adapter.
+# Each malformed envelope must serialize as ProtocolError, and a valid query
+# immediately after it proves the same adapter/client remains usable.
+protocol_input = IO::Memory.new
+protocol_paths = [
+  "demo:malformed-json",
+  "demo:non-object",
+  "demo:missing-status",
+  "demo:wrong-status-type",
+  "demo:missing-value",
+  "demo:wrong-logs-type",
+  "demo:missing-error-message",
+  "demo:wrong-error-message-type",
+]
+protocol_paths.each_with_index do |path, index|
+  protocol_input.puts({"id" => "protocol-#{index}", "op" => "query", "path" => path, "args" => {} of String => String}.to_json)
+  protocol_input.puts({"id" => "recovery-#{index}", "op" => "query", "path" => "demo:success", "args" => {} of String => String}.to_json)
+end
+protocol_input.puts({"id" => "protocol-close", "op" => "close"}.to_json)
+protocol_input.rewind
+protocol_output = IO::Memory.new
+run_adapter(protocol_input, protocol_output)
+protocol_events = protocol_output.to_s.lines.map { |line| JSON.parse(line) }
+assert(protocol_events.size == protocol_paths.size * 2 + 1, "HTTP protocol adapter fixture emitted the wrong event count")
+protocol_paths.each_index do |index|
+  error = protocol_events[index * 2]
+  recovery = protocol_events[index * 2 + 1]
+  assert(error["id"].as_s == "protocol-#{index}" && error["type"].as_s == "error", "HTTP protocol adapter error lost correlation")
+  assert(error["error"]["name"].as_s == "ProtocolError" && error["error"]["operation"].as_s == "query", "HTTP protocol violation was flattened by the adapter")
+  assert(recovery["id"].as_s == "recovery-#{index}" && recovery["type"].as_s == "result" && recovery["value"]["count"].as_i == 1, "adapter did not recover after HTTP protocol violation")
+end
+assert(protocol_events.last["id"].as_s == "protocol-close" && protocol_events.last["type"].as_s == "closed", "protocol fixture close envelope was not exact")
+server.close
 
 missing_id_output = IO::Memory.new
 run_adapter(IO::Memory.new("{not-json}\n"), missing_id_output)

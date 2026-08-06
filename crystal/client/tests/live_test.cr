@@ -136,6 +136,14 @@ class SyncConnection
   def close
     @socket.close rescue nil
   end
+
+  def reset
+    # Abortive close makes the next peer write fail instead of completing a
+    # normal FIN handshake. The owner is paused immediately before Remove, so
+    # this targets the write-failure path rather than the read loop.
+    @socket.linger = 0
+    @socket.close
+  end
 end
 
 class SyncFixture
@@ -185,6 +193,19 @@ end
 def count(update : Convex::Update) : Int32
   raise update.error.not_nil! if update.error
   update.value.not_nil!["count"].as_i
+end
+
+# `Subscription#next` exposes a bounded wait as a structured transport error.
+# Keep the assertions below focused on the real contract, while turning an
+# unrelated fixture exception into a clear failure instead of relying on a
+# compiler-specific rescue narrowing rule.
+def assert_no_update(subscription : Convex::Subscription, context : String)
+  unexpected = subscription.next(100.milliseconds)
+  raise "#{context}: #{unexpected.to_json}"
+rescue ex
+  timeout = ex.as?(Convex::TransportError)
+  raise "#{context}: unexpected #{ex.class}: #{ex.message}" unless timeout
+  assert(timeout.message == "timed out waiting for Live update", "#{context}: wrong error #{timeout.message}")
 end
 
 # Numeric timestamp ordering must cross the little-endian rollover correctly.
@@ -248,6 +269,96 @@ advance.send(nil)
 assert(count(subscription.next(2.seconds)) == 2, "QueryFailed did not recover on the same subscription")
 subscription.close
 assert(remove_seen.receive, "Remove was not sent")
+client.close
+fixture.close
+
+# A failed Remove used to retire the socket without marking the surviving
+# subscription as rehydrating. Pause the owner immediately before that write,
+# reset the raw peer, and prove the survivor replays without leaking its
+# unchanged snapshot before a later external value.
+fixture = SyncFixture.new
+reset_peer = Channel(Nil).new(1)
+reset_done = Channel(Nil).new(1)
+replayed_survivor = Channel(Bool).new(1)
+unchanged_sent = Channel(Nil).new(1)
+send_external = Channel(Nil).new(1)
+remove_after_recovery = Channel(Bool).new(1)
+spawn do
+  connection = fixture.accept
+  _, first_add = read_add(connection)
+  raise "wrong first Remove-failure query" unless first_add["queryId"].as_i == 0
+  second_modify = connection.read_json
+  second_add = second_modify["modifications"].as_a.first
+  raise "missing second Remove-failure Add" unless second_add["type"].as_s == "Add" && second_add["queryId"].as_i == 1
+  connection.send_transition(0, 1, [
+    {"type" => "QueryUpdated", "queryId" => 0, "value" => {"count" => 0}, "logLines" => [] of String},
+    {"type" => "QueryUpdated", "queryId" => 1, "value" => {"count" => 10}, "logLines" => [] of String},
+  ], 0)
+
+  reset_peer.receive
+  connection.reset
+  # The owner remains blocked on the explicit test barrier while the loopback
+  # RST reaches its kernel. No read poll can consume the failure first.
+  sleep 25.milliseconds
+  reset_done.send(nil)
+
+  replacement = fixture.accept
+  connect = replacement.read_json
+  modify = replacement.read_json
+  modifications = modify["modifications"].as_a
+  replayed_survivor.send(
+    connect["connectionCount"].as_i == 1 &&
+    modifications.size == 1 &&
+    modifications.first["type"].as_s == "Add" &&
+    modifications.first["queryId"].as_i == 1
+  )
+  replacement.send_transition(0, 1, [{"type" => "QueryUpdated", "queryId" => 1, "value" => {"count" => 10}, "logLines" => [] of String}], 0)
+  unchanged_sent.send(nil)
+  send_external.receive
+  replacement.send_transition(1, 2, [{"type" => "QueryUpdated", "queryId" => 1, "value" => {"count" => 11}, "logLines" => ["external-after-remove-failure"]}])
+  remove = replacement.read_json
+  remove_after_recovery.send(remove["modifications"].as_a.first["type"].as_s == "Remove")
+  replacement.close
+rescue ex
+  STDERR.puts "fixture Remove write failure failed: #{ex.message}"
+  reset_done.send(nil) rescue nil
+  replayed_survivor.send(false) rescue nil
+  unchanged_sent.send(nil) rescue nil
+  remove_after_recovery.send(false) rescue nil
+end
+client = Convex::Client.new(fixture.url)
+removed = client.subscribe("demo:state", {"room" => JSON::Any.new("remove-write-failure-removed")})
+survivor = client.subscribe("demo:state", {"room" => JSON::Any.new("remove-write-failure-survivor")})
+assert(count(removed.next(2.seconds)) == 0, "removed query did not receive its initial value")
+assert(count(survivor.next(2.seconds)) == 10, "surviving query did not receive its initial value")
+remove_entered = Channel(Nil).new(1)
+remove_resume = Channel(Nil).new(1)
+remove_failed = Channel(Nil).new(1)
+remove_closed = Channel(Nil).new(1)
+spawn do
+  removed.close_with_remove_pause(remove_entered, remove_resume, remove_failed)
+  remove_closed.send(nil)
+end
+remove_entered.receive
+reset_peer.send(nil)
+reset_done.receive
+remove_resume.send(nil)
+select
+when remove_failed.receive
+when timeout(2.seconds)
+  raise "raw peer did not force the Remove write-failure path"
+end
+remove_closed.receive
+remove_error = survivor.next(2.seconds).error
+assert(remove_error.is_a?(Convex::TransportError), "failed Remove did not publish TransportError to survivor")
+assert(replayed_survivor.receive, "failed Remove did not reconnect and replay the surviving Add")
+unchanged_sent.receive
+assert_no_update(survivor, "unchanged Remove-failure rehydration was published")
+send_external.send(nil)
+external_after_remove = survivor.next(2.seconds)
+assert(count(external_after_remove) == 11 && external_after_remove.logs == ["external-after-remove-failure"], "survivor did not recover after failed Remove")
+survivor.close
+assert(remove_after_recovery.receive, "survivor Remove was not sent after recovery")
 client.close
 fixture.close
 
@@ -317,12 +428,7 @@ assert(count(subscription.next(2.seconds)) == 0, "initial reconnect value was no
   expected_max = attempt == 0 ? timestamp(1) : timestamp(2)
   assert(connect["maxObservedTimestamp"].as_s == expected_max, "maxObservedTimestamp was not retained numerically")
   rehydrated.receive
-  begin
-    unexpected = subscription.next(100.milliseconds)
-    raise "unchanged rehydration crossed reconnect acknowledgement: #{unexpected.to_json}"
-  rescue ex : Convex::TransportError
-    raise ex unless ex.message == "timed out waiting for Live update"
-  end
+  assert_no_update(subscription, "unchanged rehydration crossed reconnect acknowledgement")
   external_update.send(nil)
   assert(count(subscription.next(2.seconds)) == attempt + 1, "unchanged rehydration crossed reconnect acknowledgement")
 end
