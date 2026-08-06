@@ -7,7 +7,7 @@ implementation:
   status: attempting
   provenance: native
   version: 0.2.0
-  notes: Native Nim HTTP client plus a pinned native treeform/ws RFC6455 path. HTTP is implemented locally; Live remains a partial checkpoint because the hosted reconnect-plus-mutation probe did not deliver the post-reconnect value.
+  notes: Native Nim HTTP and Live client plus a pinned native treeform/ws RFC6455 path. Shared capability evidence is pending for this exact source head.
 toolchain:
   name: Nim
   version: 2.2.4
@@ -29,7 +29,7 @@ adapter:
 limitations:
   - The Docker build applies a checked-in native source patch to treeform/ws 0.6.0 for the Convex-Client header and control frames between fragmented messages.
   - Live authentication, WebSocket mutations/actions, and TransitionChunk assembly are deferred.
-  - Five hosted debugDisconnect acknowledgements complete, but reconnect replay did not reliably deliver the later mutation update.
+  - The language-local reconnect test covers five real hosted reconnects; fragmented-frame, stale-barrier, QueryFailed recovery, and stopped-reader fixtures remain for independent review.
   - The language-local deterministic adversarial fixture suite remains for independent review; root shared conformance has not run on this branch.
   - Authentication is supported for HTTP only.
 capabilities: []

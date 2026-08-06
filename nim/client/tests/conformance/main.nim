@@ -21,7 +21,7 @@ type
   RelayArgs = object
     subscriptionId: string
     generation: uint64
-    updates: ptr Channel[LiveUpdate]
+    updates: ptr LiveMailbox
 
 proc writeEncoded(encoded: string) {.gcsafe.} =
   if encoded.len > maxAdapterEventBytes:
@@ -66,23 +66,26 @@ proc emitRelay(subscriptionId: string; generation: uint64; node: JsonNode) =
 proc wakeRelay(subscription: LiveSubscription) =
   ## The adapter owns the relay lifetime.  Send its private marker directly so
   ## a blocked relay wakes even if the Live worker is already stopping.
-  let marker = LiveUpdate(isError: true, errorName: "__closed__")
-  if not subscription.updates[].trySend(marker):
-    discard subscription.updates[].tryRecv()
-    discard subscription.updates[].trySend(marker)
+  sendLiveFrame(subscription.updates,
+    makeLiveFrame(LiveUpdate(isError: true, errorName: "__closed__")))
 
 proc relayUpdates(args: RelayArgs) {.thread, gcsafe.} =
   ## The owner sends a closed marker before retiring a subscription.  The
   ## relay can therefore block efficiently without ever closing a channel
   ## underneath a parked receiver.
+  let mailbox = args.updates
+  let subscriptionId = args.subscriptionId
+  let generation = args.generation
   while true:
     try:
-      let update = args.updates[].recv()
+      var frame = recvLiveFrame(mailbox)
+      let update = liveUpdateFromFrame(frame)
+      releaseLiveFrame(frame)
       if update.isError and update.errorName == "__closed__":
         break
       var eventOut = %*{
         "type": "subscription",
-        "subscriptionId": args.subscriptionId
+        "subscriptionId": subscriptionId
       }
       if update.isError:
         var errorOut = %*{
@@ -98,7 +101,7 @@ proc relayUpdates(args: RelayArgs) {.thread, gcsafe.} =
         let logs = parseJson(update.logs)
         if logs.kind == JArray and logs.len > 0:
           eventOut["logs"] = logs
-      emitRelay(args.subscriptionId, args.generation, eventOut)
+      emitRelay(subscriptionId, generation, eventOut)
     except CatchableError:
       break
 
@@ -252,6 +255,9 @@ proc main() =
           wakeRelay(subscription.subscription)
         if not client.isNil:
           client.close()
+        ## Client.close stops the owner without answering later unsubscribe
+        ## commands.  Drop this table before the common cleanup path.
+        subscriptions.clear()
         emit(%*{"id": id, "type": "closed"})
         break
       else:

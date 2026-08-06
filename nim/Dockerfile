@@ -13,10 +13,12 @@ RUN ulimit -s 65536 && \
     nim check -d:ssl --threads:on --threadAnalysis:off --mm:orc --path:/opt/ws-0.6.0/src client/convex.nim && \
     nim c -d:ssl -d:convexadapter --threads:on --threadAnalysis:off --mm:orc --passC:-O0 --passC:-fno-var-tracking --passC:-fno-var-tracking-assignments --passL:-O0 --hints:off --warnings:on --styleCheck:hint --path:/opt/ws-0.6.0/src --out:/out-convex-adapter client/tests/conformance/main.nim && \
     nim c -d:ssl --threads:on --threadAnalysis:off --mm:orc --passC:-O0 --passC:-fno-var-tracking --passC:-fno-var-tracking-assignments --passL:-O0 --hints:off --warnings:on --styleCheck:hint --path:/opt/ws-0.6.0/src --out:/out-convex-example examples/basics/main.nim && \
-    test -x /out-convex-adapter && test -x /out-convex-example
+    nim c -d:ssl -d:convexadapter --threads:on --threadAnalysis:off --mm:orc --passC:-O0 --passC:-fno-var-tracking --passC:-fno-var-tracking-assignments --passL:-O0 --hints:off --warnings:on --styleCheck:hint --path:/opt/ws-0.6.0/src --out:/out-reconnect-test client/tests/conformance/reconnect_test.nim && \
+    nim c --threads:on --threadAnalysis:off --mm:orc --passC:-O0 --passC:-fno-var-tracking --passC:-fno-var-tracking-assignments --passL:-O0 --hints:off --warnings:on --styleCheck:hint --out:/out-client-test client/tests/client_test.nim && \
+    test -x /out-convex-adapter && test -x /out-convex-example && test -x /out-reconnect-test && test -x /out-client-test
 
 FROM build AS test
-RUN nim check --hints:off --warnings:on --styleCheck:hint client/tests/client_test.nim && \
+  RUN /out-client-test && \
     printf '%s\n' '{"id":"hello","op":"hello","protocolVersion":1}' '{"id":"close","op":"close"}' | /out-convex-adapter | grep -F '"type":"ready"' >/dev/null
 
 FROM --platform=linux/amd64 debian:12.11-slim@sha256:b1a741487078b369e78119849663d7f1a5341ef2768798f7b7406c4240f86aef AS runtime-base
