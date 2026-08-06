@@ -379,9 +379,9 @@ precompile(Adapter.run_adapter, (Base.PipeEndpoint, Base.PipeEndpoint))
 # the owner has reported the transport error. Retain both id shapes used by
 # command and subscription failures so the stripped runtime can report that
 # error instead of terminating with a MissingCodeError.
-precompile(Adapter.failure, (Adapter.OutputPump, String, ConvexError))
-precompile(Adapter.failure, (Adapter.OutputPump, Nothing, ConvexError))
-precompile(Adapter.serialise_error, (ConvexError,))
+precompile(Adapter.failure, (Adapter.OutputPump, String, Client.ConvexError))
+precompile(Adapter.failure, (Adapter.OutputPump, Nothing, Client.ConvexError))
+precompile(Adapter.serialise_error, (Client.ConvexError,))
 precompile(Base._depwarn, (Any, Any, Bool))
 
 function fixture_transition(
