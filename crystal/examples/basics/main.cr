@@ -1,21 +1,3 @@
-# Convex from Crystal
-
-This educational, unofficial demonstration uses Crystal to query and mutate a Convex room over HTTP, then follow the same room through Convex Live. It is not a production SDK.
-
-## Start here
-
-Read the [canonical basic example](examples/basics/main.cr). It performs an HTTP query, starts Live before the mutation, applies an idempotent increment, and checks the resulting `0 -> 1` update.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| Native HTTP query, mutation, action | Verified by shared local and hosted conformance at this exact head |
-| Native Live query and reconnect | Verified by shared local and hosted conformance at this exact head |
-| Authentication | HTTP bearer token; Live auth deferred |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.cr -->
-```text
 require "json"
 require "../../client/client"
 
@@ -80,24 +62,3 @@ end
     client.close
   end
 {% end %}
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-```sh
-./run test crystal
-./run verify-example crystal
-./run verify crystal
-./run verify-hosted crystal
-```
-
-The first command formats, compiles, and runs deterministic HTTP/Live, reconnect, frame, relay, and envelope fixtures inside Docker. The remaining commands execute the exact minimal example and adapter against the approved deployments.
-
-## Protocol notes
-
-The adapter speaks NDJSON protocol v1 over stdin/stdout or `ADAPTER_LISTEN`. One Crystal owner fiber creates, reads, writes, retires, reconnects, and replays the Live socket. Every reconnect entry retires the transport, resets remote versions, and marks surviving queries for unchanged rehydration suppression before Add replay. Its incremental frame parser preserves raw TCP and OpenSSL-buffered bytes across short idle polls, while a five-second absolute frame deadline abandons a genuinely stalled partial frame and lets close commands stay responsive. HTTP rejects non-2xx status before decoding Convex JSON, retains at most 2 MiB while streaming response chunks, and reports malformed successful-response envelopes as protocol failures rather than transport failures. Subscription delivery is bounded by 16 events and 3 MiB each, with a 128-event and 16 MiB aggregate owner budget that includes structured errors, logs, and conservative envelope overhead. The adapter writes directly under one mutex instead of filling another mailbox. It validates every command before narrowing JSON values, caps the adapter at 16 active subscriptions, and allows one 3 MiB line per relay plus one controller response, a conservative 17-event/51 MiB output ceiling. The final probe runs a stopped-reader case in a separate process and cgroup, with both process RSS and cgroup memory required to stay below a 96 MiB safety gate inside the shared 128 MiB limit.
-
-## Limitations
-
-TransitionChunk assembly, Live authentication, WebSocket mutations, optimistic updates, and the complete Convex value surface remain deferred. Shared local and hosted conformance passed 31/31 from clean exact-head builds, and the manifest capability list records the evaluator award of http and live.
