@@ -932,9 +932,17 @@ convex_call: procedure(op, path, args_json) fixed;
         return 0;
     end;
 
-    call xsprintf(path_line, 'POST %s/api/%s HTTP/1.1', g_convex_prefix, op);
+    /* Built with || rather than xsprintf's %s: passing a non-empty
+       fixed length CHARACTER(n) value (g_convex_prefix, g_auth_token)
+       as an xsprintf %s argument crashes the runtime -- confirmed by
+       an isolated reproduction, unrelated to and much more severe
+       than the null-scan truncation risk noted elsewhere in this
+       file. Concatenation of the very same fixed buffers is exercised
+       constantly (every request concatenates g_convex_host this way)
+       and never misbehaves, so it is the safe construction here. */
+    path_line = 'POST ' || g_convex_prefix || '/api/' || op || ' HTTP/1.1';
     if length(g_auth_token) > 0 then
-        call xsprintf(auth_header, 'Authorization: Bearer %s', g_auth_token);
+        auth_header = 'Authorization: Bearer ' || g_auth_token;
     else auth_header = '';
 
     req = path_line || CRLF ||
@@ -1277,7 +1285,9 @@ ws_connect: procedure fixed;
     keystr = build_descriptor(EVP_EncodeBlock(addr(keyb64(0)),
         addr(keybytes(0)), 16), addr(keyb64(0)));
 
-    call xsprintf(hdrline, 'GET %s/api/sync HTTP/1.1', g_convex_prefix);
+    /* || rather than xsprintf's %s -- see the comment in convex_call
+       on why a non-empty fixed length g_convex_prefix crashes there. */
+    hdrline = 'GET ' || g_convex_prefix || '/api/sync HTTP/1.1';
     req = hdrline || CRLF ||
         'Host: ' || g_convex_host || CRLF ||
         'Upgrade: websocket' || CRLF ||
