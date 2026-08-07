@@ -47,6 +47,7 @@ extern poll
 
 section .text
 
+global dbg_str
 global convex_live_init
 global convex_live_close
 global convex_live_subscribe
