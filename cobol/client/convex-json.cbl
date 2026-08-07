@@ -73,12 +73,14 @@ COPY "cvx-limits.cpy".
          15 WS-N-IS-INT     BINARY-LONG.
 
 COPY "cvx-scratch.cpy".
-*> The one document slot's 2 MiB source text. cvx-json-parse below
-*> still copies its caller's buffer in here rather than aliasing it
-*> directly, so this redefinition is what actually saves the memory:
-*> whichever program last redefined CVX-SHARED-SCRATCH for its own
-*> 2 MiB scratch (the adapter's WS-ESC group) and this program's own
-*> copy of a parsed document occupy the very same physical page.
+*> The one document slot's 2 MiB source text lands in the leading
+*> slice of the same shared external region the adapter's WS-EVT
+*> redefines (cvx-scratch.cpy), rather than in a second 2 MiB private
+*> copy. cvx-json-parse below still copies its caller's buffer in here
+*> rather than aliasing it directly -- every caller's own source buffer
+*> (WS-RESP, WS-INBUF, WS-LINE) is a private, non-external region, so
+*> this is always a genuine cross-buffer copy, never the same address
+*> read from and written to at once.
 01 WS-DOC-SRC REDEFINES CVX-SHARED-SCRATCH PIC X(2097152).
 
 *> Parser working state.

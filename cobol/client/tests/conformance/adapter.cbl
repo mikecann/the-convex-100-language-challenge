@@ -48,24 +48,28 @@ COPY "cvx-client.cpy".
 01 WS-DISCARDING            BINARY-LONG VALUE 0.
 
 *> ---- emitted event ------------------------------------------------
-01 WS-EVT                   PIC X(2162688).
-01 WS-EVT-LEN               BINARY-LONG.
-*> WS-ESC, WS-SPAN, and WS-LINE below are three names for the very
-*> same 2 MiB: EXTRACT-COMMAND-FIELDS is the only reader of WS-SPAN and
-*> always finishes there before DO-HELLO, DO-CALL, DO-CLOSE, or any of
-*> the EMIT-* paragraphs -- the only writers of WS-ESC -- next run; and
-*> WS-LINE (the raw command line) is fully consumed by cvx-json-parse,
-*> as PROCESS-LINE's very first step, before either of the other two
-*> is next written. Redefining CVX-SHARED-SCRATCH (cvx-scratch.cpy)
-*> instead of giving each its own private 2 MiB -- and instead of even
-*> giving this program its own copy of that shared 2 MiB -- is what
-*> lets convex-json.cbl's one document slot occupy the same physical
-*> memory as this adapter's command/escape scratch, rather than the
-*> two of them adding up.
+*> WS-EVT redefines the shared external scratch (cvx-scratch.cpy)
+*> instead of owning its own 2 MiB, so convex-json.cbl's one document
+*> slot -- which also redefines it -- occupies the same physical
+*> memory as this adapter's event buffer rather than adding to it. This
+*> is safe specifically because WS-EVT is never the *source* of a
+*> cvx-json-parse call: it is built from already-decoded pieces
+*> (WS-CMD-ID via WS-ESC, CVX-R-VALUE, CVX-R-LOGS) and only ever
+*> written out afterward. See cvx-scratch.cpy's warning before
+*> redefining it with anything that also feeds a parse.
 COPY "cvx-scratch.cpy".
-01 WS-ESC REDEFINES CVX-SHARED-SCRATCH PIC X(2097152).
-01 WS-SPAN REDEFINES CVX-SHARED-SCRATCH PIC X(2097152).
-01 WS-LINE REDEFINES CVX-SHARED-SCRATCH PIC X(2097152).
+01 WS-EVT REDEFINES CVX-SHARED-SCRATCH PIC X(2162688).
+01 WS-EVT-LEN               BINARY-LONG.
+*> WS-ESC, WS-SPAN, and WS-LINE below are three more names for one
+*> more shared 2 MiB, private to this program: EXTRACT-COMMAND-FIELDS
+*> is the only reader of WS-SPAN and always finishes there before
+*> DO-HELLO, DO-CALL, DO-CLOSE, or any of the EMIT-* paragraphs -- the
+*> only writers of WS-ESC -- next run; and WS-LINE (the raw command
+*> line) is fully consumed by cvx-json-parse, as PROCESS-LINE's very
+*> first step, before either of the other two is next written.
+01 WS-ESC                   PIC X(2097152).
+01 WS-SPAN REDEFINES WS-ESC PIC X(2097152).
+01 WS-LINE REDEFINES WS-ESC PIC X(2097152).
 01 WS-ESC-LEN               BINARY-LONG.
 
 *> ---- adapter state ------------------------------------------------
