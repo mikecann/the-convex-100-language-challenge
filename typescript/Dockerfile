@@ -18,12 +18,17 @@ COPY client/package.json client/package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && rm -f node_modules/.package-lock.json
 FROM test AS compile
 RUN cd client && npm run build
+# The base node image is Debian underneath and its rootfs carries perl-base
+# (Priority: important, pulled in independently of anything this Dockerfile
+# does) even though nothing here ever invokes perl -- `apt-get remove
+# --simulate perl-base` inside this exact image reports zero reverse
+# dependencies. Strip it alongside apt/dpkg rather than leaving it unclaimed.
 FROM ${NODE_IMAGE} AS runtime-base
-RUN rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /usr/local/bin/yarn /usr/local/bin/yarnpkg /usr/bin/apt /usr/bin/apt-* /usr/bin/dpkg /usr/bin/dpkg-* /usr/bin/debconf* /usr/bin/update-alternatives /usr/sbin/dpkg-* /usr/sbin/invoke-rc.d /usr/sbin/update-rc.d && rm -rf /opt/yarn-v1.22.22 /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /etc/apt /var/lib/apt /var/cache/apt /var/lib/dpkg /var/cache/debconf /usr/lib/apt /usr/lib/dpkg /usr/share/dpkg
+RUN rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack /usr/local/bin/yarn /usr/local/bin/yarnpkg /usr/bin/apt /usr/bin/apt-* /usr/bin/dpkg /usr/bin/dpkg-* /usr/bin/debconf* /usr/bin/update-alternatives /usr/sbin/dpkg-* /usr/sbin/invoke-rc.d /usr/sbin/update-rc.d /usr/bin/perl /usr/bin/perl5.36.0 && rm -rf /opt/yarn-v1.22.22 /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /etc/apt /var/lib/apt /var/cache/apt /var/lib/dpkg /var/cache/debconf /usr/lib/apt /usr/lib/dpkg /usr/share/dpkg /usr/lib/x86_64-linux-gnu/perl-base
 WORKDIR /opt/convex
 COPY --from=production-dependencies /opt/convex/client/node_modules ./client/node_modules
 COPY --from=compile /opt/convex/client/dist/client/convex.js ./client/convex.js
-RUN test "$(node -p 'process.arch')" = x64 && test ! -e /opt/yarn-v1.22.22 && test ! -e /opt/convex/client/node_modules/.package-lock.json && test ! -e /opt/convex/client/dist && test ! -e /opt/convex/examples && test ! -e /opt/convex/client/tests && for command_name in apt apt-get dpkg npm npx corepack yarn yarnpkg; do ! command -v "$command_name"; done
+RUN test "$(node -p 'process.arch')" = x64 && test ! -e /opt/yarn-v1.22.22 && test ! -e /opt/convex/client/node_modules/.package-lock.json && test ! -e /opt/convex/client/dist && test ! -e /opt/convex/examples && test ! -e /opt/convex/client/tests && for command_name in apt apt-get dpkg npm npx corepack yarn yarnpkg perl; do ! command -v "$command_name" >/dev/null 2>&1 || exit 1; done
 USER 65532:65532
 FROM runtime-base AS example-runtime
 COPY --from=compile /opt/convex/client/dist/examples/basics/main.js /opt/convex/examples/basics/main.js
