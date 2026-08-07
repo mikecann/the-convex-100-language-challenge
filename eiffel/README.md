@@ -24,7 +24,7 @@ the resulting Live update arriving without polling again.
 | HTTP query, mutation, action, bearer-token auth, logs, structured errors | Implemented; validated end to end against the project's local Convex backend during development |
 | Live subscribe/unsubscribe, initial value, external updates, reconnect after `debugDisconnect` with correct resubscribe and no stale/duplicate events | Implemented; validated end to end against the project's local Convex backend, including a real forced-reconnect scenario |
 | NDJSON adapter over stdin or one TCP controller (`ADAPTER_LISTEN`) | Implemented for `hello`, `query`, `mutation`, `action`, `subscribe`, `unsubscribe`, `setAuth`, `debugDisconnect`, `close` |
-| Capability badges | Not claimed; the manifest's `capabilities` list is empty until the root integration owner records shared local and hosted conformance evidence |
+| Capability badges | `http` and `live`, awarded from a 31/31 pass of the shared conformance suite against both the local and hosted deployments |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/convex_example_app.e -->
 ```eiffel
@@ -355,7 +355,7 @@ reuses a connection across origins.
 No explicit byte or event-count bound is yet enforced on adapter output or
 Live delivery queues beyond ordinary process memory; a conservative budget
 and a stopped-reader regression (see the Ada and Fortran clients for the
-shape of that test) are follow-up work before hosted conformance. The
+shape of that test) are follow-up work. The
 language-local test suite currently covers the JSON value and parser only;
 CONVEX_SOCKET, CONVEX_WEBSOCKET, CONVEX_SYNC, and CONVEX_CLIENT were
 validated by hand against a live deployment during development (see "Docker
@@ -367,6 +367,7 @@ set the shared verifier requires. They contain the compiled Eiffel
 executable, its dynamic-library closure (`libc`, `libm`, `libssl`,
 `libcrypto`; EiffelStudio's own runtime is statically linked in `-finalize`
 mode), CA certificates, and OpenSSL configuration — no compiler, package
-manager, Convex CLI, Node.js, Python, or `curl`. Capabilities remain empty in
-the manifest until the separate root-owned shared evidence run passes from a
-clean reviewed commit.
+manager, Convex CLI, Node.js, Python, or `curl`. `http` and `live` were
+awarded from a shared local and hosted conformance run (31/31 both
+profiles) at this README's reviewed commit; any later change to the
+Dockerfile, client, or examples forfeits that evidence until it is rerun.

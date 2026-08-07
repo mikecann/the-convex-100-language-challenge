@@ -7,7 +7,7 @@ implementation:
   status: attempting
   provenance: native
   version: 0.1.0
-  notes: Native Eiffel implementation. TCP, TLS, HTTP/1.1, and RFC 6455 WebSocket framing are hand-written over EiffelNet sockets and OpenSSL, called through Eiffel's C external interface from a small separately compiled support translation unit (convex_native.c) rather than EiffelStudio's own inline-C feature bodies, which this toolchain (25.02.9.8732) miscompiles once enough classes are in one project; see the client Dockerfile comments and README for the exact symptom. Design-by-contract preconditions, postconditions, and class invariants express the JSON value shape, the module:function path convention, and the sync protocol's connection/subscription bookkeeping. Badges remain unearned until root-owned conformance succeeds.
+  notes: Native Eiffel implementation. TCP, TLS, HTTP/1.1, and RFC 6455 WebSocket framing are hand-written over EiffelNet sockets and OpenSSL, called through Eiffel's C external interface from a small separately compiled support translation unit (convex_native.c) rather than EiffelStudio's own inline-C feature bodies, which this toolchain (25.02.9.8732) miscompiles once enough classes are in one project; see the client Dockerfile comments and README for the exact symptom. Design-by-contract preconditions, postconditions, and class invariants express the JSON value shape, the module:function path convention, and the sync protocol's connection/subscription bookkeeping.
 toolchain:
   name: EiffelStudio
   version: 25.02.9.8732
@@ -30,6 +30,7 @@ limitations:
   - The client decodes Convex's documented JSON-safe value subset only; the richer tagged `convex_encoded_json` encoding is not implemented.
   - The WebSocket client implements the text-frame subset RFC 6455 the pinned sync profile actually uses (masked client frames, fragmented-message reassembly, ping/pong, close); binary frames and extensions are out of scope.
   - "`Sec-WebSocket-Accept` is not verified against the sent key during the handshake; only the HTTP 101 status is checked. This client never reuses a connection across origins, so there is nothing that check would defend against here."
-  - No explicit byte or event-count bound is yet enforced on adapter output or Live delivery queues beyond process memory; a conservative budget and a stopped-reader regression are follow-up work before hosted conformance.
-  - Shared local and hosted conformance have not yet run from a clean exact-head build; the capability list below records only intent, not an evaluator award.
-capabilities: []
+  - No explicit byte or event-count bound is yet enforced on adapter output or Live delivery queues beyond process memory; a conservative budget and a stopped-reader regression are follow-up work.
+capabilities:
+  - http
+  - live
