@@ -14,6 +14,7 @@ RUN apt-get update \
        busybox-static=1:1.35.0-4+deb12u1+b1 \
        file=1:5.44-3 \
        netcat-traditional=1.10-47 \
+       iproute2=6.1.0-3 \
     && rm -rf /var/lib/apt/lists/*
 COPY client ./client
 COPY examples ./examples

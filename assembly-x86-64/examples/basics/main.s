@@ -41,8 +41,17 @@ global main
 die:
     push rbp
     mov rbp, rsp
-    sub rsp, 16
+    sub rsp, 32
+    ; write's argument order (fd, buf, count) differs from ours (buf,
+    ; count), so the incoming rdi/rsi must be saved before rdi is
+    ; overwritten with the fd -- an earlier draft clobbered rdi with the fd
+    ; number first and called write with whatever rsi/rdx happened to
+    ; already hold, silently printing nothing.
+    mov [rbp-8], rdi
+    mov [rbp-16], rsi
     mov edi, 2
+    mov rsi, [rbp-8]
+    mov rdx, [rbp-16]
     call write
     mov edi, 2
     lea rsi, [nl]
