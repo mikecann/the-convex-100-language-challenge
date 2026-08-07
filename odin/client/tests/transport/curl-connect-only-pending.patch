@@ -1,0 +1,29 @@
+--- a/lib/ws.c
++++ b/lib/ws.c
+@@ -1868,15 +1868,21 @@
+ 
+ const struct curl_ws_frame *curl_ws_meta(CURL *curl)
+ {
+-  /* we only return something for websocket, called from within the callback
+-     when not using raw mode */
++  /* Upstream exposes metadata only from a write callback. CONNECT_ONLY users
++     also need to distinguish a truly idle socket from a frame whose prefix is
++     already held by libcurl's private decoder after curl_ws_recv() returned
++     CURLE_AGAIN. The frame contents remain private; a non-NULL result here is
++     only a pending-input signal until curl_ws_recv() succeeds. */
+   struct Curl_easy *data = curl;
+-  if(GOOD_EASY_HANDLE(data) && Curl_is_in_callback(data) &&
+-     data->conn && !data->set.ws_raw_mode) {
++  if(GOOD_EASY_HANDLE(data) && data->conn && !data->set.ws_raw_mode) {
+     struct websocket *ws;
+     ws = Curl_conn_meta_get(data->conn, CURL_META_PROTO_WS_CONN);
+-    if(ws)
++    if(ws &&
++       (Curl_is_in_callback(data) ||
++        (data->set.connect_only &&
++         (ws->dec.state != WS_DEC_INIT ||
++          !Curl_bufq_is_empty(&ws->recvbuf)))))
+       return &ws->recvframe;
+   }
+   return NULL;
+ }
