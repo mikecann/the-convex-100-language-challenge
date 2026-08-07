@@ -286,6 +286,46 @@ handle_set_auth: procedure(id, cmd);
     call emit_simple(id, 'ack');
 end handle_set_auth;
 
+/* True when s is exactly one well-formed JSON object: it starts with
+   '{', its braces (and any nested brackets) balance back to zero,
+   and only whitespace follows the matching close. json_skip_value
+   cannot tell this apart from a truncated object like "{malformed"
+   on its own -- it also stops at end of input, having simply run out
+   of bytes to look at rather than having found a real closing brace,
+   so an adapter command line needs this stricter check instead. */
+line_is_json_object: procedure(s) fixed;
+    declare s character, n fixed, i fixed, c fixed, depth fixed, done fixed, ok fixed;
+    n = length(s);
+    if n = 0 then return 0;
+    if byte(s, 0) ~= 123 then return 0;
+    depth = 0;
+    i = 0;
+    done = 0;
+    ok = 0;
+    do while i < n & done = 0;
+        c = byte(s, i);
+        if c = 34 then i = json_skip_string(s, i);
+        else do;
+            if c = 123 | c = 91 then depth = depth + 1;
+            else if c = 125 | c = 93 then do;
+                depth = depth - 1;
+                if depth = 0 then do;
+                    ok = 1;
+                    done = 1;
+                end;
+            end;
+            i = i + 1;
+        end;
+    end;
+    if ok = 0 then return 0;
+    do while i < n;
+        c = byte(s, i);
+        if c ~= 32 & c ~= 9 & c ~= 13 & c ~= 10 then return 0;
+        i = i + 1;
+    end;
+    return 1;
+end line_is_json_object;
+
 dispatch: procedure(cmd) fixed;
     declare cmd character, found fixed, id character, op character;
     declare version fixed;
@@ -359,7 +399,7 @@ do while running = 1;
     line = adapter_read_line;
     if length(line) = 0 then running = 0;
     else do;
-        if byte(line, 0) ~= 123 then
+        if line_is_json_object(line) = 0 then
             call emit_error('', 'ProtocolError', 'malformed adapter command', '');
         else running = dispatch(line);
     end;
