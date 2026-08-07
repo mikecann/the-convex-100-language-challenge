@@ -178,7 +178,7 @@ feature {NONE} -- Command dispatch
 		local
 			path: detachable STRING
 			args: detachable CONVEX_JSON_VALUE
-			result: detachable CONVEX_RESULT
+			call_result: detachable CONVEX_RESULT
 		do
 			path := string_field (a_command, "path")
 			if a_command.has_field ("args") and then a_command.field ("args").is_object then
@@ -188,18 +188,18 @@ feature {NONE} -- Command dispatch
 				send_protocol_error (a_id, "invalid call request")
 			else
 				if a_op.is_equal ("query") then
-					result := client.query (path, args)
+					call_result := client.query (path, args)
 				elseif a_op.is_equal ("mutation") then
-					result := client.mutation (path, args)
+					call_result := client.mutation (path, args)
 				else
-					result := client.action (path, args)
+					call_result := client.action (path, args)
 				end
-				if result = Void then
+				if call_result = Void then
 					send_transport_error (a_id, debug_string (client.last_error))
-				elseif result.is_success then
-					send_result (a_id, result.value, result.logs)
+				elseif call_result.is_success then
+					send_result (a_id, call_result.value, call_result.logs)
 				else
-					send_call_error (a_id, result.error_message, result.error_data)
+					send_call_error (a_id, call_result.error_message, call_result.error_data)
 				end
 			end
 		end
