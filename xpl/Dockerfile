@@ -72,19 +72,21 @@ RUN set -eu; \
         -o /out-example /tmp/example.c /src/xpl-compiler/libxpl.a \
         -lssl -lcrypto -I/src/xpl-compiler
 
-RUN set -eu; \
-    test "$(uname -m)" = x86_64; \
-    actual=$(/out-adapter <<'COMMANDS'
+RUN <<'EOF'
+set -eu
+test "$(uname -m)" = x86_64
+actual=$(/out-adapter <<'COMMANDS'
 {malformed
 {"id":"hello","protocolVersion":1,"op":"hello"}
 {"id":"unknown","op":"notAnOperation"}
 {"id":"close","op":"close"}
 COMMANDS
-); \
-    printf '%s\n' "$actual" | grep -Fx '{"type":"error","error":{"name":"ProtocolError","message":"malformed adapter command"}}'; \
-    printf '%s\n' "$actual" | grep -F '"id":"hello","type":"ready","language":"xpl"'; \
-    printf '%s\n' "$actual" | grep -Fx '{"type":"error","id":"unknown","error":{"name":"ProtocolError","message":"unknown adapter operation"}}'; \
-    printf '%s\n' "$actual" | grep -Fx '{"id":"close","type":"closed"}'
+)
+printf '%s\n' "$actual" | grep -Fx '{"type":"error","error":{"name":"ProtocolError","message":"malformed adapter command"}}'
+printf '%s\n' "$actual" | grep -F '"id":"hello","type":"ready","language":"xpl"'
+printf '%s\n' "$actual" | grep -Fx '{"type":"error","id":"unknown","error":{"name":"ProtocolError","message":"unknown adapter operation"}}'
+printf '%s\n' "$actual" | grep -Fx '{"id":"close","type":"closed"}'
+EOF
 
 # The TCP mode the shared harness drives: ADAPTER_LISTEN binds and accepts
 # exactly one controller connection instead of using stdin/stdout.
