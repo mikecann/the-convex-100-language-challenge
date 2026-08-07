@@ -176,7 +176,11 @@ procedure op_hello(cmd, id, hasId)
       emit_protocol_error(id, hasId, "unsupported protocolVersion")
       return
    }
-   emit(table_of(["protocolVersion", 1, "id", id, "type", "ready", "language", "unicon",
+   # "language" must be the roster's canonical id (manifest.yaml's "icon",
+   # matched against CLIENT_LANGUAGE by the pilot harness), not "unicon" --
+   # the specific dialect/toolchain this client happens to be implemented
+   # in, which "implementation" and "runtime" already say on their own.
+   emit(table_of(["protocolVersion", 1, "id", id, "type", "ready", "language", "icon",
       "implementation", "native-unicon-0.1.0", "runtime", "unicon-" || &version]))
    return
 end

@@ -103,7 +103,7 @@ RUN set -eu; \
     # legitimately differ from one run to the next. JSON semantics never
     # promised an order to begin with; only the field values matter here.
     grep -Fq '"type":"ready"' /tmp/adapter.ndjson; \
-    grep -Fq '"language":"unicon"' /tmp/adapter.ndjson; \
+    grep -Fq '"language":"icon"' /tmp/adapter.ndjson; \
     grep -Fq '"implementation":"native-unicon-0.1.0"' /tmp/adapter.ndjson; \
     grep -Fq '"id":"close"' /tmp/adapter.ndjson; \
     grep -Fq '"type":"closed"' /tmp/adapter.ndjson; \
