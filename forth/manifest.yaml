@@ -60,4 +60,6 @@ limitations:
   - The exact gforth patch version is asserted to be in the 0.7 series at build
     time and recorded into the image; it must be pinned exactly once a build
     has reported it.
-capabilities: []
+capabilities:
+  - http
+  - live
