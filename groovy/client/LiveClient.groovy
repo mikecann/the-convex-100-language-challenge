@@ -489,12 +489,22 @@ final class LiveClient implements AutoCloseable {
         List<String> logs = requireLogs(modification)
         planned[queryId] = new Update(modification.value, null, logs)
       } else if (modificationType == 'QueryFailed') {
+        // A deployment stamps a QueryFailed modification with the same
+        // opaque journal token it stamps QueryUpdated with; require and
+        // validate it identically instead of rejecting the failure shape.
         requireShape(
           modification,
           ['type', 'queryId', 'errorMessage'] as Set,
-          ['errorData', 'logLines'] as Set,
+          ['errorData', 'journal', 'logLines'] as Set,
           'QueryFailed',
         )
+        if (modification.containsKey('journal') &&
+          modification.journal != null &&
+          !(modification.journal instanceof String)) {
+          throw new ConvexClient.ProtocolException(
+            'QueryFailed journal must be a string or null',
+          )
+        }
         String errorMessage = requireString(modification, 'errorMessage')
         List<String> logs = requireLogs(modification)
         planned[queryId] = new Update(

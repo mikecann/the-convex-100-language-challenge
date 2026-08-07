@@ -141,6 +141,11 @@ final class LiveClientTests {
             queryId: queryId,
             errorMessage: 'temporary',
             errorData: [code: 'TEMPORARY'],
+            // A deployment stamps every modification, QueryFailed included,
+            // with an opaque journal token. Send one here so this fixture
+            // proves the client accepts the real server shape rather than
+            // the narrower one it used to assume.
+            journal: 'journal-temporary',
             logLines: ['failed'],
           ]],
         ))
