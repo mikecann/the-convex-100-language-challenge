@@ -202,13 +202,41 @@ RUN --mount=type=bind,from=test,source=/bin/busybox,target=/busybox,readonly \
     done; \
     "$pruner" rm -rf /etc/.pwd.lock; \
     "$pruner" mkdir -p \
-      /bin /etc/ssl/certs /lib/x86_64-linux-gnu /lib64 /usr/bin /usr/local/bin; \
+      /bin /etc/ssl/certs /lib/x86_64-linux-gnu /lib64 /usr/bin \
+      /usr/lib/x86_64-linux-gnu /usr/local/bin; \
     exec "$pruner" rm -rf /tmp
+# The `test` stage builds on the `haskell` image, which is Debian 11
+# (bullseye): a pre-usrmerge layout where /lib and /usr/lib, and /bin and
+# /usr/bin, are genuinely distinct directories -- unlike this bookworm-based
+# runtime image, and unlike every other language here, whose build and
+# runtime stages share one bookworm base. A file Debian packages under
+# /usr/lib on bullseye is not reachable at the matching /lib path (and vice
+# versa for /bin vs /usr/bin), so COPY fails outright instead of silently
+# grabbing the wrong file. Every source path below was confirmed by running
+# `ldd` on the compiled convex-adapter/convex-example and on each coreutils
+# binary inside the test stage, rather than assumed from the bookworm layout
+# the other languages share; destinations keep the /lib vs /usr/lib split
+# those languages use, since the runtime image's dynamic linker searches
+# both by default.
 COPY --from=test /lib64/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
 COPY --from=test /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/libc.so.6
 COPY --from=test /lib/x86_64-linux-gnu/libm.so.6 /lib/x86_64-linux-gnu/libm.so.6
-COPY --from=test /lib/x86_64-linux-gnu/libgmp.so.10 /lib/x86_64-linux-gnu/libgmp.so.10
-COPY --from=test /usr/lib/x86_64-linux-gnu/libffi.so.8 /usr/lib/x86_64-linux-gnu/libffi.so.8
+COPY --from=test /lib/x86_64-linux-gnu/libz.so.1 /lib/x86_64-linux-gnu/libz.so.1
+COPY --from=test /lib/x86_64-linux-gnu/librt.so.1 /lib/x86_64-linux-gnu/librt.so.1
+COPY --from=test /lib/x86_64-linux-gnu/libutil.so.1 /lib/x86_64-linux-gnu/libutil.so.1
+COPY --from=test /lib/x86_64-linux-gnu/libdl.so.2 /lib/x86_64-linux-gnu/libdl.so.2
+COPY --from=test /lib/x86_64-linux-gnu/libpthread.so.0 /lib/x86_64-linux-gnu/libpthread.so.0
+COPY --from=test /lib/x86_64-linux-gnu/libgcc_s.so.1 /lib/x86_64-linux-gnu/libgcc_s.so.1
+COPY --from=test /usr/lib/x86_64-linux-gnu/libstdc++.so.6 /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+# `libgmp.so.10` is packaged under /usr/lib on bullseye, not /lib. GHC's RTS
+# does not need libffi at runtime for an ahead-of-time compiled, non-GHCi
+# binary on x86_64 (confirmed absent from `ldd` on both convex-adapter and
+# convex-example) -- it is only the interpreter/ARM adjustor-thunk fallback
+# -- so the previous libffi.so.8 line, besides pointing at a bullseye path
+# that does not exist at all (apt installs only libffi7; GHC's own private
+# libffi.so.8 lives under /opt/ghc, unused by these binaries), was dead
+# weight rather than a genuine runtime dependency.
+COPY --from=test /usr/lib/x86_64-linux-gnu/libgmp.so.10 /lib/x86_64-linux-gnu/libgmp.so.10
 COPY --from=test /lib/x86_64-linux-gnu/libnss_dns.so.2 /lib/x86_64-linux-gnu/libnss_dns.so.2
 COPY --from=test /lib/x86_64-linux-gnu/libnss_files.so.2 /lib/x86_64-linux-gnu/libnss_files.so.2
 COPY --from=test /lib/x86_64-linux-gnu/libresolv.so.2 /lib/x86_64-linux-gnu/libresolv.so.2
@@ -216,7 +244,7 @@ COPY --from=test /etc/nsswitch.conf /etc/nsswitch.conf
 COPY --from=test /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=test /bin/dash /bin/sh
 COPY --from=test /usr/bin/id /usr/bin/id
-COPY --from=test /usr/bin/cat /usr/bin/cat
+COPY --from=test /bin/cat /usr/bin/cat
 COPY --from=test /usr/bin/cut /usr/bin/cut
 COPY --from=test /usr/bin/head /usr/bin/head
 COPY --from=test /usr/bin/tail /usr/bin/tail
@@ -224,13 +252,16 @@ COPY --from=test /usr/bin/tr /usr/bin/tr
 COPY --from=test /usr/bin/sort /usr/bin/sort
 COPY --from=test /usr/bin/uniq /usr/bin/uniq
 COPY --from=test /usr/bin/wc /usr/bin/wc
-COPY --from=test /usr/bin/uname /usr/bin/uname
-COPY --from=test /usr/bin/grep /usr/bin/grep
-COPY --from=test /usr/bin/sed /usr/bin/sed
+COPY --from=test /bin/uname /usr/bin/uname
+COPY --from=test /bin/grep /usr/bin/grep
+COPY --from=test /bin/sed /usr/bin/sed
 COPY --from=test /usr/bin/mawk /usr/bin/awk
 COPY --from=test /lib/x86_64-linux-gnu/libselinux.so.1 /lib/x86_64-linux-gnu/libselinux.so.1
-COPY --from=test /lib/x86_64-linux-gnu/libpcre2-8.so.0 /lib/x86_64-linux-gnu/libpcre2-8.so.0
-COPY --from=test /lib/x86_64-linux-gnu/libacl.so.1 /lib/x86_64-linux-gnu/libacl.so.1
+COPY --from=test /usr/lib/x86_64-linux-gnu/libpcre2-8.so.0 /lib/x86_64-linux-gnu/libpcre2-8.so.0
+COPY --from=test /usr/lib/x86_64-linux-gnu/libacl.so.1 /lib/x86_64-linux-gnu/libacl.so.1
+# bullseye's /bin/grep links the legacy libpcre.so.3 (PCRE1); bookworm's grep
+# -- what every other language's copy list assumes -- links libpcre2 instead.
+COPY --from=test /lib/x86_64-linux-gnu/libpcre.so.3 /lib/x86_64-linux-gnu/libpcre.so.3
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     PATH=/usr/local/bin:/usr/bin:/bin
 USER 65532:65532
