@@ -94,6 +94,9 @@ RUN timeout 60 sh -c 'set -eu; \
 CMD ["pike", "-e", "if (uname()->machine != \"x86_64\") { werror(\"unexpected architecture\\n\"); exit(1); } write(\"%s\\n\", version());"]
 
 FROM test AS runtime-rootfs
+# cp --parents recreates each source path under the destination relative to the
+# working directory, so the absolute paths below only resolve from /.
+WORKDIR /
 # Build the runtime closure from the package database rather than from a guessed
 # module path: every regular file pike8.0-core installed, the interpreter, and
 # the shared libraries the interpreter and its dynamic modules actually load.
