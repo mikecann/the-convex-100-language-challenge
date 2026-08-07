@@ -108,7 +108,16 @@ let read_command_line reader =
    and there is one producer per subscription: the controller would be choosing
    how much memory this process uses. Reserving first makes the number of
    producers holding a value at once a function of this budget instead, so the
-   whole output path costs at most three times [max_output_bytes]. *)
+   whole output path costs at most three concurrent producers.
+
+   What the client reserves for this process out of the shared container budget
+   has to keep agreeing with what this number implies: eight megabytes of
+   queued lines, one more line in the writer's hands, and one value plus one
+   encoding per producer that holds a slot. It must not be lowered to fewer
+   than three slots. A producer waits for room without giving up, and
+   [stop_relay] joins a relay thread that may be doing exactly that, so a
+   budget narrow enough for one producer to monopolise is a budget in which an
+   unsubscribe can wait on a relay that is waiting on the unsubscribe. *)
 let max_output_bytes = 8 * 1024 * 1024
 let max_event_bytes = (2 * 1024 * 1024) + 65536
 let output_line_timeout = 10.0
@@ -174,9 +183,12 @@ let commit writer size line =
 let release writer size =
   with_writer writer (fun () -> writer.w_reserved <- writer.w_reserved - size)
 
+(* The line goes out of the string the queue already holds. A [Bytes.of_string]
+   here would be a second copy of a near-maximum event, alive for the whole ten
+   second deadline precisely when a controller has stopped reading, and it is
+   not a copy the output budget knows about. *)
 let write_line writer line =
-  let bytes = Bytes.of_string line in
-  let total = Bytes.length bytes in
+  let total = String.length line in
   let deadline = monotonic_now () +. output_line_timeout in
   let partial = ref false in
   let rec loop position =
@@ -186,7 +198,8 @@ let write_line writer line =
       if remaining <= 0.0 then false
       else
         match
-          Unix.single_write writer.w_fd bytes position (total - position)
+          Unix.single_write_substring writer.w_fd line position
+            (total - position)
         with
         | 0 -> false
         | count ->
@@ -242,9 +255,19 @@ let stop_writer writer thread =
   with_writer writer (fun () -> writer.w_stopping <- true);
   Thread.join thread
 
+(* The terminator is appended inside the encoder's own buffer. [J.to_string
+   json ^ "\n"] would encode into a buffer, copy that buffer out, and then copy
+   the result again just to add one byte: three near-maximum strings alive at
+   once for what the budget reserves room for one of. *)
+let encode_line json =
+  let buffer = Buffer.create 1024 in
+  J.to_buffer buffer json;
+  Buffer.add_char buffer '\n';
+  Buffer.contents buffer
+
 let emit writer json =
   if reserve writer max_event_bytes then
-    commit writer max_event_bytes (J.to_string json ^ "\n")
+    commit writer max_event_bytes (encode_line json)
 
 let error_json error =
   let fields =
@@ -322,7 +345,7 @@ let start_relay writer relay =
     wanted
   in
   let deliver json =
-    let line = J.to_string json ^ "\n" in
+    let line = encode_line json in
     Mutex.lock relay.mutex;
     if publish () then commit writer max_event_bytes line
     else release writer max_event_bytes;

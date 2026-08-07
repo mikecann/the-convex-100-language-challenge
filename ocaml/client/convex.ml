@@ -1157,7 +1157,10 @@ let ws_read_frame ws timeout =
   if length > max_websocket_message then
     raise (Websocket_protocol "WebSocket message exceeds 2097152 bytes");
   let payload = ws_read_exact ws length deadline in
-  (fin, opcode, Bytes.to_string payload)
+  (* [ws_read_exact] allocates this buffer and nothing else can still name it,
+     so handing it over as a string costs a pointer rather than a second copy
+     of a payload that may be two megabytes. *)
+  (fin, opcode, Bytes.unsafe_to_string payload)
 
 (* A close frame either carries nothing or carries a code plus a UTF-8 reason.
    A single byte cannot be a code, and the codes below are the ones RFC 6455
@@ -1332,33 +1335,90 @@ type subscription_state = {
    holding "only" a few megabytes is exactly how a per-subscription bound
    passes its own test and still runs the container out of memory.
 
-   The 128 MiB gate is divided before anything is allowed to be retained:
+   First the costs that are not major-heap residency at all come off the top:
+   the OCaml runtime, OpenSSL, the code image, and one stack per worker and
+   relay thread. Twenty-four subscriptions were measured at 32 MiB resident
+   before a single sync message arrived, and that is this reserve.
 
-     - the OCaml runtime, OpenSSL, the worker and relay thread stacks, and
-       the major heap the collector has not yet returned;
-     - the transient peak of one inbound frame: its raw bytes, the string it
-       is decoded into, and the JSON tree parsed from it;
-     - the test adapter's whole output path, which is three times its own
-       queue budget: the queued lines, the values its relays have taken from
-       these queues, and the encoded copies of those values;
-     - explicit headroom so the gate is a bound, not a target.
+   What remains is the major heap, and it is halved, because the heap runs at
+   roughly twice its live set: the collector is paced by allocation, and it is
+   holding garbage from earlier messages while the current one is parsed. The
+   halving applies to the whole heap and not, as it once did, to the retained
+   queue alone - a transient frame and a queued line are the same kind of
+   residency and the collector treats them identically.
 
-   What is left is halved, because OCaml's major heap can hold roughly twice
-   the live set before a collection returns it. Every retained update is
-   charged for its value, its logs, its structured error data, and an equal
-   allowance for the encoded output that value will become. *)
+   The live set that leaves is then divided into what may be alive at once:
+
+     - the transient peak of one inbound frame, which is four near-maximum
+       strings and not one: the raw payload, the lexer's copy of it, the
+       string the parser builds, and the tree that string ends up in;
+     - the test adapter's whole output path: eight megabytes of queued lines,
+       one further line the writer has taken from that queue, and one value
+       plus one encoding for each of the three producers its own budget lets
+       hold a slot at once;
+     - the socket owner's memory of what each query last delivered, which is
+       what a reconnect compares a rehydration against;
+     - and last, what is left, which is what may actually be queued. It is one
+       near-maximum update, and that is the honest answer: everything above is
+       what a client this size must be able to have in flight before it is
+       entitled to retain anything at all.
+
+   Every retained update is charged for its value, its logs, its structured
+   error data, and an equal allowance for the encoded output that value will
+   become. *)
 let live_memory_limit_bytes = 128 * 1024 * 1024
 let live_runtime_reserve_bytes = 32 * 1024 * 1024
-let live_transient_reserve_bytes = 24 * 1024 * 1024
-let live_writer_reserve_bytes = 24 * 1024 * 1024
 let live_headroom_bytes = 16 * 1024 * 1024
 let live_heap_factor = 2
 
-let max_queue_bytes =
-  (live_memory_limit_bytes - live_runtime_reserve_bytes
- - live_transient_reserve_bytes - live_writer_reserve_bytes
- - live_headroom_bytes)
+let live_working_set_bytes =
+  (live_memory_limit_bytes - live_runtime_reserve_bytes - live_headroom_bytes)
   / live_heap_factor
+
+let live_transient_reserve_bytes = 12 * 1024 * 1024
+let live_writer_reserve_bytes = 20 * 1024 * 1024
+
+(* The socket owner also remembers, per active query, what that query last
+   delivered, so a reconnect's rehydration can be recognised as a repeat and
+   suppressed. One remembered value per query is a count bound, not a byte
+   bound: with near-maximum messages it is (active subscriptions x 2 MiB), so
+   twenty-four slow subscriptions remember more than the whole queue budget
+   without a single byte of it being charged. It gets its own reserve out of
+   the same division, and a value that does not fit is simply not remembered.
+   Remembered values are held once rather than once per representation, so
+   this reserve is spent at footprint rather than at the queue's
+   encoded-output multiple. *)
+let max_rehydration_bytes = 4 * 1024 * 1024
+
+let max_queue_bytes =
+  live_working_set_bytes - live_transient_reserve_bytes
+  - live_writer_reserve_bytes - max_rehydration_bytes
+
+(* [live_heap_factor] is an assumption about the collector, and every byte
+   above is spent against it. OCaml states that assumption as [space_overhead],
+   and its default lets the major heap carry far more garbage than a factor of
+   two: a near-maximum sync message is a large block the sweeper reaches late,
+   and one frame costs several of them between the raw payload, the lexer's
+   copy of it, the parsed tree, and the encoded line it becomes. Under the
+   stopped-reader flood the resident set tracked the major heap's high-water
+   mark almost exactly, and neither [Gc.compact] nor [malloc_trim] gave any of
+   it back: OCaml 5 does not return heap space to the operating system, so the
+   high-water mark, not the live set, is what the container has to fit.
+
+   Budgeting against a factor of two while leaving the runtime free to use
+   several is arithmetic about a machine that does not exist. The client
+   therefore states the pacing it budgeted for, once, when a Live connection
+   first makes the budget binding, and never raises a stricter setting an
+   embedding application chose for itself. *)
+let live_space_overhead = 20
+let live_pacing_applied = ref false
+
+let apply_live_heap_pacing () =
+  if not !live_pacing_applied then (
+    live_pacing_applied := true;
+    let current = Gc.get () in
+    if current.Gc.space_overhead > live_space_overhead then
+      Gc.set { current with Gc.space_overhead = live_space_overhead })
 
 (* A process-wide count bound as well, so a flood of tiny updates cannot cost
    an unbounded number of list cells while staying under the byte budget. *)
@@ -1676,9 +1736,49 @@ let remove_modification state =
 let live_initial_backoff = 0.1
 let live_maximum_backoff = 15.0
 
+(* What one query last delivered, kept in the only detail a rehydration check
+   needs: a value it can be compared against, or nothing. [remembered_value]
+   is [None] both when the last delivery was a failure and when the value was
+   too large to afford, and both mean the same thing to the check - this
+   rehydration cannot be proven to repeat what the subscriber already has, so
+   it is delivered. Losing the memory therefore costs one redundant update
+   after a reconnect and never a dropped one. *)
+type delivered = { remembered_value : J.t option; remembered_charge : int }
+
 let live_owner (manager : live_manager) =
+  apply_live_heap_pacing ();
   let active : (int, subscription_state) Hashtbl.t = Hashtbl.create 8 in
-  let last_delivered : (int, update) Hashtbl.t = Hashtbl.create 8 in
+  let last_delivered : (int, delivered) Hashtbl.t = Hashtbl.create 8 in
+  let remembered_bytes = ref 0 in
+  let forget_delivered qid =
+    match Hashtbl.find_opt last_delivered qid with
+    | None -> ()
+    | Some entry ->
+        remembered_bytes := !remembered_bytes - entry.remembered_charge;
+        Hashtbl.remove last_delivered qid
+  in
+  (* Remembering is what makes the entry exist at all: [Hashtbl.mem] on it is
+     how a reconnect decides a query has something to rehydrate against. The
+     entry is therefore always recorded, and only the value inside it is
+     dropped when the reserve cannot afford it. *)
+  let remember_delivered qid (update : update) =
+    forget_delivered qid;
+    let value =
+      match (update.error, update.value) with
+      | None, Some value -> Some value
+      | _ -> None
+    in
+    let charge =
+      match value with None -> 0 | Some value -> json_footprint value
+    in
+    let value, charge =
+      if !remembered_bytes + charge > max_rehydration_bytes then (None, 0)
+      else (value, charge)
+    in
+    remembered_bytes := !remembered_bytes + charge;
+    Hashtbl.replace last_delivered qid
+      { remembered_value = value; remembered_charge = charge }
+  in
   let awaiting : (int, bool) Hashtbl.t = Hashtbl.create 8 in
   let connection = ref None in
   let query_set_version = ref 0 in
@@ -1719,7 +1819,7 @@ let live_owner (manager : live_manager) =
            connection rehydrates the same value the subscriber last saw before
            the error, the unchanged-value suppression drops it, and an
            otherwise healthy subscription is stranded on the error. *)
-        Hashtbl.replace last_delivered qid update;
+        remember_delivered qid update;
         deliver qid update)
       active
   in
@@ -1923,28 +2023,29 @@ let live_owner (manager : live_manager) =
       (fun action ->
         match action with
         | `Forget qid ->
-            Hashtbl.remove last_delivered qid;
+            forget_delivered qid;
             Hashtbl.remove awaiting qid
         | `Applied (qid, update) when update.error = None ->
             let previous = Hashtbl.find_opt last_delivered qid in
-            Hashtbl.replace last_delivered qid update;
+            remember_delivered qid update;
             if Hashtbl.mem awaiting qid then (
               Hashtbl.remove awaiting qid;
               (* Suppress a rehydration that repeats what the subscriber
-                 already has: a reconnect must not replay it as a change. *)
+                 already has: a reconnect must not replay it as a change. A
+                 previous value the reserve could not afford to remember is
+                 [None] here, which compares unequal and delivers. *)
               match previous with
-              | Some previous
-                when previous.error = None
-                     && same_value previous.value update.value ->
+              | Some { remembered_value = Some remembered; _ }
+                when same_value (Some remembered) update.value ->
                   ()
               | _ -> Hashtbl.replace changed qid update)
             else Hashtbl.replace changed qid update
         | `Applied (qid, update) ->
             Hashtbl.remove awaiting qid;
-            Hashtbl.replace last_delivered qid update;
+            remember_delivered qid update;
             Hashtbl.replace changed qid update
         | `Removed qid ->
-            Hashtbl.remove last_delivered qid;
+            forget_delivered qid;
             Hashtbl.remove awaiting qid)
       actions;
     remote_version := end_version;
@@ -2017,7 +2118,7 @@ let live_owner (manager : live_manager) =
               | Some _ -> send_modify (add_modification state))
           | Remove state ->
               Hashtbl.remove active state.qid;
-              Hashtbl.remove last_delivered state.qid;
+              forget_delivered state.qid;
               Hashtbl.remove awaiting state.qid;
               (match !connection with
               | Some _ -> send_modify (remove_modification state)
