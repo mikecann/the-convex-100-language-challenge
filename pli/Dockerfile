@@ -50,7 +50,7 @@ RUN set -eu; \
     tar --extract --gzip --file /tmp/pli.tgz --directory /opt; \
     mv /opt/pli-1.4.1 /opt/pli; \
     rm -f /tmp/pli.tgz /opt/pli/plic.exe; \
-    file /opt/pli/plic | grep -F 'ELF 32-bit LSB executable, Intel 80386'
+    file /opt/pli/plic | grep -F 'ELF 32-bit LSB executable, Intel i386'
 
 # One wrapper so every compile in this file reads the same. plic wants its
 # alternate-NOT-character option as a single argument; without -cn(^) the
@@ -85,14 +85,16 @@ WORKDIR /build
 COPY client ./client
 COPY examples ./examples
 
+# The runtime signal-routine replacement is compiled first because every link
+# in this file names it ahead of the vendor archive.
+RUN set -eu; plic client/plisig.pli -o plisig.o
+
 # PL/I has no standard formatter. A deterministic style gate stands in for one
 # and fails the build rather than rewriting reviewed source.
 RUN set -eu; \
     plic -i/build/client client/tests/style_check.pli -o style_check.o; \
     plild /out-style-check style_check.o; \
     /out-style-check $(find client examples -name '*.pli' -o -name '*.inc' | sort)
-
-RUN set -eu; plic client/plisig.pli -o plisig.o
 
 RUN set -eu; \
     plic -i/build/client client/tests/unit_test.pli -o unit_test.o; \
@@ -112,15 +114,16 @@ RUN set -eu; \
     plic -i/build/client examples/basics/main.pli -o example.o; \
     plild /usr/local/bin/convex-example example.o; \
     test "$(uname -m)" = x86_64; \
-    file /usr/local/bin/convex-adapter | grep -F 'ELF 32-bit LSB executable, Intel 80386'; \
-    file /usr/local/bin/convex-example | grep -F 'ELF 32-bit LSB executable, Intel 80386'; \
+    file /usr/local/bin/convex-adapter | grep -F 'ELF 32-bit LSB executable, Intel i386'; \
+    file /usr/local/bin/convex-example | grep -F 'ELF 32-bit LSB executable, Intel i386'; \
     file /usr/local/bin/convex-adapter | grep -F 'dynamically linked'
 # The educational client must not carry the fault-injection hook.
 RUN set -eu; ! nm /usr/local/bin/convex-example 2>/dev/null | grep -qi 'DEBUGDISCONNECT'
 # Prove the vendor's seccomp-hostile signal routine is gone and ours is in.
 RUN set -eu; \
     nm /usr/local/bin/convex-adapter | grep -F '_pli_SigInit'; \
-    ! objdump -d /usr/local/bin/convex-adapter | grep -q 'SIGACTION'
+    ! strings /usr/local/bin/convex-adapter | grep -q 'SIGACTION'; \
+    ! strings /usr/local/bin/convex-example | grep -q 'SIGACTION'
 
 # ---------------------------------------------------------------------------
 # Test target.
@@ -134,7 +137,7 @@ RUN set -eu; \
         'not json at all' \
         '{"id":"unknown","op":"nope"}' \
         '{"id":"close","op":"close"}'; \
-    } | /usr/local/bin/convex-adapter); \
+    } | CONVEX_URL=http://127.0.0.1:1 /usr/local/bin/convex-adapter); \
     printf '%s\n' "$actual"; \
     printf '%s\n' "$actual" | grep -F '"id":"hello"' | grep -F '"type":"ready"'; \
     printf '%s\n' "$actual" | grep -F '"language":"pli"'; \
