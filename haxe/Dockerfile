@@ -84,11 +84,16 @@ RUN printf '%s\n' '#!/bin/sh' 'exec /usr/bin/neko /opt/convex/convex-example.n "
     test ! -e /usr/local/bin/convex-adapter && \
     exec rm -f /usr/bin/chmod /usr/bin/rm
 USER 65532:65532
+# The previous layer removed /usr/bin/rm as part of the final hardening, so
+# this probe cannot clean up a temp file afterward. The missing-CONVEX_URL
+# failure is deterministic and side-effect-free (Main.hx throws before
+# constructing a client), so stdout and stderr are each captured into a shell
+# variable by a separate invocation instead of into files that would need it.
 RUN set -eu; test "$(id -u):$(id -g)" = 65532:65532; \
-    code=0; CONVEX_URL= /usr/local/bin/convex-example >/tmp/example.out 2>/tmp/example.err || code=$?; \
-    test "$code" -ne 0 && test ! -s /tmp/example.out && \
-    grep -Fq 'CONVEX_URL is required' /tmp/example.err && \
-    rm -f /tmp/example.out /tmp/example.err
+    code=0; example_stdout=$(CONVEX_URL= /usr/local/bin/convex-example 2>/dev/null) || code=$?; \
+    example_stderr=$(CONVEX_URL= /usr/local/bin/convex-example 2>&1 1>/dev/null) || true; \
+    test "$code" -ne 0 && test -z "$example_stdout" && \
+    printf '%s\n' "$example_stderr" | grep -Fq 'CONVEX_URL is required'
 ENTRYPOINT ["/usr/local/bin/convex-example"]
 
 # Keep the adapter last so the default build target is the conformance image.
@@ -99,9 +104,11 @@ RUN printf '%s\n' '#!/bin/sh' 'exec /usr/bin/neko /opt/convex/convex-adapter.n "
     test ! -e /usr/local/bin/convex-example && \
     exec rm -f /usr/bin/chmod /usr/bin/rm
 USER 65532:65532
+# The previous layer removed /usr/bin/rm as part of the final hardening, so
+# this probe captures the adapter's reply in a shell variable rather than a
+# temp file it would then have no way to clean up.
 RUN set -eu; test "$(id -u):$(id -g)" = 65532:65532 && \
-    printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' \
-      | CONVEX_URL=http://127.0.0.1:9 /usr/local/bin/convex-adapter > /tmp/probe.out && \
-    grep -Fq '"type":"closed"' /tmp/probe.out && \
-    rm -f /tmp/probe.out
+    probe_reply=$(printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' \
+      | CONVEX_URL=http://127.0.0.1:9 /usr/local/bin/convex-adapter) && \
+    printf '%s\n' "$probe_reply" | grep -Fq '"type":"closed"'
 ENTRYPOINT ["/usr/local/bin/convex-adapter"]
