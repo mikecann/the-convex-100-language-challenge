@@ -571,6 +571,17 @@ it was built on.** That is not a check that failed to notice a leak; it is a
 check whose success was impossible to reconcile with the file directly above
 it, and nobody noticed because it never spoke.
 
+A second sweep then covered the forty-two merged languages the first audit had
+not reached, and found six more: bash, c, php, csharp, rescript, and — worst of
+the lot — hare, which had been merged that same night and shipped fourteen
+BusyBox applets including an FTP daemon and a web server.
+
+That brings it to **eighteen leaking out of seventy-five checked**, and the
+distribution is the point. They fall into exactly two shapes: a runtime built
+`FROM` the stock BusyBox image, or a Debian base that was never stripped. This
+is not a scatter of individual mistakes. It is two wrong patterns, each copied
+faithfully across many languages, with a check that could not object.
+
 Three things follow, and the third is the one worth arguing about:
 
 1. The check now lives in the shared harness, once, where it cannot be copied
