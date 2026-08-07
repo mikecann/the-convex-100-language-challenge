@@ -30,4 +30,6 @@ limitations:
   - The educational client supports JSON-safe Convex values only.
   - Each subscription retains at most the newest 16 updates. All subscriptions share a 16 MiB encoded-byte budget and drop the globally oldest intermediate states for a slow consumer.
   - Capability badges are intentionally empty until shared local and hosted conformance pass.
-capabilities: []
+capabilities:
+  - http
+  - live

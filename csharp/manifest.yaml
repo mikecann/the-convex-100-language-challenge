@@ -29,4 +29,6 @@ limitations:
   - Live authentication and WebSocket mutations/actions are deferred.
   - Transition chunks, optimistic updates, journals, and replay are deferred.
   - Each Live subscription retains its newest 16 updates; old intermediate updates are dropped for slow consumers.
-capabilities: []
+capabilities:
+  - http
+  - live

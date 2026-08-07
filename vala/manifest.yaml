@@ -32,4 +32,6 @@ limitations:
   - Untrusted JSON is scanned before it is parsed; a document whose retained tree would exceed 8 MiB or nest deeper than 64 levels is refused as a ProtocolError, so a wire-legal node-dense value is rejected rather than delivered.
   - HTTP bodies are capped at 2 MiB under one absolute operation deadline and must satisfy their declared framing; connection-close chunked responses are conservatively refused because libsoup 3.2 does not expose terminal-chunk completion. A valid Convex error envelope is preserved on any status while other non-2xx bodies stay transport failures. Adapter writes use a 1 second default absolute deadline.
   - Values use Convex's JSON-safe subset and are exposed as JSON-GLib nodes.
-capabilities: []
+capabilities:
+  - http
+  - live

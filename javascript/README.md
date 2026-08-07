@@ -17,10 +17,10 @@ same `0 -> 1` change. The native implementation is in [client](client/).
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, and actions | Implemented, pending shared evidence |
-| HTTP bearer token | Implemented, pending shared evidence |
-| Initial and updated Live values | Implemented, pending shared evidence |
-| Live reconnection test hook | Implemented, pending shared evidence |
+| HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
+| HTTP bearer token | Verified by shared local and hosted conformance |
+| Initial and updated Live values | Verified by shared local and hosted conformance |
+| Live reconnection test hook | Verified by shared local and hosted conformance |
 | Capability badges | Not claimed until root evidence |
 | Live authentication and WebSocket writes | Deferred |
 

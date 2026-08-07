@@ -31,4 +31,6 @@ limitations:
   - WebSocket mutations and actions are deferred.
   - TransitionChunk assembly is deferred; receiving one is treated as protocol drift and triggers reconnect.
   - Mutation ordering, replay, journals, and optimistic updates are deferred.
-capabilities: []
+capabilities:
+  - http
+  - live

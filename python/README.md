@@ -17,8 +17,8 @@ performs one idempotent mutation, and checks the resulting `0 -> 1` journey.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Awaiting shared verification | Native stdlib JSON HTTP query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented. |
-| Live | Awaiting shared verification | Native stdlib WebSocket subscription, bounded update delivery, reconnect attempt, unsubscribe, and clean close target the pinned profile. |
+| HTTP | Verified by shared local and hosted conformance | Native stdlib JSON HTTP query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented. |
+| Live | Verified by shared local and hosted conformance | Native stdlib WebSocket subscription, bounded update delivery, reconnect attempt, unsubscribe, and clean close target the pinned profile. |
 
 No capability badge is earned until shared local and hosted black-box tests pass.
 

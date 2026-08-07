@@ -28,4 +28,6 @@ adapter:
 limitations:
   - Live authentication, optimistic updates, and TransitionChunk assembly are deferred.
   - Each Live subscription keeps its newest 16 updates; slow consumers drop older intermediate states.
-capabilities: []
+capabilities:
+  - http
+  - live

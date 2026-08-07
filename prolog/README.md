@@ -17,8 +17,8 @@ and the final reactive assertion.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Awaiting shared evidence | Native documented JSON query, mutation, action, bearer token, logs, and typed failures are implemented. |
-| Live | Awaiting shared evidence | Native SWI WebSocket subscriptions, Add/Remove, typed query failures, and reconnect restoration are implemented for the pinned profile. |
+| HTTP | Verified by shared local and hosted conformance | Native documented JSON query, mutation, action, bearer token, logs, and typed failures are implemented. |
+| Live | Verified by shared local and hosted conformance | Native SWI WebSocket subscriptions, Add/Remove, typed query failures, and reconnect restoration are implemented for the pinned profile. |
 
 The manifest deliberately awards no badges. Only root-owned local and hosted
 black-box conformance can earn them.

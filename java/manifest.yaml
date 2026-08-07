@@ -30,4 +30,6 @@ limitations:
   - Live values support only the JSON-safe subset used by this experiment.
   - WebSocket mutations/actions, chunks, optimistic updates, journals, and replay are deferred.
   - Each Live subscription buffers only its newest 16 updates.
-capabilities: []
+capabilities:
+  - http
+  - live
