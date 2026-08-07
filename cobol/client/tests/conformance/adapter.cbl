@@ -465,7 +465,12 @@ DO-HELLO.
         EXIT PARAGRAPH
     END-IF
     MOVE 1 TO WS-HELLO-SEEN
-    MOVE SPACES TO WS-EVT
+    *> No bulk clear: every STRING below starts at WS-EVT-LEN = 1 and
+    *> EMIT-EVENT only ever reads the first WS-EVT-LEN bytes, so
+    *> spacing out the full 2 MiB buffer first would only dirty pages
+    *> nothing goes on to read -- real cost for a typically-small
+    *> event, and one more contributor to the adapter's memory-growth
+    *> budget for no behavioural benefit.
     MOVE 1 TO WS-EVT-LEN
     CALL "cvx-json-esc-string" USING WS-CMD-ID WS-CMD-ID-LEN
         WS-ESC WS-ESC-LEN
@@ -538,7 +543,12 @@ DO-CALL.
         PERFORM EMIT-STRUCTURED-ERROR
         EXIT PARAGRAPH
     END-IF
-    MOVE SPACES TO WS-EVT
+    *> No bulk clear: every STRING below starts at WS-EVT-LEN = 1 and
+    *> EMIT-EVENT only ever reads the first WS-EVT-LEN bytes, so
+    *> spacing out the full 2 MiB buffer first would only dirty pages
+    *> nothing goes on to read -- real cost for a typically-small
+    *> event, and one more contributor to the adapter's memory-growth
+    *> budget for no behavioural benefit.
     MOVE 1 TO WS-EVT-LEN
     CALL "cvx-json-esc-string" USING WS-CMD-ID WS-CMD-ID-LEN
         WS-ESC WS-ESC-LEN
@@ -669,7 +679,12 @@ DO-DEBUG-DISCONNECT.
     PERFORM EMIT-ACK.
 
 DO-CLOSE.
-    MOVE SPACES TO WS-EVT
+    *> No bulk clear: every STRING below starts at WS-EVT-LEN = 1 and
+    *> EMIT-EVENT only ever reads the first WS-EVT-LEN bytes, so
+    *> spacing out the full 2 MiB buffer first would only dirty pages
+    *> nothing goes on to read -- real cost for a typically-small
+    *> event, and one more contributor to the adapter's memory-growth
+    *> budget for no behavioural benefit.
     MOVE 1 TO WS-EVT-LEN
     CALL "cvx-json-esc-string" USING WS-CMD-ID WS-CMD-ID-LEN
         WS-ESC WS-ESC-LEN
@@ -716,7 +731,12 @@ DRAIN-DELIVERIES.
     END-PERFORM.
 
 EMIT-SUBSCRIPTION.
-    MOVE SPACES TO WS-EVT
+    *> No bulk clear: every STRING below starts at WS-EVT-LEN = 1 and
+    *> EMIT-EVENT only ever reads the first WS-EVT-LEN bytes, so
+    *> spacing out the full 2 MiB buffer first would only dirty pages
+    *> nothing goes on to read -- real cost for a typically-small
+    *> event, and one more contributor to the adapter's memory-growth
+    *> budget for no behavioural benefit.
     MOVE 1 TO WS-EVT-LEN
     CALL "cvx-json-esc-string" USING WS-RL-SUBID(WS-RELAYIX)
         WS-RL-SUBID-LEN(WS-RELAYIX) WS-ESC WS-ESC-LEN
@@ -783,7 +803,12 @@ APPEND-ERROR-OBJECT.
 *> Event emission
 *> ------------------------------------------------------------------
 EMIT-ACK.
-    MOVE SPACES TO WS-EVT
+    *> No bulk clear: every STRING below starts at WS-EVT-LEN = 1 and
+    *> EMIT-EVENT only ever reads the first WS-EVT-LEN bytes, so
+    *> spacing out the full 2 MiB buffer first would only dirty pages
+    *> nothing goes on to read -- real cost for a typically-small
+    *> event, and one more contributor to the adapter's memory-growth
+    *> budget for no behavioural benefit.
     MOVE 1 TO WS-EVT-LEN
     CALL "cvx-json-esc-string" USING WS-CMD-ID WS-CMD-ID-LEN
         WS-ESC WS-ESC-LEN
@@ -799,7 +824,12 @@ EMIT-ACK.
 
 *> A structured client failure keeps its name, message, and data.
 EMIT-STRUCTURED-ERROR.
-    MOVE SPACES TO WS-EVT
+    *> No bulk clear: every STRING below starts at WS-EVT-LEN = 1 and
+    *> EMIT-EVENT only ever reads the first WS-EVT-LEN bytes, so
+    *> spacing out the full 2 MiB buffer first would only dirty pages
+    *> nothing goes on to read -- real cost for a typically-small
+    *> event, and one more contributor to the adapter's memory-growth
+    *> budget for no behavioural benefit.
     MOVE 1 TO WS-EVT-LEN
     CALL "cvx-json-esc-string" USING WS-CMD-ID WS-CMD-ID-LEN
         WS-ESC WS-ESC-LEN
@@ -818,7 +848,12 @@ EMIT-STRUCTURED-ERROR.
 
 *> An adapter-level failure that never reached the client.
 EMIT-ERROR.
-    MOVE SPACES TO WS-EVT
+    *> No bulk clear: every STRING below starts at WS-EVT-LEN = 1 and
+    *> EMIT-EVENT only ever reads the first WS-EVT-LEN bytes, so
+    *> spacing out the full 2 MiB buffer first would only dirty pages
+    *> nothing goes on to read -- real cost for a typically-small
+    *> event, and one more contributor to the adapter's memory-growth
+    *> budget for no behavioural benefit.
     MOVE 1 TO WS-EVT-LEN
     STRING '{' DELIMITED SIZE INTO WS-EVT WITH POINTER WS-EVT-LEN
     END-STRING

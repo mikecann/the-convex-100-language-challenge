@@ -44,7 +44,12 @@ COPY "cvx-client.cpy".
 01 WS-DEADLINE              BINARY-DOUBLE.
 01 WS-SIXTEEN               BINARY-LONG VALUE 16.
 
-01 WS-SLOT                  BINARY-LONG VALUE 3.
+*> Every call this example makes into the client (query, subscribe,
+*> mutate, and each Live pump) has already returned by the time this
+*> program parses CVX-R-VALUE on its own behalf, so reusing slot 1
+*> (WS-SLOT-HTTP in convex.cbl) here cannot collide with anything the
+*> client itself still has in flight.
+01 WS-SLOT                  BINARY-LONG VALUE 1.
 01 WS-NODE                  BINARY-LONG.
 01 WS-CHILD                 BINARY-LONG.
 01 WS-KEY                   PIC X(64).

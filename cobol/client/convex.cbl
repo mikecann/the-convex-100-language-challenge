@@ -397,8 +397,10 @@ ENTRY "cvx-client-call" USING LK-OP LK-PATH LK-PATH-LEN LK-ARGS
     CALL "cvx_now_ms" USING BY REFERENCE WS-NOW RETURNING WS-RC
     COMPUTE CVX-HR-DEADLINE = WS-NOW + 30000
 
-    *> Body: {"path":...,"args":...,"format":"json"}
-    MOVE SPACES TO WS-BODY
+    *> Body: {"path":...,"args":...,"format":"json"}. No bulk clear:
+    *> cvx-http-post only reads the first WS-BODY-LEN bytes, so spacing
+    *> the full 2 MiB buffer first would only dirty pages the request
+    *> never uses.
     MOVE 1 TO WS-BODY-LEN
     CALL "cvx-json-esc-string" USING LK-PATH LK-PATH-LEN
         WS-ARGS-ESC WS-SPAN-LEN
