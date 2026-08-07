@@ -292,9 +292,9 @@ feature {NONE} -- Strings
 			elseif current_character = '/' then
 				a_buffer.append_character ('/')
 			elseif current_character = 'b' then
-				a_buffer.append_character (('%B').item (1))
+				a_buffer.append_character ('%B')
 			elseif current_character = 'f' then
-				a_buffer.append_character (('%F').item (1))
+				a_buffer.append_character ('%F')
 			elseif current_character = 'n' then
 				a_buffer.append_character ('%N')
 			elseif current_character = 'r' then

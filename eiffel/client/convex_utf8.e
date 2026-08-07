@@ -22,17 +22,17 @@ feature -- Encoding
 			if a_code <= 0x7F then
 				a_buffer.append_character (a_code.to_integer_32.to_character_8)
 			elseif a_code <= 0x7FF then
-				a_buffer.append_character (byte ((0xC0).bit_or (shifted_right (a_code, 6))))
-				a_buffer.append_character (byte ((0x80).bit_or (a_code.bit_and (0x3F))))
+				a_buffer.append_character (byte (mask_8 ((0xC0).to_natural_32.bit_or (shifted_right (a_code, 6)))))
+				a_buffer.append_character (byte (mask_8 ((0x80).to_natural_32.bit_or (a_code.bit_and ((0x3F).to_natural_32)))))
 			elseif a_code <= 0xFFFF then
-				a_buffer.append_character (byte ((0xE0).bit_or (shifted_right (a_code, 12))))
-				a_buffer.append_character (byte ((0x80).bit_or (shifted_right (a_code, 6).bit_and (0x3F))))
-				a_buffer.append_character (byte ((0x80).bit_or (a_code.bit_and (0x3F))))
+				a_buffer.append_character (byte (mask_8 ((0xE0).to_natural_32.bit_or (shifted_right (a_code, 12)))))
+				a_buffer.append_character (byte (mask_8 ((0x80).to_natural_32.bit_or (shifted_right (a_code, 6).bit_and ((0x3F).to_natural_32)))))
+				a_buffer.append_character (byte (mask_8 ((0x80).to_natural_32.bit_or (a_code.bit_and ((0x3F).to_natural_32)))))
 			else
-				a_buffer.append_character (byte ((0xF0).bit_or (shifted_right (a_code, 18))))
-				a_buffer.append_character (byte ((0x80).bit_or (shifted_right (a_code, 12).bit_and (0x3F))))
-				a_buffer.append_character (byte ((0x80).bit_or (shifted_right (a_code, 6).bit_and (0x3F))))
-				a_buffer.append_character (byte ((0x80).bit_or (a_code.bit_and (0x3F))))
+				a_buffer.append_character (byte (mask_8 ((0xF0).to_natural_32.bit_or (shifted_right (a_code, 18)))))
+				a_buffer.append_character (byte (mask_8 ((0x80).to_natural_32.bit_or (shifted_right (a_code, 12).bit_and ((0x3F).to_natural_32)))))
+				a_buffer.append_character (byte (mask_8 ((0x80).to_natural_32.bit_or (shifted_right (a_code, 6).bit_and ((0x3F).to_natural_32)))))
+				a_buffer.append_character (byte (mask_8 ((0x80).to_natural_32.bit_or (a_code.bit_and ((0x3F).to_natural_32)))))
 			end
 		end
 
@@ -46,6 +46,11 @@ feature {NONE} -- Implementation
 	byte (a_value: NATURAL_32): CHARACTER
 		do
 			Result := a_value.to_integer_32.to_character_8
+		end
+
+	mask_8 (a_value: NATURAL_32): NATURAL_32
+		do
+			Result := a_value.bit_and ((0xFF).to_natural_32)
 		end
 
 end
