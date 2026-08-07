@@ -152,7 +152,7 @@ RUN set -eu; \
         rustc cargo npm pip convex busybox mv chmod chown; do \
       ! command -v "$command_name" >/dev/null 2>&1 || { echo "forbidden runtime command: $command_name" >&2; exit 1; }; \
     done
-RUN mkdir -p /usr/local/bin
+RUN test -d /usr/local/bin
 ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
     PATH=/usr/local/bin:/usr/bin:/bin
 USER 65532:65532
