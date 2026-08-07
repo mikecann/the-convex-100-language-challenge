@@ -69,11 +69,11 @@ three `GET` lines rather than an import list.
 | WebSocket mutations and actions | Deferred | Mutations and actions go over HTTP |
 | Chunked transitions | Deferred | `TransitionChunk` is treated as protocol drift and reconnects |
 | Tagged Convex value types | Deferred | Live values cover the JSON-safe subset |
-| Earned capability badges | **None yet** | No shared conformance run has been recorded from this branch |
+| Earned capability badges | **http, live** | 31/31 shared conformance tests pass against both the self-hosted and hosted backends |
 
 The badge row is the one that matters: nothing is claimed until the shared
 black-box conformance suite has been run from a clean commit by the root
-integration agent.
+integration agent. It has: both `http` and `live` are earned.
 
 ## The canonical example
 
@@ -516,5 +516,5 @@ never has to read any from its own source.
   that a 64-bit host handed back above `2**32` — deep inside the
   distribution's own `cintsys.c` `dosys()`, before any client source is ever
   reached. It reproduces with no Convex extension linked in at all.
-- No capability has been earned. The shared conformance suite has not been run
-  from this branch.
+- `http` and `live` are earned: 31/31 shared conformance tests pass against
+  both the self-hosted and hosted backends, from a clean commit.

@@ -69,4 +69,6 @@ limitations:
     patches in the same one-line case the 32-bit interpreter already carries,
     anchored so an upstream sync that already has the fix fails the assertion
     instead of silently duplicating it.
-capabilities: []
+capabilities:
+  - http
+  - live
