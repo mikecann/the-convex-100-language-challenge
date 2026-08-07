@@ -4,5 +4,68 @@ displayName: "Pike"
 rank: 96
 selectionTier: curated_backfill
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >
+    Native Pike client. Pike's Standards.JSON, Stdio, SSL, Crypto, and MIME
+    modules supply ordinary JSON, sockets, TLS, SHA-1, and base64 only; Pike's
+    TLS stack is itself written in Pike over Nettle, so no OpenSSL
+    configuration, engine, or provider module is involved. The HTTP/1.1
+    exchange, the Convex request and response envelopes, the RFC 6455 client,
+    the pinned Live sync state machine, and the conformance adapter are all
+    implemented in Pike in this directory.
+toolchain:
+  name: Pike
+  version: "8.0 (Debian bookworm pike8.0-core)"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - No Docker build, no final-runtime execution, and no shared verification have
+    been run against this source. Every claim below is a source-level claim.
+  - The base image is pinned by digest and every apt package is pinned to its
+    exact bookworm revision, taken from the published Debian index rather than
+    from a build. If any revision has since left the archive the first Docker
+    pass fails loudly on that line instead of silently resolving a newer one.
+  - Pike spells the SSL.Context trust store API differently across releases, so
+    the TLS setup probes the context's own identifiers and refuses to open a
+    connection when none of the known spellings is present. The runtime image
+    asserts that the trust store loads and holds a plausible number of
+    authorities, which is where that probe gets settled.
+  - The socket channel treats the stream's first writable callback as the
+    moment a connection can carry application bytes, which for TLS is the end
+    of the handshake, and disarms that callback while nothing is queued so an
+    idle connection cannot spin the backend. Both behaviours are asserted over
+    loopback without TLS, and the SSL.File members the channel calls are
+    asserted to exist in both the test and the runtime image. That a real TLS
+    handshake reports itself writable stays a source-level claim until hosted
+    verification exercises one.
+  - The educational API covers Convex's JSON-safe value subset. Tagged Convex
+    values such as Int64 and bytes are deferred.
+  - Live authentication, WebSocket mutations and actions, optimistic updates,
+    journals, and TransitionChunk assembly are deferred; a TransitionChunk is
+    refused rather than half-applied.
+  - Each subscription relay retains at most 16 updates and 2 MiB of accounted
+    payload, and fails closed with a structured transport error rather than
+    growing. The adapter's output FIFO holds at most 64 events and 8 MiB,
+    including the partially written line a stopped reader has blocked.
+  - Pike ships no canonical source formatter, so formatting is enforced by a
+    language-local style gate covering tabs, trailing whitespace, line width,
+    line endings, and non-ASCII source characters rather than by a tool.
+  - Capability badges stay empty until the root-owned local and hosted
+    conformance gates pass.
+capabilities:
+  - http
+  - live
