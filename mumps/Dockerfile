@@ -135,6 +135,67 @@ RUN set -eu; \
     wait "$p1"; s1=$?; \
     test "$status" -eq 0; test "$s1" -eq 0
 
+# Stage exactly the runtime closure while the test stage's full toolset (cp,
+# ldd, awk, mkdir) is still available. runtime-base below deletes everything
+# in a *fresh* debian:trixie-slim FIRST, including /bin/sh itself, so any
+# staging work has to happen here, in a stage that never gets pruned, and
+# arrive as one COPY --from=test /staging / afterwards -- not as RUN commands
+# that execute after the deletion (the first attempt at this got that order
+# backwards: pruning ran in runtime-base and then a later RUN in that same
+# stage needed /bin/sh, which the prune had just deleted, and the build
+# failed to even start that step).
+#
+# yottadb is the real engine launcher binary; mumps is only ever a symlink to
+# it (confirmed on the build host: `mumps -> ./yottadb`). Copying the mumps
+# symlink with cp -a and never copying its target -- the classic "cp -a
+# stages a SONAME symlink without what it points at" failure -- would ship a
+# dangling link, so the real file is staged under its own name (dereferenced
+# with -L) and mumps is recreated as a symlink to it, matching upstream.
+#
+# libyottadb.so is the actual engine; the yottadb binary itself only links
+# libc and dlopen()s libyottadb.so at startup, so a naive ldd closure over
+# just the launcher binary silently misses it and everything it needs (this
+# was caught by actually running the built runtime image, not by reasoning
+# about it). libgtmtls.so -- the OpenSSL-backed plugin WRITE /TLS dlopen()s --
+# is the same story: it is not a link-time dependency of anything above it,
+# so it and its own closure are staged and ldd'd explicitly too, even though
+# nothing here calls dlopen() directly.
+RUN set -eu; \
+    mkdir -p /staging/bin /staging/usr/bin /staging/opt/yottadb/plugin \
+             /staging/opt/convex/db /staging/opt/convex/o /staging/etc/ssl/certs; \
+    cp -a /bin/dash /staging/bin/sh; \
+    for tool in id cat; do cp -a "/usr/bin/$tool" "/staging/usr/bin/$tool"; done; \
+    cp -aL /opt/yottadb/yottadb /staging/opt/yottadb/yottadb; \
+    ln -s ./yottadb /staging/opt/yottadb/mumps; \
+    cp -aL /opt/yottadb/libyottadb.so /staging/opt/yottadb/libyottadb.so; \
+    cp -aL /opt/yottadb/plugin/libgtmtls.so /staging/opt/yottadb/plugin/libgtmtls.so; \
+    for object in /opt/yottadb/yottadb /opt/yottadb/libyottadb.so /opt/yottadb/plugin/libgtmtls.so; do \
+      ldd "$object" 2>/dev/null \
+        | awk '{ for (f = 1; f <= NF; f++) if ($f ~ /^\//) print $f }' \
+        | while read -r library; do \
+            mkdir -p "/staging$(dirname "$library")"; \
+            cp -aL "$library" "/staging$library"; \
+          done; \
+    done; \
+    cp -aL /etc/ssl/certs/ca-certificates.crt /staging/etc/ssl/certs/ca-certificates.crt; \
+    cp -aL /etc/ssl/openssl.cnf /staging/etc/ssl/openssl.cnf; \
+    cp -aL /etc/nsswitch.conf /staging/etc/nsswitch.conf; \
+    for resolver in libnss_dns.so.2 libnss_files.so.2 libresolv.so.2; do \
+      cp -aL "/lib/x86_64-linux-gnu/$resolver" "/staging/lib/x86_64-linux-gnu/$resolver"; \
+    done; \
+    cp -a /opt/convex/db/mumps.dat /staging/opt/convex/db/mumps.dat; \
+    cp -a /opt/convex/db/mumps.gld /staging/opt/convex/db/mumps.gld; \
+    cp -a /build/o/convex.o /staging/opt/convex/o/convex.o; \
+    printf '%s\n' \
+      'tls: {' \
+      '  client: {' \
+      '    CAfile: "/etc/ssl/certs/ca-certificates.crt";' \
+      '    verify-level: "CHECK";' \
+      '    verify-depth: 9;' \
+      '  };' \
+      '}' \
+      > /staging/opt/convex/tls.conf
+
 # `./run test mumps` reruns this exact suite from the built image, so the
 # evidence is not limited to what happened during the build.
 RUN printf '%s\n' \
@@ -183,62 +244,14 @@ RUN --mount=type=bind,from=test,source=/bin/busybox,target=/busybox,readonly \
     done; \
     "$pruner" rm -rf /etc/.pwd.lock; \
     exec "$pruner" rm -rf /tmp
-# Only convex.o -- the routine both leaf images call into -- is shared here.
-# Each leaf below copies in just its own entry-point object, so neither final
-# image ships the other's entry point, and neither ships any test-only object
-# (fixture.o, jsontest.o, httptest.o, livetest.o, cryptotest.o) at all.
-COPY --from=test /opt/convex/db /opt/convex/db
-COPY --from=test /build/o/convex.o /opt/convex/o/convex.o
-# yottadb is the real engine launcher binary; mumps is only ever a symlink to
-# it (confirmed on the build host: `mumps -> ./yottadb`). Copying the mumps
-# symlink with cp -a and never copying its target -- the classic "cp -a
-# stages a SONAME symlink without what it points at" failure -- would ship a
-# dangling link, so the real file is staged under its own name (dereferenced
-# with -L) and mumps is recreated as a symlink to it, matching upstream.
-#
-# libyottadb.so is the actual engine; the yottadb binary itself only links
-# libc and dlopen()s libyottadb.so at startup, so a naive ldd closure over
-# just the launcher binary silently misses it and everything it needs (this
-# was caught by actually running the built runtime image, not by reasoning
-# about it: the first attempt at this stage shipped only the launcher's own
-# closure and the image failed to start). libgtmtls.so -- the OpenSSL-backed
-# plugin WRITE /TLS dlopen()s -- is the same story: it is not a link-time
-# dependency of anything above it, so it and its own closure are staged and
-# ldd'd explicitly too, even though nothing here calls dlopen() directly.
-RUN --mount=type=bind,from=test,source=/opt/yottadb,target=/ydb-full,readonly \
-    --mount=type=bind,from=test,source=/,target=/ydb-fs,readonly \
-    set -eu; \
-    mkdir -p /staging/bin /staging/usr/bin /staging/opt/yottadb/plugin \
-             /staging/opt/convex /staging/etc/ssl/certs; \
-    cp -a /ydb-fs/bin/dash /staging/bin/sh; \
-    for tool in id cat; do cp -a "/ydb-fs/usr/bin/$tool" "/staging/usr/bin/$tool"; done; \
-    cp -aL /ydb-full/yottadb /staging/opt/yottadb/yottadb; \
-    ln -s ./yottadb /staging/opt/yottadb/mumps; \
-    cp -aL /ydb-full/libyottadb.so /staging/opt/yottadb/libyottadb.so; \
-    cp -aL /ydb-full/plugin/libgtmtls.so /staging/opt/yottadb/plugin/libgtmtls.so; \
-    for object in /ydb-full/yottadb /ydb-full/libyottadb.so /ydb-full/plugin/libgtmtls.so; do \
-      ldd "$object" 2>/dev/null \
-        | awk '{ for (f = 1; f <= NF; f++) if ($f ~ /^\//) print $f }' \
-        | while read -r library; do \
-            mkdir -p "/staging$(dirname "$library")"; \
-            cp -aL "/ydb-fs$library" "/staging$library"; \
-          done; \
-    done; \
-    cp -aL /ydb-fs/etc/ssl/certs/ca-certificates.crt /staging/etc/ssl/certs/ca-certificates.crt; \
-    cp -aL /ydb-fs/etc/ssl/openssl.cnf /staging/etc/ssl/openssl.cnf; \
-    cp -aL /ydb-fs/etc/nsswitch.conf /staging/etc/nsswitch.conf; \
-    for resolver in libnss_dns.so.2 libnss_files.so.2 libresolv.so.2; do \
-      cp -aL "/ydb-fs/lib/x86_64-linux-gnu/$resolver" "/staging/lib/x86_64-linux-gnu/$resolver"; \
-    done; \
-    printf '%s\n' \
-      'tls: {' \
-      '  client: {' \
-      '    CAfile: "/etc/ssl/certs/ca-certificates.crt";' \
-      '    verify-level: "CHECK";' \
-      '    verify-depth: 9;' \
-      '  };' \
-      '}' \
-      > /staging/opt/convex/tls.conf
+# The whole runtime closure was built as /staging in the test stage, while
+# that stage's own filesystem (cp, ldd, awk, mumps itself) was still intact;
+# here it lands in one shot, after this stage's own broad filesystem is
+# already gone. Only convex.o -- the routine both leaf images call into -- is
+# included; each leaf below copies in just its own entry-point object, so
+# neither final image ships the other's entry point or any test-only object
+# (fixture.o, jsontest.o, httptest.o, livetest.o, cryptotest.o).
+COPY --from=test /staging /
 ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     LC_ALL=C \
