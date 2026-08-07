@@ -5,6 +5,9 @@
 			<assertions precondition="true" postcondition="true" check="true" invariant="true" loop="true" supplier_precondition="true"/>
 		</option>
 		<setting name="dotnet_naming_convention" value="true"/>
+		<capability>
+			<concurrency support="none"/>
+		</capability>
 		<library name="base" location="$ISE_LIBRARY\library\base\base.ecf"/>
 		<library name="net" location="$ISE_LIBRARY\library\net\net.ecf"/>
 		<library name="openssl" location="$ISE_LIBRARY\unstable\library\network\openssl\openssl_dynamic.ecf"/>
