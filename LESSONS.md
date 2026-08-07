@@ -508,7 +508,54 @@ teach workers to be more credulous; it is to give them a briefing complete
 enough that mid-flight expansion is rarely needed, and to make the legitimate
 channel unambiguous when it is.
 
-## 22. Miscellaneous findings worth a slide
+## 22. The safety check that could not fail, three times over
+
+The project's central claim is that every language ships a minimal runtime
+image: no compiler, no package manager, no shell toolbox, nothing but what
+serving Convex traffic requires. Each language's Dockerfile ends with a loop
+that proves it:
+
+```sh
+for command_name in gcc cc clang make ld as apt apt-get dpkg curl wget \
+    node python python3 rustc cargo npm pip convex busybox; do
+  ! command -v "$command_name" >/dev/null 2>&1
+done
+```
+
+Read it and it looks airtight. It cannot reject anything, for three independent
+reasons, any one of which alone would be enough:
+
+1. **A `for` loop's exit status is only its last iteration's.** POSIX says so
+   plainly. Twenty of those names are evaluated and thrown away. The only one
+   genuinely asserted absent is `busybox`, because it happens to be last.
+2. **`set -e` does not apply to a pipeline beginning with `!`.** Also POSIX,
+   also explicit. So even as a standalone statement, `! command -v gcc` never
+   aborts a build.
+3. **In at least one image, `command` did not exist.** That client builds a
+   purpose-trimmed BusyBox without the `cmdcmd` applet, so `command` was
+   neither a builtin nor on disk and every lookup returned 127 — "not found",
+   which `!` obligingly turned into success.
+
+Thirty-three merged languages carried some version of this. The correct form
+was already in the repository — one client wrote `! command -v "$name" || exit
+1` — so this was not ignorance, it was a broken shape getting copied from
+neighbour to neighbour faster than the working one.
+
+Two things make this worth a slide rather than a footnote. First, it is the
+same failure as the never-failing unit tests earlier in this document, in a
+completely different language and layer: **a check nobody has ever seen fail is
+indistinguishable from a check that cannot fail, and the only way to tell them
+apart is to break something on purpose and confirm it screams.** Second, it was
+found by reading, not by running. No verification run would ever have surfaced
+it, because the symptom of a vacuous check is that everything passes.
+
+There is a real question underneath, and honesty requires separating it from
+the defect: were the images actually clean? The gate being broken does not
+mean anything got through it. That is being measured directly — building each
+image and running the check the way it should have been written — because
+"probably fine" is not the standard this project claims.
+
+## 23. Miscellaneous findings worth a slide
 
 - A client passed every check except one, and the one failure was in the
   *reference* implementation used for comparison, not the client under test.
@@ -528,6 +575,19 @@ channel unambiguous when it is.
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- V's `net.ssl` verified nothing. Passing `validate: true` looks like it turns
+  certificate checking on, but vlib loads a trust store only when a separate
+  `verify` field names one, and it never calls
+  `SSL_CTX_set_default_verify_paths`. The context is left with no CA at all, so
+  every handshake fails — and the image's `SSL_CERT_FILE` is not consulted,
+  because vlib does not read it. The flag named after the security property was
+  not the flag that supplied it.
+- A library copied by `cp -a` arrived as a dangling symlink. `ldd` reports the
+  SONAME, `libgmp.so.10`, which on Debian is a symlink to `libgmp.so.10.4.1`;
+  `cp -a` preserves symlinks rather than following them, so the pointer was
+  staged and the file it pointed at never was. Six libraries in that image were
+  dangling. Three others happened to be real files rather than symlinks, which
+  is the only reason the image got far enough to fail informatively.
 - Two Pharo defects were stacked, and the first completely hid the second. Only
   after the image stopped crashing at boot did anything reach the adapter's
   listening socket, which then failed every `accept()` because the listen
