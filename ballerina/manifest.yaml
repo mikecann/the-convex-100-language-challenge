@@ -4,5 +4,40 @@ displayName: "Ballerina"
 rank: 57
 selectionTier: coverage
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Ballerina HTTP client over ballerina/http, plus a hand-rolled
+    RFC 6455 WebSocket transport for the pinned Live sync profile.
+    ballerina/websocket corrupts a multi-byte UTF-8 character split across
+    a continuation-frame boundary, so Live never uses that module.
+    ballerina/tcp carries the plaintext local-backend connection, but its
+    own TLS client never sends SNI (confirmed by disassembling its native
+    jar), which fails outright against any SNI-requiring TLS endpoint
+    including the hosted deployment; the TLS connection instead uses the
+    JDK's own SSLSocketFactory via Java interop, which sets SNI correctly.
+toolchain:
+  name: Ballerina
+  version: 2201.13.5
+intendedCapabilities:
+  - http
+  - live
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, optimistic updates, and TransitionChunk assembly are deferred.
+  - Each Live subscription keeps its newest 16 updates; slow consumers drop older intermediate states.
+  - A reconnect dial runs inline on the owner strand rather than on a separate connector strand, so a queued command can be delayed by up to the connect deadline while a reconnect is in flight.
+capabilities:
+  - http
+  - live

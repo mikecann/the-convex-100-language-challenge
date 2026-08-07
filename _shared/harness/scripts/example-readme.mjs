@@ -12,6 +12,7 @@ const fenceLanguages = {
   ".alg": "algol",
   ".asm": "nasm",
   ".awk": "awk",
+  ".bal": "ballerina",
   ".bas": "freebasic",
   ".bmx": "blitzmax",
   ".c": "c",
