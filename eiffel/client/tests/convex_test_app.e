@@ -119,7 +119,7 @@ feature {NONE} -- Initialization
 			got_update: BOOLEAN
 			ignored: BOOLEAN
 		do
-			room := "eiffel-smoke-test-room"
+			room := "eiffel-smoke-test-room-" + fresh_suffix_number.out
 			create client.make ("http://127.0.0.1:3210")
 
 			create args.make_object
@@ -189,6 +189,13 @@ feature {NONE} -- Initialization
 			else
 				print ("LIVE_UPDATE_TIMEOUT%N")
 			end
+		end
+
+	fresh_suffix_number: INTEGER
+		external
+			"C signature (): unsigned int use %"convex_native.h%""
+		alias
+			"convex_random_seed"
 		end
 
 end
