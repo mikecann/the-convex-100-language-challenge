@@ -231,41 +231,52 @@ ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     PATH=/usr/local/bin:/usr/bin:/bin
 USER 65532:65532
-RUN test "$(id -u):$(id -g)" = 65532:65532 \
-    && test "$(uname -m)" = x86_64 \
-    && test -s "$SSL_CERT_FILE" \
-    && test "$(printf 'ok\n' | cat)" = ok \
-    && test "$(printf 'a:b\n' | cut -d: -f2)" = b \
-    && test "$(printf 'first\nsecond\n' | head -n 1)" = first \
-    && test "$(printf 'first\nsecond\n' | tail -n 1)" = second \
-    && test "$(printf 'a\n' | tr a A)" = A \
-    && test "$(printf 'b\na\n' | sort | head -n 1)" = a \
-    && test "$(printf 'a\na\n' | uniq | wc -l | tr -d ' ')" = 1 \
-    && printf 'needle\n' | grep -Fqx needle \
-    && test "$(printf 'before\n' | sed 's/before/after/')" = after \
-    && test "$(printf 'value\n' | awk '{print $1}')" = value \
-    && test ! -e /etc/dpkg \
-    && test ! -e /etc/.pwd.lock \
-    && test ! -e /etc/update-motd.d \
-    && test ! -e /busybox \
-    && test ! -e /var \
-    && test ! -e /opt \
-    && test ! -e /usr/share \
-    && test ! -e /usr/include \
-    && test ! -e /usr/src \
-    && set -- /bin/* \
-    && test "$#" -eq 1 \
-    && test "$1" = /bin/sh \
-    && set -- /usr/bin/* \
-    && test "$#" -eq 13 \
-    && set -- /lib64/* \
-    && test "$#" -eq 1 \
-    && set -- /usr/lib/x86_64-linux-gnu/ossl-modules/* \
-    && test "$#" -eq 1 \
-    && for command_name in factor gcc cc clang make cmake ld apt apt-get \
+# set -eux here (rather than relying solely on the "&&" chain below) is
+# not cosmetic: a `for name in ...; do ! command -v "$name"; done` loop
+# cannot fail on its own -- POSIX gives a `for` loop the exit status of
+# only its LAST iteration, and a pipeline beginning with `!` is exempt
+# from `set -e` entirely -- so without an explicit `exit 1` inside the
+# loop body, every check except the very last (convex) was silently
+# unable to fail this build no matter what leaked into the runtime
+# image. `set -eux` also prints each command as it runs, so if this
+# chain ever does fail, the log shows exactly which assertion broke
+# instead of a bare "exit code 1" with 30-odd candidates to suspect.
+RUN set -eux; \
+    test "$(id -u):$(id -g)" = 65532:65532; \
+    test "$(uname -m)" = x86_64; \
+    test -s "$SSL_CERT_FILE"; \
+    test "$(printf 'ok\n' | cat)" = ok; \
+    test "$(printf 'a:b\n' | cut -d: -f2)" = b; \
+    test "$(printf 'first\nsecond\n' | head -n 1)" = first; \
+    test "$(printf 'first\nsecond\n' | tail -n 1)" = second; \
+    test "$(printf 'a\n' | tr a A)" = A; \
+    test "$(printf 'b\na\n' | sort | head -n 1)" = a; \
+    test "$(printf 'a\na\n' | uniq | wc -l | tr -d ' ')" = 1; \
+    printf 'needle\n' | grep -Fqx needle; \
+    test "$(printf 'before\n' | sed 's/before/after/')" = after; \
+    test "$(printf 'value\n' | awk '{print $1}')" = value; \
+    test ! -e /etc/dpkg; \
+    test ! -e /etc/.pwd.lock; \
+    test ! -e /etc/update-motd.d; \
+    test ! -e /busybox; \
+    test ! -e /var; \
+    test ! -e /opt; \
+    test ! -e /usr/share; \
+    test ! -e /usr/include; \
+    test ! -e /usr/src; \
+    set -- /bin/*; \
+    test "$#" -eq 1; \
+    test "$1" = /bin/sh; \
+    set -- /usr/bin/*; \
+    test "$#" -eq 13; \
+    set -- /lib64/*; \
+    test "$#" -eq 1; \
+    set -- /usr/lib/x86_64-linux-gnu/ossl-modules/*; \
+    test "$#" -eq 1; \
+    for command_name in factor gcc cc clang make cmake ld apt apt-get \
          dpkg curl wget nc netcat openssl node python python3 ruby perl \
          java php go rustc cargo npm pip tclsh convex; do \
-         ! command -v "$command_name" >/dev/null 2>&1; \
+         ! command -v "$command_name" >/dev/null 2>&1 || exit 1; \
        done
 
 FROM runtime-base AS example-runtime
