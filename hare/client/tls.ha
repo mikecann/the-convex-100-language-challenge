@@ -7,7 +7,7 @@
 // TLS through their own language's normal C interop, not through a second
 // Convex client.
 use net;
-use net::dial;
+use net::tcp;
 use os;
 use rt;
 use strings;
@@ -218,7 +218,10 @@ export fn tls_close(conn: *tls_conn) void = {
 	// this regression only runs when a developer opts in by setting
 	// HARE_TEST_NETWORK, and is a silent no-op otherwise.
 	if (os::getenv("HARE_TEST_NETWORK") is void) return;
-	const addr = net::dial::dial("tcp", "example.com", "443")!;
+	// resolve_host, not net::dial::dial: see its doc comment in http.ha for
+	// why this client never uses Hare 0.24.2's own name resolution path.
+	const resolved = resolve_host("example.com")!;
+	const addr = tcp::connect(resolved, 443)!;
 	let d = deadline_in(10000);
 	const conn = tls_connect(addr, "example.com", &d)!;
 	defer tls_close(conn);

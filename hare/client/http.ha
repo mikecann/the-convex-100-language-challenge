@@ -4,15 +4,20 @@
 // library has no HTTP client, so request framing, status line and header
 // parsing, and both Content-Length and chunked body decoding are implemented
 // here in Hare rather than delegated to a C library.
+use bufio;
+use crypto::random;
 use fmt;
 use io;
 use memio;
 use net;
-use net::dial;
+use net::dns;
 use net::ip;
+use net::tcp;
 use net::uri;
+use os;
 use strconv;
 use strings;
+use unix::resolvconf;
 
 export type http_error = !str;
 
@@ -71,11 +76,135 @@ export fn endpoint_finish(e: *endpoint) void = {
 	free(e.base_path);
 };
 
+// Resolves a hostname to one address. This client deliberately does not use
+// net::dial::dial or unix::hosts::lookup: Hare 0.24.2's net::ip::parse
+// rejects a bare trailing "::" (a valid IPv6 shorthand for an all-zero
+// remainder, used by entries like "fe00::" and "ff00::"), and
+// unix::hosts::next propagates that as a hard error instead of skipping the
+// unparseable line — so any /etc/hosts containing those lines, including
+// the one Docker's container networking generates by default, made every
+// hostname lookup fail with "IP address is invalid" even though the name
+// this client actually wanted was earlier in the file and perfectly valid.
+// This resolver checks for a literal IP address, then re-implements a
+// tolerant /etc/hosts scan that skips any line it cannot parse instead of
+// aborting, then falls back to a real DNS query using this project's
+// resolv.conf-configured nameservers, exactly as net::dial::dial would have.
+fn resolve_host(host: str) (ip::addr | http_error) = {
+	match (ip::parse(host)) {
+	case let addr: ip::addr =>
+		return addr;
+	case ip::invalid => void;
+	};
+	match (lookup_etc_hosts(host)) {
+	case let addr: ip::addr =>
+		return addr;
+	case void => void;
+	};
+	match (query_dns(host)) {
+	case let addr: ip::addr =>
+		return addr;
+	case void =>
+		return "could not resolve the deployment's hostname";
+	};
+};
+
+fn lookup_etc_hosts(host: str) (ip::addr | void) = {
+	const file = match (os::open("/etc/hosts")) {
+	case let f: io::file =>
+		yield f;
+	case =>
+		return void;
+	};
+	defer io::close(file)!;
+	let scan = bufio::newscanner(file, 64 * 1024);
+	defer bufio::finish(&scan);
+	for (true) {
+		const line = match (bufio::scan_line(&scan)) {
+		case let l: const str =>
+			yield l;
+		case =>
+			return void;
+		};
+		if (len(line) == 0 || strings::hasprefix(line, "#")) continue;
+		const tok = strings::tokenize(line, " \t");
+		const addr_text = match (strings::next_token(&tok)) {
+		case let s: str =>
+			yield s;
+		case done =>
+			continue;
+		};
+		// Skip a line this parser cannot make sense of instead of treating
+		// it as fatal: an unrelated line further down (or the DNS fallback
+		// below) may still answer the actual question this call is asking.
+		const addr = match (ip::parse(addr_text)) {
+		case let a: ip::addr =>
+			yield a;
+		case ip::invalid =>
+			continue;
+		};
+		for (true) {
+			const name = match (strings::next_token(&tok)) {
+			case let s: str =>
+				yield s;
+			case done =>
+				break;
+			};
+			if (name == host) return addr;
+		};
+	};
+};
+
+fn query_dns(host: str) (ip::addr | void) = {
+	const servers = resolvconf::load().nameservers;
+	if (len(servers) == 0) return void;
+	const domain = dns::parse_domain(host);
+	defer free(domain);
+	let rand: [2]u8 = [0...];
+	random::buffer(rand[..]);
+	const id = *(&rand[0]: *u16);
+	const query4 = dns::message {
+		header = dns::header {
+			id = id,
+			op = dns::op {
+				qr = dns::qr::QUERY,
+				opcode = dns::opcode::QUERY,
+				rd = true,
+				...
+			},
+			qdcount = 1,
+			...
+		},
+		questions = [
+			dns::question {
+				qname = domain,
+				qtype = dns::qtype::A,
+				qclass = dns::qclass::IN,
+			},
+		],
+		...
+	};
+	const resp = match (dns::query(&query4, servers...)) {
+	case let m: *dns::message =>
+		yield m;
+	case =>
+		return void;
+	};
+	defer dns::message_free(resp);
+	for (let i = 0z; i < len(resp.answers); i += 1) {
+		match (resp.answers[i].rdata) {
+		case let addr: dns::a =>
+			return addr: ip::addr;
+		case => void;
+		};
+	};
+	return void;
+};
+
 // Dials and, for an `https`/`wss` endpoint, completes the TLS handshake.
 // `d` bounds the whole operation.
 export fn endpoint_connect(e: *endpoint, d: *deadline) (transport | http_error) = {
-	const port_text = strconv::u16tos(e.port);
-	const sock = match (dial::dial("tcp", e.host, port_text)) {
+	const addr = resolve_host(e.host)?;
+	const sock = match (tcp::connect(addr, e.port)) {
 	case let s: net::socket =>
 		yield s;
 	case =>
