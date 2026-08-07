@@ -12,8 +12,8 @@ The [canonical basic example](examples/basics/main.clj) performs a unique room's
 
 | Capability | Status |
 | --- | --- |
-| HTTP query, mutation, action, auth, logs, and structured errors | Implemented, awaiting shared evidence |
-| Live initial values, changes, query-error recovery, and reconnects | Implemented for the pinned profile, awaiting shared evidence |
+| HTTP query, mutation, action, auth, logs, and structured errors | Verified by shared local and hosted conformance |
+| Live initial values, changes, query-error recovery, and reconnects | Verified by shared local and hosted conformance |
 | Bounded delivery and lifecycle barriers | Implemented and covered by deterministic fixtures |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.clj -->
