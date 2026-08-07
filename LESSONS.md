@@ -605,6 +605,17 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- A default file mode made an image unbootable, twenty-two layers later. Nim's
+  runtime stage swaps `/usr/lib/x86_64-linux-gnu` for a trimmed closure using a
+  small Perl copier, because the process doing the swap cannot depend on the
+  directory it is replacing. Perl's `open($to, '>')` creates at 0666 minus
+  umask, and BuildKit's umask is 0022, so every copied file landed at 0644 —
+  including `ld-linux-x86-64.so.2`, which `ldd` reports as part of a binary's
+  dependency closure. Shared libraries `dlopen` perfectly well without the
+  execute bit. An ELF *interpreter* does not: the kernel loads it through the
+  same `MAY_EXEC` check as the binary itself. So the copy succeeded, the stage
+  succeeded, and three layers later `/bin/sh` could not be executed at all.
+  The error named a file that was never touched.
 - Unison could open the socket and still could not be built. The proof was
   real: a certificate-verified TLS handshake against a public host and a
   decrypted `HTTP/1.1 200 OK` read back, from Unison source, with the socket
