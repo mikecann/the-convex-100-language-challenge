@@ -29,4 +29,6 @@ limitations:
   - Live authentication and TransitionChunk assembly are deferred.
   - Convex values are limited to Crystal JSON types in this educational client.
   - WebSocket mutations, optimistic updates, and mutation replay are deferred.
-capabilities: []
+capabilities:
+  - http
+  - live

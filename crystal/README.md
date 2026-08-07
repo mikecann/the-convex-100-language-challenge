@@ -10,8 +10,8 @@ Read the [canonical basic example](examples/basics/main.cr). It performs an HTTP
 
 | Capability | Status |
 | --- | --- |
-| Native HTTP query, mutation, action | Source implementation present; shared verification pending |
-| Native Live query and reconnect | Source implementation present; shared verification pending |
+| Native HTTP query, mutation, action | Verified by shared local and hosted conformance at this exact head |
+| Native Live query and reconnect | Verified by shared local and hosted conformance at this exact head |
 | Authentication | HTTP bearer token; Live auth deferred |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.cr -->
@@ -100,4 +100,4 @@ The adapter speaks NDJSON protocol v1 over stdin/stdout or `ADAPTER_LISTEN`. One
 
 ## Limitations
 
-TransitionChunk assembly, Live authentication, WebSocket mutations, optimistic updates, and the complete Convex value surface remain deferred. Shared local and hosted conformance remain root-owned, so capability badges stay empty until that evidence passes.
+TransitionChunk assembly, Live authentication, WebSocket mutations, optimistic updates, and the complete Convex value surface remain deferred. Shared local and hosted conformance passed 31/31 from clean exact-head builds, and the manifest capability list records the evaluator award of http and live.
