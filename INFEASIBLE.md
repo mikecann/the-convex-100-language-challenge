@@ -22,13 +22,39 @@ language so the roster still reaches one hundred.
 | xojo | Proprietary licensed IDE-bound compiler. |
 | xpp | Microsoft Dynamics X++ executes only inside the hosted Dynamics platform. |
 
-## Borderline — feasible only with an activation or licensing decision
+## Infeasible — no way to reach a socket from the language itself
 
-| Language | Condition |
+These were assessed in a second sweep. Each was independently challenged by a
+second reviewer arguing the opposite case; the verdicts below are what survived.
+A client for any of them would be a bridge — a helper process doing the real
+work while the language does something incidental — which this project rejects,
+for the same reason PostScript was declined earlier on this page.
+
+| Language | Why it cannot be done here |
 | --- | --- |
-| wolfram-language | The free Wolfram Engine for Developers runs headless in Docker but requires account activation with a license key at build or run time. |
-| q | kdb+ personal edition is gratis but license-gated and closed; redistribution inside images needs a decision. |
-| gml | GameMaker's compiler is proprietary; open reimplementations are only partially compatible. |
+| bc | Its entire outside world is a numeric stdin and a text stdout. No file handles, no `dlopen`, no FFI of any kind, so a socket could only ever be an external process. |
+| solidity | The EVM has no I/O opcode and Solidity has no `extern`. A socket would have to be an invented precompile inside a foreign host program. |
+| abap | No socket API and no public FFI even on a licensed SAP AS ABAP. The free open-abap route opens its sockets by embedding literal JavaScript inside `WRITE '@KERNEL …'` string literals, which is JavaScript doing the work, not ABAP. |
+| elm | Elm has no socket type and no foreign *call* — only asynchronous JSON ports. Transport, stdio and the adapter listener would all live in hand-written JavaScript, leaving Elm as a message formatter. This is the PostScript ruling applied consistently. |
+| cfml | Lucee, the real open CFML engine, exceeds the 128 MiB container limit and needs to unpack `.lco` files into a writable temporary directory the read-only runtime cannot provide. BoxLang clears the harness cleanly but is a different language that is merely CFML-compatible — substituting it would be the same move as substituting GNU Octave for MATLAB, already rejected above. |
+
+## Infeasible — license or GUI gate (ruled, previously borderline)
+
+Michael's ruling: entries requiring a proprietary license or a GUI toolchain are
+not built. Recorded here rather than left open.
+
+| Language | Why it cannot be done here |
+| --- | --- |
+| wolfram-language | The free Wolfram Engine requires Wolfram-ID activation or a metered cloud entitlement, forbids redistribution inside images, and wants a writable password file plus live egress on every kernel start. |
+| q | Technically excellent — kdb+ has had a built-in WebSocket client since 2014 — but every route to the binary needs a KX account, an OAuth2 bearer token and a per-user `kc.lic` license file. |
+| gml | GameMaker refuses to emit a binary without an interactive IDE sign-in, its Linux export is an OpenGL/X11 game runner rather than a headless program, and `external_define` has no Linux shared-object path. |
+
+## At risk, not yet abandoned
+
+| Language | State |
+| --- | --- |
+| actionscript | Nine real defects fixed; blocked on Apache Royale's Closure Compiler pass renaming JSON object keys on the wire, which rewrites the protocol itself. The fix is mechanical — bracket notation at every dynamic access — but spans an unknown number of call sites. |
+| logo | Lhogho's `libload`/`external` is a genuine `dlopen` FFI, and `socket()`/`connect()` were driven successfully from Logo source. But it is 2012-era i386 abandonware, and this project has already learned what emulated architectures do to trust in a result. |
 
 ## Chosen replacements
 
@@ -70,5 +96,45 @@ Deliberately not chosen, and why:
 
 If any chosen language proves infeasible once its toolchain is actually pinned
 in Docker, it moves to the table above with its reason recorded, and the next
-candidate takes the slot. The three borderline entries (wolfram-language, q,
-gml) still await a licensing decision and are not counted as replaced.
+candidate takes the slot.
+
+## Second replacement round
+
+The sweep above ruled out eight more entries, so eight more replacements are
+needed. The same four criteria apply: a free toolchain that installs unattended
+in Docker, a genuine socket and TLS route the language's own code drives, a real
+claim on a viewer's interest, and variety across eras and paradigms. Slot
+mapping is cosmetic — the slots are fungible.
+
+| # | Replaces | Language | Toolchain | Why it earns a slot |
+| --- | --- | --- | --- | --- |
+| 12 | q | **APL** (1966) | GNU APL | The glyph language itself rather than a descendant. `⎕FIO` exposes socket, connect, send and recv, with user-compiled native functions as the sanctioned OpenSSL path. Recovers the array-language slot the KX signup form took. |
+| 13 | abap | **MUMPS / M** (1966) | YottaDB | Opens its own TCP with no FFI at all — `OPEN d:(CONNECT="host:port:TCP")` — and negotiates TLS through a bundled OpenSSL plugin. Still runs a large share of the world's hospital records, which is the enterprise-invisibility story ABAP was going to tell. |
+| 14 | bc | **Simula 67** (1967) | GNU Cim | Classes, objects, inheritance, virtual methods and coroutines were all invented here. Cim compiles to C and supports `external C procedure`, the same build shape as the ALGOL 60 entry that already succeeded. |
+| 15 | solidity | **VHDL** (1983) | GHDL, VHPIDIRECT | A hardware description language, DoD-commissioned like Ada, that GHDL compiles to a standalone native executable. The strangest honest entry available, and the mirror image of Solidity's failure: the wrong kind of machine that turns out to have a door. |
+| 16 | gml | **Oz** (1995) | Mozart 2 | Dataflow variables, constraint programming, and a concurrency model unlike anything else on the roster. `Open.socket` is native. The *Concepts, Techniques and Models* language that almost nobody has run. |
+| 17 | wolfram-language | **SETL** (1969) | GNU SETL | Sets and tuples as the primitive data types, and the language NYU used to prototype the first Ada compiler — the mathematically-founded slot Wolfram was going to fill, at a fifth of the age. |
+| 18 | elm | **Dylan** (1992) | Open Dylan | Apple's Lisp-with-syntax, built for the Newton and then killed. Multimethod dispatch and a real macro system behind ALGOL-ish syntax, with `define C-function` for the transport boundary. A functional slot that is genuinely dead rather than merely unfashionable. |
+| 19 | cfml | **Harbour** (xBase, 1985 lineage) | Harbour | Restores the xBase family the project lost twice, to visual-foxpro and xbasepp, honestly and for free. The language behind a decade of DOS business software, compiling straight to C so the socket and TLS boundary is routine. |
+
+Held in reserve, if actionscript or logo cannot be recovered:
+
+- **Pop-11** (Poplog) — the British AI language, an incremental compiler whose
+  virtual machine also hosts Prolog, Common Lisp and ML inside the same image.
+  Strange in a way no modern language is.
+
+Considered in this round and not chosen:
+
+- **Limbo** (Inferno) — Bell Labs 1995, the direct ancestor of Go, and
+  `sys->dial` is native. Rejected because Inferno's security stack is its own
+  Keyring design rather than X.509 TLS, so the transport would need a foreign
+  process.
+- **Miranda** — now BSD-licensed and Haskell's direct ancestor, but it has no
+  FFI at all: the same failure shape as `bc`.
+- **Occam-π** — CSP and the transputer, but the toolchain is fragile enough that
+  pinning a reproducible build is a project of its own.
+- **Modula-3** — good language and real C interop, but modula-2 and oberon are
+  already in flight and a third Wirth-family entry buys no variety.
+- **CLU** — Liskov's, and the origin of iterators and exceptions, but the
+  surviving compiler is old enough that "does it build" would be the whole
+  project.
