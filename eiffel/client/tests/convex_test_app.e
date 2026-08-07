@@ -1,5 +1,14 @@
 note
-	description: "Temporary smoke-test root used only while bringing up the toolchain; replaced by CONVEX_JSON_TESTS once the ECF plumbing is verified."
+	description: "[
+		Language-local unit tests for the JSON value type and parser, run
+		with no network access as part of the Docker `test' image. These
+		classes' correctness does not depend on a live deployment, unlike
+		CONVEX_SOCKET, CONVEX_WEBSOCKET, CONVEX_SYNC, and CONVEX_CLIENT,
+		which were validated end to end against a running local Convex
+		backend and a real TLS host during development (see the client
+		README); that network-dependent proof is what `./run
+		verify-example' and `./run verify' repeat and check automatically.
+	]"
 
 class
 	CONVEX_TEST_APP
@@ -11,225 +20,125 @@ feature {NONE} -- Initialization
 
 	make
 		do
-			check_json
-			check_socket
-			check_websocket
-			check_client_against_local_backend
-			print ("SMOKE_OK%N")
+			check_roundtrip_and_escaping
+			check_integral_range_acceptance
+			check_object_field_lookup_by_content
+			check_array_and_nesting
+			check_parser_rejects_malformed_input
+			print ("ALL_TESTS_PASSED%N")
 		end
 
-	check_json
+feature {NONE} -- Tests
+
+	check_roundtrip_and_escaping
+			-- A value carrying every JSON shape, plus the ASCII characters
+			-- that must be escaped on the way back out, round-trips
+			-- exactly through parse then encode then parse again.
 		local
 			parser: CONVEX_JSON_PARSER
-			value: CONVEX_JSON_VALUE
-			obj: CONVEX_JSON_VALUE
+			source, reencoded: STRING
+		do
+			source := "{%"a%":1.0,%"b%":[true,false,null],%"c%":%"line1\nline2\ttab\%"quote\%"backslash\\end%"}"
+			create parser.make
+			parser.parse (source)
+			check first_parse_succeeded: parser.successful end
+			check attached parser.last_value as l_value then
+				reencoded := l_value.to_json
+			end
+			create parser.make
+			parser.parse (reencoded)
+			check second_parse_succeeded: parser.successful end
+			check attached parser.last_value as l_reparsed then
+				check same_number: l_reparsed.field ("a").number_item = 1.0 end
+				check same_array_length: l_reparsed.field ("b").array_item.count = 3 end
+				check same_string: l_reparsed.field ("c").string_item.is_equal (
+					"line1%Nline2%Ttab%"quote%"backslash\end") end
+			end
+		end
+
+	check_integral_range_acceptance
+			-- Convex's JSON transport may render an integral value as
+			-- "0.0"/"1.0"; callers must accept that form and still reject
+			-- fractional or out-of-range values rather than truncating them
+			-- silently. This is the specific regression AGENTS.md calls out
+			-- for decoding, not a fixture only exercising integer literals.
+		local
+			parser: CONVEX_JSON_PARSER
 		do
 			create parser.make
-			parser.parse ("{%"a%":1.0,%"b%":[true,false,null],%"c%":%"hi \%"quoted\%" text%"}")
+			parser.parse ("0.0")
 			check parsed: parser.successful end
-			if attached parser.last_value as l_value then
-				value := l_value
-				check has_a: value.has_field ("a") end
-				check number_ok: value.field ("a").number_item = 1.0 end
-				check array_len: value.field ("b").array_item.count = 3 end
-				print (value.to_json)
-				print ("%N")
-			else
-				print ("PARSE_FAILED_UNEXPECTEDLY%N")
+			check attached parser.last_value as l_zero then
+				check is_integral: l_zero.is_integral_in_range (0, 10) end
+				check decodes_to_zero: l_zero.integer_item = 0 end
 			end
 
-			create obj.make_object
-			obj.put_field ("room", create {CONVEX_JSON_VALUE}.make_string ("demo"))
-			print (obj.to_json)
-			print ("%N")
+			create parser.make
+			parser.parse ("2.5")
+			check parsed_fraction: parser.successful end
+			check attached parser.last_value as l_fraction then
+				check fraction_rejected: not l_fraction.is_integral_in_range (0, 10) end
+			end
+
+			create parser.make
+			parser.parse ("42")
+			check parsed_out_of_range: parser.successful end
+			check attached parser.last_value as l_out_of_range then
+				check out_of_range_rejected: not l_out_of_range.is_integral_in_range (0, 10) end
+			end
 		end
 
-	check_socket
-			-- Exercise CONVEX_SOCKET against a real TLS host to prove the
-			-- transport layer, not just the JSON layer, actually works.
+	check_object_field_lookup_by_content
+			-- `has_field' and `field' must compare by text content, not by
+			-- whether the caller happens to hold the exact same STRING
+			-- object the parser allocated: a freshly parsed key and an
+			-- unrelated literal with the same text are unrelated objects.
 		local
-			sock: CONVEX_SOCKET
-			request: STRING
-			response: detachable STRING
+			parser: CONVEX_JSON_PARSER
+			key_from_elsewhere: STRING
 		do
-			create sock.make ("example.com", 443, True)
-			if not sock.is_open then
-				print ("SOCKET_CONNECT_FAILED: ")
-				if attached sock.last_error as l_error then
-					print (l_error)
-				end
-				print ("%N")
-			else
-				request := "GET / HTTP/1.1%R%NHost: example.com%R%NConnection: close%R%N%R%N"
-				if sock.write_all (request) then
-					response := sock.read_some (256, 5000)
-					if attached response as l_response and then l_response.starts_with ("HTTP/1.1 200") then
-						print ("SOCKET_OK%N")
-					else
-						print ("SOCKET_UNEXPECTED_RESPONSE%N")
-					end
-				else
-					print ("SOCKET_WRITE_FAILED%N")
-				end
-				sock.close
+			create parser.make
+			parser.parse ("{%"status%":%"success%"}")
+			check parsed: parser.successful end
+			create key_from_elsewhere.make_from_string ("status")
+			check attached parser.last_value as l_value then
+				check has_field_by_content: l_value.has_field (key_from_elsewhere) end
+				check field_by_content: l_value.field (key_from_elsewhere).string_item.is_equal ("success") end
 			end
 		end
 
-	check_websocket
-			-- Exercise CONVEX_WEBSOCKET against a real public echo server
-			-- to prove the handshake and text-frame round trip actually
-			-- work, not just compile.
+	check_array_and_nesting
 		local
-			ws: CONVEX_WEBSOCKET
-			reply: detachable STRING
+			parser: CONVEX_JSON_PARSER
 		do
-			create ws.make ("echo.websocket.org", 443, "/", True)
-			if not ws.is_open then
-				print ("WS_CONNECT_FAILED: ")
-				if attached ws.last_error as l_error then
-					print (l_error)
-				end
-				print ("%N")
-			else
-				if ws.send_text ("hello-from-eiffel") then
-					reply := ws.try_receive_message (5000)
-					if attached reply as l_reply then
-						print ("WS_REPLY: " + l_reply + "%N")
-					else
-						print ("WS_NO_REPLY%N")
-					end
-				else
-					print ("WS_SEND_FAILED%N")
-				end
-				ws.close ("done")
+			create parser.make
+			parser.parse ("[1.0,[2.0,3.0],{%"nested%":true}]")
+			check parsed: parser.successful end
+			check attached parser.last_value as l_value then
+				check outer_length: l_value.array_item.count = 3 end
+				check inner_array: l_value.array_item.i_th (2).array_item.i_th (2).number_item = 3.0 end
+				check inner_object: l_value.array_item.i_th (3).field ("nested").boolean_item end
 			end
 		end
 
-	check_client_against_local_backend
-			-- End-to-end proof against the project's real local Convex
-			-- backend: an HTTP query and mutation, then a Live subscription
-			-- that observes the mutation's effect without polling.
+	check_parser_rejects_malformed_input
+			-- A parser that only ever reports success on well-formed input
+			-- is easy to write by accident; assert the failure path too.
 		local
-			client: CONVEX_CLIENT
-			args, mutation_args: CONVEX_JSON_VALUE
-			room: STRING
-			query_result, mutation_result: detachable CONVEX_RESULT
-			deadline_ms: INTEGER
-			poll: CONVEX_POLL
-			got_update: BOOLEAN
-			ignored: BOOLEAN
+			parser: CONVEX_JSON_PARSER
 		do
-			room := "eiffel-smoke-test-room-" + fresh_suffix_number.out
-			create client.make ("http://127.0.0.1:3210")
+			create parser.make
+			parser.parse ("{%"a%":}")
+			check rejected_missing_value: not parser.successful end
+			check attached parser.last_error end
 
-			create args.make_object
-			args.put_field ("room", create {CONVEX_JSON_VALUE}.make_string (room))
-			query_result := client.query ("demo:state", args)
-			if query_result = Void then
-				print ("CLIENT_QUERY_TRANSPORT_FAILED: ")
-				if attached client.last_error as l_error then print (l_error) end
-				print ("%N")
-			elseif not query_result.is_success then
-				print ("CLIENT_QUERY_APP_ERROR: " + query_result.error_message + "%N")
-			else
-				print ("CLIENT_QUERY_OK count=" + query_result.value.field ("count").number_item.out + "%N")
-			end
+			create parser.make
+			parser.parse ("{%"a%":1.0 extra}")
+			check rejected_trailing_content: not parser.successful end
 
-			client.live.ensure_connected
-			ignored := client.live.add_subscription ("sub-room", "demo:state", args)
-			print ("LIVE_CONNECTED=" + client.live.is_connected.out + "%N")
-
-			-- Drain the initial subscription value before mutating, mirroring
-			-- the canonical example's "subscribe before mutate" sequencing.
-			deadline_ms := 5000
-			from until got_update or deadline_ms <= 0
-			loop
-				create poll
-				if client.live.is_connected and then poll.wait_readable (client.live.descriptor, 200) then
-					client.live.poll (200)
-				end
-				if not client.live.pending_events.is_empty then
-					got_update := True
-				end
-				deadline_ms := deadline_ms - 200
-			end
-			if got_update then
-				print ("LIVE_INITIAL: " + client.live.pending_events.first.value.field ("count").number_item.out + "%N")
-				client.live.pending_events.wipe_out
-			else
-				print ("LIVE_INITIAL_TIMEOUT%N")
-			end
-
-			create mutation_args.make_object
-			mutation_args.put_field ("room", create {CONVEX_JSON_VALUE}.make_string (room))
-			mutation_args.put_field ("language", create {CONVEX_JSON_VALUE}.make_string ("Eiffel"))
-			mutation_args.put_field ("runId", create {CONVEX_JSON_VALUE}.make_string (room + "-once"))
-			mutation_result := client.mutation ("demo:increment", mutation_args)
-			if mutation_result /= Void and then mutation_result.is_success then
-				print ("CLIENT_MUTATION_OK applied=" + mutation_result.value.field ("applied").boolean_item.out + "%N")
-			else
-				print ("CLIENT_MUTATION_FAILED%N")
-			end
-
-			got_update := False
-			deadline_ms := 8000
-			from until got_update or deadline_ms <= 0
-			loop
-				create poll
-				if client.live.is_connected and then poll.wait_readable (client.live.descriptor, 200) then
-					client.live.poll (200)
-				end
-				if not client.live.pending_events.is_empty then
-					got_update := True
-				end
-				deadline_ms := deadline_ms - 200
-			end
-			if got_update then
-				print ("LIVE_UPDATED: " + client.live.pending_events.first.value.field ("count").number_item.out + "%N")
-			else
-				print ("LIVE_UPDATE_TIMEOUT%N")
-			end
-			client.live.pending_events.wipe_out
-
-			-- Prove reconnect: force-drop the transport (simulating
-			-- debugDisconnect), then confirm the subscription keeps
-			-- delivering updates after ensure_connected re-establishes it.
-			client.live.force_disconnect
-			print ("AFTER_FORCE_DISCONNECT is_connected=" + client.live.is_connected.out + "%N")
-			client.live.ensure_connected
-			print ("AFTER_RECONNECT is_connected=" + client.live.is_connected.out + "%N")
-
-			mutation_args.put_field ("runId", create {CONVEX_JSON_VALUE}.make_string (room + "-twice"))
-			mutation_result := client.mutation ("demo:increment", mutation_args)
-			if mutation_result /= Void and then mutation_result.is_success then
-				print ("RECONNECT_MUTATION_OK applied=" + mutation_result.value.field ("applied").boolean_item.out + "%N")
-			end
-
-			got_update := False
-			deadline_ms := 8000
-			from until got_update or deadline_ms <= 0
-			loop
-				create poll
-				if client.live.is_connected and then poll.wait_readable (client.live.descriptor, 200) then
-					client.live.poll (200)
-				end
-				if not client.live.pending_events.is_empty then
-					got_update := True
-				end
-				deadline_ms := deadline_ms - 200
-			end
-			if got_update then
-				print ("RECONNECT_LIVE_UPDATED: " + client.live.pending_events.first.value.field ("count").number_item.out + "%N")
-			else
-				print ("RECONNECT_LIVE_UPDATE_TIMEOUT%N")
-			end
-		end
-
-	fresh_suffix_number: INTEGER
-		external
-			"C signature (): unsigned int use %"convex_native.h%""
-		alias
-			"convex_random_seed"
+			create parser.make
+			parser.parse ("")
+			check rejected_empty_input: not parser.successful end
 		end
 
 end
