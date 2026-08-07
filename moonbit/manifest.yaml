@@ -4,5 +4,41 @@ displayName: "MoonBit"
 rank: 100
 selectionTier: curated_backfill
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native MoonBit client for the documented HTTP function endpoints and the
+    pinned sync profile, compiled with MoonBit's native backend. Ordinary
+    transport comes from moonbitlang/async 0.20.3: TCP sockets, TLS with system
+    trust-store chain and hostname verification via OpenSSL, HTTP/1.1, and
+    RFC 6455 WebSocket framing. Every Convex-specific behaviour - the function
+    call envelope, the sync protocol, query-set versioning, reconnection,
+    rehydration suppression, and the bounded update queues - is implemented in
+    MoonBit.
+toolchain:
+  name: MoonBit
+  version: 0.10.6+80dc50f24
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, optimistic updates, WebSocket mutations, and WebSocket actions are deferred; mutations and actions always use the HTTP endpoints.
+  - Live values cover the JSON-safe subset requested with format=json; tagged Convex value types are deferred.
+  - TransitionChunk assembly is deferred and treated as protocol drift that reconnects.
+  - Each subscription retains at most 16 updates and at most 1 Mi string units of serialised payload, and the process retains at most 8 Mi across all subscriptions; a unit is a UTF-16 code unit, so the worst case is 16 MiB resident, and the oldest update is dropped first with the drop counted.
+  - A Live message larger than 2 MiB or an HTTP response body larger than 2 MiB is refused rather than assembled.
+  - A read that stops part way through a WebSocket frame abandons the connection rather than resuming the parser.
+  - The adapter-only debugDisconnect hook is compiled into debug builds only; the canonical example ships from a release build that cannot contain it.
 capabilities: []
