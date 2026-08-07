@@ -1,0 +1,108 @@
+schemaVersion: 1
+id: algol60
+displayName: "ALGOL 60"
+rank: 78
+selectionTier: coverage
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native ALGOL 60 implementation of Convex's documented JSON HTTP functions
+    and the pinned /api/sync protocol, translated to C by GNU MARST. JSON,
+    HTTP/1.1 framing, RFC 6455 WebSocket framing, base64, hex, and every
+    Convex sync semantic are written in ALGOL 60. One reviewed C support
+    file, client/convexrt.c, supplies only the primitives the 1960 report
+    does not have: TCP sockets, TLS, non-blocking read and write, readiness
+    polling, listen and accept, a monotonic clock, entropy, and environment
+    variable access. It contains no HTTP, no WebSocket framing, no JSON and
+    no Convex knowledge; every deadline, retry, and bound is written in
+    ALGOL 60 as a MARST `code` procedure boundary, not assumed from the
+    generated C.
+toolchain:
+  name: GNU MARST
+  version: "2.7"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    The Docker test stage (build, every client/tests/*.alg suite, the TLS
+    trust/untrusted/wrong-host suite, and the example's no-configuration
+    failure path) passes on a remote builder for this checkpoint. Shared and
+    hosted black-box conformance have not been run, so no capability is
+    claimed and badges remain unearned.
+  - >-
+    ALGOL 60 has no identifier underscores, no string values (only literal
+    string constants), no record or struct types, and no bitwise operators.
+    Every buffer is a parallel `integer array` of bytes, every structured
+    value (an HTTP response, a parsed JSON node, a WebSocket frame header) is
+    a set of parallel scalar output parameters rather than one aggregate, and
+    bit-level work (base64, hex, WebSocket masking) is done with explicit
+    div/mod arithmetic against powers of two.
+  - >-
+    The MARST-translated language has no shared global state across outer-level
+    procedures; only lexical nesting inside a `begin ... end` block shares
+    variables. The whole client (buffers, JSON, HTTP, WebSocket framing, and
+    the Live sync state machine) is therefore one large nested block, assembled
+    at build time from separate source files rather than compiled as
+    independently linkable units.
+  - >-
+    The client is single threaded by construction, which is also true of
+    standard ALGOL 60 itself: one call path owns the WebSocket, drives
+    reconnects, and processes query-set changes. Live progress only happens
+    while a caller is inside a client procedure or the adapter's own poll
+    loop.
+  - >-
+    convexcall and livesubscribe open their own connection internally, so
+    client/tests/client-test.alg exercises the HTTP framing and envelope
+    layers directly (stream/header/chunked/error decoding) rather than
+    through convexcall itself, and client/tests/live-test.alg pre-seeds an
+    already-open loopback WebSocket handle rather than driving a real
+    connect and handshake. There is no concurrency primitive in ALGOL 60 to
+    run a fixture server and the client under test in the same process
+    otherwise.
+  - >-
+    The client's WebSocket handshake does not verify the server's
+    Sec-WebSocket-Accept response header. Implementing SHA-1 through
+    arithmetic emulation (no bitwise operators are available) was judged out
+    of scope for this checkpoint; the handshake still requires a valid HTTP
+    101 upgrade response and proceeds to real RFC 6455 frame exchange
+    afterward, so this is a narrowed trust check rather than a skipped
+    handshake.
+  - >-
+    Live authentication, optimistic updates, WebSocket mutations, WebSocket
+    actions, journals, and TransitionChunk assembly are deferred.
+  - >-
+    Live values cover Convex's JSON-safe subset; tagged Convex value
+    conversions are deferred.
+  - >-
+    JSON numbers are accepted only when mathematically integral and
+    representable exactly as a MARST `integer` (32-bit) or, for timestamps,
+    within the exact-integer range of a MARST `real` (an IEEE double,
+    exact through 2^53); fractional and out-of-range values are rejected at
+    the point of use.
+  - >-
+    Active Live subscriptions and the delivery queue are bounded; a value too
+    large for the configured byte budget becomes an observable ProtocolError
+    without changing the subscription's last delivered value, and queue
+    overflow drops the oldest undelivered event rather than growing without
+    bound.
+  - >-
+    Source style is checked at 120 columns for client and test sources and 80
+    columns for the example, matching this project's other native clients;
+    MARST's own single-line comment rule (a comment ends at the first
+    semicolon, even inside a sentence) required every doc comment in this
+    client to be rewritten to avoid a mid-sentence semicolon.
+capabilities: []
