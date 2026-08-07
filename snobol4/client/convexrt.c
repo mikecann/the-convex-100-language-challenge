@@ -706,11 +706,18 @@ lret_t CVXERRTEXT(LA_ALIST) LA_DCL {
 
 /* CVXEXIT(code) INTEGER -- SNOBOL4 has no portable way to set a process
    exit status, and the shared verifier distinguishes a clean run from a
-   failed one by that status alone. The SNOBOL4 caller flushes its own
-   output streams (ENDFILE on the standard output unit) before calling
-   this; _exit() does not flush stdio itself. */
+   failed one by that status alone. _exit() skips libc's atexit-driven
+   stdio flush, and CSNOBOL4's own ENDFILE only marks its internal unit
+   table entry closed -- it does not force the underlying C stream out to
+   the OS, so a caller relying on ENDFILE(6) before this still lost every
+   buffered "output = " line once stdout was not a terminal (as under
+   Docker, where it is fully rather than line buffered). Call fflush(NULL)
+   here instead: the C standard guarantees it flushes every open output
+   stream, so every SNOBOL4 caller gets a clean exit without needing its
+   own flush convention. */
 lret_t CVXEXIT(LA_ALIST) LA_DCL {
   long code = LA_INT(0);
+  fflush(NULL);
   _exit((int)code);
   RETINT(0); /* unreachable; keeps the compiler happy about a return path */
 }
