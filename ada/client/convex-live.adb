@@ -1057,6 +1057,7 @@ package body Convex.Live is
             Failure_Message : constant String :=
               "Live owner task failed: "
               & Ada.Exceptions.Exception_Message (E);
+            Stop_Requested  : Boolean := False;
          begin
             --  An unhandled exception here would terminate this task, and
             --  every later Manager entry call would then raise
@@ -1064,7 +1065,9 @@ package body Convex.Live is
             --  alive and answer every entry with a structured
             --  TransportError until Stop releases it, so a caller always
             --  gets a Convex.Live outcome rather than an unrelated
-            --  language-level exception.
+            --  language-level exception. An exit_statement may not appear
+            --  inside an accept_statement, so Stop only records the request
+            --  here; the loop below retires on it.
             loop
                select
                   accept Add
@@ -1111,9 +1114,10 @@ package body Convex.Live is
                   end Disconnect;
                or
                   accept Stop do
-                     exit;
+                     Stop_Requested := True;
                   end Stop;
                end select;
+               exit when Stop_Requested;
             end loop;
          end;
    end Owner_Task;
