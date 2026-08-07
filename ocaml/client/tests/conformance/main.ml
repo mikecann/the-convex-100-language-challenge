@@ -113,11 +113,14 @@ let read_command_line reader =
    What the client reserves for this process out of the shared container budget
    has to keep agreeing with what this number implies: eight megabytes of
    queued lines, one more line in the writer's hands, and one value plus one
-   encoding per producer that holds a slot. It must not be lowered to fewer
-   than three slots. A producer waits for room without giving up, and
-   [stop_relay] joins a relay thread that may be doing exactly that, so a
-   budget narrow enough for one producer to monopolise is a budget in which an
-   unsubscribe can wait on a relay that is waiting on the unsubscribe. *)
+   encoding per producer that holds a slot.
+
+   Lowering it narrows how many producers can be encoding at once, which is the
+   point, but it must stay wide enough for one whole event plus one queued
+   behind it: a producer waits for room without giving up, and [stop_relay]
+   joins a relay thread that may be doing exactly that, so a budget that cannot
+   admit a single near-maximum event alongside the queue is one in which an
+   unsubscribe waits on a relay that is waiting on the unsubscribe. *)
 let max_output_bytes = 8 * 1024 * 1024
 let max_event_bytes = (2 * 1024 * 1024) + 65536
 let output_line_timeout = 10.0
@@ -125,11 +128,21 @@ let output_line_timeout = 10.0
 type writer = {
   w_fd : Unix.file_descr;
   w_mutex : Mutex.t;
+  (* Signalled whenever room changes hands or the turn moves, so a producer
+     waiting for room sleeps until something it cares about happened rather
+     than until a timer it chose expired. *)
+  w_room : Condition.t;
   w_lines : string Queue.t;
   mutable w_queued : int;
   mutable w_reserved : int;
   mutable w_stopping : bool;
   mutable w_terminal : bool;
+  (* Producers are served strictly in the order they asked. A relay re-enters
+     [reserve] the instant it lets go of a slot, so without an order the
+     producers that never pause hold every slot between them and one that has
+     to wait is never served at all. *)
+  mutable w_next_ticket : int;
+  mutable w_serving : int;
 }
 
 let create_writer fd =
@@ -137,11 +150,14 @@ let create_writer fd =
   {
     w_fd = fd;
     w_mutex = Mutex.create ();
+    w_room = Condition.create ();
     w_lines = Queue.create ();
     w_queued = 0;
     w_reserved = 0;
     w_stopping = false;
     w_terminal = false;
+    w_next_ticket = 0;
+    w_serving = 0;
   }
 
 let with_writer writer f =
@@ -150,38 +166,57 @@ let with_writer writer f =
 
 (* Reserving room can wait, so callers reserve before taking any other lock. A
    line larger than the whole budget is still allowed through once the queue is
-   empty; refusing it would deadlock instead of bounding anything. *)
+   empty; refusing it would deadlock instead of bounding anything.
+
+   The wait is a ticket queue rather than a retry loop. Twenty-four relays and
+   one command loop compete for the three slots this budget holds, and a relay
+   gives its slot back and asks for another with nothing in between, so any
+   producer that has to wait its turn under a retry loop can be passed over
+   indefinitely. That is not a slow acknowledgement, it is one that never
+   arrives: the command loop is sequential, so a subscribe acknowledgement it
+   cannot publish stops it reading the next command at all. *)
 let reserve writer size =
-  let rec loop () =
-    let outcome =
-      with_writer writer (fun () ->
-          if writer.w_terminal then `Terminal
-          else if
-            writer.w_queued + writer.w_reserved = 0
-            || writer.w_queued + writer.w_reserved + size <= max_output_bytes
-          then (
-            writer.w_reserved <- writer.w_reserved + size;
-            `Reserved)
-          else `Full)
-    in
-    match outcome with
-    | `Reserved -> true
-    | `Terminal -> false
-    | `Full ->
-        Thread.delay 0.005;
-        loop ()
-  in
-  loop ()
+  Mutex.lock writer.w_mutex;
+  Fun.protect
+    ~finally:(fun () -> Mutex.unlock writer.w_mutex)
+    (fun () ->
+      let ticket = writer.w_next_ticket in
+      writer.w_next_ticket <- ticket + 1;
+      let rec wait () =
+        if writer.w_terminal then (
+          (* Nothing will be written again, so hand the turn on rather than
+             leaving it with a producer that is about to walk away. *)
+          if writer.w_serving = ticket then (
+            writer.w_serving <- ticket + 1;
+            Condition.broadcast writer.w_room);
+          false)
+        else if
+          writer.w_serving = ticket
+          && (writer.w_queued + writer.w_reserved = 0
+             || writer.w_queued + writer.w_reserved + size <= max_output_bytes)
+        then (
+          writer.w_reserved <- writer.w_reserved + size;
+          writer.w_serving <- ticket + 1;
+          Condition.broadcast writer.w_room;
+          true)
+        else (
+          Condition.wait writer.w_room writer.w_mutex;
+          wait ())
+      in
+      wait ())
 
 let commit writer size line =
   with_writer writer (fun () ->
       writer.w_reserved <- writer.w_reserved - size;
       if not writer.w_terminal then (
         Queue.push line writer.w_lines;
-        writer.w_queued <- writer.w_queued + String.length line))
+        writer.w_queued <- writer.w_queued + String.length line);
+      Condition.broadcast writer.w_room)
 
 let release writer size =
-  with_writer writer (fun () -> writer.w_reserved <- writer.w_reserved - size)
+  with_writer writer (fun () ->
+      writer.w_reserved <- writer.w_reserved - size;
+      Condition.broadcast writer.w_room)
 
 (* The line goes out of the string the queue already holds. A [Bytes.of_string]
    here would be a second copy of a near-maximum event, alive for the whole ten
@@ -224,6 +259,7 @@ let writer_loop writer =
           else
             let line = Queue.pop writer.w_lines in
             writer.w_queued <- writer.w_queued - String.length line;
+            Condition.broadcast writer.w_room;
             `Line line)
     in
     match next with
@@ -238,7 +274,10 @@ let writer_loop writer =
           with_writer writer (fun () ->
               writer.w_terminal <- true;
               Queue.clear writer.w_lines;
-              writer.w_queued <- 0);
+              writer.w_queued <- 0;
+              (* Everyone waiting for room has to learn there will never be
+                 any, or the process exits with producers still blocked. *)
+              Condition.broadcast writer.w_room);
           prerr_endline
             ("convex-adapter: NDJSON output stalled"
             ^ (if partial then " after a partial line" else "")
@@ -328,12 +367,25 @@ type relay = {
   mutable thread : Thread.t option;
 }
 
-(* A relay holds an output slot only while it is waiting for one update, then
-   gives it back, so an idle subscription cannot keep a slot away from a busy
-   one. The decision to publish is made under the relay's own mutex with the
+(* A relay holds an output slot while it takes one update, never while it waits
+   for one. Reserving before taking is what stops a producer holding a
+   near-maximum value it has no room to publish, but waiting for something to
+   publish costs no memory and so needs no room.
+
+   Reserving across a blocking poll is what made an idle subscription able to
+   keep a slot away from a busy one: the relay held a slot for the whole poll
+   and asked for another the instant it let go, and this budget holds three
+   slots. With twenty-four subscriptions the relays held every slot
+   continuously between them while having nothing whatever to send, and the
+   command loop - which is sequential, and publishes each acknowledgement
+   before reading the next command - stopped dead partway through the
+   subscribe batch. The pause below is deliberately outside the reservation.
+
+   The decision to publish is still made under the relay's own mutex with the
    room already reserved, which keeps that critical section free of anything
    that could block and keeps it atomic against invalidation. *)
-let relay_poll_timeout = 0.05
+let relay_poll_timeout = 0.0
+let relay_idle_pause = 0.01
 
 let start_relay writer relay =
   let generation = relay.generation in
@@ -363,7 +415,9 @@ let start_relay writer relay =
                 deliver (error_event ~subscription_id:relay.id error)
             | Ok None ->
                 release writer max_event_bytes;
-                if still_wanted () then loop ()
+                if still_wanted () then (
+                  Thread.delay relay_idle_pause;
+                  loop ())
             | Ok (Some update) ->
                 deliver (subscription_event relay.id update);
                 loop ()
@@ -720,6 +774,15 @@ let run ~input ~output =
   let thread = Thread.create (fun () -> writer_loop writer) () in
   serve (create_reader input) writer;
   stop_writer writer thread
+
+(* Writing to a peer that has gone away has to be an error value this process
+   can report, not a signal that ends it. OCaml leaves SIGPIPE at its default
+   disposition, which terminates the process silently: no stderr, no exit code
+   a controller can interpret, and none of the terminal-stream reporting above
+   - which exists precisely to make a broken output stream visible - ever runs.
+   Every descriptor this adapter writes to belongs to someone who may close it
+   first, so the condition has to arrive as EPIPE. *)
+let () = ignore (Sys.signal Sys.sigpipe Sys.Signal_ignore)
 
 let () =
   match Sys.getenv_opt "ADAPTER_LISTEN" with

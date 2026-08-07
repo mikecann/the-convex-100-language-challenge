@@ -77,7 +77,27 @@ let send process json =
   output_string process.input (json ^ "\n");
   flush process.input
 
-let receive process = J.from_string (input_line process.output)
+(* End of file here is data, not an accident: it means the adapter closed its
+   output, which for this protocol is a failure with a cause. Reporting how the
+   child ended turns a bare [End_of_file] backtrace into the actual diagnosis -
+   a signal, a nonzero exit, or a still-running process that simply stopped
+   writing. *)
+let describe_status = function
+  | Unix.WEXITED code -> Printf.sprintf "exited %d" code
+  | Unix.WSIGNALED signal -> Printf.sprintf "killed by signal %d" signal
+  | Unix.WSTOPPED signal -> Printf.sprintf "stopped by signal %d" signal
+
+let receive process =
+  match input_line process.output with
+  | line -> J.from_string line
+  | exception End_of_file ->
+      let ended =
+        match Unix.waitpid [ Unix.WNOHANG ] process.pid with
+        | 0, _ -> "still running"
+        | _, status -> describe_status status
+        | exception Unix.Unix_error _ -> "already reaped"
+      in
+      fail ("adapter closed its output stream while a reply was due: " ^ ended)
 
 let finish process =
   close_out_noerr process.input;
