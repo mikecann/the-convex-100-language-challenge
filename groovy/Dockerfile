@@ -58,28 +58,31 @@ ENV JAVA_HOME=/opt/java/openjdk
 ENV PATH=/opt/java/openjdk/bin:/usr/local/bin:/usr/bin:/bin
 # These are part of the runtime contract, not reviewer-only flags. They leave
 # room for TLS, direct buffers, threads, and native JVM bookkeeping at 128 MiB.
-# -Xint is load-bearing, not a tuning nicety. Measured against the real
-# hosted deployment (docker exec ... cat /proc/1/smaps, summed by Rss), a
-# tiered-compiling JVM here settles near 130 MiB within ~2 seconds of a real
-# wss:// handshake and keeps climbing past 260 MiB by the time the run
+# A tiered-compiling JVM settles near 130 MiB of Rss (docker exec ... cat
+# /proc/1/smaps, summed) within ~2 seconds of a real wss:// handshake against
+# the hosted deployment and keeps climbing past 260 MiB by the time the run
 # finishes - comfortably over the 128 MiB --memory cap ./run applies to
-# every runtime container, and enough to OOM-kill the container on roughly
-# half of repeated runs. A real TLS handshake and SSLEngine session link a
-# further tier of JDK TLS/X.509 call sites and spin up delegated-task worker
-# threads that a local, cert-free ws:// connection never touches, feeding
-# C1/C2 compilation. The same budget also produced a
-# "VirtualMachineError: Out of space in CodeCache for method handle
-# intrinsic" from an ordinary, unrelated call site once compilation and
-# invokedynamic linking finished racing each other for the tiny code cache;
-# raising just ReservedCodeCacheSize made the OOM kills worse, not better,
-# by adding yet more demand onto a budget that was already short overall.
-# This program runs for a few seconds doing a handful of HTTP calls and one
-# WebSocket session, so trading JIT compilation for a small, predictable
-# footprint costs nothing real: -Xint alone measured under 90 MiB RSS
-# against the same hosted deployment, because it removes both the C1/C2
-# compiler threads and the compiled code they would have produced, not just
-# the code cache bytes they would have used.
-ENV JAVA_TOOL_OPTIONS="-XX:MaxRAM=96m -Xms8m -Xmx24m -Xss256k -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -XX:MaxMetaspaceSize=24m -XX:CompressedClassSpaceSize=16m -XX:MaxDirectMemorySize=8m -XX:ReservedCodeCacheSize=8m -Xint"
+# every runtime container. Interpreter-only (-Xint) fixed that (measured
+# under 90 MiB) but traded it for a latency cliff: fully interpreted TLS/
+# X.509 crypto made the hosted client/http/query check take 10007 ms against
+# the harness's 10 s timeout, since the interpreter never compiles the
+# handshake's hot crypto loops at all. The middle ground is C1 only, capped
+# to one compiler thread, with its invocation thresholds raised well above
+# their tiered defaults (200-ish): Groovy's invokedynamic call-site
+# bootstrapping mints large numbers of small methods that each run only a
+# handful of times, and by default C1 compiles many of them anyway, which is
+# what actually drove Rss - lowering ReservedCodeCacheSize alone barely
+# moved it (16m vs 8m: no measurable difference), because the cost is C1's
+# own transient compilation working set, not the bytes of compiled output it
+# keeps. Raising Tier3*Threshold to 8000 means only genuinely hot loops -
+# like the TLS handshake's crypto - still get compiled, while the long tail
+# of Groovy's one-shot bootstrap methods stays interpreted. Measured against
+# the same hosted deployment: peak Rss 105-107 MiB across repeated runs
+# (target <110), and an isolated ConvexClient.query() call - matching how
+# the conformance adapter constructs its client, unlike this example, which
+# also builds a LiveClient up front - completed in 1.7-2.2 s across 10 runs
+# (target <4 s), both comfortably clear of their caps.
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAM=96m -Xms8m -Xmx24m -Xss256k -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -XX:MaxMetaspaceSize=24m -XX:CompressedClassSpaceSize=16m -XX:MaxDirectMemorySize=8m -XX:ReservedCodeCacheSize=16m -XX:TieredStopAtLevel=1 -XX:CICompilerCount=1 -XX:Tier3InvocationThreshold=8000 -XX:Tier3MinInvocationThreshold=4000 -XX:Tier3CompileThreshold=8000 -XX:Tier3BackEdgeThreshold=8000"
 # Runtime images expose no package manager, compiler, or build frontend
 # (AGENTS.md). debian:bookworm-slim still ships apt/apt-get/dpkg on PATH, so
 # replace /usr/bin, /usr/sbin, /usr/local/bin, and /usr/local/sbin outright
