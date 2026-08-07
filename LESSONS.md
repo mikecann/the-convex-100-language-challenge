@@ -616,6 +616,16 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- SNOBOL4 exited 0 and printed nothing, and both facts were correct. Its C
+  shim called `_exit()`, which skips libc's stdio flush. Under Docker stdout is
+  a pipe, not a terminal, so it is fully buffered — the transcript was sitting
+  in a buffer that was never drained, and every test had missed it because
+  tests write to unbuffered stderr. The documented remedy, closing the output
+  unit from SNOBOL, was tried and *empirically did not work*: it updates the
+  interpreter's own unit table without ever reaching the OS. The fix was
+  `fflush(NULL)` before `_exit()`. **A success with no output is a bug report,
+  not a pass** — and it only appeared after an earlier fix let the program
+  reach its success path for the very first time.
 - BCPL crashed because a pointer no longer fits in a word. Its 32-bit Cintcode
   interpreter stores a raw C pointer — the `FILE*` returned by `fopen()` — in a
   32-bit BCPL word. On a 64-bit host that address routinely lands above 2^32,
