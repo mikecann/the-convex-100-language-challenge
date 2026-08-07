@@ -732,6 +732,10 @@ ensure_live:
     test eax, eax
     jz .oom
     mov byte [g_live_ready], 1
+    mov edi, 'q'
+    lea rsi, [rel colon_byte]
+    xor edx, edx
+    call dbg_str
 .have_live:
     lea rax, [g_live]
     jmp .done
