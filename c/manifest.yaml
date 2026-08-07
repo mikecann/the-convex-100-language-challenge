@@ -30,4 +30,6 @@ limitations:
   - Live values cover the JSON-safe subset; tagged Convex value types are deferred.
   - TransitionChunk assembly is deferred and treated as protocol drift that reconnects.
   - Each subscription retains the newest 16 updates and drops the oldest value when its consumer is slow.
-capabilities: []
+capabilities:
+  - http
+  - live
