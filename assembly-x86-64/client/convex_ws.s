@@ -1004,6 +1004,10 @@ ws_take_frame:
     mov [rbp+TF_PLOUT], rcx
     mov [rbp+TF_LENOUT], r8
 
+    mov edi, 'i'
+    call dbg_mark_ws
+    mov rdi, [rbp+TF_W]
+
     mov rax, [rdi + ws_conn.recv + buf.len]
     sub rax, [rdi + ws_conn.recv_off]
     mov [rbp+TF_AVAIL], rax
@@ -1119,6 +1123,8 @@ ws_take_frame:
     cmp rax, 65536
     jb .parsed_ok
 .compact:
+    mov edi, 'j'
+    call dbg_mark_ws
     mov rdi, [rbp+TF_W]
     mov rax, [rdi + ws_conn.recv_off]
     test rax, rax
@@ -1131,11 +1137,15 @@ ws_take_frame:
     mov rdi, rsi
     mov rsi, rcx
     call memmove
+    mov edi, 'k'
+    call dbg_mark_ws
     mov rdi, [rbp+TF_W]
     mov rax, [rbp+TF_BASE]
     mov [rdi + ws_conn.recv + buf.len], rax
     mov qword [rdi + ws_conn.recv_off], 0
 .parsed_ok:
+    mov edi, 'l'
+    call dbg_mark_ws
     mov eax, 1
     jmp .done
 .oom:
@@ -1182,6 +1192,7 @@ ws_take_frame:
 %define PM_FIN    -48
 %define PM_PAYLOAD -56
 %define PM_PLEN   -64
+%define PM_TMP    -72
 ws_pump_message:
     push rbp
     mov rbp, rsp
@@ -1191,17 +1202,28 @@ ws_pump_message:
     mov [rbp+PM_DOUT], rdx
     mov [rbp+PM_LOUT], rcx
 .loop:
+    mov edi, 'm'
+    call dbg_mark_ws
     mov rdi, [rbp+PM_W]
     lea rsi, [rbp+PM_OPCODE]
     lea rdx, [rbp+PM_FIN]
     lea rcx, [rbp+PM_PAYLOAD]
     lea r8, [rbp+PM_PLEN]
     call ws_take_frame
+    mov [rbp+PM_TMP], rax
+    mov edi, 'n'
+    call dbg_mark_ws
+    mov rax, [rbp+PM_TMP]
     cmp eax, 0
     je .need_more
     cmp eax, -1
     je .error
 
+    mov rax, [rbp+PM_OPCODE]
+    add al, '0'
+    mov [rbp+PM_TMP], rax
+    mov edi, eax
+    call dbg_mark_ws
     mov rax, [rbp+PM_OPCODE]
     cmp rax, WS_OP_PING
     je .on_ping
@@ -1427,6 +1449,7 @@ ws_pump_message:
 %undef PM_FIN
 %undef PM_PAYLOAD
 %undef PM_PLEN
+%undef PM_TMP
 
 ; --- UTF-8 validation --------------------------------------------------
 
