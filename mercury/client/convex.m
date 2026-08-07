@@ -20,6 +20,7 @@
 :- import_module convex_transport.
 :- import_module io.
 :- import_module list.
+:- import_module maybe.
 
 %-----------------------------------------------------------------------------%
 % HTTP: query, mutation, action.
@@ -112,13 +113,26 @@
 :- pred live_remove(live_conn::in, live_state::in, int::in,
     live_state::out, maybe_ok::out, io::di, io::uo) is det.
 
-    % Every currently active (queryId, path, args) triple, e.g. so a caller
-    % can re-subscribe them all against a fresh connection after
-    % debugDisconnect.
+    % Every currently active (queryId, path, args, lastDeliveredKey)
+    % quadruple, e.g. so a caller can re-subscribe them all against a fresh
+    % connection after debugDisconnect. lastDeliveredKey carries over the
+    % change-detection key (see deliver_keyed below) so the rehydration
+    % transition a fresh subscribe always receives is correctly suppressed
+    % when it repeats the value already delivered before the reconnect,
+    % matching the exact sequence AGENTS.md requires: initial value,
+    % disconnect acknowledgement, external mutation, then one update.
 :- type active_sub_info
-    --->    active_sub_info(int, string, json).
+    --->    active_sub_info(int, string, json, maybe(string)).
 
 :- func live_active_list(live_state) = list(active_sub_info).
+
+    % Like live_add, but for restoring a subscription that was already
+    % active on a previous connection: the caller supplies the
+    % change-detection key that subscription last delivered, so an
+    % unchanged rehydration is suppressed exactly as it would have been had
+    % the connection never dropped.
+:- pred live_add_resubscribe(live_conn::in, live_state::in, active_sub_info::in,
+    int::out, live_state::out, maybe_ok::out, io::di, io::uo) is det.
 
 :- implementation.
 
@@ -126,7 +140,6 @@
 :- import_module bool.
 :- import_module float.
 :- import_module int.
-:- import_module maybe.
 :- import_module pair.
 :- import_module string.
 
@@ -363,9 +376,21 @@ live_connect(client(Url, _), Result, !IO) :-
 
 live_close(live_conn(Conn), !IO) :- tls_close(Conn, !IO).
 
-live_add(live_conn(Conn), State0, Path, Args, QueryId, State, Result, !IO) :-
+live_add(Conn, State0, Path, Args, QueryId, State, Result, !IO) :-
+    live_add_keyed(Conn, State0, Path, Args, no, QueryId, State, Result, !IO).
+
+live_add_resubscribe(Conn, State0, active_sub_info(_OldId, Path, Args, LastKey),
+        QueryId, State, Result, !IO) :-
+    live_add_keyed(Conn, State0, Path, Args, LastKey, QueryId, State, Result, !IO).
+
+:- pred live_add_keyed(live_conn::in, live_state::in, string::in, json::in,
+    maybe(string)::in, int::out, live_state::out, maybe_ok::out,
+    io::di, io::uo) is det.
+
+live_add_keyed(live_conn(Conn), State0, Path, Args, LastKey, QueryId, State,
+        Result, !IO) :-
     QueryId = State0 ^ live_next_id,
-    NewSub = active_sub(QueryId, Path, Args, no),
+    NewSub = active_sub(QueryId, Path, Args, LastKey),
     Active = State0 ^ live_active ++ [NewSub],
     BaseVersion = State0 ^ live_query_version,
     NewVersion = BaseVersion + 1,
@@ -413,7 +438,8 @@ live_active_list(State) = list.map(to_active_info, State ^ live_active).
 
 :- func to_active_info(active_sub) = active_sub_info.
 
-to_active_info(Sub) = active_sub_info(Sub ^ sub_id, Sub ^ sub_path, Sub ^ sub_args).
+to_active_info(Sub) =
+    active_sub_info(Sub ^ sub_id, Sub ^ sub_path, Sub ^ sub_args, Sub ^ sub_last_key).
 
 :- pred has_id(int::in, active_sub::in) is semidet.
 

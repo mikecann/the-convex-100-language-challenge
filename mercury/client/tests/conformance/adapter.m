@@ -371,8 +371,8 @@ ensure_live(Client, State0, State, Result, !IO) :-
 
 resubscribe_all(_Conn, [], Subs, State, State, Subs, !IO).
 resubscribe_all(Conn, [Info | Rest], Subs0, State0, State, Subs, !IO) :-
-    Info = active_sub_info(OldId, Path, Args),
-    live_add(Conn, State0, Path, Args, NewId, State1, _Result, !IO),
+    Info = active_sub_info(OldId, _, _, _),
+    live_add_resubscribe(Conn, State0, Info, NewId, State1, _Result, !IO),
     Subs1 = list.map(retarget(OldId, NewId), Subs0),
     resubscribe_all(Conn, Rest, Subs1, State1, State, Subs, !IO).
 
