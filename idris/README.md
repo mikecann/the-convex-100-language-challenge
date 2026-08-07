@@ -21,7 +21,7 @@ It is an educational, unofficial experiment, not a production SDK or a package i
 Nothing in this directory has been compiled or executed. Every capability is unearned, and the shared evaluator is the only thing that can change that.
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.idr -->
-```text
+```idris
 module Main
 
 import Convex
