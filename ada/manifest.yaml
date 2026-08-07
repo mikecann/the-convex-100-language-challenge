@@ -34,5 +34,7 @@ limitations:
   - HTTP responses with ambiguous framing are refused rather than interpreted. Repeated or list-valued Content-Length, repeated Transfer-Encoding, Content-Length combined with Transfer-Encoding, non-chunked transfer codings, malformed or folded header lines, and bodies declared above the 2 MiB cap are all rejected before allocation.
   - An intact HTTP response that is not a Convex envelope is a ProtocolError at every status, including 2xx. TransportError is reserved for connection failures, timeouts, and size-cap violations.
   - TLS handshake reset, plaintext-response, and stall failures are covered as bounded transport errors with recovery, and hostname verification is covered with an ephemeral CA and two leaves generated inside the Docker test stage. No key material is committed and the trust store is restored after the test.
-  - Capability badges are intentionally empty until shared local and hosted conformance pass.
-capabilities: []
+  - Shared local and hosted conformance passed 31/31 from clean exact-head builds; the capability list records the evaluator award.
+capabilities:
+  - http
+  - live

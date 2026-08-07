@@ -12,9 +12,9 @@ Read [`examples/basics/convex_example.adb`](examples/basics/convex_example.adb).
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, actions, bearer auth, logs, and structured errors | Implemented, awaiting shared evidence |
-| Live initial values, updates, and `QueryFailed` recovery | Implemented, awaiting shared evidence |
-| Remove, five reconnects, generation barriers, and bounded global delivery | Implemented, awaiting shared evidence |
+| HTTP queries, mutations, actions, bearer auth, logs, and structured errors | Verified by shared local and hosted conformance at this exact head |
+| Live initial values, updates, and `QueryFailed` recovery | Verified by shared local and hosted conformance |
+| Remove, five reconnects, generation barriers, and bounded global delivery | Verified by shared local and hosted conformance |
 | Production SDK compatibility | Not claimed |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/convex_example.adb -->
@@ -298,7 +298,7 @@ Alire 2.1.0 pins GNAT 14.2.1, GPRbuild 25.0.1, AWS 25.2.0, GNATCOLL 25.0.0, libg
 
 ## Limitations
 
-Live authentication, optimistic updates, mutations and actions over the WebSocket, journals, and `TransitionChunk` assembly are deferred. Receiving an unsupported or malformed Live shape produces a structured protocol event, retires that socket, and reconnects active subscriptions. Values cover Convex's JSON-safe subset; tagged Convex value conversions are not implemented. Capability badges stay empty until the root-owned local and hosted evaluators pass from a clean reviewed commit.
+Live authentication, optimistic updates, mutations and actions over the WebSocket, journals, and `TransitionChunk` assembly are deferred. Receiving an unsupported or malformed Live shape produces a structured protocol event, retires that socket, and reconnects active subscriptions. Values cover Convex's JSON-safe subset; tagged Convex value conversions are not implemented. The root-owned local and hosted evaluators passed from a clean reviewed commit (31/31 on both profiles), and the manifest capability list records the http and live award.
 
 TLS coverage is honest about what it proves. Deterministic loopback fixtures show that a handshake against a peer that resets the connection, answers with plaintext, or never speaks becomes a bounded `TransportError` and that the client still completes an ordinary call afterwards. Hostname verification is proved separately from chain verification: the Docker test stage mints one ephemeral certificate authority and two leaves for it, one named `localhost` and one named `wrong.invalid`, installs that authority as the only trusted anchor for the duration of the test, and then restores the trust store byte-for-byte. Because both leaves share an issuer, the accepted call and the refused call differ only in the certificate's name. No key material is committed; every key exists for seconds inside one build step.
 
