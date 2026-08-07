@@ -616,6 +616,22 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- Every stock Iron Spring PL/I binary is unrunnable inside Docker, and it has
+  nothing to do with the language. Its runtime's `_pli_SigInit` installs trap
+  handlers with the legacy i386 `sigaction` syscall, number 67, which Docker's
+  default seccomp profile refuses with `EPERM` — and the routine treats that as
+  fatal. So every binary, including the compiler itself, exits before `main`.
+  The 32-bit multiarch link everyone expects to be the hard part worked almost
+  immediately; the invisible container policy was what nearly sank it. This is
+  the second language tonight blocked by default seccomp — Pop-11 was not
+  recoverable, PL/I was, by recompiling that one routine against `rt_sigaction`
+  from the vendor's own source.
+- Uninitialised storage read as a pointer, and only the hosted profile died.
+  PL/I `AUTOMATIC` storage starts as stack garbage; a TLS-context cache field
+  was never initialised, so it handed OpenSSL whatever was on the stack. The
+  example survived because its stack layout differed, and the local profile
+  passed 31/31 because plain HTTP never reaches that code at all. Three
+  independent pieces of luck had to line up for the bug to hide, and they did.
 - Seed7 speaks TLS without OpenSSL. Its `tls.s7i` implements the handshake,
   AES-GCM, HMAC, elliptic-curve key exchange and X.509 parsing in Seed7
   itself — the only client on this roster whose TLS is not a C library behind
