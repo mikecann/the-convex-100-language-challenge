@@ -14,8 +14,8 @@ the Live update. It is the exact program included below and run by the image.
 
 | Capability | Status |
 | --- | --- |
-| JSON HTTP queries, mutations, and actions | Implemented, awaiting shared evidence |
-| Live query subscriptions | Experimental pinned profile, awaiting shared evidence |
+| JSON HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
+| Live query subscriptions | Verified by shared local and hosted conformance |
 | Authentication | HTTP bearer tokens only |
 
 ## The basic example
