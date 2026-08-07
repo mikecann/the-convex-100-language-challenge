@@ -32,6 +32,9 @@ CMD ["/bin/sh", "-ec", "printf '%s\\n' '{\"protocolVersion\":1,\"id\":\"hello\",
 # shared libraries, the certificate bundle, and the small POSIX set the shared
 # runtime verifier requires.
 FROM test AS runtime-rootfs
+# cp --parents recreates each source path under the destination relative to the
+# working directory, so the absolute paths below only resolve from /.
+WORKDIR /
 RUN set -eu; root=/runtime-root; \
     mkdir -p "$root/bin" "$root/usr/bin" "$root/usr/lib" "$root/usr/local/bin" "$root/etc/ssl"; \
     cp /bin/dash "$root/bin/dash"; ln -s dash "$root/bin/sh"; \
