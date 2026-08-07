@@ -1,0 +1,136 @@
+schemaVersion: 1
+id: emacs-lisp
+displayName: "Emacs Lisp"
+rank: 40
+selectionTier: ranked
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native batch-mode Emacs Lisp implementation of Convex's documented HTTP
+    JSON API and the pinned /api/sync protocol. Emacs has genuine network
+    primitives, so this is native end to end with no C anywhere in the
+    client itself: HTTP uses url.el (url-retrieve-synchronously), JSON uses
+    the built-in json-parse-string/json-serialize, SHA-1 uses secure-hash,
+    base64 uses base64-encode-string/base64-decode-string, and TLS uses
+    open-network-stream's own :type 'tls (GnuTLS), confirmed against a real
+    HTTPS host. Emacs has no WebSocket library, so the RFC 6455 handshake
+    and frame format for Live are hand-written in Emacs Lisp over
+    make-network-process/open-network-stream, the same way several other
+    clients in this project implement WebSockets by hand over a raw socket.
+    The one piece of native code anywhere in this client exists solely for
+    the test-only NDJSON adapter (client/tests/conformance/stdin-poll.c),
+    never for the client - see its limitations entry below.
+toolchain:
+  name: GNU Emacs
+  version: "28.2"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    The Docker test stage (source style, a byte-compile pass with warnings
+    treated as errors, language-local unit and loopback Live protocol
+    suites, the conformance adapter probe in both stdio and TCP mode, and
+    the example's fast-fail path) passes on a remote linux/amd64 builder for
+    this source checkpoint, and both the example-runtime and runtime Docker
+    images were additionally built and run end to end against a real
+    loopback deployment (query, Live subscribe, mutation, and the resulting
+    Live update all confirmed byte-for-byte against the canonical
+    transcript, and a real adapter query independently confirmed in the
+    runtime image). Shared local and hosted conformance have not been run,
+    so no capability badge is claimed.
+  - >-
+    client/tests/conformance/stdin-poll.c is the only native code anywhere
+    in this client, and it exists solely for the test-only NDJSON adapter,
+    never for the educational client (client/convex.el has no C in it at
+    all). The adapter's own loop must multiplex two independent readiness
+    conditions - the next NDJSON command arriving on stdin, and the next
+    Live delivery becoming available from the WebSocket the client already
+    owns - without either one blocking the other indefinitely. Emacs's own
+    network processes support exactly this via accept-process-output with a
+    timeout (used natively for the TCP transport), but batch-mode Emacs
+    Lisp has no equivalent for its own inherited stdin: read-from-minibuffer
+    (the only primitive that reads piped, non-tty stdin at all in --batch
+    mode) is an uninterruptible blocking read with no timeout,
+    read-event/read-char/sit-for never observe piped stdin data even when
+    it is already available, Lisp threads do not run concurrently with a
+    blocking read (confirmed empirically in both directions - a thread
+    blocked on stdin stalls every other thread), and a spawned subprocess
+    does not inherit this process's own external stdin (Emacs redirects a
+    child's stdin to a pipe it controls, confirmed empirically: reading
+    /dev/null always reports ready). Several other single-threaded languages
+    in this project hit the identical wall for the identical reason and
+    solve it the identical way: a poll(2) readiness check on stdin, callable
+    with a timeout (see cobol/client/convex-native.c, forth/client/convexrt.c,
+    rexx/client/shim.c, icon/client/shim.c). stdin-poll.c is this client's
+    version of that primitive - a tiny, reviewed, standalone helper invoked
+    via call-process, never linked into Emacs itself, and it never reads or
+    forwards a byte of stdin - only convex.el's own read-from-minibuffer
+    call ever consumes adapter input.
+  - >-
+    The stdio transport's own multiplexing loop (stdin-poll plus
+    read-from-minibuffer, interleaved with convex-live-pump) was observed
+    during testing to crash the whole Emacs process without a Lisp-level
+    error or backtrace - consistent with a signal, not a caught exception -
+    on some runs where a Live subscription became active while the adapter
+    was simultaneously polling stdin at a high cadence on this QEMU-emulated
+    build host; other runs of the identical scenario completed without
+    incident. It was not root-caused in the time available: isolated
+    reproductions combining call-process, open-network-stream, and
+    read-from-minibuffer in the same shapes the real adapter uses did not
+    reproduce it. The TCP transport is unaffected (proven reliably,
+    repeatedly, including a full subscribe-and-deliver-a-value exchange
+    against a real loopback fixture) because it never uses stdin-poll or
+    call-process at all - accept-process-output alone multiplexes the
+    controller connection and the Live WebSocket. client/tests/live_test.el
+    proves the full Live acceptance list (Add/Remove, an initial value, an
+    external update, five real reconnects each resending the active Add,
+    debugDisconnect's acknowledgement barrier, unsubscribe-before-ack
+    invalidation, and QueryFailed with structured errorData) against
+    convex.el directly, not through the adapter, so that suite is
+    unaffected by this gap; the risk is specifically stdio-transported Live
+    delivery through the adapter, which needs further investigation before
+    it can be relied on for shared or hosted conformance.
+  - >-
+    The educational API covers Convex's JSON-safe values (objects, arrays,
+    strings, whole numbers within a uint32 range, booleans, null). Full
+    tagged Convex values, including Int64 and bytes, are deferred.
+  - >-
+    Live authentication, optimistic updates, WebSocket mutations and
+    actions, journals, and TransitionChunk assembly are deferred; queries,
+    mutations, and actions all go over HTTP.
+  - >-
+    Live delivery is a bounded queue owned entirely by convex.el: at most 64
+    pending events and 8 MiB of conservatively charged encoded bytes,
+    oldest dropped first. The adapter adds no second queue on top of it -
+    it drains whatever is available and writes it out immediately, so a
+    stalled reader applies ordinary OS pipe or socket backpressure to the
+    adapter's own loop rather than an adapter-private buffer growing
+    without bound. Unsubscribe (and a same-subscriptionId replacement) bump
+    a per-query generation counter that invalidates any already-queued
+    event for that query before its acknowledgement is published; this
+    barrier has a deterministic, non-timing-dependent regression.
+  - >-
+    A single WebSocket frame is bounded to 2 MiB; a larger declared length
+    is protocol drift rather than something to buffer. Once any byte of a
+    frame has been consumed, an 8-second partial-frame deadline governs
+    completing it, tracked independently of the caller's own polling
+    deadline so a slow peer cannot hold the connection open with repeated
+    short polls.
+  - >-
+    Capability badges remain empty until the root-owned local and hosted
+    conformance gates pass.
+capabilities: []
