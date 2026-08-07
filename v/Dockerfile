@@ -127,12 +127,15 @@ RUN set -eu; \
       esac; \
     done; \
     rm -f /etc/.pwd.lock; \
+    rm -rf /tmp; \
+    # The sweep below deletes rm and find themselves, so every command that\
+    # needs them must already have run: only mkdir, a shell builtin path, and\
+    # COPY may follow.\
     find /usr/bin -mindepth 1 -maxdepth 1 \
       ! -name sh ! -name dash ! -name id ! -name cat ! -name cut ! -name head \
       ! -name tail ! -name tr ! -name sort ! -name uniq ! -name wc \
       ! -name uname ! -name grep ! -name sed ! -name awk ! -name mawk \
       -exec rm -rf {} +; \
-    rm -rf /tmp; \
     mkdir -p /usr/local/bin /usr/local/share /etc/ssl/certs \
       /usr/lib/x86_64-linux-gnu/ossl-modules
 # Only the TLS closure is added back: the base image ships glibc and the DNS
