@@ -780,6 +780,20 @@ actor LiveOwner
     if _connected or (_stream isnt None) then
       _connection_count = _connection_count + 1
     end
+    // Retires the stream instance being abandoned here, the same way
+    // `_connect` retires the previous one before opening a new one.
+    // Without this, a disposed stream's own `stream_closed` notification
+    // can still arrive afterwards carrying the generation that was
+    // "current" at dispose time (it is only bumped later, when `_connect`
+    // eventually runs after the reconnect backoff) and be mistaken for a
+    // fresh failure of the connection this call already retired -- for
+    // example `debug_disconnect` deliberately calls `_fail_connection`
+    // with `publish_transport = false` to reconnect silently, and without
+    // this bump the disposed socket's asynchronous close notification
+    // would still pass the generation check, re-enter here with
+    // `publish_transport = true`, and publish a spurious TransportError
+    // to every subscriber ahead of the real rehydrated value.
+    _generation = _generation + 1
     _stream = None
     _connected = false
     _handshake = None

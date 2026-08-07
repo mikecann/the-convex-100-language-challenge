@@ -335,6 +335,7 @@ actor _LiveReconnect
   let _config: ConvexConfig
   var _link: _PeerLink = _PeerLink
   var _owner: (LiveOwner | None) = None
+  var _sink: (StreamSink | None) = None
   var _generation: U64 = 0
   var _query_set: U32 = 0
   var _ts: U64 = 0
@@ -376,6 +377,7 @@ actor _LiveReconnect
     sink: StreamSink)
   =>
     _generation = generation
+    _sink = sink
     _connections = _connections + 1
     _link = _PeerLink
     _query_set = 0
@@ -400,7 +402,23 @@ actor _LiveReconnect
     end
 
   be dispose() =>
-    None
+    """
+    A real socket does not go silent the instant `dispose()` is called: Pony's
+    `TCPConnection` (via `ConvexStreamNotify.closed`, see client/stream.pony)
+    delivers its own asynchronous `stream_closed` afterwards, carrying the
+    generation the now-abandoned connection was opened with. Echoing that
+    here is what makes this fixture able to catch a real regression: without
+    it, `debug_disconnect`'s deliberate, silent reconnect (`LiveOwner`
+    passes `publish_transport = false` specifically so this round trip stays
+    quiet) can never be told apart from `LiveOwner` failing to retire the
+    generation before scheduling that reconnect, because there is no stale
+    notification here to expose the difference.
+    """
+    match _sink
+    | let sink: StreamSink =>
+      sink.stream_closed(
+        _generation, "the Convex deployment closed the connection")
+    end
 
   be convex_ok(step: String, result: ConvexResult) =>
     if step == "disconnect" then
