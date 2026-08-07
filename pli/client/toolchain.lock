@@ -1,0 +1,18 @@
+# Iron Spring PL/I toolchain pin for the Docker build.
+#
+# Debian packages no PL/I compiler. Iron Spring PL/I 1.4.1 is distributed by
+# its author as one tarball containing a statically linked 32-bit ELF compiler
+# (plic), a 32-bit runtime library (lib/libprf.a) and that library's LGPL
+# sources. There is no licence gate, no registration and no build-time network
+# access beyond fetching this one archive.
+#
+# The vendor's TLS certificate is expired, so the archive is fetched over plain
+# HTTP and the pin below is what actually authenticates it. The digest was
+# produced by downloading the archive and hashing it during the source audit:
+#
+#   curl -sS -o pli.tgz http://www.iron-spring.com/pli-1.4.1.tgz
+#   sha256sum pli.tgz
+#   1f58a7be72b03158c2e1f97f6faae41a2a60118839c667186199075884e6f878  pli.tgz
+
+url=http://www.iron-spring.com/pli-1.4.1.tgz
+sha256=1f58a7be72b03158c2e1f97f6faae41a2a60118839c667186199075884e6f878

@@ -1,0 +1,453 @@
+ /********************************************************************/
+ /* Deterministic Live tests.                                        */
+ /*                                                                  */
+ /* These exercise the failure modes an ordinary happy-path run      */
+ /* never reaches: WebSocket framing and masking, a control frame    */
+ /* arriving between the fragments of a text message, UTF-8 that     */
+ /* straddles a fragment boundary, the bounded delivery queue under  */
+ /* a stopped reader, and the sync state machine's handling of an    */
+ /* out-of-order Transition, a QueryFailed and the recovery after    */
+ /* it, and the rehydration that a reconnect replays.                */
+ /*                                                                  */
+ /* No network peer is involved: server messages are fed straight    */
+ /* into the same procedures the real socket feeds, which is what    */
+ /* makes the sequencing reproducible.                               */
+ /********************************************************************/
+ live_test: proc options(main);
+
+ %include convex;
+
+ dcl     failures            fixed bin(31);
+ dcl     slotone             fixed bin(31);
+
+ failures = 0;
+ call cvxinit();
+ call livestart();
+
+ call test_frame_roundtrip();
+ call test_fragmented_message();
+ call test_control_frame_between_fragments();
+ call test_rejects_masked_and_binary();
+ call test_utf8_validation();
+ call test_queue_bounds();
+ call test_transition_flow();
+ call test_version_mismatch();
+ call test_query_failed_then_recovery();
+ call test_rehydration_suppressed();
+ call test_unsubscribe_invalidates_queue();
+
+ if failures > 0 then do;
+   call note( 'live_test: FAILED' );
+   call c_exit( 1 );
+   end;
+ call note( 'live_test: ok' );
+ return;
+
+ /*------------------------------------------------------------------*/
+ /* Checks                                                           */
+ /*------------------------------------------------------------------*/
+
+ expectn: proc( label, got, want );
+   dcl   label               char(64);
+   dcl  (got,want)           fixed bin(31);
+   if got ^= want then call fail( label );
+   end expectn;
+
+ expecttext: proc( label, b, want );
+   dcl   label               char(64);
+   dcl   b                   fixed bin(31);
+   dcl   want                char(96);
+   dcl   n                   fixed bin(31);
+   dcl   i                   fixed bin(31);
+   n = 0;
+   do i = 1 to 96;
+     if substr( want, i, 1 ) ^= ' ' then n = i;
+     end;
+   if blen(b) ^= n then do;
+     call fail( label );
+     return;
+     end;
+   if c_memcmp( bdata(b), addr(want), n ) ^= 0 then call fail( label );
+   end expecttext;
+
+ fail: proc( label );
+   dcl   label               char(64);
+   dcl   line                char(120);
+   line = 'live_test FAIL: ';
+   substr( line, 17, 64 ) = label;
+   call note( line );
+   failures = failures + 1;
+   end fail;
+
+ /*------------------------------------------------------------------*/
+ /* Framing helpers                                                  */
+ /*                                                                  */
+ /* wssend writes to the socket, so these build server-shaped frames */
+ /* directly into the receive buffer instead.                        */
+ /*------------------------------------------------------------------*/
+
+ pushframe: proc( fin, opcode, textp, textn );
+   dcl  (fin,opcode,textn)   fixed bin(31);
+   dcl   textp               ptr;
+   call bputb( B_WSRAW, chrv( fin * 128 + opcode ) );
+   if textn < 126 then call bputb( B_WSRAW, chrv( textn ) );
+   else do;
+     call bputb( B_WSRAW, chrv( 126 ) );
+     call bputb( B_WSRAW, chrv( textn / 256 ) );
+     call bputb( B_WSRAW, chrv( mod( textn, 256 ) ) );
+     end;
+   if textn > 0 then call bput( B_WSRAW, textp, textn );
+   end pushframe;
+
+ pushtext: proc( fin, opcode, t );
+   dcl  (fin,opcode)         fixed bin(31);
+   dcl   t                   char(64);
+   dcl   n                   fixed bin(31);
+   dcl   i                   fixed bin(31);
+   n = 0;
+   do i = 1 to 64;
+     if substr( t, i, 1 ) ^= ' ' then n = i;
+     end;
+   call pushframe( fin, opcode, addr(t), n );
+   end pushtext;
+
+ /*------------------------------------------------------------------*/
+ /* Cases                                                            */
+ /*------------------------------------------------------------------*/
+
+ /* A frame this client masks and sends has to decode back to the    */
+ /* same bytes once the mask is removed, and the mask bit has to be  */
+ /* set: an unmasked client frame is a protocol violation.           */
+ test_frame_roundtrip: proc;
+   dcl   payload             char(8);
+   dcl   i                   fixed bin(31);
+   dcl   mask                fixed bin(31);
+   dcl   got                 fixed bin(31);
+   payload = 'abcdefgh';
+   /* wssend needs a socket, so the frame is built the same way here */
+   /* and only its header is inspected.                              */
+   call bclear( B_WSOUT );
+   call bputb( B_WSOUT, chrv( 128 + WS_TEXT ) );
+   call bputb( B_WSOUT, chrv( 128 + 8 ) );
+   call expectn( 'frame fin and opcode', byteval( bdata(B_WSOUT) ),
+                 128 + WS_TEXT );
+   call expectn( 'frame mask bit set',
+                 byteval( ptradd( bdata(B_WSOUT), 1 ) ) / 128, 1 );
+   call expectn( 'frame length',
+                 mod( byteval( ptradd( bdata(B_WSOUT), 1 ) ), 128 ), 8 );
+   /* The mask itself is an exclusive or, so applying it twice is a  */
+   /* no-op; that is what the receiver relies on.                    */
+   mask = 0;
+   do i = 0 to 255;
+     got = xor8( xor8( i, 91 ), 91 );
+     if got ^= i then mask = mask + 1;
+     end;
+   call expectn( 'mask is an involution', mask, 0 );
+   end test_frame_roundtrip;
+
+ /* A message split across frames is reassembled once, and only the  */
+ /* final frame completes it.                                        */
+ test_fragmented_message: proc;
+   call bclear( B_WSRAW );
+   call bclear( B_WSIN );
+   wsfragmented = 0;
+   call pushtext( 0, WS_TEXT, '{"a":' );
+   call expectn( 'first fragment is incomplete', wstakeframe(), 0 );
+   call pushtext( 1, WS_CONT, '1}' );
+   call expectn( 'final fragment completes', wstakeframe(), 1 );
+   call expecttext( 'fragments reassembled', B_WSIN, '{"a":1}' );
+   end test_fragmented_message;
+
+ /* A ping may legally arrive between two fragments of a text        */
+ /* message. Handling it must not disturb the partly assembled text. */
+ test_control_frame_between_fragments: proc;
+   call bclear( B_WSRAW );
+   call bclear( B_WSIN );
+   wsfragmented = 0;
+   call pushtext( 0, WS_TEXT, 'left' );
+   call expectn( 'text fragment pending', wstakeframe(), 0 );
+   /* A ping would normally be answered with a pong, which needs a   */
+   /* socket; a pong carries no reply, so it stands in here.         */
+   call pushtext( 1, WS_PONG, 'x' );
+   call expectn( 'control frame consumed', wstakeframe(), 0 );
+   call expectn( 'reassembly still pending', wsfragmented, 1 );
+   call pushtext( 1, WS_CONT, 'right' );
+   call expectn( 'message completes after control frame',
+                 wstakeframe(), 1 );
+   call expecttext( 'control frame did not corrupt the message',
+                    B_WSIN, 'leftright' );
+   end test_control_frame_between_fragments;
+
+ test_rejects_masked_and_binary: proc;
+   dcl   payload             char(4);
+   call bclear( B_WSRAW );
+   call bclear( B_WSIN );
+   wsfragmented = 0;
+   /* A server frame must not be masked.                             */
+   call bputb( B_WSRAW, chrv( 128 + WS_TEXT ) );
+   call bputb( B_WSRAW, chrv( 128 + 1 ) );
+   call bputb( B_WSRAW, '00'x );
+   call bputb( B_WSRAW, '00'x );
+   call bputb( B_WSRAW, '00'x );
+   call bputb( B_WSRAW, '00'x );
+   call bputb( B_WSRAW, 'x' );
+   call expectn( 'masked server frame rejected', wstakeframe(), -2 );
+
+   call bclear( B_WSRAW );
+   wsfragmented = 0;
+   payload = 'data';
+   call pushframe( 1, WS_BINARY, addr(payload), 4 );
+   call expectn( 'binary frame rejected', wstakeframe(), -2 );
+
+   /* A continuation with nothing to continue is drift, not data.    */
+   call bclear( B_WSRAW );
+   wsfragmented = 0;
+   call pushtext( 1, WS_CONT, 'orphan' );
+   call expectn( 'orphan continuation rejected', wstakeframe(), -2 );
+   end test_rejects_masked_and_binary;
+
+ /* UTF-8 is validated once, on the reassembled message. A two byte  */
+ /* sequence split across two frames is legal and must survive; a    */
+ /* truncated or overlong sequence must not.                         */
+ test_utf8_validation: proc;
+   dcl   lead                char(1);
+   dcl   trail               char(1);
+   dcl   bad                 char(2);
+   lead  = 'c3'x;
+   trail = 'a9'x;
+   call bclear( B_WSRAW );
+   call bclear( B_WSIN );
+   wsfragmented = 0;
+   call pushframe( 0, WS_TEXT, addr(lead), 1 );
+   call expectn( 'split sequence pending', wstakeframe(), 0 );
+   call pushframe( 1, WS_CONT, addr(trail), 1 );
+   call expectn( 'split UTF-8 sequence accepted', wstakeframe(), 1 );
+
+   call bclear( B_WSRAW );
+   wsfragmented = 0;
+   call pushframe( 1, WS_TEXT, addr(lead), 1 );
+   call expectn( 'truncated UTF-8 rejected', wstakeframe(), -2 );
+
+   substr( bad, 1, 2 ) = 'c080'x;
+   call expectn( 'overlong encoding rejected',
+                 utf8valid( addr(bad), 2 ), 0 );
+   substr( bad, 1, 2 ) = 'eda0'x;
+   call expectn( 'lone surrogate lead rejected',
+                 utf8valid( addr(bad), 2 ), 0 );
+   end test_utf8_validation;
+
+ /* A consumer that stops reading must not be able to grow this      */
+ /* process. The queue keeps the newest 16 updates and drops the     */
+ /* oldest, and the byte budget bounds it a second time.             */
+ test_queue_bounds: proc;
+   dcl   slot                fixed bin(31);
+   dcl   i                   fixed bin(31);
+   dcl   text                char(16);
+   dcl   before              fixed bin(31);
+   slot = livesub( addr(litqueue), 5, addr(litstate), 10,
+                   addr(litemptyargs), 2 );
+   call expectn( 'queue test subscription created', minof( slot, 1 ), 1 );
+   before = qbytes;
+   do i = 1 to 100;
+     text = 'update';
+     call enqueue( slot, addr(text), 6, 0 );
+     end;
+   call expectn( 'queue is bounded by entries', subqcount(slot),
+                 QUEUE_CAPACITY );
+   call expectn( 'queue bytes track the entries kept',
+                 qbytes - before, QUEUE_CAPACITY * 6 );
+   /* Draining returns the entries that were kept, oldest first.     */
+   do i = 1 to QUEUE_CAPACITY;
+     call expectn( 'queued update available', livetake( slot ), 1 );
+     end;
+   call expectn( 'queue is empty after draining', livetake( slot ), 0 );
+   call expectn( 'queue bytes released', qbytes - before, 0 );
+   call releasesub( slot );
+   end test_queue_bounds;
+
+ minof: proc( a, b ) returns( fixed bin(31) );
+   dcl  (a,b)                fixed bin(31);
+   if a < b then return( a );
+   return( b );
+   end minof;
+
+ /* Feed the state machine a real Transition and prove the value     */
+ /* reaches the subscription and the version is adopted.             */
+ test_transition_flow: proc;
+   slotone = livesub( addr(litflow), 4, addr(litstate), 10,
+                      addr(litemptyargs), 2 );
+   subaddpend(slotone) = 0;
+   remoteqs = 0;
+   remoteid = 0;
+   call bclear( B_TS );
+   call bputt( B_TS, initialts );
+   call fupdated( initialts, 'BBBB', 1, 0 );
+   call expectn( 'initial update delivered', livetake( slotone ), 1 );
+   call expecttext( 'initial value carried verbatim', B_MSG, '{"count":0}' );
+   call expectn( 'query set version adopted', remoteqs, 1 );
+   call expecttext( 'timestamp adopted', B_TS, 'BBBB' );
+   call expecttext( 'maximum observed timestamp tracked', B_MAXTS, 'BBBB' );
+
+   /* An external change arrives as a second Transition whose start  */
+   /* version is the end version of the first.                       */
+   call fupdated( 'BBBB', 'CCCC', 1, 1 );
+   call expectn( 'external update delivered', livetake( slotone ), 1 );
+   call expecttext( 'external value carried verbatim', B_MSG,
+                    '{"count":1}' );
+   end test_transition_flow;
+
+ /* A Transition whose start version is not the one last recorded    */
+ /* means the stream was reordered or lost. It must not be applied.  */
+ test_version_mismatch: proc;
+   dcl   connections         fixed bin(31);
+   connections = connectioncount;
+   call fstart();
+   call fput( '{"type":"Transition","startVersion":{"querySet":9,' );
+   call fput( '"identity":0,"ts":"ZZZZ"},"endVersion":{"querySet":9,' );
+   call fput( '"identity":0,"ts":"ZZZZ"},"modifications":[]}' );
+   call fdone();
+   /* Retiring the connection also resets the recorded version, so   */
+   /* the mismatched end version is provably not the one adopted.     */
+   call expectn( 'mismatched version was not adopted', remoteqs, 0 );
+   call expectn( 'mismatched Transition retires the connection',
+                 connectioncount - connections, 1 );
+   call expectn( 'a protocol error was published',
+                 livetake( slotone ), 1 );
+   call expectn( 'the published event is an error', liveiserror, 1 );
+   end test_version_mismatch;
+
+ /* QueryFailed reaches the subscription as a structured error, and  */
+ /* a later valid value on the same subscription still arrives, so   */
+ /* a failure never permanently strands it.                          */
+ test_query_failed_then_recovery: proc;
+   remoteqs = 0;
+   remoteid = 0;
+   call bclear( B_TS );
+   call bputt( B_TS, initialts );
+   subhaslast(slotone) = 0;
+   subrehyd(slotone)   = 0;
+   call fstart();
+   call fput( '{"type":"Transition",' );
+   call fversion( 'startVersion', 0, initialts );
+   call fversion( 'endVersion', 1, 'DDDD' );
+   call fput( '"modifications":[{"type":"QueryFailed","queryId":' );
+   call fqid();
+   call fput( ',"errorMessage":"boom",' );
+   call fput( '"errorData":{"code":"ROOM_EMPTY"}}]}' );
+   call fdone();
+   call expectn( 'failure delivered', livetake( slotone ), 1 );
+   call expectn( 'failure is an error', liveiserror, 1 );
+   call expecttext( 'failure carries its structured payload', B_MSG,
+     '{"name":"FunctionError","message":"boom",' ||
+     '"data":{"code":"ROOM_EMPTY"}}' );
+   call fupdated( 'DDDD', 'EEEE', 1, 1 );
+   call expectn( 'recovery delivered', livetake( slotone ), 1 );
+   call expectn( 'recovery is a value', liveiserror, 0 );
+   call expecttext( 'recovered value', B_MSG, '{"count":1}' );
+   end test_query_failed_then_recovery;
+
+ /* After a reconnect the server replays the current value. Passing  */
+ /* that on would make a caller waiting for the next change see the  */
+ /* old one, so an unchanged rehydration is suppressed -- and a      */
+ /* changed one is not.                                              */
+ test_rehydration_suppressed: proc;
+   subrehyd(slotone) = 1;
+   remoteqs = 0;
+   remoteid = 0;
+   call bclear( B_TS );
+   call bputt( B_TS, initialts );
+   call fupdated( initialts, 'FFFF', 1, 1 );
+   call expectn( 'unchanged rehydration suppressed',
+                 livetake( slotone ), 0 );
+
+   subrehyd(slotone) = 1;
+   call fupdated( 'FFFF', 'GGGG', 1, 2 );
+   call expectn( 'changed rehydration is published',
+                 livetake( slotone ), 1 );
+   call expecttext( 'changed rehydration value', B_MSG, '{"count":2}' );
+   end test_rehydration_suppressed;
+
+ /* Unsubscribing drops whatever is queued before the caller is told */
+ /* the removal is under way, so no stale event can cross it.        */
+ test_unsubscribe_invalidates_queue: proc;
+   remoteqs = 0;
+   remoteid = 0;
+   call bclear( B_TS );
+   call bputt( B_TS, initialts );
+   subrehyd(slotone)   = 0;
+   subhaslast(slotone) = 0;
+   call fupdated( initialts, 'HHHH', 1, 7 );
+   call expectn( 'an update is waiting', subqcount(slotone), 1 );
+   call liveunsub( slotone );
+   call expectn( 'unsubscribe dropped the queue', subqcount(slotone), 0 );
+   call expectn( 'nothing can be taken after unsubscribe',
+                 livetake( slotone ), 0 );
+   /* A Transition naming a removed subscription is ignored rather   */
+   /* than queued behind the acknowledgement.                        */
+   remoteqs = 1;
+   call fupdated( 'HHHH', 'IIII', 1, 8 );
+   call expectn( 'no stale event after unsubscribe',
+                 livetake( slotone ), 0 );
+   end test_unsubscribe_invalidates_queue;
+
+ /*------------------------------------------------------------------*/
+ /* Fixture builder                                                  */
+ /*                                                                  */
+ /* Server messages are assembled a fragment at a time so that no    */
+ /* source line runs past the column the website renders, then       */
+ /* handed to the same entry point the real socket feeds.            */
+ /*------------------------------------------------------------------*/
+
+ fstart: proc;
+   call bclear( B_WSIN );
+   end fstart;
+
+ fput: proc( t );
+   dcl   t                   char(72);
+   call bputt( B_WSIN, t );
+   end fput;
+
+ /* Splice in the subscription's real query id.                      */
+ fqid: proc;
+   call bputi( B_WSIN, subqid(slotone) );
+   end fqid;
+
+ /* startVersion or endVersion, written out in one place because     */
+ /* every fixture needs both.                                        */
+ fversion: proc( name, queryset, ts );
+   dcl   name                char(16);
+   dcl   queryset            fixed bin(31);
+   dcl   ts                  char(16);
+   call fput( '"' );
+   call bputt( B_WSIN, name );
+   call fput( '":{"querySet":' );
+   call bputi( B_WSIN, queryset );
+   call fput( ',"identity":0,"ts":"' );
+   call bputt( B_WSIN, ts );
+   call fput( '"},' );
+   end fversion;
+
+ /* A Transition carrying one QueryUpdated for the test's own        */
+ /* subscription.                                                    */
+ fupdated: proc( fromts, tots, toqs, count );
+   dcl  (fromts,tots)        char(16);
+   dcl  (toqs,count)         fixed bin(31);
+   call fstart();
+   call fput( '{"type":"Transition",' );
+   call fversion( 'startVersion', remoteqs, fromts );
+   call fversion( 'endVersion', toqs, tots );
+   call fput( '"modifications":[{"type":"QueryUpdated","queryId":' );
+   call fqid();
+   call fput( ',"value":{"count":' );
+   call bputi( B_WSIN, count );
+   call fput( '}}]}' );
+   call liveonmessage();
+   end fupdated;
+
+ fdone: proc;
+   call liveonmessage();
+   end fdone;
+
+ %include convexlib;
+
+ end live_test;

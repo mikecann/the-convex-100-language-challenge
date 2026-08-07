@@ -4,5 +4,50 @@ displayName: "PL/I"
 rank: 68
 selectionTier: coverage
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Convex HTTP and the pinned sync profile are written in PL/I and compiled by
+    Iron Spring PL/I 1.4.1 to 32-bit ELF. Sockets, DNS, TLS and the SHA-1 and
+    base64 primitives the RFC 6455 handshake needs are reached through
+    OPTIONS( BYVALUE LINKAGE(SYSTEM) ) declarations of libc and OpenSSL entry
+    points; JSON, HTTP/1.1 framing, WebSocket framing and the Convex sync state
+    machine contain no delegated logic.
+toolchain:
+  name: Iron Spring PL/I
+  version: 1.4.1
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, optimistic updates, WebSocket mutations, and WebSocket actions are deferred.
+  - Live values cover the JSON-safe subset; tagged Convex value types are deferred.
+  - TransitionChunk assembly is deferred and treated as protocol drift that reconnects.
+  - >-
+    Convex values are carried as their exact JSON text rather than a PL/I value
+    tree, because this compiler caps a CHAR string at about 32000 characters;
+    every payload larger than a short field lives in a libc-allocated byte
+    buffer instead of a PL/I string.
+  - >-
+    Rehydration suppression after a reconnect compares the previous and new
+    values as JSON text rather than semantically, so a value the backend
+    re-serialises differently would be republished rather than suppressed.
+  - >-
+    Delivery is bounded twice over - each subscription retains the newest 16
+    updates and drops the oldest, and the whole client refuses any single HTTP
+    response or Live message above 2 MiB, so the adapter stays far below the
+    shared 128 MiB container limit with a stopped reader.
+  - Capabilities remain unearned until the root-owned shared local and hosted conformance evidence passes.
 capabilities: []
