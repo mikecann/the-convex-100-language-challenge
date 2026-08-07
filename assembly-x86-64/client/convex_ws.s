@@ -54,25 +54,6 @@ global ws_recv_more
 global ws_pump_message
 global utf8_validate
 
-; void dbg_mark_ws(int ch) [edi] -- DEBUG ONLY: writes one raw byte + newline
-; to stderr. Used to bisect a crash by call-site sequence.
-dbg_mark_ws:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 32
-    mov [rbp-8], edi
-    mov edi, 2
-    lea rsi, [rbp-8]
-    mov edx, 1
-    call write
-    mov edi, 2
-    lea rsi, [rel dbg_nl_ws]
-    mov edx, 1
-    call write
-    mov rsp, rbp
-    pop rbp
-    ret
-
 ; --- base64 -----------------------------------------------------------------
 
 ; void b64_emit(buf *out, int sextet) -- appends alphabet[sextet] to *out.
@@ -604,19 +585,15 @@ ws_hs_read_more:
 %define WO_EXPECT -104         ; buf struct: rbp-104..rbp-81
 %define WO_LEFT   -128         ; buf struct: rbp-128..rbp-105
 %define WO_STATUS -136
-%define WO_DBGTMP -144
 ws_open:
     push rbp
     mov rbp, rsp
-    sub rsp, 160
+    sub rsp, 144
     mov [rbp+WO_URL], rdi
     mov [rbp+WO_UA], rsi
     mov [rbp+WO_UALEN], rdx
     mov [rbp+WO_OUT], rcx
 
-    mov edi, 'A'
-    call dbg_mark_ws
-    mov rcx, [rbp+WO_OUT]
     mov qword [rcx + ws_conn.assembling], 0
     mov qword [rcx + ws_conn.asm_opcode], 0
     mov qword [rcx + ws_conn.open], 0
@@ -631,10 +608,6 @@ ws_open:
     mov rdi, [rbp+WO_URL]
     lea rsi, [rcx + ws_conn.conn]
     call convex_connect
-    mov [rbp+WO_DBGTMP], rax
-    mov edi, 'B'
-    call dbg_mark_ws
-    mov rax, [rbp+WO_DBGTMP]
     test eax, eax
     jz .fail_noclose
 
@@ -642,10 +615,6 @@ ws_open:
     call buf_init
     lea rdi, [rbp+WO_KEYB64]
     call ws_build_key
-    mov [rbp+WO_DBGTMP], rax
-    mov edi, 'C'
-    call dbg_mark_ws
-    mov rax, [rbp+WO_DBGTMP]
     test eax, eax
     jz .fail_close
 
@@ -657,10 +626,6 @@ ws_open:
     mov r8, [rbp+WO_KEYB64 + buf.data]
     mov r9, [rbp+WO_KEYB64 + buf.len]
     call ws_send_handshake_request
-    mov [rbp+WO_DBGTMP], rax
-    mov edi, 'D'
-    call dbg_mark_ws
-    mov rax, [rbp+WO_DBGTMP]
     test eax, eax
     jz .fail_close
 
@@ -674,8 +639,6 @@ ws_open:
     lea rdx, [rbp+WO_LEFT]
     call ws_read_handshake_response
     mov [rbp+WO_STATUS], rax
-    mov edi, 'E'
-    call dbg_mark_ws
     cmp qword [rbp+WO_STATUS], 101
     jne .fail_close
 
@@ -685,10 +648,6 @@ ws_open:
     mov rsi, [rbp+WO_KEYB64 + buf.len]
     lea rdx, [rbp+WO_EXPECT]
     call ws_compute_accept
-    mov [rbp+WO_DBGTMP], rax
-    mov edi, 'F'
-    call dbg_mark_ws
-    mov rax, [rbp+WO_DBGTMP]
     test eax, eax
     jz .fail_close
 
@@ -713,16 +672,12 @@ ws_open:
     mov rdx, [rbp+WO_LEFT + buf.len]
     call buf_append
 .no_leftover:
-    mov edi, 'G'
-    call dbg_mark_ws
     mov rcx, [rbp+WO_OUT]
     mov qword [rcx + ws_conn.open], 1
     mov eax, 1
     jmp .cleanup
 
 .fail_close:
-    mov edi, 'x'
-    call dbg_mark_ws
     mov rcx, [rbp+WO_OUT]
     lea rdi, [rcx + ws_conn.conn]
     call convex_conn_close
@@ -751,7 +706,6 @@ ws_open:
 %undef WO_EXPECT
 %undef WO_LEFT
 %undef WO_STATUS
-%undef WO_DBGTMP
 
 ; void ws_close(ws_conn *w) -- best-effort close frame (never waited on),
 ; then tears down the transport and frees both internal buffers. Safe to
@@ -1586,7 +1540,6 @@ utf8_validate:
 %undef UV_I
 
 section .rodata
-    dbg_nl_ws: db 10
     b64_alphabet: db "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
     ws_guid: db "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
     ws_guid_len equ $ - ws_guid
