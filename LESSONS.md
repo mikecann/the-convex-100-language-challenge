@@ -316,7 +316,36 @@ primitives at all, so a client would be an external transport process wearing a
 costume. That earns this project's "bridge" label, not "native". Older and
 harder turned out to be more honest than newer and easier.
 
-## 15. Miscellaneous findings worth a slide
+## 15. Sometimes the platform's own library is the bug
+
+Ballerina's client reached forty-one of forty-two tests and stopped on one:
+a multi-byte UTF-8 character split across a WebSocket continuation-frame
+boundary came back corrupted. The diagnosis was done by elimination rather than
+assertion — the fixture's frame bytes were verified by hand, the same character
+delivered unfragmented worked, and four different read APIs in the platform's
+websocket module either shared the identical corruption or refused text frames
+outright. Four APIs failing the same way means the defect sits in native code
+beneath all of them.
+
+That is a real bug in `ballerina/websocket`, not in the client. It is also
+unwaivable here, because correct fragmented-UTF-8 decoding is explicitly on this
+project's Live acceptance list.
+
+The resolution is the interesting part: **the "workaround" is what most of this
+project already does.** More than a dozen verified clients — BCPL, Forth, Tcl,
+AWK, Pike, Io, Smalltalk — implement RFC 6455 by hand over a raw socket,
+because their languages have no WebSocket library at all. Ballerina has one,
+and it is wrong, so it joins them. Having a library is not the same as having a
+correct one, and the languages with nothing were never at a disadvantage on this
+particular axis.
+
+A second, duller platform defect sat alongside it: the package manager's local
+publish step intermittently dropped a symbol that the packaged artefact
+contained correctly every time. Proven by diffing the source, the pack output,
+and the published copy. The fix was to stop round-tripping through the local
+repository at all.
+
+## 16. Miscellaneous findings worth a slide
 
 - A client passed every check except one, and the one failure was in the
   *reference* implementation used for comparison, not the client under test.
