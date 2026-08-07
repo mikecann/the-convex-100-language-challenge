@@ -18,10 +18,10 @@ value.
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations and actions | Pending shared verification |
-| Bearer-token replacement and structured function errors | Pending shared verification |
-| Live initial values and updates | Pending shared verification |
-| Remove, reconnect, query-error recovery and bounded delivery | Pending shared verification |
+| HTTP queries, mutations and actions | Verified by shared local and hosted conformance |
+| Bearer-token replacement and structured function errors | Verified by shared local and hosted conformance |
+| Live initial values and updates | Verified by shared local and hosted conformance |
+| Remove, reconnect, query-error recovery and bounded delivery | Verified by shared local and hosted conformance |
 | Live authentication, optimistic updates, WebSocket mutations | Not implemented |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.mojo -->

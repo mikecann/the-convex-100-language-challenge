@@ -36,4 +36,6 @@ limitations:
   - TransitionChunk assembly is deferred and treated as protocol drift that reconnects.
   - Each subscription retains the newest 16 updates within a 256 KiB byte budget and drops the oldest when its consumer is slow.
   - One HTTP connection is opened per call rather than pooled, so keep-alive reuse is deferred.
-capabilities: []
+capabilities:
+  - http
+  - live
