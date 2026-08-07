@@ -43,9 +43,27 @@ func _init(deployment_url: String, target: Dictionary, options: Dictionary = {})
 	_base_url = deployment_url.trim_suffix("/")
 	_target = target
 	_bearer_token = options.get("bearer_token", "")
-	_http = ConvexHttp.new(options)
-	_live_options = options.duplicate()
+	var effective_options := _with_default_tls_options(options)
+	_http = ConvexHttp.new(effective_options)
+	_live_options = effective_options.duplicate()
 	_live_options["client_version"] = CLIENT_VERSION
+
+
+# ConvexHttp and ConvexLive both fall back to TLSOptions.client() - Godot's
+# own default trust store - whenever a caller leaves "tls_options" unset.
+# That default does not work in the shape this client runs Godot in (see
+# certs.gd), so a caller who has not supplied their own tls_options is
+# handed this client's bundled trust store instead. A caller who does supply
+# one, including explicitly passing null to opt out, is left untouched.
+func _with_default_tls_options(options: Dictionary) -> Dictionary:
+	if options.has("tls_options"):
+		return options
+	var chain := ConvexCerts.default_trusted_chain()
+	if chain == null:
+		return options
+	var merged := options.duplicate()
+	merged["tls_options"] = TLSOptions.client(chain)
+	return merged
 
 
 # Convex accepts a bearer token on every function call. Setting an empty

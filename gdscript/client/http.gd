@@ -120,9 +120,12 @@ func post(target: Dictionary, headers: PackedStringArray, body: String) -> Dicti
 
 	var tls: TLSOptions = null
 	if target["tls"]:
-		# Godot compiles its own certificate bundle into the runtime, so a
-		# default client configuration verifies the deployment hostname
-		# without the image shipping a separate CA file.
+		# ConvexClient always supplies tls_options built from this client's
+		# bundled trust store (see certs.gd) unless a caller overrides it, so
+		# TLSOptions.client() here is reached only when this transport is
+		# used directly, outside ConvexClient, with no chain of its own -
+		# Godot's own default, which does not work in this runtime (see
+		# certs.gd for why).
 		tls = _tls_options if _tls_options != null else TLSOptions.client()
 	var started := client.connect_to_host(target["host"], target["port"], tls)
 	if started != OK:

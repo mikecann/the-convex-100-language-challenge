@@ -83,6 +83,20 @@ RUN set -eu; \
     mv project/client/export_presets.cfg project/export_presets.cfg; \
     mv project/client/.gdlintrc project/.gdlintrc
 
+# Godot's headless --script launch (see the --main-pack/--script comment
+# below) never reaches the branch of Main::start() that loads a certificate
+# trust store, so TLSOptions.client() with no explicit chain cannot verify
+# any TLS connection in this runtime - see client/certs.gd. The client ships
+# its own copy of the same trust store Godot would otherwise have supplied,
+# taken from the ca-certificates package already pinned above for build
+# tooling, so this file's contents are exactly as reproducible as the rest
+# of the image. It becomes part of both exported packs because export_filter
+# in export_presets.cfg is all_resources and neither preset excludes it.
+RUN set -eu; \
+    mkdir -p /work/project/client/certs; \
+    cp /etc/ssl/certs/ca-certificates.crt /work/project/client/certs/ca-bundle.pem; \
+    test -s /work/project/client/certs/ca-bundle.pem
+
 # Formatting and linting come before anything is executed, because the README
 # and the website publish this source verbatim.
 RUN cd /work/project && gdformat --check $(find client examples -name '*.gd')
