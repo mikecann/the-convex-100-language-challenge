@@ -12,11 +12,20 @@
 ! replacement.
 
 USING: accessors arrays assocs calendar combinators
-concurrency.mailboxes continuations destructors environment io
+concurrency.mailboxes continuations debugger destructors environment io
 io.encodings.utf8 io.sockets io.timeouts kernel locals make math
 math.parser namespaces sequences splitting strings system threads
 vectors convex convex.json convex.live convex.transport ;
 IN: convex.adapter
+
+! DEBUG: print full error diagnostics for ANY uncaught error in ANY
+! thread, before Factor's default handler calls die. Temporary, for
+! diagnosing the hosted-only VM crash.
+[
+    "DEBUG uncaught error in thread: " write dup name>> print
+    "DEBUG error object: " write over error.
+    die drop rethrow
+] thread-error-hook set-global
 
 CONSTANT: adapter-language "factor"
 CONSTANT: adapter-implementation
