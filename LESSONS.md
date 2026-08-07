@@ -616,6 +616,12 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- A Dylan syntax error looked like dead code. A parse error inside a function
+  body does not fail that function — it silently drops the entire body, and
+  every name the body referenced is then reported as an unreferenced binding.
+  So a single typo presents as a scatter of unrelated dead-code warnings, with
+  nothing pointing at the real line. It happened twice, both times from using a
+  reserved word (`method`, `port`) as an ordinary identifier.
 - The "upstream bug" was ours, and five issue numbers made it look otherwise.
   GDScript's hosted TLS failure was diagnosed as an open mbedTLS/PSA-crypto
   defect in Godot, matching five upstream reports, reproduced on two engine
