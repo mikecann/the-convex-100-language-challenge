@@ -17,7 +17,7 @@ RUN apt-get update \
        build-essential=12.10ubuntu1 \
        git=1:2.43.0-1ubuntu7.3 \
        ca-certificates=20240203 \
-       libssl-dev=3.0.13-0ubuntu3.5 \
+       libssl-dev=3.0.13-0ubuntu3.12 \
        pkg-config=1.8.1-2build1 \
        nasm=2.16.01-1build1 \
        busybox-static=1:1.36.1-6ubuntu3.1 \
