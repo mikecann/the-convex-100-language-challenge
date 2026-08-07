@@ -649,7 +649,7 @@ ws_open:
     jz .fail_close
 
     mov rcx, [rbp+WO_OUT]
-    mov rdi, [rcx + ws_conn.conn]
+    lea rdi, [rcx + ws_conn.conn]
     mov rsi, [rbp+WO_URL]
     mov rdx, [rbp+WO_UA]
     mov rcx, [rbp+WO_UALEN]
@@ -668,7 +668,7 @@ ws_open:
     lea rdi, [rbp+WO_LEFT]
     call buf_init
     mov rcx, [rbp+WO_OUT]
-    mov rdi, [rcx + ws_conn.conn]
+    lea rdi, [rcx + ws_conn.conn]
     lea rsi, [rbp+WO_ACCEPT]
     lea rdx, [rbp+WO_LEFT]
     call ws_read_handshake_response
