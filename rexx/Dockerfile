@@ -43,8 +43,34 @@ RUN set -eu; \
     grep -Fqx '{"id":"close","type":"closed"}' /tmp/adapter.ndjson; \
     ( unset CONVEX_URL; regina examples/basics/main.rexx demo-room 2>&1 1>/dev/null | grep -Fq 'CONVEX_URL is required' )
 
+# Derive the exact shared-library closure for every binary this image
+# stages, via `ldd` invoked once per binary -- never as `ldd a b c`, whose
+# multi-file output interleaves "path:" header lines that a naive line
+# parser can mistake for a library path. `ldd` already flattens the full
+# transitive dependency chain, so this is the single source of truth
+# runtime-base copies wholesale below: a binary gaining a new dynamic
+# dependency (like coreutils' `id` pulling in libselinux.so.1, which in
+# turn pulls in libpcre2-8.so.0) cannot silently go unstaged again.
+RUN set -eu; \
+    stage() { \
+      bin_src=$1; bin_dst=$2; \
+      install -D -m "$(stat -c %a "$bin_src")" "$bin_src" "/closure$bin_dst"; \
+      ldd "$bin_src" | awk '{ if ($3 ~ /^\//) print $3; else if ($1 ~ /^\//) print $1 }' | \
+      while read -r lib; do \
+        [ -f "$lib" ] || continue; \
+        install -D -m "$(stat -c %a "$lib")" "$lib" "/closure$lib"; \
+      done; \
+    }; \
+    stage /usr/bin/id /usr/bin/id; \
+    stage /usr/bin/cat /usr/bin/cat; \
+    stage /usr/bin/uname /usr/bin/uname; \
+    stage /usr/bin/head /usr/bin/head; \
+    stage /bin/dash /bin/sh; \
+    stage /usr/bin/regina /usr/local/bin/regina; \
+    stage /opt/convex/client/libconvexshim.so /opt/convex/client/libconvexshim.so
+
 # Use a pinned non-scratch Debian carrier, then rebuild its visible
-# filesystem from the explicit Regina/OpenSSL/CA closure. BusyBox exists
+# filesystem from the ldd-derived closure staged above. BusyBox exists
 # only in this build stage to prune the carrier and never reaches either
 # exported runtime image.
 FROM --platform=linux/amd64 ${BUILD_IMAGE} AS runtime-base
@@ -53,32 +79,27 @@ RUN --mount=type=bind,from=test,source=/bin/busybox,target=/busybox,readonly \
     for path in /bin /boot /home /lib /lib64 /media /mnt /opt /root /run /sbin /srv /usr /var; do /busybox rm -rf "$path"; done; \
     for path in /etc/*; do case "$path" in /etc/hosts|/etc/resolv.conf) ;; *) /busybox rm -rf "$path" ;; esac; done; \
     /busybox mkdir -p /bin /etc/ssl/certs /lib/x86_64-linux-gnu /lib64 /usr/bin /usr/lib/x86_64-linux-gnu/ossl-modules /usr/local/bin /opt/convex/client
-COPY --from=test /lib64/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
-COPY --from=test /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
-COPY --from=test /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/libc.so.6
-COPY --from=test /lib/x86_64-linux-gnu/libpthread.so.0 /lib/x86_64-linux-gnu/libpthread.so.0
-COPY --from=test /lib/x86_64-linux-gnu/libdl.so.2 /lib/x86_64-linux-gnu/libdl.so.2
-COPY --from=test /usr/lib/x86_64-linux-gnu/libregina.so.3.6 /usr/lib/x86_64-linux-gnu/libregina.so.3
-COPY --from=test /usr/lib/x86_64-linux-gnu/libssl.so.3 /usr/lib/x86_64-linux-gnu/libssl.so.3
-COPY --from=test /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /usr/lib/x86_64-linux-gnu/libcrypto.so.3
-COPY --from=test /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so
-COPY --from=test /usr/bin/regina /usr/local/bin/regina
+# The full ldd-derived closure computed in the test stage: every ELF
+# interpreter, SONAME, and transitive library dependency that id/cat/
+# uname/sh/regina/libconvexshim.so actually declare (see `stage` above).
+COPY --from=test /closure/ /
+# These are not link-time (DT_NEEDED) dependencies, so `ldd` cannot see
+# them: NSS resolves libnss_dns.so.2/libnss_files.so.2/libresolv.so.2 via
+# dlopen based on /etc/nsswitch.conf, and OpenSSL's legacy provider is
+# dlopen'd based on openssl.cnf. Both mechanisms must stay explicit.
 COPY --from=test /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=test /etc/ssl/openssl.cnf /etc/ssl/openssl.cnf
 COPY --from=test /etc/nsswitch.conf /etc/nsswitch.conf
 COPY --from=test /usr/lib/x86_64-linux-gnu/libnss_dns.so.2 /usr/lib/x86_64-linux-gnu/libnss_dns.so.2
 COPY --from=test /usr/lib/x86_64-linux-gnu/libnss_files.so.2 /usr/lib/x86_64-linux-gnu/libnss_files.so.2
 COPY --from=test /usr/lib/x86_64-linux-gnu/libresolv.so.2 /usr/lib/x86_64-linux-gnu/libresolv.so.2
-COPY --from=test /bin/dash /bin/sh
-COPY --from=test /usr/bin/id /usr/bin/id
-COPY --from=test /usr/bin/cat /usr/bin/cat
-COPY --from=test /usr/bin/uname /usr/bin/uname
+COPY --from=test /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so
 ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
     OPENSSL_MODULES=/usr/lib/x86_64-linux-gnu/ossl-modules \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     LD_LIBRARY_PATH=/opt/convex/client \
     PATH=/usr/local/bin:/usr/bin:/bin
 COPY --from=test /opt/convex/client/convex.rexx /opt/convex/client/convex.rexx
-COPY --from=test /opt/convex/client/libconvexshim.so /opt/convex/client/libconvexshim.so
 USER 65532:65532
 RUN test "$(id -u):$(id -g)" = 65532:65532 \
     && test "$(uname -m)" = x86_64 \

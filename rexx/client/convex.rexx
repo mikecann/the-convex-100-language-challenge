@@ -738,8 +738,14 @@ live_connect: procedure
   connectionCount = live_state_get(stateJson, 'connectionCount')
   lastCloseReason = live_state_get(stateJson, 'lastCloseReason')
   maxObservedTs = live_state_get(stateJson, 'maxObservedTimestamp')
-  sessionId = left(translate(c2x(RXRANDBYTES(16))), 32)
-  sessionId = substr(sessionId, 3)
+  /* RXRANDBYTES returns "K:<16 raw bytes>" (the same status-tagged
+   * convention used everywhere else in this file, e.g. the WS key at
+   * keyBytes/wsKey above and the frame mask key in ws_build_frame): the
+   * "K:" must be stripped before hex-encoding, not after, or the session
+   * ID comes out 30 hex characters instead of 32 and the server rejects
+   * the Connect frame outright ("invalid length: expected length 32 for
+   * simple format, found 30"). */
+  sessionId = c2x(substr(RXRANDBYTES(16), 3))
   sessionId = translate(sessionId, xrange('a','z'), xrange('A','Z'))
 
   connectMsg = '{"type":"Connect","sessionId":' || json_estr(sessionId) || ,
