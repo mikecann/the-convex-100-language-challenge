@@ -539,6 +539,15 @@ convex_call:
     jmp .done
 
 .check_error_status:
+    ; Reload the status node from its frame slot rather than trust rax to
+    ; still hold it: the call to bytes_equal just above (checking for
+    ; "success") is a real function call and returns its own boolean in
+    ; eax, clobbering the status-node pointer this label used to assume
+    ; was still sitting in rax. That stale-rax read is what crashed on
+    ; the very first "status":"error" response this client ever received
+    ; (e.g. a ConvexError from a query) -- found with gdb: SIGSEGV at
+    ; `mov 0x18(%rax),%rdi` here with rax=0.
+    mov rax, [rbp-240]
     mov rdi, [rax + json_value.ptr]
     mov rsi, [rax + json_value.len]
     lea rdx, [rel status_error]
