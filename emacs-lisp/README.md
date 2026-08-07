@@ -20,12 +20,12 @@ exact runnable file.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Attempting | Query, mutation, action, bearer-token lifecycle, structured `FunctionError`/`ProtocolError`/`TransportError` classification, and logs pass a real loopback test suite in Docker. The example-runtime and runtime Docker images were also run end to end against a real loopback deployment, not merely built. Shared local and hosted conformance have not run yet, so no badge is claimed. |
-| Live | Attempting | Subscribe, an initial value, an external update, `QueryFailed`, and the unsubscribe-before-acknowledgement barrier pass a real loopback test suite against the client directly. `debugDisconnect`'s acknowledgement barrier and five consecutive real reconnect-and-resubscribe cycles, each required to deliver a genuine resubscribed value, are proven deterministically against a real second OS process. The TCP adapter transport was independently confirmed end to end (subscribe, deliver a value) in the real runtime image; the stdio transport has an unresolved intermittent crash under Live load - see Limitations. Shared local and hosted conformance have not run yet, so no badge is claimed. |
+| HTTP | Badge earned | Query, mutation, action, bearer-token lifecycle, structured `FunctionError`/`ProtocolError`/`TransportError` classification, and logs pass a real loopback test suite in Docker and shared local and hosted black-box conformance (31/31 both profiles). The example-runtime and runtime Docker images were also run end to end against a real loopback deployment, not merely built. |
+| Live | Badge earned | Subscribe, an initial value, an external update, `QueryFailed`, and the unsubscribe-before-acknowledgement barrier pass a real loopback test suite against the client directly, plus shared local and hosted black-box conformance (31/31 both profiles). `debugDisconnect`'s acknowledgement barrier and five consecutive real reconnect-and-resubscribe cycles, each required to deliver a genuine resubscribed value, are proven deterministically against a real second OS process. The shared harness drives the adapter over TCP; the TCP transport was independently confirmed end to end (subscribe, deliver a value) in the real runtime image, but the stdio transport has an unresolved intermittent crash under Live load that this run did not exercise - see Limitations. |
 
-The shared evaluator has not yet run local or hosted black-box conformance
-for this client; `capabilities` in `manifest.yaml` is empty by design until
-that happens.
+The shared evaluator awarded both badges from a clean exact-head build
+(`e5e2b85`): 31 of 31 conformance checks against a local backend and 31 of
+31 against the hosted deployment over real TLS.
 
 ## The basic example
 
@@ -173,7 +173,8 @@ with warnings treated as errors, lints every source file, and runs real
 loopback JSON, HTTP, WebSocket, and Live protocol fixtures, the conformance
 adapter's stdio and TCP modes, and the example's fast-fail path, all inside
 Docker. The remaining commands are root-owned shared gates for the approved
-local and hosted deployments and have not yet been run for this client.
+local and hosted deployments; `./run verify-all emacs-lisp` has passed both,
+earning the http and live badges above.
 
 ## Conformance and protocol notes
 
@@ -283,4 +284,7 @@ test-only adapter's stdio transport - see Limitations for exactly why.
   process acting as a Live peer covering Add, an initial value, an external
   update, five real reconnects, `QueryFailed` with structured `errorData`,
   and the unsubscribe generation barrier. Root-owned local and hosted
-  conformance remain the final capability gates.
+  conformance have since passed 31/31 on both profiles, earning the http
+  and live badges above; the stdio-transport Live risk noted earlier in
+  this list is unaffected by that result, since the shared harness drives
+  the adapter over TCP and never exercises the stdio transport.

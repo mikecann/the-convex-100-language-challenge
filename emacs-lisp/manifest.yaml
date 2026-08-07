@@ -50,8 +50,9 @@ limitations:
     loopback deployment (query, Live subscribe, mutation, and the resulting
     Live update all confirmed byte-for-byte against the canonical
     transcript, and a real adapter query independently confirmed in the
-    runtime image). Shared local and hosted conformance have not been run,
-    so no capability badge is claimed.
+    runtime image). Shared local and hosted conformance have since passed
+    31 of 31 checks on both profiles from this exact source checkpoint,
+    earning the http and live badges below.
   - >-
     client/tests/conformance/stdin-poll.c is the only native code anywhere
     in this client, and it exists solely for the test-only NDJSON adapter,
@@ -130,7 +131,6 @@ limitations:
     completing it, tracked independently of the caller's own polling
     deadline so a slow peer cannot hold the connection open with repeated
     short polls.
-  - >-
-    Capability badges remain empty until the root-owned local and hosted
-    conformance gates pass.
-capabilities: []
+capabilities:
+  - http
+  - live
