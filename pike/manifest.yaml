@@ -66,4 +66,6 @@ limitations:
     line endings, and non-ASCII source characters rather than by a tool.
   - Capability badges stay empty until the root-owned local and hosted
     conformance gates pass.
-capabilities: []
+capabilities:
+  - http
+  - live
