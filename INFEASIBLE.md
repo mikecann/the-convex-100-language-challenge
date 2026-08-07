@@ -146,6 +146,19 @@ mapping is cosmetic — the slots are fungible.
 | 18 | elm | **Dylan** (1992) | Open Dylan | Apple's Lisp-with-syntax, built for the Newton and then killed. Multimethod dispatch and a real macro system behind ALGOL-ish syntax, with `define C-function` for the transport boundary. A functional slot that is genuinely dead rather than merely unfashionable. |
 | 19 | cfml | **Harbour** (xBase, 1985 lineage) | Harbour | Restores the xBase family the project lost twice, to visual-foxpro and xbasepp, honestly and for free. The language behind a decade of DOS business software, compiling straight to C so the socket and TLS boundary is routine. |
 
+Slot 3 (originally matlab) has now defeated two candidates: Futhark, which
+cannot reach a socket at all, and Unison, which reaches one perfectly but
+cannot be built without a network round trip to a hosted third-party service.
+The third candidate is chosen against both failures at once:
+
+- **Seed7** (Thomas Mertes, 1989 onward) — an extensible language whose syntax
+  and operators are defined in the language itself rather than fixed by the
+  compiler, so its own standard library reads like a grammar. It is the right
+  answer to both prior failures: `s7` builds from a plain source tarball with
+  gcc and no network dependency at run or build time, and its standard library
+  ships `socket.s7i` and TLS support natively, so neither gate is in doubt the
+  way Futhark's and Unison's were.
+
 Held in reserve, if actionscript or logo cannot be recovered:
 
 - **Pop-11** (Poplog) — the British AI language, an incremental compiler whose
