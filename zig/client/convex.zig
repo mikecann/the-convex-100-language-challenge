@@ -485,6 +485,15 @@ fn classifyHttpError(err: anyerror, timed_out: bool) anyerror {
     };
 }
 
+fn replaceOwnedBytes(allocator: Allocator, destination: *?[]u8, source: ?[]const u8) !void {
+    // The source may alias destination.*, so it must be copied before the old
+    // allocation is released. A failed copy leaves destination unchanged.
+    const replacement: ?[]u8 = if (source) |bytes| try allocator.dupe(u8, bytes) else null;
+    const old = destination.*;
+    destination.* = replacement;
+    if (old) |value| allocator.free(value);
+}
+
 pub const Client = struct {
     allocator: Allocator,
     deployment_url: []const u8,
@@ -532,8 +541,8 @@ pub const Client = struct {
 
     pub fn setAuth(self: *Client, token: []const u8) !void {
         if (self.closed) return error.Closed;
-        if (self.auth_token) |old| self.allocator.free(old);
-        self.auth_token = if (token.len == 0) null else try self.allocator.dupe(u8, token);
+        const source: ?[]const u8 = if (token.len == 0) null else token;
+        try replaceOwnedBytes(self.allocator, &self.auth_token, source);
     }
 
     pub fn call(self: *Client, allocator: Allocator, operation: []const u8, path: []const u8, args: JsonValue) !CallResult {
@@ -1682,8 +1691,7 @@ const LiveOwner = struct {
                     continue;
                 }
                 query.awaiting_rehydration = false;
-                if (query.last_value) |old| self.manager.allocator.free(old);
-                query.last_value = try self.manager.allocator.dupe(u8, encoded);
+                try replaceOwnedBytes(self.manager.allocator, &query.last_value, encoded);
                 query.last_success = true;
                 try self.emitSubscription(query, value, null, modification.get("logLines"));
             } else if (std.mem.eql(u8, modification_type, "QueryFailed")) {
@@ -2297,6 +2305,31 @@ const AuthLifecycleFixture = struct {
         }
     }
 };
+
+test "setAuth preserves the current token on allocation failure and accepts its stored slice" {
+    var client = try Client.init(std.testing.allocator, "http://127.0.0.1:9");
+    defer client.deinit();
+    try client.setAuth("token-that-must-survive");
+
+    const original = client.auth_token.?;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    client.allocator = failing_allocator.allocator();
+    // Restore the allocator before Client.deinit even if an assertion fails.
+    // The token itself was allocated by std.testing.allocator.
+    defer client.allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.OutOfMemory, client.setAuth("replacement"));
+    try std.testing.expectEqual(original.ptr, client.auth_token.?.ptr);
+    try std.testing.expectEqualStrings("token-that-must-survive", client.auth_token.?);
+
+    client.allocator = std.testing.allocator;
+    const stored_token = client.auth_token.?;
+    try client.setAuth(stored_token);
+    try std.testing.expectEqualStrings("token-that-must-survive", client.auth_token.?);
+
+    try client.setAuth("");
+    try std.testing.expect(client.auth_token == null);
+}
 
 test "invalid bearer token is sent and clearing it restores anonymous calls" {
     var listener = try testListener();
@@ -3032,6 +3065,25 @@ fn testAppendActive(manager: *LiveManager, id: u32, subscription_id: []const u8)
         .args = try manager.allocator.dupe(u8, "{}"),
         .delivery_token = try manager.output.newDeliveryToken(),
     });
+}
+
+test "ActiveQuery last_value replacement preserves ownership on failure and aliasing" {
+    var query: ActiveQuery = undefined;
+    query.last_value = try std.testing.allocator.dupe(u8, "cached-live-value");
+    defer if (query.last_value) |value| std.testing.allocator.free(value);
+
+    const original = query.last_value.?;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        replaceOwnedBytes(failing_allocator.allocator(), &query.last_value, "replacement"),
+    );
+    try std.testing.expectEqual(original.ptr, query.last_value.?.ptr);
+    try std.testing.expectEqualStrings("cached-live-value", query.last_value.?);
+
+    const stored_value = query.last_value.?;
+    try replaceOwnedBytes(std.testing.allocator, &query.last_value, stored_value);
+    try std.testing.expectEqualStrings("cached-live-value", query.last_value.?);
 }
 
 test "Live transition validation is atomic and duplicate changes collapse deterministically" {
