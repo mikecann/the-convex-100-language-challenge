@@ -150,6 +150,7 @@ RUN set -eu; \
           /usr/bin/dpkg-statoverride /usr/bin/dpkg-trigger \
           /usr/sbin/dpkg-preconfigure /usr/sbin/dpkg-reconfigure; \
     rm -rf /etc/apt /usr/lib/apt /var/lib/dpkg /usr/share/dpkg; \
+    hash -r; \
     for forbidden in ${FORBIDDEN_COMMANDS}; do \
       if command -v "$forbidden" >/dev/null 2>&1; then \
         printf '%s\n' "unexpected command in the runtime image: $forbidden" >&2; \
