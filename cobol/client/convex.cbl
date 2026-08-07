@@ -55,8 +55,8 @@ COPY "cvx-http.cpy".
 01 WS-BODY                  PIC X(2097152).
 01 WS-BODY-LEN              BINARY-LONG.
 01 WS-RESP                  PIC X(2097152).
-01 WS-RESP-LEN              BINARY-LONG.
 01 WS-ARGS-ESC REDEFINES WS-RESP PIC X(2097152).
+01 WS-RESP-LEN              BINARY-LONG.
 
 *> ---- Live transport state ----------------------------------------
 01 WS-LIVE-HANDLE           BINARY-LONG VALUE -1.
