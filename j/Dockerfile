@@ -75,6 +75,17 @@ RUN printf '%s\n' \
 # linked at jconsole build time, so ldd on jconsole alone would miss them),
 # and the trust store / OpenSSL config / provider module TLS actually loads.
 #
+# libgmp.so.10 is staged for the same reason: libj.so dlopen()s it by name
+# during interpreter start-up to back J's extended-precision integers, a
+# feature this client's own code never invokes (JSON numbers are kept as
+# their verbatim source literal, never parsed into any numeric type). ldd
+# never reports it as a dependency because the load is dynamic, not linked,
+# so leaving it unstaged does not fail the build -- it silently reappears as
+# a "cannot open shared object file" diagnostic on the first line of every
+# process's stdout, ahead of the real NDJSON. Shipping the exact library the
+# build already resolved this against is what keeps that diagnostic from
+# firing at all, rather than papering over its output downstream.
+#
 # Every shared object copied here is discovered by running ldd on exactly
 # one binary per invocation (interleaved multi-argument ldd output is not
 # parsed anywhere in this file) and dereferenced with `cp -aL`, so a SONAME
@@ -88,6 +99,7 @@ RUN set -eu; \
     rm -rf /staging/opt/convex/jlibrary/addons /staging/opt/convex/jlibrary/user; \
     cp -aL /usr/lib/x86_64-linux-gnu/libssl.so.3 /staging/opt/convex/lib/libssl.so.3; \
     cp -aL /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /staging/opt/convex/lib/libcrypto.so.3; \
+    cp -aL /usr/lib/x86_64-linux-gnu/libgmp.so.10 /staging/opt/convex/lib/libgmp.so.10; \
     cp -aL /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so \
        /staging/usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so; \
     cp -aL /etc/ssl/openssl.cnf /staging/etc/ssl/openssl.cnf; \
@@ -101,6 +113,7 @@ RUN set -eu; \
                   /staging/opt/convex/jlibrary/bin/libtsdll.so \
                   /staging/opt/convex/lib/libssl.so.3 \
                   /staging/opt/convex/lib/libcrypto.so.3 \
+                  /staging/opt/convex/lib/libgmp.so.10 \
                   /staging/bin/sh /staging/usr/bin/*; do \
       test -f "$object" || continue; \
       ldd "$object" 2>/dev/null \
@@ -110,14 +123,14 @@ RUN set -eu; \
             cp -aL "$library" "/staging$library"; \
           done; \
     done; \
-    cp -a client/convex.awk /dev/null 2>/dev/null || true; \
     cp -a client/json.ijs client/transport.ijs client/convex.ijs client/websocket.ijs client/live.ijs \
        /staging/opt/convex/client/; \
     for object in /staging/opt/convex/jlibrary/bin/jconsole \
                   /staging/opt/convex/jlibrary/bin/libj.so \
                   /staging/opt/convex/jlibrary/bin/libtsdll.so \
                   /staging/opt/convex/lib/libssl.so.3 \
-                  /staging/opt/convex/lib/libcrypto.so.3; do \
+                  /staging/opt/convex/lib/libcrypto.so.3 \
+                  /staging/opt/convex/lib/libgmp.so.10; do \
       test -f "$object" || { echo "missing staged object: $object" >&2; exit 1; }; \
     done
 
