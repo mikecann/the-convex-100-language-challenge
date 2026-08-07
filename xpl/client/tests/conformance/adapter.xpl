@@ -745,48 +745,74 @@ do while running = 1;
         else call live_disconnect('TransportError');
     end;
 
-    coreword(pbase) = g_adapter_in_fd;
-    corehalfword(pbase + 4) = POLLIN;
-    corehalfword(pbase + 6) = 0;
-    poll_nfds = 1;
-    if g_ws_connected = 1 then do;
-        coreword(pbase + 8) = conn_fd(WS_SLOT);
-        corehalfword(pbase + 12) = POLLIN;
-        corehalfword(pbase + 14) = 0;
-        poll_nfds = 2;
+    /* The same "poll() cannot see bytes this client already read()"
+       gap applies to the controller connection: TCP mode's peer can
+       write an NDJSON command and its own close (or two commands
+       back to back) in one go, which one read() can pull in as a
+       single batch -- exactly what the shared harness's synchronous
+       request/response pairing does. Drain every buffered line before
+       ever polling for new controller activity. */
+    do while running = 1 & g_adapter_total > g_adapter_consumed;
+        line = adapter_read_line;
+        if length(line) = 0 then running = 0;
+        else do;
+            if line_is_json_object(line) = 0 then
+                call emit_error('', 'ProtocolError', 'malformed adapter command', '');
+            else running = dispatch(line);
+        end;
     end;
 
-    /* A bounded wait only when a reconnect is pending, so the backoff
-       deadline above is re-checked promptly; otherwise there is
-       nothing to wake up for except real activity on either fd. */
-    if g_ws_connected = 0 & any_active_sub = 1 then poll_timeout_ms = 200;
-    else poll_timeout_ms = -1;
-
-    poll_rc = poll(pbase, poll_nfds, poll_timeout_ms);
-    if poll_rc > 0 then do;
-        /* revents is checked against POLLIN | POLLHUP, not POLLIN
-           alone: once the peer has half closed its write side, poll()
-           reports POLLHUP on every call from then on (persistently
-           "ready", the classic busy-spin shape) whether or not this
-           side has drained every buffered byte first, and a bare
-           POLLIN check never fires again to notice. Treating either
-           bit as "attempt a read" both drains the last buffered bytes
-           and reaches the read() that turns them into a clean EOF. */
-        revents_controller = corehalfword(pbase + 6);
-        if (revents_controller & POLLREADABLE) ~= 0 then do;
-            line = adapter_read_line;
-            if length(line) = 0 then running = 0;
-            else do;
-                if line_is_json_object(line) = 0 then
-                    call emit_error('', 'ProtocolError', 'malformed adapter command', '');
-                else running = dispatch(line);
-            end;
+    /* Both drain loops above may have already decided to stop (a
+       close command, or a controller EOF); skip straight to the next
+       (and final) `running = 1` check at the top of this loop rather
+       than building a pollfd set and waiting on a connection that is
+       done. */
+    if running = 1 then do;
+        coreword(pbase) = g_adapter_in_fd;
+        corehalfword(pbase + 4) = POLLIN;
+        corehalfword(pbase + 6) = 0;
+        poll_nfds = 1;
+        if g_ws_connected = 1 then do;
+            coreword(pbase + 8) = conn_fd(WS_SLOT);
+            corehalfword(pbase + 12) = POLLIN;
+            corehalfword(pbase + 14) = 0;
+            poll_nfds = 2;
         end;
-        if running = 1 & poll_nfds = 2 then do;
-            revents_ws = corehalfword(pbase + 14);
-            if (revents_ws & POLLREADABLE) ~= 0 then do;
-                if ws_recv_message = 1 then call dispatch_transition(g_ws_message);
-                else call live_disconnect('TransportError');
+
+        /* A bounded wait only when a reconnect is pending, so the
+           backoff deadline above is re-checked promptly; otherwise
+           there is nothing to wake up for except real activity on
+           either fd. */
+        if g_ws_connected = 0 & any_active_sub = 1 then poll_timeout_ms = 200;
+        else poll_timeout_ms = -1;
+
+        poll_rc = poll(pbase, poll_nfds, poll_timeout_ms);
+        if poll_rc > 0 then do;
+            /* revents is checked against POLLIN | POLLHUP, not POLLIN
+               alone: once the peer has half closed its write side,
+               poll() reports POLLHUP on every call from then on
+               (persistently "ready", the classic busy-spin shape)
+               whether or not this side has drained every buffered
+               byte first, and a bare POLLIN check never fires again
+               to notice. Treating either bit as "attempt a read" both
+               drains the last buffered bytes and reaches the read()
+               that turns them into a clean EOF. */
+            revents_controller = corehalfword(pbase + 6);
+            if (revents_controller & POLLREADABLE) ~= 0 then do;
+                line = adapter_read_line;
+                if length(line) = 0 then running = 0;
+                else do;
+                    if line_is_json_object(line) = 0 then
+                        call emit_error('', 'ProtocolError', 'malformed adapter command', '');
+                    else running = dispatch(line);
+                end;
+            end;
+            if running = 1 & poll_nfds = 2 then do;
+                revents_ws = corehalfword(pbase + 14);
+                if (revents_ws & POLLREADABLE) ~= 0 then do;
+                    if ws_recv_message = 1 then call dispatch_transition(g_ws_message);
+                    else call live_disconnect('TransportError');
+                end;
             end;
         end;
     end;
