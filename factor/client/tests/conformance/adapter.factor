@@ -12,22 +12,11 @@
 ! replacement.
 
 USING: accessors arrays assocs calendar combinators
-concurrency.mailboxes continuations debugger destructors environment io
+concurrency.mailboxes continuations destructors environment io
 io.encodings.utf8 io.sockets io.timeouts kernel locals make math
 math.parser namespaces sequences splitting strings system threads
 vectors convex convex.json convex.live convex.transport ;
 IN: convex.adapter
-
-! DEBUG: print full error diagnostics for ANY uncaught error in ANY
-! thread, before Factor's default handler calls die. Temporary, for
-! diagnosing the hosted-only VM crash. Explicitly flushed because die's
-! abrupt exit does not appear to flush stdout's own buffer.
-[
-    "DEBUG uncaught error in thread: " write dup name>> print flush
-    "DEBUG error class: " write dup class>> name>> print flush
-    "DEBUG error object: " write over error. flush
-    die drop rethrow
-] thread-error-hook set-global
 
 CONSTANT: adapter-language "factor"
 CONSTANT: adapter-implementation
@@ -129,6 +118,27 @@ TUPLE: outbox stream queue bytes dropped stalls last-wait in-flight?
 ! The writer never waits forever on a reader that stopped consuming. When the
 ! absolute write deadline expires the event is abandoned and counted, so
 ! retained memory stays inside the admission budget above.
+!
+! set-timeout mutates a single timeout value shared by the whole stream
+! object -- the same one adapter-loop's stream-readln blocks on to read
+! the controller's next command, since the writer and the main command
+! loop both write to and read from the one accepted TCP connection. Left
+! at outbox-write-nanos (5 seconds) after this write returns, the very
+! next idle gap between controller commands longer than 5 seconds makes
+! that blocking read throw io-timeout -- uncaught, since adapter-loop's
+! stream-readln has no handler of its own, unlike every command
+! dispatched through handle-command's recover. That reaches the "Initial"
+! thread's top level with an empty catchstack, and Factor's default
+! thread-error-hook calls die: "critical_error: The die word was called
+! by the library", with io.backend.unix:io-timeout sitting on the data
+! stack. Confirmed by reproducing it directly against the plain
+! self-hosted backend (no TLS involved) with nothing but an open Live
+! subscription and an idle gap past 5 seconds; it is not specific to the
+! hosted profile's real TLS, only far more likely there, since real
+! round trips make an idle gap that long far more likely than they ever
+! are locally. Restoring "no timeout" after every write (successful or
+! not) keeps the outbox's own write deadline from ever leaking into how
+! long adapter-loop is willing to wait for the next command.
 :: outbox-write-once ( outbox entry -- )
     nano-count :> started
     t outbox in-flight?<<
@@ -140,6 +150,7 @@ TUPLE: outbox stream queue bytes dropped stalls last-wait in-flight?
         drop
         outbox stalls>> 1 + outbox stalls<<
     ] recover
+    f outbox stream>> set-timeout
     f outbox in-flight?<<
     nano-count started - outbox last-wait<< ;
 
