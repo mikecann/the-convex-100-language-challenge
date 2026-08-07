@@ -140,20 +140,50 @@ RUN set -eu; root=/runtime-root; \
     for config in /etc/nsswitch.conf /etc/host.conf /etc/gai.conf; do \
       test ! -e "$config" || cp --parents "$config" "$root"; \
     done; \
-    # Godot writes nothing at run time, but it does check for its user data
-    # directory at startup. Pre-creating it keeps a read-only filesystem quiet
-    # without granting the process anywhere to write.
+    # Godot still stats its user data directory at startup even with file
+    # logging and the shader cache turned off in project.godot, so it is
+    # pre-created here to keep that stat quiet on a read-only filesystem. The
+    # directory is deliberately never chowned to the runtime user: the shared
+    # verifier runs with no writable mount at all, so nothing owning it could
+    # write here either.
     mkdir -p "$root/opt/convex/state/godot/app_userdata/convex"; \
     mkdir -p "$root/opt/convex/state/godot_config" "$root/opt/convex/state/godot_cache"; \
+    # Godot 4.4.1 opens its debug log before honouring
+    # debug/file_logging/enable_file_logging=false: ProjectSettings reports the
+    # setting correctly (proven with a probe script), but the engine still
+    # creates user://logs/godot.log regardless, and a denied write there is
+    # fatal rather than merely logged - Main aborts instead of falling back to
+    # stdout only. /dev/shm is the one location Docker still mounts writable
+    # under --read-only with no tmpfs configured, so the log is pointed there
+    # explicitly instead of at the unwritable read-only state directory.
+    # --script is likewise load-bearing, not cosmetic: run/main_loop_type
+    # naming a global GDScript class only resolves when Godot is started with
+    # --path against the source tree. Started the way these images start it,
+    # with --main-pack alone, that resolution silently falls back to a bare
+    # SceneTree with no main scene configured, and the run fails immediately
+    # with 'no main scene defined' on stdout - reproducible even as root, with
+    # a fully writable filesystem, so it is a second, independent defect and
+    # not a symptom of the read-only fix above (--script res://... against the
+    # same pack runs the intended class correctly). Naming the entry script
+    # explicitly is what actually runs ConvexAdapterMain or ConvexExampleMain;
+    # run/main_loop_type is left set in project.godot only because the two
+    # exported packs still need to differ from each other. --script also
+    # brings back the "Godot Engine v4.4.1..." version banner on stdout that
+    # plain --main-pack does not print (headless still prints headers to
+    # stdout, not stderr), which would otherwise stand ahead of the first
+    # protocol line; --no-header silences it.
+    #
     # A Godot program is an engine binary plus a pack rather than one
-    # executable, so each leaf image needs a two-line wrapper naming both. Both
-    # leaves mount their own pack at the same path, so one launcher serves
-    # both. It is written here, outside "$root", because the busybox runtime
-    # has no chmod applet and because a launcher staged into the shared rootfs
-    # would land in the image that does not want it.
+    # executable, so each leaf image needs a wrapper naming both, plus the
+    # entry script for whichever pack that leaf ships. Both leaves mount their
+    # pack at the same path and select their script through
+    # CONVEX_ENTRY_SCRIPT, so one launcher still serves both. It is written
+    # here, outside "$root", because the busybox runtime has no chmod applet
+    # and because a launcher staged into the shared rootfs would land in the
+    # image that does not want it.
     mkdir -p /launchers; \
     printf '%s\n%s\n' '#!/bin/sh' \
-      'exec /opt/convex/godot --headless --main-pack /opt/convex/convex.pck -- "$@"' \
+      'exec /opt/convex/godot --headless --no-header --main-pack /opt/convex/convex.pck --log-file /dev/shm/convex-godot.log --script "$CONVEX_ENTRY_SCRIPT" -- "$@"' \
       > /launchers/convex; \
     ! ldd /tmp/godot | grep -Eq 'libX11|libwayland|libasound|libpulse|libudev|libssl|libcrypto'; \
     test -z "$(find "$root" -type f \( -name 'libapt*' -o -name 'libpam*' -o -name 'libsystemd*' \) -print -quit)"
@@ -207,6 +237,10 @@ RUN set -eu; \
 FROM runtime-base AS example-runtime
 COPY --from=test /out/convex-example.pck /opt/convex/convex.pck
 COPY --from=runtime-rootfs --chmod=0555 /launchers/convex /usr/local/bin/convex-example
+# Names the script the shared launcher passes to --script. See the comment in
+# the runtime-rootfs stage for why this, and not run/main_loop_type, is what
+# actually selects the entry point.
+ENV CONVEX_ENTRY_SCRIPT=res://examples/basics/main.gd
 USER 65532:65532
 # Prove, as the runtime user, that the pack boots in this minimal image, that
 # the example fails closed without configuration, and that standard output
@@ -223,6 +257,10 @@ ENTRYPOINT ["/usr/local/bin/convex-example"]
 FROM runtime-base AS runtime
 COPY --from=test /out/convex-adapter.pck /opt/convex/convex.pck
 COPY --from=runtime-rootfs --chmod=0555 /launchers/convex /usr/local/bin/convex-adapter
+# Names the script the shared launcher passes to --script. See the comment in
+# the runtime-rootfs stage for why this, and not run/main_loop_type, is what
+# actually selects the entry point.
+ENV CONVEX_ENTRY_SCRIPT=res://client/tests/conformance/adapter.gd
 USER 65532:65532
 # Standard output carries protocol events and nothing else: exactly two lines
 # for a hello and a close, with every diagnostic on standard error.

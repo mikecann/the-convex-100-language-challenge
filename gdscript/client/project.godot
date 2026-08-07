@@ -27,6 +27,15 @@ run/flush_stdout_on_print.debug=true
 
 settings/stdout/print_fps=false
 settings/stdout/verbose_stdout=false
+; Godot's default of true makes every run try to create and append to
+; user://logs/godot.log. Turning it off here is declared intent and costs
+; nothing, but is not sufficient by itself: ProjectSettings reports this as
+; false correctly once the project is loaded (checked with a probe script),
+; and Godot 4.4.1 opens the log file anyway regardless. The runtime images
+; work around the engine actually doing this by pointing --log-file at
+; /dev/shm, the one writable location the shared verifier's read-only,
+; no-tmpfs container leaves available - see gdscript/Dockerfile.
+file_logging/enable_file_logging=false
 
 [network]
 
@@ -41,6 +50,12 @@ common/physics_ticks_per_second=1
 [rendering]
 
 renderer/rendering_method="gl_compatibility"
+; The compatibility renderer otherwise persists compiled shader variants to
+; user://.godot/shader_cache/ so the next run skips recompilation. There is no
+; next run: every container starts from the same read-only image, so the
+; cache can only ever be write attempts against a filesystem that permits
+; none, never a hit.
+shader_compiler/shader_cache/enabled=false
 
 [threading]
 

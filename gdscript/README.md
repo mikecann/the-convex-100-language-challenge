@@ -34,7 +34,7 @@ single owner of the WebSocket, and `subscription.gd` one reactive query.
 ## Basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.gd -->
-```text
+```gdscript
 class_name ConvexExampleMain
 extends SceneTree
 
@@ -89,50 +89,35 @@ func _run() -> int:
 
 	# Convex hydrates a new subscription with the query's current value. It has
 	# to agree with the HTTP read before this example writes anything.
-	var live_initial := subscription.next_update(15.0)
-	if ConvexResult.is_failure(live_initial):
-		return _report(live_initial, "initial Live value")
-	var live_first := _count_of(live_initial["value"], "initial Live value")
-	if ConvexResult.is_failure(live_first):
-		return _report(live_first, "initial Live value")
-	if live_first["value"] != initial_count:
-		return _fail("initial Live value disagreed with the HTTP query")
-	print("live initial count: %d" % live_first["value"])
+	var live_initial := _verify_live_value(
+		subscription,
+		initial_count,
+		"initial Live value",
+		"initial Live value disagreed with the HTTP query",
+		"live initial count: %d"
+	)
+	if live_initial.has("exit_code"):
+		return live_initial["exit_code"]
 
-	# runId is the mutation's idempotency key. Convex records it, so a repeated
-	# runId returns the current state with applied false instead of counting
-	# the same logical increment twice.
-	var run_id := "gdscript:%s:%d:%d" % [room, Time.get_ticks_usec(), randi()]
-	var increment := {"room": room, "language": "gdscript", "runId": run_id}
-	var applied := client.mutation("demo:increment", increment)
-	if ConvexResult.is_failure(applied):
-		return _report(applied, "mutation")
-	var mutation_value: Variant = applied["value"]
-	if typeof(mutation_value) != TYPE_DICTIONARY or mutation_value.get("applied") != true:
-		return _fail("mutation was not applied")
-	var mutated := _count_of(mutation_value.get("state"), "mutation")
-	if ConvexResult.is_failure(mutated):
-		return _report(mutated, "mutation")
-	var mutated_count: int = mutated["value"]
-	if mutated_count != initial_count + 1:
-		return _fail("mutation count did not advance by exactly one")
-	print("mutation applied: true")
-	print("mutation count: %d" % mutated_count)
+	var mutation := _apply_increment(client, room, initial_count)
+	if mutation.has("exit_code"):
+		return mutation["exit_code"]
+	var mutated_count: int = mutation["value"]
 
 	# The same change now arrives over the subscription, pushed by Convex
 	# rather than polled for over HTTP.
-	var live_update := subscription.next_update(15.0)
-	if ConvexResult.is_failure(live_update):
-		return _report(live_update, "Live update")
-	var live_next := _count_of(live_update["value"], "Live update")
-	if ConvexResult.is_failure(live_next):
-		return _report(live_next, "Live update")
-	if live_next["value"] != mutated_count:
-		return _fail("Live update disagreed with the mutation")
-	print("live updated count: %d" % live_next["value"])
+	var live_update := _verify_live_value(
+		subscription,
+		mutated_count,
+		"Live update",
+		"Live update disagreed with the mutation",
+		"live updated count: %d"
+	)
+	if live_update.has("exit_code"):
+		return live_update["exit_code"]
 
 	# Only claim the journey once HTTP and Live have agreed on every step.
-	print("verified count: %d -> %d" % [initial_count, live_next["value"]])
+	print("verified count: %d -> %d" % [initial_count, live_update["value"]])
 
 	# Stop this query before closing the client, so the Live owner retires its
 	# socket with an empty query set and never schedules a reconnect.
@@ -143,6 +128,57 @@ func _run() -> int:
 	if ConvexResult.is_failure(closed):
 		return _report(closed, "close")
 	return 0
+
+
+# Awaits one Live delivery and checks it against the count the caller already
+# knows to be current, so `_run` shares this between the initial rehydration
+# and the update that follows the mutation instead of repeating it - the two
+# call sites differ only in the strings passed in here. On success, "value"
+# is the delivered count and the matching print line has already happened;
+# on failure, "exit_code" is the process exit status `_run` returns as-is,
+# since the failure has already been reported through `_fail` or `_report`.
+func _verify_live_value(
+	subscription: ConvexSubscription,
+	expected: int,
+	context: String,
+	mismatch_message: String,
+	print_format: String
+) -> Dictionary:
+	var update := subscription.next_update(15.0)
+	if ConvexResult.is_failure(update):
+		return {"exit_code": _report(update, context)}
+	var counted := _count_of(update["value"], context)
+	if ConvexResult.is_failure(counted):
+		return {"exit_code": _report(counted, context)}
+	if counted["value"] != expected:
+		return {"exit_code": _fail(mismatch_message)}
+	print(print_format % counted["value"])
+	return {"value": counted["value"]}
+
+
+# Applies the idempotent increment and checks that it actually landed. Same
+# "exit_code" or "value" convention as `_verify_live_value` above.
+func _apply_increment(client: ConvexClient, room: String, initial_count: int) -> Dictionary:
+	# runId is the mutation's idempotency key. Convex records it, so a repeated
+	# runId returns the current state with applied false instead of counting
+	# the same logical increment twice.
+	var run_id := "gdscript:%s:%d:%d" % [room, Time.get_ticks_usec(), randi()]
+	var increment := {"room": room, "language": "gdscript", "runId": run_id}
+	var applied := client.mutation("demo:increment", increment)
+	if ConvexResult.is_failure(applied):
+		return {"exit_code": _report(applied, "mutation")}
+	var mutation_value: Variant = applied["value"]
+	if typeof(mutation_value) != TYPE_DICTIONARY or mutation_value.get("applied") != true:
+		return {"exit_code": _fail("mutation was not applied")}
+	var mutated := _count_of(mutation_value.get("state"), "mutation")
+	if ConvexResult.is_failure(mutated):
+		return {"exit_code": _report(mutated, "mutation")}
+	var mutated_count: int = mutated["value"]
+	if mutated_count != initial_count + 1:
+		return {"exit_code": _fail("mutation count did not advance by exactly one")}
+	print("mutation applied: true")
+	print("mutation count: %d" % mutated_count)
+	return {"value": mutated_count}
 
 
 # Both the room state and the mutation's new state carry the counter in a
