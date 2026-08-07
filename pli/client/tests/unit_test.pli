@@ -1,0 +1,252 @@
+ /********************************************************************/
+ /* Language-local tests for the parts of the client that do not     */
+ /* need a network peer: byte buffers, integer and JSON string       */
+ /* formatting, and the JSON parser.                                 */
+ /*                                                                  */
+ /* Every check runs against the same source the adapter and the     */
+ /* example compile, and a failure exits non-zero so the Docker      */
+ /* build stops rather than reporting a green test image.            */
+ /********************************************************************/
+ unit_test: proc options(main);
+
+ %include convex;
+
+ dcl     failures            fixed bin(31);
+
+ failures = 0;
+ call cvxinit();
+
+ call test_buffers();
+ call test_integers();
+ call test_escapes();
+ call test_json_scalars();
+ call test_json_structure();
+ call test_json_rejects();
+ call test_json_unquote();
+
+ if failures > 0 then do;
+   call note( 'unit_test: FAILED' );
+   call c_exit( 1 );
+   end;
+ call note( 'unit_test: ok' );
+ return;
+
+ /*------------------------------------------------------------------*/
+ /* Checks                                                           */
+ /*------------------------------------------------------------------*/
+
+ /* Compare a buffer against an expected literal.                    */
+ expect: proc( label, b, want );
+   dcl   label               char(64);
+   dcl   b                   fixed bin(31);
+   dcl   want                char(64);
+   dcl   n                   fixed bin(31);
+   dcl   i                   fixed bin(31);
+   n = 0;
+   do i = 1 to 64;
+     if substr( want, i, 1 ) ^= ' ' then n = i;
+     end;
+   if blen(b) ^= n then do;
+     call fail( label );
+     return;
+     end;
+   if n > 0 then
+     if c_memcmp( bdata(b), addr(want), n ) ^= 0 then call fail( label );
+   end expect;
+
+ expectn: proc( label, got, want );
+   dcl   label               char(64);
+   dcl  (got,want)           fixed bin(31);
+   if got ^= want then call fail( label );
+   end expectn;
+
+ fail: proc( label );
+   dcl   label               char(64);
+   dcl   line                char(120);
+   line = 'unit_test FAIL: ';
+   substr( line, 17, 64 ) = label;
+   call note( line );
+   failures = failures + 1;
+   end fail;
+
+ /*------------------------------------------------------------------*/
+ /* Cases                                                            */
+ /*------------------------------------------------------------------*/
+
+ test_buffers: proc;
+   dcl   i                   fixed bin(31);
+   call bclear( B_TMP );
+   call bputt( B_TMP, 'hello' );
+   call bputb( B_TMP, ',' );
+   call bputt( B_TMP, ' world' );
+   call expect( 'buffer append', B_TMP, 'hello, world' );
+
+   /* Appending one byte at a time has to cross several growth steps */
+   /* without losing or duplicating anything.                        */
+   call bclear( B_TMP );
+   do i = 1 to 5000;
+     call bputb( B_TMP, 'x' );
+     end;
+   call expectn( 'buffer growth length', blen(B_TMP), 5000 );
+   call expectn( 'buffer growth first byte', byteval( bdata(B_TMP) ), 120 );
+   call expectn( 'buffer growth last byte',
+                 byteval( ptradd( bdata(B_TMP), 4999 ) ), 120 );
+
+   call bclear( B_TMP );
+   call expectn( 'buffer clear', blen(B_TMP), 0 );
+   end test_buffers;
+
+ test_integers: proc;
+   call bclear( B_TMP );
+   call bputi( B_TMP, 0 );
+   call expect( 'integer zero', B_TMP, '0' );
+   call bclear( B_TMP );
+   call bputi( B_TMP, 1 );
+   call expect( 'integer one', B_TMP, '1' );
+   call bclear( B_TMP );
+   call bputi( B_TMP, 4096 );
+   call expect( 'integer four digits', B_TMP, '4096' );
+   call bclear( B_TMP );
+   call bputi( B_TMP, -17 );
+   call expect( 'integer negative', B_TMP, '-17' );
+   call bclear( B_TMP );
+   call bputi( B_TMP, 2147483647 );
+   call expect( 'integer maximum', B_TMP, '2147483647' );
+   end test_integers;
+
+ test_escapes: proc;
+   dcl   raw                 char(16);
+   call bclear( B_TMP );
+   raw = 'a"b';
+   call bputesc( B_TMP, addr(raw), 3 );
+   call expect( 'escape quote', B_TMP, 'a\"b' );
+
+   call bclear( B_TMP );
+   substr( raw, 1, 3 ) = 'a' || '0a'x || 'b';
+   call bputesc( B_TMP, addr(raw), 3 );
+   call expect( 'escape newline', B_TMP, 'a\nb' );
+
+   /* A control character with no short form has to become \u00xx,   */
+   /* otherwise the adapter could emit a line the controller's JSON  */
+   /* parser rejects.                                                */
+   call bclear( B_TMP );
+   substr( raw, 1, 3 ) = 'a' || '01'x || 'b';
+   call bputesc( B_TMP, addr(raw), 3 );
+   call expect( 'escape control', B_TMP, 'a\u0001b' );
+
+   /* Bytes above 0x7f are part of a UTF-8 sequence and must survive */
+   /* untouched rather than being escaped byte by byte.              */
+   call bclear( B_TMP );
+   substr( raw, 1, 2 ) = 'c3a9'x;
+   call bputesc( B_TMP, addr(raw), 2 );
+   call expectn( 'escape utf8 length', blen(B_TMP), 2 );
+   call expectn( 'escape utf8 first', byteval( bdata(B_TMP) ), 195 );
+   end test_escapes;
+
+ test_json_scalars: proc;
+   dcl   text                char(64);
+   dcl   root                fixed bin(31);
+
+   text = '  true ';
+   root = jparse( D_TMP, addr(text), 7 );
+   call expectn( 'json true', nf( D_TMP, root, 0 ), J_TRUE );
+
+   text = 'null';
+   root = jparse( D_TMP, addr(text), 4 );
+   call expectn( 'json null', nf( D_TMP, root, 0 ), J_NULL );
+
+   text = '-12.5e3';
+   root = jparse( D_TMP, addr(text), 7 );
+   call expectn( 'json number', nf( D_TMP, root, 0 ), J_NUMBER );
+   call bclear( B_TMP );
+   call jcopy( B_TMP, D_TMP, root );
+   call expect( 'json number text', B_TMP, '-12.5e3' );
+
+   /* Non-ASCII is written as bytes rather than as source characters */
+   /* so the test does not depend on how the compiler reads its own  */
+   /* input encoding.                                                */
+   substr( text, 1, 6 ) = '"a' || 'c3a9'x || 'b"';
+   root = jparse( D_TMP, addr(text), 6 );
+   call expectn( 'json string', nf( D_TMP, root, 0 ), J_STRING );
+   end test_json_scalars;
+
+ test_json_structure: proc;
+   dcl   text                char(120);
+   dcl   root                fixed bin(31);
+   dcl   member              fixed bin(31);
+   dcl   n                   fixed bin(31);
+
+   text = '{"a":1,"bb":[10,20],"c":{"d":"x"}}';
+   n = 34;
+   root = jparse( D_TMP, addr(text), n );
+   call expectn( 'json object', nf( D_TMP, root, 0 ), J_OBJECT );
+
+   member = jmember( D_TMP, root, 'bb' );
+   call expectn( 'json member kind', nf( D_TMP, member, 0 ), J_ARRAY );
+   call bclear( B_TMP );
+   call jcopy( B_TMP, D_TMP, member );
+   call expect( 'json member text', B_TMP, '[10,20]' );
+
+   /* A name that is a prefix of another must not match it.          */
+   member = jmember( D_TMP, root, 'b' );
+   call expectn( 'json member prefix', member, -1 );
+
+   member = jmember( D_TMP, root, 'c' );
+   member = jmember( D_TMP, member, 'd' );
+   call bclear( B_TMP );
+   call jcopy( B_TMP, D_TMP, member );
+   call expect( 'json nested text', B_TMP, '"x"' );
+
+   /* An object whose value slice is copied back out has to be       */
+   /* byte identical, which is what lets the client carry a Convex   */
+   /* value without a value tree.                                    */
+   call bclear( B_TMP );
+   call jcopy( B_TMP, D_TMP, root );
+   call expectn( 'json round trip length', blen(B_TMP), n );
+   end test_json_structure;
+
+ test_json_rejects: proc;
+   dcl   text                char(64);
+
+   text = '{"a":1,}';
+   call expectn( 'reject trailing comma',
+                 jparse( D_TMP, addr(text), 8 ), -1 );
+   text = '[1,2';
+   call expectn( 'reject unterminated array',
+                 jparse( D_TMP, addr(text), 4 ), -1 );
+   text = '1 2';
+   call expectn( 'reject trailing value',
+                 jparse( D_TMP, addr(text), 3 ), -1 );
+   text = '"unterminated';
+   call expectn( 'reject unterminated string',
+                 jparse( D_TMP, addr(text), 13 ), -1 );
+   text = '01';
+   call expectn( 'reject leading zero pair',
+                 jparse( D_TMP, addr(text), 2 ), -1 );
+   text = 'tru';
+   call expectn( 'reject short literal',
+                 jparse( D_TMP, addr(text), 3 ), -1 );
+   end test_json_rejects;
+
+ test_json_unquote: proc;
+   dcl   text                char(64);
+   dcl   root                fixed bin(31);
+
+   substr( text, 1, 12 ) = '"a\nb\u00e9"';
+   root = jparse( D_TMP, addr(text), 12 );
+   call bclear( B_TMP );
+   call junquote( B_TMP, D_TMP, root );
+   call expectn( 'unquote length', blen(B_TMP), 5 );
+   call expectn( 'unquote newline',
+                 byteval( ptradd( bdata(B_TMP), 1 ) ), 10 );
+   /* The escape has to come back as the two byte UTF-8 sequence for */
+   /* U+00E9, not as one truncated byte.                             */
+   call expectn( 'unquote utf8 lead',
+                 byteval( ptradd( bdata(B_TMP), 3 ) ), 195 );
+   call expectn( 'unquote utf8 trail',
+                 byteval( ptradd( bdata(B_TMP), 4 ) ), 169 );
+   end test_json_unquote;
+
+ %include convexlib;
+
+ end unit_test;
