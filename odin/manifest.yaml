@@ -35,4 +35,6 @@ limitations:
   - TransitionChunk assembly is deferred and treated as protocol drift that reconnects.
   - Public values are bounded strict JSON text so callers choose their own Odin application type.
   - Each subscription retains only its newest update; the adapter caps active subscriptions at 16 and its output queue at 16 records or 8 MiB.
-capabilities: []
+capabilities:
+  - http
+  - live
