@@ -1,0 +1,67 @@
+schemaVersion: 1
+id: ats
+displayName: "ATS2"
+rank: 55
+selectionTier: ranked
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native ATS2 implementation of the Convex HTTP API and the pinned
+    /api/sync protocol. JSON parsing is delegated to cJSON (Ubuntu's own
+    libcjson-dev, no signing or licensing wrinkle), but the parsed tree is
+    walked exactly once at the FFI boundary into a genuine ATS algebraic
+    datatype, and every predicate that interprets a Convex value --
+    looking up a field, coalescing a Transition's modifications, deciding
+    whether a number is a whole count -- operates on that ATS type via
+    exhaustiveness-checked pattern matching, not on the C tree. ATS has no
+    HTTP, TLS, or WebSocket library, so client/convex_transport.dats
+    reaches OpenSSL and POSIX sockets directly through ATS's C
+    foreign-language interface, the natural FFI route for a language that
+    itself compiles through C. The adapter is a single-threaded reactor:
+    one poll(2) call over the control channel and the Live socket
+    together, so there is exactly one owner of every WebSocket read,
+    write, and reconnect. debugDisconnect performs a real reconnect and
+    resubscribe of every active query, preserving each one's
+    change-detection key so a rehydration transition that repeats an
+    already-delivered value is not redelivered as a spurious update.
+    Given ATS's most demanding feature -- dependent and linear types that
+    prove buffer safety at compile time -- this client's scope is
+    deliberately smaller than this project's largest native clients:
+    growable receive buffers (an HTTP body, a WebSocket frame) are
+    malloc'd and realloc'd on the C side of the transport boundary rather
+    than threaded through a dependent size proof at every step, which
+    would be a materially larger undertaking than this client's time
+    budget affords honestly. Badges remain unearned until root-owned
+    local and hosted conformance evidence succeeds.
+toolchain:
+  name: ATS2 (patscc / Postiats)
+  version: 0.4.2-1.1
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live reconnect uses immediate retry rather than exponential backoff
+    under sustained failure.
+  - Live message queuing is bounded only by the shared 8 MiB per-frame
+    limit enforced in client/convex_transport.dats, not by a dedicated
+    slow-consumer count and byte budget.
+  - Growable transport buffers (HTTP bodies, WebSocket frame payloads) are
+    managed in the C FFI shim rather than under a dependent size proof;
+    this client's dependent/linear-typing claim is in convex_json.dats's
+    algebraic value tree and convex.dats's protocol-state handling, not in
+    convex_transport.dats.
+  - The educational client supports JSON-safe Convex values only.
+capabilities: []
