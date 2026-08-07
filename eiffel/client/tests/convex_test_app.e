@@ -16,7 +16,7 @@ feature {NONE} -- Initialization
 			obj: CONVEX_JSON_VALUE
 		do
 			create parser.make
-			parser.parse ("{%"a%":1.0,%"b%":[true,false,null],%"c%":%"hi é %"quote\%"%"}")
+			parser.parse ("{%"a%":1.0,%"b%":[true,false,null],%"c%":%"hi \%"quoted\%" text%"}")
 			check parsed: parser.successful end
 			if attached parser.last_value as l_value then
 				value := l_value
