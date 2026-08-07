@@ -452,7 +452,7 @@ package body Convex is
          & ASCII.CR
          & ASCII.LF
          & "Content-Length: "
-         & Natural'Image (Data'Length)
+         & Image (Data'Length)
          & ASCII.CR
          & ASCII.LF
          & "Connection: close"
