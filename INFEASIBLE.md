@@ -59,6 +59,17 @@ with the language.
 | --- | --- |
 | pop11 | Poplog (the toolchain behind Pop-11, held in reserve for this slot pending Seed7) bootstraps every further build stage from a "corepop" binary — a fixed-address heap image inherited from a 1980s VM design — that calls `personality(ADDR_NO_RANDOMIZE)` before it can load. Docker's default seccomp profile rejects that specific flag value; this project's `./run` script never passes a custom `--security-opt seccomp=`, so both `docker build` (BuildKit's own RUN sandbox) and every `docker run` this project performs use that same restrictive default. The result under it is not a permission error but a crash — `MEMORY ACCESS VIOLATION` — reproduced directly against all five corepop images GetPoplog ships (`010` through `050`, spanning 2012–2021 builds); `--security-opt seccomp=unconfined` makes the identical binary succeed immediately, and that flag is unavailable both inside this project's hermetic build and inside the read-only, capability-dropped runtime container the shared verifier launches. GetPoplog's own repository ships a bespoke `docker/poplog_seccomp.json` profile and a "Running poplog under Docker" wiki page for exactly this reason — a documented, upstream-acknowledged constraint of the toolchain under containers, not a one-off flake or a fixable Dockerfile mistake. |
 
+## Infeasible — the runtime's own footprint exceeds the container limit
+
+The only entry on this page ruled out on resource footprint rather than
+capability. Both the language and the client are sound: a complete hand-rolled
+client exists and passes its language-local suites, including five reconnect
+cycles. It is the interpreter that does not fit.
+
+| Language | Why it cannot be done here |
+| --- | --- |
+| raku | Every runtime container in this project is limited to 128 MiB, uniformly across all hundred languages. Three removable layers were stripped in turn and measured by cgroup bisection under `docker run --memory N --memory-swap N`, five trials per side. **Cro**: replacing `Cro::HTTP::Client`/`Cro::WebSocket` with hand-rolled HTTP/1.1 and RFC 6455 over `IO::Socket::INET` cut the total from 190–210 MiB to 170–185 MiB — a real 20–25 MiB, and the client still worked. **Rakudo Star**: a bare Rakudo 2026.07 built from source, compiler and VM only, has a floor of 106 MiB for `raku -e 'say 1'` versus 134–140 MiB for the Star bundle, confirming that most of the original cost was the bundled modules rather than the interpreter. **Every external module**: binding libssl and libcrypto directly through `NativeCall`, which is core to Rakudo and needs no distribution, and hand-rolling JSON, base64, SHA-1 and randomness, was measured against a real TLS handshake and HTTP round trip to the hosted deployment — 145–170 MiB with zero Convex code loaded. That last figure also corrected an earlier, flattering 140 MiB reading taken from a probe that loaded the TLS module but never opened a connection. MoarVM offers no nursery or heap-size environment variable (`MVM_NURSERY_SIZE` is a compile-time `#define`), and its one memory-relevant tunable, `MVM_SPESH_DISABLE`, is worth about 15 MiB and was already shown to make the real WebSocket workload too slow to complete. After removing every removable layer the floor is still 17–42 MiB over budget before a single line of client code runs. The hand-rolled transport work is preserved on branch `fix/raku-rp2` should the limit or the runtime ever change. |
+
 ## Infeasible — license or GUI gate (ruled, previously borderline)
 
 Michael's ruling: entries requiring a proprietary license or a GUI toolchain are
@@ -181,6 +192,18 @@ gates cleared and turned out infeasible for a reason specific to this
 project's container security posture rather than the language; see the new
 "toolchain rejected by this project's container security posture" table
 above for the evidence.
+
+Raku's slot, vacated on footprint rather than capability, is filled by:
+
+- **Clean** (Nijmegen, 1987) — a pure lazy functional language whose
+  *uniqueness types* let the compiler prove a value has exactly one live
+  reference and therefore mutate it in place without breaking referential
+  transparency. That is the ownership reasoning Rust made famous, arriving
+  roughly twenty-five years earlier and largely unread outside its university.
+  The toolchain is free, compiles to a native binary through its own ABC
+  machine, and has a real C foreign-function interface for the transport
+  boundary. It also answers Raku's failure directly: a compiled native binary
+  has no interpreter floor to pay before it starts.
 
 Considered in this round and not chosen:
 
