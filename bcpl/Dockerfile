@@ -86,10 +86,11 @@ RUN set -eu; \
 COPY client/native/convexext.c sysc/convexext.c
 
 # Build the 64-bit interpreter with the client's native transport boundary in
-# place of the distribution's empty extfn.c stub. sdlfn.c and sdldrawlib.c are
-# compiled unmodified from the vendor tree: neither SDLavail nor USE_SDL is
-# defined, so both files compile down to inert stubs with no SDL dependency,
-# which is why upstream's own bin/cintsys64 link line includes them.
+# place of the distribution's empty extfn.c stub. sdlfn.c and glfn are
+# deliberately not compiled from the vendor tree: convexext.c supplies its own
+# no-op sdlfn/glfn definitions (cintsys64.c's dosys() only ever calls sdlfn;
+# it has no Sys_gl case at all), which keeps SDL and OpenGL out of the image
+# entirely and avoids a duplicate-symbol link error against sdlfn.c.
 RUN set -eu; \
     mkdir -p obj bin; \
     gcc -O2 -o /tmp/mkint-h sysc/mkint-h.c; \
@@ -101,12 +102,10 @@ RUN set -eu; \
     gcc $cflags -DFASTyes -c sysc/cinterp64.c -o obj/fasterp64.o; \
     gcc $cflags -c sysc/kblib64.c -o obj/kblib64.o; \
     gcc $cflags -c sysc/nrastlib64.c -o obj/nrastlib64.o; \
-    gcc $cflags -c sysc/sdlfn.c -o obj/sdlfn64.o; \
-    gcc $cflags -c sysc/sdldrawlib.c -o obj/sdldrawlib64.o; \
     gcc $cflags -c sysc/convexext.c -o obj/extfn64.o; \
     gcc -o bin/cintsys64 \
         obj/cintsys64.o obj/cinterp64.o obj/fasterp64.o obj/kblib64.o \
-        obj/nrastlib64.o obj/sdlfn64.o obj/sdldrawlib64.o obj/extfn64.o \
+        obj/nrastlib64.o obj/extfn64.o \
         -lm -lssl -lcrypto; \
     file bin/cintsys64 | grep -Eq 'ELF 64-bit.*x86-64'
 
