@@ -262,7 +262,7 @@ proc sendLiveFrame*(mailbox: ptr LiveMailbox; frame: LiveFrame) {.gcsafe.} =
   mailbox[].writeIndex.store(writeIndex + 1)
 
 proc recvLiveFrame*(mailbox: ptr LiveMailbox; closed: ptr Atomic[bool]): tuple[
-    available: bool, frame: LiveFrame] {.gcsafe.} =
+    available: bool; frame: LiveFrame] {.gcsafe.} =
   while true:
     let readIndex = mailbox[].readIndex.load
     if readIndex < mailbox[].writeIndex.load:
@@ -384,7 +384,7 @@ proc setAuth*(client: Client; token: string) =
 
 proc enqueueCommand(manager: LiveManager; command: LiveCommand): bool
 proc awaitResponse(channel: ptr Channel[LiveResponse]): tuple[
-  received: bool, answer: LiveResponse]
+  received: bool; answer: LiveResponse]
 proc awaitOwnerDone(manager: LiveManager): bool
 
 proc close*(client: Client) =
@@ -869,8 +869,8 @@ proc sendLive(socket: WebSocket; value: JsonNode) =
 
 proc nextLivePacket(socket: WebSocket; pending: var Future[string];
     connectionGeneration: uint64;
-    pendingGeneration: var uint64): tuple[status: LivePacketStatus,
-    value: string, generation: uint64] =
+    pendingGeneration: var uint64): tuple[status: LivePacketStatus;
+    value: string; generation: uint64] =
   ## Polling the same future lets the owner process Add/Remove/debugDisconnect
   ## commands while a peer is quiet. Frame-progress deadlines live inside the
   ## transport, so a timeout abandons the connection rather than restarting at
@@ -920,7 +920,7 @@ proc enqueueCommand(manager: LiveManager; command: LiveCommand): bool =
     sleep(1)
 
 proc awaitResponse(channel: ptr Channel[LiveResponse]): tuple[
-    received: bool, answer: LiveResponse] =
+    received: bool; answer: LiveResponse] =
   let deadline = epochTime() + liveCommandTimeoutSeconds
   while epochTime() < deadline:
     let received = channel[].tryRecv()
@@ -1188,7 +1188,7 @@ proc liveWorker(args: LiveWorkerArgs) {.thread.} =
         sleep(20)
       continue
 
-    var packet: tuple[status: LivePacketStatus, value: string,
+    var packet: tuple[status: LivePacketStatus; value: string;
       generation: uint64]
     try:
       packet = nextLivePacket(socket, pending, connectionGeneration,
@@ -1218,7 +1218,8 @@ proc liveWorker(args: LiveWorkerArgs) {.thread.} =
         of "FatalError", "AuthError":
           raise newException(ProtocolError,
             message["type"].getStr & ": " &
-            (if message.hasKey("error"): message["error"].getStr else: "server error"))
+            (if message.hasKey("error"): message[
+                "error"].getStr else: "server error"))
         of "TransitionChunk":
           raise newException(ProtocolError, "TransitionChunk is not supported")
         else:
@@ -1256,7 +1257,8 @@ proc newLiveManager(client: Client): LiveManager =
   createThread(result.worker, liveWorker, LiveWorkerArgs(commands: commands,
     stopped: stopped, done: done, wsUrl: result.workerWsUrl))
 
-proc subscribe*(client: Client; path: string; args: JsonNode): LiveSubscription =
+proc subscribe*(client: Client; path: string;
+    args: JsonNode): LiveSubscription =
   client.ensureOpen()
   if path.len == 0:
     raise newException(ValueError, "Convex function path is required")
