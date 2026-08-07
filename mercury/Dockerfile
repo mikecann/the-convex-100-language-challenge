@@ -63,13 +63,25 @@ RUN mkdir -p /out && cp adapter /out/convex-adapter && cp main /out/convex-examp
 # same "carry exactly what was built, not what the base image happens to
 # ship" approach the other C-backed clients in this project use, and it
 # keeps the runtime images working regardless of Debian/Ubuntu glibc drift.
+#
+# ldd only reports shared-library dependencies, not OpenSSL 3's own
+# runtime-loaded configuration and provider modules -- the config file
+# SSL_CTX_set_default_verify_paths and the certificate "store" subsystem
+# both read at connect time. Those are staged explicitly here; skipping
+# them is exactly the trap AGENTS.md warns about (a TLS client that works
+# in the build image's full OS but breaks in the minimal runtime, first
+# discovered against the hosted target instead of here).
 RUN set -eu; root=/rootfs; mkdir -p "$root"; \
     { ldd /out/convex-adapter; ldd /out/convex-example; } | \
       awk '$3 ~ /^\// {print $3} $1 ~ /^\// {print $1}' | sort -u | \
       xargs -r -I{} sh -c 'cd / && cp -L --parents "$1" "$2"' sh {} "$root"; \
     if test -d "$root/lib"; then mkdir -p "$root/usr/lib"; cp -a "$root/lib/." "$root/usr/lib/"; rm -rf "$root/lib"; fi; \
     if test -d "$root/lib64"; then mkdir -p "$root/usr/lib64"; cp -a "$root/lib64/." "$root/usr/lib64/"; rm -rf "$root/lib64"; fi; \
-    mkdir -p "$root/etc/ssl/certs"; cp -L /etc/ssl/certs/ca-certificates.crt "$root/etc/ssl/certs/ca-certificates.crt"
+    mkdir -p "$root/etc/ssl/certs"; cp -L /etc/ssl/certs/ca-certificates.crt "$root/etc/ssl/certs/ca-certificates.crt"; \
+    mkdir -p "$root/usr/lib/ssl"; cp -a /usr/lib/ssl/. "$root/usr/lib/ssl/"; \
+    mkdir -p "$root/etc/ssl"; cp -L /etc/ssl/openssl.cnf "$root/etc/ssl/openssl.cnf"; \
+    mkdir -p "$root/usr/lib/x86_64-linux-gnu/ossl-modules"; \
+    cp -a /usr/lib/x86_64-linux-gnu/ossl-modules/. "$root/usr/lib/x86_64-linux-gnu/ossl-modules/"
 
 FROM build AS test
 # The `test` target is deliberately the toolchain image: it proves
