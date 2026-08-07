@@ -16,10 +16,10 @@ idempotent mutation, and checks the resulting Live value.
 
 | Capability | Status |
 | --- | --- |
-| Native implementation | Implemented, pending root-owned evidence |
-| HTTP query, mutation, and action | Implemented, pending root-owned evidence |
-| Bearer-token lifecycle | Implemented, pending root-owned evidence |
-| Live initial values, updates, recovery, and reconnect hook | Implemented locally, pending root-owned evidence |
+| Native implementation | Verified by shared local and hosted conformance at this exact head |
+| HTTP query, mutation, and action | Verified by shared local and hosted conformance |
+| Bearer-token lifecycle | Verified by shared local and hosted conformance |
+| Live initial values, updates, recovery, and reconnect hook | Verified by shared local and hosted conformance |
 | Convex tagged values | Deferred, JSON-safe values only |
 
 The full teaching example below is generated directly from the runnable source.
@@ -222,6 +222,6 @@ an abandoned partial record, near-maximum values, and stopped-reader memory.
 Rejected HTTP replies — oversized chunked bodies, success-shaped bodies behind
 a failing status, malformed JSON, and failures without an `errorMessage` — are
 protocol failures the client recovers from, never invented function errors.
-Only the JSON-safe subset is decoded. Capability
-badges stay empty until the shared evaluator records clean local and hosted
-evidence from the reviewed commit.
+Only the JSON-safe subset is decoded. The shared
+evaluator recorded clean local and hosted evidence (31/31 on both profiles)
+from this reviewed head, and the manifest records the http and live award.

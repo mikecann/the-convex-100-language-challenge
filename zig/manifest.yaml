@@ -31,4 +31,6 @@ limitations:
   - An adapter event is one NDJSON record. If a record is abandoned after its first byte reaches the controller, the stream is terminal: queued events are discarded, no later event is appended to the truncated line, and the adapter exits without a closed event.
   - Every Live bring-up runs under one absolute ten second deadline covering the name lookup, connect, TLS, upgrade, and first Connect frame, and every outbound frame under a 250 ms deadline. Close cancels an in-flight bring-up rather than waiting it out.
   - Every complete incoming WebSocket message has one absolute five second deadline in the final runtime; fixture builds use the same mechanism with a shorter clock so hostile-peer tests stay deterministic.
-capabilities: []
+capabilities:
+  - http
+  - live
