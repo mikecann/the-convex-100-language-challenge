@@ -4,5 +4,31 @@ displayName: "Chapel"
 rank: 91
 selectionTier: curated_backfill
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Chapel implementation of documented JSON HTTP functions and the pinned unversioned WebSocket sync profile. Shared black-box verification is pending, so no capability is earned yet.
+toolchain:
+  name: Chapel
+  version: 2.8.0
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, optimistic updates, WebSocket mutations, and WebSocket actions are deferred.
+  - Live values expose the JSON-safe subset as raw JSON; tagged Convex value types are deferred.
+  - TransitionChunk assembly is deferred and treated as protocol drift that reconnects.
+  - Each Live subscription retains at most the newest 16 updates within a 4 MiB byte budget.
+  - At most 64 Live subscriptions are active at once, with one 32 MiB conservative aggregate budget for paths, arguments, last values, queued values, logs, errors, and runtime overhead.
 capabilities: []
