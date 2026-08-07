@@ -122,6 +122,7 @@ RUN set -eu; \
     done; \
     cp -aL /lib64/ld-linux-x86-64.so.2 /out/ld-linux-x86-64.so.2; \
     find /out -xtype l -print -exec false {} +; \
+    chmod 0555 /out/convex-adapter /out/convex-example; \
     rm -f "$resolved" "$queue"
 CMD ["/bin/sh", "-c", "true"]
 
@@ -170,7 +171,6 @@ COPY --from=test /usr/bin/uname /usr/bin/uname
 COPY --from=test /usr/bin/grep /usr/bin/grep
 COPY --from=test /usr/bin/sed /usr/bin/sed
 COPY --from=test /usr/bin/mawk /usr/bin/awk
-RUN chmod 0555 /usr/local/bin/convex-adapter /usr/local/bin/convex-example
 ENV PATH=/usr/local/bin:/usr/bin:/bin
 RUN test "$(printf 'ok\n' | cat)" = ok \
     && test "$(uname -m)" = x86_64 \
