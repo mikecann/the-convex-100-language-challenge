@@ -91,18 +91,51 @@ wait "$adapter_pid"
 printf '%s\n' "$actual" | grep -Fq '"id":"tcp-hello"'
 printf '%s\n' "$actual" | grep -Fqx '{"id":"tcp-close","type":"closed"}'
 EOF
+# Resolve the full shared-library closure here, inside the unpruned build
+# environment, rather than in runtime-base after that image's own /bin/sh
+# has already been swapped out: readelf, ldconfig and every tool this needs
+# still have a working libc at this point, which is exactly what running
+# this same resolution after the swap does not guarantee (this project's
+# checklist calls that out by name -- a runtime image's own RUN step is not
+# a safe place to bootstrap the runtime image).
+RUN set -eu; \
+    mkdir -p /out/lib; \
+    resolved=/tmp/resolved-libs.txt; queue=/tmp/lib-queue.txt; \
+    : > "$resolved"; : > "$queue"; \
+    for elf in /out/convex-adapter /out/convex-example \
+               /bin/dash /usr/bin/id /usr/bin/cat /usr/bin/cut /usr/bin/head \
+               /usr/bin/tail /usr/bin/tr /usr/bin/sort /usr/bin/uniq \
+               /usr/bin/wc /usr/bin/uname /usr/bin/grep /usr/bin/sed \
+               /usr/bin/mawk; do \
+      readelf -d "$elf" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' >> "$queue"; \
+    done; \
+    sort -u -o "$queue" "$queue"; \
+    while [ -s "$queue" ]; do \
+      soname="$(head -n 1 "$queue")"; sed -i '1d' "$queue"; \
+      if grep -Fqx "$soname" "$resolved" 2>/dev/null; then continue; fi; \
+      echo "$soname" >> "$resolved"; \
+      libpath="$(ldconfig -p | awk -v s="$soname" '$1 == s { print $NF; exit }')"; \
+      test -n "$libpath"; test -f "$libpath"; \
+      cp -aL "$libpath" "/out/lib/$(basename "$libpath")"; \
+      readelf -d "$libpath" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' >> "$queue"; \
+      sort -u -o "$queue" "$queue"; \
+    done; \
+    cp -aL /lib64/ld-linux-x86-64.so.2 /out/ld-linux-x86-64.so.2; \
+    find /out -xtype l -print -exec false {} +; \
+    rm -f "$resolved" "$queue"
 CMD ["/bin/sh", "-c", "true"]
 
 # Reconstruct the runtime from a pruned copy of the exact same pinned base
 # image used to build: only the compiled binaries, their real shared-library
-# closure (no SONAME symlink is staged without its target), the CA trust
-# store the TLS code path loads, and enough POSIX text tooling to satisfy the
-# shared example verifier (which still requires /bin/sh, not scratch).
-# The pruner is a statically linked busybox bind-mounted in from the test
-# stage: it depends on none of the paths it is about to delete, unlike the
-# base image's own /rm and /mkdir, which live in /usr/bin alongside each
-# other and would otherwise risk deleting a binary this same layer still
-# needs to call.
+# closure (no SONAME symlink is staged without its target, resolved above
+# while the environment doing the resolving still had a working libc), the
+# CA trust store the TLS code path loads, and enough POSIX text tooling to
+# satisfy the shared example verifier (which still requires /bin/sh, not
+# scratch). The pruner is a statically linked busybox bind-mounted in from
+# the test stage: it depends on none of the paths it is about to delete,
+# unlike the base image's own /rm and /mkdir, which live in /usr/bin
+# alongside each other and would otherwise risk deleting a binary this same
+# layer still needs to call.
 FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS runtime-base
 RUN --mount=type=bind,from=test,source=/bin/busybox,target=/busybox,readonly \
     set -eu; \
@@ -121,7 +154,8 @@ RUN --mount=type=bind,from=test,source=/bin/busybox,target=/busybox,readonly \
 COPY --from=test /out/convex-adapter /usr/local/bin/convex-adapter
 COPY --from=test /out/convex-example /usr/local/bin/convex-example
 COPY --from=test /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=test /lib64/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
+COPY --from=test /out/lib/ /lib/x86_64-linux-gnu/
+COPY --from=test /out/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
 COPY --from=test /bin/dash /bin/sh
 COPY --from=test /usr/bin/id /usr/bin/id
 COPY --from=test /usr/bin/cat /usr/bin/cat
@@ -136,31 +170,7 @@ COPY --from=test /usr/bin/uname /usr/bin/uname
 COPY --from=test /usr/bin/grep /usr/bin/grep
 COPY --from=test /usr/bin/sed /usr/bin/sed
 COPY --from=test /usr/bin/mawk /usr/bin/awk
-RUN set -eu; \
-    mkdir -p /lib/x86_64-linux-gnu; \
-    resolved=/tmp-resolved-libs.txt; queue=/tmp-lib-queue.txt; \
-    : > "$resolved"; : > "$queue"; \
-    for elf in /usr/local/bin/convex-adapter /usr/local/bin/convex-example \
-               /bin/sh /usr/bin/id /usr/bin/cat /usr/bin/cut /usr/bin/head \
-               /usr/bin/tail /usr/bin/tr /usr/bin/sort /usr/bin/uniq \
-               /usr/bin/wc /usr/bin/uname /usr/bin/grep /usr/bin/sed \
-               /usr/bin/awk; do \
-      readelf -d "$elf" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' >> "$queue"; \
-    done; \
-    sort -u -o "$queue" "$queue"; \
-    while [ -s "$queue" ]; do \
-      soname="$(head -n 1 "$queue")"; sed -i '1d' "$queue"; \
-      if grep -Fqx "$soname" "$resolved" 2>/dev/null; then continue; fi; \
-      echo "$soname" >> "$resolved"; \
-      libpath="$(ldconfig -p | awk -v s="$soname" '$1 == s { print $NF; exit }')"; \
-      test -n "$libpath"; test -f "$libpath"; \
-      cp -aL "$libpath" "/lib/x86_64-linux-gnu/$(basename "$libpath")"; \
-      readelf -d "$libpath" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' >> "$queue"; \
-      sort -u -o "$queue" "$queue"; \
-    done; \
-    find / -xdev -xtype l -print -exec false {} +; \
-    chmod 0555 /usr/local/bin/convex-adapter /usr/local/bin/convex-example; \
-    rm -f "$resolved" "$queue"
+RUN chmod 0555 /usr/local/bin/convex-adapter /usr/local/bin/convex-example
 ENV PATH=/usr/local/bin:/usr/bin:/bin
 RUN test "$(printf 'ok\n' | cat)" = ok \
     && test "$(uname -m)" = x86_64 \
