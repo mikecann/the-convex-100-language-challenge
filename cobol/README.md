@@ -43,7 +43,7 @@ either; only the shared example and conformance runs can.
 ## The canonical example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.cbl -->
-```text
+```cobol
 >>SOURCE FORMAT IS FREE
 *> ==================================================================
 *> Convex from COBOL: the shared counter journey, 0 -> 1.
@@ -90,7 +90,12 @@ COPY "cvx-client.cpy".
 01 WS-DEADLINE              BINARY-DOUBLE.
 01 WS-SIXTEEN               BINARY-LONG VALUE 16.
 
-01 WS-SLOT                  BINARY-LONG VALUE 3.
+*> Every call this example makes into the client (query, subscribe,
+*> mutate, and each Live pump) has already returned by the time this
+*> program parses CVX-R-VALUE on its own behalf, so reusing slot 1
+*> (WS-SLOT-HTTP in convex.cbl) here cannot collide with anything the
+*> client itself still has in flight.
+01 WS-SLOT                  BINARY-LONG VALUE 1.
 01 WS-NODE                  BINARY-LONG.
 01 WS-CHILD                 BINARY-LONG.
 01 WS-KEY                   PIC X(64).
@@ -147,7 +152,7 @@ MAIN-PARAGRAPH.
     CALL "cvx-json-esc-string" USING WS-ROOM WS-ROOM-LEN
         WS-ROOM-JSON WS-ROOM-JSON-LEN
     MOVE SPACES TO WS-ARGS
-    MOVE 0 TO WS-ARGS-LEN
+    MOVE 1 TO WS-ARGS-LEN
     STRING
         '{"room":' DELIMITED SIZE
         WS-ROOM-JSON(1:WS-ROOM-JSON-LEN) DELIMITED SIZE
@@ -217,7 +222,7 @@ MAIN-PARAGRAPH.
     CALL "cvx-json-esc-string" USING WS-RUNID-HEX WS-RUNID-HEX-LEN
         WS-RUNID-JSON WS-RUNID-JSON-LEN
     MOVE SPACES TO WS-ARGS
-    MOVE 0 TO WS-ARGS-LEN
+    MOVE 1 TO WS-ARGS-LEN
     STRING
         '{"room":' DELIMITED SIZE
         WS-ROOM-JSON(1:WS-ROOM-JSON-LEN) DELIMITED SIZE
