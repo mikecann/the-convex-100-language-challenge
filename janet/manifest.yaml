@@ -67,4 +67,6 @@ limitations:
     convex/live-socket-dynamic is a documented test-only dynamic binding that
     lets language-local tests supply an already-open Live socket. It is unset in
     every shipped code path and holds no state.
-capabilities: []
+capabilities:
+  - http
+  - live

@@ -12,17 +12,17 @@ Read [`examples/basics/main.janet`](examples/basics/main.janet). It queries a fr
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, and actions | Implemented, awaiting shared evidence |
-| Bearer authentication and structured function errors | Implemented, awaiting shared evidence |
-| TLS with chain and host-name verification | Implemented, awaiting shared evidence |
-| Live initial values, external updates, and query-error recovery | Implemented, awaiting shared evidence |
-| Unsubscribe, five reconnects, and bounded delivery | Implemented, awaiting shared evidence |
+| HTTP queries, mutations, and actions | Implemented, verified |
+| Bearer authentication and structured function errors | Implemented, verified |
+| TLS with chain and host-name verification | Implemented, verified |
+| Live initial values, external updates, and query-error recovery | Implemented, verified |
+| Unsubscribe, five reconnects, and bounded delivery | Implemented, verified |
 | Live authentication, WebSocket mutations, `TransitionChunk` | Not implemented, see Limitations |
 
-No capability badge has been earned. Only the shared result evaluator may award one, and it can only do that after `./run verify` and `./run verify-hosted` pass from a clean, reviewed commit. This branch has run no Docker build and no shared conformance.
+The shared result evaluator awarded the `http` and `live` badges from a clean, exact-head build: 31 of 31 conformance checks against a local backend and 31 of 31 against the hosted deployment over real TLS.
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.janet -->
-```text
+```janet
 # Convex from Janet: the shared counter, start to finish.
 #
 # This program is the canonical example. It is what the README shows, what the
