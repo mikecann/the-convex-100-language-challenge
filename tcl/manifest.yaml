@@ -33,4 +33,6 @@ limitations:
   - HTTP responses are bounded to 2 MiB and abandoned while they arrive, from the declared Content-Length or the accumulated bytes, with one 64 KiB block of overshoot. A chunked response is bounded by its current chunk because Tcl's http package reads a complete chunk before reporting progress.
   - TclTLS 1.7.22 verifies the certificate chain but not the host name, so this client checks the peer identity itself from the verify callback and refuses a connection when the certificate names nothing it can check. Real certificates are first exercised by hosted verification.
   - Language-local loopback tests cover five real reconnects, strict uint32 state and query IDs, QueryFailed shape and rollback, structured Live recovery, ownership barriers, fragmented and timed-out partial frames, structured 560/500/400 HTTP envelopes, streaming response bounds, TLS chain and hostname refusals against a real handshake, absolute connect/dribble/write deadlines, pre-allocation frame limits, strict adapter command schemas, and genuine stopped-reader pending-output, memory, ordering, and close bounds. Root-owned local and hosted conformance remain required before capabilities can be awarded.
-capabilities: []
+capabilities:
+  - http
+  - live

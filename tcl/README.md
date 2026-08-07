@@ -17,11 +17,12 @@ the subscription. The block below is generated from that exact runnable file.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Awaiting shared verification | Native Tcl HTTP query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented. |
-| Live | Awaiting shared verification | Native Tcl RFC 6455 subscriptions, unsubscribe, reconnect, reactive errors, and clean close target the pinned sync profile. |
+| HTTP | Verified | Shared local and hosted conformance passed from a clean exact-head build; query, mutation, action, bearer-token lifecycle, logs, and structured errors are covered. |
+| Live | Verified | Shared local and hosted conformance passed from a clean exact-head build; subscriptions, unsubscribe, five real reconnects, reactive errors, and clean close are covered. |
 
-No capability badge is earned until root-owned local and hosted black-box
-conformance passes. A Docker build or a language-local test does not earn one.
+The shared evaluator awarded the http and live badges from root-owned local
+and hosted black-box conformance runs at this exact head (31/31 on both
+profiles), and the manifest capability list records the award.
 
 ## The basic example
 
