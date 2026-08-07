@@ -29,15 +29,17 @@ function consume_http_request(socket, headers = read_headers(socket))
     content_length == 0 || read_exact(socket, content_length)
 end
 
-function send_http_body(socket, body)
+function send_http_status(socket, status_line, body)
     write(
         socket,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" *
+        "HTTP/1.1 $(status_line)\r\nContent-Type: application/json\r\n" *
         "Content-Length: $(ncodeunits(body))\r\nConnection: close\r\n\r\n",
         body,
     )
     flush(socket)
 end
+
+send_http_body(socket, body) = send_http_status(socket, "200 OK", body)
 
 # Real Convex responses carry log lines, so the adapter serializes a
 # Vector{String} inside an untyped event. An empty-logs fixture never compiles
@@ -64,13 +66,46 @@ function send_http_function_error(socket)
     )
 end
 
+# A hosted deployment rejects a malformed bearer token with a non-2xx HTTP
+# status before any function body runs, so the client never reaches the
+# status:"success"/"error" JSON envelope at all -- it takes call()'s separate
+# `200 <= response_status < 300` guard instead. That guard, the ConvexError it
+# throws, and the adapter's failure()/serialise_error() reporting of it were
+# previously only covered by signature-only `precompile()` calls, which this
+# file's own workout proved insufficient: the stripped image still died with
+# Core.MissingCodeError the first time a real conformance run set an invalid
+# bearer token and then issued a query. Route a real 400 through this exact
+# path so every specialization it needs is recorded from genuine execution.
+function send_http_unauthorized(socket)
+    send_http_status(
+        socket,
+        "400 Bad Request",
+        JSON3.write(
+            Dict(
+                "code" => "InvalidAuthenticationToken",
+                "message" => "precompile bearer token rejected",
+            ),
+        ),
+    )
+end
+
 # Drive the exact compiled adapter module through real TCP HTTP requests and a
 # malformed NDJSON line before close. This records the output-pump, JSON, HTTP,
 # function-error isolation, and bounded command-loop specializations.
+#
+# It also drives the setAuth op (set, then clear) and a rejected bearer token
+# through this same real command loop. Hosted conformance sends setAuth with a
+# token, then a query that a real deployment rejects with a non-2xx status
+# before setAuth ever clears it; the stripped image had no compiled code for
+# that exact sequence and crashed with a MissingCodeError that even took down
+# its own top-level error reporting. See send_http_unauthorized for why a
+# genuinely executed 400 -- not another signature-only precompile -- is what
+# closes that gap.
 http_listener = listen(ip"127.0.0.1", 0)
 http_port = getsockname(http_listener)[2]
 http_server = @async begin
     responders = (
+        send_http_unauthorized,
         socket -> send_http_response(
             socket,
             Dict("count" => 0.0);
@@ -100,6 +135,9 @@ old_url = get(ENV, "CONVEX_URL", nothing)
 ENV["CONVEX_URL"] = "http://127.0.0.1:$(http_port)"
 adapter_input = IOBuffer(
     "{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}\n" *
+    "{\"id\":\"auth-set\",\"op\":\"setAuth\",\"token\":\"precompile-invalid-token\"}\n" *
+    "{\"id\":\"auth-query\",\"op\":\"query\",\"path\":\"demo:state\",\"args\":{}}\n" *
+    "{\"id\":\"auth-clear\",\"op\":\"setAuth\",\"token\":\"\"}\n" *
     "{malformed json}\n" *
     "{\"id\":\"query\",\"op\":\"query\",\"path\":\"demo:state\",\"args\":{}}\n" *
     "{\"id\":\"mutation\",\"op\":\"mutation\",\"path\":\"demo:increment\",\"args\":{}}\n" *
