@@ -693,8 +693,15 @@ main :: proc() {
 	address := os.get_env_alloc("ADAPTER_LISTEN", context.allocator)
 	defer delete(address)
 	if address != "" {
-		if !(strings.has_prefix(address, "127.0.0.1:") || strings.has_prefix(address, "[::1]:")) {
-			fmt.eprintln("ADAPTER_LISTEN must be loopback")
+		// The controller socket is only ever reached by sibling containers on
+		// the harness's private, unpublished Docker network, never the host
+		// network or the internet, so binding all-interfaces inside that
+		// network namespace is as contained as binding loopback. Restrict to
+		// the exact address forms the harness actually uses.
+		is_loopback := strings.has_prefix(address, "127.0.0.1:") || strings.has_prefix(address, "[::1]:")
+		is_container_network := strings.has_prefix(address, "0.0.0.0:")
+		if !(is_loopback || is_container_network) {
+			fmt.eprintln("ADAPTER_LISTEN must be loopback or 0.0.0.0")
 			os.exit(1)
 		}
 		endpoint, valid := net.parse_endpoint(address)

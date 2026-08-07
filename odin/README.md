@@ -178,7 +178,7 @@ Every untrusted wire document is capped at two MiB, depth 64, and 65,536 JSON no
 
 ## Conformance adapter
 
-`client/tests/conformance/` builds a strict NDJSON protocol v1 adapter. It reserves stdout for protocol events and accepts either stdin/stdout or one loopback-only `ADAPTER_LISTEN` controller. It supports `hello`, `query`, `mutation`, `action`, `subscribe`, `unsubscribe`, `setAuth`, `debugDisconnect`, and `close`.
+`client/tests/conformance/` builds a strict NDJSON protocol v1 adapter. It reserves stdout for protocol events and accepts either stdin/stdout or one TCP `ADAPTER_LISTEN` controller (the shared harness binds it to `0.0.0.0:8080` so sibling containers on the pilot's Docker network can reach it). It supports `hello`, `query`, `mutation`, `action`, `subscribe`, `unsubscribe`, `setAuth`, `debugDisconnect`, and `close`.
 
 Subscription IDs have generation barriers. Replacing or removing an ID invalidates the old generation before its relay is joined, so no stale event can cross the acknowledgement boundary. The output owner caps its queue at 16 records or eight MiB and uses a bounded close. `debugDisconnect` is adapter-only and retires the current socket before acknowledging, which lets the shared harness test genuine reconnection without host network tricks.
 
