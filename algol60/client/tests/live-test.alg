@@ -123,39 +123,70 @@ comment ---------------------------------------------------------------
 procedure testtimestamps;
 begin
    integer array buf[0:15];
-   integer buflen, dummy, ok;
-   real decoded;
+   integer array zerobytes[0:7];
+   integer array bigbytes[0:7];
+   integer array biggerbytes[0:7];
+   integer buflen, dummy, ok, i;
+   for i := 0 step 1 until 7 do zerobytes[i] := 0;
    buflen := 0;
-   timestampencode(0.0, buf, 16, buflen);
+   timestampencode(zerobytes, 0, buf, 16, buflen);
    testliveeq(12, buflen,
       "a timestamp always encodes to twelve base 64 characters");
-   testtimestampdecodecheck(buf, buflen, 0.0,
+   testtimestampdecodecheck(buf, buflen, zerobytes,
       "zero round trips through timestamp encode and decode");
+
+   comment 70000, chosen because it exceeds a 16-bit word but still
+      fits exactly inside a real - the case the client's earlier,
+      real-valued timestamp already covered;
+   bigbytes[0] := 112; bigbytes[1] := 17; bigbytes[2] := 1;
+   for i := 3 step 1 until 7 do bigbytes[i] := 0;
    buflen := 0;
-   timestampencode(70000.0, buf, 16, buflen);
-   testtimestampdecodecheck(buf, buflen, 70000.0,
+   timestampencode(bigbytes, 0, buf, 16, buflen);
+   testtimestampdecodecheck(buf, buflen, bigbytes,
       "a value larger than a 16-bit word round trips");
+
+   comment a value far past 2^53 - the size of a genuine Convex
+      logical timestamp against a real deployment. Held in a real
+      instead of as raw bytes, this exact value used to be rounded
+      during decode and then rejected by the canonical-form check,
+      which is precisely what made the pilot's first Live delivery
+      against a live backend come back as a reported function error;
+   biggerbytes[0] := 74; biggerbytes[1] := 62; biggerbytes[2] := 62;
+   biggerbytes[3] := 210; biggerbytes[4] := 109; biggerbytes[5] := 148;
+   biggerbytes[6] := 201; biggerbytes[7] := 24;
+   buflen := 0;
+   timestampencode(biggerbytes, 0, buf, 16, buflen);
+   testtimestampdecodecheck(buf, buflen, biggerbytes,
+      "a value far past 2^53 round trips exactly, unlike through a real");
+   testliveeq(1,
+      if timestampcompare(bigbytes, 0, biggerbytes, 0) < 0 then 1 else 0,
+      "timestampcompare orders a small value before one past 2^53");
+   testliveeq(0, timestampcompare(biggerbytes, 0, biggerbytes, 0),
+      "timestampcompare reports equal timestamps as equal");
+
    begin
       integer array bad[0:15];
+      integer array decoded[0:7];
       integer badlen;
       badlen := 0;
       dummy := bufputstr(bad, 16, badlen, "not-canonical");
-      timestampdecode(bad, 0, badlen, decoded, ok);
+      timestampdecode(bad, 0, badlen, decoded, 0, ok);
       testliveeq(0, ok, "a non-canonical timestamp is rejected")
    end
 end testtimestamps;
 
 procedure testtimestampdecodecheck(buf, buflen, expected, description);
-   value buflen, expected;
-   integer array buf;
+   value buflen;
+   integer array buf, expected;
    integer buflen;
-   real expected;
    string description;
 begin
-   real decoded;
+   integer array decoded[0:7];
    integer ok;
-   timestampdecode(buf, 0, buflen, decoded, ok);
-   testlivereport(if ok != 0 & decoded = expected then 1 else 0, description)
+   timestampdecode(buf, 0, buflen, decoded, 0, ok);
+   testlivereport(
+      if ok != 0 & timestampcompare(decoded, 0, expected, 0) = 0 then 1 else 0,
+      description)
 end testtimestampdecodecheck;
 
 comment ---------------------------------------------------------------
@@ -197,7 +228,7 @@ begin
    testlivesendserverframe(serverh,
       "{\"type\":\"Transition\","
       "\"startVersion\":{\"querySet\":0,\"identity\":0,\"ts\":\"AAAAAAAAAAA=\"},"
-      "\"endVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"AQAAAAAAAAA=\"},"
+      "\"endVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"Sz4+0m2UyRg=\"},"
       "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":0,"
       "\"value\":{\"count\":0},\"logLines\":[]}]}");
    begin
@@ -214,8 +245,8 @@ begin
    end;
    testlivesendserverframe(serverh,
       "{\"type\":\"Transition\","
-      "\"startVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"AQAAAAAAAAA=\"},"
-      "\"endVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"AgAAAAAAAAA=\"},"
+      "\"startVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"Sz4+0m2UyRg=\"},"
+      "\"endVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"TD4+0m2UyRg=\"},"
       "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":0,"
       "\"value\":{\"count\":1},\"logLines\":[]}]}");
    begin
@@ -232,8 +263,8 @@ begin
    end;
    testlivesendserverframe(serverh,
       "{\"type\":\"Transition\","
-      "\"startVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"AgAAAAAAAAA=\"},"
-      "\"endVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"AwAAAAAAAAA=\"},"
+      "\"startVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"TD4+0m2UyRg=\"},"
+      "\"endVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"TT4+0m2UyRg=\"},"
       "\"modifications\":[{\"type\":\"QueryFailed\",\"queryId\":0,"
       "\"errorMessage\":\"nope\",\"errorData\":{\"code\":\"E\"},"
       "\"logLines\":[]}]}");
@@ -256,8 +287,8 @@ begin
    end;
    testlivesendserverframe(serverh,
       "{\"type\":\"Transition\","
-      "\"startVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"AwAAAAAAAAA=\"},"
-      "\"endVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"BAAAAAAAAAA=\"},"
+      "\"startVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"TT4+0m2UyRg=\"},"
+      "\"endVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"Tj4+0m2UyRg=\"},"
       "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":0,"
       "\"value\":{\"count\":2},\"logLines\":[]}]}");
    begin

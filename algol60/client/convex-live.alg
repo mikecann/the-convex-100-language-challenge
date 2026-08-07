@@ -40,64 +40,46 @@ integer procedure liveconnectbudget; begin liveconnectbudget := 8000 end;
 comment ---------------------------------------------------------------
    Version timestamps: a uint64 in little-endian byte order, base 64
    encoded into exactly twelve characters with one padding character.
-   Represented as a non-negative real rather than an integer because
-   ALGOL 60's integer is a 32-bit C int and a Convex logical timestamp
-   routinely exceeds that, while a real holds every integer exactly up
-   to 2^53, which is the same ceiling a JavaScript reference client has
-   for the same field, so this is not a narrower guarantee than the
-   oracle this client is measured against.
+   Represented as its eight raw bytes, index 0 the least significant
+   and index 7 the most significant, rather than as a real. An earlier
+   version of this client held it as a non-negative real, reasoning
+   that a real holds every integer exactly up to 2^53, a ceiling wrong
+   for this field. A real Convex deployment's logical timestamp is
+   nanosecond scale, routinely above 10^18, over two orders of
+   magnitude past 2^53, so accumulating it into a real silently
+   rounded the value, and the canonical-form check below then rejected
+   every genuine timestamp as malformed - the exact defect that made
+   the pilot's first Live delivery come back as a reported function
+   error instead of the room's state. Kept as bytes, compared byte by
+   byte through timestampcompare, the value is never rounded at all.
    ------------------------------------------------------------------;
 
-real procedure realpow256(n);
-   value n;
-   integer n;
+procedure timestampencode(srcbytes, srcoff, buf, cap, len);
+   comment appends the twelve character base 64 encoding of the eight
+   bytes at srcbytes from srcoff to buf at len;
+   value srcoff, cap;
+   integer array srcbytes, buf;
+   integer srcoff, cap, len;
 begin
-   real p;
-   integer i;
-   p := 1.0;
-   for i := 1 step 1 until n do p := p * 256.0;
-   realpow256 := p
-end realpow256;
-
-procedure timestampencode(v, buf, cap, len);
-   comment appends the twelve character base 64 encoding of the
-   non-negative real v to buf at len;
-   value v, cap;
-   integer array buf;
-   real v;
-   integer cap, len;
-begin
-   integer array bytes[0:7];
-   real remaining, divisor, quotient;
-   integer i, bv, discard;
-   remaining := v;
-   for i := 7 step -1 until 0 do
-      begin
-      divisor := realpow256(i);
-      quotient := remaining / divisor;
-      bv := entier(quotient);
-      bytes[i] := bv;
-      remaining := remaining - bv * divisor
-      end;
-   discard := b64encode(bytes, 0, 8, buf, cap, len)
+   integer discard;
+   discard := b64encode(srcbytes, srcoff, 8, buf, cap, len)
 end timestampencode;
 
-procedure timestampdecode(buf, off, blen, out, ok);
+procedure timestampdecode(buf, off, blen, outbytes, outoff, ok);
    comment decodes a canonical twelve character base 64 uint64 at buf
-   from off for blen bytes into the real out parameter. Sets ok to 1 on
-   success, 0 if the text is not exactly twelve characters, does not
-   end with the base 64 padding character, or does not re-encode to
-   the same text - the same canonical-form check convex-live.fth uses;
-   value off, blen;
-   integer array buf;
-   integer off, blen, ok;
-   real out;
+   from off for blen bytes into the eight bytes of outbytes starting
+   at outoff. Sets ok to 1 on success, 0 if the text is not exactly
+   twelve characters, does not end with the base 64 padding character,
+   or does not re-encode to the same text - the same canonical-form
+   check convex-live.fth uses;
+   value off, blen, outoff;
+   integer array buf, outbytes;
+   integer off, blen, outoff, ok;
 begin
    integer array bytes[0:7];
    integer array reencoded[0:15];
    integer bytelen, relen, i, discard;
    ok := 0;
-   out := 0.0;
    if blen = 12 & buf[off + 11] = 61 then
       begin
       bytelen := 0;
@@ -106,16 +88,8 @@ begin
       if discard = 0 then discard := b64decode(buf, off + 8, 4, bytes, 8, bytelen);
       if discard = 0 then
          begin
-         real acc, place;
-         acc := 0.0;
-         place := 1.0;
-         for i := 0 step 1 until 7 do
-            begin
-            acc := acc + bytes[i] * place;
-            place := place * 256.0
-            end;
          relen := 0;
-         timestampencode(acc, reencoded, 16, relen);
+         timestampencode(bytes, 0, reencoded, 16, relen);
          if relen = blen then
             begin
             integer same, j;
@@ -124,13 +98,55 @@ begin
                if reencoded[j] != buf[off + j] then same := 0;
             if same = 1 then
                begin
-               out := acc;
+               for i := 0 step 1 until 7 do outbytes[outoff + i] := bytes[i];
                ok := 1
                end
             end
          end
       end
 end timestampdecode;
+
+integer procedure timestampcompare(a, aoff, b, boff);
+   comment compares two eight byte little-endian timestamps, most
+   significant byte first, returning negative one, zero or one exactly
+   as an ordinary numeric comparison of a against b would;
+   value aoff, boff;
+   integer array a, b;
+   integer aoff, boff;
+begin
+   integer i, result, done;
+   result := 0;
+   done := 0;
+   for i := 7 step -1 until 0 do
+      if done = 0 then
+         if a[aoff + i] != b[boff + i] then
+            begin
+            result := if a[aoff + i] < b[boff + i] then -1 else 1;
+            done := 1
+            end;
+   timestampcompare := result
+end timestampcompare;
+
+procedure timestampzero(dst, dstoff);
+   comment sets the eight bytes of dst starting at dstoff to zero;
+   value dstoff;
+   integer array dst;
+   integer dstoff;
+begin
+   integer i;
+   for i := 0 step 1 until 7 do dst[dstoff + i] := 0
+end timestampzero;
+
+procedure timestampcopy(dst, dstoff, src, srcoff);
+   comment copies eight timestamp bytes from src at srcoff to dst at
+   dstoff;
+   value srcoff, dstoff;
+   integer array dst, src;
+   integer dstoff, srcoff;
+begin
+   integer i;
+   for i := 0 step 1 until 7 do dst[dstoff + i] := src[srcoff + i]
+end timestampcopy;
 
 integer procedure liveuint32(buf, off, blen, ok);
    comment parses a JSON integer field that must fit a uint32, used for
@@ -207,8 +223,9 @@ integer liveclosereasonlen;
 integer livequerysetversion;
 integer liveremotequeryset;
 integer liveremoteidentity;
-real liveremotets;
-real livemaxts;
+integer array liveremotetsbytes[0:7];
+integer array livemaxtsbytes[0:7];
+integer livehavemaxts;
 integer livegeneration;
 integer livebackoff;
 integer livenextconnect;
@@ -272,8 +289,9 @@ begin
    livequerysetversion := 0;
    liveremotequeryset := 0;
    liveremoteidentity := 0;
-   liveremotets := 0.0;
-   livemaxts := 0.0;
+   timestampzero(liveremotetsbytes, 0);
+   timestampzero(livemaxtsbytes, 0);
+   livehavemaxts := 0;
    livegeneration := 0;
    livebackoff := liveinitialbackoff;
    livenextconnect := 0;
@@ -595,12 +613,12 @@ begin
       discard := jsonwritestring(livesendbuf, 4096, liveoutlen, reasoncopy, 0, liveclosereasonlen)
    end;
    discard := bufputstr(livesendbuf, 4096, liveoutlen, ",\"clientTs\":0");
-   if livemaxts > 0.0 then
+   if livehavemaxts != 0 then
       begin
       integer array tsbuf[0:15];
       integer tslen;
       tslen := 0;
-      timestampencode(livemaxts, tsbuf, 16, tslen);
+      timestampencode(livemaxtsbytes, 0, tsbuf, 16, tslen);
       discard := bufputstr(livesendbuf, 4096, liveoutlen, ",\"maxObservedTimestamp\":\"");
       discard := bufputbytes(livesendbuf, 4096, liveoutlen, tsbuf, 0, tslen);
       discard := bufputbyte(livesendbuf, 4096, liveoutlen, 34)
@@ -689,7 +707,7 @@ begin
    livequerysetversion := 0;
    liveremotequeryset := 0;
    liveremoteidentity := 0;
-   liveremotets := 0.0
+   timestampzero(liveremotetsbytes, 0)
 end liveretire;
 
 procedure liveretireliteral(reasonstr);
@@ -733,7 +751,7 @@ procedure livecheckstartversion(msgbuf, startoff, startlen, errbuf, errbuflen, e
 begin
    integer qsoff, qslen, idoff, idlen, tsoff, tslen, f1, f2, f3;
    integer newqs, newid, ok1, ok2, endok, mismatch;
-   real startts;
+   integer array startts[0:7];
    jsonfindfield(msgbuf, startoff, startoff + startlen, "querySet", qsoff, qslen, f1, errbuf, errbuflen, errkind);
    if errkind = 0 then
       jsonfindfield(msgbuf, startoff, startoff + startlen, "identity", idoff, idlen, f2, errbuf, errbuflen, errkind);
@@ -749,7 +767,7 @@ begin
       begin
       newqs := liveuint32(msgbuf, qsoff, qslen, ok1);
       newid := liveuint32(msgbuf, idoff, idlen, ok2);
-      timestampdecode(msgbuf, tsoff + 1, tslen - 2, startts, endok);
+      timestampdecode(msgbuf, tsoff + 1, tslen - 2, startts, 0, endok);
       if ok1 = 0 | ok2 = 0 | endok = 0 then
          begin
          integer discard;
@@ -760,7 +778,7 @@ begin
          begin
          mismatch := if newqs != liveremotequeryset then 1 else 0;
          if newid != liveremoteidentity then mismatch := 1;
-         if startts != liveremotets then mismatch := 1;
+         if timestampcompare(startts, 0, liveremotetsbytes, 0) != 0 then mismatch := 1;
          if mismatch != 0 then
             begin
             integer discard;
@@ -786,7 +804,7 @@ begin
    integer array pendingdatalen[0:3];
    integer array pendinghasdata[0:3];
    integer i, newqs, newid, ok1, ok2, endok, discard;
-   real endts;
+   integer array endts[0:7];
    for i := 0 step 1 until 3 do pendingkind[i] := 0;
    jsonfindfield(msgbuf, 0, msglen, "startVersion", startoff, startlen, f1, errbuf, errbuflen, errkind);
    if errkind = 0 then
@@ -817,13 +835,13 @@ begin
          begin
          newqs := liveuint32(msgbuf, qsoff, qslen, ok1);
          newid := liveuint32(msgbuf, idoff, idlen, ok2);
-         timestampdecode(msgbuf, tsoff + 1, tslen - 2, endts, endok);
+         timestampdecode(msgbuf, tsoff + 1, tslen - 2, endts, 0, endok);
          if ok1 = 0 | ok2 = 0 | endok = 0 then
             begin
             errbuflen := 0; errkind := 2;
             discard := bufputstr(errbuf, 256, errbuflen, "Live end version field is invalid")
             end
-         else if endts < liveremotets then
+         else if timestampcompare(endts, 0, liveremotetsbytes, 0) < 0 then
             begin
             errbuflen := 0; errkind := 2;
             discard := bufputstr(errbuf, 256, errbuflen, "Live timestamp moved backwards")
@@ -921,8 +939,12 @@ begin
       begin
       liveremotequeryset := newqs;
       liveremoteidentity := newid;
-      liveremotets := endts;
-      if endts > livemaxts then livemaxts := endts;
+      timestampcopy(liveremotetsbytes, 0, endts, 0);
+      if livehavemaxts = 0 | timestampcompare(endts, 0, livemaxtsbytes, 0) > 0 then
+         begin
+         timestampcopy(livemaxtsbytes, 0, endts, 0);
+         livehavemaxts := 1
+         end;
       for i := 0 step 1 until 3 do
          begin
          if pendingkind[i] = 1 then
@@ -1034,7 +1056,7 @@ begin
          begin
          liveremotequeryset := 0;
          liveremoteidentity := 0;
-         liveremotets := 0.0;
+         timestampzero(liveremotetsbytes, 0);
          livenextconnect := 0;
          livebackoff := liveinitialbackoff;
          liveconnectioncount := liveconnectioncount + 1
