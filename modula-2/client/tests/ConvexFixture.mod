@@ -133,9 +133,25 @@ BEGIN
   END;
   IF keySource[0] = 0C THEN RETURN FALSE END;
 
+  (* AppendBuf tracks the combined length in i as it writes but, unlike
+     AppendQuoted/AppendText elsewhere in this client, never NUL-terminates
+     the destination itself. Calling TextLength(keySource) here instead of
+     using i directly used to scan past the just-appended GUID into
+     whatever uninitialised stack memory followed it looking for a stray
+     zero byte, so ShimSha1 hashed a garbage-length, nondeterministic
+     input: the resulting Sec-WebSocket-Accept the fixture sent almost
+     always still happened to satisfy the client (when that stray zero
+     byte landed immediately after the GUID by chance) but occasionally
+     did not, and only then as a function of whatever this call's stack
+     frame happened to contain - explaining a failure that reproduced far
+     more readily on a fast native machine (a different, more thoroughly
+     reused stack) than under bruce's slower emulation. Terminating
+     explicitly and passing the tracked length directly removes the
+     uninitialised read entirely. *)
   i := TextLength(keySource);
   AppendBuf(HandshakeGuid, keySource, i);
-  ShimSha1(keySource, TextLength(keySource), digest);
+  keySource[i] := 0C;
+  ShimSha1(keySource, i, digest);
   Encode(digest, 20, accept);
 
   responseLength := 0;
