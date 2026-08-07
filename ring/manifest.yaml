@@ -4,5 +4,62 @@ displayName: "Ring"
 rank: 71
 selectionTier: coverage
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Ring client built on the official Ring toolchain. RingLibCurl
+    supplies TLS, HTTP and RFC 6455 transport and RingLibuv supplies the
+    monotonic clock and the conformance adapter's controller stream. Convex
+    request envelopes, the response classifier, the exact-subtree JSON scanner,
+    the query-set state machine, reconnect ownership and publication decisions
+    are all implemented in Ring. Built from ring-lang/ring tag v1.27, commit
+    f88d95236319460327b05efcfdab7c342caa7d22.
+toolchain:
+  name: Ring
+  version: "1.27"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Capability badges stay empty until the root-owned local and hosted
+    conformance gates pass. Nothing here has been executed in Docker yet.
+  - RFC 6455 framing, masking and the upgrade handshake are delegated to
+    libcurl's WebSocket API, which needs a libcurl built with WebSocket support
+    (curl 8.11 or newer). The Convex sync protocol above that layer is Ring.
+  - Live authentication, optimistic updates, WebSocket mutations and actions,
+    journals and TransitionChunk assembly are deferred. A chunk is treated as
+    recoverable protocol drift.
+  - Values are limited to this experiment's JSON-safe subset. Tagged Convex
+    Int64, bytes, special floats and negative zero are outside scope.
+  - One reassembled Live message is bounded at 256 KiB and one HTTP response at
+    1 MiB. The client owns a bounded 64-event, 2 MiB delivery FIFO that drops
+    the oldest delivery for a slow consumer and reports the drop count.
+  - The Live handshake is a blocking libcurl call, so a reconnect can stall the
+    adapter's controller stream for up to the 15 second handshake budget.
+  - Ring exposes no portable process exit code, so an adapter that misses its
+    two second close deadline reports the failure on stderr and by withholding
+    the terminal event rather than by exiting non-zero.
+  - Language-local coverage is deterministic and real: a loopback fixture
+    process speaks genuine HTTP/1.1 and RFC 6455, and the tests cover five
+    forced reconnects with suppressed rehydration, QueryFailed recovery,
+    malformed transition rollback, fragmented UTF-8 with an interleaved Ping,
+    an oversized message, a stalled partial frame deadline, adapter generation
+    barriers, and a real stopped-reader socket with resident-memory, ordering
+    and bounded-close assertions.
+  - A hostile TLS peer fixture is deferred because Ring has no TLS server
+    primitive. TLS is covered by the pinned verification settings, a real
+    handshake probe inside the final runtime image, and a negative test that
+    requires an https request to a plaintext listener to fail.
 capabilities: []
