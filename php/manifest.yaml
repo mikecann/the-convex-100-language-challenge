@@ -25,4 +25,6 @@ adapter:
 limitations:
   - Live authentication, TransitionChunk assembly, optimistic writes, and non-JSON Convex values are deferred.
   - A bounded newest-16 subscription queue protects the adapter from slow consumers.
-capabilities: []
+capabilities:
+  - http
+  - live

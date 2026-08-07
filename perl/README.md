@@ -12,8 +12,8 @@ It is educational and unofficial, not a production SDK or a package to install f
 
 | Behaviour | Status |
 | --- | --- |
-| Documented JSON HTTP queries, mutations, and actions | Implemented, pending shared evidence |
-| Pinned `/api/sync` Live query profile | Implemented, pending shared evidence |
+| Documented JSON HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
+| Pinned `/api/sync` Live query profile | Verified by shared local and hosted conformance |
 | Capability badges | None earned yet |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.pl -->
