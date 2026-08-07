@@ -89,29 +89,47 @@ USER 0:0
 # Build a shell/text-tool surface containing only the applets the shared
 # verifier needs. The stock image is still the pinned non-scratch ancestry, but
 # its general-purpose multicall binary is replaced rather than hidden off PATH.
+#
+# BusyBox's multicall dispatcher only enters "top-level" mode (--list,
+# explicit `busybox <applet>`) when argv[0]'s basename is literally
+# "busybox"; invoked under any other name it looks that name up directly in
+# the compiled applet table. The restricted binary is therefore verified
+# through a copy at a path still named "busybox" that is deleted before this
+# layer ends, then installed under the applet names it actually serves — sh,
+# id, grep — and never again written to a path literally named busybox: a
+# from-source rebuild that still ends up at /bin/busybox only proves the
+# applet table changed, not that the image stopped being "a copy of BusyBox
+# with a longer denylist" the way this stage's own FROM busybox starts out.
 COPY --from=busybox-builder /out/busybox /restricted-busybox
 RUN /bin/busybox sh -c 'set -eu; \
-    /bin/busybox mkdir /policy; \
+    /bin/busybox mkdir /policy /verify; \
     cp /bin/busybox /policy/busybox; \
-    /bin/busybox rm -rf \
-      /etc/group /etc/localtime /etc/mtab /etc/network /etc/passwd /etc/shadow \
-      /.cache /home /root /sbin /tmp /usr /var /lib; \
-    /bin/busybox find /bin -mindepth 1 -maxdepth 1 ! -name busybox -delete; \
-    /bin/busybox mkdir -p /usr/bin /usr/local/bin; \
-    /bin/busybox ln -s busybox /bin/sh; \
-    /bin/busybox ln -s ../../bin/busybox /usr/bin/id; \
-    /bin/busybox ln -s ../../bin/busybox /usr/bin/grep; \
-    /bin/busybox mv /restricted-busybox /bin/busybox; \
-    test "$(/bin/busybox --list | /bin/busybox grep -c "^")" = 7; \
-    for applet in "[" "[[" ash grep id sh test; do \
-      /bin/busybox --list | /bin/busybox grep -Fqx "$applet"; \
-    done; \
+    cp /restricted-busybox /verify/busybox; \
+    test "$(/verify/busybox --list)" = "$(printf "%s\n" "[" "[[" ash grep id sh test)"; \
     for tool in apk apt apt-get apt-key curl dpkg nc rpm wget; do \
-      if /bin/busybox "$tool" >/dev/null 2>&1; then exit 1; \
+      if /verify/busybox "$tool" >/dev/null 2>&1; then exit 1; \
       else status=$?; test "$status" = 127; fi; \
     done; \
-    forbidden="$(/policy/busybox find / -xdev \( -type f -o -type l \) \
-      \( -name apk -o -name apt -o -name apt-get -o -name apt-key \
+    /policy/busybox rm -rf /verify; \
+    /policy/busybox rm -rf \
+      /etc/group /etc/localtime /etc/mtab /etc/network /etc/passwd /etc/shadow \
+      /.cache /home /root /sbin /tmp /usr /var /lib; \
+    /policy/busybox find /bin -mindepth 1 -maxdepth 1 -delete; \
+    /policy/busybox mkdir -p /usr/bin /usr/local/bin; \
+    /policy/busybox mv /restricted-busybox /bin/sh; \
+    /policy/busybox ln /bin/sh /usr/bin/id; \
+    /policy/busybox ln /bin/sh /usr/bin/grep; \
+    test -x /bin/sh; \
+    test -x /usr/bin/id; \
+    test -x /usr/bin/grep; \
+    for name in apk apt apt-get apt-key curl dpkg nc rpm wget; do \
+      implicit="$(/bin/sh -c "exec -a $name /bin/sh" >/dev/null 2>&1; printf "%s" "$?")"; \
+      test "$implicit" = 127; \
+      explicit="$(/bin/sh -c "exec -a busybox /bin/sh $name" >/dev/null 2>&1; printf "%s" "$?")"; \
+      test "$explicit" = 127; \
+    done; \
+    forbidden="$(/policy/busybox find / -xdev -path /policy -prune -o \( -type f -o -type l \) \
+      \( -name apk -o -name apt -o -name apt-get -o -name apt-key -o -name busybox \
       -o -name curl -o -name dpkg -o -name nc -o -name rpm -o -name wget \) \
       -print)"; \
     test -z "$forbidden"; \
@@ -120,17 +138,10 @@ RUN /bin/busybox sh -c 'set -eu; \
 COPY --from=runtime-rootfs /runtime /
 RUN set -eu; \
     test -x /bin/sh && test -x /usr/bin/id && test -x /usr/bin/grep; \
-    test "$(/bin/busybox --list | /bin/busybox grep -c '^')" = 7; \
-    for applet in '[' '[[' ash grep id sh test; do \
-      /bin/busybox --list | /bin/busybox grep -Fqx "$applet"; \
-    done; \
-    for tool in apk apt apt-get apt-key curl dpkg nc rpm wget; do \
-      if /bin/busybox "$tool" >/dev/null 2>&1; then exit 1; \
-      else status=$?; test "$status" = 127; fi; \
-    done; \
+    test ! -e /bin/busybox; \
     test -r /etc/ssl/certs/ca-certificates.crt; \
     for tool in dart dartaotruntime node python python3 npm npx apt apt-get apt-key dpkg rpm debconf perl openssl curl wget nc convex gcc cc make; do \
-      ! command -v "$tool"; \
+      ! command -v "$tool" >/dev/null 2>&1 || exit 1; \
     done; \
     scan_tree() { \
       for path in "$1"/* "$1"/.[!.]* "$1"/..?*; do \
@@ -138,7 +149,7 @@ RUN set -eu; \
         case "$path" in /dev|/proc|/sys) continue;; esac; \
         name="${path##*/}"; \
         case "$name" in \
-          apk|apt|apt-get|apt-key|cc|convex|curl|dart|dartaotruntime|debconf|dpkg|gcc|make|nc|node|npm|npx|openssl|perl|python|python3|rpm|wget) \
+          apk|apt|apt-get|apt-key|busybox|cc|convex|curl|dart|dartaotruntime|debconf|dpkg|gcc|make|nc|node|npm|npx|openssl|perl|python|python3|rpm|wget) \
             exit 1;; \
         esac; \
         if test -d "$path" && test ! -L "$path"; then scan_tree "$path"; fi; \
