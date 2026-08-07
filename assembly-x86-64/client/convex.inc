@@ -307,14 +307,17 @@ struc convex_update
     .err_data:     resq 1
 endstruc
 
-; convex_sub: one active (or draining) subscription. `.last_value_text`
-; holds the most recently delivered value's serialized bytes so a
-; reconnect's mandatory rehydration transition can be compared and, when
-; unchanged, suppressed -- see convex_live.s's handle_transition.
+; convex_sub: one active subscription, identified only by the opaque
+; pointer convex_live_add_subscription returns -- neither this struct nor
+; convex_live.s knows anything about an adapter-protocol subscriptionId
+; string; that mapping belongs to whichever caller wants one (the
+; conformance adapter keeps its own subscriptionId -> convex_sub* list,
+; the example just holds the pointer directly). `.last_value_text` holds
+; the most recently delivered value's serialized bytes so a reconnect's
+; mandatory rehydration transition can be compared and, when unchanged,
+; suppressed -- see convex_live.s's handle_transition.
 struc convex_sub
     .manager:          resq 1
-    .subid_ptr:        resq 1
-    .subid_len:        resq 1
     .path_ptr:         resq 1
     .path_len:         resq 1
     .args:             resq 1

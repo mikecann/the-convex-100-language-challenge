@@ -37,6 +37,7 @@ global json_object_get
 global json_free
 global json_parse
 global json_serialize
+global json_clone
 
 ; --- node allocation --------------------------------------------------------
 
@@ -474,6 +475,143 @@ json_free:
     mov rsp, rbp
     pop rbp
     ret
+
+; json_value *json_clone(json_value *v) -- a full, independent deep copy.
+; convex_live.s uses this to pull one Transition modification's "value" (or
+; "logs", or "errorData") out of the larger parsed message tree it arrived
+; in: cloning it means the whole message can always be json_free'd as one
+; unit afterward, with no manual detach-then-free bookkeeping and no way
+; for a partially-freed tree to alias something a subscription's queue is
+; still holding onto.
+%define JC_V   -8
+%define JC_OUT -16
+%define JC_I   -24
+%define JC_N   -32
+json_clone:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp+JC_V], rdi
+    test rdi, rdi
+    jnz .have_v
+    xor eax, eax
+    jmp .done
+.have_v:
+    mov rax, [rdi + json_value.tag]
+    cmp rax, JV_NULL
+    je .clone_null
+    cmp rax, JV_TRUE
+    je .clone_true
+    cmp rax, JV_FALSE
+    je .clone_false
+    cmp rax, JV_INT
+    je .clone_int
+    cmp rax, JV_DOUBLE
+    je .clone_double
+    cmp rax, JV_STRING
+    je .clone_string
+    cmp rax, JV_ARRAY
+    je .clone_array
+    cmp rax, JV_OBJECT
+    je .clone_object
+    xor eax, eax
+    jmp .done
+.clone_null:
+    call json_new_null
+    jmp .done
+.clone_true:
+    mov edi, 1
+    call json_new_bool
+    jmp .done
+.clone_false:
+    xor edi, edi
+    call json_new_bool
+    jmp .done
+.clone_int:
+    mov rdi, [rbp+JC_V]
+    mov rdi, [rdi + json_value.ival]
+    call json_new_int
+    jmp .done
+.clone_double:
+    call alloc_node
+    test rax, rax
+    jz .done
+    mov qword [rax + json_value.tag], JV_DOUBLE
+    mov rcx, [rbp+JC_V]
+    mov rdx, [rcx + json_value.dval]
+    mov [rax + json_value.dval], rdx
+    jmp .done
+.clone_string:
+    mov rdi, [rbp+JC_V]
+    mov rsi, [rdi + json_value.len]
+    mov rdi, [rdi + json_value.ptr]
+    call json_new_string
+    jmp .done
+.clone_array:
+    call json_new_array
+    test rax, rax
+    jz .done
+    mov [rbp+JC_OUT], rax
+    mov qword [rbp+JC_I], 0
+.array_loop:
+    mov rax, [rbp+JC_I]
+    mov rcx, [rbp+JC_V]
+    cmp rax, [rcx + json_value.len]
+    jae .array_done
+    mov rcx, [rbp+JC_V]
+    mov rdx, [rcx + json_value.ptr]
+    mov rdi, [rdx + rax*8]
+    call json_clone
+    mov rdi, [rbp+JC_OUT]
+    mov rsi, rax
+    call json_array_push
+    mov rax, [rbp+JC_I]
+    inc rax
+    mov [rbp+JC_I], rax
+    jmp .array_loop
+.array_done:
+    mov rax, [rbp+JC_OUT]
+    jmp .done
+.clone_object:
+    call json_new_object
+    test rax, rax
+    jz .done
+    mov [rbp+JC_OUT], rax
+    mov qword [rbp+JC_I], 0
+.object_loop:
+    mov rax, [rbp+JC_I]
+    mov rcx, [rbp+JC_V]
+    cmp rax, [rcx + json_value.len]
+    jae .object_done
+    mov rcx, [rbp+JC_V]
+    mov rdx, [rcx + json_value.ptr]        ; entries vector
+    mov rax, [rbp+JC_I]
+    imul rax, rax, json_entry_size
+    add rax, rdx
+    mov [rbp+JC_N], rax                    ; this entry's address
+    mov rdi, [rax + json_entry.value]
+    call json_clone
+    mov rcx, [rbp+JC_N]
+    mov rdi, [rbp+JC_OUT]
+    mov rsi, [rcx + json_entry.key_ptr]
+    mov rdx, [rcx + json_entry.key_len]
+    mov rcx, rax
+    call json_object_set
+    mov rax, [rbp+JC_I]
+    inc rax
+    mov [rbp+JC_I], rax
+    jmp .object_loop
+.object_done:
+    mov rax, [rbp+JC_OUT]
+    jmp .done
+.done:
+    mov rsp, rbp
+    pop rbp
+    ret
+%undef JC_V
+%undef JC_OUT
+%undef JC_I
+%undef JC_N
 
 ; --- parsing -----------------------------------------------------------
 ; Everything below reads through a json_ctx*. Registers never carry state
