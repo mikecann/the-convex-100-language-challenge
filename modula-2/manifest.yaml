@@ -1,0 +1,91 @@
+schemaVersion: 1
+id: modula-2
+displayName: "Modula-2"
+rank: 70
+selectionTier: coverage
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native GNU Modula-2 (gm2) implementation of the Convex HTTP API and the
+    pinned /api/sync WebSocket protocol. JSON, base64, HTTP/1.1 framing, the
+    RFC 6455 handshake and frame state machine, and all Convex sync behaviour
+    (query-set tracking, transition validation, rehydration suppression,
+    reconnect/backoff, and event publication) are written in Modula-2. A
+    small foreign definition module (client/CShim.def, implemented in
+    client/cshim.c) supplies only generic, Convex-unaware transport
+    primitives: raw TCP sockets, OpenSSL for TLS, poll(), a monotonic clock,
+    CSPRNG bytes and SHA-1 for the WebSocket handshake key. Badges remain
+    unearned until root-owned local and hosted conformance succeed.
+toolchain:
+  name: GNU Modula-2 (gm2)
+  version: 14.2.0
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    Live authentication, WebSocket mutations, WebSocket actions, optimistic
+    updates, and journals are deferred. Every query, mutation, and action
+    goes over the HTTP API; Live is read-only subscription delivery.
+  - >-
+    TransitionChunk assembly is deferred. Receiving one (or any other
+    unrecognised server message type) is reported as a ProtocolError and
+    triggers a reconnect of every active subscription, matching this
+    project's stated fallback for undocumented Live traffic.
+  - >-
+    Values are exposed as raw JSON text rather than a richer Modula-2 value
+    tree; callers decode the fields they need with the ConvexJSON module.
+  - >-
+    At most 16 Live subscriptions may be active at once, matching the fixed-
+    size subscription table in client/ConvexSync.mod. Each subscription's
+    path, arguments, and last delivered value are capped at 256, 8192, and
+    8192 bytes respectively for rehydration comparison and event payloads.
+  - >-
+    Pump() delivers from a bounded ring buffer of the newest 32 pending
+    events; a consumer that never calls Pump() causes the oldest queued
+    event to be dropped rather than the buffer growing without limit. This
+    overflow behaviour is implemented but not yet covered by a dedicated
+    language-local test; the deterministic Live acceptance tests in
+    client/tests/TestLive.mod exercise ordinary delivery, QueryFailed
+    recovery, and five forced reconnects with resend, but not queue
+    saturation.
+  - >-
+    HTTP request/response bodies are capped at 2 MiB (client/ConvexHTTP.mod)
+    and WebSocket messages at 4 MiB (client/ConvexWS.mod). Chunked HTTP
+    transfer-encoding is not implemented and is rejected as a transport
+    error rather than decoded.
+  - >-
+    The NDJSON adapter under client/tests/conformance/ mirrors the client's
+    16-subscription cap, uses a 1 MiB input command buffer, and an output
+    buffer sized to the 4 MiB WebSocket message cap plus headroom; it has not
+    been pressure-tested against a stopped reader at the shared 128 MiB
+    process limit the way some other language clients in this repository
+    have been.
+  - >-
+    gm2 14.2.0 (Debian's packaged GCC 14 front end) has several undocumented
+    compiler limitations this client works around rather than reports:
+    indexing a CONST string literal can crash the front end, so lookup
+    tables are module-level VAR arrays assigned once at module start; two
+    procedures that each declare a nested procedure can crash the front end
+    when one calls the other, so ConvexSync's message builders share flat,
+    top-level helper procedures instead of nested ones; and the standard
+    library's Strings.Length segfaults on arrays around 2 MiB or larger, so
+    every module uses a hand-written bounded length scan instead. These are
+    documented at each call site in the source.
+  - >-
+    Capabilities remain unearned until the root-owned shared local and
+    hosted conformance evidence passes from a clean exact-head build.
+capabilities: []

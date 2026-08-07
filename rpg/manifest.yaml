@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: rpg
-displayName: "RPG"
-rank: 70
-selectionTier: coverage
-implementation:
-  status: planned
-capabilities: []

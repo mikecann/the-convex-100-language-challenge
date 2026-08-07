@@ -14,7 +14,6 @@ language so the roster still reaches one hundred.
 | labview | Proprietary NI graphical environment; no headless Linux compiler, license required. |
 | matlab | Proprietary license required for the real MATLAB runtime; substituting GNU Octave would not honestly be MATLAB. |
 | mql5 | Runs only inside the proprietary Windows MetaTrader terminal. |
-| rpg | IBM RPG compilers exist only on IBM i systems; no free Linux toolchain. |
 | sas | Proprietary licensed runtime; no free implementation of the real language. |
 | scratch | Block-based GUI language with no network primitives; a Convex client cannot be expressed in Scratch itself. |
 | visual-foxpro | Discontinued proprietary Windows product; no Linux toolchain. |

@@ -1,0 +1,78 @@
+(* ConvexSync implements the Convex /api/sync protocol and its HTTP
+   sibling entirely in Modula-2 on top of ConvexWS (WebSocket transport)
+   and ConvexHTTP (plain HTTP transport): the Connect/ModifyQuerySet
+   client messages, Transition server messages, per-subscription
+   rehydration-suppression, reconnect backoff, and the query id/subscriber
+   bookkeeping are all implemented here, not delegated. This module is a
+   singleton (one Convex deployment per adapter process, matching how the
+   real client and the conformance adapter are both used), and it owns the
+   single Live WebSocket connection exclusively: only Pump touches
+   ConvexWS, so there is exactly one worker for reads, writes, reconnects
+   and query-set version changes. *)
+
+DEFINITION MODULE ConvexSync;
+
+CONST
+  MaxSubscriptions = 16;
+  MaxValue = 8192; (* per-subscription rehydration-comparison and event cap *)
+
+PROCEDURE Init (url: ARRAY OF CHAR; token: ARRAY OF CHAR);
+
+PROCEDURE SetAuth (token: ARRAY OF CHAR);
+
+(* Call performs one HTTP query/mutation/action. operation is "query",
+   "mutation" or "action". On ok=TRUE with errorName empty, value (and
+   logs, a raw JSON array of strings) are the successful result. On
+   ok=TRUE with errorName non-empty ("FunctionError"), errorMessage and
+   (if hasErrorData) errorData describe a structured Convex-level failure.
+   On ok=FALSE, transportError explains a connection-level failure. *)
+PROCEDURE Call (operation: ARRAY OF CHAR; path: ARRAY OF CHAR; VAR args: ARRAY OF CHAR;
+                 VAR value: ARRAY OF CHAR; VAR logs: ARRAY OF CHAR;
+                 VAR errorName: ARRAY OF CHAR; VAR errorMessage: ARRAY OF CHAR;
+                 VAR errorData: ARRAY OF CHAR; VAR hasErrorData: BOOLEAN;
+                 VAR ok: BOOLEAN; VAR transportError: ARRAY OF CHAR);
+
+(* Subscribe registers a new Live subscription and returns immediately
+   (handle identifies it for Pump/Unsubscribe); it does not wait for the
+   connection or the first value, matching the adapter's ack-then-value
+   protocol. ok is FALSE only when the subscription table is full or the
+   arguments are malformed. *)
+PROCEDURE Subscribe (path: ARRAY OF CHAR; VAR args: ARRAY OF CHAR;
+                       VAR handle: INTEGER; VAR ok: BOOLEAN; VAR errorText: ARRAY OF CHAR);
+
+(* Unsubscribe invalidates handle immediately: Pump will never again report
+   an event for it, even one already sitting in the pending queue, before
+   this call returns. Safe to call on an unknown or already removed
+   handle. *)
+PROCEDURE Unsubscribe (handle: INTEGER);
+
+(* DebugDisconnect is the adapter-only test hook. If a connection is open,
+   it is retired and an immediate reconnect is scheduled before this call
+   returns (so the caller may acknowledge right away, per this project's
+   ordering rule); active subscriptions are marked to resend their Add on
+   the new connection. ok is FALSE when no connection was open. *)
+PROCEDURE DebugDisconnect (VAR ok: BOOLEAN; VAR errorText: ARRAY OF CHAR);
+
+(* Pump performs one bounded step of Live work: send one pending
+   ModifyQuerySet command, or read and decode what is available from the
+   WebSocket, or attempt a due reconnect, or (idle) sleep up to timeoutMs.
+   It reports at most one queued event per call:
+     eventKind = 0: nothing to report
+     eventKind = 1: handle's query produced value (with logs)
+     eventKind = 2: handle's query failed: errorName/errorMessage
+                    (/errorData if hasErrorData) describe why
+   Multiple modifications arrived in a single Transition are queued
+   (bounded; see the manifest) and drained one per call, so a burst can
+   never block this call. *)
+PROCEDURE Pump (timeoutMs: INTEGER;
+                 VAR eventKind: INTEGER; VAR handle: INTEGER;
+                 VAR value: ARRAY OF CHAR; VAR logs: ARRAY OF CHAR;
+                 VAR errorName: ARRAY OF CHAR; VAR errorMessage: ARRAY OF CHAR;
+                 VAR errorData: ARRAY OF CHAR; VAR hasErrorData: BOOLEAN);
+
+PROCEDURE ConnectionCount () : INTEGER;
+PROCEDURE LastCloseReason (VAR text: ARRAY OF CHAR);
+PROCEDURE MaxObservedTimestamp (VAR text: ARRAY OF CHAR);
+PROCEDURE IsConnected () : BOOLEAN;
+
+END ConvexSync.
