@@ -62,6 +62,58 @@ removeInteractiveHandlers
 					do: [ :error |
 						self fail: 'could not remove ', name asString, ': ', (error messageText ifNil: [ 'unknown' ]) ] ] ].
 	self refuse: self interactiveHandlerNames
+!
+disableFilesystemStartupPersistence
+	"Stock Pharo ships one OmSessionStore already registered (pointed at
+	 {localDirectory}/ombu-sessions, on disk beside whatever image is
+	 running), used internally by GlobalIdentifierFuelPersistence to persist
+	 Fuel's global object identifiers -- entirely orthogonal to Convex.
+	 OmSessionStore class>>startUp re-verifies every registered store on
+	 every single image boot (`registry do: [ :each | each store ]`), and a
+	 fresh boot always counts as a new Smalltalk session
+	 (OmSessionStore>>needsReset), so this is not a one-time cost: it runs
+	 every time the saved image starts, including every verification run.
+
+	 This deployment image ships on a read-only filesystem with no writable
+	 directory anywhere -- by design, matched by the runtime-base self-test
+	 a few lines below asserting `/usr`, `/var` and `/tmp` do not exist, and
+	 by every verifier invocation in this repository's run script, which
+	 mounts none of these images with a writable filesystem. There is no
+	 honest directory this store could be pointed at instead. Clearing the
+	 registry before the snapshot below, so startUp's registry do: [ ... ]
+	 has nothing left to iterate, is the direct fix rather than papering
+	 over it with a writable location the image would only pretend to
+	 need."
+	OmSessionStore instVarNamed: 'registry' put: WeakSet new.
+	(OmSessionStore instVarNamed: 'registry') isEmpty ifFalse: [
+		self fail: 'could not clear the OmSessionStore registry' ].
+
+	"The command-line entry point itself is the more direct trigger, on
+	 every boot of a saved image regardless of the registry above:
+	 PharoCommandLineHandler>>runPreferences unconditionally sends
+	 `SystemSettingsPersistence resumeSystemSettings`, which asks
+	 GlobalIdentifier uniqueInstance for this machine's UUID; the first
+	 time that identifier has never been computed (true for every fresh
+	 process, since it is not something the object graph carries forward
+	 in a form the VM's own session bookkeeping preserves as still valid)
+	 it tries to persist a newly generated one via
+	 GlobalIdentifierFuelPersistence, hitting the same missing writable
+	 directory. Removing the whole class -- the same move
+	 removeInteractiveHandlers already makes for the command handlers
+	 above -- is honest rather than fragile: runPreferences reaches it
+	 only via `Smalltalk at: #SystemSettingsPersistence ifPresent: [...]`,
+	 so once the class is gone the call is skipped outright, not merely
+	 pre-warmed and hoping a cache survives the snapshot."
+	Smalltalk globals
+		at: #SystemSettingsPersistence
+		ifPresent: [ :settingsPersistence |
+			[ settingsPersistence removeFromSystem ]
+				on: Error
+				do: [ :error |
+					self fail: 'could not remove SystemSettingsPersistence: ',
+						(error messageText ifNil: [ 'unknown' ]) ] ].
+	(Smalltalk globals includesKey: #SystemSettingsPersistence) ifTrue: [
+		self fail: 'SystemSettingsPersistence is still present in the deployment image' ]
 ! !
 
 !ConvexBuild class methodsFor: 'saving'!
@@ -70,6 +122,7 @@ saveAs: aPathWithoutSuffix
 	 in the system dictionary at this point ships with it."
 	| result |
 	self removeInteractiveHandlers.
+	self disableFilesystemStartupPersistence.
 	Smalltalk garbageCollect.
 	result := Smalltalk saveAs: aPathWithoutSuffix.
 	result == true ifTrue: [

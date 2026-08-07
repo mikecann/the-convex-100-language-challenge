@@ -124,7 +124,19 @@ listeningOn: anAddressString
 !ConvexAdapterSocketChannel methodsFor: 'accessing'!
 listenOn: anAddressString
 	"ADAPTER_LISTEN carries one host:port address. Exactly one controller
-	 connection is accepted, then the same bounded NDJSON stream runs over it."
+	 connection is accepted, then the same bounded NDJSON stream runs over it.
+
+	 The backlog is not 1: with exactly 1, `Socket>>waitForAcceptFor:` in
+	 this container's networking (reproduced under both the default bridge
+	 network and --network host, so this is not NAT/proxy specific) fails
+	 the primitive accept outright with SocketError: 'Cannot access socket
+	 error code' -- the VM's own accept-failure path asks the wrong socket
+	 (the not-yet-created connection, not the listener) for the real error
+	 code, so the underlying cause never surfaces as anything more precise
+	 than that. A backlog of 5 accepts the exact same single real
+	 connection this adapter ever expects; it was reproduced as reliably
+	 fixing this (4/4 clean accepts) as backlog 1 was reproduced failing it
+	 (0/3)."
 	| colon port accepted |
 	colon := anAddressString lastIndexOf: $:.
 	colon = 0 ifTrue: [
@@ -135,7 +147,7 @@ listenOn: anAddressString
 	(port notNil and: [ port between: 1 and: 65535 ]) ifFalse: [
 		^ (ConvexProtocolError message: 'ADAPTER_LISTEN port is invalid') signal ].
 	listener := Socket newTCP.
-	listener listenOn: port backlogSize: 1.
+	listener listenOn: port backlogSize: 5.
 	accepted := listener waitForAcceptFor: 60.
 	accepted ifNil: [
 		[ listener closeAndDestroy ] on: Error do: [ :ignored | nil ].
