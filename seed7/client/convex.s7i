@@ -19,6 +19,7 @@
 include "json.s7i";
 include "https_request.s7i";
 include "http_request.s7i";
+include "unicode.s7i";
 
 
 (**
@@ -287,7 +288,15 @@ const func convexOutcome: convexCall (inout convexClient: client, in string: ope
     requestObj @:= ["path"] jsonValue(path);
     requestObj @:= ["args"] args;
     requestObj @:= ["format"] jsonValue("json");
-    body := jsonBody(jsonEncode(jsonValue(requestObj)));
+    # readJson (below, and everywhere else this client parses JSON)
+    # requires genuine Unicode codepoints, not raw wire bytes -- confirmed
+    # directly: feeding it a string of individual UTF-8 bytes raises
+    # RANGE_ERROR rather than decoding them. jsonEncode's output is
+    # codepoints (it copies straight through from an already-decoded
+    # jsonValue), so toUtf8 has to run right before the bytes hit the
+    # socket, and fromUtf8 right after they come off one, everywhere this
+    # client crosses that boundary.
+    body := jsonBody(toUtf8(jsonEncode(jsonValue(requestObj))));
     if client.token <> "" then
       creds := bearerAuth(client.token);
     end if;
@@ -302,7 +311,7 @@ const func convexOutcome: convexCall (inout convexClient: client, in string: ope
           "could not reach the Convex deployment");
     else
       block
-        parsed := readJson(response.body);
+        parsed := readJson(fromUtf8(response.body));
         parsedOkay := TRUE;
       exception
         catch RANGE_ERROR:

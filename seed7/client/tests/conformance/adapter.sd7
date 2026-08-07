@@ -29,9 +29,16 @@ $ include "seed7_05.s7i";
 const duration: TICK is 20000 . MICRO_SECONDS;
 
 
+(**
+ *  `line` holds decoded Unicode codepoints (every event built above goes
+ *  through `jsonEncode`, never `str`); `toUtf8` turns that into the wire
+ *  bytes the controller actually expects, exactly the same boundary
+ *  `client/convex.s7i` and `client/convex_live.s7i` cross for their own
+ *  HTTP and WebSocket traffic.
+ *)
 const proc: emit (inout file: output, in string: line) is func
   begin
-    writeln(output, line);
+    writeln(output, toUtf8(line));
     flush(output);
   end func;
 
@@ -67,7 +74,7 @@ const proc: emitReady (inout file: output, in string: id, in string: runtimeVers
     obj @:= ["language"] jsonValue("seed7");
     obj @:= ["implementation"] jsonValue("native-seed7-s7c-handrolled-websocket");
     obj @:= ["runtime"] jsonValue(runtimeVersion);
-    emit(output, str(jsonValue(obj)));
+    emit(output, jsonEncode(jsonValue(obj)));
   end func;
 
 
@@ -84,7 +91,7 @@ const proc: emitResult (inout file: output, in string: id, in convexOutcome: out
       logsArray &:= jsonValue(logLine);
     end for;
     obj @:= ["logs"] jsonValue(logsArray);
-    emit(output, str(jsonValue(obj)));
+    emit(output, jsonEncode(jsonValue(obj)));
   end func;
 
 
@@ -97,7 +104,7 @@ const proc: emitError (inout file: output, in string: id, in convexError: error)
     end if;
     obj @:= ["type"] jsonValue("error");
     obj @:= ["error"] jsonValue(errorObject(error));
-    emit(output, str(jsonValue(obj)));
+    emit(output, jsonEncode(jsonValue(obj)));
   end func;
 
 
@@ -107,7 +114,7 @@ const proc: emitAck (inout file: output, in string: id) is func
   begin
     obj @:= ["id"] jsonValue(id);
     obj @:= ["type"] jsonValue("ack");
-    emit(output, str(jsonValue(obj)));
+    emit(output, jsonEncode(jsonValue(obj)));
   end func;
 
 
@@ -117,7 +124,7 @@ const proc: emitClosed (inout file: output, in string: id) is func
   begin
     obj @:= ["id"] jsonValue(id);
     obj @:= ["type"] jsonValue("closed");
-    emit(output, str(jsonValue(obj)));
+    emit(output, jsonEncode(jsonValue(obj)));
   end func;
 
 
@@ -139,7 +146,7 @@ const proc: emitSubscriptionValue (inout file: output, in string: subscriptionId
     else
       obj @:= ["error"] jsonValue(errorObject(outcome.error));
     end if;
-    emit(output, str(jsonValue(obj)));
+    emit(output, jsonEncode(jsonValue(obj)));
   end func;
 
 
@@ -306,7 +313,7 @@ const proc: handleLine (inout adapterState: state, inout file: output,
     var string: op is "";
   begin
     block
-      command := readJson(line);
+      command := readJson(fromUtf8(line));
       parsedOkay := category(command) = JSON_OBJECT;
     exception
       catch RANGE_ERROR:
