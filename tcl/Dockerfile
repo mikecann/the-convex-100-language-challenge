@@ -14,13 +14,45 @@ RUN apt-get update \
        ca-certificates=20230311+deb12u1 \
        busybox-static=1:1.35.0-4+deb12u1+b1 \
        file=1:5.44-3 \
+    && apt-get install --no-install-recommends --yes \
+       "openssl=$(dpkg-query -W -f='${Version}' libssl3)" \
     && rm -rf /var/lib/apt/lists/*
+
+# TLS fixture material for client/tests/tls.test.tcl: an authority, a server
+# certificate that names 127.0.0.1, one the same authority issued for a
+# different host, and one that names 127.0.0.1 but nobody trusts. Generating it
+# here keeps private keys out of the repository, and it exists only in this
+# build stage: neither runtime image copies /fixtures.
+RUN set -eu; \
+    mkdir -p /fixtures; \
+    cd /fixtures; \
+    openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+      -keyout ca.key -out ca.crt -subj '/CN=Convex Tcl fixture CA' \
+      -addext 'basicConstraints=critical,CA:TRUE'; \
+    printf 'subjectAltName=IP:127.0.0.1,DNS:convex-tls-fixture.test\n' > server.ext; \
+    openssl req -newkey rsa:2048 -sha256 -nodes \
+      -keyout server.key -out server.csr -subj '/CN=127.0.0.1'; \
+    openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+      -days 3650 -sha256 -extfile server.ext -out server.crt; \
+    printf 'subjectAltName=DNS:convex-tls-mismatch.test\n' > mismatch.ext; \
+    openssl req -newkey rsa:2048 -sha256 -nodes \
+      -keyout mismatch.key -out mismatch.csr -subj '/CN=convex-tls-mismatch.test'; \
+    openssl x509 -req -in mismatch.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+      -days 3650 -sha256 -extfile mismatch.ext -out mismatch.crt; \
+    openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+      -keyout untrusted.key -out untrusted.crt -subj '/CN=127.0.0.1' \
+      -addext 'subjectAltName=IP:127.0.0.1'; \
+    rm -f server.csr mismatch.csr
+
 COPY client ./client
 COPY examples ./examples
 RUN test "$(uname -m)" = x86_64 \
     && test "$(printf 'puts [info patchlevel]\\n' | tclsh)" = 8.6.13 \
     && tclsh client/tests/run.tcl \
+    && CONVEX_TLS_FIXTURE_DIR=/fixtures tclsh client/tests/tls.test.tcl \
+    && tclsh client/tests/http_status.test.tcl \
     && tclsh client/tests/live_socket.test.tcl \
+    && tclsh client/tests/live_deadlines.test.tcl \
     && tclsh client/tests/stopped_reader.test.tcl \
     && tclsh examples/basics/main.test.tcl
 RUN printf '%s\n' \

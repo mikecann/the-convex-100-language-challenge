@@ -12,25 +12,295 @@ package require base64
 namespace eval ::convex {
     variable nextClient 0
     variable clients
-    array set clients {}
+    ::array set clients {}
     variable initialTimestamp AAAAAAAAAAA=
     variable maximumResponseBytes [expr {2 * 1024 * 1024}]
-    # A partial frame retains its exact bytes, but cannot hold the only Live
-    # connection forever. Tests shorten this production deadline explicitly.
+    # The HTTP reader compares its budget against the declared and the received
+    # size between blocks, so an oversized response is abandoned while it is
+    # still arriving instead of after Tcl has allocated all of it.
+    variable responseBlockBytes [expr {64 * 1024}]
+    variable maximumFrameBytes [expr {2 * 1024 * 1024}]
+    variable maximumHandshakeBytes [expr {32 * 1024}]
+    # Incomplete transport work cannot hold the only Live connection forever.
+    # Each deadline below is absolute: it starts when the incomplete work starts
+    # and a trickle of progress never extends it. Tests shorten these production
+    # values explicitly.
     variable partialFrameTimeoutMs 5000
-    variable callbackDepth 0
-
-    # Tcl's http package invokes this command with host and port. Keeping SNI
-    # and certificate validation here makes HTTPS and WSS use the same CA-backed
-    # transport without a shell command or a delegated client runtime.
-    proc tls_socket {args} {
-        # http::register supplies the socket command's normal host/port tail.
-        # Keeping it intact avoids assuming which optional async arguments the
-        # HTTP package prepends, while Tcl TLS still performs CA validation.
-        return [::tls::socket -autoservername 1 -require 1 -cafile /etc/ssl/certs/ca-certificates.crt {*}$args]
-    }
-    ::http::register https 443 [list ::convex::tls_socket]
+    variable connectDeadlineMs 10000
+    variable writeDeadlineMs 10000
+    # One TLS policy serves HTTPS and WSS. The CA bundle is the runtime image's,
+    # and the identity the peer certificate has to prove is recorded per channel
+    # because a trusted certificate issued for another host is still an attack.
+    variable tlsCaFile /etc/ssl/certs/ca-certificates.crt
+    variable tlsExpectedHost
+    ::array set tlsExpectedHost {}
+    variable tlsPendingHost ""
+    # OpenSSL reports every refusal as the same opaque handshake failure, so the
+    # real reason is kept here for stderr diagnostics and for the TLS tests.
+    variable tlsLastRejection ""
 }
+
+proc ::convex::ip_literal {host} {
+    if {[string first : $host] >= 0} { return 1 }
+    return [regexp {^[0-9]{1,3}(?:\.[0-9]{1,3}){3}$} $host]
+}
+
+# Certificate identities are (kind name) pairs. TclTLS builds differ in how they
+# spell subject alternative names, so read every documented spelling. Unlabelled
+# tokens are only trusted from a dedicated alternative-name field; the printed
+# extension block may contain unrelated text, so only DNS and IP entries are
+# taken from it.
+proc ::convex::identity_entries {value {labelledOnly 0}} {
+    set entries {}
+    foreach token [split [string map [list "IP Address:" "IP:" "," " " ";" " "] $value]] {
+        set token [string trim $token]
+        if {$token eq ""} { continue }
+        if {[regexp -nocase {^(DNS|IP|email|URI):(.*)$} $token -> label name]} {
+            if {[string equal -nocase $label DNS]} {
+                lappend entries [list dns $name]
+            } elseif {[string equal -nocase $label IP]} {
+                lappend entries [list ip $name]
+            }
+            continue
+        }
+        if {!$labelledOnly} { lappend entries [list dns $token] }
+    }
+    return $entries
+}
+
+# A subject is printed as either "CN=host, O=Org" or "/CN=host/O=Org" depending
+# on the TclTLS build, so normalise both separators before reading it.
+proc ::convex::subject_common_names {subject} {
+    set names {}
+    foreach part [split [string map {/ ,} $subject] ,] {
+        if {[regexp -nocase {^[ \t]*CN[ \t]*=[ \t]*(.+)$} $part -> value]} { lappend names [string trim $value] }
+    }
+    return $names
+}
+
+# The pinned TclTLS build never populates any of the field spellings above:
+# verified directly against Convex's own hosted certificate, the verify
+# callback's dict carries only sha1_hash/subject/issuer/notBefore/notAfter/
+# serial/certificate, with no parsed extension data at all. That certificate
+# names every deployment through subjectAltName ("convex.cloud, *.convex.cloud"),
+# never through the CN, so without this fallback every hosted connection loses
+# its only usable identity and gets refused. The PEM text is still there, so
+# the extension is read straight out of its DER encoding.
+proc ::convex::der_byte {der offset} {
+    if {$offset >= [string length $der]} { error "DER read past the end of the certificate" }
+    binary scan [string index $der $offset] cu value
+    return $value
+}
+
+proc ::convex::der_length {der offset} {
+    set first [der_byte $der $offset]
+    incr offset
+    if {$first < 0x80} { return [list $first $offset] }
+    set count [expr {$first & 0x7f}]
+    set length 0
+    for {set i 0} {$i < $count} {incr i} {
+        set length [expr {($length << 8) | [der_byte $der $offset]}]
+        incr offset
+    }
+    return [list $length $offset]
+}
+
+proc ::convex::pem_der {pem} {
+    set body ""
+    foreach line [split $pem "\n"] {
+        set line [string trim $line]
+        if {$line eq "" || [string match "-----*" $line]} { continue }
+        append body $line
+    }
+    return [binary decode base64 $body]
+}
+
+# GeneralName ::= CHOICE { ..., dNSName [2] IA5String, ..., iPAddress [7]
+# OCTET STRING, ... }. Both are IMPLICIT primitives, so each entry's content
+# is the name itself with no further unwrapping.
+proc ::convex::der_ip_text {bytes} {
+    set parts {}
+    foreach byte [split $bytes ""] {
+        binary scan $byte cu value
+        lappend parts $value
+    }
+    if {[llength $parts] == 4} { return [join $parts .] }
+    set groups {}
+    foreach {hi lo} $parts { lappend groups [format %02x%02x $hi $lo] }
+    return [join $groups :]
+}
+
+proc ::convex::der_general_names {der start stop} {
+    set entries {}
+    set cursor $start
+    while {$cursor < $stop} {
+        set tag [der_byte $der $cursor]
+        incr cursor
+        lassign [der_length $der $cursor] length contentStart
+        set content [string range $der $contentStart [expr {$contentStart + $length - 1}]]
+        # switch matches its patterns as literal strings, and $tag is a plain
+        # decimal integer from binary scan, so comparing it against a "0x82"
+        # pattern there would never match; use numeric expr comparisons instead.
+        if {$tag == 0x82} {
+            lappend entries [list dns $content]
+        } elseif {$tag == 0x87} {
+            lappend entries [list ip [der_ip_text $content]]
+        }
+        set cursor [expr {$contentStart + $length}]
+    }
+    return $entries
+}
+
+# The extension's own OID (2.5.29.17, subjectAltName) has a short, fixed DER
+# encoding - tag 0x06 (OBJECT IDENTIFIER), length 3, value 55 1d 11 - so it is
+# found directly rather than walking every field of the surrounding
+# TBSCertificate to reach it.
+proc ::convex::subject_alt_names_der {der} {
+    set marker "\x06\x03\x55\x1d\x11"
+    set at [string first $marker $der]
+    if {$at < 0} { return {} }
+    set offset [expr {$at + [string length $marker]}]
+    # extnID is followed by an optional BOOLEAN critical flag (tag 0x01,
+    # length 1, 3 bytes total), then the extnValue OCTET STRING (tag 0x04)
+    # that wraps the DER-encoded SubjectAltName SEQUENCE.
+    if {[der_byte $der $offset] == 0x01} { incr offset 3 }
+    if {[der_byte $der $offset] != 0x04} { return {} }
+    incr offset
+    lassign [der_length $der $offset] octetLength octetStart
+    if {[der_byte $der $octetStart] != 0x30} { return {} }
+    lassign [der_length $der [expr {$octetStart + 1}]] seqLength seqStart
+    return [der_general_names $der $seqStart [expr {$seqStart + $seqLength}]]
+}
+
+proc ::convex::certificate_identities {certificate} {
+    set identities {}
+    foreach key {alternate_names alternateNames subjectAltName subject_alt_name san} {
+        if {![dict exists $certificate $key]} { continue }
+        foreach entry [identity_entries [dict get $certificate $key]] { lappend identities $entry }
+    }
+    if {![llength $identities] && [dict exists $certificate extensions]} {
+        foreach entry [identity_entries [dict get $certificate extensions] 1] { lappend identities $entry }
+    }
+    if {![llength $identities] && [dict exists $certificate certificate]} {
+        # A malformed or unexpected PEM must never turn into a Tcl error here:
+        # it just leaves this source empty and verification falls through to
+        # the CN, same as any other certificate this client cannot read.
+        catch {
+            foreach entry [subject_alt_names_der [pem_der [dict get $certificate certificate]]] {
+                lappend identities $entry
+            }
+        }
+    }
+    # The common name is the last resort. A certificate that names nothing this
+    # client can check produces an empty list, which fails verification.
+    if {[dict exists $certificate subject]} {
+        foreach name [subject_common_names [dict get $certificate subject]] { lappend identities [list dns $name] }
+    }
+    return $identities
+}
+
+proc ::convex::identity_matches {identity host} {
+    lassign $identity kind name
+    set name [string tolower [string trim $name]]
+    set host [string tolower $host]
+    if {$name eq "" || $host eq ""} { return 0 }
+    if {$name eq $host} { return 1 }
+    # Only a leftmost single-label wildcard matches, and never for an address
+    # literal or for a name whose remainder is a single label.
+    if {$kind eq "ip" || [ip_literal $host]} { return 0 }
+    if {[string range $name 0 1] ne "*."} { return 0 }
+    set suffix [string range $name 2 end]
+    if {[string first . $suffix] < 0} { return 0 }
+    set dot [string first . $host]
+    if {$dot < 1} { return 0 }
+    return [expr {[string range $host [expr {$dot + 1}] end] eq $suffix}]
+}
+
+proc ::convex::verify_hostname {identities host} {
+    foreach identity $identities {
+        if {[identity_matches $identity $host]} { return 1 }
+    }
+    return 0
+}
+
+proc ::convex::tls_reject {reason} {
+    variable tlsLastRejection
+    set tlsLastRejection $reason
+    puts stderr "Convex TLS refused a connection: $reason"
+    return 0
+}
+
+# TclTLS reports each certificate in the chain to this callback while the
+# handshake is still in progress. Returning 0 aborts it, so this is where an
+# untrusted chain and a certificate issued for another host are both refused.
+proc ::convex::tls_callback {event channel args} {
+    variable tlsExpectedHost
+    variable tlsPendingHost
+    if {$event ne "verify"} { return 1 }
+    lassign $args depth certificate status problem
+    if {![string is integer -strict $depth] || [catch {dict size $certificate}]} {
+        return [tls_reject "TclTLS verify arguments were not (depth certificate status error)"]
+    }
+    if {![string is boolean -strict $status] || ![string is true $status]} {
+        return [tls_reject "certificate chain rejected at depth $depth: $problem"]
+    }
+    if {$depth != 0} { return 1 }
+    if {[info exists tlsExpectedHost($channel)]} {
+        set host $tlsExpectedHost($channel)
+    } elseif {$tlsPendingHost ne ""} {
+        set host $tlsPendingHost
+    } else {
+        return [tls_reject "no expected TLS host was recorded for $channel"]
+    }
+    set identities [certificate_identities $certificate]
+    if {![verify_hostname $identities $host]} {
+        return [tls_reject "certificate identities {$identities} do not match $host"]
+    }
+    return 1
+}
+
+# Channels are recorded by name, so a name reused after a closed request would
+# otherwise inherit a stale expectation. Drop the closed ones on every connect.
+# This namespace defines commands called array and close, so every use of the
+# built-in command of that name is qualified.
+proc ::convex::forget_closed_tls_channels {} {
+    variable tlsExpectedHost
+    set live [chan names]
+    foreach channel [::array names tlsExpectedHost] {
+        if {[lsearch -exact $live $channel] < 0} { unset tlsExpectedHost($channel) }
+    }
+}
+
+# Verify the chain against the image's CA bundle, refuse the obsolete protocol
+# versions, send SNI for a named host, and record the identity that the peer
+# certificate has to prove. The pending name covers the window in which TclTLS
+# could complete a handshake before it has returned the channel name.
+proc ::convex::tls_connect {host port args} {
+    variable tlsCaFile
+    variable tlsExpectedHost
+    variable tlsPendingHost
+    forget_closed_tls_channels
+    set options [list -require 1 -cafile $tlsCaFile -command [list ::convex::tls_callback] \
+        -ssl2 0 -ssl3 0 -tls1 0 -tls1.1 0]
+    if {![ip_literal $host]} { lappend options -servername $host }
+    set tlsPendingHost $host
+    try {
+        set channel [::tls::socket {*}$args {*}$options $host $port]
+    } finally {
+        set tlsPendingHost ""
+    }
+    set tlsExpectedHost($channel) $host
+    return $channel
+}
+
+# Tcl's http package invokes this command with its own leading options followed
+# by host and port. Routing it through the same policy makes HTTPS and WSS share
+# one verified transport without a shell command or a delegated client runtime.
+proc ::convex::tls_socket {args} {
+    return [tls_connect [lindex $args end-1] [lindex $args end] {*}[lrange $args 0 end-2]]
+}
+
+::http::register https 443 [list ::convex::tls_socket]
 
 proc ::convex::quote {value} {
     return [::json::write string $value]
@@ -196,7 +466,8 @@ proc ::convex::new {url {clientVersion tcl-0.1.0} {authToken ""}} {
     set clients($id) [dict create url $url version $clientVersion auth $authToken closed 0 socket "" \
         subscriptions {} nextQueryId 0 querySet 0 remote [object [list querySet 0 identity 0 ts [quote $::convex::initialTimestamp]]] \
         connectionCount 0 lastCloseReason InitialConnect reconnectTimer "" connecting 0 reconnectDelay 100 \
-        maxTimestamp "" wsStage closed wsBuffer "" wsFragments "" wsFragmentOpcode -1 wsFrameTimer "" wsKey "" wsOut ""]
+        maxTimestamp "" wsStage closed wsBuffer "" wsFragments "" wsFragmentOpcode -1 wsFrameTimer "" \
+        wsConnectTimer "" wsWriteTimer "" wsKey "" wsOut ""]
     return $id
 }
 
@@ -208,8 +479,43 @@ proc ::convex::set_auth {id token} {
     put $id auth $token
 }
 
+# Convex answers with a JSON envelope for both success and failure, but a proxy,
+# a gateway, or a misrouted request can answer with something else entirely.
+# These two helpers read an envelope field when there is one and never turn a
+# foreign response body into a Tcl error.
+proc ::convex::envelope_field {raw name} {
+    if {![regexp {^[ \t\r\n]*\{} $raw]} { return "" }
+    if {[catch {set value [field $raw $name 0]}]} { return "" }
+    return $value
+}
+
+proc ::convex::envelope_message {raw fallback} {
+    foreach name {errorMessage message} {
+        set candidate [envelope_field $raw $name]
+        if {$candidate eq "" || [string index $candidate 0] ne "\""} { continue }
+        if {[catch {set text [decode $candidate]}] || $text eq ""} { continue }
+        return $text
+    }
+    return $fallback
+}
+
+# Tcl's http package reports progress after each block it reads. Abandoning the
+# transaction here bounds the response to one block past the budget instead of
+# letting Tcl allocate a body this client has already decided to reject. The
+# declared length is checked too, so a body that only claims to be enormous is
+# refused after the first block rather than after the whole download. A chunked
+# response is bounded by its current chunk, because the http package reads a
+# complete chunk before it reports progress.
+proc ::convex::http_progress {token total current} {
+    variable maximumResponseBytes
+    if {$total > $maximumResponseBytes || $current > $maximumResponseBytes} {
+        ::http::reset $token convex-response-too-large
+    }
+}
+
 proc ::convex::http_call {id operation path argsRaw} {
     variable maximumResponseBytes
+    variable responseBlockBytes
     set client [state $id]
     if {[dict get $client closed]} { error "client is closed" }
     if {![regexp {^[^:]+:[^:]+$} $path]} { throw ProtocolError "Convex function path is required" }
@@ -225,10 +531,29 @@ proc ::convex::http_call {id operation path argsRaw} {
     set body [encoding convertto utf-8 [object [list path [quote $path] args $argsRaw format [quote json]]]]
     set headers [list Content-Type application/json Accept application/json Convex-Client [dict get $client version]]
     if {[dict get $client auth] ne ""} { lappend headers Authorization "Bearer [dict get $client auth]" }
-    if {[catch {set token [::http::geturl "[dict get $client url]/api/$operation" -method POST -headers $headers -query $body -timeout 10000 -binary 1]} problem]} {
+    if {[catch {set token [::http::geturl "[dict get $client url]/api/$operation" -method POST -headers $headers -query $body -timeout 10000 -binary 1 -blocksize $responseBlockBytes -progress ::convex::http_progress]} problem]} {
         throw TransportError $problem
     }
     try {
+        set transaction [::http::status $token]
+        if {$transaction eq "convex-response-too-large"} {
+            throw TransportError "Convex response exceeded the $maximumResponseBytes byte budget"
+        }
+        # Tcl's http package reports "eof" instead of "ok" for a Connection:
+        # close response whose entire body it did receive: a peer that closes
+        # the socket in the same read that delivers the final bytes leaves the
+        # package unable to tell that from a genuine mid-response disconnect,
+        # and this happens in practice for ordinary multi-byte UTF-8 bodies.
+        # Do not turn that into a transport failure here. The classifier below
+        # requires a well-formed status field and, on success, a value; a
+        # response that really was cut short fails there as ProtocolError
+        # instead, so nothing incomplete is ever accepted as a result.
+        if {$transaction ne "ok" && $transaction ne "eof"} {
+            set detail $transaction
+            catch {set detail "$transaction: [::http::error $token]"}
+            throw TransportError "Convex HTTP transaction did not complete ($detail)"
+        }
+        set code [::http::ncode $token]
         set wireRaw [::http::data $token]
         if {[string bytelength $wireRaw] > $maximumResponseBytes} { throw TransportError "response exceeds byte limit" }
         if {[catch {set raw [encoding convertfrom utf-8 $wireRaw]} problem]} {
@@ -239,33 +564,40 @@ proc ::convex::http_call {id operation path argsRaw} {
         # lets nested values and log strings participate in list parsing before
         # the required status field is checked. The field scanner validates the
         # envelope shape while leaving value, errorData, and logLines exact.
-        if {[catch {set statusRaw [field $raw status 0]} problem] || $statusRaw eq ""} {
-            throw ProtocolError "HTTP response omitted status"
-        }
-        if {[catch {set status [json_string $statusRaw "HTTP response status"]} problem]} {
-            throw ProtocolError $problem
+        set statusRaw [envelope_field $raw status]
+        set logs [envelope_field $raw logLines]
+        if {$logs eq ""} { set logs "\[\]" }
+        set data [envelope_field $raw errorData]
+        if {$data eq ""} { set data null }
+        set status ""
+        if {$statusRaw ne "" && [catch {set status [json_string $statusRaw "HTTP response status"]}]} {
+            throw ProtocolError "HTTP $code response had a non-string status"
         }
         if {$status eq "success"} {
-            set logsRaw [field $raw logLines 0]
-            if {$logsRaw eq ""} { set logsRaw "\[\]" }
-            return [dict create value [field $raw value] logs $logsRaw]
+            if {$code != 200} { throw ProtocolError "HTTP $code response claimed success" }
+            set value [envelope_field $raw value]
+            if {$value eq ""} { throw ProtocolError "HTTP success response omitted value" }
+            return [dict create value $value logs $logs]
         }
-        if {$status eq "error"} {
-            set messageRaw [field $raw errorMessage 0]
-            if {$messageRaw eq ""} {
-                set message "Convex function failed"
-            } else {
-                if {[catch {set message [json_string $messageRaw "HTTP errorMessage"]} problem]} {
-                    throw ProtocolError $problem
-                }
-            }
-            set data [field $raw errorData 0]
-            set logs [field $raw logLines 0]
-            if {$data eq ""} { set data null }
-            if {$logs eq ""} { set logs "\[\]" }
-            throw FunctionError $message $data $logs
+        # Convex reports a failed function either inside a 200 envelope or with
+        # status 560. Both are the deployment answering correctly about a
+        # function that failed, so both stay FunctionError rather than becoming
+        # a transport or protocol problem the caller cannot act on.
+        if {$status eq "error" || $code == 560} {
+            throw FunctionError [envelope_message $raw "Convex function failed"] $data $logs
         }
-        throw ProtocolError "HTTP response had unknown status"
+        if {$code == 200} {
+            if {$statusRaw eq ""} { throw ProtocolError "HTTP response omitted status" }
+            throw ProtocolError "HTTP response had unknown status"
+        }
+        set detail [envelope_message $raw "no Convex error envelope"]
+        # 5xx, 408, and 429 mean the deployment or something in front of it did
+        # not answer this attempt, so a caller may retry them. Every other
+        # non-200 is a request the deployment refused and would refuse again.
+        if {$code >= 500 || $code == 408 || $code == 429} {
+            throw TransportError "HTTP $code from Convex: $detail"
+        }
+        throw ProtocolError "HTTP $code from Convex: $detail"
     } finally {
         ::http::cleanup $token
     }
@@ -287,6 +619,17 @@ proc ::convex::sync_url {url} {
 # channel in nonblocking mode. Every consumed byte remains in wsBuffer until a
 # complete frame is available, never restarting from a false boundary.
 proc ::convex::random_bytes {count} {
+    # RFC 6455 masking keys and the handshake nonce should not be predictable.
+    # Prefer the kernel's generator and keep Tcl's own as a fallback for a
+    # sandbox that does not expose it.
+    if {![catch {set stream [open /dev/urandom rb]}]} {
+        try {
+            set bytes [read $stream $count]
+            if {[string bytelength $bytes] == $count} { return $bytes }
+        } finally {
+            ::close $stream
+        }
+    }
     set output ""
     for {set index 0} {$index < $count} {incr index} {
         append output [binary format c [expr {int(rand() * 256) - 128}]]
@@ -312,24 +655,72 @@ proc ::convex::ws_enqueue {id bytes} {
 proc ::convex::ws_flush {id} {
     set client [state $id]
     set socket [dict get $client socket]
-    if {$socket eq "" || [dict get $client wsOut] eq ""} { return }
-    set bytes [dict get $client wsOut]
-    if {[catch {puts -nonewline $socket $bytes} error]} {
-        retire $id "TransportError: $error"
-        return
+    if {$socket eq ""} { return }
+    if {[dict get $client wsOut] ne ""} {
+        set bytes [dict get $client wsOut]
+        if {[catch {puts -nonewline $socket $bytes} error]} {
+            retire $id "TransportError: $error"
+            return
+        }
+        # Once puts succeeds Tcl owns the complete record, including any bytes
+        # held in its nonblocking channel buffer. Clear the source buffer now so
+        # a writable retry cannot duplicate an already accepted WebSocket frame.
+        put $id wsOut ""
+        if {[catch {flush $socket} error]} {
+            retire $id "TransportError: $error"
+            return
+        }
     }
-    # Once puts succeeds Tcl owns the complete record, including any bytes held
-    # in its nonblocking channel buffer. Clear the source buffer now so a
-    # writable retry cannot duplicate an already accepted WebSocket frame.
-    put $id wsOut ""
-    if {[catch {flush $socket} error]} {
-        retire $id "TransportError: $error"
+    ws_sync_write_watch $id $socket
+}
+
+# A peer that stops reading leaves accepted bytes in Tcl's channel queue. Watch
+# that queue with one absolute deadline, and keep the writable event registered
+# only while it can do something. A permanently registered writable handler
+# fires continuously on a healthy socket and starves the reader.
+proc ::convex::ws_sync_write_watch {id socket} {
+    variable writeDeadlineMs
+    set client [state $id]
+    if {[dict get $client socket] ne $socket} { return }
+    if {[catch {set pending [chan pending output $socket]}]} { set pending 0 }
+    set timer [dict get $client wsWriteTimer]
+    if {$pending > 0} {
+        if {$timer eq ""} {
+            put $id wsWriteTimer [after $writeDeadlineMs [list ::convex::ws_write_timeout $id $socket]]
+        }
+    } elseif {$timer ne ""} {
+        after cancel $timer
+        put $id wsWriteTimer ""
     }
+    # Only an async connect needs the writable event, and it is how that connect
+    # reports it finished. Leaving it registered afterwards makes it fire
+    # continuously on a healthy socket and starve the reader, so the deadline
+    # above is what covers a peer that stops draining instead.
+    if {[dict get $client wsStage] ne "connecting"} { catch {fileevent $socket writable {}} }
+}
+
+proc ::convex::ws_write_timeout {id socket} {
+    set client [state $id]
+    if {[dict get $client socket] ne $socket || [dict get $client wsWriteTimer] eq ""} { return }
+    put $id wsWriteTimer ""
+    # Tcl drains its own channel queue in the background. A peer that finished
+    # draining before the deadline keeps its connection.
+    if {[catch {set pending [chan pending output $socket]}]} { set pending 0 }
+    if {$pending <= 0 && [dict get $client wsOut] eq ""} { return }
+    retire $id "TransportError: WebSocket write deadline exceeded"
+}
+
+proc ::convex::ws_connect_timeout {id socket} {
+    set client [state $id]
+    if {[dict get $client socket] ne $socket || [dict get $client wsConnectTimer] eq ""} { return }
+    put $id wsConnectTimer ""
+    retire $id "TransportError: WebSocket handshake deadline exceeded"
 }
 
 proc ::convex::ws_frame {opcode payload} {
+    variable maximumFrameBytes
     set length [string bytelength $payload]
-    if {$length > [expr {2 * 1024 * 1024}]} { error "WebSocket frame exceeds 2 MiB" }
+    if {$length > $maximumFrameBytes} { error "WebSocket frame exceeds 2 MiB" }
     set mask [random_bytes 4]
     set header [binary format c [expr {0x80 | $opcode}]]
     if {$length < 126} {
@@ -361,9 +752,13 @@ proc ::convex::send {id raw} {
 proc ::convex::retire {id reason {reconnect 1}} {
     set client [state $id]
     set socket [dict get $client socket]
-    if {[dict get $client wsFrameTimer] ne ""} {
-        after cancel [dict get $client wsFrameTimer]
-        put $id wsFrameTimer ""
+    # Every deadline belongs to the connection being retired. Cancelling them
+    # here keeps a replacement connection from inheriting an expiring timer.
+    foreach field {wsFrameTimer wsConnectTimer wsWriteTimer} {
+        if {[dict get $client $field] ne ""} {
+            after cancel [dict get $client $field]
+            put $id $field ""
+        }
     }
     if {$reason ne "client-closed" && $reason ne "DebugDisconnect"} { puts stderr "Convex Live retired connection: $reason" }
     # A parser failure and an unexpected peer close are subscription failures,
@@ -380,7 +775,10 @@ proc ::convex::retire {id reason {reconnect 1}} {
     if {$socket ne ""} {
         catch {fileevent $socket readable {}}
         catch {fileevent $socket writable {}}
-        catch {close $socket}
+        # This namespace defines a command called close, so the built-in one is
+        # qualified. An unqualified call would resolve to ::convex::close, be
+        # swallowed by the catch, and leave the retired socket open forever.
+        catch {::close $socket}
     }
     put $id socket ""
     put $id wsStage closed
@@ -402,6 +800,7 @@ proc ::convex::schedule_reconnect {id reason} {
 }
 
 proc ::convex::open_live {id} {
+    variable connectDeadlineMs
     set client [state $id]
     if {[dict get $client closed] || [dict size [dict get $client subscriptions]] == 0 || [dict get $client socket] ne "" || [dict get $client connecting]} { return }
     # This callback consumed the timer that scheduled it. Clearing the handle
@@ -413,7 +812,9 @@ proc ::convex::open_live {id} {
         return
     }
     if {$scheme eq "wss"} {
-        set command [list ::tls::socket -async -require 1 -cafile /etc/ssl/certs/ca-certificates.crt -servername $host $host $port]
+        # The same verified TLS transport as HTTPS, including the hostname the
+        # peer certificate has to prove.
+        set command [list ::convex::tls_connect $host $port -async]
     } else {
         set command [list socket -async $host $port]
     }
@@ -428,20 +829,24 @@ proc ::convex::open_live {id} {
     set clients($id) $client
     fileevent $socket writable [list ::convex::ws_writable $id $socket]
     fileevent $socket readable [list ::convex::ws_readable $id $socket]
+    # TCP, TLS, and the upgrade share one absolute deadline. A peer that accepts
+    # the connection and then trickles or withholds its response cannot hold the
+    # only Live connection open indefinitely.
+    put $id wsConnectTimer [after $connectDeadlineMs [list ::convex::ws_connect_timeout $id $socket]]
 }
 
 proc ::convex::ws_writable {id socket} {
     if {[dict get [state $id] socket] ne $socket} { return }
     if {[catch {set connectionError [fconfigure $socket -error]} error]} { retire $id $error; return }
     if {$connectionError ne ""} { retire $id $connectionError; return }
-    set stage [dict get [state $id] wsStage]
-    if {$stage eq "connecting"} {
+    if {[dict get [state $id] wsStage] eq "connecting"} {
         set client [state $id]
         set key [::base64::encode [random_bytes 16]]
         put $id wsKey $key
         put $id wsStage handshake
         set request "GET [dict get $client wsPath] HTTP/1.1\r\nHost: [dict get $client wsHost]\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: $key\r\nSec-WebSocket-Version: 13\r\nConvex-Client: [dict get $client version]\r\n\r\n"
         ws_enqueue $id $request
+        return
     }
     ws_flush $id
 }
@@ -480,10 +885,11 @@ proc ::convex::ws_sync_partial_timer {id socket} {
 }
 
 proc ::convex::ws_handshake {id} {
+    variable maximumHandshakeBytes
     set buffer [dict get [state $id] wsBuffer]
     set end [string first "\r\n\r\n" $buffer]
     if {$end < 0} {
-        if {[string bytelength $buffer] > 32768} { error "WebSocket upgrade headers exceed 32 KiB" }
+        if {[string bytelength $buffer] > $maximumHandshakeBytes} { error "WebSocket upgrade headers exceed 32 KiB" }
         return
     }
     set headers [string range $buffer 0 [expr {$end + 3}]]
@@ -495,6 +901,12 @@ proc ::convex::ws_handshake {id} {
     }
     set expected [::base64::encode [::sha1::sha1 -bin "[dict get [state $id] wsKey]258EAFA5-E914-47DA-95CA-C5AB0DC85B11"]]
     if {$accept eq "" || $accept ne $expected} { error "WebSocket upgrade acceptance failed" }
+    # The connection is established, so its connect deadline is discharged. The
+    # frame and write deadlines cover everything after this point.
+    if {[dict get [state $id] wsConnectTimer] ne ""} {
+        after cancel [dict get [state $id] wsConnectTimer]
+        put $id wsConnectTimer ""
+    }
     put $id wsStage open
     socket_open $id
 }
@@ -502,6 +914,7 @@ proc ::convex::ws_handshake {id} {
 proc ::convex::byte_at {bytes index} { binary scan $bytes @${index}cu value; return $value }
 
 proc ::convex::ws_frames {id} {
+    variable maximumFrameBytes
     set socket [dict get [state $id] socket]
     set buffer [dict get [state $id] wsBuffer]
     while {[string bytelength $buffer] >= 2} {
@@ -521,7 +934,9 @@ proc ::convex::ws_frames {id} {
             binary scan [string range $buffer 2 9] Wu length
             set offset 10
         }
-        if {$length > [expr {2 * 1024 * 1024}]} { error "WebSocket frame exceeds 2 MiB" }
+        # The declared length is judged from the header alone, before this
+        # reader waits for, buffers, or slices a single payload byte.
+        if {$length > $maximumFrameBytes} { error "WebSocket frame exceeds 2 MiB" }
         if {$opcode >= 8 && (!$fin || $length > 125)} { error "invalid WebSocket control frame" }
         if {[string bytelength $buffer] < $offset + $length} { break }
         set payload [string range $buffer $offset [expr {$offset + $length - 1}]]
@@ -534,13 +949,14 @@ proc ::convex::ws_frames {id} {
 }
 
 proc ::convex::ws_frame_received {id fin opcode payload} {
+    variable maximumFrameBytes
     if {$opcode == 8} { retire $id peer-close; return }
     if {$opcode == 9} { ws_enqueue $id [ws_frame 10 $payload]; return }
     if {$opcode == 10} { return }
     set fragmentOpcode [dict get [state $id] wsFragmentOpcode]
     if {$opcode == 0} {
         if {$fragmentOpcode < 0} { error "unexpected WebSocket continuation" }
-        if {[string bytelength [dict get [state $id] wsFragments]] + [string bytelength $payload] > [expr {2 * 1024 * 1024}]} {
+        if {[string bytelength [dict get [state $id] wsFragments]] + [string bytelength $payload] > $maximumFrameBytes} {
             error "fragmented WebSocket message exceeds 2 MiB"
         }
         put $id wsFragments "[dict get [state $id] wsFragments]$payload"
@@ -552,7 +968,7 @@ proc ::convex::ws_frame_received {id fin opcode payload} {
     } elseif {$opcode in {1 2}} {
         if {$fragmentOpcode >= 0} { error "new WebSocket data frame during fragment" }
         if {!$fin} {
-            if {[string bytelength $payload] > [expr {2 * 1024 * 1024}]} { error "fragmented WebSocket message exceeds 2 MiB" }
+            if {[string bytelength $payload] > $maximumFrameBytes} { error "fragmented WebSocket message exceeds 2 MiB" }
             put $id wsFragmentOpcode $opcode
             put $id wsFragments $payload
             return

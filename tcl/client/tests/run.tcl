@@ -3,19 +3,8 @@ source [file normalize [file join [file dirname [info script]] .. convex.tcl]]
 
 proc assert {condition message} { if {![uplevel 1 [list expr $condition]]} { error $message } }
 
-# The registered HTTPS transport must require a trusted certificate. Capture
-# the exact TclTLS arguments without making a network request.
-rename ::tls::socket ::tls::socket_real
-proc ::tls::socket {args} { set ::tlsSocketArgs $args; return tls-fixture }
-set tlsResult [::convex::tls_socket example.test 443]
-assert {$tlsResult eq "tls-fixture"} "HTTPS socket factory did not delegate to TclTLS"
-set requireIndex [lsearch -exact $::tlsSocketArgs -require]
-set caIndex [lsearch -exact $::tlsSocketArgs -cafile]
-assert {$requireIndex >= 0 && [lindex $::tlsSocketArgs [expr {$requireIndex + 1}]] == 1} "HTTPS socket did not require certificate validation"
-assert {$caIndex >= 0 && [lindex $::tlsSocketArgs [expr {$caIndex + 1}]] eq "/etc/ssl/certs/ca-certificates.crt"} "HTTPS socket did not use the runtime CA bundle"
-rename ::tls::socket {}
-rename ::tls::socket_real ::tls::socket
-
+# TLS chain and hostname verification live in tls.test.tcl, which exercises the
+# same policy against real handshakes instead of captured arguments.
 set nested {"unicode":"Hello, 世界 👋","nested":{"booleans":[true,false],"number":42.5,"nil":null}}
 set raw "\{$nested\}"
 assert {[::convex::field $raw unicode] eq {"Hello, 世界 👋"}} "raw string field was not retained"

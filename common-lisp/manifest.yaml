@@ -31,4 +31,6 @@ limitations:
   - TransitionChunk assembly is deferred and treated as recoverable protocol drift.
   - JSON input is limited to 128 nesting levels and 8192 structural nodes; active Live subscriptions are bounded to 64 entries and 8 MiB of conservatively charged decoded state.
   - One manager-wide queue retains the newest 16 deliveries within a conservative 20 MiB exact-encoded and recursive runtime-overhead budget.
-capabilities: []
+capabilities:
+  - http
+  - live

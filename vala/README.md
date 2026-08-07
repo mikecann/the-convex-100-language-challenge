@@ -1,9 +1,177 @@
-# Vala
+# Convex from Vala
 
-This language client is planned as roster entry 74.
+This native Vala client calls Convex over documented JSON HTTP endpoints and keeps a query current through the repository's pinned Live WebSocket profile.
 
-No implementation exists and no capabilities have been earned.
+It is educational and unofficial. It is not a production SDK and is not intended for package publication.
 
-- Selection tier: `coverage`
-- Implementation status: `planned`
-- Earned capabilities: none
+## Start here
+
+Read [`examples/basics/main.vala`](examples/basics/main.vala). It queries a fresh counter, starts Live before changing it, applies one idempotent mutation, and proves that HTTP and Live agree on `0 -> 1`.
+
+## What works
+
+| Capability | Status |
+| --- | --- |
+| HTTP queries, mutations, actions, and structured errors | Implemented, no earned badge |
+| Live initial values and updates used by the canonical example | Implemented, no earned badge |
+| Full HTTP and Live conformance | Not yet earned |
+
+<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.vala -->
+```vala
+using GLib;
+using Json;
+using Convex;
+
+// Build the shared demo's argument object, including the mutation's optional
+// language label and idempotency key when that operation needs them.
+static Json.Node object_node (string room, string? language = null, string? run_id = null) {
+  var builder = new Builder ();
+  builder.begin_object ();
+  builder.set_member_name ("room");
+  builder.add_string_value (room);
+  if (language != null) {
+    builder.set_member_name ("language");
+    builder.add_string_value (language);
+  }
+  if (run_id != null) {
+    builder.set_member_name ("runId");
+    builder.add_string_value (run_id);
+  }
+  builder.end_object ();
+  return builder.get_root ().copy ();
+}
+
+// Convex may encode an integral JSON number as either 1 or 1.0. Accept both
+// forms while rejecting fractional, non-finite, negative, or overflowing data.
+static int64 count_from (Json.Node? value, string operation) throws Error {
+  if (value == null || value.get_node_type () != NodeType.OBJECT) {
+    throw new ClientError.PROTOCOL (operation + " did not return an object");
+  }
+  // JSON-GLib returns NULL for an absent member, and dereferencing that is a
+  // crash rather than a readable failure, so check before reading the count.
+  if (!value.get_object ().has_member ("count")) {
+    throw new ClientError.PROTOCOL (operation + " returned an object without a count");
+  }
+  var count_node = value.get_object ().get_member ("count");
+  if (count_node.get_node_type () != NodeType.VALUE ||
+      (count_node.get_value_type () != typeof (int64) && count_node.get_value_type () != typeof (double))) {
+    throw new ClientError.PROTOCOL (operation + " returned a non-numeric count");
+  }
+  var count = count_node.get_double ();
+  if (count != count || count < 0 || count >= 9223372036854775808.0) {
+    throw new ClientError.PROTOCOL (operation + " returned an out-of-range count");
+  }
+  int64 integral = (int64) count;
+  if ((double) integral != count) {
+    throw new ClientError.PROTOCOL (operation + " returned a non-integral count");
+  }
+  return integral;
+}
+
+int main (string[] args) {
+  int exit_code = 1;
+  try {
+    var url = Environment.get_variable ("CONVEX_URL");
+    if (url == null || url.length == 0) throw new ClientError.PROTOCOL ("CONVEX_URL is required");
+    var room = args.length > 1 ? args[1] : (Environment.get_variable ("EXAMPLE_ROOM") ?? "vala-example");
+    // Configure one client for the deployment supplied by Docker.
+    var client = new Client (url);
+    // Query the room through Convex's documented HTTP endpoint.
+    var current = count_from (client.query ("demo:state", object_node (room)).value, "current query");
+    stdout.printf ("current count: %" + int64.FORMAT + "\n", current);
+    // Start Live before mutating so no reactive update is missed.
+    var subscription = client.subscribe ("demo:state", object_node (room));
+    var loop = new MainLoop ();
+    int stage = 0;
+    uint timeout_source = 0;
+    subscription.updated.connect ((value, failure) => {
+      try {
+        if (failure != null) {
+          throw new ClientError.PROTOCOL (failure.message);
+        }
+        var observed = count_from (value, stage == 0 ? "initial Live value" : "updated Live value");
+        if (stage == 0) {
+          if (observed != current) {
+            throw new ClientError.PROTOCOL ("initial Live count disagreed with HTTP");
+          }
+          stdout.printf ("live initial count: %" + int64.FORMAT + "\n", observed);
+          // This UUID is the mutation idempotency key, so retries cannot increment twice.
+          var mutation = client.mutation ("demo:increment", object_node (room, "Vala", Uuid.string_random ())).value;
+          // The same absent-member rule applies to the mutation envelope: read
+          // applied and state only once both are present and correctly typed.
+          if (mutation.get_node_type () != NodeType.OBJECT ||
+              !mutation.get_object ().has_member ("applied") || !mutation.get_object ().has_member ("state") ||
+              mutation.get_object ().get_member ("applied").get_value_type () != typeof (bool)) {
+            throw new ClientError.PROTOCOL ("mutation did not return applied and state");
+          }
+          if (!mutation.get_object ().get_boolean_member ("applied")) {
+            throw new ClientError.PROTOCOL ("mutation was not applied");
+          }
+          var mutation_count = count_from (mutation.get_object ().get_member ("state"), "mutation");
+          if (mutation_count != current + 1) {
+            throw new ClientError.PROTOCOL ("mutation returned an unexpected count");
+          }
+          stdout.printf ("mutation applied: true\nmutation count: %" + int64.FORMAT + "\n", mutation_count);
+          stage = 1;
+        } else {
+          if (observed != current + 1) {
+            throw new ClientError.PROTOCOL ("updated Live count disagreed with mutation");
+          }
+          stdout.printf ("live updated count: %" + int64.FORMAT + "\n", observed);
+          stdout.printf ("verified count: %" + int64.FORMAT + " -> %" + int64.FORMAT + "\n", current, observed);
+          // Retire the Live query and its transport after the proof is complete.
+          client.unsubscribe (subscription);
+          client.close ();
+          exit_code = 0;
+          if (timeout_source != 0) Source.remove (timeout_source);
+          loop.quit ();
+        }
+      } catch (Error error) {
+        stderr.printf ("Vala example failed: %s\n", error.message);
+        client.close ();
+        loop.quit ();
+      }
+    });
+    // Fail clearly instead of leaving a viewer with an example that hangs.
+    timeout_source = Timeout.add_seconds (20, () => {
+      stderr.printf ("Vala example timed out\n");
+      client.close ();
+      loop.quit ();
+      return false;
+    });
+    loop.run ();
+    return exit_code;
+  } catch (Error error) {
+    stderr.printf ("Vala example failed: %s\n", error.message);
+    return 1;
+  }
+}
+```
+<!-- END GENERATED EXAMPLE -->
+
+## Docker verification
+
+```sh
+./run sync-examples
+./run validate
+./run test vala
+./run verify-example vala
+```
+
+`test` compiles and runs Vala's language-local adapter checks inside Docker. The final-image probes exercise the exact canonical example and adapter under the runtime policy. Root-owned shared conformance is still required before either capability can be earned.
+
+## Conformance and protocol notes
+
+The client implements Convex-specific HTTP envelopes and the pinned `/api/sync` query-set profile in Vala. libsoup supplies streaming HTTP with a two MiB body limit and one absolute operation deadline, while a GLib/GIO `SocketClient` and TLS connection carry the client-owned RFC6455 handshake, masking, incremental frame parser, control frames, and close deadlines. One GLib-main-context Live owner opens, reads, writes, retires, and reconnects the socket. It commits a complete Transition before publishing updates, validates query-set versions and uint32 bounds, tracks the little-endian timestamp numerically, reports structured failures, and suppresses unchanged rehydration.
+
+HTTP responses are parsed before they are classified, so a Convex function-error envelope keeps its `errorMessage`, `errorData`, and `logLines` on any status, while a malformed or non-envelope non-2xx body stays a transport failure. A body that never satisfied its declared `Content-Length` or chunked framing is a transport failure too, rather than the value its truncated bytes happen to spell. Complete keep-alive chunked responses are supported; chunked responses which also declare `Connection: close` are conservatively refused because libsoup 3.2 does not expose the terminal zero chunk to its decoded stream.
+
+Memory bounds measure what is retained rather than what was serialized. A parsed JSON-GLib tree costs about a hundred bytes per node, so a dense array can retain roughly fifty times its wire size while staying inside every byte-count limit. Untrusted JSON is therefore scanned before it is parsed and refused if its tree would exceed eight MiB retained or nest deeper than sixty-four levels, and delivery relays are generation-tagged and bounded to sixteen reserved queued or in-flight events and eight MiB of retained value, error, log, and runtime representation. Adapter output has a two MiB event cap, conservative in-flight byte accounting, and a one-second default absolute write deadline so a stopped controller cannot pin the process indefinitely.
+
+The test-only adapter accepts strict NDJSON v1 over stdin/stdout or one `ADAPTER_LISTEN` TCP controller. `debugDisconnect` is adapter-only and lets the shared harness prove real reconnections.
+
+## Limitations
+
+The language-local raw peers cover strict HTTP status and bounded streaming, function-error envelopes on non-2xx statuses, truncated `Content-Length` and unterminated chunked bodies, inactivity and continuous-drip deadlines, malformed-envelope recovery, strict RFC6455 upgrade validation, fragmented UTF-8 with control traffic, absolute partial-frame timeout and recovery, tree-shaped frame rejection and recovery, five reconnects with `Add` replay, stale relay barriers, and bounded close. They also exercise queued and in-flight count/byte reservations against both string-shaped and tree-shaped near-maximum values, but they do not replace fresh independent review or root-owned shared conformance.
+
+The retained-JSON bound is a real refusal, not a soft cap. A Convex value whose parsed tree would exceed eight MiB retained is reported as a `ProtocolError` rather than delivered, and a Live frame carrying one retires that connection and reconnects instead of being parsed. That is a deliberate trade: a wire-legal but node-dense payload is refused rather than allowed to exhaust the shared container limit. Live authentication lifecycle, optimistic updates, mutation and action messages over WebSocket, journals, and TransitionChunk assembly are deferred. The manifest deliberately declares no earned badges.

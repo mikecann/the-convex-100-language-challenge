@@ -4,5 +4,28 @@ displayName: "CoffeeScript"
 rank: 62
 selectionTier: coverage
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: transpiled
+  version: 0.1.0
+  notes: CoffeeScript source is compiled to JavaScript during the Docker build. Node.js is the only final runtime and ws supplies WebSocket transport; Convex envelopes, HTTP handling, Live ownership, and reconnect behavior remain implemented in CoffeeScript.
+toolchain:
+  name: CoffeeScript
+  version: 2.7.0
+targetRuntimeCommand: node
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities: [http, live]
+platforms: [linux/amd64]
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands: [debugDisconnect]
+limitations:
+  - Live authentication, optimistic updates, WebSocket mutations/actions, journals, and TransitionChunk assembly are deferred.
+  - Live supports the JSON-safe value subset used by the pinned sync profile.
+  - Each subscription keeps its newest 16 updates; the adapter additionally bounds active subscriptions, input, output, and stalled-controller writes.
+capabilities:
+  - http
+  - live

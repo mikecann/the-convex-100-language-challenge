@@ -12,12 +12,12 @@ It is educational, unofficial, and not a production SDK.
 
 | Capability | Status |
 | --- | --- |
-| HTTP query, mutation, action | Implemented, awaiting shared evidence |
-| Live query updates | Implemented against the pinned profile, awaiting shared evidence |
+| HTTP query, mutation, action | Verified by shared local and hosted conformance |
+| Live query updates | Verified by shared local and hosted conformance |
 | Authentication | HTTP bearer token only |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.swift -->
-```text
+```swift
 import Convex
 import Foundation
 

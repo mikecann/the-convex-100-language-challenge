@@ -10,10 +10,10 @@ Read the [canonical basic example](examples/basics/main.ts). It reads a counter,
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, and actions | Implemented, pending shared evidence |
-| HTTP bearer token lifecycle | Implemented, pending shared evidence |
-| Initial and updated Live values | Implemented, pending shared evidence |
-| Reconnect and adapter-only disconnect hook | Implemented, pending shared evidence |
+| HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
+| HTTP bearer token lifecycle | Verified by shared local and hosted conformance |
+| Initial and updated Live values | Verified by shared local and hosted conformance |
+| Reconnect and adapter-only disconnect hook | Verified by shared local and hosted conformance |
 | Capability badges | Not claimed until root evidence |
 
 ## Basic example

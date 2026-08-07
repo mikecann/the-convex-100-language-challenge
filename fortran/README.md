@@ -18,7 +18,7 @@ It is unofficial educational material, not a production SDK.
 | Capability badges | Not claimed until the root integration owner records shared local and hosted conformance evidence |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.f90 -->
-```text
+```fortran
 program basics
   use convex_fortran
   implicit none

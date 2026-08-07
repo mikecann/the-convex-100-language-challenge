@@ -28,4 +28,6 @@ adapter:
 limitations:
   - The educational client supports the JSON-safe Convex value subset only.
   - Live authentication, TransitionChunk assembly, optimistic updates, and mutation replay are deferred.
-capabilities: []
+capabilities:
+  - http
+  - live

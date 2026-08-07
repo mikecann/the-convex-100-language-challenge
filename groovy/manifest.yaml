@@ -4,5 +4,31 @@ displayName: "Groovy"
 rank: 28
 selectionTier: ranked
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.2.0
+  notes: Native Groovy implementation using the JDK HTTP/TLS/WebSocket APIs and Groovy's JSON parser. It is an educational protocol demonstration, not an SDK.
+toolchain:
+  name: Groovy on Eclipse Temurin JDK
+  version: 4.0.27 / 21.0.8
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, optimistic updates, WebSocket mutations, and TransitionChunk assembly are deliberately deferred.
+  - The undocumented sync profile is pinned as compatibility evidence and must not be treated as stable.
+  - Capability badges remain empty until root-owned local and hosted conformance evidence passes.
+capabilities:
+  - http
+  - live

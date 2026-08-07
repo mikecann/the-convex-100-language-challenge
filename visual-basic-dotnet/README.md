@@ -15,12 +15,12 @@ image.
 
 | Capability | Status |
 | --- | --- |
-| JSON HTTP queries, mutations, and actions | Implemented, awaiting root-owned shared evidence |
-| Live query subscriptions | Experimental pinned profile, awaiting root-owned shared evidence |
+| JSON HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
+| Live query subscriptions | Verified by shared local and hosted conformance |
 | Authentication | HTTP bearer tokens only |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Program.vb -->
-```text
+```vbnet
 Imports System.Text.Json.Nodes
 Imports ConvexVisualBasic
 

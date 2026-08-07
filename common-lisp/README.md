@@ -12,13 +12,13 @@ Read [`examples/basics/main.lisp`](examples/basics/main.lisp). It queries a fres
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, and actions | Implemented, awaiting shared evidence |
-| Bearer authentication and structured function errors | Implemented, awaiting shared evidence |
-| Live initial values, updates, and query-error recovery | Implemented, awaiting shared evidence |
-| Remove, five reconnects, generation barriers, and bounded delivery | Implemented, awaiting shared evidence |
+| HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
+| Bearer authentication and structured function errors | Verified by shared local and hosted conformance |
+| Live initial values, updates, and query-error recovery | Verified by shared local and hosted conformance |
+| Remove, five reconnects, generation barriers, and bounded delivery | Verified by shared local and hosted conformance |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.lisp -->
-```text
+```common-lisp
 (in-package #:convex)
 
 (defun example-count (value operation)

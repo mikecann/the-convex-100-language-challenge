@@ -71,17 +71,16 @@ function readOptionalResult(directory, languageId) {
 }
 
 const syntaxAliases = {
-  "c-sharp": "csharp",
-  "f-sharp": "fsharp",
+  "assembly-x86-64": "asm",
+  "delphi-object-pascal": "pascal",
   fortran: "fortran-free-form",
-  "objective-c": "objective-c",
-  "visual-basic-net": "vb",
+  "visual-basic-dotnet": "vb",
+  "wolfram-language": "wolfram",
 };
 
 const extensionAliases = {
   clj: "clojure",
   cs: "csharp",
-  dart: "dart",
   erl: "erlang",
   fs: "fsharp",
   fsx: "fsharp",
@@ -90,20 +89,29 @@ const extensionAliases = {
   hs: "haskell",
   hpp: "cpp",
   kts: "kotlin",
-  lua: "lua",
   m: "objective-c",
   ml: "ocaml",
   mli: "ocaml",
   pl: "perl",
   ps1: "powershell",
   py: "python",
-  r: "r",
   rb: "ruby",
   rs: "rust",
-  scala: "scala",
   sh: "bash",
   ts: "typescript",
 };
+
+// Aliases are promises that the bundled highlighter can actually keep. Fail
+// the site build if a future edit invents a plausible-looking identifier that
+// Shiki silently degrades to plain text.
+for (const [alias, target] of [
+  ...Object.entries(syntaxAliases),
+  ...Object.entries(extensionAliases),
+]) {
+  if (!(target in bundledLanguages)) {
+    throw new Error(`syntax alias ${alias} resolves to unavailable Shiki language ${target}`);
+  }
+}
 
 function syntaxFor(languageId, file) {
   const extension = path.extname(file).slice(1).toLowerCase();

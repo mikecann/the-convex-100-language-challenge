@@ -55,11 +55,31 @@ network, compiler, and delegated-runtime commands. Use a restricted build or
 separate binaries when the stock multicall surface is too broad.
 
 The runtime probe rejects Node.js and Python unless the manifest declares the
-one approved `targetRuntimeCommand` for JavaScript or Python. This exempts only
+one approved `targetRuntimeCommand` for that language. This exempts only
 the interpreter that genuinely executes that target-language client. Package
 tooling and every other delegated runtime remain forbidden. Extending the
 allowance to another language requires a separate shared-infrastructure review;
 do not weaken it inside a language branch.
+
+A language that compiles to JavaScript may be approved for `node`, because a
+compile-to-JavaScript language has no other execution target and node is then
+the interpreter that genuinely runs its own compiled client. Such a client must
+declare `provenance: transpiled` and still implement every Convex behaviour in
+the target language; delegating protocol work to an existing JavaScript Convex
+client remains forbidden and would earn the bridge label instead.
+
+Emulation engines are not interchangeable build surfaces. Rosetta-backed
+Docker on Apple Silicon reliably runs heavy amd64 toolchains; QEMU-based
+engines segfault many of them (observed: Julia Pkg precompile, PureScript
+purs, Crystal LLVM codegen, nimpretty, BCPL Cintcode, the MoonBit bundler)
+before any client source is touched. A toolchain crash that precedes the
+client's own code is an environment artifact, not a source defect: rerun it
+on a Rosetta or native host before diagnosing the client. Route heavy
+LLVM/JIT/AOT toolchains to Rosetta or native hosts and keep QEMU hosts for
+gcc- and BEAM-class builds. AOT-compiled runtimes must exercise every
+adapter command flow, including failure reporting, during the ahead-of-time
+workout; a specialization first reached during shared conformance fails the
+whole run.
 
 Do not infer that a minimal runtime works because the build or test stage works.
 Before handoff, execute the exact `/usr/local/bin/convex-example` and
@@ -277,6 +297,10 @@ them before discovering what the example does.
   leave shared verification and shared-infrastructure edits to the coordinator.
   Finish independent review and root-owned verification in bounded waves; a
   large pile of compile-only branches is not useful progress.
+- An agent that starts a build on a remote host owns it to completion inside
+  its own task: poll the remote log actively until the run concludes. Do not
+  hand off to an external monitor or end the task with a build unresolved;
+  nothing wakes a finished task when a remote job completes.
 
 ## Language handoff checklist
 
@@ -308,6 +332,27 @@ integration agent must run the shared commands serially and add to the handoff:
 Run shared evidence after committing the reviewed source. A successful run
 with `dirty: true` or a `sourceCommit` that predates the reviewed tip must be
 rerun from the clean commit before a PR is opened.
+
+When shared evidence passes and the evaluator awards capabilities, record the
+award in one complete truth-up commit — manifest capability list, README status
+table, and every stale pending-verification or no-conformance line together —
+then rerun the shared evidence once from that head. Every extra cleanup commit
+after a green run costs a full rerun under the exact-head rule, so sweep the
+language directory for stale claims before rerunning, not after.
+
+Exception: a follow-up commit whose diff is provably limited to the manifest
+`capabilities:` list and README prose does not invalidate the parent commit's
+evidence. The Docker build inputs are unchanged and the evaluator computes the
+award from test results, not the manifest, so the PR may cite the evidence
+from the parent commit explicitly instead of rerunning. Any change touching
+the Dockerfile, client, examples, or any other manifest field forfeits this
+exception.
+
+Fixtures authored inside a checkpoint that has never executed are not
+evidence-bearing. When such a fixture encodes an environment-hostile
+parameterization, adjust the parameterization minimally with coordinator
+sign-off and a comment preserving the tested intent; do not treat the blind
+fixture as authoritative, and do not silently weaken the behavior it proves.
 
 Generated, gitignored evidence under `_shared/results/local/` and
 `_shared/results/hosted/` is exempt from the directory-only handoff rule. It is

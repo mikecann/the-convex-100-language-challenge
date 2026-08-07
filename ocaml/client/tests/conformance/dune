@@ -1,0 +1,19 @@
+(executable
+ (name main)
+ (modules main)
+ (libraries convex unix threads yojson))
+
+; The fixtures link the client so a WebSocket handshake can be answered with a
+; real Sec-WebSocket-Accept. That shared function is pinned against the
+; published RFC 6455 vector in the client's own tests.
+
+(executable
+ (name adapter_tests)
+ (modules adapter_tests)
+ (libraries convex unix threads yojson))
+
+(rule
+ (alias runtest)
+ (deps main.exe)
+ (action
+  (run ./adapter_tests.exe ./main.exe)))

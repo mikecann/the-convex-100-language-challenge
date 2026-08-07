@@ -4,5 +4,29 @@ displayName: "PowerShell"
 rank: 20
 selectionTier: ranked
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.2.0
+  notes: Native PowerShell implementation using only System.Net.Http and System.Net.WebSockets for ordinary transport primitives. Capability badges stay empty until root-owned evidence passes.
+toolchain:
+  name: PowerShell
+  version: 7.5.0
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities: [http, live]
+platforms: [linux/amd64]
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands: [debugDisconnect]
+limitations:
+  - Live authentication, optimistic updates, transition chunks, WebSocket mutations, and actions are deferred.
+  - Live values use the JSON-safe subset exercised by this demonstration.
+  - Live delivery keeps the newest 16 events per subscription within a global 64-event and 8 MiB encoded-output budget.
+  - Adapter output over stdout and TCP alike permits one event within an 18 MiB encoded/runtime reservation and terminates the stream after a one-second cumulative serialize, write, newline, and flush deadline.
+  - Live socket work uses one cumulative cancellable owner deadline across connect, the initial Connect frame, and replayed query-set changes; assembling one message has an absolute deadline that a continuously sending peer cannot extend.
+capabilities:
+  - http
+  - live
