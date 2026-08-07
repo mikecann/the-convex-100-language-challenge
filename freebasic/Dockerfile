@@ -294,6 +294,15 @@ RUN rm -rf /var/lib/apt /var/lib/dpkg /var/cache/apt /var/cache/debconf /var/log
 COPY --from=runtime-libs /runtime-root/usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
 COPY --from=runtime-libs /runtime-root/etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=runtime-libs /runtime-root/etc/ssl/openssl.cnf /etc/ssl/openssl.cnf
+# This image's OpenSSL was built with OPENSSLDIR=/usr/lib/ssl (confirmed with
+# `openssl version -d` in the test stage), so SSL_CTX_set_default_verify_paths
+# looks there by default and finds nothing -- the CA bundle above lives at
+# Debian's conventional /etc/ssl/certs instead. SSL_CERT_FILE/SSL_CERT_DIR are
+# checked ahead of the compiled-in default, so setting them here is what
+# actually makes hosted TLS verification succeed rather than fail closed.
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_DIR=/etc/ssl/certs \
+    OPENSSL_CONF=/etc/ssl/openssl.cnf
 USER 65532:65532
 
 FROM runtime-base AS example-runtime
