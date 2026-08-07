@@ -33,6 +33,7 @@ global convex_conn_write_all
 global convex_conn_read_some
 global convex_http_exchange
 global find_bytes
+global ci_find
 
 ; --- URL parsing ------------------------------------------------------------
 
