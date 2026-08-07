@@ -554,7 +554,8 @@ private sub HandleCommand(byref textLine as string)
   select case op
     case "hello"
       dim as ulongint version
-      if not JsonUnsignedField(commandValue, "protocolVersion", version) orelse version <> 1 then
+      if not JsonUnsignedField(commandValue, "protocolVersion", version) _
+          orelse version <> 1 then
         FaultSet(fault, FAULT_PROTOCOL, "unsupported adapter protocol version")
         GateEmit(RenderError(id, fault))
       else
