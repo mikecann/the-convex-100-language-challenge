@@ -180,11 +180,16 @@ parseValue bytes index depth nodes =
         eitherThen (parseString bytes (index + 1)) \text ->
           Right { value: JsonString text.text, index: text.index, nodes: nodes }
       else if byte == 0x5B then
-        parseArray bytes (Bytes.skipWhitespace bytes (index + 1)) (depth + 1)
-          (nodes + 1)
+        -- An empty array or object closes without another `parseValue` call,
+        -- so the bound has to be checked against the nesting level being
+        -- entered here, not deferred to a contained value that may not exist.
+        if depth + 1 > maxDepth then Left "JSON nesting is too deep"
+        else parseArray bytes (Bytes.skipWhitespace bytes (index + 1))
+          (depth + 1) (nodes + 1)
       else if byte == 0x7B then
-        parseObject bytes (Bytes.skipWhitespace bytes (index + 1)) (depth + 1)
-          (nodes + 1)
+        if depth + 1 > maxDepth then Left "JSON nesting is too deep"
+        else parseObject bytes (Bytes.skipWhitespace bytes (index + 1))
+          (depth + 1) (nodes + 1)
       else if isNumberStart byte then parseNumberToken bytes index nodes
       else Left "unexpected JSON byte"
 

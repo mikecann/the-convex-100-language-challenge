@@ -94,9 +94,12 @@ RUN set -eu; \
 # Type-check and emit CoreFn, then translate that to Erlang. `purs` never sees
 # the `.erl` files; it records the foreign imports and `purerl` resolves them.
 RUN purs compile --codegen corefn $(find src -name '*.purs')
-# The CoreFn documents are named explicitly rather than left to purerl's
-# default glob, so a change in that default cannot silently translate nothing.
-RUN purerl output/*/corefn.json
+# purerl's positional FILES argument loads `.purs` sources for its REPL; it is
+# not a way to hand it a list of corefn.json paths, and passing one produces
+# an optparse-applicative "Missing:" usage error rather than a compile error.
+# With no arguments purerl walks its default `-o` directory (also "output",
+# the same one `purs` just wrote) and translates every module it finds there.
+RUN purerl
 
 # Collect the generated Erlang alongside the hand-written FFI. purerl copies
 # each foreign module into its output directory; the fallback below keeps a
