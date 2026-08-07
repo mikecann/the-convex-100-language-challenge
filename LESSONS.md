@@ -169,6 +169,17 @@ The agent that hit it stopped, read the reflog, diagnosed the race, and reported
 it instead of retrying into it. That was the right call and it saved a
 misdiagnosis. Every agent now gets its own clone.
 
+The same mistake then appeared in a second form: two verification runs started
+concurrently on one machine. Verification deliberately shares a backend, a
+network, a controller image, and an evidence directory, so it must run serially
+— two runs would have interleaved their results into each other's evidence
+files. Caught before either finished.
+
+The pattern behind both: **scaling out agents keeps colliding with resources
+that are shared implicitly rather than declared.** A git working directory and
+an evidence directory are both invisible singletons until two workers reach for
+them. Worth auditing for those before adding parallelism, not after.
+
 A second incident is worth recording. A coordination instruction reached one
 agent embedded inside a tool result rather than as a direct message. It declined
 to act on it, reasoning that instructions arriving through that channel are not
@@ -176,7 +187,44 @@ trustworthy and that this one contradicted its original briefing. The
 instruction happened to be legitimate. The caution was still correct, and it is
 exactly the behaviour you want when a message like that is *not* legitimate.
 
-## 9. Not everything on the list can be done honestly
+## 9. Ahead-of-time compilation only knows the paths you rehearsed
+
+Julia's client compiles to a standalone binary ahead of time, with no
+just-in-time fallback at run time. That makes an ordinary omission fatal: any
+code path the pre-compilation workout never executed simply has no machine code,
+and reaching it at run time aborts the process.
+
+The failures arrived one layer at a time, and each was a path nobody thought to
+rehearse. First a reconnect crashed. Fixing that revealed that the *error
+reporting* for such a crash was itself uncompiled — the binary could not even
+describe what had gone wrong, because formatting that particular exception was
+also a path never taken. Behind that sat the real prize: delivering a
+`QueryFailed` transition, a genuine function-level error from the server, had
+never once been exercised, because every test fixture ever written for this
+client sent only successful updates.
+
+The general shape is worth remembering: **when a system has no fallback, your
+test corpus becomes the definition of what exists.** The unexercised error path
+is the one that fails at 3am, and here it could not even print why.
+
+## 10. Sometimes the bug belongs to someone else
+
+Midway through, every Julia build began failing before reaching project code.
+Julia's package server advertised a registry hash as current and its storage
+backend returned 404 for that exact hash — a real inconsistency in Julia's own
+CDN, reproduced from two machines on different continents.
+
+Two things made this tractable. The agent doing the work stated plainly that it
+believed the failure was not its own, rather than thrashing on its code. And the
+claim was cheaply checkable: two `curl` commands from unrelated networks either
+reproduce it or they do not.
+
+The resolution was not to wait. Julia's package server is a cache in front of a
+git registry, so the build now clones the registry directly — slower, and one
+fewer layer that can serve stale metadata. **A workaround that removes a
+dependency is an improvement; a workaround that adds a retry is a delay.**
+
+## 11. Not everything on the list can be done honestly
 
 Eleven of the hundred cannot be built under the project's own rules: they need
 proprietary licences, hosted-only platforms, or GUI-bound toolchains. Apex runs
@@ -190,7 +238,7 @@ They are recorded in `INFEASIBLE.md` with reasons and with replacement
 candidates, rather than quietly dropped or faked with a lookalike. "We tried and
 here is exactly why it cannot be done" is a real result.
 
-## 10. Miscellaneous findings worth a slide
+## 12. Miscellaneous findings worth a slide
 
 - A client passed every check except one, and the one failure was in the
   *reference* implementation used for comparison, not the client under test.
