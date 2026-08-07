@@ -196,6 +196,14 @@ COPY --from=test /lib/x86_64-linux-gnu/libdl.so.2 /lib/x86_64-linux-gnu/libdl.so
 # which then resolves through the symlink to the real file.
 COPY --from=test /usr/lib/x86_64-linux-gnu/libcob.so.5 /usr/lib/x86_64-linux-gnu/libcob.so.5
 COPY --from=test /usr/lib/x86_64-linux-gnu/libcob.so.5.0.0 /usr/lib/x86_64-linux-gnu/libcob.so.5.0.0
+# libcob itself links against GMP (COBOL's arbitrary-precision decimal
+# arithmetic) and ncurses/tinfo (its optional screen-handling support,
+# linked in regardless of whether this client's programs ever use
+# ACCEPT/DISPLAY screen sections). Confirmed with ldd against the
+# compiled convex-adapter and convex-example binaries, not assumed.
+COPY --from=test /usr/lib/x86_64-linux-gnu/libgmp.so.10 /usr/lib/x86_64-linux-gnu/libgmp.so.10
+COPY --from=test /usr/lib/x86_64-linux-gnu/libncursesw.so.6 /usr/lib/x86_64-linux-gnu/libncursesw.so.6
+COPY --from=test /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.6
 COPY --from=test /usr/lib/x86_64-linux-gnu/libssl.so.3 /usr/lib/x86_64-linux-gnu/libssl.so.3
 COPY --from=test /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /usr/lib/x86_64-linux-gnu/libcrypto.so.3
 COPY --from=test /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so
@@ -230,6 +238,9 @@ COPY --from=test /usr/bin/sed /usr/bin/sed
 COPY --from=test /usr/bin/mawk /usr/bin/awk
 COPY --from=test /lib/x86_64-linux-gnu/libselinux.so.1 /lib/x86_64-linux-gnu/libselinux.so.1
 COPY --from=test /lib/x86_64-linux-gnu/libpcre2-8.so.0 /lib/x86_64-linux-gnu/libpcre2-8.so.0
+# sed links against libacl for its extended-attribute-aware file mode;
+# nothing else copied here needs it.
+COPY --from=test /lib/x86_64-linux-gnu/libacl.so.1 /lib/x86_64-linux-gnu/libacl.so.1
 
 ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
     OPENSSL_MODULES=/usr/lib/x86_64-linux-gnu/ossl-modules \
