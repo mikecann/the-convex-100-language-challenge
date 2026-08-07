@@ -449,13 +449,13 @@ private function LiveModifyMessageLocked( _
   dim as JsonValue ptr modifications = JsonNew(JSON_ARRAY)
   dim as LiveSubscription ptr scan = manager->subscriptions
   while scan <> 0
-    dim as boolean include = false
+    dim as boolean includeScan = false
     if chosen <> 0 then
-      include = (scan = chosen)
+      includeScan = (scan = chosen)
     else
-      include = scan->active andalso (not scan->removePending)
+      includeScan = scan->active andalso (not scan->removePending)
     end if
-    if include then
+    if includeScan then
       dim as JsonValue ptr entry = JsonNew(JSON_OBJECT)
       if removing then
         JsonSet(entry, "type", JsonNewString("Remove"))
