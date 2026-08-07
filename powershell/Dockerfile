@@ -2,7 +2,14 @@
 ARG POWERSHELL_IMAGE=mcr.microsoft.com/powershell:7.5-debian-12@sha256:7ab5bd5ca6f95a3351fa0c6a1205237d57048c94542355aab55519a0861a9b25
 ARG RUNTIME_IMAGE=alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 
-FROM ${POWERSHELL_IMAGE} AS formatter
+# PSScriptAnalyzer's compiled analyzer/formatter segfaults under QEMU when a
+# linux/amd64 build is forced on an arm64 host (see elixir/Dockerfile and
+# erlang/Dockerfile for the same split applied to `mix format`/`erlc`).
+# Formatting only reads and rewrites source text, so the check has no
+# architecture-specific outcome: run it natively on BUILDPLATFORM and let the
+# target-platform stages below consume its already-verified output via COPY
+# instead of re-running PSScriptAnalyzer itself under emulation.
+FROM --platform=$BUILDPLATFORM ${POWERSHELL_IMAGE} AS formatter
 WORKDIR /opt/convex
 RUN pwsh -NoLogo -NoProfile -Command 'Set-PSRepository PSGallery -InstallationPolicy Trusted; Install-Module PSScriptAnalyzer -RequiredVersion 1.24.0 -Scope AllUsers; if ((Get-Module PSScriptAnalyzer -ListAvailable).Version -ne [version]"1.24.0") { exit 1 }'
 COPY client ./client
@@ -11,7 +18,16 @@ RUN cp -a client /tmp/client-before && cp -a examples /tmp/examples-before && \
     pwsh -NoLogo -NoProfile -Command 'Get-ChildItem client,examples -Recurse -Filter *.ps1 | ForEach-Object { $formatted = Invoke-Formatter -ScriptDefinition (Get-Content -Raw $_.FullName); [IO.File]::WriteAllText($_.FullName, $formatted, [Text.UTF8Encoding]::new($false)) }' && \
     diff -ru /tmp/client-before client && diff -ru /tmp/examples-before examples
 
-FROM formatter AS test
+# The formatter stage above already proved client/examples are correctly
+# formatted; that source text is architecture-independent, so pull it in via
+# COPY rather than inheriting formatter's BUILDPLATFORM layers. Everything
+# from here down builds and runs on the real (target) platform, so the
+# genuineness assertions immediately below prove the shipped/tested artifacts
+# are actual linux/amd64, never emulated-then-relabelled BUILDPLATFORM output.
+FROM ${POWERSHELL_IMAGE} AS test
+WORKDIR /opt/convex
+COPY --from=formatter /opt/convex/client ./client
+COPY --from=formatter /opt/convex/examples ./examples
 ENV DOTNET_GCHeapHardLimit=0x6000000
 ENV DOTNET_GCConserveMemory=9
 RUN test "$(dpkg --print-architecture)" = amd64 && test "$(uname -m)" = x86_64 && \
@@ -30,8 +46,16 @@ CMD ["pwsh", "-NoLogo", "-NoProfile", "-Command", "exit 0"]
 
 # Host-side stopped-reader verification uses this image as a separately capped
 # controller and HTTP fixture. The adapter itself still comes from the final
-# runtime target and runs in its own 128 MiB cgroup.
-FROM formatter AS stopped-reader-controller
+# runtime target and runs in its own 128 MiB cgroup. stopped-reader-proof.sh
+# later runs this image with `docker run --platform linux/amd64`, so — like
+# the test stage above — it is built fresh from POWERSHELL_IMAGE on the target
+# platform and only pulls the format-verified source via COPY, rather than
+# inheriting formatter's BUILDPLATFORM layers (which would leave a non-amd64
+# image under that forced amd64 run request on an emulated host).
+FROM ${POWERSHELL_IMAGE} AS stopped-reader-controller
+WORKDIR /opt/convex
+COPY --from=formatter /opt/convex/client ./client
+COPY --from=formatter /opt/convex/examples ./examples
 ENTRYPOINT ["pwsh", "-NoLogo", "-NoProfile", "-File", "client/tests/conformance/stopped-reader-controller.ps1"]
 
 FROM ${POWERSHELL_IMAGE} AS runtime-rootfs

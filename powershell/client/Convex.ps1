@@ -36,7 +36,20 @@ function ConvertTo-ConvexJson {
 
 function ConvertFrom-ConvexJson {
     param([Parameter(Mandatory)][string] $Text)
-    $Text | ConvertFrom-Json -AsHashtable -Depth $script:ConvexJsonDepth
+    # The built-in ConvertFrom-Json cmdlet silently substitutes U+FFFD for an
+    # unpaired UTF-16 surrogate that decoded out of a \uXXXX escape. That would
+    # let a lone-surrogate adapter command id slip past the surrogate-pair walk
+    # in Assert-AdapterCommand as a valid (replaced) character instead of
+    # failing it as a structured ProtocolError. Route through the same
+    # System.Text.Json parser already used for HTTP bodies (ConvertFrom-ConvexJsonBytes),
+    # which preserves an ill-formed lone surrogate exactly as decoded.
+    $document = [Text.Json.JsonDocument]::Parse($Text)
+    try {
+        ConvertFrom-ConvexJsonElement $document.RootElement
+    }
+    finally {
+        $document.Dispose()
+    }
 }
 
 function ConvertFrom-ConvexJsonElement {
