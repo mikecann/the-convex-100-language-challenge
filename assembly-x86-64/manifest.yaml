@@ -34,7 +34,6 @@ syncProfile:
   endpoint: /api/sync
 intendedCapabilities:
   - http
-  - live
 platforms:
   - linux/amd64
 adapter:
