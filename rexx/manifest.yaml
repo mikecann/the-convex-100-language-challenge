@@ -71,4 +71,6 @@ limitations:
     The C shim is deliberately narrow: raw connect/listen/accept/send/recv/
     close and the OpenSSL handshake only. No Convex, HTTP, JSON, or
     WebSocket behaviour lives in C.
-capabilities: []
+capabilities:
+  - http
+  - live
