@@ -2216,10 +2216,11 @@ convex_live_poll_fd:
 %define LN_LIVE -40
 %define LN_WAIT -48
 %define LN_PFD -56          ; pollfd, 8 bytes: rbp-56..rbp-49
+%define LN_TMP -64
 convex_live_next:
     push rbp
     mov rbp, rsp
-    sub rsp, 64
+    sub rsp, 80
     mov [rbp+LN_SUB], rdi
     mov [rbp+LN_OUT], rsi
     mov [rbp+LN_TIMEOUT], rdx
@@ -2238,8 +2239,14 @@ convex_live_next:
 
     mov rdi, [rbp+LN_LIVE]
     call convex_live_maintain
+    mov edi, 12
+    call dbg_mark
 
     call monotonic_ms
+    mov [rbp+LN_TMP], rax
+    mov edi, 13
+    call dbg_mark
+    mov rax, [rbp+LN_TMP]
     cmp rax, [rbp+LN_DEADLINE]
     jge .timed_out
     mov rcx, [rbp+LN_DEADLINE]
@@ -2252,6 +2259,10 @@ convex_live_next:
 
     mov rdi, [rbp+LN_LIVE]
     call convex_live_poll_fd
+    mov [rbp+LN_TMP], rax
+    mov edi, 14
+    call dbg_mark
+    mov rax, [rbp+LN_TMP]
     cmp rax, 0
     jl .no_fd
 
@@ -2262,13 +2273,21 @@ convex_live_next:
     mov esi, 1
     mov edx, [rbp+LN_WAIT]
     call poll
+    mov [rbp+LN_TMP], rax
+    mov edi, 15
+    call dbg_mark
+    mov rax, [rbp+LN_TMP]
     cmp eax, 0
     jle .loop
     movzx eax, word [rbp+LN_PFD + pollfd.revents]
     test eax, POLLIN
     jz .loop
+    mov edi, 16
+    call dbg_mark
     mov rdi, [rbp+LN_LIVE]
     call convex_live_service_socket
+    mov edi, 17
+    call dbg_mark
     jmp .loop
 .no_fd:
     xor edi, edi
@@ -2292,6 +2311,7 @@ convex_live_next:
 %undef LN_LIVE
 %undef LN_WAIT
 %undef LN_PFD
+%undef LN_TMP
 
 section .rodata
     dbg_nl_live: db 10
