@@ -189,6 +189,40 @@ feature {NONE} -- Initialization
 			else
 				print ("LIVE_UPDATE_TIMEOUT%N")
 			end
+			client.live.pending_events.wipe_out
+
+			-- Prove reconnect: force-drop the transport (simulating
+			-- debugDisconnect), then confirm the subscription keeps
+			-- delivering updates after ensure_connected re-establishes it.
+			client.live.force_disconnect
+			print ("AFTER_FORCE_DISCONNECT is_connected=" + client.live.is_connected.out + "%N")
+			client.live.ensure_connected
+			print ("AFTER_RECONNECT is_connected=" + client.live.is_connected.out + "%N")
+
+			mutation_args.put_field ("runId", create {CONVEX_JSON_VALUE}.make_string (room + "-twice"))
+			mutation_result := client.mutation ("demo:increment", mutation_args)
+			if mutation_result /= Void and then mutation_result.is_success then
+				print ("RECONNECT_MUTATION_OK applied=" + mutation_result.value.field ("applied").boolean_item.out + "%N")
+			end
+
+			got_update := False
+			deadline_ms := 8000
+			from until got_update or deadline_ms <= 0
+			loop
+				create poll
+				if client.live.is_connected and then poll.wait_readable (client.live.descriptor, 200) then
+					client.live.poll (200)
+				end
+				if not client.live.pending_events.is_empty then
+					got_update := True
+				end
+				deadline_ms := deadline_ms - 200
+			end
+			if got_update then
+				print ("RECONNECT_LIVE_UPDATED: " + client.live.pending_events.first.value.field ("count").number_item.out + "%N")
+			else
+				print ("RECONNECT_LIVE_UPDATE_TIMEOUT%N")
+			end
 		end
 
 	fresh_suffix_number: INTEGER
