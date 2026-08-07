@@ -39,4 +39,6 @@ limitations:
   - ws enforces a 2 MiB message bound and 5 second handshake deadline. A 5 second ping/pong guard retires an incomplete-frame socket within 10 seconds; this delegated behaviour still needs a hostile-peer Docker proof.
   - HTTP response bodies are streamed under a 2 MiB decoded-body limit and 10 second absolute deadline. Live delivery uses a bounded newest-value queue per subscription of 16 updates and 1 MiB, and the adapter bounds its own unflushed output to 16 records and 8 MiB.
 targetRuntimeCommand: node
-capabilities: []
+capabilities:
+  - http
+  - live

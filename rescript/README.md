@@ -22,11 +22,11 @@ transcript.
 
 | Capability | State |
 | --- | --- |
-| HTTP query, mutation, action | Implemented, awaiting shared evidence |
-| Bearer token set, replace, clear | Implemented, awaiting shared evidence |
-| Structured `ConvexError` data and log lines | Implemented, awaiting shared evidence |
-| Live subscribe, unsubscribe, reconnect, replay | Implemented, awaiting shared evidence |
-| Reactive query failure and recovery | Implemented, awaiting shared evidence |
+| HTTP query, mutation, action | Implemented, verified by shared conformance |
+| Bearer token set, replace, clear | Implemented, verified by shared conformance |
+| Structured `ConvexError` data and log lines | Implemented, verified by shared conformance |
+| Live subscribe, unsubscribe, reconnect, replay | Implemented, verified by shared conformance |
+| Reactive query failure and recovery | Implemented, verified by shared conformance |
 | Earned capability badges | None |
 
 Nothing in this table is a badge. The Docker `test` target formats, compiles,
