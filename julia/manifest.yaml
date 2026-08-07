@@ -28,4 +28,6 @@ limitations:
   - Live authentication, WebSocket mutations and actions, optimistic updates, journals, and TransitionChunk assembly are deferred.
   - The client accepts the JSON-safe Convex value subset used by this experiment.
   - Capability badges remain unearned until root-owned shared verification passes.
-capabilities: []
+capabilities:
+  - http
+  - live
