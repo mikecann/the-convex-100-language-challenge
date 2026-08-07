@@ -27,4 +27,6 @@ limitations:
   - Live delivery keeps the newest 16 events per subscription within a global 64-event and 8 MiB encoded-output budget.
   - Adapter output over stdout and TCP alike permits one event within an 18 MiB encoded/runtime reservation and terminates the stream after a one-second cumulative serialize, write, newline, and flush deadline.
   - Live socket work uses one cumulative cancellable owner deadline across connect, the initial Connect frame, and replayed query-set changes; assembling one message has an absolute deadline that a continuously sending peer cannot extend.
-capabilities: []
+capabilities:
+  - http
+  - live

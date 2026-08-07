@@ -12,9 +12,9 @@ The [canonical basic example](examples/basics/main.ps1) makes the counter's `0 -
 
 | Capability | Status |
 | --- | --- |
-| JSON HTTP queries, mutations, and actions | Implemented, pending shared evidence |
-| Pinned `/api/sync` Live reads | Implemented, pending shared evidence |
-| Capability badges | None earned yet |
+| JSON HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
+| Pinned `/api/sync` Live reads | Verified by shared local and hosted conformance |
+| Capability badges | http, live — awarded by the shared evaluator from clean exact-head local and hosted runs |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.ps1 -->
 ```text
