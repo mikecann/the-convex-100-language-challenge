@@ -51,8 +51,6 @@ func _test_rejected_numbers(harness: ConvexTestHarness) -> void:
 	harness.failed(ConvexValues.count_from_json(NAN, "count"), "ProtocolError", "NaN is refused")
 	var huge := ConvexValues.count_from_json(1.0e30, "count")
 	harness.failed(huge, "ProtocolError", "a count beyond exact integers is refused")
-	var rounded := ConvexValues.parse_object('{"value":9007199254740993}', "body")
-	harness.failed(rounded, "ProtocolError", "a rounded JSON integer is refused")
 
 
 # JSON.stringify would emit a bare inf token for a non-finite float, so values
@@ -118,6 +116,15 @@ func _test_object_parsing(harness: ConvexTestHarness) -> void:
 	harness.failed(broken, "ProtocolError", "malformed JSON is refused")
 	var empty := ConvexValues.parse_object("", "body")
 	harness.failed(empty, "ProtocolError", "an empty body is refused")
+	# parse_object no longer walks the whole document for is_json_safe: a real
+	# Live "Transition" carries a nanosecond serverTs nowhere near exact that
+	# this client never reads as a number, and rejecting the envelope over it
+	# would fail every Live update a real deployment sends. Callers that
+	# actually decode a field as a number - _decode_envelope's success value,
+	# _transition_entry's QueryUpdated value - hold that field to
+	# is_json_safe themselves instead.
+	var oversized_field := ConvexValues.parse_object('{"value":9007199254740993}', "body")
+	harness.succeeded(oversized_field, "an oversized field parses; only named consumers reject it")
 
 
 func _timestamp(value: int) -> String:

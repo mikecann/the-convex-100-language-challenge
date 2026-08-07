@@ -163,6 +163,18 @@ func _test_broken_envelopes(harness: ConvexTestHarness, fixture: ConvexHttpFixtu
 	var no_value := client.query("demo:state", {})
 	harness.failed(no_value, "ProtocolError", "a success envelope without a value is refused")
 
+	# The envelope carries protocol metadata this client never reads as a
+	# number - real deployments send a nanosecond serverTs on Live messages
+	# that is nowhere near this exact - so only the value itself, the part a
+	# caller actually decodes as a number, is held to is_json_safe.
+	fixture.queue(200, '{"status":"success","value":1,"serverTs":1786132596447083569}')
+	var metadata_only := client.query("demo:state", {})
+	harness.succeeded(metadata_only, "an oversized field outside value does not fail the call")
+
+	fixture.queue(200, '{"status":"success","value":9007199254740993}')
+	var unsafe_value := client.query("demo:state", {})
+	harness.failed(unsafe_value, "ProtocolError", "a value beyond exact integers is refused")
+
 	fixture.queue(200, '{"status":"queued"}')
 	var unknown := client.query("demo:state", {})
 	harness.failed(unknown, "ProtocolError", "an unknown envelope status is refused")

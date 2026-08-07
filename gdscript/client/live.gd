@@ -414,6 +414,15 @@ func _transition_entry(
 		"QueryUpdated":
 			if not modification.has("value"):
 				return ConvexResult.protocol_failure("QueryUpdated omitted value")
+			# Unlike the envelope this modification came from, the query result
+			# itself is business data a caller will read as a number, so it is
+			# the one part of a Transition that is still held to
+			# is_json_safe - silently handing back a value GDScript cannot
+			# represent exactly would be worse than failing the call.
+			if not ConvexValues.is_json_safe(modification["value"]):
+				return ConvexResult.protocol_failure(
+					"QueryUpdated value is outside GDScript's exact range"
+				)
 			var updated_logs := ConvexValues.log_lines(modification.get("logLines"), "logLines")
 			if ConvexResult.is_failure(updated_logs):
 				return updated_logs

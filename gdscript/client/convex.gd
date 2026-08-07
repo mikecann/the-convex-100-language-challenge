@@ -183,6 +183,13 @@ func _decode_envelope(response: Dictionary, operation: String) -> Dictionary:
 			return ConvexResult.protocol_failure("Convex success response omitted value")
 		if code < 200 or code > 299:
 			return ConvexResult.protocol_failure("HTTP %d reported a successful Convex call" % code)
+		# The envelope itself is not held to is_json_safe (see parse_object),
+		# but the value a caller reads as a number is: silently handing back
+		# one GDScript cannot represent exactly would be worse than failing.
+		if not ConvexValues.is_json_safe(envelope["value"]):
+			return ConvexResult.protocol_failure(
+				"Convex %s response value is outside GDScript's exact range" % operation
+			)
 		var result := ConvexResult.ok(envelope["value"])
 		return ConvexResult.with_logs(result, logs["value"])
 

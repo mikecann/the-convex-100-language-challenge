@@ -21,6 +21,7 @@ func _init() -> void:
 	_test_reconnect_five_times(harness)
 	_test_protocol_error_recovery(harness)
 	_test_transition_validation(harness)
+	_test_transition_number_safety(harness)
 	_test_subscription_queue_bounds(harness)
 	quit(harness.report())
 
@@ -239,6 +240,49 @@ func _test_transition_validation(harness: ConvexTestHarness) -> void:
 	harness.failed(rejected, "ProtocolError", "an unknown modification is a protocol error")
 	harness.check(subscription.pending() == 0, "the good modification beside it was not applied")
 	harness.equal(live.max_observed_timestamp(), observed, "a rejected Transition moves nothing")
+
+	live.close()
+	fixture.stop()
+
+
+# A real deployment's Transition carries protocol metadata this client never
+# reads as a number - serverTs is a nanosecond epoch timestamp nowhere near
+# exactly representable - so it must not fail a delivery. The query result
+# itself is business data the caller reads as a number, so it stays refused.
+func _test_transition_number_safety(harness: ConvexTestHarness) -> void:
+	var fixture := ConvexLiveFixture.new()
+	if not harness.succeeded(fixture.start(), "the Live fixture starts"):
+		return
+	fixture.set_auto_value("demo:state", {"count": 0.0})
+	var live := ConvexLive.new(fixture.url(), {})
+	var subscribed := live.subscribe("demo:state", {"room": "alpha"})
+	var subscription: ConvexSubscription = subscribed["value"]
+	var arrived := func(): return subscription.pending() > 0
+	harness.check(_wait_for(fixture, live, arrived, WAIT_MSEC), "the initial value arrives")
+	subscription.try_next_update()
+
+	var metadata := {"type": "Transition", "startVersion": fixture.version()}
+	metadata["endVersion"] = _version_at(501)
+	metadata["modifications"] = [_updated(0, {"count": 8.0})]
+	metadata["serverTs"] = 1786132596447083569
+	fixture.send_raw(metadata)
+	harness.check(
+		_wait_for(fixture, live, arrived, WAIT_MSEC), "a value beside oversized metadata arrives"
+	)
+	var delivered := subscription.try_next_update()
+	harness.equal(
+		delivered["value"], {"count": 8.0}, "oversized metadata elsewhere does not block delivery"
+	)
+
+	# fixture.version() is now stale: send_raw does not advance it, but the
+	# client's own remote version moved to the endVersion sent above.
+	var poisoned_value := {"type": "Transition", "startVersion": _version_at(501)}
+	poisoned_value["endVersion"] = _version_at(502)
+	poisoned_value["modifications"] = [_updated(0, {"count": 9007199254740993})]
+	fixture.send_raw(poisoned_value)
+	harness.check(_wait_for(fixture, live, arrived, WAIT_MSEC), "the bad value is reported")
+	var rejected := subscription.try_next_update()
+	harness.failed(rejected, "ProtocolError", "a value beyond exact integers is refused")
 
 	live.close()
 	fixture.stop()

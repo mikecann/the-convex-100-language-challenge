@@ -23,6 +23,15 @@ const INITIAL_TIMESTAMP := "AAAAAAAAAAA="
 # Parse one JSON document and require an object at its root. Convex response
 # envelopes, Live server messages, and adapter commands are all objects, so a
 # bare array or scalar is a protocol failure rather than an empty envelope.
+#
+# This deliberately does not apply is_json_safe to the whole envelope. A real
+# Live "Transition" message carries protocol metadata this client never reads
+# as a number - serverTs is a nanosecond epoch timestamp around 1.8e18, far
+# past MAX_EXACT_INTEGER - and rejecting the entire message over a field
+# nothing here consumes would fail every Live update a real deployment sends.
+# is_json_safe is applied narrowly instead, to the specific fields each
+# caller actually decodes as a number (see _transition_entry's QueryUpdated
+# handling and _decode_envelope's success value).
 static func parse_object(text: String, context: String) -> Dictionary:
 	var parser := JSON.new()
 	var status := parser.parse(text)
@@ -32,10 +41,6 @@ static func parse_object(text: String, context: String) -> Dictionary:
 		return ConvexResult.protocol_failure(detail)
 	if typeof(parser.data) != TYPE_DICTIONARY:
 		return ConvexResult.protocol_failure("%s: expected a JSON object at the root" % context)
-	if not is_json_safe(parser.data):
-		return ConvexResult.protocol_failure(
-			"%s: number is outside GDScript's exact range" % context
-		)
 	return ConvexResult.ok(parser.data)
 
 
