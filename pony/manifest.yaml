@@ -4,5 +4,54 @@ displayName: "Pony"
 rank: 92
 selectionTier: curated_backfill
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Pony client. The Convex HTTP envelope rules, JSON codec, RFC 6455
+    framing, and the whole /api/sync state machine are implemented in Pony.
+    A single actor owns the Live socket, query set, reconnect, and replay.
+    The only third party Pony package is ponylang/net_ssl, used for ordinary
+    TLS transport and confined to the client/tls package. OpenSSL supplies TLS
+    and operating-system entropy for WebSocket masks, keys, and session IDs.
+toolchain:
+  name: Pony
+  version: "0.58.0"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - No Pony compiler and no Docker build has been run against this source, so
+    every claim below the source level is unverified.
+  - Base images are pinned by digest and net_ssl 1.3.2 is checked against
+    commit 16ce265bbd3cfa6a6d30341ea0291ea8afd65c01, but neither pin has been
+    exercised by a Docker build yet.
+  - The net_ssl API in client/tls, the ponyc flags in the Dockerfile, the
+    ifdef "convex_adapter" gate, OpenSSL RAND_bytes WebSocket entropy, and the
+    declared @fcntl/@write FFI in the adapter output writer are the surfaces
+    with no local evidence behind them.
+  - The deterministic Live suite proves five owner-level connection
+    generations. Only the shared verifier can earn the required evidence for
+    five real TCP/WSS reconnects.
+  - Pony does not expose its runtime version to a program, so the runtime image
+    stamps PONY_RUNTIME_VERSION from the pinned toolchain and the adapter
+    reports exactly that value.
+  - Live delivery is demand driven and bounded at 32 updates or a
+    conservatively charged 2 MiB memory budget per subscription, dropping the
+    oldest values when a watcher stops asking.
+  - Unsubscribe acknowledges without waiting for the server; close waits only
+    for a bounded 250 ms.
+  - Live authentication, WebSocket mutations and actions, optimistic updates,
+    and TransitionChunk reassembly are not implemented and fail closed.
 capabilities: []
