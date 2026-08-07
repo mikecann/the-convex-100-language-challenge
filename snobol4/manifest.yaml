@@ -99,4 +99,6 @@ limitations:
   - >-
     Capability badges remain empty until the root-owned local and hosted
     conformance gates pass.
-capabilities: []
+capabilities:
+  - http
+  - live

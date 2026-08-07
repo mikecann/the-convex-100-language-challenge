@@ -20,12 +20,13 @@ exact runnable file.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Attempting | Query, mutation, action, bearer-token lifecycle, structured `FunctionError`/`ProtocolError`/`TransportError` classification, and logs pass a real loopback test suite in Docker. Shared local and hosted conformance have not run yet, so no badge is claimed. |
-| Live | Attempting | Subscribe, an initial value, an external update, `QueryFailed`, and the unsubscribe-before-acknowledgement barrier pass a real loopback test suite. `debugDisconnect`'s acknowledgement barrier (retire before ack) and five consecutive real reconnect-and-resubscribe cycles, each required to deliver a genuine resubscribed value, are proven deterministically against a real second OS process. Shared local and hosted conformance have not run yet, so no badge is claimed. |
+| HTTP | Verified | Query, mutation, action, bearer-token lifecycle, structured `FunctionError`/`ProtocolError`/`TransportError` classification, and logs pass a real loopback test suite in Docker, and shared local and hosted conformance both passed from a clean exact-head build. |
+| Live | Verified | Subscribe, an initial value, an external update, `QueryFailed`, and the unsubscribe-before-acknowledgement barrier pass a real loopback test suite. `debugDisconnect`'s acknowledgement barrier (retire before ack) and five consecutive real reconnect-and-resubscribe cycles, each required to deliver a genuine resubscribed value, are proven deterministically against a real second OS process, and shared local and hosted conformance both passed from a clean exact-head build. |
+| Earned capability badges | http, live | Awarded by the shared result evaluator from local and hosted runs at this exact head. |
 
-The shared evaluator has not yet run local or hosted black-box conformance
-for this client; `capabilities` in `manifest.yaml` is empty by design until
-that happens.
+The shared evaluator has run local and hosted black-box conformance for this
+client and awarded both capabilities; `capabilities` in `manifest.yaml`
+reflects that award.
 
 ## The basic example
 
@@ -198,8 +199,9 @@ is not packaged for Debian), builds the small native transport shim, lints
 every source file, and runs real loopback JSON, HTTP, WebSocket, and Live
 protocol fixtures, the conformance adapter's stdio and TCP modes, and the
 example's fast-fail path, all inside Docker. The remaining commands are
-root-owned shared gates for the approved local and hosted deployments and
-have not yet been run for this client.
+root-owned shared gates for the approved local and hosted deployments; both
+have passed for this client from a clean exact-head build, earning the http
+and live capability badges above.
 
 ## Conformance and protocol notes
 
