@@ -36,4 +36,6 @@ limitations:
   - There is no server-inactivity watchdog; a silent peer is detected only when a read or write fails.
   - Neko is the genuine Haxe target runtime, not a delegated Convex client or bridge.
   - Neko represents sync counters with exact non-negative signed integers. Larger unsigned protocol values are rejected rather than wrapped.
-capabilities: []
+capabilities:
+  - http
+  - live

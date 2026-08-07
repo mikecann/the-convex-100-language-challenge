@@ -24,10 +24,10 @@ Live all agree on the `0 -> 1` journey.
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, and actions | Implemented, awaiting shared evidence |
-| Bearer authentication transport and structured function errors | Implemented, awaiting shared evidence |
-| Live initial values, external updates, and query-error recovery | Implemented, awaiting shared evidence |
-| Remove, five real reconnects, generation barriers, bounded delivery | Implemented, awaiting shared evidence |
+| HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
+| Bearer authentication transport and structured function errors | Verified by shared local and hosted conformance |
+| Live initial values, external updates, and query-error recovery | Verified by shared local and hosted conformance |
+| Remove, five real reconnects, generation barriers, bounded delivery | Verified by shared local and hosted conformance |
 | Live authentication, WebSocket mutations and actions, transition chunks | Not implemented |
 
 Nothing in this table is a badge. Only the shared result evaluator may award
