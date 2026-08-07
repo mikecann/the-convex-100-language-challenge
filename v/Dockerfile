@@ -231,8 +231,10 @@ RUN set -eu; \
       'convex-example completed a TLS handshake against a locally issued' \
       'certificate using only the shipped OpenSSL closure, then failed at' \
       'Convex envelope decoding as expected for a non-Convex TLS peer.' \
-      > /usr/local/share/convex-tls-closure; \
-    rm -f /probe.out /probe.err
+      > /usr/local/share/convex-tls-closure
+# The probe files are deliberately left in place: this stage inherits the
+# pruned runtime-base, which has no rm, and nothing here reaches a shipped
+# image anyway — the leaf stages copy only the marker file out of this stage.
 
 FROM runtime-base AS example-runtime
 COPY --from=test /out/convex-example /usr/local/bin/convex-example
