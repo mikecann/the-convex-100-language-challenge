@@ -14,7 +14,7 @@ RUN apt-get update -qq && \
       ca-certificates ats2-lang=0.4.2-1.1 libssl-dev libcjson-dev=1.7.17-1 build-essential \
       >/tmp/apt.log 2>&1 || (cat /tmp/apt.log; exit 1)
 RUN test "$(uname -m)" = x86_64
-RUN patscc -version
+RUN patsopt --version
 
 COPY client ./client
 COPY examples ./examples
