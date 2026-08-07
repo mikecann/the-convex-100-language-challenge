@@ -40,7 +40,7 @@ RUN set -eu; \
     jplatform=linux j64x=j64 ./build_all.sh; \
     test -x /src/jlibrary/bin/jconsole; \
     file /src/jlibrary/bin/jconsole | grep -Eq 'ELF 64-bit.*x86-64'; \
-    printf '3+4\n' | /src/jlibrary/bin/jconsole /dev/stdin >/tmp/smoke.out; \
+    printf 'echo 3+4\n' | /src/jlibrary/bin/jconsole /dev/stdin >/tmp/smoke.out; \
     grep -Fqx 7 /tmp/smoke.out
 
 WORKDIR /project
@@ -204,7 +204,7 @@ RUN test "$(id -u):$(id -g)" = 65532:65532 \
 # jconsole itself, run --read-only as 65532 with no tmpfs: profile.ijs's own
 # directory-creation helper catches and ignores a failed mkdir (proven here,
 # not assumed), so a read-only filesystem with no writable HOME is fine.
-RUN test "$(printf '3+4\n' | /opt/convex/jlibrary/bin/jconsole /dev/stdin)" = 7
+RUN test "$(printf 'echo 3+4\n' | /opt/convex/jlibrary/bin/jconsole /dev/stdin)" = 7
 
 # TLS has to be provable inside the final image rather than at hosted
 # verification time. This exercises the exact 15!:0 bindings transport.ijs
