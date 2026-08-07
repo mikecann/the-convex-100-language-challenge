@@ -20,10 +20,12 @@ IN: convex.adapter
 
 ! DEBUG: print full error diagnostics for ANY uncaught error in ANY
 ! thread, before Factor's default handler calls die. Temporary, for
-! diagnosing the hosted-only VM crash.
+! diagnosing the hosted-only VM crash. Explicitly flushed because die's
+! abrupt exit does not appear to flush stdout's own buffer.
 [
-    "DEBUG uncaught error in thread: " write dup name>> print
-    "DEBUG error object: " write over error.
+    "DEBUG uncaught error in thread: " write dup name>> print flush
+    "DEBUG error class: " write dup class>> name>> print flush
+    "DEBUG error object: " write over error. flush
     die drop rethrow
 ] thread-error-hook set-global
 
