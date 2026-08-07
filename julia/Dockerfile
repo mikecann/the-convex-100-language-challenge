@@ -14,6 +14,16 @@ WORKDIR /work
 COPY client ./client
 COPY examples ./examples
 
+# Julia's default Pkg server is a CDN cache in front of the real General
+# registry git repository, and that cache can serve metadata (the current
+# registry tree hash) inconsistent with what its own storage backend
+# actually has, producing a 404 on a hash the server itself just advertised
+# as current. Cloning the registry straight from its git source is slower on
+# a cold depot but removes that CDN as a point of failure entirely, which
+# makes this build MORE reproducible, not less -- a deliberate robustness
+# choice, not a workaround for a one-off blip.
+ENV JULIA_PKG_SERVER=""
+
 # Dependencies are restricted to these exact direct versions in Project.toml.
 # They provide ordinary HTTP/TLS/JSON/WebSocket transport only; all Convex
 # request, transition, reconnect, and adapter behaviour remains Julia source.
@@ -42,6 +52,10 @@ FROM ${JULIA_IMAGE} AS app-build
 WORKDIR /work
 COPY client ./client
 COPY examples ./examples
+# Same reasoning as the deps stage: clone the General registry from its git
+# source rather than trust the Pkg server CDN cache, so this stage's fresh
+# depot does not depend on that CDN staying internally consistent.
+ENV JULIA_PKG_SERVER=""
 RUN apt-get update && \
     apt-get install -y --no-install-recommends gcc g++ libc6-dev && \
     rm -rf /var/lib/apt/lists/*
