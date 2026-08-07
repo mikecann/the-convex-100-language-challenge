@@ -616,6 +616,28 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- OpenSSL needs files that `ldd` will never tell you about. Two languages
+  passed every local check and then failed the hosted profile with `SSL
+  routines / STORE routines::unregistered scheme`. The build stage has a full
+  OS, so `openssl.cnf` and the `ossl-modules/*.so` providers are simply there;
+  the stripped runtime image carries neither, and `SSL_CTX_set_default_verify_
+  paths` needs both at connect time. A closure computed from `ldd` cannot find
+  them, because they are not shared-library dependencies of anything — they are
+  data and dlopened plugins. **A dependency closure is only as complete as the
+  definition of "dependency" you used to build it.**
+- A zero was mistaken for the end of a string. The Live protocol's timestamp
+  can legitimately be all-zero bytes, and base64 `"AAAAAAAAAAA="` decodes to
+  exactly that. Carried through any NUL-terminated string type — Mercury's
+  `string`, or anything reached over a C-string FFI — it silently became a
+  zero-length value. Both languages hit it independently. The fix is to decode
+  straight to an integer in C and never let the raw bytes exist as a
+  language-level string at all.
+- A stack trace pointed at the garbage collector and the bug was a missing pair
+  of parentheses. Mercury reported "caught strange segmentation violation",
+  which looks exactly like a Boehm-GC problem. The cause was calling a 0-arity
+  Mercury function exported to C without its parentheses: C reads that as a
+  function-pointer value, compiles it silently, and corrupts everything
+  downstream.
 - The local profile cannot catch a TLS bug, and twice in one night it didn't.
   The self-hosted backend is plain `http://`, so a client with an empty or
   misplaced trust store passes every local check and fails only against the
