@@ -73,7 +73,10 @@ class SyncConnection
   end
 
   def send_dribbling_frame
-    @socket.write(Bytes[0x81_u8, 126_u8, 0_u8, 100_u8])
+    # A 100-byte payload must use the short RFC 6455 length encoding. Using the
+    # 16-bit form here would correctly fail immediately as a protocol error,
+    # rather than exercising the absolute deadline for an incomplete frame.
+    @socket.write(Bytes[0x81_u8, 100_u8])
     @socket.flush
     100.times do
       sleep 100.milliseconds
@@ -113,6 +116,13 @@ class SyncConnection
 
   def ping
     @protocol.ping("flood")
+  end
+
+  # Protocol-negative fixtures need byte-exact encodings that the standard
+  # WebSocket writer correctly refuses to generate for us.
+  def send_raw_frame(frame : Bytes)
+    @socket.write(frame)
+    @socket.flush
   end
 
   # A debug-disconnect acknowledgement is meaningful only once the old
@@ -208,6 +218,27 @@ rescue ex
   assert(timeout.message == "timed out waiting for Live update", "#{context}: wrong error #{timeout.message}")
 end
 
+def assert_protocol_frame_recovery(frame : Bytes, label : String)
+  fixture = SyncFixture.new
+  spawn do
+    first = fixture.accept
+    read_add(first)
+    first.send_raw_frame(frame)
+    replacement = fixture.accept
+    read_add(replacement)
+    replacement.send_transition(0, 1, [{"type" => "QueryUpdated", "queryId" => 0, "value" => {"count" => 77}, "logLines" => [] of String}], 0)
+  rescue ex
+    STDERR.puts "fixture #{label} recovery failed: #{ex.message}"
+  end
+  client = Convex::Client.new(fixture.url)
+  subscription = client.subscribe("demo:state", {"room" => JSON::Any.new(label)})
+  failure = subscription.next(2.seconds).error
+  assert(failure.is_a?(Convex::ProtocolError), "#{label} did not publish ProtocolError")
+  assert(count(subscription.next(2.seconds)) == 77, "#{label} did not recover on a replacement socket")
+  client.close
+  fixture.close
+end
+
 # Numeric timestamp ordering must cross the little-endian rollover correctly.
 assert(Convex.decode_live_timestamp(timestamp(255_u64)) == 255_u64, "timestamp 255 did not decode")
 assert(Convex.decode_live_timestamp(timestamp(256_u64)) == 256_u64, "timestamp 256 did not decode")
@@ -232,6 +263,131 @@ socket.close
 fixture.close
 assert_handshake_rejected("h2c", "Upgrade")
 assert_handshake_rejected("websocket", "keep-alive")
+
+# TCP progress must not renew the one DNS/TCP/TLS/101 budget. This peer accepts
+# and consumes the upgrade request but never sends the 101 response.
+stall_server = TCPServer.new("127.0.0.1", 0)
+spawn do
+  peer = stall_server.accept
+  HTTP::Request.from_io(peer)
+  sleep 2.seconds
+rescue
+end
+stall_started = Time.monotonic
+begin
+  Convex::OwnerWebSocket.connect(URI.parse("http://127.0.0.1:#{stall_server.local_address.port}"), "crystal-stalled-101-test")
+  raise "stalled WebSocket 101 was accepted"
+rescue Convex::TransportError
+end
+stall_elapsed = Time.monotonic - stall_started
+assert(stall_elapsed >= 400.milliseconds && stall_elapsed < 800.milliseconds, "stalled 101 did not use one absolute connect deadline: #{stall_elapsed}")
+stall_server.close
+
+# A resolver or TCP connect which never returns is isolated on its own OS
+# thread. The owner still observes the one absolute budget and retires a late
+# socket instead of waiting for that worker.
+dial_entered = Channel(Nil).new(1)
+dial_resume = Channel(Nil).new(1)
+Convex::OwnerWebSocket.pause_next_dial(dial_entered, dial_resume)
+dial_started = Time.monotonic
+spawn do
+  dial_entered.receive
+  sleep 1.second
+  dial_resume.send(nil)
+end
+begin
+  Convex::OwnerWebSocket.connect(URI.parse("http://127.0.0.1:9"), "crystal-stalled-dial-test")
+  raise "stalled resolver/TCP worker was accepted"
+rescue Convex::TransportError
+end
+dial_elapsed = Time.monotonic - dial_started
+assert(dial_elapsed >= 400.milliseconds && dial_elapsed < 800.milliseconds, "stalled resolver/TCP worker escaped the absolute connect deadline: #{dial_elapsed}")
+
+# TCP may connect promptly while TLS itself never produces a handshake byte.
+# Closing the raw descriptor at the shared deadline must interrupt OpenSSL.
+tls_server = TCPServer.new("127.0.0.1", 0)
+spawn do
+  peer = tls_server.accept
+  sleep 2.seconds
+  peer.close
+rescue
+end
+tls_started = Time.monotonic
+begin
+  Convex::OwnerWebSocket.connect(URI.parse("https://127.0.0.1:#{tls_server.local_address.port}"), "crystal-stalled-tls-test")
+  raise "stalled TLS handshake was accepted"
+rescue Convex::TransportError
+end
+tls_elapsed = Time.monotonic - tls_started
+assert(tls_elapsed >= 400.milliseconds && tls_elapsed < 800.milliseconds, "stalled TLS handshake escaped the absolute connect deadline: #{tls_elapsed}")
+tls_server.close
+
+# The first Connect write belongs to that same absolute budget. Keep making
+# real byte-by-byte TCP progress and prove it still expires instead of gaining
+# a fresh timeout from every successful write.
+fixture = SyncFixture.new
+spawn do
+  peer = fixture.accept
+  sleep 2.seconds
+  peer.close
+rescue
+end
+slow_write_entered = Channel(Nil).new(1)
+slow_write_started = Time.monotonic
+slow_write_deadline = slow_write_started + Convex::OwnerWebSocket::CONNECT_DEADLINE
+socket = Convex::OwnerWebSocket.connect(URI.parse(fixture.url), "crystal-slow-first-connect-test", slow_write_deadline)
+Convex::OwnerWebSocket.slow_next_write(slow_write_entered)
+begin
+  socket.send_json({"type" => "Connect"}, slow_write_deadline)
+  raise "slow first Connect frame was accepted"
+rescue Convex::TransportError
+end
+slow_write_entered.receive
+slow_write_elapsed = Time.monotonic - slow_write_started
+assert(slow_write_elapsed >= 400.milliseconds && slow_write_elapsed < 800.milliseconds, "slow first Connect renewed its absolute deadline: #{slow_write_elapsed}")
+socket.close
+fixture.close
+
+# The resolver/connect worker cannot own the sole manager fiber. Both control
+# operations must interrupt a paused dial rather than wait for its full budget.
+[:unsubscribe, :close].each do |control|
+  fixture = SyncFixture.new
+  dial_entered = Channel(Nil).new(1)
+  dial_resume = Channel(Nil).new(1)
+  Convex::OwnerWebSocket.pause_next_dial(dial_entered, dial_resume)
+  client = Convex::Client.new(fixture.url)
+  subscription = client.subscribe("demo:state", {"room" => JSON::Any.new("dial-#{control}")})
+  dial_entered.receive
+  started = Time.monotonic
+  control == :close ? client.close : subscription.close
+  assert(Time.monotonic - started < 250.milliseconds, "#{control} did not interrupt a paused Live dial")
+  client.close unless control == :close
+  dial_resume.send(nil)
+  fixture.close
+end
+
+# Reject every strict RFC6455 boundary at the parser, then prove the active
+# query recovers on a clean replacement connection.
+assert_protocol_frame_recovery(Bytes[0xc1_u8, 0_u8], "reserved-rsv")
+assert_protocol_frame_recovery(Bytes[0x81_u8, 0x80_u8], "masked-server-frame")
+assert_protocol_frame_recovery(Bytes[0x83_u8, 0_u8], "reserved-opcode")
+assert_protocol_frame_recovery(Bytes[0x80_u8, 0_u8], "unexpected-continuation")
+assert_protocol_frame_recovery(Bytes[0x82_u8, 0_u8], "binary-frame")
+assert_protocol_frame_recovery(Bytes[0x09_u8, 0_u8], "fragmented-control")
+oversized_control = Bytes.new(4 + 126, 0_u8)
+oversized_control[0] = 0x89_u8
+oversized_control[1] = 126_u8
+oversized_control[3] = 126_u8
+assert_protocol_frame_recovery(oversized_control, "oversized-control")
+assert_protocol_frame_recovery(Bytes[0x81_u8, 126_u8, 0_u8, 1_u8, 'x'.ord.to_u8], "non-minimal-16")
+non_minimal_64 = Bytes.new(10 + 126, 'x'.ord.to_u8)
+non_minimal_64[0] = 0x81_u8
+non_minimal_64[1] = 127_u8
+8.times { |index| non_minimal_64[2 + index] = ((126_u64 >> ((7 - index) * 8)) & 0xff_u64).to_u8 }
+assert_protocol_frame_recovery(non_minimal_64, "non-minimal-64")
+assert_protocol_frame_recovery(Bytes[0x88_u8, 1_u8, 0_u8], "one-byte-close")
+assert_protocol_frame_recovery(Bytes[0x88_u8, 2_u8, 0x03_u8, 0xed_u8], "reserved-close-code")
+assert_protocol_frame_recovery(Bytes[0x88_u8, 3_u8, 0x03_u8, 0xe8_u8, 0xff_u8], "invalid-close-utf8")
 
 # Add, initial/external updates, QueryFailed recovery, and Remove all travel
 # through the real owner and a loopback WebSocket rather than mocked methods.
@@ -537,6 +693,47 @@ end
 assert_bounded_control(:idle)
 assert_bounded_control(:flood)
 assert_bounded_control(:half)
+
+# Two callers racing close must join one owner transition. The second caller
+# must neither enqueue an unacknowledgeable command nor return before the first
+# close has actually retired the transport.
+fixture = SyncFixture.new
+ready = Channel(Nil).new(1)
+spawn do
+  connection = fixture.accept
+  read_add(connection)
+  ready.send(nil)
+  sleep 2.seconds
+rescue
+end
+client = Convex::Client.new(fixture.url)
+client.subscribe("demo:state", {"room" => JSON::Any.new("concurrent-close")})
+ready.receive
+close_entered = Channel(Nil).new(1)
+close_resume = Channel(Nil).new(1)
+Convex::LiveManager.pause_next_close(close_entered, close_resume)
+closed = Channel(Int32).new(2)
+2.times do |index|
+  spawn do
+    client.close
+    closed.send(index)
+  end
+end
+close_entered.receive
+select
+when early = closed.receive
+  raise "concurrent close caller #{early} returned before transport retirement"
+else
+end
+close_resume.send(nil)
+2.times do
+  select
+  when closed.receive
+  when timeout(1.second)
+    raise "concurrent close caller was stranded"
+  end
+end
+fixture.close
 
 # Count and bytes are both aggregate limits, independent of one subscription.
 budget = Convex::LiveUpdateBudget.new

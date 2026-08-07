@@ -2,13 +2,24 @@ require "json"
 require "socket"
 require "http/server"
 
-# Serve schema-valid near-maximum query results from this controller container.
-# The adapter therefore performs its real HTTP decode and NDJSON encode paths;
-# the memory proof does not depend on an oversized protocol id.
-payload = "x" * 1_900_000
+# Serve large schema-valid query results from this controller container. A
+# 256 KiB value fills a stopped TCP receive window while still allowing all 17
+# commands and the terminal close to reach the output queue before its one
+# second deadline on a CPU-throttled verifier.
+payload = "x" * 256_000
+request_lock = Mutex.new
+request_count = 0
 server = HTTP::Server.new do |context|
+  complete = request_lock.synchronize do
+    request_count += 1
+    request_count == 17
+  end
   context.response.content_type = "application/json"
   context.response.print({"status" => "success", "value" => {"payload" => payload}, "logLines" => [] of String}.to_json)
+  if complete
+    puts "REQUESTS=17"
+    STDOUT.flush
+  end
 end
 server.bind_tcp("0.0.0.0", 8080)
 spawn { server.listen }
@@ -19,25 +30,15 @@ socket = TCPSocket.new(host, port)
 socket.write_timeout = 5.seconds
 socket.read_timeout = 10.seconds
 
-# The controller stops reading while two large valid commands are already on
-# the connection, so exact ordering and output backpressure are both exercised.
-socket.puts({"id" => "first", "op" => "query", "path" => "demo:large", "args" => {} of String => String}.to_json)
-socket.puts({"id" => "second", "op" => "query", "path" => "demo:large", "args" => {} of String => String}.to_json)
+# Fill all 17 ordinary output reservations with schema-valid large results,
+# then submit close into its separate terminal slot. This controller never
+# reads again. The fixture therefore cannot pass because a cooperative reader
+# eventually drained the socket after a timed sleep.
+17.times do |index|
+  socket.puts({"id" => "result-#{index}", "op" => "query", "path" => "demo:large", "args" => {} of String => String}.to_json)
+end
+socket.puts({"id" => "close", "op" => "close"}.to_json)
 socket.flush
 puts "STOPPED"
 STDOUT.flush
-sleep 8.seconds
-
-first = JSON.parse(socket.gets || raise "adapter closed before first result")
-second = JSON.parse(socket.gets || raise "adapter closed before second result")
-raise "large output lost ordering" unless first["id"].as_s == "first" && first["type"].as_s == "result"
-raise "first large value was truncated" unless first["value"]["payload"].as_s.bytesize == payload.bytesize
-raise "second output lost ordering" unless second["id"].as_s == "second" && second["type"].as_s == "result"
-raise "second large value was truncated" unless second["value"]["payload"].as_s.bytesize == payload.bytesize
-
-socket.puts({"id" => "close", "op" => "close"}.to_json)
-socket.flush
-closed = JSON.parse(socket.gets || raise "adapter closed without envelope")
-raise "close envelope was not retained" unless closed["id"].as_s == "close" && closed["type"].as_s == "closed"
-server.close
-puts "stopped-reader ordering passed"
+loop { sleep 1.second }

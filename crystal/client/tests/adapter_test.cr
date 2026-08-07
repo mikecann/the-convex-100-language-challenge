@@ -7,19 +7,19 @@ end
 
 def stale_barrier(label : String)
   output = IO::Memory.new
-  writer = Mutex.new
+  writer = AdapterOutput.new(output)
   relay = SubscriptionRelay.new
   entered = Channel(Nil).new(1)
   resume = Channel(Nil).new(1)
   relay.pause_after_dequeue(entered, resume)
   done = Channel(Nil).new(1)
   spawn do
-    relay.emit(output, writer, {"type" => json("subscription"), "subscriptionId" => json(label), "value" => JSON.parse(%({"count":0}))})
+    relay.emit(writer, {"type" => json("subscription"), "subscriptionId" => json(label), "value" => JSON.parse(%({"count":0}))})
     done.send(nil)
   end
   entered.receive
   relay.invalidate
-  emit_event(output, writer, {"id" => json(label), "type" => json("ack")})
+  emit_event(writer, {"id" => json(label), "type" => json("ack")}, wait: true)
   resume.send(nil)
   done.receive
   assert(output.to_s == %({"id":"#{label}","type":"ack"}\n), "#{label} stale delivery crossed acknowledgement")
@@ -203,14 +203,16 @@ end
 end
 
 {
-  %({"id":"extra","op":"close","unexpected":true})            => "extra",
-  %({"id":"op-type","op":3})                                  => "op-type",
-  %({"id":"version","op":"hello","protocolVersion":1.0})      => "version",
-  %({"id":"path","op":"query","path":" ","args":{}})          => "path",
-  %({"id":"args","op":"query","path":"demo:state","args":[]}) => "args",
-  %({"id":"token","op":"setAuth","token":false})              => "token",
-  %({"id":"sid","op":"unsubscribe","subscriptionId":" "})     => "sid",
-  %({"id":"subscribe","op":"subscribe","subscriptionId":"s"}) => "subscribe",
+  %({"id":"extra","op":"close","unexpected":true})                     => "extra",
+  %({"id":"op-type","op":3})                                           => "op-type",
+  %({"id":"version","op":"hello","protocolVersion":1.0})               => "version",
+  %({"id":"path","op":"query","path":" ","args":{}})                   => "path",
+  %({"id":"args","op":"query","path":"demo:state","args":[]})          => "args",
+  %({"id":"token","op":"setAuth","token":false})                       => "token",
+  %({"id":"sid","op":"unsubscribe","subscriptionId":" "})              => "sid",
+  %({"id":"u-path","op":"unsubscribe","subscriptionId":"s","path":7})  => "u-path",
+  %({"id":"u-args","op":"unsubscribe","subscriptionId":"s","args":[]}) => "u-args",
+  %({"id":"subscribe","op":"subscribe","subscriptionId":"s"})          => "subscribe",
 }.each do |line, expected_id|
   event = adapter_command_error(line)
   assert(event["id"].as_s == expected_id, "valid command ID was lost while reporting schema error")
@@ -218,21 +220,109 @@ end
 
 assert(command_identifier({"id" => json("é" * 128)}, "id").size == 128, "128-character Unicode ID was rejected")
 
-subscription_output = IO::Memory.new
-SubscriptionRelay.new.emit(subscription_output, Mutex.new, {"type" => json("subscription"), "subscriptionId" => json("s"), "error" => error_details(Convex::FunctionError.new("failed", "query", JSON.parse(%({"code":"ROOM_EMPTY"})), ["log"]))})
-assert(subscription_output.to_s == %({"type":"subscription","subscriptionId":"s","error":{"name":"FunctionError","message":"failed","operation":"query","data":{"code":"ROOM_EMPTY"},"logs":["log"]}}\n), "subscription error envelope was not exact")
+# Unsubscribe's optional path is informational in the shared schema. Empty and
+# one-character strings are valid there even though query/subscribe paths must
+# still name a real Convex function.
+validate_command(JSON.parse(%({"id":"u","op":"unsubscribe","subscriptionId":"s","path":""})).as_h, "unsubscribe")
+validate_command(JSON.parse(%({"id":"u","op":"unsubscribe","subscriptionId":"s","path":"x"})).as_h, "unsubscribe")
 
 subscription_output = IO::Memory.new
-SubscriptionRelay.new.emit(subscription_output, Mutex.new, {"type" => json("subscription"), "subscriptionId" => json("s"), "value" => JSON.parse(%({"count":1}))})
-assert(subscription_output.to_s == %({"type":"subscription","subscriptionId":"s","value":{"count":1}}\n), "subscription success envelope did not omit absent fields")
+subscription_writer = AdapterOutput.new(subscription_output)
+SubscriptionRelay.new.emit(subscription_writer, {"type" => json("subscription"), "subscriptionId" => json("s"), "error" => error_details(Convex::FunctionError.new("failed", "query", JSON.parse(%({"code":"ROOM_EMPTY"})), ["log"]))})
+subscription_writer.emit({"id" => json("flush"), "type" => json("ack")}, wait: true)
+subscription_text = subscription_output.to_s.lines.first + "\n"
+assert(subscription_text == %({"type":"subscription","subscriptionId":"s","error":{"name":"FunctionError","message":"failed","operation":"query","data":{"code":"ROOM_EMPTY"},"logs":["log"]}}\n), "subscription error envelope was not exact")
+
+subscription_output = IO::Memory.new
+subscription_writer = AdapterOutput.new(subscription_output)
+SubscriptionRelay.new.emit(subscription_writer, {"type" => json("subscription"), "subscriptionId" => json("s"), "value" => JSON.parse(%({"count":1}))})
+subscription_writer.emit({"id" => json("flush"), "type" => json("ack")}, wait: true)
+subscription_text = subscription_output.to_s.lines.first + "\n"
+assert(subscription_text == %({"type":"subscription","subscriptionId":"s","value":{"count":1}}\n), "subscription success envelope did not omit absent fields")
 
 oversized = {"id" => json("large"), "type" => json("result"), "value" => json("x" * OUTPUT_MAX_LINE_BYTES)}
 begin
-  emit_event(IO::Memory.new, Mutex.new, oversized)
+  emit_event(AdapterOutput.new(IO::Memory.new), oversized)
   raise "oversized adapter event was accepted"
 rescue Convex::ProtocolError
 end
 
 assert(OUTPUT_MAX_EVENTS == 17, "direct output count budget changed")
 assert(OUTPUT_MAX_RETAINED_BYTES == 51 * 1024 * 1024, "conservative output byte budget changed")
+
+class PermanentlyStoppedOutput < IO
+  getter entered : Channel(Nil)
+
+  def initialize
+    @entered = Channel(Nil).new(1)
+    @closed = Channel(Nil).new(1)
+    @announced = false
+  end
+
+  def read(slice : Bytes) : Int32
+    0
+  end
+
+  def write(slice : Bytes) : Nil
+    unless @announced
+      @announced = true
+      @entered.send(nil)
+    end
+    @closed.receive
+    raise IO::Error.new("stopped output closed")
+  end
+
+  def close
+    select
+    when @closed.send(nil)
+    else
+    end
+  end
+end
+
+# Fill every data reservation with near-maximum schema-valid results while the
+# controller never reads a byte. The terminal close still owns its independent
+# admission slot, every retained byte stays charged through the partial write,
+# and the one cumulative deadline releases the whole queue without a reader.
+stopped = PermanentlyStoppedOutput.new
+stopped_writer = AdapterOutput.new(stopped)
+near_payload = "x" * (OUTPUT_MAX_LINE_BYTES - 128)
+near_event = {"id" => json("near"), "type" => json("result"), "value" => json(near_payload)}
+OUTPUT_MAX_EVENTS.times { stopped_writer.emit(near_event) }
+stopped.entered.receive
+events, retained_bytes, terminal = stopped_writer.budget.retained
+assert(events == OUTPUT_MAX_EVENTS && retained_bytes > 50 * 1024 * 1024 && !terminal, "near-maximum output reservations were not retained")
+begin
+  stopped_writer.emit(near_event)
+  raise "output event-count ceiling was not enforced"
+rescue Convex::TransportError
+end
+
+terminal_done = Channel(Nil).new(1)
+spawn do
+  begin
+    stopped_writer.emit({"id" => json("close"), "type" => json("closed")}, terminal: true, wait: true)
+  rescue
+  ensure
+    terminal_done.send(nil)
+  end
+end
+10.times do
+  break if stopped_writer.budget.retained[2]
+  Fiber.yield
+end
+assert(stopped_writer.budget.retained[2], "terminal close did not retain its reserved admission slot")
+started = Time.monotonic
+select
+when terminal_done.receive
+  assert(stopped_writer.transport_failed?, "stopped controller did not fail with TransportError")
+when timeout(1.second)
+  raise "permanently stopped controller stranded terminal close"
+end
+assert(Time.monotonic - started < 1.second, "adapter output exceeded its cumulative deadline")
+100.times do
+  break if stopped_writer.budget.retained == {0, 0, false}
+  Fiber.yield
+end
+assert(stopped_writer.budget.retained == {0, 0, false}, "adapter output reservations were not fully released")
 puts "crystal adapter deterministic fixtures passed"

@@ -263,7 +263,7 @@ module Convex
   record IncomingFrame, opcode : UInt8, final : Bool, payload_offset : Int32, payload_size : Int32, total_size : Int32
 
   class OwnerWebSocket
-    CONNECT_DEADLINE     = 5.seconds
+    CONNECT_DEADLINE     = {% if flag?(:live_test) %} 500.milliseconds {% else %} 5.seconds {% end %}
     IDLE_READ_SLICE      = 25.milliseconds
     FRAME_DEADLINE       = 5.seconds
     WRITE_DEADLINE       = 250.milliseconds
@@ -271,6 +271,29 @@ module Convex
     MAX_FRAME_WIRE_BYTES = MAX_MESSAGE_BYTES + 10
     MAX_FRAMES_PER_POLL  = 8
     @frame_started_at : Time::Span?
+
+    {% if flag?(:live_test) %}
+      @@dial_pause_entered : Channel(Nil)? = nil
+      @@dial_pause_resume : Channel(Nil)? = nil
+      @@slow_write_entered : Channel(Nil)? = nil
+      @@slow_write_interval = 25.milliseconds
+
+      # Deterministically hold the next resolver/connect worker. The owner must
+      # still regain control at CONNECT_DEADLINE instead of inheriting an
+      # unbounded libc resolver or connect call.
+      def self.pause_next_dial(entered : Channel(Nil), resume : Channel(Nil))
+        @@dial_pause_entered = entered
+        @@dial_pause_resume = resume
+      end
+
+      # Drip bytes through the real socket deadline wrapper. Unlike a simple
+      # pre-write pause, this proves that partial progress cannot renew the
+      # absolute budget shared by the first Connect frame.
+      def self.slow_next_write(entered : Channel(Nil), interval = 25.milliseconds)
+        @@slow_write_entered = entered
+        @@slow_write_interval = interval
+      end
+    {% end %}
 
     def initialize(@io : LiveIO, @tcp : TCPSocket)
       # Crystal's protocol reader does not retain a partially consumed frame if
@@ -285,43 +308,41 @@ module Convex
       @message_in_progress = false
     end
 
-    def self.connect(uri : URI, client_version : String) : OwnerWebSocket
+    def self.connect(uri : URI, client_version : String, deadline = Time.monotonic + CONNECT_DEADLINE, cancelled : Proc(Bool) = -> { false }) : OwnerWebSocket
       host = uri.hostname || raise ArgumentError.new("Live URL has no host")
       path = uri.request_target
       raise ArgumentError.new("Live URL has no path") unless path
       tls = ["https", "wss"].includes?(uri.scheme)
       port = uri.port || (tls ? 443 : 80)
-      tcp = TCPSocket.new(host, port)
-      tcp.read_timeout = CONNECT_DEADLINE
-      tcp.write_timeout = CONNECT_DEADLINE
+      tcp = dial_tcp(host, port, deadline, cancelled)
       io : LiveIO = tcp
       secured_socket : OpenSSL::SSL::Socket::Client? = nil
       begin
-        if tls
-          context = OpenSSL::SSL::Context::Client.new
-          secured = OpenSSL::SSL::Socket::Client.new(tcp, context: context, sync_close: true, hostname: host)
-          secured.read_timeout = CONNECT_DEADLINE
-          secured.write_timeout = CONNECT_DEADLINE
-          secured_socket = secured
-          io = secured
-        end
-        key = Base64.strict_encode(StaticArray(UInt8, 16).new { rand(256).to_u8 })
-        headers = HTTP::Headers{
-          "Host"                  => "#{host}:#{port}",
-          "Connection"            => "Upgrade",
-          "Upgrade"               => "websocket",
-          "Sec-WebSocket-Version" => HTTP::WebSocket::Protocol::VERSION,
-          "Sec-WebSocket-Key"     => key,
-          "Convex-Client"         => client_version,
-        }
-        HTTP::Request.new("GET", path, headers).to_io(io)
-        io.flush
-        response = HTTP::Client::Response.from_io(io, ignore_body: true)
-        unless response.status.switching_protocols? &&
-               header_has_token?(response.headers, "Upgrade", "websocket") &&
-               header_has_token?(response.headers, "Connection", "upgrade") &&
-               response.headers["Sec-WebSocket-Accept"]? == HTTP::WebSocket::Protocol.key_challenge(key)
-          raise TransportError.new("Live WebSocket handshake was denied", "live dial")
+        with_socket_deadline(tcp, deadline, "Live WebSocket dial deadline exceeded", cancelled) do
+          if tls
+            context = OpenSSL::SSL::Context::Client.new
+            secured = OpenSSL::SSL::Socket::Client.new(tcp, context: context, sync_close: true, hostname: host)
+            secured_socket = secured
+            io = secured
+          end
+          key = Base64.strict_encode(StaticArray(UInt8, 16).new { rand(256).to_u8 })
+          headers = HTTP::Headers{
+            "Host"                  => "#{host}:#{port}",
+            "Connection"            => "Upgrade",
+            "Upgrade"               => "websocket",
+            "Sec-WebSocket-Version" => HTTP::WebSocket::Protocol::VERSION,
+            "Sec-WebSocket-Key"     => key,
+            "Convex-Client"         => client_version,
+          }
+          HTTP::Request.new("GET", path, headers).to_io(io)
+          io.flush
+          response = HTTP::Client::Response.from_io(io, ignore_body: true)
+          unless response.status.switching_protocols? &&
+                 header_has_token?(response.headers, "Upgrade", "websocket") &&
+                 header_has_token?(response.headers, "Connection", "upgrade") &&
+                 response.headers["Sec-WebSocket-Accept"]? == HTTP::WebSocket::Protocol.key_challenge(key)
+            raise TransportError.new("Live WebSocket handshake was denied", "live dial")
+          end
         end
         tcp.read_timeout = IDLE_READ_SLICE
         tcp.write_timeout = WRITE_DEADLINE
@@ -336,6 +357,117 @@ module Convex
       end
     end
 
+    private def self.dial_tcp(host : String, port : Int32, deadline : Time::Span, cancelled : Proc(Bool)) : TCPSocket
+      state = Mutex.new
+      abandoned = false
+      outcome : TCPSocket | Exception | Nil = nil
+      dial_paused = false
+
+      {% if flag?(:live_test) %}
+        if entered = @@dial_pause_entered
+          resume = @@dial_pause_resume.not_nil!
+          @@dial_pause_entered = nil
+          @@dial_pause_resume = nil
+          state.synchronize { dial_paused = true }
+          # Channels remain on Crystal's owner scheduler. The real OS thread
+          # below shares only mutex-protected state, which works without the
+          # preview multithreaded scheduler.
+          entered.send(nil)
+          spawn do
+            resume.receive
+            state.synchronize { dial_paused = false }
+          end
+        end
+      {% end %}
+
+      # DNS resolution may enter libc before Crystal has a socket it can poll.
+      # Use a real OS thread so that call cannot monopolise the owner's
+      # cooperative scheduler past the absolute connection deadline.
+      Thread.new do
+        begin
+          loop do
+            break unless state.synchronize { dial_paused }
+            sleep 1.millisecond
+          end
+          socket = TCPSocket.new(host, port)
+          retire = state.synchronize do
+            if abandoned
+              true
+            else
+              outcome = socket
+              false
+            end
+          end
+          socket.close rescue nil if retire
+        rescue ex
+          state.synchronize { outcome = ex unless abandoned }
+        end
+      end
+
+      loop do
+        remaining = deadline - Time.monotonic
+        interrupted = cancelled.call
+        if remaining <= 0.seconds || interrupted
+          late = state.synchronize do
+            abandoned = true
+            value = outcome
+            outcome = nil
+            value
+          end
+          # Close a socket that won the resolver race but was buffered just as
+          # the deadline or control-command branch fired. A later resolver
+          # result observes `cancelled` itself and closes before publishing.
+          late.close rescue nil if late.is_a?(TCPSocket)
+          message = interrupted ? "Live WebSocket dial interrupted by control command" : "Live WebSocket dial deadline exceeded"
+          raise TransportError.new(message, "live dial")
+        end
+        if value = state.synchronize { current = outcome; outcome = nil if current; current }
+          raise value if value.is_a?(Exception)
+          return value
+        end
+        slice = remaining < 5.milliseconds ? remaining : 5.milliseconds
+        sleep slice
+      end
+    end
+
+    def self.with_socket_deadline(tcp : TCPSocket, deadline : Time::Span, message : String, cancelled : Proc(Bool), &)
+      state = Mutex.new
+      completed = false
+      expired = false
+      remaining = deadline - Time.monotonic
+      raise TransportError.new(message, "live dial") if remaining <= 0.seconds
+      spawn do
+        loop do
+          remaining = deadline - Time.monotonic
+          interrupted = cancelled.call
+          should_close = state.synchronize do
+            if !completed && (remaining <= 0.seconds || interrupted)
+              expired = true
+              true
+            else
+              false
+            end
+          end
+          if should_close
+            tcp.close rescue nil
+            break
+          end
+          break if state.synchronize { completed }
+          sleep(remaining < 5.milliseconds ? remaining : 5.milliseconds)
+        end
+      end
+      begin
+        result = yield
+        raise TransportError.new(message, "live dial") if state.synchronize { expired }
+        result
+      rescue ex
+        raise TransportError.new(message, "live dial") if state.synchronize { expired }
+        raise ex
+      ensure
+        state.synchronize { completed = true }
+      end
+    end
+
     private def self.header_has_token?(headers : HTTP::Headers, name : String, expected : String) : Bool
       value = headers[name]?
       return false unless value
@@ -346,12 +478,12 @@ module Convex
     # ordinary idleness, even after part of a frame has arrived. The frame bytes
     # remain buffered until the absolute deadline expires, at which point the
     # owner abandons the connection and its parser state together.
-    def poll : String?
+    def poll(cancelled : Proc(Bool) = -> { false }) : String?
       frames = 0
       loop do
         if frame = next_frame?
           frames += 1
-          message = handle_frame(frame)
+          message = handle_frame(frame, cancelled)
           consume_frame(frame.total_size)
           return message if message
           return nil if frames >= MAX_FRAMES_PER_POLL
@@ -370,8 +502,8 @@ module Convex
       nil
     end
 
-    def send_json(value)
-      @writer.send(value.to_json)
+    def send_json(value, deadline = Time.monotonic + WRITE_DEADLINE, cancelled : Proc(Bool) = -> { false })
+      write_frame(deadline, cancelled) { @writer.send(value.to_json) }
     end
 
     def close
@@ -416,12 +548,15 @@ module Convex
                      when 126
                        return nil if @frame_size < 4
                        header_size = 4
-                       (@frame_buffer[2].to_i << 8) | @frame_buffer[3].to_i
+                       length = (@frame_buffer[2].to_i << 8) | @frame_buffer[3].to_i
+                       raise ProtocolError.new("Live frame uses non-minimal extended length", "live read") if length < 126
+                       length
                      when 127
                        return nil if @frame_size < 10
                        header_size = 10
                        length = 0_u64
                        8.times { |index| length = (length << 8) | @frame_buffer[2 + index].to_u64 }
+                       raise ProtocolError.new("Live frame uses non-minimal extended length", "live read") if length < 65_536_u64
                        raise ProtocolError.new("Live frame exceeds byte budget", "live read") if length > MAX_MESSAGE_BYTES.to_u64
                        length.to_i
                      else
@@ -437,15 +572,16 @@ module Convex
       IncomingFrame.new(opcode, final, header_size, payload_size, total_size)
     end
 
-    private def handle_frame(frame : IncomingFrame) : String?
+    private def handle_frame(frame : IncomingFrame, cancelled : Proc(Bool)) : String?
       payload = @frame_buffer[frame.payload_offset, frame.payload_size]
       case frame.opcode
       when 0x09_u8
-        @writer.pong(payload)
+        write_frame(Time.monotonic + WRITE_DEADLINE, cancelled) { @writer.pong(payload) }
         nil
       when 0x0a_u8
         nil
       when 0x08_u8
+        validate_close_payload(payload)
         raise TransportError.new("Live peer closed the WebSocket", "live read")
       when 0x02_u8
         raise ProtocolError.new("binary Live frames are unsupported", "live read")
@@ -468,6 +604,41 @@ module Convex
       else
         raise ProtocolError.new("unsupported Live frame", "live read")
       end
+    end
+
+    private def write_frame(deadline : Time::Span, cancelled : Proc(Bool), &)
+      self.class.with_socket_deadline(@tcp, deadline, "Live frame write deadline exceeded", cancelled) do
+        {% if flag?(:live_test) %}
+          if entered = @@slow_write_entered
+            interval = @@slow_write_interval
+            @@slow_write_entered = nil
+            entered.send(nil)
+            # The peer deliberately ignores these bytes. Keep making genuine
+            # TCP progress until the one production deadline closes the socket.
+            loop do
+              @tcp.write(Bytes[0_u8])
+              @tcp.flush
+              sleep interval
+            end
+          end
+        {% end %}
+        yield
+      end
+    rescue ex : TransportError
+      raise ex
+    rescue ex
+      raise TransportError.new(ex.message || "Live frame write failed", "live write")
+    end
+
+    private def validate_close_payload(payload : Bytes)
+      raise ProtocolError.new("Live close frame has a one-byte body", "live read") if payload.size == 1
+      return if payload.empty?
+      code = (payload[0].to_u16 << 8) | payload[1].to_u16
+      valid_code = (code >= 1000 && code <= 1014 && !{1004_u16, 1005_u16, 1006_u16}.includes?(code)) ||
+                   (code >= 3000 && code <= 4999)
+      raise ProtocolError.new("Live close frame has an invalid status code", "live read") unless valid_code
+      reason = String.new(payload[2, payload.size - 2])
+      raise ProtocolError.new("Live close frame reason is not UTF-8", "live read") unless reason.valid_encoding?
     end
 
     private def append_message(payload : Bytes)
@@ -563,9 +734,23 @@ module Convex
     def initialize(@base_url : URI, @client_version : String)
       @commands = Channel(LiveCommand).new(32)
       @closed = false
+      @closing = false
+      @close_waiters = [] of Channel(Nil | Error)
       @close_mutex = Mutex.new
+      @interrupt_mutex = Mutex.new
+      @interrupt_generation = 0_u64
       spawn { run }
     end
+
+    {% if flag?(:live_test) %}
+      @@close_pause_entered : Channel(Nil)? = nil
+      @@close_pause_resume : Channel(Nil)? = nil
+
+      def self.pause_next_close(entered : Channel(Nil), resume : Channel(Nil))
+        @@close_pause_entered = entered
+        @@close_pause_resume = resume
+      end
+    {% end %}
 
     def subscribe(path : String, args : JSON::Any) : Subscription
       response = Channel(Subscription | Error).new(1)
@@ -578,6 +763,7 @@ module Convex
     end
 
     def unsubscribe(id : Int32)
+      interrupt_owner
       response = Channel(Nil | Error).new(1)
       @commands.send(UnsubscribeCommand.new(id, response))
       result = response.receive
@@ -588,6 +774,7 @@ module Convex
 
     {% if flag?(:live_test) %}
       def unsubscribe_with_remove_pause(id : Int32, entered : Channel(Nil), resume : Channel(Nil), failed : Channel(Nil))
+        interrupt_owner
         response = Channel(Nil | Error).new(1)
         @commands.send(UnsubscribeCommand.new(id, response, entered, resume, failed))
         result = response.receive
@@ -607,12 +794,51 @@ module Convex
     end
 
     def close
-      return if @close_mutex.synchronize { @closed }
-      response = Channel(Nil | Error).new(1)
-      @commands.send(CloseCommand.new(response))
-      response.receive
-      @close_mutex.synchronize { @closed = true }
+      waiter = Channel(Nil | Error).new(1)
+      enqueue = false
+      already_closed = @close_mutex.synchronize do
+        if @closed
+          true
+        else
+          @close_waiters << waiter
+          unless @closing
+            @closing = true
+            enqueue = true
+          end
+          false
+        end
+      end
+      return if already_closed
+      if enqueue
+        interrupt_owner
+        @commands.send(CloseCommand.new(waiter))
+      end
+      result = waiter.receive
+      raise result if result.is_a?(Error)
     rescue Channel::ClosedError
+      error = ClosedError.new("Live manager is closed", "live")
+      finish_close(error)
+      raise error
+    end
+
+    private def interrupt_owner
+      @interrupt_mutex.synchronize { @interrupt_generation &+= 1_u64 }
+    end
+
+    private def operation_cancelled : Proc(Bool)
+      generation = @interrupt_mutex.synchronize { @interrupt_generation }
+      -> { @interrupt_mutex.synchronize { @interrupt_generation != generation } }
+    end
+
+    private def finish_close(error : Error? = nil)
+      waiters = @close_mutex.synchronize do
+        return if @closed && @close_waiters.empty?
+        @closed = true
+        current = @close_waiters
+        @close_waiters = [] of Channel(Nil | Error)
+        current
+      end
+      waiters.each { |waiting| waiting.send(error || nil) rescue nil }
     end
 
     private def run
@@ -707,9 +933,20 @@ module Convex
               command.response.send(TransportError.new("Live WebSocket is not connected", "live"))
             end
           when CloseCommand
+            {% if flag?(:live_test) %}
+              if entered = @@close_pause_entered
+                resume = @@close_pause_resume.not_nil!
+                @@close_pause_entered = nil
+                @@close_pause_resume = nil
+                entered.send(nil)
+                resume.receive
+              end
+            {% end %}
             socket.try &.close
             active.each_value { |state| state.subscription.finish }
-            command.response.send(nil)
+            # Wake every caller that joined this close, not just the caller
+            # whose command won the race into the owner mailbox.
+            finish_close
             break
           end
         else
@@ -738,7 +975,7 @@ module Convex
 
           if current = socket
             begin
-              if raw = current.poll
+              if raw = current.poll(operation_cancelled)
                 remote_version, max_timestamp, max_timestamp_number = handle_message(raw, active, remote_version, max_timestamp, max_timestamp_number)
                 # Reset only after the message has parsed and applied. A
                 # malformed packet must not make a failing peer look healthy.
@@ -777,6 +1014,7 @@ module Convex
       end
     rescue Channel::ClosedError
     ensure
+      finish_close(ClosedError.new("Live manager owner stopped", "live"))
       @commands.close rescue nil
     end
 
@@ -790,11 +1028,24 @@ module Convex
     end
 
     private def open_socket(connection_count : UInt32, last_close_reason : String, max_timestamp : String)
-      socket = OwnerWebSocket.connect(live_uri, @client_version)
-      connect = {"type" => "Connect", "sessionId" => UUID.random.to_s, "connectionCount" => connection_count, "lastCloseReason" => last_close_reason, "clientTs" => 0}
-      connect["maxObservedTimestamp"] = max_timestamp unless max_timestamp == INITIAL_TIMESTAMP
-      socket.send_json(connect)
-      socket
+      # DNS, TCP, TLS, HTTP 101, and the first Connect frame share one absolute
+      # budget. A close or unsubscribe increments the control generation and
+      # closes the in-flight socket instead of waiting for that whole budget.
+      deadline = Time.monotonic + OwnerWebSocket::CONNECT_DEADLINE
+      cancelled = operation_cancelled
+      socket = OwnerWebSocket.connect(live_uri, @client_version, deadline, cancelled)
+      begin
+        connect = {"type" => "Connect", "sessionId" => UUID.random.to_s, "connectionCount" => connection_count, "lastCloseReason" => last_close_reason, "clientTs" => 0}
+        connect["maxObservedTimestamp"] = max_timestamp unless max_timestamp == INITIAL_TIMESTAMP
+        socket.send_json(connect, deadline, cancelled)
+        socket
+      rescue ex
+        # Assignment to the owner's socket state happens only after this
+        # method returns, so retire the local transport here on any failed or
+        # interrupted first frame.
+        socket.close
+        raise ex
+      end
     end
 
     private def replay(socket : OwnerWebSocket, active : Hash(Int32, LiveState)) : UInt32
@@ -803,17 +1054,17 @@ module Convex
         state = active[id]
         {"type" => "Add", "queryId" => id, "udfPath" => state.path, "args" => [state.args]}
       end
-      socket.send_json({"type" => "ModifyQuerySet", "baseVersion" => 0, "newVersion" => 1, "modifications" => modifications})
+      socket.send_json({"type" => "ModifyQuerySet", "baseVersion" => 0, "newVersion" => 1, "modifications" => modifications}, cancelled: operation_cancelled)
       1_u32
     end
 
     private def add(socket : OwnerWebSocket, version : UInt32, id : Int32, state : LiveState) : UInt32
-      socket.send_json({"type" => "ModifyQuerySet", "baseVersion" => version, "newVersion" => version + 1, "modifications" => [{"type" => "Add", "queryId" => id, "udfPath" => state.path, "args" => [state.args]}]})
+      socket.send_json({"type" => "ModifyQuerySet", "baseVersion" => version, "newVersion" => version + 1, "modifications" => [{"type" => "Add", "queryId" => id, "udfPath" => state.path, "args" => [state.args]}]}, cancelled: operation_cancelled)
       version + 1
     end
 
     private def remove(socket : OwnerWebSocket, version : UInt32, id : Int32) : UInt32
-      socket.send_json({"type" => "ModifyQuerySet", "baseVersion" => version, "newVersion" => version + 1, "modifications" => [{"type" => "Remove", "queryId" => id}]})
+      socket.send_json({"type" => "ModifyQuerySet", "baseVersion" => version, "newVersion" => version + 1, "modifications" => [{"type" => "Remove", "queryId" => id}]}, cancelled: operation_cancelled)
       version + 1
     end
 

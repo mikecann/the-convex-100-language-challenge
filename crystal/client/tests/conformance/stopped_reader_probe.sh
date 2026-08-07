@@ -39,8 +39,11 @@ adapter_pid=$(docker inspect --format '{{.State.Pid}}' "$adapter_name")
 peak_cgroup_mib=0
 peak_rss_mib=0
 sample=0
-while [ "$sample" -lt 4 ]; do
-  usage=$(docker stats --no-stream --format '{{.MemUsage}}' "$adapter_name")
+while [ "$sample" -lt 20 ]; do
+  if [ "$(docker inspect --format '{{.State.Running}}' "$adapter_name")" != true ]; then
+    break
+  fi
+  usage=$(docker stats --no-stream --format '{{.MemUsage}}' "$adapter_name") || break
   resident=${usage%% / *}
   value=${resident%???}
   unit=${resident#"$value"}
@@ -50,16 +53,35 @@ while [ "$sample" -lt 4 ]; do
     else if (unit == "GiB") print value * 1024;
     else exit 1;
   }')
-  rss_kib=$(ps -o rss= -p "$adapter_pid" | tr -d ' ')
+  rss_kib=$(ps -o rss= -p "$adapter_pid" 2>/dev/null | tr -d ' ' || true)
+  rss_kib=${rss_kib:-0}
   rss_mib=$(awk -v value="$rss_kib" 'BEGIN { print value / 1024 }')
   peak_cgroup_mib=$(awk -v old="$peak_cgroup_mib" -v current="$mib" 'BEGIN { print (current > old ? current : old) }')
   peak_rss_mib=$(awk -v old="$peak_rss_mib" -v current="$rss_mib" 'BEGIN { print (current > old ? current : old) }')
   sample=$((sample + 1))
+  sleep 0.05
 done
 
 awk -v peak="$peak_cgroup_mib" 'BEGIN { if (peak >= 96) exit 1 }'
 awk -v peak="$peak_rss_mib" 'BEGIN { if (peak >= 96) exit 1 }'
-controller_status=$(docker wait "$controller_name")
-test "$controller_status" -eq 0
-docker logs "$controller_name" | grep -Fx 'stopped-reader ordering passed'
+
+# The controller is intentionally still alive and has never resumed reading.
+# The adapter itself must hit its cumulative output deadline, release the
+# terminal waiter, and stop without relying on controller cooperation.
+test "$(docker inspect --format '{{.State.Running}}' "$controller_name")" = true
+attempt=0
+while [ "$(docker inspect --format '{{.State.Running}}' "$adapter_name")" = true ]; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 100 ]; then
+    docker logs "$adapter_name" >&2
+    exit 1
+  fi
+  sleep 0.05
+done
+adapter_status=$(docker inspect --format '{{.State.ExitCode}}' "$adapter_name")
+test "$adapter_status" -ne 0
+test "$(docker inspect --format '{{.State.OOMKilled}}' "$adapter_name")" = false
+docker logs "$controller_name" | grep -Fx 'STOPPED'
+docker logs "$controller_name" | grep -Fx 'REQUESTS=17'
+docker logs "$adapter_name" 2>&1 | grep -F 'adapter output deadline exceeded'
 printf 'peak_rss_mib=%s peak_cgroup_mib=%s limit_mib=128 safety_gate_mib=96\n' "$peak_rss_mib" "$peak_cgroup_mib"
