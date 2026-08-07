@@ -63,6 +63,26 @@ LIVE_BACKOFF_MAX_MS  equ 10000
 
 ; --- small leaf helpers -----------------------------------------------
 
+; void dbg_mark(int code) [edi] -- DEBUG ONLY: writes one marker digit +
+; newline to stderr. Used to bisect a crash by call-site sequence.
+dbg_mark:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    mov [rbp-8], edi
+    add byte [rbp-8], '0'
+    mov edi, 2
+    lea rsi, [rbp-8]
+    mov edx, 1
+    call write
+    mov edi, 2
+    lea rsi, [rel dbg_nl_live]
+    mov edx, 1
+    call write
+    mov rsp, rbp
+    pop rbp
+    ret
+
 ; char hex_nibble_char(int nibble) [edi, 0-15] -- leaf, no frame needed.
 hex_nibble_char:
     mov al, dil
@@ -1105,24 +1125,39 @@ teardown_and_schedule:
 ; version we send, and (via marking every ACTIVE subscription back to
 ; PENDING_ADD) the Add resend the caller's next send_add_batch will do.
 %define TC_LIVE -8
+%define TC_TMP  -16
 try_connect:
     push rbp
     mov rbp, rsp
-    sub rsp, 16
+    sub rsp, 32
     mov [rbp+TC_LIVE], rdi
 
-    mov rax, [rdi + convex_live.client]
+    mov edi, 3
+    call dbg_mark
+
+    mov rax, [rbp+TC_LIVE]
+    mov rax, [rax + convex_live.client]
     lea rdi, [rax + convex_client.url]
     mov rsi, [rax + convex_client.user_agent_ptr]
     mov rdx, [rax + convex_client.user_agent_len]
     mov rcx, [rbp+TC_LIVE]
     lea rcx, [rcx + convex_live.ws]
     call ws_open
+    mov [rbp+TC_TMP], rax
+    mov edi, 4
+    call dbg_mark
+    mov rax, [rbp+TC_TMP]
     test eax, eax
     jz .fail
 
+    mov edi, 7
+    call dbg_mark
     mov rdi, [rbp+TC_LIVE]
     call send_connect_message
+    mov [rbp+TC_TMP], rax
+    mov edi, 8
+    call dbg_mark
+    mov rax, [rbp+TC_TMP]
     test eax, eax
     jz .fail
 
@@ -1168,6 +1203,7 @@ try_connect:
     pop rbp
     ret
 %undef TC_LIVE
+%undef TC_TMP
 
 ; void convex_live_maintain(convex_live *live) -- called every event-loop
 ; tick regardless of socket readiness: (re)connects on schedule and flushes
@@ -1180,6 +1216,10 @@ convex_live_maintain:
     mov rbp, rsp
     sub rsp, 16
     mov [rbp+LM_LIVE], rdi
+
+    mov edi, 2
+    call dbg_mark
+    mov rdi, [rbp+LM_LIVE]
 
     mov rax, [rdi + convex_live.connected]
     test rax, rax
@@ -1964,6 +2004,9 @@ convex_live_subscribe:
     mov [rbp+LS_PATHLEN], rdx
     mov [rbp+LS_ARGS], rcx
 
+    mov edi, 1
+    call dbg_mark
+
     mov edi, convex_sub_size
     call malloc
     test rax, rax
@@ -2245,6 +2288,7 @@ convex_live_next:
 %undef LN_PFD
 
 section .rodata
+    dbg_nl_live: db 10
     initial_ts: db "AAAAAAAAAAA="
     initial_ts_len equ $ - initial_ts
 
