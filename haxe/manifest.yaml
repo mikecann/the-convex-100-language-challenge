@@ -4,5 +4,36 @@ displayName: "Haxe"
 rank: 86
 selectionTier: curated_backfill
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Haxe implementation compiled to the Neko target. Neko supplies the Haxe runtime and ordinary socket, TLS, thread, and JSON primitives; all Convex HTTP envelopes, sync state, WebSocket framing, replay, and adapter behaviour are implemented in Haxe.
+toolchain:
+  name: Haxe with Neko target
+  version: "Haxe 4.2.5 / Neko 2.3.0"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Docker compilation and shared local and hosted conformance are pending independent verification.
+  - Live authentication, optimistic updates, transition chunks, WebSocket mutations, and WebSocket actions are deferred.
+  - Values use the JSON-safe subset exercised by the educational example.
+  - Live keeps at most 16 queued updates within a 24 MiB budget that charges four times each encoded event plus a fixed record allowance, dropping the globally oldest queued state under pressure.
+  - Active Live query state is bounded to 64 subscriptions and 8 MiB of encoded paths and arguments; pending owner commands and retiring query IDs have independent count caps.
+  - The adapter output queue separately retains at most 16 encoded events within 12 MiB and fails the connection rather than queueing for a stopped reader.
+  - One server message is bounded at 4 MiB and 2.5 seconds once its first byte arrives; a connection stalled mid-frame is abandoned rather than resumed.
+  - There is no server-inactivity watchdog; a silent peer is detected only when a read or write fails.
+  - Neko is the genuine Haxe target runtime, not a delegated Convex client or bridge.
+  - Neko represents sync counters with exact non-negative signed integers. Larger unsigned protocol values are rejected rather than wrapped.
 capabilities: []
