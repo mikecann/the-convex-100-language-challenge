@@ -13,6 +13,7 @@ import java.util.concurrent.TimeUnit
 final class LiveClientTests {
   static void run() {
     addInitialExternalAndRemove()
+    unsubscribeToEmptyThenResubscribeReusesConnection()
     queryFailureRecoversToSameValue()
     fragmentedUtf8AndControlFrame()
     malformedTransitionIsTransactional()
@@ -61,6 +62,60 @@ final class LiveClientTests {
     assert subscription.next(Duration.ofSeconds(3)).count == 1
     subscription.close()
     live.close()
+    finish(listener, server, failure)
+  }
+
+  /**
+   * The shared harness's own pattern for every Live test after the first is
+   * unsubscribe-then-subscribe: drop the only live subscription, then
+   * immediately subscribe a replacement. That leaves subscriptions empty for
+   * a moment while the connection itself stays up, since startConnect only
+   * dials a fresh socket when none is already open. A single fixture peer
+   * accept below proves the replacement rides that same connection and still
+   * gets delivered its own initial hydration afterward.
+   */
+  private static void unsubscribeToEmptyThenResubscribeReusesConnection() {
+    ServerSocket listener = new ServerSocket(0)
+    ArrayBlockingQueue<Map> connects = new ArrayBlockingQueue<>(2)
+    Throwable[] failure = new Throwable[1]
+    Thread server = Thread.start('live-resubscribe-fixture') {
+      try {
+        WebSocketFixture.Peer peer = WebSocketFixture.handshake(listener.accept())
+        connects.put(peer.readJson())
+        Map addFirst = peer.readJson()
+        int firstQueryId = addFirst.modifications[0].queryId
+        peer.sendJson(transition(
+          version(0, 'AAAAAAAAAAA='),
+          version(1, 'first-hydrated'),
+          [updated(firstQueryId, 0)],
+        ))
+        Map remove = peer.readJson()
+        assert remove.modifications == [[type: 'Remove', queryId: firstQueryId]]
+        Map addSecond = peer.readJson()
+        int secondQueryId = addSecond.modifications[0].queryId
+        peer.sendJson(transition(
+          version(1, 'first-hydrated'),
+          version(2, 'second-hydrated'),
+          [updated(secondQueryId, 5)],
+        ))
+        peer.awaitDisconnect()
+      } catch (Throwable error) {
+        failure[0] = error
+      }
+    }
+
+    LiveClient live = new LiveClient(url(listener))
+    LiveClient.Subscription first = live.subscribe('demo:state', [room: 'reuse-first'])
+    assert first.next(Duration.ofSeconds(3)).count == 0
+    first.close()
+
+    LiveClient.Subscription second = live.subscribe('demo:state', [room: 'reuse-second'])
+    // A leftover generation bump from cancelling the reconnect timer for the
+    // now-empty subscription set must not silently swallow this delivery.
+    assert second.next(Duration.ofSeconds(3)).count == 5
+    second.close()
+    live.close()
+    assert connects.size() == 1: 'unsubscribing to empty must not force a second handshake'
     finish(listener, server, failure)
   }
 

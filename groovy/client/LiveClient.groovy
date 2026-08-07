@@ -719,7 +719,18 @@ final class LiveClient implements AutoCloseable {
 
   private void cancelReconnect() {
     reconnectScheduled = false
-    socketGeneration++
+    // Do not bump socketGeneration here. unsubscribe() calls this once the
+    // last subscription is removed, but a live socket can still be
+    // connected at that moment; startConnect deliberately leaves it open so
+    // the next subscribe reuses it instead of forcing a fresh handshake.
+    // Every Listener callback keeps tagging that connection's events with
+    // the generation captured when it was built, so advancing the counter
+    // here would desync it from a connection nobody retired: drainIncoming
+    // would then discard that socket's Transitions forever, including the
+    // resubscribe's own initial hydration, with no error and no retry.
+    // Cancelling an in-flight connect attempt does not need the counter
+    // either: nulling pendingConnect below already makes completeConnect's
+    // `pendingConnect != candidate` check reject that stale attempt.
     pendingConnect?.cancel(true)
     pendingConnect = null
     handshakeDeadline?.cancel(false)
