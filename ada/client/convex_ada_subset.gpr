@@ -36,7 +36,39 @@ project Convex_Ada_Subset is
 
    package Compiler is
       for Default_Switches ("Ada") use
-           ("-gnat2022", "-gnatwa", "-gnatwe", "-gnatW8", "-O2");
+           ("-gnat2022", "-gnatW8", "-O2");
+
+      --  AWS and GNATCOLL are compiled as ordinary sources of this project
+      --  (see the note above Source_Dirs), so a warning gate on
+      --  Default_Switches would apply to their vendored code too, where
+      --  -gnatwe would fail the build on a warning this project cannot fix.
+      --  Scope -gnatwa (enable warnings) and -gnatwe (treat them as errors)
+      --  to the client, adapter, tests, and example sources this project
+      --  actually owns.
+      Owned_Switches := ("-gnat2022", "-gnatwa", "-gnatwe", "-gnatW8", "-O2");
+      for Switches ("convex.ads") use Owned_Switches;
+      for Switches ("convex.adb") use Owned_Switches;
+      for Switches ("convex-live.ads") use Owned_Switches;
+      for Switches ("convex-live.adb") use Owned_Switches;
+      for Switches ("convex_url.ads") use Owned_Switches;
+      for Switches ("convex_url.adb") use Owned_Switches;
+      for Switches ("convex_websocket.ads") use Owned_Switches;
+      for Switches ("convex_websocket.adb") use Owned_Switches;
+      for Switches ("convex_socket_tests.adb") use Owned_Switches;
+      for Switches ("convex_tests.adb") use Owned_Switches;
+      for Switches ("convex_tls_tests.adb") use Owned_Switches;
+      for Switches ("convex_adapter.adb") use Owned_Switches;
+      for Switches ("convex_adapter_event_tests.adb") use Owned_Switches;
+      for Switches ("convex_adapter_events.ads") use Owned_Switches;
+      for Switches ("convex_adapter_events.adb") use Owned_Switches;
+      for Switches ("convex_adapter_fixture.adb") use Owned_Switches;
+      for Switches ("convex_adapter_output.ads") use Owned_Switches;
+      for Switches ("convex_adapter_output.adb") use Owned_Switches;
+      for Switches ("convex_adapter_output_tests.adb") use Owned_Switches;
+      for Switches ("convex_adapter_stopped_reader.adb") use Owned_Switches;
+      for Switches ("convex-live-testing.ads") use Owned_Switches;
+      for Switches ("convex-live-testing.adb") use Owned_Switches;
+      for Switches ("convex_example.adb") use Owned_Switches;
    end Compiler;
 
    package Binder is
