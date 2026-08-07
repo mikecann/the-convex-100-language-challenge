@@ -200,6 +200,25 @@ RUN test "$(id -u):$(id -g)" = 65532:65532 \
 # The TLS closure is proven with the shipped binary and the shipped OpenSSL
 # files rather than with the build stage's toolchain. `openssl` is copied in
 # only for this verification stage and never reaches a published image.
+#
+# `openssl s_server -www` never answers a POST at all: it accepts the TLS
+# connection and reads the request, but sends nothing back, confirmed by
+# replaying the identical raw POST bytes with `openssl s_client` against the
+# same server and getting zero response bytes, while a GET gets an immediate
+# reply. `-WWW` (a real, if minimal, static file server) behaves the same way
+# for a POST. No standard `openssl` subcommand answers one, so this stage
+# cannot prove anything about a *response* without hand-rolling a second TLS
+# server - which would then be the untested part. It instead proves the two
+# things that only the shipped binary's own TLS path can prove: the
+# handshake itself completes, and the client's own absolute deadline, not an
+# external timeout, is what ends the call. `convex-example`'s request is
+# always a POST, so the run below is expected to fail, and its failure mode
+# is the evidence. A handshake failure surfaces as a distinct "TLS handshake
+# ... failed" transport error; the deadline elapsing after the handshake and
+# the request write both succeeded, waiting on a peer that never intends to
+# reply, surfaces as "response deadline elapsed" instead. This run takes as
+# long as http_call_budget in client/http.v (20 seconds) because the deadline
+# itself is what is under test, not a proxy for it.
 FROM runtime-base AS tls-closure
 USER root:root
 COPY --from=test /usr/bin/openssl /usr/bin/openssl
@@ -226,11 +245,15 @@ RUN set -eu; \
     cat /probe.err; \
     test "$code" -eq 1; \
     test ! -s /probe.out; \
-    grep -Fq 'payload is not valid JSON' /probe.err; \
+    grep -Fq 'response deadline elapsed' /probe.err; \
+    ! grep -Fq 'handshake' /probe.err; \
+    ! grep -Fq 'connect to' /probe.err; \
     printf '%s\n' \
-      'convex-example completed a TLS handshake against a locally issued' \
-      'certificate using only the shipped OpenSSL closure, then failed at' \
-      'Convex envelope decoding as expected for a non-Convex TLS peer.' \
+      'convex-example completed a real TLS handshake against a locally' \
+      'issued certificate and wrote its request, using only the shipped' \
+      'OpenSSL closure, then hung waiting on a peer that never answers a' \
+      'POST until its own absolute deadline - not an external timeout -' \
+      'ended the call.' \
       > /usr/local/share/convex-tls-closure
 # The probe files are deliberately left in place: this stage inherits the
 # pruned runtime-base, which has no rm, and nothing here reaches a shipped

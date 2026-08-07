@@ -76,6 +76,12 @@ fn dial_stream(endpoint Endpoint, deadline Deadline) !Stream {
 	}
 	tcp.set_read_timeout(deadline.remaining())
 	tcp.set_write_timeout(deadline.remaining())
+	// The TLS handshake below reads and writes this same file descriptor
+	// through OpenSSL, which never consults the V-level timeouts just set
+	// above (see set_socket_deadline). Setting the kernel timeout here, not
+	// only in set_stream_timeout, is what actually bounds a peer that
+	// completes the TCP connect and then stalls the handshake.
+	set_socket_deadline(tcp.sock.handle, deadline.remaining())
 	if !endpoint.secure {
 		return &TcpStream{
 			conn: tcp
@@ -170,14 +176,26 @@ fn set_stream_timeout(mut stream Stream, deadline Deadline) {
 		stream.conn.set_write_timeout(remaining)
 		stream.conn.set_read_deadline(wall_deadline)
 		stream.conn.set_write_deadline(wall_deadline)
+		// V's own TcpConn.read_ptr/write_ptr do honour the fields just set
+		// above, so this is redundant for a plaintext stream on its own -
+		// but see the TlsStream branch below for why it is set here too
+		// rather than only there.
+		set_socket_deadline(stream.conn.sock.handle, remaining)
 	} else if mut stream is TlsStream {
 		stream.tcp.set_read_timeout(remaining)
 		stream.tcp.set_write_timeout(remaining)
 		stream.tcp.set_read_deadline(wall_deadline)
 		stream.tcp.set_write_deadline(wall_deadline)
 		// The pinned OpenSSL wrapper uses this duration to build one cumulative
-		// deadline around all WANT_READ/WANT_WRITE retries in a call.
+		// deadline around all WANT_READ/WANT_WRITE retries in a call - but only
+		// the ones OpenSSL's own retry loop actually takes. SSL_read and
+		// SSL_write are ordinary blocking C calls against this same file
+		// descriptor, so when they complete in one call - the common case -
+		// neither this Duration nor any V-level timeout is ever consulted.
+		// set_socket_deadline is what actually bounds that call: SO_RCVTIMEO
+		// and SO_SNDTIMEO are kernel-enforced on the descriptor itself.
 		stream.conn.duration = remaining
+		set_socket_deadline(stream.tcp.sock.handle, remaining)
 	}
 }
 
