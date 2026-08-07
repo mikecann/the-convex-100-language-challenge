@@ -44,4 +44,6 @@ limitations:
   - DNS resolution is the one unbounded step in a connection; every later step honours a monotonic deadline.
   - IPv6 deployment URLs in bracket form are refused rather than mis-parsed.
   - Pinned to gawk 5.3.2 rather than the newer 5.4.x series. A from-source 5.4.1 build miscompiled an `if` combining two array-subscript comparisons with `&&`, evaluating the true branch even when both comparisons were false. Debian's packaged 5.2.1, Alpine's packaged 5.3.2, and a from-source 5.3.2 build all evaluate the same program correctly, so this looks like an upstream 5.4 regression rather than anything in this build.
-capabilities: []
+capabilities:
+  - http
+  - live

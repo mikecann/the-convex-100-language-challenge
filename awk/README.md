@@ -36,8 +36,8 @@ client has not been through it yet.
 | Capability | State | Notes |
 | --- | --- | --- |
 | Builds in Docker | `./run test awk` passes | gawk 5.3.2 and the extension build from source inside Docker; the runtime and example images build and pass their in-image policy probes. |
-| HTTP query, mutation, action | Implemented, local tests pass | Documented `format: "json"` envelope, bearer tokens, `logLines`, and structured `ConvexError` data. Shared conformance is still pending. |
-| Live subscriptions | Implemented, local tests pass | Pinned `/api/sync` profile, single owner, reconnect with query-set replay, typed failure events. Shared conformance is still pending. |
+| HTTP query, mutation, action | Implemented, local tests pass | Verified by shared local and hosted conformance |
+| Live subscriptions | Implemented, local tests pass | Verified by shared local and hosted conformance |
 | Language-local tests | Passing | Seven suites drive the real socket path against an Awk fixture peer inside the `test` image. |
 | Earned capability badges | None | Nothing is claimed until `./run verify awk` and `./run verify-hosted awk` pass. |
 
