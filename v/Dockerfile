@@ -116,6 +116,18 @@ FROM --platform=linux/amd64 ${BUILD_IMAGE} AS runtime-base
 # The shared policy and example verifier still require /bin/sh and basic POSIX
 # text tools, so this is deliberately not `scratch`.
 RUN set -eu; \
+    # Debian points /usr/bin/awk at mawk through /etc/alternatives, and the
+    # sweeps below delete that directory. Resolve every tool this stage keeps
+    # to a real file first, or the survivors are left as dangling symlinks and
+    # fail with "not found" despite the target binary still being present.
+    for tool in sh dash id cat cut head tail tr sort uniq wc uname grep sed awk mawk; do \
+      path="/usr/bin/$tool"; \
+      test -L "$path" || continue; \
+      target="$(readlink -f "$path")"; \
+      test -f "$target" || continue; \
+      cp "$target" "$path.real"; \
+      mv "$path.real" "$path"; \
+    done; \
     for path in /boot /home /media /mnt /opt /root /srv /var /usr/share \
                 /usr/include /usr/src /usr/games /usr/sbin /sbin /usr/libexec; do \
       rm -rf "$path"; \
