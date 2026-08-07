@@ -175,17 +175,26 @@ RUN set -eu; \
 # Entry points. Each one is a two line launcher for the exact checked-in Awk
 # program; LC_ALL=C keeps every string operation byte oriented, which is what
 # lets UTF-8 payloads pass through untouched.
-RUN printf '%s\n' \
+#
+# These go into per-image trees rather than into the shared /staging closure.
+# runtime-base is the common ancestor of both leaf images, so anything staged
+# there arrives in both of them, and each leaf image proves that the other
+# image's entry point is absent. The final images ship no `rm` and run as
+# 65532, so a leaf cannot undo an over-broad base: the split has to happen
+# here, where the launchers are written.
+RUN mkdir -p /staging-example/usr/local/bin /staging-adapter/usr/local/bin \
+    && printf '%s\n' \
       '#!/bin/sh' \
       'export LC_ALL=C AWKPATH=/opt/convex/client AWKLIBPATH=/opt/convex/lib' \
       'exec /usr/local/bin/gawk -f /opt/convex/examples/basics/main.awk -- "$@"' \
-      > /staging/usr/local/bin/convex-example \
+      > /staging-example/usr/local/bin/convex-example \
     && printf '%s\n' \
       '#!/bin/sh' \
       'export LC_ALL=C AWKPATH=/opt/convex/client AWKLIBPATH=/opt/convex/lib' \
       'exec /usr/local/bin/gawk -f /opt/convex/adapter.awk -- "$@"' \
-      > /staging/usr/local/bin/convex-adapter \
-    && chmod 0555 /staging/usr/local/bin/convex-example /staging/usr/local/bin/convex-adapter
+      > /staging-adapter/usr/local/bin/convex-adapter \
+    && chmod 0555 /staging-example/usr/local/bin/convex-example \
+       /staging-adapter/usr/local/bin/convex-adapter
 
 # `./run test awk` runs the same suites again from the built image, so the
 # evidence is not limited to what happened during the build.
@@ -286,22 +295,29 @@ RUN test ! -e /etc/dpkg \
 
 # ---------------------------------------------------------------------------
 FROM runtime-base AS example-runtime
+COPY --from=test /staging-example /
 COPY --from=test /project/examples/basics/main.awk /opt/convex/examples/basics/main.awk
-RUN test -x /usr/local/bin/convex-example \
-    && test ! -e /usr/local/bin/convex-adapter \
-    && test ! -e /opt/convex/adapter.awk
+RUN set -eux; \
+    test -x /usr/local/bin/convex-example; \
+    test ! -e /usr/local/bin/convex-adapter; \
+    test ! -e /opt/convex/adapter.awk
 ENTRYPOINT ["/usr/local/bin/convex-example"]
 
 # ---------------------------------------------------------------------------
 # Keep the adapter last: `./run build awk` uses the default target.
 FROM runtime-base AS runtime
+COPY --from=test /staging-adapter /
 COPY --from=test /project/client/tests/conformance/adapter.awk /opt/convex/adapter.awk
-RUN test -x /usr/local/bin/convex-adapter \
-    && test ! -e /usr/local/bin/convex-example \
-    && test ! -e /opt/convex/examples \
-    && printf '%s\n' \
-         '{"protocolVersion":1,"id":"hello","op":"hello"}' \
-         '{"id":"close","op":"close"}' \
-       | CONVEX_URL=http://example.invalid /usr/local/bin/convex-adapter \
-       | grep -Fq '"type":"closed"'
+# `set -x` is what makes a failure here readable: a bare `&&` chain of `test`
+# calls reports exit 1 with no output at all, which reads as "the adapter smoke
+# test failed" no matter which link actually broke.
+RUN set -eux; \
+    test -x /usr/local/bin/convex-adapter; \
+    test ! -e /usr/local/bin/convex-example; \
+    test ! -e /opt/convex/examples; \
+    printf '%s\n' \
+      '{"protocolVersion":1,"id":"hello","op":"hello"}' \
+      '{"id":"close","op":"close"}' \
+    | CONVEX_URL=http://example.invalid /usr/local/bin/convex-adapter \
+    | grep -Fq '"type":"closed"'
 ENTRYPOINT ["/usr/local/bin/convex-adapter"]
