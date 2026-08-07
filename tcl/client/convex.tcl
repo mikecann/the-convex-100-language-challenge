@@ -78,6 +78,100 @@ proc ::convex::subject_common_names {subject} {
     return $names
 }
 
+# The pinned TclTLS build never populates any of the field spellings above:
+# verified directly against Convex's own hosted certificate, the verify
+# callback's dict carries only sha1_hash/subject/issuer/notBefore/notAfter/
+# serial/certificate, with no parsed extension data at all. That certificate
+# names every deployment through subjectAltName ("convex.cloud, *.convex.cloud"),
+# never through the CN, so without this fallback every hosted connection loses
+# its only usable identity and gets refused. The PEM text is still there, so
+# the extension is read straight out of its DER encoding.
+proc ::convex::der_byte {der offset} {
+    if {$offset >= [string length $der]} { error "DER read past the end of the certificate" }
+    binary scan [string index $der $offset] cu value
+    return $value
+}
+
+proc ::convex::der_length {der offset} {
+    set first [der_byte $der $offset]
+    incr offset
+    if {$first < 0x80} { return [list $first $offset] }
+    set count [expr {$first & 0x7f}]
+    set length 0
+    for {set i 0} {$i < $count} {incr i} {
+        set length [expr {($length << 8) | [der_byte $der $offset]}]
+        incr offset
+    }
+    return [list $length $offset]
+}
+
+proc ::convex::pem_der {pem} {
+    set body ""
+    foreach line [split $pem "\n"] {
+        set line [string trim $line]
+        if {$line eq "" || [string match "-----*" $line]} { continue }
+        append body $line
+    }
+    return [binary decode base64 $body]
+}
+
+# GeneralName ::= CHOICE { ..., dNSName [2] IA5String, ..., iPAddress [7]
+# OCTET STRING, ... }. Both are IMPLICIT primitives, so each entry's content
+# is the name itself with no further unwrapping.
+proc ::convex::der_ip_text {bytes} {
+    set parts {}
+    foreach byte [split $bytes ""] {
+        binary scan $byte cu value
+        lappend parts $value
+    }
+    if {[llength $parts] == 4} { return [join $parts .] }
+    set groups {}
+    foreach {hi lo} $parts { lappend groups [format %02x%02x $hi $lo] }
+    return [join $groups :]
+}
+
+proc ::convex::der_general_names {der start stop} {
+    set entries {}
+    set cursor $start
+    while {$cursor < $stop} {
+        set tag [der_byte $der $cursor]
+        incr cursor
+        lassign [der_length $der $cursor] length contentStart
+        set content [string range $der $contentStart [expr {$contentStart + $length - 1}]]
+        # switch matches its patterns as literal strings, and $tag is a plain
+        # decimal integer from binary scan, so comparing it against a "0x82"
+        # pattern there would never match; use numeric expr comparisons instead.
+        if {$tag == 0x82} {
+            lappend entries [list dns $content]
+        } elseif {$tag == 0x87} {
+            lappend entries [list ip [der_ip_text $content]]
+        }
+        set cursor [expr {$contentStart + $length}]
+    }
+    return $entries
+}
+
+# The extension's own OID (2.5.29.17, subjectAltName) has a short, fixed DER
+# encoding - tag 0x06 (OBJECT IDENTIFIER), length 3, value 55 1d 11 - so it is
+# found directly rather than walking every field of the surrounding
+# TBSCertificate to reach it.
+proc ::convex::subject_alt_names_der {der} {
+    set marker "\x06\x03\x55\x1d\x11"
+    set at [string first $marker $der]
+    if {$at < 0} { return {} }
+    set offset [expr {$at + [string length $marker]}]
+    # extnID is followed by an optional BOOLEAN critical flag (tag 0x01,
+    # length 1, 3 bytes total), then the extnValue OCTET STRING (tag 0x04)
+    # that wraps the DER-encoded SubjectAltName SEQUENCE.
+    if {[der_byte $der $offset] == 0x01} { incr offset 3 }
+    if {[der_byte $der $offset] != 0x04} { return {} }
+    incr offset
+    lassign [der_length $der $offset] octetLength octetStart
+    if {[der_byte $der $octetStart] != 0x30} { return {} }
+    lassign [der_length $der [expr {$octetStart + 1}]] seqLength seqStart
+    return [der_general_names $der $seqStart [expr {$seqStart + $seqLength}]]
+}
+
 proc ::convex::certificate_identities {certificate} {
     set identities {}
     foreach key {alternate_names alternateNames subjectAltName subject_alt_name san} {
@@ -86,6 +180,16 @@ proc ::convex::certificate_identities {certificate} {
     }
     if {![llength $identities] && [dict exists $certificate extensions]} {
         foreach entry [identity_entries [dict get $certificate extensions] 1] { lappend identities $entry }
+    }
+    if {![llength $identities] && [dict exists $certificate certificate]} {
+        # A malformed or unexpected PEM must never turn into a Tcl error here:
+        # it just leaves this source empty and verification falls through to
+        # the CN, same as any other certificate this client cannot read.
+        catch {
+            foreach entry [subject_alt_names_der [pem_der [dict get $certificate certificate]]] {
+                lappend identities $entry
+            }
+        }
     }
     # The common name is the last resort. A certificate that names nothing this
     # client can check produces an empty list, which fails verification.
