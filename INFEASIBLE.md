@@ -50,7 +50,7 @@ languages.
 | 7 | scratch | **SNOBOL4** | CSNOBOL4 | 1962, and still the most distinctive pattern-matching model ever shipped. The oldest language in the project. |
 | 8 | visual-foxpro | **Mercury** | mercury | Logic programming with strong static types and a real module system — Prolog's ideas taken seriously. |
 | 9 | xbasepp | **Oberon-07** | OBNC | Wirth's final, radically minimal language. A whole client in a language whose report fits in sixteen pages. |
-| 10 | xojo | **Roc** | roc | A young pure-functional language with a platform/host split that maps unusually well onto a client with an FFI transport. |
+| 10 | xojo | **ALGOL 60** | GNU MARST | 1960, and the ancestor of nearly everything else on this roster: block structure, lexical scope, recursion and BNF all arrive here. The oldest language the project adds, and older than every entry except Fortran, Lisp and COBOL, which it predates in influence if not in date. |
 | 11 | xpp | **ATS** | ats2 | Dependent types over C, proving memory safety at compile time. The most demanding type system in the project. |
 
 Deliberately not chosen, and why:
@@ -58,8 +58,15 @@ Deliberately not chosen, and why:
 - **PostScript** (Ghostscript) — a page-description language with no sockets;
   a client would have to be almost entirely foreign calls, which earns the
   bridge label rather than a native one.
-- **Koka** and **Red** — both interesting, but their toolchains are young enough
-  that a reproducible pinned Docker build is a project of its own.
+- **Koka**, **Red** and **Roc** — all interesting, but young enough that pinning
+  a reproducible Docker build is a project of its own. Roc was originally chosen
+  and then displaced by ALGOL 60, which is both more interesting and, being
+  finished in 1960, not going to move under us.
+- **ALGOL 68** (Genie) — the packaged build has no networking primitives at all,
+  so a client would need an external transport process and would earn the bridge
+  label rather than the native one. ALGOL 60 via MARST avoids this because MARST
+  translates to C, where a small socket and TLS boundary is normal for this
+  project.
 
 If any chosen language proves infeasible once its toolchain is actually pinned
 in Docker, it moves to the table above with its reason recorded, and the next
