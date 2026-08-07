@@ -53,9 +53,15 @@ procedure Convex_Adapter_Event_Tests is
    --  A subscription delivery carrying one unescaped string value serializes
    --  as this fixed 59-byte envelope around the value's characters, which is
    --  what makes the assertions below exact rather than approximate.
+   --
+   --  GNATCOLL.JSON stores an object's fields in an Ada.Containers.Ordered_Maps
+   --  keyed by field name, so JSON.Write always serializes them in ascending
+   --  field-name order regardless of Set_Field call order. Every literal
+   --  expected string below is written in that order rather than the order
+   --  Convex_Adapter_Events happens to call Set_Field in.
    Value_Envelope : constant := 59;
    Delivery_Head  : constant String :=
-     "{""type"":""subscription"",""subscriptionId"":""sub-4"",""value"":""";
+     "{""subscriptionId"":""sub-4"",""type"":""subscription"",""value"":""";
 
    type String_Access is access String;
 
@@ -118,10 +124,12 @@ begin
    Check_Line
      (Convex_Adapter_Events.Ready
         ("hello", "ada", "native-aws-net-rfc6455-0.1.0", "GNAT 14.2.1"),
-      "{""protocolVersion"":1,""id"":""hello"",""type"":""ready"","
-      & """language"":""ada"","
+      "{""id"":""hello"","
       & """implementation"":""native-aws-net-rfc6455-0.1.0"","
-      & """runtime"":""GNAT 14.2.1""}",
+      & """language"":""ada"","
+      & """protocolVersion"":1,"
+      & """runtime"":""GNAT 14.2.1"","
+      & """type"":""ready""}",
       "ready event shape");
 
    Check_Line
@@ -155,7 +163,7 @@ begin
           Value    => JSON.JSON_Null,
           Has_Logs => True,
           Logs     => JSON.Empty_Array)),
-      "{""id"":""q2"",""type"":""result"",""value"":null,""logs"":[]}",
+      "{""id"":""q2"",""logs"":[],""type"":""result"",""value"":null}",
       "successful result keeps an empty logs array");
 
    Check_Line
@@ -165,8 +173,8 @@ begin
           Value    => JSON.Create (True),
           Has_Logs => True,
           Logs     => One_Log)),
-      "{""id"":""q3"",""type"":""result"",""value"":true,"
-      & """logs"":[""log line""]}",
+      "{""id"":""q3"",""logs"":[""log line""],"
+      & """type"":""result"",""value"":true}",
       "successful result carries present logs");
 
    Check_Line
@@ -180,9 +188,9 @@ begin
              Data     => JSON.Create (Long_Long_Integer (9)),
              Has_Logs => True,
              Logs     => One_Log))),
-      "{""id"":""m1"",""type"":""error"",""error"":"
-      & "{""name"":""FunctionError"",""message"":""function failed"","
-      & """data"":9},""logs"":[""log line""]}",
+      "{""error"":"
+      & "{""data"":9,""message"":""function failed"",""name"":""FunctionError""},"
+      & """id"":""m1"",""logs"":[""log line""],""type"":""error""}",
       "structured HTTP error shape");
 
    Check_Line
@@ -196,22 +204,25 @@ begin
              Data     => JSON.JSON_Null,
              Has_Logs => False,
              Logs     => JSON.Empty_Array))),
-      "{""id"":""m2"",""type"":""error"",""error"":"
-      & "{""name"":""TransportError"",""message"":""peer closed""}}",
+      "{""error"":"
+      & "{""message"":""peer closed"",""name"":""TransportError""},"
+      & """id"":""m2"",""type"":""error""}",
       "transport error omits absent data and logs");
 
    --  An unvalidated command id must never reach the controller, so the error
    --  event omits the field rather than sending an empty string.
    Check_Line
      (Convex_Adapter_Events.Protocol_Error_Event ("", "invalid command"),
-      "{""type"":""error"",""error"":"
-      & "{""name"":""ProtocolError"",""message"":""invalid command""}}",
+      "{""error"":"
+      & "{""message"":""invalid command"",""name"":""ProtocolError""},"
+      & """type"":""error""}",
       "protocol error without a validated id");
 
    Check_Line
      (Convex_Adapter_Events.Protocol_Error_Event ("p1", "unknown operation"),
-      "{""id"":""p1"",""type"":""error"",""error"":"
-      & "{""name"":""ProtocolError"",""message"":""unknown operation""}}",
+      "{""error"":"
+      & "{""message"":""unknown operation"",""name"":""ProtocolError""},"
+      & """id"":""p1"",""type"":""error""}",
       "protocol error with a validated id");
 
    Check_Line
@@ -224,7 +235,7 @@ begin
           Has_Logs  => False,
           Logs      => JSON.Empty_Array,
           Token     => 3)),
-      "{""type"":""subscription"",""subscriptionId"":""sub-1"",""value"":1}",
+      "{""subscriptionId"":""sub-1"",""type"":""subscription"",""value"":1}",
       "subscription value omits absent logs");
 
    Check_Line
@@ -237,8 +248,8 @@ begin
           Has_Logs  => True,
           Logs      => One_Log,
           Token     => 4)),
-      "{""type"":""subscription"",""subscriptionId"":""sub-1"",""value"":2,"
-      & """logs"":[""log line""]}",
+      "{""logs"":[""log line""],""subscriptionId"":""sub-1"","
+      & """type"":""subscription"",""value"":2}",
       "subscription value carries present logs");
 
    Check_Line
@@ -257,9 +268,9 @@ begin
           Has_Logs  => True,
           Logs      => One_Log,
           Token     => 5)),
-      "{""type"":""subscription"",""subscriptionId"":""sub-2"",""error"":"
-      & "{""name"":""FunctionError"",""message"":""query failed""},"
-      & """logs"":[""log line""]}",
+      "{""error"":{""message"":""query failed"",""name"":""FunctionError""},"
+      & """logs"":[""log line""],""subscriptionId"":""sub-2"","
+      & """type"":""subscription""}",
       "subscription error shape");
 
    Check_Line
@@ -278,16 +289,16 @@ begin
           Has_Logs  => False,
           Logs      => JSON.Empty_Array,
           Token     => 6)),
-      "{""type"":""subscription"",""subscriptionId"":""sub-3"",""error"":"
-      & "{""name"":""ProtocolError"",""message"":""bad transition""}}",
+      "{""error"":{""message"":""bad transition"",""name"":""ProtocolError""},"
+      & """subscriptionId"":""sub-3"",""type"":""subscription""}",
       "subscription protocol error omits absent logs");
 
    --  An adapter-detected subscription failure uses the same encoder as a
    --  QueryFailed, so the shared controller sees one subscription error shape.
    Check_Line
      (Convex_Adapter_Events.Subscription_Error_Event ("sub-4", "no room"),
-      "{""type"":""subscription"",""subscriptionId"":""sub-4"",""error"":"
-      & "{""name"":""ProtocolError"",""message"":""no room""}}",
+      "{""error"":{""message"":""no room"",""name"":""ProtocolError""},"
+      & """subscriptionId"":""sub-4"",""type"":""subscription""}",
       "adapter-detected subscription error shape");
 
    --  The output ceiling has to cover a schema-valid Live value at the
@@ -322,12 +333,12 @@ begin
    begin
       Check_Line
         (Convex_Adapter_Events.Subscription_Line ("sub-4", Item, Output_Limit),
-         "{""type"":""subscription"",""subscriptionId"":""sub-4"",""error"":"
-         & "{""name"":""ProtocolError"",""message"":""encoded event of "
+         "{""error"":{""message"":""encoded event of "
          & Image (Output_Limit + 1)
          & " bytes exceeds the "
          & Image (Output_Limit)
-         & " byte adapter output limit""}}",
+         & " byte adapter output limit"",""name"":""ProtocolError""},"
+         & """subscriptionId"":""sub-4"",""type"":""subscription""}",
          "an unencodable Live value did not become a subscription error");
    end;
 
@@ -341,9 +352,9 @@ begin
           Has_Logs => False,
           Logs     => JSON.Empty_Array),
          100),
-      "{""id"":""q4"",""type"":""error"",""error"":"
-      & "{""name"":""ProtocolError"",""message"":""encoded event of "
-      & "138 bytes exceeds the 100 byte adapter output limit""}}",
+      "{""error"":{""message"":""encoded event of "
+      & "138 bytes exceeds the 100 byte adapter output limit"","
+      & """name"":""ProtocolError""},""id"":""q4"",""type"":""error""}",
       "an unencodable call result did not become a protocol error");
 
    --  Substitution retains nothing: the next delivery on the same
@@ -351,7 +362,7 @@ begin
    Check_Line
      (Convex_Adapter_Events.Subscription_Line
         ("sub-4", Delivery ("ok"), Output_Limit),
-      "{""type"":""subscription"",""subscriptionId"":""sub-4"","
+      "{""subscriptionId"":""sub-4"",""type"":""subscription"","
       & """value"":""ok""}",
       "a subscription did not recover after an unencodable value");
 
