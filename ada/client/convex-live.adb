@@ -7,7 +7,6 @@ with Interfaces;
 
 package body Convex.Live is
    use type Ada.Real_Time.Time;
-   use type Interfaces.Unsigned_64;
    use type Interfaces.Unsigned_32;
    use type JSON.JSON_Value_Type;
    use type US.Unbounded_String;
