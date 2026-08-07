@@ -1,5 +1,10 @@
 # Languages that cannot be built honestly inside this project
 
+**Nothing on this page is ever deleted.** An entry whose slot has since been
+filled keeps its row and gains a note naming the replacement. The record of
+what could not be done, and why, is a deliverable of this project in its own
+right — not bookkeeping to be tidied away as the roster fills up.
+
 The project's rules require every client to build, test, and verify inside
 Docker on `linux/amd64`, with no proprietary licenses baked into images and no
 GUI-only toolchains. The following roster entries cannot meet that bar. They
@@ -10,13 +15,16 @@ language so the roster still reaches one hundred.
 
 | Language | Why it cannot be done here |
 | --- | --- |
-| apex | Executes only inside Salesforce's hosted platform; no local runtime exists. |
+| apex | Executes only inside Salesforce's hosted platform; no local runtime exists. Replaced by Rexx, which is merged and evidenced. |
+| labview | Proprietary NI graphical environment; no headless Linux compiler, license required. Replaced by Emacs Lisp, which is merged and evidenced. |
 | matlab | Proprietary license required for the real MATLAB runtime; substituting GNU Octave would not honestly be MATLAB. |
 | mql5 | Runs only inside the proprietary Windows MetaTrader terminal. Replaced by Hare, which is merged and evidenced. |
 | rpg | IBM RPG compilers exist only on IBM i systems; no free Linux toolchain. Replaced by Modula-2, which is merged and evidenced. |
-| sas | Proprietary licensed runtime; no free implementation of the real language. |
-| visual-foxpro | Discontinued proprietary Windows product; no Linux toolchain. |
-| xojo | Proprietary licensed IDE-bound compiler. |
+| sas | Proprietary licensed runtime; no free implementation of the real language. Replaced by Icon, which is merged and evidenced. |
+| scratch | Block-based GUI language with no network primitives; a Convex client cannot be expressed in Scratch itself. Replaced by SNOBOL4, which is merged and evidenced. |
+| visual-foxpro | Discontinued proprietary Windows product; no Linux toolchain. Replaced by Mercury, which is merged and evidenced. |
+| xbasepp | Commercial Windows-only Alaska Xbase++ compiler. Replaced by Oberon-07, which is merged and evidenced. |
+| xojo | Proprietary licensed IDE-bound compiler. Replaced by ALGOL 60, which is merged and evidenced. |
 | xpp | Microsoft Dynamics X++ executes only inside the hosted Dynamics platform. |
 
 ## Infeasible — no way to reach a socket from the language itself
