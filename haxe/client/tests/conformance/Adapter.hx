@@ -133,6 +133,17 @@ class Adapter {
       } catch (_:haxe.io.Eof) {
         if (buffer.length == 0 && !oversized) return null;
         break;
+      } catch (error:haxe.io.Error) {
+        // Neko's socket timeout is an ambient, thread-level setting rather
+        // than a true per-socket option (see AdapterOutput's writeTcp for the
+        // same quirk on the write side): a short poll timeout left over from
+        // handling an HTTP call on this thread (SocketTransport's POLL) still
+        // governs this controller socket's own read. A `Blocked` here only
+        // means the controller has not sent the next command yet - the same
+        // benign polling signal SocketTransport already treats as "retry" -
+        // so keep waiting instead of tearing down an otherwise idle session.
+        if (error == haxe.io.Error.Blocked) continue;
+        throw error;
       }
       if (byte == 10) break;
       if (!oversized) {
