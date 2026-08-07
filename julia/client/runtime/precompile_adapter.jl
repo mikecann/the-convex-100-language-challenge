@@ -89,6 +89,14 @@ function send_http_unauthorized(socket)
     )
 end
 
+# call()'s HTTP-response JSON decode failure needs sprint(showerror, ...) on
+# whatever JSON3 throws for invalid text -- a different exception type than
+# any ConvexError this file otherwise forces through that guard. A healthy
+# 2xx response with a broken body has never been sent before this.
+function send_http_malformed_response(socket)
+    send_http_status(socket, "200 OK", "{not valid json")
+end
+
 # Drive the exact compiled adapter module through real TCP HTTP requests and a
 # malformed NDJSON line before close. This records the output-pump, JSON, HTTP,
 # function-error isolation, and bounded command-loop specializations.
@@ -118,6 +126,7 @@ http_server = @async begin
         ),
         socket -> send_http_response(socket, Dict("acted" => true)),
         send_http_function_error,
+        send_http_malformed_response,
     )
     for responder in responders
         socket = accept(http_listener)
@@ -143,6 +152,7 @@ adapter_input = IOBuffer(
     "{\"id\":\"mutation\",\"op\":\"mutation\",\"path\":\"demo:increment\",\"args\":{}}\n" *
     "{\"id\":\"action\",\"op\":\"action\",\"path\":\"demo:action\",\"args\":{}}\n" *
     "{\"id\":\"failure\",\"op\":\"query\",\"path\":\"demo:fail\",\"args\":{}}\n" *
+    "{\"id\":\"malformed-response\",\"op\":\"query\",\"path\":\"demo:state\",\"args\":{}}\n" *
     "{\"id\":\"close\",\"op\":\"close\"}\n",
 )
 try
@@ -265,6 +275,195 @@ Client.unsubscribe!(subscription)
 Client.close!(live_client)
 wait(live_server)
 
+# decode_live_message's own malformed-JSON branch needs sprint(showerror,
+# ...) on whatever JSON3 throws for invalid frame text -- a third distinct
+# exception type from the HTTP-response and NDJSON-command decode failures
+# above. Every other Live fixture in this file sends well-formed Transition
+# JSON, so this path has never actually run.
+malformed_live_listener = listen(ip"127.0.0.1", 0)
+malformed_live_port = getsockname(malformed_live_listener)[2]
+malformed_live_server = @async begin
+    socket = accept(malformed_live_listener)
+    close(malformed_live_listener)
+    try
+        server_handshake(socket)
+        read_client_json(socket) # Connect
+        read_client_json(socket) # Add
+        write(socket, server_frame(0x01, Vector{UInt8}("{not valid json")))
+        flush(socket)
+    finally
+        close(socket)
+    end
+end
+malformed_live_client = Client.Client("http://127.0.0.1:$(malformed_live_port)")
+try
+    malformed_live_subscription = Client.subscribe(
+        malformed_live_client,
+        "demo:state",
+        Dict("room" => "precompile-malformed"),
+    )
+    malformed_live_update = Client.next_update(malformed_live_subscription; timeout = 5)
+    malformed_live_update.error isa Client.ConvexError ||
+        error("malformed Live message precompile omitted a typed error")
+    Client.unsubscribe!(malformed_live_subscription)
+finally
+    Client.close!(malformed_live_client)
+end
+wait(malformed_live_server)
+
+# Live delivery of a genuine function-level error via a "QueryFailed"
+# transition modification -- exactly what hosted client/live/query-error-
+# recovery conformance sends -- had never actually run through the adapter:
+# every other Live fixture in this file always sends "QueryUpdated".
+# apply_transition!'s QueryFailed branch builds a ConvexError{:function_error}
+# and hashes it for hydration deduplication through a completely different
+# call graph than a value update, and the adapter then has to serialise that
+# error onto the wire as a "subscription" event's error field -- a
+# genuinely different reporting path from the HTTP function-error test
+# above. Drive it through the real adapter command loop, not just the raw
+# client, since the wire serialisation only happens on the adapter side.
+queryfailed_listener = listen(ip"127.0.0.1", 0)
+queryfailed_port = getsockname(queryfailed_listener)[2]
+queryfailed_server = @async begin
+    socket = accept(queryfailed_listener)
+    close(queryfailed_listener)
+    try
+        server_handshake(socket)
+        read_client_json(socket) # Connect
+        add = read_client_json(socket)
+        query_id = Int(add["modifications"][1]["queryId"])
+        transition = Dict(
+            "type" => "Transition",
+            "startVersion" =>
+                Dict("querySet" => 0, "identity" => 0, "ts" => "AAAAAAAAAAA="),
+            "endVersion" => Dict("querySet" => 1, "identity" => 0, "ts" => timestamp),
+            "modifications" => [
+                Dict(
+                    "type" => "QueryFailed",
+                    "queryId" => query_id,
+                    "errorMessage" => "precompile requires nonzero",
+                    "errorData" => Dict("code" => "ROOM_EMPTY"),
+                    "journal" => nothing,
+                ),
+            ],
+        )
+        write(socket, server_frame(0x01, Vector{UInt8}(JSON3.write(transition))))
+        flush(socket)
+        remove = read_client_json(socket)
+        remove["modifications"][1]["type"] == "Remove" ||
+            error("queryfailed fixture expected Remove")
+    finally
+        close(socket)
+    end
+end
+
+old_queryfailed_url = get(ENV, "CONVEX_URL", nothing)
+ENV["CONVEX_URL"] = "http://127.0.0.1:$(queryfailed_port)"
+queryfailed_input = Pipe()
+Base.link_pipe!(
+    queryfailed_input;
+    reader_supports_async = true,
+    writer_supports_async = true,
+)
+queryfailed_output = Pipe()
+Base.link_pipe!(
+    queryfailed_output;
+    reader_supports_async = true,
+    writer_supports_async = true,
+)
+queryfailed_output_text = IOBuffer()
+queryfailed_error_seen = Channel{Nothing}(1)
+queryfailed_output_reader = @async begin
+    while !eof(queryfailed_output.out)
+        line = readline(queryfailed_output.out)
+        write(queryfailed_output_text, line, '\n')
+        occursin("\"type\":\"subscription\"", line) &&
+            occursin("\"error\"", line) &&
+            put!(queryfailed_error_seen, nothing)
+    end
+end
+queryfailed_task = @async Adapter.run_adapter(queryfailed_input.out, queryfailed_output.in)
+try
+    write(
+        queryfailed_input.in,
+        "{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}\n" *
+        "{\"id\":\"sub\",\"op\":\"subscribe\",\"subscriptionId\":\"q1\"," *
+        "\"path\":\"demo:requiresNonzero\",\"args\":{\"room\":\"queryfailed-precompile\"}}\n",
+    )
+    flush(queryfailed_input.in)
+    take!(queryfailed_error_seen)
+    write(
+        queryfailed_input.in,
+        "{\"id\":\"unsub\",\"op\":\"unsubscribe\",\"subscriptionId\":\"q1\"}\n" *
+        "{\"id\":\"close\",\"op\":\"close\"}\n",
+    )
+    flush(queryfailed_input.in)
+    close(queryfailed_input.in)
+    wait(queryfailed_task)
+finally
+    isopen(queryfailed_input.in) && close(queryfailed_input.in)
+    wait(queryfailed_task)
+    isopen(queryfailed_output.in) && close(queryfailed_output.in)
+    wait(queryfailed_output_reader)
+    isnothing(old_queryfailed_url) ? delete!(ENV, "CONVEX_URL") :
+    (ENV["CONVEX_URL"] = old_queryfailed_url)
+end
+wait(queryfailed_server)
+queryfailed_text = String(take!(queryfailed_output_text))
+occursin("\"type\":\"ready\"", queryfailed_text) ||
+    error("queryfailed precompile omitted ready")
+occursin("ROOM_EMPTY", queryfailed_text) || error("queryfailed precompile lost errorData")
+occursin("\"type\":\"closed\"", queryfailed_text) ||
+    error("queryfailed precompile omitted close")
+
+# Neither the HTTP query path nor the Live/WS path has ever been driven
+# against a connection the OS refuses outright, as opposed to a peer that
+# accepts the connection and then returns a bad status, closes mid-frame, or
+# sends garbage -- every fixture above always binds a real listener first. A
+# refused connect raises a completely different exception straight out of
+# Sockets/HTTP.jl's own connection layer, before any of Convex.jl's own
+# request/response code runs at all, and typed_error() must still convert it
+# into a plain ConvexError. A racing debugDisconnect immediately followed by
+# a reconnect attempt against a peer that has already gone away hits exactly
+# this path, and the stripped image had no compiled code for it: the Live
+# owner task failed with an unreported exception, and close!() reporting
+# that failure was the proximate MissingCodeError crash. Route both
+# real connect refusals through here so every specialization on that path is
+# compiled from genuine execution.
+refused_listener = listen(ip"127.0.0.1", 0)
+refused_port = getsockname(refused_listener)[2]
+close(refused_listener)
+old_refused_url = get(ENV, "CONVEX_URL", nothing)
+ENV["CONVEX_URL"] = "http://127.0.0.1:$(refused_port)"
+try
+    refused_http_client = Client.Client(ENV["CONVEX_URL"])
+    try
+        Client.query(refused_http_client, "demo:state", Dict("room" => "refused-http"))
+        error("precompile expected the refused HTTP connect to fail")
+    catch caught
+        caught isa Client.ConvexError || error(
+            "refused HTTP connect precompile omitted a typed error: $(typeof(caught))",
+        )
+    finally
+        Client.close!(refused_http_client)
+    end
+
+    refused_live_client = Client.Client(ENV["CONVEX_URL"])
+    try
+        Client.subscribe(refused_live_client, "demo:state", Dict("room" => "refused-live"))
+        error("precompile expected the refused Live connect to fail")
+    catch caught
+        caught isa Client.ConvexError || error(
+            "refused Live connect precompile omitted a typed error: $(typeof(caught))",
+        )
+    finally
+        Client.close!(refused_live_client)
+    end
+finally
+    isnothing(old_refused_url) ? delete!(ENV, "CONVEX_URL") :
+    (ENV["CONVEX_URL"] = old_refused_url)
+end
+
 # Drive the exact adapter Subscribe path the hosted harness uses: NDJSON args
 # decode to JSON3.Object, command_args canonicalizes them, then the Live owner
 # sends Connect + Add over a real socket. Without this, --strip-ir drops the
@@ -378,6 +577,199 @@ occursin("\"type\":\"subscription\"", adapter_live_text) ||
     error("adapter live omitted subscription")
 occursin("\"type\":\"closed\"", adapter_live_text) || error("adapter live omitted close")
 
+# Drive a real debugDisconnect through the adapter's own command loop and let
+# the owner reconnect and rehydrate for real. Hosted "reconnect five times"
+# conformance sends debugDisconnect, expects the owner to close its socket,
+# reconnect immediately, replay the still-active subscription as a
+# rehydration Add on the new connection, and deliver the next external
+# update there. The only prior coverage of debugDisconnect was a
+# signature-only precompile(debug_disconnect_for_adapter, ...) below, which
+# never actually ran the reconnect-specific half of live_worker_loop! -- the
+# second own_live_connection!, the immediate zero-delay schedule_reconnect!,
+# and a rehydration Add whose subscription no longer has a pending_reply to
+# claim. The stripped image crashed there with a MissingCodeError building
+# Base.TaskFailedException(::Task) when close!() later had to report it.
+reconnect_listener = listen(ip"127.0.0.1", 0)
+reconnect_port = getsockname(reconnect_listener)[2]
+reconnect_first_closed = Channel{Nothing}(1)
+reconnect_server = @async begin
+    socket1 = accept(reconnect_listener)
+    query_id = try
+        server_handshake(socket1)
+        read_client_json(socket1) # Connect
+        add = read_client_json(socket1)
+        qid = Int(add["modifications"][1]["queryId"])
+        transition = Dict(
+            "type" => "Transition",
+            "startVersion" =>
+                Dict("querySet" => 0, "identity" => 0, "ts" => "AAAAAAAAAAA="),
+            "endVersion" => Dict("querySet" => 1, "identity" => 0, "ts" => timestamp),
+            "modifications" => [
+                Dict(
+                    "type" => "QueryUpdated",
+                    "queryId" => qid,
+                    "value" => Dict("count" => 0.0),
+                    "logLines" => String[],
+                    "journal" => nothing,
+                ),
+            ],
+        )
+        write(socket1, server_frame(0x01, Vector{UInt8}(JSON3.write(transition))))
+        flush(socket1)
+        # debugDisconnect force-closes the owner's end without another
+        # WebSocket close handshake -- wait for that real EOF instead of
+        # closing this end first, so the timing matches the real protocol.
+        try
+            read_client_frame(socket1)
+            error("reconnect fixture expected the owner to close first")
+        catch io_error
+            io_error isa EOFError || rethrow()
+        end
+        qid
+    finally
+        close(socket1)
+    end
+    put!(reconnect_first_closed, nothing)
+
+    socket2 = accept(reconnect_listener)
+    close(reconnect_listener)
+    try
+        server_handshake(socket2)
+        read_client_json(socket2) # Connect
+        rehydrate = read_client_json(socket2) # rehydration Add, not a fresh subscribe
+        Int(rehydrate["modifications"][1]["queryId"]) == query_id ||
+            error("reconnect fixture expected the rehydrated queryId")
+        transition2 = Dict(
+            "type" => "Transition",
+            "startVersion" =>
+                Dict("querySet" => 0, "identity" => 0, "ts" => "AAAAAAAAAAA="),
+            "endVersion" => Dict("querySet" => 1, "identity" => 0, "ts" => timestamp),
+            "modifications" => [
+                Dict(
+                    "type" => "QueryUpdated",
+                    "queryId" => query_id,
+                    "value" => Dict("count" => 1.0),
+                    "logLines" => String[],
+                    "journal" => nothing,
+                ),
+            ],
+        )
+        write(socket2, server_frame(0x01, Vector{UInt8}(JSON3.write(transition2))))
+        flush(socket2)
+        remove = read_client_json(socket2)
+        remove["modifications"][1]["type"] == "Remove" ||
+            error("reconnect fixture expected Remove")
+    finally
+        close(socket2)
+    end
+end
+
+old_reconnect_url = get(ENV, "CONVEX_URL", nothing)
+ENV["CONVEX_URL"] = "http://127.0.0.1:$(reconnect_port)"
+reconnect_input = Pipe()
+Base.link_pipe!(reconnect_input; reader_supports_async = true, writer_supports_async = true)
+reconnect_output = Pipe()
+Base.link_pipe!(
+    reconnect_output;
+    reader_supports_async = true,
+    writer_supports_async = true,
+)
+reconnect_output_text = IOBuffer()
+reconnect_updates_seen = Channel{Nothing}(1)
+reconnect_output_reader = @async begin
+    while !eof(reconnect_output.out)
+        line = readline(reconnect_output.out)
+        write(reconnect_output_text, line, '\n')
+        occursin("\"type\":\"subscription\"", line) &&
+            put!(reconnect_updates_seen, nothing)
+    end
+end
+reconnect_task = @async Adapter.run_adapter(reconnect_input.out, reconnect_output.in)
+try
+    write(
+        reconnect_input.in,
+        "{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}\n" *
+        "{\"id\":\"sub\",\"op\":\"subscribe\",\"subscriptionId\":\"r1\"," *
+        "\"path\":\"demo:state\",\"args\":{\"room\":\"reconnect-precompile\"}}\n",
+    )
+    flush(reconnect_input.in)
+    take!(reconnect_updates_seen) # initial hydration value
+    write(reconnect_input.in, "{\"id\":\"disconnect\",\"op\":\"debugDisconnect\"}\n")
+    flush(reconnect_input.in)
+    take!(reconnect_first_closed)
+    take!(reconnect_updates_seen) # rehydrated external update after reconnect
+    write(
+        reconnect_input.in,
+        "{\"id\":\"unsub\",\"op\":\"unsubscribe\",\"subscriptionId\":\"r1\"}\n" *
+        "{\"id\":\"close\",\"op\":\"close\"}\n",
+    )
+    flush(reconnect_input.in)
+    close(reconnect_input.in)
+    wait(reconnect_task)
+finally
+    isopen(reconnect_input.in) && close(reconnect_input.in)
+    wait(reconnect_task)
+    isopen(reconnect_output.in) && close(reconnect_output.in)
+    wait(reconnect_output_reader)
+    isnothing(old_reconnect_url) ? delete!(ENV, "CONVEX_URL") :
+    (ENV["CONVEX_URL"] = old_reconnect_url)
+end
+wait(reconnect_server)
+reconnect_text = String(take!(reconnect_output_text))
+occursin("\"type\":\"ready\"", reconnect_text) ||
+    error("reconnect precompile omitted ready")
+occursin("\"type\":\"ack\"", reconnect_text) || error("reconnect precompile omitted an ack")
+occursin("\"type\":\"closed\"", reconnect_text) ||
+    error("reconnect precompile omitted close")
+
+# The Live owner's fail-stop mechanism -- injecting a forced error into a
+# stuck owner task via `schedule(worker, exc; error=true)` -- is the only way
+# manager.supervisor ever actually fails outside a MissingCodeError. Hosted
+# "reconnect five times" hit exactly that: an owner command exceeded its
+# bounded grace period, fail_stop_owner! killed the task for real, and
+# close!()'s `istaskfailed(manager.supervisor) && wait(manager.supervisor)`
+# then had to construct a Base.TaskFailedException for the first time in the
+# stripped image. That constructor and its reporting exist per-Task, not
+# per-error-kind, so forcing it here with a synthetic manager whose worker is
+# safely idling (no real backend, no real socket) records the exact same
+# specialization a real stalled reconnect needs.
+failure_client = Client.Client("http://127.0.0.1:1")
+lock(failure_client.lock) do
+    failure_client.live =
+        Client.LiveManager(failure_client.deployment_url, failure_client.client_version)
+end
+failure_manager = failure_client.live
+Client.fail_stop_owner!(failure_manager)
+istaskdone(failure_manager.supervisor) ||
+    error("precompile forced worker failure did not stop the supervisor")
+istaskfailed(failure_manager.supervisor) ||
+    error("precompile forced worker failure did not actually fail the task")
+try
+    Client.close!(failure_client)
+    error("precompile expected close! to report the forced worker failure")
+catch caught
+    caught isa Base.TaskFailedException || rethrow()
+    # A caller that ever prints this (a top-level handler, a log line) needs
+    # showerror for TaskFailedException compiled too, not just its
+    # constructor.
+    sprint(showerror, caught)
+    # The adapter's own "close" op catches exactly this exception from
+    # close!() and reports it through failure()/serialise_error(), which
+    # dispatch on the error's *concrete* type -- a different specialization
+    # from the plain ErrorException already forced through failure() above,
+    # and different again from calling showerror on it directly at top
+    # level. Route this exact TaskFailedException through the real adapter
+    # reporting path so that specialization is compiled from genuine
+    # execution rather than discovered the first time a hosted reconnect
+    # both stalls the owner and reaches the adapter's close handler.
+    let
+        adapter_failure_pump = Adapter.OutputPump(IOBuffer())
+        Adapter.failure(adapter_failure_pump, "precompile-task-failed", caught)
+        Adapter.stop_output!(adapter_failure_pump) ||
+            error("precompile TaskFailedException diagnostic writer did not stop")
+    end
+end
+
 function connect_with_deadline(port; timeout = 5.0)
     deadline = time() + timeout
     while true
@@ -460,9 +852,31 @@ precompile(Adapter.run_adapter, (Base.PipeEndpoint, Base.PipeEndpoint))
 precompile(Adapter.failure, (Adapter.OutputPump, String, Client.ConvexError))
 precompile(Adapter.failure, (Adapter.OutputPump, Nothing, Client.ConvexError))
 precompile(Adapter.serialise_error, (Client.ConvexError,))
+# Defensive pin alongside the genuine failure(..., ::Base.TaskFailedException)
+# execution below: cover the Nothing id shape (a failed subscription relay,
+# not a failed command) too, since only the String id shape is reachable
+# from a real "close" op in this workout.
+precompile(Adapter.failure, (Adapter.OutputPump, Nothing, Base.TaskFailedException))
 # The stalled-controller diagnostic is the one message the adapter must still
 # be able to emit when its output peer has stopped reading entirely.
 Adapter.report_output_failure("convex-adapter: precompile diagnostic")
+# serialise_error()'s fallback for a non-ConvexError exception -- the safety
+# net for whatever unexpected raw Julia exception ever reaches failure() --
+# has never actually run: every command in this file's own workout is
+# designed to always fail with a typed ConvexError. Call failure() directly
+# with a plain ErrorException so that fallback's sprint(showerror, ...) and
+# its own JSON3 encoding are compiled from genuine execution rather than
+# discovered the first time something truly unexpected reaches the adapter.
+let
+    diagnostic_pump = Adapter.OutputPump(IOBuffer())
+    Adapter.failure(
+        diagnostic_pump,
+        "precompile-raw-error",
+        ErrorException("precompile raw exception"),
+    )
+    Adapter.stop_output!(diagnostic_pump) ||
+        error("precompile raw-error diagnostic output writer did not stop")
+end
 # Pin the concrete event writers rather than trusting a fixture to reach every
 # shape. Convex log lines and structured error data must never be the first
 # thing the stripped image tries to serialize.
@@ -830,3 +1244,44 @@ precompile(Client.debug_disconnect_for_adapter, (Client.Client,))
 precompile(Client.typed_error, (Any, Symbol))
 precompile(Client.canonicalize_args, (Dict{String,Any},))
 precompile(Client.canonicalize_args, (Dict{String,String},))
+# Defensive pins for the fail-stop/TaskFailedException path exercised above.
+# Base.TaskFailedException is compiler-internal machinery that a normal
+# JIT-enabled run cannot organically construct except by genuinely failing a
+# task (already done above); these signatures cover the same construction
+# and reporting for any Task the real workout above did not happen to fail
+# through, and for the PipeEndpoint stdout production actually writes to.
+precompile(Base.TaskFailedException, (Task,))
+precompile(Base.wait, (Task,))
+precompile(Base.showerror, (IOBuffer, Base.TaskFailedException))
+precompile(Base.showerror, (Base.PipeEndpoint, Base.TaskFailedException))
+# TaskFailedException's own showerror prints the failed task's exception
+# stack (current_exceptions(t)), which destructures each boxed
+# (exception, backtrace) entry through NamedTuple's own generic
+# indexed_iterate, then shows the exception and its backtrace -- all
+# specialized per the *concrete* wrapped exception type, the same
+# devirtualized-dispatch situation as the JSON3 StructType gaps documented
+# in precompile_statements.jl, several layers deep (indexed_iterate, the
+# generic struct-show machinery for MissingCodeError and the MethodInstance
+# it wraps, a keyword-argument showerror call, show_backtrace). Hand-listing
+# every nested specialization that chain needs one at a time (as earlier
+# revisions of this block did) kept discovering another missing piece on
+# every rebuild. Core.MissingCodeError's constructor is public and only
+# needs a real MethodInstance -- which any already-compiled function has --
+# so construct a genuine one and drive it through the exact task-failure ->
+# TaskFailedException -> showerror chain close!() uses. Real execution
+# discovers every specialization that chain actually needs in one pass,
+# instead of this file guessing at each nested IOContext type.
+let
+    probe_method_instance = first(code_typed(identity, (Int,)))[1].parent
+    real_missing_code_error = Core.MissingCodeError(probe_method_instance)
+    reporting_task = @async throw(real_missing_code_error)
+    try
+        wait(reporting_task)
+        error("precompile expected the synthetic MissingCodeError task to fail")
+    catch caught
+        caught isa Base.TaskFailedException || error(
+            "precompile synthetic MissingCodeError surfaced an unexpected type: $(typeof(caught))",
+        )
+        sprint(showerror, caught)
+    end
+end
