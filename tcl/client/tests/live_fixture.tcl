@@ -14,6 +14,11 @@ namespace eval ::livefixture {
     variable connectRecords {}
     variable modificationRecords {}
     variable pongCount 0
+    # A peer may answer the upgrade one byte at a time. The client's deadlines
+    # are absolute, so a test needs a peer that keeps making progress without
+    # ever finishing.
+    variable handshakeMode normal
+    variable sentByteCount 0
 }
 
 proc ::livefixture::signal {} {
@@ -52,6 +57,8 @@ proc ::livefixture::start {} {
     variable connectRecords
     variable modificationRecords
     variable pongCount
+    variable handshakeMode
+    variable sentByteCount
     set sockets {}
     set current ""
     set acceptedCount 0
@@ -61,6 +68,8 @@ proc ::livefixture::start {} {
     set connectRecords {}
     set modificationRecords {}
     set pongCount 0
+    set handshakeMode normal
+    set sentByteCount 0
     set server [socket -server ::livefixture::accept -myaddr 127.0.0.1 0]
     set port [lindex [fconfigure $server -sockname] end]
     return $port
@@ -144,9 +153,58 @@ proc ::livefixture::handshake {channel} {
     if {$key eq ""} { error "fixture handshake omitted Sec-WebSocket-Key" }
     set accept [::base64::encode [::sha1::sha1 -bin "${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11"]]
     set response "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: $accept\r\n\r\n"
+    variable handshakeMode
+    if {$handshakeMode eq "dribble"} {
+        # Keep the connection in the upgrade stage and keep making progress. The
+        # client's connect deadline must still end it.
+        dribble_bytes $channel $response 20
+        signal
+        return
+    }
     puts -nonewline $channel $response
     flush $channel
     dict set sockets $channel stage open
+    signal
+}
+
+# Write one byte at a time on a timer. Nothing here re-arms a client deadline:
+# that is the point, because a deadline that a trickle can extend is not a
+# deadline at all.
+proc ::livefixture::dribble_bytes {channel bytes intervalMs} {
+    variable sentByteCount
+    if {$bytes eq ""} {
+        signal
+        return
+    }
+    if {[catch {
+        puts -nonewline $channel [string index $bytes 0]
+        flush $channel
+    }]} {
+        return
+    }
+    incr sentByteCount
+    signal
+    after $intervalMs [list ::livefixture::dribble_bytes $channel [string range $bytes 1 end] $intervalMs]
+}
+
+# A complete text frame header followed by a payload that arrives far too
+# slowly. Every consumed byte stays in the client's parser state until its
+# absolute partial-frame deadline abandons the connection.
+proc ::livefixture::dribble_frame {{intervalMs 25}} {
+    variable current
+    set frame [server_frame 1 {{"type":"Ping","filler":"................................"}}]
+    dribble_bytes $current $frame $intervalMs
+}
+
+# A 64-bit length header that declares far more than the client will ever hold,
+# and not one payload byte. The client has to refuse it from the header alone.
+proc ::livefixture::oversized_frame_header {{declared 8388608}} {
+    variable current
+    variable sentByteCount
+    set header "[binary format cu 129][binary format cu 127][binary format W $declared]"
+    puts -nonewline $current $header
+    flush $current
+    incr sentByteCount 10
     signal
 }
 

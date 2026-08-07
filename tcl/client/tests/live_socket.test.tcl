@@ -1,6 +1,7 @@
 #!/usr/local/bin/tclsh
 source [file normalize [file join [file dirname [info script]] .. convex.tcl]]
 source [file normalize [file join [file dirname [info script]] live_fixture.tcl]]
+source [file normalize [file join [file dirname [info script]] http_fixture.tcl]]
 
 proc assert {condition message} {
     if {![uplevel 1 [list expr $condition]]} { error $message }
@@ -140,71 +141,20 @@ set badOperation [adapter_command {{"id":"bad-op","op":"nope"}}]
 assert {$badOperation eq {{"type":"error","id":"bad-op","error":{"name":"ProtocolError","message":"unknown adapter operation nope","data":null}}}} "valid-id error envelope serialization changed"
 
 # A real loopback HTTP server covers success, FunctionError, malformed response,
-# and connection refusal through the adapter's exact envelope classifier.
-namespace eval ::httpfixture {
-    variable server ""
-    variable responses {}
-    variable buffers {}
-    variable lastRequestBody ""
-}
-proc ::httpfixture::start {items} {
-    variable server
-    variable responses
-    variable lastRequestBody
-    set responses $items
-    set lastRequestBody ""
-    set server [socket -server ::httpfixture::accept -myaddr 127.0.0.1 0]
-    return [lindex [fconfigure $server -sockname] end]
-}
-proc ::httpfixture::accept {channel host port} {
-    variable buffers
-    fconfigure $channel -blocking 0 -buffering none -translation binary -encoding binary
-    dict set buffers $channel ""
-    fileevent $channel readable [list ::httpfixture::readable $channel]
-}
-proc ::httpfixture::readable {channel} {
-    variable buffers
-    variable responses
-    variable lastRequestBody
-    append request [read $channel]
-    dict append buffers $channel $request
-    set requestBytes [dict get $buffers $channel]
-    set headerEnd [string first "\r\n\r\n" $requestBytes]
-    if {$headerEnd < 0} { return }
-    set contentLength 0
-    regexp -nocase {\r\nContent-Length:[ \t]*([0-9]+)} [string range $requestBytes 0 $headerEnd] -> contentLength
-    set bodyStart [expr {$headerEnd + 4}]
-    if {[string bytelength $requestBytes] - $bodyStart < $contentLength} { return }
-    set wireBody [string range $requestBytes $bodyStart [expr {$bodyStart + $contentLength - 1}]]
-    if {[catch {set lastRequestBody [encoding convertfrom utf-8 $wireBody]} problem]} {
-        error "HTTP fixture received invalid UTF-8 request body: $problem"
-    }
-    set body [lindex $responses 0]
-    set responses [lrange $responses 1 end]
-    # Send the exact UTF-8 bytes advertised by Content-Length. This catches
-    # response parsers that only work for ASCII or discard nested/log subtrees.
-    set wire [encoding convertto utf-8 $body]
-    set response "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: [string bytelength $wire]\r\nConnection: close\r\n\r\n$wire"
-    puts -nonewline $channel $response
-    flush $channel
-    fileevent $channel readable {}
-    close $channel
-    dict unset buffers $channel
-    ::livefixture::signal
-}
-proc ::httpfixture::stop {} {
-    variable server
-    catch {close $server}
-    set server ""
-}
+# and connection refusal through the adapter's exact envelope classifier. The
+# fixture sends the exact UTF-8 bytes it advertises in Content-Length, which
+# catches response parsers that only work for ASCII or that discard nested and
+# log subtrees. Status-code classification and streaming bounds use the same
+# fixture in http_status.test.tcl.
+set ::httpfixture::notify ::livefixture::signal
 set httpSystemEncoding [encoding system]
 encoding system iso8859-1
 set httpPort [::httpfixture::start [list \
-    {{"status":"success","value":{"ok":true},"logLines":[]}} \
-    {{"status":"success","value":{"unicode":"Hello, 世界 👋","nested":{"booleans":[true,false],"number":42.5,"nil":null}},"logLines":["[LOG] 'demo:echo received a JSON-safe value'"]}} \
-    {{"status":"success","value":["Καλημέρα","مرحبا","kia ora","🟨🟩🟦"],"logLines":["utf8 response log 世界 👋"]}} \
-    {{"status":"error","errorMessage":"fixture HTTP failure","errorData":{"code":"HTTP_FIXTURE"},"logLines":["fixture HTTP log"]}} \
-    "\{malformed"]]
+    {status 200 body {{"status":"success","value":{"ok":true},"logLines":[]}}} \
+    {status 200 body {{"status":"success","value":{"unicode":"Hello, 世界 👋","nested":{"booleans":[true,false],"number":42.5,"nil":null}},"logLines":["[LOG] 'demo:echo received a JSON-safe value'"]}}} \
+    {status 200 body {{"status":"success","value":["Καλημέρα","مرحبا","kia ora","🟨🟩🟦"],"logLines":["utf8 response log 世界 👋"]}}} \
+    {status 200 body {{"status":"error","errorMessage":"fixture HTTP failure","errorData":{"code":"HTTP_FIXTURE"},"logLines":["fixture HTTP log"]}}} \
+    [list status 200 body "\{malformed"]]]
 set ::env(CONVEX_URL) "http://127.0.0.1:$httpPort"
 set ::adapter::client ""
 set httpSuccess [adapter_command {{"id":"http-success","op":"query","path":"demo:state","args":{}}}]
@@ -222,6 +172,36 @@ assert {$httpFunction eq {{"type":"error","id":"http-function","error":{"name":"
 set httpProtocol [adapter_command {{"id":"http-protocol","op":"query","path":"demo:state","args":{}}}]
 set httpProtocolObject [::convex::decode $httpProtocol]
 assert {[dict get [dict get $httpProtocolObject error] name] eq "ProtocolError"} "malformed HTTP response was not ProtocolError"
+
+# Command schemas are strict, and every violation is a ProtocolError with the
+# command's own id. None of these may reach a deployment, so the fixture above
+# still has no unconsumed response left over.
+proc assert_command_error {raw expectedMessage} {
+    set envelope [adapter_command $raw]
+    set decoded [::convex::decode $envelope]
+    set id [dict get $decoded id]
+    set expected [::convex::object [list type [::convex::quote error] id [::convex::quote $id] \
+        error [::adapter::error_raw $expectedMessage ProtocolError null]]]
+    assert {$envelope eq $expected} "strict command schema envelope changed: actual=$envelope expected=$expected"
+}
+assert_command_error {{"id":"no-path","op":"query","args":{}}} "command omitted valid path"
+assert_command_error {{"id":"numeric-path","op":"mutation","path":7,"args":{}}} "command omitted valid path"
+assert_command_error {{"id":"no-args","op":"query","path":"demo:state"}} "command omitted valid args"
+assert_command_error {{"id":"array-args","op":"action","path":"demo:state","args":[1,2]}} "command omitted valid args"
+assert_command_error {{"id":"string-args","op":"query","path":"demo:state","args":"room"}} "command omitted valid args"
+assert_command_error {{"id":"no-subscription-id","op":"subscribe","path":"demo:state","args":{}}} "command omitted valid subscriptionId"
+assert_command_error {{"id":"no-unsubscribe-id","op":"unsubscribe"}} "command omitted valid subscriptionId"
+assert_command_error {{"id":"numeric-token","op":"setAuth","token":7}} "command omitted valid token"
+assert_command_error {{"protocolVersion":2,"id":"old-protocol","op":"hello"}} "unsupported adapter protocol version"
+
+# A token is optional: sending one authenticates, and omitting it clears the
+# credential again rather than failing the command.
+set authenticated [adapter_command {{"id":"set-auth","op":"setAuth","token":"fixture-token"}}]
+assert {$authenticated eq {{"id":"set-auth","type":"ack"}}} "setAuth acknowledgement serialization changed"
+assert {[dict get [::convex::state $::adapter::client] auth] eq "fixture-token"} "setAuth did not reach the client"
+set cleared [adapter_command {{"id":"clear-auth","op":"setAuth"}}]
+assert {$cleared eq {{"id":"clear-auth","type":"ack"}}} "clearing setAuth changed its acknowledgement"
+assert {[dict get [::convex::state $::adapter::client] auth] eq ""} "an omitted token did not clear authentication"
 ::httpfixture::stop
 encoding system $httpSystemEncoding
 ::convex::close $::adapter::client
