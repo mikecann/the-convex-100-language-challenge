@@ -42,7 +42,7 @@ shared verifier says otherwise.
 ## The basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.bas -->
-```text
+```freebasic
 ' Convex from FreeBASIC: one room, counted from 0 to 1.
 '
 ' The journey is deliberately small. Read the counter over HTTP, start a Live
