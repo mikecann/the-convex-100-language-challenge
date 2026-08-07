@@ -17,6 +17,7 @@ RUN apt-get update -qq \
        bzip2=1.0.8-5build1 \
        libgtk-3-0=3.24.33-1ubuntu2.2 \
        libssl-dev=3.0.2-0ubuntu1.26 \
+       libc6-dev=2.35-0ubuntu3.14 \
        gcc=4:11.2.0-1ubuntu1 \
        make=4.3-4.1build1 \
     && rm -rf /var/lib/apt/lists/*
