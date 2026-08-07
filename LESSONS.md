@@ -117,6 +117,15 @@ sync protocols.
 
 Across very different ecosystems, the deep bugs clustered:
 
+**Readiness misunderstood as data.** The Idris client livelocked on a brand-new
+connection: its pump would only read the socket when its own userspace buffer
+already held bytes, but subscribing only ever *writes*, so on a fresh connection
+nothing had ever performed a first read. The operating system reported the
+socket readable, the adapter dutifully called the pump two million times in
+fifteen seconds, and the pump declined to read every time. The same bug had
+already been found and fixed in a sibling function in the same file — with a
+comment explaining it — and simply never mirrored across.
+
 **Blocking calls that freeze more than themselves.** Poly/ML sets sockets
 non-blocking when it creates them but not when it *accepts* them, and a thread
 blocked inside its runtime never reaches a garbage-collection safe point — so
