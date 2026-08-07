@@ -72,7 +72,9 @@ RUN perl -MFile::Path=make_path,remove_tree -e '\
       sub copy_tree { \
         my ($from, $to) = @_; \
         if (-d $from) { \
+          my $mode = (stat($from))[2] & 07777; \
           make_path($to); \
+          chmod($mode, $to) or die $!; \
           opendir(my $directory, $from) or die $!; \
           for my $name (grep { $_ ne q{.} && $_ ne q{..} } readdir($directory)) { \
             copy_tree(qq{$from/$name}, qq{$to/$name}); \
@@ -81,16 +83,29 @@ RUN perl -MFile::Path=make_path,remove_tree -e '\
         } elsif (-l $from) { \
           symlink(readlink($from), $to) or die $!; \
         } else { \
+          my $mode = (stat($from))[2] & 07777; \
           open(my $input, q{<}, $from) or die $!; \
           open(my $output, q{>}, $to) or die $!; \
           binmode($input); binmode($output); \
           my $buffer; \
           while (read($input, $buffer, 1048576)) { print {$output} $buffer or die $! } \
           close($input); close($output); \
+          chmod($mode, $to) or die $!; \
         } \
       } \
       copy_tree($source, $target); \
       remove_tree($source);'
+RUN set -eu; \
+    loader=/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2; \
+    if ! test -x "$loader"; then \
+      echo "runtime library prune stripped the execute bit from $loader" >&2; \
+      exit 1; \
+    fi; \
+    if ! test -x /bin/sh; then \
+      echo "runtime library prune left /bin/sh non-executable" >&2; \
+      exit 1; \
+    fi; \
+    /bin/sh -c 'true'
 RUN set -eu; \
     rm -f /usr/bin/awk; \
     ln -s mawk /usr/bin/awk; \

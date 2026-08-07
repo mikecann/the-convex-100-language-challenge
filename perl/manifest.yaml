@@ -29,4 +29,6 @@ limitations:
   - Live authentication, WebSocket mutations, actions, transition chunk assembly, and full Convex values are deferred.
   - The experimental sync protocol is pinned and undocumented; it is not a stable SDK contract.
   - Live delivery uses a bounded newest-16 mailbox per subscription.
-capabilities: []
+capabilities:
+  - http
+  - live

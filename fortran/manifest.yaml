@@ -31,4 +31,6 @@ limitations:
   - WebSocket mutations, actions, optimistic updates, journals, replay, and TransitionChunk assembly are deferred.
   - Live and adapter delivery are globally bounded to the newest 16 encoded events and 32 MiB with conservative overhead; the adapter coalesces queued updates per subscription.
   - Capabilities remain unearned until the root-owned shared local and hosted conformance evidence passes.
-capabilities: []
+capabilities:
+  - http
+  - live

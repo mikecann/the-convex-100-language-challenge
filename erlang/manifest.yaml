@@ -32,4 +32,6 @@ limitations:
   - Each subscription retains the newest 16 undelivered events within a 256 KiB total byte bound, including the event currently held by its relay.
   - Controller output has one global 16-event and 256 KiB encoded-byte budget, including a blocked socket send; saturation closes the stalled controller instead of retaining more events.
   - Stdin and TCP commands share a 1 MiB newline-delimited frame limit and discard incomplete EOF fragments.
-capabilities: []
+capabilities:
+  - http
+  - live

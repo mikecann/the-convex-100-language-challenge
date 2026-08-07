@@ -18,8 +18,8 @@ journey. The source below is generated directly from that runnable file.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Awaiting shared verification | Native `Net::HTTP` query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented. |
-| Live | Awaiting shared verification | Native Ruby WebSocket subscriptions, unsubscribe, reconnect, reactive errors, and clean close target the pinned profile. |
+| HTTP | Verified by shared local and hosted conformance | Native `Net::HTTP` query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented. |
+| Live | Verified by shared local and hosted conformance | Native Ruby WebSocket subscriptions, unsubscribe, reconnect, reactive errors, and clean close target the pinned profile. |
 
 No capability badge is earned until the shared local and hosted black-box tests
 pass. A successful Docker build by itself does not count.

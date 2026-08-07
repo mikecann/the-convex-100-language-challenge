@@ -30,4 +30,6 @@ limitations:
   - The undocumented pinned sync profile can drift independently of the documented HTTP API.
   - Delivery holds at most the newest 16 updates per subscription, rejects a single encoded Live message above 2 MiB, and shares a conservative 8 MiB encoded-byte budget across all subscriptions.
   - The adapter accepts at most 16 subscriptions and abandons a controller output stream when a write remains blocked for 500 ms.
-capabilities: []
+capabilities:
+  - http
+  - live

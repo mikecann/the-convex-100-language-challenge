@@ -29,4 +29,6 @@ limitations:
   - Live authentication, WebSocket mutations/actions, optimistic updates, journals, and replay are deferred.
   - TransitionChunk is treated as protocol drift and triggers a reconnect.
   - Each Live subscription keeps at most its newest 16 pending updates; older intermediate values are deliberately dropped for a slow consumer.
-capabilities: []
+capabilities:
+  - http
+  - live

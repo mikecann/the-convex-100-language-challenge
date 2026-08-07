@@ -12,8 +12,8 @@ It is educational, unofficial, and not a production SDK.
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, actions, auth replacement, errors, and logs | Implemented, pending shared conformance |
-| Live subscriptions, unsubscribe, failures, recovery, and reconnect | Implemented, pending shared conformance |
+| HTTP queries, mutations, actions, auth replacement, errors, and logs | Verified by shared local and hosted conformance |
+| Live subscriptions, unsubscribe, failures, recovery, and reconnect | Verified by shared local and hosted conformance |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.d -->
 ```d

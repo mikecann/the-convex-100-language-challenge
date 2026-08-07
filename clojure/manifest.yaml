@@ -32,4 +32,6 @@ limitations:
   - Adapter output, including an in-flight write, shares a separate newest-16, 4 MiB encoded budget and drops only stale subscription snapshots under pressure.
   - Adapter command lines are limited to 1 MiB encoded, Live messages to 2 MiB encoded, and the Live owner queue to 64 events.
   - The runtime retains Clojure compiler classes because the Clojure runtime loads them while booting AOT-compiled namespaces; it exposes no compiler command, source tree, or package manager.
-capabilities: []
+capabilities:
+  - http
+  - live

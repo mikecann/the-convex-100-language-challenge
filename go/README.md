@@ -24,11 +24,11 @@ and tested inside Docker, so no Go toolchain is installed on the host.
 
 | Capability | Status |
 | --- | --- |
-| Queries, mutations, and actions over HTTP | Implemented and covered by Go-local tests; shared verification pending |
+| Queries, mutations, and actions over HTTP | Verified by shared local and hosted conformance |
 | Bearer-token authentication for HTTP calls | Implemented and covered by Go-local tests |
-| Initial and updated Live query values | Implemented and covered by Go-local tests; shared verification pending |
+| Initial and updated Live query values | Verified by shared local and hosted conformance |
 | Unsubscribe, reconnect, timeouts, and clean shutdown | Implemented and covered by Go-local tests |
-| Canonical basic example executed in Docker | Shared example verification pending |
+| Canonical basic example executed in Docker | Verified against self-hosted and hosted deployments |
 | Authentication for Live subscriptions | Not yet |
 | Full tagged Convex value types | Not yet |
 

@@ -55,11 +55,18 @@ network, compiler, and delegated-runtime commands. Use a restricted build or
 separate binaries when the stock multicall surface is too broad.
 
 The runtime probe rejects Node.js and Python unless the manifest declares the
-one approved `targetRuntimeCommand` for JavaScript or Python. This exempts only
+one approved `targetRuntimeCommand` for that language. This exempts only
 the interpreter that genuinely executes that target-language client. Package
 tooling and every other delegated runtime remain forbidden. Extending the
 allowance to another language requires a separate shared-infrastructure review;
 do not weaken it inside a language branch.
+
+A language that compiles to JavaScript may be approved for `node`, because a
+compile-to-JavaScript language has no other execution target and node is then
+the interpreter that genuinely runs its own compiled client. Such a client must
+declare `provenance: transpiled` and still implement every Convex behaviour in
+the target language; delegating protocol work to an existing JavaScript Convex
+client remains forbidden and would earn the bridge label instead.
 
 Emulation engines are not interchangeable build surfaces. Rosetta-backed
 Docker on Apple Silicon reliably runs heavy amd64 toolchains; QEMU-based
@@ -332,6 +339,14 @@ table, and every stale pending-verification or no-conformance line together —
 then rerun the shared evidence once from that head. Every extra cleanup commit
 after a green run costs a full rerun under the exact-head rule, so sweep the
 language directory for stale claims before rerunning, not after.
+
+Exception: a follow-up commit whose diff is provably limited to the manifest
+`capabilities:` list and README prose does not invalidate the parent commit's
+evidence. The Docker build inputs are unchanged and the evaluator computes the
+award from test results, not the manifest, so the PR may cite the evidence
+from the parent commit explicitly instead of rerunning. Any change touching
+the Dockerfile, client, examples, or any other manifest field forfeits this
+exception.
 
 Fixtures authored inside a checkpoint that has never executed are not
 evidence-bearing. When such a fixture encodes an environment-hostile

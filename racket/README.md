@@ -18,8 +18,8 @@ journey. The source below is generated directly from that runnable file.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Awaiting shared verification | Native Racket query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented. |
-| Live | Awaiting shared verification | One native Racket Live owner handles subscriptions, replacement barriers, reconnects, reactive errors, and clean close against the pinned profile. |
+| HTTP | Verified by shared local and hosted conformance | Native Racket query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented. |
+| Live | Verified by shared local and hosted conformance | One native Racket Live owner handles subscriptions, replacement barriers, reconnects, reactive errors, and clean close against the pinned profile. |
 
 No capability badge is earned until the shared local and hosted black-box tests
 pass. A successful Docker build or language-local socket test does not count.

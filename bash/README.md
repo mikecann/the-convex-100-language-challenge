@@ -16,10 +16,10 @@ increments with an idempotency key, and proves the update arrived reactively.
 
 | Capability | Status |
 | --- | --- |
-| JSON HTTP queries, mutations, and actions | Implemented, pending shared evidence |
+| JSON HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
 | Bearer authentication | Implemented |
 | UTF-8 and nested JSON | Implemented via jq |
-| Live Add, Remove, reconnect, and query-error recovery | Implemented, pending shared evidence |
+| Live Add, Remove, reconnect, and query-error recovery | Verified by shared local and hosted conformance |
 
 ## Basic example
 
@@ -69,8 +69,8 @@ printf 'live updated count: %s\nverified count: %s -> %s\n' "$after" "$count" "$
 
 Run `./run test bash` for deterministic HTTP, RFC6455, TCP, reconnect, overflow,
 and serialization fixtures. `./run verify-example bash` executes the canonical
-source against local Convex. Capability badges still require root-owned local
-and hosted conformance evidence.
+source against local Convex. Root-owned local and hosted conformance passed
+31/31 on both profiles, and the manifest records the http and live award.
 
 ## Notes
 
