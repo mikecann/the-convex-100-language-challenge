@@ -137,12 +137,19 @@ variable example-subscription
 
 -1 example-subscription !
 
-' example-run catch ?dup if
-    cvx-adopt-fault
-    s" the Forth example failed" note-line
-    report-error
+\ IF and THEN are compile-only, so this catch/if/then dispatch has to live in
+\ a word instead of directly at top level. Tick compiled into a word body
+\ would parse a name from the input stream at run time and find none there;
+\ bracket-tick resolves the execution token during compilation instead.
+: example-main ( -- )
+    ['] example-run catch ?dup if
+        cvx-adopt-fault
+        s" the Forth example failed" note-line
+        report-error
+        example-cleanup
+        1 convex-exit
+    then
     example-cleanup
-    1 convex-exit
-then
-example-cleanup
-0 convex-exit
+    0 convex-exit ;
+
+example-main
