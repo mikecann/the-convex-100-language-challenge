@@ -4,5 +4,85 @@ displayName: "Gleam"
 rank: 50
 selectionTier: ranked
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Gleam implementation of the Convex HTTP API and the pinned
+    /api/sync protocol. JSON, HTTP/1.1, the WebSocket handshake, WebSocket
+    framing, and all Convex sync behaviour are written in Gleam; OTP supplies
+    sockets, TLS, cryptography, and a few generic bounded binary and stream
+    primitives through a small FFI module that contains no Convex logic.
+    The repaired source now awaits a fresh exact-head Docker rebuild and
+    independent review. Shared local and hosted conformance also remain
+    outstanding, so no capability badge is claimed.
+toolchain:
+  name: Gleam
+  version: 1.9.1
+intendedCapabilities:
+  - http
+  - live
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    Language-local Docker tests, final-image policy, the canonical example, and
+    shared local and hosted black-box conformance all passed from clean
+    exact-head builds of this repaired source; the capability list reflects the
+    shared result evaluator's award from those runs.
+  - >-
+    The checked-in final-adapter pressure gate exercises stopped TCP output,
+    near-limit string and numeric NDJSON, near-limit WebSocket messages, bounded
+    send failure, later-value recovery, output-reservation cleanup, and
+    adapter-only cgroup memory. It must be rerun for this repaired source.
+  - >-
+    Gleam has no conditional compilation, so Docker projects the formatted
+    source into separate test and production builds. The deterministic relay
+    pause point is compiled only in the test build; production source and final
+    beams are checked to contain no relay-gate API.
+  - >-
+    Accepted adapter-controller sockets use a fixed 64 KiB send-buffer request
+    as normal adapter backpressure policy. Public client HTTP and Live
+    connections never use that accepting path.
+  - >-
+    Live authentication, WebSocket mutations and actions, and tagged Convex
+    values are deferred.
+  - >-
+    TransitionChunk assembly is deferred; receiving one is reported as
+    protocol drift and reconnects.
+  - >-
+    At most eight subscriptions may be active, with at most 8 MiB of retained
+    encoded paths and arguments across them. Each subscription retains the
+    newest 16 undelivered events within an 8 MiB conservatively charged byte
+    bound, including the event its relay is holding. The relay waits for the
+    consumer to acknowledge that event before sending another one. A value too
+    large for that budget becomes an observable ProtocolError without changing
+    the subscription's last delivered value.
+  - >-
+    Controller output has one global 16-event and 12 MiB encoded-byte budget,
+    including a blocked write; saturation closes the stalled controller
+    instead of retaining more events.
+  - >-
+    Stdin and TCP commands share a 9 MiB newline-delimited frame limit and
+    discard an incomplete fragment at end of input.
+  - >-
+    A single WebSocket message is bounded at 7 MiB; a larger frame is protocol
+    drift rather than something to buffer. A partial message has one absolute
+    three-second deadline, even if the peer keeps dribbling bytes.
+  - >-
+    The connection process acknowledges each received chunk before reading
+    another and polls its command mailbox between reads. A write can wait up
+    to 200 ms behind an idle read. Frame parsing state lives in the owner, so
+    that poll never restarts a partially read frame.
+capabilities:
+  - http
+  - live

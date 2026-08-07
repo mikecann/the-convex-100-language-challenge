@@ -1,0 +1,16 @@
+name = "convex"
+version = "0.1.0"
+target = "erlang"
+gleam = ">= 1.9.0"
+
+# The client deliberately depends on nothing but the Gleam standard library and
+# the Erlang process primitives. JSON, HTTP/1.1, the WebSocket handshake, and
+# WebSocket framing are all implemented in Gleam in this directory so the
+# demonstration shows Convex behaviour rather than a wrapper around someone
+# else's protocol code. OTP still supplies the socket, TLS, and crypto
+# primitives through the small convex_ffi module.
+[dependencies]
+gleam_stdlib = ">= 0.59.0 and < 0.60.0"
+gleam_erlang = ">= 0.34.0 and < 0.35.0"
+
+[dev-dependencies]
