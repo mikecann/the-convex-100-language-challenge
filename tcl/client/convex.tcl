@@ -435,7 +435,16 @@ proc ::convex::http_call {id operation path argsRaw} {
         if {$transaction eq "convex-response-too-large"} {
             throw TransportError "Convex response exceeded the $maximumResponseBytes byte budget"
         }
-        if {$transaction ne "ok"} {
+        # Tcl's http package reports "eof" instead of "ok" for a Connection:
+        # close response whose entire body it did receive: a peer that closes
+        # the socket in the same read that delivers the final bytes leaves the
+        # package unable to tell that from a genuine mid-response disconnect,
+        # and this happens in practice for ordinary multi-byte UTF-8 bodies.
+        # Do not turn that into a transport failure here. The classifier below
+        # requires a well-formed status field and, on success, a value; a
+        # response that really was cut short fails there as ProtocolError
+        # instead, so nothing incomplete is ever accepted as a result.
+        if {$transaction ne "ok" && $transaction ne "eof"} {
             set detail $transaction
             catch {set detail "$transaction: [::http::error $token]"}
             throw TransportError "Convex HTTP transaction did not complete ($detail)"
