@@ -1,0 +1,89 @@
+schemaVersion: 1
+id: hare
+displayName: "Hare"
+rank: 67
+selectionTier: coverage
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Hare implementation of Convex's documented JSON HTTP endpoints and
+    the pinned /api/sync Live profile. Hare's standard library has no JSON,
+    HTTP, TLS, or WebSocket support, so all four are hand-written in Hare
+    (client/json.ha, client/http.ha, client/ws.ha) directly against Hare's
+    own net::dial and net::tcp sockets. The one C-ABI boundary is OpenSSL's
+    libssl for the TLS record layer (client/tls.ha), reached through Hare's
+    `@symbol` foreign-function declarations, the same kind of boundary this
+    project's other native clients use for their own language's TLS story.
+    The Live/WebSocket layer (client/live.ha) is a single-threaded, poll-
+    driven state machine: one call stack owns the socket at all times, and a
+    caller (the adapter, or the example) advances it by calling
+    client_live_step in a loop, which is how debugDisconnect, unsubscribe,
+    and new commands stay responsive without a second thread.
+toolchain:
+  name: Hare
+  version: 0.24.2
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    Local development runs (not yet the shared conformance harness) exercised
+    the full HTTP query/mutation/action path and the full Live path —
+    subscribe, the initial value, a mutation-driven update, and five real
+    debugDisconnect-driven reconnects that each resend the active Add and
+    correctly suppress a duplicate event for an unchanged rehydrated value —
+    against both the local backend and the hosted deployment. Shared local
+    and hosted black-box conformance have not been run yet, so no capability
+    is claimed here and badges remain unearned until they do.
+  - >-
+    Hare 0.24 (current when this client was written) ships no `hare fmt` or
+    other blessed source formatter. Source in this directory is hand-
+    formatted against the tabs-for-indentation style Hare's own standard
+    library uses, not machine-checked.
+  - >-
+    Hare's build driver always shells out to the platform toolchain's `cc`
+    to link, but exposes no flag of its own to request static linking. The
+    Docker build installs a thin `cc` wrapper earlier on PATH that appends
+    `-static` to every link, so both shipped binaries are fully static musl
+    executables with no runtime library dependency beyond the CA bundle a
+    TLS deployment needs; this is a build-time workaround for a toolchain
+    gap, not a Hare language feature.
+  - >-
+    Reconnection currently has no exponential backoff: a Live bring-up that
+    keeps failing is retried on the very next `client_live_step` call rather
+    than after a growing delay. This has not caused an observed problem in
+    local runs, but a persistently unreachable deployment would retry more
+    aggressively than this project's other native clients do.
+  - >-
+    Live delivery holds at most one already-decoded event between
+    `client_live_step` calls rather than an internal bounded queue: the step
+    function itself is the backpressure, since it only decodes the next
+    frame once the caller asks for one. This is a deliberate design choice
+    for a language with no threads, not yet proven against the shared
+    stopped-reader byte-budget fixture the harness uses for other clients.
+  - >-
+    Convex tagged values are deferred; only the JSON-safe query profile is
+    implemented, matching this project's other native clients at this stage.
+  - >-
+    Live authentication, optimistic writes, WebSocket mutations and actions,
+    and TransitionChunk assembly are deferred.
+  - >-
+    WebSocket messages this client sends are never fragmented (Convex's own
+    sync messages are small), but incoming fragmented messages, control
+    frames interleaved with a fragmented message, and the masked-frame
+    rejection are implemented and exercised only against the real backend
+    so far, not yet against an adversarial local fixture peer.
+capabilities: []
