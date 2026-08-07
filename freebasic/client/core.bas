@@ -361,11 +361,11 @@ function Sha1(byref message as string) as string
   dim as uinteger blockStart = 0
   while blockStart < padded.count
     for index as integer = 0 to 15
-      dim as uinteger base = blockStart + index * 4
-      words(index) = (cast(ulong, padded.store[base]) shl 24) or _
-        (cast(ulong, padded.store[base + 1]) shl 16) or _
-        (cast(ulong, padded.store[base + 2]) shl 8) or _
-        cast(ulong, padded.store[base + 3])
+      dim as uinteger wordBase = blockStart + index * 4
+      words(index) = (cast(ulong, padded.store[wordBase]) shl 24) or _
+        (cast(ulong, padded.store[wordBase + 1]) shl 16) or _
+        (cast(ulong, padded.store[wordBase + 2]) shl 8) or _
+        cast(ulong, padded.store[wordBase + 3])
     next
     for index as integer = 16 to 79
       words(index) = RotateLeft32( _
