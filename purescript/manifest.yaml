@@ -4,5 +4,77 @@ displayName: "PureScript"
 rank: 82
 selectionTier: curated_backfill
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: transpiled
+  version: 0.1.0
+  notes: >-
+    PureScript implementation of the Convex HTTP API and the pinned /api/sync
+    protocol. JSON, HTTP/1.1, the WebSocket handshake, WebSocket framing, the
+    Live owner, and every Convex decision are written in PureScript. PureScript
+    has no runtime of its own, so this client is compiled by purs to CoreFn and
+    by the purerl backend to Erlang, and the final images carry the BEAM
+    emulator; that delegation is declared here and in the README rather than
+    hidden. OTP supplies sockets, TLS, cryptography, the monotonic clock,
+    processes, and the standard streams through three small FFI modules that
+    contain no Convex logic. The source has not yet been compiled or run in
+    Docker, so no capability is claimed and no evidence is recorded.
+toolchain:
+  name: PureScript purs with the purerl Erlang backend on Erlang/OTP
+  version: purs 0.15.14, purerl 0.0.24, OTP 26
+intendedCapabilities:
+  - http
+  - live
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    Source readiness only. Docker has not been run, so compilation, the
+    language-local tests, the final image policy, the canonical example, and
+    shared conformance are all unproven and every capability stays unearned.
+  - >-
+    PureScript compiles to a host language rather than to a runtime of its own.
+    This client targets purerl, so the final images contain the BEAM emulator
+    and the kernel, stdlib, crypto, ssl, public_key, and asn1 applications.
+    No compiler, package manager, or other delegated runtime is present.
+  - >-
+    The client depends on no PureScript packages. The prelude, list, string,
+    and byte primitives it needs are defined in client/Convex/Prelude.purs and
+    client/Convex/Bytes.purs so the build is exactly two pinned compiler
+    binaries, with no package set to resolve.
+  - >-
+    Equality and ordering are Erlang term operations rather than type classes,
+    which is sound for the integers, strings, byte strings, and decoded JSON
+    this client compares but would not be for values containing functions.
+  - >-
+    purs-tidy is not part of the pinned toolchain because it is distributed as
+    a Node package. The Docker test stage enforces a deterministic style gate
+    over the checked-in source instead of a formatter diff.
+  - >-
+    Live authentication, WebSocket mutations and actions, and tagged Convex
+    values are deferred. TransitionChunk assembly is deferred; receiving one is
+    reported as protocol drift.
+  - >-
+    A JSON object is limited to 256 entries, 64 levels of nesting, and 65536
+    structural values, which bounds duplicate-key detection on hostile input.
+  - >-
+    Each subscription retains the newest 16 undelivered events within an 8 MiB
+    total byte bound, including the event its relay is currently holding.
+  - >-
+    Adapter output has one global 16-event and 12 MiB encoded-byte budget,
+    including a blocked write; saturation closes the stalled controller instead
+    of retaining more events.
+  - >-
+    Stdin and TCP commands share a 9 MiB newline-delimited frame limit and
+    discard incomplete fragments at end of input.
+capabilities:
+  - http
+  - live
