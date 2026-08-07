@@ -1,0 +1,180 @@
+#
+# Real loopback coverage for the HTTP transport: client/tests/fixtures/
+# http_fixture.icn is a genuine TCP peer (not a mock), so this proves the
+# real client's socket transport and HTTP response reader work end to
+# end, on top of the pure-function classification coverage in
+# selftest_test.icn.
+#
+# unicon's `link` resolves an already-compiled `.u` file by looking in the
+# CURRENT WORKING DIRECTORY at compile time, not next to the file that
+# names it, and it never auto-compiles a sibling `.icn` -- so the build
+# always precompiles client/convex.icn once (from a fixed CWD) and every
+# dependent file links it back by that bare name.
+#
+link "convex"
+
+global failures, basePort
+
+procedure main()
+   failures := 0
+   basePort := 23100
+
+   test_success()
+   test_success_with_logs()
+   test_function_error_via_status()
+   test_function_error_via_560()
+   test_transport_error_503()
+   test_protocol_error_404()
+   test_chunked_body()
+
+   if failures = 0 then {
+      write("ALL HTTP LOOPBACK TESTS PASSED")
+      exit(0)
+   }
+   write(failures, " HTTP LOOPBACK TEST(S) FAILED")
+   exit(1)
+end
+
+procedure assert_eq(actual, expected, label)
+   if actual === expected then return
+   failures +:= 1
+   write(&errout, "FAIL ", label, ": expected=[", image(expected), "] actual=[", image(actual), "]")
+   return
+end
+
+procedure test_success()
+   local port, body, response, result
+   port := basePort + 1
+   body := "{\"status\":\"success\",\"value\":{\"count\":0},\"logLines\":[]}"
+   response := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " || *body || "\r\n\r\n" || body
+   start_fixture(port, response)
+   result := convex_http_call("query", "demo:state", table_of(["room", "x"]), "http://127.0.0.1:" || port, "")
+   assert_eq(result.kind, "result", "loopback success kind")
+   assert_eq(result.value["count"], 0, "loopback success value")
+   return
+end
+
+procedure test_success_with_logs()
+   local port, body, response, result
+   port := basePort + 2
+   body := "{\"status\":\"success\",\"value\":1,\"logLines\":[\"a log line\"]}"
+   response := "HTTP/1.1 200 OK\r\nContent-Length: " || *body || "\r\n\r\n" || body
+   start_fixture(port, response)
+   result := convex_http_call("query", "demo:state", table_of(["room", "x"]), "http://127.0.0.1:" || port, "")
+   assert_eq(result.value, 1, "loopback success with logs value")
+   assert_eq(result.logs[1], "a log line", "loopback success with logs content")
+   return
+end
+
+procedure test_function_error_via_status()
+   local port, body, response, result
+   port := basePort + 3
+   body := "{\"status\":\"error\",\"errorMessage\":\"boom\",\"errorData\":{\"code\":\"X\"},\"logLines\":[]}"
+   response := "HTTP/1.1 200 OK\r\nContent-Length: " || *body || "\r\n\r\n" || body
+   start_fixture(port, response)
+   result := convex_http_call("query", "demo:state", table_of(["room", "x"]), "http://127.0.0.1:" || port, "")
+   assert_eq(result.kind, "error", "loopback function error kind")
+   assert_eq(result.errName, "FunctionError", "loopback function error name")
+   assert_eq(result.errMessage, "boom", "loopback function error message")
+   assert_eq(result.errData["code"], "X", "loopback function error data")
+   return
+end
+
+procedure test_function_error_via_560()
+   local port, body, response, result
+   port := basePort + 4
+   body := "{\"status\":\"error\",\"errorMessage\":\"boom560\",\"logLines\":[]}"
+   response := "HTTP/1.1 560 Function Error\r\nContent-Length: " || *body || "\r\n\r\n" || body
+   start_fixture(port, response)
+   result := convex_http_call("query", "demo:state", table_of(["room", "x"]), "http://127.0.0.1:" || port, "")
+   assert_eq(result.errName, "FunctionError", "loopback 560 error name")
+   assert_eq(result.errMessage, "boom560", "loopback 560 error message")
+   return
+end
+
+procedure test_transport_error_503()
+   local port, body, response, result
+   port := basePort + 5
+   body := "{\"code\":\"Unavailable\",\"message\":\"try later\"}"
+   response := "HTTP/1.1 503 Service Unavailable\r\nContent-Length: " || *body || "\r\n\r\n" || body
+   start_fixture(port, response)
+   result := convex_http_call("query", "demo:state", table_of(["room", "x"]), "http://127.0.0.1:" || port, "")
+   assert_eq(result.errName, "TransportError", "loopback transport error name")
+   assert_eq(result.errMessage, "HTTP 503 from Convex: try later", "loopback transport error message")
+   return
+end
+
+procedure test_protocol_error_404()
+   local port, response, result
+   port := basePort + 6
+   response := "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+   start_fixture(port, response)
+   result := convex_http_call("query", "demo:state", table_of(["room", "x"]), "http://127.0.0.1:" || port, "")
+   assert_eq(result.errName, "ProtocolError", "loopback protocol error name")
+   assert_eq(result.errMessage, "HTTP 404 from Convex: no Convex error envelope", "loopback protocol error message")
+   return
+end
+
+procedure test_chunked_body()
+   local port, body, chunkHex, response, result
+   port := basePort + 7
+   body := "{\"status\":\"success\",\"value\":\"chunked-ok\",\"logLines\":[]}"
+   chunkHex := radix_str(*body, 16)
+   response := "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" || chunkHex || "\r\n" || body || "\r\n0\r\n\r\n"
+   start_fixture(port, response)
+   result := convex_http_call("query", "demo:state", table_of(["room", "x"]), "http://127.0.0.1:" || port, "")
+   assert_eq(result.value, "chunked-ok", "loopback chunked body value")
+   return
+end
+
+# Backgrounds the fixture, writes its canned response to a temp file (raw
+# bytes, so its own CR/LF reach the socket exactly as authored here), and
+# blocks until the fixture has printed READY. The fixture's listen
+# backlog holds exactly one pending connection and it calls accept
+# exactly once, so readiness cannot be polled by connecting: a probe
+# connection would itself be the one connection the fixture ever accepts,
+# starving the real request that follows.
+procedure start_fixture(port, responseBytes)
+   local respFile, logFile, f, attempt, sawReady, line, lf
+
+   respFile := "/tmp/http_fixture_resp_" || port
+   f := open(respFile, "w")
+   writes(f, responseBytes)
+   close(f)
+
+   logFile := "/tmp/http_fixture_" || port || ".log"
+   #
+   # unicon's system(string) is not a plain "hand the string to a shell"
+   # call: it does its own small hand-rolled scan for ">"/"2>&1" and then
+   # always execs and waitpid()s synchronously, silently discarding any
+   # trailing "&" in the string rather than backgrounding it. The
+   # documented way to actually launch a detached process is the 5-arg
+   # form below, whose "nowait" mode returns the child's pid immediately
+   # instead of blocking until the long-running fixture exits.
+   #
+   system(["client/tests/fixtures/http_fixture", string(port), respFile], &null, logFile, logFile, "nowait")
+
+   attempt := 0
+   while attempt < 50 do {
+      if lf := open(logFile, "r") then {
+         sawReady := 0
+         every line := !lf do if line == "READY" then sawReady := 1
+         close(lf)
+         if sawReady = 1 then return
+      }
+      busy_wait_ms(100)
+      attempt +:= 1
+   }
+   write(&errout, "fixture on port ", port, " did not become ready; see ", logFile)
+   exit(1)
+end
+
+procedure busy_wait_ms(ms)
+   local target
+   target := &time + ms
+   while &time < target do &null
+   return
+end
+
+# table_of is convex.icn's own helper, reused here since link makes it an
+# ordinary, already-available procedure -- no need to redeclare it.
