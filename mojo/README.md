@@ -25,7 +25,7 @@ value.
 | Live authentication, optimistic updates, WebSocket mutations | Not implemented |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.mojo -->
-```text
+```mojo
 """The shared counter, from 0 to 1, over HTTP and Live from Mojo."""
 
 from std.os import getenv
