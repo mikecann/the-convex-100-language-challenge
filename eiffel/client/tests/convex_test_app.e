@@ -18,12 +18,16 @@ feature {NONE} -- Initialization
 			create parser.make
 			parser.parse ("{%"a%":1.0,%"b%":[true,false,null],%"c%":%"hi é %"quote\%"%"}")
 			check parsed: parser.successful end
-			value := parser.last_value
-			check has_a: value.has_field ("a") end
-			check number_ok: value.field ("a").number_item = 1.0 end
-			check array_len: value.field ("b").array_item.count = 3 end
-			print (value.to_json)
-			print ("%N")
+			if attached parser.last_value as l_value then
+				value := l_value
+				check has_a: value.has_field ("a") end
+				check number_ok: value.field ("a").number_item = 1.0 end
+				check array_len: value.field ("b").array_item.count = 3 end
+				print (value.to_json)
+				print ("%N")
+			else
+				print ("PARSE_FAILED_UNEXPECTEDLY%N")
+			end
 
 			create obj.make_object
 			obj.put_field ("room", create {CONVEX_JSON_VALUE}.make_string ("demo"))

@@ -53,7 +53,7 @@ feature {NONE} -- Initialization
 			a_value_attached: a_value /= Void
 		do
 			kind := Kind_string
-			string_item := a_value
+			string_item_cell := a_value
 		ensure
 			is_string: is_string
 			value_set: string_item = a_value
@@ -61,9 +61,12 @@ feature {NONE} -- Initialization
 
 	make_array
 			-- Create an empty JSON array; grow it with `extend'.
+		local
+			l_cell: ARRAYED_LIST [CONVEX_JSON_VALUE]
 		do
 			kind := Kind_array
-			create array_item.make (4)
+			create l_cell.make (4)
+			array_item_cell := l_cell
 		ensure
 			is_array: is_array
 			empty: array_item.is_empty
@@ -71,10 +74,15 @@ feature {NONE} -- Initialization
 
 	make_object
 			-- Create an empty JSON object; grow it with `put_field'.
+		local
+			l_keys: ARRAYED_LIST [STRING]
+			l_values: ARRAYED_LIST [CONVEX_JSON_VALUE]
 		do
 			kind := Kind_object
-			create object_keys.make (4)
-			create object_values.make (4)
+			create l_keys.make (4)
+			create l_values.make (4)
+			object_keys_cell := l_keys
+			object_values_cell := l_values
 		ensure
 			is_object: is_object
 			empty: object_keys.is_empty
@@ -140,13 +148,34 @@ feature -- Access
 
 	string_item: STRING
 			-- The wrapped string. Only meaningful when `is_string'.
+		require
+			is_string: is_string
+		do
+			check attached string_item_cell as l_cell then
+				Result := l_cell
+			end
+		end
 
 	array_item: ARRAYED_LIST [CONVEX_JSON_VALUE]
 			-- The wrapped elements, in order. Only meaningful when `is_array'.
+		require
+			is_array: is_array
+		do
+			check attached array_item_cell as l_cell then
+				Result := l_cell
+			end
+		end
 
 	object_keys: ARRAYED_LIST [STRING]
 			-- Field names in the order they were added. Only meaningful
 			-- when `is_object'.
+		require
+			is_object: is_object
+		do
+			check attached object_keys_cell as l_cell then
+				Result := l_cell
+			end
+		end
 
 	has_field (a_key: STRING): BOOLEAN
 			-- Does this object carry a field named `a_key'?
@@ -238,7 +267,6 @@ feature -- Conversion helpers
 				and then number_item >= a_low.to_double
 				and then number_item <= a_high.to_double
 				and then not number_item.is_nan
-				and then number_item.finite
 		end
 
 	integer_item: INTEGER_64
@@ -321,6 +349,18 @@ feature {NONE} -- Output implementation
 	object_values: ARRAYED_LIST [CONVEX_JSON_VALUE]
 			-- Field values, parallel to `object_keys'. Only meaningful
 			-- when `is_object'.
+		require
+			is_object: is_object
+		do
+			check attached object_values_cell as l_cell then
+				Result := l_cell
+			end
+		end
+
+	string_item_cell: detachable STRING
+	array_item_cell: detachable ARRAYED_LIST [CONVEX_JSON_VALUE]
+	object_keys_cell: detachable ARRAYED_LIST [STRING]
+	object_values_cell: detachable ARRAYED_LIST [CONVEX_JSON_VALUE]
 
 	formatted_number (a_value: REAL_64): STRING
 			-- Render `a_value' the way Convex's documented format expects:
@@ -328,7 +368,7 @@ feature {NONE} -- Output implementation
 			-- `0'), matching the shared example expectation and keeping the
 			-- integral/fractional distinction visible on the wire.
 		do
-			if a_value = a_value.floor.to_double and then a_value.finite then
+			if not a_value.is_nan and then a_value = a_value.floor.to_double then
 				Result := integer_64_to_string (a_value.rounded) + ".0"
 			else
 				Result := a_value.out
@@ -399,9 +439,10 @@ feature {NONE} -- Output implementation
 invariant
 	kind_known: kind = Kind_null or kind = Kind_boolean or kind = Kind_number
 		or kind = Kind_string or kind = Kind_array or kind = Kind_object
-	string_attached_when_string: is_string implies string_item /= Void
-	array_attached_when_array: is_array implies array_item /= Void
+	string_attached_when_string: is_string implies string_item_cell /= Void
+	array_attached_when_array: is_array implies array_item_cell /= Void
 	object_parallel_when_object: is_object implies
-		(object_keys /= Void and object_values /= Void and object_keys.count = object_values.count)
+		(object_keys_cell /= Void and object_values_cell /= Void
+			and then object_keys_cell.count = object_values_cell.count)
 
 end

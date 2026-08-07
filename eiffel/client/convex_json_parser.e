@@ -17,6 +17,7 @@ feature {NONE} -- Initialization
 
 	make
 		do
+			create text.make_empty
 			successful := False
 		end
 
