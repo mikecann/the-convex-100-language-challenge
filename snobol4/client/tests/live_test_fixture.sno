@@ -1,0 +1,213 @@
+*   live_test_fixture.sno - the scripted peer for live_test.sno. Blocking
+*   I/O means a fixture and its client cannot cooperatively share one
+*   process (see live_test.sno's own comment), so this runs as a second
+*   OS process the Dockerfile starts before the real test. It carries no
+*   assertions of its own; it only speaks the exact wire protocol
+*   live_test.sno expects, in the exact order live_test.sno drives it.
+-include 'convex-live.sno'
+
+    define('fx.accept(deadlinems)') :(fx.accept.end)
+fx.accept fx.accept = io.accept(fx.listener, deadlinems)                    :s(return)
+        :(freturn)
+fx.accept.end
+
+    define('fx.read_http_request(handle)buf,headerend,cl,needed,line') :(fx.read_http_request.end)
+fx.read_http_request
+        buf = ""
+fx.read_http_request.headers
+        headerend = indexof4(buf, char(13) char(10) char(13) char(10))
+        gt(headerend, 0)                                                     :s(fx.read_http_request.gotheaders)
+        buf = buf io.read_some(handle, 65536, io.now() + 5000)                :f(freturn)
+        :(fx.read_http_request.headers)
+fx.read_http_request.gotheaders
+        line = substr(buf, 1, indexof4(buf, char(13) char(10)) - 1)
+        cl = http.header_int(substr(buf, 1, headerend - 1), "Content-Length")  :s(fx.read_http_request.body)
+        cl = 0
+fx.read_http_request.body
+        needed = headerend + 4 + cl
+fx.read_http_request.more
+        ge(size(buf), needed - 1)                                            :s(fx.read_http_request.done)
+        buf = buf io.read_some(handle, 65536, io.now() + 5000)                 :f(freturn)
+        :(fx.read_http_request.more)
+fx.read_http_request.done
+        fx.last_request = buf
+        fx.read_http_request = line                                          :(return)
+fx.read_http_request.end
+
+    define('fx.respond_http(handle,status,body)resp') :(fx.respond_http.end)
+fx.respond_http
+        resp = "HTTP/1.1 " status char(13) char(10)
+        resp = resp "Content-Type: application/json" char(13) char(10)
+        resp = resp "Content-Length: " size(body) char(13) char(10)
+        resp = resp "Connection: close" char(13) char(10) char(13) char(10)
+        resp = resp body
+        io.write_all(handle, resp, io.now() + 5000)                            :s(return)
+        :(freturn)
+fx.respond_http.end
+
+    define('fx.ws_accept_upgrade(handle,line)key,accept,resp') :(fx.ws_accept_upgrade.end)
+fx.ws_accept_upgrade
+        key = ws.header_value(fx.last_request, "Sec-WebSocket-Key")             :f(freturn)
+        accept = base64.encode(sha1.digest(key "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+        resp = "HTTP/1.1 101 Switching Protocols" char(13) char(10)
+        resp = resp "Upgrade: websocket" char(13) char(10)
+        resp = resp "Connection: Upgrade" char(13) char(10)
+        resp = resp "Sec-WebSocket-Accept: " accept char(13) char(10) char(13) char(10)
+        io.write_all(handle, resp, io.now() + 5000)                            :s(return)
+        :(freturn)
+fx.ws_accept_upgrade.end
+
+    define('fx.ws_send(handle,payload)header,length') :(fx.ws_send.end)
+fx.ws_send
+        length = size(payload)
+        header = char(129)
+        le(length, 125)                                                       :s(fx.ws_send.short)
+        header = header char(126) char(length / 256) char(remdr(length, 256))  :(fx.ws_send.go)
+fx.ws_send.short
+        header = header char(length)
+fx.ws_send.go
+        io.write_all(handle, header payload, io.now() + 5000)                  :s(return)
+        :(freturn)
+fx.ws_send.end
+
+    define('fx.ws_read(handle)buf,first,second,lengthbyte,offset,length,mask,mp,m0,m1,m2,m3,i,b,out') :(fx.ws_read.end)
+fx.ws_read
+        buf = ""
+fx.ws_read.more
+        gt(size(buf), 1)                                                      :s(fx.ws_read.havehdr)
+        buf = buf io.read_some(handle, 65536, io.now() + 5000)                 :f(freturn)
+        :(fx.ws_read.more)
+fx.ws_read.havehdr
+        first = ord(substr(buf, 1, 1))
+        second = ord(substr(buf, 2, 1))
+        lengthbyte = remdr(second, 128)
+        offset = 7
+        lt(lengthbyte, 126)                                                    :f(fx.ws_read.long)
+        length = lengthbyte                                                    :(fx.ws_read.full)
+fx.ws_read.long
+        offset = 9
+        length = ord(substr(buf, 3, 1)) * 256 + ord(substr(buf, 4, 1))
+fx.ws_read.full
+        ge(size(buf), offset + length - 1)                                      :s(fx.ws_read.complete)
+        buf = buf io.read_some(handle, 65536, io.now() + 5000)                   :f(freturn)
+        :(fx.ws_read.full)
+fx.ws_read.complete
+        mask = substr(buf, offset - 4, 4)
+        mp = substr(buf, offset, length)
+        m0 = ord(substr(mask, 1, 1))
+        m1 = ord(substr(mask, 2, 1))
+        m2 = ord(substr(mask, 3, 1))
+        m3 = ord(substr(mask, 4, 1))
+        out = ""
+        i = 1
+fx.ws_read.loop
+        gt(i, length)                                                           :s(fx.ws_read.done)
+        b = ord(substr(mp, i, 1))
+        eq(remdr(i - 1, 4), 0)                                                  :s(fx.ws_read.u0)
+        eq(remdr(i - 1, 4), 1)                                                  :s(fx.ws_read.u1)
+        eq(remdr(i - 1, 4), 2)                                                  :s(fx.ws_read.u2)
+        out = out char(bits.xor32(b, m3))                                      :(fx.ws_read.next)
+fx.ws_read.u0
+        out = out char(bits.xor32(b, m0))                                      :(fx.ws_read.next)
+fx.ws_read.u1
+        out = out char(bits.xor32(b, m1))                                      :(fx.ws_read.next)
+fx.ws_read.u2
+        out = out char(bits.xor32(b, m2))
+fx.ws_read.next
+        i = i + 1                                                               :(fx.ws_read.loop)
+fx.ws_read.done
+        fx.ws_read = out                                                        :(return)
+fx.ws_read.end
+
+    define('fx.answer_sync(handle,startv,endv,mods)') :(fx.answer_sync.end)
+fx.answer_sync
+        fx.ws_send(handle, '{"type":"Transition","startVersion":' startv ',"endVersion":' endv ',"modifications":' mods '}')  :s(return)
+        :(freturn)
+fx.answer_sync.end
+
+    define('fx.version(qs,idn,tsbyte)') :(fx.version.end)
+fx.version
+        fx.version = '{"querySet":' qs ',"identity":' idn ',"ts":"' base64.encode(char(0) char(0) char(0) char(0) char(0) char(0) char(0) char(tsbyte)) '"}'
+        :(return)
+fx.version.end
+
+*   fx.one_shot_ws(label) - accept one connection, complete the upgrade,
+*   read the client's Connect and one ModifyQuerySet (Add), then send
+*   exactly one Transition built from qs/idn/tsbyte/mods. Every phase of
+*   this fixture except the reused initial connection follows this exact
+*   shape.
+    define('fx.one_shot_ws(qs,idn,tsbyte,mods)conn,reqline,sv,ev') :(fx.one_shot_ws.end)
+fx.one_shot_ws
+        conn = fx.accept(io.now() + 15000)                                     :f(fatal)
+        reqline = fx.read_http_request(conn)                                    :f(fatal)
+        fx.ws_accept_upgrade(conn, reqline)                                     :f(fatal)
+        fx.ws_read(conn)                                                        :f(fatal)
+        fx.ws_read(conn)                                                        :f(fatal)
+        sv = fx.version(0, 0, 0)
+        ev = fx.version(qs, idn, tsbyte)
+        fx.answer_sync(conn, sv, ev, mods)                                      :f(fatal)
+        fx.one_shot_ws = conn                                                   :(return)
+fx.one_shot_ws.end
+
+    fx.listener = io.listen("127.0.0.1", "18500")                               :f(fatal)
+
+* --- connection 1: HTTP query ---
+    conn1 = fx.accept(io.now() + 15000)                                          :f(fatal)
+    reqline1 = fx.read_http_request(conn1)                                        :f(fatal)
+    fx.respond_http(conn1, "200 OK", '{"status":"success","value":{"room":"x","count":0},"logLines":["from-fixture"]}')
+    io.close(conn1)
+
+* --- connection 2: HTTP mutation -> FunctionError ---
+    conn2 = fx.accept(io.now() + 15000)                                          :f(fatal)
+    reqline2 = fx.read_http_request(conn2)                                        :f(fatal)
+    fx.respond_http(conn2, "200 OK", '{"status":"error","errorMessage":"boom","errorData":{"code":"ROOM_EMPTY"}}')
+    io.close(conn2)
+
+* --- connection 3: Live subscribe demo:state, initial value + external
+* update. The client forces this connection closed via debugDisconnect
+* right after, so it is not reused for anything further. ---
+    conn3 = fx.accept(io.now() + 15000)                                           :f(fatal)
+    reqline3 = fx.read_http_request(conn3)                                         :f(fatal)
+    fx.ws_accept_upgrade(conn3, reqline3)                                          :f(fatal)
+    fx.ws_read(conn3)                                                              :f(fatal)
+    fx.ws_read(conn3)                                                              :f(fatal)
+    startv0 = fx.version(0, 0, 0)
+    endv1 = fx.version(1, 0, 1)
+    fx.answer_sync(conn3, startv0, endv1, '[{"type":"QueryUpdated","queryId":0,"value":{"count":0},"logLines":[]}]')  :f(fatal)
+    endv2 = fx.version(1, 0, 2)
+    fx.answer_sync(conn3, endv1, endv2, '[{"type":"QueryUpdated","queryId":0,"value":{"count":1},"logLines":["ext"]}]')  :f(fatal)
+
+* --- connections 4-8: five reconnects, each resubscribing the same query.
+* The fifth of these stays open afterwards: the client's own unsubscribe
+* (Remove) for that query arrives on it before the client resets the
+* connection for the next, unrelated subscription. Each resubscribed value
+* is offset by 100 so none of them ever collides with the count:1 the
+* external update above already delivered (or with each other): a client
+* that correctly suppresses an unchanged rehydration would otherwise see
+* reconnect 1's own resubscribe as a no-op duplicate and never enqueue an
+* event for it at all, which is a fixture data bug, not a client bug. ---
+    reconnect_i = 1
+    lastconn = 0
+reconnect_loop
+    gt(reconnect_i, 5)                                                              :s(reconnects_done)
+    lastconn = fx.one_shot_ws(1, 0, reconnect_i, '[{"type":"QueryUpdated","queryId":0,"value":{"count":' (100 + reconnect_i) '},"logLines":[]}]')  :f(fatal)
+    reconnect_i = reconnect_i + 1                                                    :(reconnect_loop)
+reconnects_done
+    fx.ws_read(lastconn)                                                              :f(fatal)
+    io.close(lastconn)
+
+* --- connection 9: a fresh subscription that immediately fails. Query IDs
+* are never reused (live_test.sno's own next_query_id keeps counting up
+* even across unsubscribe), so this second subscription is queryId 1, not
+* 0: a modification naming a query the client is not tracking is silently
+* ignored rather than delivered, which would otherwise strand this check
+* waiting for an event that never comes until the fixture process itself
+* exits and the client observes that as an unrelated transport failure. ---
+    fx.one_shot_ws(0, 0, 1, '[{"type":"QueryFailed","queryId":1,"errorMessage":"empty","errorData":{"code":"ROOM_EMPTY"},"logLines":[]}]')  :f(fatal)
+
+    io.close(fx.listener)
+    cvxexit(0)
+fatal
+    io.eprintln("live_test_fixture failed: " cvx.err.name ": " cvx.err.message)
+    cvxexit(1)
+end

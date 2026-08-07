@@ -20,8 +20,31 @@ RUN dotnet build client/Convex.csproj -c Release -warnaserror && \
 CMD ["/bin/sh", "-ec", "dotnet --info >/dev/null; test \"$(uname -m)\" = x86_64"]
 
 FROM --platform=linux/amd64 ${RUNTIME} AS runtime-base
+# RUNTIME is Debian bookworm-slim underneath and its rootfs carries apt,
+# dpkg and perl-base (Priority: important) independently of anything
+# dotnet-specific -- confirmed on this exact pinned digest with
+# `apt-get remove --simulate perl-base`, which reports zero reverse
+# dependencies (only perl-base itself would be removed; dpkg still marks
+# it Essential, so apt-get refuses the real removal and the files are
+# deleted directly below). Nothing in this client or the dotnet runtime
+# ever invokes perl, apt or dpkg, so strip them before publishing either
+# minimal runtime image.
 RUN mkdir -p /opt/convex /usr/local/bin && \
-    for command in dotnet-sdk msbuild csc fsc nuget npm npx node python python3 pip pip3 curl convex; do ! command -v "$command" >/dev/null 2>&1 || exit 1; done && \
+    rm -f /usr/bin/apt /usr/bin/apt-cache /usr/bin/apt-cdrom /usr/bin/apt-config \
+          /usr/bin/apt-get /usr/bin/apt-key /usr/bin/apt-mark /usr/bin/dpkg \
+          /usr/bin/dpkg-deb /usr/bin/dpkg-divert /usr/bin/dpkg-maintscript-helper \
+          /usr/bin/dpkg-query /usr/bin/dpkg-realpath /usr/bin/dpkg-split \
+          /usr/bin/dpkg-statoverride /usr/bin/dpkg-trigger /usr/bin/debconf* \
+          /usr/bin/update-alternatives /usr/sbin/dpkg-fsys-usrunmess \
+          /usr/sbin/dpkg-preconfigure /usr/sbin/dpkg-reconfigure \
+          /usr/sbin/invoke-rc.d /usr/sbin/update-rc.d \
+          /usr/bin/perl /usr/bin/perl5.36.0 && \
+    rm -rf /etc/apt /var/lib/apt /var/cache/apt /var/lib/dpkg /var/cache/debconf \
+           /usr/lib/apt /usr/lib/dpkg /usr/share/dpkg /usr/lib/x86_64-linux-gnu/perl-base && \
+    for command in dotnet-sdk msbuild csc fsc nuget npm npx node python python3 pip pip3 curl convex \
+                   apt apt-get apt-cache dpkg dpkg-deb perl; do \
+      ! command -v "$command" >/dev/null 2>&1 || exit 1; \
+    done && \
     ! dotnet build --help >/dev/null 2>&1
 USER 65532:65532
 

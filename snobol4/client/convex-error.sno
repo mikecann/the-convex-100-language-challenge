@@ -1,0 +1,35 @@
+*   convex-error.sno - the client-wide error record. SNOBOL4 has no
+*   exceptions, so every fallible function in this client either returns its
+*   value or fails, and on failure sets these three globals before it does:
+*     cvx.err.name     one of FunctionError, ProtocolError, TransportError
+*     cvx.err.message   a human-readable detail
+*     cvx.err.data      the raw JSON error payload a Convex function raised,
+*                       or "" when there is none (a transport or protocol
+*                       failure this client detected on its own)
+*   convex-io.sno already sets these for every transport-level failure.
+*   convex-http.sno and convex-live.sno set them for FunctionError and
+*   ProtocolError. This file just builds the adapter-facing JSON shape from
+*   whatever is currently in them, so that shape is written in exactly one
+*   place.
+-include 'convex-json.sno'
+
+*   error.raw() -> a JSON "error" object built from the current
+*   cvx.err.name / cvx.err.message / cvx.err.data.
+    define('error.raw()fields') :(error.raw.end)
+error.raw
+        ident(cvx.err.data, "")                          :s(error.raw.nodata)
+        error.raw = json.object3("name", json.qs(cvx.err.name), "message", json.qs(cvx.err.message), "data", cvx.err.data)
+        :(return)
+error.raw.nodata
+        error.raw = json.object2("name", json.qs(cvx.err.name), "message", json.qs(cvx.err.message))
+        :(return)
+error.raw.end
+
+*   error.set(name, message, data) - a plain setter, used by callers that
+*   already know the JSON-encoded error payload (data may be "" for none).
+    define('error.set(name,message,data)') :(error.set.end)
+error.set
+        cvx.err.name = name
+        cvx.err.message = message
+        cvx.err.data = data                              :(return)
+error.set.end

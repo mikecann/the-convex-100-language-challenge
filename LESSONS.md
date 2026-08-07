@@ -616,6 +616,132 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- The "upstream bug" was ours, and five issue numbers made it look otherwise.
+  GDScript's hosted TLS failure was diagnosed as an open mbedTLS/PSA-crypto
+  defect in Godot, matching five upstream reports, reproduced on two engine
+  versions. It was none of those things. Reproducing the *exact* launch the
+  runtime image uses — a bare `--script` SceneTree, not a naive re-test —
+  showed `SSL module failed to initialize`, an `ERR_UNCONFIGURED`, on every
+  version from 4.2.2 to 4.5. Godot only calls `load_default_certificates()`
+  from the "game" branch of `Main::start()`, which a `--script` launch never
+  takes. Passing an explicit trust chain to `TLSOptions.client()` bypasses it
+  entirely. **A matching issue number is a hypothesis, not a diagnosis** — and
+  the reproduction has to use the configuration that actually fails, not a
+  simplified one that merely resembles it.
+- V's read timeout was set on the wrong layer. `TcpConn.set_read_timeout`
+  updates a field that V's own read wrapper consults. With the OpenSSL backend,
+  `SSL_read` talks to the raw file descriptor and never sees it, and nothing
+  ever set `SO_RCVTIMEO` on the socket. So the deadline existed, was correct,
+  and applied to a code path the bytes did not travel. `strace` showed a
+  blocking `read()` sitting past the limit with no `select()` anywhere near it.
+- Every stock Iron Spring PL/I binary is unrunnable inside Docker, and it has
+  nothing to do with the language. Its runtime's `_pli_SigInit` installs trap
+  handlers with the legacy i386 `sigaction` syscall, number 67, which Docker's
+  default seccomp profile refuses with `EPERM` — and the routine treats that as
+  fatal. So every binary, including the compiler itself, exits before `main`.
+  The 32-bit multiarch link everyone expects to be the hard part worked almost
+  immediately; the invisible container policy was what nearly sank it. This is
+  the second language tonight blocked by default seccomp — Pop-11 was not
+  recoverable, PL/I was, by recompiling that one routine against `rt_sigaction`
+  from the vendor's own source.
+- Uninitialised storage read as a pointer, and only the hosted profile died.
+  PL/I `AUTOMATIC` storage starts as stack garbage; a TLS-context cache field
+  was never initialised, so it handed OpenSSL whatever was on the stack. The
+  example survived because its stack layout differed, and the local profile
+  passed 31/31 because plain HTTP never reaches that code at all. Three
+  independent pieces of luck had to line up for the bug to hide, and they did.
+- Seed7 speaks TLS without OpenSSL. Its `tls.s7i` implements the handshake,
+  AES-GCM, HMAC, elliptic-curve key exchange and X.509 parsing in Seed7
+  itself — the only client on this roster whose TLS is not a C library behind
+  an FFI. That produced a bug nothing else could have: the client gated every
+  read behind the raw socket's `inputReady`, which misses bytes the TLS layer
+  has already decrypted and buffered above the socket. Invisible against the
+  local plain-`ws://` backend, fatal against the real `wss://` deployment.
+  When your TLS is a library, its buffer is not your problem. When it is your
+  own code, it is.
+- Seed7's extensibility is not decorative. `client query path withArgs args`
+  reads that way because the client defines it with the same `$ syntax` pragma
+  the standard library uses for `for x range y do`. A language that lets you
+  add syntax is worth using that way, or the slot is wasted.
+- For a young language, the fastest route was reading the standard library's
+  source. Mojo 0.26.2's stdlib does not match anything a model has been trained
+  on: `sys.ffi` moved to `std.ffi`, `alias` became `comptime`, `UnsafePointer`
+  grew mutability and origin parameters and lost `.alloc`, and string slicing
+  now needs an explicit `[byte=a:b]`. Guessing costs an afternoon of
+  compiler-error ping-pong. Cloning the compiler's own repository at the tag
+  matching the installed release, and reading it, costs minutes. There is also
+  a trap worth naming: `external_call["write", …]` fails to compile because
+  `print` has already instantiated the standard library's own declaration of
+  `write`, and yours must match its signature exactly.
+- Ballerina's platform betrayed it twice, in two different libraries. The known
+  defect was `ballerina/websocket` corrupting multi-byte UTF-8 split across a
+  continuation frame, fixed by not using it — hand-rolled RFC 6455 over a raw
+  socket, the same route a dozen clients here already take. The second was
+  found only by testing against the real hosted deployment: **`ballerina/tcp`'s
+  TLS client never sends SNI.** That was confirmed by disassembling the
+  library's own native jar and seeing it call Netty's single-argument
+  `SslContext.newHandler(ByteBufAllocator)` rather than the host-aware
+  overload. Convex's hosted deployment sits behind Cloudflare, which requires
+  SNI, so every handshake died with a fatal alert. `ballerina/http` is
+  unaffected, because its Netty wiring does pass the host through — the same
+  runtime, two TLS paths, one of them wrong.
+- The fixture was too polite again, in a new way. Ballerina's handshake reader
+  decoded its whole read buffer as UTF-8 looking for the end of the HTTP
+  headers. That works until a server pipelines its first binary frame straight
+  after the `101` response — which the real backend does and no local fixture
+  ever did. Every local test passed; the first real connection failed.
+- EiffelStudio miscompiles its own output past a certain size. Bundle enough
+  classes with inline-C bodies into one translation unit and the generated
+  C file comes out one `#include` short, so gcc reports the last class's
+  functions redeclared with conflicting linkage. The workaround is to put the
+  TLS and socket calls in an ordinary separately-compiled C file instead —
+  which is the same C-interop boundary every other native client here uses, so
+  nothing is lost. Separately, Eiffel's incremental "workbench" runtime reports
+  an ordinary `EINTR` as a fatal operating-system-signal exception; only the
+  finalised build behaves.
+- SNOBOL4 exited 0 and printed nothing, and both facts were correct. Its C
+  shim called `_exit()`, which skips libc's stdio flush. Under Docker stdout is
+  a pipe, not a terminal, so it is fully buffered — the transcript was sitting
+  in a buffer that was never drained, and every test had missed it because
+  tests write to unbuffered stderr. The documented remedy, closing the output
+  unit from SNOBOL, was tried and *empirically did not work*: it updates the
+  interpreter's own unit table without ever reaching the OS. The fix was
+  `fflush(NULL)` before `_exit()`. **A success with no output is a bug report,
+  not a pass** — and it only appeared after an earlier fix let the program
+  reach its success path for the very first time.
+- BCPL crashed because a pointer no longer fits in a word. Its 32-bit Cintcode
+  interpreter stores a raw C pointer — the `FILE*` returned by `fopen()` — in a
+  32-bit BCPL word. On a 64-bit host that address routinely lands above 2^32,
+  so the low half alone is not a pointer, and the crash happened inside the
+  distribution's own runtime before a line of client code ran. It reproduces on
+  the unmodified compiler with nothing linked in. Targeting the distribution's
+  64-bit Cintcode, whose word is wide enough for a real pointer, fixes it.
+  BCPL is from 1967, when a word held an address by definition; the assumption
+  is older than the problem.
+- Typelessness has a bill, and it arrives late. BCPL does not check argument
+  counts, so a mismatch between a function and its two callers went unnoticed
+  until the toolchain worked for the first time — at which point it silently
+  read stack poison (`0xDEADC0DE`) and crashed a coroutine. Code that has never
+  executed has never been checked, in a language that never checks.
+- The unfixable client bug was two bugs in the test fixture. SNOBOL4's
+  WebSocket reconnection looked genuinely broken and unsalvageable. It was the
+  fixture: a resubscribed value collided with an already-delivered one, which
+  defeated the client's own — correct — deduplication, and an unconditional
+  return swallowed an accept timeout. This is now the fourth time in this
+  project that a confident diagnosis of "the client is wrong" turned out to be
+  the harness, the fixture, or the reference implementation. **When the code
+  under test looks impossibly broken, suspect the thing doing the testing.**
+- A self-test paired the client against a server that never answers. V's
+  Dockerfile proves its TLS closure works by talking to `openssl s_server -www`
+   — which replies to a GET immediately and to a POST not at all. The client
+  sends a POST. The stage could therefore never pass, no matter how correct the
+  client was, and `strace` confirmed the handshake and the request were both
+  fine. Worse, the permanently-failing test was masking a real bug underneath
+  it: a 20-second deadline that never fired, leaving a blocking read sitting
+  indefinitely. **A test that always fails hides bugs exactly as effectively as
+  a test that always passes** — this document already has a section about the
+  second kind, and the first kind is rarer only because someone usually
+  deletes it.
 - One character silently downgraded every secure connection. Icon's scheme
   detection compared against `"https"` where the parsed value was `"https:"`,
   so every `wss://` subscription quietly opened as plain `ws://` — and the

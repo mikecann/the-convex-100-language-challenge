@@ -1,0 +1,120 @@
+$ include "seed7_05.s7i";
+  include "convex_live.s7i";
+  include "environment.s7i";
+
+
+(**
+ *  Read the shared counter's current value out of a decoded Convex
+ *  object, accepting the `0` or `0.0` forms Convex's JSON encoding may
+ *  use for a whole number. Returns -1 when `value` is not a JSON
+ *  object with a whole-numbered "count" field, which the two die()
+ *  call sites below treat as "unexpected value".
+ *)
+const func integer: countOf (in jsonValue: value) is func
+  result
+    var integer: count is -1;
+  local
+    var integer: decoded is 0;
+  begin
+    if category(value) = JSON_OBJECT and "count" in value then
+      if not wholeNumberOf(value["count"], decoded) then
+        count := -1;
+      else
+        count := decoded;
+      end if;
+    end if;
+  end func;
+
+
+const proc: die (in string: message) is func
+  begin
+    writeln(STD_ERR, message);
+  end func;
+
+
+const proc: main is func
+  local
+    var string: url is "";
+    var string: room is "seed7-basic-example";
+    var boolean: parsed is FALSE;
+    var convexClient: client is convexClient.value;
+    var jsonObject: queryArgs is jsonObject.value;
+    var convexOutcome: outcome is convexOutcome.value;
+    var convexLive: live is convexLive.value;
+    var jsonObject: mutationArgs is jsonObject.value;
+    var boolean: failed is FALSE;
+  begin
+    # Configure the deployment from the environment and create the client.
+    # The verifier's unique room ID arrives as the program's first
+    # argument; a friendly default lets someone run the image by hand.
+    url := getenv("CONVEX_URL");
+    if length(argv(PROGRAM)) >= 1 then
+      room := argv(PROGRAM)[1];
+    end if;
+    client := openConvexClient(url, parsed);
+    if not parsed then
+      die("could not create client");
+      failed := TRUE;
+    end if;
+
+    # Query the current counter over HTTP and decode its JSON object.
+    if not failed then
+      queryArgs @:= ["room"] jsonValue(room);
+      outcome := client query "demo:state" withArgs jsonValue(queryArgs);
+      if not outcome.ok or countOf(outcome.value) <> 0 then
+        die("unexpected initial query value");
+        failed := TRUE;
+      else
+        writeln("current count: 0");
+      end if;
+    end if;
+
+    # Start Live before the mutation so no reactive update can be missed.
+    if not failed then
+      live := openConvexLive(client);
+      subscribeLive(live, "state", "demo:state", jsonValue(queryArgs));
+      outcome := waitForLiveValue(live, "state", 10 . SECONDS);
+      if not outcome.ok or countOf(outcome.value) <> 0 then
+        die("unexpected initial Live value");
+        failed := TRUE;
+      else
+        writeln("live initial count: 0");
+      end if;
+    end if;
+
+    # The run ID makes the mutation safe to retry without incrementing twice.
+    if not failed then
+      mutationArgs @:= ["room"] jsonValue(room);
+      mutationArgs @:= ["language"] jsonValue("Seed7");
+      mutationArgs @:= ["runId"] jsonValue(room & "-once");
+      outcome := client mutate "demo:increment" withArgs jsonValue(mutationArgs);
+      if not outcome.ok or category(outcome.value) <> JSON_OBJECT or
+          not boolean(outcome.value["applied"]) or countOf(outcome.value["state"]) <> 1 then
+        die("unexpected mutation result");
+        failed := TRUE;
+      else
+        writeln("mutation applied: true");
+        writeln("mutation count: 1");
+      end if;
+    end if;
+
+    # Decode the resulting Live update, then cleanly remove the subscription.
+    if not failed then
+      outcome := waitForLiveValue(live, "state", 10 . SECONDS);
+      if not outcome.ok or countOf(outcome.value) <> 1 then
+        die("unexpected updated Live value");
+        failed := TRUE;
+      else
+        writeln("live updated count: 1");
+      end if;
+      unsubscribeLive(live, "state");
+      closeLive(live);
+    end if;
+
+    # Print verification only after HTTP and Live agree on the 0 -> 1 journey.
+    if failed then
+      exit(1);
+    else
+      writeln("verified count: 0 -> 1");
+    end if;
+  end func;

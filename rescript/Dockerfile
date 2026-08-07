@@ -56,6 +56,12 @@ FROM ${NODE_IMAGE} AS runtime-base
 # Node is the target runtime that executes compiled ReScript. Everything that
 # could build, fetch, or delegate is removed before either minimal image is
 # published.
+#
+# NODE_IMAGE is Debian bookworm-slim underneath and its rootfs carries
+# perl-base (Priority: important) independently of anything Node-specific --
+# confirmed on this exact pinned digest with `apt-get remove --simulate
+# perl-base`, which reports zero reverse dependencies. Nothing here ever
+# invokes perl; strip it alongside apt/dpkg rather than leaving it unclaimed.
 RUN rm -f \
       /usr/local/bin/npm \
       /usr/local/bin/npx \
@@ -68,7 +74,9 @@ RUN rm -f \
       /usr/bin/update-alternatives \
       /usr/sbin/dpkg-* \
       /usr/sbin/invoke-rc.d \
-      /usr/sbin/update-rc.d && \
+      /usr/sbin/update-rc.d \
+      /usr/bin/perl \
+      /usr/bin/perl5.36.0 && \
     rm -rf \
       /usr/local/lib/node_modules/npm \
       /usr/local/lib/node_modules/corepack \
@@ -79,7 +87,8 @@ RUN rm -f \
       /var/cache/debconf \
       /usr/lib/apt \
       /usr/lib/dpkg \
-      /usr/share/dpkg
+      /usr/share/dpkg \
+      /usr/lib/x86_64-linux-gnu/perl-base
 WORKDIR /opt/convex
 # Only the WebSocket transport is a real runtime dependency.
 COPY --from=production-dependencies /opt/convex/client/node_modules/ws ./client/node_modules/ws
@@ -102,8 +111,8 @@ COPY --from=build /opt/convex/client/Convex.res.mjs ./client/Convex.res.mjs
 # directory has to declare that explicitly for Node to parse them.
 RUN printf '%s\n' '{"type":"module"}' > ./client/node_modules/rescript/lib/es6/package.json
 RUN test "$(node -p 'process.arch')" = x64 && \
-    for command_name in apt apt-get dpkg npm npx corepack rescript bsc; do \
-      ! command -v "$command_name"; \
+    for command_name in apt apt-get dpkg npm npx corepack rescript bsc perl; do \
+      ! command -v "$command_name" >/dev/null 2>&1 || exit 1; \
     done && \
     test ! -e /opt/convex/client/node_modules/rescript/rescript && \
     test ! -e /opt/convex/client/node_modules/.bin

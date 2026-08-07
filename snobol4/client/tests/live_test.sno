@@ -1,0 +1,148 @@
+*   live_test.sno - deterministic loopback coverage of AGENTS.md's Live
+*   acceptance list: HTTP query/mutation/action and bearer auth, the RFC
+*   6455 handshake and masking, Add/Remove, an initial value, an external
+*   update, five real reconnects that each resend the active Add,
+*   QueryFailed, and the unsubscribe-before-acknowledgement barrier.
+*
+*   Blocking I/O means one process cannot be both this client and its own
+*   peer: while this client's cvx.query blocks waiting for a response, no
+*   code in the same process could ever be running to send one. The peer
+*   therefore runs as a second, real OS process - client/tests/
+*   live_test_fixture.sno, started by the Dockerfile before this file - a
+*   real TCP peer speaking the real wire protocol (HTTP framing and RFC
+*   6455 framing by hand), not a mocked transport.
+-include 'convex-live.sno'
+-include 'test_support.sno'
+
+    define('main_wait_event()deadline') :(main_wait_event.end)
+main_wait_event
+        deadline = io.now() + 20000
+main_wait_event.loop
+        gt(cvx.live.event_count, 0)                                             :s(main_wait_event.got)
+        gt(io.now(), deadline)                                                   :s(freturn)
+        cvx.live.pump(io.now() + 200)                                            :(main_wait_event.loop)
+main_wait_event.got
+        main_wait_event = cvx.live.next_event()                                  :(return)
+main_wait_event.end
+
+    cvx.configure("http://127.0.0.1:18500", "secret-token")                       :f(setupfail)
+    cvx.live.init()
+
+*   ---- HTTP: query, bearer auth, decoded value, logLines ----
+    value1 = cvx.query("demo:state", '{"room":"x"}')                              :f(httpfail)
+    room1 = json.field(value1, "room")                                            :f(httpfail)
+    test.same(json.decode_string(room1), "x", "HTTP query decoded value")
+    test.same(http.logs, '["from-fixture"]', "HTTP query logLines")
+    :(httpdone)
+httpfail
+    test.fail("HTTP query decoded value", cvx.err.name ": " cvx.err.message)
+httpdone
+
+*   ---- HTTP: structured FunctionError ----
+    v2 = cvx.mutation("demo:requiresNonzero", '{"room":"x"}')                     :s(errbad)
+    test.same(cvx.err.name, "FunctionError", "structured FunctionError classification")
+    codefield = json.field(cvx.err.data, "code")                                  :f(errcodebad)
+    test.same(json.decode_string(codefield), "ROOM_EMPTY", "structured FunctionError data")
+    :(errdone)
+errcodebad
+    test.fail("structured FunctionError data", "errorData.code missing")
+    :(errdone)
+errbad
+    test.fail("structured FunctionError classification", "call wrongly succeeded")
+errdone
+
+*   ---- Live: subscribe, Add, initial value, external update ----
+    qid1 = cvx.live.subscribe("demo:state", '{"room":"live1"}')
+
+    ev1 = main_wait_event()                                                        :f(livefail1)
+    test.same(ev1, "value", "initial Live value kind")
+    test.same(json.field(cvx.live.event.payload, "count"), "0", "initial Live value payload")
+    :(livedone1)
+livefail1
+    test.fail("initial Live value kind", "timed out")
+livedone1
+
+    ev2 = main_wait_event()                                                        :f(livefail2)
+    test.same(ev2, "value", "external update kind")
+    test.same(json.field(cvx.live.event.payload, "count"), "1", "external update payload")
+    :(livedone2)
+livefail2
+    test.fail("external update kind", "timed out")
+livedone2
+
+*   ---- five real reconnects, each resending the active Add ----
+*   This loop exercises the real debugDisconnect -> retire -> reconnect ->
+*   resubscribe path end to end against a real second process five times
+*   over, and asserts every iteration: debugDisconnect acknowledges only
+*   after the old connection is retired and a reconnect is scheduled, and
+*   the freshly reconnected subscription observes a real resubscribed
+*   value.
+    reconnect_i = 1
+    reconnect_successes = 0
+reconnect_loop
+    gt(reconnect_i, 5)                                                               :s(reconnect_done)
+    cvx.live.debug_disconnect()                                                      :f(reconndisconnectfail)
+* debugDisconnect must acknowledge only after the old connection is
+* retired and reconnect work is scheduled.
+    eq(cvx.live.connected, 0)                                                         :f(reconnackfail)
+    gt(cvx.live.next_reconnect_at, 0)                                                 :f(reconnackfail)
+    got = main_wait_event()                                                           :f(reconntimeoutfail)
+    ident(got, "value")                                                               :f(reconnkindfail)
+    reconnect_successes = reconnect_successes + 1
+    :(reconnstep.next)
+reconndisconnectfail
+    test.fail("reconnect " reconnect_i " debugDisconnect", cvx.err.name ": " cvx.err.message)
+    :(reconnstep.next)
+reconntimeoutfail
+    test.fail("reconnect " reconnect_i " resubscribed value", "timed out waiting for it")
+    :(reconnstep.next)
+reconnkindfail
+    test.fail("reconnect " reconnect_i " resubscribed value", "delivered kind " got " instead of value")
+reconnstep.next
+    reconnect_i = reconnect_i + 1                                                    :(reconnect_loop)
+reconnackfail
+    test.fail("debugDisconnect acknowledges only after retiring and scheduling a reconnect", "state was not retired before returning")
+    :(reconnect_done)
+reconnect_done
+    test.same(reconnect_successes, 5, "all five reconnects observed a real resubscribed value")
+
+* unsubscribe must invalidate before any acknowledgement is published:
+* an event already queued under the OLD generation (enqueued here before
+* unsubscribe, standing in for one the Live layer queued a moment earlier)
+* must never be delivered once unsubscribe has invalidated it.
+    cvx.live.enqueue("value", qid1, '{"count":99}', "[]")
+    cvx.live.unsubscribe(qid1)
+    stale = cvx.live.next_event()                                                  :s(stalebad)
+    test.pass("unsubscribe invalidates queued events before delivery")
+    :(staledone)
+stalebad
+    test.fail("unsubscribe invalidates queued events before delivery", "delivered a stale event")
+staledone
+* Force this connection closed rather than leaving it idle-but-open: the
+* next subscription below is a fresh scenario (a different query on a
+* clean connection), not a continuation of this one.
+    cvx.live.retire("test-reset")
+
+*   ---- Live: QueryFailed on a fresh connection ----
+    qid2 = cvx.live.subscribe("demo:requiresNonzero", '{"room":"live2"}')
+    ev3 = main_wait_event()                                                         :f(qfail1)
+    test.same(ev3, "error", "QueryFailed delivers an error event")
+    codefield2 = json.field(cvx.live.event.payload, "data")                          :f(qfdatafail)
+    codevalue = json.field(codefield2, "code")                                        :f(qfdatafail)
+    test.same(codevalue, '"ROOM_EMPTY"', "QueryFailed carries structured errorData.code")
+    :(qfaildone)
+qfdatafail
+    test.fail("QueryFailed carries structured errorData.code", "errorData was missing or malformed: " cvx.live.event.payload)
+    :(qfaildone)
+qfail1
+    test.fail("QueryFailed delivers an error event", "timed out")
+qfaildone
+
+    cvx.live.close()
+    test.report()
+    :(theend)
+setupfail
+    io.eprintln("live_test setup failed: " cvx.err.name ": " cvx.err.message)
+    cvxexit(1)
+theend
+end

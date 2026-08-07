@@ -1,0 +1,117 @@
+ /********************************************************************/
+ /* Style gate.                                                      */
+ /*                                                                  */
+ /* PL/I has no standard formatter, so this stands in for one. It    */
+ /* reads every checked-in source file named on its command line and */
+ /* fails the build rather than rewriting reviewed source.           */
+ /*                                                                  */
+ /* The rules exist for reasons this repository cares about: the     */
+ /* README and the website show these files verbatim, so a tab or a  */
+ /* long line renders differently there than it does here, and a     */
+ /* non-ASCII byte in a literal would depend on how the compiler     */
+ /* reads its own input encoding.                                    */
+ /********************************************************************/
+ style_check: proc options(main);
+
+ %include convex;
+
+ dcl   1 argc_s              ext( '_pli_argc' ),
+         5 argc              fixed bin(31),
+         5 ppargv            ptr,
+         5 ppenv             ptr;
+ dcl     argslot        (0:1)ptr        based;
+
+ %replace MAX_LINE_LENGTH    by 78;
+
+ dcl     problems            fixed bin(31);
+ dcl     i                   fixed bin(31);
+
+ call cvxinit();
+ problems = 0;
+ if argc < 2 then do;
+   call note( 'style_check: no files were named' );
+   call c_exit( 1 );
+   end;
+ do i = 1 to argc - 1;
+   call checkfile( ppargv->argslot(i) );
+   end;
+ if problems > 0 then do;
+   call note( 'style_check: FAILED' );
+   call c_exit( 1 );
+   end;
+ call note( 'style_check: ok' );
+ return;
+
+ checkfile: proc( namep );
+   dcl   namep               ptr;
+   dcl   fd                  fixed bin(31);
+   dcl   chunk               char(8192);
+   dcl   got                 fixed bin(31);
+   dcl   at                  fixed bin(31);
+   dcl   c                   fixed bin(31);
+   dcl   linestart           fixed bin(31);
+   dcl   lineno              fixed bin(31);
+   dcl   lastbyte            fixed bin(31);
+   fd = c_open( namep, 0 );
+   if fd < 0 then do;
+     call complain( namep, 0, 'could not be opened' );
+     return;
+     end;
+   call bclear( B_TMP );
+   do while( '1'b );
+     got = c_read( fd, addr(chunk), 8192 );
+     if got <= 0 then leave;
+     call bput( B_TMP, addr(chunk), got );
+     end;
+   got = c_close( fd );
+   if blen(B_TMP) = 0 then do;
+     call complain( namep, 0, 'is empty' );
+     return;
+     end;
+   lastbyte = byteval( ptradd( bdata(B_TMP), blen(B_TMP) - 1 ) );
+   if lastbyte ^= 10 then call complain( namep, 0, 'has no final newline' );
+   lineno    = 1;
+   linestart = 0;
+   do at = 0 to blen(B_TMP) - 1;
+     c = byteval( ptradd( bdata(B_TMP), at ) );
+     if c = 9 then call complain( namep, lineno, 'contains a tab' );
+     else if c = 13 then
+       call complain( namep, lineno, 'contains a carriage return' );
+     else if c > 126 then
+       call complain( namep, lineno, 'contains a non-ASCII byte' );
+     else if c < 32 & c ^= 10 then
+       call complain( namep, lineno, 'contains a control character' );
+     if c = 10 then do;
+       if at - linestart > MAX_LINE_LENGTH then
+         call complain( namep, lineno, 'is longer than 78 columns' );
+       if at > linestart then
+         if byteval( ptradd( bdata(B_TMP), at - 1 ) ) = 32 then
+           call complain( namep, lineno, 'has trailing whitespace' );
+       lineno    = lineno + 1;
+       linestart = at + 1;
+       end;
+     end;
+   end checkfile;
+
+ complain: proc( namep, lineno, what );
+   dcl   namep               ptr;
+   dcl   lineno              fixed bin(31);
+   dcl   what                char(48);
+   call bclear( B_OUT );
+   call bputt( B_OUT, 'style_check:' );
+   call bputb( B_OUT, ' ' );
+   call bput( B_OUT, namep, c_strlen( namep ) );
+   if lineno > 0 then do;
+     call bputb( B_OUT, ':' );
+     call bputi( B_OUT, lineno );
+     end;
+   call bputb( B_OUT, ' ' );
+   call bputt( B_OUT, what );
+   call bputb( B_OUT, '0a'x );
+   if tsendall( 2, sysnull(), bdata(B_OUT), blen(B_OUT) ) = 0 then;
+   problems = problems + 1;
+   end complain;
+
+ %include convexlib;
+
+ end style_check;

@@ -25,7 +25,7 @@ languages:
   - { rank: 18, id: objective-c, displayName: "Objective-C", selectionTier: ranked, feasibility: { docker: A, https: A, json: A, websocket: A } }
   - { rank: 19, id: lua, displayName: "Lua", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 20, id: powershell, displayName: "PowerShell", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
-  - { rank: 21, id: matlab, displayName: "MATLAB", selectionTier: ranked, feasibility: { docker: A, https: G, json: G, websocket: A } }
+  - { rank: 21, id: seed7, displayName: "Seed7", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 22, id: visual-basic-dotnet, displayName: "Visual Basic .NET", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 23, id: perl, displayName: "Perl", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 24, id: assembly-x86-64, displayName: "Assembly (x86-64 NASM)", selectionTier: ranked, feasibility: { docker: G, https: A, json: A, websocket: A } }
@@ -44,14 +44,14 @@ languages:
   - { rank: 37, id: zig, displayName: "Zig", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: A } }
   - { rank: 38, id: erlang, displayName: "Erlang", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 39, id: sas, displayName: "SAS", selectionTier: ranked, feasibility: { docker: R, https: G, json: G, websocket: R } }
-  - { rank: 40, id: labview, displayName: "LabVIEW", selectionTier: ranked, feasibility: { docker: R, https: A, json: G, websocket: A } }
+  - { rank: 40, id: emacs-lisp, displayName: "Emacs Lisp", selectionTier: ranked, feasibility: { docker: G, https: A, json: A, websocket: A } }
   - { rank: 41, id: vhdl, displayName: "VHDL", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: A } }
   - { rank: 42, id: apex, displayName: "Apex", selectionTier: ranked, feasibility: { docker: R, https: G, json: G, websocket: R } }
   - { rank: 43, id: d, displayName: "D", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 44, id: fsharp, displayName: "F#", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 45, id: setl, displayName: "SETL", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: A } }
   - { rank: 46, id: tcl, displayName: "Tcl", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: A } }
-  - { rank: 47, id: scratch, displayName: "Scratch", selectionTier: ranked, feasibility: { docker: A, https: A, json: A, websocket: A } }
+  - { rank: 47, id: snobol4, displayName: "SNOBOL4", selectionTier: ranked, feasibility: { docker: G, https: A, json: A, websocket: A } }
   - { rank: 48, id: clojure, displayName: "Clojure", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 49, id: gdscript, displayName: "GDScript", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 50, id: gleam, displayName: "Gleam", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: A } }

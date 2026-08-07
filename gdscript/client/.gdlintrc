@@ -1,0 +1,16 @@
+# gdlint configuration for the Convex GDScript demonstration.
+#
+# Only the three design limits below are raised, and each for a stated reason.
+# Every naming, formatting, and correctness rule keeps its default, and the
+# 100 character line limit is deliberately left alone so the canonical example
+# stays readable in the README and on the website.
+
+# This client returns a result dictionary instead of raising, so validation
+# reads as a sequence of early returns rather than nested branches.
+max-returns: 12
+
+# The Live owner and the test fixtures expose small, explicit accessors rather
+# than public state.
+max-public-methods: 32
+
+max-file-lines: 1200

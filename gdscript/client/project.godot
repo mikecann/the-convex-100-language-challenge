@@ -1,0 +1,65 @@
+; Godot project configuration for the Convex GDScript demonstration.
+;
+; It lives under client/ because it is build metadata, not educational source.
+; The Docker build moves it to the root of a temporary project tree, next to
+; client/ and examples/, so every script can refer to its neighbours through
+; ordinary res:// paths.
+;
+; run/main_loop_type selects the program the exported pack runs. The adapter
+; pack keeps the value below; the Docker build rewrites it to
+; ConvexExampleMain before exporting the canonical example pack, so each
+; runtime image contains exactly one entry point.
+
+config_version=5
+
+[application]
+
+config/name="convex"
+config/description="Educational native Convex client for Godot 4"
+config/features=PackedStringArray("4.4", "GDScript")
+run/main_loop_type="ConvexAdapterMain"
+; NDJSON is only useful if each line leaves the process when it is written,
+; rather than waiting in a buffer until exit.
+run/flush_stdout_on_print=true
+run/flush_stdout_on_print.debug=true
+
+[debug]
+
+settings/stdout/print_fps=false
+settings/stdout/verbose_stdout=false
+; Godot's default of true makes every run try to create and append to
+; user://logs/godot.log. Turning it off here is declared intent and costs
+; nothing, but is not sufficient by itself: ProjectSettings reports this as
+; false correctly once the project is loaded (checked with a probe script),
+; and Godot 4.4.1 opens the log file anyway regardless. The runtime images
+; work around the engine actually doing this by pointing --log-file at
+; /dev/shm, the one writable location the shared verifier's read-only,
+; no-tmpfs container leaves available - see gdscript/Dockerfile.
+file_logging/enable_file_logging=false
+
+[network]
+
+limits/tcp/connect_timeout_seconds=10
+
+[physics]
+
+; Nothing here simulates anything. The main loops drive their own polling, so
+; the engine's own tick rate is kept as low as the setting allows.
+common/physics_ticks_per_second=1
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+; The compatibility renderer otherwise persists compiled shader variants to
+; user://.godot/shader_cache/ so the next run skips recompilation. There is no
+; next run: every container starts from the same read-only image, so the
+; cache can only ever be write attempts against a filesystem that permits
+; none, never a hit.
+shader_compiler/shader_cache/enabled=false
+
+[threading]
+
+; The shared harness runs the adapter container with a small process limit,
+; and this program does its own polling, so the engine's worker pool stays
+; deliberately small.
+worker_pool/max_threads=1

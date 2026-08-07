@@ -1,0 +1,27 @@
+*   convex.sno - the public entry point for the native SNOBOL4 Convex
+*   client. Include this one file to get HTTPS query/mutation/action and
+*   Live sync; it exists only to give a reader and a build one obvious
+*   place to start, and pulls in the layers underneath it in dependency
+*   order:
+*     convex-io.sno     the loaded C transport shim and its blocking helpers
+*     convex-bits.sno    32-bit arithmetic for SHA-1 and WebSocket masking
+*     convex-sha1.sno    SHA-1, for the WebSocket handshake only
+*     convex-base64.sno  base64, for the WebSocket handshake only
+*     convex-json.sno    a span-based JSON reader and a JSON writer
+*     convex-error.sno   the shared cvx.err.* failure record
+*     convex-http.sno    cvx.configure / cvx.query / cvx.mutation / cvx.action
+*     convex-ws.sno      RFC 6455 handshake and framing
+*     convex-live.sno    the pinned Convex sync protocol and reconnect logic
+*
+*   Public surface once this file is included:
+*     cvx.configure(url, token)        set up the deployment and bearer token
+*     cvx.set_auth(token)              replace the bearer token
+*     cvx.query/mutation/action(path, argsraw)   one HTTP call
+*     cvx.live.init()                  reset Live state for a fresh client
+*     cvx.live.subscribe(path, argsraw) -> queryId
+*     cvx.live.unsubscribe(queryId)
+*     cvx.live.pump(deadlinems)        make one step of Live progress
+*     cvx.live.next_event()            drain one queued Live update
+*     cvx.live.debug_disconnect()      adapter-only forced reconnect
+*     cvx.live.close()                 stop reconnecting and drop the socket
+-include 'convex-live.sno'

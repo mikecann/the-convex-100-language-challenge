@@ -1,0 +1,69 @@
+schemaVersion: 1
+id: seed7
+displayName: "Seed7"
+rank: 21
+selectionTier: ranked
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Seed7 client for Convex's HTTP function-call API and Live sync
+    protocol. HTTP queries, mutations and actions use Seed7's own
+    https_request.s7i/http_request.s7i standard library (TLS via tls.s7i,
+    a pure-Seed7 TLS 1.2 implementation with no OpenSSL dependency). Live
+    hand-rolls RFC 6455 WebSocket framing and the Connect/ModifyQuerySet/
+    Transition sync state machine over raw socket.s7i/tls.s7i sockets,
+    driven from one single-threaded event loop (Seed7 ships no thread
+    library). A handful of client operations are declared with Seed7's own
+    `$ syntax` pragma -- the same mechanism the standard library itself
+    uses for `for x range y do` -- so call sites read as sentences.
+toolchain:
+  name: Seed7 (s7/s7c)
+  version: 5.2.80 (seed7_05_20260711)
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    Console (stdin/stdout) mode delivers Live updates only between adapter
+    commands, not while idle -- this toolchain's console file type does not
+    implement a readiness check (proved directly, not assumed), so it
+    cannot be multiplexed with the Live socket the way ADAPTER_LISTEN's
+    TCP control connection can. The shared conformance harness always
+    drives Live over ADAPTER_LISTEN, so this does not affect conformance.
+  - >-
+    Seed7's own tls.s7i validates a server's presented certificate chain
+    cryptographically but does not check it against a trusted root store;
+    this client does not add that check itself. TLS is still a genuine
+    encrypted, authenticated-per-chain handshake, not a bypass, but a
+    fully adversarial certificate substitution within an otherwise valid
+    chain is not detected.
+  - >-
+    Live authentication (setAuth is HTTP-only), optimistic updates, and
+    WebSocket-transported mutations/actions are deferred.
+  - >-
+    Live delivery has no internal queue beyond the bounded 16-slot,
+    drop-oldest buffer per subscription; the adapter writes a decoded
+    value to its output connection as soon as it is queued, so backpressure
+    from a stalled reader is carried by the OS socket buffer rather than
+    growing client memory.
+  - >-
+    Reconnect resends every active subscription as one Add snapshot on
+    each new connection; a same-subscriptionId replacement retires the
+    prior local state immediately but does not send an explicit Remove
+    for its old queryId first.
+capabilities:
+  - http
+  - live
