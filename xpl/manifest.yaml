@@ -46,4 +46,5 @@ limitations:
     and unescaped by a hand written JSON scanner - XPL has no recursion, so
     it tracks object/array nesting with an integer depth counter instead of
     a parse tree.
-capabilities: []
+capabilities:
+  - http
