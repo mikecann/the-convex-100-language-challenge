@@ -1248,14 +1248,18 @@ const LiveManager = struct {
     /// under this mutex, and `close` cancels through it, so a control command
     /// never waits out a peer that accepted a socket and then went silent.
     connect_deadline: ?*Deadline = null,
-    /// The interrupt channel for the owner's current established connection,
-    /// or null when no connection is up. Unlike `connect_deadline` this
-    /// carries no timeout of its own — readWebSocket's own frame deadline
-    /// still bounds a stalled peer. `submit` cancels it for remove,
-    /// disconnect, and stop so those commands do not ride out a peer that is
-    /// mid-frame and stalled on an already-established socket: cancelling
-    /// only shuts the descriptor down, and the owner's next read already
-    /// turns that into the ordinary close-and-reconnect recovery path.
+    /// The interrupt channel for the owner's *current blocking frame read*,
+    /// or null the rest of the time (idle between frames, servicing the
+    /// command queue, or with no connection up at all). It is deliberately
+    /// scoped to a single call to readWebSocket rather than the connection's
+    /// whole lifetime: an earlier version armed it for the whole connection
+    /// and cancelled it unconditionally from `submit`, which raced a
+    /// remove/disconnect/stop's own write in serviceCommands — the socket
+    /// could be shut down out from under a Remove frame that was never stuck
+    /// in a read at all, so the peer never saw it. Arming it only around the
+    /// blocking read means `submit`'s cancel is a no-op whenever the owner is
+    /// not actually blocked in a read, and only cuts short a read that is
+    /// genuinely stalled decoding a frame.
     read_interrupt: ?*Deadline = null,
 
     fn init(allocator: Allocator, client: *Client, output: *Output) !LiveManager {
@@ -1287,10 +1291,14 @@ const LiveManager = struct {
             if (self.connect_deadline) |deadline| deadline.cancel();
         }
         // Remove, debugDisconnect, and stop must not wait out a peer that is
-        // mid-frame and stalled on an already-established connection. Add
-        // only ever writes over the existing socket once serviceCommands
-        // reaches it, so it stays behind the normal draining order instead
-        // of forcing an otherwise-unnecessary reconnect.
+        // mid-frame and stalled on an already-established connection. This
+        // only ever finds `read_interrupt` non-null while the owner is
+        // genuinely blocked inside readWebSocket for the current frame — see
+        // that field's comment — so it never races the same command's own
+        // Remove/Close write in serviceCommands. Add only ever writes over
+        // the existing socket once serviceCommands reaches it, so it stays
+        // behind the normal draining order instead of forcing an otherwise-
+        // unnecessary reconnect.
         if (command.kind == .remove or command.kind == .disconnect or command.kind == .stop) {
             if (self.read_interrupt) |deadline| deadline.cancel();
         }
@@ -1315,10 +1323,13 @@ const LiveManager = struct {
         }
     }
 
-    /// Publish the owner's per-connection read-interrupt channel, or clear
-    /// it. `submit` cancels a live one for remove, debugDisconnect, and stop
-    /// so those commands can shut the socket down instead of waiting out an
-    /// in-progress frame read from a peer that is mid-frame and stalled.
+    /// Publish the read-interrupt channel for the owner's current blocking
+    /// frame read, or clear it once that read returns. `submit` cancels a
+    /// live one for remove, debugDisconnect, and stop so those commands can
+    /// shut the socket down instead of waiting out an in-progress frame read
+    /// from a peer that is mid-frame and stalled; it is a deliberate no-op
+    /// the rest of the time, which is what keeps it from racing a command's
+    /// own write.
     fn publishReadInterrupt(self: *LiveManager, deadline: ?*Deadline) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1407,10 +1418,6 @@ const LiveOwner = struct {
     generation: u64 = 0,
     retry_delay_ms: u64 = 10,
     failure_published: bool = false,
-    /// The interrupt channel published to the manager while `socket` is up.
-    /// It never runs its own watchdog thread; `submit` cancels it directly
-    /// to shut the socket down out from under a stalled read.
-    read_watch: ?Deadline = null,
 
     fn init(manager: *LiveManager) LiveOwner {
         return .{ .manager = manager };
@@ -1586,13 +1593,6 @@ const LiveOwner = struct {
         // its steps, so a peer that keeps every individual step just inside
         // its own limit still loses the connection here.
         if (deadline.timedOut()) return error.Timeout;
-        // Publish this connection's read-interrupt channel only once bring-up
-        // has fully succeeded: every earlier error path above still runs the
-        // errdefer that releases `conn`, and this deadline must never outlive
-        // (or shut down) a socket that scope has already handed back.
-        self.read_watch = try Deadline.init(frame_deadline_ms);
-        try self.read_watch.?.setFd(self.socket.?.stream.handle);
-        self.manager.publishReadInterrupt(&self.read_watch.?);
     }
 
     fn sendConnect(self: *LiveOwner) !void {
@@ -1649,10 +1649,7 @@ const LiveOwner = struct {
         // poll gives commands a deterministic chance to interrupt close,
         // unsubscribe, and debugDisconnect even when the server says nothing.
         if (!try socketReadable(self.socket.?, socket_poll_ms)) return;
-        const message = readWebSocket(self.socket.?, self.manager.allocator) catch |err| {
-            if (err == error.Timeout) return error.LiveFrameTimeout;
-            return if (err == error.InvalidResponse) error.LiveFrameInvalidResponse else err;
-        };
+        const message = try self.readInterruptibleFrame();
         defer self.manager.allocator.free(message);
         var parsed = std.json.parseFromSlice(JsonValue, self.manager.allocator, message, .{}) catch return error.ProtocolFailure;
         defer parsed.deinit();
@@ -1664,6 +1661,34 @@ const LiveOwner = struct {
         }
         if (!std.mem.eql(u8, kind, "Transition")) return error.ProtocolFailure;
         try self.handleTransition(object);
+    }
+
+    /// Read exactly one frame with the manager's read-interrupt armed for
+    /// this call only, so a remove/disconnect/stop submitted while this
+    /// blocking, potentially multi-poll read is genuinely stuck decoding a
+    /// stalled frame can cut it short, exactly as AGENTS.md's Live
+    /// acceptance rules require. Publishing (and unpublishing) it here
+    /// rather than for the connection's whole lifetime is what keeps
+    /// `submit`'s cancel from racing this same command's own write: outside
+    /// this call — idle between frames, or inside serviceCommands writing a
+    /// Remove or Close frame — `read_interrupt` is null, so the cancel finds
+    /// nothing to shut down and the write completes and reaches the peer.
+    fn readInterruptibleFrame(self: *LiveOwner) ![]u8 {
+        var watch = try Deadline.init(frame_deadline_ms);
+        try watch.setFd(self.socket.?.stream.handle);
+        self.manager.publishReadInterrupt(&watch);
+        const outcome = readWebSocket(self.socket.?, self.manager.allocator);
+        // Unpublish and finish before translating the outcome below: once
+        // this returns, a racing `submit` can no longer reach `watch`, so it
+        // can never shut down a socket this call has already stopped reading
+        // from, whether that read succeeded, failed, or was itself the thing
+        // that just got interrupted.
+        self.manager.publishReadInterrupt(null);
+        watch.finish();
+        return outcome catch |err| {
+            if (err == error.Timeout) return error.LiveFrameTimeout;
+            return if (err == error.InvalidResponse) error.LiveFrameInvalidResponse else err;
+        };
     }
 
     fn handleTransition(self: *LiveOwner, object: std.json.ObjectMap) !void {
@@ -1789,16 +1814,11 @@ const LiveOwner = struct {
     }
 
     fn closeConnection(self: *LiveOwner, reason: []const u8) void {
-        // Retire the read-interrupt channel before the descriptor is closed
-        // and recycled, exactly like the connect-phase watchdog below: once
-        // this is unpublished and finished, a racing `submit` can no longer
-        // reach it, so it can never shut down a socket this scope has
-        // already released back to the pool and the process has reused.
-        if (self.read_watch) |*watch| {
-            self.manager.publishReadInterrupt(null);
-            watch.finish();
-            self.read_watch = null;
-        }
+        // No read-interrupt channel to retire here: readInterruptibleFrame
+        // publishes and unpublishes its own around each blocking read, so by
+        // the time control reaches here (either from a normal command or
+        // from readOne propagating a read failure) it has already unpublished
+        // and finished before this runs.
         if (self.socket) |conn| {
             conn.closing = true;
             self.manager.client.http.connection_pool.release(self.manager.allocator, conn);
