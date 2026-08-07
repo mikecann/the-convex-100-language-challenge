@@ -9,7 +9,7 @@ NB. proven end to end against this project's own hosted deployment before
 NB. any client source was written. There is no compiled C helper anywhere
 NB. in this client: every foreign call below is declared in this file.
 
-load '/src/jlibrary/system/main/socket.ijs'
+load jpath '~system/main/socket.ijs'
 coinsert 'jsocket'
 
 libcdm=: 1 : '(''"libc.so.6" '',u)&(15!:0)'
