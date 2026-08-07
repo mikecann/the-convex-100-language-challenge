@@ -100,6 +100,33 @@ BEGIN
   destination[n] := 0C;
 END CopyText;
 
+(* CopyLargeText is CopyText with source passed VAR instead of by value,
+   used only where source may be one of the module's MaxBody-sized (2
+   MiB) buffers -- CallValueRaw, CallLogsRaw, CallDataRaw below. A plain
+   (value) ARRAY OF CHAR parameter is passed by gm2 copying every byte
+   into the callee's own stack frame; this is exactly the hazard
+   ConvexHTTP.mod's Post already documents ("a value-parameter ARRAY OF
+   CHAR copy of a multi-megabyte buffer is what originally crashed this
+   module") and already avoids for its own payload parameter. CopyText
+   itself was the one place that lesson was not applied, and it crashed
+   the same way, in module initialization, before any output:
+   _M2_Basics_init -> ConvexSync.Call -> CopyText(CallValueRaw, value)
+   blew the thread's stack copying 2 MiB of by-value parameter. This
+   can't just change CopyText's own source parameter to VAR, because
+   gm2 rejects binding a VAR formal to a string-literal actual (most of
+   CopyText's call sites pass literals like CopyText("...", reason)), so
+   the two large-buffer-safe call sites get this sibling instead. source
+   is never written here, so nothing behavioral differs from CopyText,
+   only how the argument arrives. *)
+PROCEDURE CopyLargeText (VAR source: ARRAY OF CHAR; VAR destination: ARRAY OF CHAR);
+VAR i, n: INTEGER;
+BEGIN
+  n := INTEGER(TextLength(source));
+  IF n > INTEGER(HIGH(destination)) THEN n := INTEGER(HIGH(destination)) END;
+  FOR i := 0 TO n - 1 DO destination[i] := source[i] END;
+  destination[n] := 0C;
+END CopyLargeText;
+
 PROCEDURE TextEqual (VAR a: ARRAY OF CHAR; b: ARRAY OF CHAR) : BOOLEAN;
 VAR la, lb, i: INTEGER;
 BEGIN
@@ -133,11 +160,24 @@ BEGIN
     hex[i] := HexDigit(VAL(INTEGER, v));
     clock := clock DIV 16;
   END;
+  (* "00000000-0000-4000-8000-" is exactly 24 characters (indices 0..23,
+     ending in its own trailing '-'), so the 12 trailing hex digits that
+     complete the UUID's fifth group belong at indices 24..35, not
+     21..32. The old 21..32 range instead overwrote three characters of
+     the prefix itself -- "8000-"'s last "00-" -- deleting the fourth/
+     fifth group's separating hyphen and truncating the fourth group to
+     a single digit, with no hyphen ever reinstated before the tacked-on
+     hex digits. The server correctly rejected the result as invalid:
+     {"type":"FatalError","error":"Received Invalid JSON on websocket:
+     invalid group count: expected 5, found 4"} -- every single Live
+     connection attempt sent a 4-group, 33-character non-UUID as its
+     sessionId and was fatally rejected before ever receiving a
+     Transition. *)
   CopyText("00000000-0000-4000-8000-", sessionId);
   FOR i := 4 TO 15 DO
-    sessionId[21 + (i - 4)] := hex[i];
+    sessionId[24 + (i - 4)] := hex[i];
   END;
-  sessionId[33] := 0C;
+  sessionId[36] := 0C;
 END NewSessionId;
 
 (* TimestampGreater decodes two base64 sync-protocol timestamps (each an
@@ -367,8 +407,23 @@ VAR
   snapshot: ARRAY [0..MaxMessageOut - 1] OF CHAR;
   addCount: INTEGER;
   deadline: LONGINT;
+  syncUrl: ARRAY [0..767] OF CHAR;
 BEGIN
-  Open(deploymentUrl, "0.1.0", 8000, ok, errorText);
+  (* ConvexURL.Parse defaults a URL's path to "/" whenever the URL itself
+     has no path component -- which deploymentUrl never does, since it is
+     always exactly the bare CONVEX_URL (e.g. "http://backend:3210" or
+     "https://foo.convex.cloud"). Opening deploymentUrl directly therefore
+     always requested "/" (the deployment's plain-text health page, "This
+     Convex deployment is running...") instead of the sync endpoint, and
+     Open correctly refused to treat that 200 OK as a WebSocket upgrade
+     ("WebSocket handshake was rejected or forged") -- so this never
+     connected at all, on either the self-hosted or the hosted backend.
+     The Live protocol lives at /api/sync specifically, so it must be
+     appended here before calling Open, the same way every HTTP call in
+     this file explicitly appends "/api/query" etc. to endpoint. *)
+  CopyText(deploymentUrl, syncUrl);
+  AppendLit("/api/sync", syncUrl);
+  Open(syncUrl, "0.1.0", 8000, ok, errorText);
   IF NOT ok THEN
     RetireConnection(errorText);
     reconnectAt := ShimMonotonicMs() + VAL(LONGINT, backoffMs);
@@ -845,7 +900,7 @@ BEGIN
       CopyText("HTTP logLines was not an array of strings", transportError);
       RETURN;
     END;
-    CopyText(CallLogsRaw, logs);
+    CopyLargeText(CallLogsRaw, logs);
   ELSE
     CopyText("[]", logs);
   END;
@@ -855,7 +910,7 @@ BEGIN
       CopyText("successful Convex response omitted value", transportError);
       RETURN;
     END;
-    CopyText(CallValueRaw, value);
+    CopyLargeText(CallValueRaw, value);
     ok := TRUE;
     RETURN;
   END;
@@ -870,7 +925,7 @@ BEGIN
       CopyText("Convex function failed", errorMessage);
     END;
     hasErrorData := Member(CallBody, "errorData", CallDataRaw, found) AND found;
-    IF hasErrorData THEN CopyText(CallDataRaw, errorData) END;
+    IF hasErrorData THEN CopyLargeText(CallDataRaw, errorData) END;
     CopyText("FunctionError", errorName);
     ok := TRUE;
     RETURN;
