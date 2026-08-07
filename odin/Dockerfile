@@ -223,7 +223,8 @@ ENTRYPOINT ["/src/client/tests/conformance/memory-probe.sh"]
 FROM test AS runtime-rootfs
 RUN set -eu; \
     root=/runtime; \
-    mkdir -p "$root/bin" "$root/usr/bin" "$root/usr/local/bin" "$root/etc"; \
+    mkdir -p "$root/bin" "$root/usr/bin" "$root/usr/local/bin" "$root/etc" \
+      "$root/usr/lib/x86_64-linux-gnu"; \
     cp /bin/dash "$root/bin/sh"; \
     cp /usr/bin/id "$root/usr/bin/id"; \
     cp /usr/bin/grep "$root/usr/bin/grep"; \
