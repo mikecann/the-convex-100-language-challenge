@@ -133,12 +133,20 @@ const func string: readExact (inout file: pollSock, inout file: dataSock,
     while length(data) < count and not failed do
       if time(NOW) >= deadline then
         failed := TRUE;
-      elsif inputReady(pollSock, LIVE_READ_STEP) then
+      else
+        # Try the read directly before waiting on the raw socket: a TLS
+        # record decrypts as a whole, so one earlier read on this same
+        # message can leave the rest already sitting in tls.s7i's own
+        # buffer with nothing further ever arriving on the wire to make
+        # inputReady(pollSock, ...) true again (confirmed directly: gating
+        # every chunk behind it hung a real multi-frame TLS response for
+        # its full deadline with zero bytes ever read). inputReady is
+        # still what keeps an empty read from busy-looping.
         chunk := gets(dataSock, count - length(data));
-        if chunk = "" then
-          failed := TRUE;
-        else
+        if chunk <> "" then
           data &:= chunk;
+        elsif not inputReady(pollSock, LIVE_READ_STEP) then
+          failed := TRUE;
         end if;
       end if;
     end while;
