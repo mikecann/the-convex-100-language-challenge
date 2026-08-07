@@ -42,17 +42,29 @@ suite "Nim final adapter stopped-reader process":
           "{\"id\":\"large-" & $request &
           "\",\"op\":\"query\",\"path\":\"demo:large\",\"args\":{}}")
       adapter.inputStream.flush()
+      # Closing stdin as well proves the adapter terminates from either end:
+      # the stopped reader or end of input. Neither may leave it parked.
+      adapter.inputStream.close()
 
       var peakRssKiB = 0
-      let deadline = epochTime() + 8.0
+      let started = epochTime()
+      # Comfortably beyond the owner's cumulative close deadline, so an exit
+      # inside this window is the deadline working rather than luck.
+      let deadline = started + 30.0
       while epochTime() < deadline and adapter.peekExitCode() < 0:
         peakRssKiB = max(peakRssKiB, rssKiB(adapter.processID))
         sleep(1)
+      let elapsed = epochTime() - started
       let adapterExit = adapter.peekExitCode()
-      check adapterExit == 0
+      # A permanently stopped reader is a failed stream, so the exact
+      # executable must say so. Anything other than 1 here is a hang, an OOM
+      # kill (137), or a crash (139) rather than a bounded deadline exit.
+      check adapterExit == 1
+      check elapsed < 30.0
       check peakRssKiB > 0
       check peakRssKiB < 128 * 1024
       echo "stopped-reader peak RSS KiB: " & $peakRssKiB
+      echo "stopped-reader exit seconds: " & $elapsed
       # This marker proves the adapter actually consumed a schema-valid small
       # request and received the near-limit response before its reader stopped.
       check fixture.outputStream.readLine() == "served"

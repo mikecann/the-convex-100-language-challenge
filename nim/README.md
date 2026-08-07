@@ -20,7 +20,8 @@ The capability list in `manifest.yaml` remains empty until the root-owned shared
 
 ## Canonical example
 
-```nim
+<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.nim -->
+```text
 ## A small, runnable journey through the native Nim Convex client.
 
 import std/[json, os, strformat, times]
@@ -87,6 +88,7 @@ proc main() =
 
 main()
 ```
+<!-- END GENERATED EXAMPLE -->
 
 ## Docker verification
 

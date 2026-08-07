@@ -11,6 +11,16 @@ import ./protocol
 
 export protocol
 
+# Under `--mm:orc` Nim's allocShared is the calling thread's own allocator, not
+# a process-wide heap, and releasing a chunk from another thread writes through
+# the allocating thread's region.  Delivery payloads therefore use libc
+# storage, which no thread owns, so a frame outlives the socket owner that
+# produced it without the release order having to guarantee anything.
+proc mallocStorage(size: csize_t): pointer {.importc: "malloc",
+    header: "<stdlib.h>", gcsafe.}
+proc freeStorage(storage: pointer) {.importc: "free", header: "<stdlib.h>",
+    gcsafe.}
+
 const
   clientVersion* = "nim-0.2.0"
   maxResponseBytes* = 2 * 1024 * 1024
@@ -77,9 +87,12 @@ type
     bytes: int
 
   LiveFrame* = object
-    ## Only shared-heap pointers cross a Nim thread boundary.  Managed strings
-    ## in a Channel value can be reclaimed by the producer before a third relay
-    ## thread receives them, which was the reconnect crash this frame fixes.
+    ## Only libc pointers cross a Nim thread boundary.  A Channel moves a
+    ## message as raw bits, so a managed string in one would change owning
+    ## thread without changing owning allocator, and whichever thread released
+    ## it last would write through the producer's region.  That was the
+    ## reconnect crash this frame fixes, and libc storage removes the need for
+    ## any argument about which thread happens to die first.
     value: SharedText
     errorName: SharedText
     errorMessage: SharedText
@@ -177,9 +190,11 @@ type
     nextQueryId: uint32
 
 proc sharedChannel[T](capacity: int): ptr Channel[T] =
-  ## Nim channels must live in the process-wide shared heap when a pointer to
-  ## them crosses a Thread boundary.  A ref Channel allocates thread-local
-  ## memory and is unsafe under ARC.
+  ## A channel a Thread points at must sit at a fixed address that ORC does
+  ## not own, so it is allocated raw rather than as a ref.  Only the client
+  ## thread allocates and releases these, and only while the owner thread is
+  ## still alive, because a channel grown by the owner holds a buffer from the
+  ## owner's own allocator.
   result = cast[ptr Channel[T]](allocShared0(sizeof(Channel[T])))
   result[].open(capacity)
 
@@ -277,12 +292,14 @@ proc drainLiveMailbox*(mailbox: ptr LiveMailbox) {.gcsafe.} =
 proc sharedText(value: string): SharedText {.gcsafe.} =
   result.len = value.len
   if value.len > 0:
-    result.data = cast[ptr UncheckedArray[char]](allocShared0(value.len))
+    result.data = cast[ptr UncheckedArray[char]](
+      mallocStorage(csize_t(value.len)))
+    doAssert not result.data.isNil, "Live frame payload allocation failed"
     copyMem(result.data, value.cstring, value.len)
 
 proc releaseSharedText(value: var SharedText) {.gcsafe.} =
   if not value.data.isNil:
-    deallocShared(value.data)
+    freeStorage(value.data)
     value.data = nil
     value.len = 0
 
@@ -379,29 +396,33 @@ proc close*(client: Client) =
     let manager = client.live
     let response = sharedChannel[LiveResponse](1)
     var closeError = ""
-    var responseCanBeReleased = false
     if enqueueCommand(manager, LiveCommand(kind: "close", response: response)):
       let reply = awaitResponse(response)
       if reply.received:
+        # Released while the owner is still running, which is the only time a
+        # buffer the owner may have grown can be handed back safely.  The
+        # message is copied out here for the same reason: `reply` is destroyed
+        # at the end of this branch, before the owner is joined below.
         releaseSharedChannel(response)
-        responseCanBeReleased = true
         if not reply.answer.ok:
           closeError = reply.answer.message
       else:
-        # The owner may still hold this pointer until its completion barrier.
+        # The owner may still hold this pointer until its completion barrier,
+        # and a late answer would have grown the channel's buffer from the
+        # owner's own allocator.  Under --mm:orc that buffer can only be
+        # released while the owner thread is alive, so a timed-out close
+        # deliberately leaks one small channel rather than write through a
+        # region that died with the owner.
         manager.stopped[].store(true)
     else:
+      # The owner never dequeued the command, so it never grew this channel.
       releaseSharedChannel(response)
-      responseCanBeReleased = true
       manager.stopped[].store(true)
     if awaitOwnerDone(manager):
       if not manager.joined:
         joinThread(manager.worker)
         manager.joined = true
         releaseSharedText(manager.workerWsUrl)
-      if not responseCanBeReleased:
-        # Once the owner has joined it cannot touch the timed-out response.
-        releaseSharedChannel(response)
       if closeError.len > 0:
         raise newException(TransportError, closeError)
     else:

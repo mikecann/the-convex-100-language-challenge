@@ -23,7 +23,12 @@ type
     relayDone: ptr Atomic[bool]
 
   RelayArgs = object
-    subscriptionId: string
+    ## createThread copies these bytes into the Thread object once and never
+    ## runs a destructor over them, so a Nim string here would be an ORC
+    ## payload owned by the spawning thread's allocator and never released.
+    ## Owned bytes make the handover explicit: the relay takes them and frees
+    ## them itself.
+    subscriptionId: OwnedBytes
     generation: uint64
     updates: ptr LiveMailbox
     closed: ptr Atomic[bool]
@@ -80,7 +85,9 @@ proc relayUpdates(args: RelayArgs) {.thread.} =
   # Copy thread arguments once. Nim's thread trampoline owns the argument
   # storage, so a long-lived relay must not repeatedly dereference that storage
   # across reconnects and allocations.
-  let subscriptionId = args.subscriptionId
+  var relayId = args.subscriptionId
+  let subscriptionId = ownedString(relayId)
+  releaseOwnedBytes(relayId)
   let generation = args.generation
   let updates = args.updates
   let closed = args.closed
@@ -306,10 +313,17 @@ proc runAdapter(controller: Socket; outputDescriptor: cint; socketOutput: bool) 
           subscription.releaseAdapterSubscription()
           raise newException(TransportError,
             "could not reserve subscribe acknowledgement")
+        var relayIdAllocated = true
+        let relayId = newOwnedBytes(subscriptionId, relayIdAllocated)
+        if not relayIdAllocated:
+          subscription.close()
+          subscription.releaseAdapterSubscription()
+          raise newException(TransportError,
+            "could not allocate the relay subscription id")
         let relay = cast[ptr Thread[RelayArgs]](
           allocShared0(sizeof(Thread[RelayArgs])))
         createThread(relay[], relayUpdates, RelayArgs(
-          subscriptionId: subscriptionId, generation: generation,
+          subscriptionId: relayId, generation: generation,
           updates: subscription.updates, closed: subscription.closed,
           done: relayDone, output: producer))
         subscriptions[subscriptionId] = AdapterSubscription(
@@ -373,8 +387,16 @@ proc runAdapter(controller: Socket; outputDescriptor: cint; socketOutput: bool) 
         client.close()
       except CatchableError:
         discard
+  # A permanently stopped controller is a broken stream, not a clean run. The
+  # owner has already bounded itself with the cumulative write deadline, so the
+  # adapter exits promptly and says so rather than reporting success or being
+  # killed for the memory an unbounded queue would have needed.
+  let streamFailed = output.failed()
   if not output.close():
     stderr.writeLine("adapter output owner did not stop before deadline")
+    quit(1)
+  if streamFailed or output.failed():
+    stderr.writeLine("adapter output stream failed; the controller stopped reading")
     quit(1)
 
 let listenAddress = getEnv("ADAPTER_LISTEN")

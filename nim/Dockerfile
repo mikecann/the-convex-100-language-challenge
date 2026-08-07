@@ -15,9 +15,42 @@ RUN httpclient_source="$(find /opt /usr/local -path '*/lib/pure/httpclient.nim' 
 # Each compilation is its own layer. The commands and assertions are identical
 # to a single combined step, but an emulated amd64 lane whose gcc dies randomly
 # resumes from the last good binary instead of restarting all twelve.
+# nimpretty has no --check flag: an unrecognised long option makes it print its
+# usage and exit 0, and `find -exec` discards the exit status anyway, so the
+# previous gate formatted nothing and could never fail. Reformat a copy of each
+# source into a scratch tree and compare, so a difference is a build failure
+# with the offending diff attached.
+RUN set -eu; \
+    rm -rf /tmp/format-check; \
+    mkdir -p /tmp/format-check; \
+    find client examples -name '*.nim' -print | sort > /tmp/format-check/sources; \
+    test -s /tmp/format-check/sources; \
+    unformatted=0; \
+    while IFS= read -r source; do \
+      copy="/tmp/format-check/tree/$source"; \
+      mkdir -p "$(dirname "$copy")"; \
+      if ! nimpretty --out:"$copy" "$source"; then \
+        echo "nimpretty failed on: $source" >&2; \
+        exit 1; \
+      fi; \
+      if test ! -s "$copy"; then \
+        echo "nimpretty produced no output for: $source" >&2; \
+        exit 1; \
+      fi; \
+      if ! cmp -s "$source" "$copy"; then \
+        echo "unformatted source: $source" >&2; \
+        diff -u "$source" "$copy" >&2 || true; \
+        unformatted=$((unformatted + 1)); \
+      fi; \
+    done < /tmp/format-check/sources; \
+    if test "$unformatted" -ne 0; then \
+      echo "$unformatted checked-in Nim source(s) are not nimpretty-clean" >&2; \
+      exit 1; \
+    fi; \
+    echo "PASS every checked-in Nim source is nimpretty-clean"; \
+    rm -rf /tmp/format-check
 RUN ulimit -s 65536 && \
     test "$(uname -m)" = x86_64 && \
-    find client examples -name '*.nim' -exec nimpretty --check {} \; && \
     nim check -d:ssl --threads:on --mm:orc --path:/opt/ws-0.6.0/src client/convex.nim
 RUN ulimit -s 65536 && \
     nim c -d:ssl -d:convexadapter --threads:on --mm:orc --passC:-O0 --passC:-fno-var-tracking --passC:-fno-var-tracking-assignments --passL:-O0 --hints:off --warnings:on --styleCheck:hint --path:/opt/ws-0.6.0/src --out:/out-convex-adapter client/tests/conformance/main.nim

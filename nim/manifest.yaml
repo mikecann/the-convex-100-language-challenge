@@ -11,11 +11,6 @@ implementation:
 toolchain:
   name: Nim
   version: 2.2.4
-dependencies:
-  - name: treeform/ws
-    version: 0.6.0
-    source: https://github.com/treeform/ws
-    checksum: sha256:d4f66d6f840084738e04eda36763f5a1badb2ddf5522cdae28d587035d39e1e2
 intendedCapabilities:
   - http
   - live
@@ -27,6 +22,7 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
+  - The only delegated transport dependency is treeform/ws 0.6.0 from https://github.com/treeform/ws, pinned in the Dockerfile by archive checksum sha256:d4f66d6f840084738e04eda36763f5a1badb2ddf5522cdae28d587035d39e1e2. The manifest schema has no dependencies key, so the pin lives in the Dockerfile and here.
   - The Docker build patches the pinned Nim HTTP parser and treeform/ws 0.6.0 sources for pre-materialisation limits, observable writes, bounded handshakes and frames, the Convex-Client header, and control frames between fragments.
   - Live authentication, WebSocket mutations/actions, and TransitionChunk assembly are deferred.
   - Evidence for this head came from Docker Desktop Rosetta linux/amd64 emulation on Apple Silicon. The images are genuine linux/amd64 and the build asserts uname -m is x86_64, but no native x86_64 host has run this exact source commit.
