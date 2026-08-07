@@ -616,6 +616,15 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- EiffelStudio miscompiles its own output past a certain size. Bundle enough
+  classes with inline-C bodies into one translation unit and the generated
+  C file comes out one `#include` short, so gcc reports the last class's
+  functions redeclared with conflicting linkage. The workaround is to put the
+  TLS and socket calls in an ordinary separately-compiled C file instead —
+  which is the same C-interop boundary every other native client here uses, so
+  nothing is lost. Separately, Eiffel's incremental "workbench" runtime reports
+  an ordinary `EINTR` as a fatal operating-system-signal exception; only the
+  finalised build behaves.
 - SNOBOL4 exited 0 and printed nothing, and both facts were correct. Its C
   shim called `_exit()`, which skips libc's stdio flush. Under Docker stdout is
   a pipe, not a terminal, so it is fully buffered — the transcript was sitting
