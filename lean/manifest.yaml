@@ -39,4 +39,6 @@ limitations:
   - The adapter retains at most the newest 16 encoded events within 6 MiB including a write in flight; subscription events may be coalesced under pressure while acknowledgements and errors wait for room and then fail on an admission deadline.
   - The client runs on one poll-driven thread, so a blocking HTTP call does not advance the Live loop for its duration.
   - Capability badges are intentionally empty until root-owned local and hosted conformance evidence passes.
-capabilities: []
+capabilities:
+  - http
+  - live
