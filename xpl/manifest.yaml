@@ -7,13 +7,14 @@ implementation:
   status: attempting
   provenance: native
   version: 0.1.0
-  notes: Native XPL implementation of documented HTTP and a working Live
-    WebSocket subscription path, built entirely from EXTERNAL-declared POSIX
-    socket and OpenSSL calls; sockaddr_in, addrinfo, and the WebSocket frame
-    header are all built and read with corebyte()/coreword()/corelongword()
-    memory pokes instead of any inline() struct declaration. The adapter
-    answers Live protocol operations with a ProtocolError and does not claim
-    the live capability; see limitations.
+  notes: Native XPL implementation of documented HTTP and Live, built entirely
+    from EXTERNAL-declared POSIX socket and OpenSSL calls; sockaddr_in,
+    addrinfo, and the WebSocket frame header are all built and read with
+    corebyte()/coreword()/corelongword() memory pokes instead of any
+    inline() struct declaration. The adapter's Live surface (subscribe,
+    unsubscribe, debugDisconnect, and multi-subscription delivery) runs on a
+    single poll(2)-driven reactor rather than threads, since XPL cannot call
+    a function through a runtime-computed pointer.
 toolchain:
   name: XPL (sergev/xpl-compiler)
   version: 1.0 (commit 5b725ef5f486873ee821f4370310f2eaa65b2e55) + gcc 14
@@ -41,3 +42,4 @@ limitations:
     a parse tree.
 capabilities:
   - http
+  - live
