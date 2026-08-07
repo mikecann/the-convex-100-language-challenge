@@ -1,0 +1,783 @@
+(*ConvexWS is a singleton RFC 6455 WebSocket client: one handshake, one
+  incremental frame parser that survives a timeout mid frame, masked
+  outgoing frames, auto-answered pings, and UTF-8 validation of each
+  reassembled text message. It has no knowledge of the Convex sync
+  protocol; ConvexSync sends and interprets JSON messages over it.
+
+  Like the standard library's own C-implemented modules, and unlike a
+  language with closures, OBNC's nested procedures see only this module's
+  top level declarations, not an enclosing procedure's locals - so helpers
+  that would naturally nest inside Open() are module level procedures
+  operating on shared module state instead.*)
+MODULE ConvexWS;
+
+	IMPORT J := ConvexJSON, U := ConvexURL, B64 := ConvexBase64, Shim := ConvexShim;
+
+	CONST
+		MaxMessage* = 4194304; (*4 MiB: this client's documented Live message cap*)
+		NetCap = 65536;
+
+		StageOpcode = 0;
+		StageLenByte = 1;
+		StageExtLen = 2;
+		StagePayload = 3;
+
+		OpContinuation = 0;
+		OpText = 1;
+		OpBinary = 2;
+		OpClose = 8;
+		OpPing = 9;
+		OpPong = 10;
+
+	VAR
+		conn: Shim.Conn;
+		connFd: INTEGER;
+		open: BOOLEAN;
+
+		(*read-ahead buffer of not-yet-consumed bytes from the socket*)
+		netBuf: ARRAY NetCap OF CHAR;
+		netPos, netLen: INTEGER;
+
+		(*current frame parse state; persists across Receive() calls so a
+		  timeout can never lose a partially read frame*)
+		stage: INTEGER;
+		finBit: BOOLEAN;
+		opcode: INTEGER;
+		extLenNeeded, extLenGot: INTEGER;
+		extLenBytes: ARRAY 8 OF CHAR;
+		payloadLen, payloadGot: INTEGER;
+
+		(*message currently being assembled (a single unfragmented frame is
+		  the common case; fragMessageActive covers a real multi-frame
+		  message)*)
+		fragMessageActive: BOOLEAN;
+		fragOpcode: INTEGER;
+		msgBuf: ARRAY MaxMessage + 1 OF CHAR;
+		msgLen: INTEGER;
+
+		controlBuf: ARRAY 128 OF CHAR;
+		controlLen: INTEGER;
+
+		(*handshake request scratch buffer; see the module comment on why
+		  this is module state rather than a local of Open().*)
+		handshakeRequest: ARRAY 2048 OF CHAR;
+		handshakeRequestLength: INTEGER;
+
+	PROCEDURE CopyText(source: ARRAY OF CHAR; VAR destination: ARRAY OF CHAR);
+	VAR i, n: INTEGER;
+	BEGIN
+		n := J.TextLength(source);
+		IF n > LEN(destination) - 1 THEN n := LEN(destination) - 1 END;
+		i := 0;
+		WHILE i < n DO destination[i] := source[i]; INC(i) END;
+		destination[n] := 0X
+	END CopyText;
+
+	PROCEDURE ShimError(VAR destination: ARRAY OF CHAR);
+	VAR buf: ARRAY 512 OF CHAR; n: INTEGER;
+	BEGIN
+		n := Shim.LastError(buf);
+		IF n > 511 THEN n := 511 END;
+		buf[n] := 0X;
+		CopyText(buf, destination)
+	END ShimError;
+
+	PROCEDURE ResetFrameState;
+	BEGIN
+		stage := StageOpcode;
+		extLenGot := 0;
+		payloadGot := 0
+	END ResetFrameState;
+
+	(*XorByte XORs two values in 0..255; written with plain arithmetic
+	  rather than Oberon's SET type so this module never needs SYSTEM.*)
+	PROCEDURE XorByte(a, b: INTEGER): INTEGER;
+	VAR result, bitValue, bitA, bitB, i: INTEGER;
+	BEGIN
+		result := 0;
+		bitValue := 1;
+		i := 0;
+		WHILE i < 8 DO
+			bitA := (a DIV bitValue) MOD 2;
+			bitB := (b DIV bitValue) MOD 2;
+			IF bitA # bitB THEN result := result + bitValue END;
+			bitValue := bitValue * 2;
+			INC(i)
+		END;
+		RETURN result
+	END XorByte;
+
+	PROCEDURE AppendText(extra: ARRAY OF CHAR; VAR destination: ARRAY OF CHAR);
+	VAR baseLength, extraLength, i: INTEGER;
+	BEGIN
+		baseLength := J.TextLength(destination);
+		extraLength := J.TextLength(extra);
+		i := 0;
+		WHILE i < extraLength DO destination[baseLength + i] := extra[i]; INC(i) END;
+		destination[baseLength + extraLength] := 0X
+	END AppendText;
+
+	(*WriteAllBounded writes length bytes of data, resuming after short
+	  writes, until either everything is sent or deadlineMs passes.*)
+	PROCEDURE WriteAllBounded(VAR data: ARRAY OF CHAR; length, deadlineMs: INTEGER; VAR ok: BOOLEAN; VAR errorText: ARRAY OF CHAR);
+	VAR sent, n, remaining, pollResult: INTEGER; ready1, ready2, done: BOOLEAN;
+	BEGIN
+		sent := 0;
+		ok := TRUE;
+		done := FALSE;
+		WHILE ok & ~done DO
+			IF sent >= length THEN
+				done := TRUE
+			ELSE
+				remaining := deadlineMs - Shim.MonotonicMs();
+				IF remaining <= 0 THEN
+					ok := FALSE;
+					CopyText("write deadline exceeded", errorText)
+				ELSE
+					(*CShim writes from data[0]; this client always sends one
+					  full frame per call.*)
+					n := Shim.Write(conn, data, length);
+					IF n = -2 THEN
+						ok := FALSE;
+						ShimError(errorText)
+					ELSIF n = -1 THEN
+						pollResult := Shim.Poll2(connFd, -1, remaining, ready1, ready2);
+						IF pollResult < 0 THEN
+							ok := FALSE;
+							ShimError(errorText)
+						END
+					ELSE
+						sent := sent + n;
+						IF sent < length THEN
+							(*A short write on a frame always started at
+							  data[0] would resend already-sent bytes; guard
+							  it explicitly rather than send a corrupt frame.*)
+							ok := FALSE;
+							CopyText("short write while sending a WebSocket frame", errorText)
+						END
+					END
+				END
+			END
+		END
+	END WriteAllBounded;
+
+	PROCEDURE Fd*(): INTEGER;
+	BEGIN
+		RETURN connFd
+	END Fd;
+
+	PROCEDURE IsOpen*(): BOOLEAN;
+	BEGIN
+		RETURN open
+	END IsOpen;
+
+	PROCEDURE Close*();
+	VAR frame: ARRAY 6 OF CHAR; mask: ARRAY 4 OF CHAR; ok: BOOLEAN; errorText: ARRAY 128 OF CHAR;
+	BEGIN
+		IF open THEN
+			Shim.RandomBytes(mask, 4);
+			frame[0] := CHR(080H + OpClose);
+			frame[1] := CHR(080H);
+			frame[2] := mask[0]; frame[3] := mask[1]; frame[4] := mask[2]; frame[5] := mask[3];
+			WriteAllBounded(frame, 6, Shim.MonotonicMs() + 500, ok, errorText);
+			Shim.CloseConn(conn);
+			conn := NIL;
+			connFd := -1;
+			open := FALSE
+		END
+	END Close;
+
+	(* --- handshake --- *)
+
+	(*Oberon-07 string literals have no backslash escapes, so every header
+	  line ends with an explicit call to AppendHandshakeCRLF rather than an
+	  embedded escape.*)
+	PROCEDURE AppendHandshakeLiteral(text: ARRAY OF CHAR);
+	VAR n, i: INTEGER;
+	BEGIN
+		n := J.TextLength(text);
+		i := 0;
+		WHILE i < n DO handshakeRequest[handshakeRequestLength] := text[i]; INC(handshakeRequestLength); INC(i) END
+	END AppendHandshakeLiteral;
+
+	PROCEDURE AppendHandshakeCRLF;
+	BEGIN
+		handshakeRequest[handshakeRequestLength] := CHR(13);
+		handshakeRequest[handshakeRequestLength + 1] := CHR(10);
+		INC(handshakeRequestLength, 2)
+	END AppendHandshakeCRLF;
+
+	PROCEDURE LineHasPrefix(VAR text: ARRAY OF CHAR; start, stop: INTEGER; prefix: ARRAY OF CHAR): BOOLEAN;
+	VAR pn, i: INTEGER; a: CHAR; ok: BOOLEAN;
+	BEGIN
+		pn := J.TextLength(prefix);
+		ok := stop - start >= pn;
+		i := 0;
+		WHILE ok & (i < pn) DO
+			a := text[start + i];
+			IF (a >= "A") & (a <= "Z") THEN a := CHR(ORD(a) + 32) END;
+			IF a # prefix[i] THEN ok := FALSE END;
+			INC(i)
+		END;
+		RETURN ok
+	END LineHasPrefix;
+
+	(*Open performs the full RFC 6455 client handshake against url (which
+	  must be ws:// or wss://): connect (optionally TLS), send the Upgrade
+	  request with a fresh random Sec-WebSocket-Key, and validate the
+	  server's 101 response and Sec-WebSocket-Accept before the connection
+	  is considered open.*)
+	PROCEDURE Open*(url, clientVersion: ARRAY OF CHAR; timeoutMs: INTEGER; VAR ok: BOOLEAN; VAR errorText: ARRAY OF CHAR);
+	VAR
+		secure, connected, closed, sawStatus101, sawUpgrade, acceptMatched, done: BOOLEAN;
+		host: ARRAY 256 OF CHAR;
+		path: ARRAY 1024 OF CHAR;
+		port, fd: INTEGER;
+		deadline, remaining: INTEGER;
+		keyRaw: ARRAY 16 OF CHAR;
+		keyB64: ARRAY 32 OF CHAR;
+		expectedAcceptSource: ARRAY 128 OF CHAR;
+		expectedDigest: ARRAY 20 OF CHAR;
+		expectedAccept: ARRAY 32 OF CHAR;
+		response: ARRAY 8192 OF CHAR;
+		responseLength, headerEnd, n, i: INTEGER;
+		ready1, ready2: BOOLEAN;
+		lineStart, lineEnd: INTEGER;
+	BEGIN
+		ok := FALSE;
+		errorText[0] := 0X;
+		IF open THEN Close() END;
+		connected := FALSE;
+		closed := FALSE;
+
+		deadline := Shim.MonotonicMs() + timeoutMs;
+		ok := U.Parse(url, secure, host, port, path);
+		IF ~ok THEN CopyText("invalid Convex sync URL", errorText) END;
+
+		IF ok THEN
+			remaining := deadline - Shim.MonotonicMs();
+			IF remaining < 1 THEN remaining := 1 END;
+			fd := Shim.TcpConnect(host, port, remaining);
+			IF fd < 0 THEN
+				ok := FALSE;
+				ShimError(errorText)
+			END
+		END;
+
+		IF ok THEN
+			IF secure THEN
+				remaining := deadline - Shim.MonotonicMs();
+				IF remaining < 1 THEN remaining := 1 END;
+				Shim.TlsWrap(fd, host, remaining, conn);
+				IF conn = NIL THEN
+					ok := FALSE;
+					ShimError(errorText)
+				ELSE
+					connected := TRUE
+				END
+			ELSE
+				Shim.PlainWrap(fd, conn);
+				connected := TRUE
+			END
+		END;
+
+		IF ok THEN
+			connFd := Shim.Fd(conn);
+			Shim.RandomBytes(keyRaw, 16);
+			(*Encode appends after the destination's existing terminator, and
+			  OBNC does not zero-initialise local arrays, so every such
+			  destination must be explicitly cleared immediately before its
+			  first use.*)
+			keyB64[0] := 0X;
+			ok := B64.Encode(keyRaw, 16, keyB64)
+		END;
+
+		IF ok THEN
+			handshakeRequestLength := 0;
+			AppendHandshakeLiteral("GET ");
+			AppendHandshakeLiteral(path);
+			AppendHandshakeLiteral(" HTTP/1.1"); AppendHandshakeCRLF;
+			AppendHandshakeLiteral("Host: "); AppendHandshakeLiteral(host); AppendHandshakeCRLF;
+			AppendHandshakeLiteral("Upgrade: websocket"); AppendHandshakeCRLF;
+			AppendHandshakeLiteral("Connection: Upgrade"); AppendHandshakeCRLF;
+			AppendHandshakeLiteral("Sec-WebSocket-Key: "); AppendHandshakeLiteral(keyB64); AppendHandshakeCRLF;
+			AppendHandshakeLiteral("Sec-WebSocket-Version: 13"); AppendHandshakeCRLF;
+			AppendHandshakeLiteral("User-Agent: convex-oberon/"); AppendHandshakeLiteral(clientVersion); AppendHandshakeCRLF;
+			AppendHandshakeCRLF;
+			handshakeRequest[handshakeRequestLength] := 0X;
+
+			WriteAllBounded(handshakeRequest, handshakeRequestLength, deadline, ok, errorText)
+		END;
+
+		IF ok THEN
+			expectedAcceptSource[0] := 0X;
+			CopyText(keyB64, expectedAcceptSource);
+			AppendText("258EAFA5-E914-47DA-95CA-C5AB0DC85B11", expectedAcceptSource);
+			Shim.Sha1(expectedAcceptSource, J.TextLength(expectedAcceptSource), expectedDigest);
+			expectedAccept[0] := 0X;
+			ok := B64.Encode(expectedDigest, 20, expectedAccept)
+		END;
+
+		IF ok THEN
+			responseLength := 0;
+			headerEnd := -1;
+			done := FALSE;
+			WHILE ok & ~done DO
+				remaining := deadline - Shim.MonotonicMs();
+				IF remaining <= 0 THEN
+					ok := FALSE;
+					CopyText("WebSocket handshake timed out", errorText)
+				ELSE
+					IF ~Shim.Pending(conn) THEN
+						n := Shim.Poll2(connFd, -1, remaining, ready1, ready2);
+						IF n < 0 THEN
+							ok := FALSE;
+							ShimError(errorText)
+						END
+					END;
+					IF ok & (responseLength >= LEN(response) - 1) THEN
+						ok := FALSE;
+						CopyText("WebSocket handshake response too large", errorText)
+					END;
+					IF ok THEN
+						n := Shim.Read(conn, netBuf, NetCap);
+						IF n = -2 THEN
+							ok := FALSE;
+							ShimError(errorText)
+						ELSIF n = -1 THEN
+							(*nothing yet*)
+						ELSIF n = 0 THEN
+							ok := FALSE;
+							CopyText("connection closed during the WebSocket handshake", errorText)
+						ELSE
+							i := 0;
+							WHILE i < n DO response[responseLength + i] := netBuf[i]; INC(i) END;
+							INC(responseLength, n);
+							response[responseLength] := 0X;
+							i := 0;
+							WHILE (headerEnd < 0) & (i <= responseLength - 4) DO
+								IF (response[i] = CHR(13)) & (response[i+1] = CHR(10)) & (response[i+2] = CHR(13)) & (response[i+3] = CHR(10)) THEN
+									headerEnd := i
+								END;
+								INC(i)
+							END;
+							IF headerEnd >= 0 THEN done := TRUE END
+						END
+					END
+				END
+			END
+		END;
+
+		IF ok THEN
+			sawStatus101 := FALSE;
+			sawUpgrade := FALSE;
+			acceptMatched := FALSE;
+			lineStart := 0;
+			WHILE lineStart < headerEnd DO
+				lineEnd := lineStart;
+				WHILE (lineEnd < headerEnd) & (response[lineEnd] # CHR(13)) DO INC(lineEnd) END;
+				IF lineStart = 0 THEN
+					IF LineHasPrefix(response, 0, lineEnd, "http/1.1 101") THEN sawStatus101 := TRUE END
+				ELSE
+					IF LineHasPrefix(response, lineStart, lineEnd, "upgrade:") THEN
+						IF LineHasPrefix(response, lineStart + 8, lineEnd, " websocket") THEN sawUpgrade := TRUE END
+					END;
+					IF LineHasPrefix(response, lineStart, lineEnd, "sec-websocket-accept:") THEN
+						i := lineStart + 21;
+						WHILE (i < lineEnd) & (response[i] = " ") DO INC(i) END;
+						IF lineEnd - i = J.TextLength(expectedAccept) THEN
+							acceptMatched := TRUE;
+							n := 0;
+							WHILE n < lineEnd - i DO
+								IF response[i + n] # expectedAccept[n] THEN acceptMatched := FALSE END;
+								INC(n)
+							END
+						END
+					END
+				END;
+				lineStart := lineEnd + 2
+			END;
+			IF ~sawStatus101 OR ~sawUpgrade OR ~acceptMatched THEN
+				ok := FALSE;
+				CopyText("WebSocket handshake was rejected or forged", errorText)
+			END
+		END;
+
+		IF connected & ~ok & ~closed THEN
+			Shim.CloseConn(conn);
+			conn := NIL; connFd := -1;
+			closed := TRUE
+		END;
+
+		IF ok THEN
+			netPos := 0;
+			netLen := 0;
+			ResetFrameState;
+			fragMessageActive := FALSE;
+			msgLen := 0;
+			open := TRUE
+		END
+	END Open;
+
+	(* --- sending --- *)
+
+	(*SendText sends text[0..length) as one unfragmented masked text frame.*)
+	PROCEDURE SendText*(VAR text: ARRAY OF CHAR; length, deadlineMs: INTEGER; VAR ok: BOOLEAN; VAR errorText: ARRAY OF CHAR);
+	VAR
+		frame: ARRAY MaxMessage + 14 OF CHAR;
+		frameLength, i: INTEGER;
+		mask: ARRAY 4 OF CHAR;
+	BEGIN
+		ok := FALSE;
+		errorText[0] := 0X;
+		IF ~open THEN
+			CopyText("WebSocket is not open", errorText)
+		ELSIF length > MaxMessage THEN
+			CopyText("outgoing message exceeds the 4 MiB cap", errorText)
+		ELSE
+			frame[0] := CHR(080H + OpText);
+			IF length <= 125 THEN
+				frame[1] := CHR(080H + length);
+				frameLength := 2
+			ELSIF length <= 65535 THEN
+				frame[1] := CHR(080H + 126);
+				frame[2] := CHR((length DIV 256) MOD 256);
+				frame[3] := CHR(length MOD 256);
+				frameLength := 4
+			ELSE
+				frame[1] := CHR(080H + 127);
+				i := 2;
+				WHILE i <= 5 DO frame[i] := CHR(0); INC(i) END;
+				frame[6] := CHR((length DIV 16777216) MOD 256);
+				frame[7] := CHR((length DIV 65536) MOD 256);
+				frame[8] := CHR((length DIV 256) MOD 256);
+				frame[9] := CHR(length MOD 256);
+				frameLength := 10
+			END;
+			Shim.RandomBytes(mask, 4);
+			i := 0;
+			WHILE i < 4 DO frame[frameLength + i] := mask[i]; INC(i) END;
+			INC(frameLength, 4);
+			i := 0;
+			WHILE i < length DO
+				frame[frameLength + i] := CHR(XorByte(ORD(text[i]), ORD(mask[i MOD 4])));
+				INC(i)
+			END;
+			INC(frameLength, length);
+			WriteAllBounded(frame, frameLength, deadlineMs, ok, errorText)
+		END
+	END SendText;
+
+	(* --- receiving --- *)
+
+	(*Utf8Valid checks that buf[0..length) is well formed UTF-8: no overlong
+	  encodings, no encoded surrogate halves, and no codepoint above
+	  U+10FFFF. RFC 6455 requires validating the reassembled message, not
+	  each fragment, since a UTF-8 sequence may legally be split across
+	  frames; this is only ever called once a whole message has been
+	  assembled.*)
+	PROCEDURE Utf8Valid(VAR buf: ARRAY OF CHAR; length: INTEGER): BOOLEAN;
+	VAR i, need, minCode, code, b, j, cont: INTEGER; ok: BOOLEAN;
+	BEGIN
+		ok := TRUE;
+		i := 0;
+		WHILE ok & (i < length) DO
+			b := ORD(buf[i]);
+			IF b < 080H THEN
+				INC(i)
+			ELSE
+				IF (b DIV 32) = 06H THEN
+					need := 1; code := b MOD 32; minCode := 080H
+				ELSIF (b DIV 16) = 0EH THEN
+					need := 2; code := b MOD 16; minCode := 0800H
+				ELSIF (b DIV 8) = 1EH THEN
+					need := 3; code := b MOD 8; minCode := 010000H
+				ELSE
+					need := 0; code := 0; minCode := 0; ok := FALSE
+				END;
+				IF ok & (i + need >= length) THEN ok := FALSE END;
+				IF ok THEN
+					j := 1;
+					WHILE ok & (j <= need) DO
+						cont := ORD(buf[i + j]);
+						IF (cont DIV 64) # 02H THEN ok := FALSE (*must be 10xxxxxx*)
+						ELSE code := code * 64 + (cont MOD 64); INC(j)
+						END
+					END
+				END;
+				IF ok & (code < minCode) THEN ok := FALSE END; (*overlong encoding*)
+				IF ok & (code >= 0D800H) & (code <= 0DFFFH) THEN ok := FALSE END; (*surrogate half*)
+				IF ok & (code > 010FFFFH) THEN ok := FALSE END;
+				IF ok THEN INC(i, need + 1) END
+			END
+		END;
+		RETURN ok
+	END Utf8Valid;
+
+	(*StartPayload validates the just-parsed frame header against RFC
+	  6455's fragmentation and control-frame rules, then arms StagePayload.*)
+	PROCEDURE StartPayload(VAR errorText: ARRAY OF CHAR): BOOLEAN;
+	VAR ok: BOOLEAN;
+	BEGIN
+		ok := TRUE;
+		IF opcode >= OpClose THEN
+			IF ~finBit THEN
+				ok := FALSE;
+				CopyText("control frame was fragmented", errorText)
+			ELSIF payloadLen > 125 THEN
+				ok := FALSE;
+				CopyText("control frame payload exceeded 125 bytes", errorText)
+			ELSE
+				controlLen := 0
+			END
+		ELSIF opcode = OpContinuation THEN
+			IF ~fragMessageActive THEN
+				ok := FALSE;
+				CopyText("unexpected WebSocket continuation frame", errorText)
+			END
+		ELSIF (opcode = OpText) OR (opcode = OpBinary) THEN
+			IF fragMessageActive THEN
+				ok := FALSE;
+				CopyText("expected a continuation frame", errorText)
+			ELSE
+				msgLen := 0
+			END
+		ELSE
+			ok := FALSE;
+			CopyText("unsupported WebSocket opcode", errorText)
+		END;
+		IF ok & ((opcode = OpContinuation) OR (opcode = OpText) OR (opcode = OpBinary)) THEN
+			IF msgLen + payloadLen > MaxMessage THEN
+				ok := FALSE;
+				CopyText("incoming WebSocket message exceeded the 4 MiB cap", errorText)
+			END
+		END;
+		IF ok THEN stage := StagePayload END;
+		RETURN ok
+	END StartPayload;
+
+	(*SendPong answers a ping with a pong echoing its payload, best effort
+	  with a short bounded deadline; a failure here is folded into the next
+	  Receive() call's own transport error rather than reported here.*)
+	PROCEDURE SendPong;
+	VAR frame: ARRAY 134 OF CHAR; mask: ARRAY 4 OF CHAR; i, frameLength: INTEGER; ok: BOOLEAN; ignored: ARRAY 64 OF CHAR;
+	BEGIN
+		frame[0] := CHR(080H + OpPong);
+		frame[1] := CHR(080H + controlLen);
+		Shim.RandomBytes(mask, 4);
+		frame[2] := mask[0]; frame[3] := mask[1]; frame[4] := mask[2]; frame[5] := mask[3];
+		frameLength := 6;
+		i := 0;
+		WHILE i < controlLen DO
+			frame[frameLength + i] := CHR(XorByte(ORD(controlBuf[i]), ORD(mask[i MOD 4])));
+			INC(i)
+		END;
+		INC(frameLength, controlLen);
+		WriteAllBounded(frame, frameLength, Shim.MonotonicMs() + 2000, ok, ignored)
+	END SendPong;
+
+	(*ProcessBuffered consumes as much of netBuf[netPos..netLen) as the
+	  current frame state allows. It returns 0 when it needs more network
+	  bytes to keep going (all buffered bytes consumed, mid frame or between
+	  frames), 1 when a complete text message is ready in text/length, 2
+	  when the peer sent a close frame, or -1 on a framing error.*)
+	PROCEDURE ProcessBuffered(VAR text: ARRAY OF CHAR; VAR length: INTEGER; VAR errorText: ARRAY OF CHAR): INTEGER;
+	VAR b, avail, need, take, i, result: INTEGER; started, ok: BOOLEAN;
+	BEGIN
+		result := -2; (*sentinel: keep processing*)
+		WHILE result = -2 DO
+			IF stage = StageOpcode THEN
+				IF netPos >= netLen THEN
+					result := 0
+				ELSE
+					b := ORD(netBuf[netPos]);
+					INC(netPos);
+					finBit := (b DIV 128) MOD 2 = 1;
+					opcode := b MOD 16;
+					stage := StageLenByte
+				END
+			ELSIF stage = StageLenByte THEN
+				IF netPos >= netLen THEN
+					result := 0
+				ELSE
+					b := ORD(netBuf[netPos]);
+					INC(netPos);
+					IF (b DIV 128) MOD 2 = 1 THEN
+						CopyText("server WebSocket frame was masked", errorText);
+						result := -1
+					ELSE
+						b := b MOD 128;
+						IF b = 126 THEN
+							extLenNeeded := 2; extLenGot := 0; stage := StageExtLen
+						ELSIF b = 127 THEN
+							extLenNeeded := 8; extLenGot := 0; stage := StageExtLen
+						ELSE
+							payloadLen := b; payloadGot := 0;
+							started := StartPayload(errorText);
+							IF ~started THEN result := -1 END
+						END
+					END
+				END
+			ELSIF stage = StageExtLen THEN
+				WHILE (netPos < netLen) & (extLenGot < extLenNeeded) DO
+					extLenBytes[extLenGot] := netBuf[netPos];
+					INC(netPos);
+					INC(extLenGot)
+				END;
+				IF extLenGot < extLenNeeded THEN
+					result := 0
+				ELSE
+					IF extLenNeeded = 2 THEN
+						payloadLen := ORD(extLenBytes[0]) * 256 + ORD(extLenBytes[1]);
+						ok := TRUE
+					ELSE
+						IF (extLenBytes[0] # 0X) OR (extLenBytes[1] # 0X) OR (extLenBytes[2] # 0X) OR (extLenBytes[3] # 0X) THEN
+							CopyText("incoming WebSocket frame exceeded the 4 MiB cap", errorText);
+							ok := FALSE
+						ELSE
+							payloadLen := ORD(extLenBytes[4]) * 16777216 + ORD(extLenBytes[5]) * 65536
+								+ ORD(extLenBytes[6]) * 256 + ORD(extLenBytes[7]);
+							ok := TRUE
+						END
+					END;
+					IF ok & (payloadLen > MaxMessage) THEN
+						CopyText("incoming WebSocket frame exceeded the 4 MiB cap", errorText);
+						ok := FALSE
+					END;
+					IF ~ok THEN
+						result := -1
+					ELSE
+						payloadGot := 0;
+						started := StartPayload(errorText);
+						IF ~started THEN result := -1 END
+					END
+				END
+			ELSIF stage = StagePayload THEN
+				avail := netLen - netPos;
+				need := payloadLen - payloadGot;
+				take := avail;
+				IF take > need THEN take := need END;
+				IF take > 0 THEN
+					IF opcode >= OpClose THEN
+						i := 0;
+						WHILE i < take DO controlBuf[controlLen + i] := netBuf[netPos + i]; INC(i) END;
+						INC(controlLen, take)
+					ELSE
+						i := 0;
+						WHILE i < take DO msgBuf[msgLen + i] := netBuf[netPos + i]; INC(i) END;
+						INC(msgLen, take)
+					END;
+					INC(netPos, take);
+					INC(payloadGot, take)
+				END;
+				IF payloadGot < payloadLen THEN
+					result := 0
+				ELSIF opcode = OpClose THEN
+					ResetFrameState;
+					result := 2
+				ELSIF opcode = OpPing THEN
+					SendPong;
+					ResetFrameState
+				ELSIF opcode = OpPong THEN
+					ResetFrameState
+				ELSE
+					(*continuation, text, or binary data frame*)
+					IF finBit THEN
+						fragMessageActive := FALSE;
+						IF opcode = OpBinary THEN
+							CopyText("binary WebSocket frames are not supported", errorText);
+							result := -1
+						ELSIF ~Utf8Valid(msgBuf, msgLen) THEN
+							CopyText("text frame was not valid UTF-8", errorText);
+							result := -1
+						ELSIF msgLen > LEN(text) - 1 THEN
+							CopyText("incoming message exceeded the caller's buffer", errorText);
+							result := -1
+						ELSE
+							i := 0;
+							WHILE i < msgLen DO text[i] := msgBuf[i]; INC(i) END;
+							text[msgLen] := 0X;
+							length := msgLen;
+							ResetFrameState;
+							result := 1
+						END
+					ELSE
+						IF opcode # OpContinuation THEN
+							fragOpcode := opcode;
+							fragMessageActive := TRUE
+						END;
+						ResetFrameState
+					END
+				END
+			END
+		END;
+		RETURN result
+	END ProcessBuffered;
+
+	(*Receive waits up to timeoutMs for the next event: status 1 with text
+	  filled in for a complete message, 2 for an orderly close, -1 with
+	  errorText for a transport or framing error, or 0 for a plain timeout
+	  (poll again later; the parser's state is preserved exactly, even mid
+	  frame).*)
+	PROCEDURE Receive*(timeoutMs: INTEGER; VAR text: ARRAY OF CHAR; VAR length: INTEGER; VAR status: INTEGER; VAR errorText: ARRAY OF CHAR);
+	VAR deadline, remaining, n: INTEGER; ready1, ready2, done: BOOLEAN;
+	BEGIN
+		status := 0;
+		length := 0;
+		errorText[0] := 0X;
+		IF ~open THEN
+			CopyText("WebSocket is not open", errorText);
+			status := -1
+		ELSE
+			deadline := Shim.MonotonicMs() + timeoutMs;
+			done := FALSE;
+			WHILE ~done DO
+				IF netPos < netLen THEN
+					status := ProcessBuffered(text, length, errorText)
+				ELSE
+					status := 0
+				END;
+				IF status # 0 THEN
+					done := TRUE
+				ELSE
+					remaining := deadline - Shim.MonotonicMs();
+					IF remaining <= 0 THEN
+						status := 0;
+						done := TRUE
+					ELSE
+						IF ~Shim.Pending(conn) THEN
+							n := Shim.Poll2(connFd, -1, remaining, ready1, ready2);
+							IF n < 0 THEN
+								ShimError(errorText);
+								status := -1;
+								done := TRUE
+							ELSIF n = 0 THEN
+								status := 0;
+								done := TRUE
+							END
+						END;
+						IF ~done THEN
+							n := Shim.Read(conn, netBuf, NetCap);
+							IF n = -2 THEN
+								ShimError(errorText);
+								status := -1;
+								done := TRUE
+							ELSIF n = -1 THEN
+								(*spurious wakeup; loop back around to poll again*)
+								netPos := 0; netLen := 0
+							ELSIF n = 0 THEN
+								CopyText("connection closed", errorText);
+								status := -1;
+								done := TRUE
+							ELSE
+								netPos := 0;
+								netLen := n
+							END
+						END
+					END
+				END
+			END
+		END
+	END Receive;
+
+END ConvexWS.

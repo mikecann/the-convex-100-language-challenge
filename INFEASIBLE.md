@@ -18,7 +18,6 @@ language so the roster still reaches one hundred.
 | sas | Proprietary licensed runtime; no free implementation of the real language. |
 | scratch | Block-based GUI language with no network primitives; a Convex client cannot be expressed in Scratch itself. |
 | visual-foxpro | Discontinued proprietary Windows product; no Linux toolchain. |
-| xbasepp | Commercial Windows-only Alaska Xbase++ compiler. |
 | xojo | Proprietary licensed IDE-bound compiler. |
 | xpp | Microsoft Dynamics X++ executes only inside the hosted Dynamics platform. |
 

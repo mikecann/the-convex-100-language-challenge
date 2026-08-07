@@ -58,6 +58,7 @@ const fenceLanguages = {
   ".mli": "ocaml",
   ".mbt": "moonbit",
   ".nim": "nim",
+  ".obn": "oberon",
   ".odin": "odin",
   ".pas": "pascal",
   ".pl": "perl",

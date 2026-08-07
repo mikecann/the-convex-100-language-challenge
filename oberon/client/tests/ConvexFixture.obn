@@ -1,0 +1,319 @@
+(*ConvexFixture is a minimal, single-connection WebSocket *server* used
+  only by this client's own deterministic tests: it accepts exactly one
+  TCP connection, performs the RFC 6455 server side of the handshake, and
+  then lets a test drive individual Convex sync-protocol frames by hand
+  (unmasking what the client sends, sending unmasked frames back). It is
+  not part of the public client and is not built into the production
+  adapter or example.*)
+MODULE ConvexFixture;
+
+	IMPORT J := ConvexJSON, B64 := ConvexBase64, Shim := ConvexShim;
+
+	CONST
+		MaxFrame* = 65536;
+
+	VAR
+		listenFd: INTEGER;
+		conn: Shim.Conn;
+		connFd: INTEGER;
+
+	PROCEDURE AppendBuf(text: ARRAY OF CHAR; VAR out: ARRAY OF CHAR; VAR outLength: INTEGER);
+	VAR n, j: INTEGER;
+	BEGIN
+		n := J.TextLength(text);
+		j := 0;
+		WHILE j < n DO out[outLength] := text[j]; INC(outLength); INC(j) END
+	END AppendBuf;
+
+	PROCEDURE XorByte(a, b: INTEGER): INTEGER;
+	VAR result, bitValue, bitA, bitB, i: INTEGER;
+	BEGIN
+		result := 0;
+		bitValue := 1;
+		i := 0;
+		WHILE i < 8 DO
+			bitA := (a DIV bitValue) MOD 2;
+			bitB := (b DIV bitValue) MOD 2;
+			IF bitA # bitB THEN result := result + bitValue END;
+			bitValue := bitValue * 2;
+			INC(i)
+		END;
+		RETURN result
+	END XorByte;
+
+	PROCEDURE Listen*(bindAddress: ARRAY OF CHAR; port: INTEGER): BOOLEAN;
+	BEGIN
+		listenFd := Shim.Listen(bindAddress, port);
+		RETURN listenFd >= 0
+	END Listen;
+
+	PROCEDURE StopListening*;
+	BEGIN
+		IF listenFd >= 0 THEN Shim.CloseFd(listenFd) END;
+		listenFd := -1
+	END StopListening;
+
+	PROCEDURE WriteAllBounded(VAR data: ARRAY OF CHAR; length, deadlineMs: INTEGER): BOOLEAN;
+	VAR sent, n, remaining: INTEGER; ready1, ready2, ok, done: BOOLEAN;
+	BEGIN
+		sent := 0;
+		ok := TRUE;
+		done := FALSE;
+		WHILE ok & ~done DO
+			IF sent >= length THEN
+				done := TRUE
+			ELSE
+				remaining := deadlineMs - Shim.MonotonicMs();
+				IF remaining <= 0 THEN
+					ok := FALSE
+				ELSE
+					n := Shim.Write(conn, data, length);
+					IF n = -2 THEN
+						ok := FALSE
+					ELSIF n = -1 THEN
+						IF Shim.Poll2(connFd, -1, remaining, ready1, ready2) < 0 THEN ok := FALSE END
+					ELSE
+						sent := sent + n;
+						IF sent < length THEN ok := FALSE END
+					END
+				END
+			END
+		END;
+		RETURN ok
+	END WriteAllBounded;
+
+	(*Accept waits for one connection and completes the WebSocket handshake
+	  on it (any path/headers are accepted).*)
+	PROCEDURE Accept*(timeoutMs: INTEGER): BOOLEAN;
+	VAR
+		fd: INTEGER;
+		deadline, remaining: INTEGER;
+		request: ARRAY 8192 OF CHAR;
+		requestLength: INTEGER;
+		headerEnd, n, i, lineStart, lineEnd, valueStart: INTEGER;
+		keySource: ARRAY 128 OF CHAR;
+		digest: ARRAY 20 OF CHAR;
+		accept: ARRAY 32 OF CHAR;
+		response: ARRAY 512 OF CHAR;
+		responseLength: INTEGER;
+		chunk: ARRAY 1024 OF CHAR;
+		ok, done, isKeyLine: BOOLEAN;
+		ready1, ready2: BOOLEAN;
+	BEGIN
+		deadline := Shim.MonotonicMs() + timeoutMs;
+		fd := Shim.Accept(listenFd, timeoutMs);
+		ok := fd >= 0;
+		IF ok THEN
+			Shim.PlainWrap(fd, conn);
+			connFd := fd;
+
+			requestLength := 0;
+			headerEnd := -1;
+			done := FALSE;
+			WHILE ok & ~done DO
+				remaining := deadline - Shim.MonotonicMs();
+				IF remaining <= 0 THEN
+					ok := FALSE
+				ELSIF Shim.Poll2(connFd, -1, remaining, ready1, ready2) <= 0 THEN
+					ok := FALSE
+				ELSE
+					n := Shim.Read(conn, chunk, 1024);
+					IF n <= 0 THEN
+						ok := FALSE
+					ELSE
+						i := 0;
+						WHILE i < n DO request[requestLength + i] := chunk[i]; INC(i) END;
+						INC(requestLength, n);
+						request[requestLength] := 0X;
+						i := 0;
+						WHILE (headerEnd < 0) & (i <= requestLength - 4) DO
+							IF (request[i] = CHR(13)) & (request[i+1] = CHR(10)) & (request[i+2] = CHR(13)) & (request[i+3] = CHR(10)) THEN
+								headerEnd := i
+							END;
+							INC(i)
+						END;
+						IF headerEnd >= 0 THEN done := TRUE END
+					END
+				END
+			END
+		END;
+
+		IF ok THEN
+			keySource[0] := 0X;
+			lineStart := 0;
+			WHILE lineStart < headerEnd DO
+				lineEnd := lineStart;
+				WHILE (lineEnd < headerEnd) & (request[lineEnd] # CHR(13)) DO INC(lineEnd) END;
+				(*"Sec-WebSocket-Key:" is exactly 18 characters; matched
+				  exactly so it is never confused with
+				  "Sec-WebSocket-Version:" or similar, which the real
+				  client also sends. Case sensitive is fine here: this
+				  fixture only ever talks to this project's own ConvexWS
+				  client, which always sends canonical header casing.*)
+				isKeyLine := (lineEnd - lineStart > 18)
+					& (request[lineStart] = "S") & (request[lineStart+1] = "e") & (request[lineStart+2] = "c")
+					& (request[lineStart+3] = "-") & (request[lineStart+4] = "W") & (request[lineStart+5] = "e")
+					& (request[lineStart+6] = "b") & (request[lineStart+7] = "S") & (request[lineStart+8] = "o")
+					& (request[lineStart+9] = "c") & (request[lineStart+10] = "k") & (request[lineStart+11] = "e")
+					& (request[lineStart+12] = "t") & (request[lineStart+13] = "-") & (request[lineStart+14] = "K")
+					& (request[lineStart+15] = "e") & (request[lineStart+16] = "y") & (request[lineStart+17] = ":");
+				IF isKeyLine THEN
+					valueStart := lineStart + 18;
+					WHILE (valueStart < lineEnd) & (request[valueStart] = " ") DO INC(valueStart) END;
+					i := 0;
+					WHILE i < lineEnd - valueStart DO keySource[i] := request[valueStart + i]; INC(i) END;
+					keySource[lineEnd - valueStart] := 0X
+				END;
+				lineStart := lineEnd + 2
+			END;
+			ok := keySource[0] # 0X
+		END;
+
+		IF ok THEN
+			i := J.TextLength(keySource);
+			AppendBuf("258EAFA5-E914-47DA-95CA-C5AB0DC85B11", keySource, i);
+			keySource[i] := 0X;
+			Shim.Sha1(keySource, J.TextLength(keySource), digest);
+			accept[0] := 0X;
+			ok := B64.Encode(digest, 20, accept)
+		END;
+
+		IF ok THEN
+			responseLength := 0;
+			AppendBuf("HTTP/1.1 101 Switching Protocols", response, responseLength);
+			response[responseLength] := CHR(13); response[responseLength+1] := CHR(10); INC(responseLength, 2);
+			AppendBuf("Upgrade: websocket", response, responseLength);
+			response[responseLength] := CHR(13); response[responseLength+1] := CHR(10); INC(responseLength, 2);
+			AppendBuf("Connection: Upgrade", response, responseLength);
+			response[responseLength] := CHR(13); response[responseLength+1] := CHR(10); INC(responseLength, 2);
+			AppendBuf("Sec-WebSocket-Accept: ", response, responseLength);
+			AppendBuf(accept, response, responseLength);
+			response[responseLength] := CHR(13); response[responseLength+1] := CHR(10); INC(responseLength, 2);
+			response[responseLength] := CHR(13); response[responseLength+1] := CHR(10); INC(responseLength, 2);
+			ok := WriteAllBounded(response, responseLength, deadline)
+		END;
+
+		RETURN ok
+	END Accept;
+
+	(*ReadByte reads exactly one raw byte, bounded by deadlineMs.*)
+	PROCEDURE ReadByte(deadlineMs: INTEGER; VAR out: CHAR): BOOLEAN;
+	VAR got, remaining: INTEGER; ready1, ready2, ok: BOOLEAN; b: ARRAY 1 OF CHAR;
+	BEGIN
+		remaining := deadlineMs - Shim.MonotonicMs();
+		ok := remaining > 0;
+		IF ok THEN ok := Shim.Poll2(connFd, -1, remaining, ready1, ready2) > 0 END;
+		IF ok THEN
+			got := Shim.Read(conn, b, 1);
+			ok := got = 1;
+			IF ok THEN out := b[0] END
+		END;
+		RETURN ok
+	END ReadByte;
+
+	(*ReceiveText waits for the next unfragmented client to server text
+	  frame and unmasks it into text. Ping/pong/continuation are consumed
+	  transparently. Returns FALSE on timeout, error, or a client close.*)
+	PROCEDURE ReceiveText*(timeoutMs: INTEGER; VAR text: ARRAY OF CHAR): BOOLEAN;
+	VAR
+		deadline: INTEGER;
+		byte0, opcode, payloadLen: INTEGER;
+		masked: BOOLEAN;
+		extBytes: ARRAY 8 OF CHAR;
+		maskKey: ARRAY 4 OF CHAR;
+		i: INTEGER;
+		ch: CHAR;
+		ok, done, isText: BOOLEAN;
+	BEGIN
+		deadline := Shim.MonotonicMs() + timeoutMs;
+		done := FALSE;
+		ok := TRUE;
+		isText := FALSE;
+		WHILE ok & ~done DO
+			ok := ReadByte(deadline, ch);
+			IF ok THEN opcode := ORD(ch) MOD 16 END;
+			IF ok THEN ok := ReadByte(deadline, ch) END;
+			IF ok THEN
+				masked := (ORD(ch) DIV 128) MOD 2 = 1;
+				payloadLen := ORD(ch) MOD 128
+			END;
+			IF ok & (payloadLen = 126) THEN
+				ok := ReadByte(deadline, ch);
+				IF ok THEN extBytes[0] := ch; ok := ReadByte(deadline, ch) END;
+				IF ok THEN extBytes[1] := ch; payloadLen := ORD(extBytes[0]) * 256 + ORD(extBytes[1]) END
+			ELSIF ok & (payloadLen = 127) THEN
+				i := 0;
+				WHILE ok & (i <= 7) DO
+					ok := ReadByte(deadline, ch);
+					IF ok THEN extBytes[i] := ch END;
+					INC(i)
+				END;
+				IF ok THEN payloadLen := ORD(extBytes[6]) * 256 + ORD(extBytes[7]) END
+			END;
+			IF ok & masked THEN
+				i := 0;
+				WHILE ok & (i <= 3) DO
+					ok := ReadByte(deadline, ch);
+					IF ok THEN maskKey[i] := ch END;
+					INC(i)
+				END
+			END;
+			IF ok & (payloadLen > MaxFrame) THEN ok := FALSE END;
+			IF ok THEN
+				i := 0;
+				WHILE ok & (i < payloadLen) DO
+					ok := ReadByte(deadline, ch);
+					IF ok THEN
+						IF masked THEN text[i] := CHR(XorByte(ORD(ch), ORD(maskKey[i MOD 4]))) ELSE text[i] := ch END
+					END;
+					INC(i)
+				END
+			END;
+			IF ok THEN
+				text[payloadLen] := 0X;
+				IF opcode = 1 THEN
+					isText := TRUE; done := TRUE
+				ELSIF opcode = 8 THEN
+					ok := FALSE (*peer sent a close frame*)
+				END
+				(*ping/pong/continuation: ignore and read the next frame*)
+			END
+		END;
+		RETURN ok & isText
+	END ReceiveText;
+
+	(*SendText sends one unmasked server to client text frame.*)
+	PROCEDURE SendText*(VAR text: ARRAY OF CHAR; length: INTEGER): BOOLEAN;
+	VAR frame: ARRAY MaxFrame + 10 OF CHAR; frameLength, i: INTEGER;
+	BEGIN
+		frame[0] := CHR(129); (*FIN=1, opcode=1*)
+		IF length <= 125 THEN
+			frame[1] := CHR(length);
+			frameLength := 2
+		ELSE
+			frame[1] := CHR(126);
+			frame[2] := CHR((length DIV 256) MOD 256);
+			frame[3] := CHR(length MOD 256);
+			frameLength := 4
+		END;
+		i := 0;
+		WHILE i < length DO frame[frameLength + i] := text[i]; INC(i) END;
+		INC(frameLength, length);
+		RETURN WriteAllBounded(frame, frameLength, Shim.MonotonicMs() + 3000)
+	END SendText;
+
+	(*CloseAbruptly drops the TCP connection without a WebSocket close
+	  frame, simulating a mid-session disconnect for reconnect tests.*)
+	PROCEDURE CloseAbruptly*;
+	BEGIN
+		IF conn # NIL THEN
+			Shim.CloseConn(conn);
+			conn := NIL
+		END
+	END CloseAbruptly;
+
+BEGIN
+	listenFd := -1;
+	conn := NIL;
+	connFd := -1
+END ConvexFixture.

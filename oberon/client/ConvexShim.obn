@@ -1,0 +1,96 @@
+(*ConvexShim declares the only foreign boundary this client uses: raw TCP
+  sockets, TLS (OpenSSL), poll(), a monotonic clock, cryptographic random
+  bytes and SHA-1 (needed for the WebSocket handshake key). Every one of
+  these primitives is generic transport plumbing with no knowledge of
+  Convex, HTTP, JSON, or the WebSocket wire format: those are implemented in
+  Oberon in ConvexBase64, ConvexJSON, ConvexHTTP, ConvexWS and ConvexSync.
+  See ConvexShim.c for the implementation.*)
+MODULE ConvexShim;
+(*implemented in C*)
+
+	TYPE
+		(*Conn is an opaque handle to a connected socket, optionally wrapped
+		  in TLS. Its one visible field is never read from Oberon; it exists
+		  only so OBNC's C interface generator has a concrete record to
+		  attach the OBNC_NEW allocator to, matching the pattern the
+		  standard library's own extPipes.Stream uses for the same reason.*)
+		Conn* = POINTER TO RECORD
+			unused: INTEGER
+		END;
+
+	PROCEDURE TcpConnect*(host: ARRAY OF CHAR; port, timeoutMs: INTEGER): INTEGER;
+	RETURN -1
+	END TcpConnect;
+
+	PROCEDURE TlsWrap*(fd: INTEGER; sniHost: ARRAY OF CHAR; timeoutMs: INTEGER; VAR conn: Conn);
+	END TlsWrap;
+
+	PROCEDURE PlainWrap*(fd: INTEGER; VAR conn: Conn);
+	END PlainWrap;
+
+	(*Read/Write return the number of bytes transferred, 0 for an orderly
+	  close, -1 when the operation would block (retry later), or -2 on a
+	  real error (see LastError).*)
+	PROCEDURE Read*(conn: Conn; VAR buf: ARRAY OF CHAR; cap: INTEGER): INTEGER;
+	RETURN -2
+	END Read;
+
+	PROCEDURE Write*(conn: Conn; VAR buf: ARRAY OF CHAR; length: INTEGER): INTEGER;
+	RETURN -2
+	END Write;
+
+	PROCEDURE Fd*(conn: Conn): INTEGER;
+	RETURN -1
+	END Fd;
+
+	PROCEDURE Pending*(conn: Conn): BOOLEAN;
+	RETURN FALSE
+	END Pending;
+
+	PROCEDURE CloseConn*(conn: Conn);
+	END CloseConn;
+
+	(*Poll2 waits up to timeoutMs for fd1 and/or fd2 (either may be -1 to
+	  skip) to become readable, or for the timeout to elapse. It returns the
+	  number of ready descriptors (0 on timeout, -1 on a poll() error) and
+	  reports which specific descriptor(s) woke it via ready1/ready2. Also
+	  used, with both fds -1, as a portable sleep.*)
+	PROCEDURE Poll2*(fd1, fd2, timeoutMs: INTEGER; VAR ready1, ready2: BOOLEAN): INTEGER;
+	RETURN -1
+	END Poll2;
+
+	PROCEDURE Listen*(bindAddress: ARRAY OF CHAR; port: INTEGER): INTEGER;
+	RETURN -1
+	END Listen;
+
+	PROCEDURE Accept*(listenFd, timeoutMs: INTEGER): INTEGER;
+	RETURN -1
+	END Accept;
+
+	PROCEDURE CloseFd*(fd: INTEGER);
+	END CloseFd;
+
+	PROCEDURE SetNonBlocking*(fd: INTEGER);
+	END SetNonBlocking;
+
+	PROCEDURE RandomBytes*(VAR buf: ARRAY OF CHAR; length: INTEGER);
+	END RandomBytes;
+
+	PROCEDURE Sha1*(VAR data: ARRAY OF CHAR; length: INTEGER; VAR outDigest: ARRAY OF CHAR);
+	END Sha1;
+
+	(*MonotonicMs returns milliseconds elapsed since this process's first
+	  call to MonotonicMs, so a 32 bit result never overflows during any
+	  realistic test or example run.*)
+	PROCEDURE MonotonicMs*(): INTEGER;
+	RETURN 0
+	END MonotonicMs;
+
+	PROCEDURE LastError*(VAR text: ARRAY OF CHAR): INTEGER;
+	RETURN 0
+	END LastError;
+
+	PROCEDURE Exit*(code: INTEGER);
+	END Exit;
+
+END ConvexShim.
