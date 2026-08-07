@@ -1,27 +1,3 @@
-# Convex from Idris
-
-This small client calls Convex functions over HTTPS and follows a reactive query through the pinned `/api/sync` WebSocket profile, written in Idris 2 and compiled to a native executable.
-
-It is an educational, unofficial experiment, not a production SDK or a package intended for publication.
-
-## Start here
-
-[`examples/basics/Main.idr`](examples/basics/Main.idr) is the canonical example. It reads a counter over HTTP, starts Live before the write, applies one idempotent mutation, and prints the resulting reactive value only when every step agrees.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| JSON HTTP queries, mutations, and actions | Written, never compiled or run |
-| Pinned Live query protocol | Written, never compiled or run |
-| Docker build and language-local tests | Not yet executed |
-| Shared conformance | Not attempted |
-| Production SDK compatibility | Not claimed |
-
-Nothing in this directory has been compiled or executed. Every capability is unearned, and the shared evaluator is the only thing that can change that.
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.idr -->
-```text
 module Main
 
 import Convex
@@ -124,30 +100,3 @@ main =
      -- never leaves a half-open connection behind.
      ignore $ unsubscribe client watch
      closeClient client
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-```sh
-./run sync-examples
-./run validate
-./run test idris
-./run build idris
-```
-
-`./run test idris` bootstraps Idris 2 from source with Chez Scheme, compiles the client with the RefC backend for `linux/amd64`, and runs four language-local suites against real loopback fixtures: wire formats, HTTP, Live, TLS, and the conformance adapter. `./run build idris` produces the non-root adapter image. Root runs `verify-example`, `verify`, and `verify-hosted` serially, because they share the backend and the evidence store.
-
-## Protocol and conformance notes
-
-The client owns every Convex-specific behaviour in Idris: the documented `format: "json"` HTTP envelopes, the separation of `logLines` from returned values, HTTP 560 as a structured function error distinct from a 400 request failure or a 500 deployment failure, strict JSON, RFC 6455 framing, and the pinned unversioned sync messages. A C shim under [`client/support/`](client/support) supplies only ordinary transport: sockets, `poll`, monotonic time, randomness, and OpenSSL bytes. Its whole surface uses `int64_t` and `char*` so the RefC foreign declarations cannot disagree with it.
-
-There is one owner of the sync socket. Subscribe, unsubscribe, close, and the adapter-only disconnect hook all run inside the same caller-driven pump, so no second path can touch the socket. A whole `Transition` is validated before anything is published, timestamps are canonical little-endian Base64 that must not move backwards, and an unchanged rehydration after a reconnect is suppressed so a reconnect delivers only what actually changed. Unsubscribe and same-identifier replacement bump a generation before their acknowledgement, which discards anything already queued for the old subscription.
-
-Every read and write carries an absolute deadline computed once, so a peer that dribbles bytes is bounded rather than merely slow. Once any byte of a WebSocket frame has been consumed, a timeout abandons the connection instead of resynchronising on a false boundary.
-
-The adapter under [`client/tests/conformance/`](client/tests/conformance) is test infrastructure, not client API. It validates every controller command against the shared schema, omits absent optional fields rather than serialising them as null, reserves stdout for protocol events, and carries the same NDJSON stream over stdin/stdout or over `ADAPTER_LISTEN`. `debugDisconnect` exists only there; the educational `Convex` module does not export it.
-
-## Limitations
-
-Execution is unverified: no Docker build, test, example run, or conformance run has happened, and the Dockerfile keeps sentinel values for the Chez Scheme package version and the Idris 2 tarball digest so it fails loudly until both are pinned from a real build. The client is single-threaded and caller-driven rather than backed by a background thread. Values are limited to the documented JSON format, so Int64, bytes, and special floats are not claimed. Live authentication, optimistic updates, WebSocket mutations and actions, and `TransitionChunk` assembly are deferred, and a `TransitionChunk` is treated as profile drift that retires the connection. The shared evaluator, not this README, awards HTTP or Live badges.

@@ -1,0 +1,8 @@
+package convex-tests-live
+
+version = 0.1.0
+sourcedir = "tests/live"
+depends = convex
+
+main = Main
+executable = "convex-tests-live"

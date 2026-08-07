@@ -1,0 +1,9 @@
+-- Test-only adapter logic. It is a separate package purely so the adapter
+-- executable and the adapter's own tests can both import it.
+package conformance
+
+version = 0.1.0
+sourcedir = "tests/conformance"
+depends = convex
+
+modules = Conformance.Adapter

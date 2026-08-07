@@ -1,0 +1,19 @@
+-- The educational client library. Docker copies this file and `client/` into
+-- the build layout Idris expects; nothing here assumes a publishable package.
+package convex
+
+version = 0.1.0
+authors = "100 Convex clients experiment"
+sourcedir = "."
+
+modules = Convex
+        , Convex.Build
+        , Convex.Codec
+        , Convex.Error
+        , Convex.Http
+        , Convex.Json
+        , Convex.Live
+        , Convex.Net
+        , Convex.Prim
+        , Convex.Update
+        , Convex.Ws
