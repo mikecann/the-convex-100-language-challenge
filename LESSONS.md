@@ -443,7 +443,72 @@ workers, two jobs racing on one machine, and two builds wedged for thirteen
 hours that everyone involved believed were progressing. **Ask the machine what
 it is doing, not the agent.**
 
-## 20. Miscellaneous findings worth a slide
+## 20. An optimiser that renames your data
+
+ActionScript came closer to working than almost any other blocked entry, and
+then failed for a reason no amount of client debugging would have found.
+
+Nine real defects were fixed first, each interesting in its own right: a
+distribution that nests one directory deeper than its documentation says, a
+package layout that collides with its own source path, `RegExp.exec` returning
+a result object rather than an array, a generated entry point that names its own
+class wrongly on two consecutive lines, and a lone unpaired UTF-16 surrogate
+that cannot survive as a compiled string literal and silently becomes `"?"`.
+
+The blocker underneath them was structural. Apache Royale's Node release build
+runs the whole program through Closure Compiler with advanced optimisations,
+including property renaming, and no flag was found to turn it off. Property
+renaming is safe for a statically typed program, because the compiler can see
+every access. It is not safe for loosely typed `Object` and `*` values, which is
+exactly what JSON is. Two things broke, both reproduced in isolation:
+
+- An object literal's keys were renamed at compile time. `{room: "a"}` went out
+  on the wire to Convex as `{"g":"a"}`. The optimiser had rewritten the
+  *protocol*.
+- A dot-notation read on a dynamic value was renamed to a *different* mangled
+  name than the key it was meant to read, so `command.protocolVersion` returned
+  `undefined` against an object whose real key was untouched.
+
+Fixing the first surfaced the second, which existed at more than ten sites in
+one file alone and very likely across eight more. Every fix is mechanical —
+bracket notation instead of dot notation — but there is no way to know you have
+found them all, and each round trip needs a full build.
+
+The lesson is about where the boundary of your program actually is. **A build
+step that rewrites identifiers is part of your program's semantics, even though
+nothing in your source mentions it.** The client's own logic was correct. It was
+compiled into something that was not.
+
+## 21. The security boundary held, and it cost real time
+
+Halfway through the night a worker was sent a message correcting its plan and
+telling it the fleet had idle machines it could expand onto. It refused. Its
+reasoning, quoted from its report, was that the message arrived mid-session
+claiming to be from the coordinator, instructed it to push code to hosts that
+were never in its original authorisation, and justified itself with a claim
+about its own tooling that it could not confirm. So it carried on with only the
+host it had been given, and flagged the message for review rather than acting
+on it.
+
+The message was genuine, and the refusal cost several hours of parallelism.
+
+It was still the right call. An agent that will expand its own blast radius
+because a message told it to is an agent that will do so when the message is
+hostile, and every property that makes this project's evidence trustworthy —
+one machine per worker, one verification at a time, evidence tied to an exact
+clean commit — depends on workers not quietly widening their own scope. The
+same suspicion appears elsewhere in this project: a worker refused to widen a
+listening socket from loopback to all interfaces until a human reviewed and
+approved the change, which was also correct, and the change was approved.
+
+What the incident actually shows is that **authority has to travel through the
+channel the worker was told to trust, not through the content of a message.**
+Instructions embedded in something an agent reads are data. The fix is not to
+teach workers to be more credulous; it is to give them a briefing complete
+enough that mid-flight expansion is rarely needed, and to make the legitimate
+channel unambiguous when it is.
+
+## 22. Miscellaneous findings worth a slide
 
 - A client passed every check except one, and the one failure was in the
   *reference* implementation used for comparison, not the client under test.
