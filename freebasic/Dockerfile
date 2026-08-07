@@ -20,12 +20,12 @@ RUN apt-get update && apt-get install --no-install-recommends --yes \
       gcc=4:14.2.0-1 \
       libc6-dev=2.41-12+deb13u3 \
       file=1:5.46-5 \
-      binutils \
-      curl \
-      libncurses-dev \
-      libssl-dev \
-      make \
-      xz-utils \
+      binutils=2.44-3 \
+      curl=8.14.1-2+deb13u4 \
+      libncurses-dev=6.5+20250216-2 \
+      libssl-dev=3.5.6-1~deb13u2 \
+      make=4.4.1-2 \
+      xz-utils=5.8.1-1+deb13u1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY client/toolchain.lock /tmp/toolchain.lock

@@ -25,19 +25,18 @@ matches what the mutation reported.
 
 ## What works
 
-Nothing is verified. No Docker image has been built, no compiler has run, and
-no shared conformance has executed against this source.
-
 | Capability | Status |
 | --- | --- |
-| HTTP query, mutation, action | Implemented in source. Unverified. |
-| Live queries over `/api/sync` | Implemented in source. Unverified. |
-| Bearer token lifecycle (HTTP) | Implemented in source. Unverified. |
-| Bearer token on the Live socket | Not implemented. |
-| Docker `test` / `runtime` images | Designed, never built. |
+| HTTP query, mutation, action | Earned (`http`) |
+| Live queries over `/api/sync` | Earned (`live`) |
+| Bearer token lifecycle (HTTP) | Passing |
+| Bearer token on the Live socket | Not implemented |
+| Docker `test` / `runtime` images | Passing, including against real backends |
 
-The `capabilities` list in `manifest.yaml` is empty and stays empty until the
-shared verifier says otherwise.
+`http` and `live` were awarded by the shared result evaluator from a clean,
+exact-head run of `./run verify-all freebasic`: 31/31 conformance checks
+passed against both the local self-hosted backend and the dedicated hosted
+drift target, from the same built image.
 
 ## The basic example
 
@@ -186,10 +185,6 @@ inside the container. `verify-example` proves the exact example above produces
 the expected transcript against a real deployment. `verify` adds the shared
 NDJSON conformance run, and only that run may award a capability badge.
 
-None of these have been run. The official FreeBASIC bootstrap archive is
-digest-pinned, but the compiler build and every later Docker stage remain
-unexecuted.
-
 ## How it is put together
 
 | File | Responsibility |
@@ -257,13 +252,16 @@ cross the acknowledgement.
 
 ## Limitations and what is deferred
 
-- **Nothing has been executed.** This is source and design only. Treat every
-  behavioural statement above as a claim to be tested, not evidence.
-- **The toolchain stage is unproven.** Debian does not package FreeBASIC, so
-  the Dockerfile builds it from the official bootstrap source release. The
-  archive URL and SHA-256 are pinned, but that source has not been compiled.
-- **Some apt versions are unpinned.** Only the four packages already proved on
-  this base image elsewhere in the repository are pinned.
+- **The toolchain builds itself.** Debian does not package FreeBASIC, so the
+  Dockerfile builds `fbc` from the official bootstrap source release: a
+  pre-generated-C bootstrap compiler builds first, then that compiler builds
+  the real self-hosted `fbc` from FreeBASIC source. The archive is
+  URL-and-SHA-256 pinned and the whole toolchain stage is now proven to build
+  unattended, but getting there took two real upstream-makefile fixes: the
+  bootstrap compiler's own `./bin` directory is never added to `PATH` before
+  the makefile shells out to `fbc` by bare name for the second half of the
+  build, and the compiler's own `.bas` sources need `-i inc` (their own
+  `file.bi` and friends) that `ALLFBCFLAGS` never supplies on its own.
 - **No standard formatter exists for FreeBASIC.**
   `client/tests/style_check.bas` enforces line length, indentation, tabs,
   trailing whitespace, line endings, and the absence of colon statement
@@ -280,3 +278,20 @@ cross the acknowledgement.
 - **JSON strings hold arbitrary bytes.** FreeBASIC strings are length counted,
   so an embedded NUL survives; `client/tests/core_test.bas` and
   `client/tests/json_test.bas` assert that rather than assuming it.
+- **The Live owner thread needs an explicit stack size.** `ThreadCreate`'s
+  default stack was not enough for a real subscription's call chain (TLS,
+  JSON parsing, string handling) against a real backend: the canonical
+  example segfaulted every time, right after its first successful HTTP
+  query, with the crash address a handful of bytes from the stack pointer
+  inside `libc.so.6` -- a stack-overflow guard page, not a null pointer or
+  heap bug. It never reproduced against the local unit tests' scripted peer,
+  whose fixture responses are smaller than a real deployment's. Both the
+  Live owner and the adapter's relay thread now request an explicit 8 MiB.
+- **The runtime image has to point OpenSSL at its own CA bundle.** This
+  build's OpenSSL has `OPENSSLDIR=/usr/lib/ssl` compiled in, so
+  `SSL_CTX_set_default_verify_paths` looks there by default and finds
+  nothing, while the actual CA bundle is copied to Debian's conventional
+  `/etc/ssl/certs/ca-certificates.crt`. The runtime image sets
+  `SSL_CERT_FILE`/`SSL_CERT_DIR` explicitly so verification actually
+  succeeds. The self-hosted backend is plain `http://`, so this only
+  surfaced against the real hosted TLS endpoint.

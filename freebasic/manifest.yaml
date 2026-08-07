@@ -16,7 +16,7 @@ implementation:
     Convex CLI.
 toolchain:
   name: FreeBASIC
-  version: "1.10.1 (built from the bootstrap source release; unbuilt)"
+  version: "1.10.1 (self-hosted build from the official bootstrap source release)"
 syncProfile:
   id: convex-rs-0.10.4-unversioned-sync
   sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
@@ -28,12 +28,6 @@ adapter:
   entrypoint: /usr/local/bin/convex-adapter
   adapterOnlyCommands: [debugDisconnect]
 limitations:
-  - No Docker build, no compiler run, and no shared verification have happened.
-    Every claim below is a design and source claim only.
-  - The official FreeBASIC bootstrap archive is URL and SHA-256 pinned, but the
-    compiler stage has not been built.
-  - Several apt packages in the toolchain stage are unpinned because no build
-    has resolved their Debian trixie versions yet.
   - FreeBASIC has no standard formatter, so a deterministic in-repo style gate
     stands in for one.
   - Live authentication is not implemented. setAuth applies to the HTTP
@@ -43,4 +37,11 @@ limitations:
     slow consumer are dropped first.
   - DNS resolution is synchronous and may outlive the requested connect timeout
     if the host resolver itself stalls.
-capabilities: []
+  - The Live owner and adapter relay threads are created with an explicit
+    8 MiB stack rather than FreeBASIC's ThreadCreate default; the default was
+    not enough for a real subscription's call chain against a real backend
+    and segfaulted with a stack-overflow signature that a smaller local test
+    fixture never reproduced.
+capabilities:
+  - http
+  - live
