@@ -46,6 +46,7 @@ extern accept
 extern inet_pton
 extern atoi
 extern gnu_get_libc_version
+extern nanosleep
 
 ; --- sockets / addrinfo (glibc x86-64 layouts; OS primitives, not Convex
 ; or HTTP logic) --------------------------------------------------------
@@ -229,5 +230,129 @@ endstruc
 CONVEX_OP_QUERY    equ 0
 CONVEX_OP_MUTATION equ 1
 CONVEX_OP_ACTION   equ 2
+
+; --- Live: WebSocket transport + Convex sync protocol ----------------------
+; See convex_ws.s (RFC 6455 framing, kept protocol-agnostic) and
+; convex_live.s (the Convex sync state machine built on top of it).
+
+; struct pollfd, for the single poll() call that watches the adapter's
+; command channel and the Live WebSocket at once.
+struc pollfd
+    .fd:      resd 1
+    .events:  resw 1
+    .revents: resw 1
+endstruc
+POLLIN  equ 0x0001
+
+; struct timespec, for clock_gettime(CLOCK_MONOTONIC, ...) backoff timing.
+struc timespec
+    .tv_sec:  resq 1
+    .tv_nsec: resq 1
+endstruc
+CLOCK_MONOTONIC equ 1
+
+WS_OP_CONT  equ 0x0
+WS_OP_TEXT  equ 0x1
+WS_OP_BIN   equ 0x2
+WS_OP_CLOSE equ 0x8
+WS_OP_PING  equ 0x9
+WS_OP_PONG  equ 0xA
+
+; A per-message assembly cap: generous for any Convex value this project's
+; demo backend produces, tiny next to the runtime container's 128 MiB
+; limit, and enough to make a runaway peer fail fast rather than exhaust
+; memory one fragment at a time.
+WS_MAX_MESSAGE_BYTES equ 8388608
+
+; ws_conn: one WebSocket connection layered over a convex_conn. `.recv` is
+; bytes read off the wire not yet consumed into a frame; `.recv_off` is how
+; much of the front of it a completed frame parse has already accounted
+; for (compacted lazily, the same deferred-consume trick main.s's adapter
+; line reader uses, and for the same reason: never compact out from under a
+; pointer the caller might still be holding). `.asmbuf` accumulates a
+; fragmented text/binary message's payload across continuation frames;
+; UTF-8 is validated once, over the fully reassembled bytes, only after FIN.
+struc ws_conn
+    .conn:        resb convex_conn_size
+    .recv:        resb buf_size
+    .recv_off:    resq 1
+    .assembling:  resq 1
+    .asm_opcode:  resq 1
+    .asmbuf:      resb buf_size
+    .open:        resq 1
+endstruc
+
+; One subscription's bounded update queue. AGENTS.md requires a
+; deliberately bounded, tested delivery buffer rather than an unbounded
+; one; depth 8 comfortably covers every burst this project's tests produce
+; while keeping worst-case memory a small constant per subscription.
+LIVE_QUEUE_DEPTH equ 8
+
+CONVEX_SUB_PENDING_ADD equ 0   ; needs an Add sent (new, or resent after reconnect)
+CONVEX_SUB_ACTIVE      equ 1   ; Add sent; receiving updates
+CONVEX_SUB_REMOVED     equ 2   ; unsubscribed; further Transitions are ignored
+
+; convex_update: one delivered value or error, as stored in a subscription's
+; queue. err_name_ptr always points at a static string literal (never
+; owned/freed); err_msg_ptr is a caller-owned malloc'd copy so it can carry
+; server-supplied text.
+struc convex_update
+    .value:        resq 1
+    .logs:         resq 1
+    .has_error:    resq 1
+    .err_name_ptr: resq 1
+    .err_name_len: resq 1
+    .err_msg_ptr:  resq 1
+    .err_msg_len:  resq 1
+    .err_data:     resq 1
+endstruc
+
+; convex_sub: one active (or draining) subscription. `.last_value_text`
+; holds the most recently delivered value's serialized bytes so a
+; reconnect's mandatory rehydration transition can be compared and, when
+; unchanged, suppressed -- see convex_live.s's handle_transition.
+struc convex_sub
+    .manager:          resq 1
+    .subid_ptr:        resq 1
+    .subid_len:        resq 1
+    .path_ptr:         resq 1
+    .path_len:         resq 1
+    .args:             resq 1
+    .query_id:         resq 1
+    .state:            resq 1
+    .just_reconnected: resq 1
+    .has_last_value:   resq 1
+    .last_value_text:  resb buf_size
+    .queue:            resb (convex_update_size * LIVE_QUEUE_DEPTH)
+    .queue_head:       resq 1
+    .queue_count:      resq 1
+    .next:             resq 1
+endstruc
+
+; convex_live: the sync state machine for one client. Single-owner by
+; construction -- every read, write, reconnect and query-set version change
+; happens on whichever thread calls convex_live_pump, and the adapter and
+; example both only ever call it from their own single control thread, so
+; there is no lock to take and no race to reason about.
+struc convex_live
+    .client:               resq 1
+    .ws:                   resb ws_conn_size
+    .connected:            resq 1
+    .session_id:           resb 40
+    .subs:                 resq 1
+    .next_query_id:        resq 1
+    .base_version:         resq 1
+    .connection_count:     resq 1
+    .last_close_reason_ptr: resq 1
+    .last_close_reason_len: resq 1
+    .max_observed_ts_ptr:  resq 1
+    .max_observed_ts_len:  resq 1
+    .remote_query_set:     resq 1
+    .remote_identity:      resq 1
+    .remote_ts_ptr:        resq 1
+    .remote_ts_len:        resq 1
+    .backoff_ms:           resq 1
+    .next_attempt_ms:      resq 1
+endstruc
 
 %endif ; CONVEX_INC
