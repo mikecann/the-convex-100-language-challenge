@@ -1,0 +1,22 @@
+with "aws";
+
+project Convex_Ada is
+   for Languages use ("Ada");
+   for Source_Dirs use (".", "tests", "tests/conformance", "../examples/basics");
+   for Object_Dir use "obj";
+   for Exec_Dir use "bin";
+   for Main use
+     ("convex_adapter.adb",
+      "convex_example.adb",
+      "convex_tests.adb",
+      "convex_socket_tests.adb");
+
+   package Compiler is
+      for Default_Switches ("Ada") use
+        ("-gnat2022", "-gnatwa", "-gnatW8", "-gnatVa", "-O2", "-gnatn2");
+   end Compiler;
+
+   package Binder is
+      for Default_Switches ("Ada") use ("-Es");
+   end Binder;
+end Convex_Ada;
