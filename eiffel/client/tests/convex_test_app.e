@@ -11,29 +11,11 @@ feature {NONE} -- Initialization
 
 	make
 		local
-			parser: CONVEX_JSON_PARSER
-			value: CONVEX_JSON_VALUE
-			obj: CONVEX_JSON_VALUE
+			sock: CONVEX_SOCKET
 		do
-			create parser.make
-			parser.parse ("{%"a%":1.0,%"b%":[true,false,null],%"c%":%"hi \%"quoted\%" text%"}")
-			check parsed: parser.successful end
-			if attached parser.last_value as l_value then
-				value := l_value
-				check has_a: value.has_field ("a") end
-				check number_ok: value.field ("a").number_item = 1.0 end
-				check array_len: value.field ("b").array_item.count = 3 end
-				print (value.to_json)
-				print ("%N")
-			else
-				print ("PARSE_FAILED_UNEXPECTEDLY%N")
-			end
-
-			create obj.make_object
-			obj.put_field ("room", create {CONVEX_JSON_VALUE}.make_string ("demo"))
-			print (obj.to_json)
+			create sock.make ("example.com", 443, True)
+			print (sock.is_open.out)
 			print ("%N")
-
 			print ("SMOKE_OK%N")
 		end
 
