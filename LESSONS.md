@@ -523,3 +523,12 @@ channel unambiguous when it is.
 - One test asserted a send would *fail* within its deadline. Read quickly, it
   looks like an assertion that the send succeeds. An agent nearly "fixed" the
   client to satisfy a misreading of the test; it stopped and checked instead.
+- A minimal image reported `awk: not found` while `awk` was still sitting in
+  `/usr/bin`. Debian points `/usr/bin/awk` at mawk through `/etc/alternatives`,
+  and the prune deleted that directory. The allow-list had carefully preserved
+  both `awk` and `mawk` by name — and left the first as a dangling symlink.
+  Preserving a *name* is not preserving a *program*.
+- Two Pharo defects were stacked, and the first completely hid the second. Only
+  after the image stopped crashing at boot did anything reach the adapter's
+  listening socket, which then failed every `accept()` because the listen
+  backlog was 1. Fixing a bug is also how you find the next one.
