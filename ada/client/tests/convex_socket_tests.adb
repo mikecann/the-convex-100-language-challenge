@@ -2895,8 +2895,12 @@ procedure Convex_Socket_Tests is
       Open_Listener (Listener, Port);
       Server.Start (Listener, Mode);
       Convex.Live.Open (Manager, URL (Port));
+      --  Validate_Add is shared with every other fixture below and hardcodes
+      --  "messages:count" as the path it accepts; the fixture never resolves
+      --  a real backend function, so the path text itself is arbitrary and
+      --  only has to agree with the shared validator.
       Convex.Live.Subscribe
-        (Manager, "messages:small", Small_Args, Small_Sub, Success, Message);
+        (Manager, "messages:count", Small_Args, Small_Sub, Success, Message);
       Check
         (Success,
          "slow Live writer initial subscribe failed: "
