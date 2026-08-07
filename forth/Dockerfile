@@ -235,18 +235,26 @@ RUN set -eu; \
 # declared closure copied back
 # ---------------------------------------------------------------------------
 FROM --platform=linux/amd64 ${BUILD_IMAGE} AS runtime-base
+# `rm` must be exec'd exactly once. When it is looked up on $PATH once per
+# path in a loop, the first iteration that deletes /bin or /usr removes the
+# `rm` binary itself, so the shell fails to find it for every later
+# iteration ("rm: not found"). A single invocation avoids this: exec happens
+# only once, while the executable and its shared libraries are still on
+# disk, and the kernel keeps rm's already-mapped code and libraries resident
+# for the life of the process even as it unlinks the files backing them.
+# Every path is therefore collected into positional parameters first (so
+# each survives word-splitting/quoting untouched) and handed to one `rm -rf`
+# call at the end.
 RUN set -eu; \
-    for path in /bin /boot /home /lib /lib64 /media /mnt /opt /root \
-                /run /sbin /srv /usr /var; do \
-      rm -rf "$path"; \
-    done; \
+    set -- /bin /boot /home /lib /lib64 /media /mnt /opt /root \
+           /run /sbin /srv /usr /var /etc/.pwd.lock; \
     for path in /etc/*; do \
       case "$path" in \
         /etc/hosts|/etc/resolv.conf) ;; \
-        *) rm -rf "$path" ;; \
+        *) set -- "$@" "$path" ;; \
       esac; \
     done; \
-    rm -rf /etc/.pwd.lock
+    rm -rf "$@"
 COPY --from=test /closure/ /
 ENV HOME=/home/convex \
     OPENSSL_CONF=/etc/ssl/openssl.cnf \
