@@ -5,9 +5,21 @@
 ; "Conformance executable" section): it implements the shared adapter
 ; protocol over stdin/stdout, or over one TCP connection when
 ; ADAPTER_LISTEN is set, and calls the real client (convex_new/convex_call/
-; convex_set_auth) for every operation. This build has no Live support, so
-; subscribe/unsubscribe/debugDisconnect answer with a structured
-; ProtocolError rather than pretending to succeed.
+; convex_set_auth/convex_live_*) for every operation.
+;
+; serve()'s main loop is poll()-driven rather than a blocking line read:
+; once any subscription exists it must service the command channel and the
+; Live WebSocket without either one starving the other, and it must never
+; block indefinitely on a peer that stops sending. adapter_try_line is the
+; non-blocking-safe line reader that makes this possible -- it performs at
+; most one `read` per call (only ever invoked after poll() said progress
+; was possible), unlike adapter_next_line's retry loop below it.
+;
+; Live delivery itself has no adapter-level queue: convex_live.s already
+; owns a bounded per-subscription queue (see convex.inc's
+; LIVE_QUEUE_DEPTH), and drain_subscriptions below just empties it into
+; NDJSON events once per event-loop tick. Nothing here buffers a second
+; time on top of that.
 ;
 ; Same fixed-frame stack discipline as the rest of this client.
 ; ---------------------------------------------------------------------------
@@ -34,6 +46,26 @@ extern convex_new
 extern convex_free
 extern convex_set_auth
 extern convex_call
+extern convex_live_init
+extern convex_live_close
+extern convex_live_subscribe
+extern convex_live_unsubscribe
+extern convex_live_debug_disconnect
+extern convex_live_maintain
+extern convex_live_service_socket
+extern convex_live_dequeue
+extern convex_live_poll_fd
+
+; adapter_sub: the adapter's own map from the NDJSON protocol's
+; subscriptionId string to the convex_sub* convex_live_subscribe returned.
+; convex_live.s deliberately knows nothing about this string -- see
+; convex.inc's convex_sub comment -- so this bookkeeping lives here.
+struc adapter_sub
+    .subid_ptr: resq 1
+    .subid_len: resq 1
+    .sub:       resq 1
+    .next:      resq 1
+endstruc
 
 section .bss
     g_client:   resq 1
@@ -43,6 +75,9 @@ section .bss
     g_pending_consume: resq 1
     g_runtime_text: resb 64
     g_runtime_len: resq 1
+    g_live:     resb convex_live_size
+    g_live_ready: resb 1
+    g_adapter_subs: resq 1
 
 section .text
 
@@ -202,6 +237,125 @@ adapter_next_line:
     pop rbp
     ret
 
+; int adapter_try_line(int fd, char **out_ptr, u64 *out_len)
+; Same line-framing contract as adapter_next_line (a line already buffered
+; is returned with no I/O at all), but never loops on raw_read_more: it
+; performs at most one read attempt, then reports "not ready yet" (0)
+; rather than trying again. Only serve()'s poll()-driven loop calls this,
+; and only after poll() (or a nonempty leftover buffer) said the fd could
+; make progress, so one attempt is always enough to either produce a line,
+; observe EOF, or legitimately have nothing more to give right now.
+; Returns 1 = line ready, 0 = not ready (no error), -1 = read error,
+; 2 = clean EOF with nothing left.
+adapter_try_line:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp-8], edi
+    mov [rbp-16], rsi
+    mov [rbp-24], rdx
+    mov rax, [g_pending_consume]
+    test rax, rax
+    jz .scan
+    lea rcx, [g_read_buf]
+    mov rdx, [rcx + buf.len]
+    cmp rax, rdx
+    jae .pending_consume_all
+    mov r9, rax
+    mov r10, rdx
+    sub r10, r9
+    mov rdi, [rcx + buf.data]
+    mov rsi, rdi
+    add rsi, r9
+    mov rdx, r10
+    call memmove
+    lea rcx, [g_read_buf]
+    mov rdx, [g_pending_consume]
+    mov rax, [rcx + buf.len]
+    sub rax, rdx
+    mov [rcx + buf.len], rax
+    jmp .pending_done
+.pending_consume_all:
+    lea rcx, [g_read_buf]
+    mov qword [rcx + buf.len], 0
+.pending_done:
+    mov qword [g_pending_consume], 0
+.scan:
+    lea rax, [g_read_buf]
+    mov rdi, [rax + buf.data]
+    mov rsi, [rax + buf.len]
+    lea rdx, [rel nl_byte]
+    mov ecx, 1
+    call find_bytes
+    cmp rax, -1
+    jne .have_line
+    mov edi, [rbp-8]
+    lea rsi, [g_read_buf]
+    call raw_read_more
+    cmp eax, 1
+    je .rescan
+    cmp eax, 0
+    je .try_final
+    mov eax, -1
+    jmp .done
+.rescan:
+    lea rax, [g_read_buf]
+    mov rdi, [rax + buf.data]
+    mov rsi, [rax + buf.len]
+    lea rdx, [rel nl_byte]
+    mov ecx, 1
+    call find_bytes
+    cmp rax, -1
+    jne .have_line
+    xor eax, eax
+    jmp .done
+.try_final:
+    lea rax, [g_read_buf]
+    mov rcx, [rax + buf.len]
+    test rcx, rcx
+    jz .eof
+    mov rax, rcx
+    jmp .have_line
+.eof:
+    mov eax, 2
+    jmp .done
+.have_line:
+    mov [rbp-32], rax           ; nl_index (or buf.len for the synthetic tail)
+    lea rcx, [g_read_buf]
+    mov rdx, [rcx + buf.data]
+    mov r8, [rbp-32]
+    test r8, r8
+    jz .no_cr
+    mov r9, rdx
+    add r9, r8
+    dec r9
+    cmp byte [r9], 13
+    jne .no_cr
+    dec r8
+.no_cr:
+    mov [rbp-40], r8
+    mov rcx, [rbp-16]
+    mov [rcx], rdx
+    mov rax, [rbp-40]
+    mov rcx, [rbp-24]
+    mov [rcx], rax
+    lea rcx, [g_read_buf]
+    mov rax, [rbp-32]
+    mov rdx, [rcx + buf.len]
+    cmp rax, rdx
+    jae .mark_consume_all
+    lea r9, [rax + 1]
+    mov [g_pending_consume], r9
+    jmp .have_line_done
+.mark_consume_all:
+    mov [g_pending_consume], rdx
+.have_line_done:
+    mov eax, 1
+.done:
+    mov rsp, rbp
+    pop rbp
+    ret
+
 ; --- event emission --------------------------------------------------------
 
 ; void emit_event(json_value *event) -- serializes, writes one NDJSON line
@@ -351,6 +505,131 @@ emit_error:
     pop rbp
     ret
 
+; void emit_subscription_value(const char *subid, u64 subid_len,
+;                               json_value *value, json_value *logs)
+; Takes ownership of value/logs -- emit_event frees the whole event tree
+; they become part of once serialized and written.
+emit_subscription_value:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp-8], rdi
+    mov [rbp-16], rsi
+    mov [rbp-24], rdx
+    mov [rbp-32], rcx
+    call json_new_object
+    mov [rbp-40], rax
+    lea rdi, [rel v_subscription]
+    mov esi, v_subscription_len
+    call json_new_string
+    mov rcx, rax
+    mov rdi, [rbp-40]
+    lea rsi, [rel k_type]
+    mov edx, k_type_len
+    call json_object_set
+    mov rdi, [rbp-8]
+    mov rsi, [rbp-16]
+    call json_new_string
+    mov rcx, rax
+    mov rdi, [rbp-40]
+    lea rsi, [rel k_subscription_id]
+    mov edx, k_subscription_id_len
+    call json_object_set
+    mov rdi, [rbp-40]
+    lea rsi, [rel k_value]
+    mov edx, k_value_len
+    mov rcx, [rbp-24]
+    call json_object_set
+    mov rax, [rbp-32]
+    test rax, rax
+    jz .no_logs
+    mov rdi, [rbp-40]
+    lea rsi, [rel k_log_lines]
+    mov edx, k_log_lines_len
+    mov rcx, rax
+    call json_object_set
+.no_logs:
+    mov rdi, [rbp-40]
+    call emit_event
+    mov rsp, rbp
+    pop rbp
+    ret
+
+; void emit_subscription_error(const char *subid, u64 subid_len,
+;                               const char *ename, u64 enlen,
+;                               const char *emsg, u64 emlen,
+;                               json_value *edata)
+; [edata arrives on the stack: the 7th argument, at [rbp+16]]
+; Reads (does not take ownership of) ename/emsg -- both are copied into a
+; fresh JSON string. edata IS taken, freed as part of the event tree.
+emit_subscription_error:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 96
+    mov [rbp-8], rdi
+    mov [rbp-16], rsi
+    mov [rbp-24], rdx
+    mov [rbp-32], rcx
+    mov [rbp-40], r8
+    mov [rbp-48], r9
+    mov rax, [rbp + 16]
+    mov [rbp-56], rax
+    call json_new_object
+    mov [rbp-64], rax
+    lea rdi, [rel v_subscription]
+    mov esi, v_subscription_len
+    call json_new_string
+    mov rcx, rax
+    mov rdi, [rbp-64]
+    lea rsi, [rel k_type]
+    mov edx, k_type_len
+    call json_object_set
+    mov rdi, [rbp-8]
+    mov rsi, [rbp-16]
+    call json_new_string
+    mov rcx, rax
+    mov rdi, [rbp-64]
+    lea rsi, [rel k_subscription_id]
+    mov edx, k_subscription_id_len
+    call json_object_set
+    call json_new_object
+    mov [rbp-72], rax
+    mov rdi, [rbp-24]
+    mov rsi, [rbp-32]
+    call json_new_string
+    mov rcx, rax
+    mov rdi, [rbp-72]
+    lea rsi, [rel k_name]
+    mov edx, k_name_len
+    call json_object_set
+    mov rdi, [rbp-40]
+    mov rsi, [rbp-48]
+    call json_new_string
+    mov rcx, rax
+    mov rdi, [rbp-72]
+    lea rsi, [rel k_message]
+    mov edx, k_message_len
+    call json_object_set
+    mov rax, [rbp-56]
+    test rax, rax
+    jz .no_data
+    mov rdi, [rbp-72]
+    lea rsi, [rel k_data]
+    mov edx, k_data_len
+    mov rcx, rax
+    call json_object_set
+.no_data:
+    mov rdi, [rbp-64]
+    lea rsi, [rel k_error]
+    mov edx, k_error_len
+    mov rcx, [rbp-72]
+    call json_object_set
+    mov rdi, [rbp-64]
+    call emit_event
+    mov rsp, rbp
+    pop rbp
+    ret
+
 ; --- Convex client lifecycle -----------------------------------------------
 
 ; void set_error_full_local(convex_error *err, const char *name, u64 name_len,
@@ -429,6 +708,274 @@ ensure_client:
     mov rsp, rbp
     pop rbp
     ret
+
+; convex_live *ensure_live(convex_error *err) -- lazily creates the client
+; (via ensure_client) and, on first use, initializes the one Live state
+; machine this process owns.
+%define EL_ERR -8
+ensure_live:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    mov [rbp+EL_ERR], rdi
+    movzx eax, byte [g_live_ready]
+    test eax, eax
+    jnz .have_live
+    mov rdi, [rbp+EL_ERR]
+    call ensure_client
+    test rax, rax
+    jz .fail
+    mov rsi, rax          ; client (2nd arg)
+    lea rdi, [g_live]     ; live (1st arg)
+    call convex_live_init
+    test eax, eax
+    jz .oom
+    mov byte [g_live_ready], 1
+.have_live:
+    lea rax, [g_live]
+    jmp .done
+.oom:
+    mov rdi, [rbp+EL_ERR]
+    call set_error_oom_local
+.fail:
+    xor eax, eax
+.done:
+    mov rsp, rbp
+    pop rbp
+    ret
+%undef EL_ERR
+
+; void set_error_oom_local(convex_error *err) -- mirrors convex_client.s's
+; own private set_error_oom (not exported), for the one failure path in
+; this file that needs it (ensure_live's convex_live_init OOM case).
+set_error_oom_local:
+    test rdi, rdi
+    jz .done
+    lea rax, [rel err_name_protocol_ref]
+    mov [rdi + convex_error.name_ptr], rax
+    mov qword [rdi + convex_error.name_len], err_name_protocol_ref_len
+    lea rax, [rel err_msg_oom_local]
+    mov [rdi + convex_error.msg_ptr], rax
+    mov qword [rdi + convex_error.msg_len], err_msg_oom_local_len
+    mov qword [rdi + convex_error.data], 0
+.done:
+    ret
+
+; adapter_sub *find_adapter_sub(const char *subid, u64 subid_len)
+find_adapter_sub:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    mov [rbp-8], rdi
+    mov [rbp-16], rsi
+    mov rax, [g_adapter_subs]
+.loop:
+    test rax, rax
+    jz .notfound
+    mov rcx, [rax + adapter_sub.subid_len]
+    cmp rcx, [rbp-16]
+    jne .next
+    mov [rbp-24], rax
+    mov rdi, [rax + adapter_sub.subid_ptr]
+    mov rsi, [rbp-8]
+    mov rdx, [rbp-16]
+    call memcmp
+    test eax, eax
+    jnz .next
+    mov rax, [rbp-24]
+    jmp .done
+.next:
+    mov rax, [rax + adapter_sub.next]
+    jmp .loop
+.notfound:
+    xor eax, eax
+.done:
+    mov rsp, rbp
+    pop rbp
+    ret
+
+; adapter_sub *add_adapter_sub(const char *subid, u64 subid_len,
+;                               convex_sub *sub) -- copies subid (the
+; wrapper must outlive the NDJSON command tree it was parsed from).
+add_adapter_sub:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    mov [rbp-8], rdi
+    mov [rbp-16], rsi
+    mov [rbp-24], rdx
+    mov edi, adapter_sub_size
+    call malloc
+    test rax, rax
+    jz .oom_bare
+    mov [rbp-32], rax
+    mov rax, [rbp-16]
+    lea rdi, [rax + 1]
+    call malloc
+    test rax, rax
+    jz .oom_free_node
+    mov rcx, [rbp-32]
+    mov [rcx + adapter_sub.subid_ptr], rax
+    mov rdi, rax
+    mov rsi, [rbp-8]
+    mov rdx, [rbp-16]
+    call memcpy
+    mov rcx, [rbp-32]
+    mov rax, [rcx + adapter_sub.subid_ptr]
+    mov rdx, [rbp-16]
+    mov byte [rax + rdx], 0
+    mov [rcx + adapter_sub.subid_len], rdx
+    mov rax, [rbp-24]
+    mov [rcx + adapter_sub.sub], rax
+    mov rax, [g_adapter_subs]
+    mov [rcx + adapter_sub.next], rax
+    mov [g_adapter_subs], rcx
+    mov rax, rcx
+    jmp .done
+.oom_free_node:
+    mov rdi, [rbp-32]
+    call free
+.oom_bare:
+    xor eax, eax
+.done:
+    mov rsp, rbp
+    pop rbp
+    ret
+
+; void remove_adapter_sub(const char *subid, u64 subid_len) -- unlinks and
+; frees the wrapper node only; the caller is responsible for the
+; convex_sub* itself (via convex_live_unsubscribe).
+%define RAS_SUBID -8
+%define RAS_LEN   -16
+%define RAS_PREV  -24
+%define RAS_MATCH -32
+remove_adapter_sub:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp+RAS_SUBID], rdi
+    mov [rbp+RAS_LEN], rsi
+    mov rax, [g_adapter_subs]
+    test rax, rax
+    jz .done
+    mov rcx, [rax + adapter_sub.subid_len]
+    cmp rcx, [rbp+RAS_LEN]
+    jne .search
+    mov rdi, [rax + adapter_sub.subid_ptr]
+    mov rsi, [rbp+RAS_SUBID]
+    mov rdx, [rbp+RAS_LEN]
+    call memcmp
+    test eax, eax
+    jnz .search
+    mov rax, [g_adapter_subs]
+    mov [rbp+RAS_MATCH], rax
+    mov rcx, [rax + adapter_sub.next]
+    mov [g_adapter_subs], rcx
+    mov rdi, [rax + adapter_sub.subid_ptr]
+    call free
+    mov rdi, [rbp+RAS_MATCH]
+    call free
+    jmp .done
+.search:
+    mov rax, [g_adapter_subs]
+    mov [rbp+RAS_PREV], rax
+.search_loop:
+    mov rax, [rbp+RAS_PREV]
+    mov rcx, [rax + adapter_sub.next]
+    test rcx, rcx
+    jz .done
+    mov rdx, [rcx + adapter_sub.subid_len]
+    cmp rdx, [rbp+RAS_LEN]
+    jne .search_next
+    mov rdi, [rcx + adapter_sub.subid_ptr]
+    mov rsi, [rbp+RAS_SUBID]
+    mov rdx, [rbp+RAS_LEN]
+    call memcmp
+    test eax, eax
+    jnz .search_next
+    mov [rbp+RAS_MATCH], rcx
+    mov rax, [rbp+RAS_PREV]
+    mov rdx, [rcx + adapter_sub.next]
+    mov [rax + adapter_sub.next], rdx
+    mov rdi, [rcx + adapter_sub.subid_ptr]
+    call free
+    mov rdi, [rbp+RAS_MATCH]
+    call free
+    jmp .done
+.search_next:
+    mov [rbp+RAS_PREV], rcx
+    jmp .search_loop
+.done:
+    mov rsp, rbp
+    pop rbp
+    ret
+%undef RAS_SUBID
+%undef RAS_LEN
+%undef RAS_PREV
+%undef RAS_MATCH
+
+; void drain_subscriptions(void) -- empties every subscription's bounded
+; queue into NDJSON "subscription" events. Called once per event-loop
+; tick; never itself grows a buffer, so it can never be the thing that
+; makes memory unbounded under a slow reader (see the file header).
+%define DS_CUR -8
+%define DS_UPDATE -72        ; convex_update, 64 bytes: rbp-72..rbp-9
+drain_subscriptions:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 80
+    mov rax, [g_adapter_subs]
+    mov [rbp+DS_CUR], rax
+.outer:
+    mov rax, [rbp+DS_CUR]
+    test rax, rax
+    jz .done
+.drain_one:
+    mov rax, [rbp+DS_CUR]
+    mov rdi, [rax + adapter_sub.sub]
+    lea rsi, [rbp+DS_UPDATE]
+    call convex_live_dequeue
+    test eax, eax
+    jz .next_sub
+
+    mov rax, [rbp+DS_UPDATE + convex_update.has_error]
+    test rax, rax
+    jnz .emit_error_update
+
+    mov rax, [rbp+DS_CUR]
+    mov rdi, [rax + adapter_sub.subid_ptr]
+    mov rsi, [rax + adapter_sub.subid_len]
+    mov rdx, [rbp+DS_UPDATE + convex_update.value]
+    mov rcx, [rbp+DS_UPDATE + convex_update.logs]
+    call emit_subscription_value
+    jmp .drain_one
+.emit_error_update:
+    mov rax, [rbp+DS_CUR]
+    mov rdi, [rax + adapter_sub.subid_ptr]
+    mov rsi, [rax + adapter_sub.subid_len]
+    mov rdx, [rbp+DS_UPDATE + convex_update.err_name_ptr]
+    mov rcx, [rbp+DS_UPDATE + convex_update.err_name_len]
+    mov r8, [rbp+DS_UPDATE + convex_update.err_msg_ptr]
+    mov r9, [rbp+DS_UPDATE + convex_update.err_msg_len]
+    sub rsp, 16
+    mov rax, [rbp+DS_UPDATE + convex_update.err_data]
+    mov [rsp], rax
+    call emit_subscription_error
+    add rsp, 16
+    mov rdi, [rbp+DS_UPDATE + convex_update.err_msg_ptr]
+    call free
+    jmp .drain_one
+.next_sub:
+    mov rax, [rbp+DS_CUR]
+    mov rax, [rax + adapter_sub.next]
+    mov [rbp+DS_CUR], rax
+    jmp .outer
+.done:
+    mov rsp, rbp
+    pop rbp
+    ret
+%undef DS_CUR
+%undef DS_UPDATE
 
 ; const char *gnu_get_libc_version(void), cached into g_runtime_text.
 build_runtime_string:
@@ -747,22 +1294,286 @@ handle_set_auth:
     pop rbp
     ret
 
-; void handle_unsupported(const char *id, u64 id_len) -- subscribe,
-; unsubscribe, and debugDisconnect all land here: this build has no Live
-; support, so they answer with a structured, honest ProtocolError instead
-; of silently pretending to succeed.
-handle_unsupported:
+; void handle_subscribe(const char *id, u64 id_len, json_value *cmd)
+; Frees `cmd` on every path. A subscribe for a subscriptionId that is
+; already active replaces it: the old subscription is fully unsubscribed
+; (invalidating its relay) before the new one's ack is published, per
+; AGENTS.md's same-ID-replacement rule.
+%define HS_ID        -8
+%define HS_IDLEN     -16
+%define HS_CMD       -24
+%define HS_SUBIDNODE -32
+%define HS_PATHNODE  -40
+%define HS_ARGSNODE  -48
+%define HS_LIVE      -56
+%define HS_SUB       -64
+%define HS_EXISTING  -72
+%define HS_ERR       -112    ; convex_error, 40 bytes: rbp-112..rbp-73
+handle_subscribe:
     push rbp
     mov rbp, rsp
-    sub rsp, 16
-    lea rdx, [rel err_name_protocol_ref]
-    mov ecx, err_name_protocol_ref_len
-    lea r8, [rel err_msg_no_live]
-    mov r9, err_msg_no_live_len
+    sub rsp, 128
+    mov [rbp+HS_ID], rdi
+    mov [rbp+HS_IDLEN], rsi
+    mov [rbp+HS_CMD], rdx
+
+    mov rdi, rdx
+    lea rsi, [rel k_subscription_id]
+    mov edx, k_subscription_id_len
+    call json_object_get
+    test rax, rax
+    jz .bad_args
+    mov rcx, [rax + json_value.tag]
+    cmp rcx, JV_STRING
+    jne .bad_args
+    mov [rbp+HS_SUBIDNODE], rax
+
+    mov rdi, [rbp+HS_CMD]
+    lea rsi, [rel k_path]
+    mov edx, k_path_len
+    call json_object_get
+    test rax, rax
+    jz .bad_args
+    mov rcx, [rax + json_value.tag]
+    cmp rcx, JV_STRING
+    jne .bad_args
+    mov [rbp+HS_PATHNODE], rax
+
+    mov rdi, [rbp+HS_CMD]
+    lea rsi, [rel k_args]
+    mov edx, k_args_len
+    call json_object_get
+    test rax, rax
+    jz .bad_args
+    mov rcx, [rax + json_value.tag]
+    cmp rcx, JV_OBJECT
+    jne .bad_args
+    mov [rbp+HS_ARGSNODE], rax
+
+    lea rdi, [rbp+HS_ERR]
+    call ensure_live
+    test rax, rax
+    jz .from_ensure_fail
+    mov [rbp+HS_LIVE], rax
+
+    mov rax, [rbp+HS_SUBIDNODE]
+    mov rdi, [rax + json_value.ptr]
+    mov rsi, [rax + json_value.len]
+    call find_adapter_sub
+    test rax, rax
+    jz .no_existing
+    mov rcx, [rax + adapter_sub.sub]
+    mov [rbp+HS_EXISTING], rcx
+    mov rdi, [rbp+HS_EXISTING]
+    call convex_live_unsubscribe
+    mov rax, [rbp+HS_SUBIDNODE]
+    mov rdi, [rax + json_value.ptr]
+    mov rsi, [rax + json_value.len]
+    call remove_adapter_sub
+.no_existing:
+    ; detach args from cmd before freeing cmd below -- convex_live_
+    ; subscribe takes ownership of it.
+    mov rdi, [rbp+HS_CMD]
+    lea rsi, [rel k_args]
+    mov edx, k_args_len
+    call find_and_null_entry
+
+    mov rdi, [rbp+HS_LIVE]
+    mov rax, [rbp+HS_PATHNODE]
+    mov rsi, [rax + json_value.ptr]
+    mov rdx, [rax + json_value.len]
+    mov rcx, [rbp+HS_ARGSNODE]
+    call convex_live_subscribe
+    test rax, rax
+    jz .oom_after_detach
+    mov [rbp+HS_SUB], rax
+
+    mov rax, [rbp+HS_SUBIDNODE]
+    mov rdi, [rax + json_value.ptr]
+    mov rsi, [rax + json_value.len]
+    mov rdx, [rbp+HS_SUB]
+    call add_adapter_sub
+    test rax, rax
+    jz .oom_wrapper
+
+    mov rdi, [rbp+HS_ID]
+    mov rsi, [rbp+HS_IDLEN]
+    lea rdx, [rel v_ack]
+    mov ecx, v_ack_len
+    call emit_simple
+    jmp .free_cmd
+
+.oom_wrapper:
+    mov rdi, [rbp+HS_SUB]
+    call convex_live_unsubscribe
+    mov rdi, [rbp+HS_ID]
+    mov rsi, [rbp+HS_IDLEN]
+    lea rdx, [rel err_name_error]
+    mov ecx, err_name_error_len
+    lea r8, [rel err_msg_oom_local]
+    mov r9, err_msg_oom_local_len
     sub rsp, 16
     mov qword [rsp], 0
     call emit_error
     add rsp, 16
+    jmp .free_cmd
+.oom_after_detach:
+    mov rdi, [rbp+HS_ARGSNODE]
+    call json_free
+    mov rdi, [rbp+HS_ID]
+    mov rsi, [rbp+HS_IDLEN]
+    lea rdx, [rel err_name_error]
+    mov ecx, err_name_error_len
+    lea r8, [rel err_msg_oom_local]
+    mov r9, err_msg_oom_local_len
+    sub rsp, 16
+    mov qword [rsp], 0
+    call emit_error
+    add rsp, 16
+    jmp .free_cmd
+.from_ensure_fail:
+    mov rdi, [rbp+HS_ID]
+    mov rsi, [rbp+HS_IDLEN]
+    mov rdx, [rbp+HS_ERR + convex_error.name_ptr]
+    mov rcx, [rbp+HS_ERR + convex_error.name_len]
+    mov r8, [rbp+HS_ERR + convex_error.msg_ptr]
+    mov r9, [rbp+HS_ERR + convex_error.msg_len]
+    sub rsp, 16
+    mov rax, [rbp+HS_ERR + convex_error.data]
+    mov [rsp], rax
+    call emit_error
+    add rsp, 16
+    jmp .free_cmd
+.bad_args:
+    mov rdi, [rbp+HS_ID]
+    mov rsi, [rbp+HS_IDLEN]
+    lea rdx, [rel err_name_protocol_ref]
+    mov ecx, err_name_protocol_ref_len
+    lea r8, [rel err_msg_bad_subscribe_args]
+    mov r9, err_msg_bad_subscribe_args_len
+    sub rsp, 16
+    mov qword [rsp], 0
+    call emit_error
+    add rsp, 16
+.free_cmd:
+    mov rdi, [rbp+HS_CMD]
+    call json_free
+    mov rsp, rbp
+    pop rbp
+    ret
+%undef HS_ID
+%undef HS_IDLEN
+%undef HS_CMD
+%undef HS_SUBIDNODE
+%undef HS_PATHNODE
+%undef HS_ARGSNODE
+%undef HS_LIVE
+%undef HS_SUB
+%undef HS_EXISTING
+%undef HS_ERR
+
+; void handle_unsubscribe(const char *id, u64 id_len, json_value *cmd)
+; Frees `cmd` on every path. Silently acks an unknown subscriptionId
+; (matching the reference JS adapter's own leniency there) rather than
+; treating it as a protocol error.
+%define HU_ID    -8
+%define HU_IDLEN -16
+%define HU_CMD   -24
+%define HU_NODE  -32
+handle_unsubscribe:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp+HU_ID], rdi
+    mov [rbp+HU_IDLEN], rsi
+    mov [rbp+HU_CMD], rdx
+
+    mov rdi, rdx
+    lea rsi, [rel k_subscription_id]
+    mov edx, k_subscription_id_len
+    call json_object_get
+    test rax, rax
+    jz .bad_args
+    mov rcx, [rax + json_value.tag]
+    cmp rcx, JV_STRING
+    jne .bad_args
+    mov [rbp+HU_NODE], rax
+
+    mov rax, [rbp+HU_NODE]
+    mov rdi, [rax + json_value.ptr]
+    mov rsi, [rax + json_value.len]
+    call find_adapter_sub
+    test rax, rax
+    jz .ack
+    mov rcx, [rax + adapter_sub.sub]
+    mov rdi, rcx
+    call convex_live_unsubscribe
+    mov rax, [rbp+HU_NODE]
+    mov rdi, [rax + json_value.ptr]
+    mov rsi, [rax + json_value.len]
+    call remove_adapter_sub
+.ack:
+    mov rdi, [rbp+HU_ID]
+    mov rsi, [rbp+HU_IDLEN]
+    lea rdx, [rel v_ack]
+    mov ecx, v_ack_len
+    call emit_simple
+    jmp .free_cmd
+.bad_args:
+    mov rdi, [rbp+HU_ID]
+    mov rsi, [rbp+HU_IDLEN]
+    lea rdx, [rel err_name_protocol_ref]
+    mov ecx, err_name_protocol_ref_len
+    lea r8, [rel err_msg_bad_unsubscribe_args]
+    mov r9, err_msg_bad_unsubscribe_args_len
+    sub rsp, 16
+    mov qword [rsp], 0
+    call emit_error
+    add rsp, 16
+.free_cmd:
+    mov rdi, [rbp+HU_CMD]
+    call json_free
+    mov rsp, rbp
+    pop rbp
+    ret
+%undef HU_ID
+%undef HU_IDLEN
+%undef HU_CMD
+%undef HU_NODE
+
+; void handle_debug_disconnect(const char *id, u64 id_len) -- adapter-only
+; fault injection; see manifest.yaml's adapter.adapterOnlyCommands.
+handle_debug_disconnect:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    mov [rbp-8], rdi
+    mov [rbp-16], rsi
+    movzx eax, byte [g_live_ready]
+    test eax, eax
+    jz .not_connected
+    lea rdi, [g_live]
+    call convex_live_debug_disconnect
+    test eax, eax
+    jz .not_connected
+    mov rdi, [rbp-8]
+    mov rsi, [rbp-16]
+    lea rdx, [rel v_ack]
+    mov ecx, v_ack_len
+    call emit_simple
+    jmp .done
+.not_connected:
+    mov rdi, [rbp-8]
+    mov rsi, [rbp-16]
+    lea rdx, [rel err_name_transport]
+    mov ecx, err_name_transport_len
+    lea r8, [rel err_msg_not_connected]
+    mov r9, err_msg_not_connected_len
+    sub rsp, 16
+    mov qword [rsp], 0
+    call emit_error
+    add rsp, 16
+.done:
     mov rsp, rbp
     pop rbp
     ret
@@ -774,6 +1585,13 @@ handle_close:
     sub rsp, 16
     mov [rbp-8], rdi
     mov [rbp-16], rsi
+    movzx eax, byte [g_live_ready]
+    test eax, eax
+    jz .no_live
+    lea rdi, [g_live]
+    call convex_live_close
+    mov byte [g_live_ready], 0
+.no_live:
     mov rax, [g_client]
     test rax, rax
     jz .no_client
@@ -944,7 +1762,13 @@ dispatch:
     mov ecx, op_subscribe_len
     call str_is
     test eax, eax
-    jnz .is_unsupported
+    jz .try_unsubscribe
+    mov rdi, [rbp-16]
+    mov rsi, [rbp-24]
+    mov rdx, [rbp-8]
+    call handle_subscribe
+    jmp .done
+.try_unsubscribe:
     mov rax, [rbp-32]
     mov rdi, [rax + json_value.ptr]
     mov rsi, [rax + json_value.len]
@@ -952,7 +1776,13 @@ dispatch:
     mov ecx, op_unsubscribe_len
     call str_is
     test eax, eax
-    jnz .is_unsupported
+    jz .try_debug_disconnect
+    mov rdi, [rbp-16]
+    mov rsi, [rbp-24]
+    mov rdx, [rbp-8]
+    call handle_unsubscribe
+    jmp .done
+.try_debug_disconnect:
     mov rax, [rbp-32]
     mov rdi, [rax + json_value.ptr]
     mov rsi, [rax + json_value.len]
@@ -961,10 +1791,9 @@ dispatch:
     call str_is
     test eax, eax
     jz .unknown_op_free
-.is_unsupported:
     mov rdi, [rbp-16]
     mov rsi, [rbp-24]
-    call handle_unsupported
+    call handle_debug_disconnect
     mov rdi, [rbp-8]
     call json_free
     jmp .done
@@ -1001,37 +1830,99 @@ dispatch:
     ret
 
 ; void serve(int in_fd, int out_fd)
+; serve()'s loop is the one place in this file that owns the WebSocket:
+; convex_live_maintain, convex_live_service_socket and drain_subscriptions
+; are only ever called from here, on this one thread, satisfying AGENTS.md's
+; "one worker owns WebSocket reads, writes, reconnects and query-set
+; version changes" requirement by construction rather than with a lock.
+%define SV_PFDS    -32       ; pollfd[2], 16 bytes: rbp-32..rbp-17
+%define SV_NFDS    -40
+%define SV_LINEPTR -48
+%define SV_LINELEN -56
+%define SV_CMDVAL  -64
 serve:
     push rbp
     mov rbp, rsp
-    sub rsp, 48
+    sub rsp, 80
     mov [g_in_fd], edi
     mov [g_out_fd], esi
     lea rdi, [g_read_buf]
     call buf_init
 .loop:
     mov al, [g_should_close]
-    cmp al, 0
-    jne .stop
+    test al, al
+    jnz .stop
+
+    movzx eax, byte [g_live_ready]
+    test eax, eax
+    jz .no_maintain
+    lea rdi, [g_live]
+    call convex_live_maintain
+.no_maintain:
+    mov eax, [g_in_fd]
+    mov [rbp+SV_PFDS + pollfd.fd], eax
+    mov word [rbp+SV_PFDS + pollfd.events], POLLIN
+    mov word [rbp+SV_PFDS + pollfd.revents], 0
+    mov dword [rbp+SV_NFDS], 1
+
+    movzx eax, byte [g_live_ready]
+    test eax, eax
+    jz .have_pfds
+    lea rdi, [g_live]
+    call convex_live_poll_fd
+    cmp rax, 0
+    jl .have_pfds
+    mov [rbp+SV_PFDS + 8 + pollfd.fd], eax
+    mov word [rbp+SV_PFDS + 8 + pollfd.events], POLLIN
+    mov word [rbp+SV_PFDS + 8 + pollfd.revents], 0
+    mov dword [rbp+SV_NFDS], 2
+.have_pfds:
+    ; a bounded 100ms tick: short enough to keep reconnect backoff and
+    ; queue draining timely, long enough not to spin the CPU.
+    lea rdi, [rbp+SV_PFDS]
+    mov esi, [rbp+SV_NFDS]
+    mov edx, 100
+    call poll
+
+    movzx eax, byte [g_live_ready]
+    test eax, eax
+    jz .no_service
+    cmp dword [rbp+SV_NFDS], 2
+    jl .no_service
+    movzx eax, word [rbp+SV_PFDS + 8 + pollfd.revents]
+    test eax, POLLIN
+    jz .no_service
+    lea rdi, [g_live]
+    call convex_live_service_socket
+.no_service:
+    movzx eax, byte [g_live_ready]
+    test eax, eax
+    jz .no_drain
+    call drain_subscriptions
+.no_drain:
+    movzx eax, word [rbp+SV_PFDS + pollfd.revents]
+    test eax, POLLIN
+    jz .loop
+.cmd_loop:
     mov edi, [g_in_fd]
-    lea rsi, [rbp-8]
-    lea rdx, [rbp-16]
-    call adapter_next_line
+    lea rsi, [rbp+SV_LINEPTR]
+    lea rdx, [rbp+SV_LINELEN]
+    call adapter_try_line
     cmp eax, 1
-    jne .stop
-    mov rdi, [rbp-8]
-    mov rsi, [rbp-16]
+    jne .cmd_loop_done
+    mov rdi, [rbp+SV_LINEPTR]
+    mov rsi, [rbp+SV_LINELEN]
     test rsi, rsi
     jnz .have_content
-    jmp .loop                   ; a blank line is not a command; skip it
+    jmp .cmd_loop                ; a blank line is not a command; skip it
 .have_content:
-    lea rdx, [rbp-24]
+    lea rdx, [rbp+SV_CMDVAL]
     call json_parse
     test eax, eax
     jz .malformed
-    mov rdi, [rbp-24]
+    mov rdi, [rbp+SV_CMDVAL]
     call dispatch
-    jmp .loop
+    jmp .cmd_loop
 .malformed:
     lea rdi, [empty_str]
     xor esi, esi
@@ -1043,13 +1934,32 @@ serve:
     mov qword [rsp], 0
     call emit_error
     add rsp, 16
+    jmp .cmd_loop
+.cmd_loop_done:
+    ; 0 = nothing more buffered right now; go back to poll(). -1 (error)
+    ; or 2 (EOF) both mean the command channel is gone.
+    test eax, eax
+    jz .loop
+    mov byte [g_should_close], 1
     jmp .loop
 .stop:
+    movzx eax, byte [g_live_ready]
+    test eax, eax
+    jz .no_live_stop
+    lea rdi, [g_live]
+    call convex_live_close
+    mov byte [g_live_ready], 0
+.no_live_stop:
     lea rdi, [g_read_buf]
     call buf_free
     mov rsp, rbp
     pop rbp
     ret
+%undef SV_PFDS
+%undef SV_NFDS
+%undef SV_LINEPTR
+%undef SV_LINELEN
+%undef SV_CMDVAL
 
 ; --- entry point --------------------------------------------------------
 
@@ -1249,6 +2159,8 @@ section .rodata
     k_data_len equ $ - k_data
     k_error: db "error"
     k_error_len equ $ - k_error
+    k_subscription_id: db "subscriptionId"
+    k_subscription_id_len equ $ - k_subscription_id
     k_protocol_version: db "protocolVersion"
     k_protocol_version_len equ $ - k_protocol_version
     k_runtime: db "runtime"
@@ -1267,12 +2179,18 @@ section .rodata
     v_ack_len equ $ - v_ack
     v_closed: db "closed"
     v_closed_len equ $ - v_closed
+    v_subscription: db "subscription"
+    v_subscription_len equ $ - v_subscription
     v_language: db "assembly-x86-64"
     v_language_len equ $ - v_language
     v_implementation: db "native-nasm-libssl-libc"
     v_implementation_len equ $ - v_implementation
     err_name_protocol_ref: db "ProtocolError"
     err_name_protocol_ref_len equ $ - err_name_protocol_ref
+    err_name_error: db "Error"
+    err_name_error_len equ $ - err_name_error
+    err_name_transport: db "TransportError"
+    err_name_transport_len equ $ - err_name_transport
     err_msg_missing_url: db "CONVEX_URL is required"
     err_msg_missing_url_len equ $ - err_msg_missing_url
     err_msg_bad_version: db "unsupported adapter protocol version"
@@ -1281,8 +2199,14 @@ section .rodata
     err_msg_bad_call_args_len equ $ - err_msg_bad_call_args
     err_msg_bad_token: db "token must be a string"
     err_msg_bad_token_len equ $ - err_msg_bad_token
-    err_msg_no_live: db "Live is not implemented in this build"
-    err_msg_no_live_len equ $ - err_msg_no_live
+    err_msg_bad_subscribe_args: db "subscribe requires subscriptionId, path and object args"
+    err_msg_bad_subscribe_args_len equ $ - err_msg_bad_subscribe_args
+    err_msg_bad_unsubscribe_args: db "unsubscribe requires subscriptionId"
+    err_msg_bad_unsubscribe_args_len equ $ - err_msg_bad_unsubscribe_args
+    err_msg_not_connected: db "Live WebSocket is not connected"
+    err_msg_not_connected_len equ $ - err_msg_not_connected
+    err_msg_oom_local: db "out of memory"
+    err_msg_oom_local_len equ $ - err_msg_oom_local
     err_msg_unknown_op: db "unknown adapter operation"
     err_msg_unknown_op_len equ $ - err_msg_unknown_op
     err_msg_malformed: db "malformed adapter command"
