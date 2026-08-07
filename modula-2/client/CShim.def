@@ -1,0 +1,116 @@
+(* CShim.def declares the only foreign boundary this client uses: raw TCP
+   sockets, TLS (OpenSSL), poll(), a monotonic clock, cryptographic random
+   bytes and SHA-1 (needed for the WebSocket handshake key). Every one of
+   these primitives is generic transport plumbing with no knowledge of
+   Convex, HTTP, JSON, or the WebSocket wire format: those are implemented in
+   Modula-2 in ConvexBase64, ConvexJSON, ConvexHTTP, ConvexWS and
+   ConvexSync. See cshim.c for the implementation. *)
+
+DEFINITION MODULE FOR "C" CShim;
+
+FROM SYSTEM IMPORT ADDRESS;
+
+EXPORT UNQUALIFIED
+  ShimTcpConnect, ShimTlsWrap, ShimPlainWrap,
+  ShimRead, ShimWrite, ShimFd, ShimPending, ShimCloseConn,
+  ShimPoll2,
+  ShimListen, ShimAccept, ShimCloseFd, ShimSetNonBlocking,
+  ShimRandomBytes, ShimSha1, ShimMonotonicMs,
+  ShimLastError, ShimExit ;
+
+(* ShimTcpConnect resolves host (a NUL terminated string) and connects a
+   TCP socket to host:port, bounded by timeoutMs. Returns a non-negative
+   file descriptor on success, or -1 on failure (see ShimLastError). *)
+PROCEDURE ShimTcpConnect (host: ARRAY OF CHAR; port: INTEGER; timeoutMs: INTEGER) : INTEGER ;
+
+(* ShimTlsWrap takes ownership of fd and performs a TLS client handshake,
+   verifying the peer certificate and hostname against the system trust
+   store using sniHost (a NUL terminated string). Returns an opaque
+   connection handle, or NIL address (all zero bits) on failure. *)
+PROCEDURE ShimTlsWrap (fd: INTEGER; sniHost: ARRAY OF CHAR; timeoutMs: INTEGER) : ADDRESS ;
+
+(* ShimPlainWrap wraps a connected, non-TLS fd as the same opaque connection
+   handle type so callers do not need to branch on scheme after connecting. *)
+PROCEDURE ShimPlainWrap (fd: INTEGER) : ADDRESS ;
+
+(* ShimRead copies at most cap bytes into buf. Returns: n > 0 bytes read;
+   0 or Cardinal minus one? no; use: 0 means the peer closed the connection;
+   -1 means no data is available right now (the caller should poll again);
+   -2 means a fatal transport error (see ShimLastError). *)
+PROCEDURE ShimRead (conn: ADDRESS; VAR buf: ARRAY OF CHAR; cap: INTEGER) : INTEGER ;
+
+(* ShimWrite writes at most length bytes from buf. It may write fewer bytes
+   than requested (a short write); the caller is responsible for resuming.
+   Returns: n >= 0 bytes actually written; -1 means nothing could be
+   written right now (the caller should poll for writability and retry);
+   -2 means a fatal transport error. *)
+PROCEDURE ShimWrite (conn: ADDRESS; buf: ARRAY OF CHAR; length: INTEGER) : INTEGER ;
+
+(* ShimFd returns the underlying file descriptor of conn, for use with
+   ShimPoll2. *)
+PROCEDURE ShimFd (conn: ADDRESS) : INTEGER ;
+
+(* ShimPending returns 1 when conn is a TLS connection with plaintext bytes
+   already buffered (SSL_pending() > 0), meaning ShimRead can make progress
+   even if poll() has not yet reported the raw file descriptor as readable;
+   otherwise it returns 0. *)
+PROCEDURE ShimPending (conn: ADDRESS) : INTEGER ;
+
+(* ShimCloseConn shuts down TLS (if present), closes the file descriptor and
+   releases the connection handle. *)
+PROCEDURE ShimCloseConn (conn: ADDRESS) ;
+
+(* ShimPoll2 waits up to timeoutMs milliseconds for fd1 (and fd2, unless it
+   is negative) to become readable. Sets ready1/ready2 to 1 when the
+   corresponding descriptor is readable, 0 otherwise. Returns the number of
+   ready descriptors, 0 on a plain timeout, or -1 on a polling error. *)
+PROCEDURE ShimPoll2 (fd1, fd2, timeoutMs: INTEGER; VAR ready1, ready2: INTEGER) : INTEGER ;
+
+(* ShimListen binds and listens on bindAddress:port (bindAddress is a NUL
+   terminated numeric host, e.g. "0.0.0.0"). Returns a listening file
+   descriptor, or -1 on failure. *)
+PROCEDURE ShimListen (bindAddress: ARRAY OF CHAR; port: INTEGER) : INTEGER ;
+
+(* ShimAccept waits up to timeoutMs milliseconds for one connection on
+   listenFd. Returns the accepted file descriptor, -1 on timeout, or -2 on
+   a fatal error. *)
+PROCEDURE ShimAccept (listenFd, timeoutMs: INTEGER) : INTEGER ;
+
+(* ShimCloseFd closes a plain file descriptor (a listening socket, or one
+   end of the adapter's stdio transport). *)
+PROCEDURE ShimCloseFd (fd: INTEGER) ;
+
+(* ShimSetNonBlocking marks fd O_NONBLOCK; used for the adapter's stdin
+   descriptor so the reactor loop can poll it alongside a WebSocket. *)
+PROCEDURE ShimSetNonBlocking (fd: INTEGER) ;
+
+(* ShimRandomBytes fills buf (length bytes) with cryptographically random
+   data, used for WebSocket masking keys and the Sec-WebSocket-Key header. *)
+PROCEDURE ShimRandomBytes (VAR buf: ARRAY OF CHAR; length: INTEGER) ;
+
+(* ShimSha1 hashes length bytes of data into the 20 byte outDigest buffer.
+   Used only to compute the WebSocket handshake's Sec-WebSocket-Accept
+   value; it is a generic cryptographic primitive, not Convex behaviour. *)
+PROCEDURE ShimSha1 (data: ARRAY OF CHAR; length: INTEGER; VAR outDigest: ARRAY OF CHAR) ;
+
+(* ShimMonotonicMs returns a monotonic millisecond clock used for timeouts,
+   backoff and the adapter's bounded write deadline. It is LONGINT because
+   CLOCK_MONOTONIC counts from an arbitrary point (often boot), which can
+   already exceed 2^31 milliseconds on a long lived host. *)
+PROCEDURE ShimMonotonicMs () : LONGINT ;
+
+(* ShimLastError copies the most recent error message (set by whichever of
+   the above calls most recently failed on this OS thread) into buf, up to
+   cap bytes, and returns the message's true length. The client is single
+   threaded, so one static buffer is sufficient and avoids any cross
+   language ownership of allocated memory. *)
+PROCEDURE ShimLastError (VAR buf: ARRAY OF CHAR; cap: INTEGER) : INTEGER ;
+
+(* ShimExit terminates the process immediately with the given exit code,
+   flushing nothing (the adapter writes every event through ShimWrite
+   directly, never through a buffered text channel, so there is nothing
+   language-runtime buffered left to lose). Used because this dialect's
+   portable pervasive procedures do not include a process-exit-code call. *)
+PROCEDURE ShimExit (code: INTEGER) ;
+
+END CShim.

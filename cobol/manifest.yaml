@@ -4,5 +4,57 @@ displayName: "COBOL"
 rank: 27
 selectionTier: ranked
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native GnuCOBOL client. JSON, HTTP/1.1 framing, the RFC 6455
+    WebSocket layer, and all Convex protocol behaviour are implemented
+    in COBOL. A reviewed native extension (client/convex-native.c)
+    supplies only what the COBOL runtime cannot: a monotonic clock, a
+    CSPRNG, a SHA-1 digest, and deadline-aware TCP and TLS stream I/O.
+    Every WORKING-STORAGE buffer is fixed at link time; the adapter's
+    shared 128 MiB memory-growth budget is met by having the JSON
+    module, the adapter, and the client redefine a handful of EXTERNAL
+    and in-program scratch regions instead of each owning a private
+    2 MiB "just in case" buffer, with any buffer a hostile document
+    could overflow bounds-checked against the real JSON span length
+    before it is ever copied.
+toolchain:
+  name: GnuCOBOL
+  version: 4.0~early~20200606-6+b1
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - COBOL has no threads, so the client is a cooperative single owner
+    rather than a worker plus mutexes. The caller drives the transport
+    by calling cvx-live-pump; nothing else touches the socket.
+  - Each subscription retains the newest 16 updates across the client
+    and drops the oldest when a consumer is slow.
+  - Live authentication, WebSocket mutations and actions, optimistic
+    updates, and mutation replay are deferred.
+  - TransitionChunk assembly is deferred and treated as profile drift
+    that retires the connection.
+  - Live values cover the JSON-safe subset; tagged Convex value types
+    are deferred.
+  - JSON numbers in exponent form round-trip verbatim but are not
+    reduced to integers.
+  - A stopped controller stalls the adapter. Events are written
+    synchronously with no output queue, so backpressure lands in the
+    kernel pipe; this is deliberate, and the accounting test asserts
+    it rather than working around it.
+capabilities:
+  - http
+  - live

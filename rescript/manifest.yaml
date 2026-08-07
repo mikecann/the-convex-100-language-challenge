@@ -4,5 +4,41 @@ displayName: "ReScript"
 rank: 98
 selectionTier: curated_backfill
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: transpiled
+  version: 0.1.0
+  notes: >-
+    Convex HTTP and the pinned convex-rs 0.10.4 sync profile are implemented in
+    ReScript. The ws package supplies WebSocket framing and Node supplies fetch;
+    every Convex-specific decision is ReScript. The Docker test target (format
+    check, compile, unit and conformance tests, canonical example, adapter
+    protocol smoke test) passes on native linux/amd64; verify and verify-hosted
+    have not run, so no capability is claimed.
+toolchain:
+  name: ReScript and Node.js
+  version: ReScript 11.1.4, Node.js 22.16.0
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities: [http, live]
+platforms: [linux/amd64]
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands: [debugDisconnect]
+limitations:
+  - The Docker test target (format check, compile, language-local unit and conformance tests, canonical example, adapter protocol smoke test) passes on native linux/amd64; shared local and hosted conformance have not run yet, so no capability badge is claimed.
+  - >-
+    ReScript compiles to JavaScript and has no other execution target, so
+    the runtime images carry node as the declared target runtime. Shared
+    review approved that for compile-to-JavaScript languages; every Convex
+    behaviour is still implemented in ReScript.
+  - Live authentication, WebSocket mutations and actions, optimistic updates, journals, and mutation replay are deferred.
+  - TransitionChunk assembly and non-JSON Convex value encodings are treated as pinned-profile drift and end the connection with a structured ProtocolError.
+  - ws enforces a 2 MiB message bound and 5 second handshake deadline. A 5 second ping/pong guard retires an incomplete-frame socket within 10 seconds; this delegated behaviour still needs a hostile-peer Docker proof.
+  - HTTP response bodies are streamed under a 2 MiB decoded-body limit and 10 second absolute deadline. Live delivery uses a bounded newest-value queue per subscription of 16 updates and 1 MiB, and the adapter bounds its own unflushed output to 16 records and 8 MiB.
+targetRuntimeCommand: node
+capabilities:
+  - http
+  - live

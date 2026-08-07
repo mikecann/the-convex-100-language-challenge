@@ -1,0 +1,167 @@
+(*FixtureServer is a standalone, test-only executable: it runs the server
+  side of one Convex /api/sync WebSocket session on 127.0.0.1, scripted
+  just enough to exercise this client's Live acceptance behaviour end to
+  end (see AGENTS.md). It is not part of the public client; the Docker
+  test stage runs it as a background process alongside TestLive, the same
+  two-process pattern this project's other compiled clients use for
+  deterministic Live tests, because proving a real reconnect needs two
+  independently scheduled peers, not two threads pretending to be one.
+
+  Script: accept connection 1, read Connect, read one ModifyQuerySet
+  carrying both subscriptions' Add (room "x" and a demo:requiresNonzero
+  style room "y" that is expected to fail), send a Transition with x's
+  count 0, send a QueryFailed for y, send a QueryUpdated with x's count 1
+  (the "external update"), then close the connection abruptly (no close
+  frame) to force a client reconnect; accept connection 2, expect one
+  ModifyQuerySet resending both Adds, send a fresh Transition with x's
+  count still 1 (unchanged - this must not surface as a new event), then
+  a QueryUpdated with y's count 2 (recovered), then stop.*)
+MODULE FixtureServer;
+
+	IMPORT F := ConvexFixture, J := ConvexJSON, Shim := ConvexShim, Out;
+
+	VAR
+		msg: ARRAY 8192 OF CHAR;
+		out: ARRAY 8192 OF CHAR;
+		outLen: INTEGER;
+		typeRaw: ARRAY 64 OF CHAR;
+		found: BOOLEAN;
+		queryIdX, queryIdY: INTEGER;
+
+	PROCEDURE Log(text: ARRAY OF CHAR);
+	BEGIN
+		Out.String("fixture: "); Out.String(text); Out.Ln
+	END Log;
+
+	PROCEDURE Die(text: ARRAY OF CHAR);
+	BEGIN
+		Log(text);
+		Shim.Exit(1)
+	END Die;
+
+	(*ReadBothAddQueryIds reads one ModifyQuerySet message and returns the
+	  queryId of each of its two Add modifications, in wire order. This
+	  fixture's script always subscribes room x before room y, and
+	  ConvexSync always flushes every pending Add it already knows about
+	  into one ModifyQuerySet (see ConvexSync.obn's BuildSnapshotAdds), so
+	  both the very first message and the post-reconnect resend carry
+	  exactly two Add modifications in that order.*)
+	PROCEDURE ReadBothAddQueryIds(VAR firstId, secondId: INTEGER);
+	VAR
+		modsText, element, idRaw: ARRAY 2048 OF CHAR;
+		found2, ok, more: BOOLEAN;
+		cursor, count, parsed: INTEGER;
+	BEGIN
+		IF ~F.ReceiveText(10000, msg) THEN Die("did not receive the resent ModifyQuerySet") END;
+		ok := J.Member(msg, "modifications", modsText, found2) & found2;
+		IF ~ok THEN Die("ModifyQuerySet omitted modifications") END;
+		ok := J.ArrayBegin(modsText, cursor);
+		IF ~ok THEN Die("modifications was not an array") END;
+		count := 0;
+		more := J.ArrayNext(modsText, cursor, element);
+		WHILE more DO
+			ok := J.Member(element, "queryId", idRaw, found2) & found2;
+			IF ok THEN ok := J.ParseNonNegativeInt(idRaw, parsed) END;
+			IF ~ok THEN Die("Add modification omitted a valid queryId") END;
+			IF count = 0 THEN firstId := parsed ELSE secondId := parsed END;
+			INC(count);
+			more := J.ArrayNext(modsText, cursor, element)
+		END;
+		IF count # 2 THEN Die("expected exactly two Add modifications") END
+	END ReadBothAddQueryIds;
+
+	(*Lit/Int append to the module level out/outLen buffer; see
+	  ConvexSync.obn's AppendBuf for why these are module level procedures
+	  rather than nested inside BuildTransition, and for the backtick
+	  convention that stands in for a literal double quote.*)
+	PROCEDURE Lit(text: ARRAY OF CHAR);
+	VAR n, j: INTEGER;
+	BEGIN
+		n := 0;
+		WHILE text[n] # 0X DO INC(n) END;
+		j := 0;
+		WHILE j < n DO
+			IF text[j] = "`" THEN out[outLen] := CHR(34) ELSE out[outLen] := text[j] END;
+			INC(outLen); INC(j)
+		END
+	END Lit;
+
+	PROCEDURE Int(value: INTEGER);
+	VAR digits: ARRAY 16 OF CHAR; dc, v: INTEGER;
+	BEGIN
+		IF value = 0 THEN
+			Lit("0")
+		ELSE
+			dc := 0; v := value;
+			WHILE v > 0 DO digits[dc] := CHR(ORD("0") + (v MOD 10)); v := v DIV 10; INC(dc) END;
+			WHILE dc > 0 DO DEC(dc); out[outLen] := digits[dc]; INC(outLen) END
+		END
+	END Int;
+
+	PROCEDURE BuildTransition(queryId, startQuerySet, endQuerySet, count: INTEGER; failed: BOOLEAN);
+	BEGIN
+		outLen := 0;
+		Lit("{`type`:`Transition`,`startVersion`:{`identity`:0,`querySet`:");
+		Int(startQuerySet);
+		Lit(",`ts`:`AAAAAAAAAAA=`},`endVersion`:{`identity`:0,`querySet`:");
+		Int(endQuerySet);
+		Lit(",`ts`:`AAAAAAAAAAA=`},`modifications`:[{`queryId`:");
+		Int(queryId);
+		IF failed THEN
+			Lit(",`type`:`QueryFailed`,`errorMessage`:`room is empty`,`errorData`:{`code`:`ROOM_EMPTY`},`logLines`:[]")
+		ELSE
+			Lit(",`type`:`QueryUpdated`,`value`:{`count`:");
+			Int(count);
+			Lit("},`logLines`:[]")
+		END;
+		Lit("}]}");
+		out[outLen] := 0X
+	END BuildTransition;
+
+BEGIN
+	IF ~F.Listen("127.0.0.1", 19191) THEN Die("listen failed") END;
+	Log("listening on 127.0.0.1:19191");
+
+	IF ~F.Accept(20000) THEN Die("accept 1 failed") END;
+	Log("accepted connection 1");
+
+	IF ~F.ReceiveText(10000, msg) THEN Die("did not receive Connect") END;
+	IF ~J.Member(msg, "type", typeRaw, found) THEN Die("Connect had no type") END;
+
+	ReadBothAddQueryIds(queryIdX, queryIdY);
+	Log("received Add for room x and room y");
+
+	BuildTransition(queryIdX, 0, 1, 0, FALSE);
+	IF ~F.SendText(out, outLen) THEN Die("send initial Transition failed") END;
+	Log("sent initial value 0");
+
+	BuildTransition(queryIdY, 1, 2, 0, TRUE);
+	IF ~F.SendText(out, outLen) THEN Die("send QueryFailed failed") END;
+	Log("sent QueryFailed for room y");
+
+	BuildTransition(queryIdX, 2, 3, 1, FALSE);
+	IF ~F.SendText(out, outLen) THEN Die("send external update failed") END;
+	Log("sent external update (count 1)");
+
+	F.CloseAbruptly;
+	Log("closed connection 1 abruptly");
+
+	IF ~F.Accept(20000) THEN Die("accept 2 failed") END;
+	Log("accepted connection 2 (reconnect)");
+
+	IF ~F.ReceiveText(10000, msg) THEN Die("did not receive Connect on reconnect") END;
+
+	ReadBothAddQueryIds(queryIdX, queryIdY);
+	Log("client resent both Adds after reconnect");
+
+	BuildTransition(queryIdX, 0, 1, 1, FALSE);
+	IF ~F.SendText(out, outLen) THEN Die("send post-reconnect value failed") END;
+	Log("sent post-reconnect value (count 1, unchanged)");
+
+	BuildTransition(queryIdY, 1, 2, 2, FALSE);
+	IF ~F.SendText(out, outLen) THEN Die("send recovered room y value failed") END;
+	Log("sent recovered room y value (count 2)");
+
+	F.StopListening;
+	Log("done")
+END FixtureServer.

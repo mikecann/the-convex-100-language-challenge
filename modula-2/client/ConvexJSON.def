@@ -1,0 +1,70 @@
+(* ConvexJSON is a minimal, allocation-free JSON reader and writer over
+   fixed ARRAY OF CHAR buffers. It never builds a parse tree: member lookup
+   and array iteration work by scanning byte positions and returning the
+   still-encoded substring for the piece the caller asked for, which the
+   caller then re-parses if it is itself an object or array. This mirrors
+   how the other compiled clients in this project (Fortran, Ada) parse
+   Convex's JSON without a dynamic tree allocator. This module, the sync
+   protocol state machine in ConvexSync, and the client API in Convex are
+   the parts of this codebase that encode "Convex behaviour is implemented
+   in the target language": nothing here is generated or delegated. *)
+
+DEFINITION MODULE ConvexJSON;
+
+(* Member scans doc, which must be exactly one JSON object (optional
+   surrounding whitespace, nothing else trailing). Returns FALSE if doc is
+   not syntactically a single valid JSON object. Otherwise returns TRUE;
+   if key is present as a member, found is set TRUE and value receives the
+   exact (still JSON-encoded) substring of its value. If key is absent,
+   found is set FALSE and value is left empty. Duplicate keys make the
+   document invalid. *)
+PROCEDURE Member (VAR doc: ARRAY OF CHAR; key: ARRAY OF CHAR;
+                   VAR value: ARRAY OF CHAR; VAR found: BOOLEAN) : BOOLEAN;
+
+(* ArrayBegin checks that array starts (after optional whitespace) with
+   '['. On success it sets cursor to resume scanning with ArrayNext and
+   returns TRUE. *)
+PROCEDURE ArrayBegin (VAR array: ARRAY OF CHAR; VAR cursor: INTEGER) : BOOLEAN;
+
+(* ArrayNext advances cursor over one array element (of any JSON value
+   type) and returns its raw substring in element. Returns FALSE, with
+   element left empty, once the closing ']' has been consumed; the caller
+   distinguishes "no more elements" from "malformed array" by then checking
+   ArrayWellFormed. *)
+PROCEDURE ArrayNext (VAR array: ARRAY OF CHAR; VAR cursor: INTEGER;
+                      VAR element: ARRAY OF CHAR) : BOOLEAN;
+
+(* ArrayWellFormed reports whether the scan that just stopped (ArrayNext
+   returned FALSE) ended on a clean ']' with nothing trailing, as opposed
+   to a parse failure partway through the array. *)
+PROCEDURE ArrayWellFormed (VAR array: ARRAY OF CHAR; cursor: INTEGER) : BOOLEAN;
+
+(* StringArrayValid reports whether doc is exactly a JSON array of string
+   literals (used to validate logLines). *)
+PROCEDURE StringArrayValid (VAR doc: ARRAY OF CHAR) : BOOLEAN;
+
+(* DecodeString decodes a JSON string literal (raw must include the
+   surrounding quotes) into its UTF-8 text, handling backslash escapes and
+   \uXXXX / surrogate pairs. Returns FALSE on malformed escapes or if
+   decoded does not have room for the result. *)
+PROCEDURE DecodeString (VAR raw: ARRAY OF CHAR; VAR decoded: ARRAY OF CHAR) : BOOLEAN;
+
+(* AppendQuoted JSON-quotes text (adding escapes as needed) and appends the
+   quoted literal, including its surrounding quotes, to destination, which
+   must already hold a NUL terminated value and have room for the result.
+   Returns FALSE (leaving destination unchanged) if it would not fit. *)
+PROCEDURE AppendQuoted (VAR text: ARRAY OF CHAR; VAR destination: ARRAY OF CHAR) : BOOLEAN;
+
+(* ParseNonNegativeInt parses raw (a bare JSON number, no surrounding
+   syntax) as a non-negative decimal integer. Returns FALSE for anything
+   fractional, signed, exponential, or out of range. *)
+PROCEDURE ParseNonNegativeInt (VAR raw: ARRAY OF CHAR; VAR value: INTEGER) : BOOLEAN;
+
+(* IsIntegralNumber reports whether raw is a JSON number token that is
+   mathematically integral (e.g. "1", "-3", "0.0", "2.0e1" all qualify;
+   "1.5" and "NaN"-shaped tokens do not). Convex may send JSON integers in
+   decimal form such as 1.0, and callers that expect a whole number must
+   accept that shape while rejecting genuinely fractional values. *)
+PROCEDURE IsIntegralNumber (VAR raw: ARRAY OF CHAR) : BOOLEAN;
+
+END ConvexJSON.

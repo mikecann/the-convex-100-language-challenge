@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: mql5
-displayName: "MQL5"
-rank: 67
-selectionTier: coverage
-implementation:
-  status: planned
-capabilities: []

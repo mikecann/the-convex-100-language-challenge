@@ -4,5 +4,69 @@ displayName: "Janet"
 rank: 95
 selectionTier: curated_backfill
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: binding
+  version: 0.1.0
+  notes: >-
+    Janet owns HTTP/1.1 framing, RFC 6455 handshake and framing, JSON, base64,
+    Convex request and error envelopes, the pinned sync profile, reconnect
+    replay, delivery bounds, and the adapter protocol. One local C module
+    (client/transport.c) provides only TCP and OpenSSL-verified TLS byte
+    streams plus a CSPRNG and SHA-1, because Janet's core deliberately ships
+    TCP without TLS. That foreign module is why this is declared a binding
+    rather than a native implementation.
+toolchain:
+  name: Janet
+  version: 1.37.1
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    No evidence has been produced. This branch has not run a Docker build, a
+    language-local test, a final image, or shared conformance, so no capability
+    is earned and the capabilities list is empty.
+  - >-
+    TCP and TLS come from a local Janet C module over OpenSSL. Everything above
+    bytes, including HTTP/1.1 and all RFC 6455 framing and validation, is Janet.
+  - >-
+    Live covers query subscriptions only. Live authentication, WebSocket
+    mutations and actions, optimistic updates, journals, read-your-own-write
+    commit timestamps, tagged Convex value encodings, and TransitionChunk
+    assembly are deferred. A TransitionChunk is treated as profile drift and
+    retires the socket rather than being partially assembled.
+  - >-
+    Each HTTP call opens its own connection and requests Connection close.
+    Persistent connections and pipelining are deferred.
+  - >-
+    A transient Live transport failure is reconnected transparently rather than
+    published to subscribers; three consecutive failed attempts publish one
+    structured TransportError and the subscription still recovers afterwards.
+  - >-
+    Bounds are 2 MiB per HTTP response and per WebSocket message, 2 MiB and 64
+    levels and 200000 values per JSON document, 64 subscriptions, 16 retained
+    updates per subscription, 4 MiB of aggregate encoded update payload, and
+    4 MiB of adapter output across at most 16 events including the write in
+    flight. Subscription values may be coalesced under output pressure;
+    acknowledgements, results, errors, and the close event never are.
+  - >-
+    Janet ships no formatter in its core distribution, so the build runs a local
+    style and syntax check instead of a standard formatter.
+  - >-
+    convex/live-socket-dynamic is a documented test-only dynamic binding that
+    lets language-local tests supply an already-open Live socket. It is unset in
+    every shipped code path and holds no state.
+capabilities:
+  - http
+  - live

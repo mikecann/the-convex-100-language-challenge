@@ -1,0 +1,54 @@
+(* ConvexWS is a singleton RFC 6455 WebSocket client: this process ever
+   holds one Live connection at a time (matching the Convex sync protocol,
+   which multiplexes every subscription over one socket), so its state is
+   plain module storage rather than a handle the caller threads through.
+   ConvexWS performs the HTTP Upgrade handshake and the frame format
+   (masking, fragmentation, control frames) itself in Modula-2 on top of
+   CShim's raw socket/TLS primitives; only the socket, TLS and a couple of
+   generic crypto primitives (SHA-1 for the handshake, random bytes for the
+   mask key) are foreign. ConvexSync.mod is the layer above this one that
+   knows what a Convex sync-protocol message looks like. *)
+
+DEFINITION MODULE ConvexWS;
+
+CONST
+  MaxMessage = 4194304; (* 4 MiB: this client's documented Live message cap *)
+
+(* Open performs a TCP connect, TLS handshake when the URL is wss://, and
+   the WebSocket HTTP Upgrade handshake, replacing any previously open
+   connection. clientVersion appears in the handshake's User-Agent header
+   only (never sent to the Convex protocol layer). *)
+PROCEDURE Open (url: ARRAY OF CHAR; clientVersion: ARRAY OF CHAR; timeoutMs: INTEGER;
+                 VAR ok: BOOLEAN; VAR errorText: ARRAY OF CHAR);
+
+(* SendText sends the first length bytes of text as one unfragmented masked
+   text frame, bounded by an absolute ShimMonotonicMs deadline. *)
+PROCEDURE SendText (VAR text: ARRAY OF CHAR; length: INTEGER; deadlineMs: LONGINT;
+                     VAR ok: BOOLEAN; VAR errorText: ARRAY OF CHAR);
+
+(* Receive waits up to timeoutMs for the connection to make progress. Frame
+   parsing state persists across calls, so a timeout (or several) never
+   loses partially read bytes and never resynchronises at a false frame
+   boundary. Ping frames are answered with a pong and otherwise absorbed
+   automatically; this call never reports one to the caller. status is set
+   to: 0 (timeout, call again later - no complete message), 1 (text, with
+   length bytes of decoded UTF-8 in text), 2 (the peer closed the
+   connection, gracefully or otherwise), or -1 (a fatal transport or
+   framing error, with errorText set - the connection should be
+   considered dead and Close()d). *)
+PROCEDURE Receive (timeoutMs: INTEGER;
+                    VAR text: ARRAY OF CHAR; VAR length: INTEGER;
+                    VAR status: INTEGER; VAR errorText: ARRAY OF CHAR);
+
+(* Fd exposes the underlying descriptor so a caller can multiplex this
+   connection with another input (such as the adapter's command stream) in
+   its own poll() call before invoking Receive. *)
+PROCEDURE Fd () : INTEGER;
+
+PROCEDURE IsOpen () : BOOLEAN;
+
+(* Close sends a close frame on a best-effort basis (bounded, never blocks
+   long) and releases the connection. Safe to call when not open. *)
+PROCEDURE Close ();
+
+END ConvexWS.

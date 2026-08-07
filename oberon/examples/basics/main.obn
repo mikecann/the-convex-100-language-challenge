@@ -1,0 +1,189 @@
+(*Convex from Oberon-07: the canonical "shared counter" walkthrough.
+
+  This program is the single source of truth for the code shown in the
+  README and on the project website; ./run sync-examples projects this
+  exact file there, comments and all.
+
+  It demonstrates, over a real Convex deployment:
+    - configuring the client from the deployment URL,
+    - an HTTP query,
+    - opening a Live subscription and reading its initial value,
+    - an idempotent HTTP mutation,
+    - the Live update that the mutation produces,
+    - and orderly shutdown.*)
+MODULE main;
+
+	IMPORT J := ConvexJSON, S := ConvexSync, Shim := ConvexShim, extEnv, extArgs, Out;
+
+	CONST MaxJson = 65536;
+
+	VAR
+		url: ARRAY 512 OF CHAR;
+		room: ARRAY 256 OF CHAR;
+		args, value, logs, errorName, errorMessage, errorData: ARRAY MaxJson OF CHAR;
+		hasErrorData, ok: BOOLEAN;
+		transportError: ARRAY 256 OF CHAR;
+		handle, count: INTEGER;
+		haveUrlRes, roomRes: INTEGER;
+
+	(*AppendLit appends a 0X terminated literal to a 0X terminated buffer;
+	  Oberon has no string concatenation operator. A backtick stands in
+	  for a literal double quote, since OBNC's lexer accepts neither an
+	  escaped quote nor the language report's alternative single quote
+	  delimiter (see ConvexSync.obn's AppendBuf for the same convention).*)
+	PROCEDURE AppendLit(text: ARRAY OF CHAR; VAR destination: ARRAY OF CHAR);
+	VAR base, extra, i: INTEGER;
+	BEGIN
+		base := 0;
+		WHILE destination[base] # 0X DO INC(base) END;
+		extra := 0;
+		WHILE text[extra] # 0X DO INC(extra) END;
+		i := 0;
+		WHILE i < extra DO
+			IF text[i] = "`" THEN destination[base + i] := CHR(34) ELSE destination[base + i] := text[i] END;
+			INC(i)
+		END;
+		destination[base + extra] := 0X
+	END AppendLit;
+
+	(*Fail prints a diagnostic and exits non zero: the example must fail
+	  loudly on any unexpected value, not just when a call errors
+	  outright.*)
+	PROCEDURE Fail(message: ARRAY OF CHAR);
+	BEGIN
+		Out.String("basics: "); Out.String(message); Out.Ln;
+		Shim.Exit(1)
+	END Fail;
+
+	(*DecodeCount extracts the "count" member of a Convex demo:state style
+	  JSON object and decodes it as an ordinary integer. Convex may encode
+	  a whole number in JSON's integral float form (0.0, 1.0); this only
+	  accepts values that are mathematically integral, matching
+	  AGENTS.md's requirement that example decoding reject genuinely
+	  fractional values rather than silently truncating them.*)
+	PROCEDURE DecodeCount(VAR json: ARRAY OF CHAR; VAR result: INTEGER): BOOLEAN;
+	VAR raw: ARRAY 64 OF CHAR; found, negative, ok: BOOLEAN; i, cap: INTEGER;
+	BEGIN
+		ok := J.Member(json, "count", raw, found) & found;
+		IF ok THEN ok := J.IsIntegralNumber(raw) END;
+		IF ok THEN
+			cap := 0;
+			WHILE raw[cap] # 0X DO INC(cap) END;
+			negative := FALSE;
+			i := 0;
+			IF (cap > 0) & (raw[0] = "-") THEN negative := TRUE; i := 1 END;
+			result := 0;
+			WHILE (i < cap) & (raw[i] >= "0") & (raw[i] <= "9") DO
+				result := result * 10 + (ORD(raw[i]) - ORD("0"));
+				INC(i)
+			END;
+			IF negative THEN result := -result END
+		END;
+		RETURN ok
+	END DecodeCount;
+
+	PROCEDURE AwaitLiveCount(targetHandle: INTEGER; VAR result: INTEGER);
+	VAR
+		eventKind, eventHandle, waited: INTEGER;
+		eventValue, eventLogs, eventErrorName, eventErrorMessage, eventErrorData: ARRAY MaxJson OF CHAR;
+		eventHasErrorData, done, decoded: BOOLEAN;
+	BEGIN
+		waited := 0;
+		done := FALSE;
+		WHILE ~done DO
+			S.Pump(200, eventKind, eventHandle, eventValue, eventLogs, eventErrorName, eventErrorMessage, eventErrorData, eventHasErrorData);
+			IF (eventKind # 0) & (eventHandle = targetHandle) THEN
+				IF eventKind = 2 THEN Fail("Live subscription failed unexpectedly") END;
+				decoded := DecodeCount(eventValue, result);
+				IF ~decoded THEN Fail("Live value was not a demo:state object") END;
+				done := TRUE
+			ELSE
+				INC(waited);
+				IF waited > 150 THEN Fail("timed out waiting for a Live update") END
+			END
+		END
+	END AwaitLiveCount;
+
+	(*CheckMutationResult validates demo:increment's {"applied":true,
+	  "state":{...,"count":1,...}} shape without assuming field order.*)
+	PROCEDURE CheckMutationResult(VAR result: ARRAY OF CHAR);
+	VAR appliedRaw, stateRaw: ARRAY MaxJson OF CHAR; found, decoded: BOOLEAN; stateCount: INTEGER;
+	BEGIN
+		IF ~(J.Member(result, "applied", appliedRaw, found) & found) THEN
+			Fail("unexpected mutation result")
+		END;
+		IF ~((appliedRaw[0] = "t") & (appliedRaw[1] = "r") & (appliedRaw[2] = "u") & (appliedRaw[3] = "e") & (appliedRaw[4] = 0X)) THEN
+			Fail("unexpected mutation result")
+		END;
+		IF ~(J.Member(result, "state", stateRaw, found) & found) THEN
+			Fail("unexpected mutation result")
+		END;
+		decoded := DecodeCount(stateRaw, stateCount);
+		IF ~decoded OR (stateCount # 1) THEN
+			Fail("unexpected mutation result")
+		END
+	END CheckMutationResult;
+
+BEGIN
+	(*Configure this client from the verifier-selected deployment. The
+	  dedicated public demo functions need no authentication token.*)
+	url[0] := 0X;
+	extEnv.Get("CONVEX_URL", url, haveUrlRes);
+	IF haveUrlRes < 0 THEN Fail("CONVEX_URL is required") END;
+	S.Init(url, "");
+
+	(*Accept the verifier's unique room ID as argv[1], with a friendly
+	  default for anyone running the image by hand.*)
+	IF extArgs.count > 0 THEN
+		extArgs.Get(0, room, roomRes)
+	ELSE
+		AppendLit("oberon-basic-example", room)
+	END;
+
+	(*Query the counter over HTTP before opening the Live subscription, so
+	  the printed transcript always starts from a known value.*)
+	args[0] := 0X;
+	AppendLit("{`room`:", args);
+	IF ~J.AppendQuoted(room, args) THEN Fail("room id was too long") END;
+	AppendLit("}", args);
+	S.Call("query", "demo:state", args, value, logs, errorName, errorMessage, errorData, hasErrorData, ok, transportError);
+	IF ~ok THEN Fail(transportError) END;
+	IF errorName[0] # 0X THEN Fail("unexpected initial HTTP value") END;
+	IF ~DecodeCount(value, count) OR (count # 0) THEN Fail("unexpected initial HTTP value") END;
+	Out.String("current count: 0"); Out.Ln;
+
+	(*Start the Live subscription before the mutation, so the mutation
+	  cannot race past it.*)
+	S.Subscribe("demo:state", args, handle, ok, transportError);
+	IF ~ok THEN Fail(transportError) END;
+	AwaitLiveCount(handle, count);
+	IF count # 0 THEN Fail("unexpected initial Live value") END;
+	Out.String("live initial count: 0"); Out.Ln;
+
+	(*The room-specific idempotency key makes a retry of this example
+	  safe: this mutation increments the counter at most once.*)
+	args[0] := 0X;
+	AppendLit("{`room`:", args);
+	IF ~J.AppendQuoted(room, args) THEN Fail("room id was too long") END;
+	AppendLit(",`language`:`Oberon-07`,`runId`:`", args);
+	AppendLit(room, args);
+	AppendLit("-once`}", args);
+	S.Call("mutation", "demo:increment", args, value, logs, errorName, errorMessage, errorData, hasErrorData, ok, transportError);
+	IF ~ok THEN Fail(transportError) END;
+	IF errorName[0] # 0X THEN Fail("unexpected mutation result") END;
+	CheckMutationResult(value);
+	Out.String("mutation applied: true"); Out.Ln;
+	Out.String("mutation count: 1"); Out.Ln;
+
+	(*Wait for the server Transition carrying the same updated counter.*)
+	AwaitLiveCount(handle, count);
+	IF count # 1 THEN Fail("unexpected updated Live value") END;
+	Out.String("live updated count: 1"); Out.Ln;
+
+	(*Unsubscribe before the process exits so the server sees an orderly
+	  close rather than a dropped connection.*)
+	S.Unsubscribe(handle);
+
+	(*Stdout is deliberately this exact six line happy-path transcript.*)
+	Out.String("verified count: 0 -> 1"); Out.Ln
+END main.

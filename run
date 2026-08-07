@@ -161,6 +161,71 @@ image_policy() {
   printf '%s\n' "PASS $language final image policy"
 }
 
+# Every language's Dockerfile ends with a loop meant to prove no compiler,
+# package manager or shell toolbox survived its prune. Those loops could not
+# fail: POSIX gives a `for` loop only its last iteration's exit status, and it
+# exempts a pipeline beginning with `!` from `set -e`, so both the per-name
+# result and the loop result were discarded. An audit of the images found real
+# leakage behind that gap, so the check lives here now — once, where it cannot
+# be copied wrong.
+#
+# The inspection reads the image's own filesystem listing rather than running a
+# shell inside it. Several of these images have no usable `printf`, `echo` or
+# `command` builtin, which is exactly how a check written to run in-image
+# becomes unreliable in the images that need it most.
+toolchain_policy() {
+  language=$1
+  image="100-convex-clients-$language:local"
+
+  forbidden='cc gcc g++ clang make ld as ar cmake rustc cargo javac
+    apt apt-get apt-cache dpkg dpkg-deb apk rpm yum dnf
+    busybox wget nc netcat telnet ftpget ftpput ftpd tftp httpd inetd
+    gdb strace ltrace perl lua'
+
+  container=$(docker create --platform linux/amd64 "$image")
+  listing=$(docker export "$container" | tar -t 2>/dev/null || true)
+  docker rm -f "$container" >/dev/null 2>&1 || true
+
+  # Surround with newlines so a whole-line match is a plain substring test. This
+  # stays inside the shell rather than spawning a grep per candidate path.
+  listing="
+$listing
+"
+
+  found=""
+  for command_name in $forbidden; do
+    # A language legitimately ships its own interpreter; the name is only
+    # forbidden in images with no claim to it. Delegated runtimes (node, php,
+    # python) are already covered by image_policy above.
+    case "$language:$command_name" in
+      perl:perl | lua:lua) continue ;;
+    esac
+    for directory in bin sbin usr/bin usr/sbin usr/local/bin usr/local/sbin; do
+      case "$listing" in
+        *"
+$directory/$command_name
+"*)
+          found="$found $directory/$command_name"
+          ;;
+      esac
+    done
+  done
+
+  if test -n "$found"; then
+    printf '%s\n' "FAIL $language final image toolchain policy" >&2
+    printf '%s\n' "Present in the runtime image:$found" >&2
+    printf '%s\n' "" >&2
+    printf '%s\n' "The runtime image must contain nothing beyond what serving Convex" >&2
+    printf '%s\n' "traffic requires. If this image is built FROM the stock busybox" >&2
+    printf '%s\n' "image, note that it ships httpd, ftpd, inetd, wget, nc and telnet as" >&2
+    printf '%s\n' "applets. Build a trimmed busybox with a restricted applet list — see" >&2
+    printf '%s\n' "gdscript/Dockerfile for the pattern — or use a scratch base." >&2
+    exit 1
+  fi
+
+  printf '%s\n' "PASS $language final image toolchain policy"
+}
+
 build_client_image() {
   language=$1
   evidence_oci_path=${EVIDENCE_OCI_PATH:-}
@@ -449,6 +514,7 @@ case "$command_name" in
     "$repo_root/run" test "$language"
     "$repo_root/run" build "$language"
     image_policy "$language"
+    toolchain_policy "$language"
     build_example_image "$language"
     run_example_verification "$language" http://backend:3210 self-hosted
     client_digest=$(
@@ -477,6 +543,7 @@ case "$command_name" in
     "$repo_root/run" test "$language"
     "$repo_root/run" build "$language"
     image_policy "$language"
+    toolchain_policy "$language"
     build_example_image "$language"
     run_example_verification "$language" https://usable-reindeer-44.convex.cloud hosted
     client_digest=$(
@@ -505,6 +572,7 @@ case "$command_name" in
     "$repo_root/run" test "$language"
     build_client_image "$language"
     image_policy "$language"
+    toolchain_policy "$language"
     build_example_image "$language"
     run_example_verification "$language" http://backend:3210 self-hosted
     run_example_verification "$language" https://usable-reindeer-44.convex.cloud hosted
