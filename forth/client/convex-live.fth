@@ -750,10 +750,22 @@ variable live-slice-deadline
 : live-connect-now ( -- )
     0 0 { live absolute }
     live-current @ to live
-    live-slice-deadline @ to absolute
+    \ A (re)connect gets its own full budget rather than the caller's slice
+    \ deadline. live-pump normally bounds each tick to adapter-slice-ms (50ms)
+    \ so that neither the controller stream nor the Convex socket waits long
+    \ behind the other, but a real TCP connect plus TLS handshake routinely
+    \ needs far more than that over a real network -- 50ms is only enough on
+    \ loopback. Clamping the connect deadline to the inherited slice made
+    \ every automatic reconnect over TLS fail with "TLS handshake timed out"
+    \ well before the handshake had a chance to finish. The bootstrap connect
+    \ from live-subscribe avoided this only because it pre-loads
+    \ live-slice-deadline with a full cvx-ws-connect-deadline budget before
+    \ calling live-pump; computing that budget here directly makes every
+    \ (re)connect get it, bootstrap or automatic alike.
+    cvx-ws-connect-deadline deadline+ to absolute
     live lv>client + @ client-dep
     cvx-sync-endpoint
-    cvx-ws-connect-deadline deadline+ absolute min
+    absolute
     ws-connect live lv>ws + !
     live absolute live-send-connect
     live absolute live-send-full-query-set
