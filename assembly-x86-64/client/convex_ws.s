@@ -1140,9 +1140,16 @@ ws_take_frame:
     mov [rbp+TF_DBGTMP], rax
     mov edi, 's'
     call dbg_mark_ws
+    mov rdi, [rbp+TF_DBGTMP]
+    call dbg_num
+    mov rdi, [rbp+TF_BASE]
+    call dbg_num
     mov rax, [rbp+TF_DBGTMP]
     test rax, rax
     jz .oom
+    mov edi, 'z'
+    call dbg_mark_ws
+    mov rax, [rbp+TF_DBGTMP]
     mov rdi, rax
     mov rsi, [rbp+TF_BASE]
     add rsi, [rbp+TF_HDRLEN]
