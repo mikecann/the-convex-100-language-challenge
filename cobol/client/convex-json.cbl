@@ -51,13 +51,15 @@ COPY "cvx-limits.cpy".
 01 WS-HEX-DIGITS            PIC X(16) VALUE "0123456789abcdef".
 
 *> One document slot, reused in sequence by the HTTP reply, the
-*> adapter's own inbound command, and the incoming Live frame.
+*> adapter's own inbound command, and the incoming Live frame. The
+*> node table stays private to this program (nothing outside it ever
+*> needs to see how a document was indexed), but the 2 MiB source text
+*> itself is the shared external scratch: see cvx-scratch.cpy.
 01 WS-DOCS.
    05 WS-DOC OCCURS 1 TIMES.
       10 WS-DOC-LEN         BINARY-LONG.
       10 WS-DOC-ROOT        BINARY-LONG.
       10 WS-DOC-COUNT       BINARY-LONG.
-      10 WS-DOC-SRC         PIC X(2097152).
       10 WS-DOC-NODE OCCURS 8192 TIMES.
          15 WS-N-TYPE       BINARY-LONG.
          15 WS-N-START      BINARY-LONG.
@@ -69,6 +71,15 @@ COPY "cvx-limits.cpy".
          15 WS-N-NEXT       BINARY-LONG.
          15 WS-N-INT        BINARY-DOUBLE.
          15 WS-N-IS-INT     BINARY-LONG.
+
+COPY "cvx-scratch.cpy".
+*> The one document slot's 2 MiB source text. cvx-json-parse below
+*> still copies its caller's buffer in here rather than aliasing it
+*> directly, so this redefinition is what actually saves the memory:
+*> whichever program last redefined CVX-SHARED-SCRATCH for its own
+*> 2 MiB scratch (the adapter's WS-ESC group) and this program's own
+*> copy of a parsed document occupy the very same physical page.
+01 WS-DOC-SRC REDEFINES CVX-SHARED-SCRATCH PIC X(2097152).
 
 *> Parser working state.
 01 WS-D                     BINARY-LONG.
@@ -154,7 +165,7 @@ ENTRY "cvx-json-parse" USING LK-SLOT LK-BUF LK-LEN LK-STATUS.
         GOBACK
     END-IF
 
-    MOVE LK-BUF(1:LK-LEN) TO WS-DOC-SRC(WS-D)(1:LK-LEN)
+    MOVE LK-BUF(1:LK-LEN) TO WS-DOC-SRC(1:LK-LEN)
     MOVE LK-LEN TO WS-DOC-LEN(WS-D)
     MOVE LK-LEN TO WS-LEN
     MOVE 0 TO WS-DOC-COUNT(WS-D)
@@ -222,7 +233,7 @@ ENTRY "cvx-json-member" USING LK-SLOT LK-NODE LK-KEY LK-KEY-LEN
     PERFORM UNTIL WS-I = 0
         IF WS-N-KEY-LEN(WS-D, WS-I) = LK-KEY-LEN
             MOVE WS-N-KEY-START(WS-D, WS-I) TO WS-J
-            IF WS-DOC-SRC(WS-D)(WS-J:LK-KEY-LEN)
+            IF WS-DOC-SRC(WS-J:LK-KEY-LEN)
                     = LK-KEY(1:LK-KEY-LEN)
                 MOVE WS-I TO LK-CHILD
                 MOVE 0 TO WS-I
@@ -286,7 +297,7 @@ ENTRY "cvx-json-copy-span" USING LK-SLOT LK-NODE LK-OUT LK-OUT-LEN
         MOVE CVX-ERR TO LK-STATUS
         GOBACK
     END-IF
-    MOVE WS-DOC-SRC(WS-D)(WS-SPAN-START:WS-SPAN-LEN)
+    MOVE WS-DOC-SRC(WS-SPAN-START:WS-SPAN-LEN)
         TO LK-OUT(1:WS-SPAN-LEN)
     MOVE WS-SPAN-LEN TO LK-OUT-LEN
     GOBACK.
@@ -312,10 +323,10 @@ ENTRY "cvx-json-string" USING LK-SLOT LK-NODE LK-OUT LK-OUT-LEN
     COMPUTE WS-K = WS-N-END(WS-D, LK-NODE) - 1
     MOVE 0 TO WS-ESC-OUT
     PERFORM UNTIL WS-I > WS-K OR LK-STATUS NOT = CVX-OK
-        MOVE WS-DOC-SRC(WS-D)(WS-I:1) TO WS-CH
+        MOVE WS-DOC-SRC(WS-I:1) TO WS-CH
         IF WS-CH = "\"
             ADD 1 TO WS-I
-            MOVE WS-DOC-SRC(WS-D)(WS-I:1) TO WS-CH
+            MOVE WS-DOC-SRC(WS-I:1) TO WS-CH
             EVALUATE WS-CH
                 WHEN QUOTE
                     ADD 1 TO WS-ESC-OUT
@@ -456,7 +467,7 @@ ENTRY "cvx-json-esc-string" USING LK-BUF LK-LEN LK-OUT LK-OUT-LEN.
 *> ==================================================================
 JSON-SKIP-WS.
     PERFORM UNTIL WS-POS > WS-LEN
-        MOVE WS-DOC-SRC(WS-D)(WS-POS:1) TO WS-CH
+        MOVE WS-DOC-SRC(WS-POS:1) TO WS-CH
         IF WS-CH = SPACE
                 OR WS-CH = FUNCTION CHAR(10)
                 OR WS-CH = FUNCTION CHAR(14)
@@ -514,7 +525,7 @@ JSON-PARSE-VALUE.
     IF WS-ERR NOT = 0
         EXIT PARAGRAPH
     END-IF
-    MOVE WS-DOC-SRC(WS-D)(WS-POS:1) TO WS-CH
+    MOVE WS-DOC-SRC(WS-POS:1) TO WS-CH
     EVALUATE TRUE
         WHEN WS-CH = "{"
             MOVE 7 TO WS-N-TYPE(WS-D, WS-NODE)
@@ -569,7 +580,7 @@ JSON-OPEN-CONTAINER.
         EXIT PARAGRAPH
     END-IF
     MOVE WS-STACK-NODE(WS-DEPTH) TO WS-PARENT
-    MOVE WS-DOC-SRC(WS-D)(WS-POS:1) TO WS-CH
+    MOVE WS-DOC-SRC(WS-POS:1) TO WS-CH
     EVALUATE TRUE
         WHEN WS-N-TYPE(WS-D, WS-PARENT) = 7 AND WS-CH = "}"
             PERFORM JSON-CLOSE-CONTAINER
@@ -603,7 +614,7 @@ JSON-AFTER-VALUE.
         EXIT PARAGRAPH
     END-IF
     MOVE WS-STACK-NODE(WS-DEPTH) TO WS-PARENT
-    MOVE WS-DOC-SRC(WS-D)(WS-POS:1) TO WS-CH
+    MOVE WS-DOC-SRC(WS-POS:1) TO WS-CH
     EVALUATE TRUE
         WHEN WS-CH = ","
             ADD 1 TO WS-POS
@@ -628,7 +639,7 @@ JSON-READ-KEY.
         MOVE 1 TO WS-ERR
         EXIT PARAGRAPH
     END-IF
-    IF WS-DOC-SRC(WS-D)(WS-POS:1) NOT = QUOTE
+    IF WS-DOC-SRC(WS-POS:1) NOT = QUOTE
         MOVE 1 TO WS-ERR
         EXIT PARAGRAPH
     END-IF
@@ -646,7 +657,7 @@ JSON-READ-KEY.
         MOVE 1 TO WS-ERR
         EXIT PARAGRAPH
     END-IF
-    IF WS-DOC-SRC(WS-D)(WS-POS:1) NOT = ":"
+    IF WS-DOC-SRC(WS-POS:1) NOT = ":"
         MOVE 1 TO WS-ERR
         EXIT PARAGRAPH
     END-IF
@@ -657,7 +668,7 @@ JSON-READ-KEY.
 JSON-SCAN-RAW-STRING.
     ADD 1 TO WS-POS
     PERFORM UNTIL WS-POS > WS-LEN
-        MOVE WS-DOC-SRC(WS-D)(WS-POS:1) TO WS-CH
+        MOVE WS-DOC-SRC(WS-POS:1) TO WS-CH
         COMPUTE WS-BYTE = FUNCTION ORD(WS-CH) - 1
         EVALUATE TRUE
             WHEN WS-CH = QUOTE
@@ -669,7 +680,7 @@ JSON-SCAN-RAW-STRING.
                     MOVE 1 TO WS-ERR
                     EXIT PARAGRAPH
                 END-IF
-                MOVE WS-DOC-SRC(WS-D)(WS-POS:1) TO WS-CH
+                MOVE WS-DOC-SRC(WS-POS:1) TO WS-CH
                 IF WS-CH = "u"
                     PERFORM VARYING WS-J FROM 1 BY 1 UNTIL WS-J > 4
                         IF WS-POS + WS-J > WS-LEN
@@ -704,7 +715,7 @@ JSON-SCAN-RAW-STRING.
     MOVE 1 TO WS-ERR.
 
 JSON-CHECK-HEX.
-    MOVE WS-DOC-SRC(WS-D)(WS-POS + WS-J:1) TO WS-CH
+    MOVE WS-DOC-SRC(WS-POS + WS-J:1) TO WS-CH
     IF NOT ((WS-CH >= "0" AND WS-CH <= "9")
             OR (WS-CH >= "a" AND WS-CH <= "f")
             OR (WS-CH >= "A" AND WS-CH <= "F"))
@@ -722,7 +733,7 @@ JSON-SCAN-STRING.
 
 JSON-SCAN-TRUE.
     IF WS-POS + 3 > WS-LEN
-            OR WS-DOC-SRC(WS-D)(WS-POS:4) NOT = "true"
+            OR WS-DOC-SRC(WS-POS:4) NOT = "true"
         MOVE 1 TO WS-ERR
         EXIT PARAGRAPH
     END-IF
@@ -731,7 +742,7 @@ JSON-SCAN-TRUE.
 
 JSON-SCAN-FALSE.
     IF WS-POS + 4 > WS-LEN
-            OR WS-DOC-SRC(WS-D)(WS-POS:5) NOT = "false"
+            OR WS-DOC-SRC(WS-POS:5) NOT = "false"
         MOVE 1 TO WS-ERR
         EXIT PARAGRAPH
     END-IF
@@ -740,7 +751,7 @@ JSON-SCAN-FALSE.
 
 JSON-SCAN-NULL.
     IF WS-POS + 3 > WS-LEN
-            OR WS-DOC-SRC(WS-D)(WS-POS:4) NOT = "null"
+            OR WS-DOC-SRC(WS-POS:4) NOT = "null"
         MOVE 1 TO WS-ERR
         EXIT PARAGRAPH
     END-IF
@@ -756,7 +767,7 @@ JSON-SCAN-NUMBER.
     MOVE 1 TO WS-FRACZERO
     MOVE 0 TO WS-ACC
 
-    IF WS-DOC-SRC(WS-D)(WS-POS:1) = "-"
+    IF WS-DOC-SRC(WS-POS:1) = "-"
         MOVE 1 TO WS-NEG
         ADD 1 TO WS-POS
     END-IF
@@ -766,18 +777,18 @@ JSON-SCAN-NUMBER.
         MOVE 1 TO WS-ERR
         EXIT PARAGRAPH
     END-IF
-    IF WS-DOC-SRC(WS-D)(WS-POS:1) = "0"
+    IF WS-DOC-SRC(WS-POS:1) = "0"
         ADD 1 TO WS-POS
         MOVE 1 TO WS-DIGITS
         IF WS-POS <= WS-LEN
-                AND WS-DOC-SRC(WS-D)(WS-POS:1) >= "0"
-                AND WS-DOC-SRC(WS-D)(WS-POS:1) <= "9"
+                AND WS-DOC-SRC(WS-POS:1) >= "0"
+                AND WS-DOC-SRC(WS-POS:1) <= "9"
             MOVE 1 TO WS-ERR
             EXIT PARAGRAPH
         END-IF
     ELSE
         PERFORM UNTIL WS-POS > WS-LEN
-            MOVE WS-DOC-SRC(WS-D)(WS-POS:1) TO WS-CH
+            MOVE WS-DOC-SRC(WS-POS:1) TO WS-CH
             IF WS-CH >= "0" AND WS-CH <= "9"
                 COMPUTE WS-BYTE = FUNCTION ORD(WS-CH) - 49
                 *> Guard the accumulator before it can overflow the
@@ -801,11 +812,11 @@ JSON-SCAN-NUMBER.
 
     *> Fractional part. All-zero fractions keep the value integral,
     *> which is what makes Convex's 0.0 acceptable as a count.
-    IF WS-POS <= WS-LEN AND WS-DOC-SRC(WS-D)(WS-POS:1) = "."
+    IF WS-POS <= WS-LEN AND WS-DOC-SRC(WS-POS:1) = "."
         ADD 1 TO WS-POS
         MOVE 0 TO WS-K
         PERFORM UNTIL WS-POS > WS-LEN
-            MOVE WS-DOC-SRC(WS-D)(WS-POS:1) TO WS-CH
+            MOVE WS-DOC-SRC(WS-POS:1) TO WS-CH
             IF WS-CH >= "0" AND WS-CH <= "9"
                 IF WS-CH NOT = "0"
                     MOVE 0 TO WS-FRACZERO
@@ -825,17 +836,17 @@ JSON-SCAN-NUMBER.
     *> Exponent form is valid JSON and is kept for verbatim re-emission,
     *> but this client does not claim to reduce it to an integer.
     IF WS-POS <= WS-LEN
-            AND (WS-DOC-SRC(WS-D)(WS-POS:1) = "e"
-                 OR WS-DOC-SRC(WS-D)(WS-POS:1) = "E")
+            AND (WS-DOC-SRC(WS-POS:1) = "e"
+                 OR WS-DOC-SRC(WS-POS:1) = "E")
         ADD 1 TO WS-POS
         IF WS-POS <= WS-LEN
-                AND (WS-DOC-SRC(WS-D)(WS-POS:1) = "+"
-                     OR WS-DOC-SRC(WS-D)(WS-POS:1) = "-")
+                AND (WS-DOC-SRC(WS-POS:1) = "+"
+                     OR WS-DOC-SRC(WS-POS:1) = "-")
             ADD 1 TO WS-POS
         END-IF
         MOVE 0 TO WS-K
         PERFORM UNTIL WS-POS > WS-LEN
-            MOVE WS-DOC-SRC(WS-D)(WS-POS:1) TO WS-CH
+            MOVE WS-DOC-SRC(WS-POS:1) TO WS-CH
             IF WS-CH >= "0" AND WS-CH <= "9"
                 ADD 1 TO WS-K
                 ADD 1 TO WS-POS
@@ -866,7 +877,7 @@ JSON-SCAN-NUMBER.
 JSON-DECODE-U.
     MOVE 0 TO WS-HEXVAL
     PERFORM VARYING WS-J FROM 1 BY 1 UNTIL WS-J > 4
-        MOVE WS-DOC-SRC(WS-D)(WS-I + WS-J:1) TO WS-CH
+        MOVE WS-DOC-SRC(WS-I + WS-J:1) TO WS-CH
         EVALUATE TRUE
             WHEN WS-CH >= "0" AND WS-CH <= "9"
                 COMPUTE WS-HEXDIG = FUNCTION ORD(WS-CH) - 49
@@ -888,7 +899,7 @@ JSON-DECODE-U.
             MOVE CVX-ERR TO LK-STATUS
             EXIT PARAGRAPH
         END-IF
-        IF WS-DOC-SRC(WS-D)(WS-I + 1:2) NOT = "\u"
+        IF WS-DOC-SRC(WS-I + 1:2) NOT = "\u"
             MOVE CVX-ERR TO LK-STATUS
             EXIT PARAGRAPH
         END-IF
@@ -896,7 +907,7 @@ JSON-DECODE-U.
         ADD 2 TO WS-I
         MOVE 0 TO WS-HEXVAL
         PERFORM VARYING WS-J FROM 0 BY 1 UNTIL WS-J > 3
-            MOVE WS-DOC-SRC(WS-D)(WS-I + WS-J:1) TO WS-CH
+            MOVE WS-DOC-SRC(WS-I + WS-J:1) TO WS-CH
             EVALUATE TRUE
                 WHEN WS-CH >= "0" AND WS-CH <= "9"
                     COMPUTE WS-HEXDIG = FUNCTION ORD(WS-CH) - 49

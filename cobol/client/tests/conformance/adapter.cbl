@@ -50,21 +50,22 @@ COPY "cvx-client.cpy".
 *> ---- emitted event ------------------------------------------------
 01 WS-EVT                   PIC X(2162688).
 01 WS-EVT-LEN               BINARY-LONG.
-01 WS-ESC                   PIC X(2097152).
-*> EXTRACT-COMMAND-FIELDS below is the only reader of WS-SPAN, and it
+*> WS-ESC, WS-SPAN, and WS-LINE below are three names for the very
+*> same 2 MiB: EXTRACT-COMMAND-FIELDS is the only reader of WS-SPAN and
 *> always finishes there before DO-HELLO, DO-CALL, DO-CLOSE, or any of
-*> the EMIT-* paragraphs -- the only writers of WS-ESC -- next run, so
-*> the two never need to hold different content at once. Redefining
-*> WS-SPAN over WS-ESC instead of giving it its own 2 MiB removes one
-*> more of the private buffers that pushed this adapter over the
-*> shared memory-growth budget.
-01 WS-SPAN REDEFINES WS-ESC PIC X(2097152).
-*> WS-LINE (the raw command line being assembled and parsed) is also
-*> fully consumed before WS-ESC's first write: cvx-json-parse copies it
-*> into the JSON module's own slot storage as PROCESS-LINE's very
-*> first step, and nothing in this program reads WS-LINE content again
-*> after that call returns.
-01 WS-LINE REDEFINES WS-ESC PIC X(2097152).
+*> the EMIT-* paragraphs -- the only writers of WS-ESC -- next run; and
+*> WS-LINE (the raw command line) is fully consumed by cvx-json-parse,
+*> as PROCESS-LINE's very first step, before either of the other two
+*> is next written. Redefining CVX-SHARED-SCRATCH (cvx-scratch.cpy)
+*> instead of giving each its own private 2 MiB -- and instead of even
+*> giving this program its own copy of that shared 2 MiB -- is what
+*> lets convex-json.cbl's one document slot occupy the same physical
+*> memory as this adapter's command/escape scratch, rather than the
+*> two of them adding up.
+COPY "cvx-scratch.cpy".
+01 WS-ESC REDEFINES CVX-SHARED-SCRATCH PIC X(2097152).
+01 WS-SPAN REDEFINES CVX-SHARED-SCRATCH PIC X(2097152).
+01 WS-LINE REDEFINES CVX-SHARED-SCRATCH PIC X(2097152).
 01 WS-ESC-LEN               BINARY-LONG.
 
 *> ---- adapter state ------------------------------------------------
