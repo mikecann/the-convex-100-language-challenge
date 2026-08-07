@@ -55,8 +55,9 @@ RUN set -eu; \
     /tmp/ydbinstall.sh r2.06 --installdir /opt/yottadb \
       --encplugin --overwrite-existing --verbose; \
     rm -f /tmp/ydbinstall.sh; \
-    /opt/yottadb/yottadb --version 2>&1 | head -n 1 | grep -Fq 'YottaDB r2.06'; \
-    test -f /opt/yottadb/plugin/libgtmcrypt.so
+    /opt/yottadb/yottadb --version 2>&1 | head -n 1 | grep -Fq 'YottaDB release:         r2.06'; \
+    test -f /opt/yottadb/plugin/libgtmcrypt.so; \
+    test -f /opt/yottadb/plugin/libgtmtls.so
 
 ENV ydb_dist=/opt/yottadb
 ENV PATH=/opt/yottadb:${PATH}
