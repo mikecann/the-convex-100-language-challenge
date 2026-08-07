@@ -89,7 +89,14 @@ procedure main(args)
    liveState := &null
    liveUrl := ""
    if *convexUrl > 0 then {
-      scheme := if map(convexUrl[1:6]) == "https:" then "wss" else "ws"
+      # convexUrl[1:6] is 5 characters (Icon's s[i:j] excludes j), so it
+      # must be compared against the 5-character "https", not the
+      # 6-character "https:" -- see the identical fix and full
+      # explanation in examples/basics/main.icn. Comparing against
+      # "https:" can never match, silently downgrading every deployment
+      # to plain ws:// and straight into Cloudflare's plain-HTTP-to-HTTPS
+      # redirect for the WebSocket upgrade request.
+      scheme := if map(convexUrl[1:6]) == "https" then "wss" else "ws"
       hostAndMore := convexUrl[find("://", convexUrl) + 3 : 0]
       liveUrl := scheme || "://" || hostAndMore || "/api/sync"
    }

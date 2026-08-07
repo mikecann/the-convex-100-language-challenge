@@ -67,7 +67,13 @@ procedure main(args)
    # Live speaks over wss:// (or ws:// for the self-hosted backend), while
    # ordinary query/mutation calls speak plain HTTPS -- convex.icn derives
    # both from convexUrl itself, so the example only builds the Live one.
-   scheme := if map(convexUrl[1:6]) == "https:" then "wss" else "ws"
+   # convexUrl[1:6] is 5 characters (Icon's s[i:j] excludes j), so it must
+   # be compared against the 5-character "https", not the 6-character
+   # "https:" -- comparing against "https:" can never match, which was
+   # silently forcing every deployment (including real wss:// hosted
+   # ones) onto plain ws://, and then straight into Cloudflare's
+   # plain-HTTP-to-HTTPS redirect for the WebSocket upgrade request.
+   scheme := if map(convexUrl[1:6]) == "https" then "wss" else "ws"
    hostAndMore := convexUrl[find("://", convexUrl) + 3 : 0]
    liveUrl := scheme || "://" || hostAndMore || "/api/sync"
 
