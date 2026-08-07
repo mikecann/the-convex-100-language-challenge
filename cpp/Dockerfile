@@ -1,6 +1,5 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 ARG GCC_IMAGE=gcc:14.2.0-bookworm@sha256:82549aa8f90ada3236a8be70c74543132a76662ef33f0c3271ed802b81584a82
-ARG ALPINE_RUNTIME_IMAGE=alpine:3.22@sha256:7c8cb692ae09657cbc4a3f3cbd0e8d5a2690ba38386aaaf252dbb060bf5eb2e6
 FROM --platform=linux/amd64 ${GCC_IMAGE} AS test
 WORKDIR /work
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,13 +29,35 @@ CMD ["/bin/sh", "-c", "true"]
 
 FROM test AS runtime-rootfs
 RUN set -eu; root=/rootfs; mkdir -p "$root/bin" "$root/usr/bin" "$root/usr/local/bin" "$root/usr/lib/x86_64-linux-gnu" "$root/etc"; cp /bin/dash "$root/bin/sh"; cp /usr/bin/id "$root/usr/bin/id"; cp /usr/bin/grep "$root/usr/bin/grep"; cp /out/convex-example "$root/usr/local/bin/convex-example"; cp /out/convex-adapter "$root/usr/local/bin/convex-adapter"; libraries="$({ ldd /bin/dash /usr/bin/id /usr/bin/grep /out/convex-example /out/convex-adapter; } | awk '$3 ~ /^\// {print $3} $1 ~ /^\// {name=$1; sub(/:$/, "", name); print name}' | sort -u)"; for library in $libraries; do cp --parents "$library" "$root"; cp -L "$library" "$root/usr/lib/x86_64-linux-gnu/$(basename "$library")"; done; cp -a /etc/ssl "$root/etc/ssl"; cp -a /usr/lib/ssl "$root/usr/lib/ssl"; cp -a /usr/lib/x86_64-linux-gnu/engines-3 /usr/lib/x86_64-linux-gnu/ossl-modules "$root/usr/lib/x86_64-linux-gnu/"; cp /etc/nsswitch.conf "$root/etc/nsswitch.conf"; cp /etc/hosts "$root/etc/hosts"
-FROM --platform=linux/amd64 ${ALPINE_RUNTIME_IMAGE} AS runtime-base
-RUN rm -f /sbin/apk && \
-    rm -rf /etc/apk /lib/apk /var/cache/apk /var/lib/apk /usr/share/apk
+# This runtime-rootfs is already self-sufficient: /bin/sh is a real dash
+# binary, id and grep are real coreutils, and every shared library the four
+# of them plus the two compiled binaries need is copied in by absolute path
+# above. An Alpine (or any other) base contributed nothing here except its
+# own BusyBox — which ships wget and nc as applets of the same multicall
+# binary that Alpine uses for /bin/sh, reachable through `busybox wget` or a
+# forged argv[0] even after apk and /sbin/apk are removed, since apk only
+# owns the busybox binary's own package entry, not the ~300 applet symlinks
+# `busybox --install` creates across /bin, /sbin, /usr/bin and /usr/sbin at
+# image-build time. scratch has none of that: the final image contains
+# exactly the files this stage assembled, nothing else.
+FROM scratch AS runtime-base
 COPY --from=runtime-rootfs /rootfs /
 USER 65532:65532
 FROM runtime-base AS runtime-checked
-RUN set -eu; for command in apk apt apt-get dpkg gcc g++ clang clang++ make cmake; do ! command -v "$command" >/dev/null 2>&1; done; message="$(/usr/local/bin/convex-example 2>&1 || true)"; test "$message" = "CONVEX_URL is required"; tls_message="$(CONVEX_URL=https://127.0.0.1:1 /usr/local/bin/convex-example 2>&1 || true)"; test "$tls_message" = "HTTP transport: connect: Connection refused"; events="$(printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | /usr/local/bin/convex-adapter)"; echo "$events" | /usr/bin/grep -Fq '"language":"cpp"'; echo "$events" | /usr/bin/grep -Fq '"type":"closed"'
+RUN set -eu; \
+    test -x /bin/sh; \
+    test -x /usr/bin/id; \
+    test -x /usr/bin/grep; \
+    for command_name in apk apt apt-get busybox dpkg gcc g++ clang clang++ make cmake wget nc netcat; do \
+      ! command -v "$command_name" >/dev/null 2>&1 || exit 1; \
+    done; \
+    message="$(/usr/local/bin/convex-example 2>&1 || true)"; \
+    test "$message" = "CONVEX_URL is required"; \
+    tls_message="$(CONVEX_URL=https://127.0.0.1:1 /usr/local/bin/convex-example 2>&1 || true)"; \
+    test "$tls_message" = "HTTP transport: connect: Connection refused"; \
+    events="$(printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | /usr/local/bin/convex-adapter)"; \
+    echo "$events" | /usr/bin/grep -Fq '"language":"cpp"'; \
+    echo "$events" | /usr/bin/grep -Fq '"type":"closed"'
 FROM runtime-checked AS example-runtime
 ENTRYPOINT ["/usr/local/bin/convex-example"]
 FROM runtime-checked AS runtime
