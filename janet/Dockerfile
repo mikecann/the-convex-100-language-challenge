@@ -253,13 +253,11 @@ cp /usr/bin/mawk "$root/usr/bin/awk"
   | sort -u \
   | xargs -r -I{} cp --parents {} "$root"
 
-printf '%s\n' '#!/bin/sh' \
-  'exec /usr/local/bin/janet /app/client/tests/conformance/adapter.janet "$@"' \
-  > "$root/usr/local/bin/convex-adapter"
-printf '%s\n' '#!/bin/sh' \
-  'exec /usr/local/bin/janet /app/examples/basics/main.janet "$@"' \
-  > "$root/usr/local/bin/convex-example"
-chmod 755 "$root/usr/local/bin/convex-adapter" "$root/usr/local/bin/convex-example"
+# Neither entrypoint is written here. runtime-base's rootfs deliberately
+# stages no `rm` (it is `FROM scratch`, and this image's whole point is
+# to hold nothing beyond what serving Convex traffic requires), so the
+# example and adapter variants below each COPY in only their own
+# launcher rather than both being written here and one later deleted.
 EOF
 
 #
@@ -316,12 +314,10 @@ test ! -e /var
 test ! -e /tmp
 EOF
 
-# Each final image keeps only its own entrypoint. The removal runs as root
-# because the runtime user deliberately owns nothing.
+# Each final image keeps only its own entrypoint: runtime-base carries
+# neither, and each variant COPYs in exactly the one it needs.
 FROM runtime-base AS example-runtime
-USER 0:0
-RUN rm -f /usr/local/bin/convex-adapter
-USER 65532:65532
+COPY --chmod=0755 client/bin/convex-example /usr/local/bin/convex-example
 RUN <<'EOF'
 set -eu
 test "$(id -u):$(id -g)" = 65532:65532
@@ -333,9 +329,7 @@ ENTRYPOINT ["/usr/local/bin/convex-example"]
 
 # The adapter target is last so `./run build janet` gets it by default.
 FROM runtime-base AS runtime
-USER 0:0
-RUN rm -f /usr/local/bin/convex-example
-USER 65532:65532
+COPY --chmod=0755 client/bin/convex-adapter /usr/local/bin/convex-adapter
 RUN <<'EOF'
 set -eu
 test "$(id -u):$(id -g)" = 65532:65532
