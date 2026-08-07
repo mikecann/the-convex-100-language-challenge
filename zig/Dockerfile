@@ -27,6 +27,12 @@ RUN zig test --dep convex -Mroot=examples/basics/main.zig -Mconvex=client/convex
 RUN zig test --dep convex -Mroot=client/tests/conformance/main.zig -Mconvex=client/convex.zig
 RUN mkdir -p /out
 RUN zig build-exe -O ReleaseSafe -target x86_64-linux-musl --dep convex -Mroot=client/tests/conformance/main.zig -Mconvex=client/convex.zig -femit-bin=/out/convex-adapter
+# Prove the real adapter binary's hello/close NDJSON lifecycle at build time,
+# the same way the other conformance-probe languages do, rather than
+# deferring it to the test image's default command. CONVEX_URL is a dummy
+# value scoped to this one RUN: hello and close never open a network
+# connection, so the adapter only needs the variable to be present.
+RUN printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | CONVEX_URL=http://127.0.0.1:9 /out/convex-adapter >/tmp/convex-adapter-hello.ndjson && grep -Fq '"language":"zig"' /tmp/convex-adapter-hello.ndjson && grep -Fq '"type":"closed"' /tmp/convex-adapter-hello.ndjson
 RUN zig build-exe -O ReleaseSafe -target x86_64-linux-musl --dep convex -Mroot=examples/basics/main.zig -Mconvex=client/convex.zig -femit-bin=/out/convex-example
 RUN zig build-exe -O ReleaseSafe -target x86_64-linux-musl -Mroot=client/tests/conformance/memory_fixture.zig -femit-bin=/out/convex-memory-fixture
 
@@ -117,8 +123,12 @@ RUN test "$(uname -m)" = x86_64 \
     && file /out/convex-prune | grep -Eq 'ELF 64-bit.*x86-64.*(statically linked|static-pie linked)' \
     && ! readelf -l /out/convex-prune | grep -Fq 'INTERP' \
     && readelf -h /out/convex-adapter | grep -Eq 'Machine:.*Advanced Micro Devices X86-64'
-ENV CONVEX_URL=http://127.0.0.1:9
-CMD ["/bin/sh", "-ec", "/out/convex-adapter <<'EOF'\n{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}\n{\"id\":\"close\",\"op\":\"close\"}\nEOF"]
+# The adapter's hello/close lifecycle already ran above, against the exact
+# binary shipped in /out, so the default command only has to be an honest,
+# CONVEX_URL-free sanity check rather than repeat a probe that would fail
+# before reading a single command: running the adapter here with no
+# deployment URL would abort in Adapter.init before it ever sees "hello".
+CMD ["/bin/sh", "-ec", "test \"$(uname -m)\" = x86_64 && echo 'zig fmt, unit tests, and the adapter hello/close probe already passed while building this image'"]
 
 FROM --platform=linux/amd64 ${ALPINE_IMAGE} AS certificates
 RUN apk add --no-cache ca-certificates=20260611-r0
