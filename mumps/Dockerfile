@@ -198,6 +198,26 @@ RUN set -eu; \
       '}' \
       > /staging/opt/convex/tls.conf
 
+# The two entry-point launchers also have to be written here, as root, rather
+# than in the leaf stages below: runtime-base switches to USER 65532:65532
+# before those leaf stages run, and that user cannot write into
+# /usr/local/bin (owned by root, from this same COPY). Each goes into its own
+# tree rather than the shared /staging closure above so runtime-base -- the
+# common ancestor of both leaf images -- never contains either one; each leaf
+# image ends up proving the OTHER launcher and the other's entry object are
+# both absent, not just that its own is present.
+RUN mkdir -p /staging-example/usr/local/bin /staging-adapter/usr/local/bin \
+    && printf '%s\n' \
+      '#!/bin/sh' \
+      'exec /opt/yottadb/mumps -run main^main "$@"' \
+      > /staging-example/usr/local/bin/convex-example \
+    && printf '%s\n' \
+      '#!/bin/sh' \
+      'exec /opt/yottadb/mumps -run main^adapter' \
+      > /staging-adapter/usr/local/bin/convex-adapter \
+    && chmod 0555 /staging-example/usr/local/bin/convex-example \
+       /staging-adapter/usr/local/bin/convex-adapter
+
 # `./run test mumps` reruns this exact suite from the built image, so the
 # evidence is not limited to what happened during the build.
 RUN printf '%s\n' \
@@ -283,28 +303,19 @@ RUN test ! -e /etc/dpkg \
 
 # ---------------------------------------------------------------------------
 FROM runtime-base AS example-runtime
+COPY --from=test /staging-example /
 COPY --from=test /build/o/main.o /opt/convex/o/main.o
-RUN printf '%s\n' \
-      '#!/bin/sh' \
-      'exec /opt/yottadb/mumps -run main^main "$@"' \
-    > /usr/local/bin/convex-example \
-    && chmod 0555 /usr/local/bin/convex-example
-RUN set -eux; \
-    test -x /usr/local/bin/convex-example; \
-    test ! -e /usr/local/bin/convex-adapter; \
-    test ! -e /opt/convex/o/adapter.o
+RUN test -x /usr/local/bin/convex-example \
+    && test ! -e /usr/local/bin/convex-adapter \
+    && test ! -e /opt/convex/o/adapter.o
 ENTRYPOINT ["/usr/local/bin/convex-example"]
 
 # ---------------------------------------------------------------------------
 # Keep the adapter last: `./run build mumps` uses the default target.
 FROM runtime-base AS runtime
+COPY --from=test /staging-adapter /
 COPY --from=test /build/o/adapter.o /opt/convex/o/adapter.o
-RUN printf '%s\n' \
-      '#!/bin/sh' \
-      'exec /opt/yottadb/mumps -run main^adapter' \
-    > /usr/local/bin/convex-adapter \
-    && chmod 0555 /usr/local/bin/convex-adapter
-RUN set -eux; \
+RUN set -eu; \
     test -x /usr/local/bin/convex-adapter; \
     test ! -e /usr/local/bin/convex-example; \
     test ! -e /opt/convex/o/main.o; \
