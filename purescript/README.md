@@ -57,7 +57,7 @@ This block is generated from the runnable file, so the source here, in the
 repository, and on the website are always the same bytes.
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.purs -->
-```text
+```purescript
 -- | Convex from PureScript: one shared counter, read two different ways.
 -- |
 -- | The program reads a room's counter over Convex's HTTP API, subscribes to

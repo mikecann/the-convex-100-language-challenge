@@ -8,6 +8,7 @@ export const approvedTargetRuntimeCommands = new Map([
   ["javascript", new Set(["node"])],
   ["php", new Set(["php"])],
   ["python", new Set(["python", "python3"])],
+  ["rescript", new Set(["node"])],
   ["typescript", new Set(["node"])],
 ]);
 
