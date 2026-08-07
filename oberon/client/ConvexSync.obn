@@ -1,0 +1,989 @@
+(*ConvexSync is the heart of this client: HTTP query/mutation/action calls,
+  and a singleton Live connection that owns the WebSocket exclusively (one
+  worker, Pump(), touches the socket, reconnect state, and query-set
+  version - matching AGENTS.md's requirement that controller and
+  subscription work never touch the socket concurrently). It tracks the
+  active subscription table, validates and applies each Transition,
+  suppresses a rehydrated value that is unchanged since before a
+  reconnect, and publishes structured FunctionError/ProtocolError/
+  TransportError events without permanently stranding a subscription.
+
+  Message builders below append JSON through AppendBuf, which is the
+  module's own literal-text appender (see its comment for the backtick
+  convention that stands in for a literal double quote, since OBNC's
+  lexer accepts neither an escaped quote nor the report's alternative
+  single quote delimiter). Every place that hands a buffer to
+  ConvexJSON.AppendQuoted (which appends after the destination's existing
+  terminator) explicitly writes that terminator immediately beforehand,
+  preserved from the same discipline the original implementation used.*)
+MODULE ConvexSync;
+
+	IMPORT J := ConvexJSON, B64 := ConvexBase64, HTTP := ConvexHTTP, WS := ConvexWS, Shim := ConvexShim;
+
+	CONST
+		MaxSubscriptions* = 16;
+		MaxValue* = 8192; (*per-subscription rehydration-comparison and event cap*)
+		MaxArgs = 8192;
+		MaxPath = 256;
+		MaxMessageOut = 16640; (*MaxArgs + protocol envelope headroom*)
+		MaxEvents = 32;
+
+	TYPE
+		Subscription = RECORD
+			occupied, active, addPending, removePending, rehydrating, hasLastValue, valueTooLargeToCompare: BOOLEAN;
+			queryId: INTEGER;
+			path: ARRAY MaxPath OF CHAR;
+			args: ARRAY MaxArgs OF CHAR;
+			lastValue: ARRAY MaxValue OF CHAR
+		END;
+
+		PendingEvent = RECORD
+			kind, handle: INTEGER; (*1 updated, 2 failed*)
+			value, logs: ARRAY MaxValue OF CHAR;
+			errorName: ARRAY 32 OF CHAR; (*"FunctionError" / "ProtocolError" / "TransportError"*)
+			errorMessage, errorData: ARRAY MaxValue OF CHAR;
+			hasErrorData: BOOLEAN
+		END;
+
+	(*Call() and Pump() work with buffers that can approach MaxBody/
+	  MaxMessage (a few megabytes); neither is reentrant (this client is
+	  single threaded), so these are static module storage.*)
+	VAR
+		pumpMsgText: ARRAY WS.MaxMessage OF CHAR;
+		callPayload: ARRAY HTTP.MaxBody OF CHAR;
+		callBody: ARRAY HTTP.MaxBody OF CHAR;
+		callValueRaw, callLogsRaw, callMsgRaw, callDataRaw: ARRAY HTTP.MaxBody OF CHAR;
+
+		deploymentUrl: ARRAY 512 OF CHAR;
+		authToken: ARRAY 2048 OF CHAR;
+		sessionId: ARRAY 64 OF CHAR;
+
+		subs: ARRAY MaxSubscriptions OF Subscription;
+		nextQueryId: INTEGER;
+
+		connected: BOOLEAN;
+		querySetVersion, remoteQuerySet, remoteIdentity: INTEGER;
+		remoteTimestamp: ARRAY 16 OF CHAR;
+		maxObservedTs: ARRAY 16 OF CHAR;
+		connectionCount: INTEGER;
+		lastCloseReasonText: ARRAY 64 OF CHAR;
+		reconnectAt, backoffMs: INTEGER;
+
+		events: ARRAY MaxEvents OF PendingEvent;
+		eventHead, eventCount: INTEGER;
+
+	(* ---------- small text helpers ---------- *)
+
+	PROCEDURE CopyText(source: ARRAY OF CHAR; VAR destination: ARRAY OF CHAR);
+	VAR i, n: INTEGER;
+	BEGIN
+		n := J.TextLength(source);
+		IF n > LEN(destination) - 1 THEN n := LEN(destination) - 1 END;
+		i := 0;
+		WHILE i < n DO destination[i] := source[i]; INC(i) END;
+		destination[n] := 0X
+	END CopyText;
+
+	PROCEDURE TextEqual(a, b: ARRAY OF CHAR): BOOLEAN;
+	VAR la, lb, i: INTEGER; equal: BOOLEAN;
+	BEGIN
+		la := J.TextLength(a);
+		lb := J.TextLength(b);
+		equal := la = lb;
+		i := 0;
+		WHILE equal & (i < la) DO
+			IF a[i] # b[i] THEN equal := FALSE END;
+			INC(i)
+		END;
+		RETURN equal
+	END TextEqual;
+
+	(* ---------- session id and timestamp comparison ---------- *)
+
+	PROCEDURE HexDigit(value: INTEGER): CHAR;
+	VAR result: CHAR;
+	BEGIN
+		IF value < 10 THEN result := CHR(ORD("0") + value) ELSE result := CHR(ORD("a") + value - 10) END;
+		RETURN result
+	END HexDigit;
+
+	PROCEDURE NewSessionId;
+	VAR clock: INTEGER; hex: ARRAY 16 OF CHAR; i: INTEGER;
+	BEGIN
+		clock := Shim.MonotonicMs();
+		IF clock < 0 THEN clock := -clock END;
+		i := 15;
+		WHILE i >= 0 DO
+			hex[i] := HexDigit(clock MOD 16);
+			clock := clock DIV 16;
+			DEC(i)
+		END;
+		CopyText("00000000-0000-4000-8000-", sessionId);
+		i := 4;
+		WHILE i <= 15 DO sessionId[21 + (i - 4)] := hex[i]; INC(i) END;
+		sessionId[33] := 0X
+	END NewSessionId;
+
+	(*TimestampGreater decodes two base64 sync-protocol timestamps (each an
+	  8 byte little-endian counter) and compares their magnitude byte by
+	  byte rather than materialising a 64 bit integer this dialect's
+	  INTEGER may not hold.*)
+	PROCEDURE TimestampGreater(left, right: ARRAY OF CHAR): BOOLEAN;
+	VAR
+		leftBytes, rightBytes: ARRAY 8 OF CHAR;
+		leftLen, rightLen, i: INTEGER;
+		leftOk, rightOk, greater, decided: BOOLEAN;
+	BEGIN
+		leftOk := B64.Decode(left, leftBytes, leftLen) & (leftLen = 8);
+		rightOk := B64.Decode(right, rightBytes, rightLen) & (rightLen = 8);
+		greater := FALSE;
+		IF leftOk & rightOk THEN
+			decided := FALSE;
+			i := 7;
+			WHILE ~decided & (i >= 0) DO
+				IF ORD(leftBytes[i]) > ORD(rightBytes[i]) THEN
+					greater := TRUE; decided := TRUE
+				ELSIF ORD(leftBytes[i]) < ORD(rightBytes[i]) THEN
+					decided := TRUE
+				END;
+				DEC(i)
+			END
+		END;
+		RETURN greater
+	END TimestampGreater;
+
+	(* ---------- subscription table ---------- *)
+
+	PROCEDURE FindSlot(queryId: INTEGER): INTEGER;
+	VAR i, result: INTEGER;
+	BEGIN
+		result := -1;
+		i := 0;
+		WHILE (result < 0) & (i < MaxSubscriptions) DO
+			IF subs[i].occupied & (subs[i].queryId = queryId) THEN result := i END;
+			INC(i)
+		END;
+		RETURN result
+	END FindSlot;
+
+	PROCEDURE FreeSlot(): INTEGER;
+	VAR i, result: INTEGER;
+	BEGIN
+		result := -1;
+		i := 0;
+		WHILE (result < 0) & (i < MaxSubscriptions) DO
+			IF ~subs[i].occupied THEN result := i END;
+			INC(i)
+		END;
+		RETURN result
+	END FreeSlot;
+
+	PROCEDURE ActiveCount(): INTEGER;
+	VAR i, count: INTEGER;
+	BEGIN
+		count := 0;
+		i := 0;
+		WHILE i < MaxSubscriptions DO
+			IF subs[i].occupied & subs[i].active & ~subs[i].removePending THEN INC(count) END;
+			INC(i)
+		END;
+		RETURN count
+	END ActiveCount;
+
+	(* ---------- pending event queue ---------- *)
+
+	PROCEDURE DiscardEventsFor(handle: INTEGER);
+	VAR i, w: INTEGER;
+	BEGIN
+		w := 0;
+		i := 0;
+		WHILE i < eventCount DO
+			IF events[(eventHead + i) MOD MaxEvents].handle # handle THEN
+				events[(eventHead + w) MOD MaxEvents] := events[(eventHead + i) MOD MaxEvents];
+				INC(w)
+			END;
+			INC(i)
+		END;
+		eventCount := w
+	END DiscardEventsFor;
+
+	PROCEDURE EnqueueEvent(VAR event: PendingEvent);
+	BEGIN
+		IF eventCount >= MaxEvents THEN
+			eventHead := (eventHead + 1) MOD MaxEvents;
+			DEC(eventCount)
+		END;
+		events[(eventHead + eventCount) MOD MaxEvents] := event;
+		INC(eventCount)
+	END EnqueueEvent;
+
+	(* ---------- outgoing message builders ---------- *)
+
+	(*AppendBuf appends text literally, except that a backtick stands in for
+	  a literal double quote: OBNC's lexer accepts neither an escaped quote
+	  inside a double quoted string nor the language report's alternative
+	  single quote delimiter, so JSON template fragments below are written
+	  with backticks in place of quote marks. Every message builder appends
+	  through this shared, module level helper rather than a procedure
+	  nested inside its caller: OBNC's nested procedures see only this
+	  module's own top level declarations, not an enclosing procedure's
+	  locals.*)
+	PROCEDURE AppendBuf(text: ARRAY OF CHAR; VAR out: ARRAY OF CHAR; VAR outLength: INTEGER);
+	VAR n, j: INTEGER;
+	BEGIN
+		n := J.TextLength(text);
+		j := 0;
+		WHILE j < n DO
+			IF text[j] = "`" THEN out[outLength] := CHR(34) ELSE out[outLength] := text[j] END;
+			INC(outLength); INC(j)
+		END
+	END AppendBuf;
+
+	PROCEDURE AppendIntBuf(value: INTEGER; VAR out: ARRAY OF CHAR; VAR outLength: INTEGER);
+	VAR digits: ARRAY 16 OF CHAR; digitCount, v: INTEGER;
+	BEGIN
+		IF value = 0 THEN
+			AppendBuf("0", out, outLength)
+		ELSE
+			digitCount := 0;
+			v := value;
+			WHILE v > 0 DO
+				digits[digitCount] := CHR(ORD("0") + (v MOD 10));
+				v := v DIV 10;
+				INC(digitCount)
+			END;
+			WHILE digitCount > 0 DO
+				DEC(digitCount);
+				out[outLength] := digits[digitCount];
+				INC(outLength)
+			END
+		END
+	END AppendIntBuf;
+
+	PROCEDURE BuildConnectMessage(VAR out: ARRAY OF CHAR);
+	VAR outLength: INTEGER; quoted: BOOLEAN;
+	BEGIN
+		outLength := 0;
+		AppendBuf("{`type`:`Connect`,`sessionId`:`", out, outLength);
+		AppendBuf(sessionId, out, outLength);
+		AppendBuf("`,`connectionCount`:", out, outLength);
+		AppendIntBuf(connectionCount, out, outLength);
+		AppendBuf(",`lastCloseReason`:", out, outLength);
+		out[outLength] := 0X;
+		quoted := J.AppendQuoted(lastCloseReasonText, out);
+		IF ~quoted THEN AppendBuf("``", out, outLength) END;
+		outLength := J.TextLength(out);
+		IF J.TextLength(maxObservedTs) > 0 THEN
+			AppendBuf(",`maxObservedTimestamp`:", out, outLength);
+			out[outLength] := 0X;
+			quoted := J.AppendQuoted(maxObservedTs, out);
+			IF ~quoted THEN AppendBuf("``", out, outLength) END;
+			outLength := J.TextLength(out)
+		END;
+		AppendBuf(",`clientTs`:0}", out, outLength);
+		out[outLength] := 0X
+	END BuildConnectMessage;
+
+	PROCEDURE AppendAddModification(slot: INTEGER; VAR out: ARRAY OF CHAR; VAR outLength: INTEGER);
+	VAR i, argsLength: INTEGER; quoted: BOOLEAN;
+	BEGIN
+		AppendBuf("{`type`:`Add`,`queryId`:", out, outLength);
+		AppendIntBuf(subs[slot].queryId, out, outLength);
+		AppendBuf(",`udfPath`:", out, outLength);
+		out[outLength] := 0X;
+		quoted := J.AppendQuoted(subs[slot].path, out);
+		IF ~quoted THEN AppendBuf("``", out, outLength) END;
+		outLength := J.TextLength(out);
+		AppendBuf(",`args`:[", out, outLength);
+		argsLength := J.TextLength(subs[slot].args);
+		i := 0;
+		WHILE i < argsLength DO out[outLength] := subs[slot].args[i]; INC(outLength); INC(i) END;
+		AppendBuf("]}", out, outLength)
+	END AppendAddModification;
+
+	(*BuildSnapshotAdds emits a ModifyQuerySet covering every currently
+	  active subscription; used right after a fresh Connect so a new
+	  connection rehydrates every Live query it owns.*)
+	PROCEDURE BuildSnapshotAdds(VAR out: ARRAY OF CHAR; VAR count: INTEGER);
+	VAR outLength, i: INTEGER; first: BOOLEAN;
+	BEGIN
+		outLength := 0;
+		count := 0;
+		first := TRUE;
+		AppendBuf("{`type`:`ModifyQuerySet`,`baseVersion`:0,`newVersion`:1,`modifications`:[", out, outLength);
+		i := 0;
+		WHILE i < MaxSubscriptions DO
+			IF subs[i].occupied & subs[i].active & ~subs[i].removePending THEN
+				IF ~first THEN AppendBuf(",", out, outLength) END;
+				first := FALSE;
+				AppendAddModification(i, out, outLength);
+				INC(count);
+				subs[i].rehydrating := subs[i].hasLastValue;
+				(*Without this, every one of these subscriptions would still
+				  read as addPending on the next Pump() and get sent a
+				  second, redundant individual Add afterwards - corrupting
+				  the query set (a real Convex backend rejects Adding a
+				  queryId that is already active) and, in this client's own
+				  loopback tests, confusing which wire queryId a later
+				  Transition belongs to.*)
+				subs[i].addPending := FALSE
+			END;
+			INC(i)
+		END;
+		AppendBuf("]}", out, outLength);
+		out[outLength] := 0X
+	END BuildSnapshotAdds;
+
+	PROCEDURE BuildSingleModification(slot: INTEGER; removing: BOOLEAN; VAR out: ARRAY OF CHAR; VAR outLength: INTEGER; baseVersion, newVersion: INTEGER);
+	BEGIN
+		outLength := 0;
+		AppendBuf("{`type`:`ModifyQuerySet`,`baseVersion`:", out, outLength);
+		AppendIntBuf(baseVersion, out, outLength);
+		AppendBuf(",`newVersion`:", out, outLength);
+		AppendIntBuf(newVersion, out, outLength);
+		AppendBuf(",`modifications`:[", out, outLength);
+		IF removing THEN
+			AppendBuf("{`type`:`Remove`,`queryId`:", out, outLength);
+			AppendIntBuf(subs[slot].queryId, out, outLength);
+			AppendBuf("}", out, outLength)
+		ELSE
+			AppendAddModification(slot, out, outLength)
+		END;
+		AppendBuf("]}", out, outLength);
+		out[outLength] := 0X
+	END BuildSingleModification;
+
+	(* ---------- connecting ---------- *)
+
+	PROCEDURE RetireConnection(reason: ARRAY OF CHAR);
+	VAR i: INTEGER;
+	BEGIN
+		connected := FALSE;
+		INC(connectionCount);
+		CopyText(reason, lastCloseReasonText);
+		querySetVersion := 0;
+		remoteQuerySet := 0;
+		remoteIdentity := 0;
+		CopyText("AAAAAAAAAAA=", remoteTimestamp);
+		i := 0;
+		WHILE i < MaxSubscriptions DO
+			IF subs[i].occupied & subs[i].active & ~subs[i].removePending THEN
+				subs[i].addPending := TRUE;
+				subs[i].rehydrating := subs[i].hasLastValue
+			END;
+			INC(i)
+		END
+	END RetireConnection;
+
+	PROCEDURE ScheduleReconnect;
+	BEGIN
+		reconnectAt := Shim.MonotonicMs() + backoffMs;
+		backoffMs := backoffMs * 2;
+		IF backoffMs > 15000 THEN backoffMs := 15000 END
+	END ScheduleReconnect;
+
+	PROCEDURE ConnectNow;
+	VAR
+		ok: BOOLEAN;
+		errorText: ARRAY 256 OF CHAR;
+		connectMsg: ARRAY 512 OF CHAR;
+		snapshot: ARRAY MaxMessageOut OF CHAR;
+		addCount: INTEGER;
+		deadline: INTEGER;
+	BEGIN
+		WS.Open(deploymentUrl, "0.1.0", 8000, ok, errorText);
+		IF ~ok THEN
+			RetireConnection(errorText);
+			ScheduleReconnect
+		ELSE
+			BuildConnectMessage(connectMsg);
+			deadline := Shim.MonotonicMs() + 5000;
+			WS.SendText(connectMsg, J.TextLength(connectMsg), deadline, ok, errorText);
+			IF ~ok THEN
+				WS.Close;
+				RetireConnection(errorText);
+				ScheduleReconnect
+			ELSE
+				BuildSnapshotAdds(snapshot, addCount);
+				IF addCount > 0 THEN
+					deadline := Shim.MonotonicMs() + 5000;
+					WS.SendText(snapshot, J.TextLength(snapshot), deadline, ok, errorText);
+					IF ~ok THEN
+						WS.Close;
+						RetireConnection(errorText);
+						ScheduleReconnect
+					END
+				END;
+				IF ok THEN
+					connected := TRUE;
+					IF addCount > 0 THEN querySetVersion := 1 ELSE querySetVersion := 0 END;
+					backoffMs := 100
+				END
+			END
+		END
+	END ConnectNow;
+
+	(* ---------- incoming Transition handling ---------- *)
+
+	PROCEDURE ParseStateVersion(obj: ARRAY OF CHAR; VAR querySet, identity: INTEGER; VAR ts: ARRAY OF CHAR; VAR ok: BOOLEAN);
+	VAR raw: ARRAY MaxValue OF CHAR; found: BOOLEAN;
+	BEGIN
+		ok := FALSE;
+		ts[0] := 0X;
+		ok := J.Member(obj, "querySet", raw, found) & found;
+		IF ok THEN ok := J.ParseNonNegativeInt(raw, querySet) END;
+		IF ok THEN ok := J.Member(obj, "identity", raw, found) & found END;
+		IF ok THEN ok := J.ParseNonNegativeInt(raw, identity) END;
+		IF ok THEN ok := J.Member(obj, "ts", raw, found) & found END;
+		IF ok THEN ok := J.DecodeString(raw, ts) END
+	END ParseStateVersion;
+
+	(*HandleTransition validates and applies one Transition message,
+	  enqueuing at most one event per modification (bounded by the shared
+	  event queue). Returns FALSE (with reason) on any structural or state
+	  mismatch, which the caller treats as a ProtocolError and a forced
+	  reconnect.*)
+	PROCEDURE HandleTransition(message: ARRAY OF CHAR; VAR ok: BOOLEAN; VAR reason: ARRAY OF CHAR);
+	VAR
+		startObj, endObj, modifications, kindRaw, kind: ARRAY MaxValue OF CHAR;
+		found, decoded: BOOLEAN;
+		startQuerySet, startIdentity, endQuerySet, endIdentity: INTEGER;
+		startTs, endTs: ARRAY 16 OF CHAR;
+		cursor: INTEGER;
+		element: ARRAY MaxValue OF CHAR;
+		queryIdRaw: ARRAY 64 OF CHAR;
+		queryId, slot: INTEGER;
+		logsRaw: ARRAY MaxValue OF CHAR;
+		hasLogs, done: BOOLEAN;
+		event: PendingEvent;
+		valueRaw, errRaw, errText, errDataRaw: ARRAY MaxValue OF CHAR;
+		hasErrData, unchanged: BOOLEAN;
+	BEGIN
+		ok := J.Member(message, "startVersion", startObj, found) & found;
+		IF ~ok THEN CopyText("Transition omitted startVersion", reason) END;
+		IF ok THEN
+			ok := J.Member(message, "endVersion", endObj, found) & found;
+			IF ~ok THEN CopyText("Transition omitted endVersion", reason) END
+		END;
+		IF ok THEN
+			ok := J.Member(message, "modifications", modifications, found) & found;
+			IF ~ok THEN CopyText("Transition omitted modifications", reason) END
+		END;
+		IF ok THEN
+			ParseStateVersion(startObj, startQuerySet, startIdentity, startTs, decoded);
+			ok := decoded;
+			IF ~ok THEN CopyText("Transition startVersion was invalid", reason) END
+		END;
+		IF ok THEN
+			ParseStateVersion(endObj, endQuerySet, endIdentity, endTs, decoded);
+			ok := decoded;
+			IF ~ok THEN CopyText("Transition endVersion was invalid", reason) END
+		END;
+		IF ok & ((startQuerySet # remoteQuerySet) OR (startIdentity # remoteIdentity) OR ~TextEqual(startTs, remoteTimestamp)) THEN
+			ok := FALSE;
+			CopyText("Transition startVersion did not match local state", reason)
+		END;
+		IF ok THEN
+			ok := J.ArrayBegin(modifications, cursor);
+			IF ~ok THEN CopyText("Transition modifications were malformed", reason) END
+		END;
+
+		IF ok THEN
+			done := FALSE;
+			WHILE ok & ~done DO
+				IF ~J.ArrayNext(modifications, cursor, element) THEN
+					done := TRUE
+				ELSE
+					ok := J.Member(element, "type", kindRaw, found) & found;
+					IF ~ok THEN CopyText("Transition modification omitted type", reason) END;
+					IF ok THEN
+						ok := J.DecodeString(kindRaw, kind);
+						IF ~ok THEN CopyText("Transition modification type was invalid", reason) END
+					END;
+					IF ok THEN
+						ok := J.Member(element, "queryId", queryIdRaw, found) & found;
+						IF ~ok THEN CopyText("Transition modification omitted queryId", reason) END
+					END;
+					IF ok THEN
+						ok := J.ParseNonNegativeInt(queryIdRaw, queryId);
+						IF ~ok THEN CopyText("Transition modification queryId was invalid", reason) END
+					END;
+					IF ok THEN
+						logsRaw[0] := 0X;
+						hasLogs := J.Member(element, "logLines", logsRaw, found) & found;
+						IF hasLogs & ~J.StringArrayValid(logsRaw) THEN
+							ok := FALSE;
+							CopyText("Transition logLines was not an array of strings", reason)
+						END
+					END;
+
+					IF ok THEN
+						slot := FindSlot(queryId);
+						IF TextEqual(kind, "QueryRemoved") THEN
+							IF slot >= 0 THEN subs[slot].hasLastValue := FALSE END
+						ELSIF TextEqual(kind, "QueryUpdated") THEN
+							ok := J.Member(element, "value", valueRaw, found) & found;
+							IF ~ok THEN
+								CopyText("QueryUpdated omitted value", reason)
+							ELSIF (slot >= 0) & subs[slot].active & ~subs[slot].removePending THEN
+								unchanged := subs[slot].rehydrating & subs[slot].hasLastValue
+									& ~subs[slot].valueTooLargeToCompare & TextEqual(subs[slot].lastValue, valueRaw);
+								IF J.TextLength(valueRaw) >= LEN(subs[slot].lastValue) THEN
+									subs[slot].valueTooLargeToCompare := TRUE
+								ELSE
+									subs[slot].valueTooLargeToCompare := FALSE;
+									CopyText(valueRaw, subs[slot].lastValue)
+								END;
+								subs[slot].hasLastValue := TRUE;
+								subs[slot].rehydrating := FALSE;
+								IF ~unchanged THEN
+									event.kind := 1;
+									event.handle := queryId;
+									CopyText(valueRaw, event.value);
+									IF hasLogs THEN CopyText(logsRaw, event.logs) ELSE CopyText("[]", event.logs) END;
+									event.hasErrorData := FALSE;
+									EnqueueEvent(event)
+								END
+							END
+						ELSIF TextEqual(kind, "QueryFailed") THEN
+							ok := J.Member(element, "errorMessage", errRaw, found) & found;
+							IF ~ok THEN
+								CopyText("QueryFailed omitted errorMessage", reason)
+							ELSE
+								IF ~J.DecodeString(errRaw, errText) THEN CopyText(errRaw, errText) END;
+								hasErrData := J.Member(element, "errorData", errDataRaw, found) & found;
+								IF (slot >= 0) & subs[slot].active & ~subs[slot].removePending THEN
+									subs[slot].hasLastValue := FALSE;
+									subs[slot].rehydrating := FALSE;
+									event.kind := 2;
+									event.handle := queryId;
+									CopyText("FunctionError", event.errorName);
+									CopyText(errText, event.errorMessage);
+									event.hasErrorData := hasErrData;
+									IF hasErrData THEN CopyText(errDataRaw, event.errorData) END;
+									IF hasLogs THEN CopyText(logsRaw, event.logs) ELSE CopyText("[]", event.logs) END;
+									EnqueueEvent(event)
+								END
+							END
+						ELSE
+							ok := FALSE;
+							CopyText("unknown Transition modification type", reason)
+						END
+					END
+				END
+			END
+		END;
+
+		IF ok THEN
+			remoteQuerySet := endQuerySet;
+			remoteIdentity := endIdentity;
+			CopyText(endTs, remoteTimestamp);
+			IF J.TextLength(maxObservedTs) = 0 THEN
+				CopyText(endTs, maxObservedTs)
+			ELSIF TimestampGreater(endTs, maxObservedTs) THEN
+				CopyText(endTs, maxObservedTs)
+			END
+		END
+	END HandleTransition;
+
+	(*PublishErrorToAll reports a connection-level failure (ProtocolError or
+	  TransportError) to every active subscription without disturbing
+	  hasLastValue/lastValue: the failure is about the transport, not a
+	  server verdict on the query, and a reconnect is about to try again
+	  immediately. Clearing the cached value here would defeat rehydration
+	  suppression on every single reconnect, redelivering a value the
+	  caller already has.*)
+	PROCEDURE PublishErrorToAll(name, message: ARRAY OF CHAR);
+	VAR i: INTEGER; event: PendingEvent;
+	BEGIN
+		i := 0;
+		WHILE i < MaxSubscriptions DO
+			IF subs[i].occupied & subs[i].active & ~subs[i].removePending THEN
+				event.kind := 2;
+				event.handle := subs[i].queryId;
+				CopyText(name, event.errorName);
+				CopyText(message, event.errorMessage);
+				event.hasErrorData := FALSE;
+				CopyText("[]", event.logs);
+				EnqueueEvent(event)
+			END;
+			INC(i)
+		END
+	END PublishErrorToAll;
+
+	PROCEDURE CompleteDisconnectedRemoves;
+	VAR i: INTEGER;
+	BEGIN
+		i := 0;
+		WHILE i < MaxSubscriptions DO
+			IF subs[i].occupied & subs[i].removePending THEN subs[i].occupied := FALSE END;
+			INC(i)
+		END
+	END CompleteDisconnectedRemoves;
+
+	PROCEDURE DisconnectDueToFailure(reason, errName: ARRAY OF CHAR);
+	BEGIN
+		IF J.TextLength(errName) > 0 THEN PublishErrorToAll(errName, reason) END;
+		WS.Close;
+		RetireConnection(reason);
+		CompleteDisconnectedRemoves;
+		ScheduleReconnect
+	END DisconnectDueToFailure;
+
+	PROCEDURE FindPendingCommand(VAR slot: INTEGER; VAR removing: BOOLEAN): BOOLEAN;
+	VAR i, found: INTEGER;
+	BEGIN
+		found := -1;
+		i := 0;
+		WHILE (found < 0) & (i < MaxSubscriptions) DO
+			IF subs[i].occupied & subs[i].removePending THEN found := i END;
+			INC(i)
+		END;
+		IF found >= 0 THEN
+			slot := found; removing := TRUE
+		ELSE
+			i := 0;
+			WHILE (found < 0) & (i < MaxSubscriptions) DO
+				IF subs[i].occupied & subs[i].active & subs[i].addPending & ~subs[i].removePending THEN found := i END;
+				INC(i)
+			END;
+			IF found >= 0 THEN slot := found; removing := FALSE END
+		END;
+		RETURN found >= 0
+	END FindPendingCommand;
+
+	PROCEDURE SendPendingCommand(slot: INTEGER; removing: BOOLEAN);
+	VAR msg: ARRAY MaxMessageOut OF CHAR; msgLength: INTEGER; ok: BOOLEAN; errorText: ARRAY 256 OF CHAR; deadline: INTEGER;
+	BEGIN
+		BuildSingleModification(slot, removing, msg, msgLength, querySetVersion, querySetVersion + 1);
+		deadline := Shim.MonotonicMs() + 5000;
+		WS.SendText(msg, msgLength, deadline, ok, errorText);
+		IF ~ok THEN
+			DisconnectDueToFailure(errorText, "")
+		ELSE
+			INC(querySetVersion);
+			IF removing THEN subs[slot].occupied := FALSE ELSE subs[slot].addPending := FALSE END
+		END
+	END SendPendingCommand;
+
+	PROCEDURE DispatchServerMessage(message: ARRAY OF CHAR);
+	VAR typeRaw, typeName: ARRAY 64 OF CHAR; found, decoded, ok: BOOLEAN; reason: ARRAY 256 OF CHAR;
+	BEGIN
+		ok := J.Member(message, "type", typeRaw, found) & found;
+		IF ~ok THEN
+			DisconnectDueToFailure("server message omitted type", "ProtocolError")
+		ELSE
+			decoded := J.DecodeString(typeRaw, typeName);
+			IF ~decoded THEN
+				DisconnectDueToFailure("server message type was invalid", "ProtocolError")
+			ELSIF TextEqual(typeName, "Transition") THEN
+				HandleTransition(message, ok, reason);
+				IF ~ok THEN DisconnectDueToFailure(reason, "ProtocolError") END
+			ELSIF TextEqual(typeName, "Ping") THEN
+				(*nothing to do*)
+			ELSIF TextEqual(typeName, "MutationResponse") OR TextEqual(typeName, "ActionResponse") THEN
+				(*WebSocket mutations/actions are not sent by this client; ignore*)
+			ELSE
+				CopyText("unknown server message type", reason);
+				DisconnectDueToFailure(reason, "ProtocolError")
+			END
+		END
+	END DispatchServerMessage;
+
+	(* ---------- Pump: the sole owner of the WebSocket connection ---------- *)
+
+	PROCEDURE DrainOneEvent(VAR eventKind, handle: INTEGER; VAR value, logs, errorName, errorMessage, errorData: ARRAY OF CHAR; VAR hasErrorData: BOOLEAN): BOOLEAN;
+	VAR event: PendingEvent; drained: BOOLEAN;
+	BEGIN
+		drained := eventCount > 0;
+		IF drained THEN
+			event := events[eventHead];
+			eventHead := (eventHead + 1) MOD MaxEvents;
+			DEC(eventCount);
+			handle := event.handle;
+			IF event.kind = 1 THEN
+				eventKind := 1;
+				CopyText(event.value, value);
+				CopyText(event.logs, logs);
+				hasErrorData := FALSE
+			ELSE
+				eventKind := 2;
+				CopyText(event.errorName, errorName);
+				CopyText(event.errorMessage, errorMessage);
+				hasErrorData := event.hasErrorData;
+				IF hasErrorData THEN CopyText(event.errorData, errorData) END;
+				CopyText(event.logs, logs)
+			END
+		END;
+		RETURN drained
+	END DrainOneEvent;
+
+	PROCEDURE Pump*(timeoutMs: INTEGER; VAR eventKind, handle: INTEGER; VAR value, logs, errorName, errorMessage, errorData: ARRAY OF CHAR; VAR hasErrorData: BOOLEAN);
+	VAR
+		slot, msgLength, status, pollResult, now, waitMs: INTEGER;
+		removing: BOOLEAN;
+		errorText: ARRAY 256 OF CHAR;
+		ready1, ready2: BOOLEAN;
+		drained: BOOLEAN;
+	BEGIN
+		eventKind := 0; handle := 0;
+		value[0] := 0X; logs[0] := 0X;
+		errorName[0] := 0X; errorMessage[0] := 0X; errorData[0] := 0X;
+		hasErrorData := FALSE;
+
+		drained := DrainOneEvent(eventKind, handle, value, logs, errorName, errorMessage, errorData, hasErrorData);
+		IF ~drained THEN
+			IF connected THEN
+				IF FindPendingCommand(slot, removing) THEN
+					SendPendingCommand(slot, removing)
+				ELSE
+					WS.Receive(timeoutMs, pumpMsgText, msgLength, status, errorText);
+					IF status = 1 THEN
+						DispatchServerMessage(pumpMsgText)
+					ELSIF status = 2 THEN
+						DisconnectDueToFailure("peer closed the connection", "TransportError")
+					ELSIF status = -1 THEN
+						DisconnectDueToFailure(errorText, "TransportError")
+					END;
+					drained := DrainOneEvent(eventKind, handle, value, logs, errorName, errorMessage, errorData, hasErrorData)
+				END
+			ELSE
+				IF ActiveCount() = 0 THEN
+					pollResult := Shim.Poll2(-1, -1, timeoutMs, ready1, ready2)
+				ELSE
+					now := Shim.MonotonicMs();
+					IF now >= reconnectAt THEN
+						ConnectNow
+					ELSE
+						waitMs := reconnectAt - now;
+						IF waitMs > timeoutMs THEN waitMs := timeoutMs END;
+						pollResult := Shim.Poll2(-1, -1, waitMs, ready1, ready2)
+					END
+				END
+			END
+		END
+	END Pump;
+
+	(* ---------- public API ---------- *)
+
+	PROCEDURE Init*(url, token: ARRAY OF CHAR);
+	VAR i: INTEGER;
+	BEGIN
+		CopyText(url, deploymentUrl);
+		CopyText(token, authToken);
+		NewSessionId;
+		nextQueryId := 0;
+		i := 0;
+		WHILE i < MaxSubscriptions DO subs[i].occupied := FALSE; INC(i) END;
+		connected := FALSE;
+		querySetVersion := 0;
+		remoteQuerySet := 0;
+		remoteIdentity := 0;
+		CopyText("AAAAAAAAAAA=", remoteTimestamp);
+		maxObservedTs[0] := 0X;
+		connectionCount := 0;
+		CopyText("InitialConnect", lastCloseReasonText);
+		reconnectAt := 0;
+		backoffMs := 100;
+		eventHead := 0; eventCount := 0
+	END Init;
+
+	PROCEDURE SetAuth*(token: ARRAY OF CHAR);
+	BEGIN
+		CopyText(token, authToken)
+	END SetAuth;
+
+	(*AppendLit appends after destination's existing terminator (destination
+	  must already be 0X terminated); like AppendBuf, a backtick stands in
+	  for a literal double quote.*)
+	PROCEDURE AppendLit(extra: ARRAY OF CHAR; VAR destination: ARRAY OF CHAR);
+	VAR baseLength, extraLength, i: INTEGER;
+	BEGIN
+		baseLength := J.TextLength(destination);
+		extraLength := J.TextLength(extra);
+		i := 0;
+		WHILE i < extraLength DO
+			IF extra[i] = "`" THEN destination[baseLength + i] := CHR(34) ELSE destination[baseLength + i] := extra[i] END;
+			INC(i)
+		END;
+		destination[baseLength + extraLength] := 0X
+	END AppendLit;
+
+	(*Call performs one HTTP query/mutation/action. operation is "query",
+	  "mutation" or "action". On ok=TRUE with errorName empty, value (and
+	  logs) hold the successful result. On ok=TRUE with errorName set to
+	  "FunctionError", the Convex function itself failed (errorMessage,
+	  optionally errorData). ok=FALSE means the HTTP transaction itself
+	  failed (transportError explains why) and no Convex verdict exists.*)
+	PROCEDURE Call*(operation, path: ARRAY OF CHAR; VAR args: ARRAY OF CHAR; VAR value, logs, errorName, errorMessage, errorData: ARRAY OF CHAR; VAR hasErrorData, ok: BOOLEAN; VAR transportError: ARRAY OF CHAR);
+	VAR
+		endpoint: ARRAY 768 OF CHAR;
+		payloadLength, i: INTEGER;
+		httpOk, quoted: BOOLEAN;
+		statusRaw, statusText: ARRAY 64 OF CHAR;
+		found: BOOLEAN;
+	BEGIN
+		value[0] := 0X; logs[0] := 0X; errorName[0] := 0X; errorMessage[0] := 0X; errorData[0] := 0X;
+		hasErrorData := FALSE; ok := FALSE; transportError[0] := 0X;
+
+		CopyText(deploymentUrl, endpoint);
+		IF TextEqual(operation, "query") THEN
+			AppendLit("/api/query", endpoint)
+		ELSIF TextEqual(operation, "mutation") THEN
+			AppendLit("/api/mutation", endpoint)
+		ELSE
+			AppendLit("/api/action", endpoint)
+		END;
+
+		callPayload[0] := 0X;
+		AppendLit("{`path`:", callPayload);
+		quoted := J.AppendQuoted(path, callPayload);
+		IF ~quoted THEN
+			CopyText("function path was too long", transportError)
+		ELSE
+			AppendLit(",`args`:", callPayload);
+			payloadLength := J.TextLength(callPayload);
+			i := 0;
+			WHILE i < J.TextLength(args) DO callPayload[payloadLength] := args[i]; INC(payloadLength); INC(i) END;
+			callPayload[payloadLength] := 0X;
+			AppendLit(",`format`:`json`}", callPayload);
+
+			HTTP.Post(endpoint, callPayload, authToken, 15000, callBody, httpOk, transportError);
+			IF httpOk THEN
+				ok := J.Member(callBody, "status", statusRaw, found) & found;
+				IF ~ok THEN
+					CopyText("HTTP response was not valid Convex JSON", transportError)
+				ELSE
+					ok := J.DecodeString(statusRaw, statusText);
+					IF ~ok THEN CopyText("HTTP response status was invalid", transportError) END
+				END;
+
+				IF ok THEN
+					IF J.Member(callBody, "logLines", callLogsRaw, found) & found THEN
+						IF ~J.StringArrayValid(callLogsRaw) THEN
+							ok := FALSE;
+							CopyText("HTTP logLines was not an array of strings", transportError)
+						ELSE
+							CopyText(callLogsRaw, logs)
+						END
+					ELSE
+						CopyText("[]", logs)
+					END
+				END;
+
+				IF ok & TextEqual(statusText, "success") THEN
+					ok := J.Member(callBody, "value", callValueRaw, found) & found;
+					IF ~ok THEN
+						CopyText("successful Convex response omitted value", transportError)
+					ELSE
+						CopyText(callValueRaw, value)
+					END
+				ELSIF ok & TextEqual(statusText, "error") THEN
+					IF J.Member(callBody, "errorMessage", callMsgRaw, found) & found THEN
+						IF ~J.DecodeString(callMsgRaw, errorMessage) THEN
+							ok := FALSE;
+							CopyText("HTTP errorMessage was not a JSON string", transportError)
+						END
+					ELSE
+						CopyText("Convex function failed", errorMessage)
+					END;
+					IF ok THEN
+						hasErrorData := J.Member(callBody, "errorData", callDataRaw, found) & found;
+						IF hasErrorData THEN CopyText(callDataRaw, errorData) END;
+						CopyText("FunctionError", errorName)
+					END
+				ELSIF ok THEN
+					ok := FALSE;
+					CopyText("HTTP response had an unknown Convex status", transportError)
+				END
+			ELSE
+				ok := FALSE
+			END
+		END
+	END Call;
+
+	(*ok here reports FALSE only on httpOk failing above; Call already sets
+	  ok := FALSE itself in that branch, matching the original semantics
+	  that a transport failure leaves ok FALSE with transportError set.*)
+
+	PROCEDURE Subscribe*(path: ARRAY OF CHAR; VAR args: ARRAY OF CHAR; VAR handle: INTEGER; VAR ok: BOOLEAN; VAR errorText: ARRAY OF CHAR);
+	VAR slot: INTEGER;
+	BEGIN
+		handle := -1;
+		ok := FALSE;
+		errorText[0] := 0X;
+		IF J.TextLength(args) >= MaxArgs THEN
+			CopyText("Live arguments were too large", errorText)
+		ELSE
+			slot := FreeSlot();
+			IF slot < 0 THEN
+				CopyText("Live subscription limit reached", errorText)
+			ELSE
+				subs[slot].occupied := TRUE;
+				subs[slot].active := TRUE;
+				subs[slot].addPending := TRUE;
+				subs[slot].removePending := FALSE;
+				subs[slot].rehydrating := FALSE;
+				subs[slot].hasLastValue := FALSE;
+				subs[slot].valueTooLargeToCompare := FALSE;
+				subs[slot].queryId := nextQueryId;
+				INC(nextQueryId);
+				CopyText(path, subs[slot].path);
+				CopyText(args, subs[slot].args);
+				handle := subs[slot].queryId;
+				ok := TRUE
+			END
+		END
+	END Subscribe;
+
+	PROCEDURE Unsubscribe*(handle: INTEGER);
+	VAR slot: INTEGER;
+	BEGIN
+		slot := FindSlot(handle);
+		IF slot >= 0 THEN
+			DiscardEventsFor(handle);
+			IF ~connected THEN
+				subs[slot].occupied := FALSE
+			ELSE
+				subs[slot].active := FALSE;
+				subs[slot].removePending := TRUE
+			END
+		END
+	END Unsubscribe;
+
+	PROCEDURE DebugDisconnect*(VAR ok: BOOLEAN; VAR errorText: ARRAY OF CHAR);
+	BEGIN
+		errorText[0] := 0X;
+		ok := connected;
+		IF ~ok THEN
+			CopyText("Live WebSocket is not connected", errorText)
+		ELSE
+			WS.Close;
+			RetireConnection("DebugDisconnect");
+			CompleteDisconnectedRemoves;
+			reconnectAt := Shim.MonotonicMs();
+			backoffMs := 100
+		END
+	END DebugDisconnect;
+
+	PROCEDURE ConnectionCount*(): INTEGER;
+	BEGIN
+		RETURN connectionCount
+	END ConnectionCount;
+
+	PROCEDURE LastCloseReason*(VAR text: ARRAY OF CHAR);
+	BEGIN
+		CopyText(lastCloseReasonText, text)
+	END LastCloseReason;
+
+	PROCEDURE MaxObservedTimestamp*(VAR text: ARRAY OF CHAR);
+	BEGIN
+		CopyText(maxObservedTs, text)
+	END MaxObservedTimestamp;
+
+	PROCEDURE IsConnected*(): BOOLEAN;
+	BEGIN
+		RETURN connected
+	END IsConnected;
+
+END ConvexSync.

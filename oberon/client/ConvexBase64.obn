@@ -1,0 +1,142 @@
+(*ConvexBase64 implements RFC 4648 standard base64 encoding and decoding.
+  Convex's Live protocol encodes each transition timestamp as standard
+  base64 of an 8 byte little-endian counter, and the WebSocket handshake
+  needs it for the Sec-WebSocket-Key/Accept exchange. This module has no
+  knowledge of either; it only encodes and decodes bytes.
+
+  Oberon-07 has no LOOP/EXIT or early RETURN (a procedure's RETURN, if any,
+  must be its last statement), so every guard below is threaded through an
+  explicit "ok" flag rather than bailing out mid-procedure.*)
+MODULE ConvexBase64;
+
+	VAR
+		alphabet: ARRAY 65 OF CHAR;
+
+	PROCEDURE ValueOf(ch: CHAR): INTEGER;
+	VAR result: INTEGER;
+	BEGIN
+		IF (ch >= "A") & (ch <= "Z") THEN result := ORD(ch) - ORD("A")
+		ELSIF (ch >= "a") & (ch <= "z") THEN result := ORD(ch) - ORD("a") + 26
+		ELSIF (ch >= "0") & (ch <= "9") THEN result := ORD(ch) - ORD("0") + 52
+		ELSIF ch = "+" THEN result := 62
+		ELSIF ch = "/" THEN result := 63
+		ELSE result := -1
+		END;
+		RETURN result
+	END ValueOf;
+
+	(*Encode appends the base64 encoding of data[0 .. length-1] to
+	  destination, which must already be 0X terminated (possibly empty).
+	  Returns FALSE, leaving destination unchanged in content, if the result
+	  would not fit.*)
+	PROCEDURE Encode*(data: ARRAY OF CHAR; length: INTEGER; VAR destination: ARRAY OF CHAR): BOOLEAN;
+	VAR
+		base, needed, groups, remainder, i, groupIndex: INTEGER;
+		b0, b1, b2: INTEGER;
+		ok: BOOLEAN;
+	BEGIN
+		base := 0;
+		WHILE destination[base] # 0X DO INC(base) END;
+		groups := length DIV 3;
+		remainder := length MOD 3;
+		needed := groups * 4;
+		IF remainder > 0 THEN needed := needed + 4 END;
+		ok := base + needed < LEN(destination);
+
+		IF ok THEN
+			i := base;
+			groupIndex := 0;
+			WHILE groupIndex < groups DO
+				b0 := ORD(data[groupIndex * 3]);
+				b1 := ORD(data[groupIndex * 3 + 1]);
+				b2 := ORD(data[groupIndex * 3 + 2]);
+				destination[i] := alphabet[b0 DIV 4];
+				destination[i + 1] := alphabet[((b0 MOD 4) * 16) + (b1 DIV 16)];
+				destination[i + 2] := alphabet[((b1 MOD 16) * 4) + (b2 DIV 64)];
+				destination[i + 3] := alphabet[b2 MOD 64];
+				i := i + 4;
+				INC(groupIndex)
+			END;
+
+			IF remainder = 1 THEN
+				b0 := ORD(data[groups * 3]);
+				destination[i] := alphabet[b0 DIV 4];
+				destination[i + 1] := alphabet[(b0 MOD 4) * 16];
+				destination[i + 2] := "=";
+				destination[i + 3] := "=";
+				i := i + 4
+			ELSIF remainder = 2 THEN
+				b0 := ORD(data[groups * 3]);
+				b1 := ORD(data[groups * 3 + 1]);
+				destination[i] := alphabet[b0 DIV 4];
+				destination[i + 1] := alphabet[((b0 MOD 4) * 16) + (b1 DIV 16)];
+				destination[i + 2] := alphabet[(b1 MOD 16) * 4];
+				destination[i + 3] := "=";
+				i := i + 4
+			END;
+
+			destination[i] := 0X
+		END;
+		RETURN ok
+	END Encode;
+
+	(*Decode replaces destination with the decoded bytes of the 0X
+	  terminated base64 text in source, setting decodedLength to the byte
+	  count. Returns FALSE on malformed input or if destination is too
+	  small; destination's content is then unspecified.*)
+	PROCEDURE Decode*(source: ARRAY OF CHAR; VAR destination: ARRAY OF CHAR; VAR decodedLength: INTEGER): BOOLEAN;
+	VAR
+		sourceLength, groups, i, outIndex, padCount: INTEGER;
+		v0, v1, v2, v3: INTEGER;
+		ok: BOOLEAN;
+		lastGroup, dropLast, dropSecondLast: BOOLEAN;
+	BEGIN
+		sourceLength := 0;
+		WHILE source[sourceLength] # 0X DO INC(sourceLength) END;
+		decodedLength := 0;
+		ok := (sourceLength MOD 4 = 0) & (sourceLength > 0);
+
+		padCount := 0;
+		IF ok THEN
+			IF source[sourceLength - 1] = "=" THEN INC(padCount) END;
+			IF (sourceLength >= 2) & (source[sourceLength - 2] = "=") THEN INC(padCount) END;
+			groups := sourceLength DIV 4;
+			ok := (groups - 1) * 3 + 3 - padCount <= LEN(destination)
+		END;
+
+		outIndex := 0;
+		i := 0;
+		WHILE ok & (i < groups) DO
+			lastGroup := i = groups - 1;
+			dropLast := lastGroup & (padCount >= 1);
+			dropSecondLast := lastGroup & (padCount >= 2);
+
+			v0 := ValueOf(source[i * 4]);
+			v1 := ValueOf(source[i * 4 + 1]);
+			IF dropSecondLast THEN v2 := 0 ELSE v2 := ValueOf(source[i * 4 + 2]) END;
+			IF dropLast THEN v3 := 0 ELSE v3 := ValueOf(source[i * 4 + 3]) END;
+
+			IF (v0 < 0) OR (v1 < 0) OR ((~dropSecondLast) & (v2 < 0)) OR ((~dropLast) & (v3 < 0)) THEN
+				ok := FALSE
+			ELSE
+				destination[outIndex] := CHR((v0 * 4) + (v1 DIV 16));
+				INC(outIndex);
+				IF ~dropSecondLast THEN
+					destination[outIndex] := CHR(((v1 MOD 16) * 16) + (v2 DIV 4));
+					INC(outIndex)
+				END;
+				IF ~dropLast THEN
+					destination[outIndex] := CHR(((v2 MOD 4) * 64) + v3);
+					INC(outIndex)
+				END
+			END;
+			INC(i)
+		END;
+
+		IF ok THEN decodedLength := outIndex END;
+		RETURN ok
+	END Decode;
+
+BEGIN
+	alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+END ConvexBase64.

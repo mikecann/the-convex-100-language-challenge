@@ -1,0 +1,98 @@
+schemaVersion: 1
+id: oberon
+displayName: "Oberon-07"
+rank: 76
+selectionTier: coverage
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Oberon-07 implementation of the Convex HTTP API and the pinned
+    /api/sync WebSocket protocol, built with OBNC (which translates Oberon to
+    C). JSON, base64, HTTP/1.1 framing, the RFC 6455 handshake and frame
+    state machine, and all Convex sync behaviour (query-set tracking,
+    transition validation, rehydration suppression, reconnect/backoff, and
+    event publication) are written in Oberon-07. A single module marked
+    "(*implemented in C*)" (client/ConvexShim.obn, implemented in
+    client/ConvexShim.c) supplies only generic, Convex-unaware transport
+    primitives: raw TCP sockets, OpenSSL for TLS, poll(), a monotonic clock,
+    CSPRNG bytes, and SHA-1 for the WebSocket handshake key. Badges remain
+    unearned until root-owned local and hosted conformance succeed.
+toolchain:
+  name: OBNC
+  version: 0.17.2
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    Live authentication, WebSocket mutations, WebSocket actions, optimistic
+    updates, and journals are deferred. Every query, mutation, and action
+    goes over the HTTP API; Live is read-only subscription delivery.
+  - >-
+    TransitionChunk assembly is deferred. Receiving one (or any other
+    unrecognised server message type) is reported as a ProtocolError and
+    triggers a reconnect of every active subscription, matching this
+    project's stated fallback for undocumented Live traffic.
+  - >-
+    Values are exposed as raw JSON text rather than a richer Oberon value
+    tree; callers decode the fields they need with the ConvexJSON module.
+  - >-
+    At most 16 Live subscriptions may be active at once, matching the fixed
+    size subscription table in client/ConvexSync.obn. Each subscription's
+    path, arguments, and last delivered value are capped at 256, 8192, and
+    8192 bytes respectively for rehydration comparison and event payloads.
+  - >-
+    Pump() delivers from a bounded ring buffer of the newest 32 pending
+    events; a consumer that never calls Pump() causes the oldest queued
+    event to be dropped rather than the buffer growing without limit. This
+    overflow behaviour is implemented but not yet covered by a dedicated
+    language-local test; the deterministic Live acceptance tests in
+    client/tests/TestLive.obn exercise ordinary delivery, QueryFailed
+    recovery, and a forced reconnect with resend, but not queue saturation.
+  - >-
+    HTTP request/response bodies are capped at 2 MiB (client/ConvexHTTP.obn)
+    and WebSocket messages at 4 MiB (client/ConvexWS.obn). Chunked HTTP
+    transfer-encoding is not implemented and is rejected as a transport
+    error rather than decoded.
+  - >-
+    The NDJSON adapter under client/tests/conformance/ mirrors the client's
+    16-subscription cap, uses a 1 MiB input command buffer, and an output
+    buffer sized to the 4 MiB WebSocket message cap plus headroom; it has not
+    been pressure-tested against a stopped reader at the shared 128 MiB
+    process limit the way some other language clients in this repository
+    have been.
+  - >-
+    OBNC 0.17.2 implements a smaller language than the report's optional
+    extensions suggest, and this client works within those bounds rather
+    than around them: Oberon-07 itself has no LOOP/EXIT, and a procedure's
+    RETURN (if present) must be its last statement, so every early-exit
+    guard clause in the source is written as an explicit boolean flag
+    threaded through a flat sequence of steps instead. OBNC's nested
+    procedures see only their enclosing module's top level declarations, not
+    an outer procedure's own locals (no closures), so helpers that would
+    naturally nest inside a caller are ordinary module level procedures
+    instead. The compiler's lexer accepts only double quoted string
+    literals, so any text that needs a literal quote character uses CHR(34)
+    (or, in JSON template fragments built with the shared AppendBuf/AppendLit
+    helpers, a backtick standing in for one). Local array variables are not
+    zero-initialised, which matters because ConvexBase64.Encode and
+    ConvexJSON.AppendQuoted both append after a destination's existing
+    terminator; every call site clears that destination explicitly first,
+    documented at each call.
+  - >-
+    Capabilities remain unearned until the root-owned shared local and
+    hosted conformance evidence passes from a clean exact-head build.
+capabilities: []

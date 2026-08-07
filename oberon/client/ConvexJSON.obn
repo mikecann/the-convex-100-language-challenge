@@ -1,0 +1,661 @@
+(*ConvexJSON is a small, allocation-free JSON reader and writer over fixed
+  size CHAR arrays. It never builds a parse tree: Member/ArrayBegin/
+  ArrayNext locate and slice out the raw text of a value, and callers
+  either compare it directly or hand it back in for further parsing. This
+  keeps every buffer a plain, bounded ARRAY OF CHAR, which is what this
+  client's Live subscriptions and HTTP calls both need.
+
+  Oberon-07 has no LOOP/EXIT and a procedure's RETURN (if any) must be its
+  last statement, so scanning loops below use an explicit "ok"/"done" flag
+  pair instead of bailing out mid-loop, and multi-step procedures thread an
+  "ok" flag through a flat sequence of "IF ok THEN ... END" steps instead of
+  the early "IF NOT step THEN RETURN FALSE END" guards a language with
+  early return would use.*)
+MODULE ConvexJSON;
+
+	VAR
+		hexDigits: ARRAY 17 OF CHAR;
+
+	(*TextLength scans for the first 0X within the array actually passed
+	  (LEN, for an open array parameter, is the caller's actual length, not
+	  a fixed capacity), so it never reads past what the caller supplied.*)
+	PROCEDURE TextLength*(s: ARRAY OF CHAR): INTEGER;
+	VAR i: INTEGER;
+	BEGIN
+		i := 0;
+		WHILE (i < LEN(s)) & (s[i] # 0X) DO INC(i) END;
+		RETURN i
+	END TextLength;
+
+	(*b is a value parameter (rather than VAR, like a) so callers may pass a
+	  literal search key directly, matching how Member's own key parameter
+	  works.*)
+	PROCEDURE StrEqual*(a, b: ARRAY OF CHAR): BOOLEAN;
+	VAR lengthA, lengthB, i: INTEGER; equal: BOOLEAN;
+	BEGIN
+		lengthA := TextLength(a);
+		lengthB := TextLength(b);
+		equal := lengthA = lengthB;
+		i := 0;
+		WHILE equal & (i < lengthA) DO
+			IF a[i] # b[i] THEN equal := FALSE END;
+			INC(i)
+		END;
+		RETURN equal
+	END StrEqual;
+
+	PROCEDURE IsDigit(ch: CHAR): BOOLEAN;
+	BEGIN
+		RETURN (ch >= "0") & (ch <= "9")
+	END IsDigit;
+
+	PROCEDURE IsSpace(ch: CHAR): BOOLEAN;
+	BEGIN
+		RETURN (ch = " ") OR (ch = CHR(9)) OR (ch = CHR(10)) OR (ch = CHR(13))
+	END IsSpace;
+
+	PROCEDURE HexValue(ch: CHAR): INTEGER;
+	VAR result: INTEGER;
+	BEGIN
+		IF (ch >= "0") & (ch <= "9") THEN result := ORD(ch) - ORD("0")
+		ELSIF (ch >= "a") & (ch <= "f") THEN result := ORD(ch) - ORD("a") + 10
+		ELSIF (ch >= "A") & (ch <= "F") THEN result := ORD(ch) - ORD("A") + 10
+		ELSE result := -1
+		END;
+		RETURN result
+	END HexValue;
+
+	PROCEDURE AtChar(doc: ARRAY OF CHAR; length, pos: INTEGER; ch: CHAR): BOOLEAN;
+	BEGIN
+		RETURN (pos < length) & (doc[pos] = ch)
+	END AtChar;
+
+	PROCEDURE SkipSpace(doc: ARRAY OF CHAR; length: INTEGER; VAR pos: INTEGER);
+	BEGIN
+		WHILE (pos < length) & IsSpace(doc[pos]) DO INC(pos) END
+	END SkipSpace;
+
+	PROCEDURE ExtractSlice(source: ARRAY OF CHAR; start, count: INTEGER; VAR dest: ARRAY OF CHAR): BOOLEAN;
+	VAR i: INTEGER; ok: BOOLEAN;
+	BEGIN
+		ok := count < LEN(dest);
+		IF ok THEN
+			i := 0;
+			WHILE i < count DO dest[i] := source[start + i]; INC(i) END;
+			dest[count] := 0X
+		END;
+		RETURN ok
+	END ExtractSlice;
+
+	(* ---------- scanning (validate + advance, no decoding) ---------- *)
+
+	PROCEDURE ScanString(doc: ARRAY OF CHAR; length: INTEGER; VAR pos: INTEGER): BOOLEAN;
+	VAR ch: CHAR; i: INTEGER; ok, done: BOOLEAN;
+	BEGIN
+		ok := AtChar(doc, length, pos, CHR(34));
+		IF ok THEN INC(pos) END;
+		done := FALSE;
+		WHILE ok & ~done DO
+			IF pos >= length THEN
+				ok := FALSE
+			ELSE
+				ch := doc[pos];
+				IF ch = CHR(34) THEN
+					INC(pos); done := TRUE
+				ELSIF ch = CHR(92) THEN
+					INC(pos);
+					IF pos >= length THEN
+						ok := FALSE
+					ELSE
+						ch := doc[pos];
+						IF (ch = CHR(34)) OR (ch = CHR(92)) OR (ch = "/") OR (ch = "b") OR (ch = "f")
+						  OR (ch = "n") OR (ch = "r") OR (ch = "t") THEN
+							INC(pos)
+						ELSIF ch = "u" THEN
+							INC(pos);
+							i := 1;
+							WHILE ok & (i <= 4) DO
+								IF pos >= length THEN ok := FALSE
+								ELSIF HexValue(doc[pos]) < 0 THEN ok := FALSE
+								ELSE INC(pos); INC(i)
+								END
+							END
+						ELSE
+							ok := FALSE
+						END
+					END
+				ELSIF ORD(ch) < 32 THEN
+					ok := FALSE
+				ELSE
+					INC(pos)
+				END
+			END
+		END;
+		RETURN ok & done
+	END ScanString;
+
+	PROCEDURE ScanNumber(doc: ARRAY OF CHAR; length: INTEGER; VAR pos: INTEGER): BOOLEAN;
+	VAR ok: BOOLEAN;
+	BEGIN
+		ok := pos < length;
+		IF ok & (doc[pos] = "-") THEN INC(pos) END;
+		IF ok THEN ok := pos < length END;
+		IF ok THEN ok := IsDigit(doc[pos]) END;
+		IF ok THEN
+			IF doc[pos] = "0" THEN
+				INC(pos)
+			ELSE
+				WHILE (pos < length) & IsDigit(doc[pos]) DO INC(pos) END
+			END
+		END;
+		IF ok & (pos < length) & (doc[pos] = ".") THEN
+			INC(pos);
+			ok := (pos < length) & IsDigit(doc[pos]);
+			IF ok THEN
+				WHILE (pos < length) & IsDigit(doc[pos]) DO INC(pos) END
+			END
+		END;
+		IF ok & (pos < length) & ((doc[pos] = "e") OR (doc[pos] = "E")) THEN
+			INC(pos);
+			IF (pos < length) & ((doc[pos] = "+") OR (doc[pos] = "-")) THEN INC(pos) END;
+			ok := (pos < length) & IsDigit(doc[pos]);
+			IF ok THEN
+				WHILE (pos < length) & IsDigit(doc[pos]) DO INC(pos) END
+			END
+		END;
+		RETURN ok
+	END ScanNumber;
+
+	PROCEDURE ScanValue(doc: ARRAY OF CHAR; length: INTEGER; VAR pos: INTEGER): BOOLEAN;
+	VAR ok, done: BOOLEAN;
+	BEGIN
+		SkipSpace(doc, length, pos);
+		ok := pos < length;
+		IF ok THEN
+			IF doc[pos] = CHR(34) THEN
+				ok := ScanString(doc, length, pos)
+			ELSIF doc[pos] = "{" THEN
+				INC(pos);
+				SkipSpace(doc, length, pos);
+				IF AtChar(doc, length, pos, "}") THEN
+					INC(pos)
+				ELSE
+					done := FALSE;
+					WHILE ok & ~done DO
+						IF ~AtChar(doc, length, pos, CHR(34)) THEN
+							ok := FALSE
+						ELSE
+							ok := ScanString(doc, length, pos);
+							IF ok THEN
+								SkipSpace(doc, length, pos);
+								ok := AtChar(doc, length, pos, ":")
+							END;
+							IF ok THEN
+								INC(pos);
+								ok := ScanValue(doc, length, pos)
+							END;
+							IF ok THEN
+								SkipSpace(doc, length, pos);
+								ok := pos < length
+							END;
+							IF ok THEN
+								IF AtChar(doc, length, pos, "}") THEN
+									INC(pos); done := TRUE
+								ELSIF AtChar(doc, length, pos, ",") THEN
+									INC(pos);
+									SkipSpace(doc, length, pos)
+								ELSE
+									ok := FALSE
+								END
+							END
+						END
+					END
+				END
+			ELSIF doc[pos] = "[" THEN
+				INC(pos);
+				SkipSpace(doc, length, pos);
+				IF AtChar(doc, length, pos, "]") THEN
+					INC(pos)
+				ELSE
+					done := FALSE;
+					WHILE ok & ~done DO
+						ok := ScanValue(doc, length, pos);
+						IF ok THEN
+							SkipSpace(doc, length, pos);
+							ok := pos < length
+						END;
+						IF ok THEN
+							IF AtChar(doc, length, pos, "]") THEN
+								INC(pos); done := TRUE
+							ELSIF AtChar(doc, length, pos, ",") THEN
+								INC(pos);
+								SkipSpace(doc, length, pos)
+							ELSE
+								ok := FALSE
+							END
+						END
+					END
+				END
+			ELSIF doc[pos] = "t" THEN
+				ok := (pos + 3 < length) & (doc[pos+1] = "r") & (doc[pos+2] = "u") & (doc[pos+3] = "e");
+				IF ok THEN pos := pos + 4 END
+			ELSIF doc[pos] = "f" THEN
+				ok := (pos + 4 < length) & (doc[pos+1] = "a") & (doc[pos+2] = "l") & (doc[pos+3] = "s") & (doc[pos+4] = "e");
+				IF ok THEN pos := pos + 5 END
+			ELSIF doc[pos] = "n" THEN
+				ok := (pos + 3 < length) & (doc[pos+1] = "u") & (doc[pos+2] = "l") & (doc[pos+3] = "l");
+				IF ok THEN pos := pos + 4 END
+			ELSIF (doc[pos] = "-") OR IsDigit(doc[pos]) THEN
+				ok := ScanNumber(doc, length, pos)
+			ELSE
+				ok := FALSE
+			END
+		END;
+		RETURN ok
+	END ScanValue;
+
+	PROCEDURE AppendUtf8(code: INTEGER; VAR dest: ARRAY OF CHAR; VAR pos: INTEGER): BOOLEAN;
+	VAR ok: BOOLEAN;
+	BEGIN
+		IF code <= 07FH THEN
+			ok := pos <= LEN(dest) - 1;
+			IF ok THEN dest[pos] := CHR(code); INC(pos) END
+		ELSIF code <= 07FFH THEN
+			ok := pos + 1 <= LEN(dest) - 1;
+			IF ok THEN
+				dest[pos] := CHR(0C0H + (code DIV 40H));
+				dest[pos+1] := CHR(080H + (code MOD 40H));
+				INC(pos, 2)
+			END
+		ELSIF code <= 0FFFFH THEN
+			ok := pos + 2 <= LEN(dest) - 1;
+			IF ok THEN
+				dest[pos] := CHR(0E0H + (code DIV 1000H));
+				dest[pos+1] := CHR(080H + ((code DIV 40H) MOD 40H));
+				dest[pos+2] := CHR(080H + (code MOD 40H));
+				INC(pos, 3)
+			END
+		ELSE
+			ok := pos + 3 <= LEN(dest) - 1;
+			IF ok THEN
+				dest[pos] := CHR(0F0H + (code DIV 40000H));
+				dest[pos+1] := CHR(080H + ((code DIV 1000H) MOD 40H));
+				dest[pos+2] := CHR(080H + ((code DIV 40H) MOD 40H));
+				dest[pos+3] := CHR(080H + (code MOD 40H));
+				INC(pos, 4)
+			END
+		END;
+		RETURN ok
+	END AppendUtf8;
+
+	PROCEDURE DecodeString*(raw: ARRAY OF CHAR; VAR decoded: ARRAY OF CHAR): BOOLEAN;
+	VAR
+		length, pos, outPos, code, lowCode, i, digit: INTEGER;
+		ch: CHAR;
+		ok: BOOLEAN;
+	BEGIN
+		decoded[0] := 0X;
+		length := TextLength(raw);
+		ok := (length >= 2) & (raw[0] = CHR(34)) & (raw[length-1] = CHR(34));
+		outPos := 0;
+		IF ok THEN
+			pos := 1;
+			WHILE ok & (pos < length - 1) DO
+				ch := raw[pos];
+				IF ch # CHR(92) THEN
+					ok := outPos <= LEN(decoded) - 1;
+					IF ok THEN decoded[outPos] := ch; INC(outPos); INC(pos) END
+				ELSE
+					INC(pos);
+					ok := pos < length - 1;
+					IF ok THEN
+						ch := raw[pos];
+						IF (ch = CHR(34)) OR (ch = CHR(92)) OR (ch = "/") THEN
+							ok := outPos <= LEN(decoded) - 1;
+							IF ok THEN decoded[outPos] := ch; INC(outPos); INC(pos) END
+						ELSIF ch = "b" THEN
+							ok := outPos <= LEN(decoded) - 1;
+							IF ok THEN decoded[outPos] := CHR(8); INC(outPos); INC(pos) END
+						ELSIF ch = "f" THEN
+							ok := outPos <= LEN(decoded) - 1;
+							IF ok THEN decoded[outPos] := CHR(12); INC(outPos); INC(pos) END
+						ELSIF ch = "n" THEN
+							ok := outPos <= LEN(decoded) - 1;
+							IF ok THEN decoded[outPos] := CHR(10); INC(outPos); INC(pos) END
+						ELSIF ch = "r" THEN
+							ok := outPos <= LEN(decoded) - 1;
+							IF ok THEN decoded[outPos] := CHR(13); INC(outPos); INC(pos) END
+						ELSIF ch = "t" THEN
+							ok := outPos <= LEN(decoded) - 1;
+							IF ok THEN decoded[outPos] := CHR(9); INC(outPos); INC(pos) END
+						ELSIF ch = "u" THEN
+							INC(pos);
+							ok := pos + 4 <= length - 1;
+							IF ok THEN
+								code := 0;
+								i := 0;
+								WHILE ok & (i <= 3) DO
+									digit := HexValue(raw[pos + i]);
+									IF digit < 0 THEN ok := FALSE
+									ELSE code := code * 16 + digit; INC(i)
+									END
+								END
+							END;
+							IF ok THEN
+								pos := pos + 4;
+								IF (code >= 0D800H) & (code <= 0DBFFH) THEN
+									ok := (pos + 6 <= length - 1) & (raw[pos] = CHR(92)) & (raw[pos+1] = "u");
+									IF ok THEN
+										pos := pos + 2;
+										lowCode := 0;
+										i := 0;
+										WHILE ok & (i <= 3) DO
+											digit := HexValue(raw[pos + i]);
+											IF digit < 0 THEN ok := FALSE
+											ELSE lowCode := lowCode * 16 + digit; INC(i)
+											END
+										END
+									END;
+									IF ok THEN
+										pos := pos + 4;
+										ok := (lowCode >= 0DC00H) & (lowCode <= 0DFFFH);
+										IF ok THEN
+											code := 010000H + ((code - 0D800H) * 400H) + (lowCode - 0DC00H)
+										END
+									END
+								ELSIF (code >= 0DC00H) & (code <= 0DFFFH) THEN
+									ok := FALSE
+								END
+							END;
+							IF ok THEN ok := AppendUtf8(code, decoded, outPos) END
+						ELSE
+							ok := FALSE
+						END
+					END
+				END
+			END
+		END;
+		IF ok THEN decoded[outPos] := 0X END;
+		RETURN ok
+	END DecodeString;
+
+	(* ---------- public API ---------- *)
+
+	PROCEDURE Member*(doc: ARRAY OF CHAR; key: ARRAY OF CHAR; VAR value: ARRAY OF CHAR; VAR found: BOOLEAN): BOOLEAN;
+	VAR
+		length, pos, keyStart, valueStart, valueEnd: INTEGER;
+		rawKey, decodedKey: ARRAY 512 OF CHAR;
+		ok, empty, done: BOOLEAN;
+	BEGIN
+		found := FALSE;
+		value[0] := 0X;
+		length := TextLength(doc);
+		pos := 0;
+		SkipSpace(doc, length, pos);
+		ok := AtChar(doc, length, pos, "{");
+		IF ok THEN
+			INC(pos);
+			SkipSpace(doc, length, pos);
+			empty := AtChar(doc, length, pos, "}");
+			IF empty THEN
+				INC(pos);
+				SkipSpace(doc, length, pos);
+				ok := pos >= length
+			ELSE
+				done := FALSE;
+				WHILE ok & ~done DO
+					IF ~AtChar(doc, length, pos, CHR(34)) THEN
+						ok := FALSE
+					ELSE
+						keyStart := pos;
+						ok := ScanString(doc, length, pos);
+						IF ok THEN ok := ExtractSlice(doc, keyStart, pos - keyStart, rawKey) END;
+						IF ok THEN ok := DecodeString(rawKey, decodedKey) END;
+						IF ok THEN
+							SkipSpace(doc, length, pos);
+							ok := AtChar(doc, length, pos, ":")
+						END;
+						IF ok THEN
+							INC(pos);
+							valueStart := pos;
+							ok := ScanValue(doc, length, pos)
+						END;
+						IF ok THEN
+							valueEnd := pos;
+							IF StrEqual(decodedKey, key) THEN
+								found := TRUE;
+								ok := ExtractSlice(doc, valueStart, valueEnd - valueStart, value)
+							END
+						END;
+						IF ok THEN
+							SkipSpace(doc, length, pos);
+							ok := pos < length
+						END;
+						IF ok THEN
+							IF AtChar(doc, length, pos, "}") THEN
+								INC(pos); done := TRUE
+							ELSIF AtChar(doc, length, pos, ",") THEN
+								INC(pos);
+								SkipSpace(doc, length, pos)
+							ELSE
+								ok := FALSE
+							END
+						END
+					END
+				END;
+				IF ok THEN
+					SkipSpace(doc, length, pos);
+					ok := pos >= length
+				END
+			END
+		END;
+		RETURN ok
+	END Member;
+
+	PROCEDURE ArrayBegin*(array: ARRAY OF CHAR; VAR cursor: INTEGER): BOOLEAN;
+	VAR length: INTEGER; ok: BOOLEAN;
+	BEGIN
+		length := TextLength(array);
+		cursor := 0;
+		SkipSpace(array, length, cursor);
+		ok := AtChar(array, length, cursor, "[");
+		IF ok THEN INC(cursor) END;
+		RETURN ok
+	END ArrayBegin;
+
+	(*ArrayNext returns FALSE both at a well formed end of array (cursor left
+	  just past "]") and on malformed input (cursor set to -1); callers that
+	  need to tell the two apart use ArrayWellFormed afterwards.*)
+	PROCEDURE ArrayNext*(array: ARRAY OF CHAR; VAR cursor: INTEGER; VAR element: ARRAY OF CHAR): BOOLEAN;
+	VAR length, elementStart: INTEGER; ok: BOOLEAN;
+	BEGIN
+		element[0] := 0X;
+		length := TextLength(array);
+		SkipSpace(array, length, cursor);
+		ok := cursor < length;
+		IF ok THEN
+			IF array[cursor] = "]" THEN
+				INC(cursor);
+				ok := FALSE
+			ELSE
+				elementStart := cursor;
+				ok := ScanValue(array, length, cursor);
+				IF ~ok THEN
+					cursor := -1
+				ELSE
+					ok := ExtractSlice(array, elementStart, cursor - elementStart, element);
+					IF ~ok THEN
+						cursor := -1
+					ELSE
+						SkipSpace(array, length, cursor);
+						IF AtChar(array, length, cursor, ",") THEN INC(cursor) END
+					END
+				END
+			END
+		END;
+		RETURN ok
+	END ArrayNext;
+
+	PROCEDURE ArrayWellFormed*(array: ARRAY OF CHAR; cursor: INTEGER): BOOLEAN;
+	VAR length: INTEGER; ok: BOOLEAN;
+	BEGIN
+		ok := cursor >= 0;
+		IF ok THEN
+			length := TextLength(array);
+			SkipSpace(array, length, cursor);
+			ok := cursor >= length
+		END;
+		RETURN ok
+	END ArrayWellFormed;
+
+	PROCEDURE StringArrayValid*(doc: ARRAY OF CHAR): BOOLEAN;
+	VAR length, pos: INTEGER; ok, empty, done: BOOLEAN;
+	BEGIN
+		length := TextLength(doc);
+		pos := 0;
+		SkipSpace(doc, length, pos);
+		ok := AtChar(doc, length, pos, "[");
+		IF ok THEN
+			INC(pos);
+			SkipSpace(doc, length, pos);
+			empty := AtChar(doc, length, pos, "]");
+			IF empty THEN
+				INC(pos);
+				SkipSpace(doc, length, pos);
+				ok := pos >= length
+			ELSE
+				done := FALSE;
+				WHILE ok & ~done DO
+					IF ~AtChar(doc, length, pos, CHR(34)) THEN
+						ok := FALSE
+					ELSE
+						ok := ScanString(doc, length, pos);
+						IF ok THEN
+							SkipSpace(doc, length, pos);
+							ok := pos < length
+						END;
+						IF ok THEN
+							IF AtChar(doc, length, pos, "]") THEN
+								INC(pos);
+								SkipSpace(doc, length, pos);
+								ok := pos >= length;
+								done := TRUE
+							ELSIF AtChar(doc, length, pos, ",") THEN
+								INC(pos);
+								SkipSpace(doc, length, pos)
+							ELSE
+								ok := FALSE
+							END
+						END
+					END
+				END
+			END
+		END;
+		RETURN ok
+	END StringArrayValid;
+
+	PROCEDURE AppendQuoted*(text: ARRAY OF CHAR; VAR destination: ARRAY OF CHAR): BOOLEAN;
+	VAR
+		outPos, textLength, i, code: INTEGER;
+		ch: CHAR;
+		ok: BOOLEAN;
+	BEGIN
+		outPos := TextLength(destination);
+		ok := outPos <= LEN(destination) - 1;
+		IF ok THEN
+			destination[outPos] := CHR(34);
+			INC(outPos);
+			textLength := TextLength(text);
+			i := 0;
+			WHILE ok & (i < textLength) DO
+				ch := text[i];
+				IF ch = CHR(34) THEN
+					ok := outPos + 1 <= LEN(destination) - 1;
+					IF ok THEN destination[outPos] := CHR(92); destination[outPos+1] := CHR(34); INC(outPos, 2) END
+				ELSIF ch = CHR(92) THEN
+					ok := outPos + 1 <= LEN(destination) - 1;
+					IF ok THEN destination[outPos] := CHR(92); destination[outPos+1] := CHR(92); INC(outPos, 2) END
+				ELSIF ch = CHR(10) THEN
+					ok := outPos + 1 <= LEN(destination) - 1;
+					IF ok THEN destination[outPos] := CHR(92); destination[outPos+1] := "n"; INC(outPos, 2) END
+				ELSIF ch = CHR(13) THEN
+					ok := outPos + 1 <= LEN(destination) - 1;
+					IF ok THEN destination[outPos] := CHR(92); destination[outPos+1] := "r"; INC(outPos, 2) END
+				ELSIF ch = CHR(9) THEN
+					ok := outPos + 1 <= LEN(destination) - 1;
+					IF ok THEN destination[outPos] := CHR(92); destination[outPos+1] := "t"; INC(outPos, 2) END
+				ELSIF ORD(ch) < 32 THEN
+					ok := outPos + 5 <= LEN(destination) - 1;
+					IF ok THEN
+						code := ORD(ch);
+						destination[outPos] := CHR(92); destination[outPos+1] := "u";
+						destination[outPos+2] := "0"; destination[outPos+3] := "0";
+						destination[outPos+4] := hexDigits[code DIV 16];
+						destination[outPos+5] := hexDigits[code MOD 16];
+						INC(outPos, 6)
+					END
+				ELSE
+					ok := outPos <= LEN(destination) - 1;
+					IF ok THEN destination[outPos] := ch; INC(outPos) END
+				END;
+				INC(i)
+			END
+		END;
+		IF ok THEN
+			ok := outPos <= LEN(destination) - 1;
+			IF ok THEN
+				destination[outPos] := CHR(34);
+				INC(outPos);
+				ok := outPos <= LEN(destination) - 1;
+				IF ok THEN destination[outPos] := 0X END
+			END
+		END;
+		RETURN ok
+	END AppendQuoted;
+
+	PROCEDURE ParseNonNegativeInt*(raw: ARRAY OF CHAR; VAR value: INTEGER): BOOLEAN;
+	VAR length, i: INTEGER; ok: BOOLEAN;
+	BEGIN
+		value := 0;
+		length := TextLength(raw);
+		ok := length > 0;
+		i := 0;
+		WHILE ok & (i < length) DO
+			IF ~IsDigit(raw[i]) THEN
+				ok := FALSE
+			ELSE
+				value := value * 10 + (ORD(raw[i]) - ORD("0"));
+				INC(i)
+			END
+		END;
+		RETURN ok
+	END ParseNonNegativeInt;
+
+	(*Convex may encode a whole number as an integral decimal, such as "0.0"
+	  or "1.0"; this accepts those alongside plain integers while rejecting
+	  a genuinely fractional value, matching AGENTS.md's requirement that
+	  decoding not silently truncate a fractional Convex number.*)
+	PROCEDURE IsIntegralNumber*(raw: ARRAY OF CHAR): BOOLEAN;
+	VAR length, pos: INTEGER; ok: BOOLEAN;
+	BEGIN
+		length := TextLength(raw);
+		pos := 0;
+		ok := ScanNumber(raw, length, pos) & (pos = length);
+		IF ok THEN
+			pos := 0;
+			WHILE (pos < length) & (raw[pos] # ".") DO INC(pos) END;
+			IF pos < length THEN
+				INC(pos);
+				WHILE ok & (pos < length) & (raw[pos] # "e") & (raw[pos] # "E") DO
+					IF raw[pos] # "0" THEN ok := FALSE
+					ELSE INC(pos)
+					END
+				END
+			END
+		END;
+		RETURN ok
+	END IsIntegralNumber;
+
+BEGIN
+	hexDigits := "0123456789abcdef"
+END ConvexJSON.
