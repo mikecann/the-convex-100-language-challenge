@@ -60,18 +60,21 @@ printf '%s\n' "$actual" | grep -Fx '{"id":"close","type":"closed"}'
 EOF
 
 # The same protocol test again, but over the ADAPTER_LISTEN TCP path the
-# shared harness actually drives verify/verify-hosted through, including a
-# check that a non-loopback peer cannot reach the loopback-only listener.
+# shared harness actually drives verify/verify-hosted through.
 #
 # This uses bash's /dev/tcp instead of nc: on the verified build host, an
-# `nc` client run inside this heredoc RUN step reliably hangs past its own
+# `nc` client run inside a heredoc RUN step reliably hangs past its own
 # `timeout` -- backgrounded or not, output captured through a pipe or not --
 # even though the exact same adapter binary, reached the exact same way,
 # answers correctly and instantly under a plain `docker run`/`docker exec`.
 # That is a BuildKit/nc interaction specific to this RUN-step execution
 # model, not a client bug, so the workaround lives here rather than in the
 # client. /dev/tcp is a bash builtin (no netcat involved) and does not
-# reproduce it.
+# reproduce the nc hang -- but two /dev/tcp connections attempted in
+# sequence from the *same* backgrounded-adapter RUN step reproduced a
+# similar hang on the verified build host, so the non-loopback check and
+# the real exchange are two separate RUN steps, each with its own freshly
+# started adapter, rather than one script making two connections.
 RUN <<'EOF'
 #!/usr/bin/env bash
 set -eu
@@ -79,7 +82,6 @@ ADAPTER_LISTEN=127.0.0.1:18080 /build/convex-adapter &
 adapter_pid=$!
 sleep 1
 container_address=$(ip -4 addr show eth0 | awk '/inet / {sub("/.*", "", $2); print $2; exit}')
-
 non_loopback=""
 if exec 4<>"/dev/tcp/$container_address/18080" 2>/dev/null; then
   printf '%s\n%s\n' \
@@ -88,11 +90,20 @@ if exec 4<>"/dev/tcp/$container_address/18080" 2>/dev/null; then
   non_loopback=$(timeout 3 cat <&4 2>/dev/null || true)
   exec 4<&- 4>&- || true
 fi
+kill "$adapter_pid" 2>/dev/null || true
+wait "$adapter_pid" 2>/dev/null || true
 if test -n "$non_loopback"; then
   printf '%s\n' 'loopback adapter unexpectedly accepted a non-loopback connection' >&2
   exit 1
 fi
+EOF
 
+RUN <<'EOF'
+#!/usr/bin/env bash
+set -eu
+ADAPTER_LISTEN=127.0.0.1:18080 /build/convex-adapter &
+adapter_pid=$!
+sleep 1
 exec 3<>/dev/tcp/127.0.0.1/18080
 printf '%s\n%s\n' \
   '{"id":"tcp-hello","protocolVersion":1,"op":"hello"}' \
