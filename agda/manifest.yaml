@@ -4,5 +4,42 @@ displayName: "Agda"
 rank: 94
 selectionTier: curated_backfill
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Agda implementation of the documented Convex JSON HTTP endpoints and
+    the pinned sync profile. JSON, UTF-8, SHA-1, base64, HTTP request and
+    response framing, RFC6455 framing, the Live envelope and state machine, and
+    the NDJSON adapter are all written in Agda. A single reviewed GHC foreign
+    boundary in client/Convex/Prim.agda supplies only the primitives Agda's
+    runtime lacks: a packed byte buffer, TCP and TLS byte transport, threads and
+    an MVar, a monotonic clock, entropy, and process I/O.
+toolchain:
+  name: Agda
+  version: 2.7.0.1
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - The Docker test target (toolchain build, type-checking, unit, conformance, and TLS tests) passes on native linux/amd64; shared local and hosted conformance have not run yet, so no capability badge is claimed.
+  - Live authentication, optimistic updates, WebSocket mutations, WebSocket actions, journals, and TransitionChunk assembly are deferred.
+  - Live values cover Convex's JSON-safe subset; tagged Convex value conversions are deferred.
+  - JSON input is limited to 1 MiB, 64 nesting levels, and 4096 structural nodes; HTTP responses and Live messages share the same 1 MiB ceiling.
+  - Active Live subscriptions are bounded to 64 entries and 8 MiB of conservatively charged state.
+  - One manager-wide queue retains the newest 16 deliveries within a conservative 20 MiB exact-encoded and runtime-overhead budget.
+  - Adapter output independently retains the newest 16 encoded events within 6 MiB, including an in-flight write.
+  - Waiting is implemented as bounded polling against absolute monotonic deadlines rather than condition variables, so the shared state has one synchronisation primitive to audit.
+  - The client depends on Agda's builtin modules only; agda-stdlib is deliberately not used, so the Docker build has a single Agda dependency to pin.
 capabilities: []
