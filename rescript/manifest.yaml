@@ -5,7 +5,7 @@ rank: 98
 selectionTier: curated_backfill
 implementation:
   status: attempting
-  provenance: native
+  provenance: transpiled
   version: 0.1.0
   notes: >-
     Convex HTTP and the pinned convex-rs 0.10.4 sync profile are implemented in
@@ -29,9 +29,14 @@ adapter:
   adapterOnlyCommands: [debugDisconnect]
 limitations:
   - The Docker test target (format check, compile, language-local unit and conformance tests, canonical example, adapter protocol smoke test) passes on native linux/amd64; shared local and hosted conformance have not run yet, so no capability badge is claimed.
-  - ReScript compiles to JavaScript, so the runtime images need `node` as their target runtime command. `rescript` is not in the shared approved list in `_shared/harness/scripts/target-runtime-policy.mjs`, so `targetRuntimeCommand` is deliberately left undeclared here and image policy cannot pass until shared review decides. This branch does not weaken that policy.
+  - >-
+    ReScript compiles to JavaScript and has no other execution target, so
+    the runtime images carry node as the declared target runtime. Shared
+    review approved that for compile-to-JavaScript languages; every Convex
+    behaviour is still implemented in ReScript.
   - Live authentication, WebSocket mutations and actions, optimistic updates, journals, and mutation replay are deferred.
   - TransitionChunk assembly and non-JSON Convex value encodings are treated as pinned-profile drift and end the connection with a structured ProtocolError.
   - ws enforces a 2 MiB message bound and 5 second handshake deadline. A 5 second ping/pong guard retires an incomplete-frame socket within 10 seconds; this delegated behaviour still needs a hostile-peer Docker proof.
   - HTTP response bodies are streamed under a 2 MiB decoded-body limit and 10 second absolute deadline. Live delivery uses a bounded newest-value queue per subscription of 16 updates and 1 MiB, and the adapter bounds its own unflushed output to 16 records and 8 MiB.
+targetRuntimeCommand: node
 capabilities: []
