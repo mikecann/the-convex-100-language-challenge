@@ -1,0 +1,87 @@
+schemaVersion: 1
+id: dylan
+displayName: "Dylan"
+rank: 83
+selectionTier: curated_backfill
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Open Dylan implementation of Convex's documented JSON HTTP
+    functions and the pinned /api/sync protocol. JSON, HTTP/1.1 framing,
+    RFC 6455 WebSocket framing, base64, and every Convex sync semantic are
+    written in Dylan. The only foreign code is a set of `define C-function`
+    declarations in client/convex-native.dylan naming POSIX socket/poll
+    calls and OpenSSL TLS entry points directly -- there is no separate C
+    source file anywhere in this client, unlike this project's other
+    compile-to-C native clients.
+toolchain:
+  name: Open Dylan
+  version: "2026.2"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    This client is single threaded by construction: convex-sync.dylan's
+    reactor is the only code path that ever touches the Live WebSocket,
+    matching this project's ALGOL 60 client's documented single-owner
+    design, since Open Dylan's C-FFI boundary here does not expose any
+    threading primitive. Live progress happens only while the adapter's
+    own poll loop is running, which it does continuously between commands.
+  - >-
+    live-test.dylan tests the sync state machine's own logic (Transition
+    application, rehydration suppression, backoff scheduling, and
+    debugDisconnect bookkeeping) by constructing manager and subscription
+    fixtures directly and feeding them hand-built messages, rather than by
+    running a fixture WebSocket server concurrently with the client under
+    test in one process -- the same tradeoff, for the same reason, that
+    the ALGOL 60 client's live-test.alg documents. The WebSocket framing
+    and handshake layer (masking, continuation-frame assembly, control
+    frames, UTF-8 validation, and the real Sec-WebSocket-Accept check) is
+    instead proven against a real public echo server.
+  - >-
+    The session id sent in the Connect message is generated once and
+    resent on every reconnect. The project's own C reference client
+    instead mints a fresh session id per reconnect; the two reference
+    implementations in this repository disagree on this point, and a
+    stable per-lifetime id was the deliberate choice here (see
+    convex-sync.dylan's header comment).
+  - >-
+    Live authentication, optimistic updates, WebSocket mutations, WebSocket
+    actions, and TransitionChunk assembly are deferred, matching every
+    other native client in this project.
+  - >-
+    Live values cover Convex's JSON-safe subset; tagged Convex value
+    conversions (the undocumented `convex_encoded_json` format) are
+    deferred.
+  - >-
+    JSON numbers are accepted whether the server renders a whole count as
+    an integer or as an integral float (e.g. 0 or 0.0); a genuinely
+    fractional value decodes as a Dylan `<float>` rather than being
+    silently truncated.
+  - >-
+    Active Live subscriptions are bounded: each subscription's delivery
+    queue holds at most 64 pending updates and drops the oldest
+    undelivered event on overflow rather than growing without bound. A
+    single Live text message is capped at 2 MiB, matching the HTTP
+    response cap.
+  - >-
+    Source style is checked at 120 columns for client and test sources and
+    80 columns for the example, matching this project's other native
+    clients. Open Dylan has no standard source formatter, so this is an
+    explicit style gate rather than a canonical formatter's output, the
+    same position this project's ALGOL 60 and Forth clients are in.
+capabilities: []
