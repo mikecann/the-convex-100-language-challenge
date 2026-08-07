@@ -211,22 +211,56 @@ RUN set -eu; \
     test "$status" -eq 0; \
     test "$fixture_status" -eq 0; \
     test "$(sha256sum < "$anchors")" = "$original"
-RUN file bin/convex_adapter | grep -Eq 'ELF 64-bit.*x86-64' \
-    && file bin/convex_example | grep -Eq 'ELF 64-bit.*x86-64' \
-    && ! ldd bin/convex_adapter | grep -Fq 'not found' \
-    && ! ldd bin/convex_example | grep -Fq 'not found' \
-    && nm -A bin/convex_adapter | grep -Fq 'SSL_set1_host'
+# ldd executes its target with LD_TRACE_LOADED_OBJECTS=1 to discover its
+# dependencies. For these GNAT/Ada binaries specifically, that trace-mode
+# execution reproducibly segfaults under this host's qemu-user x86_64
+# emulation (ordinary non-Ada ELF binaries such as /usr/bin/file are
+# unaffected, and the binaries themselves run correctly in every other test
+# in this file, including via CONVEX_URL pipelines above). Both dependency
+# checks below therefore resolve the shared-library closure statically
+# instead: readelf reads each file's own DT_NEEDED entries without executing
+# it, and ldconfig's cache maps a SONAME to the path the loader would
+# actually pick.
+RUN set -eu; \
+    file bin/convex_adapter | grep -Eq 'ELF 64-bit.*x86-64'; \
+    file bin/convex_example | grep -Eq 'ELF 64-bit.*x86-64'; \
+    for elf in bin/convex_adapter bin/convex_example; do \
+      for soname in $(readelf -d "$elf" \
+                       | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p'); do \
+        ldconfig -p | awk -v s="$soname" '$1 == s { f = 1 } END { exit !f }' \
+          || { echo "missing shared library: $soname" >&2; exit 1; }; \
+      done; \
+    done; \
+    nm -A bin/convex_adapter | grep -Fq 'SSL_set1_host'
 RUN set -eu; \
     mkdir -p /out/lib; \
     cp bin/convex_adapter /out/convex-adapter; \
     cp bin/convex_example /out/convex-example; \
-    { ldd bin/convex_adapter; ldd bin/convex_example; } \
-      | awk '$3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }' \
-      | sort -u \
-      | while IFS= read -r library; do cp -L "$library" "/out/lib/$(basename "$library")"; done; \
+    resolved=/tmp/resolved-libs.txt; \
+    queue=/tmp/lib-queue.txt; \
+    : > "$resolved"; \
+    : > "$queue"; \
+    for elf in bin/convex_adapter bin/convex_example; do \
+      readelf -d "$elf" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' >> "$queue"; \
+    done; \
+    sort -u -o "$queue" "$queue"; \
+    while [ -s "$queue" ]; do \
+      soname="$(head -n 1 "$queue")"; \
+      sed -i '1d' "$queue"; \
+      if grep -Fqx "$soname" "$resolved" 2>/dev/null; then continue; fi; \
+      echo "$soname" >> "$resolved"; \
+      case "$soname" in \
+        libgnat*|libgnarl*) \
+          echo "unexpectedly dynamic: $soname" >&2; exit 1 ;; \
+      esac; \
+      libpath="$(ldconfig -p | awk -v s="$soname" '$1 == s { print $NF; exit }')"; \
+      test -n "$libpath"; \
+      test -f "$libpath"; \
+      cp -L "$libpath" "/out/lib/$(basename "$libpath")"; \
+      readelf -d "$libpath" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' >> "$queue"; \
+      sort -u -o "$queue" "$queue"; \
+    done; \
     chmod 0555 /out/convex-adapter /out/convex-example; \
-    ! ldd bin/convex_adapter | grep -Eq 'libgnat|libgnarl'; \
-    ! ldd bin/convex_example | grep -Eq 'libgnat|libgnarl'; \
     test -f /out/lib/ld-linux-x86-64.so.2
 CMD ["/bin/sh", "-c", "true"]
 
