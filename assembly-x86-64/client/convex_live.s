@@ -1219,29 +1219,45 @@ try_connect:
 ; calls are the only place this can take real wall-clock time, bounded the
 ; same way every other blocking call in this client is.
 %define LM_LIVE -8
+%define LM_TMP  -16
 convex_live_maintain:
     push rbp
     mov rbp, rsp
-    sub rsp, 16
+    sub rsp, 32
     mov [rbp+LM_LIVE], rdi
 
     mov edi, 2
     call dbg_mark
     mov rdi, [rbp+LM_LIVE]
+    mov edi, 5
+    call dbg_mark
+    mov rdi, [rbp+LM_LIVE]
 
     mov rax, [rdi + convex_live.connected]
+    mov edi, 6
+    call dbg_mark
     test rax, rax
     jnz .connected
 
+    mov rdi, [rbp+LM_LIVE]
     mov rax, [rdi + convex_live.subs]
+    mov edi, 7
+    call dbg_mark
     test rax, rax
     jz .done
 
     call monotonic_ms
+    mov [rbp+LM_TMP], rax
+    mov edi, 8
+    call dbg_mark
+    mov rax, [rbp+LM_TMP]
     mov rcx, [rbp+LM_LIVE]
     cmp rax, [rcx + convex_live.next_attempt_ms]
     jl .done
 
+    mov rdi, [rbp+LM_LIVE]
+    mov edi, 9
+    call dbg_mark
     mov rdi, [rbp+LM_LIVE]
     call try_connect
     test eax, eax
@@ -1271,6 +1287,7 @@ convex_live_maintain:
     pop rbp
     ret
 %undef LM_LIVE
+%undef LM_TMP
 
 ; --- incoming message handling ------------------------------------------
 
