@@ -58,7 +58,7 @@ CheckEqual( _
 ' The worked example from RFC 6455 section 1.3.
 CheckEqual( _
   Base64Encode(Sha1("dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11")), _
-  "s3pPLMBiTxaQ9kYGzzhZRbK+xOo", _
+  "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", _
   "the RFC 6455 Sec-WebSocket-Accept example")
 
 ' --- UTF-8 ----------------------------------------------------------------

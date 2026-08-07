@@ -50,7 +50,7 @@ dim as string message
 dim as string reason
 
 ' --- accept token ---------------------------------------------------------
-CheckEqual(WsAcceptToken("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo", _
+CheckEqual(WsAcceptToken("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", _
   "the handshake accept token matches RFC 6455")
 Check(WsAcceptToken("x") <> WsAcceptToken("y"), "different keys produce different tokens")
 Check(WsHeaderHasToken("keep-alive, Upgrade", "upgrade"), _
