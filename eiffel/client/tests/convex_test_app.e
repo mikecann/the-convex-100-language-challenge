@@ -35,7 +35,20 @@ feature {NONE} -- Initialization
 			print ("%N")
 
 			check_socket
+			check_websocket
 			print ("SMOKE_OK%N")
+		end
+
+	check_websocket
+			-- Syntax/compile-time exercise for CONVEX_WEBSOCKET; a real
+			-- handshake test needs a WS-capable server and is covered once
+			-- the local Convex backend is available.
+		local
+			ws: CONVEX_WEBSOCKET
+		do
+			create ws.make ("127.0.0.1", 1, "/api/sync", False)
+			print ("ws_is_open=" + ws.is_open.out)
+			print ("%N")
 		end
 
 	check_socket
