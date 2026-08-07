@@ -1,26 +1,3 @@
-# Convex from Agda
-
-This is a small native Agda client that calls Convex functions over HTTP and keeps a query current over Live WebSockets. Agda is a dependently typed language with no sockets of its own, so the interesting question is how much of Convex can be expressed in Agda itself. The answer here is: all of it except the octets on the wire.
-
-It is educational and unofficial. It is not a production SDK and is not intended for package publication.
-
-## Start here
-
-Read [`examples/basics/Main.agda`](examples/basics/Main.agda). It queries a fresh counter, starts Live before changing it, applies one idempotent mutation, and checks that HTTP, the mutation result, and Live all agree on `0 -> 1`.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP queries, mutations, and actions | Implemented, awaiting shared evidence |
-| Bearer authentication and structured function errors | Implemented, awaiting shared evidence |
-| Live initial values, updates, and query-error recovery | Implemented, awaiting shared evidence |
-| Unsubscribe barriers, five reconnects, and bounded delivery | Implemented, awaiting shared evidence |
-
-The Docker `test` target builds the toolchain, type-checks and compiles the client, and runs its unit, conformance, and TLS tests on native `linux/amd64`. Shared local and hosted conformance have not run yet, so no capability badge is claimed.
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.agda -->
-```text
 {-# OPTIONS --without-K #-}
 
 module Main where
@@ -191,41 +168,3 @@ main =
       if stringLength url ==ⁿ 0
         then errLine "Agda example failed: CONVEX_URL is required" >> exitProcess 1
         else run url room
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-```sh
-./run sync-examples
-./run validate
-./run test agda
-./run verify-example agda
-./run verify agda
-./run verify-hosted agda
-./run verify-all agda
-```
-
-`test` builds the pinned Agda compiler from Hackage, type-checks the client, then compiles and runs the protocol, adapter, TLS, and Live fixture tests before saving the adapter and the canonical example as native `linux/amd64` executables. `verify-example` runs the example from its minimal image against a unique room. The remaining shared commands add local and hosted black-box conformance. Only the root result evaluator can award HTTP or Live badges, so this language branch does not claim them.
-
-## Conformance and protocol notes
-
-The public client implements Convex's documented JSON HTTP endpoints and this repository's pinned `/api/sync` profile directly in Agda. The JSON codec, UTF-8, base64, SHA-1, FNV-1a, HTTP request construction and response framing, RFC6455 framing and handshake verification, the Live envelope and state machine, and the NDJSON adapter are all Agda code. No request invokes another Convex client, the Convex CLI, `curl`, Node.js, or Python.
-
-The reviewed foreign boundary is one file, [`client/Convex/Prim.agda`](client/Convex/Prim.agda). It supplies only what Agda's runtime does not have: a packed byte buffer with constant-time length and indexing, TCP and TLS byte transport, a listener for the adapter's TCP mode, threads and one `MVar`, a monotonic clock, entropy from `/dev/urandom`, and process I/O. None of those primitives understands Convex, HTTP, or WebSockets. TLS is the pure-Haskell `tls` package with the system certificate store, and the client asks it to verify the hostname it was told to connect to; `client/tests/TlsTest.agda` proves the same certificate is accepted for `localhost` and refused for `127.0.0.1`.
-
-One worker owns the Live socket. It alone connects, reads, writes, retires, reconnects, and changes the query-set version; the public API queues acknowledged commands and waits for the worker's reply. A monotonically increasing transport generation is stamped on every published update, and unsubscribe, same-identifier replacement, and the adapter-only debug disconnect each advance it before their acknowledgement is published, so a consumer that already dequeued an update from a retired connection can still recognise and drop it. A valid value received just before a transport failure is restamped rather than discarded, so it stays ahead of the structured failure event. Unchanged rehydration after a reconnect is suppressed with a 64-bit FNV-1a signature instead of a retained copy of the value.
-
-Bounds are byte budgets, not event counts. JSON decoding refuses input past 1 MiB, 64 levels, or 4096 structural nodes, and a lexical pre-pass enforces the two structural limits before a value is built. A WebSocket frame header declaring more than 1 MiB is rejected before any payload octet is buffered. Every read carries an absolute monotonic deadline computed once, so a peer that dribbles a frame one octet at a time is abandoned rather than granted an extension, and a partially filled buffer is never rewound to a false frame boundary. The Live manager retains the newest 16 deliveries within a conservative 20 MiB budget charged at four times the exact encoded length plus a fixed record allowance; active subscriptions have a separate 64-entry, 8 MiB budget. Reconnect backoff starts at 100 ms, caps at 15 seconds, and resets after a successful handshake or a valid server transition.
-
-The adapter speaks bounded UTF-8 NDJSON protocol v1 over stdin/stdout or one `ADAPTER_LISTEN` connection. Its own output queue retains at most the newest 16 encoded events within 6 MiB, including a write currently in flight. Subscription values are droppable under pressure; acknowledgements and errors wait for room until a deadline and then fail rather than being lost. `client/tests/AdapterTest.agda` drives that queue with a reader that never drains and checks the serialised shape of every event kind, including that an absent `id` or `logs` field is omitted rather than sent as null.
-
-Waiting is implemented as bounded polling against absolute deadlines rather than condition variables. That is a deliberate trade: it costs a few milliseconds of latency and keeps the shared state to a single `MVar` per component, which is the whole synchronisation surface a reviewer has to audit.
-
-The final images contain the compiled executable, glibc, `libgmp`, `libffi`, the DNS resolver modules, certificate roots, `/bin/sh`, and the individual POSIX tools the shared verifier requires. They contain no Agda, GHC, Cabal, C compiler, package or network tool, delegated runtime, or multicall binary. Both run as `65532:65532` under the repository's read-only, capability-drop, no-new-privileges, 128 MiB policy.
-
-## Limitations
-
-No Docker build, image, example run, or conformance run has been executed for this checkpoint. Every statement above describes the checked-in source, not observed behaviour, and the manifest deliberately leaves the capability badges empty.
-
-Live authentication, optimistic updates, mutations and actions over the WebSocket, journals, and `TransitionChunk` assembly are deferred; a `TransitionChunk` is treated as recoverable protocol drift and retires the socket rather than publishing partial state. Values cover Convex's JSON-safe subset; tagged Convex value encodings are not converted into richer Agda types. The client depends on Agda's builtin modules only, so `agda-stdlib` is not fetched and the Docker build has a single Agda dependency to pin; the trade is that `client/Convex/Prelude.agda` re-implements a small set of list, string, and arithmetic helpers. Naturals compile to `Integer`, so the byte-at-a-time parsers are correct but not fast, and the documented 1 MiB ceilings are set with that cost in mind. Input beyond the documented line, JSON, subscription, delivery, or output bounds is rejected or coalesced instead of risking unbounded memory.
