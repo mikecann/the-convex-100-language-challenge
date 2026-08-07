@@ -44,13 +44,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 RUN tar -xjf /tmp/busybox.tar.bz2 -C /tmp
 WORKDIR /tmp/busybox-1.37.0
+# ASH_ECHO, ASH_PRINTF and ASH_TEST are builtins inside ash rather than
+# standalone applets, so they change behaviour without adding entries to
+# --list; the expected applet count below accounts for that.
 RUN make allnoconfig >/dev/null && \
     for option in STATIC BUSYBOX ASH ASH_ECHO ASH_PRINTF ASH_TEST AWK BASENAME CAT CMP CUT DIRNAME ENV GREP HEAD ID SED SORT TAIL TEST TR TRUE FALSE UNAME UNIQ WC; do \
       sed -i "s/# CONFIG_${option} is not set/CONFIG_${option}=y/" .config; \
     done && \
     CC=musl-gcc make -j2 busybox >/dev/null && \
-    # ASH_ECHO, ASH_PRINTF and ASH_TEST are builtins inside ash rather than\
-    # separate applets, so they enable behaviour without appearing in --list.\
     test "$(./busybox --list | wc -l)" -eq 22 && \
     test "$(./busybox sh -c 'printf shell-ok')" = shell-ok && \
     ! ./busybox --list | grep -E '^(wget|nc|telnet|ftp|ftpget|ftpput|httpd|tftp)$' && \
