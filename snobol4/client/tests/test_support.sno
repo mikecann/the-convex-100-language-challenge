@@ -1,0 +1,59 @@
+*   test_support.sno - a minimal assertion framework shared by every
+*   language-local test file. Each test file loads this, runs its checks,
+*   and calls test.report() once at the end; the process exits 1 if any
+*   assertion failed, which is what the Dockerfile's test stage relies on.
+    test.failures = 0
+    test.checks = 0
+
+*   test.ok(passed, label) - record one check. passed is any expression
+*   whose SNOBOL4 success/failure is the result to record: call it as
+*   `ident(a, b)  :(test.ok(...))`-style is awkward, so callers instead
+*   branch to test.pass(label) / test.fail(label) directly (see below) for
+*   every real assertion; this helper exists only for the rare case where
+*   the caller already has a 1/0 flag rather than a fresh predicate.
+    define('test.ok(passed,label)') :(test.ok.end)
+test.ok
+        test.checks = test.checks + 1
+        eq(passed, 1)                                                     :s(test.ok.pass)
+        test.failures = test.failures + 1
+        io.eprintln("FAIL " label)
+        :(return)
+test.ok.pass
+        io.eprintln("pass " label)                                         :(return)
+test.ok.end
+
+*   test.pass(label) / test.fail(label,detail) - the two outcomes every
+*   assertion in these test files reaches by branching, since SNOBOL4 has
+*   no boolean value to hand to a generic assert() call.
+    define('test.pass(label)') :(test.pass.end)
+test.pass
+        test.checks = test.checks + 1
+        io.eprintln("pass " label)                                         :(return)
+test.pass.end
+
+    define('test.fail(label,detail)') :(test.fail.end)
+test.fail
+        test.checks = test.checks + 1
+        test.failures = test.failures + 1
+        io.eprintln("FAIL " label ": " detail)                              :(return)
+test.fail.end
+
+*   test.same(actual, expected, label) - the common case: string identity.
+    define('test.same(actual,expected,label)') :(test.same.end)
+test.same
+        ident(actual, expected)                                            :s(test.pass.relay)
+        test.fail(label, "expected [" expected "] got [" actual "]")
+        :(return)
+test.pass.relay
+        test.pass(label)                                                   :(return)
+test.same.end
+
+*   test.report() - print a summary line and exit 1 if anything failed.
+    define('test.report()') :(test.report.end)
+test.report
+        io.eprintln(test.checks - test.failures " / " test.checks " checks passed")
+        eq(test.failures, 0)                                                :s(test.report.ok)
+        cvxexit(1)
+test.report.ok
+        cvxexit(0)
+test.report.end

@@ -16,7 +16,6 @@ language so the roster still reaches one hundred.
 | mql5 | Runs only inside the proprietary Windows MetaTrader terminal. Replacement (Hare) implemented and evidenced; row pending removal once that PR merges. |
 | rpg | IBM RPG compilers exist only on IBM i systems; no free Linux toolchain. |
 | sas | Proprietary licensed runtime; no free implementation of the real language. |
-| scratch | Block-based GUI language with no network primitives; a Convex client cannot be expressed in Scratch itself. |
 | visual-foxpro | Discontinued proprietary Windows product; no Linux toolchain. |
 | xojo | Proprietary licensed IDE-bound compiler. |
 | xpp | Microsoft Dynamics X++ executes only inside the hosted Dynamics platform. |

@@ -80,6 +80,7 @@ const fenceLanguages = {
   ".scm": "scheme",
   ".sh": "bash",
   ".sml": "sml",
+  ".sno": "snobol4",
   ".sol": "solidity",
   ".st": "smalltalk",
   ".swift": "swift",

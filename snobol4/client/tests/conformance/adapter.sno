@@ -1,0 +1,331 @@
+*   adapter.sno - the test-only NDJSON adapter protocol v1 implementation.
+*   Its public-facing client is client/convex-live.sno and client/convex-
+*   http.sno; debugDisconnect and every byte-budget concern below exist
+*   solely for the shared conformance harness, never for a program using
+*   this client as a library.
+*
+*   stdout is reserved for protocol events; every diagnostic goes to
+*   stderr. The adapter supports both stdin/stdout operation and the
+*   harness's TCP mode: when ADAPTER_LISTEN is set, it listens on that
+*   address, accepts exactly one controller connection, and speaks the same
+*   NDJSON stream over it.
+-include 'convex-live.sno'
+
+    adapter.max.line.bytes = 9437184
+    adapter.close.timeout.ms = 5000
+    adapter.write.deadline.ms = 5000
+
+*   adapter.emit(jsontext) - writes one NDJSON event line. A write that
+*   cannot complete inside adapter.write.deadline.ms (a genuinely stalled
+*   reader, exercised by client/tests/conformance/adapter_pressure.sno)
+*   ends the adapter rather than growing an unbounded local buffer.
+    define('adapter.emit(jsontext)') :(adapter.emit.end)
+adapter.emit
+        io.write_all(adapter.out, jsontext char(10), io.now() + adapter.write.deadline.ms)  :s(return)
+        cvxexit(1)
+adapter.emit.end
+
+    define('adapter.error_object(name,message,data)') :(adapter.error_object.end)
+adapter.error_object
+        ident(data, "")                                                     :s(adapter.error_object.nodata)
+        adapter.error_object = json.object3("name", json.qs(name), "message", json.qs(message), "data", data)
+        :(return)
+adapter.error_object.nodata
+        adapter.error_object = json.object2("name", json.qs(name), "message", json.qs(message))
+        :(return)
+adapter.error_object.end
+
+*   adapter.respond_error(id,name,message,data,logs) - emit a top-level
+*   error event, including id only when the caller has one (a malformed
+*   command that never yielded a valid id gets none, matching the schema).
+    define('adapter.respond_error(id,name,message,data,logs)fields') :(adapter.respond_error.end)
+adapter.respond_error
+        fields = '"type":' json.qs("error")
+        ident(id, "")                                                       :s(adapter.respond_error.nologs)
+        fields = fields ',"id":' json.qs(id)
+adapter.respond_error.nologs
+        fields = fields ',"error":' adapter.error_object(name, message, data)
+        ident(logs, "[]")                                                    :s(adapter.respond_error.send)
+        ident(logs, "")                                                      :s(adapter.respond_error.send)
+        fields = fields ',"logs":' logs
+adapter.respond_error.send
+        adapter.emit("{" fields "}")                                         :(return)
+adapter.respond_error.end
+
+*   adapter.classify(id) - reads cvx.err.name/message/data (already set by
+*   the failing client call) and emits the matching error event.
+    define('adapter.classify(id)') :(adapter.classify.end)
+adapter.classify
+        adapter.respond_error(id, cvx.err.name, cvx.err.message, cvx.err.data, "")  :(return)
+adapter.classify.end
+
+*   adapter.read_line(deadlinems) -> the next complete NDJSON line (without
+*   its newline), fails with cvx.err.name "eof" at a clean end of input, or
+*   TransportError on a timeout or transport failure. A line longer than
+*   adapter.max.line.bytes is protocol drift, not something to buffer
+*   forever; the incomplete fragment at end of input is discarded rather
+*   than treated as one final unterminated command.
+    define('adapter.read_line(deadlinems)nl,data') :(adapter.read_line.end)
+adapter.read_line
+adapter.read_line.loop
+        nl = indexof4(adapter.inbuf, char(10))
+        gt(nl, 0)                                                            :s(adapter.read_line.got)
+        gt(size(adapter.inbuf), adapter.max.line.bytes)                      :s(adapter.read_line.toolong)
+        data = io.read_some(adapter.input, 65536, deadlinems)                 :f(freturn)
+        gt(size(data), 0)                                                    :s(adapter.read_line.append)
+        eq(io.eof, 1)                                                        :s(adapter.read_line.eof)
+        :(adapter.read_line.loop)
+adapter.read_line.append
+        adapter.inbuf = adapter.inbuf data                                    :(adapter.read_line.loop)
+adapter.read_line.got
+        adapter.read_line = substr(adapter.inbuf, 1, nl - 1)
+        adapter.inbuf = substr(adapter.inbuf, nl + 1, size(adapter.inbuf) - nl)
+* A line ending in CR LF leaves a trailing CR; strip exactly one.
+        gt(size(adapter.read_line), 0)                                       :f(return)
+        ident(substr(adapter.read_line, size(adapter.read_line), 1), char(13))  :f(return)
+        adapter.read_line = substr(adapter.read_line, 1, size(adapter.read_line) - 1)
+        :(return)
+adapter.read_line.toolong
+        error.set("ProtocolError", "adapter command line exceeded the size budget", "")
+        :(freturn)
+adapter.read_line.eof
+        error.set("eof", "", "")
+        :(freturn)
+adapter.read_line.end
+
+*   adapter.subscription_event(subid,gen,kind,payload,logs) - emit a
+*   "subscription" event, but only while gen still matches the current
+*   generation for that controller-visible subscriptionId; a stale one
+*   (already unsubscribed or replaced) is silently dropped.
+    define('adapter.subscription_event(subid,gen,kind,payload,logs)fields') :(adapter.subscription_event.end)
+adapter.subscription_event
+        ne(gen, adapter.generation[subid])                                   :s(return)
+        fields = '"type":' json.qs("subscription") ',"subscriptionId":' json.qs(subid)
+        ident(kind, "value")                                                  :s(adapter.subscription_event.value)
+        fields = fields ',"error":' payload
+        :(adapter.subscription_event.logs)
+adapter.subscription_event.value
+        fields = fields ',"value":' payload
+adapter.subscription_event.logs
+        ident(logs, "[]")                                                     :s(adapter.subscription_event.send)
+        ident(logs, "")                                                      :s(adapter.subscription_event.send)
+        fields = fields ',"logs":' logs
+adapter.subscription_event.send
+        adapter.emit("{" fields "}")                                          :(return)
+adapter.subscription_event.end
+
+*   adapter.drain_events() - after every cvx.live.pump, publish every event
+*   the Live layer queued whose owning controller-visible subscriptionId is
+*   still current.
+    define('adapter.drain_events()kind,subid,gen') :(adapter.drain_events.end)
+adapter.drain_events
+        kind = cvx.live.next_event()                                         :f(return)
+        subid = adapter.qid_subid[cvx.live.event.queryid]
+        gen = adapter.generation[subid]
+        adapter.subscription_event(subid, gen, kind, cvx.live.event.payload, cvx.live.event.logs)  :(adapter.drain_events)
+adapter.drain_events.end
+
+*   adapter.required_string(command,fieldname,maxlen) -> a required string
+*   field's decoded value. Fails as a ProtocolError otherwise.
+    define('adapter.required_string(command,fieldname,maxlen)raw,value') :(adapter.required_string.end)
+adapter.required_string
+        raw = json.field(command, fieldname)                                  :f(adapter.required_string.bad)
+        json.is_object(raw)                                                    :s(adapter.required_string.bad)
+        json.is_array(raw)                                                     :s(adapter.required_string.bad)
+        value = json.decode_string(raw)                                       :f(adapter.required_string.bad)
+        gt(size(value), 0)                                                     :f(adapter.required_string.bad)
+        gt(size(value), maxlen)                                               :s(adapter.required_string.bad)
+        adapter.required_string = value                                       :(return)
+adapter.required_string.bad
+        error.set("ProtocolError", "command omitted valid " fieldname, "")
+        :(freturn)
+adapter.required_string.end
+
+*   adapter.handle(line) - decode and dispatch one command line.
+    define('adapter.handle(line)id,op,path,argsraw,subid,qid,token,value,logs') :(adapter.handle.end)
+adapter.handle
+        json.is_object(line)                                                  :f(adapter.handle.parseerr)
+        id = adapter.required_string(line, "id", 128)                         :f(adapter.handle.noid)
+        op = adapter.required_string(line, "op", 32)                          :f(adapter.handle.withid)
+adapter.handle.dispatch
+        ident(op, "hello")                                                    :s(adapter.handle.hello)
+        ident(op, "query")                                                    :s(adapter.handle.call)
+        ident(op, "mutation")                                                 :s(adapter.handle.call)
+        ident(op, "action")                                                   :s(adapter.handle.call)
+        ident(op, "setAuth")                                                  :s(adapter.handle.setauth)
+        ident(op, "subscribe")                                                :s(adapter.handle.subscribe)
+        ident(op, "unsubscribe")                                              :s(adapter.handle.unsubscribe)
+        ident(op, "debugDisconnect")                                         :s(adapter.handle.debugdisconnect)
+        ident(op, "close")                                                    :s(adapter.handle.close)
+        error.set("ProtocolError", "unknown adapter operation " op, "")
+        :(adapter.handle.withid)
+adapter.handle.hello
+        adapter.emit(json.object6("protocolVersion", 1, "id", json.qs(id), "type", json.qs("ready"), "language", json.qs("snobol4"), "implementation", json.qs("native-csnobol4-2.3.4"), "runtime", json.qs("csnobol4-2.3.4")))
+        :(return)
+adapter.handle.call
+        path = adapter.required_string(line, "path", 512)                     :f(adapter.handle.withid)
+        argsraw = json.field(line, "args")                                    :f(adapter.handle.badargs)
+        json.is_object(argsraw)                                               :f(adapter.handle.badargs)
+        ident(op, "query")                                                    :s(adapter.handle.doquery)
+        ident(op, "mutation")                                                 :s(adapter.handle.domutation)
+        value = cvx.action(path, argsraw)                                     :f(adapter.handle.withid)
+        :(adapter.handle.callresult)
+adapter.handle.doquery
+        value = cvx.query(path, argsraw)                                      :f(adapter.handle.withid)
+        :(adapter.handle.callresult)
+adapter.handle.domutation
+        value = cvx.mutation(path, argsraw)                                   :f(adapter.handle.withid)
+adapter.handle.callresult
+        ident(http.logs, "[]")                                                :s(adapter.handle.callresult2)
+        logs = ',"logs":' http.logs                                          :(adapter.handle.callresult3)
+adapter.handle.callresult2
+        logs = ""
+adapter.handle.callresult3
+        adapter.emit('{"id":' json.qs(id) ',"type":' json.qs("result") ',"value":' value logs "}")
+        :(return)
+adapter.handle.badargs
+        error.set("ProtocolError", "command omitted valid args", "")
+        :(adapter.handle.withid)
+adapter.handle.setauth
+        token = ""
+        json.field(line, "token")                                             :f(adapter.handle.setauth.apply)
+        json.is_object(json.field(line, "token"))                             :s(adapter.handle.setauth.bad)
+        json.is_array(json.field(line, "token"))                              :s(adapter.handle.setauth.bad)
+        ident(json.field(line, "token"), "null")                              :s(adapter.handle.setauth.apply)
+        token = json.decode_string(json.field(line, "token"))                  :f(adapter.handle.setauth.bad)
+adapter.handle.setauth.apply
+        cvx.set_auth(token)
+        adapter.emit(json.object2("id", json.qs(id), "type", json.qs("ack")))
+        :(return)
+adapter.handle.setauth.bad
+        error.set("ProtocolError", "command omitted valid token", "")
+        :(adapter.handle.withid)
+adapter.handle.subscribe
+        subid = adapter.required_string(line, "subscriptionId", 128)          :f(adapter.handle.withid)
+        path = adapter.required_string(line, "path", 512)                     :f(adapter.handle.withid)
+        argsraw = json.field(line, "args")                                    :f(adapter.handle.badargs)
+        json.is_object(argsraw)                                               :f(adapter.handle.badargs)
+        gt(size(adapter.subid_qid[subid]), 0)                              :f(adapter.handle.subscribe.fresh)
+* Replacing an existing subscriptionId: invalidate the old relay before the
+* new Add is even sent, so a stale value can never cross this
+* acknowledgement.
+        cvx.live.unsubscribe(adapter.subid_qid[subid] + 0)
+adapter.handle.subscribe.fresh
+        adapter.generation[subid] = adapter.next_generation(subid)
+        qid = cvx.live.subscribe(path, argsraw)
+        adapter.subid_qid[subid] = qid
+        adapter.qid_subid[qid] = subid
+        adapter.emit(json.object2("id", json.qs(id), "type", json.qs("ack")))
+        :(return)
+adapter.handle.unsubscribe
+        subid = adapter.required_string(line, "subscriptionId", 128)          :f(adapter.handle.withid)
+        gt(size(adapter.subid_qid[subid]), 0)                              :f(adapter.handle.unsubscribe.ack)
+        cvx.live.unsubscribe(adapter.subid_qid[subid] + 0)
+        adapter.subid_qid[subid] = ""
+adapter.handle.unsubscribe.ack
+        adapter.emit(json.object2("id", json.qs(id), "type", json.qs("ack")))
+        :(return)
+adapter.handle.debugdisconnect
+        cvx.live.debug_disconnect()                                           :f(adapter.handle.withid)
+        adapter.emit(json.object2("id", json.qs(id), "type", json.qs("ack")))
+        :(return)
+adapter.handle.close
+        cvx.live.close()
+        adapter.emit(json.object2("id", json.qs(id), "type", json.qs("closed")))
+        adapter.closing = 1
+        :(return)
+adapter.handle.noid
+        error.set("ProtocolError", "command omitted valid id", "")
+        adapter.respond_error("", cvx.err.name, cvx.err.message, "", "")
+        :(return)
+adapter.handle.parseerr
+        error.set("ProtocolError", "command was not a JSON object", "")
+        adapter.respond_error("", cvx.err.name, cvx.err.message, "", "")
+        :(return)
+adapter.handle.withid
+        adapter.classify(id)
+        :(return)
+adapter.handle.end
+
+*   adapter.next_generation(subid) -> the next generation counter for a
+*   controller-visible subscriptionId, starting at 1.
+    define('adapter.next_generation(subid)') :(adapter.next_generation.end)
+adapter.next_generation
+        gt(adapter.generation[subid] + 0, 0)                                  :s(adapter.next_generation.bump)
+        adapter.next_generation = 1                                            :(return)
+adapter.next_generation.bump
+        adapter.next_generation = adapter.generation[subid] + 1                :(return)
+adapter.next_generation.end
+
+*   adapter.main() - the whole event loop: read one controller line when
+*   ready, otherwise pump Live and drain whatever it queued.
+    define('adapter.main()deadline,mask,line') :(adapter.main.end)
+adapter.main
+        adapter.closing = 0
+adapter.main.loop
+        eq(adapter.closing, 1)                                                :s(adapter.main.finish)
+        deadline = io.now() + 200
+        mask = io.poll2(adapter.input, ws.handle, 200)                         :f(adapter.main.pollerr)
+        gt(remdr(mask, 2), 0)                                                  :f(adapter.main.pumponly)
+        line = adapter.read_line(deadline)                                     :f(adapter.main.readfail)
+        adapter.handle(line)
+        :(adapter.main.loop)
+adapter.main.pumponly
+        cvx.live.pump(deadline)
+        adapter.drain_events()
+        :(adapter.main.loop)
+adapter.main.readfail
+        ident(cvx.err.name, "eof")                                             :s(adapter.main.finish)
+        :(adapter.main.loop)
+adapter.main.pollerr
+        :(adapter.main.finish)
+adapter.main.finish
+        cvxexit(0)
+adapter.main.end
+
+* ---------------------------------------------------------------------
+* Entry point. Everything above this point is a function definition and
+* is skipped at load time by its own leading jump; execution really
+* starts here, top to bottom, once every function has been defined.
+* ---------------------------------------------------------------------
+    adapter.subid_qid = table()
+    adapter.qid_subid = table()
+    adapter.generation = table()
+    adapter.inbuf = ""
+    ws.handle = -1
+
+    ident(io.getenv("CONVEX_URL"), "")                                        :s(adapter.bootstrap.nourl)
+    cvx.configure(io.getenv("CONVEX_URL"), io.getenv("CONVEX_AUTH_TOKEN"))     :f(adapter.bootstrap.badurl)
+    cvx.live.init()
+
+    adapter.listen = io.getenv("ADAPTER_LISTEN")
+    gt(size(adapter.listen), 0)                                                :f(adapter.bootstrap.stdio)
+    adapter.listen break(":") . adapter.listen.host len(1) rem . adapter.listen.port  :f(adapter.bootstrap.badlisten)
+    adapter.listener = io.listen(adapter.listen.host, adapter.listen.port)     :f(adapter.bootstrap.transporterr)
+    adapter.input = io.accept(adapter.listener, io.now() + 60000)              :f(adapter.bootstrap.transporterr)
+    adapter.out = adapter.input
+    :(adapter.bootstrap.run)
+adapter.bootstrap.stdio
+    adapter.input = io.adopt(0)                                                :f(adapter.bootstrap.transporterr)
+    adapter.out = io.adopt(1)                                                  :f(adapter.bootstrap.transporterr)
+adapter.bootstrap.run
+    adapter.main()
+    :(adapter.bootstrap.end)
+adapter.bootstrap.nourl
+    io.eprintln("CONVEX_URL is required")
+    cvxexit(1)
+    :(adapter.bootstrap.end)
+adapter.bootstrap.badurl
+    io.eprintln("adapter: invalid CONVEX_URL: " cvx.err.message)
+    cvxexit(1)
+    :(adapter.bootstrap.end)
+adapter.bootstrap.badlisten
+    io.eprintln("adapter: ADAPTER_LISTEN must be host:port")
+    cvxexit(1)
+    :(adapter.bootstrap.end)
+adapter.bootstrap.transporterr
+    io.eprintln("adapter: " cvx.err.name ": " cvx.err.message)
+    cvxexit(1)
+adapter.bootstrap.end
+end
+

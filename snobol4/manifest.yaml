@@ -1,0 +1,102 @@
+schemaVersion: 1
+id: snobol4
+displayName: "SNOBOL4"
+rank: 47
+selectionTier: ranked
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native CSNOBOL4 implementation of Convex's documented HTTP JSON API and
+    the pinned /api/sync protocol. JSON, HTTP/1.1 framing, RFC 6455 framing,
+    SHA-1, base64 and every Convex sync semantic are written in SNOBOL4.
+    Standard SNOBOL4 has no sockets, no TLS, no monotonic clock and no
+    entropy source; one small reviewed C support library,
+    client/convexrt.c, is loaded through CSNOBOL4's own documented
+    external-function mechanism (LOAD(), via dlopen) and supplies only
+    those primitives: TCP connect, verified TLS, non-blocking read and
+    write, readiness polling, listen and accept, a monotonic clock, entropy,
+    environment access and the process exit status. It contains no HTTP, no
+    WebSocket framing, no JSON and no Convex protocol knowledge; every
+    deadline, retry, and protocol decision is enforced in SNOBOL4.
+toolchain:
+  name: CSNOBOL4
+  version: "2.3.4"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    The Docker test stage (build, style checks, language-local unit and
+    loopback protocol suites, the conformance adapter probe in both stdio
+    and TCP mode, and the example's fast-fail path) passes on a remote
+    builder for this source checkpoint. Shared local and hosted conformance
+    have not been run, so no capability is claimed and badges remain
+    unearned.
+  - >-
+    CSNOBOL4's own -O3 default reproducibly crashes GCC's cc1 on this
+    project's QEMU-emulated linux/amd64 build host - two independent
+    from-clean builds each segfaulted compiling a different, unrelated
+    translation unit, and -O0 has built cleanly every time. This is recorded
+    as an environment artifact, matching the pattern AGENTS.md documents for
+    other heavy toolchains on QEMU hosts; the Dockerfile pins -O0 explicitly
+    rather than relying on CSNOBOL4's own configure default.
+  - >-
+    Live reconnection is implemented in full: automatic backoff and retry,
+    a debugDisconnect adapter command, and an acknowledgement barrier that
+    only fires after the old connection is retired and a reconnect is
+    scheduled. client/tests/live_test.sno asserts five real, consecutive
+    reconnect-and-resubscribe cycles against a real second OS process
+    (client/tests/live_test_fixture.sno), each one required to deliver a
+    genuine resubscribed value, and it is deterministic on this build host
+    across repeated runs. An earlier draft of this suite treated the loop
+    as merely informational after intermittent failures to observe a
+    resubscribed value; root-causing that showed the defect was in the test
+    fixture, not the client: the fixture's first resubscribe replayed the
+    same value the preceding external update had already delivered, so the
+    client's own (correct, spec-required) suppression of an unchanged
+    rehydration legitimately produced no event, and a second, unrelated
+    fixture bug (an accept-timeout swallowed by an unconditional success
+    return) then cascaded into further failures once the client out-waited
+    it. Both are fixed; the loop is now asserted, not merely reported.
+  - >-
+    The educational API covers Convex's JSON-safe values (objects, arrays,
+    strings, whole numbers within a uint32 range, booleans, null). Full
+    tagged Convex values, including Int64 and bytes, are deferred.
+  - >-
+    Live authentication, optimistic updates, WebSocket mutations and
+    actions, journals, and TransitionChunk assembly are deferred; queries,
+    mutations, and actions all go over HTTP.
+  - >-
+    Live delivery is a bounded queue: at most 64 pending events and 8 MiB of
+    conservatively charged encoded bytes, oldest dropped first, drained by
+    the adapter after every pump. Unsubscribe (and a same-subscriptionId
+    replacement) bump a per-query generation counter that invalidates any
+    already-queued event for that query before its acknowledgement is
+    published; this barrier has a deterministic, non-timing-dependent
+    regression.
+  - >-
+    HTTP responses are bounded to 2 MiB, abandoned mid-transfer once that
+    budget would be exceeded. A single WebSocket frame is bounded to 2 MiB;
+    a larger declared length is protocol drift rather than something to
+    buffer. Once any byte of a frame has been consumed, an absolute
+    5-second-per-connection-attempt deadline (10 seconds for the initial TCP
+    and TLS connect) governs completing it, tracked independently of the
+    caller's own polling deadline so a slow peer cannot hold the connection
+    with repeated short polls.
+  - >-
+    Capability badges remain empty until the root-owned local and hosted
+    conformance gates pass.
+capabilities: []
