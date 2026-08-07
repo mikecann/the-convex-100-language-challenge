@@ -190,15 +190,22 @@ COPY --from=test /lib/x86_64-linux-gnu/libm.so.6 /lib/x86_64-linux-gnu/libm.so.6
 COPY --from=test /lib/x86_64-linux-gnu/libdl.so.2 /lib/x86_64-linux-gnu/libdl.so.2
 # GnuCOBOL runtime library. The client is compiled, not interpreted;
 # libcob is the language runtime it links against, and it exposes no
-# compiler or build frontend of its own.
-COPY --from=test /usr/lib/x86_64-linux-gnu/libcob.so.4 /usr/lib/x86_64-linux-gnu/libcob.so.4
+# compiler or build frontend of its own. libcob.so.5 is a symlink to
+# the real libcob.so.5.0.0 (the pinned gnucobol4/libcob5 packages ship
+# soname 5, not 4), so both are copied: the loader opens the SONAME,
+# which then resolves through the symlink to the real file.
+COPY --from=test /usr/lib/x86_64-linux-gnu/libcob.so.5 /usr/lib/x86_64-linux-gnu/libcob.so.5
+COPY --from=test /usr/lib/x86_64-linux-gnu/libcob.so.5.0.0 /usr/lib/x86_64-linux-gnu/libcob.so.5.0.0
 COPY --from=test /usr/lib/x86_64-linux-gnu/libssl.so.3 /usr/lib/x86_64-linux-gnu/libssl.so.3
 COPY --from=test /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /usr/lib/x86_64-linux-gnu/libcrypto.so.3
 COPY --from=test /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so
-# libcob resolves its runtime configuration from COB_CONFIG_DIR. The
-# directory is relocated out of /usr/share so the pruned filesystem
-# keeps only what is actually loaded.
-COPY --from=test /usr/share/gnucobol/config /etc/gnucobol/config
+# libcob resolves its runtime configuration (default.conf and the
+# dialect files it can select) from COB_CONFIG_DIR. The pinned
+# gnucobol4 package installs these directly under /etc/gnucobol rather
+# than under /usr/share/gnucobol, so that whole small directory of
+# text files is copied as-is; the pruned filesystem still keeps only
+# what is actually loaded.
+COPY --from=test /etc/gnucobol /etc/gnucobol
 COPY --from=test /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=test /etc/ssl/openssl.cnf /etc/ssl/openssl.cnf
 COPY --from=test /etc/nsswitch.conf /etc/nsswitch.conf
@@ -227,7 +234,7 @@ COPY --from=test /lib/x86_64-linux-gnu/libpcre2-8.so.0 /lib/x86_64-linux-gnu/lib
 ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
     OPENSSL_MODULES=/usr/lib/x86_64-linux-gnu/ossl-modules \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
-    COB_CONFIG_DIR=/etc/gnucobol/config \
+    COB_CONFIG_DIR=/etc/gnucobol \
     PATH=/usr/local/bin:/usr/bin:/bin
 USER 65532:65532
 
