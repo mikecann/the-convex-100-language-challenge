@@ -146,8 +146,9 @@ proc waitForRemoveOrClose(peer: Socket) =
   while true:
     try:
       let message = receiveClientJson(peer)
-      if message.hasKey("type") and message["type"].getStr ==
-          "ModifyQuerySet" andmessage["modifications"][0]["type"].getStr == "Remove":
+      let isModify = message.hasKey("type") and
+          message["type"].getStr == "ModifyQuerySet"
+      if isModify and message["modifications"][0]["type"].getStr == "Remove":
         return
     except CatchableError:
       return
