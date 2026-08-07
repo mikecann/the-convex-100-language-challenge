@@ -437,7 +437,7 @@ const func string: connectMessage (inout convexLive: live) is func
       obj @:= ["maxObservedTimestamp"] jsonValue(live.maxObservedTimestamp);
     end if;
     obj @:= ["clientTs"] jsonValue(0);
-    message := str(jsonValue(obj));
+    message := jsonEncode(jsonValue(obj));
   end func;
 
 
@@ -482,7 +482,7 @@ const func string: modifyQuerySetMessage (inout convexLive: live, in string: onl
       end if;
     end for;
     obj @:= ["modifications"] jsonValue(mods);
-    message := str(jsonValue(obj));
+    message := jsonEncode(jsonValue(obj));
   end func;
 
 

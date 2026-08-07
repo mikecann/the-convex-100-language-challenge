@@ -146,6 +146,92 @@ const func httpBody: jsonBody (in string: content) is func
   end func;
 
 
+(**
+ *  json.s7i's own `str(jsonValue)` reuses Seed7's `literal()` primitive
+ *  for JSON string values, which escapes a non-ASCII character as
+ *  Seed7's own `\<decimal>;` source-literal syntax -- not JSON's
+ *  `\uXXXX`. Convex's HTTP API correctly rejects that as malformed JSON
+ *  (confirmed directly: a body containing `\19990;` for '世' comes back
+ *  400 BadJsonBody "invalid escape"). This client therefore serializes
+ *  every outgoing request body itself instead of trusting `str()`
+ *  outside of pure-ASCII testing; see `client/tests/client_test.sd7`
+ *  for the regression.
+ *)
+const func string: jsonEscapeString (in string: raw) is func
+  result
+    var string: escaped is "\"";
+  local
+    var integer: index is 0;
+    var char: ch is ' ';
+  begin
+    for index range 1 to length(raw) do
+      ch := raw[index];
+      if ch = '"' then
+        escaped &:= "\\\"";
+      elsif ch = '\\' then
+        escaped &:= "\\\\";
+      elsif ch = '\n' then
+        escaped &:= "\\n";
+      elsif ch = '\r' then
+        escaped &:= "\\r";
+      elsif ch = '\t' then
+        escaped &:= "\\t";
+      elsif ord(ch) < 32 then
+        escaped &:= "\\u" & (ord(ch) RADIX 16 lpad0 4);
+      else
+        escaped &:= str(ch);
+      end if;
+    end for;
+    escaped &:= "\"";
+  end func;
+
+
+const func string: jsonEncode (in jsonValue: value) is func
+  result
+    var string: encoded is "";
+  local
+    var jsonValue: element is jsonValue.value;
+    var string: key is "";
+    var boolean: first is TRUE;
+  begin
+    if category(value) = JSON_NULL then
+      encoded := "null";
+    elsif category(value) = JSON_BOOLEAN then
+      if boolean(value) then
+        encoded := "true";
+      else
+        encoded := "false";
+      end if;
+    elsif category(value) = JSON_NUMBER then
+      encoded := str(value);
+    elsif category(value) = JSON_STRING then
+      encoded := jsonEscapeString(string(value));
+    elsif category(value) = JSON_ARRAY then
+      encoded := "[";
+      first := TRUE;
+      for element range value do
+        if not first then
+          encoded &:= ",";
+        end if;
+        first := FALSE;
+        encoded &:= jsonEncode(element);
+      end for;
+      encoded &:= "]";
+    elsif category(value) = JSON_OBJECT then
+      encoded := "{";
+      first := TRUE;
+      for key range keys(value) do
+        if not first then
+          encoded &:= ",";
+        end if;
+        first := FALSE;
+        encoded &:= jsonEscapeString(key) & ":" & jsonEncode(value[key]);
+      end for;
+      encoded &:= "}";
+    end if;
+  end func;
+
+
 const func array string: logLinesOf (in jsonValue: logsArray) is func
   result
     var array string: logs is 0 times "";
@@ -201,7 +287,7 @@ const func convexOutcome: convexCall (inout convexClient: client, in string: ope
     requestObj @:= ["path"] jsonValue(path);
     requestObj @:= ["args"] args;
     requestObj @:= ["format"] jsonValue("json");
-    body := jsonBody(str(jsonValue(requestObj)));
+    body := jsonBody(jsonEncode(jsonValue(requestObj)));
     if client.token <> "" then
       creds := bearerAuth(client.token);
     end if;

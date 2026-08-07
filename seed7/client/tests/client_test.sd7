@@ -122,6 +122,30 @@ const proc: testErrorConstruction is func
   end func;
 
 
+(**
+ *  json.s7i's own `str(jsonValue)` escapes non-ASCII characters with
+ *  Seed7's `literal()` source-string syntax (`\19990;`), which Convex's
+ *  API correctly rejects as invalid JSON (confirmed directly: 400
+ *  BadJsonBody "invalid escape"). `jsonEncode` exists specifically to
+ *  avoid that; this regression is the one a purely happy-path,
+ *  ASCII-only fixture would never catch.
+ *)
+const proc: testJsonEncodeUnicode is func
+  local
+    var jsonObject: obj is jsonObject.value;
+    var string: encoded is "";
+  begin
+    obj @:= ["greeting"] jsonValue("Hello, \16#4e16;\16#754c; \16#1f44b;");
+    encoded := jsonEncode(jsonValue(obj));
+    check(pos(encoded, "\\19990") = 0 and pos(encoded, "\\1f44b") = 0,
+        "jsonEncode never emits Seed7's own literal() escape syntax");
+    check(string(readJson(encoded)["greeting"]) = "Hello, \16#4e16;\16#754c; \16#1f44b;",
+        "jsonEncode round-trips a non-ASCII string through readJson");
+    check(jsonEncode(jsonValue("a\"b\\c")) = "\"a\\\"b\\\\c\"",
+        "jsonEncode escapes quotes and backslashes");
+  end func;
+
+
 const proc: main is func
   begin
     testWholeNumberOf;
@@ -129,6 +153,7 @@ const proc: main is func
     testMaskRoundTrip;
     testWsAcceptKey;
     testErrorConstruction;
+    testJsonEncodeUnicode;
     if failures = 0 then
       writeln("all client unit tests passed");
     else
