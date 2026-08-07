@@ -38,4 +38,6 @@ limitations:
   - Live authentication, optimistic updates, and TransitionChunk assembly are deferred.
   - Each Live subscription keeps its newest 16 updates; slow consumers drop older intermediate states.
   - A reconnect dial runs inline on the owner strand rather than on a separate connector strand, so a queued command can be delayed by up to the connect deadline while a reconnect is in flight.
-capabilities: []
+capabilities:
+  - http
+  - live
