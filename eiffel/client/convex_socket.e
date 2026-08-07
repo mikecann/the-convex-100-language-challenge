@@ -37,7 +37,7 @@ feature {NONE} -- Initialization
 		do
 			use_tls := a_use_tls
 			create raw.make_client_by_port (a_port, a_host)
-			raw.connect_timeout (connect_timeout_ms)
+			raw.set_connect_timeout (connect_timeout_ms)
 			raw.connect
 			if raw.is_open_write then
 				descriptor := raw.descriptor
