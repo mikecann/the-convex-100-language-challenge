@@ -138,6 +138,7 @@ CMD ["/tmp/client-test"]
 # Minimal runtime
 # ---------------------------------------------------------------------------
 FROM --platform=linux/amd64 ${RUNTIME_IMAGE} AS runtime-base
+ARG FORBIDDEN_COMMANDS
 RUN set -eu; \
     apt-get update; \
     apt-get install --no-install-recommends --yes ca-certificates libssl3; \
