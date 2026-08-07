@@ -616,6 +616,17 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- A self-test paired the client against a server that never answers. V's
+  Dockerfile proves its TLS closure works by talking to `openssl s_server -www`
+   — which replies to a GET immediately and to a POST not at all. The client
+  sends a POST. The stage could therefore never pass, no matter how correct the
+  client was, and `strace` confirmed the handshake and the request were both
+  fine. Worse, the permanently-failing test was masking a real bug underneath
+  it: a 20-second deadline that never fired, leaving a blocking read sitting
+  indefinitely. **A test that always fails hides bugs exactly as effectively as
+  a test that always passes** — this document already has a section about the
+  second kind, and the first kind is rarer only because someone usually
+  deletes it.
 - One character silently downgraded every secure connection. Icon's scheme
   detection compared against `"https"` where the parsed value was `"https:"`,
   so every `wss://` subscription quietly opened as plain `ws://` — and the
