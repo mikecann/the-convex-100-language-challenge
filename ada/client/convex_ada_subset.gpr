@@ -36,7 +36,7 @@ project Convex_Ada_Subset is
 
    package Compiler is
       for Default_Switches ("Ada") use
-           ("-gnat2022", "-gnatW8", "-O2");
+           ("-gnat2022", "-gnatwa", "-gnatwe", "-gnatW8", "-O2");
    end Compiler;
 
    package Binder is
