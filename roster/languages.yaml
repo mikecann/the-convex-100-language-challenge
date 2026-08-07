@@ -74,7 +74,7 @@ languages:
   - { rank: 67, id: hare, displayName: "Hare", selectionTier: coverage, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 68, id: pli, displayName: "PL/I", selectionTier: coverage, feasibility: { docker: A, https: A, json: A, websocket: A } }
   - { rank: 69, id: q, displayName: "Q", selectionTier: coverage, feasibility: { docker: A, https: G, json: G, websocket: G } }
-  - { rank: 70, id: rpg, displayName: "RPG", selectionTier: coverage, feasibility: { docker: R, https: G, json: G, websocket: A } }
+  - { rank: 70, id: modula-2, displayName: "Modula-2", selectionTier: coverage, feasibility: { docker: G, https: G, json: G, websocket: A } }
   - { rank: 71, id: ring, displayName: "Ring", selectionTier: coverage, feasibility: { docker: G, https: G, json: G, websocket: A } }
   - { rank: 72, id: scheme, displayName: "Scheme", selectionTier: coverage, feasibility: { docker: G, https: G, json: G, websocket: A } }
   - { rank: 73, id: v, displayName: "V", selectionTier: coverage, feasibility: { docker: G, https: G, json: G, websocket: G } }

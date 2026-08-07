@@ -13,8 +13,8 @@ language so the roster still reaches one hundred.
 | apex | Executes only inside Salesforce's hosted platform; no local runtime exists. |
 | labview | Proprietary NI graphical environment; no headless Linux compiler, license required. |
 | matlab | Proprietary license required for the real MATLAB runtime; substituting GNU Octave would not honestly be MATLAB. |
-| mql5 | Runs only inside the proprietary Windows MetaTrader terminal. Replacement (Hare) implemented and evidenced; row pending removal once that PR merges. |
-| rpg | IBM RPG compilers exist only on IBM i systems; no free Linux toolchain. |
+| mql5 | Runs only inside the proprietary Windows MetaTrader terminal. Replaced by Hare, which is merged and evidenced. |
+| rpg | IBM RPG compilers exist only on IBM i systems; no free Linux toolchain. Replaced by Modula-2, which is merged and evidenced. |
 | sas | Proprietary licensed runtime; no free implementation of the real language. |
 | scratch | Block-based GUI language with no network primitives; a Convex client cannot be expressed in Scratch itself. |
 | visual-foxpro | Discontinued proprietary Windows product; no Linux toolchain. |
