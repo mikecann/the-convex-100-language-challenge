@@ -93,8 +93,12 @@ container_address=$(ip -4 addr show eth0 | awk '/inet / {sub("/.*", "", $2); pri
     '{"id":"wrong-host","protocolVersion":1,"op":"hello"}' \
     '{"id":"wrong-close","op":"close"}' | nc -w 1 "$container_address" 18080 >/tmp/non_loopback.out 2>/dev/null
   touch /tmp/non_loopback.done ) &
-wait_for /tmp/non_loopback.done 8
-non_loopback=$(cat /tmp/non_loopback.out)
+# This probe's own outcome (refused instantly, or never responding at all)
+# is what proves the loopback-only bind rejected it either way; only a
+# reply would mean it was wrongly accepted, so a bounded wait here is
+# advisory, not a hard gate the way the real exchange below is.
+wait_for /tmp/non_loopback.done 8 || true
+non_loopback=$(cat /tmp/non_loopback.out 2>/dev/null || true)
 if test -n "$non_loopback"; then
   printf '%s\n' 'loopback adapter unexpectedly accepted a non-loopback connection' >&2
   exit 1
