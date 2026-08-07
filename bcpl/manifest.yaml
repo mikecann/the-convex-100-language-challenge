@@ -4,5 +4,69 @@ displayName: "BCPL"
 rank: 60
 selectionTier: coverage
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Convex behaviour is implemented in BCPL: HTTP/1.1, RFC 6455 WebSocket
+    framing, SHA-1, base64, JSON and the pinned sync protocol. BCPL has no
+    sockets and no TLS in any implementation, so the client uses the Cintcode
+    system's documented user extension hook, sys(Sys_ext, ...), for a byte
+    transport only: name resolution, TCP, an OpenSSL client session, a
+    monotonic clock, random bytes and the process environment. No Convex
+    message is parsed or generated outside BCPL. The client runs on the
+    distribution's 64-bit Cintcode system (cintsys64), not the 32-bit one:
+    the 32-bit interpreter stores a raw C pointer inside a 32-bit BCPL word,
+    which segfaults on this 64-bit host once a heap address lands above
+    2**32, confirmed directly with gdb on the plain 32-bit bcpl compiler
+    before any client source is reached.
+toolchain:
+  name: "BCPL Cintcode System (Martin Richards), 64-bit Cintcode"
+  version: "8l/bcpl@bad6eec7682368ca7ded866005cc4a47e8a67569, 64-bit Cintcode"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - TLS, TCP, name resolution, the monotonic clock and random bytes come from a
+    C extension to the Cintcode interpreter, because no BCPL implementation
+    offers any of them.
+  - Live authentication, optimistic updates, WebSocket mutations and WebSocket
+    actions are deferred; mutations and actions go over HTTP.
+  - TransitionChunk assembly is deferred and treated as protocol drift that
+    reconnects.
+  - Live values cover the JSON-safe subset; tagged Convex value types are
+    deferred.
+  - JSON numbers are carried as their literal text, so values outside this
+    64-bit system's 19-digit maxint (9223372036854775807) survive a round
+    trip but cannot be decoded to an integer.
+  - HTTP uses one connection per request; keep-alive is deferred. Request and
+    response bodies are capped at 2 MiB each under one absolute deadline, a
+    response declaring both Content-Length and a transfer encoding is refused
+    rather than reframed, and a transfer encoding other than chunked is
+    refused.
+  - Untrusted JSON is bounded before it can be retained -- 64 levels of
+    nesting, 200000 nodes, and no string past the 4 MiB buffer ceiling.
+  - A WebSocket frame is capped at 1 MiB and a reassembled message at 2 MiB;
+    the client offers no extension and no subprotocol, and refuses an upgrade
+    response that names either.
+  - Each subscription keeps at most 16 updates and 256 KiB, dropping the oldest
+    when a consumer stops draining.
+  - Cintcode memory is fixed at 3000000 64-bit words (24 MiB) by the launcher,
+    which is the client's whole heap and stack.
+  - The pinned commit's cintsys64.c dosys() never received the 2014 addition
+    of sys(Sys_ext, ...) that the 32-bit cintsys.c has, so the Dockerfile
+    patches in the same one-line case the 32-bit interpreter already carries,
+    anchored so an upstream sync that already has the fix fails the assertion
+    instead of silently duplicating it.
 capabilities: []

@@ -16,6 +16,19 @@ that the client uses the Cintcode system's own documented extension hook —
 can add facilities — and implements it in a single C file that knows nothing
 about Convex. That boundary is described in detail below.
 
+This client runs on the distribution's 64-bit Cintcode system, `cintsys64`,
+rather than the 32-bit one. The 32-bit interpreter keeps a raw C pointer —
+such as the `FILE*` a file primitive gets back from `fopen()` — inside a
+32-bit BCPL word; on a 64-bit host a heap address routinely lands above
+2**32, so the low bits alone are not a valid pointer and using them corrupts
+memory. That is not a hypothetical: the plain, unmodified 32-bit `bcpl`
+compiler compiling a five-line "hello world" program on this project's build
+host segfaults inside libc `ftell()`, called with a sign-extended garbage
+`FILE*`, before any client source is ever reached. The 64-bit interpreter's
+BCPLWORD is 64 bits, wide enough for a real pointer, so this class of
+corruption cannot occur. See [Limitations](#limitations) for the exact `gdb`
+evidence and the one vendor gap the switch to `cintsys64` uncovered.
+
 ## This is a demonstration, not an SDK
 
 This is educational material for a video and a website. It is not an official
@@ -341,8 +354,9 @@ programs. Nothing about that layout leaks back into the repository.
 
 `client/native/convexext.c` replaces `sysc/extfn.c` in the Cintcode
 distribution, which upstream documents as *"This file can be modified by users
-to provide any extension to the BCPL library that the user would like."* It
-exposes these operations, none of which knows what Convex is:
+to provide any extension to the BCPL library that the user would like."* It is
+compiled and linked into `cintsys64`, not the 32-bit `cintsys`. It exposes
+these operations, none of which knows what Convex is:
 
 | Operation | Purpose |
 | --- | --- |
@@ -383,8 +397,9 @@ on both descriptors at once and giving the owner a slice each time round.
 
 ### Memory
 
-The Cintcode memory is allocated once, at startup, at a fixed six million
-32-bit words — 24 MiB. Every BCPL allocation in this client comes out of it, so
+The Cintcode memory is allocated once, at startup, at a fixed three million
+64-bit words — 24 MiB, the same byte ceiling a 32-bit build would get from six
+million 32-bit words. Every BCPL allocation in this client comes out of it, so
 the client's memory ceiling is a property of the process rather than a promise.
 Inside it, each buffer is capped at 4 MiB, a WebSocket frame at 1 MiB, a
 reassembled message at 2 MiB, an HTTP request body and an HTTP response body at
@@ -402,13 +417,14 @@ memory beside the body it decodes to.
 
 ### Numbers
 
-JSON numbers are kept as their literal text rather than converted. This system
-has 32-bit words and a Convex document can carry a millisecond timestamp far
-larger than that, so holding the lexeme is what lets every value survive a
-round trip exactly as Convex sent it. A caller that wants an integer asks
-`jsWholeNumber`, which accepts Convex's `0` and `0.0` forms and the exponent
-notations that stay integral, and refuses anything fractional, quoted, or
-outside the word.
+JSON numbers are kept as their literal text rather than converted. Even this
+system's 64-bit words cannot hold every number a JSON document can carry — a
+value near IEEE double precision's range, for instance — so holding the
+lexeme is what lets every value survive a round trip exactly as Convex sent
+it. A caller that wants an integer asks `jsWholeNumber`, which accepts
+Convex's `0` and `0.0` forms and the exponent notations that stay integral,
+and refuses anything fractional, quoted, or wider than the 19 decimal digits
+this system's `maxint` (9223372036854775807) can hold.
 
 ### Formatting
 
@@ -479,11 +495,26 @@ never has to read any from its own source.
 - Live values cover the JSON-safe subset. Tagged Convex value types such as
   `Int64` and `Bytes` are not decoded.
 - HTTP opens one connection per request. Keep-alive is not implemented.
-- Numbers outside the 32-bit Cintcode word round trip exactly but cannot be
-  decoded to an integer.
-- The toolchain is pinned to a 2015 mirror of Martin Richards' distribution and
-  is patched at build time for one portability break: glibc 2.33 removed
-  `ftime`, so the Linux clock is routed through the distribution's own
-  `gettimeofday` branch. The patch asserts both its anchor and its result.
+- Numbers outside the 64-bit Cintcode word (wider than 19 decimal digits, or
+  past 9223372036854775807) round trip exactly but cannot be decoded to an
+  integer.
+- The toolchain is pinned to a 2015 mirror of Martin Richards' distribution
+  and is patched at build time for one gap in it: the pinned commit's
+  `cintsys64.c` `dosys()` switch never received the 2014 addition of
+  `sys(Sys_ext, ...)` that the 32-bit `cintsys.c` has, so there was no way for
+  a 64-bit-Cintcode BCPL program to reach a user C extension at all. The
+  Dockerfile patches in the same one-line `case 68` (`Sys_ext`'s value, from
+  `g/libhdr.h`) that the 32-bit interpreter already has, anchored so a future
+  upstream sync that already carries the fix fails the anchor assertion
+  instead of silently duplicating it.
+- This client targets `cintsys64`, the distribution's 64-bit Cintcode system,
+  because the 32-bit one segfaults on this architecture independently of any
+  Convex code. Confirmed directly on the build host: `gdb --batch -ex run -ex
+  bt` on the plain, unmodified 32-bit `bcpl` compiler compiling a five-line
+  "hello world" program shows `SIGSEGV` inside libc `ftell()`, called with a
+  sign-extended garbage `FILE*` — a 32-bit BCPL word holding a raw C pointer
+  that a 64-bit host handed back above `2**32` — deep inside the
+  distribution's own `cintsys.c` `dosys()`, before any client source is ever
+  reached. It reproduces with no Convex extension linked in at all.
 - No capability has been earned. The shared conformance suite has not been run
   from this branch.
