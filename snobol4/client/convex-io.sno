@@ -1,0 +1,211 @@
+*   convex-io.sno - loads client/convexrt.c and turns its raw, non-blocking
+*   primitives into a handful of small blocking helpers with an absolute
+*   millisecond deadline. Every deadline in the rest of the client is
+*   computed from io.now() and enforced here or one layer up; nothing below
+*   this file ever calls poll(2) or a socket function directly.
+*
+*   Every fallible helper below either returns its value (SNOBOL4 success)
+*   or fails (SNOBOL4 failure, the ":F()" branch) after recording the
+*   failure in the three globals cvx.err.name / cvx.err.message / cvx.err.data,
+*   which convex-error.sno turns into a structured adapter event. Callers
+*   that need to react differently to "nothing yet" versus "the stream is
+*   gone" read cvx.err.name, which is always TransportError for every
+*   failure this file itself raises.
+
+    io.lib = "/usr/local/lib/convex-snobol4/libconvexrt.so"
+
+    load("CVXGETENV(STRING)STRING", io.lib)
+    load("CVXSTDERR(STRING)INTEGER", io.lib)
+    load("CVXOPEN(STRING,STRING,INTEGER,INTEGER)INTEGER", io.lib)
+    load("CVXADOPT(INTEGER)INTEGER", io.lib)
+    load("CVXLISTEN(STRING,STRING)INTEGER", io.lib)
+    load("CVXPORT(INTEGER)INTEGER", io.lib)
+    load("CVXACCEPT(INTEGER,INTEGER)INTEGER", io.lib)
+    load("CVXREAD(INTEGER,INTEGER)INTEGER", io.lib)
+    load("CVXREADBUF(INTEGER)STRING", io.lib)
+    load("CVXWRITE(INTEGER,STRING)INTEGER", io.lib)
+    load("CVXPOLL(INTEGER,INTEGER,INTEGER,INTEGER,INTEGER,INTEGER,INTEGER)INTEGER", io.lib)
+    load("CVXCLOSE(INTEGER)INTEGER", io.lib)
+    load("CVXNOWMS()INTEGER", io.lib)
+    load("CVXRANDOM(INTEGER)STRING", io.lib)
+    load("CVXERRTEXT()STRING", io.lib)
+    load("CVXEXIT(INTEGER)INTEGER", io.lib)
+
+* The shim's own status codes (kept in sync with convexrt.c by hand; there
+* is no shared header between a SNOBOL4 source file and a C one).
+    io.again = -1
+    io.error = -2
+
+*   io.now() -> a monotonic millisecond timestamp. Every absolute deadline
+*   the client computes is io.now() plus a budget in milliseconds.
+    define('io.now()') :(io.now.end)
+io.now  io.now = cvxnowms()                            :(return)
+io.now.end
+
+*   io.fail(name, message) - record a TransportError and fail. Every helper
+*   in this file that cannot make progress calls through here so the error
+*   shape reaching the adapter is always the same three globals.
+    define('io.fail(name,message)') :(io.fail.end)
+io.fail cvx.err.name = name
+        cvx.err.message = message
+        cvx.err.data = ""
+        :(freturn)
+io.fail.end
+
+*   io.open(host, port, tls, deadlineMs) -> a handle, or fails with
+*   TransportError. port is passed as text because the shim's getaddrinfo()
+*   call takes a service name or a decimal string either way.
+    define('io.open(host,port,tls,deadlinems)') :(io.open.end)
+io.open io.open = cvxopen(host, port, tls, deadlinems)
+        ge(io.open, 0)                                  :s(return)
+        io.fail("TransportError", cvxerrtext())                    :(freturn)
+io.open.end
+
+*   io.adopt(fd) -> a handle wrapping an already-open descriptor (stdin or
+*   stdout), switched to non-blocking so it can share the same poll loop as
+*   every other stream.
+    define('io.adopt(fd)') :(io.adopt.end)
+io.adopt
+        io.adopt = cvxadopt(fd)
+        ge(io.adopt, 0)                                 :s(return)
+        io.fail("TransportError", "adopting a standard stream failed")
+        :(freturn)
+io.adopt.end
+
+*   io.listen(host, port) -> a listening handle, or fails.
+    define('io.listen(host,port)') :(io.listen.end)
+io.listen io.listen = cvxlisten(host, port)
+        ge(io.listen, 0)                                :s(return)
+        io.fail("TransportError", cvxerrtext())                    :(freturn)
+io.listen.end
+
+*   io.port(handle) -> the local port a io.listen() handle is bound to.
+    define('io.port(handle)') :(io.port.end)
+io.port io.port = cvxport(handle)                       :(return)
+io.port.end
+
+*   io.accept(handle, deadlineMs) -> an accepted handle, or fails. Failing
+*   with cvx.err.name "again" (not a structured error name any adapter event
+*   uses) tells a caller that only wanted "is a peer waiting yet" that the
+*   accept loop simply timed out with no connection, which a fixture accept
+*   loop treats as "keep waiting" rather than a transport failure.
+    define('io.accept(handle,deadlinems)remaining') :(io.accept.end)
+io.accept remaining = deadlinems - io.now()
+        le(remaining, 0)                                :s(io.accept.timeout)
+        io.accept = cvxaccept(handle, remaining)
+        ge(io.accept, 0)                                :s(return)
+        eq(io.accept, io.again)                          :s(io.accept)
+        io.fail("TransportError", cvxerrtext())                    :(freturn)
+io.accept.timeout
+        cvx.err.name = "again"
+        :(freturn)
+io.accept.end
+
+*   io.read_some(handle, maxLen, deadlineMs) -> the bytes read (possibly
+*   fewer than maxLen), or the empty string at end of stream. Distinguish
+*   the two by checking io.eof afterward; io.eof is 1 only for a genuine
+*   end of stream, never for "zero bytes were ready before the deadline",
+*   which instead fails as a TransportError.
+    define('io.read_some(handle,maxlen,deadlinems)n,data') :(io.read_some.end)
+io.read_some
+        io.eof = 0
+        remaining = deadlinems - io.now()
+        le(remaining, 0)                                :s(io.read_some.timeout)
+        n = cvxpoll(handle, 0, -1, 0, -1, 0, remaining)
+        eq(n, io.error)                                  :s(io.read_some.pollerr)
+        n = cvxread(handle, maxlen)
+        eq(n, io.again)                                  :s(io.read_some)
+        eq(n, io.error)                                  :s(io.read_some.readerr)
+        gt(n, 0)                                        :s(io.read_some.got)
+        io.eof = 1
+        io.read_some = ""                                :(return)
+io.read_some.got
+        io.read_some = cvxreadbuf(handle)                :(return)
+io.read_some.timeout
+        io.fail("TransportError", "read deadline exceeded")                    :(freturn)
+io.read_some.pollerr
+        io.fail("TransportError", cvxerrtext())                    :(freturn)
+io.read_some.readerr
+        io.fail("TransportError", cvxerrtext())                    :(freturn)
+io.read_some.end
+
+*   io.write_all(handle, data, deadlineMs) - write every byte of data,
+*   looping on partial writes until the peer drains or the deadline passes.
+    define('io.write_all(handle,data,deadlinems)offset,chunk,sent') :(io.write_all.end)
+io.write_all
+        offset = 1
+io.write_all.loop
+        gt(offset, size(data))                          :s(return)
+        remaining = deadlinems - io.now()
+        le(remaining, 0)                                :s(io.write_all.timeout)
+        chunk = substr(data, offset, size(data) - offset + 1)
+        sent = cvxwrite(handle, chunk)
+        eq(sent, io.error)                               :s(io.write_all.writeerr)
+        gt(sent, 0)                                     :s(io.write_all.advance)
+        n = cvxpoll(handle, 1, -1, 0, -1, 0, remaining)
+        eq(n, io.error)                                  :s(io.write_all.pollerr)
+        :(io.write_all.loop)
+io.write_all.advance
+        offset = offset + sent                          :(io.write_all.loop)
+io.write_all.timeout
+        io.fail("TransportError", "write deadline exceeded")                    :(freturn)
+io.write_all.writeerr
+        io.fail("TransportError", cvxerrtext())                    :(freturn)
+io.write_all.pollerr
+        io.fail("TransportError", cvxerrtext())                    :(freturn)
+io.write_all.end
+
+*   io.wait_readable(handle, deadlineMs) - block until the handle has bytes
+*   ready or fail with TransportError once the deadline passes. Used by the
+*   adapter's own command loop, which additionally watches its controller
+*   channel with io.poll2 below.
+    define('io.wait_readable(handle,deadlinems)') :(io.wait_readable.end)
+io.wait_readable
+        remaining = deadlinems - io.now()
+        le(remaining, 0)                                :s(io.wait_readable.timeout)
+        n = cvxpoll(handle, 0, -1, 0, -1, 0, remaining)
+        eq(n, io.error)                                  :s(io.wait_readable.pollerr)
+        gt(n, 0)                                        :s(return)
+        :(io.wait_readable)
+io.wait_readable.timeout
+        io.fail("TransportError", "wait deadline exceeded")                    :(freturn)
+io.wait_readable.pollerr
+        io.fail("TransportError", cvxerrtext())                    :(freturn)
+io.wait_readable.end
+
+*   io.poll2(handleA, handleB, timeoutms) -> a two-bit mask (1 = A ready to
+*   read, 2 = B ready to read), or 0 on a plain timeout. This is the
+*   adapter's event loop primitive: it watches the controller channel and
+*   the live WebSocket (when one is open) in a single wait.
+    define('io.poll2(a,b,timeoutms)') :(io.poll2.end)
+io.poll2
+        io.poll2 = cvxpoll(a, 0, b, 0, -1, 0, timeoutms)
+        ne(io.poll2, io.error)                           :s(return)
+        io.fail("TransportError", cvxerrtext())                    :(freturn)
+io.poll2.end
+
+*   io.close(handle) - always succeeds; closing an already-closed or unknown
+*   handle is a deliberate no-op so cleanup code never needs to track state.
+    define('io.close(handle)') :(io.close.end)
+io.close io.close = cvxclose(handle)                    :(return)
+io.close.end
+
+*   io.getenv(name) -> the environment variable's value, or "" when unset.
+    define('io.getenv(name)') :(io.getenv.end)
+io.getenv io.getenv = cvxgetenv(name)                   :(return)
+io.getenv.end
+
+*   io.eprintln(text) - one diagnostic line on stderr. stdout is reserved
+*   for the adapter's protocol events and the example's happy-path
+*   transcript, so every other message in this client goes through here.
+    define('io.eprintln(text)') :(io.eprintln.end)
+io.eprintln io.eprintln = cvxstderr(text)               :(return)
+io.eprintln.end
+
+*   io.random(count) -> count cryptographically random bytes, or fails.
+    define('io.random(count)') :(io.random.end)
+io.random
+        io.random = cvxrandom(count)
+        eq(size(io.random), count)                       :s(return)
+        io.fail("TransportError", "no entropy source available")                    :(freturn)
+io.random.end

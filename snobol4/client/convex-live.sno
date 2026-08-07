@@ -1,0 +1,477 @@
+*   convex-live.sno - the pinned Convex sync protocol over /api/sync:
+*   Connect, ModifyQuerySet (Add/Remove), and Transition (QueryUpdated /
+*   QueryFailed / QueryRemoved). SNOBOL4 has no threads, so the single
+*   process itself is this client's "one worker": convex-ws.sno's handle
+*   and buffers are only ever touched from the functions in this file, and
+*   the adapter is the only caller of this file, so there is no second
+*   owner to guard against.
+*
+*   Live delivery is a bounded queue of at most cvx.live.max.events pending
+*   events, each charged at its encoded size against cvx.live.max.bytes.
+*   The adapter drains it after every cvx.live.pump call; a subscription
+*   with no room left simply waits for the adapter to catch up rather than
+*   growing without bound.
+-include 'convex-ws.sno'
+-include 'convex-http.sno'
+
+    cvx.live.max.events = 64
+    cvx.live.max.bytes = 8388608
+    cvx.live.reconnect.min.ms = 100
+    cvx.live.reconnect.max.ms = 15000
+    cvx.live.connect.deadline.ms = 10000
+
+*   cvx.live.init() - one-time setup of every Live global. Called from
+*   cvx.configure so a fresh client (or a fresh adapter process) never
+*   inherits state from an earlier one.
+    define('cvx.live.init()') :(cvx.live.init.end)
+cvx.live.init
+        cvx.live.connected = 0
+        cvx.live.next_query_id = 0
+        cvx.live.query_set = 0
+        cvx.live.remote = json.object3("querySet", 0, "identity", 0, "ts", json.qs("AAAAAAAAAAA="))
+        cvx.live.max_ts = ""
+        cvx.live.max_ts_key = ""
+        cvx.live.connection_count = 0
+        cvx.live.last_close_reason = "InitialConnect"
+        cvx.live.reconnect_delay = cvx.live.reconnect.min.ms
+        cvx.live.next_reconnect_at = 0
+        cvx.live.active_count = 0
+        cvx.live.event_count = 0
+        cvx.live.event_bytes = 0
+        cvx.live.event_head = 1
+        cvx.live.event_tail = 0
+        cvx.live.event = table()
+        cvx.live.sub_path = table()
+        cvx.live.sub_args = table()
+        cvx.live.sub_active = table()
+        cvx.live.sub_last = table()
+        cvx.live.sub_gen = table()
+        :(return)
+cvx.live.init.end
+
+*   cvx.live.invalidate(queryid) - bumps a query's delivery generation.
+*   Called before unsubscribe (or a same-ID subscribe replacement) is
+*   acknowledged, so any event already queued for the old subscription is
+*   silently discarded by next_event rather than delivered after the
+*   acknowledgement that says it is gone.
+    define('cvx.live.invalidate(queryid)') :(cvx.live.invalidate.end)
+cvx.live.invalidate
+        cvx.live.sub_gen[queryid] = cvx.live.generation(queryid) + 1        :(return)
+cvx.live.invalidate.end
+
+    define('cvx.live.generation(queryid)') :(cvx.live.generation.end)
+cvx.live.generation
+        gt(size(cvx.live.sub_gen[queryid]), 0)                              :s(cvx.live.generation.have)
+        cvx.live.generation = 0                                              :(return)
+cvx.live.generation.have
+        cvx.live.generation = cvx.live.sub_gen[queryid]                      :(return)
+cvx.live.generation.end
+
+*   cvx.live.enqueue(kind, queryid, payload, logs) - append one delivery
+*   event, tagged with the query's current generation. Drops the OLDEST
+*   event once the count or byte budget is exhausted, rather than blocking
+*   or growing without bound; a slow consumer eventually only sees the
+*   newest values.
+    define('cvx.live.enqueue(kind,queryid,payload,logs)cost') :(cvx.live.enqueue.end)
+cvx.live.enqueue
+        cost = size(payload) + size(logs) + 256
+        cvx.live.event_tail = cvx.live.event_tail + 1
+        cvx.live.event[cvx.live.event_tail ".kind"] = kind
+        cvx.live.event[cvx.live.event_tail ".queryid"] = queryid
+        cvx.live.event[cvx.live.event_tail ".payload"] = payload
+        cvx.live.event[cvx.live.event_tail ".logs"] = logs
+        cvx.live.event[cvx.live.event_tail ".cost"] = cost
+        cvx.live.event[cvx.live.event_tail ".gen"] = cvx.live.generation(queryid)
+        cvx.live.event_count = cvx.live.event_count + 1
+        cvx.live.event_bytes = cvx.live.event_bytes + cost
+cvx.live.enqueue.trim
+        le(cvx.live.event_count, cvx.live.max.events)                    :s(cvx.live.enqueue.trimbytes)
+        cvx.live.drop_oldest()
+        :(cvx.live.enqueue.trim)
+cvx.live.enqueue.trimbytes
+        le(cvx.live.event_bytes, cvx.live.max.bytes)                     :s(return)
+        gt(cvx.live.event_count, 0)                                      :f(return)
+        cvx.live.drop_oldest()                                            :(cvx.live.enqueue.trimbytes)
+cvx.live.enqueue.end
+
+    define('cvx.live.drop_oldest()cost') :(cvx.live.drop_oldest.end)
+cvx.live.drop_oldest
+        cost = cvx.live.event[cvx.live.event_head ".cost"]
+        cvx.live.event[cvx.live.event_head ".kind"] = ""
+        cvx.live.event[cvx.live.event_head ".payload"] = ""
+        cvx.live.event[cvx.live.event_head ".logs"] = ""
+        cvx.live.event_head = cvx.live.event_head + 1
+        cvx.live.event_count = cvx.live.event_count - 1
+        cvx.live.event_bytes = cvx.live.event_bytes - cost               :(return)
+cvx.live.drop_oldest.end
+
+*   cvx.live.next_event() -> the oldest pending event's queryid, kind
+*   ("value" or "error"), and sets cvx.live.event.payload / .logs. Fails
+*   when the queue is empty.
+    define('cvx.live.next_event()qid,gen') :(cvx.live.next_event.end)
+cvx.live.next_event
+cvx.live.next_event.loop
+        gt(cvx.live.event_count, 0)                                       :f(freturn)
+        qid = cvx.live.event[cvx.live.event_head ".queryid"]
+        gen = cvx.live.event[cvx.live.event_head ".gen"]
+        cvx.live.event.payload = cvx.live.event[cvx.live.event_head ".payload"]
+        cvx.live.event.logs = cvx.live.event[cvx.live.event_head ".logs"]
+        cvx.live.event.queryid = qid
+        cvx.live.next_event = cvx.live.event[cvx.live.event_head ".kind"]
+        cvx.live.event[cvx.live.event_head ".kind"] = ""
+        cvx.live.event[cvx.live.event_head ".payload"] = ""
+        cvx.live.event[cvx.live.event_head ".logs"] = ""
+        cvx.live.event_head = cvx.live.event_head + 1
+        cvx.live.event_count = cvx.live.event_count - 1
+        cvx.live.event_bytes = cvx.live.event_bytes - cvx.live.event[cvx.live.event_head - 1 ".cost"]
+        eq(gen, cvx.live.generation(qid))                                   :s(return)
+        :(cvx.live.next_event.loop)
+cvx.live.next_event.end
+
+*   cvx.live.subscribe(path, argsraw) -> a new queryId. Sends an Add
+*   modification immediately when connected; otherwise the query joins the
+*   next connection's own subscribe-everything Connect sequence.
+    define('cvx.live.subscribe(path,argsraw)qid') :(cvx.live.subscribe.end)
+cvx.live.subscribe
+        qid = cvx.live.next_query_id
+        cvx.live.next_query_id = qid + 1
+        cvx.live.sub_path[qid] = path
+        cvx.live.sub_args[qid] = argsraw
+        cvx.live.sub_active[qid] = 1
+        cvx.live.sub_last[qid] = ""
+        cvx.live.active_count = cvx.live.active_count + 1
+        cvx.live.subscribe = qid
+        eq(cvx.live.connected, 1)                                         :f(return)
+        cvx.live.modify(cvx.live.add_mod(qid))                             :(return)
+cvx.live.subscribe.end
+
+*   cvx.live.unsubscribe(queryid) - marks the query inactive and sends
+*   Remove when connected. The subscription stays in the server's query set
+*   until it acknowledges Remove via a later Transition; this client does
+*   not need to wait for that acknowledgement, because it has already
+*   forgotten the query's local record and will ignore any further
+*   modification naming it.
+    define('cvx.live.unsubscribe(queryid)') :(cvx.live.unsubscribe.end)
+cvx.live.unsubscribe
+        gt(cvx.live.sub_active[queryid], 0)                                :f(return)
+        cvx.live.sub_active[queryid] = 0
+        cvx.live.active_count = cvx.live.active_count - 1
+* Invalidate before any acknowledgement is published, so an event already
+* queued for this query is discarded by next_event rather than delivered
+* under a subscriptionId the controller has already been told is gone.
+        cvx.live.invalidate(queryid)
+        eq(cvx.live.connected, 1)                                          :f(return)
+        cvx.live.modify(cvx.live.remove_mod(queryid))
+        :(return)
+cvx.live.unsubscribe.end
+
+*   cvx.live.add_mod(queryid) -> one Add modification object for the query,
+*   used both by subscribe() and by a reconnect's resubscribe-everything.
+    define('cvx.live.add_mod(queryid)') :(cvx.live.add_mod.end)
+cvx.live.add_mod
+        cvx.live.add_mod = json.object3("type", json.qs("Add"), "queryId", queryid, "udfPath", json.qs(cvx.live.sub_path[queryid]))
+        cvx.live.add_mod = substr(cvx.live.add_mod, 1, size(cvx.live.add_mod) - 1) ',"args":[' cvx.live.sub_args[queryid] "]}"
+        :(return)
+cvx.live.add_mod.end
+
+*   cvx.live.remove_mod(queryid) -> one Remove modification object.
+    define('cvx.live.remove_mod(queryid)') :(cvx.live.remove_mod.end)
+cvx.live.remove_mod cvx.live.remove_mod = json.object2("type", json.qs("Remove"), "queryId", queryid)  :(return)
+cvx.live.remove_mod.end
+
+*   cvx.live.modify(modtext) - wraps one modification in a ModifyQuerySet
+*   envelope and sends it, advancing the local query-set version. modtext
+*   is a single already-encoded JSON object; convex-live.sno never needs to
+*   batch more than one modification per call except on reconnect, which
+*   builds its own array directly (see cvx.live.resubscribe_all).
+    define('cvx.live.modify(modtext)') :(cvx.live.modify.end)
+cvx.live.modify
+        cvx.live.send_modifications("[" modtext "]")                      :(return)
+cvx.live.modify.end
+
+    define('cvx.live.send_modifications(modarray)envelope') :(cvx.live.send_modifications.end)
+cvx.live.send_modifications
+        envelope = json.object4("type", json.qs("ModifyQuerySet"), "baseVersion", cvx.live.query_set, "newVersion", cvx.live.query_set + 1, "modifications", modarray)
+        ws.send(envelope, io.now() + 5000)                                 :f(cvx.live.send_modifications.transporterr)
+        cvx.live.query_set = cvx.live.query_set + 1
+        :(return)
+cvx.live.send_modifications.transporterr
+        cvx.live.retire("TransportError")                                  :(freturn)
+cvx.live.send_modifications.end
+
+*   cvx.live.resubscribe_all() - after a fresh Connect, re-adds every
+*   still-active subscription in one ModifyQuerySet. Query IDs are not
+*   renumbered, so a subscription's identity survives a reconnect.
+    define('cvx.live.resubscribe_all()qid,mods,first') :(cvx.live.resubscribe_all.end)
+cvx.live.resubscribe_all
+        mods = ""
+        first = 1
+        qid = 0
+cvx.live.resubscribe_all.loop
+        ge(qid, cvx.live.next_query_id)                                    :s(cvx.live.resubscribe_all.send)
+        le(cvx.live.sub_active[qid], 0)                                     :s(cvx.live.resubscribe_all.next)
+        eq(first, 1)                                                        :s(cvx.live.resubscribe_all.first)
+        mods = mods ","
+cvx.live.resubscribe_all.first
+        mods = mods cvx.live.add_mod(qid)
+        first = 0
+cvx.live.resubscribe_all.next
+        qid = qid + 1                                                       :(cvx.live.resubscribe_all.loop)
+cvx.live.resubscribe_all.send
+        ident(mods, "")                                                     :s(return)
+        cvx.live.send_modifications("[" mods "]")                           :(return)
+cvx.live.resubscribe_all.end
+
+*   cvx.live.retire(reason) - tears down the current connection (if any)
+*   and, when subscriptions are still active and the client is not closed,
+*   schedules a reconnect after an exponentially growing backoff. Every
+*   still-active subscription gets a TransportError or ProtocolError event
+*   so the adapter's callers see the failure rather than silent stalling.
+    define('cvx.live.retire(reason)qid') :(cvx.live.retire.end)
+cvx.live.retire
+        eq(cvx.live.connected, 0)                                          :s(cvx.live.retire.skipclose)
+        ws.close(1000)
+cvx.live.retire.skipclose
+        cvx.live.connected = 0
+        cvx.live.connection_count = cvx.live.connection_count + 1
+        cvx.live.last_close_reason = reason
+        ident(reason, "DebugDisconnect")                                   :s(cvx.live.retire.notify)
+        qid = 0
+cvx.live.retire.notifyloop
+        ge(qid, cvx.live.next_query_id)                                     :s(cvx.live.retire.notify)
+        le(cvx.live.sub_active[qid], 0)                                      :s(cvx.live.retire.notifynext)
+        cvx.live.enqueue("error", qid, json.object2("name", json.qs(reason), "message", json.qs("Live connection lost: " reason)), "[]")
+cvx.live.retire.notifynext
+        qid = qid + 1                                                        :(cvx.live.retire.notifyloop)
+cvx.live.retire.notify
+        cvx.live.query_set = 0
+        cvx.live.remote = json.object3("querySet", 0, "identity", 0, "ts", json.qs("AAAAAAAAAAA="))
+        eq(cvx.live.closed, 1)                                              :s(return)
+        gt(cvx.live.active_count, 0)                                        :f(return)
+        cvx.live.next_reconnect_at = io.now() + cvx.live.reconnect_delay
+        cvx.live.reconnect_delay = cvx.live.reconnect_delay * 2
+        gt(cvx.live.reconnect_delay, cvx.live.reconnect.max.ms)              :f(return)
+        cvx.live.reconnect_delay = cvx.live.reconnect.max.ms
+        :(return)
+cvx.live.retire.end
+
+*   cvx.live.session_id() -> 32 hex characters of real entropy for the
+*   Connect message's sessionId. Fails only if the entropy source itself
+*   fails, which io.random already reports as TransportError.
+    define('cvx.live.session_id()raw,out,i') :(cvx.live.session_id.end)
+cvx.live.session_id
+        raw = io.random(16)                                                :f(freturn)
+        out = ""
+        i = 1
+cvx.live.session_id.loop
+        gt(i, 16)                                                           :s(cvx.live.session_id.done)
+        out = out substr("0123456789abcdef", (ord(substr(raw, i, 1)) / 16) + 1, 1)
+        out = out substr("0123456789abcdef", remdr(ord(substr(raw, i, 1)), 16) + 1, 1)
+        i = i + 1                                                            :(cvx.live.session_id.loop)
+cvx.live.session_id.done
+        cvx.live.session_id = out                                           :(return)
+cvx.live.session_id.end
+
+*   cvx.live.connect_once(deadlinems) - opens the WebSocket, sends Connect,
+*   resubscribes every active query, and marks the connection live. Any
+*   failure retires it (with backoff) rather than leaving half-open state.
+    define('cvx.live.connect_once(deadlinems)path,sid,fields') :(cvx.live.connect_once.end)
+cvx.live.connect_once
+        path = "/api/sync"
+        ws.connect(cvx.host, cvx.port, cvx.tls, path, deadlinems)           :f(cvx.live.connect_once.fail)
+        sid = cvx.live.session_id()                                          :f(cvx.live.connect_once.fail)
+        fields = json.object5("type", json.qs("Connect"), "sessionId", json.qs(sid), "connectionCount", cvx.live.connection_count, "lastCloseReason", json.qs(cvx.live.last_close_reason), "clientTs", 0)
+        ws.send(fields, deadlinems)                                          :f(cvx.live.connect_once.fail)
+        cvx.live.connected = 1
+        cvx.live.reconnect_delay = cvx.live.reconnect.min.ms
+        cvx.live.resubscribe_all()
+        :(return)
+cvx.live.connect_once.fail
+        cvx.live.retire(cvx.err.name)                                        :(freturn)
+cvx.live.connect_once.end
+
+*   cvx.live.pump(deadlinems) - the adapter's only entry point into Live.
+*   Connects or reconnects when it is due, then makes one attempt to read
+*   and process a server message before the deadline. Never fails: a
+*   transport problem retires the connection (scheduling its own retry) and
+*   pump simply returns, leaving the adapter's event loop to poll again.
+    define('cvx.live.pump(deadlinems)') :(cvx.live.pump.end)
+cvx.live.pump
+        eq(cvx.live.closed, 1)                                              :s(return)
+        le(cvx.live.active_count, 0)                                        :s(return)
+        eq(cvx.live.connected, 1)                                           :s(cvx.live.pump.read)
+        gt(io.now(), cvx.live.next_reconnect_at)                            :f(return)
+        cvx.live.connect_once(io.now() + cvx.live.connect.deadline.ms)
+        :(return)
+cvx.live.pump.read
+        cvx.live.message = ws.try_read(deadlinems)                          :f(cvx.live.pump.readfail)
+        cvx.live.handle_message(cvx.live.message)                            :(return)
+cvx.live.pump.readfail
+        ident(cvx.err.name, "again")                                        :s(return)
+        cvx.live.retire(cvx.err.name)                                        :(return)
+cvx.live.pump.end
+
+*   cvx.live.debug_disconnect() - the adapter-only forced-reconnect hook.
+*   Retires the current connection with no backoff at all, so the very next
+*   pump call reconnects immediately; the adapter acknowledges the command
+*   only after this returns, satisfying the "old connection retired and
+*   reconnect scheduled before the acknowledgement" barrier.
+    define('cvx.live.debug_disconnect()') :(cvx.live.debug_disconnect.end)
+cvx.live.debug_disconnect
+        lt(cvx.live.connected, 1)                                           :s(freturn)
+        cvx.live.retire("DebugDisconnect")
+        cvx.live.next_reconnect_at = io.now() - 1
+        cvx.live.reconnect_delay = cvx.live.reconnect.min.ms
+        :(return)
+cvx.live.debug_disconnect.end
+
+*   cvx.live.close() - the adapter's close command. Marks the client
+*   closed (no further reconnects) and drops the WebSocket if one is open.
+    define('cvx.live.close()') :(cvx.live.close.end)
+cvx.live.close
+        cvx.live.closed = 1
+        eq(cvx.live.connected, 1)                                           :f(return)
+        ws.close(1000)
+        cvx.live.connected = 0                                               :(return)
+cvx.live.close.end
+
+*   cvx.live.handle_message(raw) - classifies and applies one decoded
+*   WebSocket text message. Ping, MutationResponse and ActionResponse are
+*   silently ignored (this client only mutates and acts over HTTP).
+*   FatalError and AuthError retire the connection as a ProtocolError.
+*   Anything else that is not a Transition is protocol drift.
+    define('cvx.live.handle_message(raw)type') :(cvx.live.handle_message.end)
+cvx.live.handle_message
+        type = json.decode_string(json.field(raw, "type"))                  :f(cvx.live.handle_message.protoerr)
+        ident(type, "Ping")                                                  :s(return)
+        ident(type, "MutationResponse")                                     :s(return)
+        ident(type, "ActionResponse")                                       :s(return)
+        ident(type, "FatalError")                                           :s(cvx.live.handle_message.fatal)
+        ident(type, "AuthError")                                            :s(cvx.live.handle_message.fatal)
+        ident(type, "Transition")                                           :f(cvx.live.handle_message.protoerr)
+        cvx.live.apply_transition(raw)                                       :(return)
+cvx.live.handle_message.fatal
+        error.set("ProtocolError", type " from Convex", "")
+        cvx.live.retire("ProtocolError")                                     :(return)
+cvx.live.handle_message.protoerr
+        error.set("ProtocolError", "unsupported or malformed Live message", "")
+        cvx.live.retire("ProtocolError")                                     :(return)
+cvx.live.handle_message.end
+
+*   cvx.live.version_key(versionobj) -> a comparable form of a version
+*   object's "ts" field: the 8 timestamp bytes reordered from little-endian
+*   (as Convex encodes them, base64) into big-endian, so plain string
+*   comparison orders timestamps correctly.
+    define('cvx.live.version_key(versionobj)ts,bytes,i,out') :(cvx.live.version_key.end)
+cvx.live.version_key
+        ts = json.decode_string(json.field(versionobj, "ts"))                :f(freturn)
+        bytes = base64.decode(ts)                                             :f(freturn)
+        eq(size(bytes), 8)                                                    :f(freturn)
+        out = ""
+        i = 8
+cvx.live.version_key.loop
+        lt(i, 1)                                                              :s(cvx.live.version_key.done)
+        out = out substr(bytes, i, 1)
+        i = i - 1                                                             :(cvx.live.version_key.loop)
+cvx.live.version_key.done
+        cvx.live.version_key = out                                            :(return)
+cvx.live.version_key.end
+
+*   cvx.live.key_less(a, b) - succeeds when byte string a orders before
+*   byte string b, comparing byte values (not SNOBOL4's own EQ/LT, which
+*   are numeric-only and would raise a runtime type error on a raw byte
+*   string). Both keys are always the same length here (eight reordered
+*   timestamp bytes), so a strict byte-by-byte walk is enough.
+    define('cvx.live.key_less(a,b)i,ab,bb') :(cvx.live.key_less.end)
+cvx.live.key_less
+        i = 1
+cvx.live.key_less.loop
+        gt(i, size(a))                                                        :s(freturn)
+        ab = ord(substr(a, i, 1))
+        bb = ord(substr(b, i, 1))
+        lt(ab, bb)                                                            :s(return)
+        gt(ab, bb)                                                            :s(freturn)
+        i = i + 1                                                             :(cvx.live.key_less.loop)
+cvx.live.key_less.end
+
+*   cvx.live.apply_transition(raw) - validates startVersion against the
+*   locally held remote version, applies every modification, publishes
+*   changed values through cvx.live.enqueue, and adopts endVersion as the
+*   new remote version. Multiple modifications to the same query in one
+*   transition coalesce to the last one, matching the server's own atomic
+*   transaction semantics.
+    define('cvx.live.apply_transition(raw)startv,endv,mods,i,mod,endkey') :(cvx.live.apply_transition.end)
+cvx.live.apply_transition
+        startv = json.field(raw, "startVersion")                             :f(cvx.live.transition.protoerr)
+        cvx.live.same_version(startv, cvx.live.remote)                        :f(cvx.live.transition.protoerr)
+        endv = json.field(raw, "endVersion")                                  :f(cvx.live.transition.protoerr)
+        endkey = cvx.live.version_key(endv)                                   :f(cvx.live.transition.protoerr)
+        mods = json.field(raw, "modifications")                              :f(cvx.live.transition.protoerr)
+        i = 1
+cvx.live.apply_transition.loop
+        mod = json.array_at(mods, i)                                          :f(cvx.live.apply_transition.commit)
+        cvx.live.apply_one_modification(mod)                                  :f(cvx.live.transition.protoerr)
+        i = i + 1                                                             :(cvx.live.apply_transition.loop)
+cvx.live.apply_transition.commit
+* maxObservedTimestamp only ever grows: an intervening reconnect must not
+* let a stale connection's transitions move it backwards.
+        ident(cvx.live.max_ts_key, "")                                        :s(cvx.live.apply_transition.setmax)
+        differ(endkey, cvx.live.max_ts_key)                                    :f(cvx.live.apply_transition.remote)
+        cvx.live.key_less(endkey, cvx.live.max_ts_key)                          :s(cvx.live.apply_transition.remote)
+cvx.live.apply_transition.setmax
+        cvx.live.max_ts_key = endkey
+        cvx.live.max_ts = json.decode_string(json.field(endv, "ts"))
+cvx.live.apply_transition.remote
+        cvx.live.remote = endv                                               :(return)
+cvx.live.transition.protoerr
+        error.set("ProtocolError", "malformed or out-of-order Live transition", "")
+        cvx.live.retire("ProtocolError")                                     :(freturn)
+cvx.live.apply_transition.end
+
+*   cvx.live.same_version(a, b) - decoded-field comparison of two version
+*   objects; CSNOBOL4's own JSON encoder does not promise the same field
+*   order Convex used, so a raw-text comparison is not reliable here.
+    define('cvx.live.same_version(a,b)') :(cvx.live.same_version.end)
+cvx.live.same_version
+        eq(json.uint32(json.field(a, "querySet")), json.uint32(json.field(b, "querySet")))  :f(freturn)
+        eq(json.uint32(json.field(a, "identity")), json.uint32(json.field(b, "identity")))   :f(freturn)
+        ident(cvx.live.version_key(a), cvx.live.version_key(b))                :f(freturn)
+        :(return)
+cvx.live.same_version.end
+
+*   cvx.live.apply_one_modification(mod) - QueryUpdated publishes a value
+*   event, QueryFailed publishes an error event, QueryRemoved is a no-op
+*   here (this client already forgot an unsubscribed query's local record).
+*   A modification naming a query this client does not currently track -
+*   including one it already unsubscribed from - is silently ignored,
+*   never a protocol error, because Remove is a request and the server's
+*   own query set does not shrink until it is acknowledged.
+    define('cvx.live.apply_one_modification(mod)kind,qid,value,logs,errname,errmsg,errdata') :(cvx.live.apply_one_modification.end)
+cvx.live.apply_one_modification
+        kind = json.decode_string(json.field(mod, "type"))                   :f(freturn)
+        qid = json.uint32(json.field(mod, "queryId"))                        :f(freturn)
+        ident(kind, "QueryRemoved")                                          :s(return)
+        gt(cvx.live.sub_active[qid], 0)                                       :f(return)
+        ident(kind, "QueryUpdated")                                          :s(cvx.live.apply_one_modification.updated)
+        ident(kind, "QueryFailed")                                           :s(cvx.live.apply_one_modification.failed)
+        :(freturn)
+cvx.live.apply_one_modification.updated
+        value = json.field(mod, "value")                                     :f(freturn)
+        logs = json.field(mod, "logLines")                                   :s(cvx.live.apply_one_modification.deliver)
+        logs = "[]"
+cvx.live.apply_one_modification.deliver
+        ident(value, cvx.live.sub_last[qid])                                  :s(return)
+        cvx.live.sub_last[qid] = value
+        cvx.live.enqueue("value", qid, value, logs)                           :(return)
+cvx.live.apply_one_modification.failed
+        errmsg = json.decode_string(json.field(mod, "errorMessage"))          :f(freturn)
+        errdata = json.field(mod, "errorData")                                :s(cvx.live.apply_one_modification.faileddata)
+        errdata = "null"
+cvx.live.apply_one_modification.faileddata
+        logs = json.field(mod, "logLines")                                    :s(cvx.live.apply_one_modification.deliverfail)
+        logs = "[]"
+cvx.live.apply_one_modification.deliverfail
+        cvx.live.enqueue("error", qid, json.object3("name", json.qs("FunctionError"), "message", json.qs(errmsg), "data", errdata), logs)
+        cvx.live.sub_last[qid] = ""
+        :(return)
+cvx.live.apply_one_modification.end

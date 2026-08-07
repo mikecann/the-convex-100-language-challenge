@@ -1,0 +1,150 @@
+*   unit_test.sno - pure-function regressions for the primitives every
+*   higher layer depends on: 32-bit bitwise arithmetic, SHA-1, base64, and
+*   the JSON reader/writer. None of these need a socket.
+-include 'convex-live.sno'
+-include 'test_support.sno'
+
+* --- bits ---
+    test.same(bits.and32(255, 15), 15, "bits.and32")
+    test.same(bits.or32(240, 15), 255, "bits.or32")
+    test.same(bits.xor32(4294967295, 2863311530), 1431655765, "bits.xor32")
+    test.same(bits.not32(0), 4294967295, "bits.not32")
+    test.same(bits.rol32(1, 1), 2, "bits.rol32 low bit")
+    test.same(bits.rol32(2147483648, 1), 1, "bits.rol32 wraps top bit")
+    test.same(bits.add32(4294967295, 1), 0, "bits.add32 wraps")
+    test.same(bits.byte(305419896, 0), 18, "bits.byte 0")
+    test.same(bits.byte(305419896, 3), 120, "bits.byte 3")
+
+* --- sha1: FIPS 180-4 and the RFC 6455 worked example ---
+    define('hexof(s)i,out') :(hexof.end)
+hexof   out = ""
+        i = 1
+hexof.loop
+        gt(i, size(s))                                                     :s(hexof.done)
+        out = out substr("0123456789abcdef", (ord(substr(s, i, 1)) / 16) + 1, 1)
+        out = out substr("0123456789abcdef", remdr(ord(substr(s, i, 1)), 16) + 1, 1)
+        i = i + 1                                                           :(hexof.loop)
+hexof.done
+        hexof = out                                                         :(return)
+hexof.end
+
+    test.same(hexof(sha1.digest("")), "da39a3ee5e6b4b0d3255bfef95601890afd80709", "sha1 empty string")
+    test.same(hexof(sha1.digest("abc")), "a9993e364706816aba3e25717850c26c9cd0d89d", "sha1 abc")
+    test.same(hexof(sha1.digest("dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11")), "b37a4f2cc0624f1690f64606cf385945b2bec4ea", "sha1 RFC 6455 handshake key")
+
+* --- base64 ---
+    test.same(base64.encode(""), "", "base64 empty")
+    test.same(base64.encode("f"), "Zg==", "base64 f")
+    test.same(base64.encode("fo"), "Zm8=", "base64 fo")
+    test.same(base64.encode("foo"), "Zm9v", "base64 foo")
+    test.same(base64.encode("foobar"), "Zm9vYmFy", "base64 foobar")
+    test.same(base64.encode(sha1.digest("dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11")), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "base64 of RFC 6455 accept digest")
+    test.same(base64.decode("Zm9vYmFy"), "foobar", "base64 decode round trip")
+    test.same(size(base64.decode("AAAAAAAAAAA=")), 8, "base64 decode 8-byte timestamp size")
+
+* --- json: field/array extraction, escaping, uint32 validation ---
+    envelope = '{"status":"success","value":{"room":"x","count":0,"nested":{"a":[1,2,3]},"flag":true},"logLines":["l1","l2"]}'
+    st = json.field(envelope, "status")                                     :f(jf1)
+    test.same(json.decode_string(st), "success", "json.field status")
+    :(ja1)
+jf1
+    test.fail("json.field status", "field lookup failed")
+ja1
+
+    v = json.field(envelope, "value")                                       :f(jf2)
+    room = json.field(v, "room")                                            :f(jf2)
+    test.same(json.decode_string(room), "x", "json.field nested room")
+    :(ja2)
+jf2
+    test.fail("json.field nested room", "field lookup failed")
+ja2
+
+    countraw = json.field(v, "count")                                        :f(jf3)
+    test.same(json.uint32(countraw), 0, "json.uint32 zero")
+    :(ja3)
+jf3
+    test.fail("json.uint32 zero", "field lookup failed")
+ja3
+
+    nested = json.field(v, "nested")                                         :f(jf4)
+    arr = json.field(nested, "a")                                            :f(jf4)
+    e1 = json.array_at(arr, 1)                                               :f(jf4)
+    e2 = json.array_at(arr, 2)                                               :f(jf4)
+    e3 = json.array_at(arr, 3)                                               :f(jf4)
+    test.same(e1 "," e2 "," e3, "1,2,3", "json.array_at three elements")
+    e4 = json.array_at(arr, 4)                                                :s(jbad4)
+    test.pass("json.array_at stops past the end")
+    :(ja4)
+jbad4
+    test.fail("json.array_at stops past the end", "returned a 4th element")
+jf4
+    test.fail("json.array_at three elements", "field or array lookup failed")
+ja4
+
+    missing = json.field(v, "does_not_exist")                                 :s(jbad5)
+    test.pass("json.field absent field fails")
+    :(ja5)
+jbad5
+    test.fail("json.field absent field fails", "wrongly returned " missing)
+ja5
+
+* json.uint32 must accept the integral-decimal form Convex may send, and
+* reject fractions, out-of-range values, and leading zeros.
+    test.same(json.uint32("1.0"), 1, "json.uint32 accepts 1.0")
+    test.same(json.uint32("4294967295"), 4294967295, "json.uint32 accepts uint32 max")
+    r1 = json.uint32("4294967296")                                            :s(jbad6)
+    test.pass("json.uint32 rejects overflow")
+    :(ja6)
+jbad6
+    test.fail("json.uint32 rejects overflow", "wrongly accepted " r1)
+ja6
+    r2 = json.uint32("1.5")                                                   :s(jbad7)
+    test.pass("json.uint32 rejects a fraction")
+    :(ja7)
+jbad7
+    test.fail("json.uint32 rejects a fraction", "wrongly accepted " r2)
+ja7
+    r3 = json.uint32("007")                                                   :s(jbad8)
+    test.pass("json.uint32 rejects a leading zero")
+    :(ja8)
+jbad8
+    test.fail("json.uint32 rejects a leading zero", "wrongly accepted " r3)
+ja8
+    r4 = json.uint32('"3"')                                                   :s(jbad9)
+    test.pass("json.uint32 rejects a quoted number")
+    :(ja9)
+jbad9
+    test.fail("json.uint32 rejects a quoted number", "wrongly accepted " r4)
+ja9
+
+* escaping and UTF-8 round trip
+    original = 'He said "hi"' char(10) 'tab:' char(9) '\'
+    escaped = json.qs(original)
+    roundtrip = json.decode_string(escaped)
+    test.same(roundtrip, original, "json.qs / json.decode_string round trip")
+
+    unicode_lit = '"Hello, ' '世界 ' char(240) char(159) char(145) char(139) '"'
+    ud = json.decode_string(unicode_lit)                                       :f(jf10)
+    test.same(size(ud), 18, "utf-8 pass-through length")
+    :(ja10)
+jf10
+    test.fail("utf-8 pass-through length", "decode failed")
+ja10
+
+* a \uXXXX escape, including a surrogate pair, must decode to the correct
+* UTF-8 bytes.
+    escaped_a = json.decode_string('"A"')                                 :f(jf11)
+    test.same(escaped_a, "A", "\\u0041 decodes to A")
+    :(ja11)
+jf11
+    test.fail("\\u0041 decodes to A", "decode failed")
+ja11
+    smiley = json.decode_string('"😀"')                              :f(jf12)
+    test.same(size(smiley), 4, "surrogate pair decodes to a 4-byte UTF-8 emoji")
+    :(ja12)
+jf12
+    test.fail("surrogate pair decodes to a 4-byte UTF-8 emoji", "decode failed")
+ja12
+
+    test.report()
+end
