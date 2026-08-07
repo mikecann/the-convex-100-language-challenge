@@ -20,15 +20,18 @@
 :- module convex_transport.
 :- interface.
 
+:- import_module bool.
 :- import_module io.
 
 :- type tls_conn.
 
-    % A connected, verified TLS 1.2+ connection to host:port. Verification
-    % uses the system CA bundle and checks the peer certificate's hostname
-    % against `Host`, exactly as a browser would.
-:- pred tls_open(string::in, int::in, maybe_tls_conn::out, io::di, io::uo)
-    is det.
+    % A connected socket to host:port, optionally wrapped in a verified TLS
+    % 1.2+ session (UseTls = no is for the plain-HTTP self-hosted backend
+    % profile, e.g. http://backend:3210). Verification uses the system CA
+    % bundle and checks the peer certificate's hostname against `Host`,
+    % exactly as a browser would.
+:- pred tls_open(string::in, int::in, bool::in, maybe_tls_conn::out,
+    io::di, io::uo) is det.
 
 :- type maybe_tls_conn
     --->    tls_ok(tls_conn)
@@ -175,12 +178,24 @@
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 
-/* One connected, verified TLS session plus the socket it owns. */
+/* One connected socket, optionally wrapped in a verified TLS session. The
+   self-hosted backend profile this project also targets is plain HTTP/WS
+   (e.g. http://backend:3210), so `ssl` is NULL for that case and every I/O
+   call below falls back to plain read()/write() on `fd`; conn_read/
+   conn_write are the only two places that distinction is made. */
 typedef struct ConvexTls {
     SSL_CTX *ctx;
     SSL *ssl;
     int fd;
 } ConvexTls;
+
+static int conn_read(ConvexTls *c, void *buf, int len) {
+    return c->ssl != NULL ? SSL_read(c->ssl, buf, len) : (int) read(c->fd, buf, (size_t) len);
+}
+
+static int conn_write(ConvexTls *c, const void *buf, int len) {
+    return c->ssl != NULL ? SSL_write(c->ssl, buf, len) : (int) write(c->fd, buf, (size_t) len);
+}
 
 /* Per-fd line-buffering state for read_line/2. A handful of small fixed
    slots is enough: the adapter only ever reads from stdin or one accepted
@@ -229,7 +244,7 @@ static char *convex_dup_mercury_string(const char *bytes, size_t len) {
 :- pragma foreign_type("C", tls_conn, "ConvexTls *").
 
 :- pragma foreign_proc("C",
-    tls_open(Host::in, Port::in, Result::out, IO0::di, IO::uo),
+    tls_open(Host::in, Port::in, UseTls::in, Result::out, IO0::di, IO::uo),
     [will_not_call_mercury, promise_pure, tabled_for_io],
 "
     struct addrinfo hints, *res = NULL, *rp;
@@ -256,6 +271,16 @@ static char *convex_dup_mercury_string(const char *bytes, size_t len) {
         freeaddrinfo(res);
         if (sockfd < 0) {
             Result = convex_transport_tls_error(\"connect() failed\");
+        } else if (!UseTls) {
+            /* The self-hosted backend profile is plain HTTP/WS (e.g.
+               http://backend:3210): no TLS_client_method handshake, ssl
+               stays NULL, and conn_read/conn_write fall back to the raw
+               socket for every subsequent operation on this connection. */
+            ConvexTls *conn = malloc(sizeof(ConvexTls));
+            conn->ctx = NULL;
+            conn->ssl = NULL;
+            conn->fd = sockfd;
+            Result = convex_transport_tls_ok(conn);
         } else {
             SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
             SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
@@ -307,9 +332,11 @@ convex_transport_tls_error(Msg) = tls_error(Msg).
     tls_close(Conn::in, IO0::di, IO::uo),
     [will_not_call_mercury, promise_pure, tabled_for_io],
 "
-    SSL_shutdown(Conn->ssl);
-    SSL_free(Conn->ssl);
-    SSL_CTX_free(Conn->ctx);
+    if (Conn->ssl != NULL) {
+        SSL_shutdown(Conn->ssl);
+        SSL_free(Conn->ssl);
+        SSL_CTX_free(Conn->ctx);
+    }
     close(Conn->fd);
     free(Conn);
     IO = IO0;
@@ -330,7 +357,7 @@ convex_transport_tls_error(Msg) = tls_error(Msg).
     size_t sent = 0;
     int failed = 0;
     while (sent < total) {
-        int n = SSL_write(Conn->ssl, Text + sent, (int) (total - sent));
+        int n = conn_write(Conn, Text + sent, (int) (total - sent));
         if (n <= 0) { failed = 1; break; }
         sent += (size_t) n;
     }
@@ -373,7 +400,7 @@ convex_transport_transport_error(Msg) = transport_error(Msg).
     /* Read until the blank line ending the headers is present. */
     for (;;) {
         if (len + 4096 > cap) { cap *= 2; buf = realloc(buf, cap); }
-        int n = SSL_read(Conn->ssl, buf + len, (int) (cap - len));
+        int n = conn_read(Conn, buf + len, (int) (cap - len));
         if (n <= 0) { failed = 1; snprintf(errbuf, sizeof(errbuf), \"connection closed before response headers\"); break; }
         len += (size_t) n;
         buf[len] = '\\0';
@@ -413,7 +440,7 @@ convex_transport_transport_error(Msg) = transport_error(Msg).
             while ((line_end = strstr(cursor, \"\\r\\n\")) == NULL) {
                 if (len + 4096 > cap) { cap *= 2; buf = realloc(buf, cap); out = realloc(out, cap); }
                 size_t cursor_off = (size_t) (cursor - buf);
-                int n = SSL_read(Conn->ssl, buf + len, (int) (cap - len));
+                int n = conn_read(Conn, buf + len, (int) (cap - len));
                 if (n <= 0) { failed = 1; snprintf(errbuf, sizeof(errbuf), \"connection closed mid-chunk\"); break; }
                 len += (size_t) n;
                 buf[len] = '\\0';
@@ -426,7 +453,7 @@ convex_transport_transport_error(Msg) = transport_error(Msg).
             while ((size_t) (cursor - buf) + (size_t) chunk_size + 2 > len) {
                 if (len + 4096 > cap) { cap *= 2; buf = realloc(buf, cap); out = realloc(out, cap); }
                 size_t cursor_off = (size_t) (cursor - buf);
-                int n = SSL_read(Conn->ssl, buf + len, (int) (cap - len));
+                int n = conn_read(Conn, buf + len, (int) (cap - len));
                 if (n <= 0) { failed = 1; snprintf(errbuf, sizeof(errbuf), \"connection closed mid-chunk\"); break; }
                 len += (size_t) n;
                 buf[len] = '\\0';
@@ -444,7 +471,7 @@ convex_transport_transport_error(Msg) = transport_error(Msg).
         while (body_have < (size_t) content_length) {
             if (len + 4096 > cap) { cap *= 2; buf = realloc(buf, cap); }
             size_t body_off = (size_t) (body_start - buf);
-            int n = SSL_read(Conn->ssl, buf + len, (int) (cap - len));
+            int n = conn_read(Conn, buf + len, (int) (cap - len));
             if (n <= 0) { failed = 1; snprintf(errbuf, sizeof(errbuf), \"connection closed before full body\"); break; }
             len += (size_t) n;
             buf[len] = '\\0';
@@ -458,7 +485,7 @@ convex_transport_transport_error(Msg) = transport_error(Msg).
         for (;;) {
             if (len + 4096 > cap) { cap *= 2; buf = realloc(buf, cap); }
             size_t body_off = (size_t) (body_start - buf);
-            int n = SSL_read(Conn->ssl, buf + len, (int) (cap - len));
+            int n = conn_read(Conn, buf + len, (int) (cap - len));
             if (n <= 0) break;
             len += (size_t) n;
             buf[len] = '\\0';
@@ -529,7 +556,7 @@ static void convex_base64_encode(const unsigned char *data, size_t len, char *ou
     errbuf[0] = '\\0';
     size_t total = strlen(request), sent = 0;
     while (sent < total && !failed) {
-        int n = SSL_write(Conn->ssl, request + sent, (int) (total - sent));
+        int n = conn_write(Conn, request + sent, (int) (total - sent));
         if (n <= 0) { failed = 1; snprintf(errbuf, sizeof(errbuf), \"handshake write failed\"); }
         else sent += (size_t) n;
     }
@@ -539,7 +566,7 @@ static void convex_base64_encode(const unsigned char *data, size_t len, char *ou
     char *header_end = NULL;
     if (!failed) {
         for (;;) {
-            int n = SSL_read(Conn->ssl, buf + len, (int) (sizeof(buf) - 1 - len));
+            int n = conn_read(Conn, buf + len, (int) (sizeof(buf) - 1 - len));
             if (n <= 0) { failed = 1; snprintf(errbuf, sizeof(errbuf), \"handshake read failed\"); break; }
             len += (size_t) n;
             buf[len] = '\\0';
@@ -617,7 +644,7 @@ static void convex_base64_encode(const unsigned char *data, size_t len, char *ou
 
     size_t sent = 0;
     while (sent < frame_len) {
-        int n = SSL_write(Conn->ssl, frame + sent, (int) (frame_len - sent));
+        int n = conn_write(Conn, frame + sent, (int) (frame_len - sent));
         if (n <= 0) { failed = 1; break; }
         sent += (size_t) n;
     }
@@ -657,12 +684,12 @@ static WsSlot *convex_ws_slot(int fd) {
     return NULL;
 }
 
-/* Ensure at least `need` more bytes are buffered, reading from `ssl` (with a
-   timeout in ms) as required. Returns 1 on success, 0 on timeout with no new
-   bytes, -1 on error/peer-close. */
-static int convex_ws_fill(WsSlot *slot, SSL *ssl, int fd, size_t need, int timeout_ms) {
+/* Ensure at least `need` more bytes are buffered, reading from `conn` (with
+   a timeout in ms) as required. Returns 1 on success, 0 on timeout with no
+   new bytes, -1 on error/peer-close. */
+static int convex_ws_fill(WsSlot *slot, ConvexTls *conn, size_t need, int timeout_ms) {
     while (slot->len < need) {
-        struct pollfd pfd = { fd, POLLIN, 0 };
+        struct pollfd pfd = { conn->fd, POLLIN, 0 };
         int pr = poll(&pfd, 1, timeout_ms);
         if (pr == 0) return (slot->len > 0) ? -1 : 0;
         if (pr < 0) return -1;
@@ -670,7 +697,7 @@ static int convex_ws_fill(WsSlot *slot, SSL *ssl, int fd, size_t need, int timeo
             slot->cap += 65536;
             slot->buf = realloc(slot->buf, slot->cap);
         }
-        int n = SSL_read(ssl, slot->buf + slot->len, (int) (slot->cap - slot->len));
+        int n = conn_read(conn, slot->buf + slot->len, (int) (slot->cap - slot->len));
         if (n <= 0) return -1;
         slot->len += (size_t) n;
     }
@@ -691,7 +718,7 @@ static void convex_ws_consume(WsSlot *slot, size_t n) {
     Result = convex_transport_ws_timeout();
 
     for (;;) {
-        int fr = convex_ws_fill(slot, Conn->ssl, Conn->fd, 2, TimeoutMs);
+        int fr = convex_ws_fill(slot, Conn, 2, TimeoutMs);
         if (fr == 0) { Result = convex_transport_ws_timeout(); break; }
         if (fr < 0) { Result = convex_transport_ws_peer_closed(); break; }
 
@@ -702,11 +729,11 @@ static void convex_ws_consume(WsSlot *slot, size_t n) {
         size_t header_len = 2;
 
         if (payload_len == 126) {
-            if (convex_ws_fill(slot, Conn->ssl, Conn->fd, 4, TimeoutMs) <= 0) { Result = convex_transport_ws_peer_closed(); break; }
+            if (convex_ws_fill(slot, Conn, 4, TimeoutMs) <= 0) { Result = convex_transport_ws_peer_closed(); break; }
             payload_len = ((MR_Unsigned) slot->buf[2] << 8) | slot->buf[3];
             header_len = 4;
         } else if (payload_len == 127) {
-            if (convex_ws_fill(slot, Conn->ssl, Conn->fd, 10, TimeoutMs) <= 0) { Result = convex_transport_ws_peer_closed(); break; }
+            if (convex_ws_fill(slot, Conn, 10, TimeoutMs) <= 0) { Result = convex_transport_ws_peer_closed(); break; }
             payload_len = 0;
             int i;
             for (i = 0; i < 8; i++) payload_len = (payload_len << 8) | slot->buf[2 + i];
@@ -716,7 +743,7 @@ static void convex_ws_consume(WsSlot *slot, size_t n) {
         size_t total_len = header_len + mask_len + payload_len;
         if (total_len > 8 * 1024 * 1024) { Result = convex_transport_ws_error(\"frame exceeded 8 MiB\"); break; }
 
-        if (convex_ws_fill(slot, Conn->ssl, Conn->fd, total_len, TimeoutMs) <= 0) { Result = convex_transport_ws_peer_closed(); break; }
+        if (convex_ws_fill(slot, Conn, total_len, TimeoutMs) <= 0) { Result = convex_transport_ws_peer_closed(); break; }
 
         unsigned char *payload = slot->buf + header_len + mask_len;
         if (masked) {
@@ -758,7 +785,7 @@ static void convex_ws_consume(WsSlot *slot, size_t n) {
             size_t sent = 0;
             size_t pong_len = pong_header_len + payload_len;
             while (sent < pong_len) {
-                int n = SSL_write(Conn->ssl, pong + sent, (int) (pong_len - sent));
+                int n = conn_write(Conn, pong + sent, (int) (pong_len - sent));
                 if (n <= 0) break;
                 sent += (size_t) n;
             }

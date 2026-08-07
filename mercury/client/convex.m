@@ -176,8 +176,8 @@ http_call(Operation, client(Url, Auth), Path, Args, Result, !IO) :-
         "format" - j_string("json")
     ])),
     string.format("/api/%s", [s(Operation)], ApiPath),
-    ( host_and_path(Url, Host, Port, BasePath) ->
-        tls_open(Host, Port, MaybeConn, !IO),
+    ( host_and_path(Url, Host, Port, UseTls, BasePath) ->
+        tls_open(Host, Port, UseTls, MaybeConn, !IO),
         (
             MaybeConn = tls_ok(Conn),
             AuthHeader = ( Auth = yes(Token) -> "Authorization: Bearer " ++ Token ++ "\r\n" ; "" ),
@@ -256,13 +256,16 @@ logs_field(Fields) = Logs :-
 
     % Split "https://host[:port][/path]" into transport host/port and the
     % base path the /api/... suffix is appended to (empty when the URL had
-    % none).
-:- pred host_and_path(string::in, string::out, int::out, string::out)
-    is semidet.
+    % none). UseTls reflects the scheme: the approved self-hosted backend
+    % profile (e.g. http://backend:3210) is plain HTTP/WS, not TLS.
+:- pred host_and_path(string::in, string::out, int::out, bool::out,
+    string::out) is semidet.
 
-host_and_path(Url, Host, Port, BasePath) :-
-    ( string.remove_prefix("https://", Url, R0) -> Rest0 = R0, DefaultPort = 443
-    ; string.remove_prefix("http://", Url, R1) -> Rest0 = R1, DefaultPort = 80
+host_and_path(Url, Host, Port, UseTls, BasePath) :-
+    ( string.remove_prefix("https://", Url, R0) ->
+        Rest0 = R0, DefaultPort = 443, UseTls = yes
+    ; string.remove_prefix("http://", Url, R1) ->
+        Rest0 = R1, DefaultPort = 80, UseTls = no
     ; fail
     ),
     ( string.sub_string_search(Rest0, "/", SlashPos) ->
@@ -321,8 +324,8 @@ zero_ts = "AAAAAAAAAAA=".
 initial_live_state = live_state(0, sync_version(0, 0, zero_ts), 0, []).
 
 live_connect(client(Url, _), Result, !IO) :-
-    ( host_and_path(Url, Host, Port, _BasePath) ->
-        tls_open(Host, Port, MaybeConn, !IO),
+    ( host_and_path(Url, Host, Port, UseTls, _BasePath) ->
+        tls_open(Host, Port, UseTls, MaybeConn, !IO),
         (
             MaybeConn = tls_ok(Conn),
             ws_handshake(Conn, Host, "/api/sync", HsResult, !IO),
