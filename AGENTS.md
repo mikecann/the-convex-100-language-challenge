@@ -55,11 +55,18 @@ network, compiler, and delegated-runtime commands. Use a restricted build or
 separate binaries when the stock multicall surface is too broad.
 
 The runtime probe rejects Node.js and Python unless the manifest declares the
-one approved `targetRuntimeCommand` for JavaScript or Python. This exempts only
+one approved `targetRuntimeCommand` for that language. This exempts only
 the interpreter that genuinely executes that target-language client. Package
 tooling and every other delegated runtime remain forbidden. Extending the
 allowance to another language requires a separate shared-infrastructure review;
 do not weaken it inside a language branch.
+
+A language that compiles to JavaScript may be approved for `node`, because a
+compile-to-JavaScript language has no other execution target and node is then
+the interpreter that genuinely runs its own compiled client. Such a client must
+declare `provenance: transpiled` and still implement every Convex behaviour in
+the target language; delegating protocol work to an existing JavaScript Convex
+client remains forbidden and would earn the bridge label instead.
 
 Emulation engines are not interchangeable build surfaces. Rosetta-backed
 Docker on Apple Silicon reliably runs heavy amd64 toolchains; QEMU-based
