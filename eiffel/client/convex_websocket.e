@@ -133,40 +133,36 @@ feature -- Input
 			deadline_ms := a_timeout_ms
 			from until done
 			loop
-				if not ensure_frame_header (deadline_ms) then
+				if not try_parse_frame (deadline_ms) then
 					done := True
 				else
 					fin := last_frame_fin
 					opcode := last_frame_opcode
-					if not read_frame_payload (last_frame_payload_length, deadline_ms) then
+					payload := last_payload
+					inspect opcode
+					when Opcode_ping then
+						if not socket.write_all (encode_frame (Opcode_pong, payload)) then
+							last_error := socket.last_error
+							is_open := False
+							done := True
+						end
+					when Opcode_pong then
+						-- Nothing to do; a pong on its own is not a message.
+					when Opcode_close then
+						last_close_reason := close_reason_from_payload (payload)
+						send_close_ack
+						is_open := False
+						socket.close
 						done := True
 					else
-						payload := last_payload
-						inspect opcode
-						when Opcode_ping then
-							if not socket.write_all (encode_frame (Opcode_pong, payload)) then
-								last_error := socket.last_error
-								is_open := False
-								done := True
-							end
-						when Opcode_pong then
-							-- Nothing to do; a pong on its own is not a message.
-						when Opcode_close then
-							last_close_reason := close_reason_from_payload (payload)
-							send_close_ack
-							is_open := False
-							socket.close
+						if first_opcode = -1 then
+							first_opcode := opcode
+						end
+						message.append (payload)
+						if fin then
 							done := True
-						else
-							if first_opcode = -1 then
-								first_opcode := opcode
-							end
-							message.append (payload)
-							if fin then
-								done := True
-								if first_opcode = Opcode_text then
-									Result := message
-								end
+							if first_opcode = Opcode_text then
+								Result := message
 							end
 						end
 					end
@@ -269,15 +265,25 @@ feature {NONE} -- Framing
 
 	fill_buffer (a_min_bytes: INTEGER; a_timeout_ms: INTEGER): BOOLEAN
 			-- Ensure `buffer' holds at least `a_min_bytes', reading more
-			-- from the socket as needed. False on timeout or transport
-			-- error.
+			-- from the socket as needed, one read per still-missing
+			-- fragment. False on timeout or transport error. A read that
+			-- returns Void always ends this call rather than retrying: a
+			-- message fragmented across several TCP segments (routine
+			-- over a real network, rare on localhost) previously left
+			-- this loop spinning on zero-timeout reads until every
+			-- fragment had arrived, which could run for as long as the
+			-- whole message took to arrive and made a rare interrupted
+			-- syscall from the runtime's own signals far more likely to
+			-- land badly than the single bounded wait below does.
 		local
 			chunk: detachable STRING
+			done: BOOLEAN
 		do
-			from until buffer.count >= a_min_bytes or not is_open
+			from until buffer.count >= a_min_bytes or not is_open or done
 			loop
 				chunk := socket.read_some (4096, a_timeout_ms)
 				if chunk = Void then
+					done := True
 					if socket.is_open then
 						last_error := "read timed out"
 					else
@@ -291,67 +297,67 @@ feature {NONE} -- Framing
 			Result := buffer.count >= a_min_bytes
 		end
 
-	ensure_frame_header (a_timeout_ms: INTEGER): BOOLEAN
-			-- Parse the next frame's header from `buffer' (reading more as
-			-- needed), leaving the payload still in `buffer' and setting
-			-- `last_frame_fin', `last_frame_opcode', and
-			-- `last_frame_payload_length'.
+	try_parse_frame (a_timeout_ms: INTEGER): BOOLEAN
+			-- Parse one complete frame (header and payload together) from
+			-- `buffer', reading more data as needed, and set
+			-- `last_frame_fin', `last_frame_opcode',
+			-- `last_frame_payload_length', and `last_payload'. Bytes are
+			-- only ever removed from `buffer' once an entire frame is
+			-- confirmed present, so a call that cannot complete within
+			-- `a_timeout_ms' (a partially arrived frame is routine over a
+			-- real network, rare on localhost) leaves `buffer' exactly as
+			-- it found it: a later call safely resumes from those same
+			-- bytes plus whatever has since arrived, rather than
+			-- mistaking an already-consumed frame's leftover payload
+			-- bytes for the start of a new header.
 		local
 			byte0, byte1: INTEGER
 			base_length: INTEGER
 			header_size: INTEGER
+			payload_length: INTEGER
 			ext_start: INTEGER
+			total_size: INTEGER
 		do
 			if fill_buffer (2, a_timeout_ms) then
 				byte0 := buffer.item (1).code
 				byte1 := buffer.item (2).code
-				last_frame_fin := byte0.bit_and (0x80) /= 0
-				last_frame_opcode := byte0.bit_and (0x0F)
 				base_length := byte1.bit_and (0x7F)
 				-- Servers never mask frames sent to the client (RFC 6455 5.1).
 				if base_length = 126 then
 					header_size := 4
-					if fill_buffer (header_size, a_timeout_ms) then
-						last_frame_payload_length :=
-							buffer.item (3).code * 256 + buffer.item (4).code
-						Result := True
-					end
 				elseif base_length = 127 then
 					header_size := 10
-					if fill_buffer (header_size, a_timeout_ms) then
+				else
+					header_size := 2
+				end
+				if fill_buffer (header_size, a_timeout_ms) then
+					if base_length = 126 then
+						payload_length := buffer.item (3).code * 256 + buffer.item (4).code
+					elseif base_length = 127 then
 						-- This client's frames never approach 2^31 bytes;
 						-- treat the length as the low-order bytes only.
 						from
 							ext_start := 7
-							last_frame_payload_length := 0
+							payload_length := 0
 						until
 							ext_start > 10
 						loop
-							last_frame_payload_length :=
-								last_frame_payload_length * 256 + buffer.item (ext_start).code
+							payload_length := payload_length * 256 + buffer.item (ext_start).code
 							ext_start := ext_start + 1
 						end
+					else
+						payload_length := base_length
+					end
+					total_size := header_size + payload_length
+					if fill_buffer (total_size, a_timeout_ms) then
+						last_frame_fin := byte0.bit_and (0x80) /= 0
+						last_frame_opcode := byte0.bit_and (0x0F)
+						last_frame_payload_length := payload_length
+						last_payload := buffer.substring (header_size + 1, total_size)
+						buffer.remove_head (total_size)
 						Result := True
 					end
-				else
-					header_size := 2
-					last_frame_payload_length := base_length
-					Result := True
 				end
-				if Result then
-					buffer.remove_head (header_size)
-				end
-			end
-		end
-
-	read_frame_payload (a_length: INTEGER; a_timeout_ms: INTEGER): BOOLEAN
-			-- Move exactly `a_length' bytes from `buffer' (reading more as
-			-- needed) into `last_payload'.
-		do
-			if fill_buffer (a_length, a_timeout_ms) then
-				last_payload := buffer.substring (1, a_length)
-				buffer.remove_head (a_length)
-				Result := True
 			end
 		end
 
