@@ -22,7 +22,6 @@ extern buf_append_byte
 extern buf_append_cstr
 extern buf_append_u64
 extern buf_append_i64
-extern dbg_str    ; DEBUG ONLY
 
 section .text
 
@@ -1665,11 +1664,6 @@ json_parse:
     mov rdi, rax
     call json_free
 .fail:
-    mov edi, 'F'
-    mov rsi, [rbp-56]
-    mov rdx, [rbp-48]
-    sub rdx, rsi
-    call dbg_str
     mov rcx, [rbp-8]
     mov qword [rcx], 0
     xor eax, eax

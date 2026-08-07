@@ -47,7 +47,6 @@ extern poll
 
 section .text
 
-global dbg_str
 global convex_live_init
 global convex_live_close
 global convex_live_subscribe
@@ -61,82 +60,6 @@ global convex_live_next
 
 LIVE_BACKOFF_BASE_MS equ 200
 LIVE_BACKOFF_MAX_MS  equ 10000
-
-; void dbg_str(int tag, const char *ptr, u64 len) [edi,rsi,rdx] --
-; DEBUG ONLY: writes a one-char tag (the char code in edi), ':', then the
-; raw bytes, then a newline, all to stderr.
-%define DS_TAG -8    ; 1 byte used, rest of the qword slot is scratch
-%define DS_PTR -16
-%define DS_LEN -24
-dbg_str:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 32
-    mov [rbp+DS_TAG], dil
-    mov [rbp+DS_PTR], rsi
-    mov [rbp+DS_LEN], rdx
-    mov edi, 2
-    lea rsi, [rbp+DS_TAG]
-    mov edx, 1
-    call write
-    mov edi, 2
-    lea rsi, [rel dbg_colon]
-    mov edx, 1
-    call write
-    mov edi, 2
-    mov rsi, [rbp+DS_PTR]
-    mov rdx, [rbp+DS_LEN]
-    call write
-    mov edi, 2
-    lea rsi, [rel dbg_nl]
-    mov edx, 1
-    call write
-    mov rsp, rbp
-    pop rbp
-    ret
-%undef DS_TAG
-%undef DS_PTR
-%undef DS_LEN
-
-; void dbg_bit(int tag, int val) [edi,esi] -- DEBUG ONLY: writes tag char,
-; ':', val's low decimal digit (0-9 only -- fine for boolean/tiny results),
-; then a newline, to stderr.
-%define DB_TAG -8
-%define DB_VAL -16
-dbg_bit:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 16
-    mov [rbp+DB_TAG], dil
-    mov eax, esi
-    add al, '0'
-    mov [rbp+DB_VAL], al
-    mov edi, 2
-    lea rsi, [rbp+DB_TAG]
-    mov edx, 1
-    call write
-    mov edi, 2
-    lea rsi, [rel dbg_colon]
-    mov edx, 1
-    call write
-    mov edi, 2
-    lea rsi, [rbp+DB_VAL]
-    mov edx, 1
-    call write
-    mov edi, 2
-    lea rsi, [rel dbg_nl]
-    mov edx, 1
-    call write
-    mov rsp, rbp
-    pop rbp
-    ret
-%undef DB_TAG
-%undef DB_VAL
-
-section .rodata
-dbg_colon: db ":"
-dbg_nl: db 10
-section .text
 
 ; --- small leaf helpers -----------------------------------------------
 
@@ -802,11 +725,6 @@ send_connect_message:
     lea rsi, [rbp+SC_TMP]
     call json_serialize
 
-    mov edi, 'C'
-    mov rsi, [rbp+SC_TMP + buf.data]
-    mov rdx, [rbp+SC_TMP + buf.len]
-    call dbg_str
-
     mov rax, [rbp+SC_LIVE]
     lea rdi, [rax + convex_live.ws]
     mov esi, WS_OP_TEXT
@@ -965,11 +883,6 @@ send_add_batch:
     mov rdi, [rbp+AB_OBJ]
     lea rsi, [rbp+AB_TMP]
     call json_serialize
-
-    mov edi, 'A'
-    mov rsi, [rbp+AB_TMP + buf.data]
-    mov rdx, [rbp+AB_TMP + buf.len]
-    call dbg_str
 
     mov rax, [rbp+AB_LIVE]
     lea rdi, [rax + convex_live.ws]
@@ -1136,12 +1049,6 @@ teardown_and_schedule:
     mov [rbp+TS_REASONL], rdx
     mov [rbp+TS_IMM], rcx
 
-    mov edi, 'T'
-    mov rsi, [rbp+TS_REASONP]
-    mov rdx, [rbp+TS_REASONL]
-    call dbg_str
-
-    mov rdi, [rbp+TS_LIVE]
     lea rdi, [rdi + convex_live.ws]
     call ws_close
 
@@ -1854,11 +1761,6 @@ convex_live_service_socket:
     cmp rax, WS_OP_TEXT
     jne .free_and_protocol_error
 
-    mov edi, 'R'
-    mov rsi, [rbp+SS_DATA]
-    mov rdx, [rbp+SS_LEN]
-    call dbg_str
-
     mov rdi, [rbp+SS_DATA]
     mov rsi, [rbp+SS_LEN]
     lea rdx, [rbp+SS_MSG]
@@ -1866,10 +1768,16 @@ convex_live_service_socket:
     mov [rbp+SS_HMRESULT], rax    ; stash json_parse's result BEFORE the
                                     ; call free below -- free() is a real
                                     ; function call and is not guaranteed to
-                                    ; preserve rax, so reading rax after it
-                                    ; (as this code used to) was reading
-                                    ; free()'s leftovers, not json_parse's
-                                    ; return value.
+                                    ; preserve rax across it, so reading rax
+                                    ; after it (as this code used to) was
+                                    ; reading free()'s leftovers rather than
+                                    ; json_parse's actual return value. This
+                                    ; silently turned every successful parse
+                                    ; of a message that happened to leave a
+                                    ; nonzero-then-cleared rax after free()
+                                    ; into a false protocol error -- the bug
+                                    ; that made every live Transition after
+                                    ; the very first WS frame look malformed.
     mov rcx, [rbp+SS_DATA]
     test rcx, rcx
     jz .no_free_data
@@ -1884,9 +1792,6 @@ convex_live_service_socket:
     mov rsi, [rbp+SS_MSG]
     call handle_message
     mov [rbp+SS_HMRESULT], rax
-    mov edi, 'h'
-    mov esi, eax
-    call dbg_bit
     mov rdi, [rbp+SS_MSG]
     call json_free
     mov rax, [rbp+SS_HMRESULT]
