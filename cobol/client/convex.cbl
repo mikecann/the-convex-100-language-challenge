@@ -170,7 +170,14 @@ COPY "cvx-http.cpy".
 01 WS-ONE                   BINARY-LONG VALUE 1.
 01 WS-ZERO                  BINARY-LONG VALUE 0.
 01 WS-SLOT-HTTP             BINARY-LONG VALUE 1.
-01 WS-SLOT-LIVE             BINARY-LONG VALUE 2.
+*> Shares WS-SLOT-HTTP's slot: an HTTP call and a Live pump step are
+*> always sequential in this cooperative single-owner client, never
+*> nested, and every Live delivery is copied out of the parsed tree
+*> into WS-DELIVERIES (see QUEUE-QUERY-UPDATED/QUEUE-QUERY-FAILED
+*> below) before this slot could next be reused, so nothing keeps a
+*> live reference into the slot across the boundary. See
+*> convex-json.cbl's WS-JSON-SLOTS comment.
+01 WS-SLOT-LIVE             BINARY-LONG VALUE 1.
 01 WS-URLBUF                PIC X(1024).
 01 WS-URLLEN                BINARY-LONG.
 01 WS-CH                    PIC X.

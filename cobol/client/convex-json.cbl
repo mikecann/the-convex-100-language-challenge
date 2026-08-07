@@ -27,18 +27,18 @@ DATA DIVISION.
 WORKING-STORAGE SECTION.
 COPY "cvx-limits.cpy".
 
-*> Two slots, not four: the HTTP reply and the adapter's own inbound
-*> command never need to stay readable at the same time (the adapter
-*> extracts every field it needs from its command into small
-*> WORKING-STORAGE before it ever calls into the HTTP path), so the
-*> adapter reuses slot 1 for both. Only the Live frame genuinely needs
-*> to stay isolated from the HTTP slot, since a subscription's queued
-*> delivery can still reference decoded Live content while an
-*> unrelated HTTP call is made. Four slots of 2 MiB source apiece was
-*> the single largest contributor to this client exceeding the shared
-*> adapter memory-growth budget; see cvx-limits.cpy for the sibling
-*> convention in convex.cbl and the adapter.
-01 WS-JSON-SLOTS            BINARY-LONG VALUE 2.
+*> One slot, not four: the HTTP reply, the adapter's own inbound
+*> command, and the incoming Live frame are never readable at the same
+*> time. The adapter extracts every field it needs from its command
+*> into small WORKING-STORAGE before it ever calls into the HTTP path;
+*> an HTTP call and a Live pump step are always sequential and never
+*> nested; and every Live delivery is copied out of the parsed tree
+*> into convex.cbl's own delivery queue before the slot could next be
+*> reused. Four slots of 2 MiB source apiece was the single largest
+*> contributor to this client exceeding the shared adapter memory-
+*> growth budget; see cvx-limits.cpy for the sibling convention in
+*> convex.cbl and the adapter.
+01 WS-JSON-SLOTS            BINARY-LONG VALUE 1.
 01 WS-JSON-MAX-BYTES        BINARY-LONG VALUE 2097152.
 01 WS-JSON-MAX-NODES        BINARY-LONG VALUE 8192.
 01 WS-JSON-MAX-DEPTH        BINARY-LONG VALUE 128.
@@ -50,10 +50,10 @@ COPY "cvx-limits.cpy".
 *> `cvx-util.cbl` already keeps for `cvx-hex-encode`.
 01 WS-HEX-DIGITS            PIC X(16) VALUE "0123456789abcdef".
 
-*> Two independent documents: slot 1 for HTTP (and, in the adapter,
-*> the inbound command before it), slot 2 for Live.
+*> One document slot, reused in sequence by the HTTP reply, the
+*> adapter's own inbound command, and the incoming Live frame.
 01 WS-DOCS.
-   05 WS-DOC OCCURS 2 TIMES.
+   05 WS-DOC OCCURS 1 TIMES.
       10 WS-DOC-LEN         BINARY-LONG.
       10 WS-DOC-ROOT        BINARY-LONG.
       10 WS-DOC-COUNT       BINARY-LONG.
