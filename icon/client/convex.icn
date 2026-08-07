@@ -368,17 +368,36 @@ end
 #   from a poll).
 #
 procedure convex_live_add(state, subscriptionId, path, argsValue)
-   local events, qid, mods
+   local events, qid, mods, wasConnected
 
    convex_init_ffi()
    events := []
-   if state.connected ~= 1 then events := events ||| live_connect(state)
+   wasConnected := if state.connected = 1 then 1 else 0
 
+   # The subscription is registered *before* live_connect is attempted,
+   # not after. live_retire (which live_connect reaches on failure) uses
+   # an empty state.subs as its signal that there is nothing left worth
+   # reconnecting for, and permanently disables the backoff timer
+   # (reconnectAtMs := -1) in that case. Registering this subscription
+   # first means a first-connect failure right here is correctly treated
+   # as "one active subscription, please keep retrying" instead of
+   # silently latching reconnectAtMs at -1 forever -- which previously
+   # left convex_live_poll calling live_maybe_reconnect, seeing
+   # reconnectAtMs < 0, and returning immediately without ever touching
+   # the network again: an unbounded busy spin burning CPU until the
+   # caller's own deadline, not a bounded retry with backoff.
    qid := state.nextQueryId
    state.nextQueryId +:= 1
    state.subs[subscriptionId] := LiveSub(qid, path, argsValue, &null)
 
-   if state.connected = 1 then {
+   if state.connected ~= 1 then events := events ||| live_connect(state)
+
+   # A fresh live_connect() replays every entry already in state.subs
+   # (this one included, since it was registered above) as part of its
+   # own post-handshake ModifyQuerySet, so only send one explicitly here
+   # when the connection already existed -- otherwise this subscription
+   # would be sent twice on the very first connect.
+   if wasConnected = 1 & state.connected = 1 then {
       mods := [ live_add_modification(qid, path, argsValue) ]
       live_send_modify_query_set(state, mods)
    }
