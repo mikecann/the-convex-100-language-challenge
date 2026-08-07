@@ -4,5 +4,48 @@ displayName: "Raku"
 rank: 53
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >
+    Native Raku client. Raku libraries are used only for ordinary TLS, HTTP,
+    JSON, and WebSocket transport: Cro::HTTP for the documented Functions HTTP
+    API and Cro::WebSocket for RFC 6455 framing. The Convex request envelope,
+    the response taxonomy, the pinned Live state machine, query set
+    versioning, reconnect and rehydration behaviour, delivery buffering, and
+    the adapter protocol are all implemented in Raku. The language-local test
+    gate passes in Docker; shared conformance has not run yet, so no
+    capability is claimed.
+toolchain:
+  name: Rakudo Star
+  version: "2024.12 (tag confirmed to build; not yet pinned by digest)"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - The language-local test gate now passes. rakudo-star:2024.12's toolchain assertions, the compile checks, all eight language-local suites (http, network-http, values, live, network-live, buffering, output, and the conformance adapter test) inside the `test` image, and the runtime/example image policy probes all run green. `./run verify-example raku`, `./run verify raku`, and `./run verify-hosted raku` have not run against a real deployment, so no capability is claimed.
+  - The rakudo-star image installs Raku system-wide under `/usr` (raku/rakudo/moar, `/usr/share/perl6`, `/usr/share/nqp`), not into a dedicated prefix. The runtime image copies exactly the confirmed-necessary pieces (the interpreter, the core setting, NQP's bootstrap layer, and the site repository holding both this client's zef-installed dependencies and rakudo-star's own bundled modules) rather than the whole prefix, and strips `site/bin` (zef, prove6).
+  - Digest::SHA1::Native, a transitive dependency of Cro::HTTP, compiles a small C extension at install time; gcc, make, and libc6-dev exist only in the `test` stage and are removed and probed for in the runtime images.
+  - Raku's OpenSSL binding dlopens the unversioned `libssl.so`/`libcrypto.so`, which Debian's runtime `libssl3` package does not provide (only the SONAME-versioned `.so.3`); the Dockerfile adds those two symlinks rather than installing `libssl-dev`.
+  - JSON::Fast 0.19.1 and Cro 0.8.9 were the requested versions; zef's resolver actually installed JSON::Fast 0.20.1 (the version Cro's own dependency range required) along with the full resolved transitive set (Base64, Crypt::Random, Digest::SHA1::Native, and Cro's own dependencies), recorded in the build log by `zef list --installed`.
+  - Closing a raw `IO::Socket::INET` from one thread while another thread is blocked inside `.accept()` or `.write()` on that same socket does not reliably unblock the pending call in this Rakudo/MoarVM version; the two calls can deadlock against each other instead. This affects the production adapter's own TCP mode (`client/tests/conformance/adapter.raku`'s `serve-tcp`, used when `ADAPTER_LISTEN` is set) when a stalled controller triggers `abort-io`, not just the test fixtures that first exposed it -- the close is fired in a background thread rather than awaited synchronously.
+  - client/META6.json's `provides` paths match the checked-in flat layout directly (no `lib/` subdirectory), so `zef install` and a plain `use lib` against `client/` resolve identically; the Dockerfile no longer reshapes the source into a separate `/build/dist/lib/` tree.
+  - Live uses the explicitly pinned unversioned sync profile, not an official or stable public Convex protocol.
+  - Live authentication, WebSocket mutations and actions, optimistic updates, and TransitionChunk assembly are deferred; a TransitionChunk is reported as a protocol error.
+  - A Raku-owned bounded gate validates canonical RFC 6455 frame lengths, masking direction, opcodes, control frames, per-frame size, and a partial-frame absolute deadline before Cro's framing machinery. Fragmented total bytes and a four-message incoming backlog are also bounded. Cro still parses HTTP headers before the language-local 16 KiB post-parse check.
+  - The client accepts the JSON-safe value subset the counter demonstration exercises; Convex extended value encodings are not decoded.
+  - The stdin and TCP adapter readers are incrementally bounded. The ordered output writer has a count and byte budget plus a one-second write deadline that aborts both directions and releases queued reservations; the language-local `output.t` suite proves this against a real stopped-reader TCP socket. Final 128 MiB cgroup evidence still needs a hosted run.
+  - The shared README projector and site generator have no mapping for the .raku extension, so the canonical example is fenced as text. Fixing that is a separate shared-infrastructure change.
+  - Open policy question for the root reviewer, not decided in this branch - Rakudo is both the runtime and the compiler for Raku, so the final images necessarily contain a command that compiles Raku source, exactly as a Ruby or Perl client contains its interpreter. The Dockerfile removes zef, apt, dpkg, and perl and probes for every C toolchain command, but it cannot remove the Raku runtime itself.
 capabilities: []

@@ -1,0 +1,27 @@
+{
+  "name": "Convex",
+  "description": "Educational native Raku Convex client for the 100 Convex clients experiment",
+  "version": "0.1.0",
+  "auth": "100-convex-clients",
+  "api": "1",
+  "perl": "6.d",
+  "license": "MIT",
+  "provides": {
+    "Convex": "Convex.rakumod",
+    "Convex::Adapter": "Convex/Adapter.rakumod",
+    "Convex::CroLive": "Convex/CroLive.rakumod",
+    "Convex::CroTransport": "Convex/CroTransport.rakumod",
+    "Convex::Errors": "Convex/Errors.rakumod",
+    "Convex::HTTP": "Convex/HTTP.rakumod",
+    "Convex::Live": "Convex/Live.rakumod",
+    "Convex::Values": "Convex/Values.rakumod"
+  },
+  "depends": [
+    "JSON::Fast",
+    "Cro::HTTP",
+    "Cro::WebSocket",
+    "Base64",
+    "Crypt::Random",
+    "Digest::SHA1::Native"
+  ]
+}
