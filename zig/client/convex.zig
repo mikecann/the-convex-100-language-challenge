@@ -1248,6 +1248,15 @@ const LiveManager = struct {
     /// under this mutex, and `close` cancels through it, so a control command
     /// never waits out a peer that accepted a socket and then went silent.
     connect_deadline: ?*Deadline = null,
+    /// The interrupt channel for the owner's current established connection,
+    /// or null when no connection is up. Unlike `connect_deadline` this
+    /// carries no timeout of its own — readWebSocket's own frame deadline
+    /// still bounds a stalled peer. `submit` cancels it for remove,
+    /// disconnect, and stop so those commands do not ride out a peer that is
+    /// mid-frame and stalled on an already-established socket: cancelling
+    /// only shuts the descriptor down, and the owner's next read already
+    /// turns that into the ordinary close-and-reconnect recovery path.
+    read_interrupt: ?*Deadline = null,
 
     fn init(allocator: Allocator, client: *Client, output: *Output) !LiveManager {
         return .{
@@ -1277,6 +1286,14 @@ const LiveManager = struct {
         if (command.kind == .stop) {
             if (self.connect_deadline) |deadline| deadline.cancel();
         }
+        // Remove, debugDisconnect, and stop must not wait out a peer that is
+        // mid-frame and stalled on an already-established connection. Add
+        // only ever writes over the existing socket once serviceCommands
+        // reaches it, so it stays behind the normal draining order instead
+        // of forcing an otherwise-unnecessary reconnect.
+        if (command.kind == .remove or command.kind == .disconnect or command.kind == .stop) {
+            if (self.read_interrupt) |deadline| deadline.cancel();
+        }
         self.condition.signal();
         while (!command.done) self.condition.wait(&self.mutex);
         const result = command.result;
@@ -1296,6 +1313,16 @@ const LiveManager = struct {
                 if (command.kind == .stop) pending.cancel();
             }
         }
+    }
+
+    /// Publish the owner's per-connection read-interrupt channel, or clear
+    /// it. `submit` cancels a live one for remove, debugDisconnect, and stop
+    /// so those commands can shut the socket down instead of waiting out an
+    /// in-progress frame read from a peer that is mid-frame and stalled.
+    fn publishReadInterrupt(self: *LiveManager, deadline: ?*Deadline) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.read_interrupt = deadline;
     }
 
     /// Back off after a failed connection without stranding the owner: a
@@ -1380,6 +1407,10 @@ const LiveOwner = struct {
     generation: u64 = 0,
     retry_delay_ms: u64 = 10,
     failure_published: bool = false,
+    /// The interrupt channel published to the manager while `socket` is up.
+    /// It never runs its own watchdog thread; `submit` cancels it directly
+    /// to shut the socket down out from under a stalled read.
+    read_watch: ?Deadline = null,
 
     fn init(manager: *LiveManager) LiveOwner {
         return .{ .manager = manager };
@@ -1555,6 +1586,13 @@ const LiveOwner = struct {
         // its steps, so a peer that keeps every individual step just inside
         // its own limit still loses the connection here.
         if (deadline.timedOut()) return error.Timeout;
+        // Publish this connection's read-interrupt channel only once bring-up
+        // has fully succeeded: every earlier error path above still runs the
+        // errdefer that releases `conn`, and this deadline must never outlive
+        // (or shut down) a socket that scope has already handed back.
+        self.read_watch = try Deadline.init(frame_deadline_ms);
+        try self.read_watch.?.setFd(self.socket.?.stream.handle);
+        self.manager.publishReadInterrupt(&self.read_watch.?);
     }
 
     fn sendConnect(self: *LiveOwner) !void {
@@ -1751,6 +1789,16 @@ const LiveOwner = struct {
     }
 
     fn closeConnection(self: *LiveOwner, reason: []const u8) void {
+        // Retire the read-interrupt channel before the descriptor is closed
+        // and recycled, exactly like the connect-phase watchdog below: once
+        // this is unpublished and finished, a racing `submit` can no longer
+        // reach it, so it can never shut down a socket this scope has
+        // already released back to the pool and the process has reused.
+        if (self.read_watch) |*watch| {
+            self.manager.publishReadInterrupt(null);
+            watch.finish();
+            self.read_watch = null;
+        }
         if (self.socket) |conn| {
             conn.closing = true;
             self.manager.client.http.connection_pool.release(self.manager.allocator, conn);
@@ -3649,6 +3697,69 @@ test "same-ID replacement succeeds at the sixteen-subscription ceiling with a pa
     try std.testing.expect(std.mem.indexOf(u8, bytes.items, "\"count\":2") != null);
     try std.testing.expectEqual(@as(usize, max_live_subscriptions), client.live.?.active.items.len);
     try client.close();
+}
+
+const StalledFrameCommandFixture = struct {
+    listener: *std.net.Server,
+    ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *StalledFrameCommandFixture) void {
+        const connection = acceptWithin(self.listener, fixture_accept_timeout_ms) catch @panic("stalled fixture accept failed");
+        defer connection.stream.close();
+        testAcceptWebSocket(connection.stream) catch @panic("stalled fixture handshake failed");
+        const connect = testReadClientFrame(std.heap.page_allocator, connection.stream) catch @panic("stalled fixture Connect failed");
+        std.heap.page_allocator.free(connect.payload);
+        const add = testReadClientFrame(std.heap.page_allocator, connection.stream) catch @panic("stalled fixture Add failed");
+        std.heap.page_allocator.free(add.payload);
+        testSendTransition(connection.stream, 0, 1, 0, 1, 0, 0) catch @panic("stalled fixture initial transition failed");
+        // Begin a second Transition frame and then go silent, as a peer that
+        // has started sending but has stalled partway through the payload.
+        connection.stream.writer().writeAll(&.{ 0x81, 0x7d, '{' }) catch {};
+        self.ready.store(true, .release);
+        var discard: [256]u8 = undefined;
+        while (connection.stream.read(&discard) catch 0 > 0) {}
+    }
+};
+
+test "unsubscribe stays bounded while the owner is reading a peer's stalled half-sent frame" {
+    var listener = try testListener();
+    defer listener.deinit();
+    var fixture = StalledFrameCommandFixture{ .listener = &listener };
+    const thread = try std.Thread.spawn(.{}, StalledFrameCommandFixture.run, .{&fixture});
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{listener.listen_address.getPort()});
+    defer std.testing.allocator.free(url);
+    var client = try Client.init(std.testing.allocator, url);
+    var capture = Capture.init(std.testing.allocator);
+    var output = Output.init(std.testing.allocator, std.io.null_writer.any(), null, .none);
+    output.capture = &capture;
+    var args = JsonValue{ .object = std.json.ObjectMap.init(std.testing.allocator) };
+    try args.object.put("room", .{ .string = "stalled-frame" });
+    try client.subscribe("stalled", "demo:state", args, &output);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    _ = try capture.next(arena.allocator(), fixture_rendezvous_ns);
+
+    const ready_deadline = std.time.milliTimestamp() + 1000;
+    while (!fixture.ready.load(.acquire)) {
+        if (std.time.milliTimestamp() > ready_deadline) return error.Timeout;
+        std.time.sleep(std.time.ns_per_ms);
+    }
+    // Give the owner a moment to start reading the half-sent second frame
+    // before issuing the command that must interrupt it.
+    std.time.sleep(20 * std.time.ns_per_ms);
+    const started = std.time.milliTimestamp();
+    try client.unsubscribe("stalled");
+    const elapsed = std.time.milliTimestamp() - started;
+    // The test-mode frame deadline alone is 250 ms. Completing well inside
+    // that proves the socket shutdown interrupted the stalled read instead of
+    // unsubscribe merely riding the frame deadline out.
+    try std.testing.expect(elapsed < 150);
+    try client.close();
+    thread.join();
+    arena.deinit();
+    args.object.deinit();
+    output.deinit();
+    capture.deinit();
+    client.deinit();
 }
 
 const CloseMode = enum { idle, flood, half_frame, peer_close };
