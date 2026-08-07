@@ -131,14 +131,17 @@ feature {NONE} -- HTTP implementation
 			request_body := build_request_body (a_path, a_args)
 			response_text := http.post ("/api/" + a_op, request_body, auth_token)
 			if response_text = Void then
-				last_error := http.last_error
+				last_error := "transport: " + debug_string (http.last_error)
 			else
 				create parser.make
 				parser.parse (response_text)
 				if not parser.successful then
-					last_error := "malformed response JSON"
+					last_error := "malformed response JSON: " + debug_string (parser.last_error) + " raw=" + response_text
 				elseif attached parser.last_value as l_response then
 					Result := decode_response (l_response)
+					if Result = Void then
+						last_error := "unrecognized response shape: " + response_text
+					end
 				end
 			end
 		end
@@ -229,6 +232,15 @@ feature {NONE} -- URL parsing
 	host: STRING
 	port: INTEGER
 	use_tls: BOOLEAN
+
+	debug_string (a_text: detachable STRING): STRING
+		do
+			if a_text = Void then
+				Result := "<void>"
+			else
+				Result := a_text
+			end
+		end
 
 	parse_url (a_url: STRING)
 			-- Split `a_url' into `host', `port', and `use_tls'.
