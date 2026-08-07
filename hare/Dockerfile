@@ -1,6 +1,5 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 ARG ALPINE_IMAGE=alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
-ARG BUSYBOX_IMAGE=busybox:1.37.0-musl@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23
 
 FROM --platform=linux/amd64 ${ALPINE_IMAGE} AS test
 WORKDIR /project
@@ -68,31 +67,113 @@ CMD ["/bin/sh", "-ec", "test \"$(uname -m)\" = x86_64 && echo 'hare test and the
 FROM --platform=linux/amd64 ${ALPINE_IMAGE} AS certificates
 RUN apk add --no-cache ca-certificates=20260611-r0
 
-# BusyBox supplies the verifier's required /bin/sh and POSIX text tools. The
-# final rootfs receives only BusyBox, the CA bundle, and one statically
-# linked Hare binary; Alpine's apk database and package manager, and Hare's
-# own compiler and linker, never cross this stage boundary. Both static
-# binaries above proved they load and verify a real TLS peer certificate
-# using OpenSSL's compiled-in default provider (client/tls.ha's
-# real_tls_handshake_against_a_public_host regression), so the CA bundle is
-# the only runtime dependency this image needs to add for TLS to keep
-# working here.
-FROM --platform=linux/amd64 ${BUSYBOX_IMAGE} AS runtime-base
-COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-RUN test "$(uname -m)" = x86_64 \
-    && ! test -e /sbin/apk \
-    && ! command -v apk \
-    && for command in hare harec qbe gcc cc make node python python3 npm pip curl convex; do \
-         ! command -v "$command" >/dev/null 2>&1; \
-       done
-USER 65532:65532
+# Both /out binaries are statically linked (proved above), so this image
+# needs no libc closure and no dynamic loader — the only genuine runtime
+# dependency is the CA bundle for the TLS handshake regression already
+# proved against the exact binaries shipped here. That makes a stock
+# BusyBox base actively counterproductive: it starts this image FROM a
+# multicall binary shipping httpd, ftpd, inetd, wget, nc, telnet, ar, dpkg
+# and rpm as applets of the very same binary that would provide /bin/sh,
+# none of which a statically linked Hare program needs or uses. This stage
+# compiles a from-source BusyBox with only the applets the shared
+# verifier's image_policy and this Dockerfile's own checks require, and
+# the final image is built FROM scratch rather than the stock image, so
+# there is no ancestry to strip in the first place — only the files
+# assembled below ever exist in it.
+FROM --platform=linux/amd64 ${ALPINE_IMAGE} AS busybox-builder
+RUN apk add --no-cache \
+      build-base=0.5-r3 \
+      linux-headers=6.14.2-r0
+ADD --checksum=sha256:3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4 \
+    https://busybox.net/downloads/busybox-1.37.0.tar.bz2 /tmp/busybox.tar.bz2
+WORKDIR /src
+RUN tar -xjf /tmp/busybox.tar.bz2 && \
+    cd busybox-1.37.0 && \
+    printf '%s\n' \
+      'CONFIG_STATIC=y' \
+      'CONFIG_BUSYBOX=y' \
+      'CONFIG_ASH=y' \
+      'CONFIG_ASH_TEST=y' \
+      'CONFIG_ASH_CMDCMD=y' \
+      'CONFIG_SH_IS_ASH=y' \
+      'CONFIG_TEST=y' \
+      'CONFIG_TEST1=y' \
+      'CONFIG_TEST2=y' \
+      'CONFIG_ID=y' \
+      'CONFIG_GREP=y' \
+      > /tmp/minimal.config && \
+    make allnoconfig >/dev/null && \
+    while IFS= read -r setting; do \
+      name="${setting%%=*}"; \
+      sed -i "s/^# $name is not set$/$setting/" .config; \
+    done < /tmp/minimal.config && \
+    make oldconfig </dev/null >/dev/null && \
+    make -j2 busybox && \
+    mkdir -p /out && \
+    cp busybox /out/busybox
+RUN cd busybox-1.37.0 && \
+    file ./busybox | grep -q 'statically linked' && \
+    test "$(./busybox --list)" = "$(printf '%s\n' '[' '[[' ash grep id sh test)" && \
+    for tool in apk apt apt-get curl dpkg nc rpm wget; do \
+      test "$(./busybox "$tool" 2>/dev/null; printf '%s' "$?")" = 127; \
+    done
 
-FROM runtime-base AS example-runtime
+FROM --platform=linux/amd64 ${ALPINE_IMAGE} AS runtime-rootfs
+COPY --from=busybox-builder /out/busybox /restricted-busybox
+# BusyBox's multicall dispatcher only enters "top-level" mode (--list,
+# explicit `busybox <applet>`) when argv[0]'s basename is literally
+# "busybox"; invoked under any other name it looks that name up directly in
+# the compiled applet table. The applet table is checked byte-for-byte
+# through a copy at a path still named "busybox" (this stage's own ambient
+# shell is Alpine's stock, fully-featured BusyBox throughout, so ordering
+# does not matter here), then installed into /rootfs under the applet names
+# it actually serves and never again written to a path literally named
+# busybox.
+RUN set -eu; \
+    mkdir -p /verify; \
+    cp /restricted-busybox /verify/busybox; \
+    test "$(/verify/busybox --list)" = "$(printf '%s\n' '[' '[[' ash grep id sh test)"; \
+    for tool in apk apt apt-get curl dpkg nc rpm wget; do \
+      test "$(/verify/busybox "$tool" 2>/dev/null; printf '%s' "$?")" = 127; \
+    done; \
+    rm -rf /verify; \
+    mkdir -p /rootfs/bin /rootfs/usr/bin; \
+    mv /restricted-busybox /rootfs/bin/sh; \
+    ln /rootfs/bin/sh /rootfs/usr/bin/id; \
+    ln /rootfs/bin/sh /rootfs/usr/bin/grep
+
+FROM scratch AS runtime-base
+COPY --from=runtime-rootfs /rootfs /
+COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+USER 65532:65532
+FROM runtime-base AS runtime-checked
+RUN set -eu; \
+    test -x /bin/sh; \
+    test -x /usr/bin/id; \
+    test -x /usr/bin/grep; \
+    for name in apk apt apt-get curl dpkg nc rpm wget; do \
+      /bin/sh -c "exec -a $name /bin/sh" >/dev/null 2>&1 && exit 1; \
+    done; \
+    for name in apk apt apt-get busybox curl dpkg gcc cc hare harec make netcat nc python python3 npm pip qbe rpm wget convex; do \
+      ! command -v "$name" >/dev/null 2>&1 || exit 1; \
+    done; \
+    for directory in /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin; do \
+      test -d "$directory" || continue; \
+      for entry in "$directory"/*; do \
+        test -e "$entry" || continue; \
+        name="${entry##*/}"; \
+        case "$name" in \
+          apk|apt|apt-get|busybox|curl|dpkg|nc|rpm|wget) exit 1 ;; \
+        esac; \
+      done; \
+    done
+
+FROM runtime-checked AS example-runtime
 COPY --from=test /out/convex-example /usr/local/bin/convex-example
 ENTRYPOINT ["/usr/local/bin/convex-example"]
 
 # Keep the adapter runtime last because the root build command selects the
 # default Docker target when it builds a language.
-FROM runtime-base AS runtime
+FROM runtime-checked AS runtime
 COPY --from=test /out/convex-adapter /usr/local/bin/convex-adapter
 ENTRYPOINT ["/usr/local/bin/convex-adapter"]
