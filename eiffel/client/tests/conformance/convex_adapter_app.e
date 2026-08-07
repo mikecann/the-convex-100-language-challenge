@@ -27,17 +27,18 @@ feature {NONE} -- Initialization
 			listen_spec: detachable STRING
 		do
 			deployment_url := environment_variable ("CONVEX_URL")
+			listen_spec := environment_variable ("ADAPTER_LISTEN")
+			if listen_spec = Void then
+				create control.make_stdio
+			else
+				create control.make_listening (listen_spec)
+			end
 			if deployment_url = Void then
+				create client.make ("http://127.0.0.1:1")
 				io.error.put_string ("CONVEX_URL is required%N")
 			else
-				listen_spec := environment_variable ("ADAPTER_LISTEN")
-				if listen_spec = Void then
-					create control.make_stdio
-				else
-					create control.make_listening (listen_spec)
-				end
+				create client.make (deployment_url)
 				if control.is_ready then
-					create client.make (deployment_url)
 					run_loop
 				end
 			end
@@ -440,9 +441,13 @@ feature {NONE} -- Environment
 	environment_variable (a_name: STRING): detachable STRING
 		local
 			env: EXECUTION_ENVIRONMENT
+			wide_value: detachable STRING_32
 		do
 			create env
-			Result := env.item (a_name)
+			wide_value := env.item (a_name)
+			if wide_value /= Void then
+				Result := wide_value.to_string_8
+			end
 		end
 
 end
