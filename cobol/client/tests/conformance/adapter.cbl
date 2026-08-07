@@ -44,7 +44,6 @@ COPY "cvx-client.cpy".
 *> ---- line assembly ------------------------------------------------
 01 WS-CHUNK                 PIC X(65536).
 01 WS-CHUNK-LEN             BINARY-LONG.
-01 WS-LINE                  PIC X(2097152).
 01 WS-LINE-LEN              BINARY-LONG VALUE 0.
 01 WS-DISCARDING            BINARY-LONG VALUE 0.
 
@@ -60,6 +59,12 @@ COPY "cvx-client.cpy".
 *> more of the private buffers that pushed this adapter over the
 *> shared memory-growth budget.
 01 WS-SPAN REDEFINES WS-ESC PIC X(2097152).
+*> WS-LINE (the raw command line being assembled and parsed) is also
+*> fully consumed before WS-ESC's first write: cvx-json-parse copies it
+*> into the JSON module's own slot storage as PROCESS-LINE's very
+*> first step, and nothing in this program reads WS-LINE content again
+*> after that call returns.
+01 WS-LINE REDEFINES WS-ESC PIC X(2097152).
 01 WS-ESC-LEN               BINARY-LONG.
 
 *> ---- adapter state ------------------------------------------------
