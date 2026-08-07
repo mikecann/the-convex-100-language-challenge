@@ -42,4 +42,12 @@ int convex_select_one(int fd, int timeout_ms);
  * watched. */
 int convex_select_two(int fd_one, int fd_two, int timeout_ms);
 
+/* A seed that varies across processes and over time (getpid() folded
+ * together with the current time), used only to build a syntactically
+ * valid, practically non-colliding sync-protocol session id. Nothing in
+ * this project's threat model needs this to be cryptographically random:
+ * the server treats a session id as an opaque, self-chosen conversation
+ * label, not a credential. */
+unsigned int convex_random_seed(void);
+
 #endif

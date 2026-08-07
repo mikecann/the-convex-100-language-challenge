@@ -36,7 +36,28 @@ feature {NONE} -- Initialization
 
 			check_socket
 			check_websocket
+			check_sync
 			print ("SMOKE_OK%N")
+		end
+
+	check_sync
+			-- Compile/syntax exercise for CONVEX_SYNC against an
+			-- unreachable host; a real protocol test needs a live Convex
+			-- deployment and is covered once one is available.
+		local
+			sync: CONVEX_SYNC
+			args: CONVEX_JSON_VALUE
+			ok: BOOLEAN
+		do
+			create sync.make ("127.0.0.1", 1, False)
+			sync.ensure_connected
+			print ("sync_is_connected=" + sync.is_connected.out)
+			print ("%N")
+			create args.make_object
+			args.put_field ("room", create {CONVEX_JSON_VALUE}.make_string ("demo"))
+			ok := sync.add_subscription ("sub-1", "demo:state", args)
+			print ("sync_add_subscription=" + ok.out)
+			print ("%N")
 		end
 
 	check_websocket

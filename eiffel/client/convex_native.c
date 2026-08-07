@@ -9,6 +9,9 @@
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
+#include <time.h>
+#include <unistd.h>
+
 void *
 convex_tls_connect (int fd, const char *hostname)
 {
@@ -122,6 +125,12 @@ convex_select_one (int fd, int timeout_ms)
 		return 0;
 	}
 	return FD_ISSET (fd, &readfds) ? 1 : 0;
+}
+
+unsigned int
+convex_random_seed (void)
+{
+	return ((unsigned int) getpid () * 2654435761u) ^ (unsigned int) time (NULL);
 }
 
 int
