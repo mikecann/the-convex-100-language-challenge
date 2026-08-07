@@ -596,7 +596,48 @@ Three things follow, and the third is the one worth arguing about:
    "do the checks pass" but "has any check here ever failed, and can I make it
    fail on purpose right now?"**
 
-## 23. Miscellaneous findings worth a slide
+## 23. What it actually cost
+
+One session took the roster from 57 verified languages to 83 — twenty-six
+clients written, debugged and merged, plus the image audit that found eighteen
+leaking runtime images. Measured from the transcripts:
+
+| | Main thread | Subagents | Total |
+| --- | ---: | ---: | ---: |
+| Fresh input | 5,594 | 799,360 | 804,954 |
+| Cache creation | 14,145,504 | 344,482,042 | 358,627,546 |
+| Cache reads | 1,277,918,557 | 41,579,798,596 | 42,857,717,153 |
+| **Output** | **2,307,993** | **32,019,651** | **34,327,644** |
+| Total | 1,294,377,648 | 41,957,099,649 | **43,251,477,297** |
+
+Three things in that table are worth more than the headline.
+
+**43 billion tokens moved, and 99.1% of them were cache reads.** Only 0.8 million
+tokens were ever read fresh. That ratio is the whole economics of long-running
+agent work: the expensive thing is not thinking, it is re-reading context, and
+almost all of it can be cached. A naive accounting that treats all tokens alike
+would overstate the cost by roughly two orders of magnitude.
+
+**93% of the output came from subagents, not the coordinator.** The main thread
+generated 2.3 million tokens; the hundred-odd workers generated 32 million. The
+coordinator's job was routing, merging, and deciding — reading reports and
+committing results — which is cheap. The work is where the tokens go, and the
+work parallelises.
+
+**About 1.3 million output tokens per language merged.** That is the number to
+plan with, and it is remarkably stable across languages as different as COBOL
+and Mojo, because the cost is dominated by the debugging loop rather than by
+writing the client. The languages that came in far under it were the ones where
+someone had already done the feasibility spike; the ones far over were where a
+confident diagnosis turned out to be wrong.
+
+Two costs do not appear in this table at all. The rented build fleet ran at
+about €41 a day and was the binding constraint on wall-clock, not tokens. And
+the largest single waste was not measured in tokens either: workers ending their
+turn to wait for a notification that does not exist, which idled five machines
+at a time while the token counter sat still.
+
+## 24. Miscellaneous findings worth a slide
 
 - A client passed every check except one, and the one failure was in the
   *reference* implementation used for comparison, not the client under test.
