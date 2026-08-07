@@ -62,22 +62,33 @@ EOF
 # The same protocol test again, but over the ADAPTER_LISTEN TCP path the
 # shared harness actually drives verify/verify-hosted through, including a
 # check that a non-loopback peer cannot reach the loopback-only listener.
+#
+# Both nc calls redirect to a file and read it back afterward rather than
+# capturing nc's own stdout with `$(cmd | nc ...)` directly: that command-
+# substitution-around-a-pipe-into-nc shape reliably hangs specifically
+# inside this BuildKit heredoc RUN step on the verified build host (never
+# under a plain `docker run`/`docker exec`, and never with nc's output
+# redirected to a file instead of captured through the pipe) -- a shell/
+# BuildKit interaction, not a client bug: the exact same adapter binary,
+# reached the exact same way, answers correctly and instantly either way.
 RUN <<'EOF'
 set -eu
 ADAPTER_LISTEN=127.0.0.1:18080 /build/convex-adapter &
 adapter_pid=$!
 sleep 1
 container_address=$(ip -4 addr show eth0 | awk '/inet / {sub("/.*", "", $2); print $2; exit}')
-non_loopback=$(printf '%s\n' \
+printf '%s\n' \
   '{"id":"wrong-host","protocolVersion":1,"op":"hello"}' \
-  '{"id":"wrong-close","op":"close"}' | timeout 3 nc -w 1 "$container_address" 18080 2>/dev/null || true)
+  '{"id":"wrong-close","op":"close"}' | timeout 3 nc -w 1 "$container_address" 18080 >/tmp/non_loopback.out 2>/dev/null || true
+non_loopback=$(cat /tmp/non_loopback.out)
 if test -n "$non_loopback"; then
   printf '%s\n' 'loopback adapter unexpectedly accepted a non-loopback connection' >&2
   exit 1
 fi
-actual=$(printf '%s\n' \
+printf '%s\n' \
   '{"id":"tcp-hello","protocolVersion":1,"op":"hello"}' \
-  '{"id":"tcp-close","op":"close"}' | timeout 45 nc 127.0.0.1 18080)
+  '{"id":"tcp-close","op":"close"}' | timeout 10 nc 127.0.0.1 18080 >/tmp/actual.out
+actual=$(cat /tmp/actual.out)
 wait "$adapter_pid"
 printf '%s\n' "$actual" | grep -F '"id":"tcp-hello","protocolVersion":1,"type":"ready"'
 printf '%s\n' "$actual" | grep -Fx '{"id":"tcp-close","type":"closed"}'
