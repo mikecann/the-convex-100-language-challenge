@@ -128,16 +128,16 @@ RUN set -eu; \
     done; \
     rm -f /etc/.pwd.lock; \
     rm -rf /tmp; \
-    # The sweep below deletes rm and find themselves, so every command that\
-    # needs them must already have run: only mkdir, a shell builtin path, and\
-    # COPY may follow.\
+    mkdir -p /usr/local/bin /usr/local/share /etc/ssl/certs \
+      /usr/lib/x86_64-linux-gnu/ossl-modules; \
+    # This sweep deletes rm, find and mkdir themselves, so nothing but COPY may\
+    # follow it. mkdir in particular is /usr/bin/mkdir and not a shell builtin,\
+    # so the directories above have to exist before this runs.\
     find /usr/bin -mindepth 1 -maxdepth 1 \
       ! -name sh ! -name dash ! -name id ! -name cat ! -name cut ! -name head \
       ! -name tail ! -name tr ! -name sort ! -name uniq ! -name wc \
       ! -name uname ! -name grep ! -name sed ! -name awk ! -name mawk \
-      -exec rm -rf {} +; \
-    mkdir -p /usr/local/bin /usr/local/share /etc/ssl/certs \
-      /usr/lib/x86_64-linux-gnu/ossl-modules
+      -exec rm -rf {} +
 # Only the TLS closure is added back: the base image ships glibc and the DNS
 # resolver modules, but not OpenSSL, its provider modules, or a CA bundle.
 COPY --from=test /usr/lib/x86_64-linux-gnu/libssl.so.3 /usr/lib/x86_64-linux-gnu/libssl.so.3
