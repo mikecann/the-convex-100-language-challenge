@@ -136,9 +136,13 @@ monotonic_ms:
     push rbp
     mov rbp, rsp
     sub rsp, 32
+    mov edi, 'M'
+    call dbg_mark
     mov edi, CLOCK_MONOTONIC
     lea rsi, [rbp+MM_TS]
     call clock_gettime
+    mov edi, 'N'
+    call dbg_mark
     mov rax, [rbp+MM_TS + timespec.tv_sec]
     imul rax, rax, 1000
     mov [rbp+MM_RESULT], rax
@@ -147,6 +151,10 @@ monotonic_ms:
     mov rcx, 1000000
     div rcx
     add rax, [rbp+MM_RESULT]
+    mov [rbp+MM_RESULT], rax
+    mov edi, 'O'
+    call dbg_mark
+    mov rax, [rbp+MM_RESULT]
     mov rsp, rbp
     pop rbp
     ret
