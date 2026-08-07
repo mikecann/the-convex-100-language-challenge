@@ -616,6 +616,14 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- The unfixable client bug was two bugs in the test fixture. SNOBOL4's
+  WebSocket reconnection looked genuinely broken and unsalvageable. It was the
+  fixture: a resubscribed value collided with an already-delivered one, which
+  defeated the client's own — correct — deduplication, and an unconditional
+  return swallowed an accept timeout. This is now the fourth time in this
+  project that a confident diagnosis of "the client is wrong" turned out to be
+  the harness, the fixture, or the reference implementation. **When the code
+  under test looks impossibly broken, suspect the thing doing the testing.**
 - A self-test paired the client against a server that never answers. V's
   Dockerfile proves its TLS closure works by talking to `openssl s_server -www`
    — which replies to a GET immediately and to a POST not at all. The client
