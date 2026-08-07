@@ -71,6 +71,13 @@ procedure main(args)
       "[{\"type\":\"QueryUpdated\",\"queryId\":" || queryId1 ||
       ",\"value\":{\"room\":\"fixture-room\",\"count\":2,\"lastLanguage\":\"icon\",\"latestRunId\":\"r2\",\"updatedAt\":2},\"logLines\":[]}]")
 
+   # A third update on the same connection, sent as three WebSocket
+   # frames instead of one -- a text frame with FIN unset, a PING, then a
+   # continuation frame with FIN set -- rather than a fresh connection,
+   # since the fragmentation/control-frame-interleaving behaviour under
+   # test doesn't need a whole extra reconnect cycle to exercise.
+   send_fragmented_transition(handle2, 2, 0, timestamp_for(4), 3, 0, timestamp_for(5), queryId1)
+
    read_one_message(handle2)
    closef(handle2)
    closef(listenHandle)
@@ -194,6 +201,45 @@ procedure ws_build_server_frame(payload)
    local len, first, lenField
    len := *payload
    first := char(129)
+   if len <= 125 then lenField := char(len)
+   else lenField := char(126) || char(len / 256) || char(len % 256)
+   return first || lenField || payload
+end
+
+# Sends a Transition as three WebSocket frames instead of one: a text
+# frame with FIN unset (the message's start), a PING, then a
+# continuation frame with FIN set (the rest of the message). The split
+# point lands between the two bytes of a single UTF-8 character (o-umlaut,
+# U+00F6, encoded as 0xC3 0xB6) so that neither fragment's raw bytes are
+# valid UTF-8 on their own -- only the concatenation of both is -- and the
+# interleaved PING exists to prove a control frame arriving mid-fragment
+# does not disturb that concatenation.
+procedure send_fragmented_transition(handle, startQuerySet, startIdentity, startTs, endQuerySet, endIdentity, endTs, queryId)
+   local msg, omega, splitAt, part1, part2
+   omega := char(195) || char(182)
+   msg := "{\"type\":\"Transition\",\"startVersion\":{\"querySet\":" || startQuerySet ||
+      ",\"identity\":" || startIdentity || ",\"ts\":\"" || startTs || "\"},\"endVersion\":{\"querySet\":" ||
+      endQuerySet || ",\"identity\":" || endIdentity || ",\"ts\":\"" || endTs || "\"}," ||
+      "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":" || queryId ||
+      ",\"value\":{\"room\":\"fixture-room\",\"count\":3,\"lastLanguage\":\"ic" || omega ||
+      "n\",\"latestRunId\":\"r3\",\"updatedAt\":3},\"logLines\":[]}]}"
+   splitAt := find(omega, msg) + 1
+   part1 := msg[1 : splitAt]              # ends with omega's first byte
+   part2 := msg[splitAt : 0]              # starts with omega's second byte
+
+   sendf(handle, ws_build_raw_frame(0, 1, part1))
+   sendf(handle, ws_build_raw_frame(1, 9, "ping-mid-fragment"))
+   sendf(handle, ws_build_raw_frame(1, 0, part2))
+   return
+end
+
+# Unmasked, arbitrary-FIN raw WebSocket frame. ws_build_server_frame
+# above always sets FIN, so this exists specifically to build the
+# split/interleaved frames send_fragmented_transition needs.
+procedure ws_build_raw_frame(fin, opcode, payload)
+   local len, first, lenField
+   len := *payload
+   first := char((if fin = 1 then 128 else 0) + opcode)
    if len <= 125 then lenField := char(len)
    else lenField := char(126) || char(len / 256) || char(len % 256)
    return first || lenField || payload

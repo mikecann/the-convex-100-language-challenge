@@ -36,7 +36,8 @@ record LiveState(
    connected, handle, url, connectionCount, lastCloseReason,
    maxObservedTimestamp, querySet, remoteQuerySet, remoteIdentity, remoteTs,
    nextQueryId, reconnectDelayMs, reconnectAtMs, recvBuffer,
-   partialFrameSinceMs, subs)
+   partialFrameSinceMs, subs,
+   fragOpcode, fragBuffer)   # in-progress fragmented message, if any (see live_drain_frames)
 
 record ConvexResult(kind, value, errName, errMessage, errData, hasErrData, logs)
 
@@ -355,7 +356,8 @@ end
 #
 
 procedure convex_live_new(url)
-   return LiveState(0, -1, url, 0, "InitialConnect", &null, 0, 0, 0, "AAAAAAAAAAA=", 0, 100, -1, "", -1, table())
+   return LiveState(0, -1, url, 0, "InitialConnect", &null, 0, 0, 0, "AAAAAAAAAAA=", 0, 100, -1, "", -1, table(),
+      &null, "")
 end
 
 #
@@ -627,6 +629,12 @@ procedure live_retire(state, reason)
    state.connectionCount +:= 1
    state.recvBuffer := ""
    state.partialFrameSinceMs := -1
+   # A fragmented message being assembled belongs to the connection that
+   # was sending it; a reconnect starts a brand new WebSocket stream, so
+   # any partial assembly from the old one is meaningless and must not
+   # leak into it.
+   state.fragOpcode := &null
+   state.fragBuffer := ""
 
    events := []
    if *state.subs = 0 then {
@@ -654,10 +662,25 @@ end
 
 #
 # live_drain_frames(state) -> list of events
-#   Consumes as many complete WebSocket frames as are already buffered.
+#   Consumes as many complete WebSocket frames as are already buffered,
+#   reassembling a fragmented data message (opcode 0 continuation frames
+#   following an unfinished text frame) into one message before handing
+#   it onward. Per RFC 6455, control frames (close/ping/pong) are never
+#   themselves fragmented and may legally arrive between the fragments of
+#   a data message, so they are handled immediately and never touch
+#   state.fragOpcode/fragBuffer -- a ping in the middle of a multi-frame
+#   message cannot disturb the assembly in progress. fragOpcode/fragBuffer
+#   live on `state`, not a local variable, specifically so that assembly
+#   correctly resumes if a later fragment arrives in a separate
+#   convex_live_poll call (a "timeout" from the caller's perspective):
+#   nothing here ever discards a partial assembly or restarts it at a
+#   wrong boundary, it just waits for the next byte with the parser state
+#   exactly as it left off. live_retire clears both fields, since a
+#   reconnect starts a fresh WebSocket stream a stale partial assembly
+#   could never validly complete on.
 #
 procedure live_drain_frames(state)
-   local events, parsed, opcode, payload, remainder, since
+   local events, parsed, opcode, fin, payload, since
 
    convex_init_ffi()
    events := []
@@ -674,24 +697,81 @@ procedure live_drain_frames(state)
       }
       state.partialFrameSinceMs := -1
       opcode := parsed.opcode
+      fin := parsed.fin
       payload := parsed.payload
       state.recvBuffer := parsed.remainder
 
-      case opcode of {
-         8: {
-            events := events ||| live_retire(state, "TransportError: peer closed")
+      if opcode = 8 | opcode = 9 | opcode = 10 then {
+         if fin ~= 1 then {
+            events := events ||| live_retire(state, "ProtocolError: fragmented control frame")
             break
          }
-         9: ffi_send(state.handle, ws_build_frame(10, payload))
-         10: &null
-         1: events := events ||| live_handle_message(state, payload)
-         default: {
-            events := events ||| live_retire(state, "ProtocolError: unsupported frame opcode")
+         case opcode of {
+            8: {
+               events := events ||| live_retire(state, "TransportError: peer closed")
+               break
+            }
+            9: ffi_send(state.handle, ws_build_frame(10, payload))
+            10: &null
+         }
+         next
+      }
+
+      if opcode = 0 then {
+         if /state.fragOpcode then {
+            events := events ||| live_retire(state, "ProtocolError: continuation frame without a fragmented message in progress")
             break
          }
+         # Raw bytes only, concatenated before anything looks at their
+         # meaning: this is what keeps a multi-byte UTF-8 character split
+         # across the frame boundary intact for the single UTF-8 check
+         # that runs on the fully reassembled message in
+         # live_complete_message, rather than corrupting it by trying to
+         # interpret each fragment's bytes on their own.
+         state.fragBuffer ||:= payload
+         if *state.fragBuffer > 8388608 then {
+            events := events ||| live_retire(state, "ProtocolError: fragmented message exceeded budget")
+            break
+         }
+         if fin = 1 then {
+            events := events ||| live_complete_message(state, state.fragOpcode, state.fragBuffer)
+            state.fragOpcode := &null
+            state.fragBuffer := ""
+         }
+         next
+      }
+
+      # A new data frame. Text (opcode 1) is the only type the pinned
+      # sync profile ever sends; anything else -- binary, a reserved
+      # opcode, or a new data frame arriving before a previous fragmented
+      # one finished -- is protocol drift.
+      if opcode ~= 1 then {
+         events := events ||| live_retire(state, "ProtocolError: unsupported frame opcode")
+         break
+      }
+      if \state.fragOpcode then {
+         events := events ||| live_retire(state, "ProtocolError: new data frame while a fragmented message is in progress")
+         break
+      }
+      if fin = 1 then events := events ||| live_complete_message(state, opcode, payload)
+      else {
+         state.fragOpcode := opcode
+         state.fragBuffer := payload
       }
    }
    return events
+end
+
+# live_complete_message(state, opcode, payload) -> list of events
+#   Called once a full data message is available, whether it arrived as
+#   one frame or was reassembled from several. UTF-8 is validated exactly
+#   once here, on the complete message -- never per fragment, since a
+#   multi-byte character split across a frame boundary is invalid UTF-8
+#   in either half alone and only valid once concatenated.
+procedure live_complete_message(state, opcode, payload)
+   if opcode ~= 1 then return live_retire(state, "ProtocolError: unsupported frame opcode")
+   if not utf8_is_valid(payload) then return live_retire(state, "ProtocolError: text message was not valid UTF-8")
+   return live_handle_message(state, payload)
 end
 
 procedure live_handle_message(state, payload)
@@ -810,7 +890,7 @@ end
 # ---------------- RFC 6455 framing ----------------
 #
 
-record ParsedFrame(status, opcode, payload, remainder)
+record ParsedFrame(status, opcode, fin, payload, remainder)
 
 procedure ws_build_frame(opcode, payload)
    local len, first, lenField, maskKey, masked
@@ -840,40 +920,41 @@ procedure ws_mask(payload, maskKey)
 end
 
 procedure ws_parse_frame(buf)
-   local n, b0, b1, opcode, masked, len7, headerLen, payloadLen, maskLen
+   local n, b0, b1, opcode, fin, masked, len7, headerLen, payloadLen, maskLen
    local totalLen, payload, maskKey
 
    n := *buf
-   if n < 2 then return ParsedFrame("INCOMPLETE", &null, &null, buf)
+   if n < 2 then return ParsedFrame("INCOMPLETE", &null, &null, &null, buf)
 
    b0 := ord(buf[1])
    b1 := ord(buf[2])
    opcode := b0 % 16
    # Icon's `if EXPR then` branches on success/failure, not on 0-vs-nonzero,
-   # so masked must always land on a defined 1/0 rather than ever be left
-   # as an unassigned &null (which, being a value that "succeeds" just
-   # like 1 does, would otherwise make every `if masked then` below take
-   # the true branch regardless of the actual bit -- corrupting every
-   # ordinary unmasked server frame).
+   # so masked and fin must always land on a defined 1/0 rather than ever
+   # be left as an unassigned &null (which, being a value that "succeeds"
+   # just like 1 does, would otherwise make every `if masked then` below
+   # take the true branch regardless of the actual bit -- corrupting
+   # every ordinary unmasked server frame).
    masked := if b1 >= 128 then 1 else 0
+   fin := if b0 >= 128 then 1 else 0
    len7 := b1 % 128
 
    headerLen := 2
    payloadLen := len7
    if len7 = 126 then {
-      if n < 4 then return ParsedFrame("INCOMPLETE", &null, &null, buf)
+      if n < 4 then return ParsedFrame("INCOMPLETE", &null, &null, &null, buf)
       payloadLen := (ord(buf[3]) * 256) + ord(buf[4])
       headerLen := 4
    }
    else if len7 = 127 then {
-      if n < 10 then return ParsedFrame("INCOMPLETE", &null, &null, buf)
+      if n < 10 then return ParsedFrame("INCOMPLETE", &null, &null, &null, buf)
       payloadLen := bytes_to_int(buf[7:11])
       headerLen := 10
    }
 
    maskLen := if masked = 1 then 4 else 0
    totalLen := headerLen + maskLen + payloadLen
-   if n < totalLen then return ParsedFrame("INCOMPLETE", &null, &null, buf)
+   if n < totalLen then return ParsedFrame("INCOMPLETE", &null, &null, &null, buf)
 
    payload := buf[headerLen + maskLen + 1 : headerLen + maskLen + payloadLen + 1]
    if masked = 1 then {
@@ -881,7 +962,7 @@ procedure ws_parse_frame(buf)
       payload := ws_mask(payload, maskKey)
    }
 
-   return ParsedFrame("FRAME", opcode, payload, buf[totalLen + 1 : 0])
+   return ParsedFrame("FRAME", opcode, fin, payload, buf[totalLen + 1 : 0])
 end
 
 procedure bytes_to_int(b4)
@@ -890,6 +971,53 @@ end
 
 procedure char_of(n)
    return char(iand(n, 255))
+end
+
+# utf8_is_valid(s) -> 1 or fail
+#   A real UTF-8 validator (leading-byte range, continuation-byte count
+#   and shape, overlong-encoding rejection, and the UTF-16-surrogate-half
+#   and beyond-U+10FFFF exclusions), not a byte-count-only check. Always
+#   called on a complete text message, whether it arrived as one WebSocket
+#   frame or was reassembled from several: a multi-byte character split
+#   across a fragment boundary is invalid UTF-8 in either fragment's raw
+#   bytes alone (an incomplete or an orphaned continuation byte) and only
+#   ever valid once the fragments are concatenated, so validating per
+#   fragment instead of per message would reject perfectly valid text.
+procedure utf8_is_valid(s)
+   local i, n, b, extra, j, c
+
+   n := *s
+   i := 1
+   while i <= n do {
+      b := ord(s[i])
+      if b <= 127 then {
+         i +:= 1
+         next
+      }
+      if iand(b, 224) = 192 then {
+         extra := 1
+         if b < 194 then fail                 # overlong 2-byte lead (C0/C1)
+      }
+      else if iand(b, 240) = 224 then extra := 2
+      else if iand(b, 248) = 240 then extra := 3
+      else fail                                # continuation byte or 5/6-byte legacy lead
+      if i + extra > n then fail               # truncated at end of message
+      every j := i + 1 to i + extra do {
+         c := ord(s[j])
+         if iand(c, 192) ~= 128 then fail       # not a well-formed continuation byte
+      }
+      if extra = 2 then {
+         if b = 224 & ord(s[i + 1]) < 160 then fail    # overlong 3-byte
+         if b = 237 & ord(s[i + 1]) >= 160 then fail    # UTF-16 surrogate half U+D800-DFFF
+      }
+      if extra = 3 then {
+         if b = 240 & ord(s[i + 1]) < 144 then fail    # overlong 4-byte
+         if b = 244 & ord(s[i + 1]) >= 144 then fail    # beyond U+10FFFF
+         if b > 244 then fail                            # leading byte itself beyond U+10FFFF
+      }
+      i +:= extra + 1
+   }
+   return 1
 end
 
 #

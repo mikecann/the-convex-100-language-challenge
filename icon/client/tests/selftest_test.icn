@@ -22,6 +22,8 @@ procedure main()
    test_json()
    test_crypto()
    test_ws_frame()
+   test_utf8()
+   test_fragmentation()
    test_http_classify()
 
    if failures = 0 then {
@@ -88,6 +90,7 @@ procedure test_ws_frame()
       parsed := ws_parse_frame(frame)
       assert_eq(parsed.status, "FRAME", "ws frame parses complete")
       assert_eq(parsed.opcode, 1, "ws frame opcode")
+      assert_eq(parsed.fin, 1, "ws_build_frame always sets FIN (this client never sends a fragmented frame)")
       assert_eq(parsed.payload, payload, "ws frame payload round trip")
       assert_eq(parsed.remainder, "", "ws frame no trailing bytes")
    }
@@ -96,6 +99,17 @@ procedure test_ws_frame()
    truncated := full[1 : *full]
    parsed := ws_parse_frame(truncated)
    assert_eq(parsed.status, "INCOMPLETE", "ws truncated frame is incomplete")
+
+   # A frame with FIN unset (a fragment start/continuation) must be
+   # distinguishable from FIN set: b0's high bit, read independently of
+   # its low 4 opcode bits. ws_build_frame always sets FIN, so this is
+   # hand-built: 0x01 = FIN 0, opcode 1 (text); 0x03 = unmasked, length 3
+   # (server-to-client frames are never masked, so the mask bit is 0).
+   parsed := ws_parse_frame(char(1) || char(3) || "abc")
+   assert_eq(parsed.status, "FRAME", "unfinished frame still parses as one frame")
+   assert_eq(parsed.fin, 0, "unset FIN bit is reported as 0")
+   assert_eq(parsed.opcode, 1, "opcode read independently of FIN")
+   assert_eq(parsed.payload, "abc", "unfinished frame payload read correctly")
    return
 end
 
@@ -104,6 +118,123 @@ procedure repl(s, n)
    out := ""
    every 1 to n do out ||:= s
    return out
+end
+
+procedure test_utf8()
+   local fourByte
+
+   # Valid: ASCII, and 2/3/4-byte sequences at typical and boundary values.
+   assert_eq(utf8_is_valid("hello"), 1, "utf8 plain ascii")
+   assert_eq(utf8_is_valid("ic" || char(195) || char(182) || "n"), 1, "utf8 valid 2-byte (o-umlaut)")
+   assert_eq(utf8_is_valid(char(228) || char(184) || char(150)), 1, "utf8 valid 3-byte (CJK)")
+   fourByte := char(240) || char(159) || char(152) || char(128)   # U+1F600, a 4-byte emoji
+   assert_eq(utf8_is_valid(fourByte), 1, "utf8 valid 4-byte (astral plane)")
+   assert_eq(utf8_is_valid(""), 1, "utf8 empty string is trivially valid")
+
+   # Invalid: everything a real validator, not a byte-count check, has to
+   # reject -- including cases that only manifest by looking at more than
+   # one byte.
+   if utf8_is_valid(char(195)) then assert_eq(1, 0, "utf8 truncated 2-byte sequence should be invalid")
+   if utf8_is_valid(char(128)) then assert_eq(1, 0, "utf8 lone continuation byte should be invalid")
+   if utf8_is_valid(char(192) || char(128)) then assert_eq(1, 0, "utf8 overlong 2-byte encoding should be invalid")
+   if utf8_is_valid(char(224) || char(128) || char(128)) then assert_eq(1, 0, "utf8 overlong 3-byte encoding should be invalid")
+   if utf8_is_valid(char(237) || char(160) || char(128)) then assert_eq(1, 0, "utf8 UTF-16 surrogate half should be invalid")
+   if utf8_is_valid(char(244) || char(144) || char(128) || char(128)) then assert_eq(1, 0, "utf8 codepoint beyond U+10FFFF should be invalid")
+   if utf8_is_valid(char(245) || char(128) || char(128) || char(128)) then assert_eq(1, 0, "utf8 lead byte beyond F4 should be invalid")
+   return
+end
+
+# Fragmentation assembly is exercised directly against live_drain_frames
+# on a synthetic LiveState, with no real socket: state.handle stays -1
+# (convex_live_new's default), and the shim's uconvexsend gracefully
+# returns an ignored "E:" string for an invalid handle rather than
+# erroring, so the ping-interleaved case below is genuinely deterministic
+# and offline, exactly like every other test in this file. The real
+# end-to-end path -- a real TCP/WebSocket peer actually splitting bytes
+# across frames -- is covered separately by live_test.icn's loopback
+# fixture.
+procedure test_fragmentation()
+   local state, omega, msg, splitAt, part1, part2, events, note
+
+   omega := char(195) || char(182)     # o-umlaut, split between its two UTF-8 bytes below
+   msg := "{\"type\":\"Transition\",\"startVersion\":{\"querySet\":0,\"identity\":0,\"ts\":\"AAAAAAAAAAA=\"}," ||
+      "\"endVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"AAAAAAAAAAE=\"}," ||
+      "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":0,\"value\":{\"count\":1,\"note\":\"ic" ||
+      omega || "n\"},\"logLines\":[]}]}"
+   splitAt := find(omega, msg) + 1
+   part1 := msg[1 : splitAt]           # ends with the first byte of omega
+   part2 := msg[splitAt : 0]           # starts with omega's second byte
+
+   # A PING between the two fragments proves control frames are handled
+   # without disturbing the fragmented assembly in progress; a PONG send
+   # attempt happens (and is silently dropped by the fake handle) exactly
+   # as it would against a real peer.
+   state := convex_live_new("ws://example.invalid/api/sync")
+   state.subs["sub1"] := LiveSub(0, "demo:state", table(), &null)
+   state.recvBuffer := build_raw_ws_frame(0, 1, part1) ||
+      build_raw_ws_frame(1, 9, "ping-mid-fragment") ||
+      build_raw_ws_frame(1, 0, part2)
+   events := live_drain_frames(state)
+
+   assert_eq(*events, 1, "fragmented message reassembled into exactly one event")
+   if *events = 1 then {
+      note := events[1]["value"]["note"]
+      assert_eq(note, "ic" || omega || "n", "fragmented UTF-8 character reassembled correctly across the split")
+   }
+   assert_eq(state.remoteQuerySet, 1, "fragmented Transition was applied (version advanced)")
+   # This synthetic state was never actually connected (no live_connect
+   # call happened), so "survived" means no retire happened at all --
+   # lastCloseReason is still convex_live_new's untouched initial value.
+   assert_eq(state.lastCloseReason, "InitialConnect", "connection survives a control frame interleaved mid-fragment")
+   assert_eq(state.fragOpcode, &null, "fragment-assembly state is cleared once the message completes")
+
+   # A continuation frame with no fragmented message in progress is
+   # protocol drift, not something to guess a boundary for.
+   state := convex_live_new("ws://example.invalid/api/sync")
+   state.subs["sub1"] := LiveSub(0, "demo:state", table(), &null)
+   state.recvBuffer := build_raw_ws_frame(1, 0, "orphaned continuation")
+   events := live_drain_frames(state)
+   assert_eq(state.connected, 0, "orphaned continuation frame retires the connection")
+   assert_eq(state.lastCloseReason, "ProtocolError: continuation frame without a fragmented message in progress",
+      "orphaned continuation frame reason")
+
+   # A new data frame arriving before the previous fragmented one finished
+   # is also protocol drift: Convex never interleaves two data messages.
+   state := convex_live_new("ws://example.invalid/api/sync")
+   state.subs["sub1"] := LiveSub(0, "demo:state", table(), &null)
+   state.recvBuffer := build_raw_ws_frame(0, 1, "{\"type\":\"Ping\"") || build_raw_ws_frame(1, 1, "{\"type\":\"Ping\"}")
+   events := live_drain_frames(state)
+   assert_eq(state.connected, 0, "new data frame mid-fragment retires the connection")
+   assert_eq(state.lastCloseReason, "ProtocolError: new data frame while a fragmented message is in progress",
+      "new data frame mid-fragment reason")
+
+   # Reassembly happens before validation, so invalid UTF-8 spread across
+   # a fragment boundary is still correctly rejected once whole, not
+   # missed because each half looked incomplete rather than wrong.
+   state := convex_live_new("ws://example.invalid/api/sync")
+   state.subs["sub1"] := LiveSub(0, "demo:state", table(), &null)
+   state.recvBuffer := build_raw_ws_frame(0, 1, "{\"broken\":\"" || char(237) || char(160)) ||
+      build_raw_ws_frame(1, 0, char(128) || "\"}")
+   events := live_drain_frames(state)
+   assert_eq(state.connected, 0, "invalid UTF-8 spanning a fragment boundary retires the connection")
+   assert_eq(state.lastCloseReason, "ProtocolError: text message was not valid UTF-8",
+      "invalid UTF-8 across fragments reason")
+   return
+end
+
+# Unmasked, arbitrary-FIN raw WebSocket frame, for feeding synthetic
+# server-originated bytes directly into live_drain_frames without a real
+# socket. Server-to-client frames must never be masked (RFC 6455); the
+# real client only ever builds masked, FIN-set frames via ws_build_frame,
+# so this exists purely to construct the fragmented/control-frame test
+# inputs above.
+procedure build_raw_ws_frame(fin, opcode, payload)
+   local len, first, lenField
+   len := *payload
+   first := char((if fin = 1 then 128 else 0) + opcode)
+   if len <= 125 then lenField := char(len)
+   else lenField := char(126) || char(len / 256) || char(len % 256)
+   return first || lenField || payload
 end
 
 procedure test_http_classify()

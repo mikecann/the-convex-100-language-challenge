@@ -238,6 +238,16 @@ and the canonical example.
 - `client/tests/conformance/adapter.icn` implements NDJSON adapter
   protocol v1 over both stdin/stdout and the `ADAPTER_LISTEN` TCP mode,
   and declares `debugDisconnect` as its one adapter-only command.
+- Fragmented WebSocket messages are reassembled correctly: continuation
+  frames are concatenated as raw bytes into the message in progress,
+  control frames (ping/pong/close) are handled immediately without
+  disturbing that assembly since RFC 6455 permits them between the
+  fragments of a data message, and UTF-8 is validated once on the
+  complete reassembled message rather than per fragment, since a
+  multi-byte character split across a frame boundary is invalid UTF-8 in
+  either fragment's raw bytes alone. Fragment-assembly state lives on the
+  Live connection's own state record, so it survives correctly across a
+  `convex_live_poll` call that returns between fragments.
 
 ## Limitations
 
@@ -247,8 +257,6 @@ and the canonical example.
 - Live authentication, WebSocket-issued mutations/actions, journals, and
   `TransitionChunk` assembly are deferred; a `TransitionChunk` is reported
   as protocol drift and the connection reconnects.
-- A WebSocket message is assumed to arrive as one unfragmented frame. A
-  genuinely fragmented message is treated as an unsupported opcode.
 - The Unicon toolchain is built from source in the `test` stage (Debian
   does not package it), pinned to a specific upstream commit, with
   graphics, 3D graphics, audio, VOIP, concurrency, pattern types, and the

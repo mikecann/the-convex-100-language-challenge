@@ -5,8 +5,10 @@
 # convex_live_debug_disconnect operations through a real RFC 6455
 # handshake, an initial value, an external update, a
 # debugDisconnect-triggered reconnect that resends the active
-# subscription, and a QueryFailed-then-recovery cycle -- the scenarios
-# AGENTS.md's "Live acceptance" section calls out.
+# subscription, a QueryFailed-then-recovery cycle, and an update whose
+# WebSocket frame is fragmented mid-character with a control frame
+# interleaved -- the scenarios AGENTS.md's "Live acceptance" section
+# calls out.
 #
 # unicon's `link` resolves an already-compiled `.u` file by looking in the
 # CURRENT WORKING DIRECTORY at compile time, not next to the file that
@@ -19,7 +21,7 @@ link "convex"
 global failures
 
 procedure main()
-   local port, logFile, liveUrl, liveState, events, evt
+   local port, logFile, liveUrl, liveState, events, evt, omega
 
    failures := 0
    port := 23200
@@ -55,12 +57,26 @@ procedure main()
       write(&errout, "FAIL debugDisconnect leaves state disconnected before any further poll")
    }
 
-   # 4: polling drives the reconnect once backoff elapses; the fixture's
-   # second connection resends Add (proving query-set rebuild), then
-   # scripts a QueryFailed followed by a recovering QueryUpdated.
-   poll_until_error_then_count(liveState, "sub1", "ROOM_EMPTY", 2, "reconnect: QueryFailed then recovery")
+   # 4/5: polling drives the reconnect once backoff elapses; the fixture's
+   # second connection resends Add (proving query-set rebuild), sends a
+   # QueryFailed then a recovering QueryUpdated, and then one more update
+   # split across two WebSocket frames -- with a PING interleaved between
+   # them -- landing in the middle of a multi-byte UTF-8 character (this
+   # is the fixture's send_fragmented_transition; a wrong reassembly --
+   # per-frame UTF-8 decoding, losing the interleaved PING's effect on
+   # parser state, or restarting at a false frame boundary -- would show
+   # up here as either a spurious ProtocolError/TransportError event or a
+   # corrupted value). All of this is sent back to back with no delay, so
+   # it is watched for in one combined poll loop rather than two
+   # sequential ones: a real recv() commonly returns every one of these
+   # frames in a single batch, and a poll loop that only looks for its
+   # own phase's events would silently consume and discard whichever
+   # later phase's event happened to already be in that same batch.
+   omega := char(195) || char(182)   # o-umlaut, U+00F6, 2-byte UTF-8
+   poll_until_error_then_counts(liveState, "sub1", "ROOM_EMPTY", 2, 3, "ic" || omega || "n",
+      "reconnect: QueryFailed, recovery, then a fragmented update with an interleaved control frame")
 
-   # 5: clean shutdown.
+   # 6: clean shutdown.
    convex_live_remove(liveState, "sub1")
    convex_live_close(liveState)
 
@@ -132,27 +148,50 @@ procedure poll_until_counts_seen(liveState, subscriptionId, expectedCounts, labe
    return
 end
 
-procedure poll_until_error_then_count(liveState, subscriptionId, expectedCode, expectedCount, label)
-   local sawError, sawCount, deadline, events, evt
+# Polls for three signals that can arrive in any order and in any
+# grouping across separate convex_live_poll batches -- a real recv()
+# commonly returns everything the fixture already sent in one read, so a
+# poll loop that only watches for its own phase's events (and stops as
+# soon as it sees them) would silently consume and discard whichever
+# later phase's event happened to already be sitting in that same batch.
+# Watching for the whole sequence in one loop instead means it never
+# matters how these five WebSocket frames (QueryFailed, the recovering
+# QueryUpdated, and the fragmented update's three frames) get grouped
+# into recv() batches.
+procedure poll_until_error_then_counts(liveState, subscriptionId, expectedCode, recoveryCount, fragmentedCount,
+      expectedLastLanguage, label)
+   local sawError, sawRecovery, sawFragmented, gotLastLanguage, deadline, events, evt
 
    sawError := 0
-   sawCount := 0
+   sawRecovery := 0
+   sawFragmented := 0
    deadline := live_now_ms() + 15000
-   while live_now_ms() < deadline & (sawError = 0 | sawCount = 0) do {
+   while live_now_ms() < deadline & (sawError = 0 | sawRecovery = 0 | sawFragmented = 0) do {
       events := convex_live_poll(liveState, 500)
       every evt := !events do {
          if evt["subscriptionId"] ~== subscriptionId then next
          if member(evt, "error") then {
             if member(evt["error"], "data") & evt["error"]["data"]["code"] == expectedCode then sawError := 1
+            next
          }
-         if member(evt, "value") then {
-            if evt["value"]["count"] = expectedCount then sawCount := 1
+         if not member(evt, "value") then next
+         if evt["value"]["count"] = recoveryCount then sawRecovery := 1
+         if evt["value"]["count"] = fragmentedCount then {
+            sawFragmented := 1
+            gotLastLanguage := evt["value"]["lastLanguage"]
          }
       }
    }
-   if sawError = 1 & sawCount = 1 then return
-   failures +:= 1
-   write(&errout, "FAIL ", label, ": sawError=", sawError, " sawCount=", sawCount)
+   if sawError ~= 1 | sawRecovery ~= 1 | sawFragmented ~= 1 then {
+      failures +:= 1
+      write(&errout, "FAIL ", label, ": sawError=", sawError, " sawRecovery=", sawRecovery,
+         " sawFragmented=", sawFragmented)
+      return
+   }
+   if gotLastLanguage ~== expectedLastLanguage then {
+      failures +:= 1
+      write(&errout, "FAIL ", label, ": lastLanguage was ", image(gotLastLanguage), " expected ", image(expectedLastLanguage))
+   }
    return
 end
 

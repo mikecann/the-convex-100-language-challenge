@@ -15,7 +15,12 @@ implementation:
     ModifyQuerySet, Transition, reconnect with exponential backoff, dedup)
     are all written in Unicon (client/convex.icn), compiled and linked
     together with the adapter and the example at build time the same way
-    every other Unicon program is. Unicon has real native TCP sockets but
+    every other Unicon program is. Fragmented WebSocket messages are
+    reassembled from raw bytes across frame boundaries before UTF-8 is
+    validated once on the complete message, and control frames (ping/
+    pong/close) are handled between fragments of a data message without
+    disturbing that assembly, per RFC 6455. Unicon has real native TCP
+    sockets but
     no TLS, so a small C shim (client/shim.c) supplies raw byte transport
     -- connect/listen/accept/send/recv/close and the OpenSSL TLS handshake
     -- loaded with Unicon's own loadfunc() foreign function interface, the
@@ -64,11 +69,6 @@ limitations:
     Live authentication, WebSocket-issued mutations and actions, journals,
     and TransitionChunk assembly are deferred; receiving a TransitionChunk
     is reported as protocol drift and the connection reconnects.
-  - >-
-    A WebSocket message is assumed to arrive as a single unfragmented
-    frame; a genuinely fragmented (multi-frame) message is not
-    reassembled and is treated as an unsupported opcode, forcing a
-    reconnect.
   - >-
     The C shim is deliberately narrow: raw connect/listen/accept/send/
     recv/close, the OpenSSL handshake, and a wall-clock-milliseconds
