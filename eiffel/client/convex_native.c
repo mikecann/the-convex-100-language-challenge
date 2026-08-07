@@ -4,6 +4,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <string.h>
+#include <errno.h>
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -99,25 +100,41 @@ convex_tls_close (void *ssl)
 int
 convex_raw_write (int fd, const void *data, int count)
 {
-	return (int) send (fd, data, (size_t) count, 0);
+	int rc;
+	do {
+		rc = (int) send (fd, data, (size_t) count, 0);
+	} while (rc < 0 && errno == EINTR);
+	return rc;
 }
 
 int
 convex_raw_read (int fd, void *buffer, int max)
 {
-	return (int) recv (fd, buffer, (size_t) max, 0);
+	int rc;
+	do {
+		rc = (int) recv (fd, buffer, (size_t) max, 0);
+	} while (rc < 0 && errno == EINTR);
+	return rc;
 }
 
 int
 convex_generic_write (int fd, const void *data, int count)
 {
-	return (int) write (fd, data, (size_t) count);
+	int rc;
+	do {
+		rc = (int) write (fd, data, (size_t) count);
+	} while (rc < 0 && errno == EINTR);
+	return rc;
 }
 
 int
 convex_generic_read (int fd, void *buffer, int max)
 {
-	return (int) read (fd, buffer, (size_t) max);
+	int rc;
+	do {
+		rc = (int) read (fd, buffer, (size_t) max);
+	} while (rc < 0 && errno == EINTR);
+	return rc;
 }
 
 int
@@ -127,12 +144,21 @@ convex_select_one (int fd, int timeout_ms)
 	struct timeval tv;
 	int rc;
 
-	FD_ZERO (&readfds);
-	FD_SET (fd, &readfds);
-	tv.tv_sec = timeout_ms / 1000;
-	tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-	rc = select (fd + 1, &readfds, NULL, NULL, &tv);
+	/* EiffelStudio's runtime (GC, thread scheduling) can deliver signals
+	 * that legitimately interrupt a blocking syscall; POSIX select(2)
+	 * reports that as EINTR, not a real error. Retrying (with a fresh
+	 * deadline, since a signal-handling implementation may leave *tv in
+	 * an unspecified state) is the correct response, not surfacing it as
+	 * a failure to Eiffel, whose own runtime would otherwise misreport
+	 * an ordinary interrupted wait as a trapped "operating system
+	 * signal" exception and kill the process. */
+	do {
+		FD_ZERO (&readfds);
+		FD_SET (fd, &readfds);
+		tv.tv_sec = timeout_ms / 1000;
+		tv.tv_usec = (timeout_ms % 1000) * 1000;
+		rc = select (fd + 1, &readfds, NULL, NULL, &tv);
+	} while (rc < 0 && errno == EINTR);
 	if (rc <= 0) {
 		return 0;
 	}
@@ -154,20 +180,21 @@ convex_select_two (int fd_one, int fd_two, int timeout_ms)
 	int rc;
 	int result;
 
-	FD_ZERO (&readfds);
-	max_fd = 0;
-	if (fd_one >= 0) {
-		FD_SET (fd_one, &readfds);
-		if (fd_one > max_fd) max_fd = fd_one;
-	}
-	if (fd_two >= 0) {
-		FD_SET (fd_two, &readfds);
-		if (fd_two > max_fd) max_fd = fd_two;
-	}
-	tv.tv_sec = timeout_ms / 1000;
-	tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-	rc = select (max_fd + 1, &readfds, NULL, NULL, &tv);
+	do {
+		FD_ZERO (&readfds);
+		max_fd = 0;
+		if (fd_one >= 0) {
+			FD_SET (fd_one, &readfds);
+			if (fd_one > max_fd) max_fd = fd_one;
+		}
+		if (fd_two >= 0) {
+			FD_SET (fd_two, &readfds);
+			if (fd_two > max_fd) max_fd = fd_two;
+		}
+		tv.tv_sec = timeout_ms / 1000;
+		tv.tv_usec = (timeout_ms % 1000) * 1000;
+		rc = select (max_fd + 1, &readfds, NULL, NULL, &tv);
+	} while (rc < 0 && errno == EINTR);
 	if (rc <= 0) {
 		return 0;
 	}
