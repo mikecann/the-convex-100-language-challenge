@@ -7,7 +7,7 @@
 # documents it. s7c then compiles this client's own Seed7 source into a
 # genuine native ELF executable (it drives gcc itself, once, at image build
 # time) with no residual dependency on the Seed7 toolchain at runtime.
-FROM debian:bookworm-slim@sha256:40ad4a6bea390e0f5f57d1fbf29e363eb7f16bf6bfd07b3ceca62f81c0b8e12e AS toolchain
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS toolchain
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
       gcc=4:12.2.0-3 \
       make=4.3-4.1 \
@@ -103,7 +103,7 @@ CMD ["/bin/sh", "-c", "true"]
 # base image's own /rm and /mkdir, which live in /usr/bin alongside each
 # other and would otherwise risk deleting a binary this same layer still
 # needs to call.
-FROM debian:bookworm-slim@sha256:40ad4a6bea390e0f5f57d1fbf29e363eb7f16bf6bfd07b3ceca62f81c0b8e12e AS runtime-base
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS runtime-base
 RUN --mount=type=bind,from=test,source=/bin/busybox,target=/busybox,readonly \
     set -eu; \
     pruner=/busybox; \
