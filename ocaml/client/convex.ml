@@ -264,7 +264,7 @@ type channel = {
   fd : Unix.file_descr;
   ssl : Ssl.socket option;
   mutable closed : bool;
-  mutable nonblocking : bool;
+  nonblocking : bool;
 }
 
 let close_channel channel =
@@ -1010,7 +1010,7 @@ type ws = {
      the raw file descriptor. Reading through this buffer instead of straight
      from [channel] is what keeps that leftover plaintext from being mistaken
      for "nothing to read" the next time [ws_has_buffered] is asked. *)
-  mutable read_buffer : Bytes.t;
+  read_buffer : Bytes.t;
   mutable read_start : int;
   mutable read_length : int;
 }
