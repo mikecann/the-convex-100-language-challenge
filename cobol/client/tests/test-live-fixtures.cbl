@@ -53,7 +53,10 @@ COPY "cvx-client.cpy".
 01 WS-DEADLINE              BINARY-DOUBLE.
 01 WS-WAIT-MS               BINARY-LONG VALUE 6000.
 
-01 WS-SLOT                  BINARY-LONG VALUE 4.
+*> The client itself never makes an HTTP call in this test, so slot 1
+*> (WS-SLOT-HTTP in convex.cbl) is free for this test's own read-only
+*> verification parse of an already-dequeued delivery.
+01 WS-SLOT                  BINARY-LONG VALUE 1.
 01 WS-NODE                  BINARY-LONG.
 01 WS-CHILD                 BINARY-LONG.
 01 WS-KEY                   PIC X(64).
