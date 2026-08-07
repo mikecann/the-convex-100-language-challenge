@@ -616,6 +616,20 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- BCPL crashed because a pointer no longer fits in a word. Its 32-bit Cintcode
+  interpreter stores a raw C pointer — the `FILE*` returned by `fopen()` — in a
+  32-bit BCPL word. On a 64-bit host that address routinely lands above 2^32,
+  so the low half alone is not a pointer, and the crash happened inside the
+  distribution's own runtime before a line of client code ran. It reproduces on
+  the unmodified compiler with nothing linked in. Targeting the distribution's
+  64-bit Cintcode, whose word is wide enough for a real pointer, fixes it.
+  BCPL is from 1967, when a word held an address by definition; the assumption
+  is older than the problem.
+- Typelessness has a bill, and it arrives late. BCPL does not check argument
+  counts, so a mismatch between a function and its two callers went unnoticed
+  until the toolchain worked for the first time — at which point it silently
+  read stack poison (`0xDEADC0DE`) and crashed a coroutine. Code that has never
+  executed has never been checked, in a language that never checks.
 - The unfixable client bug was two bugs in the test fixture. SNOBOL4's
   WebSocket reconnection looked genuinely broken and unsalvageable. It was the
   fixture: a resubscribed value collided with an already-delivered one, which
