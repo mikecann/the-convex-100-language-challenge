@@ -807,7 +807,18 @@ procedure live_apply_transition(state, msg)
    state.remoteIdentity := endVersion["identity"]
    state.remoteTs := endVersion["ts"]
 
-   if /state.maxObservedTimestamp | timestamp_key(endVersion["ts"]) > timestamp_key(state.maxObservedTimestamp) then
+   # maxObservedTimestamp tracks Convex's opaque `ts` cursor, which
+   # timestamp_key turns into a fixed-width (16 hex digit), lowercase,
+   # zero-padded hex string -- ts always decodes to exactly 8 raw bytes
+   # (see the "AAAAAAAAAAA=" zero-timestamp literal above), so every key
+   # is the same length. For same-length lowercase-hex strings, byte-wise
+   # ordering matches numeric magnitude exactly, so Icon's *string*
+   # comparison operator >> is correct here. Icon's *numeric* > operator
+   # would instead coerce both operands to numbers, which happens to
+   # work while every digit is 0-9 and throws Run-time error 102 the
+   # moment a token contains a hex letter (a-f) -- these are opaque
+   # cursor tokens, not numbers, so they must be compared as strings.
+   if /state.maxObservedTimestamp | timestamp_key(endVersion["ts"]) >> timestamp_key(state.maxObservedTimestamp) then
       state.maxObservedTimestamp := endVersion["ts"]
 
    events := []

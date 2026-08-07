@@ -79,6 +79,20 @@ RUN set -eu; \
     LD_LIBRARY_PATH=/opt/convex/client client/tests/live_test; \
     unicon -o client/tests/conformance/adapter client/tests/conformance/adapter.icn; \
     unicon -o examples/basics/convex-example examples/basics/main.icn; \
+    # `unicon -o` prepends a "#!/bin/sh" launcher to the compiled icode.
+    # Line 3 of that launcher unconditionally shells out to `sed` to
+    # compute a same-directory fallback interpreter path, even though the
+    # very next line only uses that fallback when $ICONX is unset -- and
+    # the runtime images always set ICONX (see the runtime-base stage
+    # below), so the sed result is dead code there. The pruned runtime
+    # images intentionally ship no shell utilities beyond what iconx
+    # itself needs, so `sed` is missing and every invocation printed a
+    # harmless but confusing "sed: not found" before falling through to
+    # the ICONX branch. Deleting that one line removes the unused sed
+    # call; the $IXLCL check below still degrades safely to an empty,
+    # non-executable path and falls through to the next fallback.
+    sed -i '3d' client/tests/conformance/adapter; \
+    sed -i '3d' examples/basics/convex-example; \
     printf '%s\n' \
       '{"protocolVersion":1,"id":"hello","op":"hello"}' \
       '{"id":"close","op":"close"}' \
@@ -139,6 +153,7 @@ COPY --from=test /usr/bin/uname /usr/bin/uname
 COPY --from=test --chmod=0555 /src/bin/iconx /usr/local/bin/iconx
 ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
     OPENSSL_MODULES=/usr/lib/x86_64-linux-gnu/ossl-modules \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     LD_LIBRARY_PATH=/opt/convex/client \
     PATH=/usr/local/bin:/usr/bin:/bin \
     ICONX=/usr/local/bin/iconx
