@@ -43,6 +43,14 @@ RUN set -eu; \
     mkdir -p /tmp/fbc; \
     tar --extract --xz --file /tmp/fbc-source.tar.xz --directory /tmp/fbc --strip-components=1; \
     cd /tmp/fbc; \
+    # bootstrap-minimal first compiles a bootstrap fbc from the archive's
+    # pre-generated C sources into ./bin/fbc, then immediately uses that
+    # same fbc -- found only by PATH lookup, not by any path the makefile
+    # is told directly -- to compile the real compiler and runtime library
+    # from FreeBASIC source. Without ./bin on PATH before this target
+    # starts, that second half fails the moment it exists: "fbc: not
+    # found", because ./bin/fbc exists by then but was never on PATH.
+    export PATH="/tmp/fbc/bin:$PATH"; \
     # The client is console-only. bootstrap-minimal deliberately omits the \
     # optional X11/GPM/libffi surface, then installs only the compiler, headers, \
     # and thread-safe runtime instead of building the unused graphics library. \
