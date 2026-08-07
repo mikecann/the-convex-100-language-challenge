@@ -45,7 +45,16 @@ convex_tls_connect (int fd, const char *hostname)
 	SSL_set_tlsext_host_name (ssl, hostname);
 	SSL_set1_host (ssl, hostname);
 
-	rc = SSL_connect (ssl);
+	{
+		int ssl_error;
+		do {
+			rc = SSL_connect (ssl);
+			if (rc == 1) {
+				break;
+			}
+			ssl_error = SSL_get_error (ssl, rc);
+		} while (ssl_error == SSL_ERROR_SYSCALL && errno == EINTR);
+	}
 	if (rc != 1) {
 		SSL_free (ssl);
 		return NULL;
@@ -76,13 +85,31 @@ convex_tls_last_error (void)
 int
 convex_tls_write (void *ssl, const void *data, int count)
 {
-	return SSL_write ((SSL *) ssl, data, count);
+	int rc;
+	int ssl_error;
+	do {
+		rc = SSL_write ((SSL *) ssl, data, count);
+		if (rc > 0) {
+			return rc;
+		}
+		ssl_error = SSL_get_error ((SSL *) ssl, rc);
+	} while (ssl_error == SSL_ERROR_SYSCALL && errno == EINTR);
+	return rc;
 }
 
 int
 convex_tls_read (void *ssl, void *buffer, int max)
 {
-	return SSL_read ((SSL *) ssl, buffer, max);
+	int rc;
+	int ssl_error;
+	do {
+		rc = SSL_read ((SSL *) ssl, buffer, max);
+		if (rc > 0) {
+			return rc;
+		}
+		ssl_error = SSL_get_error ((SSL *) ssl, rc);
+	} while (ssl_error == SSL_ERROR_SYSCALL && errno == EINTR);
+	return rc;
 }
 
 int
