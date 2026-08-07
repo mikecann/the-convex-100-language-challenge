@@ -1233,18 +1233,30 @@ convex_live_maintain:
     sub rsp, 16
     mov [rbp+LM_LIVE], rdi
 
-    mov rax, [rdi + convex_live.connected]
+    mov edi, 'm'
+    lea rsi, [rel dbg_colon]
+    xor edx, edx
+    call dbg_str
+
+    mov rax, [rbp+LM_LIVE]
+    mov rax, [rax + convex_live.connected]
     test rax, rax
     jnz .connected
 
-    mov rax, [rdi + convex_live.subs]
+    mov rax, [rbp+LM_LIVE]
+    mov rax, [rax + convex_live.subs]
     test rax, rax
-    jz .done
+    jz .no_subs
 
     call monotonic_ms
     mov rcx, [rbp+LM_LIVE]
     cmp rax, [rcx + convex_live.next_attempt_ms]
-    jl .done
+    jl .not_due
+
+    mov edi, 'k'
+    lea rsi, [rel dbg_colon]
+    xor edx, edx
+    call dbg_str
 
     mov rdi, [rbp+LM_LIVE]
     call try_connect
@@ -1255,6 +1267,18 @@ convex_live_maintain:
     mov edx, reason_transport_error_len
     xor ecx, ecx
     call teardown_and_schedule
+    jmp .done
+.no_subs:
+    mov edi, 'x'
+    lea rsi, [rel dbg_colon]
+    xor edx, edx
+    call dbg_str
+    jmp .done
+.not_due:
+    mov edi, 'w'
+    lea rsi, [rel dbg_colon]
+    xor edx, edx
+    call dbg_str
     jmp .done
 .connected:
     mov rax, [rbp+LM_LIVE]
