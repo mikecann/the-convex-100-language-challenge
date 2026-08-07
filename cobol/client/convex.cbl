@@ -46,11 +46,29 @@ COPY "cvx-http.cpy".
 01 WS-CLOSED                BINARY-LONG VALUE 0.
 
 *> ---- HTTP scratch -------------------------------------------------
+*> WS-BODY (the outgoing request) and WS-RESP (the incoming response)
+*> are both live for the same cvx-http-post call, so each keeps its
+*> own 2 MiB region. WS-SPAN is the one remaining shared scratch
+*> region: the escaped function path (WS-ARGS-ESC below) is written
+*> and consumed entirely while building WS-BODY, before the request is
+*> even sent; the decoded status/value/error text (WS-SPAN itself) is
+*> only read after cvx-http-post has already returned; and the
+*> incoming Live frame (WS-INBUF below) is copied into the JSON
+*> module's own slot the moment it is parsed and never referenced
+*> again afterward. None of the three is ever needed while another
+*> still holds live content, so redefining all three onto one buffer
+*> instead of giving each its own 2 MiB removes three of the private
+*> buffers that used to push this client over the shared adapter
+*> memory-growth budget. See convex-json.cbl's WS-JSON-SLOTS comment
+*> and the adapter's own WS-ESC/WS-SPAN redefinition for the same
+*> convention applied there.
 01 WS-BODY                  PIC X(2097152).
 01 WS-BODY-LEN              BINARY-LONG.
 01 WS-RESP                  PIC X(2097152).
 01 WS-RESP-LEN              BINARY-LONG.
-01 WS-ARGS-ESC              PIC X(2097152).
+01 WS-SPAN                  PIC X(2097152).
+01 WS-ARGS-ESC REDEFINES WS-SPAN PIC X(2097152).
+01 WS-INBUF REDEFINES WS-SPAN PIC X(2097152).
 
 *> ---- Live transport state ----------------------------------------
 01 WS-LIVE-HANDLE           BINARY-LONG VALUE -1.
@@ -111,7 +129,6 @@ COPY "cvx-http.cpy".
 *> ---- message building --------------------------------------------
 01 WS-MSGBUF                PIC X(262144).
 01 WS-MSGLEN                BINARY-LONG.
-01 WS-INBUF                 PIC X(2097152).
 01 WS-INLEN                 BINARY-LONG.
 *> Numeric-edited, not plain alphanumeric: every use below is
 *> `MOVE <numeric> TO WS-NUMTEXT` followed by `FUNCTION TRIM`, and JSON
@@ -151,7 +168,6 @@ COPY "cvx-http.cpy".
 01 WS-NOW                   BINARY-DOUBLE.
 01 WS-DEADLINE              BINARY-DOUBLE.
 01 WS-SPAN-LEN              BINARY-LONG.
-01 WS-SPAN                  PIC X(2097152).
 01 WS-TEXT                  PIC X(1024).
 01 WS-TEXT-LEN              BINARY-LONG.
 01 WS-KEYTEXT               PIC X(64).

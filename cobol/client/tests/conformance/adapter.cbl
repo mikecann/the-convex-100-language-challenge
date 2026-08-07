@@ -24,7 +24,16 @@ COPY "cvx-limits.cpy".
 COPY "cvx-client.cpy".
 
 01 WS-MAX-LINE              BINARY-LONG VALUE 2097152.
-01 WS-SLOT-CMD              BINARY-LONG VALUE 3.
+*> Shares convex.cbl's WS-SLOT-HTTP slot rather than owning a private
+*> one: EXTRACT-COMMAND-FIELDS below always finishes copying every
+*> field this adapter needs out of the parsed command (id, op,
+*> subscriptionId, path, args, token) into small WORKING-STORAGE
+*> before PROCESS-LINE ever dispatches into a client call, so the
+*> command's parsed document is never read again once dispatch begins
+*> and the slot is free for the HTTP reply to reuse. That reuse is
+*> what keeps this client's JSON module to two slots instead of four;
+*> see convex-json.cbl's WS-JSON-SLOTS comment.
+01 WS-SLOT-CMD              BINARY-LONG VALUE 1.
 
 *> ---- transport for the controller connection ---------------------
 01 WS-TCP-MODE              BINARY-LONG VALUE 0.
@@ -43,6 +52,14 @@ COPY "cvx-client.cpy".
 01 WS-EVT                   PIC X(2162688).
 01 WS-EVT-LEN               BINARY-LONG.
 01 WS-ESC                   PIC X(2097152).
+*> EXTRACT-COMMAND-FIELDS below is the only reader of WS-SPAN, and it
+*> always finishes there before DO-HELLO, DO-CALL, DO-CLOSE, or any of
+*> the EMIT-* paragraphs -- the only writers of WS-ESC -- next run, so
+*> the two never need to hold different content at once. Redefining
+*> WS-SPAN over WS-ESC instead of giving it its own 2 MiB removes one
+*> more of the private buffers that pushed this adapter over the
+*> shared memory-growth budget.
+01 WS-SPAN REDEFINES WS-ESC PIC X(2097152).
 01 WS-ESC-LEN               BINARY-LONG.
 
 *> ---- adapter state ------------------------------------------------
@@ -86,8 +103,7 @@ COPY "cvx-client.cpy".
 01 WS-TYPE                  BINARY-LONG.
 01 WS-KEY                   PIC X(64).
 01 WS-KEY-LEN               BINARY-LONG.
-01 WS-SPAN                  PIC X(2097152).
-01 WS-SPAN-LEN              BINARY-LONG.
+01 WS-SPAN-LEN               BINARY-LONG.
 01 WS-OP                    BINARY-LONG.
 01 WS-SUBIX                 BINARY-LONG.
 01 WS-RELAYIX               BINARY-LONG.
