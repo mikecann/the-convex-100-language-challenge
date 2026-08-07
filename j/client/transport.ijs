@@ -309,7 +309,16 @@ tx_send=: 3 : 0
   if. 'plain' -: tx_kind conn do.
     tx_set_timeout s;SO_SNDTIMEO;tx_remaining deadline
     r=. text sdsend s;0
-    if. 0 ~: {. r do. TX_IO_ERROR;'write failed' return. end.
+    NB. sdsend always Link-boxes its result (0;bytesSent on success,
+    NB. 0;~sdsockerror'' on failure) -- unlike sdconnect/sdbind/sdlisten,
+    NB. which return a bare unboxed 0 through rc0 on success. {. r would
+    NB. take the still-boxed first item, and a boxed 0 is never ~: to a
+    NB. plain 0, so every successful send was wrongly read as a failure
+    NB. the first time this path ran against a plain (non-TLS) backend --
+    NB. every prior test exercised only the TLS branch below. first r
+    NB. opens the box before comparing, matching how the cd-result helper
+    NB. above the FFI declarations already does the same unboxing.
+    if. 0 ~: first r do. TX_IO_ERROR;'write failed' return. end.
     TX_IO_OK;'' return.
   end.
   ssl=. > 2 { conn
@@ -347,8 +356,16 @@ tx_recv=: 3 : 0
   if. 'plain' -: tx_kind conn do.
     tx_set_timeout s;SO_RCVTIMEO;tx_remaining deadline
     r=. sdrecv s;limit;0
-    rc=. {. r
-    if. rc < 0 do. TX_IO_TIMEOUT;'' return. end.
+    NB. sdrecv Link-boxes its result, and the two shapes are not even the
+    NB. same type: 0;data on success, '';~sdsockerror'' on failure/timeout
+    NB. (the first item is the empty string itself, not a negative number
+    NB. -- {.r<0, the original check here, compared a still-boxed value
+    NB. with a relational operator, which this codebase's own TLS branch
+    NB. never does; = / ~: tolerate box-vs-atom, < does not). first opens
+    NB. the box, and -: (Match) compares the opened value against '' by
+    NB. shape and content rather than assuming it is numeric.
+    rc=. first r
+    if. rc -: '' do. TX_IO_TIMEOUT;'' return. end.
     data=. > 1 { r
     if. 0 = # data do. TX_IO_EOF;'' return. end.
     TX_IO_OK;(a. i. data) return.
