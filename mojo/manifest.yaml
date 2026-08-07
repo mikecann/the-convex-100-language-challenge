@@ -4,5 +4,36 @@ displayName: "Mojo"
 rank: 51
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Mojo implementation. Mojo's standard library has no sockets, TLS,
+    JSON, HTTP or WebSocket support, so JSON, HTTP/1.1 and RFC 6455 framing
+    (including SHA-1 for the accept token and client masking) are written in
+    Mojo on top of sys.ffi.external_call declarations against libc and OpenSSL,
+    the same C entry points a C client links directly.
+toolchain:
+  name: Mojo
+  version: 0.26.2.0
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, optimistic updates, WebSocket mutations and WebSocket actions are deferred; setAuth applies to HTTP calls only.
+  - Live values cover the JSON-safe subset; tagged Convex value types are deferred.
+  - TransitionChunk assembly is deferred and treated as protocol drift that reconnects.
+  - Each subscription retains the newest 16 updates within a 256 KiB byte budget and drops the oldest when its consumer is slow.
+  - One HTTP connection is opened per call rather than pooled, so keep-alive reuse is deferred.
 capabilities: []
