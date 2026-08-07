@@ -58,7 +58,28 @@ ENV JAVA_HOME=/opt/java/openjdk
 ENV PATH=/opt/java/openjdk/bin:/usr/local/bin:/usr/bin:/bin
 # These are part of the runtime contract, not reviewer-only flags. They leave
 # room for TLS, direct buffers, threads, and native JVM bookkeeping at 128 MiB.
-ENV JAVA_TOOL_OPTIONS="-XX:MaxRAM=96m -Xms8m -Xmx24m -Xss256k -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -XX:MaxMetaspaceSize=24m -XX:CompressedClassSpaceSize=16m -XX:MaxDirectMemorySize=8m -XX:ReservedCodeCacheSize=4m"
+# -Xint is load-bearing, not a tuning nicety. Measured against the real
+# hosted deployment (docker exec ... cat /proc/1/smaps, summed by Rss), a
+# tiered-compiling JVM here settles near 130 MiB within ~2 seconds of a real
+# wss:// handshake and keeps climbing past 260 MiB by the time the run
+# finishes - comfortably over the 128 MiB --memory cap ./run applies to
+# every runtime container, and enough to OOM-kill the container on roughly
+# half of repeated runs. A real TLS handshake and SSLEngine session link a
+# further tier of JDK TLS/X.509 call sites and spin up delegated-task worker
+# threads that a local, cert-free ws:// connection never touches, feeding
+# C1/C2 compilation. The same budget also produced a
+# "VirtualMachineError: Out of space in CodeCache for method handle
+# intrinsic" from an ordinary, unrelated call site once compilation and
+# invokedynamic linking finished racing each other for the tiny code cache;
+# raising just ReservedCodeCacheSize made the OOM kills worse, not better,
+# by adding yet more demand onto a budget that was already short overall.
+# This program runs for a few seconds doing a handful of HTTP calls and one
+# WebSocket session, so trading JIT compilation for a small, predictable
+# footprint costs nothing real: -Xint alone measured under 90 MiB RSS
+# against the same hosted deployment, because it removes both the C1/C2
+# compiler threads and the compiled code they would have produced, not just
+# the code cache bytes they would have used.
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAM=96m -Xms8m -Xmx24m -Xss256k -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -XX:MaxMetaspaceSize=24m -XX:CompressedClassSpaceSize=16m -XX:MaxDirectMemorySize=8m -XX:ReservedCodeCacheSize=8m -Xint"
 # Runtime images expose no package manager, compiler, or build frontend
 # (AGENTS.md). debian:bookworm-slim still ships apt/apt-get/dpkg on PATH, so
 # replace /usr/bin, /usr/sbin, /usr/local/bin, and /usr/local/sbin outright

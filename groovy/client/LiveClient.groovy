@@ -168,7 +168,7 @@ final class LiveClient implements AutoCloseable {
       .buildAsync(endpoint, listener)
     pendingConnect = candidate
 
-    handshakeDeadline = owner.schedule({
+    handshakeDeadline = owner.schedule(guarded {
       if (pendingConnect == candidate) {
         candidate.cancel(true)
         pendingConnect = null
@@ -176,7 +176,7 @@ final class LiveClient implements AutoCloseable {
         lastCloseReason = 'HandshakeTimeout'
         scheduleReconnect()
       }
-    } as Runnable, HANDSHAKE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+    }, HANDSHAKE_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
 
     candidate.whenComplete { WebSocket connected, Throwable error ->
       enqueueOwner {
@@ -719,12 +719,12 @@ final class LiveClient implements AutoCloseable {
     long delay = reconnectBackoffMs
     reconnectBackoffMs = Math.min(MAX_BACKOFF_MS, reconnectBackoffMs * 2L)
     reconnectScheduled = true
-    owner.schedule({
+    owner.schedule(guarded {
       reconnectScheduled = false
       if (!closed && socket == null && pendingConnect == null && !subscriptions.isEmpty()) {
         startConnect()
       }
-    } as Runnable, delay, TimeUnit.MILLISECONDS)
+    }, delay, TimeUnit.MILLISECONDS)
   }
 
   private void cancelReconnect() {
@@ -784,10 +784,37 @@ final class LiveClient implements AutoCloseable {
 
   private void enqueueOwner(Closure<?> action) {
     try {
-      owner.execute { action.call() }
+      owner.execute(guarded(action))
     } catch (java.util.concurrent.RejectedExecutionException ignored) {
       // Shutdown invalidates late listener callbacks.
     }
+  }
+
+  // owner is a ScheduledExecutorService: every task it runs, even one
+  // submitted through plain execute(), is wrapped in a FutureTask, and
+  // FutureTask.run() catches and stores whatever the task throws instead of
+  // ever surfacing it. A fire-and-forget callback here (drainIncoming, the
+  // handshake deadline, the reconnect timer) that throws would otherwise die
+  // completely silently, mid-handshake or mid-delivery, on a connection
+  // nobody retired - every waiting subscriber then just times out with no
+  // trace of why. Route each such callback through this wrapper so a crash
+  // is at least printed and, while the client is still open, handled like
+  // any other transport failure: broadcast to current subscriptions and
+  // retried, instead of wedging this client forever.
+  private Runnable guarded(Closure<?> body) {
+    { ->
+      try {
+        body.call()
+      } catch (Throwable error) {
+        System.err.println("convex-groovy-live: owner task failed: ${concise(error)}")
+        if (!closed) {
+          subscriptions.values().each {
+            it.offerTransition(new Update(null, asTransport(error), []))
+          }
+          retireConnection('OwnerTaskFailed:' + concise(error), true)
+        }
+      }
+    } as Runnable
   }
 
   private <T> T onOwner(Closure<T> action) {
