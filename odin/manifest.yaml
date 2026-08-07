@@ -4,5 +4,37 @@ displayName: "Odin"
 rank: 87
 selectionTier: curated_backfill
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native Odin protocol implementation using Odin's checked-in libcurl binding and a private, regression-tested connect-only pending-frame patch for ordinary HTTP, TLS, and WebSocket transport. Shared verification is pending, so capabilities remain unearned.
+toolchain:
+  name: Odin
+  version: dev-2026-08
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - The Docker test stage (build, the curl connect-only patch's own regression
+    test, unit tests, the example run, and the process-driven adapter
+    conformance script) passes on a remote builder for this source
+    checkpoint. Shared and hosted conformance have not been run, so no
+    capability is claimed and badges remain unearned.
+  - Live authentication, WebSocket mutations/actions, optimistic updates, and mutation replay are deferred.
+  - TransitionChunk assembly is deferred and treated as protocol drift that reconnects.
+  - Public values are bounded strict JSON text so callers choose their own Odin application type.
+  - Each subscription retains only its newest update; the adapter caps active subscriptions at 16 and its output queue at 16 records or 8 MiB.
+capabilities:
+  - http
+  - live
