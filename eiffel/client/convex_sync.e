@@ -76,6 +76,14 @@ feature -- Access
 			Result := attached connection as l_connection and then l_connection.has_pending_bytes
 		end
 
+	is_subscribed (a_subscription_id: STRING): BOOLEAN
+			-- Is `a_subscription_id' currently an active subscription?
+		require
+			a_subscription_id_attached: a_subscription_id /= Void
+		do
+			Result := subscription_to_query.has (a_subscription_id)
+		end
+
 	pending_events: ARRAYED_LIST [CONVEX_SYNC_EVENT]
 			-- Events produced by `poll' since the caller last drained this
 			-- list. The caller empties it after reading.
@@ -129,7 +137,7 @@ feature -- Subscriptions
 			-- rely on the next `ensure_connected' to establish it.
 		require
 			a_subscription_id_attached: a_subscription_id /= Void
-			not_already_subscribed: not subscription_to_query.has (a_subscription_id)
+			not_already_subscribed: not is_subscribed (a_subscription_id)
 			a_path_attached: a_path /= Void
 			a_args_attached: a_args /= Void
 		local
@@ -154,11 +162,11 @@ feature -- Subscriptions
 			-- Stop the reactive query behind `a_subscription_id'.
 		require
 			a_subscription_id_attached: a_subscription_id /= Void
-			is_subscribed: subscription_to_query.has (a_subscription_id)
+			already_subscribed: is_subscribed (a_subscription_id)
 		local
 			query_id: INTEGER
 		do
-			query_id := subscription_to_query.item (a_subscription_id)
+			query_id := subscription_to_query.definite_item (a_subscription_id)
 			if is_connected then
 				Result := send_modify_query_set (<<remove_modification (query_id)>>)
 			else
@@ -321,9 +329,9 @@ feature {NONE} -- Message construction
 			ignored_result: BOOLEAN
 		do
 			create modifications.make (query_path.count)
-			across query_path as entry
+			across query_path.current_keys as key_cursor
 			loop
-				modifications.extend (add_modification (entry.key, entry.item, query_args.item (entry.key)))
+				modifications.extend (add_modification (key_cursor.item, query_path.definite_item (key_cursor.item), query_args.definite_item (key_cursor.item)))
 			end
 			if not modifications.is_empty then
 				ignored_result := send_modify_query_set (modifications.to_array)
@@ -391,7 +399,7 @@ feature {NONE} -- Server message handling
 			subscription_id: STRING
 			data: detachable CONVEX_JSON_VALUE
 		do
-			subscription_id := query_to_subscription.item (a_query_id)
+			subscription_id := query_to_subscription.definite_item (a_query_id)
 			if a_kind.is_equal ("QueryUpdated") and then a_modification.has_field ("value") then
 				pending_events.extend (create {CONVEX_SYNC_EVENT}.make_value (subscription_id, a_modification.field ("value")))
 			elseif a_kind.is_equal ("QueryFailed") and then a_modification.has_field ("errorMessage")
