@@ -1,6 +1,5 @@
 with Ada.Characters.Handling;
 with Ada.Exceptions;
-with Ada.Real_Time;
 with Ada.Strings;
 with Ada.Strings.Fixed;
 with Ada.Unchecked_Deallocation;

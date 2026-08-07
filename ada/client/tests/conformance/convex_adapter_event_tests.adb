@@ -293,10 +293,12 @@ begin
    --  The output ceiling has to cover a schema-valid Live value at the
    --  client's message ceiling. Before this was reconciled, a value between
    --  two and four megabytes raised out of the adapter's main loop and killed
-   --  the process instead of reaching the controller at all.
-   Check
-     (Output_Limit >= Convex_WebSocket.Max_Message_Bytes,
-      "the adapter output ceiling is below the Live message ceiling");
+   --  the process instead of reaching the controller at all. Both bounds are
+   --  static, so convex_adapter.adb enforces this with a
+   --  pragma Compile_Time_Error rather than a runtime Check here: with
+   --  today's values the comparison is unconditionally true, and GNAT
+   --  rightly flags a runtime assertion of a compile-time-proven fact as
+   --  dead code once warnings are enabled.
 
    declare
       Ceiling_Value : constant String_Access :=

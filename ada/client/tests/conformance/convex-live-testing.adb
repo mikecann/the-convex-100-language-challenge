@@ -1,5 +1,3 @@
-with Ada.Strings.Unbounded;
-
 package body Convex.Live.Testing is
    procedure Abort_Manager (M : in out Manager) is
    begin
