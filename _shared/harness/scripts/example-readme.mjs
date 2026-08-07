@@ -27,6 +27,7 @@ const fenceLanguages = {
   ".dart": "dart",
   ".d": "d",
   ".e": "eiffel",
+  ".el": "emacs-lisp",
   ".elm": "elm",
   ".erl": "erlang",
   ".ex": "elixir",
