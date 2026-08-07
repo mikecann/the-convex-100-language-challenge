@@ -1,7 +1,7 @@
 schemaVersion: 1
-id: solidity
-displayName: "Solidity"
-rank: 41
+id: oz
+displayName: "Oz"
+rank: 52
 selectionTier: ranked
 implementation:
   status: planned

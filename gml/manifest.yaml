@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: gml
-displayName: "GML"
-rank: 52
-selectionTier: ranked
-implementation:
-  status: planned
-capabilities: []

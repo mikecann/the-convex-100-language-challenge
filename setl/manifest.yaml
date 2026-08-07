@@ -1,6 +1,6 @@
 schemaVersion: 1
-id: wolfram-language
-displayName: "Wolfram Language"
+id: setl
+displayName: "SETL"
 rank: 45
 selectionTier: ranked
 implementation:
