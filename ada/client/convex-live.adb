@@ -1,5 +1,6 @@
 with Ada.Exceptions;
 with Ada.Real_Time;
+with Ada.Unchecked_Deallocation;
 with Convex_WebSocket;
 with GNATCOLL.Random;
 with Interfaces;
@@ -10,6 +11,9 @@ package body Convex.Live is
    use type Interfaces.Unsigned_32;
    use type JSON.JSON_Value_Type;
    use type US.Unbounded_String;
+
+   procedure Free_Owner is new
+     Ada.Unchecked_Deallocation (Owner_Task, Owner_Access);
 
    Initial_Timestamp : constant String := "AAAAAAAAAAA=";
    Max_Subscriptions : constant := 64;
@@ -252,7 +256,14 @@ package body Convex.Live is
          Queue_Count := Queue_Count - 1;
       end Drop_Oldest;
 
-      function Charge (Item : Update) return Natural is
+      --  Value_Length lets a caller that already serialized Item.Value (to
+      --  compare it against the subscription's last-published signature)
+      --  pass that length through, instead of Charge repeating an identical
+      --  JSON.Write of a value that can approach the 4 MiB message ceiling.
+      --  0 means "not supplied"; JSON.Write never produces an empty string.
+      function Charge
+        (Item : Update; Value_Length : Natural := 0) return Natural
+      is
          Encoded : Natural := Envelope_Charge;
          function Encoded_Length (Value : JSON.JSON_Value) return Natural is
             Text : constant String := JSON.Write (Value);
@@ -261,7 +272,11 @@ package body Convex.Live is
          end Encoded_Length;
       begin
          if Item.Has_Value then
-            Encoded := Encoded + Encoded_Length (Item.Value);
+            Encoded :=
+              Encoded
+              + (if Value_Length > 0
+                 then Value_Length
+                 else Encoded_Length (Item.Value));
          end if;
          if Item.Has_Error then
             Encoded := Encoded + US.Length (Item.Error.Message);
@@ -275,8 +290,10 @@ package body Convex.Live is
          return Natural'Min (Queue_Budget, Encoded * 4);
       end Charge;
 
-      procedure Enqueue (Index : Positive; Item : Update) is
-         Needed : constant Natural := Charge (Item);
+      procedure Enqueue
+        (Index : Positive; Item : Update; Value_Length : Natural := 0)
+      is
+         Needed : constant Natural := Charge (Item, Value_Length);
          Last   : Positive;
       begin
          while Queue_Count > 0
@@ -670,7 +687,10 @@ package body Convex.Live is
                   then
                      Subs (Chosen).Has_Last := True;
                      Subs (Chosen).Last_Value := Pending (Chosen).Signature;
-                     Enqueue (Chosen, Pending (Chosen).Item);
+                     Enqueue
+                       (Chosen,
+                        Pending (Chosen).Item,
+                        US.Length (Pending (Chosen).Signature));
                   end if;
                else
                   Subs (Chosen).Has_Last := False;
@@ -857,8 +877,17 @@ package body Convex.Live is
                         end;
                      end if;
                   end if;
+                  --  Route through Disconnect rather than shutting the
+                  --  socket down directly. A direct Shutdown left
+                  --  Connection_Active, Connection_Count, and
+                  --  Last_Close_Reason stale, so the next Establish
+                  --  incorrectly reported connectionCount 0 and
+                  --  InitialConnect for what is actually a later
+                  --  connection. Report => False: losing the last
+                  --  subscription is not itself a transport failure, and
+                  --  there is nothing left to broadcast it to.
                   if Active_Count = 0 then
-                     Convex_WebSocket.Shutdown (Socket);
+                     Disconnect ("no active subscriptions", Report => False);
                   end if;
                end;
             end Remove;
@@ -1022,6 +1051,71 @@ package body Convex.Live is
             end if;
          end select;
       end loop;
+   exception
+      when E : others =>
+         declare
+            Failure_Message : constant String :=
+              "Live owner task failed: "
+              & Ada.Exceptions.Exception_Message (E);
+         begin
+            --  An unhandled exception here would terminate this task, and
+            --  every later Manager entry call would then raise
+            --  Tasking_Error instead of a reportable Convex error. Stay
+            --  alive and answer every entry with a structured
+            --  TransportError until Stop releases it, so a caller always
+            --  gets a Convex.Live outcome rather than an unrelated
+            --  language-level exception.
+            loop
+               select
+                  accept Add
+                    (Path       : String;
+                     Args       : JSON.JSON_Value;
+                     Id         : out Natural;
+                     Generation : out Natural;
+                     Success    : out Boolean;
+                     Message    : out US.Unbounded_String)
+                  do
+                     pragma Unreferenced (Path, Args);
+                     Id := 0;
+                     Generation := 0;
+                     Success := False;
+                     Message := US.To_Unbounded_String (Failure_Message);
+                  end Add;
+               or
+                  accept Remove (Id, Generation : Natural) do
+                     pragma Unreferenced (Id, Generation);
+                     null;
+                  end Remove;
+               or
+                  accept Next
+                    (Id, Generation : Natural;
+                     Found          : out Boolean;
+                     Item           : out Update)
+                  do
+                     pragma Unreferenced (Id, Generation);
+                     Found := True;
+                     Item :=
+                       Error_Update (Convex.Transport_Error, Failure_Message);
+                  end Next;
+               or
+                  accept Release_Update (Token : Natural) do
+                     pragma Unreferenced (Token);
+                     null;
+                  end Release_Update;
+               or
+                  accept Disconnect
+                    (Success : out Boolean; Message : out US.Unbounded_String)
+                  do
+                     Success := False;
+                     Message := US.To_Unbounded_String (Failure_Message);
+                  end Disconnect;
+               or
+                  accept Stop do
+                     exit;
+                  end Stop;
+               end select;
+            end loop;
+         end;
    end Owner_Task;
 
    procedure Open (M : in out Manager; Deployment_URL : String) is
@@ -1054,6 +1148,16 @@ package body Convex.Live is
       if Success then
          Result := (Id => Id, Generation => Generation, Active => True);
       end if;
+   exception
+      --  The owner task's own top-level handler keeps it alive to answer
+      --  every entry, so Tasking_Error here means the task object itself is
+      --  gone (already Stop-ped and freed). Report it the same way a live
+      --  owner reports its own terminal failure rather than propagating a
+      --  language-level exception to an adapter that expects a Convex one.
+      when Tasking_Error =>
+         Success := False;
+         Message :=
+           US.To_Unbounded_String ("Live manager task is no longer available");
    end Subscribe;
 
    procedure Unsubscribe (M : in out Manager; Sub : in out Subscription) is
@@ -1062,6 +1166,9 @@ package body Convex.Live is
          M.Owner.Remove (Sub.Id, Sub.Generation);
       end if;
       Sub.Active := False;
+   exception
+      when Tasking_Error =>
+         Sub.Active := False;
    end Unsubscribe;
 
    procedure Try_Next
@@ -1076,6 +1183,13 @@ package body Convex.Live is
          return;
       end if;
       M.Owner.Next (Sub.Id, Sub.Generation, Found, Item);
+   exception
+      when Tasking_Error =>
+         Found := True;
+         Item :=
+           Error_Update
+             (Convex.Transport_Error,
+              "Live manager task is no longer available");
    end Try_Next;
 
    procedure Release (M : in out Manager; Item : in out Update) is
@@ -1084,14 +1198,31 @@ package body Convex.Live is
          M.Owner.Release_Update (Item.Token);
       end if;
       Item.Token := 0;
+   exception
+      when Tasking_Error =>
+         Item.Token := 0;
    end Release;
 
    procedure Close (M : in out Manager) is
    begin
       if M.Opened and then M.Owner /= null then
          M.Owner.Stop;
+         --  Unchecked_Deallocation requires a terminated task. The Stop
+         --  rendezvous above only guarantees its accept body ran, not that
+         --  the task's own activation has finished unwinding, so wait for
+         --  that before freeing the object it names.
+         while not M.Owner.all'Terminated loop
+            delay 0.001;
+         end loop;
+         Free_Owner (M.Owner);
       end if;
       M.Opened := False;
+   exception
+      when Tasking_Error =>
+         if M.Owner /= null and then M.Owner.all'Terminated then
+            Free_Owner (M.Owner);
+         end if;
+         M.Opened := False;
    end Close;
 
    function Is_Active (Sub : Subscription) return Boolean
