@@ -6,7 +6,7 @@ NB. that the Live subscription reported the same change without polling.
 NB.
 NB. Run it with:  CONVEX_URL=https://<deployment>.convex.cloud convex-example <room>
 
-load '/opt/convex/client/live.ijs'
+load '/project/client/live.ijs'
 
 NB. Convex returns the room state as a JSON object. This narrows it to the
 NB. non-negative integer the output contract needs, and refuses anything

@@ -103,7 +103,7 @@ RUN printf '%s\n' \
 # symlink never gets staged without the real file behind it.
 # ---------------------------------------------------------------------------
 RUN set -eu; \
-    mkdir -p /staging/opt/convex/client /staging/opt/convex/lib \
+    mkdir -p /staging/project/client /staging/opt/convex/lib \
              /staging/usr/local/bin /staging/usr/bin /staging/bin \
              /staging/etc/ssl/certs /staging/usr/lib/x86_64-linux-gnu/ossl-modules; \
     cp -a /src/jlibrary /staging/opt/convex/jlibrary; \
@@ -134,7 +134,7 @@ RUN set -eu; \
           done; \
     done; \
     cp -a client/json.ijs client/transport.ijs client/convex.ijs client/websocket.ijs client/live.ijs \
-       /staging/opt/convex/client/; \
+       /staging/project/client/; \
     for object in /staging/opt/convex/jlibrary/bin/jconsole \
                   /staging/opt/convex/jlibrary/bin/libj.so \
                   /staging/opt/convex/jlibrary/bin/libtsdll.so \
@@ -145,9 +145,16 @@ RUN set -eu; \
     done
 
 # Entry points. Each one is a two line launcher for the exact checked-in J
-# program. AWKPATH-style path resolution does not exist in J, so `load`
-# inside each client file uses the fixed /opt/convex/client path staged
-# above -- these launchers only need to name the entry script itself.
+# program. AWKPATH/LUA_PATH-style search-path resolution does not exist in
+# J -- `load` takes a literal string, so every client file's own load of a
+# sibling module is the same hardcoded /project/client/whatever.ijs that
+# already has to be true in the test stage (WORKDIR /project, client copied
+# beneath it). Staging the runtime closure at that identical absolute path,
+# rather than the more conventional /opt/convex/client, is what lets every
+# client .ijs file work unmodified in both places; the one file that named
+# /opt/convex/client directly (examples/basics/main.ijs, which is not
+# itself loaded by anything and so had no reason to match) is the one file
+# that was fixed instead.
 #
 # These go into per-image trees rather than into the shared /staging
 # closure. runtime-base is the common ancestor of both leaf images, so
@@ -162,7 +169,7 @@ RUN mkdir -p /staging-example/usr/local/bin /staging-adapter/usr/local/bin \
       > /staging-example/usr/local/bin/convex-example \
     && printf '%s\n' \
       '#!/bin/sh' \
-      'exec /opt/convex/jlibrary/bin/jconsole /opt/convex/client/tests/conformance/adapter.ijs "$@"' \
+      'exec /opt/convex/jlibrary/bin/jconsole /project/client/tests/conformance/adapter.ijs "$@"' \
       > /staging-adapter/usr/local/bin/convex-adapter \
     && chmod 0555 /staging-example/usr/local/bin/convex-example \
        /staging-adapter/usr/local/bin/convex-adapter
@@ -243,7 +250,7 @@ RUN test "$(printf 'echo 3+4\n' | /opt/convex/jlibrary/bin/jconsole /dev/stdin)"
 # (invalid inflection)"), which is why every test file's checks live inside
 # a 3 : 0 main, never bare at script scope. This probe needs the same shape.
 RUN printf '%s\n' \
-      "load '/opt/convex/client/transport.ijs'" \
+      "load '/project/client/transport.ijs'" \
       'tls_probe=: 3 : 0' \
       "result=. ('example.com';443;1) tx_connect 15000" \
       "status=. > 0 { result" \
@@ -281,14 +288,14 @@ COPY --from=test /project/examples/basics/main.ijs /opt/convex/examples/basics/m
 RUN set -eux; \
     test -x /usr/local/bin/convex-example; \
     test ! -e /usr/local/bin/convex-adapter; \
-    test ! -e /opt/convex/client/tests
+    test ! -e /project/client/tests
 ENTRYPOINT ["/usr/local/bin/convex-example"]
 
 # ---------------------------------------------------------------------------
 # Keep the adapter last: `./run build j` uses the default target.
 FROM runtime-base AS runtime
 COPY --from=test /staging-adapter /
-COPY --from=test /project/client/tests/conformance/adapter.ijs /opt/convex/client/tests/conformance/adapter.ijs
+COPY --from=test /project/client/tests/conformance/adapter.ijs /project/client/tests/conformance/adapter.ijs
 RUN set -eux; \
     test -x /usr/local/bin/convex-adapter; \
     test ! -e /usr/local/bin/convex-example; \
