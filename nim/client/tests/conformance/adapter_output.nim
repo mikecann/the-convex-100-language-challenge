@@ -172,7 +172,8 @@ proc admit(queue: ptr OutputQueue; item: OutputItem): OutputResult {.gcsafe.} =
       (queue[].relayRecords >= adapterRelayMaxRecords or
       item.cost > adapterRelayMaxBytes - queue[].relayBytes):
     return outputBudgetExhausted
-  queue[].slots[int(queue[].writeIndex mod uint64(adapterOutputMaxRecords))] = item
+  queue[].slots[int(queue[].writeIndex mod uint64(
+      adapterOutputMaxRecords))] = item
   queue[].writeIndex.inc
   queue[].records.inc
   queue[].bytes += item.cost
@@ -231,7 +232,7 @@ proc invalidateRelay*(output: OutputProducer; subscriptionId: string;
     return outputFailed
   result = output.enqueue(item)
 
-proc tryPop(queue: ptr OutputQueue): tuple[available: bool,
+proc tryPop(queue: ptr OutputQueue): tuple[available: bool;
     item: OutputItem] {.gcsafe.} =
   ## Removes the oldest record from the ring but keeps its reservation, so an
   ## in-flight write still counts against the process-wide budget.
@@ -329,7 +330,8 @@ proc outputWriter(args: OutputWriterArgs) {.thread.} =
       of itemActivateRelay:
         activeRelays[subscriptionId] = received.item.generation
       of itemInvalidateRelay:
-        if activeRelays.getOrDefault(subscriptionId) == received.item.generation:
+        if activeRelays.getOrDefault(subscriptionId) ==
+            received.item.generation:
           activeRelays.del(subscriptionId)
       of itemEvent:
         let stale = received.item.generation != 0 and

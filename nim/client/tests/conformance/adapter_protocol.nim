@@ -30,7 +30,8 @@ proc commandInputLimitError*(): ref AdapterValidationError =
 proc validId(node: JsonNode): bool =
   not node.isNil and node.kind == JString and node.getStr.len in 1 .. maxAdapterIdBytes
 
-proc requireOnly(node: JsonNode; allowed: openArray[string]; commandId: string) =
+proc requireOnly(node: JsonNode; allowed: openArray[string];
+    commandId: string) =
   for key, _ in node.pairs:
     var found = false
     for candidate in allowed:

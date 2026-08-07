@@ -15,7 +15,8 @@ proc valueFrom(update: LiveUpdate): JsonNode =
   ## A QueryFailed update is an explicit failure, not a missing value.  The
   ## example stops rather than accidentally printing a successful transcript.
   if update.isError:
-    raise newException(ProtocolError, update.errorName & ": " & update.errorMessage)
+    raise newException(ProtocolError, update.errorName & ": " &
+        update.errorMessage)
   parseJson(update.value)
 
 proc main() =

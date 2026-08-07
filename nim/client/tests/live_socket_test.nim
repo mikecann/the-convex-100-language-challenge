@@ -146,8 +146,8 @@ proc waitForRemoveOrClose(peer: Socket) =
   while true:
     try:
       let message = receiveClientJson(peer)
-      if message.hasKey("type") and message["type"].getStr == "ModifyQuerySet" and
-          message["modifications"][0]["type"].getStr == "Remove":
+      if message.hasKey("type") and message["type"].getStr ==
+          "ModifyQuerySet" andmessage["modifications"][0]["type"].getStr == "Remove":
         return
     except CatchableError:
       return
@@ -294,7 +294,8 @@ proc partialPayload(queryId, count: int): string =
   ])
 
 proc sendHalfFrame(peer: Socket; payload: string) =
-  peer.send(frameHeader(true, 1, payload.len) & payload[0 ..< payload.len div 2])
+  peer.send(frameHeader(true, 1, payload.len) & payload[0 ..<
+      payload.len div 2])
 
 proc partialCloseFixture(listener: Socket; args: FixtureArgs) =
   let peer = acceptWebSocket(listener)
@@ -426,7 +427,8 @@ proc finishFixture(fixture: var Fixture) =
 
 proc liveCount(update: LiveUpdate): int =
   if update.isError:
-    raise newException(ValueError, update.errorName & ": " & update.errorMessage)
+    raise newException(ValueError, update.errorName & ": " &
+        update.errorMessage)
   result = parseJson(update.value)["count"].getInt
 
 suite "Nim real-socket Live owner":
@@ -501,7 +503,8 @@ suite "Nim real-socket Live owner":
   test "a half-frame deadline emits TransportError and reconnects":
     var fixture = startFixture(fixturePartialRecovery)
     let client = newClient("http://127.0.0.1:" & $fixture.port)
-    let subscription = client.subscribe("demo:state", %*{"room": "partial-recovery"})
+    let subscription = client.subscribe("demo:state", %*{
+        "room": "partial-recovery"})
     discard fixture.ready[].recv()
     let failed = subscription.nextUpdate()
     check failed.isError

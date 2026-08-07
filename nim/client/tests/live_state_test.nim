@@ -52,7 +52,7 @@ suite "Nim Live transition transaction":
       wrongLogs).accepted
     let badId = transition(oneTimestamp,
       parseJson("[{\"type\":\"QueryUpdated\",\"queryId\":4294967296," &
-        "\"value\":0,\"logLines\":[]}]") )
+        "\"value\":0,\"logLines\":[]}]"))
     check not probeTransition("{\"count\":0}", zeroTimestamp, badId).accepted
 
   test "unexpected fields and malformed version shapes commit nothing":

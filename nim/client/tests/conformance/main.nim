@@ -40,7 +40,8 @@ proc sharedAtomic(initial: bool): ptr Atomic[bool] =
   result[].store(initial)
 
 proc enqueueNode(output: OutputProducer; node: JsonNode; id = "";
-    subscriptionId = ""; generation: uint64 = 0; relayData = false): bool {.gcsafe.} =
+    subscriptionId = ""; generation: uint64 = 0;
+        relayData = false): bool {.gcsafe.} =
   let encoded = $node & "\n"
   let outcome = output.enqueueEvent(encoded, subscriptionId, generation, relayData)
   if outcome == outputAccepted:
@@ -223,7 +224,8 @@ proc ensureClient(client: var Client): Client =
     client = newClient(deployment, getEnv("CONVEX_AUTH_TOKEN"))
   result = client
 
-proc runAdapter(controller: Socket; outputDescriptor: cint; socketOutput: bool) =
+proc runAdapter(controller: Socket; outputDescriptor: cint;
+    socketOutput: bool) =
   let output = newAdapterOutput(outputDescriptor, socketOutput)
   let producer = output.producer
   var client: Client

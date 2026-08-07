@@ -101,8 +101,8 @@ proc stormProducer(args: StormArgs) {.thread.} =
       discard args.unexpected[].fetchAdd(1)
 
 proc startPausedRelay(output: OutputProducer; caseId: int;
-    generation: uint64): tuple[worker: ptr Thread[PausedRelayArgs],
-    resume: ptr Channel[bool], result: ptr Channel[OutputResult]] =
+    generation: uint64): tuple[worker: ptr Thread[PausedRelayArgs];
+    resume: ptr Channel[bool]; result: ptr Channel[OutputResult]] =
   let dequeued = sharedChannel[bool](1)
   result.resume = sharedChannel[bool](1)
   result.result = sharedChannel[OutputResult](1)
