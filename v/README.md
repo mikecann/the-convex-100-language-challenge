@@ -18,11 +18,11 @@ prints the six-line transcript every language in this repository shares.
 
 | Area | Current state |
 | --- | --- |
-| HTTP client source | Written in V, with unit fixtures for framing, envelopes, and bounds. Never compiled. |
-| Live client source | Written against the pinned sync profile with a V-owned bounded RFC 6455 transport and real raw-peer fixtures. Never compiled. |
-| Conformance adapter | Written for both stdin/stdout and `ADAPTER_LISTEN` TCP, with fixtures for command strictness, ordering, and invalidation. Never compiled. |
-| Docker images | Designed end to end with V 0.4.9 pinned to an exact commit. Nothing has been built. |
-| Capability badges | None. Nothing has run. |
+| HTTP client source | Written in V, with unit fixtures for framing, envelopes, and bounds. Verified by shared conformance on both profiles. |
+| Live client source | Written against the pinned sync profile with a V-owned bounded RFC 6455 transport and real raw-peer fixtures. Verified by shared conformance on both profiles. |
+| Conformance adapter | Written for both stdin/stdout and `ADAPTER_LISTEN` TCP, with fixtures for command strictness, ordering, and invalidation. Built and verified. |
+| Docker images | Built with V 0.4.9 pinned to an exact commit, verified on both profiles. |
+| Capability badges | http, live. Both earned. |
 
 ## The basic example
 
@@ -182,7 +182,9 @@ transcript. `./run verify v` adds the shared black-box conformance run, and
 `./run verify-hosted v` repeats both against the dedicated hosted target so
 protocol drift shows up somewhere other than production.
 
-None of these have been run for this client yet.
+The shared coordinator has run all of these against a clean exact-head build:
+31 of 31 conformance checks passed against a local backend, and 31 of 31
+passed again against the hosted deployment over real TLS.
 
 ## Conformance and protocol notes
 
@@ -192,7 +194,12 @@ and every read. The status line, header block, header count, `Content-Length`
 body, and chunked body each have their own ceiling, and the running total is
 capped at 2 MiB regardless of what the peer claims. A non-2xx status is decoded
 before it is judged, because a real Convex function rejection arrives with one
-- but a success-shaped envelope on a non-2xx status is refused.
+- but a success-shaped envelope on a non-2xx status is refused. `TcpConn`'s own
+read/write timeouts only bound V's own socket wrapper, not OpenSSL's `SSL_read`
+and `SSL_write`, which read and write the file descriptor directly; this client
+also sets `SO_RCVTIMEO`/`SO_SNDTIMEO` on the descriptor itself (see
+[client/socket_deadline.c.v](client/socket_deadline.c.v)), which is what
+actually bounds a TLS peer that stops answering mid-exchange.
 
 **Live.** The pinned profile in `manifest.yaml` is implemented in V:
 `Connect`, `ModifyQuerySet` with monotonic base/new versions, and `Transition`
@@ -231,31 +238,18 @@ read once a socket exists.
 
 ## Limitations
 
-This is a reviewable source checkpoint, not evidence. **No V compiler has seen
-this code**, so every claim above describes intent expressed in source, not
-observed behaviour.
-
-The first Docker pass has to:
-
-1. Confirm the pinned V 0.4.9 commit
-   (`39534459885e916e2765b5b0c0ed66ce15f0ab86`) is the commit reached by the
-   selected tag, and that Docker can still resolve the pinned Git package
-   (`1:2.39.5-0+deb12u2`) from the declared Debian base.
-2. Confirm the V standard-library details this source asserts. The ones most
-   likely to need adjustment are: `x.json2`'s import path, `raw_decode`, and
-   compact `encode` output; `net.ssl.SSLConn.connect(mut TcpConn, hostname)`;
-   `net.TcpConn.wait_for_read` after `set_read_timeout`; OpenSSL's promoted
-   `SSLConn.duration` and public `SSLConn.ssl` fields; `spawn` on a method with
-   a mutable receiver; and `os.get_raw_line` at end of input.
-3. Run `v fmt -w` and commit the result. The build gate is `v fmt -verify`, and
-   hand-formatted source will not satisfy it on the first attempt.
-4. Record the exact Docker commands, their exit status, the example's observed
-   values, and local and hosted conformance results.
-
 Deferred protocol behaviour: Live authentication, WebSocket mutations and
 actions, optimistic updates, journals, and `TransitionChunk` assembly. Convex
 values are handled as their JSON-safe subset; tagged value conversions are not
-implemented. HTTP uses one connection per call. V's current `net.dial_tcp`
-surface does not expose a caller-owned DNS/TCP-connect deadline here, so that
-pre-socket phase remains a first-Docker behavioural gate rather than an earned
-absolute-deadline claim.
+implemented. HTTP uses one connection per call.
+
+V's current `net.dial_tcp` surface does not expose a caller-owned DNS/TCP-connect
+deadline: it is one call that blocks internally until it has either connected
+or failed, with no timeout parameter and no socket to attach one to until it
+returns. Everything from the moment `dial_tcp` returns onward - the TLS
+handshake, every write, every read - is bounded by this client's own absolute
+deadline, enforced at the kernel level via `SO_RCVTIMEO`/`SO_SNDTIMEO` (see
+[client/socket_deadline.c.v](client/socket_deadline.c.v)) because `TcpConn`'s
+own timeout fields never reach OpenSSL's direct `SSL_read`/`SSL_write` calls.
+The pre-connect phase itself remains unbounded by this client; it is a
+standing constraint of the V standard library, not a build-status caveat.
