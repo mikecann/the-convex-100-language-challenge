@@ -616,6 +616,23 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- Ballerina's platform betrayed it twice, in two different libraries. The known
+  defect was `ballerina/websocket` corrupting multi-byte UTF-8 split across a
+  continuation frame, fixed by not using it — hand-rolled RFC 6455 over a raw
+  socket, the same route a dozen clients here already take. The second was
+  found only by testing against the real hosted deployment: **`ballerina/tcp`'s
+  TLS client never sends SNI.** That was confirmed by disassembling the
+  library's own native jar and seeing it call Netty's single-argument
+  `SslContext.newHandler(ByteBufAllocator)` rather than the host-aware
+  overload. Convex's hosted deployment sits behind Cloudflare, which requires
+  SNI, so every handshake died with a fatal alert. `ballerina/http` is
+  unaffected, because its Netty wiring does pass the host through — the same
+  runtime, two TLS paths, one of them wrong.
+- The fixture was too polite again, in a new way. Ballerina's handshake reader
+  decoded its whole read buffer as UTF-8 looking for the end of the HTTP
+  headers. That works until a server pipelines its first binary frame straight
+  after the `101` response — which the real backend does and no local fixture
+  ever did. Every local test passed; the first real connection failed.
 - EiffelStudio miscompiles its own output past a certain size. Bundle enough
   classes with inline-C bodies into one translation unit and the generated
   C file comes out one `#include` short, so gcc reports the last class's
