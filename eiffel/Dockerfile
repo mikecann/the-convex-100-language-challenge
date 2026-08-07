@@ -119,27 +119,24 @@ RUN set -eu; \
         /usr/bin/tr /usr/bin/true /usr/bin/uname /usr/bin/uniq /usr/bin/wc; do \
       test -e "$command_path" || { echo "missing expected command: $command_path" >&2; exit 1; }; \
     done; \
-    runtime_libs=/usr/lib/x86_64-linux-gnu.runtime; \
-    mkdir -p "$runtime_libs"; \
     for executable in /tmp/convex-adapter /tmp/convex-example \
         /usr/bin/mawk /usr/bin/basename /usr/bin/cat /usr/bin/cut /usr/bin/dash \
         /usr/bin/dirname /usr/bin/env /usr/bin/find /usr/bin/grep /usr/bin/head \
         /usr/bin/id /usr/bin/sed /usr/bin/sort /usr/bin/tail /usr/bin/tr \
-        /usr/bin/true /usr/bin/uname /usr/bin/uniq /usr/bin/wc; do \
+        /usr/bin/true /usr/bin/uname /usr/bin/uniq /usr/bin/wc /bin/sh; do \
       ldd "$executable" | awk '{ for (field = 1; field <= NF; field++) if ($field ~ /^\//) print $field }'; \
-    done | sort -u > /tmp/runtime-library-paths; \
-    while IFS= read -r library; do \
-      cp -L "$library" "$runtime_libs/$(basename "$library")"; \
-    done < /tmp/runtime-library-paths; \
+    done | sort -u > /tmp/keep-library-paths; \
     for library in libnss_dns.so.2 libnss_files.so.2; do \
       if test -e "/usr/lib/x86_64-linux-gnu/$library"; then \
-        cp -L "/usr/lib/x86_64-linux-gnu/$library" "$runtime_libs/$library"; \
+        printf '%s\n' "/usr/lib/x86_64-linux-gnu/$library" >> /tmp/keep-library-paths; \
       fi; \
     done; \
-    cp -a /usr/lib/x86_64-linux-gnu/ossl-modules "$runtime_libs/ossl-modules"; \
-    rm -rf /usr/lib/x86_64-linux-gnu; \
-    cp -a "$runtime_libs" /usr/lib/x86_64-linux-gnu; \
-    rm -rf "$runtime_libs"
+    printf '%s\n' /usr/lib/x86_64-linux-gnu/ossl-modules >> /tmp/keep-library-paths; \
+    find /usr/lib/x86_64-linux-gnu -mindepth 1 -maxdepth 1 -print > /tmp/all-library-paths; \
+    while IFS= read -r path; do \
+      if ! grep -Fqx "$path" /tmp/keep-library-paths; then rm -rf "$path"; fi; \
+    done < /tmp/all-library-paths; \
+    rm -f /tmp/keep-library-paths /tmp/all-library-paths
 RUN set -eu; \
     rm -f /usr/bin/awk; ln -s mawk /usr/bin/awk; \
     find /usr/bin /usr/sbin -mindepth 1 -maxdepth 1 -print > /tmp/runtime-commands; \
