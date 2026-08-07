@@ -51,11 +51,21 @@ RUN set -eu; \
     # starts, that second half fails the moment it exists: "fbc: not
     # found", because ./bin/fbc exists by then but was never on PATH.
     export PATH="/tmp/fbc/bin:$PATH"; \
+    # Once the bootstrap fbc exists, the makefile invokes it as plain
+    # "fbc" with no include path of its own (ALLFBCFLAGS never adds one;
+    # confirmed by reading makefile's FBC/ALLFBCFLAGS definitions), so
+    # compiling the compiler's own .bas sources -- which #include their
+    # own file.bi, err.bi, and friends from the source tree's top-level
+    # inc/ -- fails immediately with "file.bi: File not found" unless
+    # FBFLAGS supplies -i inc. This has to be passed to every make
+    # invocation that (re)compiles those .bas sources, not just the
+    # first: install-compiler recompiles them again with its own flag
+    # resolution rather than reusing bootstrap-minimal's objects. \
     # The client is console-only. bootstrap-minimal deliberately omits the \
     # optional X11/GPM/libffi surface, then installs only the compiler, headers, \
     # and thread-safe runtime instead of building the unused graphics library. \
-    make -j1 bootstrap-minimal; \
-    make install-compiler install-includes install-rtlib prefix=/usr/local; \
+    make -j1 bootstrap-minimal FBFLAGS="-i inc"; \
+    make install-compiler install-includes install-rtlib prefix=/usr/local FBFLAGS="-i inc"; \
     fbc --version
 
 # ---------------------------------------------------------------------------
