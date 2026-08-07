@@ -238,14 +238,21 @@ RUN test "$(printf 'echo 3+4\n' | /opt/convex/jlibrary/bin/jconsole /dev/stdin)"
 # verification time. This exercises the exact 15!:0 bindings transport.ijs
 # declares, straight through to a real handshake and certificate
 # verification against a live host, using the shipped trust store.
+# if./do./end. only parses inside an explicit definition -- J's control
+# words are rejected at top-level immediate execution ("spelling error: fn
+# (invalid inflection)"), which is why every test file's checks live inside
+# a 3 : 0 main, never bare at script scope. This probe needs the same shape.
 RUN printf '%s\n' \
       "load '/opt/convex/client/transport.ijs'" \
+      'tls_probe=: 3 : 0' \
       "result=. ('example.com';443;1) tx_connect 15000" \
       "status=. > 0 { result" \
       "conn=. > 1 { result" \
       "if. status ~: TX_IO_OK do. echo 'TLS probe failed, status ', (\": status) [ exit 1 end." \
       'tx_close conn' \
       "echo 'TLS probe ok'" \
+      ')' \
+      "tls_probe ''" \
       'exit 0' \
     | /opt/convex/jlibrary/bin/jconsole /dev/stdin \
     | tee /tmp/tls-probe.out \
