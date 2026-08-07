@@ -22,7 +22,7 @@ Nothing in this checkpoint has been compiled or run: the source is complete, but
 | Live authentication, WebSocket mutations, optimistic updates | Not implemented |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.lean -->
-```text
+```lean
 /-
 The canonical Convex-from-Lean example.
 

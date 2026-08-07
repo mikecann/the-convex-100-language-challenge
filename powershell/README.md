@@ -17,7 +17,7 @@ The [canonical basic example](examples/basics/main.ps1) makes the counter's `0 -
 | Capability badges | http, live — awarded by the shared evaluator from clean exact-head local and hosted runs |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.ps1 -->
-```text
+```powershell
 #!/usr/bin/pwsh
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot '../../client/Convex.ps1')

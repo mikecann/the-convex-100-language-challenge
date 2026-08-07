@@ -50,7 +50,7 @@ empty until that suite says so.
 ## The canonical example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.fth -->
-```text
+```forth
 \ Convex from Forth: read a shared counter over HTTP, watch it over Live, and
 \ prove a mutation arrives on both. Against a fresh room the journey is 0 -> 1.
 
@@ -59,7 +59,7 @@ require convex.fth
 \ json-get returns only the child index, so this keeps the document beside it
 \ and lets the example walk into a nested field without losing its place.
 : example-field ( doc node key-addr key-u -- doc node )
-    {: doc node key-addr key-count :}
+    { doc node key-addr key-count }
     doc  doc node key-addr key-count json-get ;
 
 \ Convex's demo functions return a record. This narrows one to the single field
@@ -97,7 +97,7 @@ require convex.fth
 \ exact bytes Convex sent, so it goes through the same strict reader as an HTTP
 \ response instead of a looser Live-only path.
 : example-live-value ( client sub what-addr what-u -- doc node )
-    {: client sub what-addr what-count | kind :}
+    0 { client sub what-addr what-count kind }
     client sub example-live-timeout convex-live-wait to kind
     kind convex-live-none = if
         what-addr what-count note
@@ -115,7 +115,7 @@ variable example-client
 variable example-subscription
 
 : example-run ( -- )
-    {: | client subscription current initial expected applied count :}
+    0 0 0 0 0 0 0 { client subscription current initial expected applied count }
     \ Configure one client for the deployment this container was given.
     s" CONVEX_URL" getenv dup 0= if
         2drop s" CONVEX_URL is required" example-give-up
@@ -190,15 +190,22 @@ variable example-subscription
 
 -1 example-subscription !
 
-['] example-run catch ?dup if
-    cvx-adopt-fault
-    s" the Forth example failed" note-line
-    report-error
+\ IF and THEN are compile-only, so this catch/if/then dispatch has to live in
+\ a word instead of directly at top level. Tick compiled into a word body
+\ would parse a name from the input stream at run time and find none there;
+\ bracket-tick resolves the execution token during compilation instead.
+: example-main ( -- )
+    ['] example-run catch ?dup if
+        cvx-adopt-fault
+        s" the Forth example failed" note-line
+        report-error
+        example-cleanup
+        1 convex-exit
+    then
     example-cleanup
-    1 convex-exit
-then
-example-cleanup
-0 convex-exit
+    0 convex-exit ;
+
+example-main
 ```
 <!-- END GENERATED EXAMPLE -->
 

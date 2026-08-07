@@ -17,7 +17,7 @@ Read [`examples/basics/main.odin`](examples/basics/main.odin). It queries a fres
 ## Basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.odin -->
-```text
+```odin
 package main
 
 import convex "convex:."
