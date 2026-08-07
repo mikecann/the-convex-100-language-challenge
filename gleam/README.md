@@ -39,11 +39,11 @@ claimed.
 
 | Capability | State | Notes |
 | --- | --- | --- |
-| HTTP queries, mutations, actions | implemented, fresh verification pending | The repaired HTTP stream and parser paths need a new exact-head Docker run. |
-| Bearer token lifecycle | implemented, fresh verification pending | `convex.set_auth`, cleared by an empty string; unsafe header values are rejected. |
-| Live subscriptions | implemented, fresh verification pending | Deterministic fixtures cover values, errors, delayed removal, close handshakes, reconnect, and bounded delivery. |
-| Live reconnect and resend | implemented, fresh verification pending | The session identifier stays stable and active queries are rebuilt after reconnect. |
-| Earned capability badges | none | Badges come only from shared local and hosted evidence runs. |
+| HTTP queries, mutations, actions | verified | Shared local and hosted conformance passed from a clean exact-head build. |
+| Bearer token lifecycle | verified | `convex.set_auth`, cleared by an empty string; unsafe header values are rejected. |
+| Live subscriptions | verified | Deterministic fixtures cover values, errors, delayed removal, close handshakes, reconnect, and bounded delivery. |
+| Live reconnect and resend | verified | The session identifier stays stable and active queries are rebuilt after reconnect. |
+| Earned capability badges | http, live | Awarded by the shared result evaluator from local and hosted runs at this exact head. |
 
 ## The canonical example
 
@@ -300,9 +300,9 @@ message if it cannot finish within three seconds.
 
 ## Limitations
 
-* The shared local and hosted black-box conformance runs have not yet happened.
-  Fresh Docker and approved-local-backend checks are also pending for this
-  repaired source, so the manifest keeps its capability list empty.
+* The shared local and hosted black-box conformance runs passed from clean
+  exact-head builds of this source (31/31 checks on both profiles), and the
+  manifest capability list records the evaluator's award.
 * `client/manifest.toml` records the exact Hex package versions and content
   hashes used by the Docker build. Both the Gleam builder and Alpine runtime
   bases are digest-pinned.

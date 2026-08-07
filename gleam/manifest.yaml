@@ -35,10 +35,10 @@ adapter:
     - debugDisconnect
 limitations:
   - >-
-    A previous rejected checkpoint passed Docker checks, but the repaired source
-    has not yet been rebuilt. Language-local Docker, final-image policy, TLS,
-    canonical example, and shared local and hosted black-box conformance all
-    need fresh exact-head evidence, so capabilities remain deliberately empty.
+    Language-local Docker tests, final-image policy, the canonical example, and
+    shared local and hosted black-box conformance all passed from clean
+    exact-head builds of this repaired source; the capability list reflects the
+    shared result evaluator's award from those runs.
   - >-
     The checked-in final-adapter pressure gate exercises stopped TCP output,
     near-limit string and numeric NDJSON, near-limit WebSocket messages, bounded
@@ -83,4 +83,6 @@ limitations:
     another and polls its command mailbox between reads. A write can wait up
     to 200 ms behind an idle read. Frame parsing state lives in the owner, so
     that poll never restarts a partially read frame.
-capabilities: []
+capabilities:
+  - http
+  - live
