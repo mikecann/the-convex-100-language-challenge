@@ -122,6 +122,20 @@ RUN set -eu; \
     cp -a /usr/lib/x86_64-linux-gnu/ossl-modules "$runtime_libs/ossl-modules"
 # Perl is a build-stage pruner only. This single running process can replace
 # its own library directory without leaving Perl or package residue behind.
+#
+# The regular-file branch below used to open($to, '>') and stop there. Perl
+# creates a new file at mode 0666 minus umask -- buildkit's RUN umask is 0022,
+# so every copied file landed at 0644 regardless of its source permissions.
+# Nobody noticed for the shared libraries (dlopen doesn't check the execute
+# bit), but /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 is in this same
+# closure, and the kernel's loader opens an ELF interpreter through the same
+# MAY_EXEC path it uses for the binary itself. With ld.so at 0644, every
+# dynamically linked executable in the image -- starting with the very next
+# RUN's /bin/sh -- fails to exec with "permission denied". Reading each
+# source file's mode with stat and chmod-ing the copy to match, the same way
+# the shell-based rootfs stagers in this repo preserve bits with
+# `stat -c %a`, keeps the copy a single self-contained Perl process while no
+# longer flattening every mode to 0644.
 RUN perl -MFile::Path=make_path,remove_tree -e '\
       my $source = q{/usr/lib/x86_64-linux-gnu.runtime}; \
       my $target = q{/usr/lib/x86_64-linux-gnu}; \
@@ -138,12 +152,14 @@ RUN perl -MFile::Path=make_path,remove_tree -e '\
         } elsif (-l $from) { \
           symlink(readlink($from), $to) or die $!; \
         } else { \
+          my $mode = (stat($from))[2] & 07777; \
           open(my $input, q{<}, $from) or die $!; \
           open(my $output, q{>}, $to) or die $!; \
           binmode($input); binmode($output); \
           my $buffer; \
           while (read($input, $buffer, 1048576)) { print {$output} $buffer or die $! } \
           close($input); close($output); \
+          chmod($mode, $to) or die $!; \
         } \
       } \
       copy_tree($source, $target); \
