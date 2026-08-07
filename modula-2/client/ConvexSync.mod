@@ -960,7 +960,23 @@ BEGIN
   subs[slot].queryId := nextQueryId;
   INC(nextQueryId);
   CopyText(path, subs[slot].path);
-  CopyText(args, subs[slot].args);
+  (* args is VAR here specifically so a caller with a MaxBody-sized (2
+     MiB) actual argument -- the conformance adapter's cmdArgs, unlike
+     examples/basics/main.mod's own much smaller 64 KiB args buffer --
+     never has to be copied onto Subscribe's stack to reach this point.
+     But CopyText's own source parameter is still a plain value ARRAY OF
+     CHAR, so CopyText(args, ...) would copy that same 2 MiB again right
+     here regardless of args having arrived by reference; the guard at
+     the top of this procedure only bounds args' *content* length (must
+     be under MaxArgs, 8192), not its *declared* size, so it does
+     nothing to prevent this. This is exactly the crash class CopyText's
+     sibling CopyLargeText exists for (see its own comment for the full
+     mechanism); this was the one remaining call site, only reachable
+     through the adapter's TCP listener, not the example -- confirmed
+     by reproducing it directly: the adapter answered "hello" over TCP
+     and then exited 139 (SIGSEGV) on the very first "subscribe"
+     command it ever received. *)
+  CopyLargeText(args, subs[slot].args);
   handle := subs[slot].queryId;
   ok := TRUE;
 END Subscribe;
