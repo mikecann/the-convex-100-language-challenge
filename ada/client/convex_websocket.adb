@@ -431,10 +431,11 @@ package body Convex_WebSocket is
    end Send_Text;
 
    procedure Read_Network (Socket : in out Connection; Timeout : Duration) is
-      Events : AWS.Net.Event_Set := [others => False];
-      Data   : Stream_Element_Array (1 .. 16 * 1024);
-      Last   : Stream_Element_Offset;
-      Chunk  : String (1 .. Data'Length);
+      Read_Started : constant Ada.Real_Time.Time := Ada.Real_Time.Clock;
+      Events       : AWS.Net.Event_Set := [others => False];
+      Data         : Stream_Element_Array (1 .. 16 * 1024);
+      Last         : Stream_Element_Offset;
+      Chunk        : String (1 .. Data'Length);
    begin
       if Socket.Net.Pending = 0 then
          Events :=
@@ -446,7 +447,16 @@ package body Convex_WebSocket is
             return;
          end if;
       end if;
-      AWS.Net.Set_Timeout (Socket.Net.all, 0.05);
+      --  A fixed short receive timeout can turn ordinary TLS mid-record
+      --  jitter into a spurious TransportError, particularly under
+      --  emulation. Spend whatever is left of the caller's own budget
+      --  instead of a value unrelated to it.
+      AWS.Net.Set_Timeout
+        (Socket.Net.all,
+         Duration'Max
+           (0.001,
+            Timeout
+            - Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - Read_Started)));
       Socket.Net.Receive (Data, Last);
       if Last < Data'First then
          raise AWS.Net.Socket_Error with "peer closed WebSocket";
@@ -462,7 +472,7 @@ package body Convex_WebSocket is
 
    function Buffered_Frame_Ready (Buffer : US.Unbounded_String) return Boolean
    is
-      Bytes          : constant String := US.To_String (Buffer);
+      Length         : constant Natural := US.Length (Buffer);
       First_Byte     : Interfaces.Unsigned_8;
       Second_Byte    : Interfaces.Unsigned_8;
       Opcode         : Natural;
@@ -470,14 +480,18 @@ package body Convex_WebSocket is
       Payload_Length : Interfaces.Unsigned_64;
       Header_Length  : Natural := 2;
       use type Interfaces.Unsigned_64;
+
+      --  A buffered frame's header is at most ten bytes even when the
+      --  message body approaches 4 MiB. Index the unbounded buffer directly
+      --  instead of materializing the whole thing just to read them.
+      function Byte_At (Index : Positive) return Interfaces.Unsigned_8
+      is (Interfaces.Unsigned_8 (Character'Pos (US.Element (Buffer, Index))));
    begin
-      if Bytes'Length < 2 then
+      if Length < 2 then
          return False;
       end if;
-      First_Byte :=
-        Interfaces.Unsigned_8 (Character'Pos (Bytes (Bytes'First)));
-      Second_Byte :=
-        Interfaces.Unsigned_8 (Character'Pos (Bytes (Bytes'First + 1)));
+      First_Byte := Byte_At (1);
+      Second_Byte := Byte_At (2);
       Opcode := Natural (First_Byte and 16#0F#);
       if (First_Byte and 16#70#) /= 0
         or else (Second_Byte and 16#80#) /= 0
@@ -489,35 +503,37 @@ package body Convex_WebSocket is
       then
          return True;
       end if;
-      Payload_Code := Character'Pos (Bytes (Bytes'First + 1)) mod 128;
+      --  A binary message is rejected as soon as the header names it. Report
+      --  the frame ready on just these two bytes instead of waiting for an
+      --  extended length field and up to 4 MiB of payload this client will
+      --  refuse anyway once Poll sees the same opcode.
+      if Opcode = 2 then
+         return True;
+      end if;
+      Payload_Code := Natural (Second_Byte) mod 128;
       Payload_Length := Interfaces.Unsigned_64 (Payload_Code);
       if Payload_Code = 126 then
-         if Bytes'Length < 4 then
+         if Length < 4 then
             return False;
          end if;
          Payload_Length :=
            Interfaces.Unsigned_64
-             (Character'Pos (Bytes (Bytes'First + 2))
-              * 256
-              + Character'Pos (Bytes (Bytes'First + 3)));
+             (Natural (Byte_At (3)) * 256 + Natural (Byte_At (4)));
          Header_Length := 4;
          if Payload_Length < 126 then
             return True;
          end if;
       elsif Payload_Code = 127 then
-         if Bytes'Length < 10 then
+         if Length < 10 then
             return False;
          end if;
-         if Character'Pos (Bytes (Bytes'First + 2)) >= 128 then
+         if Byte_At (3) >= 128 then
             return True;
          end if;
          Payload_Length := 0;
-         for I in 2 .. 9 loop
+         for I in 3 .. 10 loop
             Payload_Length :=
-              Payload_Length
-              * 256
-              + Interfaces.Unsigned_64
-                  (Character'Pos (Bytes (Bytes'First + I)));
+              Payload_Length * 256 + Interfaces.Unsigned_64 (Byte_At (I));
          end loop;
          Header_Length := 10;
          if Payload_Length <= 65_535 then
@@ -531,7 +547,7 @@ package body Convex_WebSocket is
          -- would let a peer hold the owner forever with only ten bytes.
          return True;
       end if;
-      return Bytes'Length - Header_Length >= Natural (Payload_Length);
+      return Length - Header_Length >= Natural (Payload_Length);
    end Buffered_Frame_Ready;
 
    function Header_Value (Headers, Name : String) return String is
@@ -792,11 +808,21 @@ package body Convex_WebSocket is
    procedure Poll
      (Socket : in out Connection; Timeout : Duration; Item : out Event)
    is
-      Raw            : US.Unbounded_String;
       Fin, Masked    : Boolean;
       Opcode         : Natural;
       Payload_Length : Long_Long_Integer;
       Header_Length  : Natural;
+      Buffer_Length  : Natural;
+
+      --  Poll used to make three full copies of a buffer that may hold
+      --  close to 4 MiB just to read a header of at most ten bytes: one
+      --  Unbounded_String assignment and two To_String conversions. Index
+      --  Socket.Buffer directly for the header instead, and take only the
+      --  one copy that is unavoidable: the payload that becomes this
+      --  event's data.
+      function Byte_At (Index : Positive) return Interfaces.Unsigned_8
+      is (Interfaces.Unsigned_8
+            (Character'Pos (US.Element (Socket.Buffer, Index))));
    begin
       Item := (Kind => No_Event, Data => US.Null_Unbounded_String);
       if not Socket.Opened or else Socket.Net = null then
@@ -805,16 +831,13 @@ package body Convex_WebSocket is
       if not Buffered_Frame_Ready (Socket.Buffer) then
          Read_Network (Socket, Timeout);
       end if;
-      Raw := Socket.Buffer;
-      if US.Length (Raw) < 2 then
+      Buffer_Length := US.Length (Socket.Buffer);
+      if Buffer_Length < 2 then
          return;
       end if;
       declare
-         Bytes : constant String := US.To_String (Raw);
-         B1    : constant Interfaces.Unsigned_8 :=
-           Interfaces.Unsigned_8 (Character'Pos (Bytes (Bytes'First)));
-         B2    : constant Interfaces.Unsigned_8 :=
-           Interfaces.Unsigned_8 (Character'Pos (Bytes (Bytes'First + 1)));
+         B1 : constant Interfaces.Unsigned_8 := Byte_At (1);
+         B2 : constant Interfaces.Unsigned_8 := Byte_At (2);
       begin
          Fin := (B1 and 16#80#) /= 0;
          Opcode := Natural (B1 and 16#0F#);
@@ -825,6 +848,13 @@ package body Convex_WebSocket is
          if Opcode in 3 .. 7 or else Opcode > 10 then
             raise Constraint_Error with "unknown WebSocket opcode";
          end if;
+         --  Reject a binary message as soon as the header names it, rather
+         --  than buffering up to 4 MiB of payload this client will refuse
+         --  anyway once it is fully received.
+         if Opcode = 2 then
+            raise Constraint_Error
+              with "binary WebSocket message is unsupported";
+         end if;
          Payload_Length := Long_Long_Integer (B2 and 16#7F#);
          Header_Length := 2;
          if Opcode >= 8 and then (not Fin or else Payload_Length > 125) then
@@ -832,32 +862,28 @@ package body Convex_WebSocket is
               with "invalid fragmented WebSocket control frame";
          end if;
          if Payload_Length = 126 then
-            if Bytes'Length < 4 then
+            if Buffer_Length < 4 then
                return;
             end if;
             Payload_Length :=
               Long_Long_Integer
-                (Character'Pos (Bytes (Bytes'First + 2))
-                 * 256
-                 + Character'Pos (Bytes (Bytes'First + 3)));
+                (Natural (Byte_At (3)) * 256 + Natural (Byte_At (4)));
             if Payload_Length < 126 then
                raise Constraint_Error with "non-canonical WebSocket length";
             end if;
             Header_Length := 4;
          elsif Payload_Length = 127 then
-            if Bytes'Length < 10 then
+            if Buffer_Length < 10 then
                return;
             end if;
             Payload_Length := 0;
-            if Character'Pos (Bytes (Bytes'First + 2)) >= 128 then
+            if Byte_At (3) >= 128 then
                raise Constraint_Error
                  with "WebSocket length exceeds signed range";
             end if;
-            for I in 2 .. 9 loop
+            for I in 3 .. 10 loop
                Payload_Length :=
-                 Payload_Length
-                 * 256
-                 + Long_Long_Integer (Character'Pos (Bytes (Bytes'First + I)));
+                 Payload_Length * 256 + Long_Long_Integer (Byte_At (I));
             end loop;
             if Payload_Length <= 65_535 then
                raise Constraint_Error with "non-canonical WebSocket length";
@@ -869,23 +895,18 @@ package body Convex_WebSocket is
          then
             raise Constraint_Error with "WebSocket frame exceeds 4 MiB";
          end if;
-         if Bytes'Length < Header_Length + Natural (Payload_Length) then
+         if Buffer_Length < Header_Length + Natural (Payload_Length) then
             return;
          end if;
          declare
-            First    : constant Natural := Bytes'First + Header_Length;
-            Last     : constant Natural :=
-              First + Natural (Payload_Length) - 1;
-            Payload  : constant String :=
-              (if Payload_Length = 0 then "" else Bytes (First .. Last));
             Consumed : constant Natural :=
               Header_Length + Natural (Payload_Length);
+            Payload  : constant String :=
+              (if Payload_Length = 0
+               then ""
+               else US.Slice (Socket.Buffer, Header_Length + 1, Consumed));
          begin
-            Socket.Buffer :=
-              US.To_Unbounded_String
-                (if Consumed < Bytes'Length
-                 then Bytes (Bytes'First + Consumed .. Bytes'Last)
-                 else "");
+            US.Delete (Socket.Buffer, 1, Consumed);
             case Opcode is
                when 0      =>
                   if not Socket.Fragmented then
