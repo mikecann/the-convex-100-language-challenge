@@ -38,6 +38,17 @@ for the same reason PostScript was declined earlier on this page.
 | cfml | Lucee, the real open CFML engine, exceeds the 128 MiB container limit and needs to unpack `.lco` files into a writable temporary directory the read-only runtime cannot provide. BoxLang clears the harness cleanly but is a different language that is merely CFML-compatible — substituting it would be the same move as substituting GNU Octave for MATLAB, already rejected above. |
 | futhark | The toolchain itself is fine — `futhark` is a free, single Debian package (`apt install futhark`) that installs unattended and compiles in seconds. The language is the problem: Futhark has no I/O primitives at all, by design. `futhark c --library` emits only a numeric marshaling C API (`futhark_context`, entry points over arrays, tuples and opaque records via `futhark_new_opaque_*`/`futhark_project_opaque_*`); the non-library `futhark c` mode's standalone executable is entirely a compiler-generated CLI for Futhark's own benchmarking data format (`--runs`, `--entry-point`, `-b/--binary-output`) with no flag, hook, or extension point that touches a file descriptor, let alone a socket. There is no `extern`, no FFI directive, nothing a `.fut` source file can write to request one. The only honest structure is a C host program that owns every socket, TLS handshake and WebSocket frame while calling into Futhark for something incidental — a bridge, not a native client, exactly the shape this project has already declined for PostScript, bc and elm above. |
 
+## Infeasible — no reproducible, non-interactive build reachable
+
+Unlike the table above, this entry's language genuinely reaches a real socket
+from its own source, natively. It is recorded separately because that is not
+where it fails: it fails this project's Docker-only, hermetic-build rule, in a
+way none of the other entries on this page do.
+
+| Language | Why it cannot be done here |
+| --- | --- |
+| unison | The socket and TLS claim was fully proven, not just documented. Running non-interactively inside a bare `debian:trixie-slim` container on linux/amd64 via `ucm run.file` (piped stdin, zero prompts; `ucm --codebase-create` boots headless), the expression `Connection.tls (HostName "example.com") (Port "443")` opened a real TCP connection, completed a certificate-verified TLS handshake against a public host, sent a plaintext HTTP GET over it, and printed back a genuine decrypted `HTTP/1.1 200 OK` response — a full round trip, on `ucm` release/1.3.0 (built 2026-05-13). `IO.net.Socket` and the functions underneath `Connection.tls` are confirmed `builtin` (e.g. `builtin lib.unison_base_7_19_2.IO.net.Socket.client.impl`), i.e. real runtime primitives, not a foreign-process shim. What kills the entry is reproducibility, not capability: `Socket`, `Connection.tls`, and every ergonomic helper this used — even `HostName`, `Port`, and `Text.toUtf8` — live in the `base` library, and the only route to `base` in the current toolchain is `lib.install`/`pull` against `@unison/base/releases/...` on Unison Share (confirmed: `help pull` and `help lib.install` in ucm 1.3.0 document only that Share project syntax). The historical git-remote pull syntax (`pull https://github.com/user/repo:branch .path`) has been removed from the parser — attempting it now is a parse error. The `unisonweb/base` GitHub mirror is explicitly marked deprecated by Unison Computing itself ("Unison code hosting for this library has migrated to Unison Share"), so it is not a usable offline substitute either. The raw compiler builtins underneath `base`'s wrappers are real, but they are addressable only by content hash, not by name, and there is no local or offline way to discover those hashes without first consulting a codebase that has already resolved names through a Share pull; a guessed bare reference to one (`##IO.socketSend.impl`) was rejected by the REPL as unknown, confirming FFI-level builtins carry no special parser syntax the way ability types like `##IO` do. Every Dockerfile path to a working client therefore needs a `docker build`-time (or, if deferred, a container-start-time) network round trip to one hosted third-party service outside this project's control — exactly the "network access to Unison Share at build time" failure this candidate was explicitly held to before acceptance. Futhark's vacated slot (slot 3, replacing matlab) is therefore still open. |
+
 ## Infeasible — license or GUI gate (ruled, previously borderline)
 
 Michael's ruling: entries requiring a proprietary license or a GUI toolchain are
@@ -104,20 +115,17 @@ API, moved to the "no way to reach a socket" table above. Hare (slot 4,
 replacing mql5), tried in the same session, succeeded and is evidenced
 separately.
 
-A candidate for Futhark's now-open slot, surveyed but not yet toolchain- or
-socket-verified the way every table entry above was before being accepted:
 **Unison** (the content-addressed functional language from Unison Computing,
 not the unrelated Benjamin Pierce file-synchronization tool of the same
-name). Its `ucm` distribution is a free, unattended-installing prebuilt
-binary (`ucm-linux-x64.tar.gz` off GitHub releases; confirmed downloading and
-running `ucm --version` inside a bare `debian:trixie-slim` container), and
-its `base` library documents `builtins.io2.Socket` and `builtins.io2.Tls`
-namespaces as native primitives, not a foreign-process shim. This session
-did not get as far as compiling and running an actual TCP+TLS round trip
-from Unison source before time ran out, so treat the socket claim as a
-documented one to verify, not a demonstrated one — the same 30-minute proof
-this page's other entries were held to, still owed here before Unison is
-accepted.
+name) was tried for Futhark's now-open slot and, unlike Futhark, cleared the
+socket-and-TLS proof cleanly — see the "no reproducible, non-interactive
+build reachable" table above for the demonstrated TCP+TLS round trip. It is
+ruled infeasible anyway, on a different axis: the language's entire standard
+library, including the ergonomic `Socket`/`Tls` API that proof used, ships
+only through Unison Share, and the current `ucm` (release/1.3.0) has removed
+the old git-remote pull path that used to make that optional. There is no
+way to reach a hermetic, non-interactive Dockerfile build for it. Slot 3
+(matlab → Futhark → Unison) is still open and needs a further candidate.
 
 ## Second replacement round
 
