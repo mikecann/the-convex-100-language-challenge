@@ -605,6 +605,27 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- The local profile cannot catch a TLS bug, and twice in one night it didn't.
+  The self-hosted backend is plain `http://`, so a client with an empty or
+  misplaced trust store passes every local check and fails only against the
+  real deployment. Icon deleted Debian's OPENSSLDIR and never recreated it.
+  FreeBASIC's OpenSSL had a compiled-in `OPENSSLDIR` of `/usr/lib/ssl` while
+  the CA bundle was copied to `/etc/ssl/certs`. Same symptom, different cause,
+  and neither is visible until the profile that uses TLS runs. **A test suite
+  that never exercises a dependency cannot report anything about it** — which
+  is the whole argument for the hosted profile existing at all.
+- COBOL's compiler disagreed with COBOL's standard about a self-copy. A buffer
+  ended up simultaneously the source of a parse call and the destination of
+  another `REDEFINES` — a copy from an address to itself. The standard implies
+  a no-op; GnuCOBOL corrupted the data, and the first casualty was the
+  `protocolVersion` of the very first message. Undefined behaviour is not
+  always dramatic; sometimes it is one field, in one message, at startup.
+- FreeBASIC segfaulted only against the real backend. `dmesg` put the fault
+  inside libc with the address a few bytes from the stack pointer — a stack
+  overflow. `ThreadCreate`'s default stack was too small for the Live thread's
+  real call chain, and the local fixture's smaller responses never went deep
+  enough to reach it. The bug was in the client the whole time; the test data
+  was just too polite to find it.
 - A default file mode made an image unbootable, twenty-two layers later. Nim's
   runtime stage swaps `/usr/lib/x86_64-linux-gnu` for a trimmed closure using a
   small Perl copier, because the process doing the swap cannot depend on the
