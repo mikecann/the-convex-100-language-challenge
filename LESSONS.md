@@ -605,6 +605,17 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- Unison could open the socket and still could not be built. The proof was
+  real: a certificate-verified TLS handshake against a public host and a
+  decrypted `HTTP/1.1 200 OK` read back, from Unison source, with the socket
+  functions confirmed as genuine runtime builtins. It failed on the other axis
+  entirely — the only route to the standard library is a build-time round trip
+  to one hosted third-party service, because the git-remote syntax has been
+  removed from the parser and the GitHub mirror is deprecated. The builtins
+  underneath are still there, but they are addressable only by content hash,
+  and there is no offline way to learn a hash without first asking the service
+  that knows the name. A language where nothing has a name until something
+  tells you what the hashes are called cannot be built hermetically.
 - The framework was larger than the budget. Raku's client loads in about 200 MB
   against a 128 MiB container limit, and roughly 140 MB of that is
   `Cro::HTTP::Client` alone — the framework, not the client. Disabling the JIT,
