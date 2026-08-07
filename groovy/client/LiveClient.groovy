@@ -348,6 +348,18 @@ final class LiveClient implements AutoCloseable {
           // once. Listener errors before a candidate becomes active are noise.
           continue
         }
+        if (remoteVersion == zeroVersion()) {
+          // The read side can detect the very same dead-on-arrival connection
+          // that completeConnect's own write already guards against: an
+          // abortive reset can land after a successful handshake but surface
+          // here asynchronously instead of failing the initial Connect/Add
+          // write synchronously. No subscriber has observed a Transition on
+          // this connection yet, so retry silently instead of surfacing a
+          // visible error, exactly like the initial write failure caught in
+          // completeConnect.
+          retireConnection('InitialWriteFailed:' + concise(event.error), true)
+          continue
+        }
         subscriptions.values().each {
           it.offerTransition(new Update(null, asTransport(event.error), []))
         }
