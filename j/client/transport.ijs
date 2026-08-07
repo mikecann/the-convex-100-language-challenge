@@ -211,7 +211,17 @@ NB. millisecond count.
 tx_timeval=: 3 : 0
   ms=. 1 >. y  NB. never zero: a zero timeval means "block forever" to the kernel
   secs=. <. ms % 1000
-  usecs=. (1000 * ms) - (1000 * secs)
+  NB. The millisecond remainder converted to microseconds -- 1000*(ms-secs)
+  NB. (no missing factor of 1000 on secs) computed the wrong thing for any
+  NB. ms >= 1000: at ms=1500 it produced usecs=1499000, out of a timeval's
+  NB. valid 0-999999 range, rather than the intended 500000. setsockopt
+  NB. silently no-ops on an out-of-range tv_usec on this platform rather
+  NB. than erroring (its result was never checked here either), so the
+  NB. previously-set timeout -- or an unset, block-forever default -- stayed
+  NB. in effect instead. That is what made every large-budget probe during
+  NB. this bug's investigation "work": SO_RCVTIMEO was never really being
+  NB. applied, so reads just blocked until real data arrived.
+  usecs=. 1000 * ms - (1000 * secs)
   a. {~ (tx_le8 secs) , tx_le8 usecs
 )
 
@@ -354,7 +364,25 @@ tx_recv=: 3 : 0
   deadline=. (tx_now_ms '') + ms
   s=. > 1 { conn
   if. 'plain' -: tx_kind conn do.
-    tx_set_timeout s;SO_RCVTIMEO;tx_remaining deadline
+    NB. Wait for readability with poll() -- this client's own 15!:0 binding,
+    NB. already trusted for the adapter's stdio transport -- instead of
+    NB. leaning on sdrecv's SO_RCVTIMEO. A short-but-valid SO_RCVTIMEO here
+    NB. (proven with the deployment's own real sync connection, not a
+    NB. synthetic fixture: a live subscription over a plain, non-TLS
+    NB. connection with a sub-second read budget) made a genuine "no data
+    NB. yet" timeout come back from sdrecv indistinguishable from a
+    NB. peer-closed socket -- c=0, the same shape as a real EOF -- so every
+    NB. read that had to wait out its budget tore down a connection the
+    NB. deployment's own logs showed was never actually closed ("Connection
+    NB. reset without closing handshake: Client disconnected", logged at
+    NB. the exact moment tx_close ran on a socket poll() would have called
+    NB. healthy). Large budgets never surfaced this because they were long
+    NB. enough for real data to always win the race against the timeout.
+    NB. poll()'s own timeout is unambiguous -- it reports not-ready, never
+    NB. a fabricated EOF -- so the timeout decision happens here, before
+    NB. sdrecv is ever called, and sdrecv only runs once data is confirmed
+    NB. waiting.
+    if. -. tx_poll_ready s;1;tx_remaining deadline do. TX_IO_TIMEOUT;'' return. end.
     r=. sdrecv s;limit;0
     NB. sdrecv Link-boxes its result, and the two shapes are not even the
     NB. same type: 0;data on success, '';~sdsockerror'' on failure/timeout
