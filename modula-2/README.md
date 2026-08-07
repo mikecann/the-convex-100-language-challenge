@@ -12,9 +12,9 @@ Read [`examples/basics/main.mod`](examples/basics/main.mod). It queries a fresh 
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, actions, bearer auth, log lines, and structured errors | Implemented; language-local Docker tests pass, shared conformance pending |
-| Live initial values, external updates, and `QueryFailed` followed by recovery | Implemented; proved against a loopback fixture in `client/tests/TestLive.mod`, shared conformance pending |
-| Five forced reconnects with Add resend, rehydration suppression, and `connectionCount`/backoff bookkeeping | Implemented; proved against `client/tests/FixtureServer.mod`, shared conformance pending |
+| HTTP queries, mutations, actions, bearer auth, log lines, and structured errors | Implemented; verified by shared conformance on both profiles |
+| Live initial values, external updates, and `QueryFailed` followed by recovery | Implemented; proved against a loopback fixture in `client/tests/TestLive.mod`, and verified by shared conformance on both profiles |
+| Five forced reconnects with Add resend, rehydration suppression, and `connectionCount`/backoff bookkeeping | Implemented; proved against `client/tests/FixtureServer.mod`, and verified by shared conformance on both profiles |
 | WebSocket mutations, actions, Live authentication, optimistic updates | Not implemented |
 | `TransitionChunk` assembly | Not implemented; treated as protocol drift and reconnects |
 | Production SDK compatibility | Not claimed |
