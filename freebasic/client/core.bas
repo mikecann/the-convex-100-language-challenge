@@ -32,6 +32,11 @@ declare function sys_nanosleep cdecl alias "nanosleep" ( _
 
 ' OpenSSL is the pinned TLS provider, so its CSPRNG is already loaded when the
 ' client needs unpredictable WebSocket masking keys and session identifiers.
+' #inclib records libcrypto as a link dependency of this object file itself,
+' so any command that links core.bas pulls it in -- unlike net.bas, core.bas
+' is linked on its own by the style-check gate, without net.bas's own
+' #inclib "crypto" alongside it.
+#inclib "crypto"
 declare function RAND_bytes cdecl alias "RAND_bytes" ( _
   byval buffer as ubyte ptr, _
   byval length as long) as long
