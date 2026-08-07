@@ -18,10 +18,10 @@ checks the whole `0 -> 1` journey. The CoffeeScript implementation is under
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, and actions | Implemented, pending shared evidence |
-| HTTP bearer-token replacement | Implemented, pending shared evidence |
-| Initial and updated Live query values | Implemented, pending shared evidence |
-| Adapter-only Live reconnect hook | Implemented, pending shared evidence |
+| HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
+| HTTP bearer-token replacement | Verified by shared local and hosted conformance |
+| Initial and updated Live query values | Verified by shared local and hosted conformance |
+| Adapter-only Live reconnect hook | Verified by shared local and hosted conformance |
 | Capability badges | Not claimed until root-owned evidence |
 | Live authentication and WebSocket writes | Deferred |
 
