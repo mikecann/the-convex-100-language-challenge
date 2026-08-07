@@ -1863,16 +1863,19 @@ convex_live_service_socket:
     mov rsi, [rbp+SS_LEN]
     lea rdx, [rbp+SS_MSG]
     call json_parse
+    mov [rbp+SS_HMRESULT], rax    ; stash json_parse's result BEFORE the
+                                    ; call free below -- free() is a real
+                                    ; function call and is not guaranteed to
+                                    ; preserve rax, so reading rax after it
+                                    ; (as this code used to) was reading
+                                    ; free()'s leftovers, not json_parse's
+                                    ; return value.
     mov rcx, [rbp+SS_DATA]
     test rcx, rcx
     jz .no_free_data
     mov rdi, rcx
     call free
 .no_free_data:
-    mov [rbp+SS_HMRESULT], rax
-    mov edi, 'j'
-    mov esi, eax
-    call dbg_bit
     mov rax, [rbp+SS_HMRESULT]
     test eax, eax
     jz .protocol_error
