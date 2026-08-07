@@ -1,0 +1,8 @@
+package convex-tests-adapter
+
+version = 0.1.0
+sourcedir = "tests/conformance/tests"
+depends = convex, conformance
+
+main = Main
+executable = "convex-tests-adapter"

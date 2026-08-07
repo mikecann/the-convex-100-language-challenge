@@ -1,0 +1,9 @@
+-- The conformance executable installed at /usr/local/bin/convex-adapter.
+package convex-adapter
+
+version = 0.1.0
+sourcedir = "tests/conformance"
+depends = convex, conformance
+
+main = Main
+executable = "convex-adapter"

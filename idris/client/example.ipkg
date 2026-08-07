@@ -1,0 +1,11 @@
+-- The canonical basic example. The Dockerfile copies
+-- examples/basics/Main.idr into client/example/ so the checked-in tree keeps
+-- the teaching path while Idris gets the layout it expects.
+package convex-example
+
+version = 0.1.0
+sourcedir = "example"
+depends = convex
+
+main = Main
+executable = "convex-example"
