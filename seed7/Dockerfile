@@ -46,15 +46,15 @@ COPY examples ./examples
 # .s7i/.sd7 file must compile without warnings under -O2. The compiler
 # checks below double as that formatting/lint gate.
 RUN mkdir -p /out \
-    && s7c -w2 -O2 -l /src/seed7/lib -b /src/seed7/bin client/tests/conformance/adapter.sd7 \
+    && s7c -w2 -O2 -l client -l /src/seed7/lib -b /src/seed7/bin client/tests/conformance/adapter.sd7 \
        2>&1 | tee /tmp/adapter.build.log \
     && ! grep -qi 'warning' /tmp/adapter.build.log \
     && cp client/tests/conformance/adapter /out/convex-adapter \
-    && s7c -w2 -O2 -l /src/seed7/lib -b /src/seed7/bin examples/basics/main.sd7 \
+    && s7c -w2 -O2 -l client -l /src/seed7/lib -b /src/seed7/bin examples/basics/main.sd7 \
        2>&1 | tee /tmp/example.build.log \
     && ! grep -qi 'warning' /tmp/example.build.log \
     && cp examples/basics/main /out/convex-example \
-    && s7c -w2 -O2 -l /src/seed7/lib -b /src/seed7/bin client/tests/client_test.sd7 \
+    && s7c -w2 -O2 -l client -l /src/seed7/lib -b /src/seed7/bin client/tests/client_test.sd7 \
        2>&1 | tee /tmp/test.build.log \
     && ! grep -qi 'warning' /tmp/test.build.log \
     && cp client/tests/client_test /out/convex-client-test \
