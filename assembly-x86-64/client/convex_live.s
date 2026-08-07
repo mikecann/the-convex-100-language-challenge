@@ -63,25 +63,6 @@ LIVE_BACKOFF_MAX_MS  equ 10000
 
 ; --- small leaf helpers -----------------------------------------------
 
-; void dbg_mark(int code) [edi] -- DEBUG ONLY.
-dbg_mark:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 32
-    mov [rbp-8], edi
-    add byte [rbp-8], '0'
-    mov edi, 2
-    lea rsi, [rbp-8]
-    mov edx, 1
-    call write
-    mov edi, 2
-    lea rsi, [rel dbg_nl_live]
-    mov edx, 1
-    call write
-    mov rsp, rbp
-    pop rbp
-    ret
-
 ; char hex_nibble_char(int nibble) [edi, 0-15] -- leaf, no frame needed.
 hex_nibble_char:
     mov al, dil
@@ -1124,39 +1105,24 @@ teardown_and_schedule:
 ; version we send, and (via marking every ACTIVE subscription back to
 ; PENDING_ADD) the Add resend the caller's next send_add_batch will do.
 %define TC_LIVE -8
-%define TC_TMP  -16
 try_connect:
     push rbp
     mov rbp, rsp
-    sub rsp, 32
+    sub rsp, 16
     mov [rbp+TC_LIVE], rdi
 
-    mov edi, 3
-    call dbg_mark
-
-    mov rax, [rbp+TC_LIVE]
-    mov rax, [rax + convex_live.client]
+    mov rax, [rdi + convex_live.client]
     lea rdi, [rax + convex_client.url]
     mov rsi, [rax + convex_client.user_agent_ptr]
     mov rdx, [rax + convex_client.user_agent_len]
     mov rcx, [rbp+TC_LIVE]
     lea rcx, [rcx + convex_live.ws]
     call ws_open
-    mov [rbp+TC_TMP], rax
-    mov edi, 4
-    call dbg_mark
-    mov rax, [rbp+TC_TMP]
     test eax, eax
     jz .fail
 
-    mov edi, 7
-    call dbg_mark
     mov rdi, [rbp+TC_LIVE]
     call send_connect_message
-    mov [rbp+TC_TMP], rax
-    mov edi, 8
-    call dbg_mark
-    mov rax, [rbp+TC_TMP]
     test eax, eax
     jz .fail
 
@@ -1202,7 +1168,6 @@ try_connect:
     pop rbp
     ret
 %undef TC_LIVE
-%undef TC_TMP
 
 ; void convex_live_maintain(convex_live *live) -- called every event-loop
 ; tick regardless of socket readiness: (re)connects on schedule and flushes
@@ -1213,12 +1178,8 @@ try_connect:
 convex_live_maintain:
     push rbp
     mov rbp, rsp
-    sub rsp, 32
+    sub rsp, 16
     mov [rbp+LM_LIVE], rdi
-
-    mov edi, 2
-    call dbg_mark
-    mov rdi, [rbp+LM_LIVE]
 
     mov rax, [rdi + convex_live.connected]
     test rax, rax
@@ -1248,14 +1209,8 @@ convex_live_maintain:
     mov rax, [rax + convex_live.connected]
     test rax, rax
     jz .done
-    mov edi, 10
-    call dbg_mark
     mov rdi, [rbp+LM_LIVE]
     call send_add_batch
-    mov [rbp-16], rax
-    mov edi, 11
-    call dbg_mark
-    mov rax, [rbp-16]
     test eax, eax
     jnz .done
     mov rdi, [rbp+LM_LIVE]
@@ -1768,7 +1723,6 @@ handle_message:
 %define SS_LEN   -32
 %define SS_MSG   -40
 %define SS_HMRESULT -48
-%define SS_TMP -56
 convex_live_service_socket:
     push rbp
     mov rbp, rsp
@@ -1781,10 +1735,6 @@ convex_live_service_socket:
 
     lea rdi, [rdi + convex_live.ws]
     call ws_recv_more
-    mov [rbp+SS_TMP], rax
-    mov edi, 30
-    call dbg_mark
-    mov rax, [rbp+SS_TMP]
     cmp eax, 1
     je .pump
     mov rdi, [rbp+SS_LIVE]
@@ -1794,18 +1744,12 @@ convex_live_service_socket:
     call teardown_and_schedule
     jmp .done
 .pump:
-    mov edi, 31
-    call dbg_mark
     mov rax, [rbp+SS_LIVE]
     lea rdi, [rax + convex_live.ws]
     lea rsi, [rbp+SS_KIND]
     lea rdx, [rbp+SS_DATA]
     lea rcx, [rbp+SS_LEN]
     call ws_pump_message
-    mov [rbp+SS_TMP], rax
-    mov edi, 32
-    call dbg_mark
-    mov rax, [rbp+SS_TMP]
     cmp eax, 0
     je .done
     cmp eax, -1
@@ -1821,10 +1765,6 @@ convex_live_service_socket:
     mov rsi, [rbp+SS_LEN]
     lea rdx, [rbp+SS_MSG]
     call json_parse
-    mov [rbp+SS_TMP], rax
-    mov edi, 33
-    call dbg_mark
-    mov rax, [rbp+SS_TMP]
     mov rcx, [rbp+SS_DATA]
     test rcx, rcx
     jz .no_free_data
@@ -1838,12 +1778,8 @@ convex_live_service_socket:
     mov rsi, [rbp+SS_MSG]
     call handle_message
     mov [rbp+SS_HMRESULT], rax
-    mov edi, 34
-    call dbg_mark
     mov rdi, [rbp+SS_MSG]
     call json_free
-    mov edi, 35
-    call dbg_mark
     mov rax, [rbp+SS_HMRESULT]
     test eax, eax
     jz .protocol_error
@@ -1878,7 +1814,6 @@ convex_live_service_socket:
 %undef SS_LEN
 %undef SS_MSG
 %undef SS_HMRESULT
-%undef SS_TMP
 
 ; --- public lifecycle API ------------------------------------------------
 
@@ -2028,9 +1963,6 @@ convex_live_subscribe:
     mov [rbp+LS_PATH], rsi
     mov [rbp+LS_PATHLEN], rdx
     mov [rbp+LS_ARGS], rcx
-
-    mov edi, 1
-    call dbg_mark
 
     mov edi, convex_sub_size
     call malloc
@@ -2236,11 +2168,10 @@ convex_live_poll_fd:
 %define LN_LIVE -40
 %define LN_WAIT -48
 %define LN_PFD -56          ; pollfd, 8 bytes: rbp-56..rbp-49
-%define LN_TMP -64
 convex_live_next:
     push rbp
     mov rbp, rsp
-    sub rsp, 80
+    sub rsp, 64
     mov [rbp+LN_SUB], rdi
     mov [rbp+LN_OUT], rsi
     mov [rbp+LN_TIMEOUT], rdx
@@ -2259,14 +2190,8 @@ convex_live_next:
 
     mov rdi, [rbp+LN_LIVE]
     call convex_live_maintain
-    mov edi, 12
-    call dbg_mark
 
     call monotonic_ms
-    mov [rbp+LN_TMP], rax
-    mov edi, 13
-    call dbg_mark
-    mov rax, [rbp+LN_TMP]
     cmp rax, [rbp+LN_DEADLINE]
     jge .timed_out
     mov rcx, [rbp+LN_DEADLINE]
@@ -2279,10 +2204,6 @@ convex_live_next:
 
     mov rdi, [rbp+LN_LIVE]
     call convex_live_poll_fd
-    mov [rbp+LN_TMP], rax
-    mov edi, 14
-    call dbg_mark
-    mov rax, [rbp+LN_TMP]
     cmp rax, 0
     jl .no_fd
 
@@ -2293,21 +2214,13 @@ convex_live_next:
     mov esi, 1
     mov edx, [rbp+LN_WAIT]
     call poll
-    mov [rbp+LN_TMP], rax
-    mov edi, 15
-    call dbg_mark
-    mov rax, [rbp+LN_TMP]
     cmp eax, 0
     jle .loop
     movzx eax, word [rbp+LN_PFD + pollfd.revents]
     test eax, POLLIN
     jz .loop
-    mov edi, 16
-    call dbg_mark
     mov rdi, [rbp+LN_LIVE]
     call convex_live_service_socket
-    mov edi, 17
-    call dbg_mark
     jmp .loop
 .no_fd:
     xor edi, edi
@@ -2331,10 +2244,8 @@ convex_live_next:
 %undef LN_LIVE
 %undef LN_WAIT
 %undef LN_PFD
-%undef LN_TMP
 
 section .rodata
-    dbg_nl_live: db 10
     initial_ts: db "AAAAAAAAAAA="
     initial_ts_len equ $ - initial_ts
 

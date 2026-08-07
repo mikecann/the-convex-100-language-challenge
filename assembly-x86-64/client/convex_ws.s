@@ -46,67 +46,6 @@ extern memmove
 
 section .text
 
-; void dbg_mark_ws(int ch) [edi] -- DEBUG ONLY.
-dbg_mark_ws:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 32
-    mov [rbp-8], edi
-    mov edi, 2
-    lea rsi, [rbp-8]
-    mov edx, 1
-    call write
-    mov edi, 2
-    lea rsi, [rel dbg_nl_ws]
-    mov edx, 1
-    call write
-    mov rsp, rbp
-    pop rbp
-    ret
-
-; void dbg_num(u64 val) [rdi] -- DEBUG ONLY: writes val as decimal + newline
-; to stderr.
-%define DN_VAL -8
-%define DN_BUF -40      ; 24 usable bytes for digits, rbp-40..rbp-17, NUL at rbp-17
-dbg_num:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 48
-    mov [rbp+DN_VAL], rdi
-    mov byte [rbp+DN_BUF+23], 0
-    lea rcx, [rbp+DN_BUF+23]
-    mov rax, [rbp+DN_VAL]
-    test rax, rax
-    jnz .loop
-    dec rcx
-    mov byte [rcx], '0'
-    jmp .emit
-.loop:
-    test rax, rax
-    jz .emit
-    xor rdx, rdx
-    mov r8, 10
-    div r8
-    add dl, '0'
-    dec rcx
-    mov [rcx], dl
-    jmp .loop
-.emit:
-    mov rdi, 2
-    mov rsi, rcx
-    lea rdx, [rbp+DN_BUF+23]
-    sub rdx, rcx
-    call write
-    mov rdi, 2
-    lea rsi, [rel dbg_nl_ws]
-    mov edx, 1
-    call write
-    mov rsp, rbp
-    pop rbp
-    ret
-%undef DN_VAL
-%undef DN_BUF
-
 global base64_encode
 global ws_open
 global ws_close
@@ -646,19 +585,15 @@ ws_hs_read_more:
 %define WO_EXPECT -104         ; buf struct: rbp-104..rbp-81
 %define WO_LEFT   -128         ; buf struct: rbp-128..rbp-105
 %define WO_STATUS -136
-%define WO_DBGTMP -144
 ws_open:
     push rbp
     mov rbp, rsp
-    sub rsp, 160
+    sub rsp, 144
     mov [rbp+WO_URL], rdi
     mov [rbp+WO_UA], rsi
     mov [rbp+WO_UALEN], rdx
     mov [rbp+WO_OUT], rcx
 
-    mov edi, 'A'
-    call dbg_mark_ws
-    mov rcx, [rbp+WO_OUT]
     mov qword [rcx + ws_conn.assembling], 0
     mov qword [rcx + ws_conn.asm_opcode], 0
     mov qword [rcx + ws_conn.open], 0
@@ -673,10 +608,6 @@ ws_open:
     mov rdi, [rbp+WO_URL]
     lea rsi, [rcx + ws_conn.conn]
     call convex_connect
-    mov [rbp+WO_DBGTMP], rax
-    mov edi, 'B'
-    call dbg_mark_ws
-    mov rax, [rbp+WO_DBGTMP]
     test eax, eax
     jz .fail_noclose
 
@@ -684,10 +615,6 @@ ws_open:
     call buf_init
     lea rdi, [rbp+WO_KEYB64]
     call ws_build_key
-    mov [rbp+WO_DBGTMP], rax
-    mov edi, 'C'
-    call dbg_mark_ws
-    mov rax, [rbp+WO_DBGTMP]
     test eax, eax
     jz .fail_close
 
@@ -699,10 +626,6 @@ ws_open:
     mov r8, [rbp+WO_KEYB64 + buf.data]
     mov r9, [rbp+WO_KEYB64 + buf.len]
     call ws_send_handshake_request
-    mov [rbp+WO_DBGTMP], rax
-    mov edi, 'D'
-    call dbg_mark_ws
-    mov rax, [rbp+WO_DBGTMP]
     test eax, eax
     jz .fail_close
 
@@ -716,8 +639,6 @@ ws_open:
     lea rdx, [rbp+WO_LEFT]
     call ws_read_handshake_response
     mov [rbp+WO_STATUS], rax
-    mov edi, 'E'
-    call dbg_mark_ws
     cmp qword [rbp+WO_STATUS], 101
     jne .fail_close
 
@@ -727,10 +648,6 @@ ws_open:
     mov rsi, [rbp+WO_KEYB64 + buf.len]
     lea rdx, [rbp+WO_EXPECT]
     call ws_compute_accept
-    mov [rbp+WO_DBGTMP], rax
-    mov edi, 'F'
-    call dbg_mark_ws
-    mov rax, [rbp+WO_DBGTMP]
     test eax, eax
     jz .fail_close
 
@@ -755,16 +672,12 @@ ws_open:
     mov rdx, [rbp+WO_LEFT + buf.len]
     call buf_append
 .no_leftover:
-    mov edi, 'G'
-    call dbg_mark_ws
     mov rcx, [rbp+WO_OUT]
     mov qword [rcx + ws_conn.open], 1
     mov eax, 1
     jmp .cleanup
 
 .fail_close:
-    mov edi, 'x'
-    call dbg_mark_ws
     mov rcx, [rbp+WO_OUT]
     lea rdi, [rcx + ws_conn.conn]
     call convex_conn_close
@@ -793,7 +706,6 @@ ws_open:
 %undef WO_EXPECT
 %undef WO_LEFT
 %undef WO_STATUS
-%undef WO_DBGTMP
 
 ; void ws_close(ws_conn *w) -- best-effort close frame (never waited on),
 ; then tears down the transport and frees both internal buffers. Safe to
@@ -1037,7 +949,7 @@ ws_recv_more:
 %define TF_BYTE1   -72
 %define TF_HDRLEN  -80
 %define TF_PLEN    -88
-%define TF_DBGTMP  -96
+%define TF_ALLOC   -96
 ws_take_frame:
     push rbp
     mov rbp, rsp
@@ -1047,10 +959,6 @@ ws_take_frame:
     mov [rbp+TF_FINOUT], rdx
     mov [rbp+TF_PLOUT], rcx
     mov [rbp+TF_LENOUT], r8
-
-    mov edi, 'i'
-    call dbg_mark_ws
-    mov rdi, [rbp+TF_W]
 
     mov rax, [rdi + ws_conn.recv + buf.len]
     sub rax, [rdi + ws_conn.recv_off]
@@ -1074,8 +982,6 @@ ws_take_frame:
     test rax, 0x80
     jnz .protocol_error         ; a compliant server never masks its frames
 
-    mov edi, 'p'
-    call dbg_mark_ws
     mov rax, [rbp+TF_BYTE1]
     and rax, 0x7F
     cmp rax, 126
@@ -1114,8 +1020,6 @@ ws_take_frame:
     mov [rbp+TF_PLEN], rax
     mov dword [rbp+TF_HDRLEN], 2
 .have_lengths:
-    mov edi, 'q'
-    call dbg_mark_ws
     cmp qword [rbp+TF_PLEN], WS_MAX_MESSAGE_BYTES
     ja .protocol_error
     mov eax, [rbp+TF_HDRLEN]
@@ -1123,42 +1027,34 @@ ws_take_frame:
     cmp rax, [rbp+TF_AVAIL]
     ja .need_more
 
-    mov edi, 'r'
-    call dbg_mark_ws
-    mov rdi, [rbp+TF_PLEN]
-    call dbg_num
-    mov edi, [rbp+TF_HDRLEN]
-    call dbg_num
-    mov rdi, [rbp+TF_AVAIL]
-    call dbg_num
     ; have a complete frame: copy the payload out, advance recv_off
     mov rax, [rbp+TF_PLEN]
     test rax, rax
     jz .zero_payload
     mov rdi, rax
     call malloc
-    mov [rbp+TF_DBGTMP], rax
-    mov edi, 's'
-    call dbg_mark_ws
-    mov rdi, [rbp+TF_DBGTMP]
-    call dbg_num
-    mov rdi, [rbp+TF_BASE]
-    call dbg_num
-    mov rax, [rbp+TF_DBGTMP]
     test rax, rax
     jz .oom
-    mov edi, 'z'
-    call dbg_mark_ws
-    mov rax, [rbp+TF_DBGTMP]
+    mov [rbp+TF_ALLOC], rax      ; stash across the memcpy call rather than
+                                  ; trust rax to still hold it afterward
     mov rdi, rax
     mov rsi, [rbp+TF_BASE]
-    add rsi, [rbp+TF_HDRLEN]
+    mov eax, [rbp+TF_HDRLEN]     ; 32-bit read: TF_HDRLEN is only ever
+                                  ; written as a dword (see the three
+                                  ; `mov dword [rbp+TF_HDRLEN], N` sites
+                                  ; above); `add rsi, [rbp+TF_HDRLEN]` reads
+                                  ; a full qword and was pulling in whatever
+                                  ; 64-bit-wide garbage sat above it on the
+                                  ; stack into rsi's upper 32 bits -- found
+                                  ; with gdb after this corrupted pointer
+                                  ; crashed inside memcpy on the first
+                                  ; message large enough to need the 16-bit
+                                  ; extended length form.
+    add rsi, rax
     mov rdx, [rbp+TF_PLEN]
     call memcpy
-    mov edi, 't'
-    call dbg_mark_ws
     mov rcx, [rbp+TF_PLOUT]
-    mov rax, [rbp+TF_DBGTMP]
+    mov rax, [rbp+TF_ALLOC]
     mov [rcx], rax
     jmp .have_copy
 .zero_payload:
@@ -1193,8 +1089,6 @@ ws_take_frame:
     cmp rax, 65536
     jb .parsed_ok
 .compact:
-    mov edi, 'j'
-    call dbg_mark_ws
     mov rdi, [rbp+TF_W]
     mov rax, [rdi + ws_conn.recv_off]
     test rax, rax
@@ -1207,15 +1101,11 @@ ws_take_frame:
     mov rdi, rsi
     mov rsi, rcx
     call memmove
-    mov edi, 'k'
-    call dbg_mark_ws
     mov rdi, [rbp+TF_W]
     mov rax, [rbp+TF_BASE]
     mov [rdi + ws_conn.recv + buf.len], rax
     mov qword [rdi + ws_conn.recv_off], 0
 .parsed_ok:
-    mov edi, 'l'
-    call dbg_mark_ws
     mov eax, 1
     jmp .done
 .oom:
@@ -1242,7 +1132,7 @@ ws_take_frame:
 %undef TF_BYTE1
 %undef TF_HDRLEN
 %undef TF_PLEN
-%undef TF_DBGTMP
+%undef TF_ALLOC
 
 ; int ws_pump_message(ws_conn *w, u64 *kind_out, u8 **data_out,
 ;                      u64 *len_out)
@@ -1263,7 +1153,6 @@ ws_take_frame:
 %define PM_FIN    -48
 %define PM_PAYLOAD -56
 %define PM_PLEN   -64
-%define PM_TMP    -72
 ws_pump_message:
     push rbp
     mov rbp, rsp
@@ -1273,28 +1162,17 @@ ws_pump_message:
     mov [rbp+PM_DOUT], rdx
     mov [rbp+PM_LOUT], rcx
 .loop:
-    mov edi, 'm'
-    call dbg_mark_ws
     mov rdi, [rbp+PM_W]
     lea rsi, [rbp+PM_OPCODE]
     lea rdx, [rbp+PM_FIN]
     lea rcx, [rbp+PM_PAYLOAD]
     lea r8, [rbp+PM_PLEN]
     call ws_take_frame
-    mov [rbp+PM_TMP], rax
-    mov edi, 'n'
-    call dbg_mark_ws
-    mov rax, [rbp+PM_TMP]
     cmp eax, 0
     je .need_more
     cmp eax, -1
     je .error
 
-    mov rax, [rbp+PM_OPCODE]
-    add al, '0'
-    mov [rbp+PM_TMP], rax
-    mov edi, eax
-    call dbg_mark_ws
     mov rax, [rbp+PM_OPCODE]
     cmp rax, WS_OP_PING
     je .on_ping
@@ -1520,7 +1398,6 @@ ws_pump_message:
 %undef PM_FIN
 %undef PM_PAYLOAD
 %undef PM_PLEN
-%undef PM_TMP
 
 ; --- UTF-8 validation --------------------------------------------------
 
@@ -1679,7 +1556,6 @@ utf8_validate:
 %undef UV_I
 
 section .rodata
-    dbg_nl_ws: db 10
     b64_alphabet: db "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
     ws_guid: db "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
     ws_guid_len equ $ - ws_guid
