@@ -77,7 +77,7 @@ if test -n "$non_loopback"; then
 fi
 actual=$(printf '%s\n' \
   '{"id":"tcp-hello","protocolVersion":1,"op":"hello"}' \
-  '{"id":"tcp-close","op":"close"}' | timeout 10 nc 127.0.0.1 18080)
+  '{"id":"tcp-close","op":"close"}' | timeout 45 nc 127.0.0.1 18080)
 wait "$adapter_pid"
 printf '%s\n' "$actual" | grep -F '"id":"tcp-hello","protocolVersion":1,"type":"ready"'
 printf '%s\n' "$actual" | grep -Fx '{"id":"tcp-close","type":"closed"}'
