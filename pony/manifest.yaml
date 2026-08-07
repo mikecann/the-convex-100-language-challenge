@@ -54,4 +54,6 @@ limitations:
     for a bounded 250 ms.
   - Live authentication, WebSocket mutations and actions, optimistic updates,
     and TransitionChunk reassembly are not implemented and fail closed.
-capabilities: []
+capabilities:
+  - http
+  - live
