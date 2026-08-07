@@ -50,8 +50,24 @@ procedure main(args)
    else {
       sepPos := 0
       every sepPos := find(":", listenSpec)
-      bindHost := listenSpec[1:sepPos + 1]
-      bindPort := listenSpec[sepPos + 2 : 0]
+      # find(":", listenSpec) returns the position OF the colon itself, so
+      # the host is everything strictly before it (listenSpec[1:sepPos],
+      # not sepPos + 1 -- that slice's exclusive upper bound needs to
+      # land ON the colon to exclude it, not past it) and the port is
+      # everything strictly after it (listenSpec[sepPos + 1:0], not
+      # sepPos + 2 -- that skipped the port's own first digit). The old
+      # off-by-ones turned "0.0.0.0:8080" into bindHost "0.0.0.0:" (colon
+      # still attached, so the bindHost == "0.0.0.0" check right below
+      # never matched and never cleared it to "" for ffi_listen's
+      # any-interface bind) and bindPort "080" (missing its leading "8"),
+      # so ffi_listen("0.0.0.0:", "080") always failed DNS/address
+      # resolution on that malformed host string -- the adapter exited
+      # immediately with "listen failed: bind address resolution
+      # failed" before ever accepting a connection, which is why every
+      # ADAPTER_LISTEN-mode pilot check failed to resolve the adapter's
+      # own container hostname (the container had already exited).
+      bindHost := listenSpec[1:sepPos]
+      bindPort := listenSpec[sepPos + 1 : 0]
       if bindHost == "0.0.0.0" then bindHost := ""
       listenResult := ffi_listen(bindHost, bindPort)
       if tag_of(listenResult) ~== "K:" then {
