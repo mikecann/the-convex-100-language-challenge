@@ -32,4 +32,6 @@ limitations:
   - JSON input is limited to 2 MiB, 128 nesting levels, and 8192 structural nodes; active Live subscriptions are bounded to 64 entries and 8 MiB of conservatively charged state.
   - One manager-wide queue retains the newest 16 deliveries within a conservative 20 MiB exact-encoded and runtime-overhead budget.
   - Adapter output independently retains the newest 16 encoded events within 6 MiB, including an in-flight TCP write.
-capabilities: []
+capabilities:
+  - http
+  - live
