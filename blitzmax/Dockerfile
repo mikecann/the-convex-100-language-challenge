@@ -265,8 +265,7 @@ RUN set -eu; \
     if /usr/local/bin/convex-example probe-room >/tmp/example.out 2>/tmp/example.err; then \
       echo "the example must fail without a deployment URL" >&2; exit 1; \
     fi; \
-    grep -Fq 'CONVEX_URL is required' /tmp/example.err; \
-    rm -f /tmp/example.out /tmp/example.err
+    grep -Fq 'CONVEX_URL is required' /tmp/example.err
 ENV PATH=/usr/local/bin:/usr/bin:/bin
 # The base image's CMD would otherwise be appended to the entrypoint, so running
 # the example by hand would silently use "bash" as its room name.
