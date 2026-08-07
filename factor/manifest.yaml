@@ -15,7 +15,7 @@ implementation:
     base64, and random vocabularies provide ordinary language facilities only.
 toolchain:
   name: Factor
-  version: 0.101
+  version: "0.101"
 syncProfile:
   id: convex-rs-0.10.4-unversioned-sync
   sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7

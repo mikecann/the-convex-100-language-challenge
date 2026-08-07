@@ -31,7 +31,7 @@ black-box conformance passes.
 ## The basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.factor -->
-```text
+```factor
 ! The canonical Convex-from-Factor example.
 !
 ! It reads one counter room over HTTP, starts a Live subscription before
@@ -157,7 +157,11 @@ ERROR: example-error message ;
     es stream-flush ;
 
 : run-example ( -- )
-    [ example-main 0 exit ] [ report-failure 1 exit ] recover ;
+    ! exit terminates the process immediately, and stdout is fully
+    ! buffered rather than line-buffered once it is a pipe rather than a
+    ! terminal, so the transcript above must be flushed explicitly or a
+    ! verifier reading it back would see nothing.
+    [ example-main flush 0 exit ] [ report-failure 1 exit ] recover ;
 
 MAIN: run-example
 ```
