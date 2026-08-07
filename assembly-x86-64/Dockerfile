@@ -78,10 +78,16 @@ if test -n "$non_loopback"; then
   printf '%s\n' 'loopback adapter unexpectedly accepted a non-loopback connection' >&2
   exit 1
 fi
+echo "DIAG: lo status:"
+ip link show lo || true
+echo "DIAG: listening sockets:"
+ss -tln || true
+echo "DIAG: is adapter still alive?"
+kill -0 "$adapter_pid" && echo "DIAG: alive" || echo "DIAG: dead"
 echo "DIAG: about to do second nc"
 actual=$(printf '%s\n' \
   '{"id":"tcp-hello","protocolVersion":1,"op":"hello"}' \
-  '{"id":"tcp-close","op":"close"}' | timeout 5 nc 127.0.0.1 18080)
+  '{"id":"tcp-close","op":"close"}' | timeout 5 nc -v 127.0.0.1 18080 2>&1)
 echo "DIAG: actual=[$actual]"
 echo "DIAG: about to wait"
 wait "$adapter_pid"
