@@ -1213,7 +1213,7 @@ try_connect:
 convex_live_maintain:
     push rbp
     mov rbp, rsp
-    sub rsp, 16
+    sub rsp, 32
     mov [rbp+LM_LIVE], rdi
 
     mov edi, 2
@@ -1248,8 +1248,14 @@ convex_live_maintain:
     mov rax, [rax + convex_live.connected]
     test rax, rax
     jz .done
+    mov edi, 10
+    call dbg_mark
     mov rdi, [rbp+LM_LIVE]
     call send_add_batch
+    mov [rbp-16], rax
+    mov edi, 11
+    call dbg_mark
+    mov rax, [rbp-16]
     test eax, eax
     jnz .done
     mov rdi, [rbp+LM_LIVE]
