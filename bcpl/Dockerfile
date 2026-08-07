@@ -130,7 +130,9 @@ RUN set -eu; \
     for file in client/convexhdr.h client/base.b client/digest.b client/json.b \
                 client/http.b client/ws.b client/live.b client/convex.b \
                 client/tests/clienttests.b client/tests/livetests.b \
-                client/tests/conformance/adapter.b examples/basics/main.b \
+                client/tests/conformance/adapter.b \
+                client/tests/conformance/events.b \
+                client/tests/conformance/eventshdr.h examples/basics/main.b \
                 client/native/convexext.c client/native/convexlaunch.c; do \
       test -f "$file"; \
       if grep -q "$tab" "$file"; then echo "$file: tab" >&2; exit 1; fi; \
@@ -159,6 +161,8 @@ RUN set -eu; \
     cp client/convexhdr.h "$BCPL64HDRS/convexhdr.h"; \
     cp client/*.b client/*.h /build/src/; \
     cp client/tests/clienttests.b client/tests/livetests.b /build/src/; \
+    cp client/tests/conformance/events.b client/tests/conformance/eventshdr.h \
+       /build/src/; \
     cp client/tests/conformance/adapter.b /build/src/adapter.b; \
     cp examples/basics/main.b /build/src/example.b; \
     cd /build/src; \
