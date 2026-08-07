@@ -1,0 +1,104 @@
+*   convex-base64.sno - standard (RFC 4648) base64 encoding. The client
+*   only ever needs to produce base64, never parse it: the WebSocket
+*   handshake sends a base64-encoded random key and compares the server's
+*   Sec-WebSocket-Accept header against a base64 encoding this client
+*   computes itself, byte for byte, rather than decoding the header.
+
+    base64.alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+*   base64.encode(bytes) -> the standard padded base64 text for the raw
+*   (possibly binary, possibly embedding NUL) input string.
+    define('base64.encode(bytes)out,i,n,b0,b1,b2,triple') :(base64.encode.end)
+base64.encode
+        out = ""
+        i = 1
+        n = size(bytes)
+base64.encode.loop
+        gt(i, n)                                        :s(base64.encode.finished)
+        b0 = ord(substr(bytes, i, 1))
+        b1 = 0
+        b2 = 0
+        ge(i + 1, n + 1)                                :s(base64.encode.two)
+        b1 = ord(substr(bytes, i + 1, 1))
+        ge(i + 2, n + 1)                                :s(base64.encode.one)
+        b2 = ord(substr(bytes, i + 2, 1))
+        :(base64.encode.full)
+base64.encode.two
+* Only one input byte remains: encode two base64 characters worth of data
+* and pad the rest with "==".
+        triple = b0 * 65536
+        out = out substr(base64.alphabet, (triple / 262144) + 1, 1)
+        out = out substr(base64.alphabet, remdr(triple / 4096, 64) + 1, 1)
+        out = out "=="                                  :(base64.encode.done)
+base64.encode.one
+* Exactly two input bytes remain: three base64 characters plus one "=".
+        triple = b0 * 65536 + b1 * 256
+        out = out substr(base64.alphabet, (triple / 262144) + 1, 1)
+        out = out substr(base64.alphabet, remdr(triple / 4096, 64) + 1, 1)
+        out = out substr(base64.alphabet, remdr(triple / 64, 64) + 1, 1)
+        out = out "="                                    :(base64.encode.done)
+base64.encode.full
+        triple = b0 * 65536 + b1 * 256 + b2
+        out = out substr(base64.alphabet, (triple / 262144) + 1, 1)
+        out = out substr(base64.alphabet, remdr(triple / 4096, 64) + 1, 1)
+        out = out substr(base64.alphabet, remdr(triple / 64, 64) + 1, 1)
+        out = out substr(base64.alphabet, remdr(triple, 64) + 1, 1)
+base64.encode.done
+        i = i + 3                                       :(base64.encode.loop)
+base64.encode.finished
+        base64.encode = out                             :(return)
+base64.encode.end
+
+*   base64.decode(text) -> the raw bytes a standard padded base64 string
+*   encodes, or fails on malformed input. The only caller is
+*   convex-live.sno, decoding the 8-byte canonical timestamp Convex sends
+*   in every sync version object.
+    define('base64.decode(text)i,n,out,group,c,v0,v1,v2,v3,pad') :(base64.decode.end)
+base64.decode
+        n = size(text)
+        eq(remdr(n, 4), 0)                                :f(freturn)
+        gt(n, 0)                                           :f(base64.decode.done)
+        out = ""
+        i = 1
+base64.decode.loop
+        gt(i, n)                                            :s(base64.decode.done)
+        group = substr(text, i, 4)
+        pad = 0
+        ident(substr(group, 4, 1), "=")                      :s(base64.decode.pad1)
+        :(base64.decode.values)
+base64.decode.pad1
+        pad = 1
+        ident(substr(group, 3, 1), "=")                      :f(base64.decode.values)
+        pad = 2
+base64.decode.values
+        v0 = base64.value(substr(group, 1, 1))                :f(freturn)
+        v1 = base64.value(substr(group, 2, 1))                :f(freturn)
+        v2 = 0
+        v3 = 0
+        eq(pad, 2)                                            :s(base64.decode.assemble)
+        v2 = base64.value(substr(group, 3, 1))                :f(freturn)
+        eq(pad, 1)                                            :s(base64.decode.assemble)
+        v3 = base64.value(substr(group, 4, 1))                :f(freturn)
+base64.decode.assemble
+        out = out char((v0 * 4) + (v1 / 16))
+        eq(pad, 2)                                            :s(base64.decode.advance)
+        out = out char(remdr(v1, 16) * 16 + (v2 / 4))
+        eq(pad, 1)                                            :s(base64.decode.advance)
+        out = out char(remdr(v2, 4) * 64 + v3)
+base64.decode.advance
+        i = i + 4                                             :(base64.decode.loop)
+base64.decode.done
+        base64.decode = out                                   :(return)
+base64.decode.end
+
+*   base64.value(ch) -> the 0-63 alphabet index of one base64 character.
+    define('base64.value(ch)i') :(base64.value.end)
+base64.value
+        i = 1
+base64.value.loop
+        gt(i, 64)                                              :s(freturn)
+        ident(substr(base64.alphabet, i, 1), ch)                :s(base64.value.found)
+        i = i + 1                                               :(base64.value.loop)
+base64.value.found
+        base64.value = i - 1                                    :(return)
+base64.value.end

@@ -1,0 +1,129 @@
+*   convex-bits.sno - 32-bit bitwise arithmetic. Standard SNOBOL4 has no
+*   bitwise operators at all; CSNOBOL4 does not add any either, so every one
+*   of these is built from plain integer division and REMDR (remainder).
+*   They exist for exactly one caller each: RFC 6455's masking XOR (see
+*   convex-ws.sno) and SHA-1 (see convex-sha1.sno), so clarity is worth far
+*   more here than speed - SHA-1 runs once per WebSocket connect, hashing a
+*   handshake key well under 64 bytes.
+*
+*   Every function truncates its result to the low 32 bits, matching the
+*   unsigned 32-bit arithmetic both RFC 6455 and SHA-1 are defined over.
+*   int_t is 64 bits wide on every platform this client targets (asserted in
+*   the Dockerfile), so a 32-bit quantity never approaches SNOBOL4's own
+*   integer range.
+
+    bits.two32 = 4294967296
+
+*   bits.mod32(x) -> x truncated into [0, 2^32), the normal form every other
+*   function in this file both accepts and returns.
+    define('bits.mod32(x)') :(bits.mod32.end)
+bits.mod32
+        bits.mod32 = remdr(x, bits.two32)
+        ge(bits.mod32, 0)                               :s(return)
+        bits.mod32 = bits.mod32 + bits.two32            :(return)
+bits.mod32.end
+
+*   bits.add32(a, b) -> (a + b) mod 2^32, SHA-1's word addition.
+    define('bits.add32(a,b)') :(bits.add32.end)
+bits.add32 bits.add32 = bits.mod32(a + b)               :(return)
+bits.add32.end
+
+*   bits.and32 / bits.or32 / bits.xor32(a, b) -> the bitwise operation over
+*   32 bits, built one bit at a time from the low bit up. Each iteration
+*   peels the low bit off both operands with REMDR and DIV, combines it, and
+*   shifts the accumulator left by re-multiplying: this is the same
+*   algorithm a hardware adder would use, just without hardware.
+    define('bits.and32(a,b)abit,bbit,result,place,i') :(bits.and32.end)
+bits.and32
+        a = bits.mod32(a)
+        b = bits.mod32(b)
+        result = 0
+        place = 1
+        i = 0
+bits.and32.loop
+        ge(i, 32)                                       :s(bits.and32.done)
+        abit = remdr(a, 2)
+        bbit = remdr(b, 2)
+        eq(abit, 1)                                     :f(bits.and32.next)
+        eq(bbit, 1)                                     :f(bits.and32.next)
+        result = result + place
+bits.and32.next
+        a = (a - abit) / 2
+        b = (b - bbit) / 2
+        place = place * 2
+        i = i + 1                                       :(bits.and32.loop)
+bits.and32.done
+        bits.and32 = result                             :(return)
+bits.and32.end
+
+    define('bits.or32(a,b)abit,bbit,result,place,i') :(bits.or32.end)
+bits.or32
+        a = bits.mod32(a)
+        b = bits.mod32(b)
+        result = 0
+        place = 1
+        i = 0
+bits.or32.loop
+        ge(i, 32)                                       :s(bits.or32.done)
+        abit = remdr(a, 2)
+        bbit = remdr(b, 2)
+        eq(abit, 1)                                     :s(bits.or32.one)
+        eq(bbit, 1)                                     :f(bits.or32.next)
+bits.or32.one
+        result = result + place
+bits.or32.next
+        a = (a - abit) / 2
+        b = (b - bbit) / 2
+        place = place * 2
+        i = i + 1                                       :(bits.or32.loop)
+bits.or32.done
+        bits.or32 = result                              :(return)
+bits.or32.end
+
+    define('bits.xor32(a,b)abit,bbit,result,place,i') :(bits.xor32.end)
+bits.xor32
+        a = bits.mod32(a)
+        b = bits.mod32(b)
+        result = 0
+        place = 1
+        i = 0
+bits.xor32.loop
+        ge(i, 32)                                       :s(bits.xor32.done)
+        abit = remdr(a, 2)
+        bbit = remdr(b, 2)
+        eq(abit, bbit)                                  :s(bits.xor32.next)
+        result = result + place
+bits.xor32.next
+        a = (a - abit) / 2
+        b = (b - bbit) / 2
+        place = place * 2
+        i = i + 1                                       :(bits.xor32.loop)
+bits.xor32.done
+        bits.xor32 = result                             :(return)
+bits.xor32.end
+
+*   bits.not32(a) -> the ones' complement of a over 32 bits: (2^32 - 1 - a).
+    define('bits.not32(a)') :(bits.not32.end)
+bits.not32
+        bits.not32 = bits.two32 - 1 - bits.mod32(a)     :(return)
+bits.not32.end
+
+*   bits.rol32(a, n) -> a rotated left by n bits (0 <= n <= 31) over 32
+*   bits: the high n bits wrap around into the low n bits.
+    define('bits.rol32(a,n)left,right') :(bits.rol32.end)
+bits.rol32
+        a = bits.mod32(a)
+        eq(n, 0)                                        :s(bits.rol32.zero)
+        left = bits.mod32(a * (2 ** n))
+        right = a / (2 ** (32 - n))
+        bits.rol32 = bits.mod32(left + right)           :(return)
+bits.rol32.zero
+        bits.rol32 = a                                  :(return)
+bits.rol32.end
+
+*   bits.byte(x, index) -> the index'th byte (0 = most significant) of the
+*   32-bit value x, used to split a length or a frame size into octets.
+    define('bits.byte(x,index)') :(bits.byte.end)
+bits.byte
+        bits.byte = remdr(x / (2 ** (8 * (3 - index))), 256)  :(return)
+bits.byte.end

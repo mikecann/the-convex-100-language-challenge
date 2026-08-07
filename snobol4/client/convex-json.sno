@@ -1,0 +1,449 @@
+*   convex-json.sno - a JSON reader and writer over raw text spans rather
+*   than a materialized tree. A Convex value the client only relays (a
+*   query's result value, a mutation's arguments) is never decoded into a
+*   SNOBOL4 structure at all; it stays the exact substring of the wire
+*   response and is copied verbatim into the adapter's own JSON output. Only
+*   the handful of scalars the protocol itself inspects - status strings,
+*   uint32 counters, error messages - are ever decoded into real SNOBOL4
+*   values. This mirrors the reference Tcl client's design and keeps this
+*   file a genuine, complete JSON scanner without needing a general-purpose
+*   value representation SNOBOL4 has no natural type for.
+*
+*   Every index in this file is 1-based, matching SNOBOL4's own SUBSTR/LEN.
+
+    json.ws = " " char(9) char(13) char(10)
+
+*   json.skip(text, index) -> the first index at or after the given one
+*   whose character is not JSON whitespace. Runs off the end of text
+*   (returning size(text) + 1) rather than failing, since "nothing but
+*   trailing space" is a normal place for a scan to stop.
+    define('json.skip(text,index)') :(json.skip.end)
+json.skip
+        json.skip = index
+json.skip.loop
+        gt(json.skip, size(text))                       :s(return)
+        substr(text, json.skip, 1) span(json.ws)         :f(return)
+        json.skip = json.skip + 1                       :(json.skip.loop)
+json.skip.end
+
+*   json.string_end(text, index) -> the index just past a JSON string
+*   literal's closing quote. index must point at the opening quote. Fails
+*   on an unterminated string; a malformed \u escape is not specially
+*   detected here; json.decode_string rejects it when the value is actually
+*   decoded.
+    define('json.string_end(text,index)ch') :(json.string_end.end)
+json.string_end
+        json.string_end = index + 1
+json.string_end.loop
+        gt(json.string_end, size(text))                 :s(json.string_end.fail)
+        ch = substr(text, json.string_end, 1)
+        ident(ch, "\")                                     :s(json.string_end.escape)
+        ident(ch, '"')                                     :s(json.string_end.close)
+        json.string_end = json.string_end + 1           :(json.string_end.loop)
+json.string_end.escape
+        json.string_end = json.string_end + 1
+        gt(json.string_end, size(text))                 :s(json.string_end.fail)
+        ident(substr(text, json.string_end, 1), "u")        :s(json.string_end.uescape)
+        json.string_end = json.string_end + 1           :(json.string_end.loop)
+json.string_end.uescape
+        json.string_end = json.string_end + 5           :(json.string_end.loop)
+json.string_end.close
+        json.string_end = json.string_end + 1           :(return)
+json.string_end.fail
+        :(freturn)
+json.string_end.end
+
+*   json.value_end(text, index) -> the index just past one complete JSON
+*   value starting at index, which must already point at the value's first
+*   non-space character (call json.skip first). Fails on malformed input.
+    define('json.value_end(text,index)ch,open,close,depth') :(json.value_end.end)
+json.value_end
+        gt(index, size(text))                           :s(json.value_end.fail)
+        ch = substr(text, index, 1)
+        ident(ch, '"')                                     :s(json.value_end.string)
+        ident(ch, "{")                                      :s(json.value_end.container)
+        ident(ch, "[")                                      :s(json.value_end.container)
+        :(json.value_end.scalar)
+json.value_end.string
+        json.value_end = json.string_end(text, index)   :s(return)
+        :(freturn)
+json.value_end.container
+        open = ch
+        close = "]"
+        ident(open, "{")                                    :f(json.value_end.cont2)
+        close = "}"
+json.value_end.cont2
+        depth = 0
+        json.value_end = index
+json.value_end.cloop
+        gt(json.value_end, size(text))                  :s(json.value_end.fail)
+        ch = substr(text, json.value_end, 1)
+        ident(ch, '"')                                      :s(json.value_end.cstring)
+        ident(ch, open)                                     :s(json.value_end.copen)
+        ident(ch, close)                                    :s(json.value_end.cclose)
+        json.value_end = json.value_end + 1             :(json.value_end.cloop)
+json.value_end.cstring
+        json.value_end = json.string_end(text, json.value_end)  :f(json.value_end.fail)
+        :(json.value_end.cloop)
+json.value_end.copen
+        depth = depth + 1
+        json.value_end = json.value_end + 1             :(json.value_end.cloop)
+json.value_end.cclose
+        json.value_end = json.value_end + 1
+        depth = depth - 1
+        eq(depth, 0)                                    :s(return)
+        :(json.value_end.cloop)
+json.value_end.scalar
+* true / false / null / a number: run to the next structural character.
+        json.value_end = index
+json.value_end.sloop
+        gt(json.value_end, size(text))                  :s(return)
+        ch = substr(text, json.value_end, 1)
+        ident(ch, ",")                                      :s(return)
+        ident(ch, "}")                                      :s(return)
+        ident(ch, "]")                                      :s(return)
+        ch span(json.ws)                                 :s(return)
+        json.value_end = json.value_end + 1             :(json.value_end.sloop)
+json.value_end.fail
+        :(freturn)
+json.value_end.end
+
+*   json.field(objtext, name) -> the raw JSON subtree of the top-level field
+*   "name" within a JSON object. Fails when objtext is not an object or the
+*   field is absent, so a caller reads an optional field with :F(default).
+    define('json.field(objtext,name)i,n,keystart,keyend,key,valstart,valend') :(json.field.end)
+json.field
+        i = json.skip(objtext, 1)
+        ident(substr(objtext, i, 1), "{")                   :f(json.field.fail)
+        i = i + 1
+json.field.loop
+        i = json.skip(objtext, i)
+        gt(i, size(objtext))                            :s(json.field.fail)
+        ident(substr(objtext, i, 1), "}")                   :s(json.field.fail)
+        ident(substr(objtext, i, 1), '"')                   :f(json.field.fail)
+        keystart = i
+        keyend = json.string_end(objtext, i)             :f(json.field.fail)
+        key = json.decode_string(substr(objtext, keystart, keyend - keystart))  :f(json.field.fail)
+        i = json.skip(objtext, keyend)
+        ident(substr(objtext, i, 1), ":")                   :f(json.field.fail)
+        valstart = json.skip(objtext, i + 1)
+        valend = json.value_end(objtext, valstart)       :f(json.field.fail)
+        differ(key, name)                                   :s(json.field.advance)
+        json.field = substr(objtext, valstart, valend - valstart)  :(return)
+json.field.advance
+        i = json.skip(objtext, valend)
+        ident(substr(objtext, i, 1), ",")                   :f(json.field.loop)
+        i = i + 1                                        :(json.field.loop)
+json.field.fail
+        :(freturn)
+json.field.end
+
+*   json.array_at(arrtext, n) -> the raw JSON subtree of the n'th (1-based)
+*   top-level element of a JSON array. Fails when arrtext is not an array
+*   or has fewer than n elements, so a caller iterates n = 1, 2, ... until
+*   the first failure.
+    define('json.array_at(arrtext,n)i,count,valstart,valend') :(json.array_at.end)
+json.array_at
+        i = json.skip(arrtext, 1)
+        ident(substr(arrtext, i, 1), "[")                    :f(json.array_at.fail)
+        i = i + 1
+        count = 0
+json.array_at.loop
+        i = json.skip(arrtext, i)
+        gt(i, size(arrtext))                             :s(json.array_at.fail)
+        ident(substr(arrtext, i, 1), "]")                    :s(json.array_at.fail)
+        valstart = i
+        valend = json.value_end(arrtext, valstart)        :f(json.array_at.fail)
+        count = count + 1
+        eq(count, n)                                     :s(json.array_at.found)
+        i = json.skip(arrtext, valend)
+        ident(substr(arrtext, i, 1), ",")                    :f(json.array_at.loop)
+        i = i + 1                                         :(json.array_at.loop)
+json.array_at.found
+        json.array_at = substr(arrtext, valstart, valend - valstart)  :(return)
+json.array_at.fail
+        :(freturn)
+json.array_at.end
+
+*   json.is_object(text) / json.is_array(text) - succeed or fail depending
+*   on the first non-space character, without consuming or validating the
+*   rest of the value.
+    define('json.is_object(text)') :(json.is_object.end)
+json.is_object ident(substr(text, json.skip(text, 1), 1), "{")   :s(return)
+        :(freturn)
+json.is_object.end
+
+    define('json.is_array(text)') :(json.is_array.end)
+json.is_array ident(substr(text, json.skip(text, 1), 1), "[")    :s(return)
+        :(freturn)
+json.is_array.end
+
+*   json.decode_string(literal) -> the decoded value of a JSON string
+*   literal (literal includes its surrounding quotes). Handles \", \\, \/,
+*   \b \f \n \r \t, and \uXXXX, including surrogate pairs, encoded back out
+*   as UTF-8. Fails on anything that is not a well-formed JSON string.
+    define('json.decode_string(literal)i,n,out,ch,hex,code,hi,lo') :(json.decode_string.end)
+json.decode_string
+        i = json.skip(literal, 1)
+        ident(substr(literal, i, 1), '"')                    :f(json.decode_string.fail)
+        n = json.string_end(literal, i)                   :f(json.decode_string.fail)
+        i = i + 1
+        n = n - 1
+        out = ""
+json.decode_string.loop
+        ge(i, n)                                          :s(json.decode_string.done)
+        ch = substr(literal, i, 1)
+        differ(ch, "\")                                       :s(json.decode_string.plain)
+        i = i + 1
+        ch = substr(literal, i, 1)
+        ident(ch, '"')                                       :s(json.decode_string.lit)
+        ident(ch, "\")                                        :s(json.decode_string.lit)
+        ident(ch, "/")                                       :s(json.decode_string.lit)
+        ident(ch, "b")                                       :s(json.decode_string.ctl)
+        ident(ch, "f")                                       :s(json.decode_string.ctlf)
+        ident(ch, "n")                                       :s(json.decode_string.ctln)
+        ident(ch, "r")                                       :s(json.decode_string.ctlr)
+        ident(ch, "t")                                       :s(json.decode_string.ctlt)
+        ident(ch, "u")                                       :s(json.decode_string.unicode)
+        :(json.decode_string.fail)
+json.decode_string.lit
+        out = out ch
+        i = i + 1                                         :(json.decode_string.loop)
+json.decode_string.ctl
+        out = out char(8)
+        i = i + 1                                         :(json.decode_string.loop)
+json.decode_string.ctlf
+        out = out char(12)
+        i = i + 1                                         :(json.decode_string.loop)
+json.decode_string.ctln
+        out = out char(10)
+        i = i + 1                                         :(json.decode_string.loop)
+json.decode_string.ctlr
+        out = out char(13)
+        i = i + 1                                         :(json.decode_string.loop)
+json.decode_string.ctlt
+        out = out char(9)
+        i = i + 1                                         :(json.decode_string.loop)
+json.decode_string.unicode
+        hex = substr(literal, i + 1, 4)
+        code = json.hex4(hex)                             :f(json.decode_string.fail)
+        i = i + 5
+* A high surrogate must be immediately followed by a low surrogate; combine
+* them into one astral code point before encoding, per RFC 8259.
+        lt(code, 55296)                                   :s(json.decode_string.bmp)
+        gt(code, 56319)                                   :s(json.decode_string.bmp)
+        ident(substr(literal, i, 2), "\u")                     :f(json.decode_string.fail)
+        hi = code
+        hex = substr(literal, i + 2, 4)
+        lo = json.hex4(hex)                               :f(json.decode_string.fail)
+        lt(lo, 56320)                                      :s(json.decode_string.fail)
+        gt(lo, 57343)                                      :s(json.decode_string.fail)
+        code = 65536 + (hi - 55296) * 1024 + (lo - 56320)
+        i = i + 6
+        out = out json.utf8(code)                          :(json.decode_string.loop)
+json.decode_string.bmp
+        out = out json.utf8(code)                          :(json.decode_string.loop)
+json.decode_string.plain
+        out = out ch
+        i = i + 1                                         :(json.decode_string.loop)
+json.decode_string.done
+        json.decode_string = out                          :(return)
+json.decode_string.fail
+        :(freturn)
+json.decode_string.end
+
+*   json.hex4(text) -> the value of exactly four hex digits, or fails.
+    define('json.hex4(text)i,value,d,ch') :(json.hex4.end)
+json.hex4
+        eq(size(text), 4)                                 :f(freturn)
+        value = 0
+        i = 1
+json.hex4.loop
+        gt(i, 4)                                          :s(json.hex4.done)
+        ch = substr(text, i, 1)
+        d = 0
+        ch span("0123456789")                              :s(json.hex4.digit)
+        ch span("abcdef")                                  :s(json.hex4.lower)
+        ch span("ABCDEF")                                  :s(json.hex4.upper)
+        :(freturn)
+json.hex4.digit
+        d = ord(ch) - ord("0")                             :(json.hex4.accum)
+json.hex4.lower
+        d = ord(ch) - ord("a") + 10                        :(json.hex4.accum)
+json.hex4.upper
+        d = ord(ch) - ord("A") + 10
+json.hex4.accum
+        value = value * 16 + d
+        i = i + 1                                          :(json.hex4.loop)
+json.hex4.done
+        json.hex4 = value                                  :(return)
+json.hex4.end
+
+*   json.utf8(codepoint) -> the UTF-8 encoding of one Unicode code point.
+    define('json.utf8(code)') :(json.utf8.end)
+json.utf8
+        lt(code, 128)                                      :s(json.utf8.one)
+        lt(code, 2048)                                     :s(json.utf8.two)
+        lt(code, 65536)                                    :s(json.utf8.three)
+        :(json.utf8.four)
+json.utf8.one
+        json.utf8 = char(code)                             :(return)
+json.utf8.two
+        json.utf8 = char(192 + code / 64) char(128 + remdr(code, 64))
+        :(return)
+json.utf8.three
+        json.utf8 = char(224 + code / 4096) char(128 + remdr(code / 64, 64)) char(128 + remdr(code, 64))
+        :(return)
+json.utf8.four
+        json.utf8 = char(240 + code / 262144) char(128 + remdr(code / 4096, 64)) char(128 + remdr(code / 64, 64)) char(128 + remdr(code, 64))
+        :(return)
+json.utf8.end
+
+*   json.qs(value) -> a JSON string literal for the raw (UTF-8) SNOBOL4
+*   string value, escaping only what JSON requires: quote, backslash, and
+*   the C0 control characters. Everything else, including multi-byte UTF-8,
+*   passes through unchanged, which is valid JSON and keeps this a plain
+*   byte-oriented copy rather than something that has to understand UTF-8
+*   to write it.
+    define('json.qs(value)i,out,ch,code') :(json.qs.end)
+json.qs
+        out = '"'
+        i = 1
+json.qs.loop
+        gt(i, size(value))                                :s(json.qs.done)
+        ch = substr(value, i, 1)
+        code = ord(ch)
+        ident(ch, '"')                                       :s(json.qs.escquote)
+        ident(ch, "\")                                         :s(json.qs.escback)
+        lt(code, 32)                                       :s(json.qs.control)
+        out = out ch                                       :(json.qs.next)
+json.qs.escquote
+        out = out "\" '"'                                   :(json.qs.next)
+json.qs.escback
+        out = out "\\"                                      :(json.qs.next)
+json.qs.control
+        eq(code, 8)                                        :s(json.qs.b)
+        eq(code, 9)                                        :s(json.qs.t)
+        eq(code, 10)                                       :s(json.qs.n)
+        eq(code, 12)                                       :s(json.qs.f)
+        eq(code, 13)                                       :s(json.qs.r)
+        out = out "\u00" substr("0123456789abcdef", (code / 16) + 1, 1) substr("0123456789abcdef", remdr(code, 16) + 1, 1)
+        :(json.qs.next)
+json.qs.b
+        out = out "\b"                                      :(json.qs.next)
+json.qs.t
+        out = out "\t"                                      :(json.qs.next)
+json.qs.n
+        out = out "\n"                                      :(json.qs.next)
+json.qs.f
+        out = out "\f"                                      :(json.qs.next)
+json.qs.r
+        out = out "\r"
+json.qs.next
+        i = i + 1                                          :(json.qs.loop)
+json.qs.done
+        json.qs = out '"'                                  :(return)
+json.qs.end
+
+*   json.uint32(rawvalue) -> the value of a JSON number token that is
+*   exactly a non-negative integer in [0, 2^32), accepting the mathematically
+*   integral decimal form Convex sometimes sends (e.g. "1.0") and rejecting
+*   fractions, signs, exponents, and anything out of range.
+    define('json.uint32(rawvalue)trimmed,whole,frac,dot') :(json.uint32.end)
+json.uint32
+        trimmed = json.trim(rawvalue)
+        dot = indexof(trimmed, ".")
+        ne(dot, 0)                                          :s(json.uint32.split)
+        whole = trimmed                                      :(json.uint32.checkwhole)
+json.uint32.split
+        whole = substr(trimmed, 1, dot - 1)
+        frac = substr(trimmed, dot + 1, size(trimmed) - dot)
+        gt(size(frac), 0)                                    :f(freturn)
+        frac span("0") rpos(0)                               :f(freturn)
+json.uint32.checkwhole
+        gt(size(whole), 0)                                   :f(freturn)
+        whole span("0123456789") rpos(0)                     :f(freturn)
+        eq(size(whole), 1)                                   :s(json.uint32.value)
+        differ(substr(whole, 1, 1), "0")                          :f(freturn)
+json.uint32.value
+        json.uint32 = whole + 0
+        le(json.uint32, 4294967295)                          :s(return)
+        :(freturn)
+json.uint32.end
+
+*   json.indexof(text, needle) -> the 1-based index of the first occurrence
+*   of a single-character needle in text, or 0 when absent.
+    define('indexof(text,needle)i') :(indexof.end)
+indexof
+        i = 1
+indexof.loop
+        gt(i, size(text))                                    :s(indexof.notfound)
+        ident(substr(text, i, 1), needle)                        :s(indexof.found)
+        i = i + 1                                             :(indexof.loop)
+indexof.found
+        indexof = i                                           :(return)
+indexof.notfound
+        indexof = 0                                           :(return)
+indexof.end
+
+*   indexof4(text, needle) -> the 1-based index where a (short, fixed)
+*   multi-character needle first occurs in text, or 0 when absent. Used to
+*   find the blank-line and CRLF markers HTTP and WebSocket framing need.
+    define('indexof4(text,needle)i,n') :(indexof4.end)
+indexof4
+        n = size(needle)
+        i = 1
+indexof4.loop
+        gt(i + n - 1, size(text))                                :s(indexof4.notfound)
+        ident(substr(text, i, n), needle)                        :s(indexof4.found)
+        i = i + 1                                                :(indexof4.loop)
+indexof4.found
+        indexof4 = i                                             :(return)
+indexof4.notfound
+        indexof4 = 0                                             :(return)
+indexof4.end
+
+*   json.trim(text) -> text with leading and trailing JSON whitespace
+*   removed.
+    define('json.trim(text)a,b') :(json.trim.end)
+json.trim
+        a = json.skip(text, 1)
+        b = size(text)
+json.trim.loop
+        lt(b, a)                                            :s(json.trim.empty)
+        substr(text, b, 1) span(json.ws)                      :f(json.trim.done)
+        b = b - 1                                            :(json.trim.loop)
+json.trim.empty
+        json.trim = ""                                        :(return)
+json.trim.done
+        json.trim = substr(text, a, b - a + 1)                :(return)
+json.trim.end
+
+*   json.object1 .. json.object6 - build a JSON object from RAW value text
+*   (the caller pre-encodes strings with json.qs and passes numbers,
+*   objects, and arrays through as they already are). A fixed family of
+*   arities is simpler and just as clear as a generic list-based builder in
+*   a language with no variadic functions or list literals.
+    define('json.object1(k1,v1)') :(json.object1.end)
+json.object1 json.object1 = "{" json.qs(k1) ":" v1 "}"        :(return)
+json.object1.end
+
+    define('json.object2(k1,v1,k2,v2)') :(json.object2.end)
+json.object2 json.object2 = "{" json.qs(k1) ":" v1 "," json.qs(k2) ":" v2 "}"  :(return)
+json.object2.end
+
+    define('json.object3(k1,v1,k2,v2,k3,v3)') :(json.object3.end)
+json.object3 json.object3 = "{" json.qs(k1) ":" v1 "," json.qs(k2) ":" v2 "," json.qs(k3) ":" v3 "}"  :(return)
+json.object3.end
+
+    define('json.object4(k1,v1,k2,v2,k3,v3,k4,v4)') :(json.object4.end)
+json.object4 json.object4 = "{" json.qs(k1) ":" v1 "," json.qs(k2) ":" v2 "," json.qs(k3) ":" v3 "," json.qs(k4) ":" v4 "}"  :(return)
+json.object4.end
+
+    define('json.object5(k1,v1,k2,v2,k3,v3,k4,v4,k5,v5)') :(json.object5.end)
+json.object5 json.object5 = "{" json.qs(k1) ":" v1 "," json.qs(k2) ":" v2 "," json.qs(k3) ":" v3 "," json.qs(k4) ":" v4 "," json.qs(k5) ":" v5 "}"  :(return)
+json.object5.end
+
+    define('json.object6(k1,v1,k2,v2,k3,v3,k4,v4,k5,v5,k6,v6)') :(json.object6.end)
+json.object6 json.object6 = "{" json.qs(k1) ":" v1 "," json.qs(k2) ":" v2 "," json.qs(k3) ":" v3 "," json.qs(k4) ":" v4 "," json.qs(k5) ":" v5 "," json.qs(k6) ":" v6 "}"  :(return)
+json.object6.end
