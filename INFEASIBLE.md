@@ -49,6 +49,17 @@ way none of the other entries on this page do.
 | --- | --- |
 | unison | The socket and TLS claim was fully proven, not just documented. Running non-interactively inside a bare `debian:trixie-slim` container on linux/amd64 via `ucm run.file` (piped stdin, zero prompts; `ucm --codebase-create` boots headless), the expression `Connection.tls (HostName "example.com") (Port "443")` opened a real TCP connection, completed a certificate-verified TLS handshake against a public host, sent a plaintext HTTP GET over it, and printed back a genuine decrypted `HTTP/1.1 200 OK` response — a full round trip, on `ucm` release/1.3.0 (built 2026-05-13). `IO.net.Socket` and the functions underneath `Connection.tls` are confirmed `builtin` (e.g. `builtin lib.unison_base_7_19_2.IO.net.Socket.client.impl`), i.e. real runtime primitives, not a foreign-process shim. What kills the entry is reproducibility, not capability: `Socket`, `Connection.tls`, and every ergonomic helper this used — even `HostName`, `Port`, and `Text.toUtf8` — live in the `base` library, and the only route to `base` in the current toolchain is `lib.install`/`pull` against `@unison/base/releases/...` on Unison Share (confirmed: `help pull` and `help lib.install` in ucm 1.3.0 document only that Share project syntax). The historical git-remote pull syntax (`pull https://github.com/user/repo:branch .path`) has been removed from the parser — attempting it now is a parse error. The `unisonweb/base` GitHub mirror is explicitly marked deprecated by Unison Computing itself ("Unison code hosting for this library has migrated to Unison Share"), so it is not a usable offline substitute either. The raw compiler builtins underneath `base`'s wrappers are real, but they are addressable only by content hash, not by name, and there is no local or offline way to discover those hashes without first consulting a codebase that has already resolved names through a Share pull; a guessed bare reference to one (`##IO.socketSend.impl`) was rejected by the REPL as unknown, confirming FFI-level builtins carry no special parser syntax the way ability types like `##IO` do. Every Dockerfile path to a working client therefore needs a `docker build`-time (or, if deferred, a container-start-time) network round trip to one hosted third-party service outside this project's control — exactly the "network access to Unison Share at build time" failure this candidate was explicitly held to before acceptance. Futhark's vacated slot (slot 3, replacing matlab) is therefore still open. |
 
+## Infeasible — toolchain rejected by this project's container security posture
+
+This candidate reaches neither the socket gate nor the toolchain gate cleanly:
+its own bootstrap binary cannot run at all under this project's Docker
+constraints, at build time or run time, for a reason that has nothing to do
+with the language.
+
+| Language | Why it cannot be done here |
+| --- | --- |
+| pop11 | Poplog (the toolchain behind Pop-11, held in reserve for this slot pending Seed7) bootstraps every further build stage from a "corepop" binary — a fixed-address heap image inherited from a 1980s VM design — that calls `personality(ADDR_NO_RANDOMIZE)` before it can load. Docker's default seccomp profile rejects that specific flag value; this project's `./run` script never passes a custom `--security-opt seccomp=`, so both `docker build` (BuildKit's own RUN sandbox) and every `docker run` this project performs use that same restrictive default. The result under it is not a permission error but a crash — `MEMORY ACCESS VIOLATION` — reproduced directly against all five corepop images GetPoplog ships (`010` through `050`, spanning 2012–2021 builds); `--security-opt seccomp=unconfined` makes the identical binary succeed immediately, and that flag is unavailable both inside this project's hermetic build and inside the read-only, capability-dropped runtime container the shared verifier launches. GetPoplog's own repository ships a bespoke `docker/poplog_seccomp.json` profile and a "Running poplog under Docker" wiki page for exactly this reason — a documented, upstream-acknowledged constraint of the toolchain under containers, not a one-off flake or a fixable Dockerfile mistake. |
+
 ## Infeasible — license or GUI gate (ruled, previously borderline)
 
 Michael's ruling: entries requiring a proprietary license or a GUI toolchain are
@@ -157,13 +168,20 @@ The third candidate is chosen against both failures at once:
   answer to both prior failures: `s7` builds from a plain source tarball with
   gcc and no network dependency at run or build time, and its standard library
   ships `socket.s7i` and TLS support natively, so neither gate is in doubt the
-  way Futhark's and Unison's were.
+  way Futhark's and Unison's were. Both gates have now been verified directly,
+  not just documented: the toolchain builds unattended from the pinned
+  `seed7_05_20260711` source tarball in well under a minute, and Seed7's own
+  `openInetSocket`/`openTlsSocket` completed real HTTP and TLS 1.2 round trips
+  (the latter through a from-scratch, non-OpenSSL TLS stack in
+  `tls.s7i` — handshake, AES-GCM, HMAC, elliptic-curve key exchange, X.509
+  parsing, all in Seed7 itself). A client is in progress on
+  `codex/seed7-client`.
 
-Held in reserve, if actionscript or logo cannot be recovered:
-
-- **Pop-11** (Poplog) — the British AI language, an incremental compiler whose
-  virtual machine also hosts Prolog, Common Lisp and ML inside the same image.
-  Strange in a way no modern language is.
+`Pop-11` (Poplog), held in reserve for this slot, was tried once Seed7's own
+gates cleared and turned out infeasible for a reason specific to this
+project's container security posture rather than the language; see the new
+"toolchain rejected by this project's container security posture" table
+above for the evidence.
 
 Considered in this round and not chosen:
 
