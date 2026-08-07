@@ -28,7 +28,7 @@ checks the whole `0 -> 1` journey. The CoffeeScript implementation is under
 ## Basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.coffee -->
-```text
+```coffeescript
 #!/usr/local/bin/node
 { randomUUID } = require 'node:crypto'
 { Client } = require '../../client/convex'
@@ -36,6 +36,19 @@ checks the whole `0 -> 1` journey. The CoffeeScript implementation is under
 deploymentUrl = process.env.CONVEX_URL
 throw new Error 'CONVEX_URL is required' unless deploymentUrl
 room = process.argv[2] ? process.env.EXAMPLE_ROOM ? 'coffeescript-example'
+
+# Convex JSON may spell an integer as 0.0, but strings, fractions, and unsafe
+# numbers must not silently become valid counter values.
+assertCount = (operation, actual, expected) ->
+  unless typeof actual is 'number' and Number.isSafeInteger(actual) and actual is expected
+    throw new Error "#{operation} count was #{JSON.stringify actual}, expected #{expected}"
+
+# Bound a single wait and let the subscription report structured Live failures.
+nextUpdate = (subscription, name) ->
+  item = await subscription.next 10_000
+  throw new Error "#{name} subscription closed" if item.done
+  throw item.value.error if item.value.error?
+  item.value
 
 # Create a client for the verifier-selected Convex deployment.
 client = new Client deploymentUrl
@@ -73,19 +86,6 @@ try
 finally
   # Close the WebSocket owner before the example exits.
   await client.close()
-
-# Convex JSON may spell an integer as 0.0, but strings, fractions, and unsafe
-# numbers must not silently become valid counter values.
-assertCount = (operation, actual, expected) ->
-  unless typeof actual is 'number' and Number.isSafeInteger actual and actual is expected
-    throw new Error "#{operation} count was #{JSON.stringify actual}, expected #{expected}"
-
-# Bound a single wait and let the subscription report structured Live failures.
-nextUpdate = (subscription, name) ->
-  item = await subscription.next 10_000
-  throw new Error "#{name} subscription closed" if item.done
-  throw item.value.error if item.value.error?
-  item.value
 ```
 <!-- END GENERATED EXAMPLE -->
 

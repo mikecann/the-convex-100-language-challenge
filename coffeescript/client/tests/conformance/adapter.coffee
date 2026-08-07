@@ -168,7 +168,15 @@ runAdapter = (input, output, environment = process.env) ->
           lease = (old?.lease ? 0) + 1
           subscriptions.set command.subscriptionId, { subscription, lease }
           await gate.write id: command.id, type: 'ack'
+          # Detach the relay instead of returning its promise: `execute` is
+          # async, so a bare implicit return here would make CoffeeScript's
+          # last-expression return chain execute()'s own promise onto the
+          # relay's, which only settles once the subscription is retired.
+          # That would stall processQueue's sequential loop for as long as
+          # the subscription stays open, deadlocking every command queued
+          # behind this one (including the eventual unsubscribe).
           forward(command.subscriptionId, subscription, lease).catch -> undefined
+          undefined
         when 'unsubscribe'
           old = subscriptions.get command.subscriptionId
           if old?
