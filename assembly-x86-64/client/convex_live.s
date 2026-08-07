@@ -1768,6 +1768,7 @@ handle_message:
 %define SS_LEN   -32
 %define SS_MSG   -40
 %define SS_HMRESULT -48
+%define SS_TMP -56
 convex_live_service_socket:
     push rbp
     mov rbp, rsp
@@ -1780,6 +1781,10 @@ convex_live_service_socket:
 
     lea rdi, [rdi + convex_live.ws]
     call ws_recv_more
+    mov [rbp+SS_TMP], rax
+    mov edi, 30
+    call dbg_mark
+    mov rax, [rbp+SS_TMP]
     cmp eax, 1
     je .pump
     mov rdi, [rbp+SS_LIVE]
@@ -1789,12 +1794,18 @@ convex_live_service_socket:
     call teardown_and_schedule
     jmp .done
 .pump:
+    mov edi, 31
+    call dbg_mark
     mov rax, [rbp+SS_LIVE]
     lea rdi, [rax + convex_live.ws]
     lea rsi, [rbp+SS_KIND]
     lea rdx, [rbp+SS_DATA]
     lea rcx, [rbp+SS_LEN]
     call ws_pump_message
+    mov [rbp+SS_TMP], rax
+    mov edi, 32
+    call dbg_mark
+    mov rax, [rbp+SS_TMP]
     cmp eax, 0
     je .done
     cmp eax, -1
@@ -1810,6 +1821,10 @@ convex_live_service_socket:
     mov rsi, [rbp+SS_LEN]
     lea rdx, [rbp+SS_MSG]
     call json_parse
+    mov [rbp+SS_TMP], rax
+    mov edi, 33
+    call dbg_mark
+    mov rax, [rbp+SS_TMP]
     mov rcx, [rbp+SS_DATA]
     test rcx, rcx
     jz .no_free_data
@@ -1823,8 +1838,12 @@ convex_live_service_socket:
     mov rsi, [rbp+SS_MSG]
     call handle_message
     mov [rbp+SS_HMRESULT], rax
+    mov edi, 34
+    call dbg_mark
     mov rdi, [rbp+SS_MSG]
     call json_free
+    mov edi, 35
+    call dbg_mark
     mov rax, [rbp+SS_HMRESULT]
     test eax, eax
     jz .protocol_error
@@ -1859,6 +1878,7 @@ convex_live_service_socket:
 %undef SS_LEN
 %undef SS_MSG
 %undef SS_HMRESULT
+%undef SS_TMP
 
 ; --- public lifecycle API ------------------------------------------------
 
