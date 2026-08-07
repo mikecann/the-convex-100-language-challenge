@@ -1,0 +1,16 @@
+{
+  "name": "convex-from-coffeescript-educational-client",
+  "private": true,
+  "version": "0.1.0",
+  "dependencies": {
+    "ws": "8.21.2"
+  },
+  "devDependencies": {
+    "coffeescript": "2.7.0"
+  },
+  "scripts": {
+    "build": "coffee --compile --output /build client examples",
+    "check": "coffee --compile --bare --output /tmp/coffee-check client examples",
+    "test": "node --test /build/client/tests/*.test.js /build/client/tests/conformance/*.test.js /build/examples/basics/*.test.js"
+  }
+}
