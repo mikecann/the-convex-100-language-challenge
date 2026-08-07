@@ -115,6 +115,6 @@ The Live implementation validates a complete Transition into temporary state bef
 
 ## Limitations
 
-This branch does not run root shared conformance or award badges. Live authentication, WebSocket mutations/actions, and `TransitionChunk` assembly are deferred. The pinned third-party WebSocket transport is patched during the Docker build.
+Root shared conformance ran from a clean exact-head build: local and hosted profiles both passed 31/31 and the shared evaluator awarded the http and live badges recorded in the manifest. Live authentication, WebSocket mutations/actions, and `TransitionChunk` assembly are deferred. The pinned third-party WebSocket transport is patched during the Docker build.
 
 The evidence for this head was produced on Apple Silicon through Docker Desktop's Rosetta `linux/amd64` emulation. The images are genuine `linux/amd64` — the build fails unless `uname -m` reports `x86_64` — but no native x86_64 host has executed this exact source commit, and Rosetta's `gcc` segfaults at random during compilation. Read every timing-sensitive result here as emulated rather than native.
