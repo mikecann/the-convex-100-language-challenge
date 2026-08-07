@@ -62,7 +62,7 @@ declare function RenderSubscriptionError( _
 declare function AdapterRuntimeName() as string
 declare function ValidCommandId(byref id as string) as boolean
 declare function CommandShapeValid( _
-  byval command as JsonValue ptr, _
+  byval commandValue as JsonValue ptr, _
   byref operation as string, _
   byref reason as string) as boolean
 declare function AdapterBeginGenerationFixture() as ulongint

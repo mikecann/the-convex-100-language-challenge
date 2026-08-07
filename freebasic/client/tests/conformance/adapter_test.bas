@@ -45,17 +45,19 @@ end function
 
 function ShapeIsValid(byref commandText as string) as boolean
   dim as string parseReason
-  dim as JsonValue ptr command = JsonParse(commandText, parseReason)
-  if command = 0 then
+  ' COMMAND is a FreeBASIC built-in (command-line argument access), so the
+  ' parsed value is named commandValue rather than command.
+  dim as JsonValue ptr commandValue = JsonParse(commandText, parseReason)
+  if commandValue = 0 then
     return false
   end if
   dim as string operation
-  if not JsonStringField(command, "op", operation) then
-    JsonFree(command)
+  if not JsonStringField(commandValue, "op", operation) then
+    JsonFree(commandValue)
     return false
   end if
-  dim as boolean valid = CommandShapeValid(command, operation, parseReason)
-  JsonFree(command)
+  dim as boolean valid = CommandShapeValid(commandValue, operation, parseReason)
+  JsonFree(commandValue)
   return valid
 end function
 

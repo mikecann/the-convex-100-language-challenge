@@ -35,16 +35,19 @@ function ValidCommandId(byref id as string) as boolean
   return nonblank andalso codepoints <= ADAPTER_MAX_ID_CODEPOINTS
 end function
 
+' COMMAND is a FreeBASIC built-in (command-line argument access), so the
+' parsed value is named commandValue throughout this file rather than
+' command.
 function CommandShapeValid( _
-    byval command as JsonValue ptr, _
+    byval commandValue as JsonValue ptr, _
     byref operation as string, _
     byref reason as string) as boolean
-  if command = 0 orelse command->kind <> JSON_OBJECT then
+  if commandValue = 0 orelse commandValue->kind <> JSON_OBJECT then
     reason = "adapter command must be a JSON object"
     return false
   end if
-  for index as integer = 0 to cast(integer, command->count) - 1
-    dim as string fieldName = command->children[index]->memberKey
+  for index as integer = 0 to cast(integer, commandValue->count) - 1
+    dim as string fieldName = commandValue->children[index]->memberKey
     dim as boolean allowed = (fieldName = "id" orelse fieldName = "op")
     select case operation
       case "hello"
@@ -383,16 +386,16 @@ end function
 private sub HandleCall( _
     byref id as string, _
     byref operation as string, _
-    byval command as JsonValue ptr)
+    byval commandValue as JsonValue ptr)
   dim as ConvexFault fault
   FaultClear(fault)
   dim as string path
-  if not JsonStringField(command, "path", path) then
+  if not JsonStringField(commandValue, "path", path) then
     FaultSet(fault, FAULT_PROTOCOL, "adapter command is missing path")
     GateEmit(RenderError(id, fault))
     exit sub
   end if
-  dim as JsonValue ptr args = JsonMember(command, "args")
+  dim as JsonValue ptr args = JsonMember(commandValue, "args")
   if args = 0 orelse args->kind <> JSON_OBJECT then
     FaultSet(fault, FAULT_PROTOCOL, "adapter command args must be a JSON object")
     GateEmit(RenderError(id, fault))
@@ -424,11 +427,11 @@ private sub HandleCall( _
   ConvexResultFree(result)
 end sub
 
-private sub HandleSubscribe(byref id as string, byval command as JsonValue ptr)
+private sub HandleSubscribe(byref id as string, byval commandValue as JsonValue ptr)
   dim as ConvexFault fault
   FaultClear(fault)
   dim as string subscriptionId
-  if not JsonStringField(command, "subscriptionId", subscriptionId) orelse _
+  if not JsonStringField(commandValue, "subscriptionId", subscriptionId) orelse _
      not ValidCommandId(subscriptionId) then
     FaultSet(fault, FAULT_PROTOCOL, _
       "adapter subscriptionId must be 1 to 128 Unicode code points")
@@ -436,12 +439,12 @@ private sub HandleSubscribe(byref id as string, byval command as JsonValue ptr)
     exit sub
   end if
   dim as string path
-  if not JsonStringField(command, "path", path) then
+  if not JsonStringField(commandValue, "path", path) then
     FaultSet(fault, FAULT_PROTOCOL, "adapter subscribe is missing path")
     GateEmit(RenderError(id, fault))
     exit sub
   end if
-  dim as JsonValue ptr args = JsonMember(command, "args")
+  dim as JsonValue ptr args = JsonMember(commandValue, "args")
   if args = 0 orelse args->kind <> JSON_OBJECT then
     FaultSet(fault, FAULT_PROTOCOL, "adapter subscribe args must be a JSON object")
     GateEmit(RenderError(id, fault))
@@ -489,11 +492,11 @@ private sub HandleSubscribe(byref id as string, byval command as JsonValue ptr)
   GateEmit(RenderAck(id))
 end sub
 
-private sub HandleUnsubscribe(byref id as string, byval command as JsonValue ptr)
+private sub HandleUnsubscribe(byref id as string, byval commandValue as JsonValue ptr)
   dim as ConvexFault fault
   FaultClear(fault)
   dim as string subscriptionId
-  if not JsonStringField(command, "subscriptionId", subscriptionId) orelse _
+  if not JsonStringField(commandValue, "subscriptionId", subscriptionId) orelse _
      not ValidCommandId(subscriptionId) then
     FaultSet(fault, FAULT_PROTOCOL, _
       "adapter subscriptionId must be 1 to 128 Unicode code points")
@@ -519,30 +522,30 @@ private sub HandleCommand(byref textLine as string)
   dim as ConvexFault fault
   FaultClear(fault)
   dim as string reason
-  dim as JsonValue ptr command = JsonParse(textLine, reason)
-  if command = 0 orelse command->kind <> JSON_OBJECT then
-    JsonFree(command)
+  dim as JsonValue ptr commandValue = JsonParse(textLine, reason)
+  if commandValue = 0 orelse commandValue->kind <> JSON_OBJECT then
+    JsonFree(commandValue)
     FaultSet(fault, FAULT_PROTOCOL, "adapter command was not a JSON object: " & reason)
     GateEmit(RenderError("", fault))
     exit sub
   end if
 
   dim as string id
-  if not JsonStringField(command, "id", id) orelse not ValidCommandId(id) then
-    JsonFree(command)
+  if not JsonStringField(commandValue, "id", id) orelse not ValidCommandId(id) then
+    JsonFree(commandValue)
     FaultSet(fault, FAULT_PROTOCOL, "adapter command id must be 1 to 128 Unicode code points")
     GateEmit(RenderError("", fault))
     exit sub
   end if
   dim as string op
-  if not JsonStringField(command, "op", op) then
-    JsonFree(command)
+  if not JsonStringField(commandValue, "op", op) then
+    JsonFree(commandValue)
     FaultSet(fault, FAULT_PROTOCOL, "adapter command is missing op")
     GateEmit(RenderError(id, fault))
     exit sub
   end if
-  if not CommandShapeValid(command, op, reason) then
-    JsonFree(command)
+  if not CommandShapeValid(commandValue, op, reason) then
+    JsonFree(commandValue)
     FaultSet(fault, FAULT_PROTOCOL, reason)
     GateEmit(RenderError(id, fault))
     exit sub
@@ -551,7 +554,7 @@ private sub HandleCommand(byref textLine as string)
   select case op
     case "hello"
       dim as ulongint version
-      if not JsonUnsignedField(command, "protocolVersion", version) orelse version <> 1 then
+      if not JsonUnsignedField(commandValue, "protocolVersion", version) orelse version <> 1 then
         FaultSet(fault, FAULT_PROTOCOL, "unsupported adapter protocol version")
         GateEmit(RenderError(id, fault))
       else
@@ -559,11 +562,11 @@ private sub HandleCommand(byref textLine as string)
       end if
 
     case "query", "mutation", "action"
-      HandleCall(id, op, command)
+      HandleCall(id, op, commandValue)
 
     case "setAuth"
       dim as string token
-      if not JsonStringField(command, "token", token) then
+      if not JsonStringField(commandValue, "token", token) then
         FaultSet(fault, FAULT_PROTOCOL, "adapter setAuth is missing token")
         GateEmit(RenderError(id, fault))
       elseif not EnsureClient(fault) then
@@ -574,10 +577,10 @@ private sub HandleCommand(byref textLine as string)
       end if
 
     case "subscribe"
-      HandleSubscribe(id, command)
+      HandleSubscribe(id, commandValue)
 
     case "unsubscribe"
-      HandleUnsubscribe(id, command)
+      HandleUnsubscribe(id, commandValue)
 
     case "debugDisconnect"
       if not ClientReady then
@@ -602,7 +605,7 @@ private sub HandleCommand(byref textLine as string)
       FaultSet(fault, FAULT_PROTOCOL, "unknown adapter operation " & op)
       GateEmit(RenderError(id, fault))
   end select
-  JsonFree(command)
+  JsonFree(commandValue)
 end sub
 
 ' --- transport -----------------------------------------------------------
