@@ -1,31 +1,3 @@
-# Convex from Assembly (x86-64 NASM)
-
-A Convex client written by hand in x86-64 assembly (NASM, System V AMD64
-calling convention). It talks to Convex over plain HTTP or HTTPS, building
-and parsing the request/response JSON itself and reasoning about the C ABI
-to call OpenSSL directly for the TLS handshake.
-
-This is educational and unofficial, not a production Convex SDK.
-
-## Start here
-
-[`examples/basics/main.s`](examples/basics/main.s) queries the shared
-counter over HTTP, then applies an idempotent mutation and reports both
-results. It does not yet demonstrate Live (see "What works" below), so it
-stops after the HTTP half of the journey other language examples on this
-site show in full.
-
-## What works
-
-| Capability | Status |
-| --- | --- |
-| HTTP queries and mutations | Verified by hand against the hosted deployment (query `demo:state` and mutation `demo:increment` both returned correct, structured results); shared local/hosted conformance has not been run |
-| Structured function errors and bearer-token auth | Implemented (`FunctionError` decoding, `Authorization: Bearer` header); not yet exercised by shared conformance |
-| HTTP actions | Implemented via the same code path as query/mutation; not separately exercised yet |
-| Live (WebSocket sync) | Not implemented. `subscribe`, `unsubscribe`, and `debugDisconnect` return a structured `ProtocolError` rather than pretending to succeed |
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.s -->
-```nasm
 ; ---------------------------------------------------------------------------
 ; main.s -- the canonical Convex example: query the shared counter, apply an
 ; idempotent mutation, and report both results.
@@ -383,46 +355,3 @@ section .rodata
     msg_unexpected_query_len equ $ - msg_unexpected_query
     msg_unexpected_mutation: db "unexpected mutation result"
     msg_unexpected_mutation_len equ $ - msg_unexpected_mutation
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Docker verification
-
-`./run test assembly-x86-64` assembles every client translation unit
-individually, links the conformance adapter and the canonical example, and
-runs protocol-level smoke tests against the adapter over both stdin/stdout
-and the `ADAPTER_LISTEN` TCP path. `./run verify-example assembly-x86-64`
-and the shared conformance gates are not expected to pass yet: the
-canonical example's expected transcript requires Live, which this build
-does not implement (see "What works").
-
-Hand-verification against the project's dedicated hosted deployment
-(bypassing the shared harness, which requires Live-capable clients) showed
-correct query and mutation results:
-
-```json
-{"count":0.0,"lastLanguage":null,"latestRunId":null,"room":"asm-client-smoke-room-1","updatedAt":null}
-{"applied":true,"state":{"count":1.0,"lastLanguage":"Assembly","latestRunId":"asm-client-smoke-room-1-once","room":"asm-client-smoke-room-1","updatedAt":1786130052731.0}}
-```
-
-## Protocol notes and limits
-
-The adapter speaks NDJSON protocol v1 on stdin/stdout or one
-`ADAPTER_LISTEN` TCP connection. Every HTTP call opens a fresh TCP
-connection (TLS-wrapped for `https://` deployments, calling libssl's C ABI
-directly with full certificate verification), sends the request, and
-parses the response body per its framing (`Content-Length`, chunked
-transfer-encoding, or read-until-close). `query`, `mutation`, and `action`
-all route through the same `POST /api/<op>` envelope Convex's HTTP API
-documents. `setAuth` sets the bearer token used on subsequent calls.
-`subscribe`, `unsubscribe`, and `debugDisconnect` are not implemented and
-answer with a structured `ProtocolError`.
-
-JSON parsing preserves full 64-bit precision for integer literals (no
-decimal point or exponent) rather than routing them through a double --
-important for Convex's nanosecond sync timestamps, which routinely exceed
-2^53 and would silently lose precision as floating point. A literal that
-does contain a decimal point or exponent is decoded as a double and, on
-the way back out, printed with a bounded 6-fractional-digit formatter
-(trailing zeros trimmed) rather than a general shortest-round-trip
-algorithm.
