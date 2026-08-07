@@ -4,5 +4,46 @@ displayName: "XPL"
 rank: 77
 selectionTier: coverage
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native XPL implementation of documented HTTP and a working Live
+    WebSocket subscription path, built entirely from EXTERNAL-declared POSIX
+    socket and OpenSSL calls; sockaddr_in, addrinfo, and the WebSocket frame
+    header are all built and read with corebyte()/coreword()/corelongword()
+    memory pokes instead of any inline() struct declaration. The adapter
+    answers Live protocol operations with a ProtocolError and does not claim
+    the live capability; see limitations.
+toolchain:
+  name: XPL (sergev/xpl-compiler)
+  version: 1.0 (commit 5b725ef5f486873ee821f4370310f2eaa65b2e55) + gcc 14
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+limitations:
+  - The adapter answers subscribe, unsubscribe, and debugDisconnect with a
+    ProtocolError instead of implementing them - XPL cannot call a function
+    through a runtime computed pointer, so there is no way to hand a start
+    routine to pthread_create, and a single-threaded adapter cannot both
+    service new NDJSON commands and deliver concurrent, per-subscriptionId
+    Live updates without one. The client library's Live path
+    (convex_subscribe / convex_subscription_next / convex_unsubscribe) is
+    real and is exercised by the canonical example, which needs it to
+    reproduce the universal happy-path transcript, but only ever holds one
+    subscription at a time and is driven synchronously.
+  - The educational client supports the JSON-safe Convex value subset only;
+    values are relayed as exact source spans rather than decoded into a
+    general XPL value type.
+  - Bearer tokens, function paths, and adapter-visible strings are escaped
+    and unescaped by a hand written JSON scanner - XPL has no recursion, so
+    it tracks object/array nesting with an integer depth counter instead of
+    a parse tree.
 capabilities: []
