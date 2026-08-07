@@ -93,6 +93,10 @@ RUN ./bin/convex_tests \
        | grep -Fqx '{"id":"close","type":"closed"}'
 # An identifier the shared schema would reject must never come back inside an
 # otherwise well-formed event, so the error line has to omit id entirely.
+# GNATCOLL.JSON stores an object's fields in an Ada.Containers.Ordered_Maps
+# keyed by field name, so every adapter event below serializes fields in
+# ascending name order regardless of the order Convex_Adapter_Events calls
+# Set_Field in; the literal NDJSON checked below is written in that order.
 RUN set -eu; \
     long_id="$(awk 'BEGIN { s = ""; for (i = 0; i < 200; i++) s = s "x"; print s }')"; \
     printf '%s\n' \
@@ -100,7 +104,7 @@ RUN set -eu; \
       '{"id":"close","op":"close"}' \
       | CONVEX_URL=http://127.0.0.1:9 ./bin/convex_adapter > /tmp/oversize-id.ndjson; \
     head -n 1 /tmp/oversize-id.ndjson \
-      | grep -Fqx '{"type":"error","error":{"name":"ProtocolError","message":"id must contain 1 to 128 Unicode characters"}}'; \
+      | grep -Fqx '{"error":{"message":"id must contain 1 to 128 Unicode characters","name":"ProtocolError"},"type":"error"}'; \
     ! grep -Fq "$long_id" /tmp/oversize-id.ndjson; \
     grep -Fqx '{"id":"close","type":"closed"}' /tmp/oversize-id.ndjson; \
     rm -f /tmp/oversize-id.ndjson
@@ -125,7 +129,7 @@ RUN set -eu; \
       | CONVEX_URL=http://127.0.0.1:19092 ./bin/convex_adapter > /tmp/relay.ndjson; \
     wait "$fixture_pid" || true; \
     test "$(wc -L < /tmp/relay.ndjson)" -gt 3000000; \
-    grep -Fq '{"type":"subscription","subscriptionId":"pressure","value":"' \
+    grep -Fq '{"subscriptionId":"pressure","type":"subscription","value":"' \
       /tmp/relay.ndjson; \
     ! grep -Fq 'ProtocolError' /tmp/relay.ndjson; \
     grep -Fqx '{"id":"close","type":"closed"}' /tmp/relay.ndjson; \
