@@ -24,6 +24,38 @@ whole_count.missing
         cvxexit(1)
 whole_count.end
 
+*   main.wait_for_event() -> the next Live event's kind, pumping the
+*   connection until one arrives or ten seconds pass. A real subscriber
+*   normally reacts to events from an outer loop; this example only ever
+*   needs the very next one before it moves on to its own next step.
+*   DEFINE is a runtime statement in SNOBOL4, so this must execute before
+*   the first call site below, not merely appear earlier in the file.
+    define('main.wait_for_event()deadline') :(main.wait_for_event.end)
+main.wait_for_event
+        deadline = io.now() + 10000
+main.wait_for_event.loop
+        gt(cvx.live.event_count, 0)                                          :s(main.wait_for_event.got)
+        gt(io.now(), deadline)                                               :s(freturn)
+        cvx.live.pump(io.now() + 250)                                        :(main.wait_for_event.loop)
+main.wait_for_event.got
+        main.wait_for_event = cvx.live.next_event()                          :(return)
+main.wait_for_event.end
+
+*   main.hex(bytes) -> the lowercase hex encoding of a raw byte string,
+*   used only to turn random entropy into a printable idempotency key.
+    define('main.hex(bytes)i,out') :(main.hex.end)
+main.hex
+        out = ""
+        i = 1
+main.hex.loop
+        gt(i, size(bytes))                                                    :s(main.hex.done)
+        out = out substr("0123456789abcdef", (ord(substr(bytes, i, 1)) / 16) + 1, 1)
+        out = out substr("0123456789abcdef", remdr(ord(substr(bytes, i, 1)), 16) + 1, 1)
+        i = i + 1                                                             :(main.hex.loop)
+main.hex.done
+        main.hex = out                                                        :(return)
+main.hex.end
+
 *   Configuration: the deployment URL is required and never defaulted, so a
 *   missing environment cannot silently talk to the wrong backend. The room
 *   id is the shared counter's key; the verifier passes a unique one as the
@@ -86,36 +118,6 @@ main.gotroom
     cvx.live.unsubscribe(qid)
     cvx.live.close()
     cvxexit(0)
-
-*   main.wait_for_event() -> the next Live event's kind, pumping the
-*   connection until one arrives or ten seconds pass. A real subscriber
-*   normally reacts to events from an outer loop; this example only ever
-*   needs the very next one before it moves on to its own next step.
-    define('main.wait_for_event()deadline') :(main.wait_for_event.end)
-main.wait_for_event
-        deadline = io.now() + 10000
-main.wait_for_event.loop
-        gt(cvx.live.event_count, 0)                                          :s(main.wait_for_event.got)
-        gt(io.now(), deadline)                                               :s(freturn)
-        cvx.live.pump(io.now() + 250)                                        :(main.wait_for_event.loop)
-main.wait_for_event.got
-        main.wait_for_event = cvx.live.next_event()                          :(return)
-main.wait_for_event.end
-
-*   main.hex(bytes) -> the lowercase hex encoding of a raw byte string,
-*   used only to turn random entropy into a printable idempotency key.
-    define('main.hex(bytes)i,out') :(main.hex.end)
-main.hex
-        out = ""
-        i = 1
-main.hex.loop
-        gt(i, size(bytes))                                                    :s(main.hex.done)
-        out = out substr("0123456789abcdef", (ord(substr(bytes, i, 1)) / 16) + 1, 1)
-        out = out substr("0123456789abcdef", remdr(ord(substr(bytes, i, 1)), 16) + 1, 1)
-        i = i + 1                                                             :(main.hex.loop)
-main.hex.done
-        main.hex = out                                                        :(return)
-main.hex.end
 
 main.nourl
     io.eprintln("CONVEX_URL is required")
