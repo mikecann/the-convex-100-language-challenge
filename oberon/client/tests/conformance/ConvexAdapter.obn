@@ -515,21 +515,44 @@ MODULE ConvexAdapter;
 
 	(* ---------- input reading ---------- *)
 
-	(*PumpInput performs one non-blocking attempt to read more bytes from
-	  the command stream into inputAccum. Returns FALSE if the stream is
-	  closed or errored (the caller then treats the adapter as done).*)
+	(*PumpInput performs one non-blocking attempt to read more bytes from the
+	  command stream into inputAccum. Returns FALSE if the stream is closed
+	  or errored (the caller then treats the adapter as done) - which is not
+	  the same thing as "nothing to read yet". The non-blocking Poll2
+	  (timeoutMs=0) legitimately returns 0 on every cycle where the other
+	  side simply hasn't sent its next command yet, the normal steady state
+	  of a long-lived interactive TCP session like the pilot controller's,
+	  which sends one command, waits for a response, and only then sends the
+	  next. Only a genuine poll() error (Poll2 returning -1) or Shim.Read
+	  actually observing EOF/an error on a ready descriptor means the stream
+	  is done. An earlier version folded the 0 (timeout) and -1 (error)
+	  cases together via `<= 0`, so the adapter exited the instant it
+	  happened to poll between two commands - which a fast burst-then-EOF
+	  pipe (this client's own Dockerfile smoke tests) essentially never
+	  triggers, but a real interactive controller triggers on nearly every
+	  cycle. hasData tracks whether there is actually anything to read this
+	  cycle; ok tracks whether the stream is still alive. The caller's own
+	  PumpLive() call afterwards (S.Pump with a 20ms timeout) is what paces
+	  this loop, so returning TRUE with hasData FALSE here does not
+	  busy-spin.*)
 	PROCEDURE PumpInput(): BOOLEAN;
-	VAR n, cap, i: INTEGER; ready1, ready2, ok: BOOLEAN;
+	VAR n, cap, i, pollResult: INTEGER; ready1, ready2, ok, hasData: BOOLEAN;
 	BEGIN
 		ok := TRUE;
-		IF ~Shim.Pending(readConn) THEN
-			IF Shim.Poll2(readFd, -1, 0, ready1, ready2) <= 0 THEN ok := FALSE END
+		hasData := Shim.Pending(readConn);
+		IF ~hasData THEN
+			pollResult := Shim.Poll2(readFd, -1, 0, ready1, ready2);
+			IF pollResult < 0 THEN
+				ok := FALSE
+			ELSE
+				hasData := pollResult > 0
+			END
 		END;
 		IF ok & (inputAccumLen >= CmdBufCap - 1) THEN
 			WriteStderrLit("command line exceeded the adapter's input cap");
 			ok := FALSE
 		END;
-		IF ok THEN
+		IF ok & hasData THEN
 			cap := CmdBufCap - 1 - inputAccumLen;
 			IF cap > 65536 THEN cap := 65536 END;
 			n := Shim.Read(readConn, inputChunk, cap);

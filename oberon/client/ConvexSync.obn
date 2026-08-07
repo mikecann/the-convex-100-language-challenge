@@ -118,10 +118,20 @@ MODULE ConvexSync;
 			clock := clock DIV 16;
 			DEC(i)
 		END;
+		(*"00000000-0000-4000-8000-" is exactly 24 characters (indices 0..23,
+		  with the final `-` at index 23), so the 12-digit node segment that
+		  replaces the trailing zeros must start at index 24 and the whole
+		  36 character UUID is terminated at index 36. The previous offset of
+		  21 wrote three characters too early, overwriting two of "8000"'s
+		  zeros and destroying the fourth hyphen entirely - producing a
+		  4-group string a real Convex backend rejects outright ("Received
+		  Invalid JSON on websocket: invalid group count: expected 5, found
+		  4"), which surfaced as every Live subscription failing immediately
+		  after every Connect.*)
 		CopyText("00000000-0000-4000-8000-", sessionId);
 		i := 4;
-		WHILE i <= 15 DO sessionId[21 + (i - 4)] := hex[i]; INC(i) END;
-		sessionId[33] := 0X
+		WHILE i <= 15 DO sessionId[24 + (i - 4)] := hex[i]; INC(i) END;
+		sessionId[36] := 0X
 	END NewSessionId;
 
 	(*TimestampGreater decodes two base64 sync-protocol timestamps (each an
@@ -355,6 +365,26 @@ MODULE ConvexSync;
 
 	(* ---------- connecting ---------- *)
 
+	(*BuildSyncUrl derives the WebSocket endpoint from the plain deployment
+	  URL. This repository's pinned sync profile (see manifest.yaml) lives at
+	  the fixed path /api/sync, not at the deployment root: a real Convex
+	  backend answers a plain "GET /" with an ordinary 200 OK, not a 101
+	  Switching Protocols, and only upgrades a request that targets
+	  /api/sync (confirmed by hand against the self-hosted backend used in
+	  verification). ConvexWS.Open otherwise treats deploymentUrl's own
+	  scheme and host verbatim (http/https here are equivalent to ws/wss to
+	  the handshake), so only the path needs correcting.*)
+	PROCEDURE BuildSyncUrl(VAR out: ARRAY OF CHAR);
+	VAR outLength, n: INTEGER;
+	BEGIN
+		CopyText(deploymentUrl, out);
+		n := J.TextLength(out);
+		IF (n > 0) & (out[n - 1] = "/") THEN out[n - 1] := 0X; n := n - 1 END;
+		outLength := n;
+		AppendBuf("/api/sync", out, outLength);
+		out[outLength] := 0X
+	END BuildSyncUrl;
+
 	PROCEDURE RetireConnection(reason: ARRAY OF CHAR);
 	VAR i: INTEGER;
 	BEGIN
@@ -390,8 +420,10 @@ MODULE ConvexSync;
 		snapshot: ARRAY MaxMessageOut OF CHAR;
 		addCount: INTEGER;
 		deadline: INTEGER;
+		syncUrl: ARRAY 560 OF CHAR;
 	BEGIN
-		WS.Open(deploymentUrl, "0.1.0", 8000, ok, errorText);
+		BuildSyncUrl(syncUrl);
+		WS.Open(syncUrl, "0.1.0", 8000, ok, errorText);
 		IF ~ok THEN
 			RetireConnection(errorText);
 			ScheduleReconnect

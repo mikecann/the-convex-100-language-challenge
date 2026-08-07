@@ -168,46 +168,58 @@ ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
     SSL_CERT_DIR=/etc/ssl/certs \
     PATH=/usr/local/bin:/usr/bin:/bin
 USER 65532:65532
-RUN test "$(id -u):$(id -g)" = 65532:65532 \
-    && test "$(printf 'ok\n' | cat)" = ok \
-    && test "$(printf 'a:b\n' | cut -d: -f2)" = b \
-    && test "$(printf 'first\nsecond\n' | head -n 1)" = first \
-    && test "$(printf 'first\nsecond\n' | tail -n 1)" = second \
-    && test "$(printf 'a\n' | tr a A)" = A \
-    && test "$(printf 'b\na\n' | sort | head -n 1)" = a \
-    && test "$(printf 'a\na\n' | uniq | wc -l | tr -d ' ')" = 1 \
-    && test "$(uname -m)" = x86_64 \
-    && printf 'needle\n' | grep -Fqx needle \
-    && test "$(printf 'before\n' | sed 's/before/after/')" = after \
-    && test "$(printf 'value\n' | awk '{print $1}')" = value \
-    && test ! -e /etc/dpkg \
-    && test ! -e /etc/.pwd.lock \
-    && test ! -e /busybox \
-    && test ! -e /var \
-    && test ! -e /usr/share \
-    && test ! -e /usr/include \
-    && test ! -e /usr/src \
-    && set -- /bin/* \
-    && test "$#" -eq 1 \
-    && test "$1" = /bin/sh \
-    && for command_name in obnc obnc-compile obnc-path gcc cc clang make ld as apt apt-get dpkg \
+# set -eux (rather than a bare && chain) so that a failing assertion here
+# names itself in the build log instead of looking identical to every other
+# possible failure in the chain -- a silent-looking `test` failure two links
+# into a &&-chain has already cost real diagnosis time elsewhere in this
+# project. The forbidden-command loop below also needs `|| exit 1` inside the
+# loop body: a POSIX `for` loop's exit status is only its last iteration's,
+# so without it 30 of the 31 names would be silently discarded, and a
+# pipeline beginning with `!` is exempt from `set -e` on its own, so the
+# inverted status would be thrown away either way without the explicit exit.
+RUN set -eux; \
+    test "$(id -u):$(id -g)" = 65532:65532; \
+    test "$(printf 'ok\n' | cat)" = ok; \
+    test "$(printf 'a:b\n' | cut -d: -f2)" = b; \
+    test "$(printf 'first\nsecond\n' | head -n 1)" = first; \
+    test "$(printf 'first\nsecond\n' | tail -n 1)" = second; \
+    test "$(printf 'a\n' | tr a A)" = A; \
+    test "$(printf 'b\na\n' | sort | head -n 1)" = a; \
+    test "$(printf 'a\na\n' | uniq | wc -l | tr -d ' ')" = 1; \
+    test "$(uname -m)" = x86_64; \
+    printf 'needle\n' | grep -Fqx needle; \
+    test "$(printf 'before\n' | sed 's/before/after/')" = after; \
+    test "$(printf 'value\n' | awk '{print $1}')" = value; \
+    test ! -e /etc/dpkg; \
+    test ! -e /etc/.pwd.lock; \
+    test ! -e /busybox; \
+    test ! -e /var; \
+    test ! -e /usr/share; \
+    test ! -e /usr/include; \
+    test ! -e /usr/src; \
+    set -- /bin/*; \
+    test "$#" -eq 1; \
+    test "$1" = /bin/sh; \
+    for command_name in obnc obnc-compile obnc-path gcc cc clang make ld as apt apt-get dpkg \
          curl wget nc netcat openssl node python python3 ruby perl java php go \
          rustc cargo npm pip convex busybox; do \
-         ! command -v "$command_name" >/dev/null 2>&1; \
+         ! command -v "$command_name" >/dev/null 2>&1 || exit 1; \
        done
 
 FROM runtime-base AS example-runtime
 COPY --from=test /out/convex-example /usr/local/bin/convex-example
-RUN test -x /usr/local/bin/convex-example \
-    && test ! -e /usr/local/bin/convex-adapter
+RUN set -eux; \
+    test -x /usr/local/bin/convex-example; \
+    test ! -e /usr/local/bin/convex-adapter
 ENTRYPOINT ["/usr/local/bin/convex-example"]
 
 # Keep the adapter last because `./run build oberon` uses the default target.
 FROM runtime-base AS runtime
 COPY --from=test /out/convex-adapter /usr/local/bin/convex-adapter
-RUN test -x /usr/local/bin/convex-adapter \
-    && test ! -e /usr/local/bin/convex-example \
-    && printf '%s\n' \
+RUN set -eux; \
+    test -x /usr/local/bin/convex-adapter; \
+    test ! -e /usr/local/bin/convex-example; \
+    printf '%s\n' \
          '{"id":"h1","protocolVersion":1,"op":"hello"}' \
          '{"id":"c1","op":"close"}' \
        | CONVEX_URL=http://127.0.0.1:9 /usr/local/bin/convex-adapter \
