@@ -75,6 +75,17 @@ RUN printf '%s\n' \
 # linked at jconsole build time, so ldd on jconsole alone would miss them),
 # and the trust store / OpenSSL config / provider module TLS actually loads.
 #
+# jlibrary is staged whole, addons and user included: profile.ijs (run by
+# every jconsole start-up, script mode or not) unconditionally tries to load
+# a handful of addon scripts and prints "not found: <path>" to stdout, ahead
+# of any real output, for each one that is missing. That first attempt at
+# this image pruned addons/ and user/ out to save the (7.6 MiB of 18 MiB
+# total) space; the diagnostic line it produced looked identical in shape to
+# the libgmp one above -- a prune removing something later called, just from
+# this Dockerfile's own staging step rather than a missed ldd edge. jlibrary
+# is small enough whole that trimming it buys nothing but a new way to leak
+# noise onto the adapter's stdout.
+#
 # libgmp.so.10 is staged for the same reason: libj.so dlopen()s it by name
 # during interpreter start-up to back J's extended-precision integers, a
 # feature this client's own code never invokes (JSON numbers are kept as
@@ -96,7 +107,6 @@ RUN set -eu; \
              /staging/usr/local/bin /staging/usr/bin /staging/bin \
              /staging/etc/ssl/certs /staging/usr/lib/x86_64-linux-gnu/ossl-modules; \
     cp -a /src/jlibrary /staging/opt/convex/jlibrary; \
-    rm -rf /staging/opt/convex/jlibrary/addons /staging/opt/convex/jlibrary/user; \
     cp -aL /usr/lib/x86_64-linux-gnu/libssl.so.3 /staging/opt/convex/lib/libssl.so.3; \
     cp -aL /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /staging/opt/convex/lib/libcrypto.so.3; \
     cp -aL /usr/lib/x86_64-linux-gnu/libgmp.so.10 /staging/opt/convex/lib/libgmp.so.10; \
@@ -105,7 +115,7 @@ RUN set -eu; \
     cp -aL /etc/ssl/openssl.cnf /staging/etc/ssl/openssl.cnf; \
     cp -aL /etc/ssl/certs/ca-certificates.crt /staging/etc/ssl/certs/ca-certificates.crt; \
     cp -a /bin/dash /staging/bin/sh; \
-    for tool in id cat cut head tail tr sort uniq wc uname grep sed; do \
+    for tool in id cat cut head tail tr sort uniq wc uname grep sed tee; do \
       cp -a "/usr/bin/$tool" "/staging/usr/bin/$tool"; \
     done; \
     for object in /staging/opt/convex/jlibrary/bin/jconsole \
@@ -191,8 +201,13 @@ RUN --mount=type=bind,from=test,source=/bin/busybox,target=/busybox,readonly \
         *) "$pruner" rm -rf "$path" ;; \
       esac; \
     done; \
-    "$pruner" rm -rf /etc/.pwd.lock; \
-    exec "$pruner" rm -rf /tmp
+    exec "$pruner" rm -rf /etc/.pwd.lock
+# /tmp is deliberately left alone: jconsole's own start-up probes for a
+# writable scratch directory there (see the read-only/non-root check below),
+# and it needs the directory itself to exist to do so gracefully. Deleting
+# it here -- as opposed to leaving the base image's stock empty 1777 /tmp in
+# place -- turned a tolerated "read-only" failure into a hard "Directory
+# nonexistent" one from the shell itself, on every process start-up.
 COPY --from=test /staging /
 ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
     OPENSSL_MODULES=/usr/lib/x86_64-linux-gnu/ossl-modules \
