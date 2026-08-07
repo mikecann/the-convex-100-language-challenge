@@ -105,4 +105,6 @@ limitations:
     MARST's own single-line comment rule (a comment ends at the first
     semicolon, even inside a sentence) required every doc comment in this
     client to be rewritten to avoid a mid-sentence semicolon.
-capabilities: []
+capabilities:
+  - http
+  - live
