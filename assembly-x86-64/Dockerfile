@@ -25,17 +25,19 @@ COPY examples ./examples
 # conformance adapter and the canonical example.
 RUN test "$(uname -m)" = x86_64 \
     && mkdir -p /build \
-    && for unit in convex_buf convex_json convex_http convex_client; do \
+    && for unit in convex_buf convex_json convex_http convex_ws convex_live convex_client; do \
          nasm -f elf64 -Iclient client/$unit.s -o /build/$unit.o; \
        done \
     && nasm -f elf64 -Iclient client/tests/conformance/main.s -o /build/adapter.o \
     && nasm -f elf64 -Iclient examples/basics/main.s -o /build/example.o \
     && gcc -no-pie -o /build/convex-adapter \
          /build/adapter.o /build/convex_client.o /build/convex_http.o \
-         /build/convex_json.o /build/convex_buf.o -lssl -lcrypto \
+         /build/convex_ws.o /build/convex_live.o /build/convex_json.o \
+         /build/convex_buf.o -lssl -lcrypto \
     && gcc -no-pie -o /build/convex-example \
          /build/example.o /build/convex_client.o /build/convex_http.o \
-         /build/convex_json.o /build/convex_buf.o -lssl -lcrypto \
+         /build/convex_ws.o /build/convex_live.o /build/convex_json.o \
+         /build/convex_buf.o -lssl -lcrypto \
     && file /build/convex-adapter | grep -Eq 'ELF 64-bit.*x86-64' \
     && file /build/convex-example | grep -Eq 'ELF 64-bit.*x86-64'
 
