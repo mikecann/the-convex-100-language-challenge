@@ -230,7 +230,7 @@ RUN set -eu; \
     cp /usr/bin/grep "$root/usr/bin/grep"; \
     cp /out/convex-example "$root/usr/local/bin/convex-example"; \
     cp /out/convex-adapter "$root/usr/local/bin/convex-adapter"; \
-    libraries="$({ ldd /bin/dash /usr/bin/id /usr/bin/grep /out/convex-example /out/convex-adapter; } | awk '$3 ~ /^\// {print $3} $1 ~ /^\// {name=$1; sub(/:$/, "", name); print name}' | sort -u)"; \
+    libraries="$({ for binary in /bin/dash /usr/bin/id /usr/bin/grep /out/convex-example /out/convex-adapter; do ldd "$binary"; done; } | awk '$3 ~ /^\// {print $3} $1 ~ /^\// {print $1}' | sort -u)"; \
     for library in $libraries; do \
       case "$library" in \
         /opt/curl/lib/*) cp -L "$library" "$root/usr/lib/x86_64-linux-gnu/$(basename "$library")" ;; \
