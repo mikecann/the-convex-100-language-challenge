@@ -171,7 +171,8 @@ AND testJson() BE
   checkWhole("-7", -7, "json: a negative whole number decodes")
   checkWhole("1e2", 100, "json: an exponent that stays integral decodes")
   checkWhole("100e-2", 1, "json: a negative exponent that cancels decodes")
-  checkWhole("2147483647", 2147483647, "json: the largest word decodes")
+  checkWhole("9223372036854775807", 9223372036854775807,
+             "json: the largest word decodes")
 
   checkWhole("-0", 0, "json: negative zero decodes as zero")
   checkWhole("0e0", 0, "json: a zero exponent decodes")
@@ -179,11 +180,21 @@ AND testJson() BE
   checkNotWhole("0.5", "json: a fractional value is refused")
   checkNotWhole("42.5", "json: 42.5 is refused")
   checkNotWhole("1e-2", "json: a value below one is refused")
-  checkNotWhole("2147483648", "json: an overflowing value is refused")
-  checkNotWhole("1750000000000", "json: a millisecond timestamp is refused")
-  // 1e10 is integral but far outside a 32-bit word, so it must be refused
-  // rather than silently wrapping into a plausible-looking count.
-  checkNotWhole("1e10", "json: an integral value past the word is refused")
+  checkNotWhole("9223372036854775808", "json: an overflowing value is refused")
+  // A 20 digit integer needs a 20th place this 64-bit word cannot hold, no
+  // matter what its leading digits are, so the scale bound must refuse it
+  // before the digit loop ever accumulates a value.
+  checkNotWhole("10000000000000000000",
+                "json: twenty digits is refused regardless of magnitude")
+  // A millisecond timestamp comfortably fits this system's 64-bit word, so
+  // Convex sending one as a plain count now decodes rather than being
+  // refused the way it was refused on the 32-bit Cintcode word this client
+  // used to run on.
+  checkWhole("1750000000000", 1750000000000,
+             "json: a millisecond timestamp decodes as a whole number")
+  // Likewise 1e10 is integral and well inside a 64-bit word, so it decodes
+  // instead of being refused the way a 32-bit word would have to refuse it.
+  checkWhole("1e10", 10000000000, "json: 1e10 decodes as a whole number")
   checkNotWhole("0.0001e2", "json: a value that stays fractional is refused")
 
   { LET source = bbFromStr("*"0*"")
@@ -547,12 +558,12 @@ AND testQueueBounds() BE
 
   // A consumer that has stopped reading must not be able to grow the queue.
   FOR index = 1 TO Maxqueueupdates * 4 DO
-    sbDeliver(subscription, makeUpdate(index, 64))
+    sbDeliver(0, subscription, makeUpdate(index, 64))
   check((subscription!Sb_queue)!Vl_len = Maxqueueupdates,
         "queue: a stopped consumer is bounded by the update count")
 
   // The newest values are the ones kept.
-  taken := sbTake(subscription)
+  taken := sbTake(0, subscription)
   { LET value = 0
     jsWholeNumber(taken!Up_value, @value)
     check(value = Maxqueueupdates * 4 - Maxqueueupdates + 1,
@@ -560,11 +571,11 @@ AND testQueueBounds() BE
   }
   upFree(taken)
 
-  { LET rest = sbTake(subscription)
+  { LET rest = sbTake(0, subscription)
     UNTIL rest = 0 DO
     { count := count + 1
       upFree(rest)
-      rest := sbTake(subscription)
+      rest := sbTake(0, subscription)
     }
   }
   check(count = Maxqueueupdates - 1, "queue: the remaining values drain")
@@ -574,36 +585,36 @@ AND testQueueBounds() BE
   // A count bound alone is not a memory bound: one Convex value can approach
   // the maximum frame size, so the byte budget has to bite first.
   FOR index = 1 TO 8 DO
-    sbDeliver(subscription, makeUpdate(index, Maxqueuebytes / 3))
+    sbDeliver(0, subscription, makeUpdate(index, Maxqueuebytes / 3))
   check(subscription!Sb_queuebytes <= Maxqueuebytes,
         "queue: a stopped consumer is bounded by the byte budget")
   check((subscription!Sb_queue)!Vl_len < Maxqueueupdates,
         "queue: the byte budget bites before the count bound")
 
-  sbFree(subscription)
+  sbFree(0, subscription)
 }
 
 AND testGenerationBarrier() BE
 { LET subscription = makeSubscription()
   LET relayed = 0
 
-  sbDeliver(subscription, makeUpdate(1, 64))
-  sbDeliver(subscription, makeUpdate(2, 64))
+  sbDeliver(0, subscription, makeUpdate(1, 64))
+  sbDeliver(0, subscription, makeUpdate(2, 64))
 
   // Dequeue one update and hold it, exactly as a paused relay would.
-  relayed := sbTake(subscription)
+  relayed := sbTake(0, subscription)
   check(relayed ~= 0, "generation: an update can be dequeued")
 
   // Unsubscribing, or replacing the subscription with the same identifier,
   // retires the generation before any acknowledgement is published.
   subscription!Sb_generation := subscription!Sb_generation + 1
 
-  check(sbTake(subscription) = 0,
+  check(sbTake(0, subscription) = 0,
         "generation: values queued before the bump cannot be published")
   check(relayed!Up_generation ~= subscription!Sb_generation,
         "generation: a paused relay carries the retired generation")
   upFree(relayed)
-  sbFree(subscription)
+  sbFree(0, subscription)
 }
 
 AND testBackoff() BE

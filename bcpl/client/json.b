@@ -1,12 +1,12 @@
 // json.b -- a bounded JSON reader and writer.
 //
 // Numbers are kept as their literal text rather than converted to a machine
-// number. That is not laziness: this Cintcode system has 32-bit words, and a
-// Convex document can carry a millisecond timestamp far larger than that.
-// Holding the lexeme means every value survives a round trip exactly as Convex
-// sent it, and a caller that genuinely wants an integer asks for one through
-// jsWholeNumber, which accepts Convex's integral 0 or 0.0 forms and refuses
-// anything fractional or out of range.
+// number. That is not laziness: a Convex document can carry a number too big
+// for even this system's 64-bit words, such as a value close to IEEE double
+// precision's range. Holding the lexeme means every value survives a round
+// trip exactly as Convex sent it, and a caller that genuinely wants an
+// integer asks for one through jsWholeNumber, which accepts Convex's
+// integral 0 or 0.0 forms and refuses anything fractional or out of range.
 
 LET jsNew(type) = VALOF
 { LET node = getvec(Js_upb)
@@ -688,9 +688,13 @@ AND jsWholeNumber(node, target) = VALOF
   IF pointat < 0 DO pointat := digits
 
   // scale is where the decimal point ends up once the exponent is applied.
+  // maxint on this 64-bit build is 9223372036854775807, a 19 digit number,
+  // so a value needing a 20th integer digit cannot be a whole number here
+  // regardless of what its leading digits are; reject it before the digit
+  // loop below ever risks reading past what "used" can count against scale.
   scale := pointat + exponent * exponentsign
   IF scale < 0 RESULTIS FALSE
-  IF scale > 10 RESULTIS FALSE
+  IF scale > 19 RESULTIS FALSE
 
   // Every digit beyond the point must be zero, or the value is fractional.
   { LET index = position

@@ -628,7 +628,7 @@ AND testTransitions() BE
 
   serverTransition(manager, 0, "AAAAAAAAAAA=", 1, "AQAAAAAAAAA=",
                    modUpdated(0, 0))
-  update := sbTake(subscription)
+  update := sbTake(manager, subscription)
   check(update ~= 0, "live: an initial QueryUpdated is delivered")
   IF update ~= 0 DO
   { LET count = -1
@@ -642,7 +642,7 @@ AND testTransitions() BE
 
   serverTransition(manager, 1, "AQAAAAAAAAA=", 1, "AgAAAAAAAAA=",
                    modUpdated(0, 1))
-  update := sbTake(subscription)
+  update := sbTake(manager, subscription)
   check(update ~= 0, "live: an external update is delivered")
   IF update ~= 0 DO
   { LET count = -1
@@ -668,7 +668,7 @@ AND testVersionBarrier() BE
   // A Transition that does not continue from the version this client holds is
   // drift, not data: accepting it would silently desynchronise the query set.
   serverTransition(manager, 7, "AAAAAAAAAAA=", 8, "AQAAAAAAAAA=", 0)
-  update := sbTake(subscription)
+  update := sbTake(manager, subscription)
   check(update ~= 0, "barrier: a version mismatch reaches the subscriber")
   IF update ~= 0 DO
   { check(bbEqualStr(update!Up_errname, "ProtocolError"),
@@ -695,7 +695,7 @@ AND testQueryFailureAndRecovery() BE
 
   serverTransition(manager, 0, "AAAAAAAAAAA=", 1, "AQAAAAAAAAA=",
                    modFailed(0))
-  update := sbTake(subscription)
+  update := sbTake(manager, subscription)
   check(update ~= 0, "recovery: a failed query reaches the subscriber")
   IF update ~= 0 DO
   { check(bbEqualStr(update!Up_errname, "FunctionError"),
@@ -709,7 +709,7 @@ AND testQueryFailureAndRecovery() BE
   // The subscription must not be stranded by its own failure.
   serverTransition(manager, 1, "AQAAAAAAAAA=", 1, "AgAAAAAAAAA=",
                    modUpdated(0, 1))
-  update := sbTake(subscription)
+  update := sbTake(manager, subscription)
   check(update ~= 0, "recovery: the repaired query delivers again")
   IF update ~= 0 DO
   { LET count = -1
@@ -733,7 +733,7 @@ AND testRehydrationSuppression() BE
 
   serverTransition(manager, 0, "AAAAAAAAAAA=", 1, "AQAAAAAAAAA=",
                    modUpdated(0, 0))
-  update := sbTake(subscription)
+  update := sbTake(manager, subscription)
   check(update ~= 0, "rehydrate: the initial value is delivered")
   IF update DO upFree(update)
 
@@ -743,14 +743,14 @@ AND testRehydrationSuppression() BE
   subscription!Sb_rehydrate := TRUE
   serverTransition(manager, 1, "AQAAAAAAAAA=", 1, "AgAAAAAAAAA=",
                    modUpdated(0, 0))
-  check(sbTake(subscription) = 0,
+  check(sbTake(manager, subscription) = 0,
         "rehydrate: an unchanged rehydration is suppressed")
 
   // A genuinely different value after a reconnect must still arrive.
   subscription!Sb_rehydrate := TRUE
   serverTransition(manager, 1, "AgAAAAAAAAA=", 1, "AwAAAAAAAAA=",
                    modUpdated(0, 1))
-  update := sbTake(subscription)
+  update := sbTake(manager, subscription)
   check(update ~= 0, "rehydrate: a changed value after a reconnect is kept")
   IF update DO upFree(update)
 
