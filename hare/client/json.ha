@@ -279,7 +279,14 @@ fn parse_string(p: *parser) (value | decode_error) = {
 			return decode_error;
 		};
 		if (b != '\\') {
-			memio::appendrune(&out, b: u32: rune)!;
+			// The input is already UTF-8 encoded bytes straight from the
+			// wire. Writing the raw byte through unchanged is required,
+			// not just faster: treating it as one rune (as appendrune
+			// would) reinterprets each individual byte of a multi-byte
+			// sequence as its own Latin-1-like codepoint and re-encodes
+			// it, corrupting every non-ASCII character into a cascade of
+			// mojibake.
+			io::writeall(&out, [b])!;
 			continue;
 		};
 		const esc = match (peek(p)) {
@@ -517,4 +524,19 @@ fn encode_string(out: *memio::stream, s: str) void = {
 	const overflow = parse("99999999999999999999")!;
 	defer finish(&overflow);
 	assert(overflow is f64);
+};
+
+@test fn decodes_multibyte_utf8_without_corruption() void = {
+	// A regression for a real bug: decoding used to treat each raw UTF-8
+	// byte of a multi-byte character as its own codepoint and re-encode it,
+	// corrupting every non-ASCII string into cascading mojibake. This
+	// exercises a 2-byte, 3-byte, and 4-byte (surrogate-pair-in-source)
+	// character together.
+	const text = `"Hello, 世界 👋"`;
+	const v = parse(text)!;
+	defer finish(&v);
+	assert(v as str == "Hello, 世界 👋");
+	const encoded = encode(v);
+	defer free(encoded);
+	assert(encoded == text);
 };
