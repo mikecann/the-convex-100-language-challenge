@@ -191,7 +191,7 @@ const func string: jsonEncode (in jsonValue: value) is func
     var string: encoded is "";
   local
     var jsonValue: element is jsonValue.value;
-    var string: key is "";
+    var string: objKey is "";
     var boolean: first is TRUE;
   begin
     if category(value) = JSON_NULL then
@@ -220,12 +220,12 @@ const func string: jsonEncode (in jsonValue: value) is func
     elsif category(value) = JSON_OBJECT then
       encoded := "{";
       first := TRUE;
-      for key range keys(value) do
+      for objKey range keys(value) do
         if not first then
           encoded &:= ",";
         end if;
         first := FALSE;
-        encoded &:= jsonEscapeString(key) & ":" & jsonEncode(value[key]);
+        encoded &:= jsonEscapeString(objKey) & ":" & jsonEncode(value[objKey]);
       end for;
       encoded &:= "}";
     end if;
