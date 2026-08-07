@@ -13,8 +13,8 @@ a counter, starts Live, mutates the counter, and proves the Live update agrees.
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, actions, and bearer-token replacement | Awaiting shared verification |
-| Live query snapshots, updates, unsubscribe, reconnect | Awaiting shared verification |
+| HTTP queries, mutations, actions, and bearer-token replacement | Verified by shared local and hosted conformance |
+| Live query snapshots, updates, unsubscribe, reconnect | Verified by shared local and hosted conformance |
 | Live authentication and optimistic writes | Deferred |
 
 ## Basic example

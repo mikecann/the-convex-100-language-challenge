@@ -12,8 +12,8 @@ It is educational, unofficial, and not a production SDK.
 
 | Capability | Status |
 | --- | --- |
-| HTTP query, mutation, and action | Pending shared conformance |
-| Live subscription and reconnect | Pending shared conformance |
+| HTTP query, mutation, and action | Verified by shared local and hosted conformance |
+| Live subscription and reconnect | Verified by shared local and hosted conformance |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.cc -->
 ```cpp
@@ -102,7 +102,7 @@ int main(int argc, char **argv) {
 
 ## Docker verification
 
-`./run test cpp` builds and tests the client wholly inside Docker. `./run verify-example cpp`, `./run verify cpp`, and `./run verify-hosted cpp` are root-owned evidence gates and have not yet awarded a capability.
+`./run test cpp` builds and tests the client wholly inside Docker. `./run verify-example cpp`, `./run verify cpp`, and `./run verify-hosted cpp` are root-owned evidence gates; local and hosted conformance passed 31/31 and awarded the http and live badges recorded in the manifest.
 
 ## Protocol notes
 
