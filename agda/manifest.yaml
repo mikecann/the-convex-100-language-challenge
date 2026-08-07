@@ -42,4 +42,6 @@ limitations:
   - Adapter output independently retains the newest 16 encoded events within 6 MiB, including an in-flight write.
   - Waiting is implemented as bounded polling against absolute monotonic deadlines rather than condition variables, so the shared state has one synchronisation primitive to audit.
   - The client depends on Agda's builtin modules only; agda-stdlib is deliberately not used, so the Docker build has a single Agda dependency to pin.
-capabilities: []
+capabilities:
+  - http
+  - live
