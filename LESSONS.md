@@ -290,7 +290,62 @@ itself.
 are honest failures and eleven are considered substitutions is a better artifact
 than a hundred entries where some are quietly faked.
 
-## 14. Miscellaneous findings worth a slide
+## 14. The oldest language was already in the roster
+
+Asked to add the oldest language likely to work, the honest first answer was
+that the project had already done it: **Fortran, 1957**, verified with full
+HTTP and Live badges. Lisp and COBOL are there too. The three oldest languages
+in common use are all in and all working.
+
+Among languages *not* yet represented, the oldest plausible candidate is
+**ALGOL 60**. It is the ancestor of nearly everything else on the roster —
+block structure, lexical scope, recursion and BNF all arrive with it — and
+GNU MARST still translates it to C, so it builds anywhere GCC does.
+
+The feasibility check was done before promising anything, and it is a good
+illustration of how to answer "can we?" honestly. MARST built cleanly from
+source in a container, ALGOL 60 programs compiled and ran, and the external-C
+mechanism (`code` procedures, the standard's own escape hatch for
+implementation-defined bodies) exists. Two things surfaced immediately that a
+paper answer would have missed: ALGOL 60 identifiers cannot contain
+underscores, and `code` procedures must be declared outside the main block.
+
+The rejected sibling makes the point sharper. **ALGOL 68** is younger, better
+known, and packaged in Debian — but the packaged build has no networking
+primitives at all, so a client would be an external transport process wearing a
+costume. That earns this project's "bridge" label, not "native". Older and
+harder turned out to be more honest than newer and easier.
+
+## 15. Sometimes the platform's own library is the bug
+
+Ballerina's client reached forty-one of forty-two tests and stopped on one:
+a multi-byte UTF-8 character split across a WebSocket continuation-frame
+boundary came back corrupted. The diagnosis was done by elimination rather than
+assertion — the fixture's frame bytes were verified by hand, the same character
+delivered unfragmented worked, and four different read APIs in the platform's
+websocket module either shared the identical corruption or refused text frames
+outright. Four APIs failing the same way means the defect sits in native code
+beneath all of them.
+
+That is a real bug in `ballerina/websocket`, not in the client. It is also
+unwaivable here, because correct fragmented-UTF-8 decoding is explicitly on this
+project's Live acceptance list.
+
+The resolution is the interesting part: **the "workaround" is what most of this
+project already does.** More than a dozen verified clients — BCPL, Forth, Tcl,
+AWK, Pike, Io, Smalltalk — implement RFC 6455 by hand over a raw socket,
+because their languages have no WebSocket library at all. Ballerina has one,
+and it is wrong, so it joins them. Having a library is not the same as having a
+correct one, and the languages with nothing were never at a disadvantage on this
+particular axis.
+
+A second, duller platform defect sat alongside it: the package manager's local
+publish step intermittently dropped a symbol that the packaged artefact
+contained correctly every time. Proven by diffing the source, the pack output,
+and the published copy. The fix was to stop round-tripping through the local
+repository at all.
+
+## 16. Miscellaneous findings worth a slide
 
 - A client passed every check except one, and the one failure was in the
   *reference* implementation used for comparison, not the client under test.
