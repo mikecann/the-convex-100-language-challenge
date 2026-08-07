@@ -36,26 +36,31 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - Console (stdin/stdout) mode delivers Live updates only between adapter
-    commands, not while idle: this toolchain's console file type does not
+  - >-
+    Console (stdin/stdout) mode delivers Live updates only between adapter
+    commands, not while idle -- this toolchain's console file type does not
     implement a readiness check (proved directly, not assumed), so it
     cannot be multiplexed with the Live socket the way ADAPTER_LISTEN's
     TCP control connection can. The shared conformance harness always
     drives Live over ADAPTER_LISTEN, so this does not affect conformance.
-  - Seed7's own tls.s7i validates a server's presented certificate chain
+  - >-
+    Seed7's own tls.s7i validates a server's presented certificate chain
     cryptographically but does not check it against a trusted root store;
     this client does not add that check itself. TLS is still a genuine
     encrypted, authenticated-per-chain handshake, not a bypass, but a
     fully adversarial certificate substitution within an otherwise valid
     chain is not detected.
-  - Live authentication (setAuth is HTTP-only), optimistic updates, and
+  - >-
+    Live authentication (setAuth is HTTP-only), optimistic updates, and
     WebSocket-transported mutations/actions are deferred.
-  - Live delivery has no internal queue beyond the bounded 16-slot,
+  - >-
+    Live delivery has no internal queue beyond the bounded 16-slot,
     drop-oldest buffer per subscription; the adapter writes a decoded
     value to its output connection as soon as it is queued, so backpressure
     from a stalled reader is carried by the OS socket buffer rather than
     growing client memory.
-  - Reconnect resends every active subscription as one Add snapshot on
+  - >-
+    Reconnect resends every active subscription as one Add snapshot on
     each new connection; a same-subscriptionId replacement retires the
     prior local state immediately but does not send an explicit Remove
     for its old queryId first.
