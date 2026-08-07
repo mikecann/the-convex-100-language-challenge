@@ -25,9 +25,26 @@ here parses or generates a Convex message.
 Cintcode addressing note: a BCPL pointer is a word index into the Cintcode
 memory W, so the machine address of BCPL byte `p%off` is (char *)(W + p) + off.
 That is the same convention cintsys.c uses for sys(Sys_read, ...).
+
+64-bit Cintcode note: this client links against the distribution's 64-bit
+Cintcode system (cintsys64.c / cinterp64.c / cfuncs64.c / kblib64.c /
+nrastlib64.c, selected by -DforLinux64 -DforLinuxAMD64), not the 32-bit one.
+The 32-bit interpreter stores a raw C pointer -- such as the stdio FILE* a
+file-handling primitive receives from fopen() -- directly inside a 32-bit
+BCPL word; on a 64-bit host a heap or mmap address routinely lands above
+2**32, so the low 32 bits alone are not a valid pointer and dereferencing the
+reconstructed value corrupts memory (observed directly: a SIGSEGV inside libc
+ftell(), called with a sign-extended garbage FILE*, before any client source
+ever ran). The 64-bit interpreter uses a 64-bit BCPLWORD that a real pointer
+fits in natively, which is why this client targets it instead of working
+around the 32-bit interpreter's pointer truncation. One vendor gap remains:
+the pinned commit's cintsys64.c dosys() switch never received the 2014
+Sys_ext addition that cintsys.c has, so the Dockerfile patches in a `case 68`
+(Sys_ext's value in g/libhdr.h) that calls extfn() exactly as the 32-bit
+interpreter does; see the Dockerfile for that patch and its anchor assertion.
 */
 
-#include "cintsys.h"
+#include "cintsys64.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -123,9 +140,9 @@ static void cxsetsslerror(const char *what) {
   cxseterror(what, buffer);
 }
 
-/* Milliseconds since EXT_Init. A monotonic 32-bit millisecond clock keeps every
-   deadline inside a Cintcode word; wall-clock epoch milliseconds would not fit
-   in the 32-bit BCPL word this system uses. */
+/* Milliseconds since EXT_Init. A monotonic clock relative to process start,
+   rather than the wall-clock epoch, keeps every deadline comfortably inside a
+   single Cintcode word on this 64-bit Cintcode build. */
 static BCPLWORD cxnow(void) {
   struct timespec now;
   long long ms;

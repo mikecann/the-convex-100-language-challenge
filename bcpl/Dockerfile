@@ -4,6 +4,22 @@
 # system is built from Martin Richards' distribution pinned to one commit of a
 # mirror. A commit identifier is the content: the tree cannot change under the
 # build the way an unversioned tarball URL can.
+#
+# This client targets the distribution's 64-bit Cintcode system (cintsys64,
+# selected by -DforLinux64 -DforLinuxAMD64), not the 32-bit one. The 32-bit
+# interpreter stores a raw C pointer -- such as the stdio FILE* a file
+# primitive receives from fopen() -- directly inside a 32-bit BCPL word; on a
+# 64-bit host a heap or mmap address routinely lands above 2**32, so the low
+# 32 bits alone are not a valid pointer and dereferencing the reconstructed
+# value corrupts memory. Confirmed directly on this host: `gdb --batch -ex run
+# -ex bt` on the plain, unmodified 32-bit `bcpl` compiler compiling a
+# five-line "hello world" program shows a SIGSEGV inside libc ftell(), called
+# with a sign-extended garbage FILE*, deep inside the distribution's own
+# cintsys.c dosys() -- before any client source is ever reached. It reproduces
+# with no Convex extension linked in at all, so it is a property of the
+# 32-bit interpreter on this architecture, not a defect in this client. The
+# 64-bit interpreter's BCPLWORD is 64 bits, wide enough for a real pointer, so
+# this class of corruption cannot occur.
 ARG BUILD_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 ARG BCPL_COMMIT=bad6eec7682368ca7ded866005cc4a47e8a67569
 
@@ -33,61 +49,73 @@ RUN test "$(uname -m)" = x86_64 \
 
 WORKDIR /opt/bcpl-source/cintcode
 
-# The 2015 sources ask glibc for ftime, which glibc 2.33 removed along with
-# <sys/timeb.h>. Route the Linux clock through the distribution's own
-# gettimeofday branch instead. Both edits assert their anchor first and their
-# result afterwards, so a silent no-op cannot slip through.
+# The pinned commit's cintsys64.c dosys() switch never received the 2014
+# addition of sys(Sys_ext, ...) that cintsys.c (the 32-bit interpreter) has --
+# there is no `case 68` (Sys_ext's value, from g/libhdr.h) in it at all, so a
+# BCPL program built for cintsys64 has no way to reach a user C extension. The
+# 32-bit interpreter's own case is one line: `return extfn(&W[p+4], &W[g],
+# W);`. This patch adds the identical case to cintsys64.c, anchored right
+# after the neighbouring Sys_sdl case so a future upstream sync that already
+# carries this fix fails the anchor check instead of silently duplicating it.
 RUN set -eu; \
-    grep -Fq '#if defined(forWIN32) || defined(forCYGWIN32) || defined(forLinux)' sysc/cintsys.c; \
-    sed -i 's@#if defined(forWIN32) || defined(forCYGWIN32) || defined(forLinux)@#if defined(forWIN32) || defined(forCYGWIN32)@' sysc/cintsys.c; \
-    ! grep -Fq '#if defined(forWIN32) || defined(forCYGWIN32) || defined(forLinux)' sysc/cintsys.c; \
-    grep -Fq '#include <sys/timeb.h>' sysc/cintsys.h; \
-    sed -i 's@^#include <sys/timeb.h>@/* removed: glibc no longer provides ftime */@' \
-        sysc/cintsys.h sysc/cfuncs.c; \
-    ! grep -Fq 'sys/timeb.h' sysc/cintsys.h; \
-    ! grep -Fq 'sys/timeb.h' sysc/cfuncs.c
+    anchor='    case Sys_sdl: /* res := sys(Sys_sdl, fno, a1, a2,...) */'; \
+    body='      return sdlfn(&W[p+4], &W[g], W);'; \
+    grep -Fq "$anchor" sysc/cintsys64.c; \
+    grep -Fq "$body" sysc/cintsys64.c; \
+    awk -v anchor="$anchor" -v body="$body" ' \
+      { print } \
+      $0 == body { \
+        print ""; \
+        print "    case 68: /* res := sys(Sys_ext, fno, a1, a2,...) -- see g/libhdr.h */"; \
+        print "      return extfn(&W[p+4], &W[g], W);"; \
+      }' sysc/cintsys64.c > sysc/cintsys64.c.patched; \
+    mv sysc/cintsys64.c.patched sysc/cintsys64.c; \
+    grep -Fq 'case 68: /* res := sys(Sys_ext' sysc/cintsys64.c
 
-# The distribution ships prebuilt Cintcode for both endiannesses; x86-64 is a
-# little ender, so install that set exactly as the upstream Makefile does.
+# The distribution ships prebuilt 64-bit Cintcode for both endiannesses;
+# x86-64 is a little ender, so install that set exactly as the upstream
+# Makefile's litender64 target does.
 RUN set -eu; \
     for part in syslib boot blib dlib cli; do \
-      cp "enderlit/$part" cin/syscin/"$part"; \
+      cp "enderlit64/$part" cin64/syscin/"$part"; \
     done; \
     for part in bcpl c echo; do \
-      cp "enderlit/$part" cin/"$part"; \
+      cp "enderlit64/$part" cin64/"$part"; \
     done
 
 COPY client/native/convexext.c sysc/convexext.c
 
-# Build the interpreter with the client's native transport boundary in place of
-# the distribution's empty extfn.c stub. sdlfn.c and glfn.c are deliberately not
-# compiled: convexext.c supplies the two stubs cintsys needs so that neither SDL
-# nor OpenGL is pulled into this image at all.
+# Build the 64-bit interpreter with the client's native transport boundary in
+# place of the distribution's empty extfn.c stub. sdlfn.c and sdldrawlib.c are
+# compiled unmodified from the vendor tree: neither SDLavail nor USE_SDL is
+# defined, so both files compile down to inert stubs with no SDL dependency,
+# which is why upstream's own bin/cintsys64 link line includes them.
 RUN set -eu; \
     mkdir -p obj bin; \
     gcc -O2 -o /tmp/mkint-h sysc/mkint-h.c; \
     /tmp/mkint-h > sysc/INT.h; \
     rm -f /tmp/mkint-h; \
-    cflags="-O2 -std=gnu99 -fcommon -w -DforLinux -DEXTavail -Isysc"; \
-    gcc $cflags -c sysc/cintsys.c -o obj/cintsys.o; \
-    gcc $cflags -c sysc/cinterp.c -o obj/cinterp.o; \
-    gcc $cflags -DFASTyes -c sysc/cinterp.c -o obj/fasterp.o; \
-    gcc $cflags -c sysc/kblib.c -o obj/kblib.o; \
-    gcc $cflags -c sysc/cfuncs.c -o obj/cfuncs.o; \
-    gcc $cflags -c sysc/nrastlib.c -o obj/nrastlib.o; \
-    gcc $cflags -c sysc/convexext.c -o obj/extfn.o; \
-    gcc -o bin/cintsys \
-        obj/cintsys.o obj/cinterp.o obj/fasterp.o obj/kblib.o obj/cfuncs.o \
-        obj/nrastlib.o obj/extfn.o \
+    cflags="-O2 -std=gnu99 -fcommon -w -DforLinux64 -DforLinuxAMD64 -DEXTavail -Isysc"; \
+    gcc $cflags -c sysc/cintsys64.c -o obj/cintsys64.o; \
+    gcc $cflags -c sysc/cinterp64.c -o obj/cinterp64.o; \
+    gcc $cflags -DFASTyes -c sysc/cinterp64.c -o obj/fasterp64.o; \
+    gcc $cflags -c sysc/kblib64.c -o obj/kblib64.o; \
+    gcc $cflags -c sysc/nrastlib64.c -o obj/nrastlib64.o; \
+    gcc $cflags -c sysc/sdlfn.c -o obj/sdlfn64.o; \
+    gcc $cflags -c sysc/sdldrawlib.c -o obj/sdldrawlib64.o; \
+    gcc $cflags -c sysc/convexext.c -o obj/extfn64.o; \
+    gcc -o bin/cintsys64 \
+        obj/cintsys64.o obj/cinterp64.o obj/fasterp64.o obj/kblib64.o \
+        obj/nrastlib64.o obj/sdlfn64.o obj/sdldrawlib64.o obj/extfn64.o \
         -lm -lssl -lcrypto; \
-    file bin/cintsys | grep -Eq 'ELF 64-bit.*x86-64'
+    file bin/cintsys64 | grep -Eq 'ELF 64-bit.*x86-64'
 
-ENV BCPLROOT=/opt/bcpl-source/cintcode \
-    BCPLPATH=/opt/bcpl-source/cintcode/cin \
-    BCPLHDRS=/opt/bcpl-source/cintcode/g \
+ENV BCPL64ROOT=/opt/bcpl-source/cintcode \
+    BCPL64PATH=/opt/bcpl-source/cintcode/cin64 \
+    BCPL64HDRS=/opt/bcpl-source/cintcode/g \
     PATH=/opt/bcpl-source/cintcode/bin:/usr/local/bin:/usr/bin:/bin
 
-RUN cintsys -c echo bcpl-cintcode-ready 2>&1 | grep -Fq bcpl-cintcode-ready
+RUN cintsys64 -c echo bcpl-cintcode-ready 2>&1 | grep -Fq bcpl-cintcode-ready
 
 WORKDIR /project
 COPY client ./client
@@ -127,9 +155,9 @@ RUN set -eu; \
 # performs first. The libhdr.h assertion fails the build loudly if the header
 # directory is ever somewhere else.
 RUN set -eu; \
-    mkdir -p /build/src /build/cin /out/bcpl/bin /out/bcpl/cin/syscin; \
-    test -f "$BCPLHDRS/libhdr.h"; \
-    cp client/convexhdr.h "$BCPLHDRS/convexhdr.h"; \
+    mkdir -p /build/src /build/cin /out/bcpl/bin /out/bcpl/cin64/syscin; \
+    test -f "$BCPL64HDRS/libhdr.h"; \
+    cp client/convexhdr.h "$BCPL64HDRS/convexhdr.h"; \
     cp client/*.b client/*.h /build/src/; \
     cp client/tests/clienttests.b client/tests/livetests.b /build/src/; \
     cp client/tests/conformance/adapter.b /build/src/adapter.b; \
@@ -141,7 +169,7 @@ RUN set -eu; \
       object=/build/cin/${program##*:}; \
       name=${program##*:}; \
       status=0; \
-      cintsys -m 8000000 -c bcpl "$source" to "$name" size 600000 \
+      cintsys64 -m 8000000 -c bcpl64 "$source" to "$name" size 600000 \
         > "/tmp/$name.log" 2>&1 || status=$?; \
       cat "/tmp/$name.log"; \
       test "$status" -eq 0; \
@@ -153,13 +181,13 @@ RUN set -eu; \
 # Install the runtime tree. The BCPL compiler is deliberately not part of it:
 # only the boot image, the standard library and this client's own objects.
 RUN set -eu; \
-    cp /opt/bcpl-source/cintcode/bin/cintsys /out/bcpl/bin/cintsys; \
+    cp /opt/bcpl-source/cintcode/bin/cintsys64 /out/bcpl/bin/cintsys64; \
     for part in boot blib syslib dlib cli; do \
-      cp "/opt/bcpl-source/cintcode/cin/syscin/$part" /out/bcpl/cin/syscin/"$part"; \
+      cp "/opt/bcpl-source/cintcode/cin64/syscin/$part" /out/bcpl/cin64/syscin/"$part"; \
     done; \
-    cp /build/cin/convexadapter /build/cin/convexexample /out/bcpl/cin/; \
-    test ! -e /out/bcpl/cin/bcpl; \
-    test ! -e /out/bcpl/cin/c; \
+    cp /build/cin/convexadapter /build/cin/convexexample /out/bcpl/cin64/; \
+    test ! -e /out/bcpl/cin64/bcpl64; \
+    test ! -e /out/bcpl/cin64/c; \
     mkdir -p /usr/local/lib; \
     cp -R /out/bcpl /usr/local/lib/bcpl
 
@@ -175,9 +203,9 @@ RUN set -eu; \
 
 # Language-local unit tests: JSON, digests, bounds, adapter event bytes.
 RUN set -eu; \
-    cp /build/cin/clienttests /build/cin/livetests /opt/bcpl-source/cintcode/cin/; \
+    cp /build/cin/clienttests /build/cin/livetests /opt/bcpl-source/cintcode/cin64/; \
     status=0; \
-    cintsys -m 6000000 -c clienttests > /tmp/clienttests.out 2>&1 || status=$?; \
+    cintsys64 -m 3000000 -c clienttests > /tmp/clienttests.out 2>&1 || status=$?; \
     cat /tmp/clienttests.out; \
     test "$status" -eq 0; \
     ! grep -q FAIL /tmp/clienttests.out; \
@@ -187,7 +215,7 @@ RUN set -eu; \
 # bounded-close deadlines.
 RUN set -eu; \
     status=0; \
-    cintsys -m 6000000 -c livetests > /tmp/livetests.out 2>&1 || status=$?; \
+    cintsys64 -m 3000000 -c livetests > /tmp/livetests.out 2>&1 || status=$?; \
     cat /tmp/livetests.out; \
     test "$status" -eq 0; \
     ! grep -q FAIL /tmp/livetests.out; \
@@ -293,11 +321,11 @@ COPY --from=test /lib/x86_64-linux-gnu/libacl.so.1 /lib/x86_64-linux-gnu/libacl.
 # libacl's own dependency. Copying a library without its closure is the usual
 # way a pruned image passes its build and then fails on first use.
 COPY --from=test /lib/x86_64-linux-gnu/libattr.so.1 /lib/x86_64-linux-gnu/libattr.so.1
-# The BCPL Cintcode system: the interpreter, its boot image and its standard
-# library. This is the language runtime, in the same sense a virtual machine is
-# a language runtime; the BCPL compiler is not here.
-COPY --from=test /out/bcpl/bin/cintsys /usr/local/lib/bcpl/bin/cintsys
-COPY --from=test /out/bcpl/cin/syscin /usr/local/lib/bcpl/cin/syscin
+# The BCPL 64-bit Cintcode system: the interpreter, its boot image and its
+# standard library. This is the language runtime, in the same sense a virtual
+# machine is a language runtime; the BCPL compiler (bcpl64) is not here.
+COPY --from=test /out/bcpl/bin/cintsys64 /usr/local/lib/bcpl/bin/cintsys64
+COPY --from=test /out/bcpl/cin64/syscin /usr/local/lib/bcpl/cin64/syscin
 ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
     OPENSSL_MODULES=/usr/lib/x86_64-linux-gnu/ossl-modules \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
@@ -316,9 +344,9 @@ RUN test "$(id -u):$(id -g)" = 65532:65532 \
     && printf 'needle\n' | grep -Fqx needle \
     && test "$(printf 'before\n' | sed 's/before/after/')" = after \
     && test "$(printf 'value\n' | awk '{print $1}')" = value \
-    && test -x /usr/local/lib/bcpl/bin/cintsys \
-    && test -s /usr/local/lib/bcpl/cin/syscin/cli \
-    && test ! -e /usr/local/lib/bcpl/cin/bcpl \
+    && test -x /usr/local/lib/bcpl/bin/cintsys64 \
+    && test -s /usr/local/lib/bcpl/cin64/syscin/cli \
+    && test ! -e /usr/local/lib/bcpl/cin64/bcpl64 \
     && test ! -e /etc/dpkg \
     && test ! -e /etc/.pwd.lock \
     && test ! -e /busybox \
@@ -334,14 +362,14 @@ RUN test "$(id -u):$(id -g)" = 65532:65532 \
     && test "$#" -eq 1 \
     && set -- /usr/lib/x86_64-linux-gnu/ossl-modules/* \
     && test "$#" -eq 1 \
-    && for command_name in bcpl cintsys gcc cc clang make cmake apt apt-get \
-         dpkg curl wget nc netcat openssl node python python3 ruby perl java \
-         php go rustc cargo npm npx pip pip3 convex; do \
+    && for command_name in bcpl bcpl64 cintsys cintsys64 gcc cc clang make \
+         cmake apt apt-get dpkg curl wget nc netcat openssl node python \
+         python3 ruby perl java php go rustc cargo npm npx pip pip3 convex; do \
          ! command -v "$command_name" >/dev/null 2>&1; \
        done
 
 FROM runtime-base AS example-runtime
-COPY --from=test /out/bcpl/cin/convexexample /usr/local/lib/bcpl/cin/convexexample
+COPY --from=test /out/bcpl/cin64/convexexample /usr/local/lib/bcpl/cin64/convexexample
 COPY --from=test /out/convex-example /usr/local/bin/convex-example
 # No deployment is configured here, so the example must refuse to run, write
 # nothing at all to stdout, and say why on stderr. That is also the proof that
@@ -350,7 +378,7 @@ COPY --from=test /out/convex-example /usr/local/bin/convex-example
 RUN set -eu; \
     test -x /usr/local/bin/convex-example; \
     test ! -e /usr/local/bin/convex-adapter; \
-    test ! -e /usr/local/lib/bcpl/cin/convexadapter; \
+    test ! -e /usr/local/lib/bcpl/cin64/convexadapter; \
     code=0; \
     transcript=$(/usr/local/bin/convex-example 2>/dev/null) || code=$?; \
     test "$code" -ne 0; \
@@ -361,11 +389,11 @@ ENTRYPOINT ["/usr/local/bin/convex-example"]
 
 # Keep the adapter last because `./run build bcpl` uses the default target.
 FROM runtime-base AS runtime
-COPY --from=test /out/bcpl/cin/convexadapter /usr/local/lib/bcpl/cin/convexadapter
+COPY --from=test /out/bcpl/cin64/convexadapter /usr/local/lib/bcpl/cin64/convexadapter
 COPY --from=test /out/convex-adapter /usr/local/bin/convex-adapter
 RUN test -x /usr/local/bin/convex-adapter \
     && test ! -e /usr/local/bin/convex-example \
-    && test ! -e /usr/local/lib/bcpl/cin/convexexample \
+    && test ! -e /usr/local/lib/bcpl/cin64/convexexample \
     && printf '%s\n' \
          '{"protocolVersion":1,"id":"hello","op":"hello"}' \
          '{"id":"close","op":"close"}' \

@@ -35,7 +35,7 @@ AND convexToolchainCommit() = "bad6eec7682368ca7ded866005cc4a47e8a67569"
 AND convexRuntime() = VALOF
 { LET text = bbNew(96)
   UNLESS text RESULTIS 0
-  bbPushStr(text, "BCPL Cintcode 32-bit cintsys (8l/bcpl ")
+  bbPushStr(text, "BCPL Cintcode 64-bit cintsys64 (8l/bcpl ")
   bbPushStr(text, convexToolchainCommit())
   bbPushStr(text, ")")
   RESULTIS text

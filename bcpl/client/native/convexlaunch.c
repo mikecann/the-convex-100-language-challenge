@@ -37,17 +37,20 @@ Compiled twice, with CONVEX_PROGRAM set to the Cintcode object to run.
 
 /* Cintcode memory is allocated once, at startup, and every BCPL allocation in
    this client comes out of it. Fixing it here is what makes the client's
-   memory ceiling a property of the process rather than a promise: 6,000,000
-   32-bit words is 24 MiB, comfortably inside the shared 128 MiB limit even
-   with the interpreter, OpenSSL and the CA store loaded alongside it. */
+   memory ceiling a property of the process rather than a promise. This client
+   runs on the distribution's 64-bit Cintcode system, where a BCPLWORD is 8
+   bytes, so 3,000,000 words is 24 MiB -- the same byte ceiling a 32-bit build
+   would get from 6,000,000 32-bit words -- comfortably inside the shared
+   128 MiB limit even with the interpreter, OpenSSL and the CA store loaded
+   alongside it. */
 #ifndef CONVEX_CINTCODE_WORDS
-#define CONVEX_CINTCODE_WORDS "6000000"
+#define CONVEX_CINTCODE_WORDS "3000000"
 #endif
 
 int main(int argc, char **argv) {
   char descriptor[16];
   int saved = dup(1);
-  char *interpreter = CONVEX_BCPLROOT "/bin/cintsys";
+  char *interpreter = CONVEX_BCPLROOT "/bin/cintsys64";
   char *arguments[6];
 
   if (saved < 0) {
@@ -70,9 +73,9 @@ int main(int argc, char **argv) {
     setenv("CONVEX_ROOM_ARG", argv[1], 1);
   }
 
-  setenv("BCPLROOT", CONVEX_BCPLROOT, 1);
-  setenv("BCPLPATH", CONVEX_BCPLROOT "/cin", 1);
-  setenv("BCPLHDRS", CONVEX_BCPLROOT "/g", 1);
+  setenv("BCPL64ROOT", CONVEX_BCPLROOT, 1);
+  setenv("BCPL64PATH", CONVEX_BCPLROOT "/cin64", 1);
+  setenv("BCPL64HDRS", CONVEX_BCPLROOT "/g", 1);
 
   arguments[0] = interpreter;
   arguments[1] = "-m";
