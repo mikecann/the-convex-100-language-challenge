@@ -36,6 +36,8 @@ main :: Effect Unit
 main = do
   initialValueAndExternalUpdate
   queryFailureThenRecovery
+  initialValueThenFailureThenRepair
+  lastQueryRemovalIsAcknowledged
   unsubscribeIsABarrier
   sameIdentifierReplacementIsABarrier
   reconnectResendsAndSuppresses
@@ -115,6 +117,95 @@ queryFailureThenRecovery = do
   sendText socket (transition 1 1 1 2 (updated 0 7))
   recovered <- nextCount subscription
   Check.equalInt "the subscription recovers" recovered 7
+
+  shutdown client socket listener.socket
+
+-- | The shape the shared pilot drives: a value arrives, the query then fails,
+-- | the failure is repaired on the server, and a `QueryUpdated` for the same
+-- | query id carries the repaired value.
+-- |
+-- | A `QueryFailed` is a value-state, not a removal. The query is still in the
+-- | server's query set, so it has to stay registered here: forgetting it would
+-- | make the repair look like a transition referencing an unknown query.
+initialValueThenFailureThenRepair :: Effect Unit
+initialValueThenFailureThenRepair = do
+  listener <- startListener
+  client <- newClient listener.port
+  self <- Sys.selfPid
+  subscription <- expectSubscribe client "demo:repair" (roomArgs "delta") self
+
+  socket <- acceptUpgrade listener.socket
+  connect <- expectMessage socket Bytes.empty
+  _ <- expectMessage socket connect.rest
+
+  sendText socket (transition 0 0 1 1 (updated 0 3))
+  initial <- nextCount subscription
+  Check.equalInt "the initial value arrives" initial 3
+
+  sendText socket (transition 1 1 1 2 (failed 0 "repairing"))
+  event <- nextEvent subscription
+  case event of
+    LiveFailure problem ->
+      Check.equalString "the failure carries its message" problem.message
+        "repairing"
+    LiveValue _ _ -> Check.ok "expected a failure, not a value" false
+
+  sendText socket (transition 1 2 1 3 (updated 0 4))
+  repaired <- nextCount subscription
+  Check.equalInt "the repaired value arrives" repaired 4
+
+  -- And the subscription is ordinary again afterwards.
+  sendText socket (transition 1 3 1 4 (updated 0 5))
+  following <- nextCount subscription
+  Check.equalInt "the repaired subscription keeps updating" following 5
+
+  shutdown client socket listener.socket
+
+-- | Unsubscribing the last query and immediately subscribing again, which is
+-- | how the shared pilot moves from one Live check to the next.
+-- |
+-- | Removing the *last* query takes a different path from removing one of
+-- | several, because it also has to close an otherwise idle socket. The
+-- | acknowledgement the server sends for that removal names a query this
+-- | client has already dropped from its subscriptions, so unless the removal
+-- | was recorded as retiring it reads as a transition about a query the client
+-- | never had. The protocol error that follows is broadcast to whichever
+-- | subscription happens to be live by then, which is the next check's.
+lastQueryRemovalIsAcknowledged :: Effect Unit
+lastQueryRemovalIsAcknowledged = do
+  listener <- startListener
+  client <- newClient listener.port
+  self <- Sys.selfPid
+  first <- expectSubscribe client "demo:state" (roomArgs "epsilon") self
+
+  socket <- acceptUpgrade listener.socket
+  connect <- expectMessage socket Bytes.empty
+  add <- expectMessage socket connect.rest
+  Check.ok "the client adds the first query"
+    (stringContains add.text "\"type\":\"Add\"")
+
+  sendText socket (transition 0 0 1 1 (updated 0 0))
+  initial <- nextCount first
+  Check.equalInt "the initial value arrives" initial 0
+
+  expectOk "unsubscribe is accepted" (Convex.unsubscribe client first)
+  remove <- expectMessage socket add.rest
+  Check.ok "removing the last query still reaches the wire"
+    (stringContains remove.text "\"Remove\"")
+
+  -- The replacement arrives before the server has acknowledged that removal.
+  second <- expectSubscribe client "demo:repair" (roomArgs "zeta") self
+  readd <- expectMessage socket remove.rest
+  Check.ok "the replacement query is added"
+    (stringContains readd.text "\"type\":\"Add\"")
+
+  -- The acknowledgement names the query that was removed. It is the answer to
+  -- a request this client made, not news about a query it never had.
+  sendText socket (transition 1 1 2 2 (removed 0))
+  sendText socket (transition 2 2 3 3 (updated 1 5))
+
+  replacement <- nextCount second
+  Check.equalInt "the replacement subscription is unaffected" replacement 5
 
   shutdown client socket listener.socket
 

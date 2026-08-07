@@ -850,6 +850,12 @@ modifyQuerySet baseVersion modification = JsonObject
 -- | otherwise idle socket after a short replacement grace period. `ConnSend`
 -- | is intentionally asynchronous for normal traffic, but using it here would
 -- | race the final close and make the required Remove vanish from the wire.
+-- |
+-- | The removed query is recorded in `retiring` exactly as `retireRemoteQuery`
+-- | records it. A `Remove` is a request, not an effect: the query stays in the
+-- | server's set until a transition says otherwise, and that transition names a
+-- | query this client has already dropped from `subscriptions`. `retiring` is
+-- | the only thing that tells the two apart from a query the client never had.
 removeThenIdleClose :: Subscription -> State -> Effect State
 removeThenIdleClose subscription state = case state.connection of
   Just connection | connection.ready -> do
@@ -866,7 +872,14 @@ removeThenIdleClose subscription state = case state.connection of
       (ConnSendAndAcknowledge frame self reference)
     written <- Sys.awaitReply reference frameSendTimeout
     case written of
-      Just true -> scheduleIdleClose (state { querySet = state.querySet + 1 })
+      Just true ->
+        let
+          sent = state { querySet = state.querySet + 1 }
+        in
+          if listLength sent.retiring >= maxRetiringQueries then
+            disconnect "retiring query capacity reached" sent
+          else scheduleIdleClose
+            (sent { retiring = Cons subscription.queryId sent.retiring })
       Just _ -> transportReconnect "the final query removal was not written"
         state
       Nothing ->
