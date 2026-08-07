@@ -27,7 +27,7 @@ prints the six-line transcript every language in this repository shares.
 ## The basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.v -->
-```text
+```v
 module main
 
 import os

@@ -36,7 +36,7 @@ limitations:
   - Source-only checkpoint. No Docker build, final-image audit, example run, or conformance result exists yet, so no capability is claimed.
   - The V 0.4.9 toolchain and git build package are pinned in Docker, but the first amd64 build must still prove those package artifacts remain resolvable from the declared Debian base and that the V commit exists under the selected tag.
   - Several V standard-library API details are asserted by this source but not yet confirmed by a compiler; the generic OpenSSL pending-byte boundary was source-inspected against V's current public `SSLConn.ssl` layout, not against the unbuilt pinned commit.
-  - V's net.websocket is intentionally not used: this source owns bounded upgrade and frame parsing so peer-declared lengths are checked before allocation and read/write deadlines are cumulative.
+  - V's net.websocket is intentionally not used; this source owns bounded upgrade and frame parsing so peer-declared lengths are checked before allocation and read/write deadlines are cumulative.
   - Live authentication, WebSocket mutations and actions, optimistic updates, journals, and TransitionChunk assembly are deferred.
   - HTTP uses one bounded connection-close exchange per call; persistent connections and request compression are deferred.
   - Live values cover Convex's JSON-safe subset; tagged Convex value conversions are deferred.
