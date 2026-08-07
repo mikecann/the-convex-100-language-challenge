@@ -129,7 +129,8 @@ RUN set -eu; \
       | CONVEX_URL=http://127.0.0.1:19092 ./bin/convex_adapter > /tmp/relay.ndjson; \
     wait "$fixture_pid" || true; \
     test "$(wc -L < /tmp/relay.ndjson)" -gt 3000000; \
-    grep -Fq '{"subscriptionId":"pressure","type":"subscription","value":"' \
+    grep -Fq \
+      '{"logs":[],"subscriptionId":"pressure","type":"subscription","value":"' \
       /tmp/relay.ndjson; \
     ! grep -Fq 'ProtocolError' /tmp/relay.ndjson; \
     grep -Fqx '{"id":"close","type":"closed"}' /tmp/relay.ndjson; \
