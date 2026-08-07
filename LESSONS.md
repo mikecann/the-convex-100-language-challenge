@@ -616,6 +616,16 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- For a young language, the fastest route was reading the standard library's
+  source. Mojo 0.26.2's stdlib does not match anything a model has been trained
+  on: `sys.ffi` moved to `std.ffi`, `alias` became `comptime`, `UnsafePointer`
+  grew mutability and origin parameters and lost `.alloc`, and string slicing
+  now needs an explicit `[byte=a:b]`. Guessing costs an afternoon of
+  compiler-error ping-pong. Cloning the compiler's own repository at the tag
+  matching the installed release, and reading it, costs minutes. There is also
+  a trap worth naming: `external_call["write", …]` fails to compile because
+  `print` has already instantiated the standard library's own declaration of
+  `write`, and yours must match its signature exactly.
 - Ballerina's platform betrayed it twice, in two different libraries. The known
   defect was `ballerina/websocket` corrupting multi-byte UTF-8 split across a
   continuation frame, fixed by not using it — hand-rolled RFC 6455 over a raw
