@@ -599,15 +599,29 @@ variable command-root
     convex-open adapter-client !
     adapter-serve ;
 
-\ Loading this file with ADAPTER_LIBRARY_ONLY set defines the adapter without
-\ starting it, so the language-local tests can drive its event composition and
-\ its outbox directly. The shipped entrypoint never sets it.
-s" ADAPTER_LIBRARY_ONLY" getenv nip 0= [if]
-    ' adapter-main catch ?dup if
+\ IF and THEN are compile-only: standard Forth throws "Interpreting a
+\ compile-only word" if they run outside a colon definition, which is
+\ exactly the state the [IF] guard below interprets in. So the catch/if/then
+\ dispatch is compiled into a word here and merely executed below, instead of
+\ appearing directly inside the [IF] block. Inside that colon definition,
+\ tick (') is also wrong: compiled into a word body it parses its argument
+\ from the input stream at run time, and by then nothing follows on the
+\ source line, which throws "zero-length string as a name." The
+\ compile-time bracket-tick ([']) below resolves the execution token once,
+\ during compilation, and compiles it in as a literal, which is what a word
+\ body needs.
+: adapter-run ( -- )
+    ['] adapter-main catch ?dup if
         cvx-adopt-fault
         s" the Forth adapter failed" note-line
         report-error
         1 convex-exit
     then
-    0 convex-exit
+    0 convex-exit ;
+
+\ Loading this file with ADAPTER_LIBRARY_ONLY set defines the adapter without
+\ starting it, so the language-local tests can drive its event composition and
+\ its outbox directly. The shipped entrypoint never sets it.
+s" ADAPTER_LIBRARY_ONLY" getenv nip 0= [if]
+    adapter-run
 [then]
