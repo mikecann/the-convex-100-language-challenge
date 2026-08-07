@@ -12,6 +12,7 @@
 
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
 
 void *
 convex_tls_connect (int fd, const char *hostname)
@@ -169,6 +170,12 @@ unsigned int
 convex_random_seed (void)
 {
 	return ((unsigned int) getpid () * 2654435761u) ^ (unsigned int) time (NULL);
+}
+
+void
+convex_ignore_sigpipe (void)
+{
+	signal (SIGPIPE, SIG_IGN);
 }
 
 int

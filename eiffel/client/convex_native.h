@@ -59,4 +59,14 @@ int convex_select_two(int fd_one, int fd_two, int timeout_ms);
  * label, not a credential. */
 unsigned int convex_random_seed(void);
 
+/* Writing to a socket after the peer has already closed its end raises
+ * SIGPIPE, whose default disposition kills the whole process outright
+ * (this is also true of send(2) on a peer-reset TCP connection, which a
+ * transient real network path -- as opposed to a stable localhost
+ * connection -- makes far more likely to actually happen in practice).
+ * Call this once at startup so a broken pipe instead surfaces as an
+ * ordinary EPIPE return from write/send, exactly like any other
+ * transport error this client already handles. */
+void convex_ignore_sigpipe(void);
+
 #endif

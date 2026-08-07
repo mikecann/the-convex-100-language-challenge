@@ -26,6 +26,7 @@ feature {NONE} -- Initialization
 			room: STRING
 			client: CONVEX_CLIENT
 		do
+			ignore_sigpipe
 			deployment_url := environment_variable ("CONVEX_URL")
 			if deployment_url = Void then
 				fail ("CONVEX_URL is required")
@@ -215,6 +216,19 @@ feature {NONE} -- Helpers
 			io.error.put_string (a_message)
 			io.error.put_string ("%N")
 			(create {EXCEPTIONS}).die (1)
+		end
+
+feature {NONE} -- Externals
+
+	ignore_sigpipe
+			-- See convex_native.h: a hosted deployment's connection can
+			-- reset mid-stream in ordinary operation, and the default
+			-- SIGPIPE disposition would otherwise kill this whole process
+			-- the moment a write lands on it.
+		external
+			"C signature () use %"convex_native.h%""
+		alias
+			"convex_ignore_sigpipe"
 		end
 
 end

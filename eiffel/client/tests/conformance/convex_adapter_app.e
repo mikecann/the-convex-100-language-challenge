@@ -26,6 +26,7 @@ feature {NONE} -- Initialization
 			deployment_url: detachable STRING
 			listen_spec: detachable STRING
 		do
+			ignore_sigpipe
 			deployment_url := environment_variable ("CONVEX_URL")
 			listen_spec := environment_variable ("ADAPTER_LISTEN")
 			if listen_spec = Void then
@@ -448,6 +449,19 @@ feature {NONE} -- Environment
 			if wide_value /= Void then
 				Result := wide_value.to_string_8
 			end
+		end
+
+feature {NONE} -- Externals
+
+	ignore_sigpipe
+			-- See convex_native.h: a hosted deployment's connection can
+			-- reset mid-stream in ordinary operation, and the default
+			-- SIGPIPE disposition would otherwise kill this whole process
+			-- the moment a write lands on it.
+		external
+			"C signature () use %"convex_native.h%""
+		alias
+			"convex_ignore_sigpipe"
 		end
 
 end
