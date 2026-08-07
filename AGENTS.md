@@ -333,6 +333,14 @@ then rerun the shared evidence once from that head. Every extra cleanup commit
 after a green run costs a full rerun under the exact-head rule, so sweep the
 language directory for stale claims before rerunning, not after.
 
+Exception: a follow-up commit whose diff is provably limited to the manifest
+`capabilities:` list and README prose does not invalidate the parent commit's
+evidence. The Docker build inputs are unchanged and the evaluator computes the
+award from test results, not the manifest, so the PR may cite the evidence
+from the parent commit explicitly instead of rerunning. Any change touching
+the Dockerfile, client, examples, or any other manifest field forfeits this
+exception.
+
 Fixtures authored inside a checkpoint that has never executed are not
 evidence-bearing. When such a fixture encodes an environment-hostile
 parameterization, adjust the parameterization minimally with coordinator
