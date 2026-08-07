@@ -76,6 +76,18 @@ RUN apk add --no-cache ca-certificates=20260413-r0
 
 # BusyBox supplies only the shell and POSIX tools the shared verifier needs.
 # Alpine's package database and apk executable stop at the certificates stage.
+#
+# BusyBox's multicall dispatcher only enters "top-level" mode (--list,
+# explicit `busybox <applet>`) when argv[0]'s basename is literally
+# "busybox"; invoked under any other name it looks that name up directly in
+# the compiled applet table. The restricted binary is therefore verified
+# through a copy at a path still named "busybox" that is deleted before this
+# layer ends, then installed under the applet names it actually serves — sh,
+# id, grep — and never again written to a path literally named busybox: a
+# from-source rebuild that still ends up at /bin/busybox only proves the
+# applet table changed, not that the image stopped being "a copy of BusyBox
+# with a longer denylist" the way this stage's own FROM BUSYBOX_IMAGE starts
+# out.
 FROM --platform=linux/amd64 ${BUSYBOX_IMAGE} AS runtime-base
 COPY --from=busybox-builder /out/busybox /restricted-busybox
 COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
@@ -85,18 +97,39 @@ COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-ce
 COPY --from=certificates /etc/ssl/cert.pem /etc/ssl/cert.pem
 COPY --from=certificates /etc/ssl/openssl.cnf /etc/ssl/openssl.cnf
 RUN /bin/busybox sh -c 'set -eu; \
-    /bin/busybox find /bin -mindepth 1 -maxdepth 1 ! -name busybox -delete; \
-    /bin/busybox rm -rf /sbin /usr; \
-    /bin/busybox mkdir -p /bin /usr/bin /usr/local/bin; \
-    /bin/busybox ln -s busybox /bin/sh; \
-    /bin/busybox ln -s ../../bin/busybox /usr/bin/id; \
-    /bin/busybox ln -s ../../bin/busybox /usr/bin/grep; \
-    /bin/busybox mv /restricted-busybox /bin/busybox' \
-    && test "$(/bin/busybox --list)" = "$(printf '%s\n' '[' '[[' ash grep id sh test)" \
-    && for tool in apk apt apt-get apt-key curl dpkg ftpget ftpput nc rpm telnet tftp wget; do test "$(/bin/busybox "$tool" 2>/dev/null; printf '%s' "$?")" = 127; done \
-    && ! test -e /sbin/apk \
-    && ! command -v apk \
-    && for command in crystal shards npm npx node python python3 pip pip3 curl convex gcc cc clang make; do ! command -v "$command"; done
+    /bin/busybox mkdir /policy /verify; \
+    /bin/busybox cp /bin/busybox /policy/busybox; \
+    /bin/busybox cp /restricted-busybox /verify/busybox; \
+    test "$(/verify/busybox --list)" = "$(printf "%s\n" "[" "[[" ash grep id sh test)"; \
+    for tool in apk apt apt-get apt-key curl dpkg ftpget ftpput nc rpm telnet tftp wget; do \
+      test "$(/verify/busybox "$tool" 2>/dev/null; printf "%s" "$?")" = 127; \
+    done; \
+    /policy/busybox rm -rf /verify; \
+    /policy/busybox find /bin -mindepth 1 -maxdepth 1 -delete; \
+    /policy/busybox rm -rf /sbin /usr; \
+    /policy/busybox mkdir -p /bin /usr/bin /usr/local/bin; \
+    /policy/busybox mv /restricted-busybox /bin/sh; \
+    /policy/busybox ln /bin/sh /usr/bin/id; \
+    /policy/busybox ln /bin/sh /usr/bin/grep; \
+    test -x /bin/sh; \
+    test -x /usr/bin/id; \
+    test -x /usr/bin/grep; \
+    for name in apk apt apt-get apt-key curl dpkg ftpget ftpput nc rpm telnet tftp wget; do \
+      implicit="$(/bin/sh -c "exec -a $name /bin/sh" >/dev/null 2>&1; printf "%s" "$?")"; \
+      test "$implicit" = 127; \
+      explicit="$(/bin/sh -c "exec -a busybox /bin/sh $name" >/dev/null 2>&1; printf "%s" "$?")"; \
+      test "$explicit" = 127; \
+    done; \
+    forbidden="$(/policy/busybox find / -xdev -path /policy -prune -o \( -type f -o -type l \) \( -name apk -o -name apt -o -name apt-get -o -name apt-key -o -name busybox -o -name curl -o -name dpkg -o -name ftpget -o -name ftpput -o -name nc -o -name rpm -o -name telnet -o -name tftp -o -name wget \) -print)"; \
+    test -z "$forbidden"; \
+    /policy/busybox rm -rf /policy; \
+    test ! -e /policy'
+RUN set -eu; \
+    test ! -e /sbin/apk; \
+    ! command -v apk >/dev/null 2>&1 || exit 1; \
+    for command_name in crystal shards npm npx node python python3 pip pip3 curl convex gcc cc clang make; do \
+      ! command -v "$command_name" >/dev/null 2>&1 || exit 1; \
+    done
 USER 65532:65532
 
 FROM runtime-base AS example-runtime
