@@ -4,7 +4,10 @@ note
 		single I/O owner a bounded wait across the control stream and, when
 		a Live subscription is open, the sync WebSocket's file descriptor.
 		Every wait carries an explicit deadline so neither a silent peer
-		nor a stalled TLS read can block the process forever.
+		nor a stalled TLS read can block the process forever. The actual
+		`select' call lives in convex_native.c; see that file's header
+		comment for why this project keeps such logic out of EiffelStudio's
+		own inline-C feature bodies.
 	]"
 
 class
@@ -38,64 +41,17 @@ feature -- Waiting
 feature {NONE} -- Externals
 
 	c_select_one (a_fd: INTEGER; a_timeout_ms: INTEGER): INTEGER
-			-- 1 if `a_fd' is readable before the deadline, 0 on timeout,
-			-- -1 on a `select' error (treated as "not ready" by callers).
 		external
-			"C inline use %"sys/select.h%""
+			"C signature (int, int): int use %"convex_native.h%""
 		alias
-			"{
-				fd_set readfds;
-				struct timeval tv;
-				int rc;
-
-				FD_ZERO(&readfds);
-				FD_SET((int) $a_fd, &readfds);
-				tv.tv_sec = ((long) $a_timeout_ms) / 1000;
-				tv.tv_usec = (((long) $a_timeout_ms) % 1000) * 1000;
-
-				rc = select((int) $a_fd + 1, &readfds, NULL, NULL, &tv);
-				if (rc <= 0) {
-					return 0;
-				}
-				return FD_ISSET((int) $a_fd, &readfds) ? 1 : 0;
-			}"
+			"convex_select_one"
 		end
 
 	c_select_two (a_fd_one, a_fd_two: INTEGER; a_timeout_ms: INTEGER): INTEGER
 		external
-			"C inline use %"sys/select.h%""
+			"C signature (int, int, int): int use %"convex_native.h%""
 		alias
-			"{
-				fd_set readfds;
-				struct timeval tv;
-				int max_fd;
-				int rc;
-				int result;
-				int fd1 = (int) $a_fd_one;
-				int fd2 = (int) $a_fd_two;
-
-				FD_ZERO(&readfds);
-				max_fd = 0;
-				if (fd1 >= 0) {
-					FD_SET(fd1, &readfds);
-					if (fd1 > max_fd) max_fd = fd1;
-				}
-				if (fd2 >= 0) {
-					FD_SET(fd2, &readfds);
-					if (fd2 > max_fd) max_fd = fd2;
-				}
-				tv.tv_sec = ((long) $a_timeout_ms) / 1000;
-				tv.tv_usec = (((long) $a_timeout_ms) % 1000) * 1000;
-
-				rc = select(max_fd + 1, &readfds, NULL, NULL, &tv);
-				if (rc <= 0) {
-					return 0;
-				}
-				result = 0;
-				if (fd1 >= 0 && FD_ISSET(fd1, &readfds)) result |= 1;
-				if (fd2 >= 0 && FD_ISSET(fd2, &readfds)) result |= 2;
-				return result;
-			}"
+			"convex_select_two"
 		end
 
 end

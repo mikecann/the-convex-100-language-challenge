@@ -8,6 +8,8 @@
 		<library name="base" location="$ISE_LIBRARY\library\base\base.ecf"/>
 		<library name="net" location="$ISE_LIBRARY\library\net\net.ecf"/>
 		<library name="openssl" location="$ISE_LIBRARY\unstable\library\network\openssl\openssl_dynamic.ecf"/>
+		<external_include location=".\"/>
+		<external_object location=".\convex_native.o"/>
 		<cluster name="convex" location=".\" recursive="false">
 			<file_rule>
 				<exclude>/tests$</exclude>
