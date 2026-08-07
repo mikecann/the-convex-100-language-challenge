@@ -82,7 +82,7 @@ languages:
   - { rank: 75, id: visual-foxpro, displayName: "Visual FoxPro", selectionTier: coverage, feasibility: { docker: R, https: G, json: G, websocket: R } }
   - { rank: 76, id: xbasepp, displayName: "XBase++", selectionTier: coverage, feasibility: { docker: R, https: G, json: G, websocket: A } }
   - { rank: 77, id: xpl, displayName: "XPL", selectionTier: coverage, feasibility: { docker: A, https: A, json: A, websocket: A } }
-  - { rank: 78, id: xojo, displayName: "Xojo", selectionTier: coverage, feasibility: { docker: R, https: G, json: G, websocket: A } }
+  - { rank: 78, id: algol60, displayName: "ALGOL 60", selectionTier: coverage, feasibility: { docker: A, https: A, json: A, websocket: A } }
   - { rank: 79, id: bc, displayName: "bc", selectionTier: coverage, feasibility: { docker: G, https: R, json: A, websocket: R } }
   - { rank: 80, id: nim, displayName: "Nim", selectionTier: curated_backfill, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 81, id: crystal, displayName: "Crystal", selectionTier: curated_backfill, feasibility: { docker: G, https: G, json: G, websocket: G } }

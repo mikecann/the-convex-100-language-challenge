@@ -345,7 +345,65 @@ contained correctly every time. Proven by diffing the source, the pack output,
 and the published copy. The fix was to stop round-tripping through the local
 repository at all.
 
-## 16. Miscellaneous findings worth a slide
+## 16. A faster machine is a debugging tool
+
+The Modula-2 client's test suite passed on one build host and failed roughly
+half the time on another, faster one. The temptation with an intermittent
+failure is to widen a timeout. The actual cause was a memory bug that the
+slower machine had been hiding.
+
+Its test fixture computed the WebSocket handshake's `Sec-WebSocket-Accept` by
+appending a GUID to the client's key and hashing the result. The append helper
+tracked its output length in a parameter but never wrote a terminating NUL, and
+the next line asked for the length again by scanning for that NUL — so the scan
+ran off the end and hashed a garbage-length input made of whatever happened to
+be on the stack. Whether it worked depended entirely on whether a stray zero
+byte followed the buffer, which depends on how the stack was last used, which
+depends on the machine.
+
+Two lessons sit on top of each other. **An intermittent failure that correlates
+with hardware is usually uninitialised memory, not timing** — and this project
+found the same shape again in Oberon, where the compiler does not zero local
+arrays. And **the fixture was wrong, not the client**: the code under test had
+computed its own key and expected-accept value correctly all along.
+
+## 17. An assumption written in a comment is still an assumption
+
+The ALGOL 60 client stored Convex's sync-protocol timestamps as floating-point
+numbers, with a comment explaining that a `real` holds every integer exactly up
+to 2^53 — which is true, and beside the point. A real deployment's logical
+timestamp is nanosecond-scale, routinely above 10^18, roughly two hundred times
+past that bound. Every genuine timestamp was silently rounded, failed its own
+round-trip check, and surfaced as a misleading "the initial Live value was a
+Convex function error".
+
+The local tests had used timestamps 0 through 4.
+
+Two things generalise. **A bound stated correctly can still be the wrong bound**
+— the comment was accurate about the format and wrong about the data. And
+**test fixtures inherit the author's imagination**: nobody who believed
+timestamps were small would write a fixture with a large one, so the assumption
+protected itself from discovery until a real server sent a real number.
+
+## 18. Undiagnosable failures are a design choice
+
+An investigator spent hours on a hypothesis about container sandboxes throttling
+a client's timing, because a Docker build step failed with exit 1 and no output
+at all. The step was a long `&&` chain of `test` commands ending in a smoke test
+that ran the adapter — so the visible tail looked like the culprit.
+
+It was the second link. `test ! -e /usr/local/bin/convex-example` was false,
+because both launchers were being staged into a shared directory that each leaf
+image then inherited, while each leaf asserted the other's launcher was absent —
+unsatisfiable by construction. `test` reports a false condition as exit 1 with
+nothing written anywhere, so every link's failure looks exactly like every
+other's.
+
+The fix included `set -eux` on those chains, so the trace now names the failing
+link. **A check that cannot say why it failed will eventually cost more than it
+saves** — and the cost lands on whoever is furthest from having written it.
+
+## 19. Miscellaneous findings worth a slide
 
 - A client passed every check except one, and the one failure was in the
   *reference* implementation used for comparison, not the client under test.

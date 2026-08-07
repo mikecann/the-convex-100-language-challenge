@@ -1,0 +1,10 @@
+import {
+  "convexdemo/moonbit/convex",
+  "moonbitlang/core/env",
+  "moonbitlang/async",
+  "moonbitlang/async/stdio",
+}
+
+supported_targets = "+native"
+
+pkgtype(kind: "executable")
