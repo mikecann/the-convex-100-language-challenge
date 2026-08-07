@@ -240,8 +240,10 @@ RUN test "$(printf 'echo 3+4\n' | /opt/convex/jlibrary/bin/jconsole /dev/stdin)"
 # verification against a live host, using the shipped trust store.
 RUN printf '%s\n' \
       "load '/opt/convex/client/transport.ijs'" \
-      "'status conn'=. cx_unpack2 ('example.com';443;1) tx_connect 15000" \
-      "if. status ~: TX_IO_OK do. echo 'TLS probe failed: ', conn [ exit 1 end." \
+      "result=. ('example.com';443;1) tx_connect 15000" \
+      "status=. > 0 { result" \
+      "conn=. > 1 { result" \
+      "if. status ~: TX_IO_OK do. echo 'TLS probe failed, status ', (\": status) [ exit 1 end." \
       'tx_close conn' \
       "echo 'TLS probe ok'" \
       'exit 0' \
