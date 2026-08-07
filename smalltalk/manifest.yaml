@@ -4,5 +4,72 @@ displayName: "Smalltalk"
 rank: 84
 selectionTier: curated_backfill
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Pharo 12 Smalltalk client. HTTPS uses Zinc and Zodiac from the Pharo
+    image; RFC 6455 framing, the Convex sync protocol, strict JSON and all
+    Convex behaviour are implemented in Smalltalk. Pharo 12 ships no WebSocket
+    package, so none is delegated to. This source has not been built or
+    exercised in Docker yet, so it deliberately earns no badges.
+toolchain:
+  name: Pharo
+  version: "12.0-64bit-build-1258-sha-1645336"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    Not yet built or run in Docker. Every claim below is a property of the
+    checked-in source and its deterministic tests, not of a verified image.
+  - >-
+    Live authentication, optimistic updates, WebSocket mutations and actions,
+    journals, extended Convex value tags, and TransitionChunk assembly are
+    deferred. Only the JSON-safe Convex value subset is carried.
+  - >-
+    HTTP responses, single WebSocket frames and reassembled Live messages are
+    bounded to 2 MiB, with 128 nesting levels and 8192 structural JSON nodes.
+    Active subscriptions are bounded to 64 entries and 8 MiB of charged state.
+  - >-
+    The Live owner keeps the newest 16 deliveries within a 20 MiB budget charged
+    from encoded values, logs and error data plus a per-entry overhead. The adapter independently
+    keeps the newest 16 encoded events within 6 MiB, including the line currently
+    being written; command responses are never dropped and report a transport
+    failure instead.
+  - >-
+    Zodiac socket streams always raise on a read timeout and a bulk read that
+    raises loses the bytes it already consumed, so the WebSocket parser consumes
+    one byte at a time. One absolute five-second deadline spans short owner polls.
+    That keeps mid-frame timeouts safe but makes very large Live frames slower
+    than a bulk reader would be.
+  - >-
+    Zodiac does not reject an untrusted certificate chain by itself. Both the
+    HTTPS client and the Live client assert a zero certificate verification
+    state after the handshake; that assertion has not yet been exercised against
+    a real bad certificate in Docker.
+  - >-
+    The runtime images carry the Pharo virtual machine and a saved object image.
+    Pharo's compiler is part of the image the runtime needs in order to boot, as
+    it is for any Smalltalk. The build removes every interactive command handler
+    (evaluate, file-in, save, test, package loading) before the snapshot and the
+    Docker build asserts the saved images refuse to evaluate arbitrary
+    Smalltalk. The virtual machine is installed outside PATH and only
+    /usr/local/bin/convex-adapter and /usr/local/bin/convex-example are nameable
+    commands.
+  - >-
+    The saved images ship without a changes file, and Pharo's behaviour on a
+    read-only filesystem without one is proven only by the Docker entry point
+    probes, which have not been run yet.
 capabilities: []
