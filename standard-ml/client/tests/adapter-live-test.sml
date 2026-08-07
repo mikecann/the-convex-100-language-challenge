@@ -223,6 +223,154 @@ struct
       Fixture.join (adapter, 10.0, "the adapter");
       Fixture.join (liveServer, 20.0, "the Live fixture")
     end
+
+  (* ---- reconnect-then-resubscribe cycles --------------------------------
+
+     The cycle above proves five reconnects on one long-lived subscription.
+     The shared harness's actual reconnect-five-times test does something
+     subtly different: every cycle unsubscribes and subscribes a brand-new
+     query before the next debugDisconnect. Each cycle's rehydration is
+     deliberately unchanged (the count is still 0, so the client must
+     suppress it) before the external mutation lands and pushes the real
+     value the harness is waiting for. Reusing the same live port after `run`
+     has finished is what lets this reuse the fixed CONVEX_URL the Docker
+     test stage sets. *)
+
+  val cycleControlPort = 19410
+  val cycleCount = 3
+
+  fun readModification (peer, expectedType) =
+    let
+      val modify = Fixture.readClientJson (peer, "ModifyQuerySet")
+    in
+      case Json.asList (Json.getOr (modify, "modifications", Json.Null)) of
+          SOME (first :: _) =>
+            (Check.that
+               ("cycle ModifyQuerySet carries a " ^ expectedType,
+                Json.asString (Json.getOr (first, "type", Json.Null)) = SOME expectedType);
+             first)
+        | _ => raise Fail ("cycle sent no " ^ expectedType)
+    end
+
+  fun queryIdOfChange change =
+    case Json.asInt (Json.getOr (change, "queryId", Json.Null)) of
+        SOME queryId => queryId
+      | NONE => raise Fail "modification carried no query identifier"
+
+  fun cycleScript listener =
+    let
+      val (peer0, queryId0) = acceptLive (listener, 0)
+      fun cycle (peer, connectionCount, index, queryId, ts) =
+        let
+          val afterInitial = ts + 1
+        in
+          sendTransition (peer, ts, afterInitial, updated (queryId, 0));
+          ignore (Fixture.waitForDisconnect peer);
+          Fixture.closePeer peer;
+          let
+            val (peer2, queryId2) = acceptLive (listener, connectionCount + 1)
+            val _ =
+              Check.that
+                ("cycle " ^ Int.toString index ^ " reconnect resends the active query",
+                 queryId2 = queryId)
+            val afterRehydration = 1
+            val afterMutation = afterRehydration + 1
+          in
+            (* Unchanged rehydration first: the client must suppress this and
+               keep the subscriber waiting for the value below. *)
+            sendTransition (peer2, 0, afterRehydration, updated (queryId, 0));
+            (* The external mutation the harness performs after the
+               debugDisconnect acknowledgement, delivered as a genuine push. *)
+            sendTransition (peer2, afterRehydration, afterMutation, updated (queryId, 1));
+            ignore (readModification (peer2, "Remove"));
+            if index >= cycleCount then
+              (ignore (Fixture.waitForDisconnect peer2); Fixture.closePeer peer2)
+            else
+              let
+                val nextQueryId = queryIdOfChange (readModification (peer2, "Add"))
+              in
+                cycle (peer2, connectionCount + 1, index + 1, nextQueryId, afterMutation)
+              end
+          end
+        end
+    in
+      cycle (peer0, 0, 1, queryId0, 0);
+      Socket.close listener
+    end
+
+  fun cycleController (channel, reader) =
+    (command (channel, "{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}");
+     Check.that ("the cycle adapter is ready", typeOf (nextEvent reader) = SOME "ready");
+     (let
+        fun cycle index =
+          if index > cycleCount then ()
+          else
+            let
+              val subscriptionId = "cyc-" ^ Int.toString index
+              val label = "cycle " ^ Int.toString index
+            in
+              command
+                (channel,
+                 "{\"id\":\"sub" ^ Int.toString index
+                 ^ "\",\"op\":\"subscribe\",\"subscriptionId\":\""
+                 ^ subscriptionId ^ "\",\"path\":\"demo:state\",\"args\":{\"room\":\"cycle-"
+                 ^ Int.toString index ^ "\"}}");
+              expectAck
+                (reader, "sub" ^ Int.toString index, label ^ " subscribe is acknowledged");
+              expectValue (reader, 0, label ^ " initial value");
+              command
+                (channel, "{\"id\":\"drop" ^ Int.toString index ^ "\",\"op\":\"debugDisconnect\"}");
+              expectAck
+                (reader, "drop" ^ Int.toString index, label ^ " debugDisconnect is acknowledged");
+              expectValue (reader, 1, label ^ " delivers after the external mutation");
+              command
+                (channel,
+                 "{\"id\":\"unsub" ^ Int.toString index
+                 ^ "\",\"op\":\"unsubscribe\",\"subscriptionId\":\""
+                 ^ subscriptionId ^ "\"}");
+              expectAck
+                (reader, "unsub" ^ Int.toString index, label ^ " unsubscribe is acknowledged");
+              cycle (index + 1)
+            end
+      in
+        cycle 1
+      end);
+     command (channel, "{\"id\":\"bye\",\"op\":\"close\"}");
+     Check.that ("the cycle adapter ends cleanly", typeOf (nextEvent reader) = SOME "closed"))
+
+  fun cycleRun () =
+    let
+      val liveListener = Fixture.listenOn livePort
+      val liveServer = Fixture.spawn (fn () => cycleScript liveListener)
+      val controlListener = Fixture.listenOn cycleControlPort
+      val adapter =
+        Fixture.spawn
+          (fn () =>
+             let
+               val {channel, reader} = Fixture.acceptPeer controlListener
+             in
+               Socket.close controlListener;
+               Check.that
+                 ("the cycle adapter ends the Live session cleanly",
+                  Adapter.runLoop
+                    (fn () => Reader.byte (reader, Clock.deadlineIn 60.0),
+                     fn text => Transport.writeAll (channel, text, Clock.deadlineIn 3.0))
+                  = Adapter.Ended);
+               Transport.close channel
+             end)
+      val channel =
+        Transport.connect
+          {host = "127.0.0.1", port = cycleControlPort, secure = false,
+           deadline = Clock.deadlineIn 3.0}
+      val reader = Reader.new channel
+    in
+      cycleController (channel, reader);
+      Transport.close channel;
+      Fixture.join (adapter, 10.0, "the cycle adapter");
+      Fixture.join (liveServer, 20.0, "the cycle Live fixture")
+    end
 end
 
-fun main () = Check.run ("adapter-live-test", AdapterLiveTest.run)
+fun main () =
+  Check.run
+    ("adapter-live-test", fn () => (AdapterLiveTest.run (); AdapterLiveTest.cycleRun ()))

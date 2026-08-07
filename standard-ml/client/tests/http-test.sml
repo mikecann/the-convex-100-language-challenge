@@ -14,6 +14,7 @@ struct
   val servicePort = 19100
   val stallPort = 19101
   val framingPort = 19102
+  val acceptedPort = 19103
 
   (* U+96EA, three UTF-8 bytes, as escapes: a Standard ML string literal may
      only contain printable ASCII. *)
@@ -287,6 +288,55 @@ struct
       Fixture.join (server, 8.0, "TLS stall fixture")
     end
 
+  (* A read on a socket this process accepted must end at the caller's own
+     deadline, not when the peer finally decides to speak.
+
+     Poly/ML opens its own sockets non-blocking but leaves an accepted one
+     blocking, and its non-blocking receive is a plain recv, so a transport that
+     does not correct the flag sits inside the runtime for as long as the peer
+     stays quiet. Nothing about that stays local: a thread inside the runtime
+     never reaches a garbage-collection safe point, so the next collection stops
+     every other thread until the peer speaks.
+
+     The connecting side here stays silent well past the read's deadline and
+     only then sends a byte. That is what makes both outcomes terminate: a
+     transport that honours the deadline gives up first, and one that blocks is
+     released by the byte and fails these checks on the numbers rather than
+     hanging the suite. *)
+  fun acceptedChecks () =
+    let
+      val listener = Fixture.listenOn acceptedPort
+      val bounded = ref false
+      val seconds = ref 0.0
+      val server =
+        Fixture.spawn
+          (fn () =>
+             let
+               val peer = Fixture.acceptPeer listener
+               val _ = Socket.close listener
+               val started = Clock.now ()
+             in
+               (ignore (Reader.byte (#reader peer, Clock.deadlineIn 0.2)); bounded := false)
+               handle Transport.Timeout => bounded := true;
+               seconds := Time.toReal (Time.- (Clock.now (), started));
+               Fixture.closePeer peer
+             end)
+      val channel =
+        Transport.connect
+          {host = "127.0.0.1", port = acceptedPort, secure = false,
+           deadline = Clock.deadlineIn 3.0}
+    in
+      Clock.sleep 1.0;
+      (* Only a transport that blocked is still waiting for this byte. *)
+      (Transport.writeAll (channel, "x", Clock.deadlineIn 1.0) handle _ => ());
+      Fixture.join (server, 8.0, "the quiet-peer fixture");
+      Transport.close channel;
+      Check.that ("a read on an accepted socket ends at its own deadline", !bounded);
+      Check.that
+        ("an accepted socket waits for its deadline rather than for the peer",
+         !seconds < 0.7)
+    end
+
   fun run () =
     let
       val listener = Fixture.listenOn servicePort
@@ -298,6 +348,7 @@ struct
       injectionChecks ();
       framingChecks ();
       resolverChecks ();
+      acceptedChecks ();
       stallChecks ()
     end
 end

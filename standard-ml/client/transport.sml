@@ -527,9 +527,31 @@ struct
     end
 
   (* Wrap an already-accepted socket. The deterministic test fixtures serve
-     plain HTTP and raw WebSocket bytes through the same reader as the client. *)
+     plain HTTP and raw WebSocket bytes through the same reader as the client.
+
+     Poly/ML puts every socket it opens itself into non-blocking mode, but a
+     socket handed back by accept never goes through that step and Linux does
+     not inherit the flag from the listener. That gap is not cosmetic here.
+     Poly/ML's recvVecNB and sendVecNB are an ordinary recv and send inside the
+     runtime, and they answer "would block" only when the descriptor itself
+     says so: on an accepted socket they block in the runtime rather than
+     returning NONE. A thread blocked inside the runtime never reaches a
+     garbage-collection safe point, so the next collection stops every other
+     thread - the Live owner among them - until the peer happens to send
+     something. Setting the flag here is what keeps this file's promise that
+     nothing blocks where only the Standard ML deadlines should decide. *)
   fun ofSocket socket : t =
-    {socket = socket, security = Plain, closed = ref false}
+    let
+      val descriptor =
+        case Posix.FileSys.iodToFD (Socket.ioDesc socket) of
+            SOME value => value
+          | NONE => transportFail "an accepted socket carried no file descriptor"
+      val (flags, _) = Posix.IO.getfl descriptor
+    in
+      (Posix.IO.setfl (descriptor, Posix.IO.O.flags [flags, Posix.IO.O.nonblock])
+       handle exn => ((Socket.close socket handle _ => ()); raise exn));
+      {socket = socket, security = Plain, closed = ref false}
+    end
 
   (* Returns "" at end of stream. Raises Transport.Timeout at the deadline, so
      a reader can tell a quiet stream from a finished one. *)
