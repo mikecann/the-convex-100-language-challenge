@@ -169,7 +169,7 @@ RUN --mount=type=bind,from=test,source=/bin/busybox,target=/busybox,readonly \
     done; \
     "$pruner" rm -rf /etc/.pwd.lock; \
     "$pruner" mkdir -p \
-      /etc/ssl/certs /lib/x86_64-linux-gnu /lib64 /usr/local/bin; \
+      /bin /etc/ssl/certs /lib/x86_64-linux-gnu /lib64 /usr/local/bin; \
     exec "$pruner" rm -rf /tmp
 COPY --from=test /lib64/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
 COPY --from=test /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
@@ -183,17 +183,31 @@ COPY --from=test /etc/nsswitch.conf /etc/nsswitch.conf
 COPY --from=test /lib/x86_64-linux-gnu/libnss_dns.so.2 /lib/x86_64-linux-gnu/libnss_dns.so.2
 COPY --from=test /lib/x86_64-linux-gnu/libnss_files.so.2 /lib/x86_64-linux-gnu/libnss_files.so.2
 COPY --from=test /lib/x86_64-linux-gnu/libresolv.so.2 /lib/x86_64-linux-gnu/libresolv.so.2
+# AGENTS.md: "the shared policy and example verifier currently require
+# /bin/sh and basic POSIX text tools in runtime images" -- the shared
+# `image_policy` check in ./run itself execs `/bin/sh -lc '...test "$(id -u)"...'`
+# against the built runtime image. dash and coreutils' `id` are copied in
+# by name (not the multicall busybox already used above only to prune) so
+# the runtime image's command surface stays exactly these two single-
+# purpose binaries -- no wget/tar/compiler applet ever becomes reachable
+# through them, unlike a multicall busybox would risk (see AGENTS.md's
+# "Treat multicall binaries as their complete compiled command surface").
+COPY --from=test /usr/bin/dash /bin/sh
+COPY --from=test /usr/bin/id /usr/local/bin/id
+COPY --from=test /lib/x86_64-linux-gnu/libselinux.so.1 /lib/x86_64-linux-gnu/libselinux.so.1
+COPY --from=test /lib/x86_64-linux-gnu/libpcre2-8.so.0 /lib/x86_64-linux-gnu/libpcre2-8.so.0
 ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 USER 65532:65532
 RUN test "$(id -u):$(id -g)" = 65532:65532 \
     && test -s "$SSL_CERT_FILE" \
     && test ! -e /usr/bin \
-    && test ! -e /bin \
+    && set -- /bin/* \
+    && test "$#" -eq 1 \
     && set -- /usr/lib/x86_64-linux-gnu/* \
     && test "$#" -eq 2 \
     && set -- /lib/x86_64-linux-gnu/* \
-    && test "$#" -eq 6 \
+    && test "$#" -eq 8 \
     && set -- /lib64/* \
     && test "$#" -eq 1
 
