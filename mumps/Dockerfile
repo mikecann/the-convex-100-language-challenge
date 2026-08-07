@@ -161,7 +161,8 @@ RUN set -eu; \
 # so it and its own closure are staged and ldd'd explicitly too, even though
 # nothing here calls dlopen() directly.
 RUN set -eu; \
-    mkdir -p /staging/bin /staging/usr/bin /staging/opt/yottadb/plugin \
+    mkdir -p /staging/bin /staging/usr/bin /staging/usr/local/bin \
+             /staging/opt/yottadb/plugin \
              /staging/opt/convex/db /staging/opt/convex/o /staging/etc/ssl/certs; \
     cp -a /bin/dash /staging/bin/sh; \
     for tool in id cat uname; do cp -a "/usr/bin/$tool" "/staging/usr/bin/$tool"; done; \
