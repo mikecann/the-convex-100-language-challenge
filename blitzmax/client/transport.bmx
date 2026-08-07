@@ -312,6 +312,22 @@ Type TConvexBuffer
 End Type
 
 Rem
+bbdoc: Encodes @text as one LF-terminated line, never BlitzMax's platform CRLF.
+about: BRL.Stream's WriteLine always appends the two bytes 13 and 10, even on
+Linux targets, because the terminator is hard-coded rather than chosen per
+platform. Anything that must produce an exact, portable line ending — this
+client's canonical example transcript, for instance, which the harness
+compares byte-for-byte against a checked-in LF-only transcript — builds its
+line with this instead of going through Print or WriteLine.
+End Rem
+Function ConvexEncodeLine:TConvexBuffer(text:String)
+	Local line:TConvexBuffer = TConvexBuffer.Create(text.length + 2)
+	line.AppendString(text)
+	line.AppendByte(10)
+	Return line
+End Function
+
+Rem
 bbdoc: Validates that the first @count bytes of @data are well-formed UTF-8.
 about: RFC 6455 requires text frames to carry valid UTF-8, and BlitzMax's
 decoder is permissive, so invalid sequences are rejected here rather than

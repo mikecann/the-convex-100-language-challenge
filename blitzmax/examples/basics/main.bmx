@@ -10,6 +10,23 @@ Extern
 	Function convex_example_exit(code:Int) = "exit"
 End Extern
 
+' The harness compares this example's stdout byte-for-byte against
+' _shared/examples/basics.expected.txt, which is LF-only, so the transcript
+' is written straight to the file descriptor with ConvexEncodeLine's bare LF
+' terminator rather than through Print; see that function's comment in
+' transport.bmx for why Print itself cannot be used here.
+Function WriteStdoutLine(text:String)
+	Local line:TConvexBuffer = ConvexEncodeLine(text)
+	Local offset:Int = 0
+	While offset < line.length
+		Local written:Long = convex_write(1, Varptr line.data[offset], Size_T(line.length - offset))
+		If written <= 0 Then
+			Throw TConvexError.Transport("could not write the example transcript to stdout")
+		End If
+		offset :+ Int(written)
+	Wend
+End Function
+
 ' Convex's demo counter lives in a room. Every argument object the example
 ' sends is built here so the room name is quoted once, correctly, in one place.
 Function RoomArguments:TJSONObject(room:String)
@@ -95,7 +112,7 @@ Type TCounterObserver Extends TConvexObserver
 		If observed <> startingCount Then
 			Throw TConvexError.Protocol("the initial Live count disagreed with the HTTP query")
 		End If
-		Print "live initial count: " + observed
+		WriteStdoutLine("live initial count: " + observed)
 		sawInitial = True
 
 		' Only now is it safe to change the room: the subscription is live, so
@@ -105,8 +122,8 @@ Type TCounterObserver Extends TConvexObserver
 		If applied <> startingCount + 1 Then
 			Throw TConvexError.Protocol("the mutation returned an unexpected count")
 		End If
-		Print "mutation applied: true"
-		Print "mutation count: " + applied
+		WriteStdoutLine("mutation applied: true")
+		WriteStdoutLine("mutation count: " + applied)
 	End Method
 
 	' The second Live value is the reactive proof: Convex pushed the new count
@@ -116,8 +133,8 @@ Type TCounterObserver Extends TConvexObserver
 		If observed <> startingCount + 1 Then
 			Throw TConvexError.Protocol("the updated Live count disagreed with the mutation")
 		End If
-		Print "live updated count: " + observed
-		Print "verified count: " + startingCount + " -> " + observed
+		WriteStdoutLine("live updated count: " + observed)
+		WriteStdoutLine("verified count: " + startingCount + " -> " + observed)
 		finished = True
 	End Method
 
@@ -143,7 +160,7 @@ Function Run:Int()
 
 	' Read the room over Convex's documented HTTP query endpoint.
 	Local current:Long = CountFrom(client.Query("demo:state", RoomArguments(room)).value, "current query")
-	Print "current count: " + current
+	WriteStdoutLine("current count: " + current)
 
 	' Start Live before anything changes the room.
 	Local observer:TCounterObserver = New TCounterObserver

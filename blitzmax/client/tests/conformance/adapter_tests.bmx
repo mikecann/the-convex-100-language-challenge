@@ -163,6 +163,31 @@ Function TestProtocolEnvelopes()
 	Next
 End Function
 
+Rem
+bbdoc: Proves every raw byte the adapter writes is LF-terminated NDJSON.
+about: Emit builds each event with ConvexEncodeLine, never Print or
+WriteLine, because BRL.Stream's WriteLine always appends the platform CRLF
+"~r~n" even on Linux. TMemoryChannel.Events() already strips the trailing
+newline before assertions run elsewhere, so this checks the raw buffer
+Emit actually handed to the channel, before any of that stripping.
+End Rem
+Function TestOutputIsLfOnly()
+	Local channel:TMemoryChannel = TMemoryChannel.Create()
+	channel.Send("{~qprotocolVersion~q:1,~qid~q:~qh1~q,~qop~q:~qhello~q}")
+	channel.Send("{~qid~q:~qc1~q,~qop~q:~qclose~q}")
+	Local adapter:TConvexAdapter = TConvexAdapter.Create(channel)
+	adapter.Run()
+	ConvexCheck(channel.written.length > 0 And channel.written.data[channel.written.length - 1] = 10, ..
+		"the adapter's raw output ends with a bare LF")
+	Local hasCr:Int = False
+	For Local index:Int = 0 Until channel.written.length
+		If channel.written.data[index] = 13 Then
+			hasCr = True
+		End If
+	Next
+	ConvexCheck(Not hasCr, "the adapter's raw output never contains a CR byte")
+End Function
+
 Function TestResultAndStructuredError()
 	Local script:THttpPeerScript = THttpPeerScript.Create(ConvexHttpResponse("200 OK", ..
 		"{~qstatus~q:~qsuccess~q,~qvalue~q:{~qcount~q:1},~qlogLines~q:[~q[LOG] demo:echo~q]}"))
@@ -271,6 +296,7 @@ Function TestOversizedCommandRefused()
 End Function
 
 TestProtocolEnvelopes()
+TestOutputIsLfOnly()
 TestResultAndStructuredError()
 TestSubscriptionEvents()
 TestSubscriptionFailureEvent()

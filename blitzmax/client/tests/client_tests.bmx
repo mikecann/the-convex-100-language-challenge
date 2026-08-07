@@ -203,6 +203,26 @@ Function TestUtf8()
 	ConvexCheck(Not ConvexIsValidUtf8(truncated, 2), "a truncated sequence is rejected")
 End Function
 
+Rem
+bbdoc: Proves ConvexEncodeLine never reproduces Print's platform CRLF.
+about: BRL.Stream's WriteLine always appends the bytes 13 and 10, even on
+Linux, which once corrupted the canonical example's byte-exact transcript.
+This is the one place that regression can be caught in isolation, without
+capturing a real file descriptor.
+End Rem
+Function TestLineEncodingIsLfOnly()
+	Local encoded:TConvexBuffer = ConvexEncodeLine("sample")
+	ConvexCheck(encoded.length > 0 And encoded.data[encoded.length - 1] = 10, ..
+		"an encoded line ends with a bare LF")
+	Local hasCr:Int = False
+	For Local index:Int = 0 Until encoded.length
+		If encoded.data[index] = 13 Then
+			hasCr = True
+		End If
+	Next
+	ConvexCheck(Not hasCr, "an encoded line never contains a CR byte")
+End Function
+
 Function TestHex()
 	ConvexCheckEqualInt(ConvexParseHex("1f"), 31, "lowercase hex parses")
 	ConvexCheckEqualInt(ConvexParseHex("1F"), 31, "uppercase hex parses")
@@ -302,6 +322,7 @@ TestQuoting()
 TestNumbers()
 TestTimestamps()
 TestUtf8()
+TestLineEncodingIsLfOnly()
 TestHex()
 TestWebSocketAccept()
 TestRelayBounds()
