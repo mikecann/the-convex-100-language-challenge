@@ -178,12 +178,25 @@ feature -- Access
 		end
 
 	has_field (a_key: STRING): BOOLEAN
-			-- Does this object carry a field named `a_key'?
+			-- Does this object carry a field named `a_key'? Compares by
+			-- content (`~'), not object identity: `object_keys.has' alone
+			-- would use ARRAYED_LIST's default reference equality, which
+			-- almost never matches a freshly parsed key against a literal
+			-- written at the call site even when both hold the same text.
 		require
 			is_object: is_object
 			a_key_attached: a_key /= Void
+		local
+			i: INTEGER
 		do
-			Result := object_keys.has (a_key)
+			from
+				i := 1
+			until
+				Result or i > object_keys.count
+			loop
+				Result := object_keys.i_th (i) ~ a_key
+				i := i + 1
+			end
 		end
 
 	field (a_key: STRING): CONVEX_JSON_VALUE
