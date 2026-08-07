@@ -616,6 +616,19 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- Seed7 speaks TLS without OpenSSL. Its `tls.s7i` implements the handshake,
+  AES-GCM, HMAC, elliptic-curve key exchange and X.509 parsing in Seed7
+  itself — the only client on this roster whose TLS is not a C library behind
+  an FFI. That produced a bug nothing else could have: the client gated every
+  read behind the raw socket's `inputReady`, which misses bytes the TLS layer
+  has already decrypted and buffered above the socket. Invisible against the
+  local plain-`ws://` backend, fatal against the real `wss://` deployment.
+  When your TLS is a library, its buffer is not your problem. When it is your
+  own code, it is.
+- Seed7's extensibility is not decorative. `client query path withArgs args`
+  reads that way because the client defines it with the same `$ syntax` pragma
+  the standard library uses for `for x range y do`. A language that lets you
+  add syntax is worth using that way, or the slot is wasted.
 - For a young language, the fastest route was reading the standard library's
   source. Mojo 0.26.2's stdlib does not match anything a model has been trained
   on: `sys.ffi` moved to `std.ffi`, `alias` became `comptime`, `UnsafePointer`
