@@ -48,7 +48,7 @@ RUN mkdir -p /tmp/curl && \
     cd /tmp/curl && \
     CC=clang-14 AR=llvm-ar-14 RANLIB=llvm-ranlib-14 \
       CFLAGS='-O1 -pthread' LDFLAGS='-pthread' ./configure \
-      --build=aarch64-linux-gnu \
+      --build=x86_64-linux-gnu \
       --host=x86_64-linux-gnu \
       --prefix=/opt/curl \
       --disable-static \
