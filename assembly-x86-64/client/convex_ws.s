@@ -994,10 +994,11 @@ ws_recv_more:
 %define TF_BYTE1   -72
 %define TF_HDRLEN  -80
 %define TF_PLEN    -88
+%define TF_DBGTMP  -96
 ws_take_frame:
     push rbp
     mov rbp, rsp
-    sub rsp, 96
+    sub rsp, 112
     mov [rbp+TF_W], rdi
     mov [rbp+TF_OPOUT], rsi
     mov [rbp+TF_FINOUT], rdx
@@ -1030,6 +1031,8 @@ ws_take_frame:
     test rax, 0x80
     jnz .protocol_error         ; a compliant server never masks its frames
 
+    mov edi, 'p'
+    call dbg_mark_ws
     mov rax, [rbp+TF_BYTE1]
     and rax, 0x7F
     cmp rax, 126
@@ -1068,6 +1071,8 @@ ws_take_frame:
     mov [rbp+TF_PLEN], rax
     mov dword [rbp+TF_HDRLEN], 2
 .have_lengths:
+    mov edi, 'q'
+    call dbg_mark_ws
     cmp qword [rbp+TF_PLEN], WS_MAX_MESSAGE_BYTES
     ja .protocol_error
     mov eax, [rbp+TF_HDRLEN]
@@ -1075,12 +1080,18 @@ ws_take_frame:
     cmp rax, [rbp+TF_AVAIL]
     ja .need_more
 
+    mov edi, 'r'
+    call dbg_mark_ws
     ; have a complete frame: copy the payload out, advance recv_off
     mov rax, [rbp+TF_PLEN]
     test rax, rax
     jz .zero_payload
     mov rdi, rax
     call malloc
+    mov [rbp+TF_DBGTMP], rax
+    mov edi, 's'
+    call dbg_mark_ws
+    mov rax, [rbp+TF_DBGTMP]
     test rax, rax
     jz .oom
     mov rdi, rax
@@ -1088,7 +1099,10 @@ ws_take_frame:
     add rsi, [rbp+TF_HDRLEN]
     mov rdx, [rbp+TF_PLEN]
     call memcpy
+    mov edi, 't'
+    call dbg_mark_ws
     mov rcx, [rbp+TF_PLOUT]
+    mov rax, [rbp+TF_DBGTMP]
     mov [rcx], rax
     jmp .have_copy
 .zero_payload:
@@ -1172,6 +1186,7 @@ ws_take_frame:
 %undef TF_BYTE1
 %undef TF_HDRLEN
 %undef TF_PLEN
+%undef TF_DBGTMP
 
 ; int ws_pump_message(ws_conn *w, u64 *kind_out, u8 **data_out,
 ;                      u64 *len_out)
