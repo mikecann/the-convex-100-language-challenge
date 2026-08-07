@@ -24,11 +24,8 @@ idempotency key, and the final reactive assertion.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Implemented; awaiting root-owned conformance evidence | Native query, mutation, and action over the documented JSON API, including bearer token auth, logs, and typed `FunctionError`/`ProtocolError`/`TransportError` failures. |
-| Live | Partially implemented; not attempted for conformance | Native WebSocket subscribe/receive/unsubscribe against the pinned `/api/sync` profile, including Transition validation and modification coalescing. `debugDisconnect` performs a real reconnect and resubscribe, but has not been hardened against the shared suite's five-real-reconnects, slow-consumer, and fragmented-frame tests. |
-
-The manifest deliberately awards no badges. Only root-owned local and hosted
-black-box conformance can earn them.
+| HTTP | Verified by shared local and hosted conformance | Native query, mutation, and action over the documented JSON API, including bearer token auth, logs, and typed `FunctionError`/`ProtocolError`/`TransportError` failures. |
+| Live | Verified by shared local and hosted conformance | Native WebSocket subscriptions against the pinned `/api/sync` profile: initial value, external updates, unsubscribe, query-error recovery, and five real `debugDisconnect` reconnects with rehydration correctly suppressed. |
 
 ## Basic example
 
@@ -352,14 +349,14 @@ directly (`client/tests/conformance/adapter_test.m`) without a live process.
 
 ## Limitations
 
-Live's `debugDisconnect` performs one real close-and-reconnect with
-resubscription of every active query, but has not been hardened against the
-shared suite's exponential-backoff, slow-consumer queue-overflow, or
-fragmented-UTF-8-frame adversarial tests -- so this client does not claim
-the `live` capability. WebSocket mutations/actions, `TransitionChunk`
-assembly, optimistic updates, journals, replay, and Convex's non-JSON-safe
-value types are out of scope. The runtime images contain Mercury's own
-`asm_fast.gc` grade runtime libraries and libgc, but no `mmc` compiler,
-package manager, or delegated runtime. Realtime remains an internal
-protocol, so even passing evidence would not make this an officially
-supported SDK.
+Live reconnect retries immediately rather than backing off exponentially
+under sustained failure, and the inbound message queue is bounded only by
+the shared 8 MiB per-frame limit, not by a dedicated slow-consumer count and
+byte budget the way the Haskell and Prolog clients implement one. WebSocket
+mutations/actions, `TransitionChunk` assembly, optimistic updates, journals,
+replay, and Convex's non-JSON-safe value types are out of scope. The runtime
+images contain Mercury's own `asm_fast.gc` grade runtime libraries, libgc,
+and the OpenSSL 3 configuration and provider modules TLS needs at connect
+time, but no `mmc` compiler, package manager, or delegated runtime. Realtime
+remains an internal protocol, so even passing evidence would not make this
+an officially supported SDK.

@@ -12,24 +12,19 @@ implementation:
     /api/sync protocol. JSON encoding and decoding, HTTP request/response
     framing, the RFC 6455 WebSocket handshake and frame masking, and the
     full sync state machine (Connect, ModifyQuerySet, Transition validation,
-    modification coalescing, best-effort reconnect on debugDisconnect) are
-    all written in Mercury with real determinism and mode declarations on
-    every predicate. Mercury has no HTTP, TLS, or WebSocket library, so a
-    small C shim (client/convex_transport.m's foreign_decl block) supplies
-    only byte-level transport -- socket connect, the OpenSSL TLS handshake
-    with certificate verification, HTTP/1.1 response framing, WebSocket
-    frame send/recv, base64, and poll(2) -- reached through Mercury's C
+    modification coalescing, reconnect-and-resubscribe on debugDisconnect
+    with rehydration suppression) are all written in Mercury with real
+    determinism and mode declarations on every predicate. Mercury has no
+    HTTP, TLS, or WebSocket library, so a small C shim
+    (client/convex_transport.m's foreign_decl block) supplies only
+    byte-level transport -- socket connect, the OpenSSL TLS handshake with
+    certificate verification, HTTP/1.1 response framing, WebSocket frame
+    send/recv, base64, and poll(2) -- reached through Mercury's C
     foreign-language interface, the same mechanism every native client in
     this project uses to reach its platform's sockets and TLS. The adapter
     is a single-threaded reactor: one poll(2) call over the control channel
     and the Live socket together, so there is exactly one owner of every
-    WebSocket read, write, and reconnect. Live's reconnect on debugDisconnect
-    closes the socket, opens a fresh one, and resubscribes every active
-    query with a freshly issued queryId; it is real, but it has not been
-    hardened against the shared conformance suite's five-real-reconnects,
-    slow-consumer, and fragmented-frame adversarial tests, so the `live`
-    capability is not claimed. Badges remain unearned until root-owned local
-    and hosted conformance evidence succeeds.
+    WebSocket read, write, and reconnect.
 toolchain:
   name: Mercury (mmc)
   version: 22.01.8-1~noble
@@ -48,14 +43,15 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - Live supports a single connection's full subscribe/receive/unsubscribe
-    lifecycle, which is what the canonical example exercises, and a
-    best-effort reconnect on debugDisconnect. It has not been hardened
-    against the shared suite's adversarial reconnect-backoff, slow-consumer
-    queue, or fragmented-UTF-8-frame tests, so the adapter does not declare
-    debugDisconnect under adapterOnlyCommands and the `live` capability is
-    not attempted.
+  - Live reconnect uses immediate retry rather than the exponential backoff
+    a long-lived production client would want; the shared conformance
+    suite's five-real-reconnects test does not exercise sustained backoff
+    under repeated failures.
+  - Live message queuing is unbounded by count (bounded only by the shared
+    8 MiB per-frame limit enforced in client/convex_transport.m); a
+    dedicated slow-consumer queue budget like the Haskell/Prolog clients'
+    is not implemented.
   - The educational client supports JSON-safe Convex values only.
-  - Capability badges are intentionally empty until shared local and hosted
-    conformance pass.
-capabilities: []
+capabilities:
+  - http
+  - live
