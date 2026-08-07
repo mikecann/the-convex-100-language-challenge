@@ -8,19 +8,24 @@ package Convex is
    type Error_Kind is
      (Function_Error, Protocol_Error, Transport_Error, Closed_Error);
 
+   --  Convex omits logLines entirely when a call produced no logs. Has_Logs
+   --  records that difference so the conformance adapter can omit the optional
+   --  field instead of serializing an empty array the schema never asked for.
    type Error_Info is record
       Kind     : Error_Kind := Protocol_Error;
       Message  : US.Unbounded_String;
       Has_Data : Boolean := False;
       Data     : JSON.JSON_Value := JSON.JSON_Null;
+      Has_Logs : Boolean := False;
       Logs     : JSON.JSON_Array := JSON.Empty_Array;
    end record;
 
    type Call_Result (Success : Boolean := False) is record
       case Success is
          when True =>
-            Value : JSON.JSON_Value;
-            Logs  : JSON.JSON_Array;
+            Value    : JSON.JSON_Value;
+            Has_Logs : Boolean := False;
+            Logs     : JSON.JSON_Array;
 
          when False =>
             Error : Error_Info;

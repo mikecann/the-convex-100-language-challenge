@@ -5,11 +5,15 @@ package Convex.Live is
    package US renames Ada.Strings.Unbounded;
    package JSON renames GNATCOLL.JSON;
 
+   --  Has_Logs distinguishes "the server sent no logLines field" from "the
+   --  server sent an empty logLines array". The conformance adapter must omit
+   --  the optional field in the first case rather than serialize [].
    type Update is record
       Has_Value : Boolean := False;
       Value     : JSON.JSON_Value := JSON.JSON_Null;
       Has_Error : Boolean := False;
       Error     : Convex.Error_Info;
+      Has_Logs  : Boolean := False;
       Logs      : JSON.JSON_Array := JSON.Empty_Array;
       Token     : Natural := 0;
    end record;
@@ -39,7 +43,15 @@ package Convex.Live is
    function Is_Active (Sub : Subscription) return Boolean;
 
 private
-   task type Owner_Task is
+   --  This task holds a complete Live message, its decoded tree, and the
+   --  encoded signature it compares against the previous value, so a single
+   --  delivery at the four-megabyte message ceiling occupies several
+   --  megabytes at once. Say so rather than inheriting whatever default the
+   --  runtime happens to use, because the failure mode of a default that is
+   --  too small is Storage_Error on exactly the largest valid values.
+   task type Owner_Task
+     with Storage_Size => 16 * 1024 * 1024
+   is
       entry Configure (Deployment_URL : String);
       entry Add
         (Path       : String;

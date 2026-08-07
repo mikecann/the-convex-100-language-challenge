@@ -10,7 +10,6 @@ package body Convex_Adapter_Output is
    use type Interfaces.C.long;
 
    Queue_Capacity : constant := Max_Events;
-   Metadata_Bytes : constant := 4 * 1024;
 
    type Output_Item is record
       Line       : US.Unbounded_String;
@@ -502,14 +501,13 @@ package body Convex_Adapter_Output is
    is
       Charge : Natural;
    begin
-      if Line'Length > Max_Line_Bytes then
-         Accepted := False;
-         return;
-      end if;
       --  Four times the encoded line plus fixed metadata is deliberately
       --  conservative. It covers the queue string, writer copy, JSON encoder
       --  temporaries, and runtime bookkeeping while staying under 128 MiB.
-      if Line'Length > (Max_Bytes - Metadata_Bytes) / 4 - 1 then
+      --  Max_Line_Bytes is the exact point where that charge reaches the
+      --  budget, so one ceiling-sized line still fits an empty queue and
+      --  nothing longer can be charged at all.
+      if Line'Length > Max_Line_Bytes then
          Accepted := False;
          return;
       end if;

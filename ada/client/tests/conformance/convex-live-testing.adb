@@ -1,6 +1,14 @@
 with Ada.Strings.Unbounded;
 
 package body Convex.Live.Testing is
+   procedure Abort_Manager (M : in out Manager) is
+   begin
+      if M.Owner /= null then
+         abort M.Owner.all;
+      end if;
+      M.Opened := False;
+   end Abort_Manager;
+
    procedure Debug_Disconnect
      (M       : in out Manager;
       Success : out Boolean;

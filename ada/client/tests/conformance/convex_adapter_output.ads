@@ -4,10 +4,25 @@ with GNAT.Sockets;
 package Convex_Adapter_Output is
    package US renames Ada.Strings.Unbounded;
 
-   Max_Line_Bytes : constant := 2 * 1024 * 1024;
    Max_Events     : constant := 16;
    Max_Bytes      : constant := 20 * 1024 * 1024;
    Write_Deadline : constant Duration := 3.0;
+
+   --  Fixed per-event bookkeeping charged on top of four times the encoded
+   --  line: the queue string, the writer's copy, encoder temporaries, and
+   --  runtime overhead.
+   Metadata_Bytes : constant := 4 * 1024;
+
+   --  The largest line one event may carry. A Live delivery may legitimately
+   --  hold a value close to the client's four-megabyte message ceiling, so a
+   --  two-megabyte output cap would refuse schema-valid traffic rather than
+   --  bound memory. The ceiling is therefore derived from the byte budget:
+   --  it is exactly the longest line whose conservative charge still fits in
+   --  Max_Bytes, which leaves roughly a megabyte of headroom above the client
+   --  message ceiling for the event envelope and for re-encoding. The adapter
+   --  asserts that relationship at compile time, and an event that still does
+   --  not fit is reported as a structured error rather than emitted.
+   Max_Line_Bytes : constant := (Max_Bytes - Metadata_Bytes) / 4 - 1;
 
    procedure Start
      (Use_TCP    : Boolean;

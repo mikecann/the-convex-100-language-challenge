@@ -147,7 +147,9 @@ package body Convex.Live is
             Message  => US.To_Unbounded_String (Message),
             Has_Data => False,
             Data     => JSON.JSON_Null,
+            Has_Logs => False,
             Logs     => JSON.Empty_Array),
+         Has_Logs  => False,
          Logs      => JSON.Empty_Array,
          Token     => 0);
    end Error_Update;
@@ -373,7 +375,8 @@ package body Convex.Live is
 
       procedure Send_Modifications
         (Base, New_Version : Interfaces.Unsigned_32;
-         Modifications     : JSON.JSON_Array)
+         Modifications     : JSON.JSON_Array;
+         Deadline          : Ada.Real_Time.Time)
       is
          Message : constant JSON.JSON_Value := JSON.Create_Object;
       begin
@@ -386,15 +389,36 @@ package body Convex.Live is
          --  Send_Text owns one deadline for the complete frame. A slow peer
          --  therefore releases this sole owner to service Remove or Stop
          --  instead of renewing a timeout for every encoded chunk.
-         Convex_WebSocket.Send_Text (Socket, JSON.Write (Message));
+         Convex_WebSocket.Send_Text (Socket, JSON.Write (Message), Deadline);
          Query_Set_Version := New_Version;
+      end Send_Modifications;
+
+      procedure Send_Modifications
+        (Base, New_Version : Interfaces.Unsigned_32;
+         Modifications     : JSON.JSON_Array) is
+      begin
+         Send_Modifications
+           (Base,
+            New_Version,
+            Modifications,
+            Ada.Real_Time.Clock
+            + Ada.Real_Time.To_Time_Span
+                (Convex_WebSocket.Frame_Write_Budget));
       end Send_Modifications;
 
       procedure Establish is
          Connect_Message : constant JSON.JSON_Value := JSON.Create_Object;
          Adds            : JSON.JSON_Array := JSON.Empty_Array;
+
+         --  Name resolution, connect, TLS, the upgrade write, the 101 read,
+         --  and the first Convex Connect frame share one absolute budget. A
+         --  peer that makes a little progress at each step therefore cannot
+         --  keep this sole owner away from a queued Remove or Stop.
+         Deadline        : constant Ada.Real_Time.Time :=
+           Ada.Real_Time.Clock
+           + Ada.Real_Time.To_Time_Span (Convex_WebSocket.Connect_Budget);
       begin
-         Convex_WebSocket.Open (Socket, US.To_String (URL));
+         Convex_WebSocket.Open (Socket, US.To_String (URL), Deadline);
          Connection_Active := True;
          Connect_Message.Set_Field ("type", "Connect");
          Connect_Message.Set_Field ("sessionId", Session_Id);
@@ -409,7 +433,11 @@ package body Convex.Live is
               ("maxObservedTimestamp",
                Convex_WebSocket.Encode_Timestamp (Max_Timestamp));
          end if;
-         Convex_WebSocket.Send_Text (Socket, JSON.Write (Connect_Message));
+         Convex_WebSocket.Send_Text
+           (Socket, JSON.Write (Connect_Message), Deadline);
+         --  Replay is unchanged: every still-active subscription is re-added
+         --  on the new connection. Each replay frame keeps its own ordinary
+         --  frame budget so one large Add cannot consume the handshake's.
          for Sub of Subs loop
             if Sub.Active then
                JSON.Append (Adds, Add_Modification (Sub));
@@ -421,6 +449,13 @@ package body Convex.Live is
          Remote_Query_Set := 0;
          Remote_Identity := 0;
          Remote_Timestamp := US.To_Unbounded_String (Initial_Timestamp);
+         --  A validated handshake is evidence the transport is healthy again.
+         --  Without this reset a connection that succeeded after several
+         --  failures would still hand the next failure the old maximum delay.
+         --  Protocol failures on this connection are unaffected: they run
+         --  through Handle_Message and Disconnect, which reschedule from the
+         --  freshly reset backoff.
+         Backoff := 0.1;
       exception
          when E : others =>
             Disconnect
@@ -451,10 +486,18 @@ package body Convex.Live is
          return Value.Get;
       end String_Field;
 
-      function Logs_Field (Object : JSON.JSON_Value) return JSON.JSON_Array is
+      --  Presence is part of the value. A modification without logLines must
+      --  not become one with an empty array by the time the adapter serializes
+      --  it, so report the field's absence rather than a defaulted array.
+      procedure Logs_Field
+        (Object  : JSON.JSON_Value;
+         Present : out Boolean;
+         Logs    : out JSON.JSON_Array) is
       begin
+         Present := False;
+         Logs := JSON.Empty_Array;
          if not Object.Has_Field ("logLines") then
-            return JSON.Empty_Array;
+            return;
          end if;
          declare
             Value : constant JSON.JSON_Value := Object.Get ("logLines");
@@ -463,15 +506,16 @@ package body Convex.Live is
                raise Constraint_Error with "logLines must be an array";
             end if;
             declare
-               Logs : constant JSON.JSON_Array := Value.Get;
+               Values : constant JSON.JSON_Array := Value.Get;
             begin
-               for I in 1 .. JSON.Length (Logs) loop
-                  if JSON.Get (Logs, I).Kind /= JSON.JSON_String_Type then
+               for I in 1 .. JSON.Length (Values) loop
+                  if JSON.Get (Values, I).Kind /= JSON.JSON_String_Type then
                      raise Constraint_Error
                        with "logLines entries must be strings";
                   end if;
                end loop;
-               return Logs;
+               Present := True;
+               Logs := Values;
             end;
          end;
       end Logs_Field;
@@ -536,10 +580,11 @@ package body Convex.Live is
                   declare
                      Value     : constant JSON.JSON_Value :=
                        Modification.Get ("value");
-                     Logs      : constant JSON.JSON_Array :=
-                       Logs_Field (Modification);
+                     Has_Logs  : Boolean;
+                     Logs      : JSON.JSON_Array;
                      Signature : constant String := JSON.Write (Value);
                   begin
+                     Logs_Field (Modification, Has_Logs, Logs);
                      Pending (Index) :=
                        (Present   => True,
                         Item      =>
@@ -547,14 +592,15 @@ package body Convex.Live is
                            Value     => Value,
                            Has_Error => False,
                            Error     => <>,
+                           Has_Logs  => Has_Logs,
                            Logs      => Logs,
                            Token     => 0),
                         Signature => US.To_Unbounded_String (Signature));
                   end;
                elsif Kind = "QueryFailed" then
                   declare
-                     Logs     : constant JSON.JSON_Array :=
-                       Logs_Field (Modification);
+                     Has_Logs : Boolean;
+                     Logs     : JSON.JSON_Array;
                      Has_Data : constant Boolean :=
                        Modification.Has_Field ("errorData");
                      Data     : constant JSON.JSON_Value :=
@@ -562,6 +608,7 @@ package body Convex.Live is
                         then Modification.Get ("errorData")
                         else JSON.JSON_Null);
                   begin
+                     Logs_Field (Modification, Has_Logs, Logs);
                      Pending (Index) :=
                        (Present   => True,
                         Item      =>
@@ -576,7 +623,9 @@ package body Convex.Live is
                                      (Modification, "errorMessage")),
                               Has_Data => Has_Data,
                               Data     => Data,
+                              Has_Logs => Has_Logs,
                               Logs     => Logs),
+                           Has_Logs  => Has_Logs,
                            Logs      => Logs,
                            Token     => 0),
                         Signature => US.Null_Unbounded_String);

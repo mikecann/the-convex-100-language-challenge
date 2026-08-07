@@ -79,6 +79,19 @@ procedure Convex_Adapter_Output_Tests is
       Convex_Adapter_Output.Status (Failed, Message, Events, Bytes);
    end Snapshot;
 
+   type String_Access is access String;
+
+   --  A ceiling-sized line is five megabytes. Keep it off the environment
+   --  task's stack.
+   function Filled (Length : Natural) return String_Access is
+      Result : constant String_Access := new String (1 .. Length);
+   begin
+      for I in Result.all'Range loop
+         Result.all (I) := 'x';
+      end loop;
+      return Result;
+   end Filled;
+
    Accepted : Boolean;
    Paused   : Boolean;
    Drained  : Boolean;
@@ -167,6 +180,38 @@ begin
       Convex_Adapter_Output.Test_Resume;
       Convex_Adapter_Output.Wait_Idle (Drained);
       Check (Drained, "large-line reservations did not release after send");
+   end;
+
+   --  The ceiling itself. One line of exactly Max_Line_Bytes must fit an
+   --  empty queue, because that is what makes a Live value at the client's
+   --  four-megabyte message ceiling deliverable at all; one byte more must be
+   --  refused even when nothing else is queued, because that is the signal
+   --  the adapter turns into a structured per-subscription error.
+   declare
+      Over : constant String_Access :=
+        Filled (Convex_Adapter_Output.Max_Line_Bytes + 1);
+   begin
+      Convex_Adapter_Output.Test_Pause_Next;
+      Convex_Adapter_Output.Try_Emit
+        (Over.all (1 .. Convex_Adapter_Output.Max_Line_Bytes), Accepted);
+      Check (Accepted, "a line at the output ceiling was rejected");
+      Convex_Adapter_Output.Test_Wait_Paused (Paused);
+      Check (Paused, "the ceiling-sized line did not pause after dequeue");
+      Snapshot (Failed, Events, Bytes);
+      Check
+        (not Failed
+         and then Events = 1
+         and then Bytes = Convex_Adapter_Output.Max_Bytes,
+         "a ceiling-sized line did not charge exactly the byte budget");
+      Convex_Adapter_Output.Try_Emit ("one more", Accepted);
+      Check (not Accepted, "the byte budget accepted a line beyond its whole");
+      Convex_Adapter_Output.Test_Resume;
+      Convex_Adapter_Output.Wait_Idle (Drained);
+      Check (Drained, "the ceiling-sized line did not drain");
+      Convex_Adapter_Output.Try_Emit (Over.all, Accepted);
+      Check
+        (not Accepted,
+         "a line one byte above the ceiling was accepted by an empty queue");
    end;
 
    Convex_Adapter_Output.Test_Pause_Next;

@@ -22,11 +22,95 @@ package body Convex_WebSocket is
    WebSocket_GUID      : constant String :=
      "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
    Max_Handshake_Bytes : constant := 16 * 1024;
-   Frame_Write_Timeout : constant Duration := 0.5;
+
+   --  A frame sent outside a larger bounded operation earns its own budget,
+   --  measured from the moment the masked bytes are ready rather than from
+   --  the moment the caller asked for the send.
+   No_Deadline         : constant Ada.Real_Time.Time :=
+     Ada.Real_Time.Time_First;
 
    function C_Shutdown
      (FD : Interfaces.C.int; How : Interfaces.C.int) return Interfaces.C.int
    with Import, Convention => C, External_Name => "shutdown";
+
+   --  AWS 25.2 normally enforces its socket timeout inside the TLS-aware send
+   --  loop. Keep an independent monotonic guard as the hard boundary: if a
+   --  backend call ever stays blocked, shutting the descriptor down interrupts
+   --  it without writing plaintext around OpenSSL. The ordinary data path
+   --  remains AWS.Net.Send, so this never bypasses TLS.
+   procedure Send_Bounded
+     (Net      : AWS.Net.Socket_Access;
+      Data     : Stream_Element_Array;
+      Deadline : Ada.Real_Time.Time;
+      Stage    : String)
+   is
+      FD : constant Interfaces.C.int := Interfaces.C.int (Net.Get_FD);
+
+      task Deadline_Guard is
+         entry Cancel;
+      end Deadline_Guard;
+
+      task body Deadline_Guard is
+         Ignored : Interfaces.C.int;
+         pragma Unreferenced (Ignored);
+      begin
+         select
+            accept Cancel;
+         or
+            delay until Deadline;
+            Ignored := C_Shutdown (FD, Interfaces.C.int (2));
+         end select;
+      end Deadline_Guard;
+
+      procedure Cancel_Guard (Expired : out Boolean) is
+      begin
+         Expired := False;
+         begin
+            --  An ordinary entry call is intentional. Task activation has
+            --  completed, so this can only wait for the guard to enter its
+            --  immediately following selective accept.
+            Deadline_Guard.Cancel;
+         exception
+            when Tasking_Error =>
+               --  The delay alternative won and retired the descriptor.
+               Expired := True;
+         end;
+      end Cancel_Guard;
+
+      Expired : Boolean;
+   begin
+      --  Let AWS drive its native or OpenSSL send loop against the time left
+      --  in this operation rather than a fresh timeout of its own.
+      AWS.Net.Set_Timeout
+        (Net.all,
+         Duration'Max
+           (0.001,
+            Ada.Real_Time.To_Duration (Deadline - Ada.Real_Time.Clock)));
+      begin
+         AWS.Net.Send (Net.all, Data);
+      exception
+         when others =>
+            Cancel_Guard (Expired);
+            raise;
+      end;
+      if Ada.Real_Time.Clock >= Deadline then
+         --  Fail closed if AWS returned success only after the public
+         --  operation deadline. Retire the transport before cancelling the
+         --  guard so a late success cannot remain usable.
+         declare
+            Ignored : Interfaces.C.int;
+            pragma Unreferenced (Ignored);
+         begin
+            Ignored := C_Shutdown (FD, Interfaces.C.int (2));
+         end;
+         Cancel_Guard (Expired);
+         raise AWS.Net.Socket_Error with Stage & " timed out";
+      end if;
+      Cancel_Guard (Expired);
+      if Expired then
+         raise AWS.Net.Socket_Error with Stage & " timed out";
+      end if;
+   end Send_Bounded;
 
    function Valid_Close_Code (Payload : String) return Boolean is
       Code : Natural;
@@ -225,7 +309,10 @@ package body Convex_WebSocket is
    end Next_Mask;
 
    procedure Send_Frame
-     (Socket : in out Connection; Opcode : Natural; Payload : String)
+     (Socket   : in out Connection;
+      Opcode   : Natural;
+      Payload  : String;
+      Deadline : Ada.Real_Time.Time)
    is
       --  AWS.Net.Send owns the TLS-aware poll/write loop. It creates one
       --  deadline for each call, so a complete masked frame must be supplied
@@ -249,25 +336,7 @@ package body Convex_WebSocket is
          Stream_Element (Mask and 16#FF#)];
       Work     : Interfaces.Unsigned_64 :=
         Interfaces.Unsigned_64 (Payload'Length);
-      Deadline : constant Ada.Real_Time.Time :=
-        Ada.Real_Time.Clock + Ada.Real_Time.To_Time_Span (Frame_Write_Timeout);
       use type Interfaces.Unsigned_64;
-
-      procedure Send_Bounded is
-      begin
-         if Ada.Real_Time.Clock >= Deadline then
-            raise AWS.Net.Socket_Error with "WebSocket frame write timed out";
-         end if;
-         --  Let AWS drive its native or OpenSSL send loop against the time
-         --  left in this frame. A raw send(2) loop would bypass TLS.
-         AWS.Net.Set_Timeout
-           (Socket.Net.all,
-            Duration'Max
-              (0.001,
-               Ada.Real_Time.To_Duration (Deadline - Ada.Real_Time.Clock)));
-         AWS.Net.Send
-           (Socket.Net.all, Frame.all (Frame.all'First .. Cursor - 1));
-      end Send_Bounded;
    begin
       if not Socket.Opened or else Socket.Net = null then
          raise AWS.Net.Socket_Error with "WebSocket is closed";
@@ -307,7 +376,20 @@ package body Convex_WebSocket is
          end loop;
       end if;
       Cursor := Cursor + Stream_Element_Offset (Payload'Length);
-      Send_Bounded;
+      --  Frame construction is CPU work, not transmission time. A frame with
+      --  no caller-supplied deadline starts its own budget only now that the
+      --  masked bytes are ready. This matters when linux/amd64 runs under
+      --  emulation, where masking a near-maximum frame can legitimately take
+      --  longer than the wire deadline without the peer delaying a byte.
+      Send_Bounded
+        (Socket.Net,
+         Frame.all (Frame.all'First .. Cursor - 1),
+         (if Deadline = No_Deadline
+          then
+            Ada.Real_Time.Clock
+            + Ada.Real_Time.To_Time_Span (Frame_Write_Budget)
+          else Deadline),
+         "WebSocket frame write");
       Free_Frame (Frame);
    exception
       when others =>
@@ -330,7 +412,10 @@ package body Convex_WebSocket is
          raise;
    end Send_Frame;
 
-   procedure Send_Text (Socket : in out Connection; Message : String) is
+   procedure Send_Text
+     (Socket   : in out Connection;
+      Message  : String;
+      Deadline : Ada.Real_Time.Time) is
    begin
       if Message'Length > Max_Message_Bytes then
          raise Constraint_Error with "WebSocket message exceeds 4 MiB";
@@ -338,7 +423,12 @@ package body Convex_WebSocket is
       if not Valid_UTF8 (Message) then
          raise Constraint_Error with "WebSocket text is not UTF-8";
       end if;
-      Send_Frame (Socket, 1, Message);
+      Send_Frame (Socket, 1, Message, Deadline);
+   end Send_Text;
+
+   procedure Send_Text (Socket : in out Connection; Message : String) is
+   begin
+      Send_Text (Socket, Message, No_Deadline);
    end Send_Text;
 
    procedure Read_Network (Socket : in out Connection; Timeout : Duration) is
@@ -506,7 +596,11 @@ package body Convex_WebSocket is
       return False;
    end Header_Has_Token;
 
-   procedure Open (Socket : in out Connection; Deployment_URL : String) is
+   procedure Open
+     (Socket         : in out Connection;
+      Deployment_URL : String;
+      Deadline       : Ada.Real_Time.Time)
+   is
       Parsed    : constant Convex_URL.Object :=
         Convex_URL.Parse (Deployment_URL);
       Host      : constant String := Convex_URL.Host (Parsed);
@@ -520,8 +614,19 @@ package body Convex_WebSocket is
          then Base_Path (Base_Path'First .. Base_Path'Last - 1) & "/api/sync"
          else Base_Path & "/api/sync");
       Key_Data  : Stream_Element_Array (1 .. 16);
-      Deadline  : constant Ada.Real_Time.Time :=
-        Ada.Real_Time.Clock + Ada.Real_Time.To_Time_Span (2.0);
+
+      --  Every step below spends the same absolute budget. Without this, name
+      --  resolution, the connect, the TLS handshake, the request write, and
+      --  the 101 read each received a full timeout of their own, so a peer
+      --  making slow progress at each step could hold the sole Live owner far
+      --  past the deadline its Stop and Remove callers were promised.
+      procedure Check_Deadline (Stage : String) is
+      begin
+         if Ada.Real_Time.Clock >= Deadline then
+            raise AWS.Net.Socket_Error
+              with "WebSocket " & Stage & " exceeded the connect deadline";
+         end if;
+      end Check_Deadline;
    begin
       Shutdown (Socket);
       if Deployment_URL'Length < 8
@@ -580,8 +685,19 @@ package body Convex_WebSocket is
          Expected : constant String := Encode_Base64 (Digest);
       begin
          Socket.Net := AWS.Net.Socket (Security => Secure);
-         AWS.Net.Set_Timeout (Socket.Net.all, 2.0);
+         Check_Deadline ("connect");
+         --  Name resolution, the TCP connect, and the TLS handshake all run
+         --  inside AWS's Connect, so give it only what is left of the budget.
+         AWS.Net.Set_Timeout
+           (Socket.Net.all,
+            Duration'Max
+              (0.001,
+               Ada.Real_Time.To_Duration (Deadline - Ada.Real_Time.Clock)));
          Socket.Net.Connect (Host, Port);
+         --  AWS's Connect resolves the name before it owns a descriptor, so
+         --  a pathological resolver can still overrun. Fail closed here rather
+         --  than continuing into the upgrade with no budget left.
+         Check_Deadline ("handshake");
          declare
             Bytes : Stream_Element_Array (1 .. Request'Length);
          begin
@@ -589,7 +705,8 @@ package body Convex_WebSocket is
                Bytes (Stream_Element_Offset (I - Request'First + 1)) :=
                  Stream_Element (Character'Pos (Request (I)));
             end loop;
-            AWS.Net.Send (Socket.Net.all, Bytes);
+            Send_Bounded
+              (Socket.Net, Bytes, Deadline, "WebSocket upgrade request");
          end;
          loop
             if Ada.Real_Time.Clock >= Deadline then
@@ -663,6 +780,14 @@ package body Convex_WebSocket is
       when others =>
          Shutdown (Socket);
          raise;
+   end Open;
+
+   procedure Open (Socket : in out Connection; Deployment_URL : String) is
+   begin
+      Open
+        (Socket,
+         Deployment_URL,
+         Ada.Real_Time.Clock + Ada.Real_Time.To_Time_Span (Connect_Budget));
    end Open;
 
    procedure Poll
@@ -833,7 +958,7 @@ package body Convex_WebSocket is
                   Shutdown (Socket);
 
                when 9      =>
-                  Send_Frame (Socket, 10, Payload);
+                  Send_Frame (Socket, 10, Payload, No_Deadline);
                   Item := (Control_Traffic, US.Null_Unbounded_String);
 
                when 10     =>
@@ -864,7 +989,7 @@ package body Convex_WebSocket is
       if Socket.Net /= null then
          if Socket.Opened then
             begin
-               Send_Frame (Socket, 8, "");
+               Send_Frame (Socket, 8, "", No_Deadline);
             exception
                when others =>
                   null;

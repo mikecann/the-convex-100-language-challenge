@@ -1,6 +1,7 @@
 with Ada.Command_Line;
 with Ada.Environment_Variables;
 with Ada.Exceptions;
+with Ada.Real_Time;
 with Ada.Streams;
 with Ada.Strings.Fixed;
 with Ada.Strings.Unbounded;
@@ -9,6 +10,7 @@ with Convex;
 with Convex.Live;
 with Convex.Live.Testing;
 with Convex_WebSocket;
+with Convex_Adapter_Events;
 with Convex_Adapter_Output;
 with GNAT.Sockets;
 with GNATCOLL.JSON;
@@ -18,12 +20,24 @@ procedure Convex_Adapter is
    package JSON renames GNATCOLL.JSON;
    use type JSON.JSON_Value_Type;
    use type GNAT.Sockets.Socket_Type;
+   use type Ada.Real_Time.Time;
    use type Ada.Streams.Stream_Element_Offset;
 
-   Max_Line_Bytes   : constant := Convex_Adapter_Output.Max_Line_Bytes;
-   -- Keep controller input bounded independently of the 2 MiB line cap. The
-   -- shared controller is request/response oriented, so eight pending commands
-   -- leave useful burst tolerance without consuming the 128 MiB runtime limit.
+   -- Input and output are bounded separately because they are bounded by
+   -- different things. Every command the shared schema defines is small, so
+   -- 2 MiB of NDJSON is already far more than a command can need. An emitted
+   -- event is as large as the deployment's data: one Live delivery may carry
+   -- a value close to the client's 4 MiB message ceiling, so refusing it here
+   -- would reject valid traffic rather than bound memory.
+   Max_Command_Bytes : constant := 2 * 1024 * 1024;
+   Max_Output_Bytes  : constant := Convex_Adapter_Output.Max_Line_Bytes;
+   pragma Compile_Time_Error
+     (Max_Output_Bytes < Convex_WebSocket.Max_Message_Bytes,
+      "adapter output ceiling must cover the Live message ceiling");
+
+   -- Keep controller input bounded independently of the line cap. The shared
+   -- controller is request/response oriented, so eight pending commands leave
+   -- useful burst tolerance without consuming the 128 MiB runtime limit.
    Command_Capacity : constant := 8;
 
    type Line_Array is
@@ -68,17 +82,42 @@ procedure Convex_Adapter is
 
    Output_Backpressure : exception;
 
+   --  A full queue is transient. The writer owns one absolute three-second
+   --  deadline per line, so a controller that is merely slow drains and a
+   --  controller that is gone fails the whole output owner; both end this
+   --  wait, and the main loop reports the failure once with its peak
+   --  evidence. Only an event the output contract cannot carry at all is
+   --  unrecoverable here, and the two callers that can produce one substitute
+   --  a structured error before reaching this point.
    procedure Write_Line
      (Line : String; Subscription_Id : String := ""; Generation : Natural := 0)
    is
+      Deadline : constant Ada.Real_Time.Time :=
+        Ada.Real_Time.Clock
+        + Ada.Real_Time.To_Time_Span (Convex_Adapter_Output.Write_Deadline)
+        + Ada.Real_Time.To_Time_Span (1.0);
       Accepted : Boolean;
+      Failed   : Boolean;
+      Message  : US.Unbounded_String;
+      Events   : Natural;
+      Bytes    : Natural;
    begin
-      Convex_Adapter_Output.Try_Emit
-        (Line, Accepted, Subscription_Id, Generation);
-      if not Accepted then
+      if Line'Length > Max_Output_Bytes then
          raise Output_Backpressure
-           with "adapter output count or byte budget exhausted";
+           with "adapter event exceeds the output line ceiling";
       end if;
+      loop
+         Convex_Adapter_Output.Try_Emit
+           (Line, Accepted, Subscription_Id, Generation);
+         exit when Accepted;
+         Convex_Adapter_Output.Status (Failed, Message, Events, Bytes);
+         exit when Failed;
+         if Ada.Real_Time.Clock >= Deadline then
+            raise Output_Backpressure
+              with "adapter output count or byte budget exhausted";
+         end if;
+         delay 0.001;
+      end loop;
    end Write_Line;
 
    task type Reader_Task;
@@ -107,7 +146,7 @@ procedure Convex_Adapter is
             begin
                Ada.Text_IO.Get_Line (Buffer, Last);
                if not Oversize then
-                  if US.Length (Line) + Last > Max_Line_Bytes then
+                  if US.Length (Line) + Last > Max_Command_Bytes then
                      Oversize := True;
                      Line := US.Null_Unbounded_String;
                   else
@@ -149,7 +188,7 @@ procedure Convex_Adapter is
                      end if;
                      Publish (Line, Oversize);
                   elsif not Oversize then
-                     if US.Length (Line) = Max_Line_Bytes then
+                     if US.Length (Line) = Max_Command_Bytes then
                         Oversize := True;
                         Line := US.Null_Unbounded_String;
                      else
@@ -205,40 +244,27 @@ procedure Convex_Adapter is
       end if;
    end Retire_Subscription;
 
-   function Error_Object (Error : Convex.Error_Info) return JSON.JSON_Value is
-      Result : constant JSON.JSON_Value := JSON.Create_Object;
-   begin
-      Result.Set_Field ("name", Convex.Error_Name (Error.Kind));
-      Result.Set_Field ("message", US.To_String (Error.Message));
-      if Error.Has_Data then
-         Result.Set_Field ("data", Error.Data);
-      end if;
-      return Result;
-   end Error_Object;
-
-   function Protocol_Error_Object (Message : String) return JSON.JSON_Value is
-      Error : Convex.Error_Info;
-   begin
-      Error.Kind := Convex.Protocol_Error;
-      Error.Message := US.To_Unbounded_String (Message);
-      return Error_Object (Error);
-   end Protocol_Error_Object;
-
    procedure Emit_Error (Id : String; Message : String) is
-      Event : constant JSON.JSON_Value := JSON.Create_Object;
    begin
-      if Id'Length > 0 then
-         Event.Set_Field ("id", Id);
-      end if;
-      Event.Set_Field ("type", "error");
-      Event.Set_Field ("error", Protocol_Error_Object (Message));
-      Write_Line (JSON.Write (Event));
+      Write_Line (Convex_Adapter_Events.Protocol_Error_Event (Id, Message));
    end Emit_Error;
+
+   function Required_Field
+     (Object : JSON.JSON_Value; Name : String) return JSON.JSON_Value is
+   begin
+      --  GNATCOLL returns JSON_Null for an absent field, which the shared
+      --  schema never accepts in place of a required value. Treat missing and
+      --  explicitly null identically rather than letting one through.
+      if not Object.Has_Field (Name) then
+         raise Constraint_Error with "command field " & Name & " is required";
+      end if;
+      return Object.Get (Name);
+   end Required_Field;
 
    function Required_String
      (Object : JSON.JSON_Value; Name : String) return String
    is
-      Value : constant JSON.JSON_Value := Object.Get (Name);
+      Value : constant JSON.JSON_Value := Required_Field (Object, Name);
    begin
       if Value.Kind /= JSON.JSON_String_Type then
          raise Constraint_Error with Name & " must be a string";
@@ -246,24 +272,55 @@ procedure Convex_Adapter is
       return Value.Get;
    end Required_String;
 
+   function Required_Object
+     (Object : JSON.JSON_Value; Name : String) return JSON.JSON_Value
+   is
+      Value : constant JSON.JSON_Value := Required_Field (Object, Name);
+   begin
+      if Value.Kind /= JSON.JSON_Object_Type then
+         raise Constraint_Error with Name & " must be an object";
+      end if;
+      return Value;
+   end Required_Object;
+
+   --  One predicate decides whether an identifier may be retained and echoed.
+   --  The event builders apply the same one, so nothing an operation refuses
+   --  here can still be serialized somewhere else.
    function Required_Id (Object : JSON.JSON_Value; Name : String) return String
    is
       Value : constant String := Required_String (Object, Name);
    begin
-      if Value'Length not in 1 .. 128 then
+      if not Convex_Adapter_Events.Valid_Id (Value) then
          raise Constraint_Error
-           with Name & " must contain 1 to 128 characters";
+           with Name & " must contain 1 to 128 Unicode characters";
       end if;
       return Value;
    end Required_Id;
 
+   --  additionalProperties is false for every command, so an exact match
+   --  against the allowed set is required. A substring test would accept a
+   --  field literally named "id|op" because "|id|op|" appears in the list.
    procedure Validate_Fields (Object : JSON.JSON_Value; Allowed : String) is
       procedure Check_Field (Name : String; Value : JSON.JSON_Value) is
          pragma Unreferenced (Value);
+         First : Natural := Allowed'First;
       begin
-         if Ada.Strings.Fixed.Index (Allowed, "|" & Name & "|") = 0 then
-            raise Constraint_Error with "unexpected command field " & Name;
+         if Name'Length = 0 then
+            raise Constraint_Error with "command field name is empty";
          end if;
+         while First <= Allowed'Last loop
+            declare
+               Stop : constant Natural :=
+                 Ada.Strings.Fixed.Index (Allowed, "|", First);
+            begin
+               exit when Stop = 0;
+               if Allowed (First .. Stop - 1) = Name then
+                  return;
+               end if;
+               First := Stop + 1;
+            end;
+         end loop;
+         raise Constraint_Error with "unexpected command field " & Name;
       end Check_Field;
    begin
       JSON.Map_JSON_Object (Object, Check_Field'Access);
@@ -338,11 +395,8 @@ procedure Convex_Adapter is
    end Free_Sub;
 
    procedure Ack (Id : String) is
-      Event : constant JSON.JSON_Value := JSON.Create_Object;
    begin
-      Event.Set_Field ("id", Id);
-      Event.Set_Field ("type", "ack");
-      Write_Line (JSON.Write (Event));
+      Write_Line (Convex_Adapter_Events.Ack (Id));
    end Ack;
 
    procedure Handle (Text : String) is
@@ -363,64 +417,47 @@ procedure Convex_Adapter is
       declare
          Root : constant JSON.JSON_Value := Parsed.Value;
       begin
-         if Root.Has_Field ("id")
-           and then Root.Get ("id").Kind = JSON.JSON_String_Type
-         then
-            Command_Id := US.To_Unbounded_String (String'(Root.Get ("id")));
-         end if;
+         --  Validate the id before retaining it, and retain it before anything
+         --  else can fail. Echoing an unvalidated id back in the error path is
+         --  how an over-long or wrongly typed id reaches the controller inside
+         --  an otherwise well-formed event.
+         Command_Id := US.To_Unbounded_String (Required_Id (Root, "id"));
          declare
-            Id : constant String := Required_Id (Root, "id");
+            Id : constant String := US.To_String (Command_Id);
             Op : constant String := Required_String (Root, "op");
          begin
             if Op = "hello" then
                Validate_Fields (Root, "|protocolVersion|id|op|");
-               if not Root.Has_Field ("protocolVersion")
-                 or else Root.Get ("protocolVersion").Kind
-                         /= JSON.JSON_Int_Type
+               if Required_Field (Root, "protocolVersion").Kind
+                    /= JSON.JSON_Int_Type
                  or else Integer'(Root.Get ("protocolVersion")) /= 1
                then
                   Emit_Error (Id, "unsupported adapter protocol version");
                   return;
                end if;
-               declare
-                  Event : constant JSON.JSON_Value := JSON.Create_Object;
-               begin
-                  Event.Set_Field ("protocolVersion", Integer'(1));
-                  Event.Set_Field ("id", Id);
-                  Event.Set_Field ("type", "ready");
-                  Event.Set_Field ("language", "ada");
-                  Event.Set_Field
-                    ("implementation", "native-aws-net-rfc6455-0.1.0");
-                  Event.Set_Field ("runtime", "GNAT 14.2.1");
-                  Write_Line (JSON.Write (Event));
-               end;
+               Write_Line
+                 (Convex_Adapter_Events.Ready
+                    (Id,
+                     "ada",
+                     "native-aws-net-rfc6455-0.1.0",
+                     "GNAT 14.2.1"));
             elsif Op = "query" or else Op = "mutation" or else Op = "action"
             then
                Validate_Fields (Root, "|id|op|path|args|");
                declare
                   Path   : constant String := Required_String (Root, "path");
-                  Args   : constant JSON.JSON_Value := Root.Get ("args");
+                  Args   : constant JSON.JSON_Value :=
+                    Required_Object (Root, "args");
                   Result : constant Convex.Call_Result :=
                     (if Op = "query"
                      then Convex.Query (Client, Path, Args)
                      elsif Op = "mutation"
                      then Convex.Mutation (Client, Path, Args)
                      else Convex.Action (Client, Path, Args));
-                  Event  : constant JSON.JSON_Value := JSON.Create_Object;
                begin
-                  Event.Set_Field ("id", Id);
-                  if Result.Success then
-                     Event.Set_Field ("type", "result");
-                     Event.Set_Field ("value", Result.Value);
-                     Event.Set_Field ("logs", Result.Logs);
-                  else
-                     Event.Set_Field ("type", "error");
-                     Event.Set_Field ("error", Error_Object (Result.Error));
-                     if JSON.Length (Result.Error.Logs) > 0 then
-                        Event.Set_Field ("logs", Result.Error.Logs);
-                     end if;
-                  end if;
-                  Write_Line (JSON.Write (Event));
+                  Write_Line
+                    (Convex_Adapter_Events.Call_Result_Line
+                       (Id, Result, Max_Output_Bytes));
                end;
             elsif Op = "setAuth" then
                Validate_Fields (Root, "|id|op|token|");
@@ -431,6 +468,9 @@ procedure Convex_Adapter is
                declare
                   Name     : constant String :=
                     Required_Id (Root, "subscriptionId");
+                  Path     : constant String := Required_String (Root, "path");
+                  Args     : constant JSON.JSON_Value :=
+                    Required_Object (Root, "args");
                   Existing : constant Natural := Find_Sub (Name);
                   Slot     : Natural;
                   Success  : Boolean;
@@ -446,12 +486,7 @@ procedure Convex_Adapter is
                      return;
                   end if;
                   Convex.Live.Subscribe
-                    (Live_Manager,
-                     Required_String (Root, "path"),
-                     Root.Get ("args"),
-                     Sub,
-                     Success,
-                     Message);
+                    (Live_Manager, Path, Args, Sub, Success, Message);
                   if not Success then
                      Emit_Error (Id, US.To_String (Message));
                      return;
@@ -512,13 +547,7 @@ procedure Convex_Adapter is
                end loop;
                Convex.Live.Close (Live_Manager);
                Convex.Close (Client);
-               declare
-                  Event : constant JSON.JSON_Value := JSON.Create_Object;
-               begin
-                  Event.Set_Field ("id", Id);
-                  Event.Set_Field ("type", "closed");
-                  Write_Line (JSON.Write (Event));
-               end;
+               Write_Line (Convex_Adapter_Events.Closed (Id));
                declare
                   Drained : Boolean;
                begin
@@ -560,26 +589,21 @@ procedure Convex_Adapter is
                Convex.Live.Try_Next
                  (Live_Manager, Subscriptions (I).Value, Found, Item);
                if Found then
-                  declare
-                     Event : constant JSON.JSON_Value := JSON.Create_Object;
                   begin
-                     Event.Set_Field ("type", "subscription");
-                     Event.Set_Field
-                       ("subscriptionId",
-                        US.To_String (Subscriptions (I).Name));
-                     if Item.Has_Value then
-                        Event.Set_Field ("value", Item.Value);
-                        Event.Set_Field ("logs", Item.Logs);
-                     elsif Item.Has_Error then
-                        Event.Set_Field ("error", Error_Object (Item.Error));
-                        if JSON.Length (Item.Error.Logs) > 0 then
-                           Event.Set_Field ("logs", Item.Error.Logs);
-                        end if;
-                     end if;
-                     Write_Line
-                       (JSON.Write (Event),
-                        US.To_String (Subscriptions (I).Name),
-                        Subscriptions (I).Relay_Generation);
+                     declare
+                        Name : constant String :=
+                          US.To_String (Subscriptions (I).Name);
+                     begin
+                        --  A value this adapter cannot encode within its
+                        --  output contract becomes a ProtocolError for this
+                        --  subscription alone. The subscription stays active
+                        --  and its next delivery is published normally.
+                        Write_Line
+                          (Convex_Adapter_Events.Subscription_Line
+                             (Name, Item, Max_Output_Bytes),
+                           Name,
+                           Subscriptions (I).Relay_Generation);
+                     end;
                      Convex.Live.Release (Live_Manager, Item);
                      return;
                   exception
@@ -697,6 +721,13 @@ exception
       Ada.Text_IO.Put_Line
         (Ada.Text_IO.Standard_Error,
          "Ada adapter failed: " & Ada.Exceptions.Exception_Message (E));
+      --  Retire the input task here too. A controller that stopped reading is
+      --  usually a controller that has also stopped writing, and this task's
+      --  master is this procedure: without the abort, a failed adapter waits
+      --  for a peer that will never speak again instead of exiting.
+      if Reader /= null then
+         abort Reader.all;
+      end if;
       begin
          Convex.Live.Close (Live_Manager);
       exception

@@ -13,6 +13,18 @@ package body Convex_URL is
       Secure_Scheme   : Boolean;
    begin
       Result.Is_IPv6 := False;
+      --  The host and path below are interpolated straight into a request line
+      --  and a Host header. A carriage return, line feed, NUL, or space here
+      --  would let a deployment URL append request headers of its own, so
+      --  reject them before any of this text reaches a header builder.
+      for C of Text loop
+         if C <= ' ' or else C >= Character'Val (16#7F#) then
+            raise Constraint_Error
+              with
+                "deployment URL must not contain spaces, controls, "
+                & "or non-ASCII bytes";
+         end if;
+      end loop;
       if Text'Length >= 8
         and then Text (Text'First .. Text'First + 7) = "https://"
       then
@@ -77,6 +89,23 @@ package body Convex_URL is
       if Host_First > Host_Last then
          raise Constraint_Error with "deployment URL must include a host";
       end if;
+      --  Restrict the authority to characters a registered name or an IPv6
+      --  literal may actually contain. This rejects ':' smuggled into a name,
+      --  stray brackets, and anything else that would change how the Host
+      --  header is later framed.
+      for I in Host_First .. Host_Last loop
+         if Result.Is_IPv6 then
+            if Text (I) not in '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' | ':' | '.'
+            then
+               raise Constraint_Error with "invalid IPv6 host";
+            end if;
+         elsif Text (I)
+               not in 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '.' | '-' | '_'
+         then
+            raise Constraint_Error
+              with "deployment URL host is not a registered name";
+         end if;
+      end loop;
       Result.Host_Name :=
         US.To_Unbounded_String (Text (Host_First .. Host_Last));
       Result.Path_Name :=
@@ -90,6 +119,17 @@ package body Convex_URL is
          if Port_First > Authority_Last then
             raise Constraint_Error with "host port is empty";
          end if;
+         --  Positive'Value would silently accept "8_080" and a signed form.
+         --  A port is a bare digit string or the authority is not what the
+         --  caller thinks it is.
+         if Authority_Last - Port_First + 1 > 5 then
+            raise Constraint_Error with "host port is out of range";
+         end if;
+         for I in Port_First .. Authority_Last loop
+            if Text (I) not in '0' .. '9' then
+               raise Constraint_Error with "host port must be decimal digits";
+            end if;
+         end loop;
          Result.Port_No :=
            Positive'Value (Text (Port_First .. Authority_Last));
       end if;

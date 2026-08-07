@@ -18,7 +18,18 @@ procedure Convex_Adapter_Fixture is
    WebSocket_GUID    : constant String :=
      "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
    Initial_TS        : constant String := "AAAAAAAAAAA=";
-   Large_Value_Bytes : constant := 900_000;
+
+   --  The stopped-reader evidence needs deliveries close to the client's
+   --  four-megabyte message ceiling, and the ordinary relay tests need
+   --  something smaller. One fixture serves both: the caller names the size
+   --  and the fixture refuses anything the client would reject as an
+   --  oversized frame, so a mistake here fails loudly instead of silently
+   --  testing a smaller value than it claims.
+   Large_Value_Bytes : constant Natural :=
+     (if Ada.Environment_Variables.Exists ("FIXTURE_VALUE_BYTES")
+      then
+        Natural'Value (Ada.Environment_Variables.Value ("FIXTURE_VALUE_BYTES"))
+      else 900_000);
 
    function Byte (Value : Natural) return Character
    is (Character'Val (Value));
@@ -317,8 +328,8 @@ begin
              (Index, Character'Val (Character'Pos ('A') + Index - 1));
       begin
          Check
-           (Message'Length < 2 * 1024 * 1024,
-            "fixture transition exceeds adapter line limit");
+           (Message'Length <= Convex_WebSocket.Max_Message_Bytes,
+            "fixture transition exceeds the client message ceiling");
          Send_Frame (Peer, Message);
       end;
    end loop;

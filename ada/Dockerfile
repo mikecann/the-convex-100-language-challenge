@@ -83,6 +83,7 @@ RUN mkdir -p obj \
       -cargs:Ada -O0 -fno-inline \
     && alr exec -- gprbuild -j1 -XGNATCOLL_BUILD_MODE=DEBUG -P convex_ada_subset.gpr -cargs:Ada -O0 -fno-inline
 RUN ./bin/convex_tests \
+    && ./bin/convex_adapter_event_tests \
     && ./bin/convex_adapter_output_tests \
     && if test -x ./bin/convex_socket_tests; then ./bin/convex_socket_tests; fi \
     && printf '%s\n' \
@@ -90,6 +91,121 @@ RUN ./bin/convex_tests \
          '{"id":"close","op":"close"}' \
        | CONVEX_URL=http://127.0.0.1:9 ./bin/convex_adapter \
        | grep -Fqx '{"id":"close","type":"closed"}'
+# An identifier the shared schema would reject must never come back inside an
+# otherwise well-formed event, so the error line has to omit id entirely.
+RUN set -eu; \
+    long_id="$(awk 'BEGIN { s = ""; for (i = 0; i < 200; i++) s = s "x"; print s }')"; \
+    printf '%s\n' \
+      "{\"protocolVersion\":1,\"id\":\"$long_id\",\"op\":\"hello\"}" \
+      '{"id":"close","op":"close"}' \
+      | CONVEX_URL=http://127.0.0.1:9 ./bin/convex_adapter > /tmp/oversize-id.ndjson; \
+    head -n 1 /tmp/oversize-id.ndjson \
+      | grep -Fqx '{"type":"error","error":{"name":"ProtocolError","message":"id must contain 1 to 128 Unicode characters"}}'; \
+    ! grep -Fq "$long_id" /tmp/oversize-id.ndjson; \
+    grep -Fqx '{"id":"close","type":"closed"}' /tmp/oversize-id.ndjson; \
+    rm -f /tmp/oversize-id.ndjson
+# A Live delivery close to the client's four-megabyte message ceiling is
+# schema-valid traffic. It has to reach the controller intact, and the adapter
+# has to finish normally afterwards: an output limit that refuses it would
+# raise out of the main loop and end the process instead of the delivery.
+RUN set -eu; \
+    rm -f /tmp/relay.log /tmp/relay.ndjson; \
+    FIXTURE_PORT=19092 FIXTURE_VALUE_BYTES=4000000 \
+      ./bin/convex_adapter_fixture > /tmp/relay.log 2>&1 & \
+    fixture_pid=$!; \
+    waited=0; \
+    until grep -Fq 'adapter fixture ready' /tmp/relay.log; do \
+      waited=$((waited + 1)); test "$waited" -lt 200; sleep 0.1; \
+    done; \
+    { printf '%s\n' \
+        '{"protocolVersion":1,"id":"hello","op":"hello"}' \
+        '{"id":"sub","op":"subscribe","subscriptionId":"pressure","path":"fixture:large","args":{}}'; \
+      sleep 3; \
+      printf '%s\n' '{"id":"close","op":"close"}'; } \
+      | CONVEX_URL=http://127.0.0.1:19092 ./bin/convex_adapter > /tmp/relay.ndjson; \
+    wait "$fixture_pid" || true; \
+    test "$(wc -L < /tmp/relay.ndjson)" -gt 3000000; \
+    grep -Fq '{"type":"subscription","subscriptionId":"pressure","value":"' \
+      /tmp/relay.ndjson; \
+    ! grep -Fq 'ProtocolError' /tmp/relay.ndjson; \
+    grep -Fqx '{"id":"close","type":"closed"}' /tmp/relay.ndjson; \
+    rm -f /tmp/relay.log /tmp/relay.ndjson
+# An event-count limit is not a memory limit when one delivery may approach the
+# client's four-megabyte message ceiling. Relay five near-ceiling values to a
+# controller that connects and then never reads, and require the real adapter
+# to stay far below the shared 128 MiB limit, to end on its own bounded write
+# deadline rather than growing, and to say what it was holding when it did.
+RUN set -eu; \
+    rm -f /tmp/fixture.log /tmp/adapter.log /tmp/hwm.txt; \
+    FIXTURE_PORT=19090 FIXTURE_VALUE_BYTES=4000000 \
+      ./bin/convex_adapter_fixture > /tmp/fixture.log 2>&1 & \
+    fixture_pid=$!; \
+    waited=0; \
+    until grep -Fq 'adapter fixture ready' /tmp/fixture.log; do \
+      waited=$((waited + 1)); test "$waited" -lt 200; sleep 0.1; \
+    done; \
+    CONVEX_URL=http://127.0.0.1:19090 ADAPTER_LISTEN=127.0.0.1:19091 \
+      ./bin/convex_adapter > /tmp/adapter.log 2>&1 & \
+    adapter_pid=$!; \
+    waited=0; \
+    until grep -Fq ':4A93 ' /proc/net/tcp; do \
+      waited=$((waited + 1)); test "$waited" -lt 200; sleep 0.1; \
+    done; \
+    ADAPTER_HOST=127.0.0.1 ADAPTER_PORT=19091 \
+      ./bin/convex_adapter_stopped_reader > /dev/null 2>&1 & \
+    reader_pid=$!; \
+    waited=0; \
+    while kill -0 "$adapter_pid" 2>/dev/null; do \
+      awk '/^VmHWM:/ { print $2 }' "/proc/$adapter_pid/status" >> /tmp/hwm.txt \
+        2>/dev/null || true; \
+      waited=$((waited + 1)); test "$waited" -lt 300; sleep 0.2; \
+    done; \
+    adapter_status=0; \
+    wait "$adapter_pid" || adapter_status=$?; \
+    wait "$reader_pid" || true; \
+    wait "$fixture_pid" || true; \
+    peak_kb="$(sort -n /tmp/hwm.txt | tail -n 1)"; \
+    printf 'stopped reader peak RSS: %s KiB\n' "$peak_kb"; \
+    test -n "$peak_kb"; \
+    test "$peak_kb" -lt 98304; \
+    test "$adapter_status" -ne 0; \
+    grep -Fq 'peakBytes' /tmp/adapter.log; \
+    rm -f /tmp/fixture.log /tmp/adapter.log /tmp/hwm.txt
+# Hostname verification is proved with key material that is minted here and
+# never committed: the fixture generates one ephemeral CA and two leaves for
+# it, one named localhost and one named wrong.invalid. The trust store is
+# replaced with that CA alone while the test runs, so the only difference
+# between the accepted and refused connections is the certificate's name, and
+# it is restored byte-for-byte afterwards.
+RUN alr exec -- gcc -O1 -Wall tests/convex_tls_fixture.c \
+      -o bin/convex_tls_fixture -lssl -lcrypto
+RUN set -eu; \
+    anchors=/etc/ssl/certs/ca-certificates.crt; \
+    original="$(sha256sum < "$anchors")"; \
+    cp "$anchors" /tmp/anchors.original; \
+    rm -f /tmp/convex-test-ca.pem /tmp/convex-test-ca.pem.partial; \
+    ./bin/convex_tls_fixture /tmp/convex-test-ca.pem 19443 19444 & \
+    fixture_pid=$!; \
+    waited=0; \
+    until test -f /tmp/convex-test-ca.pem; do \
+      waited=$((waited + 1)); test "$waited" -lt 300; sleep 0.1; \
+    done; \
+    cp /tmp/convex-test-ca.pem "$anchors"; \
+    status=0; \
+    CONVEX_TLS_PORT=19443 CONVEX_TLS_WRONG_HOST_PORT=19444 \
+      ./bin/convex_tls_tests || status=$?; \
+    cp /tmp/anchors.original "$anchors"; \
+    fixture_status=0; \
+    if test "$status" -eq 0; then \
+      wait "$fixture_pid" || fixture_status=$?; \
+    else \
+      kill "$fixture_pid" 2>/dev/null || true; \
+      wait "$fixture_pid" || true; \
+    fi; \
+    rm -f /tmp/convex-test-ca.pem /tmp/anchors.original; \
+    test "$status" -eq 0; \
+    test "$fixture_status" -eq 0; \
+    test "$(sha256sum < "$anchors")" = "$original"
 RUN file bin/convex_adapter | grep -Eq 'ELF 64-bit.*x86-64' \
     && file bin/convex_example | grep -Eq 'ELF 64-bit.*x86-64' \
     && ! ldd bin/convex_adapter | grep -Fq 'not found' \

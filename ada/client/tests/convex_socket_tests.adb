@@ -515,6 +515,37 @@ procedure Convex_Socket_Tests is
          & ASCII.LF);
    end Send_Chunked_HTTP_Response;
 
+   --  A client that rejects a response during header parsing closes before the
+   --  fixture has finished writing. That is the behaviour under test, not a
+   --  fixture failure.
+   procedure Send_Response_Quietly
+     (Socket : GNAT.Sockets.Socket_Type; Text : String) is
+   begin
+      Send_All (Socket, Text);
+   exception
+      when GNAT.Sockets.Socket_Error =>
+         null;
+   end Send_Response_Quietly;
+
+   function Sized_Response (Status, Response_Body : String) return String
+   is ("HTTP/1.1 "
+       & Status
+       & ASCII.CR
+       & ASCII.LF
+       & "Content-Type: application/json"
+       & ASCII.CR
+       & ASCII.LF
+       & "Content-Length: "
+       & Image (Response_Body'Length)
+       & ASCII.CR
+       & ASCII.LF
+       & "Connection: close"
+       & ASCII.CR
+       & ASCII.LF
+       & ASCII.CR
+       & ASCII.LF
+       & Response_Body);
+
    procedure Validate_HTTP_Envelope
      (Request, Operation, Path, Expected_Auth : String)
    is
@@ -1026,6 +1057,750 @@ procedure Convex_Socket_Tests is
          raise;
    end Run_HTTP_Write_Deadline;
 
+   --  Convex answers some function failures with a non-2xx status such as 560
+   --  and a perfectly ordinary error envelope. The status line alone must not
+   --  decide the taxonomy, and a non-2xx body still has to be framed, bounded,
+   --  read, and parsed like any other.
+   task type HTTP_Envelope_Server is
+      entry Start (Listener : GNAT.Sockets.Socket_Type);
+      entry Finish (Success : out Boolean; Message : out US.Unbounded_String);
+   end HTTP_Envelope_Server;
+
+   task body HTTP_Envelope_Server is
+      Listen  : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Peer    : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Passed  : Boolean := False;
+      Error   : US.Unbounded_String;
+      Address : GNAT.Sockets.Sock_Addr_Type;
+   begin
+      accept Start (Listener : GNAT.Sockets.Socket_Type) do
+         Listen := Listener;
+      end Start;
+      begin
+         for Step in 1 .. 10 loop
+            GNAT.Sockets.Accept_Socket (Listen, Peer, Address);
+            declare
+               Request : constant String := Read_HTTP_Request (Peer);
+               pragma Unreferenced (Request);
+            begin
+               case Step is
+                  when 1 =>
+                     Send_Response_Quietly
+                       (Peer,
+                        Sized_Response
+                          ("560 Convex Error",
+                           "{""status"":""error"","
+                           & """errorMessage"":""function threw"","
+                           & """errorData"":{""code"":3},"
+                           & """logLines"":[""e1""]}"));
+
+                  when 2 =>
+                     Send_Response_Quietly
+                       (Peer,
+                        Sized_Response
+                          ("560 Convex Error",
+                           "{""status"":""success"",""value"":1}"));
+
+                  when 3 =>
+                     Send_Response_Quietly
+                       (Peer,
+                        Sized_Response
+                          ("500 Internal Server Error",
+                           "<html>gateway said no</html>"));
+
+                  when 4 =>
+                     Send_Response_Quietly
+                       (Peer,
+                        Sized_Response ("404 Not Found", "{""nope"":1}"));
+
+                  when 5 =>
+                     --  A non-2xx body still has to survive chunked framing.
+                     Send_Response_Quietly
+                       (Peer,
+                        "HTTP/1.1 560 Convex Error"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "Transfer-Encoding: chunked"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "19"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "{""status"":""error"",""errorM"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "12"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "essage"":""chunked""}"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "0"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & ASCII.CR
+                        & ASCII.LF);
+
+                  when 6 =>
+                     Send_Response_Quietly
+                       (Peer, Sized_Response ("560 Convex Error", ""));
+
+                  when 7 =>
+                     --  A 2xx status is not evidence that the body is a
+                     --  Convex envelope. An intact response this client
+                     --  cannot honour is a protocol failure whatever the
+                     --  status line said.
+                     Send_Response_Quietly
+                       (Peer,
+                        Sized_Response ("200 OK", "<html>not convex</html>"));
+
+                  when 8 =>
+                     Send_Response_Quietly
+                       (Peer, Sized_Response ("200 OK", "[1,2]"));
+
+                  when 9 =>
+                     Send_Response_Quietly
+                       (Peer, Sized_Response ("200 OK", "{""value"":1}"));
+
+                  when 10 =>
+                     Send_Response_Quietly
+                       (Peer,
+                        Sized_Response
+                          ("200 OK",
+                           "{""status"":""success"",""value"":42}"));
+               end case;
+            end;
+            Close_Quietly (Peer);
+         end loop;
+         Passed := True;
+      exception
+         when E : others =>
+            Error :=
+              US.To_Unbounded_String
+                (Ada.Exceptions.Exception_Information (E));
+      end;
+      Close_Quietly (Peer);
+      Close_Quietly (Listen);
+      accept Finish
+        (Success : out Boolean; Message : out US.Unbounded_String)
+      do
+         Success := Passed;
+         Message := Error;
+      end Finish;
+   end HTTP_Envelope_Server;
+
+   procedure Run_HTTP_Envelopes is
+      Listener : GNAT.Sockets.Socket_Type;
+      Port     : GNAT.Sockets.Port_Type;
+      Server   : HTTP_Envelope_Server;
+      Client   : Convex.Client;
+      Args     : constant JSON.JSON_Value := JSON.Create_Object;
+      Success  : Boolean;
+      Message  : US.Unbounded_String;
+   begin
+      Open_Listener (Listener, Port);
+      Server.Start (Listener);
+      Convex.Open (Client, URL (Port));
+
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:throws", Args);
+      begin
+         Check
+           (not Result.Success, "HTTP 560 error envelope became a success");
+         Check
+           (Result.Error.Kind = Convex.Function_Error,
+            "HTTP 560 error envelope was not a function error");
+         Check
+           (US.To_String (Result.Error.Message) = "function threw",
+            "HTTP 560 error envelope lost its message");
+         Check (Result.Error.Has_Data, "HTTP 560 errorData was lost");
+         Check
+           (Result.Error.Has_Logs
+            and then JSON.Length (Result.Error.Logs) = 1,
+            "HTTP 560 logLines were lost");
+      end;
+
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:mislabeled", Args);
+      begin
+         Check
+           (not Result.Success
+            and then Result.Error.Kind = Convex.Protocol_Error,
+            "a success envelope under HTTP 560 was not a protocol error");
+      end;
+
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:gateway", Args);
+      begin
+         Check
+           (not Result.Success
+            and then Result.Error.Kind = Convex.Protocol_Error,
+            "a non-JSON non-2xx body was not a protocol error");
+      end;
+
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:missing", Args);
+      begin
+         Check
+           (not Result.Success
+            and then Result.Error.Kind = Convex.Protocol_Error,
+            "a non-2xx object without status was not a protocol error");
+      end;
+
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:chunkedError", Args);
+      begin
+         Check
+           (not Result.Success
+            and then Result.Error.Kind = Convex.Function_Error
+            and then US.To_String (Result.Error.Message) = "chunked",
+            "a chunked non-2xx error envelope was not read and parsed");
+         Check
+           (not Result.Error.Has_Logs,
+            "an envelope without logLines gained logs");
+      end;
+
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:emptyError", Args);
+      begin
+         Check
+           (not Result.Success
+            and then Result.Error.Kind = Convex.Protocol_Error,
+            "an empty non-2xx body was not a protocol error");
+      end;
+
+      --  The same taxonomy under a 2xx status. A body that never parses, a
+      --  body whose root is not an object, and an object without status are
+      --  all responses this client understood the transport for and could not
+      --  interpret, so all three are protocol errors rather than transport
+      --  errors.
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:html", Args);
+      begin
+         Check
+           (not Result.Success
+            and then Result.Error.Kind = Convex.Protocol_Error,
+            "an unparseable 2xx body was not a protocol error");
+      end;
+
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:array", Args);
+      begin
+         Check
+           (not Result.Success
+            and then Result.Error.Kind = Convex.Protocol_Error,
+            "a non-object 2xx body was not a protocol error");
+      end;
+
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:statusless", Args);
+      begin
+         Check
+           (not Result.Success
+            and then Result.Error.Kind = Convex.Protocol_Error,
+            "a 2xx object without status was not a protocol error");
+      end;
+
+      --  Transport taxonomy and recovery: none of the above may poison the
+      --  next ordinary call on the same client.
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:count", Args);
+      begin
+         Check (Result.Success, "HTTP did not recover after non-2xx bodies");
+         Check
+           (Result.Value.Kind = JSON.JSON_Int_Type
+            and then Long_Long_Integer'(Result.Value.Get) = 42,
+            "HTTP recovery returned the wrong value");
+         Check
+           (not Result.Has_Logs,
+            "a success envelope without logLines gained logs");
+      end;
+
+      Convex.Close (Client);
+      Server.Finish (Success, Message);
+      Check
+        (Success, "HTTP envelope fixture failed: " & US.To_String (Message));
+   exception
+      when others =>
+         Convex.Close (Client);
+         abort Server;
+         raise;
+   end Run_HTTP_Envelopes;
+
+   --  Ambiguous framing is the classic request-smuggling primitive. A client
+   --  that guesses which Content-Length to believe is worse than one that
+   --  refuses the message, so each of these must be rejected outright and none
+   --  of them may leave the client unable to make the next call.
+   task type HTTP_Framing_Server is
+      entry Start (Listener : GNAT.Sockets.Socket_Type);
+      entry Finish (Success : out Boolean; Message : out US.Unbounded_String);
+   end HTTP_Framing_Server;
+
+   task body HTTP_Framing_Server is
+      Listen   : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Peer     : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Passed   : Boolean := False;
+      Error    : US.Unbounded_String;
+      Address  : GNAT.Sockets.Sock_Addr_Type;
+      Envelope : constant String := "{""status"":""success"",""value"":5}";
+   begin
+      accept Start (Listener : GNAT.Sockets.Socket_Type) do
+         Listen := Listener;
+      end Start;
+      begin
+         for Step in 1 .. 9 loop
+            GNAT.Sockets.Accept_Socket (Listen, Peer, Address);
+            declare
+               Request : constant String := Read_HTTP_Request (Peer);
+               pragma Unreferenced (Request);
+            begin
+               case Step is
+                  when 1 =>
+                     --  Two different Content-Length values.
+                     Send_Response_Quietly
+                       (Peer,
+                        "HTTP/1.1 200 OK"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "Content-Length: 30"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "Content-Length: 5"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & ASCII.CR
+                        & ASCII.LF
+                        & Envelope);
+
+                  when 2 =>
+                     --  Two identical Content-Length values are still two
+                     --  framing statements. Do not pick one.
+                     Send_Response_Quietly
+                       (Peer,
+                        "HTTP/1.1 200 OK"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "Content-Length: 30"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "Content-Length: 30"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & ASCII.CR
+                        & ASCII.LF
+                        & Envelope);
+
+                  when 3 =>
+                     Send_Response_Quietly
+                       (Peer,
+                        "HTTP/1.1 200 OK"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "Content-Length: 30"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "Transfer-Encoding: chunked"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & ASCII.CR
+                        & ASCII.LF
+                        & Envelope);
+
+                  when 4 =>
+                     Send_Response_Quietly
+                       (Peer,
+                        "HTTP/1.1 200 OK"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "Transfer-Encoding: chunked"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "Transfer-Encoding: chunked"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "0"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & ASCII.CR
+                        & ASCII.LF);
+
+                  when 5 =>
+                     --  A header line with no field name at all.
+                     Send_Response_Quietly
+                       (Peer,
+                        "HTTP/1.1 200 OK"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "Content-Length: 30"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "ThisLineHasNoColon"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & ASCII.CR
+                        & ASCII.LF
+                        & Envelope);
+
+                  when 6 =>
+                     --  Obsolete line folding lets one header carry another
+                     --  header's text past a naive parser.
+                     Send_Response_Quietly
+                       (Peer,
+                        "HTTP/1.1 200 OK"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "Content-Length: 30"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & " continued: value"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & ASCII.CR
+                        & ASCII.LF
+                        & Envelope);
+
+                  when 7 =>
+                     Send_Response_Quietly
+                       (Peer,
+                        "HTTP/1.1 200 OK"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "Content-Length: 30, 30"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & ASCII.CR
+                        & ASCII.LF
+                        & Envelope);
+
+                  when 8 =>
+                     --  Advertising more than the 2 MiB body cap must be
+                     --  refused before a buffer that size is ever reserved.
+                     Send_Response_Quietly
+                       (Peer,
+                        "HTTP/1.1 200 OK"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & "Content-Length: 4194304"
+                        & ASCII.CR
+                        & ASCII.LF
+                        & ASCII.CR
+                        & ASCII.LF
+                        & Envelope);
+
+                  when 9 =>
+                     Send_Response_Quietly
+                       (Peer, Sized_Response ("200 OK", Envelope));
+               end case;
+            end;
+            Close_Quietly (Peer);
+         end loop;
+         Passed := True;
+      exception
+         when E : others =>
+            Error :=
+              US.To_Unbounded_String
+                (Ada.Exceptions.Exception_Information (E));
+      end;
+      Close_Quietly (Peer);
+      Close_Quietly (Listen);
+      accept Finish
+        (Success : out Boolean; Message : out US.Unbounded_String)
+      do
+         Success := Passed;
+         Message := Error;
+      end Finish;
+   end HTTP_Framing_Server;
+
+   procedure Run_HTTP_Framing is
+      Listener : GNAT.Sockets.Socket_Type;
+      Port     : GNAT.Sockets.Port_Type;
+      Server   : HTTP_Framing_Server;
+      Client   : Convex.Client;
+      Args     : constant JSON.JSON_Value := JSON.Create_Object;
+      Success  : Boolean;
+      Message  : US.Unbounded_String;
+      function Framing_Case (Step : Positive) return String
+      is (case Step is
+            when 1      => "conflicting Content-Length",
+            when 2      => "repeated Content-Length",
+            when 3      => "Content-Length with Transfer-Encoding",
+            when 4      => "repeated Transfer-Encoding",
+            when 5      => "a header line without a colon",
+            when 6      => "an obsolete folded header line",
+            when 7      => "a Content-Length list",
+            when others => "an unexpected framing case");
+   begin
+      Open_Listener (Listener, Port);
+      Server.Start (Listener);
+      Convex.Open (Client, URL (Port));
+
+      for Step in 1 .. 7 loop
+         declare
+            Result : constant Convex.Call_Result :=
+              Convex.Query (Client, "messages:framing", Args);
+         begin
+            Check
+              (not Result.Success
+               and then Result.Error.Kind = Convex.Protocol_Error,
+               "HTTP framing accepted " & Framing_Case (Step));
+         end;
+      end loop;
+
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:oversize", Args);
+      begin
+         Check
+           (not Result.Success
+            and then Result.Error.Kind = Convex.Transport_Error,
+            "an oversized Content-Length was not a bounded transport failure");
+      end;
+
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:count", Args);
+      begin
+         Check
+           (Result.Success
+            and then Result.Value.Kind = JSON.JSON_Int_Type
+            and then Long_Long_Integer'(Result.Value.Get) = 5,
+            "HTTP did not recover after rejected framing");
+      end;
+
+      Convex.Close (Client);
+      Server.Finish (Success, Message);
+      Check
+        (Success, "HTTP framing fixture failed: " & US.To_String (Message));
+   exception
+      when others =>
+         Convex.Close (Client);
+         abort Server;
+         raise;
+   end Run_HTTP_Framing;
+
+   --  TLS failures must arrive as bounded transport errors, not as hangs and
+   --  not as protocol or function errors, and the client must stay usable.
+   type TLS_Scenario is (TLS_Immediate_EOF, TLS_Garbage, TLS_Silent);
+
+   task type TLS_Failure_Server is
+      entry Start
+        (Listener : GNAT.Sockets.Socket_Type; Scenario : TLS_Scenario);
+      entry Finish (Success : out Boolean; Message : out US.Unbounded_String);
+   end TLS_Failure_Server;
+
+   task body TLS_Failure_Server is
+      Listen  : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Peer    : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Mode    : TLS_Scenario := TLS_Immediate_EOF;
+      Passed  : Boolean := False;
+      Error   : US.Unbounded_String;
+      Address : GNAT.Sockets.Sock_Addr_Type;
+      Data    : Ada.Streams.Stream_Element_Array (1 .. 4 * 1024);
+      Last    : Ada.Streams.Stream_Element_Offset;
+   begin
+      accept Start
+        (Listener : GNAT.Sockets.Socket_Type; Scenario : TLS_Scenario)
+      do
+         Listen := Listener;
+         Mode := Scenario;
+      end Start;
+      begin
+         GNAT.Sockets.Accept_Socket (Listen, Peer, Address);
+         case Mode is
+            when TLS_Immediate_EOF =>
+               --  Retire the connection while the client is still inside the
+               --  handshake, which is what a TLS terminator does when it has
+               --  no route or no certificate for the requested name.
+               GNAT.Sockets.Set_Socket_Option
+                 (Peer,
+                  GNAT.Sockets.Socket_Level,
+                  (Name    => GNAT.Sockets.Linger,
+                   Enabled => True,
+                   Seconds => 0));
+
+            when TLS_Garbage       =>
+               GNAT.Sockets.Receive_Socket (Peer, Data, Last);
+               Check
+                 (Last >= Data'First,
+                  "TLS fixture received no ClientHello");
+               Send_Response_Quietly
+                 (Peer,
+                  "HTTP/1.1 400 Bad Request"
+                  & ASCII.CR
+                  & ASCII.LF
+                  & ASCII.CR
+                  & ASCII.LF);
+
+            when TLS_Silent        =>
+               --  Accept and then never speak. The absolute request deadline,
+               --  not an inactivity timer, has to end this.
+               delay 6.5;
+         end case;
+         Passed := True;
+      exception
+         when E : others =>
+            Error :=
+              US.To_Unbounded_String
+                (Ada.Exceptions.Exception_Information (E));
+      end;
+      Close_Quietly (Peer);
+      Close_Quietly (Listen);
+      accept Finish
+        (Success : out Boolean; Message : out US.Unbounded_String)
+      do
+         Success := Passed;
+         Message := Error;
+      end Finish;
+   end TLS_Failure_Server;
+
+   procedure Run_TLS_Failure (Mode : TLS_Scenario) is
+      Listener : GNAT.Sockets.Socket_Type;
+      Port     : GNAT.Sockets.Port_Type;
+      Server   : TLS_Failure_Server;
+      Client   : Convex.Client;
+      Args     : constant JSON.JSON_Value := JSON.Create_Object;
+      Success  : Boolean;
+      Message  : US.Unbounded_String;
+      Started  : Ada.Real_Time.Time;
+      Elapsed  : Duration;
+      Result   : Convex.Call_Result;
+   begin
+      Open_Listener (Listener, Port);
+      Server.Start (Listener, Mode);
+      Convex.Open (Client, "https://127.0.0.1:" & Image (Natural (Port)));
+      Started := Ada.Real_Time.Clock;
+      --  The assertion below is about the deadline, so the test must not
+      --  depend on the deadline working in order to terminate at all.
+      select
+         delay 8.0;
+         Check
+           (False,
+            "a failed TLS handshake never returned for "
+            & TLS_Scenario'Image (Mode));
+      then abort
+         Result := Convex.Query (Client, "messages:count", Args);
+      end select;
+      Elapsed := Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - Started);
+      Check
+        (not Result.Success,
+         "a failed TLS handshake produced a successful call for "
+         & TLS_Scenario'Image (Mode));
+      Check
+        (Result.Error.Kind = Convex.Transport_Error,
+         "a failed TLS handshake was not a transport error for "
+         & TLS_Scenario'Image (Mode));
+      Check
+        (Elapsed < 6.0,
+         "a failed TLS handshake exceeded the request deadline for "
+         & TLS_Scenario'Image (Mode));
+      Convex.Close (Client);
+      Server.Finish (Success, Message);
+      Check
+        (Success,
+         "TLS failure fixture failed for "
+         & TLS_Scenario'Image (Mode)
+         & ": "
+         & US.To_String (Message));
+   exception
+      when others =>
+         Convex.Close (Client);
+         abort Server;
+         raise;
+   end Run_TLS_Failure;
+
+   task type Single_Response_Server is
+      entry Start (Listener : GNAT.Sockets.Socket_Type);
+      entry Finish (Success : out Boolean; Message : out US.Unbounded_String);
+   end Single_Response_Server;
+
+   task body Single_Response_Server is
+      Listen  : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Peer    : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Passed  : Boolean := False;
+      Error   : US.Unbounded_String;
+      Address : GNAT.Sockets.Sock_Addr_Type;
+   begin
+      accept Start (Listener : GNAT.Sockets.Socket_Type) do
+         Listen := Listener;
+      end Start;
+      begin
+         GNAT.Sockets.Accept_Socket (Listen, Peer, Address);
+         declare
+            Request : constant String := Read_HTTP_Request (Peer);
+            pragma Unreferenced (Request);
+         begin
+            Send_Response_Quietly
+              (Peer,
+               Sized_Response
+                 ("200 OK", "{""status"":""success"",""value"":11}"));
+         end;
+         Passed := True;
+      exception
+         when E : others =>
+            Error :=
+              US.To_Unbounded_String
+                (Ada.Exceptions.Exception_Information (E));
+      end;
+      Close_Quietly (Peer);
+      Close_Quietly (Listen);
+      accept Finish
+        (Success : out Boolean; Message : out US.Unbounded_String)
+      do
+         Success := Passed;
+         Message := Error;
+      end Finish;
+   end Single_Response_Server;
+
+   procedure Run_TLS_Recovery is
+      Listener : GNAT.Sockets.Socket_Type;
+      Port     : GNAT.Sockets.Port_Type;
+      Server   : Single_Response_Server;
+      Client   : Convex.Client;
+      Args     : constant JSON.JSON_Value := JSON.Create_Object;
+      Success  : Boolean;
+      Message  : US.Unbounded_String;
+   begin
+      --  Run immediately after the three TLS failures above. A failed OpenSSL
+      --  handshake must leave no process-wide residue that stops the next
+      --  ordinary call from completing.
+      Open_Listener (Listener, Port);
+      Server.Start (Listener);
+      Convex.Open (Client, URL (Port));
+      declare
+         Result : constant Convex.Call_Result :=
+           Convex.Query (Client, "messages:count", Args);
+      begin
+         Check
+           (Result.Success
+            and then Result.Value.Kind = JSON.JSON_Int_Type
+            and then Long_Long_Integer'(Result.Value.Get) = 11,
+            "the client did not recover after failed TLS handshakes");
+      end;
+      Convex.Close (Client);
+      Server.Finish (Success, Message);
+      Check
+        (Success, "TLS recovery fixture failed: " & US.To_String (Message));
+   exception
+      when others =>
+         Convex.Close (Client);
+         abort Server;
+         raise;
+   end Run_TLS_Recovery;
+
    type Transport_Scenario is
      (Valid_Text,
       Fragmented_UTF8,
@@ -1035,6 +1810,10 @@ procedure Convex_Socket_Tests is
       Noncanonical_Length,
       Fragmented_Control,
       Invalid_UTF8,
+      Reserved_Bit,
+      Orphan_Continuation,
+      Interleaved_Data,
+      Reserved_Close_Code,
       Stalled_Upgrade,
       Idle_Shutdown,
       Half_Frame_Shutdown,
@@ -1114,6 +1893,23 @@ procedure Convex_Socket_Tests is
 
                when Invalid_UTF8        =>
                   Send_Frame (Peer, 16#81#, Byte (16#C0#) & Byte (16#80#));
+
+               when Reserved_Bit        =>
+                  --  RSV1 without a negotiated extension.
+                  Send_Frame (Peer, 16#C1#, "x");
+
+               when Orphan_Continuation =>
+                  --  A continuation with no data frame to continue.
+                  Send_Frame (Peer, 16#80#, "x");
+
+               when Interleaved_Data    =>
+                  --  A second data frame while a fragmented message is open.
+                  Send_Frame (Peer, 16#01#, "a");
+                  Send_Frame (Peer, 16#81#, "b");
+
+               when Reserved_Close_Code =>
+                  --  1005 is reserved for local use and must never be sent.
+                  Send_Frame (Peer, 16#88#, Byte (3) & Byte (237));
 
                when Stalled_Upgrade     =>
                   null;
@@ -1297,6 +2093,21 @@ procedure Convex_Socket_Tests is
        & Image (Value)
        & ",""logLines"":[""fixture""]}]}");
 
+   --  Convex omits logLines entirely when a query produced no logs. This is
+   --  the shape that must not gain an empty array on its way to the adapter.
+   function Bare_Updated_Transition
+     (Start_Query, End_Query : Natural;
+      Start_TS, End_TS       : String;
+      Value                  : Natural) return String
+   is ("{""type"":""Transition"",""startVersion"":"
+       & Version (Start_Query, Start_TS)
+       & ",""endVersion"":"
+       & Version (End_Query, End_TS)
+       & ",""modifications"":[{""type"":""QueryUpdated"",""queryId"":1,"
+       & """value"":"
+       & Image (Value)
+       & "}]}");
+
    function Failed_Transition return String
    is ("{""type"":""Transition"",""startVersion"":"
        & Version (1, One_TS)
@@ -1422,7 +2233,7 @@ procedure Convex_Socket_Tests is
          Send_Frame (Peer, 16#81#, Failed_Transition);
          delay 0.05;
          Send_Frame
-           (Peer, 16#81#, Updated_Transition (1, 1, Two_TS, Two_TS, 1));
+           (Peer, 16#81#, Bare_Updated_Transition (1, 1, Two_TS, Two_TS, 1));
          Validate_Remove (Read_Client_Text (Peer));
          Passed := True;
       exception
@@ -1825,7 +2636,9 @@ procedure Convex_Socket_Tests is
 
       Wait_Update (Manager, Sub, Item);
       Check_Integer_Update (Item, 0);
-      Check (JSON.Length (Item.Logs) = 1, "QueryUpdated logs were lost");
+      Check
+        (Item.Has_Logs and then JSON.Length (Item.Logs) = 1,
+         "QueryUpdated logs were lost");
       Convex.Live.Release (Manager, Item);
 
       Wait_Update (Manager, Sub, Item);
@@ -1839,11 +2652,18 @@ procedure Convex_Socket_Tests is
         (US.To_String (Item.Error.Message) = "fixture failed",
          "QueryFailed message was lost");
       Check (Item.Error.Has_Data, "QueryFailed errorData was lost");
-      Check (JSON.Length (Item.Logs) = 1, "QueryFailed logs were lost");
+      Check
+        (Item.Has_Logs
+         and then Item.Error.Has_Logs
+         and then JSON.Length (Item.Logs) = 1,
+         "QueryFailed logs were lost");
       Convex.Live.Release (Manager, Item);
 
       Wait_Update (Manager, Sub, Item);
       Check_Integer_Update (Item, 1);
+      Check
+        (not Item.Has_Logs,
+         "an update without logLines gained an empty logs array");
       Convex.Live.Release (Manager, Item);
 
       Convex.Live.Unsubscribe (Manager, Sub);
@@ -1954,8 +2774,7 @@ procedure Convex_Socket_Tests is
       entry Start (Manager : Live_Manager_Access; Args : JSON_Value_Access);
       entry Finish
         (Success : out Boolean;
-         Message : out US.Unbounded_String;
-         Elapsed : out Duration);
+         Message : out US.Unbounded_String);
    end Slow_Add_Worker;
 
    task body Slow_Add_Worker is
@@ -1964,14 +2783,11 @@ procedure Convex_Socket_Tests is
       Sub          : Convex.Live.Subscription;
       Added        : Boolean := False;
       Detail       : US.Unbounded_String;
-      Started      : Ada.Real_Time.Time;
-      Add_Duration : Duration := 0.0;
    begin
       accept Start (Manager : Live_Manager_Access; Args : JSON_Value_Access) do
          Live := Manager;
          Arguments := Args;
       end Start;
-      Started := Ada.Real_Time.Clock;
       begin
          Convex.Live.Subscribe
            (Live.all, "messages:large", Arguments.all, Sub, Added, Detail);
@@ -1982,16 +2798,12 @@ procedure Convex_Socket_Tests is
               US.To_Unbounded_String
                 (Ada.Exceptions.Exception_Information (E));
       end;
-      Add_Duration :=
-        Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - Started);
       accept Finish
         (Success : out Boolean;
-         Message : out US.Unbounded_String;
-         Elapsed : out Duration)
+         Message : out US.Unbounded_String)
       do
          Success := Added;
          Message := Detail;
-         Elapsed := Add_Duration;
       end Finish;
    end Slow_Add_Worker;
 
@@ -2030,6 +2842,15 @@ procedure Convex_Socket_Tests is
          Validate_Add (Read_Client_Text (Peer));
          accept Initial_Ready;
 
+         --  A broken client must not leave the fixture itself stuck in recv.
+         --  This timeout is only the outer diagnostic bound. The production
+         --  frame deadline remains the stricter 500 ms contract.
+         GNAT.Sockets.Set_Socket_Option
+           (Peer,
+            GNAT.Sockets.Socket_Level,
+            (Name    => GNAT.Sockets.Receive_Timeout,
+             Timeout => 2.0));
+
          --  Consume only the near-maximum Add frame's header and mask. The
          --  small receive window then keeps the owner inside frame output
          --  while the controller queues Remove or Stop.
@@ -2037,17 +2858,7 @@ procedure Convex_Socket_Tests is
          Check
            (Large_Length > 2_000_000,
             "slow Live writer fixture did not receive a near-maximum Add");
-         --  The owner must reach the first frame bytes promptly. Without this
-         --  bounded rendezvous, an allocation or transport regression before
-         --  the header would leave the test waiting forever instead of giving
-         --  a useful failure at the actual boundary.
-         select
-            accept Large_Frame_Started;
-         or
-            delay 2.0;
-            raise Program_Error
-              with "slow Live writer client never reached the frame barrier";
-         end select;
+         accept Large_Frame_Started;
          delay 1.1;
          Wait_For_Close (Peer);
          Passed := True;
@@ -2080,9 +2891,10 @@ procedure Convex_Socket_Tests is
       Large_Args  : aliased JSON.JSON_Value := JSON.Create_Object;
       Success     : Boolean;
       Message     : US.Unbounded_String;
-      Started     : Ada.Real_Time.Time;
-      Action_Time : Duration;
-      Add_Time    : Duration;
+      Started              : Ada.Real_Time.Time;
+      Transmission_Started : Ada.Real_Time.Time;
+      Action_Time          : Duration;
+      Transmission_Time    : Duration;
    begin
       --  This is close to the largest argument that fits beside the first
       --  subscription under Live's conservative 8 MiB ownership budget.
@@ -2096,18 +2908,46 @@ procedure Convex_Socket_Tests is
         (Success,
          "slow Live writer initial subscribe failed: "
          & US.To_String (Message));
-      Server.Initial_Ready;
+      select
+         Server.Initial_Ready;
+      or
+         delay 2.0;
+         raise Program_Error
+           with "slow Live writer server did not reach its initial barrier";
+      end select;
 
       Worker.Start (Manager'Unchecked_Access, Large_Args'Unchecked_Access);
-      Server.Large_Frame_Started;
+      --  Put the timeout around the caller. The previous server-side select
+      --  was after its blocking header read, so it could never fire when the
+      --  client failed before sending the first byte.
+      select
+         Server.Large_Frame_Started;
+      or
+         delay 2.0;
+         raise Program_Error
+           with "slow Live writer client never reached the frame barrier";
+      end select;
+      Transmission_Started := Ada.Real_Time.Clock;
       Started := Ada.Real_Time.Clock;
-      case Mode is
-         when Concurrent_Unsubscribe =>
-            Convex.Live.Unsubscribe (Manager, Small_Sub);
+      --  The action being measured is also inside an independent deadline.
+      --  Measuring only after a synchronous call returns cannot diagnose a
+      --  regression that never returns at all.
+      select
+         delay 0.9;
+         raise Program_Error
+           with
+             "slow Live frame kept the owner from "
+             & Slow_Live_Write_Action'Image (Mode)
+             & " for 900 ms";
+      then abort
+         case Mode is
+            when Concurrent_Unsubscribe =>
+               Convex.Live.Unsubscribe (Manager, Small_Sub);
 
-         when Concurrent_Close       =>
-            Convex.Live.Close (Manager);
-      end case;
+            when Concurrent_Close       =>
+               Convex.Live.Close (Manager);
+         end case;
+      end select;
       Action_Time := Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - Started);
       Check
         (Action_Time < 0.9,
@@ -2115,22 +2955,45 @@ procedure Convex_Socket_Tests is
          & Slow_Live_Write_Action'Image (Mode)
          & " for 900 ms");
 
-      Worker.Finish (Success, Message, Add_Time);
+      select
+         Worker.Finish (Success, Message);
+      or
+         delay 0.9;
+         raise Program_Error
+           with "near-maximum Live Add did not retire after its deadline";
+      end select;
+      Transmission_Time :=
+        Ada.Real_Time.To_Duration
+          (Ada.Real_Time.Clock - Transmission_Started);
       Check
         (Success,
          "near-maximum Live Add was rejected: " & US.To_String (Message));
       Check
-        (Add_Time < 0.9,
+        (Transmission_Time < 0.9,
          "near-maximum Live Add renewed its frame deadline per chunk");
       if Mode = Concurrent_Unsubscribe then
-         Convex.Live.Close (Manager);
+         select
+            delay 0.9;
+            raise Program_Error
+              with "slow Live write cleanup close exceeded 900 ms";
+         then abort
+            Convex.Live.Close (Manager);
+         end select;
       end if;
-      Server.Finish (Success, Message);
+      select
+         Server.Finish (Success, Message);
+      or
+         delay 2.0;
+         raise Program_Error with "slow Live writer server did not finish";
+      end select;
       Check
         (Success, "slow Live write fixture failed: " & US.To_String (Message));
    exception
       when others =>
-         Convex.Live.Close (Manager);
+         --  Never call the synchronous Stop entry while handling a failure in
+         --  the test that proves Stop is bounded. The test-only abort path
+         --  guarantees that diagnostic cleanup cannot hide the first failure.
+         Convex.Live.Testing.Abort_Manager (Manager);
          abort Worker;
          abort Server;
          raise;
@@ -2319,6 +3182,204 @@ procedure Convex_Socket_Tests is
          raise;
    end Run_Reconnects;
 
+   --  Four refused upgrades grow the exponential backoff. The fifth
+   --  connection is a complete, validated handshake, so the delay after it
+   --  fails must come from the reset interval and not from the delay the
+   --  earlier failures had accumulated.
+   task type Backoff_Reset_Server is
+      entry Start (Listener : GNAT.Sockets.Socket_Type);
+      entry Finish (Success : out Boolean; Message : out US.Unbounded_String);
+   end Backoff_Reset_Server;
+
+   task body Backoff_Reset_Server is
+      Listen     : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Peer       : GNAT.Sockets.Socket_Type := GNAT.Sockets.No_Socket;
+      Passed     : Boolean := False;
+      Error      : US.Unbounded_String;
+      Address    : GNAT.Sockets.Sock_Addr_Type;
+      Retired_At : Ada.Real_Time.Time;
+      Waited     : Duration := 0.0;
+   begin
+      accept Start (Listener : GNAT.Sockets.Socket_Type) do
+         Listen := Listener;
+      end Start;
+      begin
+         for Attempt in 1 .. 4 loop
+            GNAT.Sockets.Accept_Socket (Listen, Peer, Address);
+            declare
+               Request : constant String := Read_HTTP_Headers (Peer);
+               pragma Unreferenced (Request);
+            begin
+               Send_Response_Quietly
+                 (Peer,
+                  "HTTP/1.1 400 Bad Request"
+                  & ASCII.CR
+                  & ASCII.LF
+                  & "Content-Length: 0"
+                  & ASCII.CR
+                  & ASCII.LF
+                  & "Connection: close"
+                  & ASCII.CR
+                  & ASCII.LF
+                  & ASCII.CR
+                  & ASCII.LF);
+            end;
+            Close_Quietly (Peer);
+         end loop;
+
+         Upgrade (Listen, Peer);
+         Check
+           (String_Field (Read_Object (Read_Client_Text (Peer)), "type")
+            = "Connect",
+            "backoff fixture expected Connect on the validated handshake");
+         Validate_Add (Read_Client_Text (Peer));
+         Send_Frame
+           (Peer, 16#81#, Updated_Transition (0, 1, Initial_TS, One_TS, 0));
+
+         --  Retire the healthy connection abruptly and time the next attempt.
+         GNAT.Sockets.Set_Socket_Option
+           (Peer,
+            GNAT.Sockets.Socket_Level,
+            (Name => GNAT.Sockets.Linger, Enabled => True, Seconds => 0));
+         Close_Quietly (Peer);
+         Retired_At := Ada.Real_Time.Clock;
+
+         Upgrade (Listen, Peer);
+         Waited :=
+           Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - Retired_At);
+         Check
+           (Waited < 0.9,
+            "a reconnect after a validated handshake inherited the backoff "
+            & "grown by the earlier failures");
+         Check
+           (String_Field (Read_Object (Read_Client_Text (Peer)), "type")
+            = "Connect",
+            "backoff fixture expected Connect after the reset");
+         --  Replay is unchanged by the reset: the active query is re-added.
+         Validate_Add (Read_Client_Text (Peer));
+         Send_Frame
+           (Peer, 16#81#, Updated_Transition (0, 1, Initial_TS, Two_TS, 1));
+
+         --  A masked server frame is a protocol violation. Later protocol
+         --  error handling must still retire this connection and report.
+         Send_All
+           (Peer,
+            Byte (16#81#)
+            & Byte (16#80#)
+            & Byte (0)
+            & Byte (0)
+            & Byte (0)
+            & Byte (0));
+         Wait_For_Close (Peer);
+         Close_Quietly (Peer);
+
+         Upgrade (Listen, Peer);
+         Check
+           (String_Field (Read_Object (Read_Client_Text (Peer)), "type")
+            = "Connect",
+            "backoff fixture expected Connect after the protocol failure");
+         Validate_Add (Read_Client_Text (Peer));
+         Send_Frame
+           (Peer,
+            16#81#,
+            Updated_Transition
+              (0,
+               1,
+               Initial_TS,
+               Convex_WebSocket.Encode_Timestamp (3),
+               2));
+         Validate_Remove (Read_Client_Text (Peer));
+         Passed := True;
+      exception
+         when E : others =>
+            Error :=
+              US.To_Unbounded_String
+                (Ada.Exceptions.Exception_Information (E));
+      end;
+      Close_Quietly (Peer);
+      Close_Quietly (Listen);
+      accept Finish
+        (Success : out Boolean; Message : out US.Unbounded_String)
+      do
+         Success := Passed;
+         Message := Error;
+      end Finish;
+   end Backoff_Reset_Server;
+
+   --  Drain intervening transport and protocol notices while waiting for the
+   --  next real value, recording whether a protocol error was among them.
+   procedure Wait_For_Value
+     (Manager            : in out Convex.Live.Manager;
+      Sub                : Convex.Live.Subscription;
+      Expected           : Long_Long_Integer;
+      Saw_Protocol_Error : in out Boolean;
+      Timeout            : Duration := 8.0)
+   is
+      Deadline : constant Ada.Real_Time.Time :=
+        Ada.Real_Time.Clock + Ada.Real_Time.To_Time_Span (Timeout);
+      Found    : Boolean;
+      Item     : Convex.Live.Update;
+   begin
+      while Ada.Real_Time.Clock < Deadline loop
+         Convex.Live.Try_Next (Manager, Sub, Found, Item);
+         if Found then
+            if Item.Has_Value then
+               Check_Integer_Update (Item, Expected);
+               Convex.Live.Release (Manager, Item);
+               return;
+            end if;
+            if Item.Has_Error
+              and then Item.Error.Kind = Convex.Protocol_Error
+            then
+               Saw_Protocol_Error := True;
+            end if;
+            Convex.Live.Release (Manager, Item);
+         else
+            delay 0.005;
+         end if;
+      end loop;
+      Check (False, "timed out waiting for a Live value");
+   end Wait_For_Value;
+
+   procedure Run_Backoff_Reset is
+      Listener   : GNAT.Sockets.Socket_Type;
+      Port       : GNAT.Sockets.Port_Type;
+      Server     : Backoff_Reset_Server;
+      Manager    : Convex.Live.Manager;
+      Sub        : Convex.Live.Subscription;
+      Args       : constant JSON.JSON_Value := JSON.Create_Object;
+      Success    : Boolean;
+      Message    : US.Unbounded_String;
+      Saw_Broken : Boolean := False;
+   begin
+      Open_Listener (Listener, Port);
+      Server.Start (Listener);
+      Convex.Live.Open (Manager, URL (Port));
+      Convex.Live.Subscribe
+        (Manager, "messages:count", Args, Sub, Success, Message);
+      Check
+        (Success, "backoff reset subscribe failed: " & US.To_String (Message));
+
+      Wait_For_Value (Manager, Sub, 0, Saw_Broken);
+      Wait_For_Value (Manager, Sub, 1, Saw_Broken);
+      Saw_Broken := False;
+      Wait_For_Value (Manager, Sub, 2, Saw_Broken);
+      Check
+        (Saw_Broken,
+         "a protocol failure after the backoff reset was not reported");
+
+      Convex.Live.Unsubscribe (Manager, Sub);
+      Convex.Live.Close (Manager);
+      Server.Finish (Success, Message);
+      Check
+        (Success, "backoff reset fixture failed: " & US.To_String (Message));
+   exception
+      when others =>
+         Convex.Live.Testing.Abort_Manager (Manager);
+         abort Server;
+         raise;
+   end Run_Backoff_Reset;
+
    procedure Run_Failure_Reconnect (Mode : Reconnect_Failure) is
       Listener : GNAT.Sockets.Socket_Type;
       Port     : GNAT.Sockets.Port_Type;
@@ -2384,6 +3445,10 @@ begin
    Run_Transport (Noncanonical_Length, Convex_WebSocket.Protocol_Failure);
    Run_Transport (Fragmented_Control, Convex_WebSocket.Protocol_Failure);
    Run_Transport (Invalid_UTF8, Convex_WebSocket.Protocol_Failure);
+   Run_Transport (Reserved_Bit, Convex_WebSocket.Protocol_Failure);
+   Run_Transport (Orphan_Continuation, Convex_WebSocket.Protocol_Failure);
+   Run_Transport (Interleaved_Data, Convex_WebSocket.Protocol_Failure);
+   Run_Transport (Reserved_Close_Code, Convex_WebSocket.Protocol_Failure);
 
    -- A fresh valid socket after malformed traffic proves parser failure does
    -- not poison later connections.
@@ -2401,6 +3466,16 @@ begin
    Run_HTTP_Edges;
    Ada.Text_IO.Put_Line ("http: absolute request transmission deadline");
    Run_HTTP_Write_Deadline;
+   Ada.Text_IO.Put_Line ("http: non-2xx Convex error envelopes and recovery");
+   Run_HTTP_Envelopes;
+   Ada.Text_IO.Put_Line ("http: strict response framing and recovery");
+   Run_HTTP_Framing;
+
+   Ada.Text_IO.Put_Line ("tls: bounded handshake failures and recovery");
+   for Mode in TLS_Scenario loop
+      Run_TLS_Failure (Mode);
+   end loop;
+   Run_TLS_Recovery;
 
    Ada.Text_IO.Put_Line ("live: recovery, reconnects, and bounded lifecycle");
    Run_Live_Flow;
@@ -2408,6 +3483,8 @@ begin
    for Mode in Reconnect_Failure loop
       Run_Failure_Reconnect (Mode);
    end loop;
+   Ada.Text_IO.Put_Line ("live: backoff reset on a validated handshake");
+   Run_Backoff_Reset;
    Ada.Text_IO.Put_Line ("live: five reconnects");
    Run_Reconnects;
    Ada.Text_IO.Put_Line ("live: count and byte backpressure");
