@@ -13,7 +13,7 @@ language so the roster still reaches one hundred.
 | apex | Executes only inside Salesforce's hosted platform; no local runtime exists. |
 | labview | Proprietary NI graphical environment; no headless Linux compiler, license required. |
 | matlab | Proprietary license required for the real MATLAB runtime; substituting GNU Octave would not honestly be MATLAB. |
-| mql5 | Runs only inside the proprietary Windows MetaTrader terminal. |
+| mql5 | Runs only inside the proprietary Windows MetaTrader terminal. Replacement (Hare) implemented and evidenced; row pending removal once that PR merges. |
 | rpg | IBM RPG compilers exist only on IBM i systems; no free Linux toolchain. |
 | sas | Proprietary licensed runtime; no free implementation of the real language. |
 | scratch | Block-based GUI language with no network primitives; a Convex client cannot be expressed in Scratch itself. |
@@ -36,6 +36,7 @@ for the same reason PostScript was declined earlier on this page.
 | abap | No socket API and no public FFI even on a licensed SAP AS ABAP. The free open-abap route opens its sockets by embedding literal JavaScript inside `WRITE '@KERNEL …'` string literals, which is JavaScript doing the work, not ABAP. |
 | elm | Elm has no socket type and no foreign *call* — only asynchronous JSON ports. Transport, stdio and the adapter listener would all live in hand-written JavaScript, leaving Elm as a message formatter. This is the PostScript ruling applied consistently. |
 | cfml | Lucee, the real open CFML engine, exceeds the 128 MiB container limit and needs to unpack `.lco` files into a writable temporary directory the read-only runtime cannot provide. BoxLang clears the harness cleanly but is a different language that is merely CFML-compatible — substituting it would be the same move as substituting GNU Octave for MATLAB, already rejected above. |
+| futhark | The toolchain itself is fine — `futhark` is a free, single Debian package (`apt install futhark`) that installs unattended and compiles in seconds. The language is the problem: Futhark has no I/O primitives at all, by design. `futhark c --library` emits only a numeric marshaling C API (`futhark_context`, entry points over arrays, tuples and opaque records via `futhark_new_opaque_*`/`futhark_project_opaque_*`); the non-library `futhark c` mode's standalone executable is entirely a compiler-generated CLI for Futhark's own benchmarking data format (`--runs`, `--entry-point`, `-b/--binary-output`) with no flag, hook, or extension point that touches a file descriptor, let alone a socket. There is no `extern`, no FFI directive, nothing a `.fut` source file can write to request one. The only honest structure is a C host program that owns every socket, TLS handshake and WebSocket frame while calling into Futhark for something incidental — a bridge, not a native client, exactly the shape this project has already declined for PostScript, bc and elm above. |
 
 ## Infeasible — license or GUI gate (ruled, previously borderline)
 
@@ -68,7 +69,7 @@ languages.
 | --- | --- | --- | --- | --- |
 | 1 | apex | **Rexx** | Regina Rexx | The scripting language of mainframes, OS/2 and Amiga. Ubiquitous for two decades, near-invisible today. |
 | 2 | labview | **Emacs Lisp** | Emacs batch mode | A Convex client inside a text editor's extension language. Emacs has real network primitives and TLS, so this is honest, not a stunt. |
-| 3 | matlab | **Futhark** | futhark | A purely functional array language that compiles to GPU code. Its FFI story makes the transport boundary genuinely interesting. |
+| 3 | matlab | ~~Futhark~~ → see below | — | Futhark itself turned out infeasible once actually tried; see the "no way to reach a socket" table above and the note below the table. |
 | 4 | mql5 | **Hare** | hare | A deliberately small systems language, self-hosted, no runtime. Modern, obscure, and a fair test of doing everything by hand. |
 | 5 | rpg | **Modula-2** | GNU gm2 | Wirth's successor to Pascal, and a GCC front end, so it builds anywhere GCC does. Direct historical line from the Pascal family already on the roster. |
 | 6 | sas | **Icon** | Unicon | Griswold's goal-directed evaluation with backtracking built into the language. Unlike anything else here. |
@@ -96,6 +97,27 @@ Deliberately not chosen, and why:
 If any chosen language proves infeasible once its toolchain is actually pinned
 in Docker, it moves to the table above with its reason recorded, and the next
 candidate takes the slot.
+
+Futhark (slot 3, replacing matlab) is the first case of this: confirmed
+infeasible after actually pinning the toolchain and reading the generated C
+API, moved to the "no way to reach a socket" table above. Hare (slot 4,
+replacing mql5), tried in the same session, succeeded and is evidenced
+separately.
+
+A candidate for Futhark's now-open slot, surveyed but not yet toolchain- or
+socket-verified the way every table entry above was before being accepted:
+**Unison** (the content-addressed functional language from Unison Computing,
+not the unrelated Benjamin Pierce file-synchronization tool of the same
+name). Its `ucm` distribution is a free, unattended-installing prebuilt
+binary (`ucm-linux-x64.tar.gz` off GitHub releases; confirmed downloading and
+running `ucm --version` inside a bare `debian:trixie-slim` container), and
+its `base` library documents `builtins.io2.Socket` and `builtins.io2.Tls`
+namespaces as native primitives, not a foreign-process shim. This session
+did not get as far as compiling and running an actual TCP+TLS round trip
+from Unison source before time ran out, so treat the socket claim as a
+documented one to verify, not a demonstrated one — the same 30-minute proof
+this page's other entries were held to, still owed here before Unison is
+accepted.
 
 ## Second replacement round
 
