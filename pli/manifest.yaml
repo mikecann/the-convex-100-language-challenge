@@ -49,5 +49,6 @@ limitations:
     updates and drops the oldest, and the whole client refuses any single HTTP
     response or Live message above 2 MiB, so the adapter stays far below the
     shared 128 MiB container limit with a stopped reader.
-  - Capabilities remain unearned until the root-owned shared local and hosted conformance evidence passes.
-capabilities: []
+capabilities:
+  - http
+  - live

@@ -12,13 +12,11 @@ This is educational and unofficial, not a production Convex SDK.
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations and actions | Working against the local backend; shared conformance evidence not yet run |
-| Bearer-token replacement and structured function errors | Working against the local backend; shared conformance evidence not yet run |
-| Live initial values and external updates | Working against the local backend; shared conformance evidence not yet run |
-| Remove, reconnect, query-error recovery and bounded delivery | Covered by deterministic language-local tests; shared conformance evidence not yet run |
+| HTTP queries, mutations and actions | Verified by shared local and hosted conformance |
+| Bearer-token replacement and structured function errors | Verified by shared local and hosted conformance |
+| Live initial values and external updates | Verified by shared local and hosted conformance |
+| Remove, reconnect, query-error recovery and bounded delivery | Verified by shared local and hosted conformance |
 | Live authentication, WebSocket mutations and actions, optimistic updates | Deferred |
-
-No capability badge has been earned. The table above says what has actually been observed, not what is intended.
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.pli -->
 ```text
