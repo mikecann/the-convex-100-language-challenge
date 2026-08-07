@@ -12,7 +12,7 @@ cryptotest ; SHA-1, base64, RFC 6455 accept-digest, and sync-timestamp compare
  . set b=$ascii(digest,i)
  . set hex=hex_$extract(hexDigits,(b\16)+1)_$extract(hexDigits,(b#16)+1)
  write "sha1(abc)=",hex,!
- if hex'="a9993e364706816aba3e25717850c26c9cd0d89" write "FAIL sha1 abc",! set failures=failures+1
+ if hex'="a9993e364706816aba3e25717850c26c9cd0d89d" write "FAIL sha1 abc",! set failures=failures+1
  ;
  new digest2 set digest2=$$sha1^convex("")
  set hex=""
@@ -47,13 +47,17 @@ cryptotest ; SHA-1, base64, RFC 6455 accept-digest, and sync-timestamp compare
  write "accept=",accept,!
  if accept'="s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" write "FAIL RFC6455 accept",! set failures=failures+1
  ;
- ; Convex sync timestamps are little-endian base64 uint64: an all-zero
- ; timestamp compares below one whose low byte is 1, which in turn compares
- ; below one whose HIGH byte is 1 -- not just the low byte, which is what a
- ; (wrongly) big-endian compare would get right by accident.
+ ; Convex sync timestamps are little-endian base64 uint64: byte[0] is the
+ ; LEAST significant byte and byte[7] is the MOST significant. tsOne below
+ ; has only its first (low-order) byte set -- decimal value 1. tsHighByte has
+ ; only its LAST (high-order) byte set -- decimal value 2^56, vastly larger
+ ; despite every byte before it being zero. A comparison that walked the
+ ; bytes forward (or, worse, treated the string as big-endian) would get
+ ; tsOne > tsHighByte wrong by comparing the first byte (1 > 0); tsCmp must
+ ; walk from the end to get this right.
  new tsZero set tsZero=$$b64Encode^convex($char(0,0,0,0,0,0,0,0))
- new tsOne set tsOne=$$b64Encode^convex($char(0,0,0,0,0,0,0,1))
- new tsHighByte set tsHighByte=$$b64Encode^convex($char(1,0,0,0,0,0,0,0))
+ new tsOne set tsOne=$$b64Encode^convex($char(1,0,0,0,0,0,0,0))
+ new tsHighByte set tsHighByte=$$b64Encode^convex($char(0,0,0,0,0,0,0,1))
  if $$tsCmp^convex(tsZero,tsOne)'=-1 write "FAIL tsCmp zero<one",! set failures=failures+1
  if $$tsCmp^convex(tsOne,tsZero)'=1 write "FAIL tsCmp one>zero",! set failures=failures+1
  if $$tsCmp^convex(tsZero,tsZero)'=0 write "FAIL tsCmp equal",! set failures=failures+1
