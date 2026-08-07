@@ -72,4 +72,6 @@ limitations:
     The saved images ship without a changes file, and Pharo's behaviour on a
     read-only filesystem without one is proven only by the Docker entry point
     probes, which have not been run yet.
-capabilities: []
+capabilities:
+  - http
+  - live
