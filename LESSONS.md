@@ -659,12 +659,16 @@ Three things follow, and the third is the one worth arguing about:
   and there is no offline way to learn a hash without first asking the service
   that knows the name. A language where nothing has a name until something
   tells you what the hashes are called cannot be built hermetically.
-- The framework was larger than the budget. Raku's client loads in about 200 MB
-  against a 128 MiB container limit, and roughly 140 MB of that is
-  `Cro::HTTP::Client` alone — the framework, not the client. Disabling the JIT,
-  the optimiser and the thread pool together only reached 176 MB. The fix is not
-  a smaller limit but a smaller dependency: hand-roll the transport, as a dozen
-  clients here already do.
+- The framework was larger than the budget, and then the interpreter was too.
+  Raku's client loaded in about 200 MB against a 128 MiB limit, and roughly
+  140 MB of that looked like `Cro::HTTP::Client` — the framework, not the
+  client. So the transport was hand-rolled onto plain sockets, which worked and
+  saved a real 20–25 MB. It was still not enough, and the bisection that
+  followed is the actual lesson: `raku -e 'say 1'`, with **zero** project code
+  loaded, holds 134–140 MB. The budget was already spent before the program
+  started. Every earlier measurement had been attributing to the library what
+  belonged to the runtime, because nobody had measured the empty case first.
+  **Measure the floor before optimising the building.**
 - V's `net.ssl` verified nothing. Passing `validate: true` looks like it turns
   certificate checking on, but vlib loads a trust store only when a separate
   `verify` field names one, and it never calls
