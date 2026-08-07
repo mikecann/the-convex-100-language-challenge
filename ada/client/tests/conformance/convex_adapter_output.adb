@@ -417,7 +417,16 @@ package body Convex_Adapter_Output is
       return True;
    end Write_Bounded;
 
-   task Writer;
+   --  Write_Bounded's local Payload is Line & ASCII.LF, and Line may hold a
+   --  Live delivery close to the client's four-megabyte message ceiling (up
+   --  to Max_Line_Bytes, several megabytes). That concatenation lives on
+   --  this task's own stack, so the default is not an option here for the
+   --  same reason Convex.Live.Owner_Task states explicitly: the failure mode
+   --  of a default that is too small is Storage_Error on exactly the largest
+   --  valid values, which is precisely what a near-ceiling Live delivery hit
+   --  with no Storage_Size clause at all.
+   task Writer
+     with Storage_Size => 16 * 1024 * 1024;
 
    task body Writer is
       Item       : Output_Item;
