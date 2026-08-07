@@ -40,15 +40,6 @@ adapter:
     - debugDisconnect
 limitations:
   - >-
-    Local development runs (not yet the shared conformance harness) exercised
-    the full HTTP query/mutation/action path and the full Live path —
-    subscribe, the initial value, a mutation-driven update, and five real
-    debugDisconnect-driven reconnects that each resend the active Add and
-    correctly suppress a duplicate event for an unchanged rehydrated value —
-    against both the local backend and the hosted deployment. Shared local
-    and hosted black-box conformance have not been run yet, so no capability
-    is claimed here and badges remain unearned until they do.
-  - >-
     Hare 0.24 (current when this client was written) ships no `hare fmt` or
     other blessed source formatter. Source in this directory is hand-
     formatted against the tabs-for-indentation style Hare's own standard
@@ -86,4 +77,6 @@ limitations:
     frames interleaved with a fragmented message, and the masked-frame
     rejection are implemented and exercised only against the real backend
     so far, not yet against an adversarial local fixture peer.
-capabilities: []
+capabilities:
+  - http
+  - live

@@ -25,10 +25,11 @@ agree on the resulting `0 -> 1` count.
 
 | Capability | Status |
 | --- | --- |
-| Native implementation | Verified locally against the local and hosted Convex backends; not yet run through the shared conformance harness, so no badge is earned yet |
-| HTTP query, mutation, and action | Implemented and locally verified end to end; awaiting shared conformance |
-| Bearer-token lifecycle | Implemented (`setAuth`); awaiting shared conformance |
-| Live initial values, updates, and recovery | Implemented and locally verified, including five real `debugDisconnect`-driven reconnects that resend the active subscription and correctly suppress a duplicate event for an unchanged rehydrated value; awaiting shared conformance |
+| Native implementation | Verified by shared local and hosted conformance at this exact head (31/31 both profiles) |
+| HTTP query, mutation, and action | Verified by shared local and hosted conformance |
+| Bearer-token lifecycle | Verified by shared local and hosted conformance |
+| Live initial values, updates, unsubscribe, and error recovery | Verified by shared local and hosted conformance |
+| Live reconnect | Verified by shared local and hosted conformance, including five real `debugDisconnect`-driven reconnects that each resend the active subscription and correctly suppress a duplicate event for an unchanged rehydrated value |
 | Convex tagged values | Deferred, JSON-safe values only |
 | Live authentication, optimistic writes, WebSocket mutations/actions | Deferred |
 
@@ -284,6 +285,17 @@ live deployment locally.
   installs a thin `cc` wrapper earlier on `PATH` that adds it, so both
   shipped binaries are fully static musl executables whose only runtime
   dependency is the CA certificate bundle a TLS deployment needs.
+- This client does not use `net::dial::dial` for hostname resolution
+  (`http.ha`'s `resolve_host` instead). Hare 0.24.2's `net::ip::parse`
+  rejects a bare trailing `::` — valid IPv6 shorthand for an all-zero
+  remainder, as in `fe00::` or `ff00::` — and `unix::hosts::next` propagates
+  that as a hard error instead of skipping the unparseable line. Docker's
+  container networking generates an `/etc/hosts` containing exactly those
+  lines (`ip6-localnet`, `ip6-mcastprefix`), so `net::dial::dial` failed to
+  resolve any hostname at all inside this project's own backend network,
+  including a host with a perfectly valid entry earlier in the same file.
+  `resolve_host` re-implements a tolerant `/etc/hosts` scan that skips a
+  line it cannot parse, then falls back to a real DNS query.
 
 ## Honest limitations
 
@@ -291,10 +303,6 @@ live deployment locally.
   other blessed formatter in its toolchain. Source here is hand-formatted
   against the tabs-for-indentation style Hare's own standard library uses,
   not machine-checked.
-- Shared local and hosted black-box conformance have not been run yet
-  through this repository's harness, so the capability badges above are not
-  yet earned even though the underlying behavior has been exercised directly
-  against both a local self-hosted backend and the hosted deployment.
 - Reconnection has no exponential backoff yet: a Live bring-up that keeps
   failing is retried on the very next step call rather than after a growing
   delay.
