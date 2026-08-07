@@ -17,9 +17,9 @@ idempotent mutation, and confirms the Live update agrees with the response.
 
 | Capability | Status |
 | --- | --- |
-| Native HTTP query, mutation, and action implementation | Implemented, pending shared evidence |
-| Native Live query implementation | Implemented, pending shared evidence |
-| Docker test and final runtime image | Implemented, pending shared evidence |
+| Native HTTP query, mutation, and action implementation | Verified by shared local and hosted conformance |
+| Native Live query implementation | Verified by shared local and hosted conformance |
+| Docker test and final runtime image | Verified by shared local and hosted conformance |
 | Earned capability badges | None until shared local and hosted verification passes |
 | Live authentication, WebSocket mutations/actions, optimistic updates, replay | Deferred |
 
