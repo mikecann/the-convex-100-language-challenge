@@ -25,7 +25,7 @@ languages:
   - { rank: 18, id: objective-c, displayName: "Objective-C", selectionTier: ranked, feasibility: { docker: A, https: A, json: A, websocket: A } }
   - { rank: 19, id: lua, displayName: "Lua", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 20, id: powershell, displayName: "PowerShell", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
-  - { rank: 21, id: matlab, displayName: "MATLAB", selectionTier: ranked, feasibility: { docker: A, https: G, json: G, websocket: A } }
+  - { rank: 21, id: seed7, displayName: "Seed7", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 22, id: visual-basic-dotnet, displayName: "Visual Basic .NET", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 23, id: perl, displayName: "Perl", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 24, id: assembly-x86-64, displayName: "Assembly (x86-64 NASM)", selectionTier: ranked, feasibility: { docker: G, https: A, json: A, websocket: A } }
