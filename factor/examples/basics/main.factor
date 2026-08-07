@@ -1,37 +1,3 @@
-# Convex from Factor
-
-This demonstration uses Factor to call Convex's documented JSON HTTP
-endpoints and to keep a reactive query current over a native Factor
-WebSocket connection. Factor is a concatenative, stack-based language, so
-the client reads as a pipeline of small words rather than a class hierarchy.
-
-It is an educational, unofficial experiment. It is not a production SDK, an
-officially sanctioned Convex client, or a package intended for publication.
-
-## Start here
-
-[`examples/basics/main.factor`](examples/basics/main.factor) is the canonical
-example. It reads a fresh counter room over HTTP, starts Live before changing
-it, applies an idempotent mutation, and proves the same `0 -> 1` journey
-arrived through the subscription. The block below is generated from that exact
-runnable file.
-
-## What works
-
-| Capability | Current state | What that means |
-| --- | --- | --- |
-| HTTP | Not yet built or verified | Native Factor query, mutation, action, bearer-token lifecycle, log lines, and structured `560`/`500`/`400` failures are written but have never been compiled. |
-| Live | Not yet built or verified | Native Factor RFC 6455 subscriptions, unsubscribe, five forced reconnects, reactive error recovery, and bounded close target the pinned sync profile but have never been compiled. |
-
-No Docker command has been run for this checkpoint. Compilation, the language-
-local tests, the runtime images, and every behavioural claim above are
-unproven. No capability badge is earned until root-owned local and hosted
-black-box conformance passes.
-
-## The basic example
-
-<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.factor -->
-```text
 ! The canonical Convex-from-Factor example.
 !
 ! It reads one counter room over HTTP, starts a Live subscription before
@@ -157,78 +123,10 @@ ERROR: example-error message ;
     es stream-flush ;
 
 : run-example ( -- )
-    [ example-main 0 exit ] [ report-failure 1 exit ] recover ;
+    ! exit terminates the process immediately, and stdout is fully
+    ! buffered rather than line-buffered once it is a pipe rather than a
+    ! terminal, so the transcript above must be flushed explicitly or a
+    ! verifier reading it back would see nothing.
+    [ example-main flush 0 exit ] [ report-failure 1 exit ] recover ;
 
 MAIN: run-example
-```
-<!-- END GENERATED EXAMPLE -->
-
-## Verify it in Docker
-
-```sh
-./run test factor
-./run verify-example factor
-./run verify factor
-./run verify-hosted factor
-./run verify-all factor
-```
-
-`test` runs the source formatting check, compiles every vocabulary (which is
-Factor's own stack-effect check), then exercises real loopback HTTP, raw
-WebSocket, sync-protocol, TLS, and stopped-reader fixtures inside Docker.
-`verify-example` executes the canonical source above and compares its stdout
-with the universal transcript. The remaining commands are root-owned shared
-gates for the approved local and hosted deployments.
-
-## Conformance and protocol notes
-
-The test-only adapter under `client/tests/conformance/` speaks NDJSON protocol
-v1 on stdin/stdout and over TCP when `ADAPTER_LISTEN` is set. It calls the real
-Factor client for every operation and reserves stdout for protocol events. Its
-adapter-only `debugDisconnect` command lets the shared harness prove five real
-reconnects; it is declared in `manifest.yaml` and is deliberately absent from
-the educational client API.
-
-HTTP uses Convex's documented `format: "json"` endpoints. Live pins
-`convex-rs-0.10.4-unversioned-sync` at
-`6f1df8a8ba1665084ec001e307ca841ca17074d7` and `/api/sync`. That realtime
-protocol is not documented as stable, so hosted verification remains required.
-
-Both runtime images are produced by Factor's `deploy` tool, which embeds a
-stripped image in a copy of the Factor VM. Word definitions and the dictionary
-are stripped, so neither image exposes an interactive Factor compiler, and the
-final-image probe asserts that no `factor` command is present.
-
-## Buffering and deadlines
-
-Delivery buffering belongs to this client rather than to a runtime mailbox.
-Each subscription owns an explicitly bounded relay that keeps the newest 16
-events inside an 8 MiB conservatively charged budget, and each relay carries a
-generation so an unsubscribe or a same-id replacement invalidates queued work
-before its acknowledgement is published. Adapter output is bounded separately
-at 16 events and 6 MiB, reserving four slots and 64 KiB for control events, so
-a burst of large Live values can never starve a controller answer.
-
-Two deadline kinds appear throughout the transport. A stream timeout bounds one
-blocking read. An absolute deadline is fixed before the first byte of a record
-is consumed, so a peer that dribbles one byte at a time cannot extend it; the
-WebSocket test asserts that deadline against a peer that stays alive and keeps
-sending.
-
-## Limitations
-
-- Nothing here has been compiled or run. The Docker build, the language-local
-  tests, and both runtime images are unverified.
-- Live authentication and `TransitionChunk` assembly are not implemented. A
-  chunk is treated as recoverable protocol drift.
-- Values are limited to this experiment's JSON-safe subset. Tagged Convex
-  Int64, bytes, special floats, and negative zero are outside scope, and
-  exponent-form JSON numbers are rejected rather than guessed at.
-- Mutations and actions use HTTP. Optimistic updates, journals, mutation
-  replay, and WebSocket writes are deferred.
-- HTTP response framing supports Content-Length, chunked transfer encoding, and
-  connection close, bounded at 2 MiB. Persistent connection reuse is deferred:
-  every call opens its own connection.
-- The adapter reports a pinned runtime string rather than querying the Factor
-  VM for its version. Root-owned verification records the toolchain pin
-  separately.
