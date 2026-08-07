@@ -575,6 +575,12 @@ image and running the check the way it should have been written — because
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- The framework was larger than the budget. Raku's client loads in about 200 MB
+  against a 128 MiB container limit, and roughly 140 MB of that is
+  `Cro::HTTP::Client` alone — the framework, not the client. Disabling the JIT,
+  the optimiser and the thread pool together only reached 176 MB. The fix is not
+  a smaller limit but a smaller dependency: hand-roll the transport, as a dozen
+  clients here already do.
 - V's `net.ssl` verified nothing. Passing `validate: true` looks like it turns
   certificate checking on, but vlib loads a trust store only when a separate
   `verify` field names one, and it never calls
