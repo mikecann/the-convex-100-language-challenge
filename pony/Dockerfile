@@ -176,37 +176,59 @@ RUN mkdir -p /common/etc/ssl/certs /adapter /example && \
 FROM busybox AS runtime-base
 USER 0:0
 COPY --from=busybox-builder /out/busybox /restricted-busybox
+# BusyBox's multicall dispatcher only enters "top-level" mode (--list,
+# explicit `busybox <applet>`) when argv[0]'s basename is literally
+# "busybox"; invoked under any other name it looks that name up directly in
+# the compiled applet table. The restricted binary is therefore verified
+# through a copy at a path still named "busybox" that is deleted before this
+# layer ends, then installed under the applet names it actually serves and
+# never again written to a path literally named busybox: a from-source
+# rebuild that still ends up at /bin/busybox only proves the applet table
+# changed, not that the image stopped being "a copy of BusyBox with a longer
+# denylist" the way this stage's own FROM busybox starts out.
 RUN /bin/busybox sh -c 'set -eu; \
-    /bin/busybox mkdir /policy; \
-    cp /bin/busybox /policy/busybox; \
-    /bin/busybox rm -rf /etc/group /etc/localtime /etc/mtab /etc/network /etc/passwd /etc/shadow /.cache /home /root /sbin /tmp /usr /var /lib; \
-    /bin/busybox find /bin -mindepth 1 -maxdepth 1 ! -name busybox -delete; \
-    /bin/busybox mkdir -p /usr/bin /usr/local/bin; \
-    /bin/busybox ln -s busybox /bin/sh; \
-    for applet in awk cat cut grep head id sed sort tail tr uname uniq wc; do \
-      /bin/busybox ln -s ../../bin/busybox "/usr/bin/$applet"; \
-    done; \
-    /bin/busybox mv /restricted-busybox /bin/busybox; \
-    test "$(/bin/busybox --list | /bin/busybox grep -c "^")" = 18; \
-    for applet in "[" "[[" ash awk cat cut grep head id sed sh sort tail test tr uname uniq wc; do /bin/busybox --list | /bin/busybox grep -Fqx "$applet"; done; \
+    /bin/busybox mkdir /policy /verify; \
+    /bin/busybox cp /bin/busybox /policy/busybox; \
+    /bin/busybox cp /restricted-busybox /verify/busybox; \
+    test "$(/verify/busybox --list | /verify/busybox grep -c "^")" = 18; \
+    for applet in "[" "[[" ash awk cat cut grep head id sed sh sort tail test tr uname uniq wc; do /verify/busybox --list | /verify/busybox grep -Fqx "$applet"; done; \
     for tool in apk apt apt-get curl nc wget; do \
-      if /bin/busybox "$tool" >/dev/null 2>&1; then exit 1; else test "$?" = 127; fi; \
+      if /verify/busybox "$tool" >/dev/null 2>&1; then exit 1; else test "$?" = 127; fi; \
     done; \
-    forbidden="$(/policy/busybox find / -xdev \( -type f -o -type l \) \( -name apk -o -name apt -o -name apt-get -o -name curl -o -name nc -o -name wget -o -name ponyc -o -name corral \) -print)"; \
+    /policy/busybox rm -rf /verify; \
+    /policy/busybox rm -rf /etc/group /etc/localtime /etc/mtab /etc/network /etc/passwd /etc/shadow /.cache /home /root /sbin /tmp /usr /var /lib; \
+    /policy/busybox find /bin -mindepth 1 -maxdepth 1 -delete; \
+    /policy/busybox mkdir -p /usr/bin /usr/local/bin; \
+    /policy/busybox mv /restricted-busybox /bin/sh; \
+    for applet in awk cat cut grep head id sed sort tail tr uname uniq wc; do \
+      /policy/busybox ln /bin/sh "/usr/bin/$applet"; \
+    done; \
+    test -x /bin/sh; \
+    test -x /usr/bin/grep; \
+    for name in apk apt apt-get curl nc wget; do \
+      implicit="$(/bin/sh -c "exec -a $name /bin/sh" >/dev/null 2>&1; printf "%s" "$?")"; \
+      test "$implicit" = 127; \
+      explicit="$(/bin/sh -c "exec -a busybox /bin/sh $name" >/dev/null 2>&1; printf "%s" "$?")"; \
+      test "$explicit" = 127; \
+    done; \
+    forbidden="$(/policy/busybox find / -xdev -path /policy -prune -o \( -type f -o -type l \) \( -name apk -o -name apt -o -name apt-get -o -name busybox -o -name curl -o -name nc -o -name wget -o -name ponyc -o -name corral \) -print)"; \
     test -z "$forbidden"; \
-    /policy/busybox rm -rf /policy'
+    /policy/busybox rm -rf /policy; \
+    test ! -e /policy'
 COPY --from=artifacts /common /
 # The runtime version is not exposed to a Pony program, so the image that pins
 # the toolchain stamps it here and the adapter reports exactly this value.
 ENV PONY_RUNTIME_VERSION=0.58.0
 RUN set -eu; \
     test -x /bin/sh && test -x /usr/bin/id && test -x /usr/bin/grep; \
-    test "$(/bin/busybox --list | /bin/busybox grep -c "^")" = 18; \
+    test ! -e /bin/busybox; \
     for tool in apk apt apt-get curl wget nc gcc cc make ld ponyc corral node npm python python3 convex; do \
-      ! command -v "$tool"; \
+      ! command -v "$tool" >/dev/null 2>&1 || exit 1; \
     done; \
     test -r /etc/ssl/certs/ca-certificates.crt; \
-    test -z "$(find /usr/local/bin -mindepth 1 -maxdepth 1 -print)"
+    for entry in /usr/local/bin/*; do \
+      test "$entry" = "/usr/local/bin/*" || { printf 'unexpected entry: %s\n' "$entry" >&2; exit 1; }; \
+    done
 USER 65532:65532
 
 FROM runtime-base AS example-runtime
