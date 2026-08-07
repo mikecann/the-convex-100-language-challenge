@@ -4,5 +4,44 @@ displayName: "Awk"
 rank: 59
 selectionTier: coverage
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native GNU Awk implementation of the documented JSON HTTP functions and the
+    pinned Live sync profile. A compiled in-process gawk extension built from
+    client/convexext.c supplies bounded TLS sockets, a monotonic clock,
+    SHA-1/base64/randomness, unsigned 64-bit timestamp comparison, and RFC6455
+    frame encode/decode. The Convex HTTP envelope, JSON reader and writer, Live
+    owner and state machine, replay after reconnect, NDJSON adapter, example,
+    and tests are Awk. No curl, websocat, Node, Python, or other delegated
+    client runtime is used.
+toolchain:
+  name: GNU Awk
+  version: 5.3.2
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - The language-local test gate now passes. The gawk source build, the extension, and every test suite run green in Docker. Shared conformance (verify, verify-hosted) has not run yet, so no capability is claimed.
+  - RFC6455 framing, masking, and fragment reassembly live in the compiled extension rather than in Awk; the Live owner, state machine, replay, and protocol validation are Awk.
+  - The client is single threaded by design. The adapter loop interleaves Live pumping with controller commands, so an in-flight HTTP call delays Live reads until its own deadline expires.
+  - WebSocket mutations, WebSocket actions, Live authentication, optimistic updates, journals, and TransitionChunk assembly are deferred.
+  - Live values cover Convex's JSON-safe subset; tagged convex_encoded_json conversions are out of scope.
+  - JSON input is limited to 1 MiB, 128 nesting levels, and 8192 nodes; strings containing U+0000 are refused rather than truncated.
+  - Live is bounded to 64 subscriptions and 768 KiB of charged subscription state so reconnect replay stays below the 1 MiB frame limit, with a newest-8 delivery queue inside 4 MiB; the adapter retains the newest 8 encoded events inside 4 MiB and fails rather than growing when only undroppable responses remain.
+  - DNS resolution is the one unbounded step in a connection; every later step honours a monotonic deadline.
+  - IPv6 deployment URLs in bracket form are refused rather than mis-parsed.
+  - Pinned to gawk 5.3.2 rather than the newer 5.4.x series. A from-source 5.4.1 build miscompiled an `if` combining two array-subscript comparisons with `&&`, evaluating the true branch even when both comparisons were false. Debian's packaged 5.2.1, Alpine's packaged 5.3.2, and a from-source 5.3.2 build all evaluate the same program correctly, so this looks like an upstream 5.4 regression rather than anything in this build.
 capabilities: []
