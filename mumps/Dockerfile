@@ -164,12 +164,13 @@ RUN set -eu; \
     mkdir -p /staging/bin /staging/usr/bin /staging/opt/yottadb/plugin \
              /staging/opt/convex/db /staging/opt/convex/o /staging/etc/ssl/certs; \
     cp -a /bin/dash /staging/bin/sh; \
-    for tool in id cat; do cp -a "/usr/bin/$tool" "/staging/usr/bin/$tool"; done; \
+    for tool in id cat uname; do cp -a "/usr/bin/$tool" "/staging/usr/bin/$tool"; done; \
     cp -aL /opt/yottadb/yottadb /staging/opt/yottadb/yottadb; \
     ln -s ./yottadb /staging/opt/yottadb/mumps; \
     cp -aL /opt/yottadb/libyottadb.so /staging/opt/yottadb/libyottadb.so; \
     cp -aL /opt/yottadb/plugin/libgtmtls.so /staging/opt/yottadb/plugin/libgtmtls.so; \
-    for object in /opt/yottadb/yottadb /opt/yottadb/libyottadb.so /opt/yottadb/plugin/libgtmtls.so; do \
+    for object in /opt/yottadb/yottadb /opt/yottadb/libyottadb.so \
+                  /opt/yottadb/plugin/libgtmtls.so /staging/usr/bin/*; do \
       ldd "$object" 2>/dev/null \
         | awk '{ for (f = 1; f <= NF; f++) if ($f ~ /^\//) print $f }' \
         | while read -r library; do \
