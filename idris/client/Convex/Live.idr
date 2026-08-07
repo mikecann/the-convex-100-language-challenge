@@ -666,11 +666,36 @@ pumpReady live =
                 do now <- nowMs
                    when (now >= at) (ignore (connectNow live))
 
+    -- `wsReadable` only reports bytes a *previous* read has already pulled
+    -- into a userspace buffer (see the `pumpLive` note below): it is never
+    -- satisfied by OS-level readiness alone. On a connection nothing has
+    -- read from yet -- which is every connection the moment its `Add` is
+    -- sent, since `subscribeLive` only ever writes -- `wsReadable` is
+    -- permanently zero, so `drain` below would never call `serviceSocket`
+    -- even once, no matter how long the caller keeps calling `pumpReady` in
+    -- a loop. That was a genuine livelock: `poll` kept reporting the
+    -- descriptor readable, `pumpReady` kept declining to read it, and no
+    -- subscription -- not even its first value -- was ever delivered.
+    --
+    -- `pumpReady` must not block waiting for readiness (an adapter's turn
+    -- loop calls it every iteration and owns its own timeout), so unlike
+    -- `pumpLive`'s `waitForSocket` this cannot `awaitDescriptor`. A single
+    -- non-blocking `refill` attempt is the equivalent primer: it returns
+    -- immediately either way, and when bytes (or an EOF/error signal) are
+    -- actually waiting it makes them visible to `wsReadable` so `drain` can
+    -- act on them in the same turn instead of silently doing nothing.
+    covering
+    primed : WsConnection -> IO Bool
+    primed wire =
+      do added <- refill (wsLink wire)
+         pure (added /= 0)
+
     covering
     drain : WsConnection -> IO ()
     drain wire =
       do readable <- wsReadable wire
-         if readable <= 0
+         ready <- if readable > 0 then pure True else primed wire
+         if not ready
             then pure ()
             else do alive <- serviceSocket live wire
                     if alive then drain wire else pure ()
