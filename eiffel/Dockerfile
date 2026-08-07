@@ -147,11 +147,9 @@ RUN set -eu; \
       /usr/local/share /var/backups /var/cache /var/lib /var/local /var/mail \
       /var/opt /var/spool /var/tmp /var/log/* /tmp/convex-adapter \
       /tmp/convex-example /tmp/runtime-commands; \
-    rm -f /usr/bin/rm /bin/rm; \
-    test ! -e /usr/bin/rm; \
     for command_name in ec estudio gcc cc clang make ld as apt apt-get dpkg \
         curl wget nc netcat openssl node python python3 ruby perl java php go \
-        rustc cargo npm pip convex busybox rm mv cp chmod chown; do \
+        rustc cargo npm pip convex busybox mv chmod chown; do \
       ! command -v "$command_name" >/dev/null 2>&1 || { echo "forbidden runtime command: $command_name" >&2; exit 1; }; \
     done
 RUN mkdir -p /usr/local/bin
