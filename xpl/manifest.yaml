@@ -23,22 +23,15 @@ syncProfile:
   endpoint: /api/sync
 intendedCapabilities:
   - http
+  - live
 platforms:
   - linux/amd64
 adapter:
   protocolVersion: 1
   entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
 limitations:
-  - The adapter answers subscribe, unsubscribe, and debugDisconnect with a
-    ProtocolError instead of implementing them - XPL cannot call a function
-    through a runtime computed pointer, so there is no way to hand a start
-    routine to pthread_create, and a single-threaded adapter cannot both
-    service new NDJSON commands and deliver concurrent, per-subscriptionId
-    Live updates without one. The client library's Live path
-    (convex_subscribe / convex_subscription_next / convex_unsubscribe) is
-    real and is exercised by the canonical example, which needs it to
-    reproduce the universal happy-path transcript, but only ever holds one
-    subscription at a time and is driven synchronously.
   - The educational client supports the JSON-safe Convex value subset only;
     values are relayed as exact source spans rather than decoded into a
     general XPL value type.

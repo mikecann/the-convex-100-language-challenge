@@ -228,6 +228,204 @@ emit_error: procedure(id, name, message, data_json);
     call adapter_write_line(line);
 end emit_error;
 
+/* --- Live: subscription table and the WebSocket side of the reactor ---- */
+/*                                                                        */
+/* There is exactly one Live worker: this reactor. It owns every read,   */
+/* write, reconnect, and query-set version change on the WebSocket, and  */
+/* dispatch by subscriptionId is a table lookup and an if-chain -- never */
+/* a call through a runtime computed pointer -- so none of this needs a  */
+/* thread. A subscription's table slot index doubles as its Convex       */
+/* queryId, which keeps mapping a Transition's modifications back to a   */
+/* subscriptionId a single array read.                                   */
+
+declare MAX_SUBS literally '31';
+declare sub_active(MAX_SUBS) fixed;
+declare sub_id(MAX_SUBS) character;
+declare sub_path(MAX_SUBS) character;
+declare sub_args(MAX_SUBS) character;
+declare sub_has_value(MAX_SUBS) fixed;
+declare sub_last_value(MAX_SUBS) character;
+
+declare g_ws_connected fixed;
+declare g_query_set_version fixed;
+declare g_reconnect_at_ms address;
+declare g_backoff_ms fixed;
+declare g_connections fixed;
+declare g_last_close_reason character;
+
+find_sub_slot: procedure(sid) fixed;
+    declare sid character, i fixed;
+    do i = 0 to MAX_SUBS;
+        if sub_active(i) = 1 & raw_eq(sub_id(i), 0, length(sub_id(i)), sid) = 1
+        then return i;
+    end;
+    return -1;
+end find_sub_slot;
+
+find_free_slot: procedure fixed;
+    declare i fixed;
+    do i = 0 to MAX_SUBS;
+        if sub_active(i) = 0 then return i;
+    end;
+    return -1;
+end find_free_slot;
+
+any_active_sub: procedure fixed;
+    declare i fixed;
+    do i = 0 to MAX_SUBS;
+        if sub_active(i) = 1 then return 1;
+    end;
+    return 0;
+end any_active_sub;
+
+ws_send_add: procedure(query_id, path, args_json) fixed;
+    declare query_id fixed, path character, args_json character, msg character;
+    msg = '{"type":"ModifyQuerySet","baseVersion":' || g_query_set_version ||
+        ',"newVersion":' || (g_query_set_version + 1) ||
+        ',"modifications":[{"type":"Add","queryId":' || query_id ||
+        ',"udfPath":' || json_encode_string('', path) || ',"args":[' ||
+        args_json || ']}]}';
+    if ws_send_frame(1, msg) = 0 then return 0;
+    g_query_set_version = g_query_set_version + 1;
+    return 1;
+end ws_send_add;
+
+ws_send_remove: procedure(query_id) fixed;
+    declare query_id fixed, msg character, ok fixed;
+    msg = '{"type":"ModifyQuerySet","baseVersion":' || g_query_set_version ||
+        ',"newVersion":' || (g_query_set_version + 1) ||
+        ',"modifications":[{"type":"Remove","queryId":' || query_id || '}]}';
+    ok = ws_send_frame(1, msg);
+    if ok = 1 then g_query_set_version = g_query_set_version + 1;
+    return ok;
+end ws_send_remove;
+
+/* Opens the Live connection, sends Connect, then re-adds every
+   currently active table entry (an initial connect and a post
+   disconnect reconnect are the same operation: query set version 0,
+   the full active set re-Added fresh). Returns 1 on success. */
+live_connect: procedure fixed;
+    declare msg character, sid character, i fixed, ok fixed;
+    if ws_connect = 0 then return 0;
+
+    sid = make_uuid;
+    msg = '{"type":"Connect","sessionId":' || json_encode_string('', sid) ||
+        ',"connectionCount":' || g_connections ||
+        ',"lastCloseReason":' || json_encode_string('', g_last_close_reason) ||
+        ',"clientTs":0}';
+    if ws_send_frame(1, msg) = 0 then do;
+        call transport_close(WS_SLOT);
+        return 0;
+    end;
+
+    g_query_set_version = 0;
+    ok = 1;
+    do i = 0 to MAX_SUBS;
+        if sub_active(i) = 1 & ok = 1 then
+            ok = ws_send_add(i, sub_path(i), sub_args(i));
+    end;
+    if ok = 0 then do;
+        call transport_close(WS_SLOT);
+        return 0;
+    end;
+
+    g_ws_connected = 1;
+    g_backoff_ms = 100;
+    return 1;
+end live_connect;
+
+/* Retires the old connection (if one is open) and schedules the next
+   reconnect attempt with exponential backoff from 100 ms up to a
+   15 s cap -- the same profile every Live-capable client in this
+   repository uses. Safe to call whether or not a connection is
+   currently open, so both an unexpected close and a deliberate
+   debugDisconnect can share it. */
+live_disconnect: procedure(reason);
+    declare reason character;
+    if g_ws_connected = 1 then do;
+        call transport_close(WS_SLOT);
+        g_connections = g_connections + 1;
+    end;
+    g_ws_connected = 0;
+    g_last_close_reason = reason;
+    g_reconnect_at_ms = now_ms + g_backoff_ms;
+    g_backoff_ms = g_backoff_ms * 2;
+    if g_backoff_ms > 15000 then g_backoff_ms = 15000;
+end live_disconnect;
+
+emit_subscription_value: procedure(sid, value_json, logs_json);
+    declare sid character, value_json character, logs_json character;
+    declare line character;
+    line = '{"type":"subscription","subscriptionId":' ||
+        json_encode_string('', sid) || ',"value":' || value_json ||
+        ',"logs":' || logs_json || '}';
+    call adapter_write_line(line);
+end emit_subscription_value;
+
+emit_subscription_error: procedure(sid, name, message, data_json);
+    declare sid character, name character, message character, data_json character;
+    declare line character;
+    line = '{"type":"subscription","subscriptionId":' ||
+        json_encode_string('', sid) || ',"error":{"name":' ||
+        json_encode_string('', name) || ',"message":' ||
+        json_encode_string('', message);
+    if length(data_json) > 0 then line = line || ',"data":' || data_json;
+    line = line || '}}';
+    call adapter_write_line(line);
+end emit_subscription_error;
+
+/* Walks one decoded WebSocket text message. A Transition's
+   modifications are fanned out to whichever active subscription each
+   queryId (== table slot index) names; Ping/MutationResponse/
+   ActionResponse and a modification naming an inactive or unknown
+   queryId (a Remove that is still in flight when a fresh Add for the
+   same slot arrives) are silently ignored rather than erroring the
+   connection.
+
+   A rehydration that reconnecting after debugDisconnect triggers --
+   resubscribing from scratch always replays the query's current value
+   even when it has not changed since the last one this adapter
+   already delivered -- is suppressed: only a value that actually
+   differs from the last one sent for that subscription is emitted, so
+   the sequence a caller observes stays initial value, disconnect
+   acknowledgement, external change, updated value, with no duplicate
+   in between. An error is never suppressed this way (there is no
+   equivalent "nothing changed" case for a QueryFailed). */
+dispatch_transition: procedure(msg);
+    declare msg character, more fixed, slot fixed, changed fixed;
+    if ws_transition_begin(msg) = 0 then return;
+    more = 1;
+    do while more = 1;
+        more = ws_transition_next;
+        if more = 1 & g_mod_query_id >= 0 & g_mod_query_id <= MAX_SUBS then do;
+            slot = g_mod_query_id;
+            if sub_active(slot) = 1 then do;
+                if g_mod_is_error = 1 then do;
+                    if g_mod_has_error_data = 1 then
+                        call emit_subscription_error(sub_id(slot),
+                            'FunctionError', g_mod_error_message,
+                            g_mod_error_data_json);
+                    else
+                        call emit_subscription_error(sub_id(slot),
+                            'FunctionError', g_mod_error_message, '');
+                end;
+                else if g_mod_is_update = 1 then do;
+                    changed = 1;
+                    if sub_has_value(slot) = 1 then
+                        if raw_eq(g_mod_value_json, 0, length(g_mod_value_json),
+                                sub_last_value(slot)) = 1
+                        then changed = 0;
+                    if changed = 1 then
+                        call emit_subscription_value(sub_id(slot),
+                            g_mod_value_json, g_mod_logs_json);
+                    sub_last_value(slot) = g_mod_value_json;
+                    sub_has_value(slot) = 1;
+                end;
+            end;
+        end;
+    end;
+end dispatch_transition;
+
 /* --- Command dispatch -------------------------------------------------- */
 
 declare g_client_ready fixed;
@@ -238,6 +436,100 @@ ensure_client: procedure fixed;
     g_client_ready = 1;
     return 1;
 end ensure_client;
+
+handle_subscribe: procedure(id, cmd);
+    declare id character, cmd character, found fixed;
+    declare sid character, path character, args_span character;
+    declare slot fixed, ok fixed;
+
+    found = json_find_member(cmd, 1, 'subscriptionId');
+    if found = 0 then do;
+        call emit_error(id, 'ProtocolError', 'subscribe needs a subscriptionId', '');
+        return;
+    end;
+    sid = json_decode_string(cmd, g_span_start, g_span_end);
+
+    found = json_find_member(cmd, 1, 'path');
+    if found = 0 then do;
+        call emit_error(id, 'ProtocolError', 'subscribe needs a path', '');
+        return;
+    end;
+    path = json_decode_string(cmd, g_span_start, g_span_end);
+
+    found = json_find_member(cmd, 1, 'args');
+    if found = 1 then
+        args_span = substr(cmd, g_span_start, g_span_end - g_span_start);
+    else args_span = '{}';
+
+    if ensure_client = 0 then do;
+        call emit_error(id, g_error_name, g_error_message, '');
+        return;
+    end;
+
+    /* A repeat subscribe on an id already in use invalidates the old
+       one before the new one is added, matching how a same-ID
+       replacement must never let a stale value cross the swap. */
+    slot = find_sub_slot(sid);
+    if slot >= 0 then do;
+        if g_ws_connected = 1 then ok = ws_send_remove(slot);
+        sub_active(slot) = 0;
+    end;
+
+    slot = find_free_slot;
+    if slot < 0 then do;
+        call emit_error(id, 'ProtocolError', 'too many concurrent subscriptions', '');
+        return;
+    end;
+
+    sub_id(slot) = sid;
+    sub_path(slot) = path;
+    sub_args(slot) = args_span;
+    sub_active(slot) = 1;
+    sub_has_value(slot) = 0;
+
+    if g_ws_connected = 0 then ok = live_connect;
+    else ok = ws_send_add(slot, path, args_span);
+
+    if ok = 0 then do;
+        sub_active(slot) = 0;
+        call emit_error(id, g_error_name, g_error_message, '');
+        return;
+    end;
+    call emit_simple(id, 'ack');
+end handle_subscribe;
+
+handle_unsubscribe: procedure(id, cmd);
+    declare id character, cmd character, found fixed;
+    declare sid character, slot fixed, ok fixed;
+    found = json_find_member(cmd, 1, 'subscriptionId');
+    if found = 0 then do;
+        call emit_error(id, 'ProtocolError', 'unsubscribe needs a subscriptionId', '');
+        return;
+    end;
+    sid = json_decode_string(cmd, g_span_start, g_span_end);
+    slot = find_sub_slot(sid);
+    if slot >= 0 then do;
+        sub_active(slot) = 0;
+        if g_ws_connected = 1 then ok = ws_send_remove(slot);
+    end;
+    /* Unsubscribing an id this adapter has no record of is treated as
+       success: it is already gone, which is what the caller wanted. */
+    call emit_simple(id, 'ack');
+end handle_unsubscribe;
+
+handle_debug_disconnect: procedure(id, cmd);
+    declare id character, cmd character;
+    if g_ws_connected = 0 then do;
+        call emit_error(id, 'TransportError', 'Live WebSocket is not connected', '');
+        return;
+    end;
+    /* The old connection is retired (live_disconnect closes it) and
+       reconnect work is scheduled (the backoff deadline is set)
+       before this acknowledges, so the shared controller can rely on
+       the ack meaning both have already happened. */
+    call live_disconnect('DebugDisconnect');
+    call emit_simple(id, 'ack');
+end handle_debug_disconnect;
 
 handle_call: procedure(op, id, cmd);
     declare op character, id character, cmd character;
@@ -359,11 +651,16 @@ dispatch: procedure(cmd) fixed;
         call handle_set_auth(id, cmd);
         return 1;
     end;
-    if raw_eq(op, 0, length(op), 'subscribe') = 1 |
-            raw_eq(op, 0, length(op), 'unsubscribe') = 1 |
-            raw_eq(op, 0, length(op), 'debugDisconnect') = 1 then do;
-        call emit_error(id, 'ProtocolError',
-            'Live is not implemented by this adapter (see manifest.yaml)', '');
+    if raw_eq(op, 0, length(op), 'subscribe') = 1 then do;
+        call handle_subscribe(id, cmd);
+        return 1;
+    end;
+    if raw_eq(op, 0, length(op), 'unsubscribe') = 1 then do;
+        call handle_unsubscribe(id, cmd);
+        return 1;
+    end;
+    if raw_eq(op, 0, length(op), 'debugDisconnect') = 1 then do;
+        call handle_debug_disconnect(id, cmd);
         return 1;
     end;
     if raw_eq(op, 0, length(op), 'close') = 1 then do;
@@ -374,17 +671,48 @@ dispatch: procedure(cmd) fixed;
     return 1;
 end dispatch;
 
-/* --- Entry point -------------------------------------------------- */
+/* --- Entry point: the poll driven reactor --------------------------- */
+/*                                                                      */
+/* Two file descriptors, one loop: the controller connection (NDJSON    */
+/* commands in, events out) and, once at least one subscription needs   */
+/* it, the Live WebSocket. Nothing here is threaded and nothing is      */
+/* called through a runtime computed pointer -- nfds is 1 or 2, and the */
+/* two branches below are it. */
+
+declare POLLIN literally '1';
+declare POLLHUP literally '16';
+declare POLLREADABLE literally '17';
+
+poll: procedure(fds, nfds, timeout_ms) fixed external;
+    declare fds address, nfds address, timeout_ms fixed;
+end poll;
 
 declare listen_spec character;
 declare line character;
 declare running fixed;
+declare pfds(15) bit(8);
+declare pbase address;
+declare poll_nfds fixed;
+declare poll_timeout_ms fixed;
+declare poll_rc fixed;
+declare revents_controller fixed;
+declare revents_ws fixed;
+declare init_i fixed;
 
 /* LF is otherwise only set up lazily inside convex_init, which a
    hello-then-close session never calls; NDJSON framing needs it from
    the very first line this adapter writes. */
 byte(LF, 0) = 10;
 g_client_ready = 0;
+g_ws_connected = 0;
+g_connections = 0;
+g_backoff_ms = 100;
+g_reconnect_at_ms = 0;
+g_last_close_reason = 'InitialConnect';
+do init_i = 0 to MAX_SUBS;
+    sub_active(init_i) = 0;
+end;
+
 listen_spec = env_get('ADAPTER_LISTEN');
 if length(listen_spec) > 0 then do;
     if setup_tcp_adapter(listen_spec) = 0 then call exit(1);
@@ -394,14 +722,73 @@ else do;
     g_adapter_out_fd = 1;
 end;
 
+pbase = addr(pfds(0));
 running = 1;
 do while running = 1;
-    line = adapter_read_line;
-    if length(line) = 0 then running = 0;
-    else do;
-        if line_is_json_object(line) = 0 then
-            call emit_error('', 'ProtocolError', 'malformed adapter command', '');
-        else running = dispatch(line);
+    if g_ws_connected = 0 & any_active_sub = 1 & now_ms >= g_reconnect_at_ms then do;
+        if live_connect = 0 then call live_disconnect('ReconnectFailed');
+    end;
+
+    /* poll() only reports bytes still sitting in the kernel socket
+       buffer. It cannot see application-buffered bytes this client
+       already pulled out of the socket with a read() -- which
+       happens routinely here, since the WebSocket handshake reads
+       whatever the peer sent along with its 101 response (the server
+       is free to pipeline the first frame right after it), and since
+       one read() can return more than one complete frame at once.
+       Drain everything already sitting in recvbuf before ever asking
+       poll() whether there is anything new on the wire; otherwise a
+       pipelined or batched message can sit unprocessed until some
+       unrelated event happens to make the socket "ready" again. */
+    do while g_ws_connected = 1 & g_ws_total > g_ws_consumed;
+        if ws_recv_message = 1 then call dispatch_transition(g_ws_message);
+        else call live_disconnect('TransportError');
+    end;
+
+    coreword(pbase) = g_adapter_in_fd;
+    corehalfword(pbase + 4) = POLLIN;
+    corehalfword(pbase + 6) = 0;
+    poll_nfds = 1;
+    if g_ws_connected = 1 then do;
+        coreword(pbase + 8) = conn_fd(WS_SLOT);
+        corehalfword(pbase + 12) = POLLIN;
+        corehalfword(pbase + 14) = 0;
+        poll_nfds = 2;
+    end;
+
+    /* A bounded wait only when a reconnect is pending, so the backoff
+       deadline above is re-checked promptly; otherwise there is
+       nothing to wake up for except real activity on either fd. */
+    if g_ws_connected = 0 & any_active_sub = 1 then poll_timeout_ms = 200;
+    else poll_timeout_ms = -1;
+
+    poll_rc = poll(pbase, poll_nfds, poll_timeout_ms);
+    if poll_rc > 0 then do;
+        /* revents is checked against POLLIN | POLLHUP, not POLLIN
+           alone: once the peer has half closed its write side, poll()
+           reports POLLHUP on every call from then on (persistently
+           "ready", the classic busy-spin shape) whether or not this
+           side has drained every buffered byte first, and a bare
+           POLLIN check never fires again to notice. Treating either
+           bit as "attempt a read" both drains the last buffered bytes
+           and reaches the read() that turns them into a clean EOF. */
+        revents_controller = corehalfword(pbase + 6);
+        if (revents_controller & POLLREADABLE) ~= 0 then do;
+            line = adapter_read_line;
+            if length(line) = 0 then running = 0;
+            else do;
+                if line_is_json_object(line) = 0 then
+                    call emit_error('', 'ProtocolError', 'malformed adapter command', '');
+                else running = dispatch(line);
+            end;
+        end;
+        if running = 1 & poll_nfds = 2 then do;
+            revents_ws = corehalfword(pbase + 14);
+            if (revents_ws & POLLREADABLE) ~= 0 then do;
+                if ws_recv_message = 1 then call dispatch_transition(g_ws_message);
+                else call live_disconnect('TransportError');
+            end;
+        end;
     end;
 end;
 call close(g_adapter_in_fd);

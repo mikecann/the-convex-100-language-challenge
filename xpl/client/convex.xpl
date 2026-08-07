@@ -1346,6 +1346,134 @@ ws_connect: procedure fixed;
     return 1;
 end ws_connect;
 
+/* ------------------------------------------------------------------ */
+/* Monotonic clock, for reconnect backoff scheduling.                  */
+/* ------------------------------------------------------------------ */
+
+declare CLOCK_MONOTONIC literally '1';
+
+clock_gettime: procedure(clk_id, tp) fixed external;
+    declare clk_id fixed, tp address;
+end clock_gettime;
+
+/* Milliseconds on a monotonic clock. Returned as address (bit(64)),
+   not fixed (32 bits): CLOCK_MONOTONIC's origin is unspecified and on
+   a long-lived host can already be a large number of seconds, which
+   would overflow a 32-bit millisecond count almost immediately. */
+now_ms: procedure address;
+    declare ts(15) bit(8), base address, sec address, nsec address;
+    base = addr(ts(0));
+    call clock_gettime(CLOCK_MONOTONIC, base);
+    sec = corelongword(base);
+    nsec = corelongword(base + 8);
+    return sec * 1000 + nsec / 1000000;
+end now_ms;
+
+/* ------------------------------------------------------------------ */
+/* Transition iterator: multi-subscription Live dispatch.              */
+/*                                                                     */
+/* handle_ws_message below (used by the single-subscription example   */
+/* API) hardcodes queryId 0. The adapter needs to fan a Transition out */
+/* to whichever of potentially many active subscriptions each          */
+/* modification names, so it walks the modifications array itself     */
+/* with this iterator instead of going through handle_ws_message.      */
+/* ------------------------------------------------------------------ */
+
+declare g_trans_msg character;
+declare g_trans_pos fixed;
+declare g_trans_limit fixed;
+declare g_mod_query_id fixed;
+declare g_mod_is_update fixed;
+declare g_mod_is_error fixed;
+declare g_mod_value_json character;
+declare g_mod_logs_json character;
+declare g_mod_error_message character;
+declare g_mod_error_data_json character;
+declare g_mod_has_error_data fixed;
+
+/* Starts iterating a Transition message's modifications. Returns 1 for
+   a Transition (even one with zero modifications -- the caller should
+   just get no ws_transition_next calls back), 0 for any other message
+   type (Ping, MutationResponse, ActionResponse), which the caller
+   should silently skip. */
+ws_transition_begin: procedure(msg) fixed;
+    declare msg character, found fixed;
+    found = json_find_member(msg, 1, 'type');
+    if found = 0 then return 0;
+    if raw_eq(msg, g_span_start, g_span_end - g_span_start, '"Transition"') = 0
+    then return 0;
+    found = json_find_member(msg, 1, 'modifications');
+    if found = 0 then return 0;
+    g_trans_msg = msg;
+    g_trans_pos = g_span_start + 1;
+    g_trans_limit = g_span_end - 1;
+    return 1;
+end ws_transition_begin;
+
+/* Advances to the next modification, filling g_mod_*. Returns 1 if one
+   was found, 0 once the array is exhausted. Modification types other
+   than QueryUpdated/QueryFailed (there are none today, but a future
+   server could add one) are reported with g_mod_query_id only, no
+   value/error -- callers should treat that combination as "nothing to
+   deliver" rather than erroring the whole connection. */
+ws_transition_next: procedure fixed;
+    declare item_start fixed, item_end fixed, found fixed, kind character;
+    g_trans_pos = json_skip_ws(g_trans_msg, g_trans_pos);
+    if g_trans_pos >= g_trans_limit | byte(g_trans_msg, g_trans_pos) = 93
+    then return 0;
+
+    item_start = g_trans_pos;
+    item_end = json_skip_value(g_trans_msg, g_trans_pos);
+
+    g_mod_query_id = -1;
+    g_mod_is_update = 0;
+    g_mod_is_error = 0;
+    g_mod_value_json = 'null';
+    g_mod_logs_json = '[]';
+    g_mod_error_message = '';
+    g_mod_error_data_json = 'null';
+    g_mod_has_error_data = 0;
+
+    found = json_find_member(g_trans_msg, item_start + 1, 'queryId');
+    if found = 1 then
+        g_mod_query_id = parse_uint(g_trans_msg, g_span_start, g_span_end - g_span_start);
+
+    found = json_find_member(g_trans_msg, item_start + 1, 'type');
+    if found = 1 then kind = substr(g_trans_msg, g_span_start, g_span_end - g_span_start);
+    else kind = '';
+
+    if raw_eq(kind, 0, length(kind), '"QueryUpdated"') = 1 then do;
+        g_mod_is_update = 1;
+        found = json_find_member(g_trans_msg, item_start + 1, 'value');
+        if found = 1 then
+            g_mod_value_json = substr(g_trans_msg, g_span_start, g_span_end - g_span_start);
+        found = json_find_member(g_trans_msg, item_start + 1, 'logLines');
+        if found = 1 then
+            g_mod_logs_json = substr(g_trans_msg, g_span_start, g_span_end - g_span_start);
+    end;
+    else if raw_eq(kind, 0, length(kind), '"QueryFailed"') = 1 then do;
+        g_mod_is_error = 1;
+        found = json_find_member(g_trans_msg, item_start + 1, 'errorMessage');
+        if found = 1 then
+            g_mod_error_message =
+                json_decode_string(g_trans_msg, g_span_start, g_span_end);
+        found = json_find_member(g_trans_msg, item_start + 1, 'errorData');
+        if found = 1 then do;
+            g_mod_error_data_json =
+                substr(g_trans_msg, g_span_start, g_span_end - g_span_start);
+            g_mod_has_error_data = 1;
+        end;
+        found = json_find_member(g_trans_msg, item_start + 1, 'logLines');
+        if found = 1 then
+            g_mod_logs_json = substr(g_trans_msg, g_span_start, g_span_end - g_span_start);
+    end;
+
+    g_trans_pos = json_skip_ws(g_trans_msg, item_end);
+    if g_trans_pos < g_trans_limit & byte(g_trans_msg, g_trans_pos) = 44 then
+        g_trans_pos = g_trans_pos + 1;
+    return 1;
+end ws_transition_next;
+
 declare g_query_set fixed;
 declare g_sub_pending_value character;
 declare g_sub_pending_logs character;

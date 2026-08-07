@@ -19,20 +19,22 @@ the mutation, and an idempotent mutation.
 | --- | --- |
 | HTTP queries, mutations and actions | Verified by shared local and hosted conformance |
 | Bearer-token replacement and structured function errors | Verified by shared local and hosted conformance |
-| Live subscribe, the initial value, and one reactive update | Exercised by the canonical example; not claimed as the `live` capability (see below) |
-| Reconnect, `debugDisconnect`, concurrent subscriptions, adapter-driven Live | Not implemented |
+| Live subscribe, unsubscribe, external updates, and query error recovery | Verified by shared local and hosted conformance |
+| Concurrent multi-subscription delivery and five real `debugDisconnect` reconnects | Verified by shared local and hosted conformance |
 
-The `live` capability requires the adapter to answer `subscribe`,
-`unsubscribe`, and `debugDisconnect` for arbitrarily many concurrently
-active subscriptions while still reading new commands from stdin -- in
-practice, a background worker per connection. XPL has no way to call a
-function through a runtime-computed pointer, so there is no start routine to
-hand to `pthread_create`, and this client does not attempt a hand-rolled
-cooperative scheduler to fake one. The Live *client code* is real (see
-`client/convex.xpl`'s `convex_subscribe` / `convex_subscription_next` /
-`convex_unsubscribe`, and the example that drives them against the real
-backend below) -- only the adapter's multi-subscription surface is missing.
-This client reports `intendedCapabilities: [http]` and earns only `http`.
+The adapter's Live surface needs to answer `subscribe`, `unsubscribe`, and
+`debugDisconnect` for arbitrarily many concurrently active subscriptions
+while still reading new NDJSON commands -- normally a job for a background
+worker per connection. XPL has no way to call a function through a
+runtime-computed pointer, so there is no start routine to hand to
+`pthread_create`, and this client does not use threads at all: instead, one
+`poll(2)` call multiplexes the controller connection and the Convex
+WebSocket, subscriptions live in a plain table keyed by `subscriptionId`
+(whose table slot doubles as the Convex `queryId`), and dispatch is an
+`if`/`case` chain over that table rather than an indirect call. See
+`client/tests/conformance/adapter.xpl`'s entry point for the reactor and
+`client/convex.xpl`'s `ws_transition_begin` / `ws_transition_next` for how a
+`Transition` message's modifications get walked without recursion.
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.xpl -->
 ```text
@@ -157,8 +159,7 @@ eof
 canonical example in Docker, and runs the language-local unit tests.
 `./run verify-example xpl` exercises the exact example above against the
 dedicated backend -- including the Live subscription. `./run verify xpl` is
-the shared HTTP conformance gate (the `live` block is skipped because this
-manifest does not intend that capability).
+the shared HTTP and Live conformance gate.
 
 ## Protocol notes and limits
 
@@ -178,10 +179,12 @@ parse tree, and a fragment this client only needs to relay -- call
 arguments, a result value, log lines -- is copied as its exact source span
 instead of being decoded and re-encoded.
 
-The adapter answers `subscribe`, `unsubscribe`, and `debugDisconnect` with a
-`ProtocolError`; see "What works" above for why. Live authentication,
-optimistic updates, WebSocket mutations and actions, tagged (non-JSON-safe)
-Convex values, and `TransitionChunk` assembly are also deferred. XPL has no
+Live authentication, optimistic updates, WebSocket mutations and actions,
+tagged (non-JSON-safe) Convex values, and `TransitionChunk` assembly are
+deferred. A rehydration that reconnecting after `debugDisconnect` triggers is
+suppressed when it repeats the last value already delivered for that
+subscription, so a caller sees initial value, disconnect acknowledgement,
+external change, updated value -- never a duplicate in between. XPL has no
 `#include` or module system, so the Docker build concatenates
 `client/convex.xpl` ahead of each entry point (the adapter, the example,
 and the language-local test program) before invoking the compiler, the same
