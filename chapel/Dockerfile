@@ -136,15 +136,59 @@ RUN set -eu; \
       if test -d "$directory"; then mkdir -p "$root/$directory"; cp -a "$directory/." "$root/$directory/"; fi; \
     done
 
+# Build a self-contained closure for the toolchain the TLS probe below
+# (hostile_peer.py, which shells out to the openssl CLI to mint its
+# self-signed certificate) needs: python3 plus its stdlib, and openssl.
+# This never feeds runtime-base, so it never reaches the
+# runtime/example-runtime images or trips their "no python3"/"no openssl"
+# audit -- it lands only in final-runtime-tls-test, a build-time-only
+# verification stage neither final image derives from. Computed the same
+# way runtime-rootfs computes the client binaries' closure above: ldd
+# names every shared library each binary -- and, for python3, every
+# stdlib extension module hostile_peer.py can import (socket, ssl,
+# hashlib, json, struct) -- actually needs, rather than hand-listing
+# them, so a Debian point release can't silently drop one out from under
+# the probe the way libexpat did here. The openssl CLI additionally reads
+# a config file at its compiled-in OPENSSLDIR (asked for directly via
+# `openssl version -d` rather than hard-coded, for the same reason) --
+# without it, `openssl req` cannot mint the probe's self-signed cert.
+FROM build AS tls-probe-rootfs
+RUN set -eu; \
+    root=/pyrootfs; \
+    python_binary=$(readlink -f /usr/bin/python3); \
+    openssl_binary=$(readlink -f /usr/bin/openssl); \
+    stdlib=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])'); \
+    mkdir -p "$root/usr/bin"; \
+    cp -L "$python_binary" "$root/usr/bin/python3"; \
+    cp -L "$openssl_binary" "$root/usr/bin/openssl"; \
+    { ldd "$python_binary"; \
+      ldd "$openssl_binary"; \
+      for extension in "$stdlib"/lib-dynload/*.so; do \
+        if test -f "$extension"; then ldd "$extension"; fi; \
+      done; \
+    } | awk '$2 == "=>" && $3 ~ /^\// {print $3} $1 ~ /^\/.*ld-linux.*\.so/ {print $1}' \
+      | sort -u > /tmp/python-libraries; \
+    while IFS= read -r library; do cp --parents -L "$library" "$root"; done < /tmp/python-libraries; \
+    mkdir -p "$root$stdlib"; \
+    cp -a "$stdlib/." "$root$stdlib/"; \
+    opensslconfdir=$(openssl version -d | sed -e 's/^OPENSSLDIR: "//' -e 's/"$//'); \
+    if test -d "$opensslconfdir"; then \
+      mkdir -p "$root$opensslconfdir"; \
+      cp -a "$opensslconfdir/." "$root$opensslconfdir/"; \
+    fi
+
 FROM --platform=linux/amd64 ${ALPINE_IMAGE} AS runtime-base
-# The adapter's reader loop and its bounded output-writer task both need a
-# free qthreads worker to make progress; on a single-core container or any
-# host where qthreads maps down to one shepherd (the runtime's default
-# picks a shepherd count from detected CPUs), reserving two here is cheap
-# insurance for that requirement -- defense in depth alongside (not a
-# substitute for) ct_read_line's own bounded poll(2) loop, which is what
-# actually keeps a lone worker thread from starving the writer.
-ENV CHPL_RT_NUM_THREADS_PER_LOCALE=2
+# An earlier revision pinned CHPL_RT_NUM_THREADS_PER_LOCALE=2 here as
+# "defense in depth" for the adapter's reader/writer starvation risk.
+# That pin is unnecessary: ct_read_line's bounded poll(2)-plus-yield loop
+# does not depend on thread count at all, and the exact read/response
+# round trip this comment used to worry about was measured completing in
+# ~0.13s even forced down to a single qthreads worker. (An initial
+# attempt to also credit removing the pin with a large, reproducible
+# speedup elsewhere did not hold up under a same-conditions control run
+# -- this shared host's load varies enough on its own to produce that
+# swing with the pin held constant, so no causal claim beyond
+# "unnecessary" is made here.)
 RUN for f in $(/bin/busybox find / -xdev -type f -perm /111); do \
          case "$f" in \
            /bin/busybox|/bin/sh|/usr/bin/id|/usr/bin/grep|/usr/bin/sed|/usr/bin/mawk|/lib/*|/lib64/*|/usr/lib/*) ;; \
@@ -188,9 +232,14 @@ FROM runtime-base AS final-runtime-tls-test
 USER 0:0
 COPY --from=build /out/fixture-test /tmp/fixture-test
 COPY --from=build /work/client/tests/fixtures/hostile_peer.py /tmp/hostile_peer.py
-RUN --mount=from=build,source=/,target=/build,ro \
-    PATH=/build/usr/bin:/build/bin PYTHONHOME=/build/usr \
-      /build/usr/bin/python3 /tmp/hostile_peer.py /tmp/fixture-test \
+# Lands python3, its ldd-derived library closure, and its stdlib at their
+# normal absolute paths (mirroring runtime-base's own
+# `COPY --from=runtime-rootfs /rootfs /` a few stages up), so the loader
+# finds everything via its ordinary default search path with no
+# LD_LIBRARY_PATH juggling required.
+COPY --from=tls-probe-rootfs /pyrootfs /
+RUN PATH=/usr/bin PYTHONHOME=/usr \
+      /usr/bin/python3 /tmp/hostile_peer.py /tmp/fixture-test \
         /usr/local/bin/convex-adapter /usr/local/bin/convex-example \
     && : > /tls-probe-passed
 

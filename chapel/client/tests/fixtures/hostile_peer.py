@@ -268,26 +268,29 @@ class Fixture:
             conn.sendall(b"\x81\x7d" + b'{"type":')
             time.sleep(1.25)
             # A loaded/virtualized host can delay this process's own view
-            # of socket readiness by several seconds (observed on this
-            # shared, contended host: over 1.8s in one run, over 8s in a
-            # more heavily loaded run, and over 15s in a still more
-            # heavily loaded run, always well after the client had already
-            # abandoned the connection). This settimeout, and the
-            # assertion below, only bound how long the *fixture* waits to
-            # observe that close before complaining -- fixture-side
-            # teardown housekeeping, not the client behavior under test
-            # (which is exercised by the 1.25s stall above) -- so they
-            # carry a generous absolute margin, well under the harness's
-            # overall 90s subprocess budget, rather than racing the
-            # scheduler. Do not tighten this back down without
-            # re-measuring on an idle host.
-            conn.settimeout(23.75)
+            # of socket readiness by tens of seconds under enough
+            # concurrent load (observed on this shared, contended host:
+            # over 1.8s in one run, over 8s in a more heavily loaded run,
+            # over 15s in a still more heavily loaded run, and the whole
+            # multi-round gauntlet this fixture drives taking upwards of a
+            # minute end to end under sustained heavy load -- this margin
+            # has been raised more than once as this host's load grew,
+            # always well after the client had already abandoned the
+            # connection). This settimeout, and the assertion below, only
+            # bound how long the *fixture* waits to observe that close
+            # before complaining -- fixture-side teardown housekeeping,
+            # not the client behavior under test (which is exercised by
+            # the 1.25s stall above) -- so they carry a generous absolute
+            # margin, well under the harness's overall subprocess budget,
+            # rather than racing the scheduler. Do not tighten this back
+            # down without re-measuring on an idle host.
+            conn.settimeout(48.75)
             try:
                 while conn.recv(4096):
                     pass
             except socket.timeout as error:
                 raise AssertionError("partial-frame connection was not retired") from error
-            assert time.monotonic() - started < 25
+            assert time.monotonic() - started < 50
             return
         if mode == "utf8":
             send_frame(conn, 1, b'{"type":"\xff"}')
@@ -303,13 +306,13 @@ class Fixture:
             # round above, for the same reason: this bounds how long the
             # fixture waits to observe the client's close, not how quickly
             # the client actually abandoned the connection.
-            conn.settimeout(24.9)
+            conn.settimeout(49.9)
             try:
                 while conn.recv(4096):
                     pass
             except socket.timeout as error:
                 raise AssertionError("ping-flood connection was not retired") from error
-            assert time.monotonic() - started < 25
+            assert time.monotonic() - started < 50
             return
 
         connect = read_text(conn)
@@ -343,11 +346,11 @@ class Fixture:
             # Same fixture-teardown housekeeping margin as the "partial"
             # and "ping_flood" rounds above: a loaded/virtualized host can
             # delay this process's own view of the old TCP connection's
-            # retirement by seconds, independent of how quickly the client
-            # actually retired it, so this waits well under the harness's
-            # overall 30s subprocess budget rather than racing the
-            # scheduler.
-            assert self.retired[round_number - 1].wait(25), (
+            # retirement by tens of seconds, independent of how quickly
+            # the client actually retired it, so this waits well under
+            # the harness's overall subprocess budget rather than racing
+            # the scheduler.
+            assert self.retired[round_number - 1].wait(50), (
                 "new WebSocket became active before the old TCP retired"
             )
         assert add["baseVersion"] == 0 and add["newVersion"] == 1
@@ -424,7 +427,7 @@ class Fixture:
         if self.failures:
             raise self.failures[0]
         # Same fixture-teardown housekeeping margin as the rounds above.
-        assert self.retired[5].wait(25), "final Live TCP connection was not retired"
+        assert self.retired[5].wait(50), "final Live TCP connection was not retired"
         assert self.ws_index == 14, f"expected 14 WebSocket attempts, got {self.ws_index}"
         assert self.auth_headers == [
             "Bearer opaque-ONE_~!$&'*+.^`|",
@@ -580,15 +583,17 @@ def main() -> None:
             environment["SSL_CERT_FILE"] = os.path.join(directory, "cert.pem")
             # This subprocess walks every HTTP, TLS, slow-peer, short-write,
             # and Live-reconnect round below, several of which now carry
-            # their own generous (up to 25s) fixture-teardown margins for
-            # a loaded/virtualized host. 150s keeps ample headroom above
-            # their sum without being open-ended.
+            # their own generous (up to 50s) fixture-teardown margins for
+            # a loaded/virtualized host, and has itself been observed
+            # taking upwards of a minute end to end under heavy load.
+            # 240s keeps ample headroom above their sum without being
+            # open-ended.
             completed = subprocess.run([
                 sys.argv[1], f"http://127.0.0.1:{fixture.port}",
                 f"https://localhost:{tls_port}",
                 f"ws://127.0.0.1:{slow_ws_port}",
                 f"ws://127.0.0.1:{short_ws_port}",
-            ], timeout=150, check=False, text=True, capture_output=True,
+            ], timeout=240, check=False, text=True, capture_output=True,
                 env=environment)
         finally:
             tls.close()

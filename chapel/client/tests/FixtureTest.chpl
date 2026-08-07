@@ -13,12 +13,12 @@ module ChapelConvexFixtureTest {
     // The first caller subscribes before the Live reconnect loop has even
     // dialed once, so this budget must outlast the whole hostile pre-Add
     // gauntlet (nine dial attempts, several of which deliberately stall,
-    // each with its own up-to-25s fixture-teardown margin -- see the
+    // each with its own up-to-50s fixture-teardown margin -- see the
     // matching comments in hostile_peer.py) ahead of the first real
     // hydration, not just one round's own margin. This is generous test
     // patience for a loaded/virtualized host, not a claim about how fast
     // delivery must be.
-    const deadline = monotonicMillis() + 40000;
+    const deadline = monotonicMillis() + 80000;
     while monotonicMillis() < deadline {
       const update = subscription.next(0.25);
       if !update.available then continue;
@@ -155,7 +155,7 @@ module ChapelConvexFixtureTest {
       // same fixture round-trip that showed multi-second scheduling
       // delays elsewhere in this file, so this is fixture-adjacent test
       // patience, not a claim about debugDisconnect's real-world latency.
-      assert(!client.debugDisconnect(25.0).isPresent);
+      assert(!client.debugDisconnect(50.0).isPresent);
       nextValue(subscription!, expected);
     }
 
