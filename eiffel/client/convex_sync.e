@@ -44,6 +44,7 @@ feature {NONE} -- Initialization
 			create query_to_subscription.make (8)
 			create query_path.make (8)
 			create query_args.make (8)
+			create last_signature.make (8)
 			create pending_events.make (4)
 			last_close_reason := "InitialConnect"
 		end
@@ -176,6 +177,9 @@ feature -- Subscriptions
 			query_to_subscription.remove (query_id)
 			query_path.remove (query_id)
 			query_args.remove (query_id)
+			if last_signature.has (query_id) then
+				last_signature.remove (query_id)
+			end
 		end
 
 feature -- Polling
@@ -395,24 +399,48 @@ feature {NONE} -- Server message handling
 		end
 
 	dispatch_modification (a_kind: STRING; a_query_id: INTEGER; a_modification: CONVEX_JSON_VALUE)
+			-- Reconnecting resends every active query, and the server's
+			-- reply is an ordinary `Transition' the same as any other
+			-- update, even when nothing actually changed. Deliver an event
+			-- only when the decoded state differs from what this
+			-- subscription last reported, so a same-value rehydration
+			-- after `debugDisconnect' never masquerades as (or delays) a
+			-- real change: the caller must still see exactly initial
+			-- value, then the next genuine update, with nothing stale
+			-- in between.
 		local
 			subscription_id: STRING
 			data: detachable CONVEX_JSON_VALUE
+			signature: STRING
 		do
 			subscription_id := query_to_subscription.definite_item (a_query_id)
 			if a_kind.is_equal ("QueryUpdated") and then a_modification.has_field ("value") then
-				pending_events.extend (create {CONVEX_SYNC_EVENT}.make_value (subscription_id, a_modification.field ("value")))
+				signature := "V:" + a_modification.field ("value").to_json
+				if not signature_unchanged (a_query_id, signature) then
+					pending_events.extend (create {CONVEX_SYNC_EVENT}.make_value (subscription_id, a_modification.field ("value")))
+				end
 			elseif a_kind.is_equal ("QueryFailed") and then a_modification.has_field ("errorMessage")
 				and then a_modification.field ("errorMessage").is_string
 			then
 				if a_modification.has_field ("errorData") then
 					data := a_modification.field ("errorData")
 				end
-				pending_events.extend (create {CONVEX_SYNC_EVENT}.make_error (
-					subscription_id, a_modification.field ("errorMessage").string_item, data))
+				signature := "E:" + a_modification.field ("errorMessage").string_item
+				if not signature_unchanged (a_query_id, signature) then
+					pending_events.extend (create {CONVEX_SYNC_EVENT}.make_error (
+						subscription_id, a_modification.field ("errorMessage").string_item, data))
+				end
 			end
 			-- QueryRemoved needs no event: the adapter already stopped
 			-- expecting updates once it asked to unsubscribe.
+		end
+
+	signature_unchanged (a_query_id: INTEGER; a_signature: STRING): BOOLEAN
+			-- Has `a_query_id' already reported exactly `a_signature'?
+			-- Records `a_signature' as the new last-known state either way.
+		do
+			Result := last_signature.has (a_query_id) and then last_signature.definite_item (a_query_id).is_equal (a_signature)
+			last_signature.force (a_signature, a_query_id)
 		end
 
 	json_escaped (a_text: STRING): STRING
@@ -458,5 +486,6 @@ feature {NONE} -- Implementation
 	query_to_subscription: HASH_TABLE [STRING, INTEGER]
 	query_path: HASH_TABLE [STRING, INTEGER]
 	query_args: HASH_TABLE [STRING, INTEGER]
+	last_signature: HASH_TABLE [STRING, INTEGER]
 
 end
