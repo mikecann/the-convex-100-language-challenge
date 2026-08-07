@@ -31,6 +31,8 @@ feature {NONE} -- Initialization
 			status_line: detachable STRING
 		do
 			create buffer.make_empty
+			create last_payload.make_empty
+			last_close_reason := "InitialConnect"
 			create socket.make (a_host, a_port, a_use_tls)
 			if not socket.is_open then
 				last_error := socket.last_error
@@ -178,9 +180,11 @@ feature -- Input
 			-- already closed.
 		require
 			a_reason_attached: a_reason /= Void
+		local
+			ignored_result: BOOLEAN
 		do
 			if is_open then
-				socket.write_all (encode_frame (Opcode_close, close_payload (a_reason)))
+				ignored_result := socket.write_all (encode_frame (Opcode_close, close_payload (a_reason)))
 				is_open := False
 			end
 			socket.close
@@ -421,9 +425,11 @@ feature {NONE} -- Framing
 		end
 
 	send_close_ack
+		local
+			ignored_result: BOOLEAN
 		do
 			if socket.is_open then
-				socket.write_all (encode_frame (Opcode_close, close_payload ("ack")))
+				ignored_result := socket.write_all (encode_frame (Opcode_close, close_payload ("ack")))
 			end
 		end
 
