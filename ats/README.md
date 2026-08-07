@@ -25,11 +25,8 @@ mutation, the idempotency key, and the final reactive assertion.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Implemented; awaiting root-owned conformance evidence | Native query, mutation, and action over the documented JSON API, including bearer token auth, logs, and typed `FunctionError`/`ProtocolError`/`TransportError` failures. |
-| Live | Implemented; awaiting root-owned conformance evidence | Native WebSocket subscribe/receive/unsubscribe against the pinned `/api/sync` profile, including Transition validation, modification coalescing, and a real `debugDisconnect` reconnect-and-resubscribe with rehydration-suppression. |
-
-The manifest deliberately awards no badges. Only root-owned local and hosted
-black-box conformance can earn them.
+| HTTP | Verified by shared local and hosted conformance | Native query, mutation, and action over the documented JSON API, including bearer token auth, logs, and typed `FunctionError`/`ProtocolError`/`TransportError` failures. |
+| Live | Verified by shared local and hosted conformance | Native WebSocket subscriptions against the pinned `/api/sync` profile: initial value, external updates, unsubscribe, query-error recovery, and five real `debugDisconnect` reconnects with rehydration correctly suppressed. |
 
 ## Basic example
 

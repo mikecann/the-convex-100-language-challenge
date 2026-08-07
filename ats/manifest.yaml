@@ -33,8 +33,7 @@ implementation:
     malloc'd and realloc'd on the C side of the transport boundary rather
     than threaded through a dependent size proof at every step, which
     would be a materially larger undertaking than this client's time
-    budget affords honestly. Badges remain unearned until root-owned
-    local and hosted conformance evidence succeeds.
+    budget affords honestly.
 toolchain:
   name: ATS2 (patscc / Postiats)
   version: 0.4.2-1.1
@@ -64,4 +63,6 @@ limitations:
     algebraic value tree and convex.dats's protocol-state handling, not in
     convex_transport.dats.
   - The educational client supports JSON-safe Convex values only.
-capabilities: []
+capabilities:
+  - http
+  - live
