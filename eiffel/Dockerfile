@@ -138,7 +138,8 @@ RUN set -eu; \
     done; \
     cp -a /usr/lib/x86_64-linux-gnu/ossl-modules "$runtime_libs/ossl-modules"; \
     rm -rf /usr/lib/x86_64-linux-gnu; \
-    mv "$runtime_libs" /usr/lib/x86_64-linux-gnu
+    cp -a "$runtime_libs" /usr/lib/x86_64-linux-gnu; \
+    rm -rf "$runtime_libs"
 RUN set -eu; \
     rm -f /usr/bin/awk; ln -s mawk /usr/bin/awk; \
     find /usr/bin /usr/sbin -mindepth 1 -maxdepth 1 -print > /tmp/runtime-commands; \
