@@ -103,14 +103,19 @@ data Channel
   = StdIo
   | TcpChannel Socket
 
--- | `ADAPTER_LISTEN` is `host:port`. The harness always connects to loopback,
--- | and binding elsewhere would expose a test-only control surface, so the
--- | host part is accepted and then ignored in favour of loopback.
+-- | `ADAPTER_LISTEN` is `host:port`, and the host is honoured rather than
+-- | assumed. A controller sharing this network namespace connects to loopback,
+-- | but one running as a peer container reaches this image across a Docker
+-- | network, and a loopback bind refuses every connection from outside the
+-- | namespace while still looking like a healthy listener inside it. Only
+-- | loopback and the unspecified address are accepted, so this test-only
+-- | control surface still cannot be pinned to an arbitrary interface, and the
+-- | container boundary stays the thing that contains it.
 listen :: Client -> String -> Effect Unit
 listen client address = case parseListen address of
   Left reason -> Sys.stderrWrite reason
-  Right port -> do
-    listener <- Sys.listen port
+  Right (Tuple host port) -> do
+    listener <- Sys.listenOn host port
     case listener of
       Left reason -> Sys.stderrWrite ("adapter cannot listen: " <> reason)
       Right socket -> do
@@ -122,18 +127,29 @@ listen client address = case parseListen address of
             Sys.close connection
         Sys.close socket
 
-parseListen :: String -> Either String Int
+parseListen :: String -> Either String (Tuple String Int)
 parseListen address = case stringSplitOnce address ":" of
   Nothing -> Left "ADAPTER_LISTEN must be host:port"
   Just (Tuple host rawPort) -> case parseInt rawPort of
     Nothing -> Left "ADAPTER_LISTEN has an invalid port"
     Just port ->
-      if
-        (host == "127.0.0.1" || host == "localhost" || host == "0.0.0.0")
-          && port > 0
-          && port < 65536 then Right port
-      else Left
-        "ADAPTER_LISTEN must name a loopback-compatible host and valid port"
+      if port > 0 && port < 65536 then case bindHost host of
+        Just bind -> Right (Tuple bind port)
+        Nothing -> Left listenProblem
+      else Left listenProblem
+
+-- | `localhost` is normalised to the address it names, because the bind call
+-- | takes an address and resolving a name at that point would let what this
+-- | listener is reachable from depend on the host's resolver.
+bindHost :: String -> Maybe String
+bindHost host =
+  if host == "127.0.0.1" || host == "localhost" then Just "127.0.0.1"
+  else if host == "0.0.0.0" then Just "0.0.0.0"
+  else Nothing
+
+listenProblem :: String
+listenProblem =
+  "ADAPTER_LISTEN must name a loopback or unspecified host and valid port"
 
 -- ---------------------------------------------------------------------------
 -- Controller

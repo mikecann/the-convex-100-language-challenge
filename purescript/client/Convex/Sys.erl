@@ -10,7 +10,7 @@
 -module(convex_sys@foreign).
 
 -export([connectImpl/7, sendImpl/5, recvImpl/7, close/1,
-         listenImpl/3, listenPortImpl/3, acceptImpl/4, controllingProcess/2,
+         listenImpl/4, listenPortImpl/3, acceptImpl/4, controllingProcess/2,
          monotonicMs/0, randomBytes/1, collectGarbage/0,
          stdinReadImpl/3, stdoutWriteImpl/3, stderrWrite/1,
          otpRelease/0, plainArgumentsImpl/2, getenvImpl/3, halt/1,
@@ -128,13 +128,28 @@ close(Socket) ->
         unit
     end.
 
-listenImpl(Port, Left, Right) ->
+%% The bind address is supplied by the caller rather than fixed here. Loopback
+%% is the right default and every fixture in this repository uses it, but a
+%% conformance controller running in its own container reaches this one across
+%% a Docker network, and loopback inside a container is not the caller's
+%% loopback: binding it there refuses every connection from outside the network
+%% namespace while `/proc/net/tcp` still shows a healthy listener within it.
+listenImpl(Address, Port, Left, Right) ->
     fun() ->
-        Options = tcp_options() ++ [{reuseaddr, true}, {ip, {127, 0, 0, 1}}],
+        Options = tcp_options()
+            ++ [{reuseaddr, true}, {ip, bind_address(Address)}],
         case gen_tcp:listen(Port, Options) of
             {ok, Socket} -> Right({tcp, Socket});
             {error, Reason} -> Left(reason(Reason))
         end
+    end.
+
+%% An address that does not parse binds loopback, because the narrower of the
+%% two is the one that is safe to reach by accident.
+bind_address(Address) ->
+    case inet:parse_address(binary_to_list(Address)) of
+        {ok, Parsed} -> Parsed;
+        {error, _} -> {127, 0, 0, 1}
     end.
 
 listenPortImpl(Socket, Left, Right) ->

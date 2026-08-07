@@ -24,6 +24,7 @@ module Convex.Sys
   , recv
   , close
   , listen
+  , listenOn
   , listenPort
   , accept
   , controllingProcess
@@ -136,10 +137,22 @@ foreign import close :: Socket -> Effect Unit
 -- | Listen on loopback. Port 0 asks the kernel to pick, which keeps the
 -- | fixture servers in the language-local tests from colliding.
 listen :: Int -> Effect (Either String Socket)
-listen port = listenImpl port Left Right
+listen = listenOn "127.0.0.1"
+
+-- | Listen on a named local address. Loopback is the default above and a
+-- | wider address has to be asked for by name, because a listener reachable
+-- | from off the host is not something to arrive at by omission.
+-- |
+-- | `0.0.0.0` is the address a controller running in a separate container has
+-- | to be given: loopback inside a container is a different loopback from the
+-- | caller's, so binding it there refuses every connection from outside that
+-- | network namespace while still looking like a healthy listener from within.
+listenOn :: String -> Int -> Effect (Either String Socket)
+listenOn address port = listenImpl address port Left Right
 
 foreign import listenImpl
-  :: Int
+  :: String
+  -> Int
   -> (String -> Either String Socket)
   -> (Socket -> Either String Socket)
   -> Effect (Either String Socket)

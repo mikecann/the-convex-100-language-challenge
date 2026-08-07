@@ -349,6 +349,37 @@ RUN set -eu; \
     grep -Fq '"language":"purescript"' /tmp/final-adapter.ndjson; \
     grep -Fq '"type":"closed"' /tmp/final-adapter.ndjson
 
+# The shared controller also drives this adapter over TCP from its own
+# container, and a listener bound to loopback *inside* a container is reachable
+# from nothing outside that network namespace. That failure arrives as an
+# ordinary connection refusal, indistinguishable at the far end from a process
+# that crashed, so what `ADAPTER_LISTEN` actually binds is asserted here rather
+# than inferred from a process that started and stayed up. In /proc/net/tcp
+# column 2 is the local address and column 4 the state: 0A is LISTEN, 1F90 and
+# 1F91 are ports 8080 and 8081, 00000000 is the unspecified address and
+# 0100007F is loopback. Two ports keep the two listeners from overlapping.
+RUN set -eu; \
+    cd /tmp; \
+    bound() { \
+      CONVEX_URL=http://127.0.0.1:9 ADAPTER_LISTEN="$1" \
+        /usr/local/bin/convex-adapter >listen.out 2>listen.err & \
+      listener=$!; \
+      found=""; \
+      attempt=0; \
+      while [ -z "$found" ] && [ "$attempt" -lt 100 ]; do \
+        found=$(awk -v port=":$2" \
+          '$4 == "0A" && index($2, port) { print $2; exit }' \
+          /proc/net/tcp || true); \
+        attempt=$((attempt + 1)); \
+        sleep 0.2; \
+      done; \
+      kill "$listener" 2>/dev/null || true; \
+      printf '%s' "$found"; \
+    }; \
+    test "$(bound 0.0.0.0:8080 1F90)" = 00000000:1F90; \
+    test "$(bound 127.0.0.1:8081 1F91)" = 0100007F:1F91; \
+    rm -f listen.out listen.err
+
 # The memory proof, run against the real final adapter rather than a build
 # stage. A named pipe is opened for reading and never read, so every write
 # blocks in the kernel; the input is six commands at the 9 MiB frame limit
