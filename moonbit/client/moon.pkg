@@ -1,0 +1,31 @@
+import {
+  "moonbitlang/core/buffer",
+  "moonbitlang/core/encoding/utf8",
+  "moonbitlang/core/env",
+  "moonbitlang/core/json",
+  "moonbitlang/async",
+  "moonbitlang/async/aqueue",
+  "moonbitlang/async/cond_var",
+  "moonbitlang/async/http",
+  "moonbitlang/async/io",
+  "moonbitlang/async/tls",
+  "moonbitlang/async/websocket",
+}
+
+import {
+  "moonbitlang/core/test",
+  "moonbitlang/core/encoding/base64",
+  "moonbitlang/core/string",
+  "moonbitlang/async/socket",
+} for "test"
+
+import {
+  "moonbitlang/core/test",
+} for "wbtest"
+
+supported_targets = "+native"
+
+options(
+  "max-concurrent-tests": 1,
+  targets: { "debug_hook.mbt": [ "debug" ] },
+)

@@ -1,0 +1,99 @@
+(*TestJSON is a deterministic, offline unit test of ConvexJSON: member
+  extraction, string decode/encode, array iteration, and the integral
+  number regression AGENTS.md calls out (Convex may send a whole number as
+  "0.0"/"1.0"; decoding must accept that shape and reject a genuinely
+  fractional one). It is test-only, not part of the public client.*)
+MODULE TestJSON;
+
+	IMPORT J := ConvexJSON, Shim := ConvexShim, Out;
+
+	VAR
+		failed: BOOLEAN;
+		doc, value, decoded, out: ARRAY 1024 OF CHAR;
+		found, ok: BOOLEAN;
+		n, cursor: INTEGER;
+		elem: ARRAY 1024 OF CHAR;
+
+	PROCEDURE Check(label: ARRAY OF CHAR; cond: BOOLEAN);
+	BEGIN
+		IF cond THEN Out.String("PASS ") ELSE Out.String("FAIL ") END;
+		Out.String(label); Out.Ln;
+		IF ~cond THEN failed := TRUE END
+	END Check;
+
+	(*SetLit assigns a literal to dest, translating a backtick into a
+	  literal double quote; see ConvexSync.obn's AppendBuf for why.*)
+	PROCEDURE SetLit(text: ARRAY OF CHAR; VAR dest: ARRAY OF CHAR);
+	VAR i: INTEGER;
+	BEGIN
+		i := 0;
+		WHILE text[i] # 0X DO
+			IF text[i] = "`" THEN dest[i] := CHR(34) ELSE dest[i] := text[i] END;
+			INC(i)
+		END;
+		dest[i] := 0X
+	END SetLit;
+
+BEGIN
+	failed := FALSE;
+
+	SetLit("{`status`:`success`,`value`:{`room`:`abc`,`count`:1.0,`nested`:[1,2,3]},`logLines`:[`a`,`b`]}", doc);
+	ok := J.Member(doc, "status", value, found);
+	Check("member: doc valid", ok);
+	Check("member: status found", found);
+	Check("member: status raw is quoted", value[0] = CHR(34));
+
+	ok := J.Member(doc, "value", value, found);
+	Check("member: nested value found", ok & found);
+
+	ok := J.Member(value, "count", out, found);
+	Check("member: nested count found", ok & found);
+	Check("integral: 1.0 accepted", J.IsIntegralNumber(out));
+
+	SetLit("{`count`:1.5}", doc);
+	ok := J.Member(doc, "count", out, found);
+	Check("integral: fractional 1.5 is parsed as a number", ok & found);
+	Check("integral: 1.5 rejected", ~J.IsIntegralNumber(out));
+
+	SetLit("{`count`:2.0e1}", doc);
+	ok := J.Member(doc, "count", out, found);
+	Check("integral: 2.0e1 accepted", ok & found & J.IsIntegralNumber(out));
+
+	SetLit("{`logLines`:[`a`,`b`]}", doc);
+	ok := J.Member(doc, "logLines", value, found);
+	Check("logLines found", ok & found);
+	Check("logLines is a string array", J.StringArrayValid(value));
+	ok := J.ArrayBegin(value, cursor);
+	Check("array begin", ok);
+	ok := J.ArrayNext(value, cursor, elem);
+	Check("array next 1", ok);
+	ok := J.DecodeString(elem, decoded);
+	Check("decode a", ok & (decoded[0] = "a") & (decoded[1] = 0X));
+	ok := J.ArrayNext(value, cursor, elem);
+	Check("array next 2", ok);
+	ok := J.ArrayNext(value, cursor, elem);
+	Check("array next end", ~ok);
+	Check("array well formed", J.ArrayWellFormed(value, cursor));
+
+	doc := "42";
+	ok := J.ParseNonNegativeInt(doc, n);
+	Check("parse non-negative int", ok & (n = 42));
+
+	out[0] := 0X;
+	SetLit("He said `hi`", decoded);
+	ok := J.AppendQuoted(decoded, out);
+	Check("quote roundtrip ok", ok);
+	Check("quote roundtrip content", out[0] = CHR(34));
+
+	SetLit("`Hello, world`", doc);
+	ok := J.DecodeString(doc, decoded);
+	Check("decode basic string", ok);
+
+	IF failed THEN
+		Out.String("TestJSON: FAILED"); Out.Ln;
+		Shim.Exit(1)
+	ELSE
+		Out.String("TestJSON: all checks passed"); Out.Ln;
+		Shim.Exit(0)
+	END
+END TestJSON.

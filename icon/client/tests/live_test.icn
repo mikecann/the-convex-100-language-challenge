@@ -1,0 +1,199 @@
+#
+# Real loopback coverage for Live: client/tests/fixtures/ws_fixture.icn is
+# a genuine WebSocket peer (not a mock), so this drives the real client's
+# convex_live_add/convex_live_poll/convex_live_remove/
+# convex_live_debug_disconnect operations through a real RFC 6455
+# handshake, an initial value, an external update, a
+# debugDisconnect-triggered reconnect that resends the active
+# subscription, a QueryFailed-then-recovery cycle, and an update whose
+# WebSocket frame is fragmented mid-character with a control frame
+# interleaved -- the scenarios AGENTS.md's "Live acceptance" section
+# calls out.
+#
+# unicon's `link` resolves an already-compiled `.u` file by looking in the
+# CURRENT WORKING DIRECTORY at compile time, not next to the file that
+# names it, and it never auto-compiles a sibling `.icn` -- so the build
+# always precompiles client/convex.icn once (from a fixed CWD) and every
+# dependent file links it back by that bare name.
+#
+link "convex"
+
+global failures
+
+procedure main()
+   local port, logFile, liveUrl, liveState, events, evt, omega
+
+   failures := 0
+   port := 23200
+   logFile := "/tmp/ws_fixture_" || port || ".log"
+   #
+   # unicon's system(string) is not a plain "hand the string to a shell"
+   # call: it does its own small hand-rolled scan for ">"/"2>&1" and then
+   # always execs and waitpid()s synchronously, silently discarding any
+   # trailing "&" in the string rather than backgrounding it. The
+   # documented way to actually launch a detached process is the 5-arg
+   # form below, whose "nowait" mode returns the child's pid immediately
+   # instead of blocking until the long-running fixture exits.
+   #
+   system(["client/tests/fixtures/ws_fixture", string(port)], &null, logFile, logFile, "nowait")
+   wait_for_ready(logFile)
+
+   liveUrl := "ws://127.0.0.1:" || port || "/api/sync"
+
+   # 1/2: Add opens the connection and sends the subscribe; the initial
+   # value and the external update arrive later, from a poll, and
+   # typically land in the same batch since the fixture sends them back
+   # to back with no delay.
+   liveState := convex_live_new(liveUrl)
+   convex_live_add(liveState, "sub1", "demo:state", table_of(["room", "fixture-room"]))
+   poll_until_counts_seen(liveState, "sub1", [0, 1], "initial value and external update")
+
+   # 3: debugDisconnect must retire the old connection and arm a
+   # reconnect before it acks -- convex_live_debug_disconnect does this
+   # synchronously.
+   convex_live_debug_disconnect(liveState)
+   if liveState.connected = 1 then {
+      failures +:= 1
+      write(&errout, "FAIL debugDisconnect leaves state disconnected before any further poll")
+   }
+
+   # 4/5: polling drives the reconnect once backoff elapses; the fixture's
+   # second connection resends Add (proving query-set rebuild), sends a
+   # QueryFailed then a recovering QueryUpdated, and then one more update
+   # split across two WebSocket frames -- with a PING interleaved between
+   # them -- landing in the middle of a multi-byte UTF-8 character (this
+   # is the fixture's send_fragmented_transition; a wrong reassembly --
+   # per-frame UTF-8 decoding, losing the interleaved PING's effect on
+   # parser state, or restarting at a false frame boundary -- would show
+   # up here as either a spurious ProtocolError/TransportError event or a
+   # corrupted value). All of this is sent back to back with no delay, so
+   # it is watched for in one combined poll loop rather than two
+   # sequential ones: a real recv() commonly returns every one of these
+   # frames in a single batch, and a poll loop that only looks for its
+   # own phase's events would silently consume and discard whichever
+   # later phase's event happened to already be in that same batch.
+   omega := char(195) || char(182)   # o-umlaut, U+00F6, 2-byte UTF-8
+   poll_until_error_then_counts(liveState, "sub1", "ROOM_EMPTY", 2, 3, "ic" || omega || "n",
+      "reconnect: QueryFailed, recovery, then a fragmented update with an interleaved control frame")
+
+   # 6: clean shutdown.
+   convex_live_remove(liveState, "sub1")
+   convex_live_close(liveState)
+
+   if failures = 0 then {
+      write("ALL LIVE LOOPBACK TESTS PASSED")
+      exit(0)
+   }
+   write(failures, " LIVE LOOPBACK TEST(S) FAILED")
+   exit(1)
+end
+
+procedure wait_for_ready(logFile)
+   local attempt, lf, sawReady, line
+   attempt := 0
+   while attempt < 50 do {
+      if lf := open(logFile, "r") then {
+         sawReady := 0
+         every line := !lf do if line == "READY" then sawReady := 1
+         close(lf)
+         if sawReady = 1 then return
+      }
+      busy_wait_ms(100)
+      attempt +:= 1
+   }
+   write(&errout, "ws fixture did not become ready; see ", logFile)
+   exit(1)
+end
+
+procedure busy_wait_ms(ms)
+   local target
+   # live_now_ms() (from the linked client library) is real wall-clock
+   # time; Icon's own &time is documented as *execution* time, which
+   # barely advances while convex_live_poll below is blocked waiting on
+   # the network -- using it here would make every deadline in this file
+   # effectively unbounded.
+   target := live_now_ms() + ms
+   while live_now_ms() < target do &null
+   return
+end
+
+# Polls convex_live_poll (short timeout per call, bounded overall
+# deadline) until an event for subscriptionId has been seen for every
+# count in expectedCounts, scanning each poll's whole event batch rather
+# than stopping at the first match (two expected events can legitimately
+# arrive together in one batch).
+procedure poll_until_counts_seen(liveState, subscriptionId, expectedCounts, label)
+   local seen, remaining, deadline, events, evt, c
+
+   seen := table()
+   every c := !expectedCounts do seen[c] := 0
+   remaining := *expectedCounts
+   deadline := live_now_ms() + 15000
+   while live_now_ms() < deadline & remaining > 0 do {
+      events := convex_live_poll(liveState, 500)
+      every evt := !events do {
+         if evt["subscriptionId"] ~== subscriptionId then next
+         if not member(evt, "value") then next
+         every c := !expectedCounts do {
+            if seen[c] = 0 & evt["value"]["count"] = c then {
+               seen[c] := 1
+               remaining -:= 1
+            }
+         }
+      }
+   }
+   if remaining = 0 then return
+   failures +:= 1
+   write(&errout, "FAIL ", label, ": ", remaining, " expected count(s) not observed within deadline")
+   return
+end
+
+# Polls for three signals that can arrive in any order and in any
+# grouping across separate convex_live_poll batches -- a real recv()
+# commonly returns everything the fixture already sent in one read, so a
+# poll loop that only watches for its own phase's events (and stops as
+# soon as it sees them) would silently consume and discard whichever
+# later phase's event happened to already be sitting in that same batch.
+# Watching for the whole sequence in one loop instead means it never
+# matters how these five WebSocket frames (QueryFailed, the recovering
+# QueryUpdated, and the fragmented update's three frames) get grouped
+# into recv() batches.
+procedure poll_until_error_then_counts(liveState, subscriptionId, expectedCode, recoveryCount, fragmentedCount,
+      expectedLastLanguage, label)
+   local sawError, sawRecovery, sawFragmented, gotLastLanguage, deadline, events, evt
+
+   sawError := 0
+   sawRecovery := 0
+   sawFragmented := 0
+   deadline := live_now_ms() + 15000
+   while live_now_ms() < deadline & (sawError = 0 | sawRecovery = 0 | sawFragmented = 0) do {
+      events := convex_live_poll(liveState, 500)
+      every evt := !events do {
+         if evt["subscriptionId"] ~== subscriptionId then next
+         if member(evt, "error") then {
+            if member(evt["error"], "data") & evt["error"]["data"]["code"] == expectedCode then sawError := 1
+            next
+         }
+         if not member(evt, "value") then next
+         if evt["value"]["count"] = recoveryCount then sawRecovery := 1
+         if evt["value"]["count"] = fragmentedCount then {
+            sawFragmented := 1
+            gotLastLanguage := evt["value"]["lastLanguage"]
+         }
+      }
+   }
+   if sawError ~= 1 | sawRecovery ~= 1 | sawFragmented ~= 1 then {
+      failures +:= 1
+      write(&errout, "FAIL ", label, ": sawError=", sawError, " sawRecovery=", sawRecovery,
+         " sawFragmented=", sawFragmented)
+      return
+   }
+   if gotLastLanguage ~== expectedLastLanguage then {
+      failures +:= 1
+      write(&errout, "FAIL ", label, ": lastLanguage was ", image(gotLastLanguage), " expected ", image(expectedLastLanguage))
+   }
+   return
+end
+
+# table_of is convex.icn's own helper, reused here since link makes it an
+# ordinary, already-available procedure -- no need to redeclare it.

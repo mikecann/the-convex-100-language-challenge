@@ -17,7 +17,7 @@ It is an educational, unofficial protocol demonstration, not a production SDK or
 | Live auth, optimistic mutations, and `TransitionChunk` | Deliberately deferred |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.groovy -->
-```text
+```groovy
 package examples.basics
 
 import convex.ConvexClient

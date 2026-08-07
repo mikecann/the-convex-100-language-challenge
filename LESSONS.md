@@ -345,7 +345,247 @@ contained correctly every time. Proven by diffing the source, the pack output,
 and the published copy. The fix was to stop round-tripping through the local
 repository at all.
 
-## 16. Miscellaneous findings worth a slide
+## 16. A faster machine is a debugging tool
+
+The Modula-2 client's test suite passed on one build host and failed roughly
+half the time on another, faster one. The temptation with an intermittent
+failure is to widen a timeout. The actual cause was a memory bug that the
+slower machine had been hiding.
+
+Its test fixture computed the WebSocket handshake's `Sec-WebSocket-Accept` by
+appending a GUID to the client's key and hashing the result. The append helper
+tracked its output length in a parameter but never wrote a terminating NUL, and
+the next line asked for the length again by scanning for that NUL — so the scan
+ran off the end and hashed a garbage-length input made of whatever happened to
+be on the stack. Whether it worked depended entirely on whether a stray zero
+byte followed the buffer, which depends on how the stack was last used, which
+depends on the machine.
+
+Two lessons sit on top of each other. **An intermittent failure that correlates
+with hardware is usually uninitialised memory, not timing** — and this project
+found the same shape again in Oberon, where the compiler does not zero local
+arrays. And **the fixture was wrong, not the client**: the code under test had
+computed its own key and expected-accept value correctly all along.
+
+## 17. An assumption written in a comment is still an assumption
+
+The ALGOL 60 client stored Convex's sync-protocol timestamps as floating-point
+numbers, with a comment explaining that a `real` holds every integer exactly up
+to 2^53 — which is true, and beside the point. A real deployment's logical
+timestamp is nanosecond-scale, routinely above 10^18, roughly two hundred times
+past that bound. Every genuine timestamp was silently rounded, failed its own
+round-trip check, and surfaced as a misleading "the initial Live value was a
+Convex function error".
+
+The local tests had used timestamps 0 through 4.
+
+Two things generalise. **A bound stated correctly can still be the wrong bound**
+— the comment was accurate about the format and wrong about the data. And
+**test fixtures inherit the author's imagination**: nobody who believed
+timestamps were small would write a fixture with a large one, so the assumption
+protected itself from discovery until a real server sent a real number.
+
+## 18. Undiagnosable failures are a design choice
+
+An investigator spent hours on a hypothesis about container sandboxes throttling
+a client's timing, because a Docker build step failed with exit 1 and no output
+at all. The step was a long `&&` chain of `test` commands ending in a smoke test
+that ran the adapter — so the visible tail looked like the culprit.
+
+It was the second link. `test ! -e /usr/local/bin/convex-example` was false,
+because both launchers were being staged into a shared directory that each leaf
+image then inherited, while each leaf asserted the other's launcher was absent —
+unsatisfiable by construction. `test` reports a false condition as exit 1 with
+nothing written anywhere, so every link's failure looks exactly like every
+other's.
+
+The fix included `set -eux` on those chains, so the trace now names the failing
+link. **A check that cannot say why it failed will eventually cost more than it
+saves** — and the cost lands on whoever is furthest from having written it.
+
+## 19. The agents' most expensive failure was politeness, not error
+
+The single largest source of wasted wall-clock in this project was not a broken
+build. It was agents deciding to wait.
+
+A worker would start a long build on a remote machine, correctly recognise that
+it had nothing useful to do for the next twenty minutes, and end its turn with a
+sentence like "I'll pause here and resume when I'm notified that the backend is
+free." That sounds like good behaviour. It is the reasonable thing a person
+would do. But no such notification exists for a job launched over SSH with
+`nohup` — nothing was ever going to wake them. Ten agents did this at once and
+sat idle for a full window while five rented servers ran nothing, until a check
+of what was actually executing found exactly one live process across the entire
+fleet.
+
+The failure is subtle because the agent's reasoning is locally correct at every
+step. It knows it should not busy-wait. It knows something else is responsible
+for the build. It infers that something will therefore tell it when the build is
+done. That last step is the invention — a plausible mechanism assumed into
+existence because the situation seemed to call for one. The same shape shows up
+in the code bugs elsewhere in this document: **the confident assumption about a
+thing never actually checked is the recurring failure mode**, whether the thing
+is a notification channel, a socket's blocking mode, or a library's UTF-8
+handling.
+
+Two changes fixed it. Every worker brief now says, in as many words, that no
+monitor and no notification exist, that it must poll inline within its own turn,
+and that it must never end a turn while a build is unresolved. And the
+supervisor stopped trusting status reports as a picture of the fleet, replacing
+them with a direct look at what was running:
+
+```
+ps -eo etime,args | grep -E "verify-all [a-z0-9-]+$"
+```
+
+That command found more real problems than any status summary did — idle
+workers, two jobs racing on one machine, and two builds wedged for thirteen
+hours that everyone involved believed were progressing. **Ask the machine what
+it is doing, not the agent.**
+
+## 20. An optimiser that renames your data
+
+ActionScript came closer to working than almost any other blocked entry, and
+then failed for a reason no amount of client debugging would have found.
+
+Nine real defects were fixed first, each interesting in its own right: a
+distribution that nests one directory deeper than its documentation says, a
+package layout that collides with its own source path, `RegExp.exec` returning
+a result object rather than an array, a generated entry point that names its own
+class wrongly on two consecutive lines, and a lone unpaired UTF-16 surrogate
+that cannot survive as a compiled string literal and silently becomes `"?"`.
+
+The blocker underneath them was structural. Apache Royale's Node release build
+runs the whole program through Closure Compiler with advanced optimisations,
+including property renaming, and no flag was found to turn it off. Property
+renaming is safe for a statically typed program, because the compiler can see
+every access. It is not safe for loosely typed `Object` and `*` values, which is
+exactly what JSON is. Two things broke, both reproduced in isolation:
+
+- An object literal's keys were renamed at compile time. `{room: "a"}` went out
+  on the wire to Convex as `{"g":"a"}`. The optimiser had rewritten the
+  *protocol*.
+- A dot-notation read on a dynamic value was renamed to a *different* mangled
+  name than the key it was meant to read, so `command.protocolVersion` returned
+  `undefined` against an object whose real key was untouched.
+
+Fixing the first surfaced the second, which existed at more than ten sites in
+one file alone and very likely across eight more. Every fix is mechanical —
+bracket notation instead of dot notation — but there is no way to know you have
+found them all, and each round trip needs a full build.
+
+The lesson is about where the boundary of your program actually is. **A build
+step that rewrites identifiers is part of your program's semantics, even though
+nothing in your source mentions it.** The client's own logic was correct. It was
+compiled into something that was not.
+
+## 21. The security boundary held, and it cost real time
+
+Halfway through the night a worker was sent a message correcting its plan and
+telling it the fleet had idle machines it could expand onto. It refused. Its
+reasoning, quoted from its report, was that the message arrived mid-session
+claiming to be from the coordinator, instructed it to push code to hosts that
+were never in its original authorisation, and justified itself with a claim
+about its own tooling that it could not confirm. So it carried on with only the
+host it had been given, and flagged the message for review rather than acting
+on it.
+
+The message was genuine, and the refusal cost several hours of parallelism.
+
+It was still the right call. An agent that will expand its own blast radius
+because a message told it to is an agent that will do so when the message is
+hostile, and every property that makes this project's evidence trustworthy —
+one machine per worker, one verification at a time, evidence tied to an exact
+clean commit — depends on workers not quietly widening their own scope. The
+same suspicion appears elsewhere in this project: a worker refused to widen a
+listening socket from loopback to all interfaces until a human reviewed and
+approved the change, which was also correct, and the change was approved.
+
+What the incident actually shows is that **authority has to travel through the
+channel the worker was told to trust, not through the content of a message.**
+Instructions embedded in something an agent reads are data. The fix is not to
+teach workers to be more credulous; it is to give them a briefing complete
+enough that mid-flight expansion is rarely needed, and to make the legitimate
+channel unambiguous when it is.
+
+## 22. The safety check that could not fail, three times over
+
+The project's central claim is that every language ships a minimal runtime
+image: no compiler, no package manager, no shell toolbox, nothing but what
+serving Convex traffic requires. Each language's Dockerfile ends with a loop
+that proves it:
+
+```sh
+for command_name in gcc cc clang make ld as apt apt-get dpkg curl wget \
+    node python python3 rustc cargo npm pip convex busybox; do
+  ! command -v "$command_name" >/dev/null 2>&1
+done
+```
+
+Read it and it looks airtight. It cannot reject anything, for three independent
+reasons, any one of which alone would be enough:
+
+1. **A `for` loop's exit status is only its last iteration's.** POSIX says so
+   plainly. Twenty of those names are evaluated and thrown away. The only one
+   genuinely asserted absent is `busybox`, because it happens to be last.
+2. **`set -e` does not apply to a pipeline beginning with `!`.** Also POSIX,
+   also explicit. So even as a standalone statement, `! command -v gcc` never
+   aborts a build.
+3. **In at least one image, `command` did not exist.** That client builds a
+   purpose-trimmed BusyBox without the `cmdcmd` applet, so `command` was
+   neither a builtin nor on disk and every lookup returned 127 — "not found",
+   which `!` obligingly turned into success.
+
+Thirty-three merged languages carried some version of this. The correct form
+was already in the repository — one client wrote `! command -v "$name" || exit
+1` — so this was not ignorance, it was a broken shape getting copied from
+neighbour to neighbour faster than the working one.
+
+Two things make this worth a slide rather than a footnote. First, it is the
+same failure as the never-failing unit tests earlier in this document, in a
+completely different language and layer: **a check nobody has ever seen fail is
+indistinguishable from a check that cannot fail, and the only way to tell them
+apart is to break something on purpose and confirm it screams.** Second, it was
+found by reading, not by running. No verification run would ever have surfaced
+it, because the symptom of a vacuous check is that everything passes.
+
+There is a real question underneath, and honesty requires separating it from
+the defect: were the images actually clean? The gate being broken does not by
+itself mean anything got through it. So it was measured — all thirty-three
+images built, and the check run the way it should have been written.
+
+**Twelve of the thirty-three leaked.** This was not a paperwork problem.
+
+Seven of them — cpp, crystal, dart, elixir, go, pony and rust — are built
+`FROM` the stock BusyBox image, which ships `httpd`, `ftpd`, `inetd`, `wget`,
+`nc`, `telnet`, `ar`, `dpkg` and `rpm` as applets. So an image described as
+containing nothing beyond what serving Convex traffic requires contained a web
+server, an FTP daemon and two network clients. Perl leaked into three images
+that declare Node as their runtime and into one that has nothing to do with
+Perl.
+
+The best detail is rust's. Its Dockerfile reads `FROM ${BUSYBOX_IMAGE} AS
+runtime-base`, and five lines later its policy loop lists `busybox` among the
+commands it asserts are absent. **The image asserted the absence of the thing
+it was built on.** That is not a check that failed to notice a leak; it is a
+check whose success was impossible to reconcile with the file directly above
+it, and nobody noticed because it never spoke.
+
+Three things follow, and the third is the one worth arguing about:
+
+1. The check now lives in the shared harness, once, where it cannot be copied
+   wrong — rather than as a stanza pasted into a hundred Dockerfiles.
+2. It reads the image's filesystem listing through `docker export` instead of
+   running a shell inside the image. Three of the leaking images turned out to
+   have no usable `printf`, `echo` or `command` at all, which is precisely how
+   an in-image check becomes unreliable in the images that need it most.
+3. Finding this *late* was expensive, and it was found only because someone
+   asked whether a passing check had ever actually rejected anything. That
+   question is cheap and almost never asked. **The audit that matters is not
+   "do the checks pass" but "has any check here ever failed, and can I make it
+   fail on purpose right now?"**
+
+## 23. Miscellaneous findings worth a slide
 
 - A client passed every check except one, and the one failure was in the
   *reference* implementation used for comparison, not the client under test.
@@ -360,3 +600,42 @@ repository at all.
 - One test asserted a send would *fail* within its deadline. Read quickly, it
   looks like an assertion that the send succeeds. An agent nearly "fixed" the
   client to satisfy a misreading of the test; it stopped and checked instead.
+- A minimal image reported `awk: not found` while `awk` was still sitting in
+  `/usr/bin`. Debian points `/usr/bin/awk` at mawk through `/etc/alternatives`,
+  and the prune deleted that directory. The allow-list had carefully preserved
+  both `awk` and `mawk` by name — and left the first as a dangling symlink.
+  Preserving a *name* is not preserving a *program*.
+- Unison could open the socket and still could not be built. The proof was
+  real: a certificate-verified TLS handshake against a public host and a
+  decrypted `HTTP/1.1 200 OK` read back, from Unison source, with the socket
+  functions confirmed as genuine runtime builtins. It failed on the other axis
+  entirely — the only route to the standard library is a build-time round trip
+  to one hosted third-party service, because the git-remote syntax has been
+  removed from the parser and the GitHub mirror is deprecated. The builtins
+  underneath are still there, but they are addressable only by content hash,
+  and there is no offline way to learn a hash without first asking the service
+  that knows the name. A language where nothing has a name until something
+  tells you what the hashes are called cannot be built hermetically.
+- The framework was larger than the budget. Raku's client loads in about 200 MB
+  against a 128 MiB container limit, and roughly 140 MB of that is
+  `Cro::HTTP::Client` alone — the framework, not the client. Disabling the JIT,
+  the optimiser and the thread pool together only reached 176 MB. The fix is not
+  a smaller limit but a smaller dependency: hand-roll the transport, as a dozen
+  clients here already do.
+- V's `net.ssl` verified nothing. Passing `validate: true` looks like it turns
+  certificate checking on, but vlib loads a trust store only when a separate
+  `verify` field names one, and it never calls
+  `SSL_CTX_set_default_verify_paths`. The context is left with no CA at all, so
+  every handshake fails — and the image's `SSL_CERT_FILE` is not consulted,
+  because vlib does not read it. The flag named after the security property was
+  not the flag that supplied it.
+- A library copied by `cp -a` arrived as a dangling symlink. `ldd` reports the
+  SONAME, `libgmp.so.10`, which on Debian is a symlink to `libgmp.so.10.4.1`;
+  `cp -a` preserves symlinks rather than following them, so the pointer was
+  staged and the file it pointed at never was. Six libraries in that image were
+  dangling. Three others happened to be real files rather than symlinks, which
+  is the only reason the image got far enough to fail informatively.
+- Two Pharo defects were stacked, and the first completely hid the second. Only
+  after the image stopped crashing at boot did anything reach the adapter's
+  listening socket, which then failed every `accept()` because the listen
+  backlog was 1. Fixing a bug is also how you find the next one.

@@ -1,0 +1,78 @@
+schemaVersion: 1
+id: icon
+displayName: "Icon"
+rank: 39
+selectionTier: ranked
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Unicon implementation of the Convex HTTP API and the pinned
+    /api/sync protocol. JSON encoding and decoding, HTTP request/response
+    handling, RFC 6455 WebSocket framing and masking, SHA-1 and base64 for
+    the WebSocket handshake, and the full sync state machine (Connect,
+    ModifyQuerySet, Transition, reconnect with exponential backoff, dedup)
+    are all written in Unicon (client/convex.icn), compiled and linked
+    together with the adapter and the example at build time the same way
+    every other Unicon program is. Fragmented WebSocket messages are
+    reassembled from raw bytes across frame boundaries before UTF-8 is
+    validated once on the complete message, and control frames (ping/
+    pong/close) are handled between fragments of a data message without
+    disturbing that assembly, per RFC 6455. Unicon has real native TCP
+    sockets but
+    no TLS, so a small C shim (client/shim.c) supplies raw byte transport
+    -- connect/listen/accept/send/recv/close and the OpenSSL TLS handshake
+    -- loaded with Unicon's own loadfunc() foreign function interface, the
+    documented mechanism for exactly this. The shim also supplies one
+    non-transport primitive: wall-clock milliseconds, because Icon/Unicon's
+    built-in &time keyword is documented as *execution* time and barely
+    advances while blocked in poll()/recv(), which would otherwise leave
+    Live's reconnect backoff and every read deadline effectively unbounded.
+    Toolchain built from source (uniconproject/unicon, pinned commit) since
+    Debian does not package Unicon.
+toolchain:
+  name: Unicon
+  version: 13.2-16bebbfd
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    Language-local Docker tests pass from a clean build; shared local and
+    hosted black-box conformance have not been run yet, so the capability
+    list below reflects no earned badges rather than an evaluator award.
+  - >-
+    The Unicon toolchain is built from source in the test stage (Debian
+    does not package it), pinned to a specific upstream commit. Its
+    graphics, 3D graphics, audio, VOIP, concurrency, built-in pattern
+    type, and built-in database features are disabled (--disable-graphics
+    --disable-graphics3d --disable-audio --disable-voip
+    --disable-concurrency --disable-pattern --disable-database): none of
+    them are needed for a headless network client, and disabling them
+    removes a large, otherwise-unused build surface. Plugins (loadfunc)
+    stay enabled, since the client's own C shim is loaded that way --
+    --enable-thin looks like the obvious way to shed the same surface, but
+    it also silently disables plugins.
+  - >-
+    Live authentication, WebSocket-issued mutations and actions, journals,
+    and TransitionChunk assembly are deferred; receiving a TransitionChunk
+    is reported as protocol drift and the connection reconnects.
+  - >-
+    The C shim is deliberately narrow: raw connect/listen/accept/send/
+    recv/close, the OpenSSL handshake, and a wall-clock-milliseconds
+    reader only. No Convex, HTTP, JSON, or WebSocket behaviour lives in C.
+capabilities:
+  - http
+  - live
