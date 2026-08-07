@@ -403,7 +403,47 @@ The fix included `set -eux` on those chains, so the trace now names the failing
 link. **A check that cannot say why it failed will eventually cost more than it
 saves** — and the cost lands on whoever is furthest from having written it.
 
-## 19. Miscellaneous findings worth a slide
+## 19. The agents' most expensive failure was politeness, not error
+
+The single largest source of wasted wall-clock in this project was not a broken
+build. It was agents deciding to wait.
+
+A worker would start a long build on a remote machine, correctly recognise that
+it had nothing useful to do for the next twenty minutes, and end its turn with a
+sentence like "I'll pause here and resume when I'm notified that the backend is
+free." That sounds like good behaviour. It is the reasonable thing a person
+would do. But no such notification exists for a job launched over SSH with
+`nohup` — nothing was ever going to wake them. Ten agents did this at once and
+sat idle for a full window while five rented servers ran nothing, until a check
+of what was actually executing found exactly one live process across the entire
+fleet.
+
+The failure is subtle because the agent's reasoning is locally correct at every
+step. It knows it should not busy-wait. It knows something else is responsible
+for the build. It infers that something will therefore tell it when the build is
+done. That last step is the invention — a plausible mechanism assumed into
+existence because the situation seemed to call for one. The same shape shows up
+in the code bugs elsewhere in this document: **the confident assumption about a
+thing never actually checked is the recurring failure mode**, whether the thing
+is a notification channel, a socket's blocking mode, or a library's UTF-8
+handling.
+
+Two changes fixed it. Every worker brief now says, in as many words, that no
+monitor and no notification exist, that it must poll inline within its own turn,
+and that it must never end a turn while a build is unresolved. And the
+supervisor stopped trusting status reports as a picture of the fleet, replacing
+them with a direct look at what was running:
+
+```
+ps -eo etime,args | grep -E "verify-all [a-z0-9-]+$"
+```
+
+That command found more real problems than any status summary did — idle
+workers, two jobs racing on one machine, and two builds wedged for thirteen
+hours that everyone involved believed were progressing. **Ask the machine what
+it is doing, not the agent.**
+
+## 20. Miscellaneous findings worth a slide
 
 - A client passed every check except one, and the one failure was in the
   *reference* implementation used for comparison, not the client under test.
