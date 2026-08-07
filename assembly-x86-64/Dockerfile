@@ -63,33 +63,57 @@ EOF
 # shared harness actually drives verify/verify-hosted through, including a
 # check that a non-loopback peer cannot reach the loopback-only listener.
 #
-# Both nc calls redirect to a file and read it back afterward rather than
-# capturing nc's own stdout with `$(cmd | nc ...)` directly: that command-
-# substitution-around-a-pipe-into-nc shape reliably hangs specifically
-# inside this BuildKit heredoc RUN step on the verified build host (never
-# under a plain `docker run`/`docker exec`, and never with nc's output
-# redirected to a file instead of captured through the pipe) -- a shell/
-# BuildKit interaction, not a client bug: the exact same adapter binary,
-# reached the exact same way, answers correctly and instantly either way.
+# Every step here is driven by polling a marker file rather than a foreground
+# `nc` invocation or a shell `wait` builtin: on the verified build host, an
+# `nc` client run in the foreground of this heredoc RUN step -- whether or
+# not its output is captured through a pipe -- reliably hangs past its own
+# `timeout`, even though the exact same adapter binary, reached the exact
+# same way, answers correctly and instantly under a plain `docker run`/
+# `docker exec`, or when `nc` itself is backgrounded. That is a BuildKit/
+# shell interaction specific to this RUN-step execution model, not a client
+# bug, so the workaround lives here rather than in the client.
 RUN <<'EOF'
 set -eu
+wait_for() {
+  file=$1; budget=$2; n=0
+  while test ! -e "$file"; do
+    if test "$n" -ge "$budget"; then
+      printf '%s\n' "timed out waiting for $file" >&2
+      return 1
+    fi
+    sleep 1
+    n=$((n + 1))
+  done
+}
 ADAPTER_LISTEN=127.0.0.1:18080 /build/convex-adapter &
 adapter_pid=$!
 sleep 1
 container_address=$(ip -4 addr show eth0 | awk '/inet / {sub("/.*", "", $2); print $2; exit}')
-printf '%s\n' \
-  '{"id":"wrong-host","protocolVersion":1,"op":"hello"}' \
-  '{"id":"wrong-close","op":"close"}' | timeout 3 nc -w 1 "$container_address" 18080 >/tmp/non_loopback.out 2>/dev/null || true
+( printf '%s\n' \
+    '{"id":"wrong-host","protocolVersion":1,"op":"hello"}' \
+    '{"id":"wrong-close","op":"close"}' | nc -w 1 "$container_address" 18080 >/tmp/non_loopback.out 2>/dev/null
+  touch /tmp/non_loopback.done ) &
+wait_for /tmp/non_loopback.done 8
 non_loopback=$(cat /tmp/non_loopback.out)
 if test -n "$non_loopback"; then
   printf '%s\n' 'loopback adapter unexpectedly accepted a non-loopback connection' >&2
   exit 1
 fi
-printf '%s\n' \
-  '{"id":"tcp-hello","protocolVersion":1,"op":"hello"}' \
-  '{"id":"tcp-close","op":"close"}' | timeout 10 nc 127.0.0.1 18080 >/tmp/actual.out
+( printf '%s\n' \
+    '{"id":"tcp-hello","protocolVersion":1,"op":"hello"}' \
+    '{"id":"tcp-close","op":"close"}' | nc 127.0.0.1 18080 >/tmp/actual.out 2>/dev/null
+  touch /tmp/actual.done ) &
+wait_for /tmp/actual.done 15
 actual=$(cat /tmp/actual.out)
-wait "$adapter_pid"
+n=0
+while kill -0 "$adapter_pid" 2>/dev/null; do
+  if test "$n" -ge 10; then
+    printf '%s\n' 'adapter did not exit after processing close' >&2
+    exit 1
+  fi
+  sleep 1
+  n=$((n + 1))
+done
 printf '%s\n' "$actual" | grep -F '"id":"tcp-hello","protocolVersion":1,"type":"ready"'
 printf '%s\n' "$actual" | grep -Fx '{"id":"tcp-close","type":"closed"}'
 EOF
