@@ -2,7 +2,7 @@ schemaVersion: 1
 id: seed7
 displayName: "Seed7"
 rank: 21
-selectionTier: coverage
+selectionTier: ranked
 implementation:
   status: attempting
   provenance: native
