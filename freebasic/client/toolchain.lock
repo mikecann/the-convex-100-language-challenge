@@ -1,0 +1,11 @@
+# FreeBASIC toolchain pin for the Docker build.
+#
+# Debian does not package FreeBASIC, so the compiler is built from the official
+# bootstrap source release inside the build stage. The bootstrap archive ships
+# pre-generated C sources, so gcc alone can produce the first fbc.
+#
+# The official SourceForge release archive was downloaded directly and hashed
+# during the source audit. The compiler build itself remains unexecuted.
+
+url=https://downloads.sourceforge.net/project/fbc/FreeBASIC-1.10.1/Source/FreeBASIC-1.10.1-source-bootstrap.tar.xz
+sha256=2fae2c66b435240d4de11bb534843baa188574508a8a5bdaa5020bf729bf0a3e

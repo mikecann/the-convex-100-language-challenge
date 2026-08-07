@@ -4,5 +4,44 @@ displayName: "FreeBASIC"
 rank: 63
 selectionTier: coverage
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native FreeBASIC client. JSON, HTTP/1.1 framing, RFC 6455, the Convex
+    envelopes, and the /api/sync state machine are all written in FreeBASIC.
+    OpenSSL supplies TLS and the CSPRNG, and libc supplies sockets, the
+    monotonic clock, and number formatting, through direct extern declarations.
+    Nothing shells out to another Convex client, Node.js, Python, curl, or the
+    Convex CLI.
+toolchain:
+  name: FreeBASIC
+  version: "1.10.1 (self-hosted build from the official bootstrap source release)"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities: [http, live]
+platforms: [linux/amd64]
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands: [debugDisconnect]
+limitations:
+  - FreeBASIC has no standard formatter, so a deterministic in-repo style gate
+    stands in for one.
+  - Live authentication is not implemented. setAuth applies to the HTTP
+    endpoints only, which is what the shared conformance suite exercises.
+  - Live delivery uses a client-owned mailbox bounded to 16 updates per
+    subscription and 8 MiB across all subscriptions; the oldest updates for a
+    slow consumer are dropped first.
+  - DNS resolution is synchronous and may outlive the requested connect timeout
+    if the host resolver itself stalls.
+  - The Live owner and adapter relay threads are created with an explicit
+    8 MiB stack rather than FreeBASIC's ThreadCreate default; the default was
+    not enough for a real subscription's call chain against a real backend
+    and segfaulted with a stack-overflow signature that a smaller local test
+    fixture never reproduced.
+capabilities:
+  - http
+  - live
