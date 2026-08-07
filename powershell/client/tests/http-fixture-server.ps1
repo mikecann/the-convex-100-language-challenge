@@ -53,7 +53,16 @@ function Write-Headers(
     [int] $StatusCode,
     [string[]] $Headers
 ) {
-    $reason = if ($StatusCode -eq 200) { 'OK' } elseif ($StatusCode -eq 400) { 'Bad Request' } else { 'Internal Server Error' }
+    # Convex answers a failed function with 560 as well as the ordinary 400 and
+    # 500, so the fixture has to be able to emit that exact status line.
+    $reason = switch ($StatusCode) {
+        200 { 'OK' }
+        400 { 'Bad Request' }
+        500 { 'Internal Server Error' }
+        502 { 'Bad Gateway' }
+        560 { 'Convex Error' }
+        default { 'Internal Server Error' }
+    }
     $lines = @("HTTP/1.1 $StatusCode $reason", 'Content-Type: application/json', 'Connection: close') + $Headers + @('', '')
     $bytes = $utf8.GetBytes(($lines -join "`r`n"))
     $Stream.Write($bytes, 0, $bytes.Length)
@@ -124,8 +133,15 @@ function Write-Chunk(
     $Stream.Flush()
 }
 
-function Write-OverLimitChunkedResponse([Net.Sockets.NetworkStream] $Stream) {
-    Write-Headers $Stream 200 @('Transfer-Encoding: chunked')
+function Write-OverLimitChunkedResponse(
+    [Net.Sockets.NetworkStream] $Stream,
+    [int] $StatusCode = 200
+) {
+    # Chunked framing declares no Content-Length, so the client cannot reject
+    # this from headers alone and has to stop while streaming. Emitting it on a
+    # failing status proves the 8 MiB bound still applies once the error
+    # envelope is parsed before the status.
+    Write-Headers $Stream $StatusCode @('Transfer-Encoding: chunked')
     [byte[]]$chunk = [byte[]]::new(16KB)
     [Array]::Fill[byte]($chunk, [byte][char]'x')
     $remaining = [long]$maximumBodyBytes + 1
@@ -200,6 +216,24 @@ try {
                     'fixture:httpLogLinesType' { Write-FixedResponse $stream '{"status":"success","value":true,"logLines":"bad"}' }
                     'fixture:httpLogLineType' { Write-FixedResponse $stream '{"status":"success","value":true,"logLines":[1]}' }
                     'fixture:httpFunctionError' { Write-FixedResponse $stream '{"status":"error","errorMessage":"expected raw failure","errorData":{"code":"RAW"},"logLines":["raw log"]}' }
+                    # A complete Convex error envelope on each status Convex
+                    # actually uses for a failed function. Two log lines prove
+                    # the array survives in order rather than being flattened.
+                    'fixture:http560FunctionError' { Write-FixedResponse $stream '{"status":"error","errorMessage":"expected 560 failure","errorData":{"code":"560","detail":{"nested":true}},"logLines":["560 first log","560 second log"]}' 560 }
+                    'fixture:http500FunctionError' { Write-FixedResponse $stream '{"status":"error","errorMessage":"expected 500 failure","errorData":{"code":"500","detail":{"nested":true}},"logLines":["500 first log","500 second log"]}' 500 }
+                    'fixture:http400FunctionError' { Write-FixedResponse $stream '{"status":"error","errorMessage":"expected 400 failure","errorData":{"code":"400","detail":{"nested":true}},"logLines":["400 first log","400 second log"]}' 400 }
+                    # A recognizable Convex error envelope that then breaks the
+                    # envelope contract stays a protocol fault on 560.
+                    'fixture:http560MissingErrorMessage' { Write-FixedResponse $stream '{"status":"error"}' 560 }
+                    'fixture:http560ErrorMessageType' { Write-FixedResponse $stream '{"status":"error","errorMessage":12}' 560 }
+                    'fixture:http560LogLinesType' { Write-FixedResponse $stream '{"status":"error","errorMessage":"bad logs","logLines":"nope"}' 560 }
+                    # Bodies that never identify themselves as Convex envelopes.
+                    # The failing status is the only honest classification.
+                    'fixture:http560Malformed' { Write-FixedResponse $stream '{"status":' 560 }
+                    'fixture:http560UnknownStatus' { Write-FixedResponse $stream '{"status":"maybe","value":true}' 560 }
+                    'fixture:http560NonObject' { Write-FixedResponse $stream '[]' 560 }
+                    'fixture:http502Html' { Write-FixedResponse $stream '<html><head><title>502 Bad Gateway</title></head><body>proxy</body></html>' 502 }
+                    'fixture:http560OverLimit' { Write-OverLimitChunkedResponse $stream 560 }
                     'fixture:httpExactBoundary' { Write-SizedSuccessResponse $stream $maximumBodyBytes }
                     'fixture:httpFixedOverLimit' { Write-FixedOverLimitResponse $stream }
                     'fixture:httpDishonestLength' { Write-FixedResponse $stream '{}' 200 1GB }

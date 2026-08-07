@@ -84,7 +84,11 @@ The first command formats/parses and runs deterministic client and adapter check
 
 ## Conformance and protocol notes
 
-`/usr/local/bin/convex-adapter` implements NDJSON protocol v1 through stdin/stdout or `ADAPTER_LISTEN`. Its one owner runspace alone reads, writes, reconnects, and advances `/api/sync` versions. Subscription relays check the active generation under a lock. Live delivery keeps the newest 16 events per subscription inside a global 64-event and 8 MiB queue budget. TCP output permits one encoded event at a time within a separate 18 MiB reservation that charges the UTF-8 bytes, retained event graph, and runtime overhead. A controller write has one cumulative one-second deadline; timeout retires the connection after releasing the reservation exactly.
+`/usr/local/bin/convex-adapter` implements NDJSON protocol v1 through stdin/stdout or `ADAPTER_LISTEN`. Its one owner runspace alone reads, writes, reconnects, and advances `/api/sync` versions. Subscription relays check the active generation under a lock. Live delivery keeps the newest 16 events per subscription inside a global 64-event and 8 MiB queue budget.
+
+Both adapter modes share one ordered writer. It admits a single encoded event at a time within an 18 MiB reservation that charges the UTF-8 bytes, retained event graph, and runtime overhead, and it holds that reservation for the whole record so events can never interleave. Serializing, every chunked write, the newline, and the flush share one cumulative one-second deadline. A timeout releases the reservation exactly once and then terminates the stream — disposing the controller socket, or standard output in stdin mode — so nothing can follow a partial record.
+
+Every Live socket operation is bounded the same way. One cumulative cancellable budget covers DNS, connect, TLS, the 101 upgrade, the initial `Connect` frame, and the replayed `ModifyQuerySet`; a public call that stops waiting cancels that budget so the abandoned work retires instead of delaying the next control command. Assembling one WebSocket message has an absolute deadline armed by its first byte and never extended by later fragments, so a peer that trickles bytes forever fails exactly like one that stops mid-frame: a structured `TransportError`, a reconnect, replayed `Add` operations, and a later valid value on the same subscription.
 
 ## Limitations
 

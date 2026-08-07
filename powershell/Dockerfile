@@ -97,6 +97,20 @@ USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/convex-example"]
 
 FROM runtime-base AS runtime
+# Hosted Live keeps TLS and a dedicated owner runspace alongside the adapter.
+# Leave native headroom inside the verifier's 128 MiB cgroup instead of letting
+# the managed heap claim half of it while WebSocket transports are replaced.
+ENV DOTNET_GCHeapHardLimit=0x3000000
+# Reconnects dispose the previous TLS transport before opening the next one.
+# Bound glibc to one arena and return medium native buffers promptly so those
+# retired transports cannot accumulate outside the managed heap.
+ENV MALLOC_ARENA_MAX=1
+ENV MALLOC_TRIM_THRESHOLD_=65536
+ENV MALLOC_MMAP_THRESHOLD_=65536
+# Adapter messages are culture-neutral JSON. Invariant mode avoids mapping the
+# ICU data closure solely to parse protocol numbers and Unicode strings.
+ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
+RUN rm -f /lib/x86_64-linux-gnu/libicu*
 COPY --chmod=0444 client/tests/conformance/adapter.ps1 /opt/convex/client/tests/conformance/adapter.ps1
 RUN printf '%s\n' '#!/bin/sh' 'exec /usr/bin/pwsh -NoLogo -NoProfile -NonInteractive -File /opt/convex/client/tests/conformance/adapter.ps1 "$@"' > /usr/local/bin/convex-adapter && \
     chmod 0555 /usr/local/bin/convex-adapter && chmod -R a+rX /opt/convex/client && rm /bin/chmod

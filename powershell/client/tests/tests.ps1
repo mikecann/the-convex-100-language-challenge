@@ -95,6 +95,79 @@ function Stop-HttpFixture {
     }
 }
 
+# A raw WebSocket peer that accepts immediately, delays only the 101 upgrade,
+# and then never drains the connection. It is deliberately not the ordinary
+# fixture: HttpListener completes the upgrade as soon as it accepts and keeps
+# reading, so it cannot hold the owner inside connect and send at all.
+$slowPeerWorker = {
+    param($Listener, [int] $DelayMilliseconds, $State)
+    Set-StrictMode -Version Latest
+    $ErrorActionPreference = 'Stop'
+    try {
+        while (-not $State.Stop) {
+            if (-not $Listener.Pending()) {
+                Start-Sleep -Milliseconds 20
+                continue
+            }
+            $client = $Listener.AcceptTcpClient()
+            $State.Clients.Add($client)
+            $client.ReceiveBufferSize = 512
+            $stream = $client.GetStream()
+            $request = [Text.StringBuilder]::new()
+            while (-not $request.ToString().EndsWith("`r`n`r`n")) {
+                $value = $stream.ReadByte()
+                if ($value -lt 0) {
+                    break
+                }
+                [void]$request.Append([char]$value)
+            }
+            $key = ''
+            foreach ($line in ($request.ToString() -split "`r`n")) {
+                if ($line -match '^Sec-WebSocket-Key:\s*(.+)$') {
+                    $key = $Matches[1].Trim()
+                }
+            }
+            Start-Sleep -Milliseconds $DelayMilliseconds
+            $sha = [Security.Cryptography.SHA1]::Create()
+            try {
+                $accept = [Convert]::ToBase64String(
+                    $sha.ComputeHash(
+                        [Text.Encoding]::ASCII.GetBytes("$key258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+                    )
+                )
+            }
+            finally {
+                $sha.Dispose()
+            }
+            $response = @(
+                'HTTP/1.1 101 Switching Protocols'
+                'Upgrade: websocket'
+                'Connection: Upgrade'
+                "Sec-WebSocket-Accept: $accept"
+                'Sec-WebSocket-Protocol: convex-1.0.0'
+                ''
+                ''
+            ) -join "`r`n"
+            $bytes = [Text.Encoding]::ASCII.GetBytes($response)
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush()
+            # No read follows. The client's next frame fills the closed window.
+        }
+    }
+    catch {
+        # Stopping the listener interrupts the accept loop by design; anything
+        # else is a genuine fixture fault worth reporting.
+        if (-not $State.Stop) {
+            [Console]::Error.WriteLine("slow peer stopped: $($_.Exception.Message)")
+        }
+    }
+    finally {
+        foreach ($client in $State.Clients) {
+            try { $client.Dispose() } catch {}
+        }
+    }
+}
+
 function Assert-HttpFailure {
     param($Client, [string] $Path, [string] $ExpectedName)
     $caught = $null
@@ -142,6 +215,57 @@ try {
     Assert-Array $functionFailure.Logs 'raw FunctionError logs must remain an array'
     Assert-Equal $functionFailure.Logs.Count 1 'raw FunctionError log count'
     Assert-True (Get-ConvexQuery $httpClient 'fixture:httpRecovery' @{}).Value.recovered 'HTTP parser did not recover after invalid envelopes'
+
+    # Convex delivers a failed function as a complete error envelope carried on
+    # a non-2xx status: 560 for a developer error, 400 and 500 for other server
+    # rejections. Each must stay a FunctionError with its errorData and its
+    # logLines intact, and the client must keep serving the next call. Reading
+    # the status before the body would turn all three into TransportError and
+    # silently drop everything the function reported about its own failure.
+    foreach ($code in @('560', '500', '400')) {
+        $path = "fixture:http${code}FunctionError"
+        $statusFailure = Assert-HttpFailure $httpClient $path 'FunctionError'
+        Assert-Equal $statusFailure.Message "expected $code failure" "$path FunctionError message"
+        Assert-Equal $statusFailure.Data.code $code "$path FunctionError data"
+        Assert-True $statusFailure.Data.detail.nested "$path FunctionError nested data"
+        Assert-Array $statusFailure.Logs "$path logs must remain an array"
+        Assert-Equal $statusFailure.Logs.Count 2 "$path log count"
+        Assert-Equal $statusFailure.Logs[0] "$code first log" "$path first log"
+        Assert-Equal $statusFailure.Logs[1] "$code second log" "$path second log"
+        Assert-True (Get-ConvexQuery $httpClient 'fixture:httpRecovery' @{}).Value.recovered "HTTP client did not recover after a $code function error"
+    }
+
+    # A body that already identified itself as a Convex error envelope and then
+    # broke the envelope contract is a protocol fault even on 560. A broken
+    # backend must not be laundered into a transport failure.
+    foreach ($path in @(
+            'fixture:http560MissingErrorMessage',
+            'fixture:http560ErrorMessageType',
+            'fixture:http560LogLinesType'
+        )) {
+        Assert-HttpFailure $httpClient $path 'ProtocolError' | Out-Null
+    }
+
+    # A body that never claimed to be a Convex envelope cannot be a protocol
+    # violation when the status already reports a failure. Each must name the
+    # status so the caller can tell a proxy page from a Convex response.
+    foreach ($path in @(
+            'fixture:http560Malformed',
+            'fixture:http560UnknownStatus',
+            'fixture:http560NonObject'
+        )) {
+        $statusFailure = Assert-HttpFailure $httpClient $path 'TransportError'
+        Assert-True ($statusFailure.Message.Contains('status 560')) "$path must report its HTTP status"
+    }
+    $gatewayFailure = Assert-HttpFailure $httpClient 'fixture:http502Html' 'TransportError'
+    Assert-True ($gatewayFailure.Message.Contains('status 502')) 'proxy error page must report its HTTP status'
+
+    # The 8 MiB streaming bound has to hold on the error path too, now that a
+    # failing response is read instead of rejected from its status line. This
+    # peer declares no Content-Length, so the client must stop mid-stream.
+    $overLimitOnError = Assert-HttpFailure $httpClient 'fixture:http560OverLimit' 'TransportError'
+    Assert-True ($overLimitOnError.Message.Contains('8 MiB')) 'oversize non-2xx body must stop at the streaming bound'
+    Assert-True (Get-ConvexQuery $httpClient 'fixture:httpRecovery' @{}).Value.recovered 'HTTP client did not recover after non-2xx envelope failures'
 
     $boundary = Get-ConvexQuery $httpClient 'fixture:httpExactBoundary' @{}
     Assert-Equal $boundary.Value.blob.Length (8MB - 40) 'exact 8 MiB HTTP response was not accepted completely'
@@ -313,6 +437,81 @@ try {
     $invalidTimestampFailure = Receive-ConvexSubscription $live $invalidTimestamp 5000
     Assert-Equal $invalidTimestampFailure.error.name 'ProtocolError' 'invalid timestamp classification'
     Remove-ConvexSubscription $live 'invalid-timestamp'
+
+    # Live validates logLines exactly like the HTTP envelope. Coercing each
+    # element with [string] would publish a type name as a log line instead of
+    # rejecting the transition.
+    $logLineType = Add-ConvexSubscription $live 'log-line-type' 'demo:state' @{
+        room = 'log-line-type'
+        mode = 'logLineType'
+    }
+    $logLineTypeFailure = Receive-ConvexSubscription $live $logLineType 5000
+    Assert-Equal $logLineTypeFailure.error.name 'ProtocolError' 'non-string Live log line classification'
+    Remove-ConvexSubscription $live 'log-line-type'
+
+    $logLinesType = Add-ConvexSubscription $live 'log-lines-type' 'demo:state' @{
+        room = 'log-lines-type'
+        mode = 'logLinesType'
+    }
+    $logLinesTypeFailure = Receive-ConvexSubscription $live $logLinesType 5000
+    Assert-Equal $logLinesTypeFailure.error.name 'ProtocolError' 'non-array Live logLines classification'
+    Remove-ConvexSubscription $live 'log-lines-type'
+
+    # A byte-native parse accepts any JSON root, so a non-object frame must be a
+    # ProtocolError rather than an indexing failure reclassified as a transport
+    # fault that would drive a reconnect.
+    $nonObjectRoot = Add-ConvexSubscription $live 'non-object-root' 'demo:state' @{
+        room = 'non-object-root'
+        mode = 'nonObjectRoot'
+    }
+    $nonObjectRootFailure = Receive-ConvexSubscription $live $nonObjectRoot 5000
+    Assert-Equal $nonObjectRootFailure.error.name 'ProtocolError' 'non-object Live root classification'
+    Remove-ConvexSubscription $live 'non-object-root'
+
+    # QueryFailed carries the Convex function's own message. A missing or
+    # non-string errorMessage is a malformed transition, so it must surface as a
+    # ProtocolError instead of a FunctionError invented from placeholder text.
+    # The same subscription then recovers on the replacement connection.
+    foreach ($failureMode in @('queryFailedNoMessage', 'queryFailedMessageType')) {
+        $malformed = Add-ConvexSubscription $live $failureMode 'demo:state' @{
+            room = $failureMode
+            mode = $failureMode
+        }
+        $malformedFailure = Receive-ConvexSubscription $live $malformed 5000
+        Assert-Equal $malformedFailure.error.name 'ProtocolError' "$failureMode classification"
+        $malformedRecovery = Receive-ConvexSubscription $live $malformed 10000
+        Assert-True ($malformedRecovery.ContainsKey('value')) "$failureMode did not recover on the same subscription"
+        Remove-ConvexSubscription $live $failureMode
+    }
+
+    # This peer never stops sending, but never finishes its message either. An
+    # inactivity timer would be reset by every byte it trickles out, so only an
+    # absolute per-message deadline can end the frame. The failure is a
+    # TransportError and the reconnect replays the Add for the same subscription.
+    $dribbleTimer = [Diagnostics.Stopwatch]::StartNew()
+    $dribble = Add-ConvexSubscription $live 'dribble' 'demo:state' @{
+        room = 'dribble'
+        mode = 'dribble'
+    }
+    $dribbleFailure = Receive-ConvexSubscription $live $dribble 12000
+    $dribbleTimer.Stop()
+    Assert-Equal $dribbleFailure.error.name 'TransportError' 'continuous dribble classification'
+    Assert-True ($dribbleTimer.ElapsedMilliseconds -lt 8000) 'dribbled message outlived its absolute assembly deadline'
+    $dribbleRecovery = Receive-ConvexSubscription $live $dribble 10000
+    Assert-True ($dribbleRecovery.ContainsKey('value')) 'dribbled subscription did not recover after reconnect'
+    Remove-ConvexSubscription $live 'dribble'
+
+    # The same absolute deadline retires a peer that stops permanently halfway
+    # through a frame rather than trickling.
+    $partial = Add-ConvexSubscription $live 'partial-frame' 'demo:state' @{
+        room = 'partial-frame'
+        mode = 'stalledFrameOnce'
+    }
+    $partialFailure = Receive-ConvexSubscription $live $partial 12000
+    Assert-Equal $partialFailure.error.name 'TransportError' 'permanently partial frame classification'
+    $partialRecovery = Receive-ConvexSubscription $live $partial 10000
+    Assert-True ($partialRecovery.ContainsKey('value')) 'partially framed subscription did not recover after reconnect'
+    Remove-ConvexSubscription $live 'partial-frame'
 
     # A peer stalled halfway through a frame cannot prevent unsubscribe or close
     # because the owner retains the outstanding ReceiveAsync and polls commands.
@@ -545,6 +744,55 @@ try {
     finally {
         if (-not $handshakeLive.Closed) { Close-ConvexLive $handshakeLive }
         $handshakeListener.Stop()
+    }
+
+    # This peer completes the WebSocket upgrade slowly and then never reads the
+    # connection again, so the replayed ModifyQuerySet blocks with a closed
+    # receive window. Connect, the initial Connect frame, and that Add all draw
+    # on one cumulative owner budget: private per-step timeouts would report the
+    # failure only after the upgrade delay plus a whole send timeout.
+    $slowState = [hashtable]::Synchronized(@{
+            Stop    = $false
+            Clients = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+        })
+    $slowListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 43145)
+    # An explicit small receive buffer on the listening socket is inherited by
+    # accepted connections and disables receive-window auto-tuning, so the peer
+    # cannot silently absorb the whole Add message in kernel buffers.
+    $slowListener.Server.ReceiveBufferSize = 512
+    $slowListener.Start()
+    $slowPeer = [PowerShell]::Create()
+    [void]$slowPeer.AddScript($slowPeerWorker)
+    [void]$slowPeer.AddArgument($slowListener)
+    [void]$slowPeer.AddArgument(2000)
+    [void]$slowPeer.AddArgument($slowState)
+    $slowHandle = $slowPeer.BeginInvoke()
+    $slowLive = New-ConvexLiveState 'http://127.0.0.1:43145'
+    try {
+        $slowTimer = [Diagnostics.Stopwatch]::StartNew()
+        $slowSubscription = Add-ConvexSubscription $slowLive 'slow-owner' 'demo:state' @{
+            room = 'slow-owner'
+            blob = 'x' * (2MB)
+        }
+        $slowFailure = Receive-ConvexSubscription $slowLive $slowSubscription 9000
+        $slowTimer.Stop()
+        Assert-Equal $slowFailure.error.name 'TransportError' 'slow connect and stalled write classification'
+        # Past the 2000 ms upgrade delay proves the owner reached the send phase
+        # on the same budget rather than failing during the handshake alone.
+        Assert-True ($slowTimer.ElapsedMilliseconds -ge 2500) 'slow peer failed before its blocked send drew on the owner budget'
+        Assert-True ($slowTimer.ElapsedMilliseconds -lt 4500) 'connect and sends did not share one cumulative owner deadline'
+        $slowCloseTimer = [Diagnostics.Stopwatch]::StartNew()
+        Close-ConvexLive $slowLive
+        $slowCloseTimer.Stop()
+        Assert-True ($slowCloseTimer.ElapsedMilliseconds -lt 5000) 'slow peer close exceeded its bounded deadline'
+    }
+    finally {
+        if (-not $slowLive.Closed) { Close-ConvexLive $slowLive }
+        $slowState.Stop = $true
+        $slowListener.Stop()
+        if (-not $slowHandle.AsyncWaitHandle.WaitOne(5000)) { $slowPeer.Stop() }
+        try { $slowPeer.EndInvoke($slowHandle) | Out-Null } catch {}
+        $slowPeer.Dispose()
     }
     Write-Output 'PASS PowerShell HTTP and adversarial Live fixtures'
 }

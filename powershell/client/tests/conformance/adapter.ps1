@@ -20,156 +20,172 @@ function New-AdapterProtocolException {
     $exception
 }
 
+function New-AdapterWriter {
+    param($Stream, [scriptblock] $Terminate)
+    # stdout and the controller socket use the same ordered bounded writer, so
+    # the published output bounds hold in both adapter modes.
+    [pscustomobject]@{
+        Stream         = $Stream
+        Terminate      = $Terminate
+        OutputGate     = [object]::new()
+        ReservedBytes  = 0L
+        Failed         = $false
+        FailureMessage = ''
+    }
+}
+
+function Get-AdapterWriteRemaining {
+    param($Timer)
+    $remaining = $script:AdapterWriteDeadlineMilliseconds - [int]$Timer.ElapsedMilliseconds
+    if ($remaining -le 0) {
+        throw [TimeoutException]::new('adapter output write deadline expired')
+    }
+    $remaining
+}
+
 function Write-AdapterEvent {
     param($Writer, [hashtable] $Event)
-    if ($Writer.PSObject.Properties['Failed'] -and $Writer.Failed) {
+    if ($Writer.Failed) {
+        # A partial record already terminated the stream. Writing again would
+        # splice a second event onto a truncated NDJSON line.
         throw [IO.IOException]::new([string]$Writer.FailureMessage)
     }
-    if ($Writer.PSObject.Properties['TcpStream']) {
-        # HTTP decoding temporarily owns the raw response bytes and JSON text.
-        # They are dead once the event graph reaches this function. Reclaim
-        # them before the bounded streaming serializer starts.
-        [GC]::Collect(2, [GCCollectionMode]::Optimized, $true, $true)
-
-        # Reserve the complete allowance before serialization. This charge
-        # covers the retained event graph, bounded pipe segments, one network
-        # chunk, and serializer/task overhead without an event-sized byte array.
-        # A second event can never accumulate behind the one synchronous writer.
+    # Start the cumulative window before the collection hint below so serializing,
+    # writing, and the newline are all charged to the same one-second deadline.
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    # HTTP decoding temporarily owns the raw response bytes and JSON text, which
+    # are dead once the event graph reaches this function. Ask for a background,
+    # non-compacting collection instead: a blocking collect or a finalizer wait
+    # cannot be bounded, so it would spend an unaccounted part of the deadline.
+    [GC]::Collect(2, [GCCollectionMode]::Optimized, $false, $false)
+    if (-not [Threading.Monitor]::TryEnter($Writer.OutputGate, (Get-AdapterWriteRemaining $timer))) {
+        throw [TimeoutException]::new('adapter output writer stayed busy past its deadline')
+    }
+    $reservation = 0L
+    $failure = $null
+    $pipe = $null
+    $serializerStream = $null
+    $readerStream = $null
+    $serializeCancellation = $null
+    $writerCompleted = $false
+    try {
+        # The gate is held for the whole record, so events are ordered and never
+        # interleaved. The reservation covers the retained event graph, bounded
+        # pipe segments, one stream chunk, and serializer/task overhead without
+        # ever materialising an event-sized byte array. Holding the entire budget
+        # keeps this check an active invariant: a leaked reservation fails loudly
+        # instead of silently doubling the adapter's output memory.
+        if (($Writer.ReservedBytes + $script:AdapterOutputBudgetBytes) -gt $script:AdapterOutputBudgetBytes) {
+            throw [IO.IOException]::new('adapter encoded-output byte budget exhausted')
+        }
         $reservation = [long]$script:AdapterOutputBudgetBytes
-        [Threading.Monitor]::Enter($Writer.OutputGate)
-        try {
-            if (($Writer.ReservedBytes + $reservation) -gt $script:AdapterOutputBudgetBytes) {
-                throw [IO.IOException]::new('adapter encoded-output byte budget exhausted')
-            }
-            $Writer.ReservedBytes += $reservation
-        }
-        finally {
-            [Threading.Monitor]::Exit($Writer.OutputGate)
-        }
+        $Writer.ReservedBytes += $reservation
 
-        $failure = $null
-        $timer = [Diagnostics.Stopwatch]::StartNew()
-        $pipe = $null
-        $serializerStream = $null
-        $readerStream = $null
-        $serializeCancellation = $null
-        $writerCompleted = $false
-        try {
-            $pipe = [IO.Pipelines.Pipe]::new()
-            $serializerStream = $pipe.Writer.AsStream($true)
-            $readerStream = $pipe.Reader.AsStream($true)
-            $serializeCancellation = [Threading.CancellationTokenSource]::new()
-            $eventType = $Event.GetType()
-            $serializeTask = [Text.Json.JsonSerializer]::SerializeAsync(
-                $serializerStream,
-                $Event,
-                $eventType,
-                $script:AdapterJsonOptions,
-                $serializeCancellation.Token
-            )
-            [byte[]]$chunk = [byte[]]::new($script:AdapterWriteChunkBytes)
-            $encodedBytes = 0L
-            $readTask = $readerStream.ReadAsync($chunk, 0, $chunk.Length)
-            while ($true) {
-                if (-not $readTask.Wait(20)) {
-                    if ($serializeTask.IsCompleted -and -not $writerCompleted) {
-                        $serializeTask.GetAwaiter().GetResult() | Out-Null
-                        $pipe.Writer.Complete()
-                        $writerCompleted = $true
-                    }
-                    if ($timer.ElapsedMilliseconds -ge $script:AdapterWriteDeadlineMilliseconds) {
-                        throw [TimeoutException]::new('adapter controller write deadline expired')
-                    }
-                    continue
-                }
-                $count = $readTask.GetAwaiter().GetResult()
-                if ($count -eq 0) {
-                    break
-                }
-                $encodedBytes += $count
-                if (($encodedBytes + 1L) -gt $script:AdapterMaximumEncodedEventBytes) {
-                    throw [IO.IOException]::new('adapter event exceeds the 8 MiB encoded-output limit')
-                }
-                $remaining = $script:AdapterWriteDeadlineMilliseconds - [int]$timer.ElapsedMilliseconds
-                if ($remaining -le 0) {
-                    throw [TimeoutException]::new('adapter controller write deadline expired')
-                }
-                $writeTask = $Writer.TcpStream.WriteAsync(
-                    $chunk,
-                    0,
-                    $count,
-                    [Threading.CancellationToken]::None
-                )
-                if (-not $writeTask.Wait($remaining)) {
-                    throw [TimeoutException]::new('adapter controller write deadline expired')
-                }
-                $writeTask.GetAwaiter().GetResult() | Out-Null
-                $readTask = $readerStream.ReadAsync($chunk, 0, $chunk.Length)
+        $pipe = [IO.Pipelines.Pipe]::new()
+        $serializerStream = $pipe.Writer.AsStream($true)
+        $readerStream = $pipe.Reader.AsStream($true)
+        $serializeCancellation = [Threading.CancellationTokenSource]::new()
+        $eventType = $Event.GetType()
+        $serializeTask = [Text.Json.JsonSerializer]::SerializeAsync(
+            $serializerStream,
+            $Event,
+            $eventType,
+            $script:AdapterJsonOptions,
+            $serializeCancellation.Token
+        )
+        [byte[]]$chunk = [byte[]]::new($script:AdapterWriteChunkBytes)
+        $encodedBytes = 0L
+        $readTask = $readerStream.ReadAsync($chunk, 0, $chunk.Length)
+        while ($true) {
+            if (-not $readTask.Wait(20)) {
                 if ($serializeTask.IsCompleted -and -not $writerCompleted) {
                     $serializeTask.GetAwaiter().GetResult() | Out-Null
                     $pipe.Writer.Complete()
                     $writerCompleted = $true
                 }
+                Get-AdapterWriteRemaining $timer | Out-Null
+                continue
             }
-            $serializeTask.GetAwaiter().GetResult() | Out-Null
-            $remaining = $script:AdapterWriteDeadlineMilliseconds - [int]$timer.ElapsedMilliseconds
-            if ($remaining -le 0) {
-                throw [TimeoutException]::new('adapter controller write deadline expired')
+            $count = $readTask.GetAwaiter().GetResult()
+            if ($count -eq 0) {
+                break
             }
-            [byte[]]$newline = @(10)
-            $newlineTask = $Writer.TcpStream.WriteAsync(
-                $newline,
+            $encodedBytes += $count
+            if (($encodedBytes + 1L) -gt $script:AdapterMaximumEncodedEventBytes) {
+                throw [IO.IOException]::new('adapter event exceeds the 8 MiB encoded-output limit')
+            }
+            $writeTask = $Writer.Stream.WriteAsync(
+                $chunk,
                 0,
-                1,
+                $count,
                 [Threading.CancellationToken]::None
             )
-            if (-not $newlineTask.Wait($remaining)) {
-                throw [TimeoutException]::new('adapter controller write deadline expired')
+            if (-not $writeTask.Wait((Get-AdapterWriteRemaining $timer))) {
+                throw [TimeoutException]::new('adapter output write deadline expired')
             }
-            $newlineTask.GetAwaiter().GetResult() | Out-Null
+            $writeTask.GetAwaiter().GetResult() | Out-Null
+            $readTask = $readerStream.ReadAsync($chunk, 0, $chunk.Length)
+            if ($serializeTask.IsCompleted -and -not $writerCompleted) {
+                $serializeTask.GetAwaiter().GetResult() | Out-Null
+                $pipe.Writer.Complete()
+                $writerCompleted = $true
+            }
         }
-        catch {
-            $failure = $_.Exception
-            if ($null -ne $serializeCancellation) { $serializeCancellation.Cancel() }
-            if ($null -ne $pipe) {
-                $pipe.Reader.CancelPendingRead()
-                $pipe.Writer.CancelPendingFlush()
+        $serializeTask.GetAwaiter().GetResult() | Out-Null
+        [byte[]]$newline = @(10)
+        $newlineTask = $Writer.Stream.WriteAsync(
+            $newline,
+            0,
+            1,
+            [Threading.CancellationToken]::None
+        )
+        if (-not $newlineTask.Wait((Get-AdapterWriteRemaining $timer))) {
+            throw [TimeoutException]::new('adapter output write deadline expired')
+        }
+        $newlineTask.GetAwaiter().GetResult() | Out-Null
+        $flushTask = $Writer.Stream.FlushAsync()
+        if (-not $flushTask.Wait((Get-AdapterWriteRemaining $timer))) {
+            throw [TimeoutException]::new('adapter output write deadline expired')
+        }
+        $flushTask.GetAwaiter().GetResult() | Out-Null
+    }
+    catch {
+        $failure = $_.Exception
+        if ($null -ne $serializeCancellation) { $serializeCancellation.Cancel() }
+        if ($null -ne $pipe) {
+            $pipe.Reader.CancelPendingRead()
+            $pipe.Writer.CancelPendingFlush()
+        }
+        # Terminating the stream abandons any partial NDJSON line and interrupts
+        # the outstanding kernel write deterministically. For the controller
+        # socket that is disposing the sole connection; for stdin mode it is
+        # disposing standard output so nothing can follow the truncated record.
+        & $Writer.Terminate
+    }
+    finally {
+        $timer.Stop()
+        if ($null -ne $pipe -and -not $writerCompleted) {
+            try { $pipe.Writer.Complete() } catch {}
+        }
+        if ($null -ne $pipe) { try { $pipe.Reader.Complete() } catch {} }
+        if ($null -ne $serializerStream) { try { $serializerStream.Dispose() } catch {} }
+        if ($null -ne $readerStream) { try { $readerStream.Dispose() } catch {} }
+        if ($null -ne $serializeCancellation) { $serializeCancellation.Dispose() }
+        try {
+            $Writer.ReservedBytes -= $reservation
+            if ($Writer.ReservedBytes -ne 0L) {
+                throw [InvalidOperationException]::new('adapter output reservation was not released exactly')
             }
-            # Disposing the sole controller socket abandons any partial NDJSON
-            # line and interrupts the outstanding kernel write deterministically.
-            $Writer.TcpClient.Dispose()
         }
         finally {
-            $timer.Stop()
-            if ($null -ne $pipe -and -not $writerCompleted) {
-                try { $pipe.Writer.Complete() } catch {}
-            }
-            if ($null -ne $pipe) { try { $pipe.Reader.Complete() } catch {} }
-            if ($null -ne $serializerStream) { try { $serializerStream.Dispose() } catch {} }
-            if ($null -ne $readerStream) { try { $readerStream.Dispose() } catch {} }
-            if ($null -ne $serializeCancellation) { $serializeCancellation.Dispose() }
-            [Threading.Monitor]::Enter($Writer.OutputGate)
-            try {
-                $Writer.ReservedBytes -= $reservation
-                if ($Writer.ReservedBytes -ne 0L) {
-                    throw [InvalidOperationException]::new('adapter output reservation was not released exactly')
-                }
-            }
-            finally {
-                [Threading.Monitor]::Exit($Writer.OutputGate)
-            }
-        }
-        if ($null -ne $failure) {
-            $Writer.Failed = $true
-            $Writer.FailureMessage = "adapter controller output failed within $($script:AdapterWriteDeadlineMilliseconds) ms; reserved output bytes after release: $($Writer.ReservedBytes)"
-            [Console]::Error.WriteLine($Writer.FailureMessage)
-            throw [IO.IOException]::new($Writer.FailureMessage, $failure)
+            [Threading.Monitor]::Exit($Writer.OutputGate)
         }
     }
-    else {
-        $json = $Event | ConvertTo-Json -Depth 64 -Compress
-        $Writer.WriteLine($json)
-        $Writer.Flush()
+    if ($null -ne $failure) {
+        $Writer.Failed = $true
+        $Writer.FailureMessage = "adapter controller output failed within $($script:AdapterWriteDeadlineMilliseconds) ms; reserved output bytes after release: $($Writer.ReservedBytes)"
+        [Console]::Error.WriteLine($Writer.FailureMessage)
+        throw [IO.IOException]::new($Writer.FailureMessage, $failure)
     }
 }
 
@@ -341,15 +357,50 @@ function Drain-Subscriptions {
 function Assert-AdapterCommand {
     param([hashtable] $Command)
 
-    function Get-JsonStringLength([string] $Value) {
+    # A controller can put an unpaired surrogate into an otherwise valid UTF-8
+    # line with a \ud800 escape, so the byte-level UTF-8 check upstream does not
+    # exclude it. Rune.GetRuneAt throws a plain ArgumentException on that input,
+    # which Get-ConvexError would then report as a TransportError even though a
+    # malformed command field is a protocol violation. Walk the pairs directly
+    # so an ill-formed field is rejected with the right name, and so a valid
+    # astral scalar still counts as the single code point JSON Schema measures.
+    function Get-JsonStringLength([string] $Value, [string] $Field) {
         $length = 0
         $offset = 0
         while ($offset -lt $Value.Length) {
-            $rune = [Text.Rune]::GetRuneAt($Value, $offset)
-            $offset += $rune.Utf16SequenceLength
+            $current = $Value[$offset]
+            if ([char]::IsLowSurrogate($current)) {
+                throw (New-AdapterProtocolException "adapter command $Field is not well-formed Unicode")
+            }
+            if ([char]::IsHighSurrogate($current)) {
+                if (
+                    $offset + 1 -ge $Value.Length -or
+                    -not [char]::IsLowSurrogate($Value[$offset + 1])
+                ) {
+                    throw (New-AdapterProtocolException "adapter command $Field is not well-formed Unicode")
+                }
+                $offset += 2
+            }
+            else {
+                $offset++
+            }
             $length++
         }
         $length
+    }
+
+    # PowerShell hashtable lookups and -in are case-insensitive, but JSON Schema
+    # property names are not. Without an exact-case test, a command carrying
+    # "ID" or "OP" would satisfy the required-field check and slip past
+    # additionalProperties, so the adapter would accept input the shared schema
+    # rejects. Compare key names ordinally instead.
+    function Test-CommandKey([hashtable] $Value, [string] $Field) {
+        foreach ($key in $Value.Keys) {
+            if (([string]$key) -ceq $Field) {
+                return $true
+            }
+        }
+        $false
     }
 
     function Assert-RequiredString(
@@ -358,12 +409,12 @@ function Assert-AdapterCommand {
         [int] $MinimumLength,
         [int] $MaximumLength = [int]::MaxValue
     ) {
-        if (-not $Value.ContainsKey($Field) -or $Value[$Field] -isnot [string]) {
+        if (-not (Test-CommandKey $Value $Field) -or $Value[$Field] -isnot [string]) {
             throw (New-AdapterProtocolException "adapter command $Field must be a string")
         }
         # JSON Schema measures string length in Unicode code points, not .NET
         # UTF-16 code units. This keeps astral IDs within the shared 128 limit.
-        $length = Get-JsonStringLength $Value[$Field]
+        $length = Get-JsonStringLength $Value[$Field] $Field
         if ($length -lt $MinimumLength -or $length -gt $MaximumLength) {
             throw (New-AdapterProtocolException "adapter command $Field length is out of range")
         }
@@ -371,13 +422,13 @@ function Assert-AdapterCommand {
 
     function Assert-Fields([hashtable] $Value, [string[]] $Required, [string[]] $Allowed) {
         foreach ($field in $Required) {
-            if (-not $Value.ContainsKey($field)) {
+            if (-not (Test-CommandKey $Value $field)) {
                 throw (New-AdapterProtocolException "adapter command omitted $field")
             }
         }
         foreach ($field in $Value.Keys) {
-            if ($field -notin $Allowed) {
-                throw (New-AdapterProtocolException "adapter command contains unexpected field $field")
+            if (([string]$field) -cnotin $Allowed) {
+                throw (New-AdapterProtocolException "adapter command contains unexpected field $([string]$field)")
             }
         }
     }
@@ -417,8 +468,19 @@ function Assert-AdapterCommand {
             }
         }
         'unsubscribe' {
-            Assert-Fields $Command @('id', 'op', 'subscriptionId') @('id', 'op', 'subscriptionId')
+            # The shared schema shares one definition between subscribe and
+            # unsubscribe, so path and args are optional but permitted here. An
+            # unsubscribe carrying them is valid input the controller may send;
+            # rejecting it would fail a schema-valid command. Their types and the
+            # additionalProperties and length bounds are still enforced exactly.
+            Assert-Fields $Command @('id', 'op', 'subscriptionId') @('id', 'op', 'subscriptionId', 'path', 'args')
             Assert-RequiredString $Command 'subscriptionId' 1 128
+            if (Test-CommandKey $Command 'path') {
+                Assert-RequiredString $Command 'path' 0
+            }
+            if ((Test-CommandKey $Command 'args') -and $Command['args'] -isnot [hashtable]) {
+                throw (New-AdapterProtocolException 'unsubscribe args must be a JSON object')
+            }
         }
         'setAuth' {
             Assert-Fields $Command @('id', 'op', 'token') @('id', 'op', 'token')
@@ -434,6 +496,7 @@ function Run-Adapter {
     param($InputStream, $Writer, [string] $Url)
     $client = $null
     $live = $null
+    [string]$authToken = ''
     $subscriptions = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new()
     $inputState = New-BoundedNdjsonReader $InputStream
     $closed = $false
@@ -511,15 +574,17 @@ function Run-Adapter {
                         $closed = $true
                     }
                     'setAuth' {
+                        $authToken = [string]$command['token']
                         if (-not $client) {
                             $client = New-ConvexClient $Url
                         }
-                        Set-ConvexAuth $client $command['token']
+                        Set-ConvexAuth $client $authToken
                         Write-AdapterEvent $Writer @{ id = $id; type = 'ack' }
                     }
                     { $_ -in @('query', 'mutation', 'action') } {
                         if (-not $client) {
                             $client = New-ConvexClient $Url
+                            Set-ConvexAuth $client $authToken
                         }
                         $callArguments = @{
                             Client       = $client
@@ -536,6 +601,22 @@ function Run-Adapter {
                         Write-AdapterEvent $Writer $event
                     }
                     'subscribe' {
+                        if ($client) {
+                            # The hosted pilot performs HTTP and Live in one
+                            # adapter session. Retaining the HTTP TLS pool while
+                            # the worker runspace and WebSocket are live crosses
+                            # the final adapter's 128 MiB cgroup. Keep auth as
+                            # adapter state, but retire the idle HTTP transport
+                            # on every subscribe: a query between two subscribes
+                            # rebuilds the client, so gating this on the first
+                            # subscribe would leave the pool resident for the
+                            # rest of the session. Disposal closes those sockets
+                            # deterministically; a forced collect and finalizer
+                            # wait here would sit outside the client's bounded
+                            # subscribe deadline for an unbounded time.
+                            Close-ConvexClient $client
+                            $client = $null
+                        }
                         if (-not $live) {
                             $live = New-ConvexLiveState $Url
                         }
@@ -609,14 +690,7 @@ if ($env:ADAPTER_LISTEN) {
         # buffering outside the managed byte reservation.
         $tcp.SendBufferSize = $script:AdapterWriteChunkBytes
         $stream = $tcp.GetStream()
-        $writer = [pscustomobject]@{
-            TcpStream      = $stream
-            TcpClient      = $tcp
-            OutputGate     = [object]::new()
-            ReservedBytes  = 0L
-            Failed         = $false
-            FailureMessage = ''
-        }
+        $writer = New-AdapterWriter $stream { $tcp.Dispose() }
         Run-Adapter -InputStream $stream -Writer $writer -Url $env:CONVEX_URL
     }
     finally {
@@ -627,5 +701,12 @@ if ($env:ADAPTER_LISTEN) {
     }
 }
 else {
-    Run-Adapter -InputStream ([Console]::OpenStandardInput()) -Writer ([Console]::Out) -Url $env:CONVEX_URL
+    # Write raw UTF-8 bytes rather than through the console TextWriter so stdin
+    # mode gets the same bounded, ordered, byte-exact NDJSON records as TCP.
+    # Each record is flushed as it is written, and only the terminal partial-record
+    # path closes this handle. A clean shutdown leaves standard output for the
+    # runtime to close, so a normal exit cannot fail on a disposed handle.
+    $standardOutput = [Console]::OpenStandardOutput()
+    $writer = New-AdapterWriter $standardOutput { $standardOutput.Dispose() }
+    Run-Adapter -InputStream ([Console]::OpenStandardInput()) -Writer $writer -Url $env:CONVEX_URL
 }

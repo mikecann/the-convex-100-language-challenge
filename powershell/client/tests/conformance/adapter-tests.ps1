@@ -142,6 +142,12 @@ try {
     $adapter = Start-Adapter $fixture.Url
     $longId = 'i' * 129
     $longSubscriptionId = 's' * 129
+    # JSON Schema measures the 128-character ID bound in Unicode code points, so
+    # an astral scalar counts once even though .NET stores it as two UTF-16 code
+    # units. Cover both sides of that boundary, not just the ASCII one.
+    $astralScalar = [char]::ConvertFromUtf32(0x1F600)
+    $astralId = $astralScalar * 128
+    $overlongAstralId = $astralScalar * 129
     $invalidCommands = [ordered]@{
         'malformed JSON'              = '{'
         'array root'                  = '[]'
@@ -156,6 +162,32 @@ try {
         'null ID'                     = '{"protocolVersion":1,"id":null,"op":"hello"}'
         'empty ID'                    = '{"protocolVersion":1,"id":"","op":"hello"}'
         'overlong ID'                 = (@{ protocolVersion = 1; id = $longId; op = 'hello' } | ConvertTo-Json -Compress)
+        'overlong astral ID'          = (@{ protocolVersion = 1; id = $overlongAstralId; op = 'hello' } | ConvertTo-Json -Compress)
+        # A \ud800 escape is plain ASCII on the wire, so it survives the
+        # byte-level UTF-8 check and only becomes an unpaired surrogate after
+        # JSON decoding. Counting code points over it must stay a structured
+        # ProtocolError rather than escaping as an ArgumentException that
+        # Get-ConvexError would relabel a TransportError.
+        'lone high surrogate ID'      = '{"protocolVersion":1,"id":"\ud800","op":"hello"}'
+        'lone low surrogate ID'       = '{"protocolVersion":1,"id":"\udc00","op":"hello"}'
+        'reversed surrogate pair ID'  = '{"protocolVersion":1,"id":"\udc00\ud800","op":"hello"}'
+        'trailing surrogate ID'       = '{"protocolVersion":1,"id":"ok\ud800","op":"hello"}'
+        'surrogate operation'         = '{"protocolVersion":1,"id":"bad","op":"\ud800"}'
+        'surrogate subscription ID'   = '{"id":"bad","op":"subscribe","subscriptionId":"\ud800","path":"demo:state","args":{}}'
+        'surrogate unsubscribe ID'    = '{"id":"bad","op":"unsubscribe","subscriptionId":"\ud800"}'
+        'surrogate path'              = '{"id":"bad","op":"query","path":"\ud800\ud800\ud800","args":{}}'
+        'surrogate token'             = '{"id":"bad","op":"setAuth","token":"\ud800"}'
+        # JSON Schema property names are case-sensitive, so each of these is a
+        # missing required field plus an additionalProperties violation. They
+        # must not be accepted just because PowerShell hashtable lookups and
+        # -in ignore case.
+        'uppercase ID field'          = '{"protocolVersion":1,"ID":"bad","op":"hello"}'
+        'uppercase operation field'   = '{"protocolVersion":1,"id":"bad","OP":"hello"}'
+        'mixed case version field'    = '{"ProtocolVersion":1,"id":"bad","op":"hello"}'
+        'uppercase path field'        = '{"id":"bad","op":"query","PATH":"demo:echo","args":{}}'
+        'uppercase args field'        = '{"id":"bad","op":"query","path":"demo:echo","ARGS":{}}'
+        'uppercase subscription ID'   = '{"id":"bad","op":"subscribe","SubscriptionId":"sub","path":"demo:state","args":{}}'
+        'uppercase token field'       = '{"id":"bad","op":"setAuth","TOKEN":""}'
         'hello missing version'       = '{"id":"bad","op":"hello"}'
         'hello null version'          = '{"protocolVersion":null,"id":"bad","op":"hello"}'
         'hello string version'        = '{"protocolVersion":"1","id":"bad","op":"hello"}'
@@ -175,9 +207,18 @@ try {
         'subscribe null ID'           = '{"id":"bad","op":"subscribe","subscriptionId":null,"path":"demo:state","args":{}}'
         'subscribe empty ID'          = '{"id":"bad","op":"subscribe","subscriptionId":"","path":"demo:state","args":{}}'
         'subscribe overlong ID'       = (@{ id = 'bad'; op = 'subscribe'; subscriptionId = $longSubscriptionId; path = 'demo:state'; args = @{} } | ConvertTo-Json -Compress)
+        'subscribe astral overlong'   = (@{ id = 'bad'; op = 'subscribe'; subscriptionId = $overlongAstralId; path = 'demo:state'; args = @{} } | ConvertTo-Json -Compress)
         'subscribe extra field'       = '{"id":"bad","op":"subscribe","subscriptionId":"sub","path":"demo:state","args":{},"extra":true}'
         'unsubscribe missing ID'      = '{"id":"bad","op":"unsubscribe"}'
-        'unsubscribe extra path'      = '{"id":"bad","op":"unsubscribe","subscriptionId":"sub","path":"demo:state"}'
+        # path and args are optional for unsubscribe, but their types, the
+        # additionalProperties rule, and the ID bound are still exact.
+        'unsubscribe null path'       = '{"id":"bad","op":"unsubscribe","subscriptionId":"sub","path":null}'
+        'unsubscribe numeric path'    = '{"id":"bad","op":"unsubscribe","subscriptionId":"sub","path":12}'
+        'unsubscribe null args'       = '{"id":"bad","op":"unsubscribe","subscriptionId":"sub","args":null}'
+        'unsubscribe array args'      = '{"id":"bad","op":"unsubscribe","subscriptionId":"sub","args":[]}'
+        'unsubscribe extra field'     = '{"id":"bad","op":"unsubscribe","subscriptionId":"sub","extra":true}'
+        'unsubscribe overlong ID'     = (@{ id = 'bad'; op = 'unsubscribe'; subscriptionId = $longSubscriptionId } | ConvertTo-Json -Compress)
+        'unsubscribe astral overlong' = (@{ id = 'bad'; op = 'unsubscribe'; subscriptionId = $overlongAstralId } | ConvertTo-Json -Compress)
         'setAuth missing token'       = '{"id":"bad","op":"setAuth"}'
         'setAuth null token'          = '{"id":"bad","op":"setAuth","token":null}'
         'setAuth numeric token'       = '{"id":"bad","op":"setAuth","token":12}'
@@ -201,6 +242,24 @@ try {
     $auth = Read-LineBefore $adapter.StandardOutput
     Assert-True ($auth.type -eq 'ack') 'setAuth failed after ProtocolError recovery'
     Assert-ExactKeys $auth @('id', 'type') 'setAuth acknowledgement shape'
+    # Exactly 128 astral scalars is 256 UTF-16 code units and one code point
+    # under the schema bound, so it must be accepted and echoed unchanged.
+    Send-Line $adapter (@{ protocolVersion = 1; id = $astralId; op = 'hello' } | ConvertTo-Json -Compress)
+    $astralReady = Read-LineBefore $adapter.StandardOutput
+    Assert-True ($astralReady.type -eq 'ready') '128 astral code point ID was rejected'
+    Assert-True ($astralReady.id -eq $astralId) 'astral ID was not echoed exactly'
+    Send-Line $adapter (
+        @{ id = 'astral-unsubscribe'; op = 'unsubscribe'; subscriptionId = $astralId } | ConvertTo-Json -Compress
+    )
+    $astralAck = Read-LineBefore $adapter.StandardOutput
+    Assert-True ($astralAck.type -eq 'ack') '128 astral code point subscription ID was rejected'
+    Assert-ExactKeys $astralAck @('id', 'type') 'astral unsubscribe acknowledgement shape'
+    # The shared schema shares one definition between subscribe and unsubscribe,
+    # so an unsubscribe carrying path and args is valid controller input.
+    Send-Line $adapter '{"id":"unsub-path","op":"unsubscribe","subscriptionId":"absent","path":"demo:state","args":{"room":"absent"}}'
+    $unsubscribeWithPath = Read-LineBefore $adapter.StandardOutput
+    Assert-True ($unsubscribeWithPath.type -eq 'ack') 'schema-valid unsubscribe with path and args was rejected'
+    Assert-ExactKeys $unsubscribeWithPath @('id', 'type') 'unsubscribe acknowledgement shape'
     Send-Line $adapter '{"id":"action","op":"action","path":"demo:greet","args":{}}'
     $action = Read-LineBefore $adapter.StandardOutput
     Assert-True ($action.value.message -eq 'Convex is responding from fixture') 'valid action command failed'
@@ -282,6 +341,24 @@ try {
     $longLivedStream = $longLivedTcp.GetStream()
     Send-TcpCommand $longLivedStream @{ protocolVersion = 1; id = 'long-hello'; op = 'hello' }
     Assert-True ((Read-TcpEvent $longLivedStream).type -eq 'ready') 'long-lived TCP hello failed'
+    # Match the hosted pilot's HTTP-to-Live boundary in one TCP session. The
+    # adapter must preserve auth state while retiring the warmed HTTP transport
+    # before it creates the sole Live owner and its TLS WebSocket.
+    Send-TcpCommand $longLivedStream @{ id = 'long-auth-set'; op = 'setAuth'; token = 'fixture-token' }
+    Assert-True ((Read-TcpEvent $longLivedStream).type -eq 'ack') 'long-lived auth set failed'
+    for ($httpAttempt = 1; $httpAttempt -le 8; $httpAttempt++) {
+        Send-TcpCommand $longLivedStream @{
+            id = "long-http-$httpAttempt"; op = 'query'; path = 'demo:echo'
+            args = @{ value = "http-before-live-$httpAttempt" }
+        }
+        $httpResult = Read-TcpEvent $longLivedStream
+        Assert-True (
+            $httpResult.type -eq 'result' -and
+            $httpResult.value -eq "http-before-live-$httpAttempt"
+        ) "long-lived HTTP warmup $httpAttempt failed"
+    }
+    Send-TcpCommand $longLivedStream @{ id = 'long-auth-clear'; op = 'setAuth'; token = '' }
+    Assert-True ((Read-TcpEvent $longLivedStream).type -eq 'ack') 'long-lived auth clear failed'
     Send-TcpCommand $longLivedStream @{
         id = 'long-recovery-subscribe'; op = 'subscribe'; subscriptionId = 'long-recovery'
         path = 'demo:requiresNonzero'; args = @{ room = 'long-recovery' }
@@ -335,7 +412,6 @@ try {
     Assert-True ((Read-TcpEvent $longLivedStream).value.count -eq 7) 'client-unsubscribe external update failed'
     Send-TcpCommand $longLivedStream @{ id = 'unsubscribe-64'; op = 'unsubscribe'; subscriptionId = 'client-unsubscribe' }
     Assert-True ((Read-TcpEvent $longLivedStream).type -eq 'ack') 'unsubscribe-64 acknowledgement failed'
-    Start-Sleep -Milliseconds 250
     Assert-True (-not $longLivedAdapter.HasExited) 'long-lived adapter exited before explicit close'
     Send-TcpCommand $longLivedStream @{ id = 'long-echo'; op = 'query'; path = 'demo:echo'; args = @{ value = 'still-listening' } }
     $echo = Read-TcpEvent $longLivedStream

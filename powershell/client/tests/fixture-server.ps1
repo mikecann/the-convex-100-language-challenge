@@ -18,6 +18,9 @@ $state = [hashtable]::Synchronized(@{
         Connections           = 0
         Adds                  = 0
         Stop                  = $false
+        # Faults that must be injected exactly once so the reconnect after them
+        # can prove recovery on the same subscription.
+        Triggers              = [System.Collections.Concurrent.ConcurrentDictionary[string, bool]]::new()
         ConnectMessages       = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
         AddBatches            = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
         Sockets               = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
@@ -48,6 +51,17 @@ $socketWorker = {
     }
     $seenRevision = -1
     $seenFailure = 0
+    # Set when this connection deliberately abandons a half-sent frame.
+    $stalling = $false
+    # Bytes of a transition this connection releases one at a time, forever.
+    $dribbleBytes = $null
+    $dribbleOffset = 0
+
+    function Test-FirstTrigger([string] $Key) {
+        # True only for the connection that reaches this mode first. Later
+        # connections behave normally so recovery is observable.
+        $State.Triggers.TryAdd($Key, $true)
+    }
 
     function New-Version([int] $QuerySet) {
         [Threading.Monitor]::Enter($State.Sync)
@@ -85,6 +99,16 @@ $socketWorker = {
             ).GetAwaiter().GetResult() | Out-Null
             return
         }
+        $Socket.SendAsync(
+            [ArraySegment[byte]]::new($bytes),
+            [Net.WebSockets.WebSocketMessageType]::Text,
+            $true,
+            [Threading.CancellationToken]::None
+        ).GetAwaiter().GetResult() | Out-Null
+    }
+
+    function Send-Raw([string] $Json) {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($Json)
         $Socket.SendAsync(
             [ArraySegment[byte]]::new($bytes),
             [Net.WebSockets.WebSocketMessageType]::Text,
@@ -206,10 +230,46 @@ $socketWorker = {
                                         $modification['queryId'] = [uint64]4294967296
                                     }
                                 }
+                                if ($mode -eq 'logLineType') {
+                                    foreach ($modification in $modifications) {
+                                        $modification['logLines'] = @(1)
+                                    }
+                                }
+                                if ($mode -eq 'logLinesType') {
+                                    foreach ($modification in $modifications) {
+                                        $modification['logLines'] = 'bad'
+                                    }
+                                }
+                                if ($mode -eq 'queryFailedNoMessage' -and (Test-FirstTrigger 'queryFailedNoMessage')) {
+                                    $modifications = [System.Collections.Generic.List[object]]::new()
+                                    $modifications.Add(@{
+                                            type     = 'QueryFailed'
+                                            queryId  = $queryId
+                                            logLines = @('fixture failure')
+                                        })
+                                }
+                                if ($mode -eq 'queryFailedMessageType' -and (Test-FirstTrigger 'queryFailedMessageType')) {
+                                    $modifications = [System.Collections.Generic.List[object]]::new()
+                                    $modifications.Add(@{
+                                            type         = 'QueryFailed'
+                                            queryId      = $queryId
+                                            errorMessage = 12
+                                            logLines     = @('fixture failure')
+                                        })
+                                }
                                 if ($mode -eq 'invalidTimestamp') {
                                     $end['ts'] = 'not-base64'
                                 }
-                                if ($mode -eq 'stalledFrame') {
+                                if ($mode -eq 'nonObjectRoot') {
+                                    # A byte-native parser accepts any JSON root.
+                                    # The client must reject this array frame as a
+                                    # ProtocolError rather than fail while indexing.
+                                    Send-Raw '[1,2,3]'
+                                }
+                                elseif (
+                                    $mode -eq 'stalledFrame' -or
+                                    ($mode -eq 'stalledFrameOnce' -and (Test-FirstTrigger 'stalledFrameOnce'))
+                                ) {
                                     $payload = @{
                                         type          = 'Transition'
                                         startVersion  = $owner.Version
@@ -224,6 +284,21 @@ $socketWorker = {
                                         $false,
                                         [Threading.CancellationToken]::None
                                     ).GetAwaiter().GetResult() | Out-Null
+                                    $stalling = $true
+                                }
+                                elseif ($mode -eq 'dribble' -and (Test-FirstTrigger 'dribble')) {
+                                    # Release this transition one byte at a time
+                                    # and never finish it. The peer stays busy, so
+                                    # only an absolute assembly deadline can end
+                                    # the message; an inactivity timer never fires.
+                                    $payload = @{
+                                        type          = 'Transition'
+                                        startVersion  = $owner.Version
+                                        endVersion    = $end
+                                        modifications = @($modifications)
+                                    } | ConvertTo-Json -Depth 64 -Compress
+                                    $dribbleBytes = [Text.Encoding]::UTF8.GetBytes($payload)
+                                    $dribbleOffset = 0
                                 }
                                 else {
                                     Send-Json @{
@@ -262,7 +337,20 @@ $socketWorker = {
                     }
                 }
             }
-            if ($null -eq $queryId -or $mode -eq 'stalledFrame') {
+            if ($null -ne $dribbleBytes) {
+                if ($dribbleOffset -lt $dribbleBytes.Length) {
+                    $Socket.SendAsync(
+                        [ArraySegment[byte]]::new($dribbleBytes, $dribbleOffset, 1),
+                        [Net.WebSockets.WebSocketMessageType]::Text,
+                        $false,
+                        [Threading.CancellationToken]::None
+                    ).GetAwaiter().GetResult() | Out-Null
+                    $dribbleOffset++
+                }
+                Start-Sleep -Milliseconds 50
+                continue
+            }
+            if ($null -eq $queryId -or $stalling) {
                 continue
             }
             if ($mode -eq 'flood') {

@@ -12,9 +12,22 @@ $script:ConvexPerSubscriptionItems = 16
 $script:ConvexGlobalQueueItems = 64
 $script:ConvexGlobalQueueBytes = 8MB
 $script:ConvexQueueItemOverhead = 512
-$script:ConvexConnectTimeoutMilliseconds = 3000
-$script:ConvexSendTimeoutMilliseconds = 3000
+# One cumulative, cancellable budget covers everything the sole owner does for a
+# single operation: DNS, TCP connect, TLS, the 101 upgrade, the initial Connect
+# frame, and the replayed ModifyQuerySet. Separate per-step timeouts would let a
+# slow peer consume a multiple of this budget and delay the next control command.
+$script:ConvexOwnerDeadlineMilliseconds = 3000
+# The caller's cumulative acknowledgement budget. It is deliberately longer than
+# the owner budget so a stalled peer surfaces as a structured owner failure
+# rather than as a bare caller timeout.
 $script:ConvexControlTimeoutMilliseconds = 4000
+# An absolute deadline for assembling one WebSocket message, armed by its first
+# byte. It is never extended by later fragments, so a peer that dribbles bytes
+# forever fails exactly like a peer that stops halfway through a frame. Against
+# the 4 MiB frame cap it asks for roughly 820 KiB/s, so a legal maximum message
+# still arrives comfortably while an endless trickle cannot outlast it. Commands
+# are polled between fragments, so this budget never delays close or unsubscribe.
+$script:ConvexMessageDeadlineMilliseconds = 5000
 
 function ConvertTo-ConvexJson {
     param([Parameter(Mandatory)] $Value)
@@ -119,20 +132,57 @@ function Read-ConvexHttpBody {
     }
 }
 
-function ConvertFrom-ConvexHttpEnvelope {
-    param($Decoded, [string] $Operation)
-    if ($Decoded -isnot [hashtable]) {
+function Test-ConvexHttpSuccessStatus {
+    param([int] $StatusCode)
+    $StatusCode -ge 200 -and $StatusCode -lt 300
+}
+
+# A body that never identified itself as a Convex envelope cannot be judged a
+# protocol violation when the peer also returned a failing status: a proxy error
+# page on 502 is a transport fault, not a Convex one. Report the status in that
+# case and keep ProtocolError for unparseable bodies that arrived on 2xx, where
+# the peer claimed success and then failed to speak the protocol.
+function Throw-ConvexHttpBodyError {
+    param([string] $Operation, [int] $StatusCode, [string] $Message)
+    if (Test-ConvexHttpSuccessStatus $StatusCode) {
         Throw-ConvexError (
-            New-ConvexError -Name ProtocolError -Message "Convex $Operation response root must be an object" -Operation $Operation
+            New-ConvexError -Name ProtocolError -Message $Message -Operation $Operation
         )
+    }
+    Throw-ConvexError (
+        New-ConvexError -Name TransportError -Message "Convex HTTP request failed with status $StatusCode" -Operation $Operation
+    )
+}
+
+# Convex reports a failed function as a complete error envelope carried on a
+# non-2xx status: 560 for a developer error, and 400 or 500 for other server
+# rejections. Classifying on the status first would discard errorData and
+# logLines and mislabel an ordinary function failure as a transport fault, so
+# the envelope is always parsed before the status is consulted. The status then
+# decides only what the envelope itself cannot: a body that is not a Convex
+# envelope at all, and a body that contradicts the status by claiming success.
+function ConvertFrom-ConvexHttpEnvelope {
+    param($Decoded, [string] $Operation, [int] $StatusCode = 200)
+    if ($Decoded -isnot [hashtable]) {
+        Throw-ConvexHttpBodyError $Operation $StatusCode "Convex $Operation response root must be an object"
     }
     if (-not $Decoded.ContainsKey('status') -or $Decoded['status'] -isnot [string]) {
-        Throw-ConvexError (
-            New-ConvexError -Name ProtocolError -Message "Convex $Operation response status must be a string" -Operation $Operation
-        )
+        Throw-ConvexHttpBodyError $Operation $StatusCode "Convex $Operation response status must be a string"
+    }
+    if ($Decoded['status'] -notin @('success', 'error')) {
+        Throw-ConvexHttpBodyError $Operation $StatusCode "Convex $Operation response had unexpected status"
     }
 
-    [string[]]$logs = @()
+    # Past this point the body is a recognizable Convex envelope, so a remaining
+    # violation is a protocol fault in its own right and the HTTP status no
+    # longer changes the classification. A broken backend returning a malformed
+    # error envelope on 560 must not be laundered into a transport failure.
+    #
+    # Append into a list rather than growing a [string[]] one element at a time.
+    # A near-8 MiB body can declare hundreds of thousands of log lines, and
+    # repeated array reallocation would cost quadratic copying inside the final
+    # adapter's 128 MiB cgroup.
+    $logLines = [Collections.Generic.List[string]]::new()
     if ($Decoded.ContainsKey('logLines')) {
         if ($Decoded['logLines'] -isnot [array]) {
             Throw-ConvexError (
@@ -145,18 +195,11 @@ function ConvertFrom-ConvexHttpEnvelope {
                     New-ConvexError -Name ProtocolError -Message "Convex $Operation response logLines must contain strings" -Operation $Operation
                 )
             }
-            $logs += $line
+            $logLines.Add($line)
         }
     }
+    [string[]]$logs = $logLines.ToArray()
 
-    if ($Decoded['status'] -eq 'success') {
-        if (-not $Decoded.ContainsKey('value')) {
-            Throw-ConvexError (
-                New-ConvexError -Name ProtocolError -Message "Convex $Operation success response omitted value" -Operation $Operation
-            )
-        }
-        return [pscustomobject]@{ Value = $Decoded['value']; Logs = [string[]]$logs }
-    }
     if ($Decoded['status'] -eq 'error') {
         if (-not $Decoded.ContainsKey('errorMessage') -or $Decoded['errorMessage'] -isnot [string]) {
             Throw-ConvexError (
@@ -168,9 +211,21 @@ function ConvertFrom-ConvexHttpEnvelope {
             New-ConvexError -Name FunctionError -Message $Decoded['errorMessage'] -Data $errorData -Logs $logs -Operation $Operation
         )
     }
-    Throw-ConvexError (
-        New-ConvexError -Name ProtocolError -Message "Convex $Operation response had unexpected status" -Operation $Operation
-    )
+
+    # A success envelope contradicts a failing status. Trust the status: the
+    # body most likely came from something other than the function that was
+    # called, so it must never be handed back as a value.
+    if (-not (Test-ConvexHttpSuccessStatus $StatusCode)) {
+        Throw-ConvexError (
+            New-ConvexError -Name TransportError -Message "Convex HTTP request failed with status $StatusCode" -Operation $Operation
+        )
+    }
+    if (-not $Decoded.ContainsKey('value')) {
+        Throw-ConvexError (
+            New-ConvexError -Name ProtocolError -Message "Convex $Operation success response omitted value" -Operation $Operation
+        )
+    }
+    [pscustomobject]@{ Value = $Decoded['value']; Logs = [string[]]$logs }
 }
 
 function New-ConvexError {
@@ -281,6 +336,8 @@ function Invoke-ConvexFunction {
         'application/json'
     )
     $response = $null
+    $statusCode = 0
+    $decoded = $null
     $deadline = [Threading.CancellationTokenSource]::CreateLinkedTokenSource($CancellationToken)
     try {
         $deadline.CancelAfter([int]$Client.HttpTimeoutMilliseconds)
@@ -289,11 +346,12 @@ function Invoke-ConvexFunction {
             [Net.Http.HttpCompletionOption]::ResponseHeadersRead,
             $deadline.Token
         )
-        if (-not $response.IsSuccessStatusCode) {
-            Throw-ConvexError (
-                New-ConvexError -Name TransportError -Message "Convex HTTP request failed with status $([int]$response.StatusCode)" -Operation $Operation
-            )
-        }
+        # The status is captured but not acted on yet. Convex carries a complete
+        # function-error envelope on 560, 500, and 400, so the body is read and
+        # parsed first and the status only classifies what the body cannot. The
+        # 8 MiB streaming bound below applies to failing responses too, so a
+        # hostile error body is no cheaper to send than a successful one.
+        $statusCode = [int]$response.StatusCode
         $bodyBytes = Read-ConvexHttpBody $response.Content $deadline.Token
         # Parse UTF-8 directly. Converting an 8 MiB response to one giant
         # UTF-16 string first would duplicate the payload inside the final
@@ -302,9 +360,7 @@ function Invoke-ConvexFunction {
             $decoded = ConvertFrom-ConvexJsonBytes $bodyBytes.Bytes $bodyBytes.Length
         }
         catch {
-            Throw-ConvexError (
-                New-ConvexError -Name ProtocolError -Message "Convex $Operation response was not valid JSON: $($_.Exception.Message)" -Operation $Operation
-            )
+            Throw-ConvexHttpBodyError $Operation $statusCode "Convex $Operation response was not valid JSON: $($_.Exception.Message)"
         }
     }
     catch [OperationCanceledException] {
@@ -326,7 +382,7 @@ function Invoke-ConvexFunction {
         }
         $deadline.Dispose()
     }
-    ConvertFrom-ConvexHttpEnvelope $decoded $Operation
+    ConvertFrom-ConvexHttpEnvelope $decoded $Operation $statusCode
 }
 
 function Get-ConvexQuery {
@@ -397,7 +453,12 @@ function New-ConvexLiveState {
             NextConnectAt       = [datetime]::UtcNow
             ReceiveTask         = $null
             Frame               = [IO.MemoryStream]::new()
-            Buffer              = [byte[]]::new(4096)
+            # Absolute expiry for the message currently being assembled in Frame.
+            MessageDeadline     = $null
+            # One receive holds a whole ordinary transition, so a near-maximum
+            # frame assembles in tens of fragments rather than a thousand. The
+            # per-message deadline below has to be achievable for legal frames.
+            Buffer              = [byte[]]::new(64KB)
             # Adapter-only disconnect uses this barrier to acknowledge only after
             # every active query has applied its replacement-socket hydration.
             HydrationQueryIds   = [System.Collections.Generic.HashSet[uint32]]::new()
@@ -414,11 +475,62 @@ $script:ConvexLiveWorker = {
         $GlobalQueueBytes,
         $QueueItemOverhead,
         $MaxFrameBytes,
-        $ConnectTimeoutMilliseconds,
-        $SendTimeoutMilliseconds
+        $OwnerDeadlineMilliseconds,
+        $MessageDeadlineMilliseconds
     )
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
+
+    function ConvertFrom-LiveJsonElement {
+        param([Parameter(Mandatory)][Text.Json.JsonElement] $Element)
+        switch ($Element.ValueKind.ToString()) {
+            'Object' {
+                $value = @{}
+                foreach ($property in $Element.EnumerateObject()) {
+                    $value[$property.Name] = ConvertFrom-LiveJsonElement $property.Value
+                }
+                return $value
+            }
+            'Array' {
+                $items = [Collections.Generic.List[object]]::new()
+                foreach ($item in $Element.EnumerateArray()) {
+                    $items.Add((ConvertFrom-LiveJsonElement $item))
+                }
+                return , ([object[]]$items.ToArray())
+            }
+            'String' { return $Element.GetString() }
+            'Number' {
+                [int64]$integer = 0
+                if ($Element.TryGetInt64([ref]$integer)) {
+                    return $integer
+                }
+                [decimal]$decimal = 0
+                if ($Element.TryGetDecimal([ref]$decimal)) {
+                    return $decimal
+                }
+                return $Element.GetDouble()
+            }
+            'True' { return $true }
+            'False' { return $false }
+            'Null' { return $null }
+            default { throw "unsupported JSON value kind $($Element.ValueKind)" }
+        }
+    }
+
+    function ConvertFrom-LiveJsonBytes([byte[]] $Bytes, [int] $Length) {
+        # Parse the bounded WebSocket frame directly as UTF-8. A whole-frame
+        # UTF-16 string doubles transient memory and can cross the adapter's
+        # 128 MiB cgroup even for an ordinary hosted Transition.
+        $document = [Text.Json.JsonDocument]::Parse(
+            [ReadOnlyMemory[byte]]::new($Bytes, 0, $Length)
+        )
+        try {
+            ConvertFrom-LiveJsonElement $document.RootElement
+        }
+        finally {
+            $document.Dispose()
+        }
+    }
 
     function ConvertTo-ConvexUInt32($Value, [string] $Label) {
         if ($Value -is [bool] -or $Value -isnot [ValueType]) {
@@ -496,27 +608,32 @@ $script:ConvexLiveWorker = {
         $failure
     }
 
-    function Send-Frame($Value) {
+    function New-OwnerDeadline {
+        # A background reconnect has no caller to abandon it, so it owns the same
+        # cumulative budget on its own cancellation source.
+        $source = [Threading.CancellationTokenSource]::new()
+        $source.CancelAfter($OwnerDeadlineMilliseconds)
+        $source
+    }
+
+    function Send-Frame($Value, $Deadline) {
         $socket = $State.Owner.Socket
         if ($null -eq $socket) {
             throw (New-WorkerFailure 'TransportError' 'Live WebSocket is not connected')
         }
         $bytes = [Text.Encoding]::UTF8.GetBytes(($Value | ConvertTo-Json -Depth 64 -Compress))
-        $deadline = [Threading.CancellationTokenSource]::new()
         try {
-            $deadline.CancelAfter($SendTimeoutMilliseconds)
+            # No private timeout here. The send spends whatever remains of the
+            # operation's one cumulative deadline.
             $socket.SendAsync(
                 [ArraySegment[byte]]::new($bytes),
                 [Net.WebSockets.WebSocketMessageType]::Text,
                 $true,
-                $deadline.Token
+                $Deadline.Token
             ).GetAwaiter().GetResult() | Out-Null
         }
         catch {
             throw (New-WorkerFailure 'TransportError' "Live send failed: $($_.Exception.Message)")
-        }
-        finally {
-            $deadline.Dispose()
         }
     }
 
@@ -621,6 +738,7 @@ $script:ConvexLiveWorker = {
         $State.Owner.Socket = $null
         $State.Owner.ReceiveTask = $null
         $State.Owner.Frame.SetLength(0)
+        $State.Owner.MessageDeadline = $null
         $State.Owner.Version = New-ZeroVersion
         $State.Owner.QuerySet = 0
         if ($null -ne $oldSocket) {
@@ -629,6 +747,11 @@ $script:ConvexLiveWorker = {
                 try { $oldReceive.Wait(500) | Out-Null } catch {}
             }
             $oldSocket.Dispose()
+            # Disposal already closed the transport. Hint that the retired
+            # wrappers are collectable, but never block and never wait on
+            # finalizers: this runs inside a caller's cumulative deadline, and an
+            # unbounded pause here would silently spend someone else's budget.
+            [GC]::Collect(2, [GCCollectionMode]::Optimized, $false, $false)
             $State.ConnectionCount++
         }
         $State.LastCloseReason = $Reason
@@ -637,6 +760,21 @@ $script:ConvexLiveWorker = {
         }
         $State.Owner.NextConnectAt = [datetime]::UtcNow.AddMilliseconds($State.Owner.BackoffMilliseconds)
         $State.Owner.BackoffMilliseconds = [Math]::Min($State.Owner.BackoffMilliseconds * 2, 15000)
+    }
+
+    function Assert-MessageDeadline {
+        # The deadline is absolute, so a peer that keeps trickling bytes cannot
+        # postpone it. Failing here retires the socket, publishes a structured
+        # TransportError, and lets the ordinary reconnect replay the active Adds.
+        if (
+            $State.Owner.Frame.Length -gt 0 -and
+            $null -ne $State.Owner.MessageDeadline -and
+            [datetime]::UtcNow -ge $State.Owner.MessageDeadline
+        ) {
+            throw (
+                New-WorkerFailure 'TransportError' 'Live message assembly exceeded its absolute deadline'
+            )
+        }
     }
 
     function Add-Modification($Record) {
@@ -648,7 +786,7 @@ $script:ConvexLiveWorker = {
         }
     }
 
-    function Send-Modify([object[]] $Changes) {
+    function Send-Modify([object[]] $Changes, $Deadline) {
         if ($Changes.Count -eq 0) {
             return
         }
@@ -661,27 +799,24 @@ $script:ConvexLiveWorker = {
             baseVersion   = $State.Owner.QuerySet
             newVersion    = $newVersion
             modifications = @($Changes)
-        }
+        } $Deadline
         $State.Owner.QuerySet = $newVersion
     }
 
-    function Connect-Socket {
+    function Connect-Socket($Deadline) {
         $candidate = [Net.WebSockets.ClientWebSocket]::new()
         # HttpListener and several WebSocket proxies require an explicit offered
         # protocol. Convex may either select it or leave the response unnegotiated.
         $candidate.Options.AddSubProtocol('convex-1.0.0')
         $candidate.Options.SetRequestHeader('Convex-Client', $State.Version)
-        $deadline = [Threading.CancellationTokenSource]::new()
         try {
-            $deadline.CancelAfter($ConnectTimeoutMilliseconds)
-            $candidate.ConnectAsync([Uri]$State.Endpoint, $deadline.Token).GetAwaiter().GetResult() | Out-Null
+            # DNS, TCP, TLS, and the 101 upgrade all draw on the same budget the
+            # Connect and ModifyQuerySet frames below must still fit inside.
+            $candidate.ConnectAsync([Uri]$State.Endpoint, $Deadline.Token).GetAwaiter().GetResult() | Out-Null
         }
         catch {
             $candidate.Dispose()
             throw (New-WorkerFailure 'TransportError' "Live connect failed: $($_.Exception.Message)")
-        }
-        finally {
-            $deadline.Dispose()
         }
         $State.Owner.Socket = $candidate
         $State.Owner.Version = New-ZeroVersion
@@ -697,13 +832,13 @@ $script:ConvexLiveWorker = {
         if ($null -ne $State.MaxObservedTimestamp) {
             $connect['maxObservedTimestamp'] = $State.MaxObservedTimestamp
         }
-        Send-Frame $connect
+        Send-Frame $connect $Deadline
         [object[]] $adds = @(
             $State.Subscriptions.Values |
                 Sort-Object QueryId |
                 ForEach-Object { Add-Modification $_ }
         )
-        Send-Modify $adds
+        Send-Modify $adds $Deadline
     }
 
     function Validate-Transition([hashtable] $Message) {
@@ -754,7 +889,18 @@ $script:ConvexLiveWorker = {
             }
             [string[]] $logs = @()
             if ($modification.ContainsKey('logLines')) {
-                [string[]] $logs = @($modification['logLines'] | ForEach-Object { [string] $_ })
+                # Match the HTTP envelope exactly. Coercing with [string] would
+                # turn a nested object into its type name and publish a
+                # schema-invalid log line instead of rejecting the transition.
+                if ($modification['logLines'] -isnot [array]) {
+                    throw (New-WorkerFailure 'ProtocolError' "$kind logLines must be an array")
+                }
+                foreach ($line in $modification['logLines']) {
+                    if ($line -isnot [string]) {
+                        throw (New-WorkerFailure 'ProtocolError' "$kind logLines must contain strings")
+                    }
+                }
+                [string[]] $logs = @($modification['logLines'])
             }
             if ($kind -eq 'QueryUpdated') {
                 if (-not $modification.ContainsKey('value')) {
@@ -767,13 +913,17 @@ $script:ConvexLiveWorker = {
                     })
             }
             elseif ($kind -eq 'QueryFailed') {
-                $failureMessage = if ($modification.ContainsKey('errorMessage')) {
-                    [string]$modification['errorMessage']
+                # A missing or non-string errorMessage is a malformed transition,
+                # not a function that failed. Substituting placeholder text would
+                # publish a FunctionError the Convex function never raised and
+                # hide the protocol defect behind a plausible application error.
+                if (
+                    -not $modification.ContainsKey('errorMessage') -or
+                    $modification['errorMessage'] -isnot [string]
+                ) {
+                    throw (New-WorkerFailure 'ProtocolError' 'QueryFailed requires a string errorMessage')
                 }
-                else {
-                    'query failed'
-                }
-                $error = @{ name = 'FunctionError'; message = $failureMessage }
+                $error = @{ name = 'FunctionError'; message = [string]$modification['errorMessage'] }
                 if ($modification.ContainsKey('errorData')) {
                     $error['data'] = $modification['errorData']
                 }
@@ -823,11 +973,34 @@ $script:ConvexLiveWorker = {
                 [datetime]::UtcNow -ge $State.Owner.NextConnectAt -and
                 $State.Subscriptions.Count -gt 0
             ) {
-                Connect-Socket
+                $reconnectDeadline = New-OwnerDeadline
+                try {
+                    Connect-Socket $reconnectDeadline
+                }
+                finally {
+                    $reconnectDeadline.Dispose()
+                }
             }
 
+            # Poll idly for commands, but never sleep between the fragments of a
+            # message: the assembly deadline must be spent receiving, not
+            # waiting on an empty command queue. Commands are still inspected
+            # between every fragment, so close and unsubscribe stay bounded while
+            # the peer streams.
+            $commandWait = if ($State.Owner.Frame.Length -gt 0) { 0 } else { 20 }
             $command = $null
-            if ($State.Commands.TryTake([ref]$command, 20)) {
+            if ($State.Commands.TryTake([ref]$command, $commandWait)) {
+                # The caller already stopped waiting at its cumulative deadline.
+                # Failing this command immediately keeps the sole owner available
+                # for the control work queued behind it instead of spending a
+                # fresh budget on abandoned socket work. Stop is exempt: shutdown
+                # must run even when its caller has given up waiting for it.
+                if ($command.Kind -ne 'Stop' -and $command.Cancellation.IsCancellationRequested) {
+                    Complete-Command $command (
+                        New-WorkerFailure 'TransportError' 'Live command was abandoned at its cumulative deadline'
+                    )
+                    continue
+                }
                 $commandFailure = $null
                 try {
                     switch ($command.Kind) {
@@ -846,10 +1019,11 @@ $script:ConvexLiveWorker = {
                                 $State.Owner.HydrationApplied.Set() | Out-Null
                             }
                             else {
-                                # Connect synchronously on the sole owner. The
-                                # caller's acknowledgement barrier below then
-                                # waits for every rehydrated transition to apply.
-                                Connect-Socket
+                                # Connect synchronously on the sole owner, inside
+                                # the caller's own cumulative deadline. Retirement
+                                # and reconnect scheduling therefore cannot outlive
+                                # the acknowledgement the caller is waiting for.
+                                Connect-Socket $command.Cancellation
                             }
                         }
                         'Subscribe' {
@@ -869,7 +1043,7 @@ $script:ConvexLiveWorker = {
                             $State.Subscriptions[$command.Record.Id] = $command.Record
                             $changes.Add((Add-Modification $command.Record))
                             if ($null -ne $State.Owner.Socket) {
-                                Send-Modify $changes.ToArray()
+                                Send-Modify $changes.ToArray() $command.Cancellation
                             }
                         }
                         'Unsubscribe' {
@@ -921,6 +1095,8 @@ $script:ConvexLiveWorker = {
                 )
             }
             if (-not $State.Owner.ReceiveTask.Wait(1)) {
+                # A peer that stops halfway through a frame expires here.
+                Assert-MessageDeadline
                 continue
             }
             $result = $State.Owner.ReceiveTask.GetAwaiter().GetResult()
@@ -931,27 +1107,36 @@ $script:ConvexLiveWorker = {
             if ($result.MessageType -ne [Net.WebSockets.WebSocketMessageType]::Text) {
                 throw (New-WorkerFailure 'ProtocolError' 'Live server sent a non-text data message')
             }
+            if ($State.Owner.Frame.Length -eq 0) {
+                # Arm the assembly deadline from the first byte of the message.
+                $State.Owner.MessageDeadline = [datetime]::UtcNow.AddMilliseconds($MessageDeadlineMilliseconds)
+            }
             $State.Owner.Frame.Write($State.Owner.Buffer, 0, $result.Count)
             if ($State.Owner.Frame.Length -gt $MaxFrameBytes) {
                 throw (New-WorkerFailure 'ProtocolError' 'Live frame exceeds 4 MiB')
             }
             if (-not $result.EndOfMessage) {
+                # Bytes arriving continuously do not reset the deadline, so an
+                # endless dribble expires at the same instant a stall would.
+                Assert-MessageDeadline
                 continue
             }
-            $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
             try {
-                $text = $strictUtf8.GetString(
-                    $State.Owner.Frame.GetBuffer(),
-                    0,
-                    [int]$State.Owner.Frame.Length
-                )
-                $message = $text | ConvertFrom-Json -AsHashtable -Depth 64
+                $message = ConvertFrom-LiveJsonBytes -Bytes $State.Owner.Frame.GetBuffer() -Length ([int]$State.Owner.Frame.Length)
             }
             catch {
                 throw (New-WorkerFailure 'ProtocolError' "invalid Live UTF-8 or JSON: $($_.Exception.Message)")
             }
             finally {
                 $State.Owner.Frame.SetLength(0)
+                $State.Owner.MessageDeadline = $null
+            }
+            # A byte-native parse accepts any JSON root. Reject non-object roots
+            # here, exactly as the HTTP envelope does, so a scalar or array frame
+            # is a ProtocolError instead of an indexing failure reclassified as
+            # a TransportError that would then drive a reconnect.
+            if ($message -isnot [hashtable]) {
+                throw (New-WorkerFailure 'ProtocolError' 'Live message root must be an object')
             }
             if ($message['type'] -in @('Ping', 'MutationResponse', 'ActionResponse')) {
                 continue
@@ -986,8 +1171,8 @@ function Start-ConvexLive {
     [void]$powerShell.AddArgument($script:ConvexGlobalQueueBytes)
     [void]$powerShell.AddArgument($script:ConvexQueueItemOverhead)
     [void]$powerShell.AddArgument($script:ConvexMaxLiveBytes)
-    [void]$powerShell.AddArgument($script:ConvexConnectTimeoutMilliseconds)
-    [void]$powerShell.AddArgument($script:ConvexSendTimeoutMilliseconds)
+    [void]$powerShell.AddArgument($script:ConvexOwnerDeadlineMilliseconds)
+    [void]$powerShell.AddArgument($script:ConvexMessageDeadlineMilliseconds)
     $State.Worker = [pscustomobject]@{
         PowerShell = $powerShell
         Handle     = $powerShell.BeginInvoke()
@@ -1017,11 +1202,49 @@ function New-ConvexSubscriptionRecord {
     }
 }
 
+function New-ConvexLiveCommand {
+    param([string] $Kind, [string] $Id = '', $Record = $null)
+    $cancellation = [Threading.CancellationTokenSource]::new()
+    # The owner's socket work and the caller's wait share this one source, so a
+    # caller that gives up also retires the operation it started.
+    $cancellation.CancelAfter($script:ConvexOwnerDeadlineMilliseconds)
+    [pscustomobject]@{
+        Kind         = $Kind
+        Id           = $Id
+        Record       = $Record
+        Done         = [Threading.ManualResetEventSlim]::new($false)
+        Failure      = $null
+        Cancellation = $cancellation
+    }
+}
+
+function Get-ConvexRemainingMilliseconds {
+    param([datetime] $Deadline)
+    $remaining = [int][Math]::Ceiling(($Deadline - [datetime]::UtcNow).TotalMilliseconds)
+    if ($remaining -lt 0) { 0 } else { $remaining }
+}
+
+function Add-ConvexLiveCommand {
+    param($Live, $Command, [datetime] $Deadline)
+    # Queueing spends the same budget as the acknowledgement, so a full command
+    # queue cannot silently add a second full timeout to a public call.
+    if (-not $Live.Commands.TryAdd($Command, (Get-ConvexRemainingMilliseconds $Deadline))) {
+        $Command.Cancellation.Cancel()
+        throw 'Live command queue is full'
+    }
+}
+
 function Wait-ConvexControl {
-    param($Command, [string] $Operation)
-    if (-not $Command.Done.Wait($script:ConvexControlTimeoutMilliseconds)) {
+    param($Command, [string] $Operation, [datetime] $Deadline)
+    if (-not $Command.Done.Wait((Get-ConvexRemainingMilliseconds $Deadline))) {
+        # Cancel rather than abandon. The owner drops the timed-out operation
+        # instead of finishing it and delaying the next control command.
+        $Command.Cancellation.Cancel()
         throw "Live $Operation exceeded the bounded control deadline"
     }
+    # The owner completes a command only after its socket work has finished, so
+    # the shared cancellation source and its timer can be released here.
+    $Command.Cancellation.Dispose()
     if ($null -ne $Command.Failure) {
         throw $Command.Failure
     }
@@ -1029,6 +1252,8 @@ function Wait-ConvexControl {
 
 function Add-ConvexSubscription {
     param($Live, [string] $Id, [string] $Path, [hashtable] $FunctionArgs)
+    # One cumulative deadline covers queueing and acknowledgement together.
+    $deadline = [datetime]::UtcNow.AddMilliseconds($script:ConvexControlTimeoutMilliseconds)
     Assert-ConvexPath $Path
     if ($Live.Closed) {
         Throw-ConvexError (New-ConvexError -Name ClosedError -Message 'Live client is closed')
@@ -1046,16 +1271,9 @@ function Add-ConvexSubscription {
         FunctionArgs = [hashtable]$FunctionArgs
     }
     $record = New-ConvexSubscriptionRecord @recordArguments
-    $command = [pscustomobject]@{
-        Kind    = 'Subscribe'
-        Record  = $record
-        Done    = [Threading.ManualResetEventSlim]::new($false)
-        Failure = $null
-    }
-    if (-not $Live.Commands.TryAdd($command, 1000)) {
-        throw 'Live command queue is full'
-    }
-    Wait-ConvexControl $command 'subscribe'
+    $command = New-ConvexLiveCommand 'Subscribe' $Id $record
+    Add-ConvexLiveCommand $Live $command $deadline
+    Wait-ConvexControl $command 'subscribe' $deadline
     $record
 }
 
@@ -1064,16 +1282,10 @@ function Remove-ConvexSubscription {
     if ($Live.Closed) {
         return
     }
-    $command = [pscustomobject]@{
-        Kind    = 'Unsubscribe'
-        Id      = $Id
-        Done    = [Threading.ManualResetEventSlim]::new($false)
-        Failure = $null
-    }
-    if (-not $Live.Commands.TryAdd($command, 1000)) {
-        throw 'Live command queue is full'
-    }
-    Wait-ConvexControl $command 'unsubscribe'
+    $deadline = [datetime]::UtcNow.AddMilliseconds($script:ConvexControlTimeoutMilliseconds)
+    $command = New-ConvexLiveCommand 'Unsubscribe' $Id
+    Add-ConvexLiveCommand $Live $command $deadline
+    Wait-ConvexControl $command 'unsubscribe' $deadline
 }
 
 function Receive-ConvexSubscription {
@@ -1125,16 +1337,14 @@ function Disconnect-ConvexLiveForAdapter {
     if ($Live.Closed) {
         Throw-ConvexError (New-ConvexError -Name ClosedError -Message 'Live client is closed')
     }
-    $command = [pscustomobject]@{
-        Kind    = 'DebugDisconnect'
-        Done    = [Threading.ManualResetEventSlim]::new($false)
-        Failure = $null
-    }
-    if (-not $Live.Commands.TryAdd($command, 1000)) {
-        throw 'Live command queue is full'
-    }
-    Wait-ConvexControl $command 'debug disconnect'
-    if (-not $Live.Owner.HydrationApplied.Wait($script:ConvexControlTimeoutMilliseconds)) {
+    # Retirement, reconnect scheduling, the acknowledgement, and the rehydration
+    # barrier all draw on this single budget. Charging each step its own timeout
+    # would let one debug disconnect hold the owner for a multiple of it.
+    $deadline = [datetime]::UtcNow.AddMilliseconds($script:ConvexControlTimeoutMilliseconds)
+    $command = New-ConvexLiveCommand 'DebugDisconnect'
+    Add-ConvexLiveCommand $Live $command $deadline
+    Wait-ConvexControl $command 'debug disconnect' $deadline
+    if (-not $Live.Owner.HydrationApplied.Wait((Get-ConvexRemainingMilliseconds $deadline))) {
         throw 'Live debug disconnect exceeded the rehydration transition deadline'
     }
     if (
@@ -1150,14 +1360,11 @@ function Close-ConvexLive {
     if ($Live.Closed) {
         return
     }
-    $command = [pscustomobject]@{
-        Kind    = 'Stop'
-        Done    = [Threading.ManualResetEventSlim]::new($false)
-        Failure = $null
-    }
+    $deadline = [datetime]::UtcNow.AddMilliseconds($script:ConvexControlTimeoutMilliseconds)
+    $command = New-ConvexLiveCommand 'Stop'
     if ($null -ne $Live.Worker) {
-        if ($Live.Commands.TryAdd($command, 1000)) {
-            $command.Done.Wait($script:ConvexControlTimeoutMilliseconds) | Out-Null
+        if ($Live.Commands.TryAdd($command, (Get-ConvexRemainingMilliseconds $deadline))) {
+            $command.Done.Wait((Get-ConvexRemainingMilliseconds $deadline)) | Out-Null
         }
         if (-not $Live.Worker.Handle.IsCompleted) {
             $Live.Worker.PowerShell.Stop()
