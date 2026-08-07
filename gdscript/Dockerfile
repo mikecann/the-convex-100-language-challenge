@@ -129,7 +129,7 @@ CMD ["/bin/sh", "-c", "test \"$(uname -m)\" = x86_64 && godot --headless --versi
 FROM ${DEBIAN_IMAGE} AS runtime-rootfs
 COPY --from=godot-dist /out/templates/linux_release.x86_64 /tmp/godot
 RUN set -eu; root=/runtime-root; \
-    mkdir -p "$root/opt/convex" "$root/etc"; \
+    mkdir -p "$root/opt/convex" "$root/etc" "$root/usr/local/bin"; \
     install -Dm0555 /tmp/godot "$root/opt/convex/godot"; \
     ldd /tmp/godot | \
       awk '{ if ($3 ~ /^\//) print $3; if ($1 ~ /^\//) { path = $1; sub(/:$/, "", path); print path } }' | \
