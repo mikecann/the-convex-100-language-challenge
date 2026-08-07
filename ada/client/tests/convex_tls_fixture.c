@@ -243,7 +243,7 @@ static void write_all(SSL *connection, const char *text)
 }
 
 static void serve_once(int listener, X509 *certificate, EVP_PKEY *key,
-                       int must_handshake)
+                       int must_handshake, int serve_response)
 {
     static const char envelope[] = "{\"status\":\"success\",\"value\":11}";
     char response[512];
@@ -274,10 +274,16 @@ static void serve_once(int listener, X509 *certificate, EVP_PKEY *key,
         /*
          * On the mismatched port the client is the side that refuses, and a
          * TLS server can regard its own half of the handshake as finished
-         * before that refusal arrives. Nothing is asserted here: the client
-         * is the thing under test, and it is asserted in the Ada test.
+         * before that refusal arrives. Serve the identical success envelope
+         * on both ports whenever the handshake completes: a client that
+         * verifies hostnames never reaches this branch on the
+         * mismatched-name port, while one that does not verify hostnames
+         * completes the handshake here and receives a response it can parse
+         * as success, so the Ada test's `not Result.Success` assertion
+         * actually depends on verification having happened rather than on
+         * both outcomes reducing to the same EOF.
          */
-        if (must_handshake) {
+        if (serve_response) {
             read_request(connection);
             snprintf(response, sizeof response,
                      "HTTP/1.1 200 OK\r\n"
@@ -338,8 +344,14 @@ int main(int argc, char **argv)
     mismatched_listener = listen_on((unsigned short)atoi(argv[3]));
     write_certificate(argv[1], authority);
 
-    serve_once(matching_listener, matching, matching_key, 1);
-    serve_once(mismatched_listener, mismatched, mismatched_key, 0);
+    /*
+     * must_handshake stays exclusive to the matching-name port: only that
+     * port's failed handshake is a fixture bug. serve_response is 1 on both
+     * ports, so the mismatched-name port answers exactly like the matching
+     * one whenever a client's handshake reaches it at all.
+     */
+    serve_once(matching_listener, matching, matching_key, 1, 1);
+    serve_once(mismatched_listener, mismatched, mismatched_key, 0, 1);
 
     close(matching_listener);
     close(mismatched_listener);
