@@ -616,6 +616,25 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- One character silently downgraded every secure connection. Icon's scheme
+  detection compared against `"https"` where the parsed value was `"https:"`,
+  so every `wss://` subscription quietly opened as plain `ws://` — and the
+  visible symptom was a Cloudflare 301 redirect, which looks like a routing
+  problem, not a security one. The same off-by-one was duplicated in the
+  example and the adapter.
+- A timeout set once and never cleared crashed Factor. Its outbox writer put a
+  five-second write timeout on the shared controller socket and left it there,
+  so any idle gap longer than five seconds between commands raised an uncaught
+  `io-timeout` and took the whole adapter down through Factor's default `die`
+  handler. It presented as a hosted-only failure and was assumed to be a TLS or
+  network-variability problem; it reproduced locally too, once someone waited
+  long enough. **"Only fails against the real thing" is a hypothesis, not a
+  diagnosis.**
+- gm2 passes large `ARRAY OF CHAR` parameters by value on the stack. Modula-2's
+  `CopyText` took its source by value, and three 2 MiB call sites blew the
+  stack during module initialisation — before `main()`, so nothing printed. The
+  crash then masked two further bugs, a missing `/api/sync` path and a UUID
+  off-by-three, which only appeared once it stopped faulting.
 - OpenSSL needs files that `ldd` will never tell you about. Two languages
   passed every local check and then failed the hosted profile with `SSL
   routines / STORE routines::unregistered scheme`. The build stage has a full
