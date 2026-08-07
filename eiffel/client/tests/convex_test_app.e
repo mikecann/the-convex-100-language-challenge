@@ -40,15 +40,33 @@ feature {NONE} -- Initialization
 		end
 
 	check_websocket
-			-- Syntax/compile-time exercise for CONVEX_WEBSOCKET; a real
-			-- handshake test needs a WS-capable server and is covered once
-			-- the local Convex backend is available.
+			-- Exercise CONVEX_WEBSOCKET against a real public echo server
+			-- to prove the handshake and text-frame round trip actually
+			-- work, not just compile.
 		local
 			ws: CONVEX_WEBSOCKET
+			reply: detachable STRING
 		do
-			create ws.make ("127.0.0.1", 1, "/api/sync", False)
-			print ("ws_is_open=" + ws.is_open.out)
-			print ("%N")
+			create ws.make ("echo.websocket.org", 443, "/", True)
+			if not ws.is_open then
+				print ("WS_CONNECT_FAILED: ")
+				if attached ws.last_error as l_error then
+					print (l_error)
+				end
+				print ("%N")
+			else
+				if ws.send_text ("hello-from-eiffel") then
+					reply := ws.try_receive_message (5000)
+					if attached reply as l_reply then
+						print ("WS_REPLY: " + l_reply + "%N")
+					else
+						print ("WS_NO_REPLY%N")
+					end
+				else
+					print ("WS_SEND_FAILED%N")
+				end
+				ws.close ("done")
+			end
 		end
 
 	check_socket
