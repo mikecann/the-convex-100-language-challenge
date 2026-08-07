@@ -281,6 +281,26 @@ ENTRY "cvx-json-index" USING LK-SLOT LK-NODE LK-INDEX LK-CHILD.
     END-PERFORM
     GOBACK.
 
+*> The raw span length a node would need, without copying anything.
+*> Callers with a small fixed-size destination -- the adapter's
+*> command-field extraction is the only one today -- check this before
+*> calling cvx-json-string or cvx-json-copy-span, so an oversized field
+*> in a hostile or merely unexpected document is rejected instead of
+*> overflowing a buffer sized for the protocol's normal case. Decoded
+*> string length is always <= raw span length (escapes only shrink),
+*> so this bound is safe for cvx-json-string's output too.
+ENTRY "cvx-json-span-len" USING LK-SLOT LK-NODE LK-LEN.
+    MOVE LK-SLOT TO WS-D
+    MOVE 0 TO LK-LEN
+    IF LK-NODE >= 1 AND LK-NODE <= WS-DOC-COUNT(WS-D)
+        COMPUTE LK-LEN =
+            WS-N-END(WS-D, LK-NODE) - WS-N-START(WS-D, LK-NODE) + 1
+        IF LK-LEN < 0
+            MOVE 0 TO LK-LEN
+        END-IF
+    END-IF
+    GOBACK.
+
 *> Verbatim raw span. This is how a Convex value reaches an adapter
 *> event without being re-encoded, so no formatting detail changes.
 ENTRY "cvx-json-copy-span" USING LK-SLOT LK-NODE LK-OUT LK-OUT-LEN

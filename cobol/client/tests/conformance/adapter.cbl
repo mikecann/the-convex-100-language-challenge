@@ -22,6 +22,17 @@ DATA DIVISION.
 WORKING-STORAGE SECTION.
 COPY "cvx-limits.cpy".
 COPY "cvx-client.cpy".
+*> The raw command line being assembled and parsed is fully consumed by
+*> cvx-json-parse, as PROCESS-LINE's very first step, before this
+*> program next writes into CVX-RESULT -- the client itself does not
+*> set CVX-R-VALUE until DO-CALL's cvx-client-call, which always runs
+*> after that parse -- and CVX-R-VALUE is always read into WS-EVT
+*> before this program loops back to assemble the next line, so the
+*> two never need to hold different content at once. Redefining
+*> CVX-RESULT (only its leading 2 MiB, exactly CVX-R-VALUE's own span)
+*> removes WS-LINE's private 2 MiB entirely rather than merely sharing
+*> it with something else.
+01 WS-LINE REDEFINES CVX-RESULT PIC X(2097152).
 
 01 WS-MAX-LINE              BINARY-LONG VALUE 2097152.
 *> Shares convex.cbl's WS-SLOT-HTTP slot rather than owning a private
@@ -60,16 +71,24 @@ COPY "cvx-client.cpy".
 COPY "cvx-scratch.cpy".
 01 WS-EVT REDEFINES CVX-SHARED-SCRATCH PIC X(2162688).
 01 WS-EVT-LEN               BINARY-LONG.
-*> WS-ESC, WS-SPAN, and WS-LINE below are three more names for one
-*> more shared 2 MiB, private to this program: EXTRACT-COMMAND-FIELDS
-*> is the only reader of WS-SPAN and always finishes there before
-*> DO-HELLO, DO-CALL, DO-CLOSE, or any of the EMIT-* paragraphs -- the
-*> only writers of WS-ESC -- next run; and WS-LINE (the raw command
-*> line) is fully consumed by cvx-json-parse, as PROCESS-LINE's very
-*> first step, before either of the other two is next written.
-01 WS-ESC                   PIC X(2097152).
-01 WS-SPAN REDEFINES WS-ESC PIC X(2097152).
-01 WS-LINE REDEFINES WS-ESC PIC X(2097152).
+*> WS-ESC and WS-SPAN are two names for one shared, deliberately small
+*> buffer: EXTRACT-COMMAND-FIELDS is the only reader of WS-SPAN and
+*> always finishes there before DO-HELLO, DO-CALL, DO-CLOSE, or any of
+*> the EMIT-* paragraphs -- the only writers of WS-ESC -- next run.
+*>
+*> 8192 bytes, not 2 MiB: every legitimate use of this buffer is
+*> bounded well under that (an escaped id/subscriptionId/error name or
+*> message, or a decoded/raw command field -- id, op, subscriptionId,
+*> path, token, or the args object, none of which this adapter accepts
+*> past its own small declared caps). What is NOT safe is trusting that
+*> bound implicitly: cvx-json-string and cvx-json-copy-span write
+*> exactly as many bytes as the source span calls for regardless of
+*> this buffer's real size, so EXTRACT-COMMAND-FIELDS below checks
+*> cvx-json-span-len first and skips any field whose raw span would
+*> overflow it, the same way it already discarded an oversized decoded
+*> result before this buffer shrank.
+01 WS-ESC                   PIC X(8192).
+01 WS-SPAN REDEFINES WS-ESC PIC X(8192).
 01 WS-ESC-LEN               BINARY-LONG.
 
 *> ---- adapter state ------------------------------------------------
@@ -114,6 +133,9 @@ COPY "cvx-scratch.cpy".
 01 WS-KEY                   PIC X(64).
 01 WS-KEY-LEN               BINARY-LONG.
 01 WS-SPAN-LEN               BINARY-LONG.
+*> The raw span a field would need, checked via cvx-json-span-len
+*> before it is ever copied into the small WS-SPAN buffer.
+01 WS-RAWLEN                BINARY-LONG.
 01 WS-OP                    BINARY-LONG.
 01 WS-SUBIX                 BINARY-LONG.
 01 WS-RELAYIX               BINARY-LONG.
@@ -362,17 +384,26 @@ PROCESS-LINE.
             PERFORM EMIT-ERROR
     END-EVALUATE.
 
+*> Every extraction below calls cvx-json-span-len before it ever calls
+*> cvx-json-string or cvx-json-copy-span, and skips the field (leaving
+*> it absent, exactly as an oversized decoded value was already
+*> silently left absent below) when the raw span would not fit in the
+*> now much smaller WS-SPAN buffer. See WS-ESC's own comment above.
 EXTRACT-COMMAND-FIELDS.
     MOVE "id" TO WS-KEY
     MOVE 2 TO WS-KEY-LEN
     CALL "cvx-json-member" USING WS-SLOT-CMD WS-NODE WS-KEY
         WS-KEY-LEN WS-CHILD
     IF WS-CHILD NOT = 0
-        CALL "cvx-json-string" USING WS-SLOT-CMD WS-CHILD WS-SPAN
-            WS-SPAN-LEN WS-ST
-        IF WS-ST = CVX-OK AND WS-SPAN-LEN >= 1 AND WS-SPAN-LEN <= 128
-            MOVE WS-SPAN(1:WS-SPAN-LEN) TO WS-CMD-ID(1:WS-SPAN-LEN)
-            MOVE WS-SPAN-LEN TO WS-CMD-ID-LEN
+        CALL "cvx-json-span-len" USING WS-SLOT-CMD WS-CHILD WS-RAWLEN
+        IF WS-RAWLEN <= 8192
+            CALL "cvx-json-string" USING WS-SLOT-CMD WS-CHILD WS-SPAN
+                WS-SPAN-LEN WS-ST
+            IF WS-ST = CVX-OK AND WS-SPAN-LEN >= 1
+                    AND WS-SPAN-LEN <= 128
+                MOVE WS-SPAN(1:WS-SPAN-LEN) TO WS-CMD-ID(1:WS-SPAN-LEN)
+                MOVE WS-SPAN-LEN TO WS-CMD-ID-LEN
+            END-IF
         END-IF
     END-IF
 
@@ -381,11 +412,15 @@ EXTRACT-COMMAND-FIELDS.
     CALL "cvx-json-member" USING WS-SLOT-CMD WS-NODE WS-KEY
         WS-KEY-LEN WS-CHILD
     IF WS-CHILD NOT = 0
-        CALL "cvx-json-string" USING WS-SLOT-CMD WS-CHILD WS-SPAN
-            WS-SPAN-LEN WS-ST
-        IF WS-ST = CVX-OK AND WS-SPAN-LEN >= 1 AND WS-SPAN-LEN <= 32
-            MOVE WS-SPAN(1:WS-SPAN-LEN) TO WS-CMD-OP(1:WS-SPAN-LEN)
-            MOVE WS-SPAN-LEN TO WS-CMD-OP-LEN
+        CALL "cvx-json-span-len" USING WS-SLOT-CMD WS-CHILD WS-RAWLEN
+        IF WS-RAWLEN <= 8192
+            CALL "cvx-json-string" USING WS-SLOT-CMD WS-CHILD WS-SPAN
+                WS-SPAN-LEN WS-ST
+            IF WS-ST = CVX-OK AND WS-SPAN-LEN >= 1
+                    AND WS-SPAN-LEN <= 32
+                MOVE WS-SPAN(1:WS-SPAN-LEN) TO WS-CMD-OP(1:WS-SPAN-LEN)
+                MOVE WS-SPAN-LEN TO WS-CMD-OP-LEN
+            END-IF
         END-IF
     END-IF
 
@@ -394,11 +429,16 @@ EXTRACT-COMMAND-FIELDS.
     CALL "cvx-json-member" USING WS-SLOT-CMD WS-NODE WS-KEY
         WS-KEY-LEN WS-CHILD
     IF WS-CHILD NOT = 0
-        CALL "cvx-json-string" USING WS-SLOT-CMD WS-CHILD WS-SPAN
-            WS-SPAN-LEN WS-ST
-        IF WS-ST = CVX-OK AND WS-SPAN-LEN >= 1 AND WS-SPAN-LEN <= 128
-            MOVE WS-SPAN(1:WS-SPAN-LEN) TO WS-CMD-SUBID(1:WS-SPAN-LEN)
-            MOVE WS-SPAN-LEN TO WS-CMD-SUBID-LEN
+        CALL "cvx-json-span-len" USING WS-SLOT-CMD WS-CHILD WS-RAWLEN
+        IF WS-RAWLEN <= 8192
+            CALL "cvx-json-string" USING WS-SLOT-CMD WS-CHILD WS-SPAN
+                WS-SPAN-LEN WS-ST
+            IF WS-ST = CVX-OK AND WS-SPAN-LEN >= 1
+                    AND WS-SPAN-LEN <= 128
+                MOVE WS-SPAN(1:WS-SPAN-LEN)
+                    TO WS-CMD-SUBID(1:WS-SPAN-LEN)
+                MOVE WS-SPAN-LEN TO WS-CMD-SUBID-LEN
+            END-IF
         END-IF
     END-IF
 
@@ -408,11 +448,15 @@ EXTRACT-COMMAND-FIELDS.
         WS-KEY-LEN WS-CHILD
     IF WS-CHILD NOT = 0
         MOVE 1 TO WS-HAS-PATH
-        CALL "cvx-json-string" USING WS-SLOT-CMD WS-CHILD WS-SPAN
-            WS-SPAN-LEN WS-ST
-        IF WS-ST = CVX-OK AND WS-SPAN-LEN <= 256
-            MOVE WS-SPAN(1:WS-SPAN-LEN) TO WS-CMD-PATH(1:WS-SPAN-LEN)
-            MOVE WS-SPAN-LEN TO WS-CMD-PATH-LEN
+        CALL "cvx-json-span-len" USING WS-SLOT-CMD WS-CHILD WS-RAWLEN
+        IF WS-RAWLEN <= 8192
+            CALL "cvx-json-string" USING WS-SLOT-CMD WS-CHILD WS-SPAN
+                WS-SPAN-LEN WS-ST
+            IF WS-ST = CVX-OK AND WS-SPAN-LEN <= 256
+                MOVE WS-SPAN(1:WS-SPAN-LEN)
+                    TO WS-CMD-PATH(1:WS-SPAN-LEN)
+                MOVE WS-SPAN-LEN TO WS-CMD-PATH-LEN
+            END-IF
         END-IF
     END-IF
 
@@ -426,12 +470,16 @@ EXTRACT-COMMAND-FIELDS.
         CALL "cvx-json-type" USING WS-SLOT-CMD WS-CHILD WS-TYPE
         IF WS-TYPE = 7
             MOVE 1 TO WS-HAS-ARGS
-            CALL "cvx-json-copy-span" USING WS-SLOT-CMD WS-CHILD
-                WS-SPAN WS-SPAN-LEN WS-ST
-            IF WS-SPAN-LEN <= 8192
-                MOVE WS-SPAN(1:WS-SPAN-LEN)
-                    TO WS-CMD-ARGS(1:WS-SPAN-LEN)
-                MOVE WS-SPAN-LEN TO WS-CMD-ARGS-LEN
+            CALL "cvx-json-span-len" USING WS-SLOT-CMD WS-CHILD
+                WS-RAWLEN
+            IF WS-RAWLEN <= 8192
+                CALL "cvx-json-copy-span" USING WS-SLOT-CMD WS-CHILD
+                    WS-SPAN WS-SPAN-LEN WS-ST
+                IF WS-SPAN-LEN <= 8192
+                    MOVE WS-SPAN(1:WS-SPAN-LEN)
+                        TO WS-CMD-ARGS(1:WS-SPAN-LEN)
+                    MOVE WS-SPAN-LEN TO WS-CMD-ARGS-LEN
+                END-IF
             END-IF
         END-IF
     END-IF
@@ -441,11 +489,15 @@ EXTRACT-COMMAND-FIELDS.
     CALL "cvx-json-member" USING WS-SLOT-CMD WS-NODE WS-KEY
         WS-KEY-LEN WS-CHILD
     IF WS-CHILD NOT = 0
-        CALL "cvx-json-string" USING WS-SLOT-CMD WS-CHILD WS-SPAN
-            WS-SPAN-LEN WS-ST
-        IF WS-ST = CVX-OK AND WS-SPAN-LEN <= 4096
-            MOVE WS-SPAN(1:WS-SPAN-LEN) TO WS-CMD-TOKEN(1:WS-SPAN-LEN)
-            MOVE WS-SPAN-LEN TO WS-CMD-TOKEN-LEN
+        CALL "cvx-json-span-len" USING WS-SLOT-CMD WS-CHILD WS-RAWLEN
+        IF WS-RAWLEN <= 8192
+            CALL "cvx-json-string" USING WS-SLOT-CMD WS-CHILD WS-SPAN
+                WS-SPAN-LEN WS-ST
+            IF WS-ST = CVX-OK AND WS-SPAN-LEN <= 4096
+                MOVE WS-SPAN(1:WS-SPAN-LEN)
+                    TO WS-CMD-TOKEN(1:WS-SPAN-LEN)
+                MOVE WS-SPAN-LEN TO WS-CMD-TOKEN-LEN
+            END-IF
         END-IF
     END-IF
 
