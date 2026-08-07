@@ -36,6 +36,7 @@ extern clock_gettime
 extern getenv
 extern exit
 extern __errno_location
+extern fcntl
 extern getaddrinfo
 extern freeaddrinfo
 extern setsockopt
@@ -243,6 +244,18 @@ struc pollfd
     .revents: resw 1
 endstruc
 POLLIN  equ 0x0001
+
+; fcntl(fd, F_SETFL, O_NONBLOCK) on the ADAPTER_LISTEN accepted socket --
+; see main.s's serve()/adapter_try_line for why: a poll()-driven single
+; command fd that is still in blocking mode can hang the whole event loop
+; the moment a caller drains it in a loop without re-checking poll() before
+; every read (exactly what cmd_loop's multi-line drain does). Values are
+; the fixed Linux x86-64 constants (not portable to other platforms, but
+; this client only ever targets linux/amd64 containers).
+F_GETFL    equ 3
+F_SETFL    equ 4
+O_NONBLOCK equ 0x800
+EAGAIN     equ 11
 
 ; struct timespec, for clock_gettime(CLOCK_MONOTONIC, ...) backoff timing.
 struc timespec

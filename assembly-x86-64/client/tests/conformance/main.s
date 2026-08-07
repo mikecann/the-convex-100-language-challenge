@@ -87,7 +87,14 @@ global main
 ; --- raw line reader over a plain fd (never TLS -- this is always a local
 ; loopback connection to the shared harness or the test's own stdio) ------
 
-; int raw_read_more(int fd, buf *b) -- 1 progress, 0 EOF, -1 error.
+; int raw_read_more(int fd, buf *b) -- 1 progress, 0 EOF, 2 EAGAIN (fd is
+; non-blocking and genuinely has nothing buffered right now -- not an
+; error, not EOF, just "ask again after the next poll() wakes you"), -1
+; error. Only a fd that adapter_try_line's caller has already put in
+; non-blocking mode (the ADAPTER_LISTEN accepted socket -- see main()) can
+; ever actually produce case 2; a blocking fd's read() would simply block
+; instead, which is exactly the bug this return case exists to let the
+; caller avoid.
 raw_read_more:
     push rbp
     mov rbp, rsp
@@ -107,11 +114,20 @@ raw_read_more:
     mov edx, 4096
     call read
     cmp rax, 0
-    jl .fail
+    jl .check_errno
     jz .eof
     mov rcx, [rbp-16]
     add [rcx + buf.len], rax
     mov eax, 1
+    jmp .done
+.check_errno:
+    call __errno_location
+    mov eax, [rax]
+    cmp eax, EAGAIN
+    je .again
+    jmp .fail
+.again:
+    mov eax, 2
     jmp .done
 .eof:
     xor eax, eax
@@ -297,7 +313,25 @@ adapter_try_line:
     je .rescan
     cmp eax, 0
     je .try_final
+    cmp eax, 2
+    je .not_ready_yet
     mov eax, -1
+    jmp .done
+.not_ready_yet:
+    ; EAGAIN: the fd is non-blocking and genuinely has nothing more
+    ; buffered right now. Not EOF, not an error -- report "0 lines ready"
+    ; so the caller (serve()'s cmd_loop) goes back to poll() instead of
+    ; this function's own read() blocking the whole single-threaded event
+    ; loop, which is exactly what happened before the command fd was put
+    ; in non-blocking mode: cmd_loop drains every currently-buffered line
+    ; in one pass by calling this function repeatedly, and only the FIRST
+    ; such call in a pass is preceded by a poll() that actually confirmed
+    ; readiness -- every subsequent call in the same drain pass had no
+    ; such guarantee, so its `read` would sit blocked until the peer sent
+    ; more, freezing convex_live_maintain/service_socket/drain_
+    ; subscriptions along with it. Reproduced by subscribing and then
+    ; sending nothing further: the whole event loop stalled forever.
+    xor eax, eax
     jmp .done
 .rescan:
     lea rax, [g_read_buf]
@@ -2083,6 +2117,30 @@ main:
     cmp eax, 0
     jl .listen_bad_free_both
     mov [rbp-72], eax           ; accepted fd
+
+    ; Put the accepted socket in non-blocking mode: serve()'s cmd_loop
+    ; drains every currently-buffered command line in one pass by calling
+    ; adapter_try_line repeatedly, and only the first such call in a pass
+    ; follows a poll() that actually confirmed the fd was readable. On a
+    ; blocking fd, every later call's `read` -- reached the instant the
+    ; peer has sent exactly as many lines as are currently buffered, which
+    ; is the ordinary case right after a subscribe -- sits blocked until
+    ; the peer sends more, freezing the whole single-threaded event loop
+    ; (WS servicing and subscription draining included) along with it.
+    mov edi, [rbp-72]
+    mov esi, F_GETFL
+    xor edx, edx
+    call fcntl
+    cmp eax, 0
+    jl .listen_bad_free_both
+    mov [rbp-104], eax
+    mov edi, [rbp-72]
+    mov esi, F_SETFL
+    mov edx, [rbp-104]
+    or edx, O_NONBLOCK
+    call fcntl
+    cmp eax, 0
+    jl .listen_bad_free_both
 
     mov rdi, [rbp-32]
     call free
