@@ -442,7 +442,7 @@ invariant
 	string_attached_when_string: is_string implies string_item_cell /= Void
 	array_attached_when_array: is_array implies array_item_cell /= Void
 	object_parallel_when_object: is_object implies
-		(object_keys_cell /= Void and then object_values_cell /= Void
-			and then object_keys_cell.count = object_values_cell.count)
+		(attached object_keys_cell as l_inv_keys and then attached object_values_cell as l_inv_values
+			and then l_inv_keys.count = l_inv_values.count)
 
 end
