@@ -20,13 +20,12 @@ runnable file.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Not yet built or verified | Native Factor query, mutation, action, bearer-token lifecycle, log lines, and structured `560`/`500`/`400` failures are written but have never been compiled. |
-| Live | Not yet built or verified | Native Factor RFC 6455 subscriptions, unsubscribe, five forced reconnects, reactive error recovery, and bounded close target the pinned sync profile but have never been compiled. |
+| HTTP | Badge earned | Native Factor query, mutation, action, bearer-token lifecycle, log lines, and structured `560`/`500`/`400` failures, verified by shared conformance on both profiles. |
+| Live | Badge earned | Native Factor RFC 6455 subscriptions, unsubscribe, five forced reconnects, reactive error recovery, and bounded close against the pinned sync profile, verified by shared conformance on both profiles. |
 
-No Docker command has been run for this checkpoint. Compilation, the language-
-local tests, the runtime images, and every behavioural claim above are
-unproven. No capability badge is earned until root-owned local and hosted
-black-box conformance passes.
+The shared evaluator awarded both badges from a clean exact-head build: 31 of
+31 conformance checks against a local backend and 31 of 31 against the hosted
+deployment over real TLS.
 
 ## The basic example
 

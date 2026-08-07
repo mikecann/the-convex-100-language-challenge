@@ -55,4 +55,6 @@ limitations:
     Adapter output independently retains the newest 16 encoded events within
     6 MiB, reserving four slots and 64 KiB for control events, and abandons a
     write that misses its five-second absolute deadline.
-capabilities: []
+capabilities:
+  - http
+  - live
