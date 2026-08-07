@@ -59,6 +59,11 @@ ENV PATH=/opt/java/openjdk/bin:/usr/local/bin:/usr/bin:/bin
 # These are part of the runtime contract, not reviewer-only flags. They leave
 # room for TLS, direct buffers, threads, and native JVM bookkeeping at 128 MiB.
 ENV JAVA_TOOL_OPTIONS="-XX:MaxRAM=96m -Xms8m -Xmx24m -Xss256k -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -XX:MaxMetaspaceSize=24m -XX:CompressedClassSpaceSize=16m -XX:MaxDirectMemorySize=8m -XX:ReservedCodeCacheSize=4m"
+# Runtime images expose no package manager, compiler, or build frontend
+# (AGENTS.md). debian:bookworm-slim still ships apt/apt-get/dpkg on PATH, so
+# replace /usr/bin, /usr/sbin, /usr/local/bin, and /usr/local/sbin outright
+# with a minimal allowlisted toolset rather than deleting distro tooling
+# piecemeal, which would leave anything the allowlist forgot to name intact.
 RUN set -eu; \
     mkdir /restricted-tools; \
     for tool in dash mawk basename cat cmp cut env grep head id sed sort tail tr uname wc; do \
@@ -82,6 +87,10 @@ RUN set -eu; \
     /restricted-tools/.rm -rf /restricted-tools
 COPY --from=build /src/out/groovy-runtime-4.0.27.jar /opt/convex/lib/
 COPY --from=build /opt/groovy/lib/groovy-json-4.0.27.jar /opt/convex/lib/
+# Prove the stripped rootfs above at build time: both the package-manager
+# family (apt, apt-get, apt-cache, aptitude, debconf, dpkg, dpkg-deb) and
+# every compiler/build/runtime frontend must be absent, or this stage fails
+# and neither final image below (runtime, example-runtime) gets produced.
 RUN set -eu; \
     for forbidden in \
       apt apt-get apt-cache aptitude debconf dpkg dpkg-deb perl wget curl \

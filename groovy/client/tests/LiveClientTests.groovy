@@ -18,6 +18,7 @@ final class LiveClientTests {
     malformedTransitionIsTransactional()
     reconnectsFiveTimesWithMetadataAndDedupe()
     failedHandshakeBackoffDoubles()
+    initialWriteFailureAfterHandshakeReconnects()
     peerCloseReasonCarriesToReconnect()
     maxObservedTimestampUsesLittleEndianNumericOrder()
     closeIsBoundedDuringStalledHandshake()
@@ -105,6 +106,11 @@ final class LiveClientTests {
     LiveClient.Update failed = subscription.nextUpdate(Duration.ofSeconds(3))
     assert failed.error() instanceof ConvexClient.FunctionException
     assert failed.error().data.code == 'TEMPORARY'
+    // The recovery above repeats the exact JSON value ({count: 0}) that was
+    // cached before the QueryFailed. If the subscription did not clear its
+    // cached lastValue when it recorded that error, this identical recovery
+    // would be deduped against the stale cache and this call would time out
+    // instead of observing the healthy value again.
     assert subscription.next(Duration.ofSeconds(3)).count == 0
     live.close()
     finish(listener, server, failure)
@@ -308,6 +314,48 @@ final class LiveClientTests {
     long secondGap = TimeUnit.NANOSECONDS.toMillis(acceptedAt[2] - acceptedAt[1])
     assert firstGap >= 75: "first retry was too early: ${firstGap}ms"
     assert secondGap >= 175: "second retry did not double: ${secondGap}ms"
+    live.close()
+    finish(listener, server, failure)
+  }
+
+  private static void initialWriteFailureAfterHandshakeReconnects() {
+    ServerSocket listener = new ServerSocket(0)
+    ArrayBlockingQueue<Map> reconnect = new ArrayBlockingQueue<>(1)
+    Throwable[] failure = new Throwable[1]
+    Thread server = Thread.start('live-initial-write-failure-fixture') {
+      try {
+        // Complete the WebSocket handshake, then abort the raw socket before
+        // reading anything. The owner's very first protocol write (Connect)
+        // must land on a dead connection and fail, even though the handshake
+        // itself already succeeded.
+        Socket first = listener.accept()
+        WebSocketFixture.handshake(first)
+        first.setSoLinger(true, 0)
+        first.close()
+
+        // A second connection only arrives if the owner cleared the failed
+        // candidate socket instead of leaving it set, which is what let the
+        // scheduled reconnect below actually dial again.
+        WebSocketFixture.Peer second = WebSocketFixture.handshake(listener.accept())
+        Map connect = second.readJson()
+        Map add = second.readJson()
+        reconnect.put(connect)
+        second.sendJson(transition(
+          version(0, 'AAAAAAAAAAA='),
+          version(1, 'after-initial-write-failure'),
+          [updated(add.modifications[0].queryId, 0)],
+        ))
+        second.awaitDisconnect()
+      } catch (Throwable error) {
+        failure[0] = error
+      }
+    }
+
+    LiveClient live = new LiveClient(url(listener))
+    LiveClient.Subscription subscription = live.subscribe('demo:state', [room: 'initial-write'])
+    assert subscription.next(Duration.ofSeconds(5)).count == 0
+    Map connect = reconnect.poll(1, TimeUnit.SECONDS)
+    assert connect.lastCloseReason.startsWith('InitialWriteFailed:')
     live.close()
     finish(listener, server, failure)
   }
