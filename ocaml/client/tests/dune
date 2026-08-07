@@ -1,0 +1,9 @@
+(executable
+ (name local_tests)
+ (modules local_tests)
+ (libraries convex unix threads yojson))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./local_tests.exe)))
