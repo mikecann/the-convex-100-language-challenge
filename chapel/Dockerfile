@@ -145,13 +145,18 @@ FROM --platform=linux/amd64 ${ALPINE_IMAGE} AS runtime-base
 # substitute for) ct_read_line's own bounded poll(2) loop, which is what
 # actually keeps a lone worker thread from starving the writer.
 ENV CHPL_RT_NUM_THREADS_PER_LOCALE=2
-RUN /bin/busybox rm -f /sbin/apk \
+RUN for f in $(/bin/busybox find / -xdev -type f -perm /111); do \
+         case "$f" in \
+           /bin/busybox|/bin/sh|/usr/bin/id|/usr/bin/grep|/usr/bin/sed|/usr/bin/mawk|/lib/*|/lib64/*|/usr/lib/*) ;; \
+           *) /bin/busybox rm -f "$f" ;; \
+         esac; \
+       done \
     && /bin/busybox find /bin /sbin /usr/bin /usr/sbin -type l -delete \
     && /bin/busybox rm -rf /etc/apk /lib/apk /var/cache/apk /var/lib/apk /usr/share/apk
 COPY --from=runtime-rootfs /rootfs /
 RUN for candidate in $(/bin/busybox find / -xdev -type f -perm /111); do \
          case "$candidate" in \
-           /bin/busybox|/bin/sh|/usr/bin/id|/usr/bin/grep|/usr/bin/sed|/usr/bin/mawk|/usr/local/bin/convex-adapter|/usr/local/bin/convex-example|/lib/*|/usr/lib/*) ;; \
+           /bin/busybox|/bin/sh|/usr/bin/id|/usr/bin/grep|/usr/bin/sed|/usr/bin/mawk|/usr/local/bin/convex-adapter|/usr/local/bin/convex-example|/lib/*|/lib64/*|/usr/lib/*) ;; \
            *) printf '%s\n' "unexpected runtime executable: $candidate" >&2; exit 1 ;; \
          esac; \
        done \
