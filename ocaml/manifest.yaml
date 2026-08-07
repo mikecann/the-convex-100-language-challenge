@@ -32,4 +32,6 @@ limitations:
   - Live delivery is bounded process-wide rather than per subscription: at most 256 retained updates and 16 MiB of accounted memory across every subscription together, plus at most 16 updates for any one subscription. The accounted cost of an update covers its decoded value, its logs, its structured error data, and the encoded output it becomes. When the budget is exceeded the oldest update anywhere in the process is dropped.
   - The test-only adapter orders every event through one writer with an 8 MiB queue, and reserves that room before taking a value from the client, so the whole output path costs at most three times the queue budget however many subscriptions a controller opens. A line that cannot be written within 10 seconds makes the NDJSON stream terminal and fails the process, because a partially written line cannot be followed by anything a controller could parse.
   - Adapter command lines are bounded at 4 MiB while they are read; a longer line is counted, discarded, and reported without being allocated.
-capabilities: []
+capabilities:
+  - http
+  - live
