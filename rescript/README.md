@@ -38,7 +38,7 @@ Live badge, and it has not run for ReScript.
 ## The canonical example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.res -->
-```text
+```rescript
 // The canonical Convex-from-ReScript example: read a shared counter over HTTP,
 // watch it over a Live subscription, increment it once, and prove the
 // subscription reports the new value without asking again.

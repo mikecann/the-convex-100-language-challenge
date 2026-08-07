@@ -161,6 +161,15 @@ type rec manager = {
   mutable pumping: bool,
   mutable nextQueryId: int,
   mutable querySetVersion: int,
+  // True from the moment a ModifyQuerySet is written to the socket until the
+  // Transition confirming it arrives. The protocol allows only one
+  // outstanding query-set change at a time: a second one sent before the
+  // first is acknowledged races the server's own reply and is exactly the
+  // "Transition query-set version does not match" failure this flag exists
+  // to prevent. A Subscribe or Unsubscribe that lands while this is true
+  // queues its modification instead of writing it immediately.
+  mutable querySetAckPending: bool,
+  mutable queuedModifications: array<ConvexProtocol.queryModification>,
   mutable remoteVersion: ConvexProtocol.stateVersion,
   mutable maxObservedTimestamp: string,
   mutable connectionCount: int,
@@ -203,6 +212,8 @@ let make = (~deploymentUrl, ~clientVersion, ~transport) => {
   pumping: false,
   nextQueryId: 0,
   querySetVersion: 0,
+  querySetAckPending: false,
+  queuedModifications: [],
   remoteVersion: ConvexProtocol.zeroVersion(),
   maxObservedTimestamp: "",
   connectionCount: 0,
@@ -396,8 +407,12 @@ and closeConnection = (manager, reason, schedule) => {
   manager.lastCloseReason = reason
 
   // Query-set and transition versions belong to one connection. A new session
-  // always starts from zero.
+  // always starts from zero. Anything still queued or awaiting the dead
+  // connection's own ack is moot: the next resendActiveQueries() rebuilds the
+  // whole query set from manager.active's current membership regardless.
   manager.querySetVersion = 0
+  manager.querySetAckPending = false
+  manager.queuedModifications = []
   manager.remoteVersion = ConvexProtocol.zeroVersion()
   if schedule && !manager.closed && activeCount(manager) > 0 {
     scheduleReconnect(manager, manager.backoffMs)
@@ -446,6 +461,8 @@ and handleSocketOpen = (manager, generation) =>
         manager.backoffMs = initialBackoffMs
         manager.handshakeComplete = true
         manager.querySetVersion = 0
+        manager.querySetAckPending = false
+        manager.queuedModifications = []
         manager.remoteVersion = ConvexProtocol.zeroVersion()
         let connect = ConvexProtocol.connectMessage(
           ~sessionId=manager.sessionId,
@@ -480,7 +497,63 @@ and resendActiveQueries = manager => {
       ~modifications,
     )
     switch sendMessage(manager, message) {
-    | None => manager.querySetVersion = 1
+    | None => {
+        manager.querySetVersion = 1
+        manager.querySetAckPending = true
+      }
+    | Some(text) =>
+      failConnection(manager, ConvexError.transport("Live WebSocket write failed: " ++ text))
+    }
+  }
+}
+// The protocol allows only one outstanding, unacknowledged ModifyQuerySet at
+// a time: a Subscribe immediately followed by an Unsubscribe (or vice versa)
+// used to write two of these back to back, and the server's Transition for
+// the first one would arrive reporting a querySet version this client had
+// already raced past locally -- the exact "Transition query-set version does
+// not match the locally sent query set" failure the shared conformance pilot
+// caught. Queue instead of writing whenever one is already in flight;
+// flushQueuedModifications sends the backlog, combined into a single
+// message, the moment the outstanding one is confirmed.
+and sendOrQueueModification = (manager, modification) =>
+  if manager.querySetAckPending {
+    let _ = Js.Array2.push(manager.queuedModifications, modification)
+  } else {
+    let newVersion = manager.querySetVersion + 1
+    let message = ConvexProtocol.modifyQuerySetMessage(
+      ~baseVersion=manager.querySetVersion,
+      ~newVersion,
+      ~modifications=[modification],
+    )
+    switch sendMessage(manager, message) {
+    | None => {
+        manager.querySetVersion = newVersion
+        manager.querySetAckPending = true
+      }
+    | Some(text) =>
+      failConnection(manager, ConvexError.transport("Live WebSocket write failed: " ++ text))
+    }
+  }
+// The Transition that just landed confirms the server has caught up to
+// manager.querySetVersion, so whatever Subscribe or Unsubscribe queued a
+// modification while that was still outstanding can now go out as one
+// combined ModifyQuerySet.
+and flushQueuedModifications = manager => {
+  manager.querySetAckPending = false
+  if Js.Array2.length(manager.queuedModifications) > 0 {
+    let modifications = manager.queuedModifications
+    manager.queuedModifications = []
+    let newVersion = manager.querySetVersion + Js.Array2.length(modifications)
+    let message = ConvexProtocol.modifyQuerySetMessage(
+      ~baseVersion=manager.querySetVersion,
+      ~newVersion,
+      ~modifications,
+    )
+    switch sendMessage(manager, message) {
+    | None => {
+        manager.querySetVersion = newVersion
+        manager.querySetAckPending = true
+      }
     | Some(text) =>
       failConnection(manager, ConvexError.transport("Live WebSocket write failed: " ++ text))
     }
@@ -568,6 +641,10 @@ and applyTransition = (manager, transition) =>
         )
         manager.remoteVersion = transition.endVersion
         rememberTimestamp(manager, transition.endVersion.ts)
+        // The server has now caught up to manager.querySetVersion, so any
+        // Subscribe or Unsubscribe that queued a modification while this
+        // Transition was outstanding can be sent now.
+        flushQueuedModifications(manager)
         Js.Array2.forEach(sortedActive(manager), state => {
           let key = subscriptionKey(state.queryId)
           switch Js.Dict.get(changed, key) {
@@ -659,18 +736,7 @@ and handleSubscribe = (manager, path, args, reply) =>
     Js.Dict.set(manager.active, subscriptionKey(queryId), state)
     reply.resolve(queryId)
     switch (manager.connection, manager.handshakeComplete) {
-    | (Some(_), true) => {
-        let message = ConvexProtocol.modifyQuerySetMessage(
-          ~baseVersion=manager.querySetVersion,
-          ~newVersion=manager.querySetVersion + 1,
-          ~modifications=[ConvexProtocol.Add({queryId, path, args})],
-        )
-        switch sendMessage(manager, message) {
-        | None => manager.querySetVersion = manager.querySetVersion + 1
-        | Some(text) =>
-          failConnection(manager, ConvexError.transport("Live WebSocket write failed: " ++ text))
-        }
-      }
+    | (Some(_), true) => sendOrQueueModification(manager, ConvexProtocol.Add({queryId, path, args}))
     // A connection that has not finished its handshake will send an Add for
     // every active query, including this one, so there is nothing to do here.
     | (Some(_), false) => ()
@@ -715,18 +781,8 @@ and handleUnsubscribe = (manager, queryId, reply) => {
       ConvexNode.removeKey(manager.awaitingRehydration, key)
       finishSubscription(state)
       switch (manager.connection, manager.handshakeComplete) {
-      | (Some(_), true) => {
-          let message = ConvexProtocol.modifyQuerySetMessage(
-            ~baseVersion=manager.querySetVersion,
-            ~newVersion=manager.querySetVersion + 1,
-            ~modifications=[ConvexProtocol.Remove({queryId: queryId})],
-          )
-          switch sendMessage(manager, message) {
-          | None => manager.querySetVersion = manager.querySetVersion + 1
-          | Some(text) =>
-            failConnection(manager, ConvexError.transport("Live WebSocket write failed: " ++ text))
-          }
-        }
+      | (Some(_), true) =>
+        sendOrQueueModification(manager, ConvexProtocol.Remove({queryId: queryId}))
       | _ => ()
       }
       if activeCount(manager) == 0 {

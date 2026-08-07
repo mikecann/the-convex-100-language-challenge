@@ -267,6 +267,111 @@ test("five debugDisconnects each reconnect, replay, and suppress a stale value",
   await ConvexLive.close(manager)
 })
 
+// Matches the shared harness's client/live/reconnect-five-times scenario
+// exactly: each of the five rounds subscribes to a brand-new query, forces a
+// disconnect, mutates, awaits the reconnected value, and unsubscribes before
+// the next round starts -- unlike the test above, which keeps one
+// subscription alive across all five rounds. This is the shape that exposed
+// the real "Live WebSocket is not connected" failure the shared conformance
+// pilot reported: activeCount(manager) legitimately hits zero between
+// rounds, and a subsequent debugDisconnect must still find a live
+// connection.
+test(
+  "five independent subscribe/disconnect/mutate/unsubscribe rounds each reconnect and deliver",
+  async () => {
+    let fake = makeFakeTransport()
+    let manager = makeManager(fake)
+    let socketCount = ref(0)
+    let tsCounter = ref(0)
+    let nextTimestamp = () => {
+      tsCounter := tsCounter.contents + 1
+      timestampFor(tsCounter.contents)
+    }
+    // Mirrors manager.remoteVersion. querySetVersion is read straight off the
+    // manager instead of tracked by hand: the protocol allows only one
+    // outstanding ModifyQuerySet at a time (see sendOrQueueModification in
+    // ConvexLive.res), so a Remove this test never acknowledges would leave a
+    // later Subscribe's Add queued rather than sent, and any hand-computed
+    // version would silently drift from what the client actually wrote.
+    let remote = ref(startVersion)
+
+    let round = ref(1)
+    while round.contents <= 5 {
+      let attempt = round.contents
+      let label = "round " ++ Belt.Int.toString(attempt)
+      let subscription = await ConvexLive.subscribe(
+        manager,
+        "demo:state",
+        roomArgs("round-" ++ Belt.Int.toString(attempt)),
+      )
+
+      // The very first round's subscribe opens a fresh connection; every
+      // later round's subscribe reuses the connection left open by the
+      // previous round's reconnect, exactly like the real transport does --
+      // activeCount(manager) genuinely reaches zero between rounds, since
+      // each round unsubscribes before the next one starts.
+      let socket = if attempt == 1 {
+        socketCount := socketCount.contents + 1
+        let socket = await handshake(fake, socketCount.contents)
+        remote := startVersion
+        socket
+      } else {
+        switch latestSocket(fake) {
+        | Some(socket) => socket
+        | None => await waitForSocket(fake, socketCount.contents)
+        }
+      }
+      let initialTs = nextTimestamp()
+      sendTransition(
+        socket,
+        ~from=remote.contents,
+        ~to_=(manager.querySetVersion, initialTs),
+        ~modifications=[queryUpdated(~queryId=attempt - 1, ~value=countValue(0.0))],
+      )
+      remote := (manager.querySetVersion, initialTs)
+      expectCount(await ConvexLive.next(subscription), label ++ ": initial value", 0)
+
+      let beforeDisconnect = switch latestSocket(fake) {
+      | Some(socket) => socket
+      | None => await waitForSocket(fake, socketCount.contents)
+      }
+      await ConvexLive.debugDisconnect(manager)
+      ok(beforeDisconnect.terminated, label ++ ": the old connection was retired")
+
+      socketCount := socketCount.contents + 1
+      let reconnected = await handshake(fake, socketCount.contents)
+      // Every reconnect resets remoteVersion and immediately re-adds the
+      // still-active subscription, exactly like the very first connection.
+      remote := startVersion
+      let mutatedTs = nextTimestamp()
+      sendTransition(
+        reconnected,
+        ~from=remote.contents,
+        ~to_=(manager.querySetVersion, mutatedTs),
+        ~modifications=[queryUpdated(~queryId=attempt - 1, ~value=countValue(1.0))],
+      )
+      remote := (manager.querySetVersion, mutatedTs)
+      expectCount(await ConvexLive.next(subscription), label ++ ": the value after reconnect", 1)
+
+      await ConvexLive.closeSubscription(subscription)
+      // Acknowledge the Remove closeSubscription just sent, the way a real
+      // server eventually would, so it never sits as an outstanding,
+      // unacknowledged ModifyQuerySet across the boundary into the next
+      // round -- exactly the gap that let two of these race in production.
+      let removeTs = nextTimestamp()
+      sendTransition(
+        reconnected,
+        ~from=remote.contents,
+        ~to_=(manager.querySetVersion, removeTs),
+        ~modifications=[],
+      )
+      remote := (manager.querySetVersion, removeTs)
+      round := attempt + 1
+    }
+    await ConvexLive.close(manager)
+  },
+)
+
 test("transport backoff resets after a healthy connection", async () => {
   let fake = makeFakeTransport()
   let manager = makeManager(fake)
