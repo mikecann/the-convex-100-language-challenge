@@ -12,8 +12,8 @@ Read [`examples/basics/main.bmx`](examples/basics/main.bmx). It queries a fresh 
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, actions, and structured function errors | Implemented, no earned badge |
-| Live initial values, external updates, failure recovery, and reconnection | Implemented, no earned badge |
+| HTTP queries, mutations, actions, and structured function errors | Verified by shared local and hosted conformance |
+| Live initial values, external updates, failure recovery, and reconnection | Verified by shared local and hosted conformance |
 | Full HTTP and Live conformance against the shared harness | Not yet earned |
 | Live authentication, optimistic updates, WebSocket mutations and actions | Deferred |
 
@@ -256,4 +256,4 @@ The language-local peers are cooperative rather than threaded: the peer is servi
 
 Name resolution and the TCP connect are the one step outside the absolute deadline. mbed TLS performs both inside a single blocking call, so those two phases are bounded by the operating system's resolver and connect timeouts. Everything after them — the TLS handshake, every request, every frame, and every close — is bounded by the client.
 
-A Convex value whose parsed tree would exceed the retained bound is reported as a `ProtocolError` rather than delivered, and a Live frame carrying one retires that connection instead of being parsed. That is a deliberate trade: a wire-legal but node-dense payload is refused rather than allowed to exhaust the container's memory limit. Live authentication lifecycle, optimistic updates, mutations and actions over the WebSocket, journals, and `TransitionChunk` assembly are all deferred. The shared README and site generator has no BlitzMax fence mapping yet, so the example below renders as plain text rather than highlighted source; that mapping lives in shared infrastructure. The manifest deliberately declares no earned badges.
+A Convex value whose parsed tree would exceed the retained bound is reported as a `ProtocolError` rather than delivered, and a Live frame carrying one retires that connection instead of being parsed. That is a deliberate trade: a wire-legal but node-dense payload is refused rather than allowed to exhaust the container's memory limit. Live authentication lifecycle, optimistic updates, mutations and actions over the WebSocket, journals, and `TransitionChunk` assembly are all deferred. The shared README and site generator has no BlitzMax fence mapping yet, so the example below renders as plain text rather than highlighted source; that mapping lives in shared infrastructure. The manifest records the http and live badges the shared evaluator awarded from clean exact-head local and hosted runs.

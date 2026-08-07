@@ -38,4 +38,6 @@ limitations:
   - HTTP bodies are capped at 2 MiB under one absolute deadline and must satisfy Content-Length or complete chunked framing. A response carrying neither framing header is read to a clean connection close, which is the one place truncation is indistinguishable from completion.
   - Values use Convex's JSON-safe subset and are exposed as Text.Json nodes.
   - The shared README and site generator has no BlitzMax fence mapping, so the canonical example renders as plain text rather than highlighted source. Changing that is a shared-infrastructure edit, not a language one.
-capabilities: []
+capabilities:
+  - http
+  - live
