@@ -66,19 +66,26 @@ RUN <<'EOF'
 set -eu
 ADAPTER_LISTEN=127.0.0.1:18080 /build/convex-adapter &
 adapter_pid=$!
+echo "DIAG: adapter_pid=$adapter_pid"
 sleep 0.2
 container_address=$(ip -4 addr show eth0 | awk '/inet / {sub("/.*", "", $2); print $2; exit}')
+echo "DIAG: container_address=$container_address"
 non_loopback=$(printf '%s\n' \
   '{"id":"wrong-host","protocolVersion":1,"op":"hello"}' \
-  '{"id":"wrong-close","op":"close"}' | nc -w 1 "$container_address" 18080 2>/dev/null || true)
+  '{"id":"wrong-close","op":"close"}' | timeout 3 nc -w 1 "$container_address" 18080 2>/dev/null || true)
+echo "DIAG: non_loopback=[$non_loopback]"
 if test -n "$non_loopback"; then
   printf '%s\n' 'loopback adapter unexpectedly accepted a non-loopback connection' >&2
   exit 1
 fi
+echo "DIAG: about to do second nc"
 actual=$(printf '%s\n' \
   '{"id":"tcp-hello","protocolVersion":1,"op":"hello"}' \
-  '{"id":"tcp-close","op":"close"}' | nc 127.0.0.1 18080)
+  '{"id":"tcp-close","op":"close"}' | timeout 5 nc 127.0.0.1 18080)
+echo "DIAG: actual=[$actual]"
+echo "DIAG: about to wait"
 wait "$adapter_pid"
+echo "DIAG: wait done"
 printf '%s\n' "$actual" | grep -F '"id":"tcp-hello","protocolVersion":1,"type":"ready"'
 printf '%s\n' "$actual" | grep -Fx '{"id":"tcp-close","type":"closed"}'
 EOF
