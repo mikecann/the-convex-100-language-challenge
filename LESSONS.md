@@ -616,6 +616,24 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- The "upstream bug" was ours, and five issue numbers made it look otherwise.
+  GDScript's hosted TLS failure was diagnosed as an open mbedTLS/PSA-crypto
+  defect in Godot, matching five upstream reports, reproduced on two engine
+  versions. It was none of those things. Reproducing the *exact* launch the
+  runtime image uses — a bare `--script` SceneTree, not a naive re-test —
+  showed `SSL module failed to initialize`, an `ERR_UNCONFIGURED`, on every
+  version from 4.2.2 to 4.5. Godot only calls `load_default_certificates()`
+  from the "game" branch of `Main::start()`, which a `--script` launch never
+  takes. Passing an explicit trust chain to `TLSOptions.client()` bypasses it
+  entirely. **A matching issue number is a hypothesis, not a diagnosis** — and
+  the reproduction has to use the configuration that actually fails, not a
+  simplified one that merely resembles it.
+- V's read timeout was set on the wrong layer. `TcpConn.set_read_timeout`
+  updates a field that V's own read wrapper consults. With the OpenSSL backend,
+  `SSL_read` talks to the raw file descriptor and never sees it, and nothing
+  ever set `SO_RCVTIMEO` on the socket. So the deadline existed, was correct,
+  and applied to a code path the bytes did not travel. `strace` showed a
+  blocking `read()` sitting past the limit with no `select()` anywhere near it.
 - Every stock Iron Spring PL/I binary is unrunnable inside Docker, and it has
   nothing to do with the language. Its runtime's `_pli_SigInit` installs trap
   handlers with the legacy i386 `sigaction` syscall, number 67, which Docker's
