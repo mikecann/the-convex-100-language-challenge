@@ -4,5 +4,33 @@ displayName: "Nim"
 rank: 80
 selectionTier: curated_backfill
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.2.0
+  notes: Native Nim HTTP and Live client plus a pinned native treeform/ws RFC6455 path. Shared local and hosted conformance passed 31/31 from clean exact-head builds; the capability list records the evaluator award.
+toolchain:
+  name: Nim
+  version: 2.2.4
+intendedCapabilities:
+  - http
+  - live
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - The only delegated transport dependency is treeform/ws 0.6.0 from https://github.com/treeform/ws, pinned in the Dockerfile by archive checksum sha256:d4f66d6f840084738e04eda36763f5a1badb2ddf5522cdae28d587035d39e1e2. The manifest schema has no dependencies key, so the pin lives in the Dockerfile and here.
+  - The Docker build patches the pinned Nim HTTP parser and treeform/ws 0.6.0 sources for pre-materialisation limits, observable writes, bounded handshakes and frames, the Convex-Client header, and control frames between fragments.
+  - Live authentication, WebSocket mutations/actions, and TransitionChunk assembly are deferred.
+  - Evidence for this head came from Docker Desktop Rosetta linux/amd64 emulation on Apple Silicon. The images are genuine linux/amd64 and the build asserts uname -m is x86_64, but no native x86_64 host has run this exact source commit.
+  - Authentication is supported for HTTP only.
+capabilities:
+  - http
+  - live
