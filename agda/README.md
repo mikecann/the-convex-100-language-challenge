@@ -20,7 +20,7 @@ Read [`examples/basics/Main.agda`](examples/basics/Main.agda). It queries a fres
 The Docker `test` target builds the toolchain, type-checks and compiles the client, and runs its unit, conformance, and TLS tests on native `linux/amd64`. Shared local and hosted conformance have not run yet, so no capability badge is claimed.
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.agda -->
-```text
+```agda
 {-# OPTIONS --without-K #-}
 
 module Main where

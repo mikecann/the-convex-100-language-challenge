@@ -31,17 +31,13 @@ Extern
 	Function convex_example_exit(code:Int) = "exit"
 End Extern
 
-' BRL.StandardIO's Print goes through TStream.WriteLine, whose terminator is a
-' hard-coded "~r~n" on every BlitzMax NG target, Linux included: see
-' brl.mod/stream.mod/stream.bmx, which writes the literal bytes [13, 10] after
-' every line regardless of platform. The harness compares this example's
-' stdout byte-for-byte against _shared/examples/basics.expected.txt, which is
-' LF-only, so the transcript is written here straight to the file descriptor
-' with a single LF terminator instead of through Print.
+' The harness compares this example's stdout byte-for-byte against
+' _shared/examples/basics.expected.txt, which is LF-only, so the transcript
+' is written straight to the file descriptor with ConvexEncodeLine's bare LF
+' terminator rather than through Print; see that function's comment in
+' transport.bmx for why Print itself cannot be used here.
 Function WriteStdoutLine(text:String)
-	Local line:TConvexBuffer = TConvexBuffer.Create(text.length + 2)
-	line.AppendString(text)
-	line.AppendByte(10)
+	Local line:TConvexBuffer = ConvexEncodeLine(text)
 	Local offset:Int = 0
 	While offset < line.length
 		Local written:Long = convex_write(1, Varptr line.data[offset], Size_T(line.length - offset))
