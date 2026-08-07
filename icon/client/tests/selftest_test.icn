@@ -1,0 +1,139 @@
+#
+# Deterministic, offline unit tests for the pure functions in
+# client/convex.icn: the JSON codec, base64/SHA-1, WebSocket framing, and
+# HTTP response classification. Unicon's `link` gives real access to
+# convex.icn's procedures directly (unlike a language with no
+# module system), so these tests call the exact same code the client
+# itself runs, with no duplication.
+#
+# unicon's `link` resolves an already-compiled `.u` file by looking in the
+# CURRENT WORKING DIRECTORY at compile time, not next to the file that
+# names it, and it never auto-compiles a sibling `.icn` -- so the build
+# always precompiles client/convex.icn once (from a fixed CWD) and every
+# dependent file links it back by that bare name.
+#
+link "convex"
+
+global failures
+
+procedure main()
+   failures := 0
+
+   test_json()
+   test_crypto()
+   test_ws_frame()
+   test_http_classify()
+
+   if failures = 0 then {
+      write("ALL SELFTEST CHECKS PASSED")
+      exit(0)
+   }
+   write(failures, " SELFTEST CHECK(S) FAILED")
+   exit(1)
+end
+
+procedure assert_eq(actual, expected, label)
+   if actual === expected then return
+   failures +:= 1
+   write(&errout, "FAIL ", label, ": expected=[", image(expected), "] actual=[", image(actual), "]")
+   return
+end
+
+procedure test_json()
+   local doc, top, items, roundTripped
+
+   assert_eq(json_estr("hello"), "\"hello\"", "json string")
+   assert_eq(json_estr("a\"b\\c"), "\"a\\\"b\\\\c\"", "json escaping")
+
+   doc := "{\"a\":1,\"b\":\"two\",\"c\":[1,2,3],\"d\":{\"e\":true,\"f\":null},\"g\":-4.5,\"h\":\"utf8:世界\"}"
+   top := json_decode(doc)
+   assert_eq(type(top), "table", "json top type")
+   assert_eq(top["a"], 1, "json number field")
+   assert_eq(top["b"], "two", "json string field")
+   assert_eq(member(top, "missing"), &null, "json missing key")
+   assert_eq(*top["c"], 3, "json array item count")
+   assert_eq(type(top["d"]["e"]), "JBool", "json nested bool type")
+   assert_eq(top["d"]["e"].v, 1, "json nested bool value")
+   assert_eq(top["d"]["f"], &null, "json nested null")
+   assert_eq(top["g"], -4.5, "json negative decimal")
+
+   roundTripped := json_decode(json_encode(top))
+   assert_eq(roundTripped["a"], top["a"], "json round trip number")
+   assert_eq(roundTripped["b"], top["b"], "json round trip string")
+
+   assert_eq(json_decode("\"a\\\"b\\nc\""), "a\"b" || "\n" || "c", "json round trip escaped string")
+   return
+end
+
+procedure test_crypto()
+   local key, magic, accept
+   assert_eq(b64encode("foobar"), "Zm9vYmFy", "base64 foobar")
+   assert_eq(b64decode("Zm9vYmFy"), "foobar", "base64 decode foobar")
+   assert_eq(b64decode(b64encode("a" || char(0) || "b")), "a" || char(0) || "b", "base64 round trip with nul")
+
+   assert_eq(hex_of(sha1_raw("")), "da39a3ee5e6b4b0d3255bfef95601890afd80709", "sha1 empty")
+   assert_eq(hex_of(sha1_raw("abc")), "a9993e364706816aba3e25717850c26c9cd0d89d", "sha1 abc")
+
+   key := "dGhlIHNhbXBsZSBub25jZQ=="
+   magic := "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+   accept := b64encode(sha1_raw(key || magic))
+   assert_eq(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "rfc6455 handshake vector")
+   return
+end
+
+procedure test_ws_frame()
+   local payload, frame, parsed, full, truncated
+   every payload := ("hello" | repl("x", 130) | "") do {
+      frame := ws_build_frame(1, payload)
+      parsed := ws_parse_frame(frame)
+      assert_eq(parsed.status, "FRAME", "ws frame parses complete")
+      assert_eq(parsed.opcode, 1, "ws frame opcode")
+      assert_eq(parsed.payload, payload, "ws frame payload round trip")
+      assert_eq(parsed.remainder, "", "ws frame no trailing bytes")
+   }
+
+   full := ws_build_frame(1, "abcdef")
+   truncated := full[1 : *full]
+   parsed := ws_parse_frame(truncated)
+   assert_eq(parsed.status, "INCOMPLETE", "ws truncated frame is incomplete")
+   return
+end
+
+procedure repl(s, n)
+   local out
+   out := ""
+   every 1 to n do out ||:= s
+   return out
+end
+
+procedure test_http_classify()
+   local success, withLogs, errViaStatus, err560, transport, protocolErr
+
+   success := http_classify(200, "{\"status\":\"success\",\"value\":{\"count\":0},\"logLines\":[]}")
+   assert_eq(success.kind, "result", "http classify success kind")
+   assert_eq(success.value["count"], 0, "http classify success value")
+   assert_eq(*success.logs, 0, "http classify success no logs")
+
+   withLogs := http_classify(200, "{\"status\":\"success\",\"value\":1,\"logLines\":[\"hi\"]}")
+   assert_eq(*withLogs.logs, 1, "http classify success with logs")
+   assert_eq(withLogs.logs[1], "hi", "http classify log content")
+
+   errViaStatus := http_classify(200, "{\"status\":\"error\",\"errorMessage\":\"boom\",\"errorData\":{\"code\":\"X\"},\"logLines\":[]}")
+   assert_eq(errViaStatus.kind, "error", "http classify function error via status kind")
+   assert_eq(errViaStatus.errName, "FunctionError", "http classify function error via status name")
+   assert_eq(errViaStatus.errMessage, "boom", "http classify function error via status message")
+   assert_eq(errViaStatus.errData["code"], "X", "http classify function error via status data")
+
+   err560 := http_classify(560, "{\"status\":\"error\",\"errorMessage\":\"boom560\",\"logLines\":[]}")
+   assert_eq(err560.errName, "FunctionError", "http classify function error via 560")
+   assert_eq(err560.errMessage, "boom560", "http classify function error via 560 message")
+
+   transport := http_classify(503, "{\"code\":\"Unavailable\",\"message\":\"try later\"}")
+   assert_eq(transport.errName, "TransportError", "http classify transport error")
+   assert_eq(transport.errMessage, "HTTP 503 from Convex: try later", "http classify transport error message")
+
+   protocolErr := http_classify(404, "")
+   assert_eq(protocolErr.errName, "ProtocolError", "http classify protocol error")
+   assert_eq(protocolErr.errMessage, "HTTP 404 from Convex: no Convex error envelope", "http classify protocol error message")
+   return
+end

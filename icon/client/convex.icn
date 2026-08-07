@@ -1,0 +1,1306 @@
+#
+# Native Convex client for Unicon.
+#
+# Unicon has real native TCP sockets (open(s, "n")) but no TLS, so this
+# file implements the whole Convex HTTP and Live protocol itself --
+# request construction, response classification, a JSON encoder/decoder,
+# RFC 6455 framing and masking, SHA-1 and base64 for the WebSocket
+# handshake, and the sync protocol's Connect/ModifyQuerySet/Transition
+# state machine with reconnect and dedup -- and delegates only raw byte
+# transport and the TLS handshake itself to a small C shim (shim.c,
+# compiled to libconvexshim.so and loaded with Unicon's own loadfunc()
+# foreign-function interface, the documented mechanism for exactly this).
+#
+# Unlike languages with no module system, Unicon compiles multiple source
+# files together at build time via `link`, so convex.icn is an ordinary
+# reusable library: the adapter and the example each `link "convex"` and
+# call its procedures directly, with real Icon values -- tables, lists,
+# records -- rather than any serialize-across-a-call trick. `link`
+# resolves that bare name to an already-compiled convex.u by the current
+# working directory at compile time, not by the linking file's own
+# location, so every build precompiles this file once (`unicon -c
+# client/convex.icn`, from a fixed working directory) before anything
+# that links it.
+#
+# JSON values decode to plain Icon types: an object becomes a table, an
+# array becomes a list, a string stays a string, a number becomes an
+# integer or a real, JSON null becomes Icon's own &null, and JSON true/
+# false become the small JBool record below (Icon has no separate boolean
+# type, and &null is already spoken for by JSON null).
+#
+record JBool(v)          # v is 1 (true) or 0 (false)
+
+record LiveSub(queryId, path, args, lastSignature)
+
+record LiveState(
+   connected, handle, url, connectionCount, lastCloseReason,
+   maxObservedTimestamp, querySet, remoteQuerySet, remoteIdentity, remoteTs,
+   nextQueryId, reconnectDelayMs, reconnectAtMs, recvBuffer,
+   partialFrameSinceMs, subs)
+
+record ConvexResult(kind, value, errName, errMessage, errData, hasErrData, logs)
+
+global ffi_connect, ffi_listen, ffi_accept, ffi_send, ffi_recv, ffi_close, ffi_randbytes, ffi_nowms
+
+#
+# ---------------- FFI loading ----------------
+#
+procedure convex_init_ffi()
+   static done
+   initial done := &null
+   if \done then return
+   ffi_connect := loadfunc("libconvexshim.so", "uconvexconnect")
+   ffi_listen := loadfunc("libconvexshim.so", "uconvexlisten")
+   ffi_accept := loadfunc("libconvexshim.so", "uconvexaccept")
+   ffi_send := loadfunc("libconvexshim.so", "uconvexsend")
+   ffi_recv := loadfunc("libconvexshim.so", "uconvexrecv")
+   ffi_close := loadfunc("libconvexshim.so", "uconvexclose")
+   ffi_randbytes := loadfunc("libconvexshim.so", "uconvexrandbytes")
+   ffi_nowms := loadfunc("libconvexshim.so", "uconvexnowms")
+   if /ffi_connect | /ffi_listen | /ffi_accept | /ffi_send | /ffi_recv | /ffi_close | /ffi_randbytes | /ffi_nowms then {
+      write(&errout, "convex: failed to load libconvexshim.so")
+      exit(1)
+   }
+   done := 1
+   return
+end
+
+procedure tag_of(s)
+   return s[1:3]
+end
+
+procedure payload_of(s)
+   return s[3:0]
+end
+
+#
+# ---------------- HTTP ----------------
+#
+# convex_http_call(op, path, argsTable, baseUrl, token) -> ConvexResult
+#   kind is "result" or "error"; on "result", value is the decoded JSON
+#   value and logs is a (possibly empty) list of strings; on "error",
+#   errName/errMessage/errData/hasErrData describe it the same way the
+#   adapter protocol's own error object does.
+#
+procedure convex_http_call(httpOp, path, argsValue, baseUrl, token)
+   local scheme, hostAndMore, host, port, useTls, body, req, headers
+   local handle, sendResult, response, statusCode, rawBody
+
+   convex_init_ffi()
+
+   scheme := baseUrl[1:1 + find("://", baseUrl) - 1]
+   hostAndMore := baseUrl[find("://", baseUrl) + 3 : 0]
+   useTls := if map(scheme) == "https" then 1 else 0
+   # Convex deployment URLs are always bare scheme://host[:port], never
+   # with a trailing path, so a colon (if any) is always the port
+   # separator.
+   if find(":", hostAndMore) then {
+      host := hostAndMore[1 : find(":", hostAndMore)]
+      port := hostAndMore[find(":", hostAndMore) + 1 : 0]
+   }
+   else {
+      host := hostAndMore
+      port := if useTls = 1 then "443" else "80"
+   }
+
+   body := "{\"path\":" || json_estr(path) || ",\"args\":" || json_encode(argsValue) || ",\"format\":\"json\"}"
+
+   req := "POST /api/" || httpOp || " HTTP/1.1\r\n"
+   req ||:= "Host: " || host || "\r\n"
+   req ||:= "Content-Type: application/json\r\n"
+   req ||:= "Accept: application/json\r\n"
+   req ||:= "Convex-Client: icon-0.1.0\r\n"
+   if *token > 0 then req ||:= "Authorization: Bearer " || token || "\r\n"
+   req ||:= "Content-Length: " || *body || "\r\n"
+   req ||:= "Connection: close\r\n\r\n"
+   req ||:= body
+
+   handle := shim_connect(host, port, useTls)
+   if \handle.err then return convex_transport_error("connect failed: " || handle.err)
+
+   sendResult := shim_send_all(handle.h, req)
+   if \sendResult.err then {
+      shim_close(handle.h)
+      return convex_transport_error("send failed: " || sendResult.err)
+   }
+
+   response := http_read_response(handle.h)
+   shim_close(handle.h)
+   if \response.err then return convex_transport_error(response.err)
+
+   return http_classify(response.status, response.body)
+end
+
+record ShimHandle(h, err)
+record ShimSize(n, err)
+record HttpResponse(status, body, err)
+
+procedure shim_connect(host, port, useTls)
+   local raw
+   raw := ffi_connect(host, port, useTls)
+   if tag_of(raw) == "K:" then return ShimHandle(integer(payload_of(raw)), &null)
+   return ShimHandle(&null, payload_of(raw))
+end
+
+procedure shim_send_all(handle, data)
+   local sent, chunk, raw, n
+   sent := 0
+   while sent < *data do {
+      chunk := data[sent + 1 : 0]
+      raw := ffi_send(handle, chunk)
+      if tag_of(raw) ~== "K:" then return ShimSize(&null, payload_of(raw))
+      n := integer(payload_of(raw))
+      if /n | n <= 0 then return ShimSize(&null, "send made no progress")
+      sent +:= n
+   }
+   return ShimSize(sent, &null)
+end
+
+procedure shim_close(handle)
+   ffi_close(handle)
+   return
+end
+
+#
+# Reads a full HTTP response (headers plus body honouring Content-Length,
+# chunked transfer encoding, or a close-terminated body) within a bounded
+# time budget.
+#
+procedure http_read_response(handle)
+   local deadline, buf, chunk, headerEnd, headerText, statusLine, statusCode
+   local restHeaders, headerLine, hname, hvalue, contentLength, chunked
+   local bodySoFar, decoded
+
+   deadline := live_now_ms() + 15000
+   buf := ""
+   headerEnd := 0
+   while headerEnd = 0 do {
+      if live_now_ms() > deadline then return HttpResponse(&null, &null, "timed out reading response headers")
+      chunk := ffi_recv(handle, 65536, 5000)
+      case tag_of(chunk) of {
+         "D:": buf ||:= payload_of(chunk)
+         "T:": &null
+         default: return HttpResponse(&null, &null, payload_of(chunk))
+      }
+      headerEnd := find("\r\n\r\n", buf)
+      if *buf > 8388608 then return HttpResponse(&null, &null, "response headers exceeded budget")
+   }
+
+   headerText := buf[1:headerEnd + 1]
+   # headerEnd is the index of the first byte of the "\r\n\r\n" terminator
+   # (single-character indexing, not a between-characters position), so
+   # the body starts 4 bytes later, not 5 -- the extra +1 here silently
+   # dropped the body's first byte on every response.
+   bodySoFar := buf[headerEnd + 4 : 0]
+
+   statusLine := headerText[1:find("\r\n", headerText) + 1]
+   statusLine ? {
+      tab(find("HTTP/") + 5)
+      tab(many(&digits ++ '.'))
+      tab(many(' '))                      # the space between "HTTP/1.1" and the status code
+      statusCode := tab(many(&digits))
+   }
+   # A "\r\n" match indexes its own first byte, so skipping past it lands
+   # 2 positions later, not 3 -- the +3 here was silently dropping the
+   # first character of the header block that follows the status line.
+   restHeaders := headerText[find("\r\n", headerText) + 2 : 0]
+
+   contentLength := -1
+   chunked := 0
+   restHeaders ? {
+      while not pos(0) do {
+         headerLine := tab(find("\r\n") | 0)
+         move(2) | &null
+         if find(":", headerLine) then {
+            headerLine ? {
+               hname := map(tab(find(":")))
+               move(1)
+               hvalue := trim_ws(tab(0))
+            }
+            if hname == "content-length" then contentLength := integer(hvalue)
+            if hname == "transfer-encoding" & map(hvalue) == "chunked" then chunked := 1
+         }
+      }
+   }
+
+   if chunked = 1 then {
+      decoded := http_dechunk(handle, bodySoFar, deadline)
+      if \decoded.err then return HttpResponse(&null, &null, decoded.err)
+      return HttpResponse(statusCode, decoded.body, &null)
+   }
+
+   if contentLength >= 0 then {
+      while *bodySoFar < contentLength do {
+         if live_now_ms() > deadline then return HttpResponse(&null, &null, "timed out reading response body")
+         chunk := ffi_recv(handle, 65536, 5000)
+         case tag_of(chunk) of {
+            "D:": bodySoFar ||:= payload_of(chunk)
+            "T:": &null
+            "C:": break
+            default: return HttpResponse(&null, &null, payload_of(chunk))
+         }
+         if *bodySoFar > 8388608 then return HttpResponse(&null, &null, "response body exceeded budget")
+      }
+      return HttpResponse(statusCode, bodySoFar[1:contentLength + 1], &null)
+   }
+
+   repeat {
+      if live_now_ms() > deadline then return HttpResponse(&null, &null, "timed out reading response body")
+      chunk := ffi_recv(handle, 65536, 5000)
+      case tag_of(chunk) of {
+         "D:": bodySoFar ||:= payload_of(chunk)
+         "T:": &null
+         "C:": break
+         default: return HttpResponse(&null, &null, payload_of(chunk))
+      }
+      if *bodySoFar > 8388608 then return HttpResponse(&null, &null, "response body exceeded budget")
+   }
+   return HttpResponse(statusCode, bodySoFar, &null)
+end
+
+record Dechunked(body, err)
+
+procedure http_dechunk(handle, buf, deadline)
+   local out, lineEnd, sizeLine, size, chunk
+   out := ""
+   repeat {
+      lineEnd := find("\r\n", buf)
+      while /lineEnd do {
+         if live_now_ms() > deadline then return Dechunked(&null, "timed out reading chunk size")
+         chunk := ffi_recv(handle, 65536, 5000)
+         if tag_of(chunk) == "D:" then buf ||:= payload_of(chunk)
+         else if tag_of(chunk) ~== "T:" then return Dechunked(&null, "connection closed mid chunk")
+         lineEnd := find("\r\n", buf)
+      }
+      sizeLine := buf[1:lineEnd + 1]
+      # A "\r\n" match indexes its own first byte, so skipping past it
+      # lands 2 positions later, not 3.
+      buf := buf[lineEnd + 2 : 0]
+      size := 0
+      sizeLine ? size := integer("16r" || tab(many(&digits ++ 'abcdefABCDEF')))
+      while *buf < size + 2 do {
+         if live_now_ms() > deadline then return Dechunked(&null, "timed out reading chunk body")
+         chunk := ffi_recv(handle, 65536, 5000)
+         if tag_of(chunk) == "D:" then buf ||:= payload_of(chunk)
+         else if tag_of(chunk) ~== "T:" then return Dechunked(&null, "connection closed mid chunk body")
+      }
+      if size = 0 then return Dechunked(out, &null)
+      out ||:= buf[1:size + 1]
+      buf := buf[size + 3 : 0]
+   }
+end
+
+#
+# Classifies a raw HTTP status + body per the documented "format":"json"
+# contract: 200 with status:"success" is a result; 200 with
+# status:"error", or HTTP 560 (Convex's function-threw status), is a
+# structured FunctionError; other 5xx/408/429 are retryable
+# TransportErrors; everything else is a ProtocolError.
+#
+procedure http_classify(statusCode, rawBody)
+   local top, status, message, dataValue, hasData, logs, detail
+
+   if statusCode = 200 | statusCode = 560 then {
+      top := json_decode(rawBody)
+      if type(top) ~== "table" then return convex_protocol_error("HTTP response body was not a JSON object")
+      if not member(top, "status") then return convex_protocol_error("HTTP response omitted status")
+      status := top["status"]
+
+      if status == "success" & statusCode = 200 then {
+         if not member(top, "value") then return convex_protocol_error("HTTP success response omitted value")
+         logs := if member(top, "logLines") then top["logLines"] else []
+         return ConvexResult("result", top["value"], &null, &null, &null, 0, logs)
+      }
+
+      if status == "error" | statusCode = 560 then {
+         message := "Convex function failed"
+         if member(top, "errorMessage") then message := top["errorMessage"]
+         else if member(top, "message") then message := top["message"]
+         hasData := 0
+         dataValue := &null
+         if member(top, "errorData") then {
+            dataValue := top["errorData"]
+            hasData := 1
+         }
+         logs := if member(top, "logLines") then top["logLines"] else []
+         return ConvexResult("error", &null, "FunctionError", message, dataValue, hasData, logs)
+      }
+
+      return convex_protocol_error("HTTP response had unknown status")
+   }
+
+   detail := "no Convex error envelope"
+   top := json_decode(rawBody)
+   if type(top) == "table" then {
+      if member(top, "errorMessage") then detail := top["errorMessage"]
+      else if member(top, "message") then detail := top["message"]
+   }
+   message := "HTTP " || statusCode || " from Convex: " || detail
+
+   if statusCode = 500 | statusCode = 502 | statusCode = 503 | statusCode = 504 | statusCode = 408 | statusCode = 429 then
+      return convex_transport_error(message)
+   return convex_protocol_error(message)
+end
+
+procedure convex_transport_error(message)
+   return ConvexResult("error", &null, "TransportError", message, &null, 0, [])
+end
+
+procedure convex_protocol_error(message)
+   return ConvexResult("error", &null, "ProtocolError", message, &null, 0, [])
+end
+
+#
+# ---------------- Live: WebSocket transport and the sync protocol ----------------
+#
+
+procedure convex_live_new(url)
+   return LiveState(0, -1, url, 0, "InitialConnect", &null, 0, 0, 0, "AAAAAAAAAAA=", 0, 100, -1, "", -1, table())
+end
+
+#
+# convex_live_add(state, subscriptionId, path, argsValue) -> list of events
+#   Mutates state in place (Icon tables/records are reference types) and
+#   returns any events observed synchronously (there normally are none:
+#   like the adapter's own subscribe op, the initial value arrives later,
+#   from a poll).
+#
+procedure convex_live_add(state, subscriptionId, path, argsValue)
+   local events, qid, mods
+
+   convex_init_ffi()
+   events := []
+   if state.connected ~= 1 then events := events ||| live_connect(state)
+
+   qid := state.nextQueryId
+   state.nextQueryId +:= 1
+   state.subs[subscriptionId] := LiveSub(qid, path, argsValue, &null)
+
+   if state.connected = 1 then {
+      mods := [ live_add_modification(qid, path, argsValue) ]
+      live_send_modify_query_set(state, mods)
+   }
+   return events
+end
+
+procedure convex_live_remove(state, subscriptionId)
+   local sub, mods
+   sub := \state.subs[subscriptionId]
+   delete(state.subs, subscriptionId)
+   if \sub & state.connected = 1 then {
+      mods := [ table_of(["type", "Remove", "queryId", sub.queryId]) ]
+      live_send_modify_query_set(state, mods)
+   }
+   return []
+end
+
+#
+# convex_live_poll(state, timeoutMs) -> list of events
+#
+procedure convex_live_poll(state, timeoutMs)
+   local events, chunk, reason
+
+   convex_init_ffi()
+   events := []
+   if state.connected ~= 1 then {
+      events := events ||| live_maybe_reconnect(state)
+      if state.connected ~= 1 then return events
+   }
+
+   chunk := ffi_recv(state.handle, 262144, timeoutMs)
+   case tag_of(chunk) of {
+      "T:": &null
+      "D:": {
+         state.recvBuffer ||:= payload_of(chunk)
+         events := events ||| live_drain_frames(state)
+      }
+      default: {
+         reason := if tag_of(chunk) == "C:" then "TransportError: peer closed" else "TransportError: " || payload_of(chunk)
+         events := events ||| live_retire(state, reason)
+      }
+   }
+   return events
+end
+
+#
+# convex_live_debug_disconnect(state) -> list of events
+#   Retires the current connection and arms the reconnect timer
+#   synchronously, so the caller can ack immediately after this returns.
+#
+procedure convex_live_debug_disconnect(state)
+   return live_retire(state, "DebugDisconnect")
+end
+
+procedure convex_live_close(state)
+   if state.connected = 1 then ffi_close(state.handle)
+   state.connected := 0
+   state.handle := -1
+   return
+end
+
+procedure live_add_modification(qid, path, argsValue)
+   return table_of(["type", "Add", "queryId", qid, "udfPath", path, "args", [argsValue]])
+end
+
+procedure table_of(pairs)
+   local t, i
+   t := table()
+   every i := 1 to *pairs by 2 do t[pairs[i]] := pairs[i + 1]
+   return t
+end
+
+procedure live_send_modify_query_set(state, modifications)
+   local baseVersion, msg
+   baseVersion := state.querySet
+   state.querySet +:= 1
+   msg := table_of(["type", "ModifyQuerySet", "baseVersion", baseVersion, "newVersion", state.querySet,
+      "modifications", modifications])
+   ffi_send(state.handle, ws_build_frame(1, json_encode(msg)))
+   return
+end
+
+#
+# live_connect(state) -> list of events
+#
+procedure live_connect(state)
+   local scheme, hostAndMore, host, port, useTls, urlPath, handle, wsKey
+   local handshake, sendResult, hsResult, accept, expected, sessionId
+   local connectMsg, mods, subId, sub
+
+   scheme := state.url[1:1 + find("://", state.url) - 1]
+   hostAndMore := state.url[find("://", state.url) + 3 : 0]
+   useTls := if map(scheme) == "wss" then 1 else 0
+   urlPath := "/api/sync"
+   if find("/", hostAndMore) then {
+      urlPath := hostAndMore[find("/", hostAndMore) : 0]
+      hostAndMore := hostAndMore[1 : find("/", hostAndMore)]
+   }
+   if find(":", hostAndMore) then {
+      host := hostAndMore[1 : find(":", hostAndMore)]
+      port := hostAndMore[find(":", hostAndMore) + 1 : 0]
+   }
+   else {
+      host := hostAndMore
+      port := if useTls = 1 then "443" else "80"
+   }
+
+   handle := shim_connect(host, port, useTls)
+   if \handle.err then return live_retire(state, "TransportError: connect failed")
+
+   wsKey := b64encode(payload_of(ffi_randbytes(16)))
+   handshake := "GET " || urlPath || " HTTP/1.1\r\n"
+   handshake ||:= "Host: " || host || "\r\n"
+   handshake ||:= "Upgrade: websocket\r\n"
+   handshake ||:= "Connection: Upgrade\r\n"
+   handshake ||:= "Sec-WebSocket-Key: " || wsKey || "\r\n"
+   handshake ||:= "Sec-WebSocket-Version: 13\r\n"
+   handshake ||:= "Convex-Client: icon-0.1.0\r\n\r\n"
+
+   sendResult := shim_send_all(handle.h, handshake)
+   if \sendResult.err then {
+      ffi_close(handle.h)
+      return live_retire(state, "TransportError: handshake send failed")
+   }
+
+   hsResult := http_read_handshake(handle.h)
+   if \hsResult.err then {
+      ffi_close(handle.h)
+      return live_retire(state, "ProtocolError: handshake failed")
+   }
+
+   expected := b64encode(sha1_raw(wsKey || "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+   if hsResult.accept ~== expected then {
+      ffi_close(handle.h)
+      return live_retire(state, "ProtocolError: Sec-WebSocket-Accept mismatch")
+   }
+
+   state.connected := 1
+   state.handle := handle.h
+   state.querySet := 0
+   state.remoteQuerySet := 0
+   state.remoteIdentity := 0
+   state.remoteTs := "AAAAAAAAAAA="
+   state.recvBuffer := hsResult.leftover
+   state.partialFrameSinceMs := -1
+
+   sessionId := map(hex_of(payload_of(ffi_randbytes(16))), &ucase, &lcase)
+   connectMsg := table_of(["type", "Connect", "sessionId", sessionId,
+      "connectionCount", state.connectionCount, "lastCloseReason", state.lastCloseReason, "clientTs", 0])
+   if \state.maxObservedTimestamp then connectMsg["maxObservedTimestamp"] := state.maxObservedTimestamp
+   ffi_send(state.handle, ws_build_frame(1, json_encode(connectMsg)))
+
+   mods := []
+   every subId := key(state.subs) do {
+      sub := state.subs[subId]
+      put(mods, live_add_modification(sub.queryId, sub.path, sub.args))
+   }
+   if *mods > 0 then live_send_modify_query_set(state, mods)
+
+   return []
+end
+
+record HandshakeResult(accept, leftover, err)
+
+procedure http_read_handshake(handle)
+   local deadline, buf, chunk, headerEnd, headerText, leftover, statusLine
+   local restHeaders, headerLine, hname, hvalue, accept
+
+   deadline := live_now_ms() + 10000
+   buf := ""
+   headerEnd := 0
+   while headerEnd = 0 do {
+      if live_now_ms() > deadline then return HandshakeResult(&null, &null, "timed out reading handshake")
+      chunk := ffi_recv(handle, 65536, 5000)
+      case tag_of(chunk) of {
+         "D:": buf ||:= payload_of(chunk)
+         "T:": &null
+         default: return HandshakeResult(&null, &null, payload_of(chunk))
+      }
+      headerEnd := find("\r\n\r\n", buf)
+      if *buf > 32768 then return HandshakeResult(&null, &null, "handshake headers exceeded budget")
+   }
+   headerText := buf[1:headerEnd + 1]
+   # headerEnd indexes the first byte of "\r\n\r\n" itself, so the body/
+   # leftover bytes start 4 positions later, not 5.
+   leftover := buf[headerEnd + 4 : 0]
+
+   statusLine := headerText[1:find("\r\n", headerText) + 1]
+   if not find("101", statusLine) then return HandshakeResult(&null, &null, "handshake did not return 101")
+
+   # Likewise, a "\r\n" match indexes its own first byte, so skipping past
+   # it lands 2 positions later, not 3 -- the +3 here was silently
+   # dropping the first character of the header block that follows the
+   # status line.
+   restHeaders := headerText[find("\r\n", headerText) + 2 : 0]
+   accept := &null
+   restHeaders ? {
+      while not pos(0) do {
+         headerLine := tab(find("\r\n") | 0)
+         move(2) | &null
+         if find(":", headerLine) then {
+            headerLine ? {
+               hname := map(tab(find(":")))
+               move(1)
+               hvalue := trim_ws(tab(0))
+            }
+            if hname == "sec-websocket-accept" then accept := hvalue
+         }
+      }
+   }
+   if /accept then return HandshakeResult(&null, &null, "handshake omitted Sec-WebSocket-Accept")
+   return HandshakeResult(accept, leftover, &null)
+end
+
+#
+# live_maybe_reconnect(state) -> list of events
+#   Reconnects only once the backoff deadline has elapsed and only if
+#   there is still at least one active subscription.
+#
+procedure live_maybe_reconnect(state)
+   if state.reconnectAtMs < 0 then return []
+   if live_now_ms() < state.reconnectAtMs then return []
+   if *state.subs = 0 then return []
+   return live_connect(state)
+end
+
+procedure live_now_ms()
+   # &time is documented as *execution* time, not wall-clock time, so it
+   # barely advances while blocked in poll()/recv() -- exactly what Live
+   # spends most of its time doing between frames. Reconnect backoff needs
+   # real elapsed wall-clock milliseconds, which the shim supplies.
+   convex_init_ffi()
+   return integer(payload_of(ffi_nowms()))
+end
+
+#
+# live_retire(state, reason) -> list of events
+#   Every path that loses the connection funnels through here so
+#   connectionCount/lastCloseReason/backoff stay consistent.
+#
+procedure live_retire(state, reason)
+   local events, delay, errName, subId
+
+   if state.connected = 1 then ffi_close(state.handle)
+   state.connected := 0
+   state.handle := -1
+   state.lastCloseReason := reason
+   state.connectionCount +:= 1
+   state.recvBuffer := ""
+   state.partialFrameSinceMs := -1
+
+   events := []
+   if *state.subs = 0 then {
+      state.reconnectAtMs := -1
+      return events
+   }
+   if reason == "client-closed" then {
+      state.reconnectAtMs := -1
+      return events
+   }
+
+   delay := state.reconnectDelayMs
+   state.reconnectAtMs := live_now_ms() + delay
+   state.reconnectDelayMs := delay * 2
+   if state.reconnectDelayMs > 15000 then state.reconnectDelayMs := 15000
+
+   if reason ~== "DebugDisconnect" then {
+      errName := if reason[1:14] == "ProtocolError:" then "ProtocolError" else "TransportError"
+      every subId := key(state.subs) do
+         put(events, table_of(["subscriptionId", subId, "type", "subscription",
+            "error", table_of(["name", errName, "message", reason])]))
+   }
+   return events
+end
+
+#
+# live_drain_frames(state) -> list of events
+#   Consumes as many complete WebSocket frames as are already buffered.
+#
+procedure live_drain_frames(state)
+   local events, parsed, opcode, payload, remainder, since
+
+   convex_init_ffi()
+   events := []
+   repeat {
+      parsed := ws_parse_frame(state.recvBuffer)
+      if parsed.status == "INCOMPLETE" then {
+         if *state.recvBuffer > 0 then {
+            since := state.partialFrameSinceMs
+            if since < 0 then state.partialFrameSinceMs := live_now_ms()
+            else if live_now_ms() - since > 5000 then
+               events := events ||| live_retire(state, "ProtocolError: partial frame deadline exceeded")
+         }
+         break
+      }
+      state.partialFrameSinceMs := -1
+      opcode := parsed.opcode
+      payload := parsed.payload
+      state.recvBuffer := parsed.remainder
+
+      case opcode of {
+         8: {
+            events := events ||| live_retire(state, "TransportError: peer closed")
+            break
+         }
+         9: ffi_send(state.handle, ws_build_frame(10, payload))
+         10: &null
+         1: events := events ||| live_handle_message(state, payload)
+         default: {
+            events := events ||| live_retire(state, "ProtocolError: unsupported frame opcode")
+            break
+         }
+      }
+   }
+   return events
+end
+
+procedure live_handle_message(state, payload)
+   local msg, msgType
+
+   msg := json_decode(payload)
+   if type(msg) ~== "table" then return live_retire(state, "ProtocolError: Live message was not a JSON object")
+   if not member(msg, "type") then return live_retire(state, "ProtocolError: Live message omitted type")
+   msgType := msg["type"]
+
+   case msgType of {
+      "Transition": return live_apply_transition(state, msg)
+      "Ping" | "MutationResponse" | "ActionResponse": return []
+      "TransitionChunk": return live_retire(state, "ProtocolError: TransitionChunk is not implemented")
+      "FatalError": return live_retire(state, "ProtocolError: FatalError from server")
+      "AuthError": return live_retire(state, "ProtocolError: AuthError from server")
+      default: return live_retire(state, "ProtocolError: unsupported Live message " || msgType)
+   }
+end
+
+procedure live_apply_transition(state, msg)
+   local startVersion, endVersion, events, mods, m, byQuery, qid, order, i
+
+   startVersion := msg["startVersion"]
+   endVersion := msg["endVersion"]
+   if /startVersion | /endVersion then return live_retire(state, "ProtocolError: Transition omitted a version")
+
+   if startVersion["querySet"] ~= state.remoteQuerySet | startVersion["identity"] ~= state.remoteIdentity |
+      startVersion["ts"] ~== state.remoteTs then
+      return live_retire(state, "ProtocolError: transition start version mismatch")
+
+   state.remoteQuerySet := endVersion["querySet"]
+   state.remoteIdentity := endVersion["identity"]
+   state.remoteTs := endVersion["ts"]
+
+   if /state.maxObservedTimestamp | timestamp_key(endVersion["ts"]) > timestamp_key(state.maxObservedTimestamp) then
+      state.maxObservedTimestamp := endVersion["ts"]
+
+   events := []
+   mods := if member(msg, "modifications") then msg["modifications"] else []
+   byQuery := table()
+   order := []
+   every m := !mods do {
+      qid := m["queryId"]
+      if not member(byQuery, qid) then put(order, qid)
+      byQuery[qid] := m
+   }
+   every qid := !order do
+      events := events ||| live_apply_one_modification(state, byQuery[qid])
+   return events
+end
+
+procedure live_apply_one_modification(state, m)
+   local qid, subId, sub, sig, evt, dataValue, hasData
+
+   qid := m["queryId"]
+   subId := &null
+   every subId := key(state.subs) do {
+      if state.subs[subId].queryId = qid then break
+   }
+   if /subId then return []
+   sub := state.subs[subId]
+
+   case m["type"] of {
+      "QueryRemoved": return []
+      "QueryUpdated": {
+         sig := "value" || json_encode(m["value"]) || "|logs" || json_encode(logs_of(m))
+         # A fresh subscription's lastSignature is &null by design (there is
+         # no previous update to compare against yet), but Icon's "=="
+         # requires an actual string on both sides and errors -- rather
+         # than just failing -- when given &null. \sub.lastSignature short
+         # -circuits the "&" and skips the comparison entirely until there
+         # is a real previous signature to compare.
+         if \sub.lastSignature & sig == sub.lastSignature then return []
+         sub.lastSignature := sig
+         evt := table_of(["subscriptionId", subId, "type", "subscription", "value", m["value"]])
+         if *logs_of(m) > 0 then evt["logs"] := logs_of(m)
+         return [evt]
+      }
+      "QueryFailed": {
+         hasData := member(m, "errorData")
+         dataValue := if hasData then m["errorData"] else &null
+         sig := "error" || (\m["errorMessage"] | "") || "|" || (if hasData then json_encode(dataValue) else "") || 
+            "|logs" || json_encode(logs_of(m))
+         # A fresh subscription's lastSignature is &null by design (there is
+         # no previous update to compare against yet), but Icon's "=="
+         # requires an actual string on both sides and errors -- rather
+         # than just failing -- when given &null. \sub.lastSignature short
+         # -circuits the "&" and skips the comparison entirely until there
+         # is a real previous signature to compare.
+         if \sub.lastSignature & sig == sub.lastSignature then return []
+         sub.lastSignature := sig
+         evt := table_of(["subscriptionId", subId, "type", "subscription",
+            "error", table_of(["name", "FunctionError", "message", \m["errorMessage"] | ""])])
+         if hasData then evt["error"]["data"] := dataValue
+         if *logs_of(m) > 0 then evt["logs"] := logs_of(m)
+         return [evt]
+      }
+      default: return []
+   }
+end
+
+procedure logs_of(m)
+   return if member(m, "logLines") then m["logLines"] else []
+end
+
+procedure timestamp_key(base64Ts)
+   local raw, reversed, i
+   raw := b64decode(base64Ts)
+   reversed := ""
+   every i := *raw to 1 by -1 do reversed ||:= raw[i]
+   return hex_of(reversed)
+end
+
+#
+# ---------------- RFC 6455 framing ----------------
+#
+
+record ParsedFrame(status, opcode, payload, remainder)
+
+procedure ws_build_frame(opcode, payload)
+   local len, first, lenField, maskKey, masked
+   convex_init_ffi()                      # needs ffi_randbytes for the mask key
+   len := *payload
+   first := char_of(128 + opcode)
+   # Bit 0x80 of this byte is the mask flag; RFC 6455 requires every
+   # client-to-server frame to set it (the server only accepts masked
+   # frames), so it is OR'd into the length byte here -- including the
+   # 126 marker byte when an extended 16-bit length follows.
+   if len <= 125 then lenField := char_of(128 + len)
+   else {
+      lenField := char_of(128 + 126) || char_of(len / 256) || char_of(len % 256)
+   }
+   maskKey := payload_of(ffi_randbytes(4))
+   masked := ws_mask(payload, maskKey)
+   return first || lenField || maskKey || masked
+end
+
+procedure ws_mask(payload, maskKey)
+   local out, i
+   if *payload = 0 then return ""
+   out := ""
+   every i := 1 to *payload do
+      out ||:= char_of(ixor(ord(payload[i]), ord(maskKey[(i - 1) % 4 + 1])))
+   return out
+end
+
+procedure ws_parse_frame(buf)
+   local n, b0, b1, opcode, masked, len7, headerLen, payloadLen, maskLen
+   local totalLen, payload, maskKey
+
+   n := *buf
+   if n < 2 then return ParsedFrame("INCOMPLETE", &null, &null, buf)
+
+   b0 := ord(buf[1])
+   b1 := ord(buf[2])
+   opcode := b0 % 16
+   # Icon's `if EXPR then` branches on success/failure, not on 0-vs-nonzero,
+   # so masked must always land on a defined 1/0 rather than ever be left
+   # as an unassigned &null (which, being a value that "succeeds" just
+   # like 1 does, would otherwise make every `if masked then` below take
+   # the true branch regardless of the actual bit -- corrupting every
+   # ordinary unmasked server frame).
+   masked := if b1 >= 128 then 1 else 0
+   len7 := b1 % 128
+
+   headerLen := 2
+   payloadLen := len7
+   if len7 = 126 then {
+      if n < 4 then return ParsedFrame("INCOMPLETE", &null, &null, buf)
+      payloadLen := (ord(buf[3]) * 256) + ord(buf[4])
+      headerLen := 4
+   }
+   else if len7 = 127 then {
+      if n < 10 then return ParsedFrame("INCOMPLETE", &null, &null, buf)
+      payloadLen := bytes_to_int(buf[7:11])
+      headerLen := 10
+   }
+
+   maskLen := if masked = 1 then 4 else 0
+   totalLen := headerLen + maskLen + payloadLen
+   if n < totalLen then return ParsedFrame("INCOMPLETE", &null, &null, buf)
+
+   payload := buf[headerLen + maskLen + 1 : headerLen + maskLen + payloadLen + 1]
+   if masked = 1 then {
+      maskKey := buf[headerLen + 1 : headerLen + 5]
+      payload := ws_mask(payload, maskKey)
+   }
+
+   return ParsedFrame("FRAME", opcode, payload, buf[totalLen + 1 : 0])
+end
+
+procedure bytes_to_int(b4)
+   return (ord(b4[1]) * 16777216) + (ord(b4[2]) * 65536) + (ord(b4[3]) * 256) + ord(b4[4])
+end
+
+procedure char_of(n)
+   return char(iand(n, 255))
+end
+
+#
+# ---------------- JSON codec ----------------
+#
+# json_decode/json_value and friends run inside a `s ? ...` string-scan
+# environment: &subject/&pos are ordinary (dynamically scoped) globals, so
+# nested procedure calls made while still inside that scan see the same
+# position the caller left it at, which is exactly the recursive-descent
+# idiom Icon's string scanning is built for.
+#
+
+procedure json_decode(s)
+   local result
+   s ? {
+      json_skip_ws()
+      result := json_value()
+   }
+   return result
+end
+
+procedure json_skip_ws()
+   tab(many(' \t\r\n'))
+   return
+end
+
+procedure json_value()
+   local c
+   json_skip_ws()
+   c := &subject[&pos]
+   case c of {
+      "\"": return json_string()
+      "{": return json_object()
+      "[": return json_array()
+      "t": return json_match_true()
+      "f": return json_match_false()
+      "n": return json_match_null()
+      default: return json_number()
+   }
+end
+
+procedure json_match_true()
+   ="true"
+   return JBool(1)
+end
+
+procedure json_match_false()
+   ="false"
+   return JBool(0)
+end
+
+procedure json_match_null()
+   ="null"
+   return &null
+end
+
+#
+# Icon/Unicon's &pos advance from move()/tab() is *reversibly bound*: when
+# move()'s result feeds a comparison and that comparison fails (as in the
+# natural-looking `while (c := move(1)) ~== "\"" do ...`), the failed
+# comparison unwinds &pos back to where it was before that move() as part
+# of ordinary expression-failure handling, even though the `:=` to c
+# itself sticks. That silently leaves the scan one character short of the
+# closing quote every time, corrupting every value that follows in the
+# object. The fix is to never let a failing comparison be the thing that
+# consumed the character: peek the next character with plain
+# subscripting (never fails-with-rollback, only errors out of range, which
+# the bounds check above avoids), decide, and only then move() -- so
+# move()'s advance is always paired with an unconditionally succeeding
+# comparison.
+#
+procedure json_string()
+   local out, c
+   move(1)                                # opening quote
+   out := ""
+   while &pos <= *&subject & &subject[&pos] ~== "\"" do {
+      c := move(1)
+      if c == "\\" then {
+         c := move(1)
+         case c of {
+            "\"": out ||:= "\""
+            "\\": out ||:= "\\"
+            "/": out ||:= "/"
+            "b": out ||:= "\b"
+            "f": out ||:= "\f"
+            "n": out ||:= "\n"
+            "r": out ||:= "\r"
+            "t": out ||:= "\t"
+            "u": {
+               out ||:= utf8_of_codepoint(integer("16r" || move(4)))
+            }
+            default: out ||:= c
+         }
+      }
+      else out ||:= c
+   }
+   if &pos > *&subject then fail          # unterminated string
+   move(1)                                # closing quote
+   return out
+end
+
+procedure utf8_of_codepoint(cp)
+   if cp <= 127 then return char(cp)
+   if cp <= 2047 then
+      return char(192 + ishift(cp, -6)) || char(128 + iand(cp, 63))
+   return char(224 + ishift(cp, -12)) || char(128 + iand(ishift(cp, -6), 63)) || char(128 + iand(cp, 63))
+end
+
+procedure json_number()
+   local text
+   text := tab(many('-+0123456789.eE'))
+   if find(".", text) | find("e", text) | find("E", text) then return real(text)
+   return integer(text)
+end
+
+procedure json_object()
+   local t, key
+   t := table()
+   move(1)                                # {
+   json_skip_ws()
+   if ="}" then return t
+   repeat {
+      json_skip_ws()
+      key := json_string()
+      json_skip_ws()
+      move(1)                             # :
+      t[key] := json_value()
+      json_skip_ws()
+      if ="," then next
+      break
+   }
+   json_skip_ws()
+   move(1)                                # }
+   return t
+end
+
+procedure json_array()
+   local lst
+   lst := []
+   move(1)                                # [
+   json_skip_ws()
+   if ="]" then return lst
+   repeat {
+      put(lst, json_value())
+      json_skip_ws()
+      if ="," then next
+      break
+   }
+   json_skip_ws()
+   move(1)                                # ]
+   return lst
+end
+
+procedure json_encode(v)
+   local out, first, k, item
+
+   if /v then return "null"
+   case type(v) of {
+      "JBool": return if v.v = 1 then "true" else "false"
+      "string": return json_estr(v)
+      "integer" | "real": return string(v)
+      "list": {
+         out := "["
+         first := 1
+         every item := !v do {
+            if first ~= 1 then out ||:= ","
+            first := 0
+            out ||:= json_encode(item)
+         }
+         return out || "]"
+      }
+      "table": {
+         out := "{"
+         first := 1
+         every k := key(v) do {
+            if first ~= 1 then out ||:= ","
+            first := 0
+            out ||:= json_estr(k) || ":" || json_encode(v[k])
+         }
+         return out || "}"
+      }
+      default: return "null"
+   }
+end
+
+procedure json_estr(raw)
+   local out, i, c, code
+   out := "\""
+   every i := 1 to *raw do {
+      c := raw[i]
+      case c of {
+         "\"": out ||:= "\\\""
+         "\\": out ||:= "\\\\"
+         "\n": out ||:= "\\n"
+         "\r": out ||:= "\\r"
+         "\t": out ||:= "\\t"
+         default: {
+            code := ord(c)
+            if code < 32 then out ||:= "\\u" || right_pad_hex(code)
+            else out ||:= c
+         }
+      }
+   }
+   return out || "\""
+end
+
+procedure right_pad_hex(n)
+   return "00" || hex_of(char(n))
+end
+
+#
+# ---------------- base64 and SHA-1 (WebSocket handshake only) ----------------
+#
+
+procedure b64encode(raw)
+   local alphabet, n, out, i, chunk, chunkLen, b0, b1, b2, c0, c1, c2, c3
+   alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+   n := *raw
+   out := ""
+   i := 1
+   while i <= n do {
+      # Icon's "|" binds tighter than ":=", so an unparenthesized
+      # "x := a | b" assigns "a" immediately and alternates the rest as a
+      # separate, discarded expression -- min(3, remaining) has to be
+      # spelled with an explicit if/then/else to actually land in
+      # chunkLen. (This one happened to stay harmless: chunkLen is only
+      # ever compared with >=2/>=3, which come out the same whether it
+      # holds 3 or the uncapped remaining count -- but that's luck, not
+      # correctness, so it's written the safe way regardless.)
+      chunkLen := if 3 < (n - i + 1) then 3 else (n - i + 1)
+      b0 := ord(raw[i])
+      b1 := if chunkLen >= 2 then ord(raw[i + 1]) else 0
+      b2 := if chunkLen >= 3 then ord(raw[i + 2]) else 0
+
+      c0 := ishift(b0, -2)
+      c1 := iand(ishift(b0, 4), 63) + ishift(b1, -4)
+      c2 := iand(ishift(b1, 2), 63) + ishift(b2, -6)
+      c3 := iand(b2, 63)
+
+      out ||:= alphabet[c0 + 1] || alphabet[c1 + 1]
+      out ||:= if chunkLen >= 2 then alphabet[c2 + 1] else "="
+      out ||:= if chunkLen >= 3 then alphabet[c3 + 1] else "="
+      i +:= 3
+   }
+   return out
+end
+
+procedure b64decode(text)
+   local alphabet, out, bits, i, idx, byteVal
+   alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+   text := trim_ws(text)
+   text ? {
+      tab(many(&letters ++ &digits ++ '+/'))
+      text := &subject[1:&pos]
+   }
+   bits := ""
+   every i := 1 to *text do {
+      idx := find(text[i], alphabet) - 1
+      bits ||:= right_bits(idx, 6)
+   }
+   out := ""
+   i := 1
+   while i + 7 <= *bits do {
+      byteVal := integer("2r" || bits[i:i + 8])
+      out ||:= char(byteVal)
+      i +:= 8
+   }
+   return out
+end
+
+procedure right_bits(n, width)
+   local s
+   s := ""
+   while n > 0 do {
+      s := string(n % 2) || s
+      n := n / 2
+   }
+   while *s < width do s := "0" || s
+   return s
+end
+
+procedure hex_of(raw)
+   local out, i
+   out := ""
+   every i := 1 to *raw do out ||:= right(radix_str(ord(raw[i]), 16), 2, "0")
+   return out
+end
+
+procedure radix_str(n, base)
+   local digits, s, d
+   digits := "0123456789abcdef"
+   if n = 0 then return "0"
+   s := ""
+   while n > 0 do {
+      d := n % base
+      s := digits[d + 1] || s
+      n := n / base
+   }
+   return s
+end
+
+procedure right(s, width, pad)
+   while *s < width do s := pad || s
+   return s
+end
+
+procedure trim_ws(s)
+   local start, stop
+   start := 1
+   stop := *s
+   while start <= stop & any(' \t\r\n', s[start]) do start +:= 1
+   while stop >= start & any(' \t\r\n', s[stop]) do stop -:= 1
+   if start > stop then return ""
+   return s[start : stop + 1]
+end
+
+#
+# sha1_raw(message) -> 20-byte raw digest. Only used once per Live
+# connection (the WebSocket handshake), on a fixed ~60-byte input, so
+# clarity wins over speed. Icon promotes integers to arbitrary precision
+# automatically, so 32-bit values are kept in range with an explicit
+# `iand(x, 16rFFFFFFFF)` after each arithmetic op rather than relying on
+# wraparound.
+#
+$define M32 16rFFFFFFFF
+
+procedure sha1_mod32(v)
+   local r
+   r := v % 4294967296
+   if r < 0 then r +:= 4294967296
+   return r
+end
+
+procedure sha1_rotl(v, bits)
+   local left, right
+   v := sha1_mod32(v)
+   left := sha1_mod32(ishift(v, bits))
+   right := ishift(v, bits - 32)
+   return sha1_mod32(iand(left, M32) + iand(right, M32))
+end
+
+procedure sha1_word_to_bytes(v)
+   v := sha1_mod32(v)
+   return char(ishift(v, -24)) || char(iand(ishift(v, -16), 255)) || 
+      char(iand(ishift(v, -8), 255)) || char(iand(v, 255))
+end
+
+procedure sha1_bytes_to_word(b4)
+   return (ord(b4[1]) * 16777216) + (ord(b4[2]) * 65536) + (ord(b4[3]) * 256) + ord(b4[4])
+end
+
+procedure sha1_raw(message)
+   local h0, h1, h2, h3, h4, msgLen, bitLen, padded, blocks, blockIndex
+   local block, w, wArr, a, b, c, d, e, t, f, k, temp, i3, i8, i14, i16
+
+   h0 := 1732584193
+   h1 := 4023233417
+   h2 := 2562383102
+   h3 := 271733878
+   h4 := 3285377520
+
+   msgLen := *message
+   bitLen := msgLen * 8
+
+   padded := message || char(128)
+   while (*padded % 64) ~= 56 do padded ||:= char(0)
+   padded ||:= sha1_word_to_bytes(bitLen / 4294967296) || sha1_word_to_bytes(bitLen % 4294967296)
+
+   wArr := table()
+   blocks := *padded / 64
+   every blockIndex := 1 to blocks do {
+      block := padded[(blockIndex - 1) * 64 + 1 : blockIndex * 64 + 1]
+      every w := 0 to 15 do wArr[w] := sha1_bytes_to_word(block[w * 4 + 1 : w * 4 + 5])
+      every w := 16 to 79 do {
+         i3 := iand(wArr[w - 3], M32)
+         i8 := iand(wArr[w - 8], M32)
+         i14 := iand(wArr[w - 14], M32)
+         i16 := iand(wArr[w - 16], M32)
+         wArr[w] := sha1_rotl(ixor(ixor(i3, i8), ixor(i14, i16)), 1)
+      }
+
+      a := h0; b := h1; c := h2; d := h3; e := h4
+
+      every t := 0 to 79 do {
+         if t <= 19 then {
+            f := ior(iand(b, c), iand(iand(icom(b), M32), d))
+            k := 1518500249
+         }
+         else if t <= 39 then {
+            f := ixor(ixor(b, c), d)
+            k := 1859775393
+         }
+         else if t <= 59 then {
+            f := ior(ior(iand(b, c), iand(b, d)), iand(c, d))
+            k := 2400959708
+         }
+         else {
+            f := ixor(ixor(b, c), d)
+            k := 3395469782
+         }
+         temp := sha1_mod32(sha1_rotl(a, 5) + iand(f, M32) + e + k + wArr[t])
+         e := d; d := c; c := sha1_rotl(b, 30); b := a; a := temp
+      }
+
+      h0 := sha1_mod32(h0 + a)
+      h1 := sha1_mod32(h1 + b)
+      h2 := sha1_mod32(h2 + c)
+      h3 := sha1_mod32(h3 + d)
+      h4 := sha1_mod32(h4 + e)
+   }
+
+   return sha1_word_to_bytes(h0) || sha1_word_to_bytes(h1) || sha1_word_to_bytes(h2) || 
+      sha1_word_to_bytes(h3) || sha1_word_to_bytes(h4)
+end

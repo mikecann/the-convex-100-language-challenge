@@ -1,0 +1,209 @@
+#
+# Loopback WebSocket/sync-protocol fixture for client/tests/live_test.icn.
+#
+# Speaks just enough of the pinned sync profile, as a real TCP+WS peer, to
+# drive the real client's Live state machine through a real handshake, an
+# initial value, an external update, an unsubscribe, and a
+# debugDisconnect -> reconnect -> fresh-value cycle. This is test-only
+# infrastructure: it duplicates the shim-loading step (a separate process
+# needs its own) and hand-builds just enough JSON/WebSocket framing to
+# act as a peer, but it holds no Convex client logic of its own.
+#
+# unicon's `link` resolves an already-compiled `.u` file by looking in the
+# CURRENT WORKING DIRECTORY at compile time, not next to the file that
+# names it, and it never auto-compiles a sibling `.icn` -- so the build
+# always precompiles client/convex.icn once (from a fixed CWD) and every
+# dependent file links it back by that bare name.
+#
+link "convex"
+
+global listenf, acceptf, sendf, recvf, closef
+
+procedure main(args)
+   local port, listenResult, listenHandle, handle, queryId0, handle2, queryId1
+
+   listenf := loadfunc("libconvexshim.so", "uconvexlisten")
+   acceptf := loadfunc("libconvexshim.so", "uconvexaccept")
+   sendf := loadfunc("libconvexshim.so", "uconvexsend")
+   recvf := loadfunc("libconvexshim.so", "uconvexrecv")
+   closef := loadfunc("libconvexshim.so", "uconvexclose")
+
+   port := args[1]
+
+   listenResult := listenf("127.0.0.1", port)
+   if listenResult[1:3] ~== "K:" then {
+      write(&errout, "ws_fixture: listen failed: ", listenResult[3:0])
+      exit(1)
+   }
+   listenHandle := integer(listenResult[3:0])
+   write("READY")
+   flush(&output)
+
+   # --- connection 1: handshake, Add, initial value, external update ---
+   handle := accept_and_handshake(listenHandle)
+   if /handle then exit(1)
+
+   queryId0 := read_modify_query_set_add(handle)
+   send_transition(handle, 0, 0, "AAAAAAAAAAA=", 1, 0, timestamp_for(1),
+      "[{\"type\":\"QueryUpdated\",\"queryId\":" || queryId0 ||
+      ",\"value\":{\"room\":\"fixture-room\",\"count\":0,\"lastLanguage\":null,\"latestRunId\":null,\"updatedAt\":null},\"logLines\":[]}]")
+
+   send_transition(handle, 1, 0, timestamp_for(1), 2, 0, timestamp_for(2),
+      "[{\"type\":\"QueryUpdated\",\"queryId\":" || queryId0 ||
+      ",\"value\":{\"room\":\"fixture-room\",\"count\":1,\"lastLanguage\":\"icon\",\"latestRunId\":\"r1\",\"updatedAt\":1},\"logLines\":[]}]")
+
+   # A real debugDisconnect closes from the client side; from here that
+   # looks the same as any other lost connection, so this simply waits
+   # for whatever comes next (or a timeout) and moves on.
+   read_one_message(handle)
+   closef(handle)
+
+   # --- connection 2: reconnect resends Add, then QueryFailed followed
+   # by a recovering QueryUpdated (query-error-recovery), scripted on the
+   # same connection so the fixture stays one small file. ---
+   handle2 := accept_and_handshake(listenHandle)
+   if /handle2 then exit(1)
+   queryId1 := read_modify_query_set_add(handle2)
+   send_transition(handle2, 0, 0, "AAAAAAAAAAA=", 1, 0, timestamp_for(3),
+      "[{\"type\":\"QueryFailed\",\"queryId\":" || queryId1 ||
+      ",\"errorMessage\":\"Increment the room to repair this reactive query\",\"errorData\":{\"code\":\"ROOM_EMPTY\"},\"logLines\":[]}]")
+   send_transition(handle2, 1, 0, timestamp_for(3), 2, 0, timestamp_for(4),
+      "[{\"type\":\"QueryUpdated\",\"queryId\":" || queryId1 ||
+      ",\"value\":{\"room\":\"fixture-room\",\"count\":2,\"lastLanguage\":\"icon\",\"latestRunId\":\"r2\",\"updatedAt\":2},\"logLines\":[]}]")
+
+   read_one_message(handle2)
+   closef(handle2)
+   closef(listenHandle)
+end
+
+procedure accept_and_handshake(listenHandle)
+   local acceptResult, handle, buf, chunk, headerEnd, headerText, key
+   local restHeaders, headerLine, colonAt, hname, hvalue, accept, response, nlPos
+
+   acceptResult := acceptf(listenHandle, 15000)
+   if acceptResult[1:3] ~== "K:" then {
+      write(&errout, "ws_fixture: accept failed: ", acceptResult[3:0])
+      fail
+   }
+   handle := integer(acceptResult[3:0])
+
+   #
+   # find() failing makes the whole assignment expression fail too, and
+   # wrapping that failing assignment directly in "/(...)" makes the
+   # WHOLE thing fail rather than falling back to headerEnd's prior
+   # value -- so on an empty buf this loop would never run its body even
+   # once. Assign headerEnd first, then test the plain variable.
+   #
+   buf := ""
+   headerEnd := find("\r\n\r\n", buf)
+   while /headerEnd do {
+      chunk := recvf(handle, 65536, 5000)
+      if chunk[1:3] == "D:" then buf ||:= chunk[3:0]
+      else {
+         write(&errout, "ws_fixture: handshake request incomplete")
+         fail
+      }
+      headerEnd := find("\r\n\r\n", buf)
+   }
+   # buf[1:headerEnd] (not headerEnd+1) stops right before the "\r\n\r\n"
+   # terminator, so headerText holds only complete "line\r\n" pairs with
+   # nothing dangling after the last one -- except the very last line,
+   # which has no trailing "\r\n" of its own to find. That means the
+   # advance amount can't be a single fixed "+3 past the line" formula:
+   # when a real "\r\n" is found, the rest starts 2 bytes past it; when
+   # none is found (the last line), headerLine is everything remaining
+   # and there is nothing left to advance past. Getting this wrong once
+   # already produced a genuine infinite loop (out-of-range slicing fails
+   # silently in Icon rather than erroring, so a wrong advance just
+   # freezes restHeaders and spins forever) -- so this handles the two
+   # cases explicitly instead of reusing one formula for both.
+   headerText := buf[1 : headerEnd]
+   key := &null
+   restHeaders := headerText
+   while *restHeaders > 0 do {
+      # find() failing leaves a plain ":=" target holding whatever it had
+      # from the previous iteration rather than clearing it -- reusing
+      # nlPos across iterations without resetting it first meant the last
+      # (no-"\r\n") line kept re-testing an earlier line's stale match
+      # position and looping forever instead of ever taking the "else"
+      # branch below.
+      nlPos := &null
+      nlPos := find("\r\n", restHeaders)
+      if \nlPos then {
+         headerLine := restHeaders[1 : nlPos]
+         restHeaders := restHeaders[nlPos + 2 : 0]
+      }
+      else {
+         headerLine := restHeaders
+         restHeaders := ""
+      }
+      colonAt := &null
+      colonAt := find(":", headerLine)
+      if \colonAt then {
+         hname := map(headerLine[1:colonAt])
+         hvalue := trim_ws(headerLine[colonAt + 1 : 0])
+         if hname == "sec-websocket-key" then key := hvalue
+      }
+   }
+
+   accept := b64encode(sha1_raw(key || "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+   response := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" ||
+      "Connection: Upgrade\r\nSec-WebSocket-Accept: " || accept || "\r\n\r\n"
+   sendf(handle, response)
+   return handle
+end
+
+procedure read_one_message(handle)
+   local buf, chunk, parsed
+   buf := ""
+   repeat {
+      chunk := recvf(handle, 65536, 5000)
+      if chunk[1:3] ~== "D:" then return &null
+      buf ||:= chunk[3:0]
+      parsed := ws_parse_frame(buf)
+      if parsed.status == "FRAME" then return parsed.payload
+   }
+end
+
+procedure read_modify_query_set_add(handle)
+   local payload, at, rest, comma
+   repeat {
+      payload := read_one_message(handle)
+      if /payload then return &null
+      if find("\"ModifyQuerySet\"", payload) & find("\"Add\"", payload) then {
+         at := find("\"queryId\":", payload)
+         rest := payload[at + 10 : 0]
+         comma := find(",", rest)
+         return rest[1 : comma]
+      }
+   }
+end
+
+procedure send_transition(handle, startQuerySet, startIdentity, startTs, endQuerySet, endIdentity, endTs, modifications)
+   local msg
+   msg := "{\"type\":\"Transition\",\"startVersion\":{\"querySet\":" || startQuerySet ||
+      ",\"identity\":" || startIdentity || ",\"ts\":\"" || startTs || "\"},\"endVersion\":{\"querySet\":" ||
+      endQuerySet || ",\"identity\":" || endIdentity || ",\"ts\":\"" || endTs || "\"},\"modifications\":" ||
+      modifications || "}"
+   sendf(handle, ws_build_server_frame(msg))
+   return
+end
+
+# Server-to-client frames must NOT be masked (RFC 6455).
+procedure ws_build_server_frame(payload)
+   local len, first, lenField
+   len := *payload
+   first := char(129)
+   if len <= 125 then lenField := char(len)
+   else lenField := char(126) || char(len / 256) || char(len % 256)
+   return first || lenField || payload
+end
+
+# A distinct, monotonically increasing 8-byte little-endian-on-the-wire
+# timestamp per logical step, base64 encoded, matching the pinned
+# profile's opaque ts representation.
+procedure timestamp_for(step)
+   local bytes
+   bytes := char(step) || char(0) || char(0) || char(0) || char(0) || char(0) || char(0) || char(0)
+   return b64encode(bytes)
+end
