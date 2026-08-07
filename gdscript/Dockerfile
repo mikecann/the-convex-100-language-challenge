@@ -182,13 +182,26 @@ ENV XDG_DATA_HOME=/opt/convex/state \
 RUN set -eu; \
     test -x /opt/convex/godot; \
     for applet in wget nc telnet ftp ftpget ftpput httpd tftp; do \
-      ! /bin/sh -c "exec -a $applet /bin/sh" >/dev/null 2>&1; \
-      ! /bin/sh -c "exec -a busybox /bin/sh $applet" >/dev/null 2>&1; \
+      /bin/sh -c "exec -a $applet /bin/sh" >/dev/null 2>&1 && exit 1; \
+      /bin/sh -c "exec -a busybox /bin/sh $applet" >/dev/null 2>&1 && exit 1; \
+      true; \
     done; \
-    for command in busybox apk apt apt-get apt-cache dpkg gcc cc make scons \
+    # Each name is looked up by hand across the PATH directories rather than
+    # with `command -v`: this BusyBox is built without the cmdcmd applet, so
+    # `command` is neither a builtin nor on disk and every lookup returned 127.
+    # Combined with `!`, which POSIX exempts from `set -e`, and a `for` loop,
+    # whose status is only that of its last iteration, the old assertion could
+    # not fail for any name. /opt/convex is excluded on purpose: the engine
+    # lives there and is deliberately not on PATH.
+    for name in busybox apk apt apt-get apt-cache dpkg gcc cc make scons \
         node npm npx python python3 pip pip3 curl wget nc telnet convex godot \
         gdformat gdlint; do \
-      ! command -v "$command" >/dev/null 2>&1; \
+      for directory in /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin; do \
+        if test -x "$directory/$name"; then \
+          printf 'forbidden command present: %s/%s\n' "$directory" "$name" >&2; \
+          exit 1; \
+        fi; \
+      done; \
     done
 
 FROM runtime-base AS example-runtime
