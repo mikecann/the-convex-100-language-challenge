@@ -47,7 +47,7 @@ This block is generated from the runnable source file, so the repository, the
 README, and the website always show the same code.
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.mbt -->
-```text
+```moonbit
 // Convex from MoonBit: the shared counter demonstration.
 //
 // One room goes from 0 to 1 and every surface agrees about it. The example
@@ -121,12 +121,13 @@ fn count_of(value : Json, what : String) -> Int64 raise {
 async fn next_live_count(
   subscription : @convex.Subscription,
   what : String,
-) -> Int64 raise {
+) -> Int64 {
   guard subscription.next(timeout_ms=20000) is Some(update) else {
     fail(what + " did not arrive before the deadline")
   }
   match update.error {
-    Some(info) => fail(what + " failed: " + info.kind.to_string() + ": " + info.message)
+    Some(info) =>
+      fail(what + " failed: " + info.kind.to_string() + ": " + info.message)
     None => ()
   }
   guard update.value is Some(value) else { fail(what + " carried no value") }
@@ -134,11 +135,14 @@ async fn next_live_count(
 }
 
 ///|
-async fn run(url : String, room : String) -> Unit raise {
+async fn run(url : String, room : String) -> Unit {
   @convex.with_client(url, client => {
     // Read the current count through Convex's documented HTTP endpoint. This
     // is a plain request/response call: no socket, no subscription.
-    let current = count_of(client.query("demo:state", room_args(room)).value, "current")
+    let current = count_of(
+      client.query("demo:state", room_args(room)).value,
+      "current",
+    )
 
     // The demonstration is only meaningful from a room nobody has touched.
     guard current == 0L else {
@@ -162,12 +166,10 @@ async fn run(url : String, room : String) -> Unit raise {
 
     // Apply the mutation. The idempotency key is what makes this safe to retry:
     // Convex records it and answers a repeat with `applied: false`.
-    let mutation = client
-      .mutation(
+    let mutation = client.mutation(
         "demo:increment",
         room_args(room, language="MoonBit", run_id=fresh_run_id()),
-      )
-      .value
+      ).value
     guard @convex.json_field(mutation, "applied") is Some(True) else {
       fail("the mutation was not applied")
     }
@@ -226,7 +228,9 @@ async fn main {
   // instead of a container that never exits.
   @async.with_timeout(60000, () => run(url, room)) catch {
     error => {
-      @stdio.stderr.write("MoonBit example failed: \{error}\n") catch { _ => () }
+      @stdio.stderr.write("MoonBit example failed: \{error}\n") catch {
+        _ => ()
+      }
       panic()
     }
   }

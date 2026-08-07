@@ -44,14 +44,14 @@ languages:
   - { rank: 37, id: zig, displayName: "Zig", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: A } }
   - { rank: 38, id: erlang, displayName: "Erlang", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 39, id: sas, displayName: "SAS", selectionTier: ranked, feasibility: { docker: R, https: G, json: G, websocket: R } }
-  - { rank: 40, id: labview, displayName: "LabVIEW", selectionTier: ranked, feasibility: { docker: R, https: A, json: G, websocket: A } }
+  - { rank: 40, id: emacs-lisp, displayName: "Emacs Lisp", selectionTier: ranked, feasibility: { docker: G, https: A, json: A, websocket: A } }
   - { rank: 41, id: solidity, displayName: "Solidity", selectionTier: ranked, feasibility: { docker: G, https: R, json: A, websocket: R } }
   - { rank: 42, id: apex, displayName: "Apex", selectionTier: ranked, feasibility: { docker: R, https: G, json: G, websocket: R } }
   - { rank: 43, id: d, displayName: "D", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 44, id: fsharp, displayName: "F#", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 45, id: wolfram-language, displayName: "Wolfram Language", selectionTier: ranked, feasibility: { docker: A, https: G, json: G, websocket: A } }
   - { rank: 46, id: tcl, displayName: "Tcl", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: A } }
-  - { rank: 47, id: scratch, displayName: "Scratch", selectionTier: ranked, feasibility: { docker: A, https: A, json: A, websocket: A } }
+  - { rank: 47, id: snobol4, displayName: "SNOBOL4", selectionTier: ranked, feasibility: { docker: G, https: A, json: A, websocket: A } }
   - { rank: 48, id: clojure, displayName: "Clojure", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 49, id: gdscript, displayName: "GDScript", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 50, id: gleam, displayName: "Gleam", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: A } }
@@ -74,7 +74,7 @@ languages:
   - { rank: 67, id: hare, displayName: "Hare", selectionTier: coverage, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 68, id: pli, displayName: "PL/I", selectionTier: coverage, feasibility: { docker: A, https: A, json: A, websocket: A } }
   - { rank: 69, id: q, displayName: "Q", selectionTier: coverage, feasibility: { docker: A, https: G, json: G, websocket: G } }
-  - { rank: 70, id: rpg, displayName: "RPG", selectionTier: coverage, feasibility: { docker: R, https: G, json: G, websocket: A } }
+  - { rank: 70, id: modula-2, displayName: "Modula-2", selectionTier: coverage, feasibility: { docker: G, https: G, json: G, websocket: A } }
   - { rank: 71, id: ring, displayName: "Ring", selectionTier: coverage, feasibility: { docker: G, https: G, json: G, websocket: A } }
   - { rank: 72, id: scheme, displayName: "Scheme", selectionTier: coverage, feasibility: { docker: G, https: G, json: G, websocket: A } }
   - { rank: 73, id: v, displayName: "V", selectionTier: coverage, feasibility: { docker: G, https: G, json: G, websocket: G } }

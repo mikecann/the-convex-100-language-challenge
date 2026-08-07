@@ -1,5 +1,10 @@
 # Languages that cannot be built honestly inside this project
 
+**Nothing on this page is ever deleted.** An entry whose slot has since been
+filled keeps its row and gains a note naming the replacement. The record of
+what could not be done, and why, is a deliverable of this project in its own
+right — not bookkeeping to be tidied away as the roster fills up.
+
 The project's rules require every client to build, test, and verify inside
 Docker on `linux/amd64`, with no proprietary licenses baked into images and no
 GUI-only toolchains. The following roster entries cannot meet that bar. They
@@ -10,15 +15,16 @@ language so the roster still reaches one hundred.
 
 | Language | Why it cannot be done here |
 | --- | --- |
-| apex | Executes only inside Salesforce's hosted platform; no local runtime exists. |
-| labview | Proprietary NI graphical environment; no headless Linux compiler, license required. |
+| apex | Executes only inside Salesforce's hosted platform; no local runtime exists. Replaced by Rexx, which is merged and evidenced. |
+| labview | Proprietary NI graphical environment; no headless Linux compiler, license required. Replaced by Emacs Lisp, which is merged and evidenced. |
 | matlab | Proprietary license required for the real MATLAB runtime; substituting GNU Octave would not honestly be MATLAB. |
 | mql5 | Runs only inside the proprietary Windows MetaTrader terminal. Replaced by Hare, which is merged and evidenced. |
 | rpg | IBM RPG compilers exist only on IBM i systems; no free Linux toolchain. Replaced by Modula-2, which is merged and evidenced. |
-| sas | Proprietary licensed runtime; no free implementation of the real language. |
-| scratch | Block-based GUI language with no network primitives; a Convex client cannot be expressed in Scratch itself. |
-| visual-foxpro | Discontinued proprietary Windows product; no Linux toolchain. |
-| xojo | Proprietary licensed IDE-bound compiler. |
+| sas | Proprietary licensed runtime; no free implementation of the real language. Replaced by Icon, which is merged and evidenced. |
+| scratch | Block-based GUI language with no network primitives; a Convex client cannot be expressed in Scratch itself. Replaced by SNOBOL4, which is merged and evidenced. |
+| visual-foxpro | Discontinued proprietary Windows product; no Linux toolchain. Replaced by Mercury, which is merged and evidenced. |
+| xbasepp | Commercial Windows-only Alaska Xbase++ compiler. Replaced by Oberon-07, which is merged and evidenced. |
+| xojo | Proprietary licensed IDE-bound compiler. Replaced by ALGOL 60, which is merged and evidenced. |
 | xpp | Microsoft Dynamics X++ executes only inside the hosted Dynamics platform. |
 
 ## Infeasible — no way to reach a socket from the language itself
@@ -59,6 +65,17 @@ with the language.
 | Language | Why it cannot be done here |
 | --- | --- |
 | pop11 | Poplog (the toolchain behind Pop-11, held in reserve for this slot pending Seed7) bootstraps every further build stage from a "corepop" binary — a fixed-address heap image inherited from a 1980s VM design — that calls `personality(ADDR_NO_RANDOMIZE)` before it can load. Docker's default seccomp profile rejects that specific flag value; this project's `./run` script never passes a custom `--security-opt seccomp=`, so both `docker build` (BuildKit's own RUN sandbox) and every `docker run` this project performs use that same restrictive default. The result under it is not a permission error but a crash — `MEMORY ACCESS VIOLATION` — reproduced directly against all five corepop images GetPoplog ships (`010` through `050`, spanning 2012–2021 builds); `--security-opt seccomp=unconfined` makes the identical binary succeed immediately, and that flag is unavailable both inside this project's hermetic build and inside the read-only, capability-dropped runtime container the shared verifier launches. GetPoplog's own repository ships a bespoke `docker/poplog_seccomp.json` profile and a "Running poplog under Docker" wiki page for exactly this reason — a documented, upstream-acknowledged constraint of the toolchain under containers, not a one-off flake or a fixable Dockerfile mistake. |
+
+## Infeasible — the runtime's own footprint exceeds the container limit
+
+The only entry on this page ruled out on resource footprint rather than
+capability. Both the language and the client are sound: a complete hand-rolled
+client exists and passes its language-local suites, including five reconnect
+cycles. It is the interpreter that does not fit.
+
+| Language | Why it cannot be done here |
+| --- | --- |
+| raku | Every runtime container in this project is limited to 128 MiB, uniformly across all hundred languages. Three removable layers were stripped in turn and measured by cgroup bisection under `docker run --memory N --memory-swap N`, five trials per side. **Cro**: replacing `Cro::HTTP::Client`/`Cro::WebSocket` with hand-rolled HTTP/1.1 and RFC 6455 over `IO::Socket::INET` cut the total from 190–210 MiB to 170–185 MiB — a real 20–25 MiB, and the client still worked. **Rakudo Star**: a bare Rakudo 2026.07 built from source, compiler and VM only, has a floor of 106 MiB for `raku -e 'say 1'` versus 134–140 MiB for the Star bundle, confirming that most of the original cost was the bundled modules rather than the interpreter. **Every external module**: binding libssl and libcrypto directly through `NativeCall`, which is core to Rakudo and needs no distribution, and hand-rolling JSON, base64, SHA-1 and randomness, was measured against a real TLS handshake and HTTP round trip to the hosted deployment — 145–170 MiB with zero Convex code loaded. That last figure also corrected an earlier, flattering 140 MiB reading taken from a probe that loaded the TLS module but never opened a connection. MoarVM offers no nursery or heap-size environment variable (`MVM_NURSERY_SIZE` is a compile-time `#define`), and its one memory-relevant tunable, `MVM_SPESH_DISABLE`, is worth about 15 MiB and was already shown to make the real WebSocket workload too slow to complete. After removing every removable layer the floor is still 17–42 MiB over budget before a single line of client code runs. The hand-rolled transport work is preserved on branch `fix/raku-rp2` should the limit or the runtime ever change. |
 
 ## Infeasible — license or GUI gate (ruled, previously borderline)
 
@@ -182,6 +199,18 @@ gates cleared and turned out infeasible for a reason specific to this
 project's container security posture rather than the language; see the new
 "toolchain rejected by this project's container security posture" table
 above for the evidence.
+
+Raku's slot, vacated on footprint rather than capability, is filled by:
+
+- **Clean** (Nijmegen, 1987) — a pure lazy functional language whose
+  *uniqueness types* let the compiler prove a value has exactly one live
+  reference and therefore mutate it in place without breaking referential
+  transparency. That is the ownership reasoning Rust made famous, arriving
+  roughly twenty-five years earlier and largely unread outside its university.
+  The toolchain is free, compiles to a native binary through its own ABC
+  machine, and has a real C foreign-function interface for the transport
+  boundary. It also answers Raku's failure directly: a compiled native binary
+  has no interpreter floor to pay before it starts.
 
 Considered in this round and not chosen:
 

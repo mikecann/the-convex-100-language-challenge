@@ -176,16 +176,26 @@ FROM --platform=linux/amd64 ${BUILD_IMAGE} AS runtime-base
 # onto this merged-usr image's symlinks at those paths. The base image's
 # package manager is then removed outright rather than merely hidden from
 # PATH.
+#
+# BUILD_IMAGE is Debian underneath and its rootfs carries perl-base
+# (Priority: important) independently of anything Ring's own build does --
+# Ring links libcurl, libuv and OpenSSL, never Perl, and `apt-get remove
+# --simulate perl-base` inside this exact image reports zero reverse
+# dependencies. This stage is a fresh FROM of BUILD_IMAGE rather than a
+# derivative of the build stage, so removing it here is the only place it
+# can be removed.
 COPY --from=build /rootfs/ /
 RUN set -eu; \
-    rm -rf /etc/apt /usr/lib/apt /var/lib/apt /var/cache/apt /var/lib/dpkg /usr/share/dpkg; \
+    rm -rf /etc/apt /usr/lib/apt /var/lib/apt /var/cache/apt /var/lib/dpkg /usr/share/dpkg \
+           /usr/lib/x86_64-linux-gnu/perl-base; \
     rm -f /usr/bin/apt /usr/bin/apt-cache /usr/bin/apt-cdrom /usr/bin/apt-config \
           /usr/bin/apt-get /usr/bin/apt-key /usr/bin/apt-mark /usr/bin/dpkg \
           /usr/bin/dpkg-deb /usr/bin/dpkg-divert /usr/bin/dpkg-maintscript-helper \
           /usr/bin/dpkg-query /usr/bin/dpkg-split /usr/bin/dpkg-statoverride \
-          /usr/bin/dpkg-trigger /usr/sbin/dpkg-preconfigure /usr/sbin/dpkg-reconfigure; \
+          /usr/bin/dpkg-trigger /usr/sbin/dpkg-preconfigure /usr/sbin/dpkg-reconfigure \
+          /usr/bin/perl /usr/bin/perl5.40.1; \
     for forbidden in apt apt-get dpkg curl node php python python3 npm npx pip pip3 convex \
-                     gcc cc g++ ld as make; do \
+                     gcc cc g++ ld as make perl; do \
       if command -v "$forbidden" >/dev/null 2>&1; then \
         printf '%s\n' "unexpected command in the runtime image: $forbidden" >&2; \
         exit 1; \

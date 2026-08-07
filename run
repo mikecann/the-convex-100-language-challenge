@@ -182,6 +182,19 @@ toolchain_policy() {
     busybox wget nc netcat telnet ftpget ftpput ftpd tftp httpd inetd
     gdb strace ltrace perl lua'
 
+  # A language whose execution model IS process composition — a shell — cannot
+  # express a transport any other way, so it may declare the tools it genuinely
+  # invokes. The declaration is the point: it lives in the manifest, is shown on
+  # the site, and is narrow. It is not a way to quiet the gate, and a language
+  # with an in-process alternative does not qualify for one.
+  declared=$(
+    awk '
+      /^runtimeTools:/ { collecting = 1; next }
+      collecting && /^  - / { print $2; next }
+      collecting { exit }
+    ' "$repo_root/$language/manifest.yaml" 2>/dev/null || true
+  )
+
   container=$(docker create --platform linux/amd64 "$image")
   listing=$(docker export "$container" | tar -t 2>/dev/null || true)
   docker rm -f "$container" >/dev/null 2>&1 || true
@@ -200,6 +213,15 @@ $listing
     case "$language:$command_name" in
       perl:perl | lua:lua) continue ;;
     esac
+    skip=""
+    for declared_tool in $declared; do
+      if test "$declared_tool" = "$command_name"; then
+        skip=yes
+      fi
+    done
+    if test -n "$skip"; then
+      continue
+    fi
     for directory in bin sbin usr/bin usr/sbin usr/local/bin usr/local/sbin; do
       case "$listing" in
         *"

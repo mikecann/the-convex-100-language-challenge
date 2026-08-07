@@ -1,0 +1,22 @@
+(* ConvexBase64 implements standard (RFC 4648) base64 encoding and decoding.
+   It is used for the WebSocket handshake's Sec-WebSocket-Key/Accept values
+   and for comparing the little-endian sync protocol timestamp, which the
+   Convex wire protocol represents as a base64 string. This is generic text
+   encoding, not Convex behaviour, but it is implemented natively rather
+   than delegated because gm2's standard library has no base64 module. *)
+
+DEFINITION MODULE ConvexBase64;
+
+(* Encode writes the base64 (with '=' padding) representation of the first
+   dataLength bytes of data into destination, which must be able to hold
+   4*ceil(dataLength/3) characters plus a terminating 0C. destination is
+   always NUL terminated on return. *)
+PROCEDURE Encode (data: ARRAY OF CHAR; dataLength: INTEGER; VAR destination: ARRAY OF CHAR);
+
+(* Decode reverses Encode. It requires the canonical padded form (length a
+   multiple of 4). Returns the number of decoded bytes in outLength and TRUE
+   on success; returns FALSE if text is not valid base64 or destination is
+   too small. *)
+PROCEDURE Decode (text: ARRAY OF CHAR; VAR destination: ARRAY OF CHAR; VAR outLength: INTEGER) : BOOLEAN;
+
+END ConvexBase64.

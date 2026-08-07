@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<system xmlns="http://www.eiffel.com/developers/xml/configuration-1-22-0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.eiffel.com/developers/xml/configuration-1-22-0 http://www.eiffel.com/developers/xml/configuration-1-22-0.xsd" name="convex" uuid="9C4E9C2C-1B2E-4A6B-9B7A-2D6F8E1A5C40">
+	<target name="convex_lib">
+		<option>
+			<assertions precondition="true" postcondition="true" check="true" invariant="true" loop="true" supplier_precondition="true"/>
+		</option>
+		<setting name="dotnet_naming_convention" value="true"/>
+		<library name="base" location="$ISE_LIBRARY\library\base\base.ecf"/>
+		<library name="net" location="$ISE_LIBRARY\library\net\net.ecf"/>
+		<library name="openssl" location="$ISE_LIBRARY\unstable\library\network\openssl\openssl_dynamic.ecf"/>
+		<external_include location="."/>
+		<external_object location="convex_native.o"/>
+		<cluster name="convex" location=".\" recursive="false">
+			<file_rule>
+				<exclude>/tests$</exclude>
+			</file_rule>
+		</cluster>
+	</target>
+
+	<target name="convex_tests" extends="convex_lib">
+		<root class="CONVEX_TEST_APP" feature="make"/>
+		<setting name="console_application" value="true"/>
+		<library name="testing" location="$ISE_LIBRARY\library\testing\testing.ecf"/>
+		<cluster name="convex_tests" location=".\tests\" recursive="false"/>
+	</target>
+
+	<target name="convex_adapter" extends="convex_lib">
+		<root class="CONVEX_ADAPTER_APP" feature="make"/>
+		<setting name="console_application" value="true"/>
+		<cluster name="convex_conformance" location=".\tests\conformance\" recursive="false"/>
+	</target>
+
+	<target name="convex_example" extends="convex_lib">
+		<root class="CONVEX_EXAMPLE_APP" feature="make"/>
+		<setting name="console_application" value="true"/>
+		<cluster name="convex_example_src" location="..\examples\basics\" recursive="false"/>
+	</target>
+</system>

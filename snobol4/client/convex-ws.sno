@@ -1,0 +1,327 @@
+*   convex-ws.sno - RFC 6455 in SNOBOL4: the upgrade handshake, frame
+*   encoding (every client->server frame must be masked), and frame
+*   decoding (server->client frames are never masked, so decoding never
+*   needs the masking primitives at all). convex-live.sno is this file's
+*   only caller; it owns reconnects and the query-set state machine, and it
+*   is the single owner of every read, write and poll against ws.handle, so
+*   nothing here needs to guard against a second concurrent user.
+-include 'convex-io.sno'
+-include 'convex-sha1.sno'
+-include 'convex-base64.sno'
+-include 'convex-bits.sno'
+-include 'convex-json.sno'
+-include 'convex-error.sno'
+
+    ws.max.frame.bytes = 2097152
+    ws.max.handshake.bytes = 32768
+    ws.connect.deadline.ms = 10000
+    ws.partial.frame.timeout.ms = 8000
+
+*   ws.connect(host, port, tls, path, deadlinems) - opens ws.handle,
+*   performs the handshake, and leaves the connection ready for ws.send /
+*   ws.try_read. Resets every piece of per-connection framing state, so a
+*   reconnect never inherits a byte left over from the connection it
+*   replaced.
+    define('ws.connect(host,port,tls,path,deadlinems)key,request,response,headerend,accept,line,expected') :(ws.connect.end)
+ws.connect
+        ws.buffer = ""
+        ws.frag.opcode = -1
+        ws.frag.payload = ""
+        ws.partial.deadline = 0
+        ws.handle = io.open(host, port, tls, deadlinems)         :f(freturn)
+        key = base64.encode(io.random(16))                        :f(ws.connect.closefail)
+        request = "GET " path " HTTP/1.1" char(13) char(10)
+        request = request "Host: " host char(13) char(10)
+        request = request "Upgrade: websocket" char(13) char(10)
+        request = request "Connection: Upgrade" char(13) char(10)
+        request = request "Sec-WebSocket-Key: " key char(13) char(10)
+        request = request "Sec-WebSocket-Version: 13" char(13) char(10)
+        request = request "Convex-Client: " cvx.version char(13) char(10) char(13) char(10)
+        io.write_all(ws.handle, request, deadlinems)               :f(ws.connect.closefail)
+        response = ""
+ws.connect.readheaders
+        headerend = indexof4(response, char(13) char(10) char(13) char(10))
+        gt(headerend, 0)                                            :s(ws.connect.gotheaders)
+        gt(size(response), ws.max.handshake.bytes)                   :s(ws.connect.badhandshake)
+        response = response io.read_some(ws.handle, 8192, deadlinems)  :f(ws.connect.closefail)
+        :(ws.connect.readheaders)
+ws.connect.gotheaders
+        line = substr(response, 1, indexof4(response, char(13) char(10)) - 1)
+        differ(substr(line, 1, 7), "HTTP/1.")                        :s(ws.connect.badhandshake)
+        differ(substr(line, 10, 4), "101 ")                           :s(ws.connect.badhandshake)
+        accept = ws.header_value(substr(response, 1, headerend - 1), "Sec-WebSocket-Accept")  :f(ws.connect.badhandshake)
+        expected = base64.encode(sha1.digest(key "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+        ident(accept, expected)                                      :f(ws.connect.badhandshake)
+* Any bytes past the header terminator already belong to the first
+* WebSocket frame; keep them rather than discarding them.
+        ws.buffer = substr(response, headerend + 4, size(response) - headerend - 3)
+        :(return)
+ws.connect.badhandshake
+        error.set("ProtocolError", "WebSocket upgrade handshake failed", "")
+        :(ws.connect.closefail)
+ws.connect.closefail
+        io.close(ws.handle)
+        ws.handle = -1
+        :(freturn)
+ws.connect.end
+
+*   ws.header_value(headers, name) -> the value of a header line, or fails
+*   when it is absent. Matching is case-insensitive on the name only,
+*   because that is all RFC 6455 requires here.
+    define('ws.header_value(headers,name)lines,line,rest,upper') :(ws.header_value.end)
+ws.header_value
+        lines = headers
+ws.header_value.loop
+        gt(size(lines), 0)                                          :f(freturn)
+        lines break(char(13) char(10)) . line len(2) rem . rest      :s(ws.header_value.gotline)
+        line = lines
+        rest = ""
+ws.header_value.gotline
+        lines = rest
+        line break(":") . upper rem                                 :f(ws.header_value.loop)
+        ident(ws.upper(upper), ws.upper(name))                        :f(ws.header_value.loop)
+        line ":" span(" ") rem . ws.header_value                     :f(freturn)
+        :(return)
+ws.header_value.end
+
+*   ws.upper(text) -> text with any lowercase ASCII letter folded to
+*   uppercase, used only for the case-insensitive header name match above.
+    define('ws.upper(text)i,ch,code,out') :(ws.upper.end)
+ws.upper
+        out = ""
+        i = 1
+ws.upper.loop
+        gt(i, size(text))                                            :s(ws.upper.done)
+        ch = substr(text, i, 1)
+        code = ord(ch)
+        lt(code, 97)                                                  :s(ws.upper.keep)
+        gt(code, 122)                                                 :s(ws.upper.keep)
+        out = out char(code - 32)                                     :(ws.upper.next)
+ws.upper.keep
+        out = out ch
+ws.upper.next
+        i = i + 1                                                     :(ws.upper.loop)
+ws.upper.done
+        ws.upper = out                                                :(return)
+ws.upper.end
+
+*   ws.frame_encode(opcode, payload) -> one complete masked frame. Fails
+*   only when payload exceeds the frame size budget; Convex never asks this
+*   client to send anything close to that size.
+    define('ws.frame_encode(opcode,payload)length,header,mask,m0,m1,m2,m3,masked,i,b') :(ws.frame_encode.end)
+ws.frame_encode
+        length = size(payload)
+        gt(length, ws.max.frame.bytes)                                :s(freturn)
+        header = char(128 + opcode)
+        le(length, 125)                                                :s(ws.frame_encode.short)
+        le(length, 65535)                                              :s(ws.frame_encode.medium)
+        header = header char(255)
+        header = header char(0) char(0) char(0) char(0)
+        header = header char(bits.byte(length, 0)) char(bits.byte(length, 1)) char(bits.byte(length, 2)) char(bits.byte(length, 3))
+        :(ws.frame_encode.mask)
+ws.frame_encode.short
+        header = header char(128 + length)                            :(ws.frame_encode.mask)
+ws.frame_encode.medium
+        header = header char(254) char(bits.byte(length, 2)) char(bits.byte(length, 3))
+ws.frame_encode.mask
+        mask = io.random(4)                                            :f(freturn)
+        header = header mask
+        m0 = ord(substr(mask, 1, 1))
+        m1 = ord(substr(mask, 2, 1))
+        m2 = ord(substr(mask, 3, 1))
+        m3 = ord(substr(mask, 4, 1))
+        masked = ""
+        i = 1
+ws.frame_encode.maskloop
+        gt(i, length)                                                  :s(ws.frame_encode.done)
+        b = ord(substr(payload, i, 1))
+        eq(remdr(i - 1, 4), 0)                                          :s(ws.frame_encode.m0)
+        eq(remdr(i - 1, 4), 1)                                          :s(ws.frame_encode.m1)
+        eq(remdr(i - 1, 4), 2)                                          :s(ws.frame_encode.m2)
+        masked = masked char(bits.xor32(b, m3))                         :(ws.frame_encode.maskadvance)
+ws.frame_encode.m0
+        masked = masked char(bits.xor32(b, m0))                         :(ws.frame_encode.maskadvance)
+ws.frame_encode.m1
+        masked = masked char(bits.xor32(b, m1))                         :(ws.frame_encode.maskadvance)
+ws.frame_encode.m2
+        masked = masked char(bits.xor32(b, m2))
+ws.frame_encode.maskadvance
+        i = i + 1                                                       :(ws.frame_encode.maskloop)
+ws.frame_encode.done
+        ws.frame_encode = header masked                                 :(return)
+ws.frame_encode.end
+
+*   ws.send(payload, deadlinems) - sends one complete unfragmented text
+*   frame (opcode 1). Convex's own protocol messages are ordinary JSON well
+*   under this client's frame budget, so this client never sends a
+*   fragmented message.
+    define('ws.send(payload,deadlinems)frame') :(ws.send.end)
+ws.send
+        frame = ws.frame_encode(1, payload)                            :f(freturn)
+        io.write_all(ws.handle, frame, deadlinems)                      :s(return)
+        :(freturn)
+ws.send.end
+
+*   ws.pong(payload, deadlinems) - replies to a ping. Failure here just
+*   means the connection is already gone, which the caller's next read
+*   discovers on its own.
+    define('ws.pong(payload,deadlinems)frame') :(ws.pong.end)
+ws.pong
+        frame = ws.frame_encode(10, payload)                            :f(freturn)
+        io.write_all(ws.handle, frame, deadlinems)                      :(return)
+ws.pong.end
+
+*   ws.try_read(deadlinems) -> the decoded text payload of the next
+*   complete WebSocket message. A ping is answered and skipped
+*   automatically; a pong is skipped. Fails with cvx.err.name "again" when
+*   no complete message arrived before the deadline (not an error - the
+*   caller polls again), "TransportError" when the peer disappears or the
+*   deadline is exceeded mid-frame, or "ProtocolError" for anything
+*   malformed, including a close frame, which this function reports as
+*   ProtocolError "peer closed" so the caller always goes through the same
+*   reconnect path.
+    define('ws.try_read(deadlinems)first,second,fin,opcode,lengthbyte,offset,length,ext,payload') :(ws.try_read.end)
+ws.try_read
+ws.try_read.loop
+        ge(size(ws.buffer), 2)                                          :s(ws.try_read.haveheader)
+        gt(io.now(), deadlinems)                                        :s(ws.try_read.timeout)
+        ws.sync_partial_deadline(deadlinems)
+        gt(io.now(), ws.effective_deadline(deadlinems))                 :s(ws.try_read.deadlinehit)
+        ws.buffer = ws.buffer io.read_some(ws.handle, 65536, ws.step_deadline(deadlinems))  :f(ws.try_read.stepfail)
+        :(ws.try_read.loop)
+ws.try_read.haveheader
+        first = ord(substr(ws.buffer, 1, 1))
+        second = ord(substr(ws.buffer, 2, 1))
+        fin = 0
+        lt(first, 128)                                                  :s(ws.try_read.notfin)
+        fin = 1
+ws.try_read.notfin
+        opcode = remdr(first, 16)
+        gt(second, 127)                                                 :s(ws.try_read.malformed)
+        lengthbyte = second
+        offset = 3
+        lt(lengthbyte, 126)                                              :s(ws.try_read.havelength)
+        eq(lengthbyte, 126)                                              :s(ws.try_read.midlength)
+        offset = 11
+        ge(size(ws.buffer), 10)                                          :f(ws.try_read.loop)
+        length = ord(substr(ws.buffer, 7, 1)) * 16777216
+        length = length + ord(substr(ws.buffer, 8, 1)) * 65536
+        length = length + ord(substr(ws.buffer, 9, 1)) * 256
+        length = length + ord(substr(ws.buffer, 10, 1))
+        :(ws.try_read.checklength)
+ws.try_read.midlength
+        offset = 5
+        ge(size(ws.buffer), 4)                                          :f(ws.try_read.loop)
+        length = ord(substr(ws.buffer, 3, 1)) * 256 + ord(substr(ws.buffer, 4, 1))
+        :(ws.try_read.checklength)
+ws.try_read.havelength
+        length = lengthbyte
+ws.try_read.checklength
+        gt(length, ws.max.frame.bytes)                                   :s(ws.try_read.malformed)
+        ge(opcode, 8)                                                     :s(ws.try_read.checkcontrol)
+        :(ws.try_read.havefull)
+ws.try_read.checkcontrol
+        gt(length, 125)                                                   :s(ws.try_read.malformed)
+        eq(fin, 0)                                                        :s(ws.try_read.malformed)
+ws.try_read.havefull
+        ge(size(ws.buffer), offset + length - 1)                          :s(ws.try_read.complete)
+        gt(io.now(), deadlinems)                                          :s(ws.try_read.timeout)
+        ws.sync_partial_deadline(deadlinems)
+        gt(io.now(), ws.effective_deadline(deadlinems))                   :s(ws.try_read.deadlinehit)
+        ws.buffer = ws.buffer io.read_some(ws.handle, 65536, ws.step_deadline(deadlinems))  :f(ws.try_read.stepfail)
+        :(ws.try_read.haveheader)
+ws.try_read.complete
+        payload = substr(ws.buffer, offset, length)
+        ws.buffer = substr(ws.buffer, offset + length, size(ws.buffer) - offset - length + 1)
+        ws.partial.deadline = 0
+        eq(opcode, 8)                                                     :s(ws.try_read.closeframe)
+        eq(opcode, 9)                                                     :s(ws.try_read.pingframe)
+        eq(opcode, 10)                                                    :s(ws.try_read.loop)
+        eq(opcode, 0)                                                     :s(ws.try_read.continuation)
+        ge(ws.frag.opcode, 0)                                             :s(ws.try_read.malformed)
+        eq(fin, 1)                                                        :s(ws.try_read.deliver)
+        ws.frag.opcode = opcode
+        ws.frag.payload = payload                                        :(ws.try_read.loop)
+ws.try_read.continuation
+        lt(ws.frag.opcode, 0)                                             :s(ws.try_read.malformed)
+        gt(size(ws.frag.payload) + size(payload), ws.max.frame.bytes)     :s(ws.try_read.malformed)
+        ws.frag.payload = ws.frag.payload payload
+        eq(fin, 0)                                                        :s(ws.try_read.loop)
+        opcode = ws.frag.opcode
+        payload = ws.frag.payload
+        ws.frag.opcode = -1
+        ws.frag.payload = ""
+ws.try_read.deliver
+        eq(opcode, 1)                                                     :f(ws.try_read.malformed)
+        ws.try_read = payload                                             :(return)
+ws.try_read.pingframe
+        ws.pong(payload, deadlinems)                                      :(ws.try_read.loop)
+ws.try_read.closeframe
+        error.set("ProtocolError", "peer closed the WebSocket", "")
+        :(freturn)
+ws.try_read.malformed
+        error.set("ProtocolError", "malformed WebSocket frame", "")
+        :(freturn)
+ws.try_read.timeout
+        error.set("again", "", "")
+        :(freturn)
+ws.try_read.deadlinehit
+        error.set("TransportError", "partial WebSocket frame timed out", "")
+        :(freturn)
+* io.read_some was itself given a deliberately short step deadline (see
+* ws.step_deadline) so this loop can re-check the caller's own deadline and
+* the partial-frame deadline on a steady cadence; that step deadline
+* expiring with nothing to show for it is not a real failure. Only a read
+* that failed for a different reason - a genuine transport error - is.
+ws.try_read.stepfail
+        ident(cvx.err.message, "read deadline exceeded")                     :s(ws.try_read.loop)
+        :(freturn)
+ws.try_read.end
+
+*   A partial frame gets one absolute deadline from the moment its first
+*   byte arrives, independent of the caller's own polling deadline: once any
+*   byte of a frame has been consumed, a slow peer cannot use repeated short
+*   polls to hold the connection open indefinitely.
+    define('ws.sync_partial_deadline(deadlinems)') :(ws.sync_partial_deadline.end)
+ws.sync_partial_deadline
+        gt(size(ws.buffer), 0)                                            :f(return)
+        gt(ws.partial.deadline, 0)                                        :s(return)
+        ws.partial.deadline = io.now() + ws.partial.frame.timeout.ms      :(return)
+ws.sync_partial_deadline.end
+
+    define('ws.effective_deadline(deadlinems)') :(ws.effective_deadline.end)
+ws.effective_deadline
+        gt(ws.partial.deadline, 0)                                        :f(ws.effective_deadline.plain)
+        lt(ws.partial.deadline, deadlinems)                                :s(ws.effective_deadline.partial)
+ws.effective_deadline.plain
+        ws.effective_deadline = deadlinems                                 :(return)
+ws.effective_deadline.partial
+        ws.effective_deadline = ws.partial.deadline                        :(return)
+ws.effective_deadline.end
+
+*   ws.step_deadline(deadlinems) -> the deadline for one single io.read_some
+*   call: never further away than 200 ms, so try_read's own loop keeps
+*   re-checking both the caller's deadline and the partial-frame deadline
+*   instead of blocking inside one long read.
+    define('ws.step_deadline(deadlinems)effective,budget') :(ws.step_deadline.end)
+ws.step_deadline
+        effective = ws.effective_deadline(deadlinems)
+        budget = io.now() + 200
+        lt(budget, effective)                                              :s(ws.step_deadline.usebudget)
+        ws.step_deadline = effective                                       :(return)
+ws.step_deadline.usebudget
+        ws.step_deadline = budget                                          :(return)
+ws.step_deadline.end
+
+*   ws.close(code) - best-effort close frame, then a hard close. Never
+*   fails: a peer that is already gone still leaves the local handle
+*   released.
+    define('ws.close(code)payload,frame') :(ws.close.end)
+ws.close
+        lt(ws.handle, 0)                                                    :s(return)
+        payload = char(bits.byte(code, 2)) char(bits.byte(code, 3))
+        frame = ws.frame_encode(8, payload)
+        io.write_all(ws.handle, frame, io.now() + 500)
+        io.close(ws.handle)
+        ws.handle = -1                                                      :(return)
+ws.close.end

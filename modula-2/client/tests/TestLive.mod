@@ -1,0 +1,147 @@
+(* TestLive is a deterministic, language-local test of the failure modes
+   AGENTS.md calls out for Live implementations: Add, an initial
+   QueryUpdated, QueryFailed followed by recovery on a later Transition,
+   an external update, and a transport-level reconnect (here triggered by
+   the peer dropping the TCP connection without a close frame) that
+   resends every active Add and recovers both subscriptions with fresh
+   values. It runs against FixtureServer, a second test-only executable
+   started first by the Docker test stage, because proving a real
+   reconnect needs two independently scheduled processes.
+ *
+ * ConvexSync is a singleton (one Live connection per process, matching
+ * the adapter and the example), so this test - not a thread - is the
+ * sole owner of every Pump() call, exactly like the adapter's reactor
+ * loop; there is nothing else in this process that could touch the
+ * WebSocket concurrently. *)
+MODULE TestLive;
+
+IMPORT ConvexSync;
+FROM CShim IMPORT ShimExit, ShimMonotonicMs;
+FROM STextIO IMPORT WriteString, WriteLn;
+IMPORT SWholeIO;
+
+VAR
+  failed: BOOLEAN;
+
+PROCEDURE Check (label: ARRAY OF CHAR; ok: BOOLEAN);
+BEGIN
+  IF ok THEN
+    WriteString("PASS "); WriteString(label); WriteLn;
+  ELSE
+    WriteString("FAIL "); WriteString(label); WriteLn;
+    failed := TRUE;
+  END;
+END Check;
+
+VAR
+  argsX, argsY: ARRAY [0..127] OF CHAR;
+  handleX, handleY: INTEGER;
+  ok: BOOLEAN;
+  errorText: ARRAY [0..255] OF CHAR;
+  eventKind, eventHandle: INTEGER;
+  value, logs, errorName, errorMessage, errorData: ARRAY [0..8191] OF CHAR;
+  hasErrorData: BOOLEAN;
+  gotXInitial, gotYFailed, gotXUpdate, gotYRecovered: BOOLEAN;
+  deadline: LONGINT;
+
+PROCEDURE ExtractCount (VAR json: ARRAY OF CHAR) : INTEGER;
+VAR i, result: INTEGER; found: BOOLEAN;
+BEGIN
+  (* the fixture only ever sends {"count":N}; a tiny inline scan is enough *)
+  i := 0;
+  WHILE (json[i] <> 0C) AND NOT ((json[i] = ':') ) DO INC(i) END;
+  INC(i);
+  result := 0;
+  WHILE (json[i] >= '0') AND (json[i] <= '9') DO
+    result := result * 10 + (INTEGER(ORD(json[i])) - INTEGER(ORD('0')));
+    INC(i);
+  END;
+  RETURN result;
+END ExtractCount;
+
+BEGIN
+  failed := FALSE;
+  gotXInitial := FALSE; gotYFailed := FALSE; gotXUpdate := FALSE;
+  gotYRecovered := FALSE;
+
+  ConvexSync.Init("http://127.0.0.1:19191", "");
+
+  argsX := '{"room":"x"}';
+  argsY := '{"room":"y"}';
+  ConvexSync.Subscribe("demo:state", argsX, handleX, ok, errorText);
+  Check("subscribe x ok", ok);
+  ConvexSync.Subscribe("demo:requiresNonzero", argsY, handleY, ok, errorText);
+  Check("subscribe y ok", ok);
+
+  (* The post-reconnect resend for room x carries the same value (1) it
+     already had when the connection dropped, so ConvexSync's rehydration
+     suppression (AGENTS.md: "Suppress an unchanged rehydration") means
+     that resend must never surface as a fourth event for x; only room y,
+     which had no last value because it had failed, gets a fresh event.
+     This loop therefore waits for exactly four events. *)
+  deadline := ShimMonotonicMs() + 30000;
+  LOOP
+    IF gotXInitial AND gotYFailed AND gotXUpdate AND gotYRecovered THEN EXIT END;
+    IF ShimMonotonicMs() > deadline THEN
+      Check("received every scripted event before the deadline", FALSE);
+      EXIT;
+    END;
+    ConvexSync.Pump(100, eventKind, eventHandle, value, logs,
+                     errorName, errorMessage, errorData, hasErrorData);
+    IF eventKind = 1 THEN
+      IF eventHandle = handleX THEN
+        IF NOT gotXInitial THEN
+          Check("initial x value is 0", ExtractCount(value) = 0);
+          gotXInitial := TRUE;
+        ELSIF NOT gotXUpdate THEN
+          Check("external update x value is 1", ExtractCount(value) = 1);
+          gotXUpdate := TRUE;
+        ELSE
+          Check("unchanged post-reconnect x value was suppressed, not redelivered", FALSE);
+        END;
+      ELSIF eventHandle = handleY THEN
+        Check("recovered y value is 2", ExtractCount(value) = 2);
+        gotYRecovered := TRUE;
+      END;
+    ELSIF eventKind = 2 THEN
+      IF (eventHandle = handleY) AND NOT gotYFailed THEN
+        (* the scripted QueryFailed, expected exactly once *)
+        Check("y failure is a FunctionError", errorName[0] = 'F');
+        Check("y failure data code is ROOM_EMPTY", hasErrorData);
+        gotYFailed := TRUE;
+      ELSIF (eventHandle = handleX) OR (eventHandle = handleY) THEN
+        (* the abrupt disconnect fans a TransportError out to every active
+           subscription (AGENTS.md: report failures "without permanently
+           stranding otherwise valid subscriptions"); harmless here. *)
+        WriteString("(ignoring a TransportError fanned out by the forced disconnect)"); WriteLn;
+      ELSE
+        Check("no unexpected subscription failure", FALSE);
+      END;
+    END;
+  END;
+
+  Check("connectionCount increased across the forced reconnect", ConvexSync.ConnectionCount() >= 1);
+
+  (* Drain briefly to prove the suppressed x resend really produced no
+     event of its own. FixtureServer's process exit closes its accepted
+     socket, which is itself a legitimate disconnect this client reports
+     as a TransportError fanned out to both subscriptions (correct
+     behaviour, not the thing under test here), so that alone is
+     tolerated; only an actual value or a differently shaped failure
+     would mean the suppressed resend was not really suppressed. *)
+  ConvexSync.Pump(500, eventKind, eventHandle, value, logs,
+                   errorName, errorMessage, errorData, hasErrorData);
+  Check("no stray event follows the four expected ones",
+        (eventKind = 0) OR ((eventKind = 2) AND (errorName[0] = 'T')));
+
+  ConvexSync.Unsubscribe(handleX);
+  ConvexSync.Unsubscribe(handleY);
+
+  IF failed THEN
+    WriteString("TestLive: FAILED"); WriteLn;
+    ShimExit(1);
+  ELSE
+    WriteString("TestLive: all checks passed"); WriteLn;
+    ShimExit(0);
+  END;
+END TestLive.

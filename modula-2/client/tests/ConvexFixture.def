@@ -1,0 +1,35 @@
+(* ConvexFixture is a minimal, single-connection WebSocket *server* used
+   only by this client's own deterministic tests: it accepts exactly one
+   TCP connection, performs the RFC 6455 server side of the handshake,
+   and then lets a test drive individual Convex sync-protocol frames by
+   hand (unmasking what the client sends, sending unmasked frames back).
+   It is not part of the public client and is not built into the
+   production adapter or example. *)
+
+DEFINITION MODULE ConvexFixture;
+
+CONST
+  MaxFrame = 65536;
+
+(* Listen binds bindAddress:port. *)
+PROCEDURE Listen (bindAddress: ARRAY OF CHAR; port: INTEGER) : BOOLEAN;
+
+(* Accept waits for one connection and completes the WebSocket handshake
+   on it (any path/headers are accepted). *)
+PROCEDURE Accept (timeoutMs: INTEGER) : BOOLEAN;
+
+(* ReceiveText waits for the next unfragmented client->server text frame
+   and unmasks it into text. Ping/pong/close are handled transparently.
+   Returns FALSE on timeout, error, or a client close. *)
+PROCEDURE ReceiveText (timeoutMs: INTEGER; VAR text: ARRAY OF CHAR) : BOOLEAN;
+
+(* SendText sends one unmasked server->client text frame. *)
+PROCEDURE SendText (VAR text: ARRAY OF CHAR; length: INTEGER) : BOOLEAN;
+
+(* CloseAbruptly drops the TCP connection without a WebSocket close frame,
+   simulating a mid-session disconnect for reconnect tests. *)
+PROCEDURE CloseAbruptly;
+
+PROCEDURE StopListening;
+
+END ConvexFixture.

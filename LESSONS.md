@@ -571,6 +571,17 @@ it was built on.** That is not a check that failed to notice a leak; it is a
 check whose success was impossible to reconcile with the file directly above
 it, and nobody noticed because it never spoke.
 
+A second sweep then covered the forty-two merged languages the first audit had
+not reached, and found six more: bash, c, php, csharp, rescript, and — worst of
+the lot — hare, which had been merged that same night and shipped fourteen
+BusyBox applets including an FTP daemon and a web server.
+
+That brings it to **eighteen leaking out of seventy-five checked**, and the
+distribution is the point. They fall into exactly two shapes: a runtime built
+`FROM` the stock BusyBox image, or a Debian base that was never stripped. This
+is not a scatter of individual mistakes. It is two wrong patterns, each copied
+faithfully across many languages, with a check that could not object.
+
 Three things follow, and the third is the one worth arguing about:
 
 1. The check now lives in the shared harness, once, where it cannot be copied
@@ -605,6 +616,158 @@ Three things follow, and the third is the one worth arguing about:
   and the prune deleted that directory. The allow-list had carefully preserved
   both `awk` and `mawk` by name — and left the first as a dangling symlink.
   Preserving a *name* is not preserving a *program*.
+- For a young language, the fastest route was reading the standard library's
+  source. Mojo 0.26.2's stdlib does not match anything a model has been trained
+  on: `sys.ffi` moved to `std.ffi`, `alias` became `comptime`, `UnsafePointer`
+  grew mutability and origin parameters and lost `.alloc`, and string slicing
+  now needs an explicit `[byte=a:b]`. Guessing costs an afternoon of
+  compiler-error ping-pong. Cloning the compiler's own repository at the tag
+  matching the installed release, and reading it, costs minutes. There is also
+  a trap worth naming: `external_call["write", …]` fails to compile because
+  `print` has already instantiated the standard library's own declaration of
+  `write`, and yours must match its signature exactly.
+- Ballerina's platform betrayed it twice, in two different libraries. The known
+  defect was `ballerina/websocket` corrupting multi-byte UTF-8 split across a
+  continuation frame, fixed by not using it — hand-rolled RFC 6455 over a raw
+  socket, the same route a dozen clients here already take. The second was
+  found only by testing against the real hosted deployment: **`ballerina/tcp`'s
+  TLS client never sends SNI.** That was confirmed by disassembling the
+  library's own native jar and seeing it call Netty's single-argument
+  `SslContext.newHandler(ByteBufAllocator)` rather than the host-aware
+  overload. Convex's hosted deployment sits behind Cloudflare, which requires
+  SNI, so every handshake died with a fatal alert. `ballerina/http` is
+  unaffected, because its Netty wiring does pass the host through — the same
+  runtime, two TLS paths, one of them wrong.
+- The fixture was too polite again, in a new way. Ballerina's handshake reader
+  decoded its whole read buffer as UTF-8 looking for the end of the HTTP
+  headers. That works until a server pipelines its first binary frame straight
+  after the `101` response — which the real backend does and no local fixture
+  ever did. Every local test passed; the first real connection failed.
+- EiffelStudio miscompiles its own output past a certain size. Bundle enough
+  classes with inline-C bodies into one translation unit and the generated
+  C file comes out one `#include` short, so gcc reports the last class's
+  functions redeclared with conflicting linkage. The workaround is to put the
+  TLS and socket calls in an ordinary separately-compiled C file instead —
+  which is the same C-interop boundary every other native client here uses, so
+  nothing is lost. Separately, Eiffel's incremental "workbench" runtime reports
+  an ordinary `EINTR` as a fatal operating-system-signal exception; only the
+  finalised build behaves.
+- SNOBOL4 exited 0 and printed nothing, and both facts were correct. Its C
+  shim called `_exit()`, which skips libc's stdio flush. Under Docker stdout is
+  a pipe, not a terminal, so it is fully buffered — the transcript was sitting
+  in a buffer that was never drained, and every test had missed it because
+  tests write to unbuffered stderr. The documented remedy, closing the output
+  unit from SNOBOL, was tried and *empirically did not work*: it updates the
+  interpreter's own unit table without ever reaching the OS. The fix was
+  `fflush(NULL)` before `_exit()`. **A success with no output is a bug report,
+  not a pass** — and it only appeared after an earlier fix let the program
+  reach its success path for the very first time.
+- BCPL crashed because a pointer no longer fits in a word. Its 32-bit Cintcode
+  interpreter stores a raw C pointer — the `FILE*` returned by `fopen()` — in a
+  32-bit BCPL word. On a 64-bit host that address routinely lands above 2^32,
+  so the low half alone is not a pointer, and the crash happened inside the
+  distribution's own runtime before a line of client code ran. It reproduces on
+  the unmodified compiler with nothing linked in. Targeting the distribution's
+  64-bit Cintcode, whose word is wide enough for a real pointer, fixes it.
+  BCPL is from 1967, when a word held an address by definition; the assumption
+  is older than the problem.
+- Typelessness has a bill, and it arrives late. BCPL does not check argument
+  counts, so a mismatch between a function and its two callers went unnoticed
+  until the toolchain worked for the first time — at which point it silently
+  read stack poison (`0xDEADC0DE`) and crashed a coroutine. Code that has never
+  executed has never been checked, in a language that never checks.
+- The unfixable client bug was two bugs in the test fixture. SNOBOL4's
+  WebSocket reconnection looked genuinely broken and unsalvageable. It was the
+  fixture: a resubscribed value collided with an already-delivered one, which
+  defeated the client's own — correct — deduplication, and an unconditional
+  return swallowed an accept timeout. This is now the fourth time in this
+  project that a confident diagnosis of "the client is wrong" turned out to be
+  the harness, the fixture, or the reference implementation. **When the code
+  under test looks impossibly broken, suspect the thing doing the testing.**
+- A self-test paired the client against a server that never answers. V's
+  Dockerfile proves its TLS closure works by talking to `openssl s_server -www`
+   — which replies to a GET immediately and to a POST not at all. The client
+  sends a POST. The stage could therefore never pass, no matter how correct the
+  client was, and `strace` confirmed the handshake and the request were both
+  fine. Worse, the permanently-failing test was masking a real bug underneath
+  it: a 20-second deadline that never fired, leaving a blocking read sitting
+  indefinitely. **A test that always fails hides bugs exactly as effectively as
+  a test that always passes** — this document already has a section about the
+  second kind, and the first kind is rarer only because someone usually
+  deletes it.
+- One character silently downgraded every secure connection. Icon's scheme
+  detection compared against `"https"` where the parsed value was `"https:"`,
+  so every `wss://` subscription quietly opened as plain `ws://` — and the
+  visible symptom was a Cloudflare 301 redirect, which looks like a routing
+  problem, not a security one. The same off-by-one was duplicated in the
+  example and the adapter.
+- A timeout set once and never cleared crashed Factor. Its outbox writer put a
+  five-second write timeout on the shared controller socket and left it there,
+  so any idle gap longer than five seconds between commands raised an uncaught
+  `io-timeout` and took the whole adapter down through Factor's default `die`
+  handler. It presented as a hosted-only failure and was assumed to be a TLS or
+  network-variability problem; it reproduced locally too, once someone waited
+  long enough. **"Only fails against the real thing" is a hypothesis, not a
+  diagnosis.**
+- gm2 passes large `ARRAY OF CHAR` parameters by value on the stack. Modula-2's
+  `CopyText` took its source by value, and three 2 MiB call sites blew the
+  stack during module initialisation — before `main()`, so nothing printed. The
+  crash then masked two further bugs, a missing `/api/sync` path and a UUID
+  off-by-three, which only appeared once it stopped faulting.
+- OpenSSL needs files that `ldd` will never tell you about. Two languages
+  passed every local check and then failed the hosted profile with `SSL
+  routines / STORE routines::unregistered scheme`. The build stage has a full
+  OS, so `openssl.cnf` and the `ossl-modules/*.so` providers are simply there;
+  the stripped runtime image carries neither, and `SSL_CTX_set_default_verify_
+  paths` needs both at connect time. A closure computed from `ldd` cannot find
+  them, because they are not shared-library dependencies of anything — they are
+  data and dlopened plugins. **A dependency closure is only as complete as the
+  definition of "dependency" you used to build it.**
+- A zero was mistaken for the end of a string. The Live protocol's timestamp
+  can legitimately be all-zero bytes, and base64 `"AAAAAAAAAAA="` decodes to
+  exactly that. Carried through any NUL-terminated string type — Mercury's
+  `string`, or anything reached over a C-string FFI — it silently became a
+  zero-length value. Both languages hit it independently. The fix is to decode
+  straight to an integer in C and never let the raw bytes exist as a
+  language-level string at all.
+- A stack trace pointed at the garbage collector and the bug was a missing pair
+  of parentheses. Mercury reported "caught strange segmentation violation",
+  which looks exactly like a Boehm-GC problem. The cause was calling a 0-arity
+  Mercury function exported to C without its parentheses: C reads that as a
+  function-pointer value, compiles it silently, and corrupts everything
+  downstream.
+- The local profile cannot catch a TLS bug, and twice in one night it didn't.
+  The self-hosted backend is plain `http://`, so a client with an empty or
+  misplaced trust store passes every local check and fails only against the
+  real deployment. Icon deleted Debian's OPENSSLDIR and never recreated it.
+  FreeBASIC's OpenSSL had a compiled-in `OPENSSLDIR` of `/usr/lib/ssl` while
+  the CA bundle was copied to `/etc/ssl/certs`. Same symptom, different cause,
+  and neither is visible until the profile that uses TLS runs. **A test suite
+  that never exercises a dependency cannot report anything about it** — which
+  is the whole argument for the hosted profile existing at all.
+- COBOL's compiler disagreed with COBOL's standard about a self-copy. A buffer
+  ended up simultaneously the source of a parse call and the destination of
+  another `REDEFINES` — a copy from an address to itself. The standard implies
+  a no-op; GnuCOBOL corrupted the data, and the first casualty was the
+  `protocolVersion` of the very first message. Undefined behaviour is not
+  always dramatic; sometimes it is one field, in one message, at startup.
+- FreeBASIC segfaulted only against the real backend. `dmesg` put the fault
+  inside libc with the address a few bytes from the stack pointer — a stack
+  overflow. `ThreadCreate`'s default stack was too small for the Live thread's
+  real call chain, and the local fixture's smaller responses never went deep
+  enough to reach it. The bug was in the client the whole time; the test data
+  was just too polite to find it.
+- A default file mode made an image unbootable, twenty-two layers later. Nim's
+  runtime stage swaps `/usr/lib/x86_64-linux-gnu` for a trimmed closure using a
+  small Perl copier, because the process doing the swap cannot depend on the
+  directory it is replacing. Perl's `open($to, '>')` creates at 0666 minus
+  umask, and BuildKit's umask is 0022, so every copied file landed at 0644 —
+  including `ld-linux-x86-64.so.2`, which `ldd` reports as part of a binary's
+  dependency closure. Shared libraries `dlopen` perfectly well without the
+  execute bit. An ELF *interpreter* does not: the kernel loads it through the
+  same `MAY_EXEC` check as the binary itself. So the copy succeeded, the stage
+  succeeded, and three layers later `/bin/sh` could not be executed at all.
+  The error named a file that was never touched.
 - Unison could open the socket and still could not be built. The proof was
   real: a certificate-verified TLS handshake against a public host and a
   decrypted `HTTP/1.1 200 OK` read back, from Unison source, with the socket
@@ -616,12 +779,16 @@ Three things follow, and the third is the one worth arguing about:
   and there is no offline way to learn a hash without first asking the service
   that knows the name. A language where nothing has a name until something
   tells you what the hashes are called cannot be built hermetically.
-- The framework was larger than the budget. Raku's client loads in about 200 MB
-  against a 128 MiB container limit, and roughly 140 MB of that is
-  `Cro::HTTP::Client` alone — the framework, not the client. Disabling the JIT,
-  the optimiser and the thread pool together only reached 176 MB. The fix is not
-  a smaller limit but a smaller dependency: hand-roll the transport, as a dozen
-  clients here already do.
+- The framework was larger than the budget, and then the interpreter was too.
+  Raku's client loaded in about 200 MB against a 128 MiB limit, and roughly
+  140 MB of that looked like `Cro::HTTP::Client` — the framework, not the
+  client. So the transport was hand-rolled onto plain sockets, which worked and
+  saved a real 20–25 MB. It was still not enough, and the bisection that
+  followed is the actual lesson: `raku -e 'say 1'`, with **zero** project code
+  loaded, holds 134–140 MB. The budget was already spent before the program
+  started. Every earlier measurement had been attributing to the library what
+  belonged to the runtime, because nobody had measured the empty case first.
+  **Measure the floor before optimising the building.**
 - V's `net.ssl` verified nothing. Passing `validate: true` looks like it turns
   certificate checking on, but vlib loads a trust store only when a separate
   `verify` field names one, and it never calls

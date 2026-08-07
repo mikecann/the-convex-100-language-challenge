@@ -36,16 +36,23 @@ CMD ["/bin/sh", "-ec", "echo 'coffeescript compile, syntax checks and node --tes
 FROM --platform=linux/amd64 ${NODE_IMAGE} AS runtime-base
 # Node is the declared target runtime. ws is an ordinary WebSocket transport
 # library, copied without npm, npx, corepack, or the CoffeeScript compiler.
+# The base node image is Debian underneath and its rootfs carries perl-base
+# (Priority: important, pulled in independently of anything this Dockerfile
+# does) even though nothing here ever invokes perl -- `apt-get remove
+# --simulate perl-base` inside this exact image reports zero reverse
+# dependencies. Strip it alongside apt/dpkg rather than leaving it unclaimed.
 RUN rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
  /usr/bin/apt /usr/bin/apt-* /usr/bin/dpkg /usr/bin/dpkg-* /usr/bin/debconf* \
  /usr/bin/update-alternatives /usr/sbin/dpkg-* /usr/sbin/invoke-rc.d /usr/sbin/update-rc.d \
+ /usr/bin/perl /usr/bin/perl5.36.0 \
  && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
- /etc/apt /var/lib/apt /var/cache/apt /var/lib/dpkg /var/cache/debconf /usr/lib/apt /usr/lib/dpkg /usr/share/dpkg
+ /etc/apt /var/lib/apt /var/cache/apt /var/lib/dpkg /var/cache/debconf /usr/lib/apt /usr/lib/dpkg /usr/share/dpkg \
+ /usr/lib/x86_64-linux-gnu/perl-base
 WORKDIR /opt/convex
 COPY --from=build /opt/convex/client/node_modules/ws ./node_modules/ws
 COPY --from=build /build/client/convex.js ./client/convex.js
 RUN test "$(node -p 'process.arch')" = x64 \
- && for command_name in apt apt-get dpkg npm npx corepack coffee; do ! command -v "$command_name"; done
+ && for command_name in apt apt-get dpkg npm npx corepack coffee perl; do ! command -v "$command_name" >/dev/null 2>&1 || exit 1; done
 USER 65532:65532
 
 FROM runtime-base AS example-runtime
