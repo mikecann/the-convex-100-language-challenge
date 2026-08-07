@@ -34,6 +34,15 @@ void convex_tls_close(void *ssl);
 int convex_raw_write(int fd, const void *data, int count);
 int convex_raw_read(int fd, void *buffer, int max);
 
+/* Plain POSIX read(2)/write(2), unlike convex_raw_read/write above which
+ * call send(2)/recv(2) and therefore require an actual socket. The
+ * adapter's control stream is stdin/stdout (ordinary pipes or a terminal)
+ * unless ADAPTER_LISTEN is set, so it needs the descriptor-agnostic form;
+ * a socket happens to work fine through read(2)/write(2) too, so the
+ * accepted-TCP-connection case can share the same two functions. */
+int convex_generic_write(int fd, const void *data, int count);
+int convex_generic_read(int fd, void *buffer, int max);
+
 /* 1 if `fd' is readable before `timeout_ms' elapses, else 0. */
 int convex_select_one(int fd, int timeout_ms);
 

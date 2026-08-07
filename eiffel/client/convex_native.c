@@ -109,6 +109,18 @@ convex_raw_read (int fd, void *buffer, int max)
 }
 
 int
+convex_generic_write (int fd, const void *data, int count)
+{
+	return (int) write (fd, data, (size_t) count);
+}
+
+int
+convex_generic_read (int fd, void *buffer, int max)
+{
+	return (int) read (fd, buffer, (size_t) max);
+}
+
+int
 convex_select_one (int fd, int timeout_ms)
 {
 	fd_set readfds;
