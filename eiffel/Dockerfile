@@ -126,17 +126,19 @@ RUN set -eu; \
         /usr/bin/true /usr/bin/uname /usr/bin/uniq /usr/bin/wc /bin/sh; do \
       ldd "$executable" | awk '{ for (field = 1; field <= NF; field++) if ($field ~ /^\//) print $field }'; \
     done | sort -u > /tmp/keep-library-paths; \
+    : > /tmp/keep-library-names; \
+    while IFS= read -r path; do basename "$path" >> /tmp/keep-library-names; done < /tmp/keep-library-paths; \
     for library in libnss_dns.so.2 libnss_files.so.2; do \
-      if test -e "/usr/lib/x86_64-linux-gnu/$library"; then \
-        printf '%s\n' "/usr/lib/x86_64-linux-gnu/$library" >> /tmp/keep-library-paths; \
-      fi; \
+      test -e "/usr/lib/x86_64-linux-gnu/$library" && printf '%s\n' "$library" >> /tmp/keep-library-names; \
+      true; \
     done; \
-    printf '%s\n' /usr/lib/x86_64-linux-gnu/ossl-modules >> /tmp/keep-library-paths; \
+    printf '%s\n' ossl-modules >> /tmp/keep-library-names; \
     find /usr/lib/x86_64-linux-gnu -mindepth 1 -maxdepth 1 -print > /tmp/all-library-paths; \
     while IFS= read -r path; do \
-      if ! grep -Fqx "$path" /tmp/keep-library-paths; then rm -rf "$path"; fi; \
+      name=$(basename "$path"); \
+      if ! grep -Fqx "$name" /tmp/keep-library-names; then rm -rf "$path"; fi; \
     done < /tmp/all-library-paths; \
-    rm -f /tmp/keep-library-paths /tmp/all-library-paths
+    rm -f /tmp/keep-library-names /tmp/keep-library-paths /tmp/all-library-paths
 RUN set -eu; \
     rm -f /usr/bin/awk; ln -s mawk /usr/bin/awk; \
     find /usr/bin /usr/sbin -mindepth 1 -maxdepth 1 -print > /tmp/runtime-commands; \
