@@ -39,6 +39,7 @@ const fenceLanguages = {
   ".gleam": "gleam",
   ".go": "go",
   ".groovy": "groovy",
+  ".ha": "hare",
   ".hs": "haskell",
   ".hx": "haxe",
   ".idr": "idris",
