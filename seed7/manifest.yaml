@@ -64,4 +64,6 @@ limitations:
     each new connection; a same-subscriptionId replacement retires the
     prior local state immediately but does not send an explicit Remove
     for its old queryId first.
-capabilities: []
+capabilities:
+  - http
+  - live
