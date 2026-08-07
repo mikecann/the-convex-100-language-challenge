@@ -29,4 +29,6 @@ limitations:
   - Live authentication, WebSocket mutations/actions, transition chunks, and optimistic updates are deferred.
   - The Live owner globally retains the newest 16 updates within a 16 MiB encoded-byte budget and rejects an event over 2 MiB.
   - The adapter output queue is globally limited to 16 events and 8 MiB of encoded JSON.
-capabilities: []
+capabilities:
+  - http
+  - live
