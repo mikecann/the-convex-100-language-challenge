@@ -63,61 +63,43 @@ EOF
 # shared harness actually drives verify/verify-hosted through, including a
 # check that a non-loopback peer cannot reach the loopback-only listener.
 #
-# Every step here is driven by polling a marker file rather than a foreground
-# `nc` invocation or a shell `wait` builtin: on the verified build host, an
-# `nc` client run in the foreground of this heredoc RUN step -- whether or
-# not its output is captured through a pipe -- reliably hangs past its own
-# `timeout`, even though the exact same adapter binary, reached the exact
-# same way, answers correctly and instantly under a plain `docker run`/
-# `docker exec`, or when `nc` itself is backgrounded. That is a BuildKit/
-# shell interaction specific to this RUN-step execution model, not a client
-# bug, so the workaround lives here rather than in the client.
+# This uses bash's /dev/tcp instead of nc: on the verified build host, an
+# `nc` client run inside this heredoc RUN step reliably hangs past its own
+# `timeout` -- backgrounded or not, output captured through a pipe or not --
+# even though the exact same adapter binary, reached the exact same way,
+# answers correctly and instantly under a plain `docker run`/`docker exec`.
+# That is a BuildKit/nc interaction specific to this RUN-step execution
+# model, not a client bug, so the workaround lives here rather than in the
+# client. /dev/tcp is a bash builtin (no netcat involved) and does not
+# reproduce it.
 RUN <<'EOF'
+#!/usr/bin/env bash
 set -eu
-wait_for() {
-  file=$1; budget=$2; n=0
-  while test ! -e "$file"; do
-    if test "$n" -ge "$budget"; then
-      printf '%s\n' "timed out waiting for $file" >&2
-      return 1
-    fi
-    sleep 1
-    n=$((n + 1))
-  done
-}
 ADAPTER_LISTEN=127.0.0.1:18080 /build/convex-adapter &
 adapter_pid=$!
 sleep 1
 container_address=$(ip -4 addr show eth0 | awk '/inet / {sub("/.*", "", $2); print $2; exit}')
-( printf '%s\n' \
+
+non_loopback=""
+if exec 4<>"/dev/tcp/$container_address/18080" 2>/dev/null; then
+  printf '%s\n%s\n' \
     '{"id":"wrong-host","protocolVersion":1,"op":"hello"}' \
-    '{"id":"wrong-close","op":"close"}' | nc -w 1 "$container_address" 18080 >/tmp/non_loopback.out 2>/dev/null
-  touch /tmp/non_loopback.done ) &
-# This probe's own outcome (refused instantly, or never responding at all)
-# is what proves the loopback-only bind rejected it either way; only a
-# reply would mean it was wrongly accepted, so a bounded wait here is
-# advisory, not a hard gate the way the real exchange below is.
-wait_for /tmp/non_loopback.done 8 || true
-non_loopback=$(cat /tmp/non_loopback.out 2>/dev/null || true)
+    '{"id":"wrong-close","op":"close"}' >&4
+  non_loopback=$(timeout 3 cat <&4 2>/dev/null || true)
+  exec 4<&- 4>&- || true
+fi
 if test -n "$non_loopback"; then
   printf '%s\n' 'loopback adapter unexpectedly accepted a non-loopback connection' >&2
   exit 1
 fi
-( printf '%s\n' \
-    '{"id":"tcp-hello","protocolVersion":1,"op":"hello"}' \
-    '{"id":"tcp-close","op":"close"}' | nc 127.0.0.1 18080 >/tmp/actual.out 2>/dev/null
-  touch /tmp/actual.done ) &
-wait_for /tmp/actual.done 15
-actual=$(cat /tmp/actual.out)
-n=0
-while kill -0 "$adapter_pid" 2>/dev/null; do
-  if test "$n" -ge 10; then
-    printf '%s\n' 'adapter did not exit after processing close' >&2
-    exit 1
-  fi
-  sleep 1
-  n=$((n + 1))
-done
+
+exec 3<>/dev/tcp/127.0.0.1/18080
+printf '%s\n%s\n' \
+  '{"id":"tcp-hello","protocolVersion":1,"op":"hello"}' \
+  '{"id":"tcp-close","op":"close"}' >&3
+actual=$(timeout 10 cat <&3)
+exec 3<&- 3>&-
+wait "$adapter_pid"
 printf '%s\n' "$actual" | grep -F '"id":"tcp-hello","protocolVersion":1,"type":"ready"'
 printf '%s\n' "$actual" | grep -Fx '{"id":"tcp-close","type":"closed"}'
 EOF
