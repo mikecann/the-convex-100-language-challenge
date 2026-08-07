@@ -612,7 +612,12 @@ end sub
 ' --- transport -----------------------------------------------------------
 
 function AdapterRun(byval inputFd as long, byval outputFd as long) as long
+  ' WriteAllFd's deadline only has a chance to run between EAGAIN-driven
+  ' POLLOUT waits; on a blocking fd, a stalled reader instead wedges the
+  ' single underlying write() syscall in the kernel forever, and the
+  ' deadline check in the FreeBASIC code above it never gets scheduled.
   GateInit(outputFd)
+  MakeNonBlocking(outputFd)
   MakeNonBlocking(inputFd)
   CloseRequested = false
   ClientReady = false
