@@ -315,13 +315,19 @@ ENTRYPOINT ["/usr/local/bin/convex-example"]
 FROM runtime-base AS runtime
 COPY --from=test /staging-adapter /
 COPY --from=test /build/o/adapter.o /opt/convex/o/adapter.o
+# Neither grep nor any other text tool ships in this image (see the
+# toolchain policy check in runtime-base), so this checks the probe's output
+# with a plain shell parameter-expansion substring test instead.
 RUN set -eu; \
     test -x /usr/local/bin/convex-adapter; \
     test ! -e /usr/local/bin/convex-example; \
     test ! -e /opt/convex/o/main.o; \
-    printf '%s\n' \
+    probe=$(printf '%s\n' \
       '{"protocolVersion":1,"id":"hello","op":"hello"}' \
       '{"id":"close","op":"close"}' \
-    | CONVEX_URL=http://example.invalid /usr/local/bin/convex-adapter \
-    | grep -Fq '"type":"closed"'
+      | CONVEX_URL=http://example.invalid /usr/local/bin/convex-adapter); \
+    case "$probe" in \
+      *'"type":"closed"'*) ;; \
+      *) printf '%s\n' "$probe" >&2; exit 1 ;; \
+    esac
 ENTRYPOINT ["/usr/local/bin/convex-adapter"]
