@@ -41,4 +41,6 @@ limitations:
   - A Live message larger than 2 MiB or an HTTP response body larger than 2 MiB is refused rather than assembled.
   - A read that stops part way through a WebSocket frame abandons the connection rather than resuming the parser.
   - The adapter-only debugDisconnect hook is compiled into debug builds only; the canonical example ships from a release build that cannot contain it.
-capabilities: []
+capabilities:
+  - http
+  - live
