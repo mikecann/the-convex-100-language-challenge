@@ -241,7 +241,13 @@ const proc: dispatch (inout adapterState: state, inout file: output,
       if not state.clientReady then
         emitError(output, id, state.clientError);
       else
-        state.client setAuthToken token;
+        # Not `state.client setAuthToken token;` here: this toolchain's
+        # parser rejects that custom-syntax call once this specific set of
+        # includes (environment.s7i, listener.s7i for ADAPTER_LISTEN) is
+        # also present, even though it compiles fine without them and even
+        # with the identical struct-field-receiver shape in isolation. The
+        # plain field assignment below is exactly what that function does.
+        state.client.token := token;
         emitAck(output, id);
       end if;
     elsif op = "subscribe" then
@@ -393,7 +399,7 @@ const proc: initClient (inout adapterState: state) is func
         state.clientReady := TRUE;
         authToken := getenv("CONVEX_AUTH_TOKEN");
         if authToken <> "" then
-          state.client setAuthToken authToken;
+          state.client.token := authToken;
         end if;
       end if;
     end if;
