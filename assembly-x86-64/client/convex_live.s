@@ -47,7 +47,6 @@ extern poll
 
 section .text
 
-global dbg_str
 global convex_live_init
 global convex_live_close
 global convex_live_subscribe
@@ -61,47 +60,6 @@ global convex_live_next
 
 LIVE_BACKOFF_BASE_MS equ 200
 LIVE_BACKOFF_MAX_MS  equ 10000
-
-; void dbg_str(int tag, const char *ptr, u64 len) [edi,rsi,rdx] --
-; DEBUG ONLY: writes a one-char tag, ':', the raw bytes, then a newline,
-; all to stderr.
-%define DS_TAG -8
-%define DS_PTR -16
-%define DS_LEN -24
-dbg_str:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 32
-    mov [rbp+DS_TAG], dil
-    mov [rbp+DS_PTR], rsi
-    mov [rbp+DS_LEN], rdx
-    mov edi, 2
-    lea rsi, [rbp+DS_TAG]
-    mov edx, 1
-    call write
-    mov edi, 2
-    lea rsi, [rel dbg_colon]
-    mov edx, 1
-    call write
-    mov edi, 2
-    mov rsi, [rbp+DS_PTR]
-    mov rdx, [rbp+DS_LEN]
-    call write
-    mov edi, 2
-    lea rsi, [rel dbg_nl]
-    mov edx, 1
-    call write
-    mov rsp, rbp
-    pop rbp
-    ret
-%undef DS_TAG
-%undef DS_PTR
-%undef DS_LEN
-
-section .rodata
-dbg_colon: db ":"
-dbg_nl: db 10
-section .text
 
 ; --- small leaf helpers -----------------------------------------------
 
@@ -767,11 +725,6 @@ send_connect_message:
     lea rsi, [rbp+SC_TMP]
     call json_serialize
 
-    mov edi, 'C'
-    mov rsi, [rbp+SC_TMP + buf.data]
-    mov rdx, [rbp+SC_TMP + buf.len]
-    call dbg_str
-
     mov rax, [rbp+SC_LIVE]
     lea rdi, [rax + convex_live.ws]
     mov esi, WS_OP_TEXT
@@ -930,11 +883,6 @@ send_add_batch:
     mov rdi, [rbp+AB_OBJ]
     lea rsi, [rbp+AB_TMP]
     call json_serialize
-
-    mov edi, 'A'
-    mov rsi, [rbp+AB_TMP + buf.data]
-    mov rdx, [rbp+AB_TMP + buf.len]
-    call dbg_str
 
     mov rax, [rbp+AB_LIVE]
     lea rdi, [rax + convex_live.ws]
@@ -1233,30 +1181,18 @@ convex_live_maintain:
     sub rsp, 16
     mov [rbp+LM_LIVE], rdi
 
-    mov edi, 'm'
-    lea rsi, [rel dbg_colon]
-    xor edx, edx
-    call dbg_str
-
-    mov rax, [rbp+LM_LIVE]
-    mov rax, [rax + convex_live.connected]
+    mov rax, [rdi + convex_live.connected]
     test rax, rax
     jnz .connected
 
-    mov rax, [rbp+LM_LIVE]
-    mov rax, [rax + convex_live.subs]
+    mov rax, [rdi + convex_live.subs]
     test rax, rax
-    jz .no_subs
+    jz .done
 
     call monotonic_ms
     mov rcx, [rbp+LM_LIVE]
     cmp rax, [rcx + convex_live.next_attempt_ms]
-    jl .not_due
-
-    mov edi, 'k'
-    lea rsi, [rel dbg_colon]
-    xor edx, edx
-    call dbg_str
+    jl .done
 
     mov rdi, [rbp+LM_LIVE]
     call try_connect
@@ -1267,18 +1203,6 @@ convex_live_maintain:
     mov edx, reason_transport_error_len
     xor ecx, ecx
     call teardown_and_schedule
-    jmp .done
-.no_subs:
-    mov edi, 'x'
-    lea rsi, [rel dbg_colon]
-    xor edx, edx
-    call dbg_str
-    jmp .done
-.not_due:
-    mov edi, 'w'
-    lea rsi, [rel dbg_colon]
-    xor edx, edx
-    call dbg_str
     jmp .done
 .connected:
     mov rax, [rbp+LM_LIVE]
@@ -1836,11 +1760,6 @@ convex_live_service_socket:
     mov rax, [rbp+SS_KIND]
     cmp rax, WS_OP_TEXT
     jne .free_and_protocol_error
-
-    mov edi, 'R'
-    mov rsi, [rbp+SS_DATA]
-    mov rdx, [rbp+SS_LEN]
-    call dbg_str
 
     mov rdi, [rbp+SS_DATA]
     mov rsi, [rbp+SS_LEN]

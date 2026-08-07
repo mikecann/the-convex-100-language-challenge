@@ -55,7 +55,6 @@ extern convex_live_maintain
 extern convex_live_service_socket
 extern convex_live_dequeue
 extern convex_live_poll_fd
-extern dbg_str    ; DEBUG ONLY
 
 ; adapter_sub: the adapter's own map from the NDJSON protocol's
 ; subscriptionId string to the convex_sub* convex_live_subscribe returned.
@@ -766,10 +765,6 @@ ensure_live:
     test eax, eax
     jz .oom
     mov byte [g_live_ready], 1
-    mov edi, 'q'
-    lea rsi, [rel colon_byte]
-    xor edx, edx
-    call dbg_str
 .have_live:
     lea rax, [g_live]
     jmp .done
@@ -1892,14 +1887,6 @@ serve:
     test al, al
     jnz .stop
 
-    movzx edi, byte [g_live_ready]
-    add dil, '0'
-    mov [dbg_live_ready_byte], dil
-    mov edi, 'l'
-    lea rsi, [rel dbg_live_ready_byte]
-    mov edx, 1
-    call dbg_str
-
     movzx eax, byte [g_live_ready]
     test eax, eax
     jz .no_maintain
@@ -2178,7 +2165,6 @@ main:
 
 section .bss
     g_should_close: resb 1
-    dbg_live_ready_byte: resb 1    ; DEBUG ONLY
 
 section .rodata
     nl_byte: db 10
