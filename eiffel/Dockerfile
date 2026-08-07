@@ -112,39 +112,29 @@ RUN apt-get update -qq \
        openssl=3.0.20-1~deb12u2 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/convex-adapter /out/convex-example /tmp/
+#
+# This deliberately does not also prune individual shared libraries out of
+# /usr/lib/x86_64-linux-gnu: grep's optional PCRE2 acceleration and a few
+# other tools load some of their libraries with dlopen rather than an
+# ordinary link-time dependency, so `ldd` on the kept executables alone
+# does not enumerate a safe-to-keep set, and this stage already deletes
+# any executable ldd would need to inspect them with a chicken-and-egg
+# ordering problem if that first deletion pass gets it wrong. The base
+# image is already the "slim" Debian variant, so what remains here is a
+# small, known set, not an arbitrary full distribution's library tree.
 RUN set -eu; \
     for command_path in /usr/bin/mawk /usr/bin/basename /usr/bin/cat /usr/bin/cut \
         /usr/bin/dash /usr/bin/dirname /usr/bin/env /usr/bin/find /usr/bin/grep \
         /usr/bin/head /usr/bin/id /usr/bin/sed /usr/bin/sort /usr/bin/tail \
         /usr/bin/tr /usr/bin/true /usr/bin/uname /usr/bin/uniq /usr/bin/wc; do \
       test -e "$command_path" || { echo "missing expected command: $command_path" >&2; exit 1; }; \
-    done; \
-    for executable in /tmp/convex-adapter /tmp/convex-example \
-        /usr/bin/mawk /usr/bin/basename /usr/bin/cat /usr/bin/cut /usr/bin/dash \
-        /usr/bin/dirname /usr/bin/env /usr/bin/find /usr/bin/grep /usr/bin/head \
-        /usr/bin/id /usr/bin/sed /usr/bin/sort /usr/bin/tail /usr/bin/tr \
-        /usr/bin/true /usr/bin/uname /usr/bin/uniq /usr/bin/wc /bin/sh; do \
-      ldd "$executable" | awk '{ for (field = 1; field <= NF; field++) if ($field ~ /^\//) print $field }'; \
-    done | sort -u > /tmp/keep-library-paths; \
-    : > /tmp/keep-library-names; \
-    while IFS= read -r path; do basename "$path" >> /tmp/keep-library-names; done < /tmp/keep-library-paths; \
-    for library in libnss_dns.so.2 libnss_files.so.2; do \
-      test -e "/usr/lib/x86_64-linux-gnu/$library" && printf '%s\n' "$library" >> /tmp/keep-library-names; \
-      true; \
-    done; \
-    printf '%s\n' ossl-modules >> /tmp/keep-library-names; \
-    find /usr/lib/x86_64-linux-gnu -mindepth 1 -maxdepth 1 -print > /tmp/all-library-paths; \
-    while IFS= read -r path; do \
-      name=$(basename "$path"); \
-      if ! grep -Fqx "$name" /tmp/keep-library-names; then rm -rf "$path"; fi; \
-    done < /tmp/all-library-paths; \
-    rm -f /tmp/keep-library-names /tmp/keep-library-paths /tmp/all-library-paths
+    done
 RUN set -eu; \
     rm -f /usr/bin/awk; ln -s mawk /usr/bin/awk; \
     find /usr/bin /usr/sbin -mindepth 1 -maxdepth 1 -print > /tmp/runtime-commands; \
     while IFS= read -r path; do \
       case "$path" in \
-        /usr/bin/awk|/usr/bin/mawk|/usr/bin/basename|/usr/bin/cat|/usr/bin/cut|/usr/bin/dash|/usr/bin/dirname|/usr/bin/env|/usr/bin/find|/usr/bin/grep|/usr/bin/head|/usr/bin/id|/usr/bin/sed|/usr/bin/sh|/usr/bin/sort|/usr/bin/tail|/usr/bin/tr|/usr/bin/true|/usr/bin/uname|/usr/bin/uniq|/usr/bin/wc) ;; \
+        /usr/bin/awk|/usr/bin/mawk|/usr/bin/basename|/usr/bin/cat|/usr/bin/cut|/usr/bin/dash|/usr/bin/dirname|/usr/bin/env|/usr/bin/find|/usr/bin/grep|/usr/bin/head|/usr/bin/id|/usr/bin/rm|/usr/bin/sed|/usr/bin/sh|/usr/bin/sort|/usr/bin/tail|/usr/bin/tr|/usr/bin/true|/usr/bin/uname|/usr/bin/uniq|/usr/bin/wc) ;; \
         *) rm -rf "$path" ;; \
       esac; \
     done < /tmp/runtime-commands; \
@@ -156,7 +146,9 @@ RUN set -eu; \
       /usr/lib/systemd /usr/libexec /usr/share /usr/src /usr/local/man \
       /usr/local/share /var/backups /var/cache /var/lib /var/local /var/mail \
       /var/opt /var/spool /var/tmp /var/log/* /tmp/convex-adapter \
-      /tmp/convex-example /tmp/runtime-commands /tmp/runtime-library-paths; \
+      /tmp/convex-example /tmp/runtime-commands; \
+    rm -f /usr/bin/rm; \
+    test ! -e /usr/bin/rm; \
     for command_name in ec estudio gcc cc clang make ld as apt apt-get dpkg \
         curl wget nc netcat openssl node python python3 ruby perl java php go \
         rustc cargo npm pip convex busybox rm mv cp chmod chown; do \
