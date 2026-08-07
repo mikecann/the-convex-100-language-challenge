@@ -85,7 +85,7 @@ RUN mkdir -p obj \
 RUN ./bin/convex_tests \
     && ./bin/convex_adapter_event_tests \
     && ./bin/convex_adapter_output_tests \
-    && if test -x ./bin/convex_socket_tests; then ./bin/convex_socket_tests; fi \
+    && ./bin/convex_socket_tests \
     && printf '%s\n' \
          '{"protocolVersion":1,"id":"hello","op":"hello"}' \
          '{"id":"close","op":"close"}' \
@@ -318,4 +318,24 @@ RUN test -x /usr/local/bin/convex-adapter \
          '{"id":"close","op":"close"}' \
        | CONVEX_URL=http://127.0.0.1:9 /usr/local/bin/convex-adapter \
        | grep -Fqx '{"id":"close","type":"closed"}'
+# The plaintext check above never asks AWS.Net.SSL to do anything: it proves
+# the binary runs, not that this pruned image's OpenSSL/CA closure actually
+# works. Force a real TLS code path here. Port 9 refuses the TCP connection
+# immediately, so a correctly wired image fails the query as an ordinary
+# connect failure; a CA bundle, OPENSSL_CONF, or provider/module problem in
+# this minimal runtime would instead surface as a TLS setup or handshake
+# error, which the negative grep below would catch. No file is written:
+# /tmp does not exist in this image, so the transcript stays in a variable.
+RUN set -eu; \
+    output="$(printf '%s\n' \
+         '{"protocolVersion":1,"id":"hello","op":"hello"}' \
+         '{"id":"q","op":"query","path":"messages:count","args":{}}' \
+         '{"id":"close","op":"close"}' \
+       | CONVEX_URL=https://127.0.0.1:9 /usr/local/bin/convex-adapter)"; \
+    printf '%s\n' "$output" | grep -Fqx '{"id":"close","type":"closed"}'; \
+    printf '%s\n' "$output" | grep -Fq '"id":"q"'; \
+    printf '%s\n' "$output" | grep -Fq '"name":"TransportError"'; \
+    ! printf '%s\n' "$output" | grep -Eiq \
+      'ca-certificat|openssl_conf|provider|no such file|unable to load|legacy\.so|x509 lookup|certificate verify|SSL_CTX'; \
+    printf '%s\n' "$output" | grep -Fqi 'refused'
 ENTRYPOINT ["/usr/local/bin/convex-adapter"]
