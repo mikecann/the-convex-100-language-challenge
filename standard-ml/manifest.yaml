@@ -67,4 +67,6 @@ limitations:
   - The bounded-writer audit is a separate test-only executable. Nothing
     selects it at run time and the build asserts it is absent from the shipped
     adapter.
-capabilities: []
+capabilities:
+  - http
+  - live
