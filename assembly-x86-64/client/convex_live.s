@@ -97,6 +97,41 @@ dbg_str:
 %undef DS_PTR
 %undef DS_LEN
 
+; void dbg_bit(int tag, int val) [edi,esi] -- DEBUG ONLY: writes tag char,
+; ':', val's low decimal digit (0-9 only -- fine for boolean/tiny results),
+; then a newline, to stderr.
+%define DB_TAG -8
+%define DB_VAL -16
+dbg_bit:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    mov [rbp+DB_TAG], dil
+    mov eax, esi
+    add al, '0'
+    mov [rbp+DB_VAL], al
+    mov edi, 2
+    lea rsi, [rbp+DB_TAG]
+    mov edx, 1
+    call write
+    mov edi, 2
+    lea rsi, [rel dbg_colon]
+    mov edx, 1
+    call write
+    mov edi, 2
+    lea rsi, [rbp+DB_VAL]
+    mov edx, 1
+    call write
+    mov edi, 2
+    lea rsi, [rel dbg_nl]
+    mov edx, 1
+    call write
+    mov rsp, rbp
+    pop rbp
+    ret
+%undef DB_TAG
+%undef DB_VAL
+
 section .rodata
 dbg_colon: db ":"
 dbg_nl: db 10
@@ -1833,6 +1868,11 @@ convex_live_service_socket:
     mov rdi, rcx
     call free
 .no_free_data:
+    mov [rbp+SS_HMRESULT], rax
+    mov edi, 'j'
+    mov esi, eax
+    call dbg_bit
+    mov rax, [rbp+SS_HMRESULT]
     test eax, eax
     jz .protocol_error
 
@@ -1840,6 +1880,9 @@ convex_live_service_socket:
     mov rsi, [rbp+SS_MSG]
     call handle_message
     mov [rbp+SS_HMRESULT], rax
+    mov edi, 'h'
+    mov esi, eax
+    call dbg_bit
     mov rdi, [rbp+SS_MSG]
     call json_free
     mov rax, [rbp+SS_HMRESULT]
