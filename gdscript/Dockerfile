@@ -145,6 +145,16 @@ RUN set -eu; root=/runtime-root; \
     # without granting the process anywhere to write.
     mkdir -p "$root/opt/convex/state/godot/app_userdata/convex"; \
     mkdir -p "$root/opt/convex/state/godot_config" "$root/opt/convex/state/godot_cache"; \
+    # A Godot program is an engine binary plus a pack rather than one
+    # executable, so each leaf image needs a two-line wrapper naming both. Both
+    # leaves mount their own pack at the same path, so one launcher serves
+    # both. It is written here, outside "$root", because the busybox runtime
+    # has no chmod applet and because a launcher staged into the shared rootfs
+    # would land in the image that does not want it.
+    mkdir -p /launchers; \
+    printf '%s\n%s\n' '#!/bin/sh' \
+      'exec /opt/convex/godot --headless --main-pack /opt/convex/convex.pck -- "$@"' \
+      > /launchers/convex; \
     ! ldd /tmp/godot | grep -Eq 'libX11|libwayland|libasound|libpulse|libudev|libssl|libcrypto'; \
     test -z "$(find "$root" -type f \( -name 'libapt*' -o -name 'libpam*' -o -name 'libsystemd*' \) -print -quit)"
 
@@ -183,12 +193,7 @@ RUN set -eu; \
 
 FROM runtime-base AS example-runtime
 COPY --from=test /out/convex-example.pck /opt/convex/convex.pck
-# A Godot program is an engine binary plus a pack rather than one executable,
-# so the entry point is a two-line wrapper that names both. It adds no logic.
-RUN printf '%s\n%s\n' '#!/bin/sh' \
-      'exec /opt/convex/godot --headless --main-pack /opt/convex/convex.pck -- "$@"' \
-      > /usr/local/bin/convex-example && \
-    chmod 0555 /usr/local/bin/convex-example
+COPY --from=runtime-rootfs --chmod=0555 /launchers/convex /usr/local/bin/convex-example
 USER 65532:65532
 # Prove, as the runtime user, that the pack boots in this minimal image, that
 # the example fails closed without configuration, and that standard output
@@ -204,10 +209,7 @@ ENTRYPOINT ["/usr/local/bin/convex-example"]
 
 FROM runtime-base AS runtime
 COPY --from=test /out/convex-adapter.pck /opt/convex/convex.pck
-RUN printf '%s\n%s\n' '#!/bin/sh' \
-      'exec /opt/convex/godot --headless --main-pack /opt/convex/convex.pck -- "$@"' \
-      > /usr/local/bin/convex-adapter && \
-    chmod 0555 /usr/local/bin/convex-adapter
+COPY --from=runtime-rootfs --chmod=0555 /launchers/convex /usr/local/bin/convex-adapter
 USER 65532:65532
 # Standard output carries protocol events and nothing else: exactly two lines
 # for a hello and a close, with every diagnostic on standard error.
