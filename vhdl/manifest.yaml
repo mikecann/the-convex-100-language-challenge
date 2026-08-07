@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: vhdl
+displayName: "VHDL"
+rank: 41
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []

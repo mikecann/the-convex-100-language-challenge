@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: setl
+displayName: "SETL"
+rank: 45
+selectionTier: ranked
+implementation:
+  status: planned
+capabilities: []
