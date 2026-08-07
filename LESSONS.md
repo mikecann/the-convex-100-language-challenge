@@ -550,10 +550,40 @@ found by reading, not by running. No verification run would ever have surfaced
 it, because the symptom of a vacuous check is that everything passes.
 
 There is a real question underneath, and honesty requires separating it from
-the defect: were the images actually clean? The gate being broken does not
-mean anything got through it. That is being measured directly — building each
-image and running the check the way it should have been written — because
-"probably fine" is not the standard this project claims.
+the defect: were the images actually clean? The gate being broken does not by
+itself mean anything got through it. So it was measured — all thirty-three
+images built, and the check run the way it should have been written.
+
+**Twelve of the thirty-three leaked.** This was not a paperwork problem.
+
+Seven of them — cpp, crystal, dart, elixir, go, pony and rust — are built
+`FROM` the stock BusyBox image, which ships `httpd`, `ftpd`, `inetd`, `wget`,
+`nc`, `telnet`, `ar`, `dpkg` and `rpm` as applets. So an image described as
+containing nothing beyond what serving Convex traffic requires contained a web
+server, an FTP daemon and two network clients. Perl leaked into three images
+that declare Node as their runtime and into one that has nothing to do with
+Perl.
+
+The best detail is rust's. Its Dockerfile reads `FROM ${BUSYBOX_IMAGE} AS
+runtime-base`, and five lines later its policy loop lists `busybox` among the
+commands it asserts are absent. **The image asserted the absence of the thing
+it was built on.** That is not a check that failed to notice a leak; it is a
+check whose success was impossible to reconcile with the file directly above
+it, and nobody noticed because it never spoke.
+
+Three things follow, and the third is the one worth arguing about:
+
+1. The check now lives in the shared harness, once, where it cannot be copied
+   wrong — rather than as a stanza pasted into a hundred Dockerfiles.
+2. It reads the image's filesystem listing through `docker export` instead of
+   running a shell inside the image. Three of the leaking images turned out to
+   have no usable `printf`, `echo` or `command` at all, which is precisely how
+   an in-image check becomes unreliable in the images that need it most.
+3. Finding this *late* was expensive, and it was found only because someone
+   asked whether a passing check had ever actually rejected anything. That
+   question is cheap and almost never asked. **The audit that matters is not
+   "do the checks pass" but "has any check here ever failed, and can I make it
+   fail on purpose right now?"**
 
 ## 23. Miscellaneous findings worth a slide
 
