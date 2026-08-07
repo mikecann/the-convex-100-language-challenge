@@ -1047,7 +1047,15 @@ function ConvexSubscribe( _
   end if
   if client.live = 0 then
     client.live = LiveNewManager(client.target)
-    client.live->worker = threadcreate(@LiveOwnerThread, client.live)
+    ' FreeBASIC's default ThreadCreate stack was not enough for this
+    ' worker's real call chain (TLS, JSON parsing, string handling):
+    ' confirmed against the local self-hosted backend with a real
+    ' subscription, a segfault inside libc with the fault address a few
+    ' bytes from the stack pointer -- the signature of a stack-overflow
+    ' guard page, not a null-pointer or heap bug. A fixed local test
+    ' peer's smaller responses never reproduced it. 8 MiB, matching a
+    ' typical Linux pthread default, comfortably covers it.
+    client.live->worker = threadcreate(@LiveOwnerThread, client.live, 8388608)
     if client.live->worker = 0 then
       dim as LiveManager ptr orphan = client.live
       client.live = 0

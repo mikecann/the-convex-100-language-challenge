@@ -482,7 +482,13 @@ private sub HandleSubscribe(byref id as string, byval commandValue as JsonValue 
   Relays(slot).stopping = false
   Relays(slot).slot = slot
   mutexunlock(Gate.mutex)
-  Relays(slot).worker = threadcreate(@RelayThread, cast(any ptr, cast(integer, slot)))
+  ' See convex.bas's LiveOwnerThread ThreadCreate call: the default stack
+  ' was not enough for a real subscription's call chain against a real
+  ' backend. This relay thread's own work is lighter (it only re-renders
+  ' an already-decoded delivery), but it is cheap to give it the same
+  ' safety margin rather than assume its stack use stays small forever.
+  Relays(slot).worker = _
+    threadcreate(@RelayThread, cast(any ptr, cast(integer, slot)), 8388608)
   if Relays(slot).worker = 0 then
     FaultSet(fault, FAULT_CLIENT, "could not start the subscription relay")
     RetireRelay(slot, 2000)
