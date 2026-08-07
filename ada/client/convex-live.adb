@@ -414,7 +414,7 @@ package body Convex.Live is
          --  and the first Convex Connect frame share one absolute budget. A
          --  peer that makes a little progress at each step therefore cannot
          --  keep this sole owner away from a queued Remove or Stop.
-         Deadline        : constant Ada.Real_Time.Time :=
+         Deadline : constant Ada.Real_Time.Time :=
            Ada.Real_Time.Clock
            + Ada.Real_Time.To_Time_Span (Convex_WebSocket.Connect_Budget);
       begin

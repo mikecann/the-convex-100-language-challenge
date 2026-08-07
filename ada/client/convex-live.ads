@@ -49,9 +49,7 @@ private
    --  megabytes at once. Say so rather than inheriting whatever default the
    --  runtime happens to use, because the failure mode of a default that is
    --  too small is Storage_Error on exactly the largest valid values.
-   task type Owner_Task
-     with Storage_Size => 16 * 1024 * 1024
-   is
+   task type Owner_Task with Storage_Size => 16 * 1024 * 1024 is
       entry Configure (Deployment_URL : String);
       entry Add
         (Path       : String;

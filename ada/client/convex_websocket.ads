@@ -15,7 +15,7 @@ package Convex_WebSocket is
    --  a single absolute deadline for all of it, and normally extend the same
    --  deadline over the first Convex Connect frame, so a peer that makes slow
    --  progress at every step still cannot hold the sole Live owner past it.
-   Connect_Budget     : constant Duration := 2.0;
+   Connect_Budget : constant Duration := 2.0;
 
    --  One complete outgoing frame, header and masked payload, shares one
    --  deadline. Renewing per chunk would let a slow reader stall the owner.

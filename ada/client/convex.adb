@@ -348,8 +348,7 @@ package body Convex is
                        with "HTTP response repeated Transfer-Encoding";
                   end if;
                   Transfer_Seen := True;
-                  if Ada.Characters.Handling.To_Lower (Value) /= "chunked"
-                  then
+                  if Ada.Characters.Handling.To_Lower (Value) /= "chunked" then
                      raise Constraint_Error
                        with "unsupported HTTP transfer encoding";
                   end if;
@@ -379,7 +378,7 @@ package body Convex is
             Status :=
               (Character'Pos (Status_Line (Status_Line'First + 9))
                - Character'Pos ('0'))
-                * 100
+              * 100
               + (Character'Pos (Status_Line (Status_Line'First + 10))
                  - Character'Pos ('0'))
                 * 10
@@ -710,9 +709,7 @@ package body Convex is
                return
                  Failure
                    (Protocol_Error,
-                    "HTTP "
-                    & Image (Code)
-                    & " response is not a JSON object");
+                    "HTTP " & Image (Code) & " response is not a JSON object");
             end if;
             if not Parsed.Value.Has_Field ("status") then
                return

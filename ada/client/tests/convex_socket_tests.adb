@@ -1084,7 +1084,7 @@ procedure Convex_Socket_Tests is
                pragma Unreferenced (Request);
             begin
                case Step is
-                  when 1 =>
+                  when 1  =>
                      Send_Response_Quietly
                        (Peer,
                         Sized_Response
@@ -1094,26 +1094,26 @@ procedure Convex_Socket_Tests is
                            & """errorData"":{""code"":3},"
                            & """logLines"":[""e1""]}"));
 
-                  when 2 =>
+                  when 2  =>
                      Send_Response_Quietly
                        (Peer,
                         Sized_Response
                           ("560 Convex Error",
                            "{""status"":""success"",""value"":1}"));
 
-                  when 3 =>
+                  when 3  =>
                      Send_Response_Quietly
                        (Peer,
                         Sized_Response
                           ("500 Internal Server Error",
                            "<html>gateway said no</html>"));
 
-                  when 4 =>
+                  when 4  =>
                      Send_Response_Quietly
                        (Peer,
                         Sized_Response ("404 Not Found", "{""nope"":1}"));
 
-                  when 5 =>
+                  when 5  =>
                      --  A non-2xx body still has to survive chunked framing.
                      Send_Response_Quietly
                        (Peer,
@@ -1143,11 +1143,11 @@ procedure Convex_Socket_Tests is
                         & ASCII.CR
                         & ASCII.LF);
 
-                  when 6 =>
+                  when 6  =>
                      Send_Response_Quietly
                        (Peer, Sized_Response ("560 Convex Error", ""));
 
-                  when 7 =>
+                  when 7  =>
                      --  A 2xx status is not evidence that the body is a
                      --  Convex envelope. An intact response this client
                      --  cannot honour is a protocol failure whatever the
@@ -1156,11 +1156,11 @@ procedure Convex_Socket_Tests is
                        (Peer,
                         Sized_Response ("200 OK", "<html>not convex</html>"));
 
-                  when 8 =>
+                  when 8  =>
                      Send_Response_Quietly
                        (Peer, Sized_Response ("200 OK", "[1,2]"));
 
-                  when 9 =>
+                  when 9  =>
                      Send_Response_Quietly
                        (Peer, Sized_Response ("200 OK", "{""value"":1}"));
 
@@ -1168,8 +1168,7 @@ procedure Convex_Socket_Tests is
                      Send_Response_Quietly
                        (Peer,
                         Sized_Response
-                          ("200 OK",
-                           "{""status"":""success"",""value"":42}"));
+                          ("200 OK", "{""status"":""success"",""value"":42}"));
                end case;
             end;
             Close_Quietly (Peer);
@@ -1218,8 +1217,7 @@ procedure Convex_Socket_Tests is
             "HTTP 560 error envelope lost its message");
          Check (Result.Error.Has_Data, "HTTP 560 errorData was lost");
          Check
-           (Result.Error.Has_Logs
-            and then JSON.Length (Result.Error.Logs) = 1,
+           (Result.Error.Has_Logs and then JSON.Length (Result.Error.Logs) = 1,
             "HTTP 560 logLines were lost");
       end;
 
@@ -1635,8 +1633,7 @@ procedure Convex_Socket_Tests is
             when TLS_Garbage       =>
                GNAT.Sockets.Receive_Socket (Peer, Data, Last);
                Check
-                 (Last >= Data'First,
-                  "TLS fixture received no ClientHello");
+                 (Last >= Data'First, "TLS fixture received no ClientHello");
                Send_Response_Quietly
                  (Peer,
                   "HTTP/1.1 400 Bad Request"
@@ -2772,17 +2769,15 @@ procedure Convex_Socket_Tests is
 
    task type Slow_Add_Worker is
       entry Start (Manager : Live_Manager_Access; Args : JSON_Value_Access);
-      entry Finish
-        (Success : out Boolean;
-         Message : out US.Unbounded_String);
+      entry Finish (Success : out Boolean; Message : out US.Unbounded_String);
    end Slow_Add_Worker;
 
    task body Slow_Add_Worker is
-      Live         : Live_Manager_Access;
-      Arguments    : JSON_Value_Access;
-      Sub          : Convex.Live.Subscription;
-      Added        : Boolean := False;
-      Detail       : US.Unbounded_String;
+      Live      : Live_Manager_Access;
+      Arguments : JSON_Value_Access;
+      Sub       : Convex.Live.Subscription;
+      Added     : Boolean := False;
+      Detail    : US.Unbounded_String;
    begin
       accept Start (Manager : Live_Manager_Access; Args : JSON_Value_Access) do
          Live := Manager;
@@ -2799,8 +2794,7 @@ procedure Convex_Socket_Tests is
                 (Ada.Exceptions.Exception_Information (E));
       end;
       accept Finish
-        (Success : out Boolean;
-         Message : out US.Unbounded_String)
+        (Success : out Boolean; Message : out US.Unbounded_String)
       do
          Success := Added;
          Message := Detail;
@@ -2848,8 +2842,7 @@ procedure Convex_Socket_Tests is
          GNAT.Sockets.Set_Socket_Option
            (Peer,
             GNAT.Sockets.Socket_Level,
-            (Name    => GNAT.Sockets.Receive_Timeout,
-             Timeout => 2.0));
+            (Name => GNAT.Sockets.Receive_Timeout, Timeout => 2.0));
 
          --  Consume only the near-maximum Add frame's header and mask. The
          --  small receive window then keeps the owner inside frame output
@@ -2881,16 +2874,16 @@ procedure Convex_Socket_Tests is
    end Slow_Live_Write_Server;
 
    procedure Run_Slow_Live_Write (Mode : Slow_Live_Write_Action) is
-      Listener    : GNAT.Sockets.Socket_Type;
-      Port        : GNAT.Sockets.Port_Type;
-      Server      : Slow_Live_Write_Server;
-      Worker      : Slow_Add_Worker;
-      Manager     : aliased Convex.Live.Manager;
-      Small_Sub   : Convex.Live.Subscription;
-      Small_Args  : constant JSON.JSON_Value := JSON.Create_Object;
-      Large_Args  : aliased JSON.JSON_Value := JSON.Create_Object;
-      Success     : Boolean;
-      Message     : US.Unbounded_String;
+      Listener             : GNAT.Sockets.Socket_Type;
+      Port                 : GNAT.Sockets.Port_Type;
+      Server               : Slow_Live_Write_Server;
+      Worker               : Slow_Add_Worker;
+      Manager              : aliased Convex.Live.Manager;
+      Small_Sub            : Convex.Live.Subscription;
+      Small_Args           : constant JSON.JSON_Value := JSON.Create_Object;
+      Large_Args           : aliased JSON.JSON_Value := JSON.Create_Object;
+      Success              : Boolean;
+      Message              : US.Unbounded_String;
       Started              : Ada.Real_Time.Time;
       Transmission_Started : Ada.Real_Time.Time;
       Action_Time          : Duration;
@@ -2963,8 +2956,7 @@ procedure Convex_Socket_Tests is
            with "near-maximum Live Add did not retire after its deadline";
       end select;
       Transmission_Time :=
-        Ada.Real_Time.To_Duration
-          (Ada.Real_Time.Clock - Transmission_Started);
+        Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - Transmission_Started);
       Check
         (Success,
          "near-maximum Live Add was rejected: " & US.To_String (Message));
@@ -3283,11 +3275,7 @@ procedure Convex_Socket_Tests is
            (Peer,
             16#81#,
             Updated_Transition
-              (0,
-               1,
-               Initial_TS,
-               Convex_WebSocket.Encode_Timestamp (3),
-               2));
+              (0, 1, Initial_TS, Convex_WebSocket.Encode_Timestamp (3), 2));
          Validate_Remove (Read_Client_Text (Peer));
          Passed := True;
       exception
@@ -3328,8 +3316,7 @@ procedure Convex_Socket_Tests is
                Convex.Live.Release (Manager, Item);
                return;
             end if;
-            if Item.Has_Error
-              and then Item.Error.Kind = Convex.Protocol_Error
+            if Item.Has_Error and then Item.Error.Kind = Convex.Protocol_Error
             then
                Saw_Protocol_Error := True;
             end if;

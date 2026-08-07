@@ -15,9 +15,8 @@ procedure Convex_Adapter_Fixture is
    use type Ada.Streams.Stream_Element_Offset;
    use type Interfaces.Unsigned_8;
 
-   WebSocket_GUID    : constant String :=
-     "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-   Initial_TS        : constant String := "AAAAAAAAAAA=";
+   WebSocket_GUID : constant String := "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+   Initial_TS     : constant String := "AAAAAAAAAAA=";
 
    --  The stopped-reader evidence needs deliveries close to the client's
    --  four-megabyte message ceiling, and the ordinary relay tests need

@@ -67,8 +67,7 @@ begin
       "CRLF in the path");
    Check_Rejected_URL
      ("http://example.test/api" & ASCII.LF, "bare LF in the path");
-   Check_Rejected_URL
-     ("http://exam ple.test/api", "space in the authority");
+   Check_Rejected_URL ("http://exam ple.test/api", "space in the authority");
    Check_Rejected_URL
      ("http://example.test/api" & Character'Val (0), "NUL in the path");
    Check_Rejected_URL
@@ -99,8 +98,7 @@ begin
    Check_Rejected_Token ("good" & ASCII.LF & "X-Injected: yes", "LF");
    Check_Rejected_Token ("good" & Character'Val (0), "NUL");
    Check_Rejected_Token ("good" & Character'Val (16#7F#), "DEL");
-   Check_Rejected_Token
-     ("good" & Character'Val (16#C3#), "non-ASCII byte");
+   Check_Rejected_Token ("good" & Character'Val (16#C3#), "non-ASCII byte");
    Check
      (Convex_WebSocket.Encode_Base64
         (Ada.Streams.Stream_Element_Array'

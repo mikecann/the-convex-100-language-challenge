@@ -31,9 +31,10 @@ procedure Convex_Adapter is
    -- would reject valid traffic rather than bound memory.
    Max_Command_Bytes : constant := 2 * 1024 * 1024;
    Max_Output_Bytes  : constant := Convex_Adapter_Output.Max_Line_Bytes;
-   pragma Compile_Time_Error
-     (Max_Output_Bytes < Convex_WebSocket.Max_Message_Bytes,
-      "adapter output ceiling must cover the Live message ceiling");
+   pragma
+     Compile_Time_Error
+       (Max_Output_Bytes < Convex_WebSocket.Max_Message_Bytes,
+        "adapter output ceiling must cover the Live message ceiling");
 
    -- Keep controller input bounded independently of the line cap. The shared
    -- controller is request/response oriented, so eight pending commands leave
@@ -429,7 +430,7 @@ procedure Convex_Adapter is
             if Op = "hello" then
                Validate_Fields (Root, "|protocolVersion|id|op|");
                if Required_Field (Root, "protocolVersion").Kind
-                    /= JSON.JSON_Int_Type
+                 /= JSON.JSON_Int_Type
                  or else Integer'(Root.Get ("protocolVersion")) /= 1
                then
                   Emit_Error (Id, "unsupported adapter protocol version");

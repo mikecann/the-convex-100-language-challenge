@@ -26,8 +26,7 @@ package body Convex_WebSocket is
    --  A frame sent outside a larger bounded operation earns its own budget,
    --  measured from the moment the masked bytes are ready rather than from
    --  the moment the caller asked for the send.
-   No_Deadline         : constant Ada.Real_Time.Time :=
-     Ada.Real_Time.Time_First;
+   No_Deadline : constant Ada.Real_Time.Time := Ada.Real_Time.Time_First;
 
    function C_Shutdown
      (FD : Interfaces.C.int; How : Interfaces.C.int) return Interfaces.C.int
@@ -325,16 +324,16 @@ package body Convex_WebSocket is
       --  This belongs on the heap rather than the Live owner task's stack.
       --  A valid 4 MiB message is part of the public bound and must not turn
       --  into an unbounded task-stack requirement.
-      Frame    : Frame_Access :=
+      Frame  : Frame_Access :=
         new Stream_Element_Array (1 .. Payload'Length + 14);
-      Cursor   : Stream_Element_Offset := Frame.all'First;
-      Mask     : constant Interfaces.Unsigned_32 := Next_Mask (Socket);
-      Keys     : constant array (Natural range 0 .. 3) of Stream_Element :=
+      Cursor : Stream_Element_Offset := Frame.all'First;
+      Mask   : constant Interfaces.Unsigned_32 := Next_Mask (Socket);
+      Keys   : constant array (Natural range 0 .. 3) of Stream_Element :=
         [Stream_Element (Interfaces.Shift_Right (Mask, 24) and 16#FF#),
          Stream_Element (Interfaces.Shift_Right (Mask, 16) and 16#FF#),
          Stream_Element (Interfaces.Shift_Right (Mask, 8) and 16#FF#),
          Stream_Element (Mask and 16#FF#)];
-      Work     : Interfaces.Unsigned_64 :=
+      Work   : Interfaces.Unsigned_64 :=
         Interfaces.Unsigned_64 (Payload'Length);
       use type Interfaces.Unsigned_64;
    begin

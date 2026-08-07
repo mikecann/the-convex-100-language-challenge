@@ -59,9 +59,8 @@ package Convex_Adapter_Events is
    --  instead, so one unrepresentable value costs that delivery rather than
    --  the process. Neither retains state, so the next delivery is unaffected.
    function Subscription_Line
-     (Subscription_Id : String;
-      Item            : Convex.Live.Update;
-      Limit           : Positive) return String;
+     (Subscription_Id : String; Item : Convex.Live.Update; Limit : Positive)
+      return String;
 
    function Call_Result_Line
      (Id : String; Result : Convex.Call_Result; Limit : Positive)

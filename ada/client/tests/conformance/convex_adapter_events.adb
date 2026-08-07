@@ -169,9 +169,8 @@ package body Convex_Adapter_Events is
        & " byte adapter output limit");
 
    function Subscription_Line
-     (Subscription_Id : String;
-      Item            : Convex.Live.Update;
-      Limit           : Positive) return String
+     (Subscription_Id : String; Item : Convex.Live.Update; Limit : Positive)
+      return String
    is
       Event : constant String := Subscription_Event (Subscription_Id, Item);
    begin
