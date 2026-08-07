@@ -23,9 +23,7 @@ let require_no_id json =
 
 let require_error_name ?id name json =
   require_string "type" "error" json;
-  (match id with
-  | Some value -> require_string "id" value json
-  | None -> ());
+  (match id with Some value -> require_string "id" value json | None -> ());
   match member "error" json with
   | Some error -> require_string "name" name error
   | None -> fail ("error event omitted error object: " ^ J.to_string json)
@@ -626,7 +624,8 @@ let base64_digits =
    the encoding is written out directly rather than pulling in an encoder. *)
 let sync_timestamp index =
   let byte = index land 0xff in
-  Printf.sprintf "%c%cAAAAAAAAA=" base64_digits.[byte lsr 2]
+  Printf.sprintf "%c%cAAAAAAAAA="
+    base64_digits.[byte lsr 2]
     base64_digits.[(byte land 3) lsl 4]
 
 let flood_transition ~index ~query_id ~padding =
@@ -679,8 +678,7 @@ let start_flood_fixture ~subscriptions ~transitions ~padding_bytes ~linger =
                   let rec await_adds seen =
                     if seen < subscriptions then
                       let payload = read_websocket_frame input in
-                      await_adds
-                        (seen + occurrences_of {|"type":"Add"|} payload)
+                      await_adds (seen + occurrences_of {|"type":"Add"|} payload)
                   in
                   await_adds 0;
                   for index = 1 to transitions do
@@ -771,8 +769,8 @@ let test_stopped_reader executable =
   if !peak <= 0 then fail "no resident memory sample was taken";
   if !peak >= stopped_reader_limit_bytes then
     fail
-      (Printf.sprintf
-         "adapter reached %d bytes resident with a stopped reader" !peak);
+      (Printf.sprintf "adapter reached %d bytes resident with a stopped reader"
+         !peak);
   (match status with
   | Unix.WEXITED 1 -> ()
   | Unix.WEXITED code ->
@@ -780,8 +778,8 @@ let test_stopped_reader executable =
         ("adapter with a stopped reader exited " ^ string_of_int code
        ^ " instead of 1")
   | Unix.WSIGNALED signal | Unix.WSTOPPED signal ->
-      fail ("adapter with a stopped reader died on signal "
-           ^ string_of_int signal));
+      fail
+        ("adapter with a stopped reader died on signal " ^ string_of_int signal));
   (* Whatever reached the pipe is the truncated line the writer gave up on.
      Nothing may follow it, so there must be no further line terminator. *)
   let remainder = drain_channel process.output in
@@ -799,8 +797,8 @@ let test_stopped_reader executable =
    replacement goes through the identical invalidate-then-acknowledge path. *)
 let test_unsubscribe_ordering executable =
   let port, fixture =
-    start_flood_fixture ~subscriptions:1 ~transitions:8
-      ~padding_bytes:200_000 ~linger:15.0
+    start_flood_fixture ~subscriptions:1 ~transitions:8 ~padding_bytes:200_000
+      ~linger:15.0
   in
   let process =
     start_adapter executable (Printf.sprintf "http://127.0.0.1:%d" port)
@@ -896,8 +894,7 @@ let test_schema_string_lengths executable =
     (Printf.sprintf {|{"id":"path-two","op":"query","path":"%s","args":{}}|}
        (repeat 2));
   require_error ~id:"path-two" "ProtocolError"
-    "adapter command path must contain at least 3 characters"
-    (receive process);
+    "adapter command path must contain at least 3 characters" (receive process);
   (* Bytes that are not well-formed UTF-8 have no character length at all. The
      rejection may come from the JSON reader or from the id check; either way
      the command must not be accepted. *)

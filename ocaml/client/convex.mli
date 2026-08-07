@@ -44,13 +44,13 @@ val subscription_next :
 val unsubscribe : subscription -> (unit, error) Stdlib.result
 
 val debug_disconnect : client -> (unit, error) Stdlib.result
-(** Force the live connection closed and let the socket owner reconnect on
-    its own, without closing the client. Exposed only because the
-    conformance adapter's [debugDisconnect] operation exercises this
-    client's reconnect-and-recover path the same way every other language's
-    adapter does; application code has no reason to call it, and closing the
-    connection out from under a live subscription is not a capability this
-    client otherwise offers. *)
+(** Force the live connection closed and let the socket owner reconnect on its
+    own, without closing the client. Exposed only because the conformance
+    adapter's [debugDisconnect] operation exercises this client's
+    reconnect-and-recover path the same way every other language's adapter does;
+    application code has no reason to call it, and closing the connection out
+    from under a live subscription is not a capability this client otherwise
+    offers. *)
 
 val close : client -> unit
 val parse_integral_int64 : Yojson.Safe.t -> (int64, string) Stdlib.result

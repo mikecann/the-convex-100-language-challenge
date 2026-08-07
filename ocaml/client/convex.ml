@@ -589,10 +589,7 @@ let parse_header_line line =
       in
       if name = "" || not (String.for_all http_token_char name) then
         raise (Http_protocol "invalid HTTP header line");
-      if
-        String.exists
-          (fun char -> Char.code char < 0x20 && char <> '\t')
-          value
+      if String.exists (fun char -> Char.code char < 0x20 && char <> '\t') value
       then raise (Http_protocol "invalid HTTP header line");
       (String.lowercase_ascii name, value)
 
@@ -738,8 +735,7 @@ let read_http_response_until ?interrupt channel deadline =
 let http_call endpoint ~client_version ~auth_token ~timeout operation path args
     =
   protect_error ("HTTP " ^ operation) (fun () ->
-      if path = "" then
-        raise (Http_protocol "Convex function path is required");
+      if path = "" then raise (Http_protocol "Convex function path is required");
       let deadline = deadline_after timeout in
       let channel = open_channel ~deadline endpoint in
       Fun.protect
@@ -912,9 +908,11 @@ let base64_decode string =
 let sha1 message =
   let mask = 0xffffffff in
   let rotate value amount =
-    ((value lsl amount) lor (value lsr (32 - amount))) land mask
+    (value lsl amount) lor (value lsr (32 - amount)) land mask
   in
-  let state = [| 0x67452301; 0xefcdab89; 0x98badcfe; 0x10325476; 0xc3d2e1f0 |] in
+  let state =
+    [| 0x67452301; 0xefcdab89; 0x98badcfe; 0x10325476; 0xc3d2e1f0 |]
+  in
   let length = String.length message in
   (* One 0x80 byte, then zero padding, then the length in bits as a big-endian
      64-bit count, rounded up to whole 64-byte blocks. *)
@@ -943,7 +941,8 @@ let sha1 message =
     for index = 16 to 79 do
       words.(index) <-
         rotate
-          (words.(index - 3) lxor words.(index - 8)
+          (words.(index - 3)
+          lxor words.(index - 8)
           lxor words.(index - 14)
           lxor words.(index - 16))
           1
@@ -955,11 +954,10 @@ let sha1 message =
     let e = ref state.(4) in
     for index = 0 to 79 do
       let mixed, constant =
-        if index < 20 then
-          ((!b land !c) lor ((!b lxor mask) land !d), 0x5a827999)
+        if index < 20 then (!b land !c lor (!b lxor mask land !d), 0x5a827999)
         else if index < 40 then (!b lxor !c lxor !d, 0x6ed9eba1)
         else if index < 60 then
-          ((!b land !c) lor (!b land !d) lor (!c land !d), 0x8f1bbcdc)
+          (!b land !c lor (!b land !d) lor (!c land !d), 0x8f1bbcdc)
         else (!b lxor !c lxor !d, 0xca62c1d6)
       in
       let next =
@@ -1066,7 +1064,8 @@ let ws_fill ws deadline =
   ws.read_start <- 0;
   ws.read_length <-
     read_some_until ~interrupt:ws.interrupt ws.channel ws.read_buffer 0
-      (Bytes.length ws.read_buffer) deadline
+      (Bytes.length ws.read_buffer)
+      deadline
 
 (* True once bytes are sitting in [ws.read_buffer] unconsumed. A previous
    [ws_fill] can have pulled in more than the caller asked for, and that
@@ -1137,7 +1136,7 @@ let ws_read_frame ws timeout =
         raise
           (Websocket_protocol "WebSocket frame length was not minimally encoded");
       value)
-    else (
+    else
       let bytes = ws_read_exact ws 8 deadline in
       if Char.code (Bytes.get bytes 0) land 0x80 <> 0 then
         raise (Websocket_protocol "WebSocket frame length has its top bit set");
@@ -1153,7 +1152,7 @@ let ws_read_frame ws timeout =
           (Websocket_protocol "WebSocket frame length was not minimally encoded");
       if Int64.compare !value (Int64.of_int max_websocket_message) > 0 then
         raise (Websocket_protocol "WebSocket message exceeds 2097152 bytes");
-      Int64.to_int !value)
+      Int64.to_int !value
   in
   if length > max_websocket_message then
     raise (Websocket_protocol "WebSocket message exceeds 2097152 bytes");
@@ -1167,7 +1166,8 @@ let websocket_close_reason payload =
   let length = String.length payload in
   if length = 0 then "server close"
   else if length = 1 then
-    raise (Websocket_protocol "WebSocket close frame carried a one byte payload")
+    raise
+      (Websocket_protocol "WebSocket close frame carried a one byte payload")
   else
     let code = (Char.code payload.[0] lsl 8) lor Char.code payload.[1] in
     let permitted =
@@ -1245,7 +1245,8 @@ let validate_websocket_handshake ~key ~status ~headers =
   let required name =
     match single_header name headers with
     | Ok value -> value
-    | Error message -> raise (Websocket_protocol ("WebSocket handshake " ^ message))
+    | Error message ->
+        raise (Websocket_protocol ("WebSocket handshake " ^ message))
   in
   if String.lowercase_ascii (required "upgrade") <> "websocket" then
     raise
@@ -1383,7 +1384,8 @@ let json_footprint (json : J.t) =
         | `Null | `Bool _ -> walk (acc + 16) rest
         | `Int _ -> walk (acc + 24) rest
         | `Float _ -> walk (acc + 32) rest
-        | `String text | `Intlit text -> walk (acc + 32 + String.length text) rest
+        | `String text | `Intlit text ->
+            walk (acc + 32 + String.length text) rest
         | `List items | `Tuple items ->
             walk
               (acc + 24 + (24 * List.length items))
@@ -1449,8 +1451,7 @@ let prune_states_locked () =
       !live_queue_states
 
 let register_state state =
-  with_live_queue (fun () ->
-      live_queue_states := state :: !live_queue_states)
+  with_live_queue (fun () -> live_queue_states := state :: !live_queue_states)
 
 let drop_oldest_locked state =
   match state.queue with
@@ -1465,8 +1466,9 @@ let drop_oldest_locked state =
    behind current state anywhere in the client. *)
 let evict_locked () =
   let rec evict () =
-    if !live_queue_bytes > max_queue_bytes || !live_queue_items > max_queue_items
-    then (
+    if
+      !live_queue_bytes > max_queue_bytes || !live_queue_items > max_queue_items
+    then
       let oldest =
         List.fold_left
           (fun oldest state ->
@@ -1481,7 +1483,7 @@ let evict_locked () =
       | None -> ()
       | Some (state, _) ->
           drop_oldest_locked state;
-          evict ())
+          evict ()
   in
   evict ()
 
@@ -1900,13 +1902,15 @@ let live_owner (manager : live_manager) =
             {
               value = None;
               error =
-                Some (Function_error { operation = "query"; message; data; logs });
+                Some
+                  (Function_error { operation = "query"; message; data; logs });
               logs;
             }
           in
           `Applied (qid, update)
       | Some "QueryRemoved" -> `Removed qid
-      | Some other -> raise (Failure ("unknown Transition modification " ^ other))
+      | Some other ->
+          raise (Failure ("unknown Transition modification " ^ other))
       | None -> raise (Failure "Transition modification omitted type")
     in
     let actions = List.map action_of modifications in

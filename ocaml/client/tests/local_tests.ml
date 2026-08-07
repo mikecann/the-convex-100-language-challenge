@@ -266,10 +266,7 @@ let test_http_framing () =
     "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" ^ unframed_body
   in
   let both_framings =
-    "HTTP/1.1 200 OK\r\n\
-     Content-Length: 2\r\n\
-     Transfer-Encoding: chunked\r\n\
-     \r\n"
+    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n"
   in
   let conflicting_lengths =
     "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nok"
@@ -291,8 +288,7 @@ let test_http_framing () =
       (match Convex.query client "tests:chunked" (`Assoc []) with
       | Ok { value = `Assoc [ ("framing", `String "chunked") ]; logs = [] } ->
           ()
-      | Ok result ->
-          fail ("chunked body decoded to " ^ J.to_string result.value)
+      | Ok result -> fail ("chunked body decoded to " ^ J.to_string result.value)
       | Error error -> fail (Convex.error_message error));
       (match Convex.query client "tests:unframed" (`Assoc []) with
       | Ok { value = `Assoc [ ("framing", `String "eof") ]; logs = [] } -> ()
@@ -328,9 +324,7 @@ let test_http_header_lines () =
     "HTTP/1.1 200 OK\r\nContent Length: 2\r\nConnection: close\r\n\r\nok"
   in
   let empty_name = "HTTP/1.1 200 OK\r\n: 2\r\nConnection: close\r\n\r\nok" in
-  let folded =
-    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\tfolded\r\n\r\nok"
-  in
+  let folded = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\tfolded\r\n\r\nok" in
   with_scripted_http ~scheme:"http" ~timeout:2.0
     [
       Plain_chunks ([ no_colon ], 0.0);
@@ -488,7 +482,7 @@ let frame_bytes ?(fin = true) ?(rsv = 0) ?(masked = false) ?(length_form = 0)
   let length = String.length payload in
   let buffer = Buffer.create (length + 14) in
   Buffer.add_char buffer
-    (Char.chr (((if fin then 0x80 else 0) lor (rsv lsl 4) lor opcode) land 255));
+    (Char.chr ((if fin then 0x80 else 0) lor (rsv lsl 4) lor opcode land 255));
   let mask_bit = if masked then 0x80 else 0 in
   let form =
     if length_form <> 0 then length_form
@@ -558,7 +552,9 @@ let accept_response key =
   "HTTP/1.1 101 Switching Protocols\r\n\
    Upgrade: websocket\r\n\
    Connection: Upgrade\r\n\
-   Sec-WebSocket-Accept: " ^ Convex.websocket_accept_key key ^ "\r\n\r\n"
+   Sec-WebSocket-Accept: "
+  ^ Convex.websocket_accept_key key
+  ^ "\r\n\r\n"
 
 (* [response] receives the client's Sec-WebSocket-Key so a turn can answer with
    a genuinely correct accept value, a deliberately wrong one, or a response
@@ -718,25 +714,26 @@ let test_websocket_handshake_validation () =
         let subscription = subscribe_live client in
         expect_live_value label subscription 15.0 good_value)
   in
-  let wrong_accept =
-    Convex.websocket_accept_key "AAECAwQFBgcICQoLDA0ODw=="
-  in
+  let wrong_accept = Convex.websocket_accept_key "AAECAwQFBgcICQoLDA0ODw==" in
   reject_then_recover "non-101 handshake"
     "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
   reject_then_recover "wrong Upgrade target"
     "HTTP/1.1 101 Switching Protocols\r\n\
      Upgrade: h2c\r\n\
      Connection: Upgrade\r\n\
-     Sec-WebSocket-Accept: ignored\r\n\r\n";
+     Sec-WebSocket-Accept: ignored\r\n\
+     \r\n";
   reject_then_recover "Connection without the Upgrade token"
     "HTTP/1.1 101 Switching Protocols\r\n\
      Upgrade: websocket\r\n\
      Connection: keep-alive\r\n\
-     Sec-WebSocket-Accept: ignored\r\n\r\n";
+     Sec-WebSocket-Accept: ignored\r\n\
+     \r\n";
   reject_then_recover "absent accept"
     "HTTP/1.1 101 Switching Protocols\r\n\
      Upgrade: websocket\r\n\
-     Connection: Upgrade\r\n\r\n";
+     Connection: Upgrade\r\n\
+     \r\n";
   reject_then_recover "accept for another key"
     ("HTTP/1.1 101 Switching Protocols\r\n\
       Upgrade: websocket\r\n\
@@ -747,12 +744,14 @@ let test_websocket_handshake_validation () =
      Upgrade: websocket\r\n\
      Connection: Upgrade\r\n\
      Sec-WebSocket-Extensions: permessage-deflate\r\n\
-     Sec-WebSocket-Accept: ignored\r\n\r\n";
+     Sec-WebSocket-Accept: ignored\r\n\
+     \r\n";
   reject_then_recover "framed 101"
     "HTTP/1.1 101 Switching Protocols\r\n\
      Upgrade: websocket\r\n\
      Connection: Upgrade\r\n\
-     Content-Length: 0\r\n\r\n"
+     Content-Length: 0\r\n\
+     \r\n"
 
 (* The positive half of the same rule. Header names and the Upgrade value are
    case insensitive and Connection is a token list, so a correct server that
@@ -766,7 +765,9 @@ let test_websocket_handshake_accepts_case_and_tokens () =
         "HTTP/1.1 101 Switching Protocols\r\n\
          upgrade: WebSocket\r\n\
          connection: keep-alive, UPGRADE\r\n\
-         SEC-WEBSOCKET-ACCEPT: " ^ Convex.websocket_accept_key key ^ "\r\n\r\n")
+         SEC-WEBSOCKET-ACCEPT: "
+        ^ Convex.websocket_accept_key key
+        ^ "\r\n\r\n")
       [ good_transition ]
   in
   List.iter
@@ -780,7 +781,12 @@ let test_websocket_frame_validation () =
   let reject_then_recover label frames expected =
     with_live_fixture
       [
-        { response = accept_response; client_frames = 2; send = frames; linger = 0.4 };
+        {
+          response = accept_response;
+          client_frames = 2;
+          send = frames;
+          linger = 0.4;
+        };
         accepted_turn [ good_transition ];
       ]
       (fun client ->
@@ -794,7 +800,8 @@ let test_websocket_frame_validation () =
   reject_then_recover "masked server frame"
     [ frame_bytes ~masked:true 1 "{}" ]
     "WebSocket server frame was masked";
-  reject_then_recover "reserved opcode" [ frame_bytes 3 "" ]
+  reject_then_recover "reserved opcode"
+    [ frame_bytes 3 "" ]
     "WebSocket frame used a reserved opcode";
   reject_then_recover "fragmented control frame"
     [ frame_bytes ~fin:false 9 "x" ]
@@ -808,21 +815,26 @@ let test_websocket_frame_validation () =
   reject_then_recover "non-minimal 64-bit length"
     [ frame_bytes ~length_form:8 1 (String.make 200 'x') ]
     "WebSocket frame length was not minimally encoded";
-  reject_then_recover "one byte close payload" [ frame_bytes 8 "\003" ]
+  reject_then_recover "one byte close payload"
+    [ frame_bytes 8 "\003" ]
     "WebSocket close frame carried a one byte payload";
-  reject_then_recover "invalid close code" [ frame_bytes 8 "\003\237" ]
+  reject_then_recover "invalid close code"
+    [ frame_bytes 8 "\003\237" ]
     "WebSocket close frame used an invalid code";
   reject_then_recover "close reason that is not UTF-8"
     [ frame_bytes 8 "\003\232\255" ]
     "WebSocket close reason was not valid UTF-8";
-  reject_then_recover "text that is not UTF-8" [ frame_bytes 1 "\255\254" ]
+  reject_then_recover "text that is not UTF-8"
+    [ frame_bytes 1 "\255\254" ]
     "WebSocket text message was not valid UTF-8";
-  reject_then_recover "unexpected continuation" [ frame_bytes 0 "abc" ]
+  reject_then_recover "unexpected continuation"
+    [ frame_bytes 0 "abc" ]
     "unexpected WebSocket continuation";
   reject_then_recover "interleaved data frame"
     [ frame_bytes ~fin:false 1 "{"; frame_bytes 1 "{}" ]
     "WebSocket data frame interrupted a fragmented message";
-  reject_then_recover "binary opcode" [ frame_bytes 2 "\000" ]
+  reject_then_recover "binary opcode"
+    [ frame_bytes 2 "\000" ]
     "unsupported WebSocket opcode"
 
 (* Each of these frames is inside the per-frame limit. Together they are not,
@@ -892,8 +904,7 @@ let test_unknown_query_id () =
       let subscription = subscribe_live client in
       expect_live_error_containing "unknown query id" subscription
         "Transition names unknown query 99";
-      expect_live_value "unknown query id recovery" subscription 15.0
-        good_value)
+      expect_live_value "unknown query id recovery" subscription 15.0 good_value)
 
 (* Five refused handshakes drive the reconnect delay up to seconds. The
    connection after them is healthy, so the delay that follows *it* must start
@@ -902,7 +913,8 @@ let test_backoff_resets_after_handshake () =
   let refusal =
     "HTTP/1.1 503 Service Unavailable\r\n\
      Content-Length: 0\r\n\
-     Connection: close\r\n\r\n"
+     Connection: close\r\n\
+     \r\n"
   in
   let second_value = `Assoc [ ("count", `Int 1) ] in
   with_live_fixture

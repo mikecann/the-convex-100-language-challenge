@@ -185,7 +185,9 @@ let write_line writer line =
       let remaining = deadline -. monotonic_now () in
       if remaining <= 0.0 then false
       else
-        match Unix.single_write writer.w_fd bytes position (total - position) with
+        match
+          Unix.single_write writer.w_fd bytes position (total - position)
+        with
         | 0 -> false
         | count ->
             if position + count < total then partial := true;
@@ -589,8 +591,7 @@ let serve reader writer =
         | Some json -> (
             match parse_command json with
             | Error (id, message) ->
-                emit writer
-                  (error_event ?id (Convex.Protocol_error message))
+                emit writer (error_event ?id (Convex.Protocol_error message))
             | Ok (Hello id) ->
                 emit writer
                   (`Assoc
