@@ -29,4 +29,6 @@ limitations:
   - Live authentication and WebSocket mutations/actions are deferred.
   - The undocumented sync profile is pinned and may drift.
   - Each subscription holds its newest 16 updates; a slow consumer loses oldest intermediate updates.
-capabilities: []
+capabilities:
+  - http
+  - live

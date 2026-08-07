@@ -15,8 +15,8 @@ The block is generated from that exact runnable source.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Awaiting shared verification | Native JSON query, mutation, action, bearer auth, logs, and structured errors. |
-| Live | Awaiting shared verification | Native WebSocket query-set Add/Remove, reconnect, recovery, and clean close. |
+| HTTP | Verified by shared local and hosted conformance | Native JSON query, mutation, action, bearer auth, logs, and structured errors. |
+| Live | Verified by shared local and hosted conformance | Native WebSocket query-set Add/Remove, reconnect, recovery, and clean close. |
 
 No badge is earned until local and hosted black-box verification passes.
 

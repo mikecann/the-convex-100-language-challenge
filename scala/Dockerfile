@@ -20,7 +20,7 @@ RUN cd client && \
 RUN java -cp client/target/classes:client/target/scala-client-0.1.0-all.jar convex.LiveAcceptanceTests && \
     mkdir -p /work/out/adapter /work/out/example && \
     cp examples/basics/Main.scala /work/out/canonical-example.scala && \
-    sed -n '/^```text$/,/^```$/p' README.md | sed '1d;$d' > /tmp/readme-example.scala && \
+    sed -n '/^```scala$/,/^```$/p' README.md | sed '1d;$d' > /tmp/readme-example.scala && \
     cmp examples/basics/Main.scala /tmp/readme-example.scala && \
     cd client/target/classes && \
     find convex -maxdepth 1 -type f -name 'Adapter*.class' -exec cp --parents '{}' /work/out/adapter ';' && \

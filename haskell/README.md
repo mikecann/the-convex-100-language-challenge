@@ -12,8 +12,8 @@ It is an educational, unofficial experiment, not a production SDK or a package i
 
 | Capability | Status |
 | --- | --- |
-| JSON HTTP queries, mutations, and actions | Implemented locally, unearned pending shared evidence |
-| Pinned Live query protocol | Implemented locally, unearned pending shared evidence |
+| JSON HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
+| Pinned Live query protocol | Verified by shared local and hosted conformance |
 | Production SDK compatibility | Not claimed |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.hs -->
