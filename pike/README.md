@@ -38,7 +38,7 @@ HTTP, RFC 6455, the Live sync state machine, and the client facade.
 ## The basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.pike -->
-```text
+```pike
 #!/usr/local/bin/pike
 
 // Convex from Pike: read a shared counter over HTTP, watch the same query over
@@ -75,6 +75,11 @@ string client_source()
 int room_count(object convex, mixed state, string what)
 {
   mapping room_state = convex->require_object(state, what);
+  // Pike's `->` on a mapping returns 0 for a missing key, which is also a
+  // legitimate count, so absence has to be checked before extraction can
+  // treat a bare 0 as meaningful.
+  if (zero_type(room_state->count))
+    throw(convex->protocol_error(what + " state is missing its count field"));
   return convex->require_whole_number(room_state->count, what + " count");
 }
 

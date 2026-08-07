@@ -100,6 +100,33 @@ WORKDIR /
 # Build the runtime closure from the package database rather than from a guessed
 # module path: every regular file pike8.0-core installed, the interpreter, and
 # the shared libraries the interpreter and its dynamic modules actually load.
+#
+# Debian ships most runtime .so files as a SONAME symlink (e.g.
+# libgmp.so.10 -> libgmp.so.10.4.1) rather than a plain regular file. ldd
+# reports the SONAME path, never the versioned file behind it, so the naive
+# `cp -a --parents "$library" "$root"` used to copy only the symlink: the
+# runtime image ended up with a dangling libgmp.so.10 -> libgmp.so.10.4.1
+# link whose target was never copied, and the dynamic loader failed with
+# "cannot open shared object file" for the first NEEDED entry it walked
+# (libgmp, ahead of libm/libcrypt/libc in pike8.0's DT_NEEDED order) even
+# though most of this closure's libraries -- libcom_err, libcrypt, libgssapi_krb5,
+# libhogweed, libk5crypto, libkeyutils, libkrb5, libkrb5support, libnettle,
+# libnsl, libtirpc -- are symlinks with exactly the same defect and would have
+# failed the same way once gmp was "fixed" by hand. `cp -aL` dereferences the
+# symlink and copies the real bytes to the SONAME path instead, so the file
+# the loader opens is never a link to something absent. The dangling-symlink
+# assertion below makes that correct by construction: if a future package
+# bump reintroduces a broken link anywhere in the closure, this stage fails
+# loudly instead of shipping a runtime image that only fails at `pike -e`.
+#
+# The module scan also has to run ldd one file at a time (`-exec ldd {} \;`,
+# not the batched `-exec ldd {} +`): given more than one path in a single
+# invocation, ldd prints a "path:" header before each file's own dependency
+# list, and that header line is itself an absolute path followed by a colon --
+# exactly the shape the awk below treats as a library to copy. Batched, that
+# copied each pike8.0 module's own already-installed path a second time under
+# $root's own path (producing a nested /runtime-root/runtime-root/... tree in
+# the final image); one file per ldd invocation never emits a header at all.
 RUN set -eu; \
     root=/runtime-root; \
     mkdir -p "$root/usr/local/bin" "$root/opt/convex/client"; \
@@ -108,13 +135,18 @@ RUN set -eu; \
     done; \
     ln -s /usr/bin/pike8.0 "$root/usr/local/bin/pike"; \
     { ldd /usr/bin/pike8.0; \
-      find "$root" -name '*.so' -type f -exec ldd {} + 2>/dev/null || true; } \
+      find "$root" -name '*.so' -type f -exec ldd {} \; 2>/dev/null || true; } \
       | awk '{ if ($3 ~ /^\//) print $3; \
                if ($1 ~ /^\//) { p = $1; sub(/:$/, "", p); print p } }' \
       | sort -u \
       | while IFS= read -r library; do \
-          if [ -f "$library" ]; then cp -a --parents "$library" "$root"; fi; \
+          if [ -f "$library" ]; then cp -aL --parents "$library" "$root"; fi; \
         done; \
+    test -z "$(find "$root" \( -name '*.so' -o -name '*.so.*' \) \
+                    -xtype l -print -quit)" \
+      || { echo "runtime closure has a dangling shared-library symlink:" >&2; \
+           find "$root" \( -name '*.so' -o -name '*.so.*' \) -xtype l; \
+           exit 1; }; \
     cp -a --parents /etc/ssl "$root"; \
     cp -a --parents /usr/share/ca-certificates "$root"; \
     for config in /etc/nsswitch.conf /etc/host.conf /etc/gai.conf; do \

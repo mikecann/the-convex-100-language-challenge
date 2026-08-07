@@ -157,6 +157,41 @@ array(string) pem_certificates(string bundle)
 
 object cached_tls_context;
 
+// The OS CA bundle is generated once and then frozen inside whatever image
+// ships this client, so by the time that image actually runs, some of its
+// legacy roots (long-lived cross-signing roots such as "Baltimore CyberTrust
+// Root" are the common case) have already gone past their own notAfter, and a
+// handful of older roots never carried a keyUsage/basicConstraints extension
+// modern profiles expect. SSL.Context()->set_trusted_issuers() runs both
+// checks -- chain self-verification, then "is this leaf actually allowed to
+// sign other certificates" -- against every chain it is handed, and aborts
+// installing the entire trust store the moment ONE chain fails either check.
+// A single stale or underspecified root would otherwise silently take out
+// every other, still-good root with it instead of just itself. Run the exact
+// same two checks up front, per candidate and isolated from the others, so
+// only the roots this build can actually use ever reach the trust store.
+array(string) verifiable_authorities(array(string) authorities)
+{
+  array(string) usable = ({});
+  foreach (authorities, string der) {
+    int accepted = 0;
+    mixed failure = catch {
+      mapping result =
+        Standards.X509.verify_certificate_chain(({ der }), ([]), 0);
+      if (result->verified) {
+        object cert = result->certificates[-1];
+        accepted = cert->ext_basicConstraints_cA &&
+          (cert->ext_keyUsage & Standards.X509.KU_keyCertSign);
+      }
+    };
+    // A certificate this build cannot even decode is exactly as unusable as
+    // one that fails either check outright; either way it is left out.
+    if (accepted)
+      usable += ({ der });
+  }
+  return usable;
+}
+
 // Pike spells "trust exactly these DER certificate authorities" differently
 // across releases. Probe the context's own identifiers instead of guessing, and
 // refuse to open a TLS connection at all if no known spelling is present: an
@@ -205,6 +240,10 @@ object tls_context(void|string bundle_path)
   if (!sizeof(authorities))
     throw(transport_error("CA bundle " + path + " contains no certificates",
                           "tls"));
+  authorities = verifiable_authorities(authorities);
+  if (!sizeof(authorities))
+    throw(transport_error("CA bundle " + path +
+                          " has no certificate this build can verify", "tls"));
   object context = SSL.Context();
   install_authorities(context, authorities);
   cached_tls_context = context;
@@ -315,6 +354,12 @@ class SocketChannel
   string failure = "";
   int announced;
 
+  // Candidates still to try, most preferred first, drained one at a time by
+  // try_next_candidate(). The plain host is always the last entry, so a
+  // literal address or an IPv6-only name still resolves exactly the way it
+  // did before any of this existed.
+  array(string) pending_addresses;
+
   protected void create(string connect_host, int connect_port, int use_tls,
                         void|string bundle_path)
   {
@@ -322,11 +367,53 @@ class SocketChannel
     port = connect_port;
     want_tls = use_tls;
     ca_bundle_path = bundle_path || DEFAULT_CA_BUNDLE;
+    // Some networks advertise an AAAA record for a dual-stack host without
+    // actually routing IPv6 traffic -- a plain Docker bridge network is
+    // exactly this shape. async_connect(host, ...) resolves the hostname
+    // itself and, per the platform resolver's address ordering, can pick
+    // that unreachable address and give up instead of falling back to a
+    // working one. Resolve the A records ourselves first and try each in
+    // turn before ever falling back to async_connect's own hostname
+    // resolution as the last candidate.
+    pending_addresses = ipv4_candidates(host) + ({ host });
+    try_next_candidate();
+  }
+
+  // gethostbyname() is Pike's legacy, IPv4-only resolver: it never returns
+  // an AAAA record, so every address it hands back is one async_connect can
+  // reach even from a network namespace with no IPv6 route at all. Anything
+  // that keeps it from answering -- an IPv6-only name, a literal address it
+  // does not parse, a resolver error -- yields an empty list rather than an
+  // exception, leaving the plain hostname as the sole, original candidate.
+  array(string) ipv4_candidates(string name)
+  {
+    array(string) addresses = ({});
+    catch {
+      array info = gethostbyname(name);
+      if (info && sizeof(info) >= 2 && arrayp(info[1]))
+        addresses = info[1];
+    };
+    return addresses;
+  }
+
+  // Pop the next candidate address and attempt it. Exhausting the list
+  // (the plain host, tried last, already failed too) is reported the same
+  // way a single failed attempt always was.
+  void try_next_candidate()
+  {
+    if (!sizeof(pending_addresses)) {
+      die(sprintf("could not connect to %s:%d", host, port));
+      return;
+    }
+    string candidate = pending_addresses[0];
+    pending_addresses = pending_addresses[1..];
     raw = Stdio.File();
-    mixed failed = catch { raw->async_connect(host, port, tcp_connected); };
+    mixed failed =
+      catch { raw->async_connect(candidate, port, tcp_connected); };
+    // A synchronous throw for this candidate is exactly as unusable as an
+    // async failure callback; move on to the next candidate the same way.
     if (failed)
-      die(sprintf("connect to %s:%d failed: %s", host, port,
-                  as_convex_error(failed)->message));
+      tcp_connected(0);
   }
 
   // Whoever installs handlers also inherits a close that already happened. A
@@ -352,7 +439,7 @@ class SocketChannel
     if (dead)
       return;
     if (!success) {
-      die(sprintf("could not connect to %s:%d", host, port));
+      try_next_candidate();
       return;
     }
     mixed failed = catch {
