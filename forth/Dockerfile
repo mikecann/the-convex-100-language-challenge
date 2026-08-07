@@ -162,6 +162,12 @@ RUN set -eu; \
 # "No such file or directory" for some trees (observed on /usr/share/gforth)
 # despite the source existing, seemingly while trying to preserve attributes
 # on a parent it mis-resolves as relative.
+#
+# /usr/lib/gforth holds only the architecture-independent site-forth
+# directory; the interpreter's actual core VM image, gforth.fi, lives under
+# the architecture-specific /usr/lib/x86_64-linux-gnu/gforth instead, so that
+# tree needs its own explicit copy or the runtime image has a gforth binary
+# with no image to load.
 RUN set -eu; \
     mkdir -p /closure/bin /closure/usr/bin /closure/usr/local/bin \
              /closure/usr/local/lib/convex-forth /closure/etc/ssl/certs \
@@ -178,6 +184,7 @@ RUN set -eu; \
     mkdir -p /closure/usr/lib /closure/usr/share /closure/home; \
     cp -a /usr/lib/gforth /closure/usr/lib/; \
     cp -a /usr/share/gforth /closure/usr/share/; \
+    cp -a /usr/lib/x86_64-linux-gnu/gforth /closure/usr/lib/x86_64-linux-gnu/; \
     cp -a /home/convex /closure/home/; \
     cp -aL /etc/ssl/certs/ca-certificates.crt /closure/etc/ssl/certs/; \
     cp -aL /etc/ssl/openssl.cnf /closure/etc/ssl/openssl.cnf; \
