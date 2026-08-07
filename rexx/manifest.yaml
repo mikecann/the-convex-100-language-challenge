@@ -1,0 +1,76 @@
+schemaVersion: 1
+id: rexx
+displayName: "Rexx"
+rank: 42
+selectionTier: ranked
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Regina Rexx implementation of the Convex HTTP API and the pinned
+    /api/sync protocol. JSON encoding and decoding, HTTP request/response
+    handling, RFC 6455 WebSocket framing and masking, SHA-1 and base64 for
+    the WebSocket handshake, and the full sync state machine (Connect,
+    ModifyQuerySet, Transition, reconnect with exponential backoff, dedup)
+    are all written in Rexx. Classic Rexx has no sockets or TLS, so a small
+    C shim (client/shim.c, ~330 lines) supplies only raw byte transport --
+    connect/listen/accept/send/recv/close and the OpenSSL TLS handshake --
+    loaded with RXFUNCADD, the same mechanism Regina's own built-in
+    packages (regutil, rxmath) use to reach the C library. Deterministic
+    language-local tests (client/tests/selftest_test.rexx for the JSON/
+    crypto/framing/HTTP-classification/state-surgery pure functions, plus
+    real loopback fixtures in client/tests/fixtures/ for HTTP and Live
+    including a debugDisconnect-triggered reconnect and a
+    QueryFailed-then-recovery cycle) pass locally in Docker. Shared local
+    and hosted conformance have not run yet, so no capability badge is
+    claimed.
+toolchain:
+  name: Regina Rexx
+  version: 3.6-2.4
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    Language-local Docker tests (selftest, HTTP loopback, and Live loopback
+    against real fixture sockets) pass from a clean build; shared local and
+    hosted black-box conformance have not been run yet, so the capability
+    list below reflects no earned badges rather than an evaluator award.
+  - >-
+    Classic Rexx's CALL statement has no variable indirection (no "call
+    whatever this variable names"), so every caller of the client library
+    addresses it by one fixed installed path, /opt/convex/client/convex.rexx,
+    rather than a configurable client handle.
+  - >-
+    Live authentication, WebSocket-issued mutations and actions, journals,
+    and TransitionChunk assembly are deferred; receiving a TransitionChunk
+    is reported as protocol drift and the connection reconnects.
+  - >-
+    A WebSocket message is assumed to arrive as a single unfragmented frame;
+    a genuinely fragmented (multi-frame) message is not reassembled and is
+    treated as an unsupported opcode, forcing a reconnect.
+  - >-
+    Reconnect backoff and the partial-frame abandonment deadline are timed
+    with wall-clock milliseconds since midnight (Rexx's TIME('E') resets on
+    every separate external CALL, so it cannot time anything spanning more
+    than one call into convex.rexx); a run that straddles local midnight
+    could see one incorrect backoff interval.
+  - >-
+    The C shim is deliberately narrow: raw connect/listen/accept/send/recv/
+    close and the OpenSSL handshake only. No Convex, HTTP, JSON, or
+    WebSocket behaviour lives in C.
+capabilities:
+  - http
+  - live
