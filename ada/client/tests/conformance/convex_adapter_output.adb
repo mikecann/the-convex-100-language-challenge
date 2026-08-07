@@ -367,15 +367,19 @@ package body Convex_Adapter_Output is
       end if;
    end Set_Nonblocking;
 
-   function Write_Bounded
-     (FD : Interfaces.C.int; Line : String; TCP : Boolean) return Boolean
+   --  Poll-and-write one bounded slice against the shared Deadline, without
+   --  ever copying it. Data is addressed directly (Data'Address plus a
+   --  cursor); no local buffer here scales with a caller-supplied line, so
+   --  this never grows the task's stack usage with the size of a delivery.
+   function Write_Slice
+     (FD       : Interfaces.C.int;
+      Data     : String;
+      TCP      : Boolean;
+      Deadline : Ada.Real_Time.Time) return Boolean
    is
-      Payload  : aliased constant String := Line & ASCII.LF;
-      Cursor   : Natural := 0;
-      Deadline : constant Ada.Real_Time.Time :=
-        Ada.Real_Time.Clock + Ada.Real_Time.To_Time_Span (Write_Deadline);
+      Cursor : Natural := 0;
    begin
-      while Cursor < Payload'Length loop
+      while Cursor < Data'Length loop
          if Ada.Real_Time.Clock >= Deadline then
             return False;
          end if;
@@ -398,14 +402,14 @@ package body Convex_Adapter_Output is
                      then
                        C_Send
                          (FD,
-                          Payload (Payload'First + Cursor)'Address,
-                          Interfaces.C.size_t (Payload'Length - Cursor),
+                          Data (Data'First + Cursor)'Address,
+                          Interfaces.C.size_t (Data'Length - Cursor),
                           Message_Dont_Wait + Message_No_Signal)
                      else
                        C_Write
                          (FD,
-                          Payload (Payload'First + Cursor)'Address,
-                          Interfaces.C.size_t (Payload'Length - Cursor)));
+                          Data (Data'First + Cursor)'Address,
+                          Interfaces.C.size_t (Data'Length - Cursor)));
                begin
                   if Written > 0 then
                      Cursor := Cursor + Natural (Written);
@@ -415,18 +419,36 @@ package body Convex_Adapter_Output is
          end;
       end loop;
       return True;
+   end Write_Slice;
+
+   --  Line's own bytes are written first, directly out of the caller's
+   --  String; the ASCII.LF terminator is a second, one-byte slice. Splitting
+   --  it this way is deliberate: the previous `Line & ASCII.LF` local
+   --  concatenation held a full copy of the line on this task's stack, and
+   --  for a delivery near the client's four-megabyte message ceiling that is
+   --  exactly the failure mode Convex.Live.Owner_Task's own Storage_Size
+   --  comment warns about. Neither slice here scales with Line's length.
+   function Write_Bounded
+     (FD : Interfaces.C.int; Line : String; TCP : Boolean) return Boolean
+   is
+      Deadline : constant Ada.Real_Time.Time :=
+        Ada.Real_Time.Clock + Ada.Real_Time.To_Time_Span (Write_Deadline);
+      Newline  : aliased constant String := [1 => ASCII.LF];
+   begin
+      return
+        Write_Slice (FD, Line, TCP, Deadline)
+        and then Write_Slice (FD, Newline, TCP, Deadline);
    end Write_Bounded;
 
-   --  Write_Bounded's local Payload is Line & ASCII.LF, and Line may hold a
-   --  Live delivery close to the client's four-megabyte message ceiling (up
-   --  to Max_Line_Bytes, several megabytes). That concatenation lives on
-   --  this task's own stack, so the default is not an option here for the
-   --  same reason Convex.Live.Owner_Task states explicitly: the failure mode
-   --  of a default that is too small is Storage_Error on exactly the largest
-   --  valid values, which is precisely what a near-ceiling Live delivery hit
-   --  with no Storage_Size clause at all.
+   --  Write_Slice addresses Line directly instead of copying it onto this
+   --  stack (see its own comment), so nothing here scales with a delivery
+   --  that may be several megabytes wide. A small explicit size is still
+   --  given rather than inheriting the runtime default, so this is a
+   --  deliberate bound rather than whatever happens to be enough today: the
+   --  locals actually placed on this stack are a handful of small records
+   --  and scalars per poll/write iteration, not the line itself.
    task Writer
-     with Storage_Size => 16 * 1024 * 1024;
+     with Storage_Size => 256 * 1024;
 
    task body Writer is
       Item       : Output_Item;
