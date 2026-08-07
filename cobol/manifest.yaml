@@ -4,5 +4,52 @@ displayName: "COBOL"
 rank: 27
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native GnuCOBOL client. JSON, HTTP/1.1 framing, the RFC 6455
+    WebSocket layer, and all Convex protocol behaviour are implemented
+    in COBOL. A reviewed native extension (client/convex-native.c)
+    supplies only what the COBOL runtime cannot: a monotonic clock, a
+    CSPRNG, a SHA-1 digest, and deadline-aware TCP and TLS stream I/O.
+    Source is complete but has never been compiled or executed; no
+    Docker evidence exists yet.
+toolchain:
+  name: GnuCOBOL
+  version: 4.0~early~20200606-6+b1
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Never compiled or run. Every capability is unearned until the
+    Docker test, example, and conformance gates pass.
+  - COBOL has no threads, so the client is a cooperative single owner
+    rather than a worker plus mutexes. The caller drives the transport
+    by calling cvx-live-pump; nothing else touches the socket.
+  - Each subscription retains the newest 16 updates across the client
+    and drops the oldest when a consumer is slow.
+  - Live authentication, WebSocket mutations and actions, optimistic
+    updates, and mutation replay are deferred.
+  - TransitionChunk assembly is deferred and treated as profile drift
+    that retires the connection.
+  - Live values cover the JSON-safe subset; tagged Convex value types
+    are deferred.
+  - JSON numbers in exponent form round-trip verbatim but are not
+    reduced to integers.
+  - A stopped controller stalls the adapter. Events are written
+    synchronously with no output queue, so backpressure lands in the
+    kernel pipe; this is deliberate, and the accounting test asserts
+    it rather than working around it.
 capabilities: []
