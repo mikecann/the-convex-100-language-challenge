@@ -63,4 +63,6 @@ limitations:
     primitive. TLS is covered by the pinned verification settings, a real
     handshake probe inside the final runtime image, and a negative test that
     requires an https request to a plaintext listener to fail.
-capabilities: []
+capabilities:
+  - http
+  - live

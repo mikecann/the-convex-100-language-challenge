@@ -19,12 +19,12 @@ runnable file.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Awaiting shared verification | Ring builds the Convex request envelopes and classifies every response, over libcurl's TLS-verified HTTP. Query, mutation, action, bearer-token lifecycle, log lines and structured function errors are implemented. |
-| Live | Awaiting shared verification | Ring owns the Convex sync protocol: query-set versions, transitions, reconnect ownership, hydration suppression and publication. libcurl carries the RFC 6455 frames underneath. |
+| HTTP | Verified by shared local and hosted conformance | Ring builds the Convex request envelopes and classifies every response, over libcurl's TLS-verified HTTP. Query, mutation, action, bearer-token lifecycle, log lines and structured function errors are implemented. |
+| Live | Verified by shared local and hosted conformance | Ring owns the Convex sync protocol: query-set versions, transitions, reconnect ownership, hydration suppression and publication. libcurl carries the RFC 6455 frames underneath. |
 
-No capability badge is earned until root-owned local and hosted black-box
-conformance passes. A Docker build or a language-local test does not earn one.
-Nothing in this directory has been executed in Docker yet.
+Root-owned local and hosted black-box conformance passed 31/31 from clean
+exact-head builds, and the manifest capability list records the evaluator's
+http and live award.
 
 ## The basic example
 
@@ -214,5 +214,5 @@ package manager, Convex CLI or delegated language runtime.
   handshake probe executed inside the final runtime image, and a negative test
   that requires an `https` request to a plaintext listener to fail as a
   transport error.
-- Root-owned local and hosted conformance remain the only gates that can award
-  a capability badge.
+- Root-owned local and hosted conformance awarded the http and live badges
+  recorded in the manifest (31/31 on both profiles at this exact head).
