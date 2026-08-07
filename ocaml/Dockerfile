@@ -34,8 +34,18 @@ RUN /out-adapter <<'EOF'
 EOF
 
 FROM --platform=linux/amd64 debian@sha256:34cd9e9fd437c0a095ec39cb2e73422c9f30821b0d0848ed74fd0d43bae4d958 AS runtime-base
+# apt-get install completes, including every postinst hook the ca-certificates
+# package runs, before any of this image's own cleanup begins. Debian's base
+# rootfs carries perl-base regardless of what gets installed on top of it, and
+# nothing in this image's entrypoint is a perl script, so it is deleted here
+# by file rather than through apt: purging an Essential package can refuse or
+# cascade, and dpkg is being removed in the same layer anyway and will never
+# run again to care whether its database still agrees with the filesystem.
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 libffi8 && \
     rm -rf /var/lib/apt/lists/* /usr/bin/apt* /usr/bin/dpkg* /usr/sbin/update-ca-certificates && \
+    rm -rf /usr/bin/perl* /usr/lib/*/perl* /usr/share/perl* /etc/perl \
+           /usr/share/doc/* /usr/share/man/* /usr/share/info/* \
+           /var/lib/dpkg /var/cache/debconf && \
     groupadd --system --gid 65532 convex && useradd --system --uid 65532 --gid 65532 --no-create-home convex
 USER 65532:65532
 # The build stage working proves nothing about the minimal image: it has its own
@@ -45,7 +55,8 @@ RUN test "$(uname -m)" = x86_64 \
     && test "$(id -u):$(id -g)" = 65532:65532 \
     && test -s /etc/ssl/certs/ca-certificates.crt \
     && for command_name in ocaml ocamlfind ocamlopt dune opam gcc cc clang make \
-         cmake apt apt-get dpkg curl wget node python python3 npm pip convex; do \
+         cmake apt apt-get dpkg curl wget node python python3 npm pip convex \
+         perl perl5 cpan; do \
          ! command -v "$command_name" >/dev/null 2>&1 || exit 1; \
        done
 

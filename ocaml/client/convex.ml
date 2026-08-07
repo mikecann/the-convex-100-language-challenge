@@ -46,6 +46,68 @@ exception Http_protocol of string
 exception Websocket_closed of string
 exception Websocket_protocol of string
 
+(* The socket owner reports a failed frame or handshake by turning the escaping
+   exception into a ProtocolError message with [Printexc.to_string]. Without
+   these printers a subscriber would receive the OCaml constructor spelling
+   instead of the protocol rule that was actually broken. *)
+let () =
+  Printexc.register_printer (function
+    | Http_protocol message -> Some message
+    | Websocket_protocol message -> Some message
+    | Websocket_closed reason -> Some ("WebSocket closed: " ^ reason)
+    | _ -> None)
+
+(* Convex strings, the sync protocol, and the adapter schema all count Unicode
+   characters rather than bytes, and RFC 6455 requires text frames and close
+   reasons to be well-formed UTF-8. This returns the scalar count of a valid
+   encoding and [None] for anything a conforming decoder must reject:
+   overlong forms, surrogate halves, and scalars above U+10FFFF. *)
+let utf8_scalar_count value =
+  let length = String.length value in
+  let byte index = Char.code (String.unsafe_get value index) in
+  let continuation index = index < length && byte index land 0xc0 = 0x80 in
+  let rec scan index count =
+    if index >= length then Some count
+    else
+      let first = byte index in
+      if first < 0x80 then scan (index + 1) (count + 1)
+      else if first < 0xc2 then
+        (* 0x80-0xbf is a stray continuation byte and 0xc0-0xc1 can only ever
+           be an overlong encoding of an ASCII scalar. *)
+        None
+      else if first < 0xe0 then
+        if continuation (index + 1) then scan (index + 2) (count + 1) else None
+      else if first < 0xf0 then
+        if continuation (index + 1) && continuation (index + 2) then
+          let scalar =
+            ((first land 0x0f) lsl 12)
+            lor ((byte (index + 1) land 0x3f) lsl 6)
+            lor (byte (index + 2) land 0x3f)
+          in
+          if scalar < 0x800 || (scalar >= 0xd800 && scalar <= 0xdfff) then None
+          else scan (index + 3) (count + 1)
+        else None
+      else if first < 0xf5 then
+        if
+          continuation (index + 1)
+          && continuation (index + 2)
+          && continuation (index + 3)
+        then
+          let scalar =
+            ((first land 0x07) lsl 18)
+            lor ((byte (index + 1) land 0x3f) lsl 12)
+            lor ((byte (index + 2) land 0x3f) lsl 6)
+            lor (byte (index + 3) land 0x3f)
+          in
+          if scalar < 0x10000 || scalar > 0x10ffff then None
+          else scan (index + 4) (count + 1)
+        else None
+      else None
+  in
+  scan 0 0
+
+let valid_utf8 value = utf8_scalar_count value <> None
+
 (* OCaml 5.2's Unix module does not expose clock_gettime. This tiny libc stub
    gives every HTTP operation a clock that cannot jump when wall time changes. *)
 external monotonic_now : unit -> float = "convex_monotonic_now"
@@ -503,6 +565,55 @@ let parse_chunk_size line =
     raise (Http_protocol "invalid HTTP chunk size")
   else int_of_string ("0x" ^ text)
 
+(* RFC 7230 field names are tokens. A line with no colon, an empty or padded
+   name, or a non-token character is not a header this client may quietly
+   ignore: it is evidence that something other than the deployment framed this
+   response, and the framing headers it carries can no longer be trusted. *)
+let http_token_char char =
+  match char with
+  | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' -> true
+  | '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' | '_' | '`'
+  | '|' | '~' ->
+      true
+  | _ -> false
+
+let parse_header_line line =
+  let content = String.sub line 0 (String.length line - 2) in
+  match String.index_opt content ':' with
+  | None -> raise (Http_protocol "invalid HTTP header line")
+  | Some colon ->
+      let name = String.sub content 0 colon in
+      let value =
+        String.trim
+          (String.sub content (colon + 1) (String.length content - colon - 1))
+      in
+      if name = "" || not (String.for_all http_token_char name) then
+        raise (Http_protocol "invalid HTTP header line");
+      if
+        String.exists
+          (fun char -> Char.code char < 0x20 && char <> '\t')
+          value
+      then raise (Http_protocol "invalid HTTP header line");
+      (String.lowercase_ascii name, value)
+
+let header_values name headers =
+  List.filter_map
+    (fun (key, value) -> if key = name then Some value else None)
+    headers
+
+let single_header name headers =
+  match header_values name headers with
+  | [ value ] -> Ok value
+  | [] -> Error ("omitted " ^ name)
+  | _ -> Error ("repeated " ^ name)
+
+(* Comma-separated header lists such as Connection carry tokens, so a value of
+   "keep-alive, Upgrade" satisfies a required "upgrade" token while a prefix
+   match on the whole value would not. *)
+let header_tokens value =
+  String.split_on_char ',' value
+  |> List.map (fun token -> String.lowercase_ascii (String.trim token))
+
 let read_http_response_until ?interrupt channel deadline =
   let status_line = read_line_until ?interrupt channel deadline in
   let status_code =
@@ -527,36 +638,36 @@ let read_http_response_until ?interrupt channel deadline =
       if value < 100 then raise Exit else value
     with _ -> raise (Http_protocol "invalid HTTP status line")
   in
-  let rec headers remaining content_length chunked =
+  let rec read_headers remaining acc =
     if remaining <= 0 then
       raise (Http_protocol "HTTP response has too many header lines")
     else
       let line = read_line_until ?interrupt channel deadline in
-      if line = "\r\n" then (content_length, chunked)
-      else
-        match String.index_opt line ':' with
-        | None -> headers (remaining - 1) content_length chunked
-        | Some colon ->
-            let key = String.lowercase_ascii (String.sub line 0 colon) in
-            let value =
-              String.trim
-                (String.sub line (colon + 1) (String.length line - colon - 3))
-            in
-            if key = "content-length" then (
-              let length = parse_content_length value in
-              match content_length with
-              | Some previous when previous <> length ->
-                  raise
-                    (Http_protocol "conflicting HTTP Content-Length headers")
-              | _ -> headers (remaining - 1) (Some length) chunked)
-            else if key = "transfer-encoding" then (
-              match String.lowercase_ascii value with
-              | "chunked" -> headers (remaining - 1) content_length true
-              | "identity" -> headers (remaining - 1) content_length chunked
-              | _ -> raise (Http_protocol "unsupported HTTP Transfer-Encoding"))
-            else headers (remaining - 1) content_length chunked
+      if line = "\r\n" then List.rev acc
+      else read_headers (remaining - 1) (parse_header_line line :: acc)
   in
-  let content_length, chunked = headers max_http_header_lines None false in
+  let headers = read_headers max_http_header_lines [] in
+  let content_length =
+    List.fold_left
+      (fun previous value ->
+        let length = parse_content_length value in
+        match previous with
+        | Some earlier when earlier <> length ->
+            raise (Http_protocol "conflicting HTTP Content-Length headers")
+        | _ -> Some length)
+      None
+      (header_values "content-length" headers)
+  in
+  let chunked =
+    List.fold_left
+      (fun chunked value ->
+        match String.lowercase_ascii value with
+        | "chunked" -> true
+        | "identity" -> chunked
+        | _ -> raise (Http_protocol "unsupported HTTP Transfer-Encoding"))
+      false
+      (header_values "transfer-encoding" headers)
+  in
   (* A response carrying both framings is unrecoverable rather than merely
      redundant: the two lengths can disagree, and picking either one is how a
      client gets talked into reading the next response as this one's body. *)
@@ -564,6 +675,10 @@ let read_http_response_until ?interrupt channel deadline =
     raise
       (Http_protocol
          "HTTP response used both Content-Length and chunked encoding");
+  (* A 101 has no body at all. Believing a Content-Length or chunked header on
+     one would consume the first WebSocket frames as if they were HTTP. *)
+  if status_code = 101 && (chunked || content_length <> None) then
+    raise (Http_protocol "HTTP 101 response must not carry a body framing");
   let read_body () =
     match (content_length, chunked) with
     | Some length, _ when length <= max_http_body ->
@@ -618,7 +733,7 @@ let read_http_response_until ?interrupt channel deadline =
         drain ();
         Buffer.contents output
   in
-  (status_code, read_body ())
+  (status_code, headers, read_body ())
 
 let http_call endpoint ~client_version ~auth_token ~timeout operation path args
     =
@@ -653,7 +768,7 @@ let http_call endpoint ~client_version ~auth_token ~timeout operation path args
             ^ "\r\nConnection: close\r\n\r\n" ^ body
           in
           write_string_until channel request deadline;
-          let status_code, response_body =
+          let status_code, _headers, response_body =
             read_http_response_until channel deadline
           in
           let successful_status = status_code >= 200 && status_code < 300 in
@@ -789,6 +904,92 @@ let base64_decode string =
   loop 0;
   Bytes.of_string (Buffer.contents output)
 
+(* RFC 6455 binds a handshake response to the key the client just generated with
+   SHA-1. OCaml's standard library ships only MD5 and the pinned image installs
+   no digest package, so the 160-bit digest is implemented here. It exists to
+   prove the peer answered this handshake, never as a security primitive; the
+   published RFC vectors pin it in the language-local fixtures. *)
+let sha1 message =
+  let mask = 0xffffffff in
+  let rotate value amount =
+    ((value lsl amount) lor (value lsr (32 - amount))) land mask
+  in
+  let state = [| 0x67452301; 0xefcdab89; 0x98badcfe; 0x10325476; 0xc3d2e1f0 |] in
+  let length = String.length message in
+  (* One 0x80 byte, then zero padding, then the length in bits as a big-endian
+     64-bit count, rounded up to whole 64-byte blocks. *)
+  let padded_length = ((length + 8) / 64 * 64) + 64 in
+  let block = Bytes.make padded_length '\000' in
+  Bytes.blit_string message 0 block 0 length;
+  Bytes.set block length '\x80';
+  let bits = Int64.of_int (length * 8) in
+  for index = 0 to 7 do
+    Bytes.set block
+      (padded_length - 1 - index)
+      (Char.chr
+         (Int64.to_int
+            (Int64.logand (Int64.shift_right_logical bits (index * 8)) 255L)))
+  done;
+  let words = Array.make 80 0 in
+  for start = 0 to (padded_length / 64) - 1 do
+    for index = 0 to 15 do
+      let offset = (start * 64) + (index * 4) in
+      words.(index) <-
+        (Char.code (Bytes.get block offset) lsl 24)
+        lor (Char.code (Bytes.get block (offset + 1)) lsl 16)
+        lor (Char.code (Bytes.get block (offset + 2)) lsl 8)
+        lor Char.code (Bytes.get block (offset + 3))
+    done;
+    for index = 16 to 79 do
+      words.(index) <-
+        rotate
+          (words.(index - 3) lxor words.(index - 8)
+          lxor words.(index - 14)
+          lxor words.(index - 16))
+          1
+    done;
+    let a = ref state.(0) in
+    let b = ref state.(1) in
+    let c = ref state.(2) in
+    let d = ref state.(3) in
+    let e = ref state.(4) in
+    for index = 0 to 79 do
+      let mixed, constant =
+        if index < 20 then
+          ((!b land !c) lor ((!b lxor mask) land !d), 0x5a827999)
+        else if index < 40 then (!b lxor !c lxor !d, 0x6ed9eba1)
+        else if index < 60 then
+          ((!b land !c) lor (!b land !d) lor (!c land !d), 0x8f1bbcdc)
+        else (!b lxor !c lxor !d, 0xca62c1d6)
+      in
+      let next =
+        (rotate !a 5 + mixed + !e + constant + words.(index)) land mask
+      in
+      e := !d;
+      d := !c;
+      c := rotate !b 30;
+      b := !a;
+      a := next
+    done;
+    state.(0) <- (state.(0) + !a) land mask;
+    state.(1) <- (state.(1) + !b) land mask;
+    state.(2) <- (state.(2) + !c) land mask;
+    state.(3) <- (state.(3) + !d) land mask;
+    state.(4) <- (state.(4) + !e) land mask
+  done;
+  let digest = Bytes.create 20 in
+  for index = 0 to 4 do
+    let value = state.(index) in
+    Bytes.set digest (index * 4) (Char.chr ((value lsr 24) land 255));
+    Bytes.set digest ((index * 4) + 1) (Char.chr ((value lsr 16) land 255));
+    Bytes.set digest ((index * 4) + 2) (Char.chr ((value lsr 8) land 255));
+    Bytes.set digest ((index * 4) + 3) (Char.chr (value land 255))
+  done;
+  digest
+
+let websocket_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+let websocket_accept_key key = base64_encode (sha1 (key ^ websocket_guid))
+
 let random_bytes length =
   let fd = Unix.openfile "/dev/urandom" [ Unix.O_RDONLY ] 0 in
   Fun.protect
@@ -803,6 +1004,17 @@ type ws = {
   interrupt : Unix.file_descr;
   mutable fragment_opcode : int option;
   fragments : Buffer.t;
+  (* Bytes already pulled out of [channel] but not yet handed to a frame
+     reader. A single [Ssl.read] can return more than one WebSocket frame's
+     worth of plaintext: TLS records and WebSocket frames do not line up, and
+     OpenSSL keeps whatever a caller's buffer was too small to hold in a
+     buffer of its own, inside the process, invisible to a later [select] on
+     the raw file descriptor. Reading through this buffer instead of straight
+     from [channel] is what keeps that leftover plaintext from being mistaken
+     for "nothing to read" the next time [ws_has_buffered] is asked. *)
+  mutable read_buffer : Bytes.t;
+  mutable read_start : int;
+  mutable read_length : int;
 }
 
 let ws_write_frame ws opcode payload =
@@ -841,31 +1053,94 @@ let ws_write_frame ws opcode payload =
   write_all ~interrupt:ws.interrupt ws.channel header 0 (Bytes.length header);
   write_all ~interrupt:ws.interrupt ws.channel body 0 length
 
+let max_websocket_message = 2 * 1024 * 1024
+let max_websocket_control_payload = 125
+let live_read_timeout = 30.0
+let ws_read_buffer_capacity = 8192
+
+(* Refill [ws.read_buffer] with one underlying read. This is the only place
+   that touches [ws.channel] directly; a short read here is normal (the
+   kernel or OpenSSL had less immediately available than the buffer's
+   capacity) and is not distinguished from a full one. *)
+let ws_fill ws deadline =
+  ws.read_start <- 0;
+  ws.read_length <-
+    read_some_until ~interrupt:ws.interrupt ws.channel ws.read_buffer 0
+      (Bytes.length ws.read_buffer) deadline
+
+(* True once bytes are sitting in [ws.read_buffer] unconsumed. A previous
+   [ws_fill] can have pulled in more than the caller asked for, and that
+   remainder cannot be observed at the socket: [select] on the raw file
+   descriptor reports nothing new until the peer sends more, even while a
+   complete frame is already sitting here decrypted and ready. *)
+let ws_has_buffered ws = ws.read_start < ws.read_length
+
+let ws_read_some ws bytes offset length deadline =
+  if not (ws_has_buffered ws) then ws_fill ws deadline;
+  let available = ws.read_length - ws.read_start in
+  let count = min available length in
+  Bytes.blit ws.read_buffer ws.read_start bytes offset count;
+  ws.read_start <- ws.read_start + count;
+  count
+
+let ws_read_exact ws length deadline =
+  let bytes = Bytes.create length in
+  let rec loop offset =
+    if offset = length then bytes
+    else loop (offset + ws_read_some ws bytes offset (length - offset) deadline)
+  in
+  loop 0
+
 (* One deadline covers the whole frame. A peer that dribbles a byte at a time
    cannot keep resetting the clock, and a timeout mid-frame is fatal to the
-   connection rather than something the caller may retry at a false boundary. *)
+   connection rather than something the caller may retry at a false boundary.
+
+   Every structural rule RFC 6455 gives a client is checked here, before any
+   payload is consumed, because each one is a way for a peer to describe a
+   frame differently from the frame it actually sent. *)
 let ws_read_frame ws timeout =
   let deadline = deadline_after timeout in
-  let header = read_exact_until ~interrupt:ws.interrupt ws.channel 2 deadline in
+  let header = ws_read_exact ws 2 deadline in
   let first, second =
     (Char.code (Bytes.get header 0), Char.code (Bytes.get header 1))
   in
   let fin = first land 0x80 <> 0 in
+  (* This client negotiates no extension, so a reserved bit has no meaning it
+     could act on and the frame cannot be interpreted. *)
+  if first land 0x70 <> 0 then
+    raise (Websocket_protocol "WebSocket frame set a reserved bit");
   let opcode = first land 0x0f in
-  let masked = second land 0x80 <> 0 in
+  (match opcode with
+  | 0 | 1 | 2 | 8 | 9 | 10 -> ()
+  | _ -> raise (Websocket_protocol "WebSocket frame used a reserved opcode"));
+  let control = opcode land 0x08 <> 0 in
+  (* A server must never mask. Accepting a masked frame would also let a peer
+     hide the real payload behind a key we were not required to read. *)
+  if second land 0x80 <> 0 then
+    raise (Websocket_protocol "WebSocket server frame was masked");
   let short_length = second land 0x7f in
+  if control && not fin then
+    raise (Websocket_protocol "WebSocket control frame was fragmented");
+  if control && short_length > max_websocket_control_payload then
+    raise (Websocket_protocol "WebSocket control frame exceeds 125 bytes");
   let length =
-    if short_length < 126 then Int64.of_int short_length
-    else if short_length = 126 then
-      let bytes =
-        read_exact_until ~interrupt:ws.interrupt ws.channel 2 deadline
+    if short_length < 126 then short_length
+    else if short_length = 126 then (
+      let bytes = ws_read_exact ws 2 deadline in
+      let value =
+        (Char.code (Bytes.get bytes 0) lsl 8) lor Char.code (Bytes.get bytes 1)
       in
-      Int64.of_int
-        ((Char.code (Bytes.get bytes 0) lsl 8) lor Char.code (Bytes.get bytes 1))
-    else
-      let bytes =
-        read_exact_until ~interrupt:ws.interrupt ws.channel 8 deadline
-      in
+      (* A non-minimal length is the same byte count described two ways. One
+         spelling is the protocol's; the other is a peer probing what this
+         parser will accept. *)
+      if value < 126 then
+        raise
+          (Websocket_protocol "WebSocket frame length was not minimally encoded");
+      value)
+    else (
+      let bytes = ws_read_exact ws 8 deadline in
+      if Char.code (Bytes.get bytes 0) land 0x80 <> 0 then
+        raise (Websocket_protocol "WebSocket frame length has its top bit set");
       let value = ref 0L in
       for index = 0 to 7 do
         value :=
@@ -873,63 +1148,125 @@ let ws_read_frame ws timeout =
             (Int64.shift_left !value 8)
             (Int64.of_int (Char.code (Bytes.get bytes index)))
       done;
-      if Int64.compare !value (Int64.of_int (2 * 1024 * 1024)) > 0 then
+      if Int64.compare !value 65536L < 0 then
+        raise
+          (Websocket_protocol "WebSocket frame length was not minimally encoded");
+      if Int64.compare !value (Int64.of_int max_websocket_message) > 0 then
         raise (Websocket_protocol "WebSocket message exceeds 2097152 bytes");
-      !value
+      Int64.to_int !value)
   in
-  if Int64.compare length (Int64.of_int (2 * 1024 * 1024)) > 0 then
+  if length > max_websocket_message then
     raise (Websocket_protocol "WebSocket message exceeds 2097152 bytes");
-  let mask =
-    if masked then
-      Some (read_exact_until ~interrupt:ws.interrupt ws.channel 4 deadline)
-    else None
-  in
-  let payload =
-    read_exact_until ~interrupt:ws.interrupt ws.channel (Int64.to_int length)
-      deadline
-  in
-  (match mask with
-  | Some mask ->
-      for index = 0 to Bytes.length payload - 1 do
-        Bytes.set payload index
-          (Char.chr
-             (Char.code (Bytes.get payload index)
-             lxor Char.code (Bytes.get mask (index mod 4))))
-      done
-  | None -> ());
+  let payload = ws_read_exact ws length deadline in
   (fin, opcode, Bytes.to_string payload)
+
+(* A close frame either carries nothing or carries a code plus a UTF-8 reason.
+   A single byte cannot be a code, and the codes below are the ones RFC 6455
+   and the IANA registry allow a peer to send on the wire. *)
+let websocket_close_reason payload =
+  let length = String.length payload in
+  if length = 0 then "server close"
+  else if length = 1 then
+    raise (Websocket_protocol "WebSocket close frame carried a one byte payload")
+  else
+    let code = (Char.code payload.[0] lsl 8) lor Char.code payload.[1] in
+    let permitted =
+      (code >= 1000 && code <= 1003)
+      || (code >= 1007 && code <= 1011)
+      || (code >= 3000 && code <= 4999)
+    in
+    if not permitted then
+      raise (Websocket_protocol "WebSocket close frame used an invalid code");
+    if not (valid_utf8 (String.sub payload 2 (length - 2))) then
+      raise (Websocket_protocol "WebSocket close reason was not valid UTF-8");
+    "server close " ^ string_of_int code
+
+let websocket_text value =
+  if valid_utf8 value then value
+  else raise (Websocket_protocol "WebSocket text message was not valid UTF-8")
 
 let ws_read_message ws =
   let rec loop () =
-    let fin, opcode, payload = ws_read_frame ws 30.0 in
-    if opcode = 8 then raise (Websocket_closed "server close")
-    else if opcode = 9 then (
-      ws_write_frame ws 10 payload;
-      loop ())
-    else if opcode = 10 then loop ()
-    else if opcode = 0 then (
-      match ws.fragment_opcode with
-      | None -> raise (Websocket_protocol "unexpected WebSocket continuation")
-      | Some _ ->
+    let fin, opcode, payload = ws_read_frame ws live_read_timeout in
+    match opcode with
+    | 8 -> raise (Websocket_closed (websocket_close_reason payload))
+    | 9 ->
+        ws_write_frame ws 10 payload;
+        loop ()
+    | 10 -> loop ()
+    | 0 -> (
+        match ws.fragment_opcode with
+        | None -> raise (Websocket_protocol "unexpected WebSocket continuation")
+        | Some _ ->
+            (* The per-frame limit says nothing about a message split into many
+               frames, so the accumulated total is what has to be bounded. *)
+            if
+              Buffer.length ws.fragments + String.length payload
+              > max_websocket_message
+            then
+              raise
+                (Websocket_protocol "WebSocket message exceeds 2097152 bytes");
+            Buffer.add_string ws.fragments payload;
+            if fin then (
+              let value = Buffer.contents ws.fragments in
+              Buffer.clear ws.fragments;
+              ws.fragment_opcode <- None;
+              websocket_text value)
+            else loop ())
+    | 1 ->
+        if ws.fragment_opcode <> None then
+          raise
+            (Websocket_protocol
+               "WebSocket data frame interrupted a fragmented message");
+        if fin then websocket_text payload
+        else (
+          Buffer.clear ws.fragments;
           Buffer.add_string ws.fragments payload;
-          if fin then (
-            let value = Buffer.contents ws.fragments in
-            Buffer.clear ws.fragments;
-            ws.fragment_opcode <- None;
-            value)
-          else loop ())
-    else if opcode = 1 then
-      if fin then payload
-      else (
-        Buffer.clear ws.fragments;
-        Buffer.add_string ws.fragments payload;
-        ws.fragment_opcode <- Some opcode;
-        loop ())
-    else raise (Websocket_protocol "unsupported WebSocket opcode")
+          ws.fragment_opcode <- Some opcode;
+          loop ())
+    | _ -> raise (Websocket_protocol "unsupported WebSocket opcode")
   in
   loop ()
 
 let live_handshake_timeout = 30.0
+
+(* HTTP 101 alone only says "something switched protocols". These four checks
+   are what make the response an answer to *this* upgrade: the peer must name
+   the websocket protocol, must actually mean the Upgrade token in its
+   Connection list, must echo the accept value derived from the key generated
+   moments ago, and must not select an extension or subprotocol that was never
+   offered and that this frame reader could not honour. Without them a cached
+   or misrouted 101 would be treated as a live Convex sync socket. *)
+let validate_websocket_handshake ~key ~status ~headers =
+  if status <> 101 then
+    raise
+      (Websocket_protocol
+         ("WebSocket handshake returned HTTP " ^ string_of_int status));
+  let required name =
+    match single_header name headers with
+    | Ok value -> value
+    | Error message -> raise (Websocket_protocol ("WebSocket handshake " ^ message))
+  in
+  if String.lowercase_ascii (required "upgrade") <> "websocket" then
+    raise
+      (Websocket_protocol "WebSocket handshake did not upgrade to websocket");
+  if not (List.mem "upgrade" (header_tokens (required "connection"))) then
+    raise
+      (Websocket_protocol
+         "WebSocket handshake omitted the Upgrade connection token");
+  if required "sec-websocket-accept" <> websocket_accept_key key then
+    raise
+      (Websocket_protocol
+         "WebSocket handshake returned an incorrect Sec-WebSocket-Accept");
+  if
+    List.exists
+      (fun (name, _) ->
+        name = "sec-websocket-extensions" || name = "sec-websocket-protocol")
+      headers
+  then
+    raise
+      (Websocket_protocol
+         "WebSocket handshake selected an unrequested extension or subprotocol")
 
 (* The socket owner runs the handshake inline, so an unbounded connect would
    also block close, unsubscribe, and debugDisconnect. One deadline bounds DNS,
@@ -952,82 +1289,242 @@ let websocket_connect endpoint ~client_version ~auth_token ~interrupt =
       ^ "\r\n"
     in
     write_string_until ~interrupt channel request deadline;
-    let status, _ = read_http_response_until ~interrupt channel deadline in
-    if status <> 101 then
-      raise
-        (Failure ("WebSocket handshake returned HTTP " ^ string_of_int status));
+    let status, headers, _ =
+      read_http_response_until ~interrupt channel deadline
+    in
+    validate_websocket_handshake ~key ~status ~headers;
     {
       channel;
       interrupt;
       fragment_opcode = None;
       fragments = Buffer.create 256;
+      read_buffer = Bytes.create ws_read_buffer_capacity;
+      read_start = 0;
+      read_length = 0;
     }
   with error ->
     close_channel channel;
     raise error
 
-type queued_update = update
-and update = { value : J.t option; error : error option; logs : string list }
+type update = { value : J.t option; error : error option; logs : string list }
+
+(* [charge] is the accounted memory cost of holding this update, and [sequence]
+   is a process-wide arrival order so an overflowing budget can evict the
+   globally oldest update rather than a locally oldest one. *)
+type queued_update = { queued : update; charge : int; sequence : int }
 
 type subscription_state = {
   qid : int;
   path : string;
   args : J.t;
-  mutex : Mutex.t;
   mutable queue : queued_update list;
-  mutable queue_bytes : int;
   mutable closed : bool;
 }
 
-let max_queue_items = 16
-let max_queue_bytes = 4 * 1024 * 1024
+(* ------------------------------------------------------------------------
+   Live delivery budget
 
-let update_size update =
-  (match update.value with
-  | None -> 0
-  | Some value -> String.length (J.to_string value))
-  +
-  match update.error with
-  | None -> 0
-  | Some error -> String.length (error_message error)
+   The shared conformance gate runs this client's container with
+   --memory 128m, and a single sync message may be almost the 2 MiB frame
+   limit, so an event count is not a memory bound. The budget below is
+   process-wide rather than per subscription: twenty slow subscriptions each
+   holding "only" a few megabytes is exactly how a per-subscription bound
+   passes its own test and still runs the container out of memory.
+
+   The 128 MiB gate is divided before anything is allowed to be retained:
+
+     - the OCaml runtime, OpenSSL, the worker and relay thread stacks, and
+       the major heap the collector has not yet returned;
+     - the transient peak of one inbound frame: its raw bytes, the string it
+       is decoded into, and the JSON tree parsed from it;
+     - the test adapter's whole output path, which is three times its own
+       queue budget: the queued lines, the values its relays have taken from
+       these queues, and the encoded copies of those values;
+     - explicit headroom so the gate is a bound, not a target.
+
+   What is left is halved, because OCaml's major heap can hold roughly twice
+   the live set before a collection returns it. Every retained update is
+   charged for its value, its logs, its structured error data, and an equal
+   allowance for the encoded output that value will become. *)
+let live_memory_limit_bytes = 128 * 1024 * 1024
+let live_runtime_reserve_bytes = 32 * 1024 * 1024
+let live_transient_reserve_bytes = 24 * 1024 * 1024
+let live_writer_reserve_bytes = 24 * 1024 * 1024
+let live_headroom_bytes = 16 * 1024 * 1024
+let live_heap_factor = 2
+
+let max_queue_bytes =
+  (live_memory_limit_bytes - live_runtime_reserve_bytes
+ - live_transient_reserve_bytes - live_writer_reserve_bytes
+ - live_headroom_bytes)
+  / live_heap_factor
+
+(* A process-wide count bound as well, so a flood of tiny updates cannot cost
+   an unbounded number of list cells while staying under the byte budget. *)
+let max_queue_items = 256
+
+(* One slow subscription still may not fill the whole process budget on its
+   own. This is subordinate to the two bounds above, not a replacement. *)
+let max_subscription_items = 16
+let queued_update_overhead_bytes = 512
+let encoded_output_factor = 2
+
+(* An estimate of what a decoded JSON value costs in the OCaml heap, walked
+   with an explicit stack so a deeply nested value cannot overflow the
+   measuring thread. The per-node constants are deliberately generous: a list
+   of small integers costs far more as boxed cells than it did as text, and
+   charging by encoded length would under-count exactly that shape. *)
+let json_footprint (json : J.t) =
+  let rec walk acc (stack : J.t list) =
+    match stack with
+    | [] -> acc
+    | value :: rest -> (
+        match value with
+        | `Null | `Bool _ -> walk (acc + 16) rest
+        | `Int _ -> walk (acc + 24) rest
+        | `Float _ -> walk (acc + 32) rest
+        | `String text | `Intlit text -> walk (acc + 32 + String.length text) rest
+        | `List items | `Tuple items ->
+            walk
+              (acc + 24 + (24 * List.length items))
+              (List.rev_append items rest)
+        | `Variant (name, payload) ->
+            walk
+              (acc + 32 + String.length name)
+              (match payload with None -> rest | Some value -> value :: rest)
+        | `Assoc fields ->
+            walk
+              (List.fold_left
+                 (fun acc (name, _) -> acc + 56 + String.length name)
+                 (acc + 24) fields)
+              (List.rev_append (List.map snd fields) rest))
+  in
+  walk 0 [ json ]
+
+let logs_footprint logs =
+  List.fold_left (fun acc line -> acc + 32 + String.length line) 24 logs
+
+let error_footprint = function
+  | Function_error { operation; message; data; logs } ->
+      String.length operation + String.length message
+      + (match data with None -> 0 | Some value -> json_footprint value)
+      + logs_footprint logs
+  | Protocol_error message -> String.length message
+  | Http_error { operation; message; _ } ->
+      String.length operation + String.length message
+  | Transport_error { operation; message } ->
+      String.length operation + String.length message
+  | Closed -> 0
+
+let update_charge update =
+  queued_update_overhead_bytes
+  + encoded_output_factor
+    * ((match update.value with
+       | None -> 0
+       | Some value -> json_footprint value)
+      + (match update.error with
+        | None -> 0
+        | Some error -> error_footprint error)
+      + logs_footprint update.logs)
+
+(* Every subscription queue in the process is guarded by this one mutex, which
+   is also what makes the shared counters and the eviction scan consistent
+   without any lock ordering to get wrong. *)
+let live_queue_mutex = Mutex.create ()
+let live_queue_bytes = ref 0
+let live_queue_items = ref 0
+let live_queue_sequence = ref 0
+let live_queue_states : subscription_state list ref = ref []
+
+let with_live_queue f =
+  Mutex.lock live_queue_mutex;
+  Fun.protect ~finally:(fun () -> Mutex.unlock live_queue_mutex) f
+
+(* Closed subscriptions stay registered until their queue is drained, because a
+   consumer is still entitled to the updates that arrived before the close. *)
+let prune_states_locked () =
+  live_queue_states :=
+    List.filter
+      (fun state -> not (state.closed && state.queue = []))
+      !live_queue_states
+
+let register_state state =
+  with_live_queue (fun () ->
+      live_queue_states := state :: !live_queue_states)
+
+let drop_oldest_locked state =
+  match state.queue with
+  | [] -> ()
+  | oldest :: rest ->
+      state.queue <- rest;
+      live_queue_bytes := !live_queue_bytes - oldest.charge;
+      live_queue_items := !live_queue_items - 1
+
+(* When the process budget is exceeded, the globally oldest queued update is
+   the one whose loss costs a consumer the least: it is the update furthest
+   behind current state anywhere in the client. *)
+let evict_locked () =
+  let rec evict () =
+    if !live_queue_bytes > max_queue_bytes || !live_queue_items > max_queue_items
+    then (
+      let oldest =
+        List.fold_left
+          (fun oldest state ->
+            match (state.queue, oldest) with
+            | [], _ -> oldest
+            | head :: _, Some (_, sequence) when head.sequence >= sequence ->
+                oldest
+            | head :: _, _ -> Some (state, head.sequence))
+          None !live_queue_states
+      in
+      match oldest with
+      | None -> ()
+      | Some (state, _) ->
+          drop_oldest_locked state;
+          evict ())
+  in
+  evict ()
 
 let enqueue state update =
-  Mutex.lock state.mutex;
-  if not state.closed then (
-    let update_bytes = update_size update in
-    state.queue <- state.queue @ [ update ];
-    state.queue_bytes <- state.queue_bytes + update_bytes;
-    let rec trim () =
-      if
-        List.length state.queue > max_queue_items
-        || state.queue_bytes > max_queue_bytes
-      then (
-        match state.queue with
-        | [] -> ()
-        | oldest :: rest ->
-            state.queue <- rest;
-            state.queue_bytes <- state.queue_bytes - update_size oldest;
-            trim ())
-      else ()
-    in
-    trim ());
-  Mutex.unlock state.mutex
+  let charge = update_charge update in
+  with_live_queue (fun () ->
+      if not state.closed then (
+        incr live_queue_sequence;
+        let entry =
+          { queued = update; charge; sequence = !live_queue_sequence }
+        in
+        state.queue <- state.queue @ [ entry ];
+        live_queue_bytes := !live_queue_bytes + charge;
+        incr live_queue_items;
+        while List.length state.queue > max_subscription_items do
+          drop_oldest_locked state
+        done;
+        evict_locked ()))
+
+let close_state state =
+  with_live_queue (fun () ->
+      state.closed <- true;
+      prune_states_locked ())
 
 let dequeue state timeout =
   let deadline = monotonic_now () +. timeout in
   let rec loop () =
-    Mutex.lock state.mutex;
-    match state.queue with
-    | update :: rest ->
-        state.queue <- rest;
-        state.queue_bytes <- state.queue_bytes - update_size update;
-        Mutex.unlock state.mutex;
-        Some update
-    | [] when state.closed ->
-        Mutex.unlock state.mutex;
-        None
-    | [] ->
-        Mutex.unlock state.mutex;
+    let taken =
+      with_live_queue (fun () ->
+          match state.queue with
+          | entry :: rest ->
+              state.queue <- rest;
+              live_queue_bytes := !live_queue_bytes - entry.charge;
+              live_queue_items := !live_queue_items - 1;
+              if state.closed && rest = [] then prune_states_locked ();
+              `Update entry.queued
+          | [] when state.closed -> `Closed
+          | [] -> `Empty)
+    in
+    match taken with
+    | `Update update -> Some update
+    | `Closed -> None
+    | `Empty ->
         if timeout >= 0.0 && monotonic_now () >= deadline then None
         else (
           Thread.delay 0.02;
@@ -1172,9 +1669,14 @@ let add_modification state =
 let remove_modification state =
   `Assoc [ ("type", `String "Remove"); ("queryId", `Int state.qid) ]
 
+(* Reconnect delay bounds. The floor is also what a healthy connection resets
+   to, so an intervening good connection never inherits an old maximum. *)
+let live_initial_backoff = 0.1
+let live_maximum_backoff = 15.0
+
 let live_owner (manager : live_manager) =
   let active : (int, subscription_state) Hashtbl.t = Hashtbl.create 8 in
-  let last_delivered : (int, queued_update) Hashtbl.t = Hashtbl.create 8 in
+  let last_delivered : (int, update) Hashtbl.t = Hashtbl.create 8 in
   let awaiting : (int, bool) Hashtbl.t = Hashtbl.create 8 in
   let connection = ref None in
   let query_set_version = ref 0 in
@@ -1183,7 +1685,7 @@ let live_owner (manager : live_manager) =
   let last_close_reason = ref "InitialConnect" in
   let max_timestamp : string option ref = ref None in
   let reconnect_at = ref None in
-  let backoff = ref 0.1 in
+  let backoff = ref live_initial_backoff in
   let retired_for_disconnect = ref false in
   let set_reconnect delay = reconnect_at := Some (monotonic_now () +. delay) in
   let close_connection reason schedule =
@@ -1198,7 +1700,7 @@ let live_owner (manager : live_manager) =
     remote_version := zero_version ();
     if schedule && Hashtbl.length active > 0 then (
       set_reconnect !backoff;
-      backoff := min 15.0 (!backoff *. 2.0))
+      backoff := min live_maximum_backoff (!backoff *. 2.0))
     else reconnect_at := None
   in
   let deliver qid update =
@@ -1273,7 +1775,12 @@ let live_owner (manager : live_manager) =
           states;
         json_send ws (modify_message 0 1 (List.map add_modification states));
         query_set_version := 1);
-      reconnect_at := None
+      reconnect_at := None;
+      (* The handshake was validated and this connection has already carried the
+         Connect message and the replayed Add operations, so the delay that got
+         us here has been paid off. A later failure starts from the floor again
+         rather than inheriting the previous connection's maximum. *)
+      backoff := live_initial_backoff
     with
     | Read_interrupted ->
         (* A controller command arrived mid-handshake. Retire this attempt so
@@ -1308,28 +1815,113 @@ let live_owner (manager : live_manager) =
     in
     if not (equal_json start_version !remote_version) then
       raise (Failure "Transition start version does not match local version");
-    let changed = Hashtbl.create 4 in
     let modifications =
       match assoc "modifications" json with
       | `List values -> values
       | _ -> raise (Failure "Transition modifications must be an array")
     in
+    let timestamp =
+      match string_member "ts" end_version with
+      | Some value -> value
+      | None -> raise (Failure "Transition endVersion omitted ts")
+    in
+    (* Whether this transition's timestamp becomes the new watermark. Computed
+       now, alongside every other validation, but not written to
+       [max_timestamp] until the transition is known to be valid in full. *)
+    let advances_max_timestamp =
+      match !max_timestamp with
+      | None -> true
+      | Some previous -> (
+          match compare_timestamps timestamp previous with
+          | Ok comparison -> comparison > 0
+          | Error _ as error ->
+              raise
+                (Failure
+                   (error_message
+                      (match error with
+                      | Error value -> value
+                      | Ok _ -> assert false))))
+    in
+    (* Query IDs are handed out by this client, counting up from zero. An ID
+       this client has issued but already removed can still appear in a
+       transition the server had in flight, so it is dropped rather than
+       retained. An ID that was never issued is not late bookkeeping: it names
+       a query this client cannot serve, and remembering it in [last_delivered]
+       would grow with every such message and answer for a real query later. *)
+    let issued qid =
+      Mutex.lock manager.command_mutex;
+      let next = manager.next_qid in
+      Mutex.unlock manager.command_mutex;
+      qid >= 0 && qid < next
+    in
+    (* Every modification is parsed into an action here, without touching
+       [last_delivered], [awaiting], or [changed]. A later modification in the
+       same message failing to parse must not leave an earlier one already
+       committed: half of a rejected transition is not a smaller valid one. *)
+    let action_of modification =
+      let qid = int_member "queryId" modification in
+      match string_member "type" modification with
+      | Some ("QueryUpdated" | "QueryFailed") when not (Hashtbl.mem active qid)
+        ->
+          if not (issued qid) then
+            raise
+              (Failure ("Transition names unknown query " ^ string_of_int qid));
+          `Forget qid
+      | Some "QueryUpdated" ->
+          let value = assoc "value" modification in
+          let update =
+            {
+              value = Some value;
+              error = None;
+              logs =
+                (match list_string_member "logLines" modification with
+                | Ok values -> values
+                | Error _ -> []);
+            }
+          in
+          `Applied (qid, update)
+      | Some "QueryFailed" ->
+          let message =
+            match string_member "errorMessage" modification with
+            | Some value -> value
+            | None -> "Convex query failed"
+          in
+          let data =
+            match member "errorData" modification with
+            | Some `Null | None -> None
+            | Some value -> Some value
+          in
+          let logs =
+            match list_string_member "logLines" modification with
+            | Ok values -> values
+            | Error _ -> []
+          in
+          let update =
+            {
+              value = None;
+              error =
+                Some (Function_error { operation = "query"; message; data; logs });
+              logs;
+            }
+          in
+          `Applied (qid, update)
+      | Some "QueryRemoved" -> `Removed qid
+      | Some other -> raise (Failure ("unknown Transition modification " ^ other))
+      | None -> raise (Failure "Transition modification omitted type")
+    in
+    let actions = List.map action_of modifications in
+    (* Every modification validated. Only now does the transition touch
+       [last_delivered], [remote_version], or [max_timestamp], and all three
+       move together so a later message can never observe one without the
+       others. *)
+    let changed = Hashtbl.create 4 in
     List.iter
-      (fun modification ->
-        let qid = int_member "queryId" modification in
-        match string_member "type" modification with
-        | Some "QueryUpdated" ->
-            let value = assoc "value" modification in
-            let update =
-              {
-                value = Some value;
-                error = None;
-                logs =
-                  (match list_string_member "logLines" modification with
-                  | Ok values -> values
-                  | Error _ -> []);
-              }
-            in
+      (fun action ->
+        match action with
+        | `Forget qid ->
+            Hashtbl.remove last_delivered qid;
+            Hashtbl.remove awaiting qid
+        | `Applied (qid, update) when update.error = None ->
             let previous = Hashtbl.find_opt last_delivered qid in
             Hashtbl.replace last_delivered qid update;
             if Hashtbl.mem awaiting qid then (
@@ -1343,71 +1935,18 @@ let live_owner (manager : live_manager) =
                   ()
               | _ -> Hashtbl.replace changed qid update)
             else Hashtbl.replace changed qid update
-        | Some "QueryFailed" ->
-            let message =
-              match string_member "errorMessage" modification with
-              | Some value -> value
-              | None -> "Convex query failed"
-            in
-            let data =
-              match member "errorData" modification with
-              | Some `Null | None -> None
-              | Some value -> Some value
-            in
-            let update =
-              {
-                value = None;
-                error =
-                  Some
-                    (Function_error
-                       {
-                         operation = "query";
-                         message;
-                         data;
-                         logs =
-                           (match
-                              list_string_member "logLines" modification
-                            with
-                           | Ok values -> values
-                           | Error _ -> []);
-                       });
-                logs =
-                  (match list_string_member "logLines" modification with
-                  | Ok values -> values
-                  | Error _ -> []);
-              }
-            in
+        | `Applied (qid, update) ->
             Hashtbl.remove awaiting qid;
             Hashtbl.replace last_delivered qid update;
             Hashtbl.replace changed qid update
-        | Some "QueryRemoved" ->
+        | `Removed qid ->
             Hashtbl.remove last_delivered qid;
-            Hashtbl.remove awaiting qid
-        | Some other ->
-            raise (Failure ("unknown Transition modification " ^ other))
-        | None -> raise (Failure "Transition modification omitted type"))
-      modifications;
+            Hashtbl.remove awaiting qid)
+      actions;
     remote_version := end_version;
-    let timestamp =
-      match string_member "ts" end_version with
-      | Some value -> value
-      | None -> raise (Failure "Transition endVersion omitted ts")
-    in
-    (match !max_timestamp with
-    | None -> max_timestamp := Some timestamp
-    | Some previous -> (
-        match compare_timestamps timestamp previous with
-        | Ok comparison when comparison > 0 -> max_timestamp := Some timestamp
-        | Ok _ -> ()
-        | Error _ as error ->
-            raise
-              (Failure
-                 (error_message
-                    (match error with
-                    | Error value -> value
-                    | Ok _ -> assert false)))));
+    if advances_max_timestamp then max_timestamp := Some timestamp;
     Hashtbl.iter (fun qid update -> deliver qid update) changed;
-    backoff := 0.1
+    backoff := live_initial_backoff
   in
   let handle_message message =
     match string_member "type" message with
@@ -1435,10 +1974,21 @@ let live_owner (manager : live_manager) =
     List.rev !commands
   in
   let rec loop () =
+    (* [ws_has_buffered] is what notices a frame [ws_fill] already pulled out
+       of TLS but this loop has not yet consumed. Without it, the [select]
+       below blocks for the full timeout while that frame sits decrypted and
+       unread: TLS records do not line up with WebSocket frames, so a single
+       underlying read can leave a second, complete one buffered with
+       nothing left at the raw file descriptor for [select] to see. *)
+    let pending =
+      match !connection with Some ws -> ws_has_buffered ws | None -> false
+    in
     let timeout =
-      match !reconnect_at with
-      | None -> 30.0
-      | Some at -> max 0.0 (at -. monotonic_now ())
+      if pending then 0.0
+      else
+        match !reconnect_at with
+        | None -> 30.0
+        | Some at -> max 0.0 (at -. monotonic_now ())
     in
     let descriptors =
       manager.wake_read
@@ -1468,9 +2018,7 @@ let live_owner (manager : live_manager) =
               (match !connection with
               | Some _ -> send_modify (remove_modification state)
               | None -> ());
-              Mutex.lock state.mutex;
-              state.closed <- true;
-              Mutex.unlock state.mutex
+              close_state state
           | Disconnect reply ->
               if !connection = None && not !retired_for_disconnect then
                 reply :=
@@ -1491,9 +2039,7 @@ let live_owner (manager : live_manager) =
               close_connection "ClientClosed" false;
               Hashtbl.iter
                 (fun (_ : int) (state : subscription_state) ->
-                  Mutex.lock state.mutex;
-                  state.closed <- true;
-                  Mutex.unlock state.mutex)
+                  close_state state)
                 active;
               manager.closed <- true)
         (drain_commands ());
@@ -1503,7 +2049,7 @@ let live_owner (manager : live_manager) =
       | Some at when at <= monotonic_now () && !connection = None -> connect ()
       | _ -> ());
       match !connection with
-      | Some ws when List.mem ws.channel.fd ready ->
+      | Some ws when pending || List.mem ws.channel.fd ready ->
           (try handle_message (J.from_string (ws_read_message ws)) with
           | Read_interrupted ->
               retired_for_disconnect := queued_disconnect ();
@@ -1604,17 +2150,10 @@ let subscribe (client : client) path args =
         let qid = client.live.next_qid in
         client.live.next_qid <- client.live.next_qid + 1;
         Mutex.unlock client.live.command_mutex;
-        let state =
-          {
-            qid;
-            path;
-            args;
-            mutex = Mutex.create ();
-            queue = [];
-            queue_bytes = 0;
-            closed = false;
-          }
-        in
+        let state = { qid; path; args; queue = []; closed = false } in
+        (* Registering before the Add reaches the owner keeps this queue inside
+           the process-wide budget from its very first update. *)
+        register_state state;
         command client.live (Add state);
         Ok { manager = client.live; state }))
 

@@ -149,9 +149,13 @@ The first command checks formatting, unit fixtures, and compilation. The example
 
 ## Protocol notes
 
-The client implements the documented JSON Functions API directly with OCaml Unix sockets, and implements the pinned `/api/sync` profile directly with an OCaml WebSocket frame reader and writer. TLS uses `ocaml-ssl`; JSON uses `yojson`. The Live worker exclusively owns socket reads, writes, reconnects, and query-set versions. Updates use a bounded current-state queue with both count and byte limits.
+The client implements the documented JSON Functions API directly with OCaml Unix sockets, and implements the pinned `/api/sync` profile directly with an OCaml WebSocket frame reader and writer. TLS uses `ocaml-ssl`; JSON uses `yojson`. The Live worker exclusively owns socket reads, writes, reconnects, and query-set versions.
 
-The adapter speaks NDJSON v1 over stdin/stdout or a single loopback TCP connection. `debugDisconnect` is compiled into the adapter surface only and is used to prove that active `Add` operations are replayed after five real reconnects.
+The WebSocket handshake is validated rather than assumed: a `101` is accepted only when the peer names the websocket protocol, carries the `Upgrade` token in its `Connection` list, and echoes the exact `Sec-WebSocket-Accept` derived from the key this client just generated. Frames are checked against the structural rules RFC 6455 gives a client before any payload is used, including reserved bits, masked server frames, control frame size and fragmentation, minimally encoded lengths, close codes, and UTF-8 in text frames and close reasons. Reconnect backoff returns to its floor after a validated handshake, so a healthy connection never leaves the next attempt waiting out an older maximum.
+
+Live delivery is bounded across the whole process rather than per subscription, because a container memory limit is shared by every subscription at once. The budget is derived from the 128 MiB conformance gate after reserving for the OCaml runtime, one inbound frame being parsed, the adapter's whole output path, and explicit headroom; an update is charged for its value, logs, structured error data, and the encoded output it becomes. When the budget is exceeded the oldest update anywhere in the process is dropped.
+
+The adapter speaks NDJSON v1 over stdin/stdout or a single loopback TCP connection. Command lines are bounded while they are read, and every event leaves through one bounded ordered writer, so a controller that stops reading cannot block an unsubscribe or grow the process. `debugDisconnect` is compiled into the adapter surface only and is used to prove that active `Add` operations are replayed after five real reconnects.
 
 ## Limitations
 

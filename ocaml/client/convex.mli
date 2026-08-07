@@ -42,6 +42,27 @@ val subscription_next :
   subscription -> float -> (update option, error) Stdlib.result
 
 val unsubscribe : subscription -> (unit, error) Stdlib.result
+
 val debug_disconnect : client -> (unit, error) Stdlib.result
+(** Force the live connection closed and let the socket owner reconnect on
+    its own, without closing the client. Exposed only because the
+    conformance adapter's [debugDisconnect] operation exercises this
+    client's reconnect-and-recover path the same way every other language's
+    adapter does; application code has no reason to call it, and closing the
+    connection out from under a live subscription is not a capability this
+    client otherwise offers. *)
+
 val close : client -> unit
 val parse_integral_int64 : Yojson.Safe.t -> (int64, string) Stdlib.result
+
+val utf8_scalar_count : string -> int option
+(** Number of Unicode scalars in a valid UTF-8 string, or [None] when the bytes
+    are not well-formed UTF-8. Exposed because the adapter schema's string
+    lengths are character counts, so the test-only conformance executable must
+    measure them the same way this client measures sync protocol text rather
+    than growing a second, divergent decoder. *)
+
+val websocket_accept_key : string -> string
+(** The RFC 6455 [Sec-WebSocket-Accept] value for a client key. Exposed so the
+    language-local WebSocket fixtures can answer a handshake correctly and so
+    the published RFC vector can pin this implementation from a test. *)
