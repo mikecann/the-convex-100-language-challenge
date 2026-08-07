@@ -134,7 +134,8 @@ feature -- Input
 			out_buffer: MANAGED_POINTER
 			rc: INTEGER
 		do
-			if pending_tls_bytes or else (create poll).wait_readable (descriptor, a_timeout_ms) then
+			create poll
+			if pending_tls_bytes or else poll.wait_readable (descriptor, a_timeout_ms) then
 				create out_buffer.make (a_max_bytes)
 				if use_tls then
 					rc := c_tls_read (ssl_ptr, out_buffer.item, a_max_bytes)
@@ -332,14 +333,14 @@ feature {NONE} -- Plain TCP externals
 
 	c_raw_write (a_fd: INTEGER; a_data: POINTER; a_count: INTEGER): INTEGER
 		external
-			"C inline use %"<sys/socket.h>%""
+			"C inline use %"sys/socket.h%""
 		alias
 			"return (EIF_INTEGER) send((int) $a_fd, (const void *) $a_data, (size_t) $a_count, 0);"
 		end
 
 	c_raw_read (a_fd: INTEGER; a_buffer: POINTER; a_max: INTEGER): INTEGER
 		external
-			"C inline use %"<sys/socket.h>%""
+			"C inline use %"sys/socket.h%""
 		alias
 			"return (EIF_INTEGER) recv((int) $a_fd, (void *) $a_buffer, (size_t) $a_max, 0);"
 		end

@@ -41,7 +41,7 @@ feature {NONE} -- Externals
 			-- 1 if `a_fd' is readable before the deadline, 0 on timeout,
 			-- -1 on a `select' error (treated as "not ready" by callers).
 		external
-			"C inline use %"<sys/select.h>%""
+			"C inline use %"sys/select.h%""
 		alias
 			"{
 				fd_set readfds;
@@ -63,7 +63,7 @@ feature {NONE} -- Externals
 
 	c_select_two (a_fd_one, a_fd_two: INTEGER; a_timeout_ms: INTEGER): INTEGER
 		external
-			"C inline use %"<sys/select.h>%""
+			"C inline use %"sys/select.h%""
 		alias
 			"{
 				fd_set readfds;
