@@ -34,7 +34,7 @@ Nothing in this table is a badge. Only the shared result evaluator may award
 HTTP or Live, and it has not run against this source yet.
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.hx -->
-```text
+```haxe
 import haxe.Exception;
 
 class Main {

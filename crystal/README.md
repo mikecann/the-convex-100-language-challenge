@@ -15,7 +15,7 @@ Read the [canonical basic example](examples/basics/main.cr). It performs an HTTP
 | Authentication | HTTP bearer token; Live auth deferred |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.cr -->
-```text
+```crystal
 require "json"
 require "../../client/client"
 

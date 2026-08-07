@@ -22,7 +22,7 @@ the `0 -> 1` journey rather than merely issuing individual requests.
 | Capability badges | None earned until root-owned local and hosted conformance passes |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.jl -->
-```text
+```julia
 #!/usr/local/bin/julia
 
 # Load the client from this repository. The compiled image already defines it,
