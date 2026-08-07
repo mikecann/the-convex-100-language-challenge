@@ -73,9 +73,10 @@ ENV ydb_chset=M
 # into the runtime images read-only, and never written again.
 RUN set -eu; \
     mkdir -p /opt/convex/db; \
+    export ydb_gbldir=/opt/convex/db/mumps.gld; \
     printf 'change -segment DEFAULT -file=/opt/convex/db/mumps.dat\nexit\n' \
-      | /opt/yottadb/mumps -run GDE >/dev/null; \
-    ydb_gbldir=/opt/convex/db/mumps.gld /opt/yottadb/mupip create -region DEFAULT >/dev/null; \
+      | /opt/yottadb/mumps -run GDE; \
+    /opt/yottadb/mupip create -region DEFAULT; \
     test -s /opt/convex/db/mumps.dat; \
     test -s /opt/convex/db/mumps.gld
 ENV ydb_gbldir=/opt/convex/db/mumps.gld
