@@ -66,6 +66,23 @@ RUN test "$(uname -m)" = x86_64 \
 # Stage the exact runtime closure. ldd resolves what the interpreter and its
 # extensions actually link, and the extra entries cover what OpenSSL and glibc
 # load at run time rather than link time.
+#
+# BUILD_IMAGE ships merged-usr: /lib, /lib64, /bin and /sbin are symlinks
+# into /usr/*. ldd and the raw /etc and /usr ls entries below report library
+# paths through those symlinks (e.g. /lib/x86_64-linux-gnu/libc.so.6), so a
+# naive `tar ... -T closure.txt` extraction into an empty /rootfs recreates
+# /rootfs/lib as a real directory rather than a symlink. Later, copying that
+# real directory onto the runtime-base image's /lib symlink makes buildkit's
+# containerd-snapshotter backend fail with "cannot copy to non-directory";
+# it refuses to write a directory over a symlink even though the symlink's
+# target (/usr/lib) is itself a directory. Resolving only the directory
+# component of each path with `readlink -f` (never the basename, which is
+# often itself a SONAME symlink such as libcurl.so.4 -> libcurl.so.4.8.0
+# that must keep its name) rewrites every entry to its canonical /usr/*
+# location before the tar step, so /rootfs only ever gains real directories
+# - usr/, etc/, opt/ - that already exist as real directories in
+# runtime-base too, and the final COPY never touches /lib, /lib64, /bin or
+# /sbin at all.
 RUN set -eu; \
     mkdir -p /rootfs; \
     { ldd /opt/ring/bin/ring; \
@@ -82,6 +99,10 @@ RUN set -eu; \
     ls /lib/x86_64-linux-gnu/libnss_*.so.2 /lib/x86_64-linux-gnu/libresolv.so.2 \
       >> /tmp/closure.txt 2>/dev/null || true; \
     sort -u /tmp/closure.txt -o /tmp/closure.txt; \
+    while IFS= read -r closure_path; do \
+      printf '%s/%s\n' "$(readlink -f "$(dirname "$closure_path")")" "$(basename "$closure_path")"; \
+    done < /tmp/closure.txt | sort -u > /tmp/closure.resolved.txt; \
+    mv /tmp/closure.resolved.txt /tmp/closure.txt; \
     tar -chf /tmp/closure.tar -T /tmp/closure.txt; \
     tar -xpf /tmp/closure.tar -C /rootfs; \
     mkdir -p /rootfs/opt/ring/bin/load /rootfs/opt/ring/lib \
@@ -149,8 +170,12 @@ CMD ["/opt/ring/bin/ring", "/project/client/tests/run.ring"]
 FROM --platform=linux/amd64 ${BUILD_IMAGE} AS runtime-base
 
 # Only the staged closure is installed, so no compiler, no build frontend and
-# no development headers exist here. The base image's package manager is then
-# removed outright rather than merely hidden from PATH.
+# no development headers exist here. /rootfs holds only real directories
+# that also exist as real directories here (usr/, etc/, opt/); it has no
+# entries at /lib, /lib64, /bin or /sbin, so this never copies a directory
+# onto this merged-usr image's symlinks at those paths. The base image's
+# package manager is then removed outright rather than merely hidden from
+# PATH.
 COPY --from=build /rootfs/ /
 RUN set -eu; \
     rm -rf /etc/apt /usr/lib/apt /var/lib/apt /var/cache/apt /var/lib/dpkg /usr/share/dpkg; \
