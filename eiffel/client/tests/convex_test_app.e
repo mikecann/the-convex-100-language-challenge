@@ -34,7 +34,6 @@ feature {NONE} -- Initialization
 			print (obj.to_json)
 			print ("%N")
 
-			check_socket
 			print ("SMOKE_OK%N")
 		end
 
