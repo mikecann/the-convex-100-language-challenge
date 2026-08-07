@@ -75,4 +75,6 @@ limitations:
   - >-
     Stdin and TCP commands share a 9 MiB newline-delimited frame limit and
     discard incomplete fragments at end of input.
-capabilities: []
+capabilities:
+  - http
+  - live

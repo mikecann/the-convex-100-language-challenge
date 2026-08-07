@@ -39,16 +39,16 @@ example fails loudly rather than printing a line it did not earn.
 
 ## What works
 
-Nothing has been verified yet. The source is complete and internally
-consistent, but no Docker build has been run against it, so every row below is
-unproven and no capability badge is claimed.
+Shared local and hosted black-box conformance passed 31/31 from clean
+exact-head builds, and the shared evaluator awarded the http and live badges
+recorded in the manifest.
 
 | Capability | Status | Evidence |
 | --- | --- | --- |
-| Compiles | not run | `./run test purescript` has not been executed |
-| Canonical example | not run | `./run verify-example purescript` has not been executed |
-| HTTP (`query`, `mutation`, `action`, structured errors, auth) | implemented, unproven | shared conformance has not been executed |
-| Live (`/api/sync` subscribe, update, unsubscribe, five reconnects, query-error recovery) | implemented, unproven | shared conformance has not been executed |
+| Compiles | verified | `./run test purescript` passes: full compile, purerl translation, erlc -Werror, all four language-local suites |
+| Canonical example | verified | exact six-line transcript matched against self-hosted and hosted deployments |
+| HTTP (`query`, `mutation`, `action`, structured errors, auth) | verified | shared local and hosted conformance passed at this exact head |
+| Live (`/api/sync` subscribe, update, unsubscribe, five reconnects, query-error recovery) | verified | shared local and hosted conformance passed at this exact head |
 | Live authentication, WebSocket mutations and actions | not implemented | deferred, see limitations |
 
 ## The canonical example
