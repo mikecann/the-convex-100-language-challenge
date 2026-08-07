@@ -1,0 +1,8 @@
+package convex-tests-wire
+
+version = 0.1.0
+sourcedir = "tests/wire"
+depends = convex
+
+main = Main
+executable = "convex-tests-wire"

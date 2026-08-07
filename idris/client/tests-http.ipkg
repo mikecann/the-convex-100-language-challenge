@@ -1,0 +1,8 @@
+package convex-tests-http
+
+version = 0.1.0
+sourcedir = "tests/http"
+depends = convex
+
+main = Main
+executable = "convex-tests-http"
