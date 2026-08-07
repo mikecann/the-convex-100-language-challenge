@@ -693,11 +693,21 @@
  /* Start-up                                                         */
  /*==================================================================*/
 
- /* Put every buffer and document slot into its empty state. A null  */
- /* data pointer is a legal starting point because realloc(NULL,n)   */
- /* is malloc(n), so bgrow needs no separate first-allocation path.  */
+ /* Put every buffer, document slot and piece of client state into    */
+ /* its empty state. This is not housekeeping: PL/I AUTOMATIC storage */
+ /* starts as whatever the stack happened to contain, so a state      */
+ /* variable left unset is genuinely random. The cached TLS context   */
+ /* is the sharp example -- an unset sslctx reads as a non-null       */
+ /* pointer, tlsctx believes a context already exists, and OpenSSL is */
+ /* handed a garbage SSL_CTX on the first https call. Everything a    */
+ /* procedure below tests before assigning belongs in here.           */
+ /*                                                                   */
+ /* A null data pointer is a legal starting point for a buffer        */
+ /* because realloc(NULL,n) is malloc(n), so bgrow needs no separate  */
+ /* first-allocation path.                                            */
  cvxinit: proc;
    dcl   i                   fixed bin(31);
+   dcl   j                   fixed bin(31);
    do i = 1 to NBUFFERS;
      bdata(i) = sysnull();
      blen(i)  = 0;
@@ -712,6 +722,58 @@
      dpos(i)   = 0;
      ddepth(i) = 0;
      dok(i)    = 1;
+     end;
+   cvxtls      = 0;
+   sslctx      = sysnull();
+   httpfd      = -1;
+   httpssl     = sysnull();
+   httpstatus  = 0;
+   callok      = 0;
+   callvalue   = -1;
+   calllogs    = -1;
+   callerrdata = -1;
+   callerrname = ' ';
+   livestarted = 0;
+   liveclosing = 0;
+   livefailed  = 0;
+   liveiserror = 0;
+   wsfd        = -1;
+   wsssl       = sysnull();
+   wsconnected = 0;
+   wsfragmented = 0;
+   wsmsgopcode = 0;
+   qsversion   = 0;
+   remoteqs    = 0;
+   remoteid    = 0;
+   connectioncount = 0;
+   nextqueryid = 0;
+   reconnectat = 0;
+   backoffms   = 100;
+   qbytes      = 0;
+   do i = 1 to MAX_SUBSCRIPTIONS;
+     subused(i)    = 0;
+     subactive(i)  = 0;
+     subaddpend(i) = 0;
+     subrempend(i) = 0;
+     subremdone(i) = 0;
+     subrehyd(i)   = 0;
+     subhaslast(i) = 0;
+     subqid(i)     = -1;
+     sublastp(i)   = sysnull();
+     sublastn(i)   = 0;
+     subnamep(i)   = sysnull();
+     subnamen(i)   = 0;
+     subpathp(i)   = sysnull();
+     subpathn(i)   = 0;
+     subargsp(i)   = sysnull();
+     subargsn(i)   = 0;
+     subqstart(i)  = 0;
+     subqcount(i)  = 0;
+     do j = 1 to QUEUE_CAPACITY;
+       qtextp(i,j)   = sysnull();
+       qtextn(i,j)   = 0;
+       qiserror(i,j) = 0;
+       end;
      end;
    end cvxinit;
 
