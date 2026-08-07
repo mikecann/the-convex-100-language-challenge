@@ -157,6 +157,7 @@ feature {NONE} -- Response parsing
 			line: detachable STRING
 			done: BOOLEAN
 			lower: STRING
+			value_text: STRING
 		do
 			Result := -1
 			from until done
@@ -167,7 +168,10 @@ feature {NONE} -- Response parsing
 				else
 					lower := line.as_lower
 					if lower.starts_with ("content-length:") then
-						Result := line.substring (17, line.count).trimmed.to_integer
+						value_text := line.substring (17, line.count)
+						value_text.left_adjust
+						value_text.right_adjust
+						Result := value_text.to_integer
 					end
 				end
 			end

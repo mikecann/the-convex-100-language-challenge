@@ -202,11 +202,7 @@ feature {NONE} -- HTTP implementation
 			end
 		end
 
-feature {NONE} -- URL parsing
-
-	host: STRING
-	port: INTEGER
-	use_tls: BOOLEAN
+feature -- Validation
 
 	url_is_well_formed (a_url: STRING): BOOLEAN
 			-- Does `a_url' start with "http://" or "https://" and carry a
@@ -227,6 +223,12 @@ feature {NONE} -- URL parsing
 				Result := colon_index > 1 and colon_index < a_path.count
 			end
 		end
+
+feature {NONE} -- URL parsing
+
+	host: STRING
+	port: INTEGER
+	use_tls: BOOLEAN
 
 	parse_url (a_url: STRING)
 			-- Split `a_url' into `host', `port', and `use_tls'.
