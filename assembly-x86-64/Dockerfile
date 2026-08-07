@@ -104,13 +104,35 @@ set -eu
 ADAPTER_LISTEN=127.0.0.1:18080 /build/convex-adapter &
 adapter_pid=$!
 sleep 1
-exec 3<>/dev/tcp/127.0.0.1/18080
-printf '%s\n%s\n' \
-  '{"id":"tcp-hello","protocolVersion":1,"op":"hello"}' \
-  '{"id":"tcp-close","op":"close"}' >&3
-actual=$(timeout 10 cat <&3)
-exec 3<&- 3>&-
-wait "$adapter_pid"
+attempt=1
+actual=""
+while test -z "$actual"; do
+  actual=$(timeout 5 bash -c '
+    exec 3<>/dev/tcp/127.0.0.1/18080
+    printf "%s\n%s\n" \
+      "{\"id\":\"tcp-hello\",\"protocolVersion\":1,\"op\":\"hello\"}" \
+      "{\"id\":\"tcp-close\",\"op\":\"close\"}" >&3
+    cat <&3
+  ' || true)
+  if test -n "$actual"; then
+    break
+  fi
+  attempt=$((attempt + 1))
+  if test "$attempt" -gt 5; then
+    printf '%s\n' 'exhausted retries connecting to the ADAPTER_LISTEN adapter' >&2
+    exit 1
+  fi
+  sleep 1
+done
+n=0
+while kill -0 "$adapter_pid" 2>/dev/null; do
+  if test "$n" -ge 10; then
+    printf '%s\n' 'adapter did not exit after processing close' >&2
+    exit 1
+  fi
+  sleep 1
+  n=$((n + 1))
+done
 printf '%s\n' "$actual" | grep -F '"id":"tcp-hello","protocolVersion":1,"type":"ready"'
 printf '%s\n' "$actual" | grep -Fx '{"id":"tcp-close","type":"closed"}'
 EOF
