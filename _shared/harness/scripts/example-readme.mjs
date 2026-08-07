@@ -9,6 +9,7 @@ const fenceLanguages = {
   ".adb": "ada",
   ".ads": "ada",
   ".agda": "agda",
+  ".alg": "algol",
   ".asm": "nasm",
   ".awk": "awk",
   ".bas": "freebasic",
