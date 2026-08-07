@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install --no-install-recommends --yes \
     ca-certificates \
     git \
     libssl-dev \
+    netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 RUN git clone -q https://github.com/sergev/xpl-compiler.git xpl-compiler \
