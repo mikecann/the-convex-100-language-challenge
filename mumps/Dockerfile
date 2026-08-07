@@ -42,13 +42,17 @@ RUN apt-get update \
 # treats the first non-flag word as the requested version).
 # --encplugin builds YottaDB's OpenSSL-backed TLS plugin from source as part
 # of the same install; this answers the brief's one open question -- the
-# plugin does ship, and does build unattended.
+# plugin does ship, and does build unattended. --utf8 is deliberately never
+# passed: it installs a second, ICU-linked engine variant purely to support a
+# UTF-8 chset this client never selects (ydb_chset=M below is set for every
+# stage, including this one), so omitting it also drops the ICU dependency
+# from the whole image.
 ADD --checksum=sha256:ca1def5ae28a136dbaec58bb72630420f9e7c9f43633a2b9aeb4a036be441f47 \
     https://download.yottadb.com/ydbinstall.sh /tmp/ydbinstall.sh
 RUN set -eu; \
     test "$(uname -m)" = x86_64; \
     chmod +x /tmp/ydbinstall.sh; \
-    /tmp/ydbinstall.sh r2.06 --installdir /opt/yottadb --utf8 default \
+    /tmp/ydbinstall.sh r2.06 --installdir /opt/yottadb \
       --encplugin --overwrite-existing --verbose; \
     rm -f /tmp/ydbinstall.sh; \
     /opt/yottadb/yottadb --version 2>&1 | head -n 1 | grep -Fq 'YottaDB r2.06'; \
