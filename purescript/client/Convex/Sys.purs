@@ -30,6 +30,7 @@ module Convex.Sys
   , monotonicMs
   , remainingMs
   , randomBytes
+  , collectGarbage
   , stdinRead
   , stdoutWrite
   , println
@@ -180,14 +181,22 @@ remainingMs deadline = mapEffect (\now -> maxInt 0 (deadline - now)) monotonicMs
 
 foreign import randomBytes :: Int -> Effect Bytes
 
--- | Read bytes, not characters: NDJSON framing is defined on bytes and one
--- | command may split a multi-byte character across two reads.
-stdinRead :: Int -> Effect ReadResult
-stdinRead count = stdinReadImpl count ReadChunk ReadEnd ReadFailed
+-- | Free this process's unreachable memory now, including the byte strings it
+-- | no longer references. Ordinary code never needs this; a loop that discards
+-- | a large buffer and then keeps running on a small one does, because nothing
+-- | else will prompt a collection until long after the bytes are dead.
+foreign import collectGarbage :: Effect Unit
+
+-- | Read whatever bytes have arrived, as bytes rather than characters: NDJSON
+-- | framing is defined on bytes and one command may split a multi-byte
+-- | character across two reads. Like `recv` with a length of zero this answers
+-- | with the next arrival rather than a fixed count, so a caller waiting on a
+-- | single small command is never held back waiting for a full buffer.
+stdinRead :: Effect ReadResult
+stdinRead = stdinReadImpl ReadChunk ReadEnd ReadFailed
 
 foreign import stdinReadImpl
-  :: Int
-  -> (Bytes -> ReadResult)
+  :: (Bytes -> ReadResult)
   -> ReadResult
   -> (String -> ReadResult)
   -> Effect ReadResult

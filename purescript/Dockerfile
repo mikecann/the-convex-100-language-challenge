@@ -163,11 +163,13 @@ RUN erl -noshell -pa ebin -eval "('convex_test_example@ps':main())(), halt(0)."
 RUN erl -noshell -pa ebin -eval "('convex_test_live@ps':main())(), halt(0)."
 
 # The adapter must speak protocol v1 over stdin/stdout before anything relies
-# on it.
+# on it. `-noinput` matches the runtime entrypoint: the adapter reads standard
+# input through a port it owns, and the reader OTP starts under `-noshell`
+# would take bytes off the same descriptor first.
 RUN set -eu; \
     printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' \
       '{"id":"close","op":"close"}' \
-      | CONVEX_URL=http://127.0.0.1:9 erl -noshell -pa ebin \
+      | CONVEX_URL=http://127.0.0.1:9 erl -noinput -pa ebin \
         -eval "('adapter@ps':main())(), halt(0)." >/tmp/adapter.ndjson; \
     grep -Fq '"language":"purescript"' /tmp/adapter.ndjson; \
     grep -Fq '"type":"closed"' /tmp/adapter.ndjson
@@ -178,7 +180,7 @@ RUN set -eu; \
 # the stream.
 RUN set -eu; \
     adapter() { \
-      CONVEX_URL=http://127.0.0.1:9 erl -noshell -pa ebin \
+      CONVEX_URL=http://127.0.0.1:9 erl -noinput -pa ebin \
         -eval "('adapter@ps':main())(), halt(0)."; \
     }; \
     long_id=$(head -c 129 /dev/zero | tr '\000' x); \

@@ -11,8 +11,8 @@
 
 -export([connectImpl/7, sendImpl/5, recvImpl/7, close/1,
          listenImpl/3, listenPortImpl/3, acceptImpl/4, controllingProcess/2,
-         monotonicMs/0, randomBytes/1,
-         stdinReadImpl/4, stdoutWriteImpl/3, stderrWrite/1,
+         monotonicMs/0, randomBytes/1, collectGarbage/0,
+         stdinReadImpl/3, stdoutWriteImpl/3, stderrWrite/1,
          otpRelease/0, plainArgumentsImpl/2, getenvImpl/3, halt/1,
          spawnProcess/1, selfPid/0,
          sendCommand/2, receiveCommandImpl/3,
@@ -21,6 +21,10 @@
          sendCommandAfter/3, cancelTimer/1, killAndWait/2]).
 
 -define(CA_BUNDLE, "/etc/ssl/certs/ca-certificates.crt").
+
+%% Where the reading process remembers its standard input port. A port belongs
+%% to the process that opened it, and only that process may receive from it.
+-define(STDIN_KEY, '$convex_stdin').
 
 %% ---------------------------------------------------------------------------
 %% Sockets and TLS
@@ -176,15 +180,86 @@ randomBytes(Count) ->
         crypto:strong_rand_bytes(Count)
     end.
 
-stdinReadImpl(Count, Chunk, End, Failed) ->
+%% Collect this process now, sweeping the old generation too.
+%%
+%% A byte string larger than 64 bytes lives off the process heap and is freed
+%% by reference count, and the reference this process holds is only dropped
+%% when the heap cell naming it is collected. A loop that keeps a small heap
+%% therefore collects rarely, so megabytes that are already unreachable stay
+%% resident: the reader below abandons whole rejected commands and would
+%% otherwise carry several of them at once. A full sweep is the only collection
+%% that reaches references promoted to the old generation.
+collectGarbage() ->
     fun() ->
-        _ = io:setopts(standard_io, [binary]),
-        case file:read(standard_io, Count) of
-            {ok, Data} -> Chunk(Data);
-            eof -> End;
-            {error, Reason} -> Failed(reason(Reason))
+        _ = erlang:garbage_collect(erlang:self(), [{type, major}]),
+        unit
+    end.
+
+%% Standard input is read through a port this process owns rather than through
+%% the `standard_io` io server, because the io server is not flow controlled.
+%% Under `-noshell` OTP starts a tty reader that pushes everything it can take
+%% from file descriptor 0 into the `group` process's mailbox whether or not
+%% anybody has asked for data, so a peer that writes faster than this client
+%% parses is buffered on the emulator's heap instead of in the kernel's pipe.
+%% Draining 54 MiB that way was measured here at 6.0 s and 101 MB of resident
+%% memory, with 26k messages holding 27 MB of reference-counted binaries queued
+%% inside `group`; the same 54 MiB through a port owned by the reader took
+%% 0.09 s and 66 MB, because the bytes land in the mailbox of the one process
+%% that is about to consume them. The entrypoint passes `-noinput` so OTP
+%% starts no competing reader: with `-noshell` the tty reader wins part of the
+%% stream and those bytes never reach this port at all.
+%%
+%% `eof` keeps the port alive at end of input rather than letting it exit and
+%% signal its owner, so end of input is an ordinary message like any other.
+stdinReadImpl(Chunk, End, Failed) ->
+    fun() ->
+        case stdin_port() of
+            closed ->
+                End;
+            {failed, Why} ->
+                Failed(Why);
+            Port ->
+                receive
+                    {Port, {data, Data}} ->
+                        Chunk(Data);
+                    {Port, eof} ->
+                        stdin_close(Port),
+                        End;
+                    %% Only a process trapping exits is handed a port's exit as
+                    %% a message, so these two are for a caller that does. They
+                    %% are what makes a driver failure a read failure instead of
+                    %% a case that was assumed not to happen.
+                    {'EXIT', Port, normal} ->
+                        stdin_close(Port),
+                        End;
+                    {'EXIT', Port, Reason} ->
+                        stdin_close(Port),
+                        Failed(reason(Reason))
+                end
         end
     end.
+
+%% There is no descriptor to open when standard input was never connected, and
+%% a read that cannot happen is a read failure rather than a crash.
+stdin_port() ->
+    case erlang:get(?STDIN_KEY) of
+        undefined ->
+            Opened =
+                try erlang:open_port({fd, 0, 1}, [in, binary, stream, eof]) of
+                    Port -> Port
+                catch
+                    _:Reason -> {failed, reason(Reason)}
+                end,
+            _ = erlang:put(?STDIN_KEY, Opened),
+            Opened;
+        Remembered ->
+            Remembered
+    end.
+
+stdin_close(Port) ->
+    _ = (catch erlang:port_close(Port)),
+    _ = erlang:put(?STDIN_KEY, closed),
+    ok.
 
 stdoutWriteImpl(Payload, Left, Right) ->
     fun() ->

@@ -65,7 +65,8 @@ maxCommandBytes :: Int
 maxCommandBytes = 9437184
 
 -- | Bounds on queued output, including the payload the sender is physically
--- | writing. Saturation closes the stalled controller instead of buffering.
+-- | writing. Saturation never buffers past these; a saturation that outlasts
+-- | `emitTimeout` is what closes a controller that has stopped reading.
 maxOutputCount :: Int
 maxOutputCount = 16
 
@@ -80,9 +81,6 @@ emitTimeout = 1000
 -- | How long the reader waits for the controller to acknowledge a command.
 ackTimeout :: Int
 ackTimeout = 5000
-
-readChunk :: Int
-readChunk = 16384
 
 main :: Effect Unit
 main = do
@@ -670,10 +668,19 @@ type ReaderState =
   { chunks :: Bytes.Chunks
   , bytes :: Int
   , discarding :: Boolean
+  -- | Set when the last step threw away a partly read command. The bytes are
+  -- | unreachable from the next state but not yet returned, and only the loop
+  -- | head can act on that; see `readerLoop`.
+  , abandoned :: Boolean
   }
 
 emptyReader :: ReaderState
-emptyReader = { chunks: Bytes.emptyChunks, bytes: 0, discarding: false }
+emptyReader =
+  { chunks: Bytes.emptyChunks
+  , bytes: 0
+  , discarding: false
+  , abandoned: false
+  }
 
 -- | Wait for the controller to confirm that this process owns the transport,
 -- | then start reading. Reading first would race the ownership handover.
@@ -688,6 +695,14 @@ readerStart handover events channel = do
 -- | process's mailbox with unread work.
 readerLoop :: Pid -> Channel -> ReaderState -> Effect Unit
 readerLoop events channel state = do
+  -- Reclaim an abandoned command here rather than where it was abandoned. A
+  -- collection only frees what the *current* call stack can no longer reach,
+  -- and while `parseLines` is deciding to reject a command its own frame still
+  -- names the accumulated bytes. Those frames have all returned by the time
+  -- the loop comes back round, which makes this the first point where the
+  -- memory is genuinely unreachable, and the last point before this process
+  -- blocks and starts accumulating the next command on top of the old one.
+  whenEffect state.abandoned Sys.collectGarbage
   chunk <- readChannel channel
   case chunk of
     Left reason -> do
@@ -707,7 +722,7 @@ readerLoop events channel state = do
 readChannel :: Channel -> Effect (Either String (Maybe Bytes))
 readChannel channel = case channel of
   StdIo -> do
-    outcome <- Sys.stdinRead readChunk
+    outcome <- Sys.stdinRead
     case outcome of
       ReadChunk bytes -> pure (Right (Just bytes))
       ReadEnd -> pure (Right Nothing)
@@ -730,10 +745,14 @@ consumeChunk events state bytes =
     let
       newline = Bytes.indexOfByte bytes 0x0A 0
     in
-      if newline < 0 then
-        pure (Just { chunks: Bytes.emptyChunks, bytes: 0, discarding: true })
+      if newline < 0 then pure (Just discardingReader)
       else consumeChunk events emptyReader (Bytes.drop (newline + 1) bytes)
   else parseLines events state.chunks state.bytes bytes
+
+-- | Consuming the tail of a rejected command. Nothing is accumulated, so each
+-- | further chunk of it is read and dropped rather than held.
+discardingReader :: ReaderState
+discardingReader = emptyReader { discarding = true }
 
 parseLines
   :: Pid -> Bytes.Chunks -> Int -> Bytes -> Effect (Maybe ReaderState)
@@ -750,13 +769,14 @@ parseLines events chunks carried bytes =
         if total > maxCommandBytes then do
           delivered <- deliver events Oversized
           if delivered then
-            pure (Just { chunks: Bytes.emptyChunks, bytes: 0, discarding: true })
+            pure (Just (discardingReader { abandoned = true }))
           else pure Nothing
         else pure
           ( Just
               { chunks: Bytes.pushChunk bytes chunks
               , bytes: total
               , discarding: false
+              , abandoned: false
               }
           )
     else
@@ -767,13 +787,26 @@ parseLines events chunks carried bytes =
       in
         if lineBytes > maxCommandBytes then do
           delivered <- deliver events Oversized
-          if delivered then parseLines events Bytes.emptyChunks 0 rest
+          if delivered then markAbandoned (parseLines events Bytes.emptyChunks 0 rest)
           else pure Nothing
         else do
           let line = Bytes.chunksToBytes (Bytes.pushChunk prefix chunks)
           delivered <- deliver events (Incoming line)
-          if delivered then parseLines events Bytes.emptyChunks 0 rest
-          else pure Nothing
+          if not delivered then pure Nothing
+          -- Flattening copied the accumulated chunks into `line`, so a command
+          -- that spanned more than one read leaves a second, dead copy of
+          -- itself behind. Only the copy the controller was handed is live.
+          else if carried > 0 then
+            markAbandoned (parseLines events Bytes.emptyChunks 0 rest)
+          else parseLines events Bytes.emptyChunks 0 rest
+
+-- | Carry "a large accumulation was just dropped" out through the rest of the
+-- | chunk, so the loop head collects once for the whole read rather than once
+-- | for every command inside it.
+markAbandoned :: Effect (Maybe ReaderState) -> Effect (Maybe ReaderState)
+markAbandoned action = do
+  advanced <- action
+  pure (maybeMap (\state -> state { abandoned = true }) advanced)
 
 deliver :: Pid -> (Pid -> Ref -> Event) -> Effect Boolean
 deliver events build = do
@@ -793,6 +826,17 @@ data WriterMessage
   | FlushWhenIdle Pid Ref
   | StopWriter
 
+-- | One event the writer has been offered but has not answered, because
+-- | accepting it would breach the budget. It is not charged to the queue: the
+-- | caller built the payload, is still holding it, and is still blocked on the
+-- | answer, so the writer is not storing anything the caller was not already.
+type Pending =
+  { payload :: Bytes
+  , size :: Int
+  , replyPid :: Pid
+  , replyRef :: Ref
+  }
+
 type Writer =
   { events :: Pid
   , sender :: Pid
@@ -800,6 +844,7 @@ type Writer =
   , count :: Int
   , bytes :: Int
   , inflight :: Maybe Int
+  , pending :: Maybe Pending
   , waiters :: List (Tuple Pid Ref)
   }
 
@@ -817,6 +862,7 @@ startWriter events channel = Sys.spawnProcess do
     , count: 0
     , bytes: 0
     , inflight: Nothing
+    , pending: Nothing
     , waiters: Nil
     }
 
@@ -829,20 +875,13 @@ writerLoop writer = do
     -- peer has stopped reading and a write is blocked in the kernel.
     Just StopWriter -> voidEffect (Sys.killAndWait writer.sender 1000)
     Just (Enqueue payload replyPid replyRef) -> do
-      let size = Bytes.size payload
-      if writer.count >= maxOutputCount || writer.bytes + size > maxOutputBytes then do
-        Sys.sendReply replyPid replyRef Overflowed
-        writerLoop writer
-      else do
-        Sys.sendReply replyPid replyRef Emitted
-        dispatched <- dispatch
-          ( writer
-              { queue = listSnoc writer.queue (Tuple payload size)
-              , count = writer.count + 1
-              , bytes = writer.bytes + size
-              }
-          )
-        writerLoop dispatched
+      admitted <- admit writer
+        { payload: payload
+        , size: Bytes.size payload
+        , replyPid: replyPid
+        , replyRef: replyRef
+        }
+      writerLoop admitted
     Just (SendDone ok reason) -> do
       let
         released = fromMaybe 0 writer.inflight
@@ -853,7 +892,8 @@ writerLoop writer = do
           }
       unlessEffect ok (Sys.sendCommand settled.events (OutputFailed reason))
       dispatched <- dispatch settled
-      notified <- notify dispatched
+      resumed <- resume dispatched
+      notified <- notify resumed
       writerLoop notified
     Just (FlushWhenIdle replyPid replyRef) ->
       if writer.count == 0 then do
@@ -861,6 +901,46 @@ writerLoop writer = do
         writerLoop writer
       else writerLoop
         (writer { waiters = Cons (Tuple replyPid replyRef) writer.waiters })
+
+-- | Take one event if the budget has room for it.
+-- |
+-- | A full queue is not by itself a stalled controller. This node runs on a
+-- | single scheduler, so the process filling the queue routinely runs a whole
+-- | burst before the process draining it is scheduled at all, and answering
+-- | `Overflowed` on sight of a full queue would abandon a conformance run over
+-- | ordinary scheduling. The writer holds the event unanswered instead and
+-- | answers it when a completed write makes room, which leaves `emitTimeout` —
+-- | the caller's own bound — as the thing that decides the peer has stopped
+-- | reading. Memory is still bounded, because holding one unanswered event
+-- | admits nothing to the queue.
+admit :: Writer -> Pending -> Effect Writer
+admit writer offered =
+  if writer.count >= maxOutputCount
+    || writer.bytes + offered.size > maxOutputBytes then
+    case writer.pending of
+      -- Only the controller emits, and it blocks until it is answered, so a
+      -- second unanswered event means the first caller has already given up.
+      -- Refuse it rather than accumulate callers.
+      Just _ -> do
+        Sys.sendReply offered.replyPid offered.replyRef Overflowed
+        pure writer
+      Nothing -> pure (writer { pending = Just offered })
+  else do
+    Sys.sendReply offered.replyPid offered.replyRef Emitted
+    dispatch
+      ( writer
+          { queue = listSnoc writer.queue (Tuple offered.payload offered.size)
+          , count = writer.count + 1
+          , bytes = writer.bytes + offered.size
+          }
+      )
+
+-- | Reconsider the held event now that a write has completed. It goes back to
+-- | being held if the queue is still full.
+resume :: Writer -> Effect Writer
+resume writer = case writer.pending of
+  Nothing -> pure writer
+  Just held -> admit (writer { pending = Nothing }) held
 
 dispatch :: Writer -> Effect Writer
 dispatch writer = case writer.inflight, writer.queue of
