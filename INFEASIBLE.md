@@ -30,25 +30,45 @@ language so the roster still reaches one hundred.
 | q | kdb+ personal edition is gratis but license-gated and closed; redistribution inside images needs a decision. |
 | gml | GameMaker's compiler is proprietary; open reimplementations are only partially compatible. |
 
-## Proposed replacement languages
+## Chosen replacements
 
-Buildable with free toolchains in Docker, distinct from every current roster
-entry, and each with a real ecosystem or historical significance worth showing:
+Eleven entries are infeasible, so eleven replacements are needed to keep the
+roster at one hundred. These were selected against four criteria: a free
+toolchain that installs unattended in Docker, enough of a standard library or C
+FFI to reach a socket and speak TLS, a genuine claim on a viewer's interest, and
+variety across eras and paradigms rather than eleven more curly-brace
+languages.
 
-1. Rexx (Regina)
-2. PostScript (Ghostscript)
-3. Emacs Lisp (batch Emacs)
-4. Modula-2 (GNU gm2)
-5. Oberon-07 (OBNC)
-6. Icon (Unicon)
-7. SNOBOL4 (CSNOBOL4)
-8. Mercury
-9. ATS
-10. Hare
-11. Roc
-12. Koka
-13. Red
-14. Futhark
+| # | Replaces | Language | Toolchain | Why it earns a slot |
+| --- | --- | --- | --- | --- |
+| 1 | apex | **Rexx** | Regina Rexx | The scripting language of mainframes, OS/2 and Amiga. Ubiquitous for two decades, near-invisible today. |
+| 2 | labview | **Emacs Lisp** | Emacs batch mode | A Convex client inside a text editor's extension language. Emacs has real network primitives and TLS, so this is honest, not a stunt. |
+| 3 | matlab | **Futhark** | futhark | A purely functional array language that compiles to GPU code. Its FFI story makes the transport boundary genuinely interesting. |
+| 4 | mql5 | **Hare** | hare | A deliberately small systems language, self-hosted, no runtime. Modern, obscure, and a fair test of doing everything by hand. |
+| 5 | rpg | **Modula-2** | GNU gm2 | Wirth's successor to Pascal, and a GCC front end, so it builds anywhere GCC does. Direct historical line from the Pascal family already on the roster. |
+| 6 | sas | **Icon** | Unicon | Griswold's goal-directed evaluation with backtracking built into the language. Unlike anything else here. |
+| 7 | scratch | **SNOBOL4** | CSNOBOL4 | 1962, and still the most distinctive pattern-matching model ever shipped. The oldest language in the project. |
+| 8 | visual-foxpro | **Mercury** | mercury | Logic programming with strong static types and a real module system — Prolog's ideas taken seriously. |
+| 9 | xbasepp | **Oberon-07** | OBNC | Wirth's final, radically minimal language. A whole client in a language whose report fits in sixteen pages. |
+| 10 | xojo | **ALGOL 60** | GNU MARST | 1960, and the ancestor of nearly everything else on this roster: block structure, lexical scope, recursion and BNF all arrive here. The oldest language the project adds, and older than every entry except Fortran, Lisp and COBOL, which it predates in influence if not in date. |
+| 11 | xpp | **ATS** | ats2 | Dependent types over C, proving memory safety at compile time. The most demanding type system in the project. |
 
-Swapping any of these in for an infeasible entry is a shared-infrastructure
-roster change and follows the normal shared-change review path.
+Deliberately not chosen, and why:
+
+- **PostScript** (Ghostscript) — a page-description language with no sockets;
+  a client would have to be almost entirely foreign calls, which earns the
+  bridge label rather than a native one.
+- **Koka**, **Red** and **Roc** — all interesting, but young enough that pinning
+  a reproducible Docker build is a project of its own. Roc was originally chosen
+  and then displaced by ALGOL 60, which is both more interesting and, being
+  finished in 1960, not going to move under us.
+- **ALGOL 68** (Genie) — the packaged build has no networking primitives at all,
+  so a client would need an external transport process and would earn the bridge
+  label rather than the native one. ALGOL 60 via MARST avoids this because MARST
+  translates to C, where a small socket and TLS boundary is normal for this
+  project.
+
+If any chosen language proves infeasible once its toolchain is actually pinned
+in Docker, it moves to the table above with its reason recorded, and the next
+candidate takes the slot. The three borderline entries (wolfram-language, q,
+gml) still await a licensing decision and are not counted as replaced.

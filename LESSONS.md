@@ -247,7 +247,76 @@ They are recorded in `INFEASIBLE.md` with reasons and with replacement
 candidates, rather than quietly dropped or faked with a lookalike. "We tried and
 here is exactly why it cannot be done" is a real result.
 
-## 12. Miscellaneous findings worth a slide
+## 12. A wrong build triple silently disabled TLS trust
+
+The Odin client bundles its own build of curl. Its configure line said
+`--build=aarch64-linux-gnu --host=x86_64-linux-gnu` on a machine that is
+genuinely x86-64 — a leftover from when builds ran on an ARM Mac. Those two
+values differing is how you *declare* a cross-compile, so autoconf believed it
+was cross-compiling and skipped the step that finds the system CA bundle,
+noting it in a log nobody reads: "skipped the ca-cert path detection when
+cross-compiling."
+
+The result was a libcurl with no trust store compiled in. Everything built,
+every local test passed, and every real HTTPS connection failed peer
+verification. One stale build flag, no error, TLS trust silently switched off.
+
+The pattern generalises past autoconf: **configuration that describes your
+environment will be believed, and being wrong about your environment disables
+things quietly rather than loudly.**
+
+## 13. Choosing what not to build is part of the work
+
+Eleven of the hundred cannot be done honestly, so eleven replacements were
+chosen. The criteria were deliberate: a free toolchain that installs unattended
+in Docker, enough standard library or C FFI to reach a socket and speak TLS, a
+real claim on a viewer's attention, and variety across eras rather than eleven
+more curly-brace languages.
+
+That last criterion did real work. The list runs from SNOBOL4 (1962, and still
+the most distinctive pattern matching ever shipped) through Rexx, Modula-2,
+Icon, Oberon and Mercury to Hare, Roc, Futhark and ATS. It includes Emacs Lisp,
+because a Convex client living inside a text editor's extension language is a
+legitimate client — Emacs has real sockets and real TLS — and not a stunt.
+
+Two candidates were rejected for reasons worth stating. PostScript has no
+sockets at all, so a client would be almost entirely foreign calls and would
+earn the "bridge" label rather than the native one — building it would produce
+a misleading badge. Koka and Red are genuinely interesting but their toolchains
+are young enough that pinning a reproducible Docker build is a project in
+itself.
+
+**Saying no for a stated reason is a result.** A hundred entries where eleven
+are honest failures and eleven are considered substitutions is a better artifact
+than a hundred entries where some are quietly faked.
+
+## 14. The oldest language was already in the roster
+
+Asked to add the oldest language likely to work, the honest first answer was
+that the project had already done it: **Fortran, 1957**, verified with full
+HTTP and Live badges. Lisp and COBOL are there too. The three oldest languages
+in common use are all in and all working.
+
+Among languages *not* yet represented, the oldest plausible candidate is
+**ALGOL 60**. It is the ancestor of nearly everything else on the roster —
+block structure, lexical scope, recursion and BNF all arrive with it — and
+GNU MARST still translates it to C, so it builds anywhere GCC does.
+
+The feasibility check was done before promising anything, and it is a good
+illustration of how to answer "can we?" honestly. MARST built cleanly from
+source in a container, ALGOL 60 programs compiled and ran, and the external-C
+mechanism (`code` procedures, the standard's own escape hatch for
+implementation-defined bodies) exists. Two things surfaced immediately that a
+paper answer would have missed: ALGOL 60 identifiers cannot contain
+underscores, and `code` procedures must be declared outside the main block.
+
+The rejected sibling makes the point sharper. **ALGOL 68** is younger, better
+known, and packaged in Debian — but the packaged build has no networking
+primitives at all, so a client would be an external transport process wearing a
+costume. That earns this project's "bridge" label, not "native". Older and
+harder turned out to be more honest than newer and easier.
+
+## 15. Miscellaneous findings worth a slide
 
 - A client passed every check except one, and the one failure was in the
   *reference* implementation used for comparison, not the client under test.
