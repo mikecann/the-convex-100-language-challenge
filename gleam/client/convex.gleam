@@ -65,6 +65,7 @@ pub fn new_with_relay_gate(
 ) -> Result(Client, ConvexError) {
   start(url, Some(gate))
 }
+
 // TEST_ONLY_END
 
 // PROD fn start(url: String) -> Result(Client, ConvexError) {
@@ -73,7 +74,7 @@ fn start(
   url: String,
   gate: Option(convex_live.RelayGate),
 ) -> Result(Client, ConvexError) {
-// TEST_ONLY_END
+  // TEST_ONLY_END
   use parsed <- result.try(
     convex_http.parse_url(url)
     |> result.map_error(convex_error.protocol_error),

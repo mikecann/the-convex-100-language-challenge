@@ -116,6 +116,7 @@ pub type GateMessage {
   /// The relay has taken an event and is waiting to be released.
   GateHeld(release: Subject(Nil), subscription_id: String, event: LiveEvent)
 }
+
 // TEST_ONLY_END
 
 pub opaque type Command {
@@ -262,7 +263,7 @@ pub fn start(
   verify_peer: Bool,
   gate: Option(RelayGate),
 ) -> Result(Live, String) {
-// TEST_ONLY_END
+  // TEST_ONLY_END
   let handshake = process.new_subject()
   let _pid =
     process.start(
@@ -335,7 +336,7 @@ fn initial_state(
   verify_peer: Bool,
   gate: Option(RelayGate),
 ) -> State {
-// TEST_ONLY_END
+  // TEST_ONLY_END
   State(
     self: self,
     url: url,
@@ -473,10 +474,7 @@ fn handle(command: Command, state: State) -> Option(State) {
         Some(Connection(inbox: Some(inbox), ready: True, ..)) -> {
           // The connection process sends this after any byte batch already in
           // flight has been acknowledged, so shutdown cannot deadlock the owner.
-          process.send(
-            inbox,
-            ConnShutdown(ws.close_frame(1000, ""), reply),
-          )
+          process.send(inbox, ConnShutdown(ws.close_frame(1000, ""), reply))
           Some(state)
         }
         _ -> finish_close(reply, state)
@@ -1054,11 +1052,10 @@ fn remove_then_idle_close(subscription: Subscription, state: State) -> State {
               )
             False ->
               schedule_idle_close(
-                State(
-                  ..state,
-                  query_set: state.query_set + 1,
-                  retiring: [subscription.query_id, ..state.retiring],
-                ),
+                State(..state, query_set: state.query_set + 1, retiring: [
+                  subscription.query_id,
+                  ..state.retiring
+                ]),
               )
           }
         Ok(Error(reason)) -> transport_reconnect(reason, state)
@@ -1195,8 +1192,7 @@ fn handle_message(
     }
     ws.Pong(_) -> Ok(state)
     ws.Close(code, reason) -> {
-      let detail =
-        "WebSocket close " <> int.to_string(code) <> ": " <> reason
+      let detail = "WebSocket close " <> int.to_string(code) <> ": " <> reason
       case current_connection(state, connection) {
         Some(Connection(inbox: Some(inbox), ..)) -> {
           // The connection process is waiting for this byte batch to be
@@ -1521,7 +1517,7 @@ fn start_relay(
   owner: Subject(Command),
   gate: Option(RelayGate),
 ) -> #(Pid, Subject(RelayMessage)) {
-// TEST_ONLY_END
+  // TEST_ONLY_END
   let handshake = process.new_subject()
   let pid =
     process.start(
@@ -1546,7 +1542,7 @@ fn relay_loop(
   inbox: Subject(RelayMessage),
   gate: Option(RelayGate),
 ) -> Nil {
-// TEST_ONLY_END
+  // TEST_ONLY_END
   case process.receive(inbox, 60_000) {
     // PROD Error(_) -> relay_loop(owner, inbox)
     // TEST_ONLY_BEGIN
@@ -1603,6 +1599,7 @@ fn hold(gate: Option(RelayGate), id: String, event: LiveEvent) -> Nil {
     }
   }
 }
+
 // TEST_ONLY_END
 
 /// Hand an event to the relay if it is idle, otherwise queue it under the
@@ -1652,8 +1649,7 @@ fn enqueue_value(
   let event = LiveValue(value, logs)
   case event_bytes(event) > max_queue_bytes {
     True -> enqueue(id, event, subscription)
-    False ->
-      enqueue(id, event, Subscription(..subscription, last: Some(value)))
+    False -> enqueue(id, event, Subscription(..subscription, last: Some(value)))
   }
 }
 

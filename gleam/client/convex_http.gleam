@@ -275,10 +275,7 @@ fn read_head_chunks(
 }
 
 fn split_head(input: BitArray) -> Result(#(BitArray, BitArray), Nil) {
-  use index <- result.try(convex_sys.find_sequence(
-    input,
-    <<"\r\n\r\n":utf8>>,
-  ))
+  use index <- result.try(convex_sys.find_sequence(input, <<"\r\n\r\n":utf8>>))
   split_binary(input, index, 4)
 }
 
@@ -305,13 +302,11 @@ fn split_binary(
   separator_bytes: Int,
 ) -> Result(#(BitArray, BitArray), Nil) {
   use prefix <- result.try(bit_array.slice(input, 0, prefix_bytes))
-  use rest <- result.try(
-    bit_array.slice(
-      input,
-      prefix_bytes + separator_bytes,
-      bit_array.byte_size(input) - prefix_bytes - separator_bytes,
-    ),
-  )
+  use rest <- result.try(bit_array.slice(
+    input,
+    prefix_bytes + separator_bytes,
+    bit_array.byte_size(input) - prefix_bytes - separator_bytes,
+  ))
   Ok(#(prefix, rest))
 }
 

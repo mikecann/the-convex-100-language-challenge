@@ -125,9 +125,7 @@ pub fn parse_listen(address: String) -> Result(#(String, Int), String) {
   {
     True, True -> Ok(#(bind_host, port))
     _, _ ->
-      Error(
-        "ADAPTER_LISTEN must name an approved numeric host and valid port",
-      )
+      Error("ADAPTER_LISTEN must name an approved numeric host and valid port")
   }
 }
 

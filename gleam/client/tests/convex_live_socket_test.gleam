@@ -235,10 +235,7 @@ fn same_identifier_replacement_is_a_barrier() -> Nil {
   let assert [#(replacement, "shared")] = dict.to_list(replaced)
   // The server may acknowledge the old Remove only after the replacement Add
   // is active. That old query must remain retired until this transition lands.
-  send_text(
-    socket,
-    transition_many(1, 1, 3, 2, [removed(0), updated(1, 5)]),
-  )
+  send_text(socket, transition_many(1, 1, 3, 2, [removed(0), updated(1, 5)]))
   let assert Ok(GateHeld(release_replacement, replacement_id, _event)) =
     process.receive(gate, wait)
   check.equal_string(
@@ -277,10 +274,7 @@ fn oversized_value_reports_failure_and_recovers() -> Nil {
   let #(_connect, buffer) = expect_message(socket, <<>>)
   let #(_modify, _buffer) = expect_message(socket, buffer)
 
-  send_text(
-    socket,
-    transition(0, 0, 1, 1, updated_with_blob(0, 1, 2_100_000)),
-  )
+  send_text(socket, transition(0, 0, 1, 1, updated_with_blob(0, 1, 2_100_000)))
   case next_event(updates, subscription) {
     LiveFailure(error) ->
       check.equal_string(
@@ -288,7 +282,8 @@ fn oversized_value_reports_failure_and_recovers() -> Nil {
         error.name,
         "ProtocolError",
       )
-    LiveValue(_, _) -> check.ok("the oversized value must not be delivered", False)
+    LiveValue(_, _) ->
+      check.ok("the oversized value must not be delivered", False)
   }
 
   send_text(socket, transition(1, 1, 1, 2, updated(0, 9)))
@@ -706,7 +701,11 @@ fn expect_message(socket: Socket, buffer: BitArray) -> #(String, BitArray) {
   }
 }
 
-fn expect_close_reply(socket: Socket, buffer: BitArray, expected_code: Int) -> Nil {
+fn expect_close_reply(
+  socket: Socket,
+  buffer: BitArray,
+  expected_code: Int,
+) -> Nil {
   case take_client_close(buffer) {
     Ok(code) -> check.equal_int("the peer Close is echoed", code, expected_code)
     Error(_) -> {
@@ -813,13 +812,9 @@ fn transition(
   end_ts: Int,
   modification: String,
 ) -> String {
-  transition_many(
-    start_query_set,
-    start_ts,
-    end_query_set,
-    end_ts,
-    [modification],
-  )
+  transition_many(start_query_set, start_ts, end_query_set, end_ts, [
+    modification,
+  ])
 }
 
 fn transition_many(
