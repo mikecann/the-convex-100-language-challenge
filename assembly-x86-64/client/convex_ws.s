@@ -64,6 +64,49 @@ dbg_mark_ws:
     pop rbp
     ret
 
+; void dbg_num(u64 val) [rdi] -- DEBUG ONLY: writes val as decimal + newline
+; to stderr.
+%define DN_VAL -8
+%define DN_BUF -40      ; 24 usable bytes for digits, rbp-40..rbp-17, NUL at rbp-17
+dbg_num:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+    mov [rbp+DN_VAL], rdi
+    mov byte [rbp+DN_BUF+23], 0
+    lea rcx, [rbp+DN_BUF+23]
+    mov rax, [rbp+DN_VAL]
+    test rax, rax
+    jnz .loop
+    dec rcx
+    mov byte [rcx], '0'
+    jmp .emit
+.loop:
+    test rax, rax
+    jz .emit
+    xor rdx, rdx
+    mov r8, 10
+    div r8
+    add dl, '0'
+    dec rcx
+    mov [rcx], dl
+    jmp .loop
+.emit:
+    mov rdi, 2
+    mov rsi, rcx
+    lea rdx, [rbp+DN_BUF+23]
+    sub rdx, rcx
+    call write
+    mov rdi, 2
+    lea rsi, [rel dbg_nl_ws]
+    mov edx, 1
+    call write
+    mov rsp, rbp
+    pop rbp
+    ret
+%undef DN_VAL
+%undef DN_BUF
+
 global base64_encode
 global ws_open
 global ws_close
@@ -1082,6 +1125,12 @@ ws_take_frame:
 
     mov edi, 'r'
     call dbg_mark_ws
+    mov rdi, [rbp+TF_PLEN]
+    call dbg_num
+    mov edi, [rbp+TF_HDRLEN]
+    call dbg_num
+    mov rdi, [rbp+TF_AVAIL]
+    call dbg_num
     ; have a complete frame: copy the payload out, advance recv_off
     mov rax, [rbp+TF_PLEN]
     test rax, rax
