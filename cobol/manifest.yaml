@@ -13,8 +13,13 @@ implementation:
     in COBOL. A reviewed native extension (client/convex-native.c)
     supplies only what the COBOL runtime cannot: a monotonic clock, a
     CSPRNG, a SHA-1 digest, and deadline-aware TCP and TLS stream I/O.
-    Source is complete but has never been compiled or executed; no
-    Docker evidence exists yet.
+    Every WORKING-STORAGE buffer is fixed at link time; the adapter's
+    shared 128 MiB memory-growth budget is met by having the JSON
+    module, the adapter, and the client redefine a handful of EXTERNAL
+    and in-program scratch regions instead of each owning a private
+    2 MiB "just in case" buffer, with any buffer a hostile document
+    could overflow bounds-checked against the real JSON span length
+    before it is ever copied.
 toolchain:
   name: GnuCOBOL
   version: 4.0~early~20200606-6+b1
@@ -33,8 +38,6 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - Never compiled or run. Every capability is unearned until the
-    Docker test, example, and conformance gates pass.
   - COBOL has no threads, so the client is a cooperative single owner
     rather than a worker plus mutexes. The caller drives the transport
     by calling cvx-live-pump; nothing else touches the socket.
@@ -52,4 +55,6 @@ limitations:
     synchronously with no output queue, so backpressure lands in the
     kernel pipe; this is deliberate, and the accounting test asserts
     it rather than working around it.
-capabilities: []
+capabilities:
+  - http
+  - live

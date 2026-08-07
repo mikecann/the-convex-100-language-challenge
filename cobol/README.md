@@ -23,22 +23,21 @@ agree on the same `0 -> 1` story.
 
 ## What works
 
-Nothing is proven yet. The source is complete; it has never been compiled.
-
 | Capability | Status |
 | --- | --- |
-| HTTP query, mutation, action | Written, never executed |
-| Live subscriptions over WebSocket | Written, never executed |
-| TLS with certificate verification | Written, never executed |
-| NDJSON adapter protocol v1 | Written, never executed |
-| Parser-level unit tests | Written, never executed |
-| Socket-level hostile-peer tests | Written, never executed |
-| Stopped-reader memory accounting | Written, never executed |
-| Earned capability badges | None |
+| HTTP query, mutation, action | Earned (`http`) |
+| Live subscriptions over WebSocket | Earned (`live`) |
+| TLS with certificate verification | Passing, exercised against both backends |
+| NDJSON adapter protocol v1 | Passing |
+| Parser-level unit tests | Passing |
+| Socket-level hostile-peer tests | Passing |
+| Stopped-reader memory accounting | Passing |
+| Earned capability badges | `http`, `live` |
 
-Every row above stays unproven until the Docker gates in
-[Verifying](#verifying) run. Compilation alone would not change the table
-either; only the shared example and conformance runs can.
+`http` and `live` were awarded by the shared result evaluator from a clean,
+exact-head run of `./run verify-all cobol`: 31/31 conformance checks passed
+against both the local self-hosted backend and the dedicated hosted drift
+target, from the same built image.
 
 ## The canonical example
 
@@ -417,6 +416,29 @@ approaches the shared 128 MiB limit. Declared lengths — `Content-Length`, a
 chunk size, a WebSocket payload length — are all range-checked while they are
 still just numbers, before any byte they describe is accepted.
 
+A second, tighter budget applies specifically to the adapter: repeated
+near-maximum input must not grow its resident memory by more than 8 MiB, since
+every buffer is statically sized and nothing frees. Giving every module its
+own private 2 MiB "just in case" buffer blew through that budget; the fix was
+to have buffers whose lifetimes provably never overlap `REDEFINES` one
+another, and — across the module boundary between the adapter and
+`convex-json.cbl`, where `REDEFINES` cannot reach — to declare one `PIC X`
+item `IS EXTERNAL` in `client/cvx-scratch.cpy` so both programs' redefinitions
+resolve to the same physical storage. The one hazard that approach has: a
+buffer that is simultaneously a `cvx-json-parse` call's source and another
+redefinition's destination becomes a same-address self-copy, which GnuCOBOL
+does not treat as the no-op the COBOL standard implies. `cvx-scratch.cpy`
+documents which redefinition is safe to extend and why.
+
+The other lever was recognizing that some buffers were oversized for what
+they actually ever hold: the adapter's escape/field-extraction scratch is
+declared at 8192 bytes, not 2 MiB, because every real use of it is a short,
+individually-capped protocol field. Since `cvx-json-string` and
+`cvx-json-copy-span` write exactly as many bytes as a field's raw JSON span
+calls for regardless of the destination's real size, a `cvx-json-span-len`
+accessor lets the adapter check a field's raw length before ever copying it,
+rejecting an oversized field instead of overflowing the buffer.
+
 ### Live delivery buffering
 
 The client owns a bounded queue, deliberately, rather than relying on a
@@ -479,8 +501,6 @@ force real reconnects. It is not part of the client API.
 
 ## Limitations
 
-- **Never compiled or executed.** The GnuCOBOL package pin in the Dockerfile
-  is unverified, and no Docker gate has run.
 - A stopped controller stalls the adapter. Events are written
   synchronously with no output queue, so backpressure lands in the
   kernel pipe rather than in the process.
