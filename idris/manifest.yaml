@@ -39,4 +39,6 @@ limitations:
   - Live authentication, optimistic updates, WebSocket mutations and actions, and TransitionChunk assembly are deferred; a TransitionChunk is treated as profile drift.
   - Values are limited to the documented JSON format; Int64, bytes, and special floats are not claimed.
   - Capability badges are intentionally empty until shared local and hosted conformance pass.
-capabilities: []
+capabilities:
+  - http
+  - live
