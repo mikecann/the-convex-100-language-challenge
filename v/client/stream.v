@@ -2,6 +2,7 @@ module convex
 
 import net
 import net.ssl
+import os
 import time
 
 // Deadline is an absolute monotonic budget. Every network operation in this
@@ -80,8 +81,17 @@ fn dial_stream(endpoint Endpoint, deadline Deadline) !Stream {
 			conn: tcp
 		}
 	}
+	// `validate: true` on its own is not enough to verify anything. V's
+	// `net.ssl` calls SSL_CTX_load_verify_locations only when `verify` names a
+	// bundle, and it never calls SSL_CTX_set_default_verify_paths, so the
+	// context is left with an empty trust store and every handshake fails with
+	// verify result 20 — including against a certificate the system trusts.
+	// The bundle is therefore named here, honouring SSL_CERT_FILE so a caller
+	// can point at its own CA, as the TLS closure probe does.
+	ca_bundle := os.getenv_opt('SSL_CERT_FILE') or { '/etc/ssl/certs/ca-certificates.crt' }
 	mut conn := ssl.new_ssl_conn(ssl.SSLConnectConfig{
 		validate: true
+		verify:   ca_bundle
 	}) or {
 		tcp.close() or {}
 		return IError(transport_error('connect', 'could not create a TLS context: ${err.msg()}'))
