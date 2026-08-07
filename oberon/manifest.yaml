@@ -95,4 +95,6 @@ limitations:
   - >-
     Capabilities remain unearned until the root-owned shared local and
     hosted conformance evidence passes from a clean exact-head build.
-capabilities: []
+capabilities:
+  - http
+  - live

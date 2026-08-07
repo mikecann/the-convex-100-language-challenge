@@ -12,9 +12,9 @@ Read [`examples/basics/main.obn`](examples/basics/main.obn). It queries a fresh 
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, actions, bearer auth, log lines, and structured errors | Implemented; language-local Docker tests pass, shared conformance pending |
-| Live initial values, external updates, and `QueryFailed` followed by recovery | Implemented; proved against a loopback fixture in `client/tests/TestLive.obn`, shared conformance pending |
-| A forced reconnect with Add resend, rehydration suppression, and `connectionCount` bookkeeping | Implemented; proved against `client/tests/FixtureServer.obn`, shared conformance pending |
+| HTTP queries, mutations, actions, bearer auth, log lines, and structured errors | Implemented; language-local Docker tests pass, and shared conformance passes on both profiles |
+| Live initial values, external updates, and `QueryFailed` followed by recovery | Implemented; proved against a loopback fixture in `client/tests/TestLive.obn`, and shared conformance passes on both profiles |
+| A forced reconnect with Add resend, rehydration suppression, and `connectionCount` bookkeeping | Implemented; proved against `client/tests/FixtureServer.obn`, and shared conformance passes on both profiles |
 | WebSocket mutations, actions, Live authentication, optimistic updates | Not implemented |
 | `TransitionChunk` assembly | Not implemented; treated as protocol drift and reconnects |
 | Production SDK compatibility | Not claimed |
@@ -248,4 +248,4 @@ Live authentication, WebSocket mutations, WebSocket actions, optimistic updates,
 
 At most 16 Live subscriptions may be active at once (`client/ConvexSync.obn`'s fixed subscription table), with a 256-byte path and an 8192-byte argument and last-value cap per subscription. `Pump()` delivers from a bounded ring buffer of the newest 32 pending events; a slow or absent consumer causes the oldest queued event to be dropped rather than unbounded growth, but that overflow path is implemented without a dedicated language-local test yet. HTTP bodies are capped at 2 MiB and WebSocket messages at 4 MiB; chunked HTTP transfer-encoding is rejected as a transport error rather than decoded.
 
-Values are exposed as raw JSON text rather than a richer Oberon value tree; the example and tests decode only the specific fields they need. The root-owned local and hosted evaluators have not yet run against this exact commit, so no capability badge is claimed in `manifest.yaml` even though the language-local Docker `test` gate, the loopback HTTP/TLS/WebSocket smoke tests exercised during development, and the two-process Live acceptance test all pass.
+Values are exposed as raw JSON text rather than a richer Oberon value tree; the example and tests decode only the specific fields they need. The shared local and hosted evaluators both pass against this commit, 31 of 31 checks each, so `manifest.yaml` claims the `http` and `live` badges.
