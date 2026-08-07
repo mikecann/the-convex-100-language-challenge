@@ -1,0 +1,426 @@
+$ include "seed7_05.s7i";
+  include "convex_live.s7i";
+  include "environment.s7i";
+  include "listener.s7i";
+
+
+(**
+ *  Test-only conformance executable implementing NDJSON adapter
+ *  protocol v1 (see AGENTS.md and _shared/schemas/adapter.schema.json).
+ *  This program is not part of the public client: it exists so the
+ *  shared black-box controller can drive `client/convex.s7i` and
+ *  `client/convex_live.s7i` the same way every other language's
+ *  adapter is driven, over either stdin/stdout or one `ADAPTER_LISTEN`
+ *  TCP connection.
+ *
+ *  Seed7 has no thread library, so this whole program is one
+ *  single-threaded event loop. In `ADAPTER_LISTEN` mode the control
+ *  connection is a real `socket`, which -- like the Live connection --
+ *  supports [[inputReady]], so the loop below polls both and services
+ *  whichever is ready. Plain stdin/stdout mode has no such readiness
+ *  check available on a console file (proved directly against this
+ *  toolchain, not assumed), so that mode falls back to blocking reads
+ *  between commands; the shared harness never exercises it for a
+ *  language's Live behaviour, only `ADAPTER_LISTEN` does. Both facts
+ *  are recorded again in the README and manifest.
+ *)
+
+
+const duration: TICK is 20000 . MICRO_SECONDS;
+
+
+const proc: emit (inout file: output, in string: line) is func
+  begin
+    writeln(output, line);
+    flush(output);
+  end func;
+
+
+const func jsonObject: errorObject (in convexError: error) is func
+  result
+    var jsonObject: obj is jsonObject.value;
+  local
+    var string: errName is "Error";
+    var string: errMessage is "unknown error";
+  begin
+    if error.name <> "" then
+      errName := error.name;
+    end if;
+    if error.message <> "" then
+      errMessage := error.message;
+    end if;
+    obj @:= ["name"] jsonValue(errName);
+    obj @:= ["message"] jsonValue(errMessage);
+    if error.hasData then
+      obj @:= ["data"] error.data;
+    end if;
+  end func;
+
+
+const proc: emitReady (inout file: output, in string: id, in string: runtimeVersion) is func
+  local
+    var jsonObject: obj is jsonObject.value;
+  begin
+    obj @:= ["protocolVersion"] jsonValue(1);
+    obj @:= ["id"] jsonValue(id);
+    obj @:= ["type"] jsonValue("ready");
+    obj @:= ["language"] jsonValue("seed7");
+    obj @:= ["implementation"] jsonValue("native-seed7-s7c-handrolled-websocket");
+    obj @:= ["runtime"] jsonValue(runtimeVersion);
+    emit(output, str(jsonValue(obj)));
+  end func;
+
+
+const proc: emitResult (inout file: output, in string: id, in convexOutcome: outcome) is func
+  local
+    var jsonObject: obj is jsonObject.value;
+    var jsonValueArray: logsArray is 0 times jsonValue.value;
+    var string: logLine is "";
+  begin
+    obj @:= ["id"] jsonValue(id);
+    obj @:= ["type"] jsonValue("result");
+    obj @:= ["value"] outcome.value;
+    for logLine range outcome.logs do
+      logsArray &:= jsonValue(logLine);
+    end for;
+    obj @:= ["logs"] jsonValue(logsArray);
+    emit(output, str(jsonValue(obj)));
+  end func;
+
+
+const proc: emitError (inout file: output, in string: id, in convexError: error) is func
+  local
+    var jsonObject: obj is jsonObject.value;
+  begin
+    if id <> "" then
+      obj @:= ["id"] jsonValue(id);
+    end if;
+    obj @:= ["type"] jsonValue("error");
+    obj @:= ["error"] jsonValue(errorObject(error));
+    emit(output, str(jsonValue(obj)));
+  end func;
+
+
+const proc: emitAck (inout file: output, in string: id) is func
+  local
+    var jsonObject: obj is jsonObject.value;
+  begin
+    obj @:= ["id"] jsonValue(id);
+    obj @:= ["type"] jsonValue("ack");
+    emit(output, str(jsonValue(obj)));
+  end func;
+
+
+const proc: emitClosed (inout file: output, in string: id) is func
+  local
+    var jsonObject: obj is jsonObject.value;
+  begin
+    obj @:= ["id"] jsonValue(id);
+    obj @:= ["type"] jsonValue("closed");
+    emit(output, str(jsonValue(obj)));
+  end func;
+
+
+const proc: emitSubscriptionValue (inout file: output, in string: subscriptionId,
+    in convexOutcome: outcome) is func
+  local
+    var jsonObject: obj is jsonObject.value;
+    var jsonValueArray: logsArray is 0 times jsonValue.value;
+    var string: logLine is "";
+  begin
+    obj @:= ["type"] jsonValue("subscription");
+    obj @:= ["subscriptionId"] jsonValue(subscriptionId);
+    if outcome.ok then
+      obj @:= ["value"] outcome.value;
+      for logLine range outcome.logs do
+        logsArray &:= jsonValue(logLine);
+      end for;
+      obj @:= ["logs"] jsonValue(logsArray);
+    else
+      obj @:= ["error"] jsonValue(errorObject(outcome.error));
+    end if;
+    emit(output, str(jsonValue(obj)));
+  end func;
+
+
+(**
+ *  Drain and emit every subscription's pending deliveries. Called every
+ *  loop iteration so a value is written out as soon as [[pumpLive]]
+ *  decodes it -- see convex_live.s7i's module comment for why this
+ *  client has no separate internal delivery queue beyond the bounded
+ *  per-subscription one already in [[convexSubscriptionState]].
+ *)
+const proc: flushDeliveries (inout convexLive: live, inout file: output) is func
+  local
+    var string: subscriptionId is "";
+    var integer: index is 0;
+  begin
+    for subscriptionId range keys(live.subs) do
+      for index range 1 to length(live.subs[subscriptionId].queue) do
+        emitSubscriptionValue(output, subscriptionId, live.subs[subscriptionId].queue[index]);
+      end for;
+      live.subs[subscriptionId].queue := 0 times convexOutcome.value;
+    end for;
+  end func;
+
+
+(**
+ *  Adapter-wide state threaded through command dispatch: one HTTP
+ *  client (stateless beyond its auth token) and one Live connection
+ *  (started lazily on the first `subscribe`, since a purely
+ *  HTTP-capability run never needs a socket at all).
+ *)
+const type: adapterState is new struct
+    var convexClient: client is convexClient.value;
+    var boolean: clientReady is FALSE;
+    var convexError: clientError is convexError.value;
+    var convexLive: live is convexLive.value;
+    var boolean: liveStarted is FALSE;
+  end struct;
+
+
+const proc: ensureLiveStarted (inout adapterState: state) is func
+  begin
+    if not state.liveStarted then
+      state.live := openConvexLive(state.client);
+      state.liveStarted := TRUE;
+    end if;
+  end func;
+
+
+(**
+ *  Handle one decoded adapter command. `id` and `op` have already been
+ *  pulled out because a malformed command (not even a JSON object) still
+ *  needs a ProtocolError reply with no `id`, which is handled by the
+ *  caller before this function is reached.
+ *)
+const proc: dispatch (inout adapterState: state, inout file: output,
+    in string: id, in string: op, in jsonValue: command, inout boolean: closing) is func
+  local
+    var jsonValue: protocolVersionField is jsonValue.value;
+    var string: path is "";
+    var jsonValue: args is jsonValue.value;
+    var convexOutcome: outcome is convexOutcome.value;
+    var string: token is "";
+    var string: subscriptionId is "";
+  begin
+    if op = "hello" then
+      protocolVersionField := jsonValue.value;
+      if "protocolVersion" in command then
+        protocolVersionField := command["protocolVersion"];
+      end if;
+      if category(protocolVersionField) <> JSON_NUMBER or integer(protocolVersionField) <> 1 then
+        emitError(output, id, convexError("ProtocolError", "unsupported adapter protocol version"));
+      else
+        emitReady(output, id, "Seed7 s7c 3.5 (compiled)");
+      end if;
+    elsif op = "query" or op = "mutation" or op = "action" then
+      path := "";
+      if "path" in command and category(command["path"]) = JSON_STRING then
+        path := string(command["path"]);
+      end if;
+      args := jsonValue(jsonObject.value);
+      if "args" in command then
+        args := command["args"];
+      end if;
+      if not state.clientReady then
+        emitError(output, id, state.clientError);
+      else
+        outcome := convexCall(state.client, op, path, args);
+        if outcome.ok then
+          emitResult(output, id, outcome);
+        else
+          emitError(output, id, outcome.error);
+        end if;
+      end if;
+    elsif op = "setAuth" then
+      token := "";
+      if "token" in command and category(command["token"]) = JSON_STRING then
+        token := string(command["token"]);
+      end if;
+      if not state.clientReady then
+        emitError(output, id, state.clientError);
+      else
+        state.client setAuthToken token;
+        emitAck(output, id);
+      end if;
+    elsif op = "subscribe" then
+      subscriptionId := "";
+      if "subscriptionId" in command and category(command["subscriptionId"]) = JSON_STRING then
+        subscriptionId := string(command["subscriptionId"]);
+      end if;
+      path := "";
+      if "path" in command and category(command["path"]) = JSON_STRING then
+        path := string(command["path"]);
+      end if;
+      args := jsonValue(jsonObject.value);
+      if "args" in command then
+        args := command["args"];
+      end if;
+      if not state.clientReady then
+        emitError(output, id, state.clientError);
+      else
+        ensureLiveStarted(state);
+        subscribeLive(state.live, subscriptionId, path, args);
+        emitAck(output, id);
+      end if;
+    elsif op = "unsubscribe" then
+      subscriptionId := "";
+      if "subscriptionId" in command and category(command["subscriptionId"]) = JSON_STRING then
+        subscriptionId := string(command["subscriptionId"]);
+      end if;
+      if state.liveStarted then
+        unsubscribeLive(state.live, subscriptionId);
+      end if;
+      emitAck(output, id);
+    elsif op = "debugDisconnect" then
+      if state.liveStarted and debugDisconnectLive(state.live) then
+        emitAck(output, id);
+      else
+        emitError(output, id, convexError("TransportError", "Live WebSocket is not connected"));
+      end if;
+    elsif op = "close" then
+      if state.liveStarted then
+        closeLive(state.live);
+      end if;
+      emitClosed(output, id);
+      closing := TRUE;
+    else
+      emitError(output, id, convexError("ProtocolError", "unknown adapter operation"));
+    end if;
+  end func;
+
+
+const proc: handleLine (inout adapterState: state, inout file: output,
+    in string: line, inout boolean: closing) is func
+  local
+    var jsonValue: command is jsonValue.value;
+    var boolean: parsedOkay is FALSE;
+    var string: id is "";
+    var string: op is "";
+  begin
+    block
+      command := readJson(line);
+      parsedOkay := category(command) = JSON_OBJECT;
+    exception
+      catch RANGE_ERROR:
+        parsedOkay := FALSE;
+    end block;
+    if not parsedOkay then
+      emitError(output, "", convexError("ProtocolError", "malformed adapter command"));
+    else
+      if "id" in command and category(command["id"]) = JSON_STRING then
+        id := string(command["id"]);
+      end if;
+      if "op" in command and category(command["op"]) = JSON_STRING then
+        op := string(command["op"]);
+      end if;
+      dispatch(state, output, id, op, command, closing);
+    end if;
+  end func;
+
+
+(**
+ *  Console mode: not used by the shared conformance harness (which
+ *  always drives this adapter's Live behaviour over `ADAPTER_LISTEN`
+ *  -- see [[serveTcp]]), only by a person running the image by hand or
+ *  by this Dockerfile's own `hello`/`close` sanity check. A console
+ *  `file` has no readiness check this toolchain implements (proved
+ *  directly, see the module comment), so Live delivery here is
+ *  best-effort: pumped once after every command, never while idle
+ *  between commands.
+ *)
+const proc: serveStdin (inout adapterState: state) is func
+  local
+    var boolean: closing is FALSE;
+    var string: line is "";
+  begin
+    while not closing and not eof(IN) do
+      line := getln(IN);
+      handleLine(state, OUT, line, closing);
+      if state.liveStarted then
+        pumpLive(state.live);
+      end if;
+      flushDeliveries(state.live, OUT);
+    end while;
+  end func;
+
+
+(**
+ *  `ADAPTER_LISTEN` mode: the shape the shared harness actually drives.
+ *  The control connection is a real `socket`, so it can be polled for
+ *  readiness exactly like the Live connection, and every loop
+ *  iteration first flushes whatever [[pumpLive]] has already decoded
+ *  before deciding whether to read a new command or take one more pump
+ *  step.
+ *)
+const proc: serveTcp (inout adapterState: state, inout file: controlSocket) is func
+  local
+    var boolean: closing is FALSE;
+    var string: line is "";
+  begin
+    while not closing do
+      flushDeliveries(state.live, controlSocket);
+      if inputReady(controlSocket, TICK) then
+        if eof(controlSocket) then
+          closing := TRUE;
+        else
+          line := getln(controlSocket);
+          handleLine(state, controlSocket, line, closing);
+        end if;
+      elsif state.liveStarted then
+        pumpLive(state.live);
+      end if;
+    end while;
+  end func;
+
+
+const proc: initClient (inout adapterState: state) is func
+  local
+    var string: url is "";
+    var string: authToken is "";
+    var boolean: parsed is FALSE;
+  begin
+    url := getenv("CONVEX_URL");
+    if url = "" then
+      state.clientError := convexError("ProtocolError", "CONVEX_URL is required");
+    else
+      state.client := openConvexClient(url, parsed);
+      if not parsed then
+        state.clientError := convexError("ProtocolError",
+            "Convex deployment URL must use http or https");
+      else
+        state.clientReady := TRUE;
+        authToken := getenv("CONVEX_AUTH_TOKEN");
+        if authToken <> "" then
+          state.client setAuthToken authToken;
+        end if;
+      end if;
+    end if;
+  end func;
+
+
+const proc: main is func
+  local
+    var adapterState: state is adapterState.value;
+    var string: listenAddr is "";
+    var integer: colonPos is 0;
+    var integer: port is 0;
+    var listener: serverListener is listener.value;
+    var file: controlSocket is STD_NULL;
+  begin
+    initClient(state);
+    listenAddr := getenv("ADAPTER_LISTEN");
+    if listenAddr = "" then
+      serveStdin(state);
+    else
+      colonPos := pos(listenAddr, ":");
+      port := integer(listenAddr[succ(colonPos) ..]);
+      serverListener := openInetListener(port);
+      listen(serverListener, 1);
+      controlSocket := accept(serverListener);
+      serveTcp(state, controlSocket);
+      close(controlSocket);
+      close(serverListener);
+    end if;
+  end func;

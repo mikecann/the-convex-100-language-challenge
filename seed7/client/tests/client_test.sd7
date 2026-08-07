@@ -1,0 +1,138 @@
+$ include "seed7_05.s7i";
+  include "convex_live.s7i";
+
+
+(**
+ *  Language-local unit tests, compiled and run entirely inside Docker
+ *  (see the Dockerfile `test` stage). These do not touch the network;
+ *  shared HTTP and Live conformance against a real deployment is
+ *  proved separately by `./run verify seed7` and `./run verify-hosted
+ *  seed7`, not by this file.
+ *)
+
+
+var integer: failures is 0;
+
+
+const proc: check (in boolean: condition, in string: description) is func
+  begin
+    if condition then
+      writeln("ok - " <& description);
+    else
+      writeln("NOT OK - " <& description);
+      failures +:= 1;
+    end if;
+  end func;
+
+
+(**
+ *  Convex JSON numbers may arrive in an integral decimal form such as
+ *  `0.0` or `1.0`. This must accept both, and reject a genuinely
+ *  fractional value, scientific notation, a quoted number, and a
+ *  non-number value -- the shapes a mocked integer-only fixture would
+ *  never catch (AGENTS.md is explicit that this needs its own
+ *  regression, not just happy-path coverage from the example).
+ *)
+const proc: testWholeNumberOf is func
+  local
+    var integer: decoded is 0;
+  begin
+    check(wholeNumberOf(jsonValue(0), decoded) and decoded = 0,
+        "wholeNumberOf accepts a plain integer 0");
+    check(wholeNumberOf(readJson("0.0"), decoded) and decoded = 0,
+        "wholeNumberOf accepts the 0.0 form of zero");
+    check(wholeNumberOf(readJson("42.00"), decoded) and decoded = 42,
+        "wholeNumberOf accepts trailing zero fraction digits");
+    check(wholeNumberOf(readJson("-3"), decoded) and decoded = -3,
+        "wholeNumberOf accepts a negative integer");
+    check(not wholeNumberOf(readJson("1.5"), decoded),
+        "wholeNumberOf rejects a genuinely fractional value");
+    check(not wholeNumberOf(readJson("1e2"), decoded),
+        "wholeNumberOf rejects scientific notation");
+    check(not wholeNumberOf(readJson("\"3\""), decoded),
+        "wholeNumberOf rejects a quoted number");
+    check(not wholeNumberOf(readJson("null"), decoded),
+        "wholeNumberOf rejects a non-number value");
+  end func;
+
+
+const proc: testUrlParsing is func
+  local
+    var convexClient: client is convexClient.value;
+    var boolean: okay is FALSE;
+  begin
+    client := openConvexClient("https://happy-otter-123.convex.cloud", okay);
+    check(okay and client.useTls and client.hostAndPort = "happy-otter-123.convex.cloud",
+        "openConvexClient parses an https deployment URL");
+    client := openConvexClient("http://127.0.0.1:3210", okay);
+    check(okay and not client.useTls and client.hostAndPort = "127.0.0.1:3210",
+        "openConvexClient parses a plain http deployment URL with a port");
+    client := openConvexClient("https://happy-otter-123.convex.cloud/", okay);
+    check(okay and client.hostAndPort = "happy-otter-123.convex.cloud",
+        "openConvexClient trims a trailing slash");
+    client := openConvexClient("ftp://example.com", okay);
+    check(not okay, "openConvexClient rejects a non-http(s) scheme");
+  end func;
+
+
+(**
+ *  RFC 6455 client frames must be masked; the server never masks its
+ *  own frames. Round-tripping a payload through mask/unmask with the
+ *  same key must reproduce it exactly, which is the one property this
+ *  client's WebSocket layer actually leans on ([[maskPayload]] doubles
+ *  as its own inverse for a byte-XOR mask).
+ *)
+const proc: testMaskRoundTrip is func
+  local
+    var string: payload is "Hello, world! This line is deliberately longer than one mask period.";
+    var string: mask is "\16#DE;\16#AD;\16#BE;\16#EF;";
+    var string: masked is "";
+    var string: roundTripped is "";
+  begin
+    masked := maskPayload(payload, mask);
+    check(masked <> payload, "maskPayload changes a non-empty payload");
+    roundTripped := maskPayload(masked, mask);
+    check(roundTripped = payload, "maskPayload with the same key is its own inverse");
+  end func;
+
+
+(**
+ *  The Sec-WebSocket-Accept value is specified by RFC 6455 section
+ *  1.3's own worked example; matching it byte-for-byte is a stronger
+ *  check than round-tripping this client's own encode against its own
+ *  decode.
+ *)
+const proc: testWsAcceptKey is func
+  begin
+    check(wsAcceptKeyFor("dGhlIHNhbXBsZSBub25jZQ==") = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+        "wsAcceptKeyFor matches RFC 6455's own worked example");
+  end func;
+
+
+const proc: testErrorConstruction is func
+  local
+    var convexError: err is convexError.value;
+  begin
+    err := convexError("FunctionError", "boom");
+    check(err.name = "FunctionError" and err.message = "boom" and not err.hasData,
+        "convexError without data leaves hasData FALSE");
+    err := convexError("FunctionError", "boom", jsonValue("detail"));
+    check(err.hasData and string(err.data) = "detail",
+        "convexError with data sets hasData and carries it");
+  end func;
+
+
+const proc: main is func
+  begin
+    testWholeNumberOf;
+    testUrlParsing;
+    testMaskRoundTrip;
+    testWsAcceptKey;
+    testErrorConstruction;
+    if failures = 0 then
+      writeln("all client unit tests passed");
+    else
+      writeln(failures <& " client unit test(s) failed");
+      exit(1);
+    end if;
+  end func;

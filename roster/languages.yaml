@@ -105,3 +105,4 @@ languages:
   - { rank: 98, id: rescript, displayName: "ReScript", selectionTier: curated_backfill, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 99, id: eiffel, displayName: "Eiffel", selectionTier: curated_backfill, feasibility: { docker: G, https: G, json: G, websocket: A } }
   - { rank: 100, id: moonbit, displayName: "MoonBit", selectionTier: curated_backfill, feasibility: { docker: G, https: G, json: G, websocket: A } }
+  - { rank: 21, id: seed7, displayName: "Seed7", selectionTier: coverage, feasibility: { docker: G, https: G, json: G, websocket: G } }

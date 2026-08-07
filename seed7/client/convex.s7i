@@ -1,0 +1,322 @@
+
+(********************************************************************)
+(*                                                                  *)
+(*  convex.s7i     Native Seed7 client for the Convex backend:      *)
+(*                 HTTP queries, mutations and actions.             *)
+(*                                                                  *)
+(*  Extensibility is the reason Seed7 has a slot in this project:   *)
+(*  Seed7's own control structures (`for ... range ... do`, `case`, *)
+(*  even `:=`) are ordinary library declarations, not compiler      *)
+(*  built-ins -- the standard library file json.s7i included below  *)
+(*  defines its own `for value range aJsonArray do` loop the same   *)
+(*  way this file defines `client query path withArgs args`. A      *)
+(*  handful of small keyword-shaped functions below let call sites  *)
+(*  in the adapter and the example read like sentences describing   *)
+(*  the Convex protocol instead of a stack of positional arguments. *)
+(*                                                                  *)
+(********************************************************************)
+
+include "json.s7i";
+include "https_request.s7i";
+include "http_request.s7i";
+
+
+(**
+ *  A structured Convex failure. Mirrors the three error shapes the shared
+ *  adapter protocol distinguishes: a function that ran and rejected its
+ *  own arguments or business rule (FunctionError, with structured `data`
+ *  from ConvexError), a malformed request or response on the wire
+ *  (ProtocolError), and a socket or handshake failure (TransportError).
+ *)
+const type: convexError is new struct
+    var string: name is "";
+    var string: message is "";
+    var jsonValue: data is jsonValue.value;
+    var boolean: hasData is FALSE;
+  end struct;
+
+
+const func convexError: convexError (in string: errName, in string: errMessage) is func
+  result
+    var convexError: error is convexError.value;
+  begin
+    error.name := errName;
+    error.message := errMessage;
+  end func;
+
+
+const func convexError: convexError (in string: errName, in string: errMessage,
+                                     in jsonValue: errData) is func
+  result
+    var convexError: error is convexError.value;
+  begin
+    error.name := errName;
+    error.message := errMessage;
+    error.data := errData;
+    error.hasData := TRUE;
+  end func;
+
+
+(**
+ *  The result of one HTTP query, mutation or action: either a decoded
+ *  Convex value plus the function's console logs, or a [[convexError]].
+ *)
+const type: convexOutcome is new struct
+    var boolean: ok is FALSE;
+    var jsonValue: value is jsonValue.value;
+    var array string: logs is 0 times "";
+    var convexError: error is convexError.value;
+  end struct;
+
+
+(**
+ *  A Convex deployment connection. Holds the parsed deployment URL and the
+ *  current bearer token; HTTP calls are stateless beyond that, so this
+ *  record alone is enough to make a query, mutation or action call.
+ *)
+const type: convexClient is new struct
+    var boolean: useTls is TRUE;
+    var string: hostAndPort is ""; # e.g. "happy-otter-123.convex.cloud"
+    var string: token is "";
+  end struct;
+
+
+const func boolean: parseConvexUrl (in string: url, inout convexClient: client) is func
+  result
+    var boolean: valid is FALSE;
+  begin
+    if startsWith(url, "https://") then
+      client.useTls := TRUE;
+      client.hostAndPort := url[9 ..];
+      valid := TRUE;
+    elsif startsWith(url, "http://") then
+      client.useTls := FALSE;
+      client.hostAndPort := url[8 ..];
+      valid := TRUE;
+    end if;
+    while valid and endsWith(client.hostAndPort, "/") do
+      client.hostAndPort := client.hostAndPort[.. pred(length(client.hostAndPort))];
+    end while;
+    if valid and (client.hostAndPort = "" or pos(client.hostAndPort, "/") <> 0) then
+      valid := FALSE;
+    end if;
+  end func;
+
+
+(**
+ *  Create a client for a Convex deployment URL such as
+ *  "https://happy-otter-123.convex.cloud" or "http://127.0.0.1:3210" (the
+ *  local conformance backend). Sets `okay` to FALSE when the URL is not
+ *  an http(s) Convex deployment URL.
+ *)
+const func convexClient: openConvexClient (in string: deploymentUrl, inout boolean: okay) is func
+  result
+    var convexClient: client is convexClient.value;
+  begin
+    okay := parseConvexUrl(deploymentUrl, client);
+  end func;
+
+
+(**
+ *  `client setAuthToken token` -- one of a handful of small custom
+ *  statement/expression forms this file registers with Seed7's own
+ *  `$ syntax` pragma so the calls below read as sentences. This is not
+ *  decoration bolted on top of the language: `$ syntax` is the exact
+ *  mechanism the standard library itself uses (`for x range collection
+ *  do`, `x @:= [key] value` in json.s7i) to make its own control forms,
+ *  so a client author gets the same tool the language's own designer
+ *  used. Priority 9 keeps these forms binding tighter than assignment
+ *  (`:=`) but looser than a plain function call, and `-><-` (Seed7's
+ *  "not associative in either direction") is correct because none of
+ *  these forms chain with themselves.
+ *)
+$ syntax expr: .().setAuthToken.() is -><- 9;
+const proc: (inout convexClient: client) setAuthToken (in string: token) is func
+  begin
+    client.token := token;
+  end func;
+
+
+const func httpBody: jsonBody (in string: content) is func
+  result
+    var httpBody: body is httpBody.value;
+  begin
+    body.contentType := "application/json";
+    body.content := content;
+  end func;
+
+
+const func array string: logLinesOf (in jsonValue: logsArray) is func
+  result
+    var array string: logs is 0 times "";
+  local
+    var jsonValue: line is jsonValue.value;
+  begin
+    for line range logsArray do
+      if category(line) = JSON_STRING then
+        logs &:= string(line);
+      end if;
+    end for;
+  end func;
+
+
+const func convexError: errorOf (in jsonValue: response) is func
+  result
+    var convexError: error is convexError.value;
+  local
+    var string: message is "Convex function failed";
+  begin
+    if "errorMessage" in response and category(response["errorMessage"]) = JSON_STRING then
+      message := string(response["errorMessage"]);
+    end if;
+    if "errorData" in response then
+      error := convexError("FunctionError", message, response["errorData"]);
+    else
+      error := convexError("FunctionError", message);
+    end if;
+  end func;
+
+
+(**
+ *  Send one Convex function call over HTTP. `operation` is "query",
+ *  "mutation" or "action"; `path` is a Convex function reference such as
+ *  "demo:state". The deployment's documented `/api/<operation>` endpoint
+ *  is used with `{"path", "args", "format": "json"}` as the request body,
+ *  matching every official Convex HTTP client.
+ *)
+const func convexOutcome: convexCall (inout convexClient: client, in string: operation,
+                                      in string: path, in jsonValue: args) is func
+  result
+    var convexOutcome: outcome is convexOutcome.value;
+  local
+    var jsonObject: requestObj is jsonObject.value;
+    var httpBody: body is httpBody.value;
+    var httpCreds: creds is httpCreds.value;
+    var httpResponse: response is httpResponse.value;
+    var string: location is "";
+    var jsonValue: parsed is jsonValue.value;
+    var boolean: parsedOkay is FALSE;
+    var string: statusText is "";
+  begin
+    requestObj @:= ["path"] jsonValue(path);
+    requestObj @:= ["args"] args;
+    requestObj @:= ["format"] jsonValue("json");
+    body := jsonBody(str(jsonValue(requestObj)));
+    if client.token <> "" then
+      creds := bearerAuth(client.token);
+    end if;
+    location := client.hostAndPort & "/api/" & operation;
+    if client.useTls then
+      response := https(POST, location, body, creds);
+    else
+      response := http(POST, location, body, creds);
+    end if;
+    if response.status = "" then
+      outcome.error := convexError("TransportError",
+          "could not reach the Convex deployment");
+    else
+      block
+        parsed := readJson(response.body);
+        parsedOkay := TRUE;
+      exception
+        catch RANGE_ERROR:
+          parsedOkay := FALSE;
+      end block;
+      if not parsedOkay or category(parsed) <> JSON_OBJECT then
+        outcome.error := convexError("ProtocolError",
+            "HTTP response was not valid Convex JSON");
+      else
+        if "status" in parsed and category(parsed["status"]) = JSON_STRING then
+          statusText := string(parsed["status"]);
+        end if;
+        if statusText = "success" and "value" in parsed then
+          outcome.ok := TRUE;
+          outcome.value := parsed["value"];
+          if "logLines" in parsed and category(parsed["logLines"]) = JSON_ARRAY then
+            outcome.logs := logLinesOf(parsed["logLines"]);
+          end if;
+        elsif statusText = "error" then
+          outcome.error := errorOf(parsed);
+        else
+          outcome.error := convexError("ProtocolError",
+              "HTTP response had an unknown status");
+        end if;
+      end if;
+    end if;
+  end func;
+
+
+(**
+ *  `client query path withArgs args` reads like the sentence it performs:
+ *  see the `setAuthToken` comment above for why that is idiomatic here
+ *  rather than decorative.
+ *)
+$ syntax expr: .().query.().withArgs.() is -><- 9;
+const func convexOutcome: (inout convexClient: client) query (in string: path)
+    withArgs (in jsonValue: args) is
+  return convexCall(client, "query", path, args);
+
+
+$ syntax expr: .().mutate.().withArgs.() is -><- 9;
+const func convexOutcome: (inout convexClient: client) mutate (in string: path)
+    withArgs (in jsonValue: args) is
+  return convexCall(client, "mutation", path, args);
+
+
+$ syntax expr: .().runAction.().withArgs.() is -><- 9;
+const func convexOutcome: (inout convexClient: client) runAction (in string: path)
+    withArgs (in jsonValue: args) is
+  return convexCall(client, "action", path, args);
+
+
+(**
+ *  Convex's JSON encoding may represent a whole count as `0` or `0.0`;
+ *  json.s7i's ''jsonNumber'' keeps the server's own decimal text
+ *  (see its `.number` field), so this checks that text directly
+ *  rather than round-tripping through `float` and risking precision
+ *  artifacts. Accepts an integral value in `integer` range; rejects a
+ *  genuinely fractional value, scientific notation, a quoted number,
+ *  and anything that is not a JSON number at all.
+ *)
+const func boolean: wholeNumberOf (in jsonValue: value, inout integer: result) is func
+  result
+    var boolean: whole is FALSE;
+  local
+    var string: text is "";
+    var integer: dotPos is 0;
+    var string: fracPart is "";
+    var integer: index is 0;
+    var boolean: fracAllZero is TRUE;
+  begin
+    if category(value) = JSON_NUMBER then
+      text := str(value);
+      if pos(text, "e") = 0 and pos(text, "E") = 0 then
+        dotPos := pos(text, ".");
+        if dotPos = 0 then
+          block
+            result := integer(text);
+            whole := TRUE;
+          exception
+            catch RANGE_ERROR:
+              whole := FALSE;
+          end block;
+        else
+          fracPart := text[succ(dotPos) ..];
+          for index range 1 to length(fracPart) do
+            if fracPart[index] <> '0' then
+              fracAllZero := FALSE;
+            end if;
+          end for;
+          if fracAllZero then
+            block
+              result := integer(text[.. pred(dotPos)]);
+              whole := TRUE;
+            exception
+              catch RANGE_ERROR:
+                whole := FALSE;
+            end block;
+          end if;
+        end if;
+      end if;
+    end if;
+  end func;
