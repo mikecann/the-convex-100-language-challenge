@@ -11,8 +11,11 @@ implementation:
     Native GDScript client for Godot 4. HTTPClient provides ordinary HTTP and
     TLS, WebSocketPeer provides RFC 6455 framing, and the Convex request and
     response envelopes, the strict Live query set, transitions, reconnects, and
-    every deadline are implemented in GDScript. Capability badges stay empty
-    until the coordinator runs shared local and hosted conformance.
+    every deadline are implemented in GDScript. The client bundles its own
+    certificate trust store because Godot's own default one never loads under
+    this runtime's headless --script launch (see client/certs.gd). Both
+    capability badges are earned: the shared coordinator ran local and hosted
+    conformance against a clean exact-head build and both passed 31 of 31.
 toolchain:
   name: Godot
   version: 4.4.1-stable
@@ -31,7 +34,6 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - No Docker build, example verification, or conformance run has been executed for this source yet.
   - The educational client supports the JSON-safe Convex value subset within
     GDScript's exact numeric range; Godot's JSON parser decodes every number as
     a float, so unsafe values fail closed.
@@ -41,4 +43,6 @@ limitations:
     bounds idle connections, and stopped-reader memory evidence applies to the
     TCP adapter transport rather than stdio.
   - Live authentication, TransitionChunk assembly, optimistic updates, and WebSocket mutation replay are deferred.
-capabilities: []
+capabilities:
+  - http
+  - live

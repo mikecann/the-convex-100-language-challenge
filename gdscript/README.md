@@ -5,9 +5,10 @@ running on headless Godot 4. It calls Convex queries, mutations, and actions
 over the documented JSON HTTP API, and subscribes to a reactive query over a
 Live WebSocket, using only Godot's own networking.
 
-This is educational, unofficial, and not a production SDK. It is an honest
-work in progress: no capability badge is earned until the coordinator runs the
-shared local and hosted conformance suites, and none has been run yet.
+This is educational, unofficial, and not a production SDK. Both the HTTP and
+Live capability badges are earned: the shared coordinator ran the local and
+hosted conformance suites against a clean exact-head build, and both passed
+31 of 31 on each profile.
 
 ## Start here
 
@@ -25,11 +26,11 @@ single owner of the WebSocket, and `subscription.gd` one reactive query.
 
 | Surface | Repository state |
 | --- | --- |
-| JSON HTTP queries, mutations, actions, and bearer auth | Native candidate with local fixtures; capability unearned |
-| Live subscriptions, reconnects, and query recovery | Native candidate with deterministic fixtures; capability unearned |
-| Canonical `0 -> 1` HTTP and Live journey | The exact runnable source is present; no run has been executed |
-| Docker images and the hardened runtime | Designed and pinned in the Dockerfile; never built |
-| Earned capabilities | None |
+| JSON HTTP queries, mutations, actions, and bearer auth | Verified by shared conformance on both profiles; HTTP badge earned |
+| Live subscriptions, reconnects, and query recovery | Verified by shared conformance on both profiles; Live badge earned |
+| Canonical `0 -> 1` HTTP and Live journey | Verified against a local backend and the hosted deployment over real TLS |
+| Docker images and the hardened runtime | Built and verified on both profiles |
+| Earned capabilities | http, live |
 
 ## Basic example
 
@@ -255,6 +256,15 @@ response envelopes, `format: "json"`, bearer transport, the query set and its
 versions, atomic transition application, unchanged-rehydration suppression,
 timestamp tracking, backoff, and every deadline.
 
+Godot only loads its own certificate trust store from a code path this
+client's headless `--script` launch never takes (see
+[client/certs.gd](client/certs.gd) for the mechanism), so `TLSOptions.client()`
+with no explicit chain cannot verify a TLS connection in this runtime.
+`ConvexClient` supplies its own trust store instead: a certificate bundle
+generated at build time from the pinned `ca-certificates` Debian package,
+loaded once and passed to every HTTP and Live connection unless a caller
+supplies its own `tls_options`.
+
 The image pins Godot 4.4.1-stable by the published SHA-512 of its Linux
 editor archive and export templates, Debian bookworm-slim and BusyBox
 1.37.0-musl by digest, and gdtoolkit 4.3.4 for `gdformat` and `gdlint`. The
@@ -264,10 +274,6 @@ required applets compiled in. The Live wire profile is pinned to
 `6f1df8a8ba1665084ec001e307ca841ca17074d7`.
 
 ## Limitations
-
-No Docker build, example run, or conformance run has been executed against
-this source, so every capability is unearned and the Dockerfile is a design
-rather than evidence.
 
 Values cover Convex's JSON-safe subset. Godot's JSON parser decodes every
 number as a float and is lax about numeric literals, so integers are validated
