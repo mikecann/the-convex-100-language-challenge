@@ -51,7 +51,8 @@ limitations:
   - Ring exposes no portable process exit code, so an adapter that misses its
     two second close deadline reports the failure on stderr and by withholding
     the terminal event rather than by exiting non-zero.
-  - Language-local coverage is deterministic and real: a loopback fixture
+  - >-
+    Language-local coverage is deterministic and real: a loopback fixture
     process speaks genuine HTTP/1.1 and RFC 6455, and the tests cover five
     forced reconnects with suppressed rehydration, QueryFailed recovery,
     malformed transition rollback, fragmented UTF-8 with an interleaved Ping,
