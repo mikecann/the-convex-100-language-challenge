@@ -62,6 +62,7 @@ const fenceLanguages = {
   ".mbt": "moonbit",
   ".mod": "modula2",
   ".mojo": "mojo",
+  ".pli": "pli",
   ".nim": "nim",
   ".obn": "oberon",
   ".odin": "odin",

@@ -19,7 +19,7 @@ This is educational and unofficial, not a production Convex SDK.
 | Live authentication, WebSocket mutations and actions, optimistic updates | Deferred |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.pli -->
-```text
+```pli
  /********************************************************************/
  /* Convex from PL/I -- the canonical introductory example.          */
  /*                                                                  */
