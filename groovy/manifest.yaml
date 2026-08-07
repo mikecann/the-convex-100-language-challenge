@@ -29,4 +29,6 @@ limitations:
   - Live authentication, optimistic updates, WebSocket mutations, and TransitionChunk assembly are deliberately deferred.
   - The undocumented sync profile is pinned as compatibility evidence and must not be treated as stable.
   - Capability badges remain empty until root-owned local and hosted conformance evidence passes.
-capabilities: []
+capabilities:
+  - http
+  - live

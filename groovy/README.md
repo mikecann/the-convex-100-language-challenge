@@ -12,8 +12,8 @@ It is an educational, unofficial protocol demonstration, not a production SDK or
 
 | Capability | Status |
 | --- | --- |
-| JSON HTTP query, mutation, action, bearer auth, logs, and structured errors | Implemented, pending root-owned conformance evidence |
-| `/api/sync` live queries with reconnect and error recovery | Implemented, pending root-owned conformance evidence |
+| JSON HTTP query, mutation, action, bearer auth, logs, and structured errors | Verified by shared local and hosted conformance at this exact head |
+| `/api/sync` live queries with reconnect and error recovery | Verified by shared local and hosted conformance at this exact head |
 | Live auth, optimistic mutations, and `TransitionChunk` | Deliberately deferred |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.groovy -->
