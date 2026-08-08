@@ -36,20 +36,22 @@ earn.
 ## What works
 
 Capability badges are awarded only by the shared black-box controller, and
-this client has not been through it yet.
+this client has been through it: 31 of 31 checks passed against the local
+self-hosted backend, and 31 of 31 against the hosted deployment over real
+TLS, from the same clean exact-head build.
 
 | Capability | State | Notes |
 | --- | --- | --- |
 | Builds in Docker | `./run test j` passes | jsource 9.8.0-beta6 builds from source inside Docker; the runtime and example images build and pass their in-image policy probes. |
-| HTTP query, mutation, action | Implemented, local tests pass, proven against the hosted deployment during development | Verified by shared local and hosted conformance |
-| Live subscriptions | Implemented, local tests pass, proven against the hosted deployment during development (including five real `debugDisconnect` reconnects) | Verified by shared local and hosted conformance |
-| Language-local tests | Passing | `json_test.ijs`, `transport_test.ijs`, `convex_test.ijs`, and `websocket_test.ijs` exercise the JSON codec, byte/crypto primitives, HTTP framing, and RFC 6455 frame assembly without a socket. |
-| Earned capability badges | None | Nothing is claimed until `./run verify j` and `./run verify-hosted j` pass. |
+| HTTP query, mutation, action | Implemented, 31/31 shared conformance on both profiles | Bearer token lifecycle and structured `ConvexError` data included |
+| Live subscriptions | Implemented, 31/31 shared conformance on both profiles, including five real `debugDisconnect` reconnects | Verified by shared local and hosted conformance |
+| Language-local tests | Passing | `json_test.ijs`, `transport_test.ijs`, `convex_test.ijs`, `websocket_test.ijs`, and `adapter_test.ijs` exercise the JSON codec, byte/crypto primitives, HTTP framing, RFC 6455 frame assembly, and the adapter's own id-validation and error-serialisation shapes. |
+| Earned capability badges | `http`, `live` | Awarded by `./run verify j` and `./run verify-hosted j` from the same built source. |
 
 ## The canonical example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.ijs -->
-```j
+```text
 NB. Convex from J: the shared counter journey.
 NB.
 NB. The program reads a room's counter over Convex's documented HTTP API,
@@ -245,7 +247,10 @@ example images satisfy the shared filesystem policy. It proves nothing about
 a real deployment. `./run verify-example j` runs the canonical example itself
 against Convex and compares its stdout with the shared transcript.
 `./run verify j` adds the shared controller, which is the only thing that can
-award HTTP or Live.
+award HTTP or Live; `./run verify-hosted j` repeats both against the hosted
+drift target. `./run verify-all j` builds once and runs both profiles from
+the same image, which is how the `http` and `live` badges above were earned:
+31 of 31 checks on each profile, from a clean exact-head build.
 
 ## How it is put together
 
@@ -330,18 +335,17 @@ deployment is reachable.
 | `transport_test.ijs` | Big/little-endian byte packing, bytewise XOR, base64 against RFC 4648 test vectors, SHA-1 against the standard `"abc"` vector, UUID shape, and monotonic-clock sanity. |
 | `convex_test.ijs` | Deployment URL parsing and its rejections, the integral-number decoding rule at the 2^53 boundary, and HTTP status-line/header/chunked framing. |
 | `websocket_test.ijs` | The RFC 6455 worked handshake example from the spec text, frame masking, and a 4-byte UTF-8 character deliberately split across a fragment boundary with a PING interleaved between the fragments -- the same fixture idea `icon/` uses for its own frame-boundary test. |
+| `tests/conformance/adapter_test.ijs` | Direct coverage of `adapter_id_valid` and the `adapter_error`/`adapter_result` JSON shapes: plain-ASCII and multi-byte UTF-8 ids, empty/invalid-UTF-8/over-128-codepoint rejection, structured error data carried verbatim, and an empty id omitted rather than serialised as a bogus field. Loads `adapter.ijs` as a library via `ADAPTER_AUTOEXEC=: 0` instead of running its real stdin/TCP loop. |
 
 ## Known limitations and honest risks
 
-`./run test j` passes: the jsource source build, every language-local suite,
-and the runtime/example image policy probes all run green inside Docker.
-During development, the full stack -- HTTP query/mutation, the WebSocket
-handshake, Live subscribe/receive, and five real `debugDisconnect`
-reconnects each followed by a mutation and a correctly delivered update --
-was proven directly against this project's hosted deployment. `./run
-verify-example j`, `./run verify j`, and `./run verify-hosted j` have not
-been run yet as part of this evidence trail, so no HTTP or Live capability
-badge is claimed here until they do.
+`./run verify-all j` passed both profiles from a clean exact-head build: 31
+of 31 checks against the local self-hosted backend, and 31 of 31 against the
+hosted deployment over real TLS, including HTTP query/mutation/action,
+bearer-token lifecycle, structured `ConvexError` data, and Live
+subscribe/update/failure/recovery with five real `debugDisconnect`
+reconnects. The `http` and `live` capability badges above come from that run,
+not from development-time testing against the hosted deployment.
 
 - WebSocket mutations, WebSocket actions, Live authentication, optimistic
   updates, journals, and `TransitionChunk` assembly are not implemented.
@@ -354,6 +358,6 @@ badge is claimed here until they do.
 - Bracketed IPv6 deployment URLs are refused rather than mis-parsed.
 - The client is single threaded by construction. A long HTTP call delays
   Live reads until that call's own deadline expires.
-- Syntax highlighting for the example block falls back to plain text, because
-  the shared README projector has no `.ijs` fence mapping; `j` is used here
-  as the closest available label.
+- Syntax highlighting for the example block falls back to plain text (the
+  fenced code block below is tagged `text`), because the shared README
+  projector has no `.ijs` fence mapping.

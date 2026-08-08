@@ -38,12 +38,14 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - The language-local test gate passes: json.ijs, transport.ijs, convex.ijs, and websocket.ijs round trip, reject malformed input, and decode a multi-byte UTF-8 character deliberately split across a WebSocket fragment boundary with a PING interleaved. Shared conformance (verify, verify-hosted) has not run yet, so no capability is claimed here until it does.
+  - "The language-local test gate passes: json.ijs, transport.ijs, convex.ijs, and websocket.ijs round trip, reject malformed input, and decode a multi-byte UTF-8 character deliberately split across a WebSocket fragment boundary with a PING interleaved. Shared conformance (verify, verify-hosted) passed 31/31 on both profiles from a clean exact-head build; capabilities below reflect that run."
   - DNS resolution (glibc gethostbyname, via J's own stock socket.ijs) is the one unbounded step in a connection; every later step -- TCP connect, the TLS handshake, and every read or write -- honours a monotonic deadline enforced with SO_RCVTIMEO/SO_SNDTIMEO on the socket, or poll() for the adapter's stdio transport.
-  - The client is single threaded by construction, matching J's own execution model: the adapter loop alternates pumping the WebSocket owner and taking one controller command, both bounded by a monotonic deadline, so an in-flight HTTP call delays Live reads until its own deadline expires.
+  - "The client is single threaded by construction, matching J's own execution model: the adapter loop alternates pumping the WebSocket owner and taking one controller command, both bounded by a monotonic deadline, so an in-flight HTTP call delays Live reads until its own deadline expires."
   - WebSocket mutations, WebSocket actions, Live authentication, optimistic updates, journals, and TransitionChunk assembly are deferred.
   - Live values cover Convex's JSON-safe subset; tagged convex_encoded_json conversions are out of scope. JSON numbers are kept as their verbatim source literal rather than parsed into a float, so a round trip never rewrites precision.
   - Strings containing an embedded U+0000 are refused during JSON parsing rather than silently truncated, because J's own EOF sentinel used while scanning would otherwise collide with a genuine NUL byte in the source.
   - Live delivery is a bounded newest-N queue (16 entries, 4 MiB) that drops the oldest droppable subscription event first; the adapter's own output queue is separately bounded (8 entries, 4 MiB) and fails loudly rather than growing if only undroppable responses remain.
   - Bracketed IPv6 deployment URLs are refused rather than mis-parsed; only a plain hostname or dotted-decimal IPv4 host is accepted.
-capabilities: []
+capabilities:
+  - http
+  - live
