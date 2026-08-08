@@ -514,3 +514,488 @@ BAD:
 TRAILING:
   Z←JErr 'trailing data after JSON document'
 ∇
+
+⍝ ================================================================
+⍝ Connections
+⍝
+⍝ A connection is a 2-element vector (kind handle): kind is 'p' for a
+⍝ plain ⎕FIO socket or 't' for a CONVEXTLS handle. Every function below
+⍝ takes/returns byte vectors (integers 0-255), never characters.
+⍝ ================================================================
+
+∇Z←HOST ResolveHost B;R
+ ⍝⍝ B is ignored (dyadic only to read naturally at call sites);
+ ⍝⍝ resolves HOST to a host-byte-order uint32. Returns ('k' ip) or
+ ⍝⍝ ('e' message).
+  R←CONVEXTLS[6] BytesOfStr HOST
+  →('K'=1⊃R)⍴OK
+  Z←JErr 2↓R
+  →0
+OK:
+  Z←'k' (⍎2↓R)
+∇
+
+∇Z←USETLS ConnConnect HOSTPORT;HOST;PORT;R;IP;SOCK;ADDR;ERR
+ ⍝⍝ HOSTPORT is (host port), port a number. USETLS is 1 for TLS.
+  HOST←1⊃HOSTPORT
+  PORT←2⊃HOSTPORT
+  →(USETLS≠0)⍴TLS
+  R←HOST ResolveHost 0
+  →('k'≡1⊃R)⍴PLAINOK
+  Z←JErr 2⊃R
+  →0
+PLAINOK:
+  IP←2⊃R
+  SOCK←⎕FIO[32] 2               ⍝ AF_INET, SOCK_STREAM
+  →(SOCK≥0)⍴SOCKOK
+  Z←JErr 'socket() failed'
+  →0
+SOCKOK:
+  ADDR←2 IP PORT
+  ERR←ADDR ⎕FIO[36] SOCK        ⍝ connect(Bh, Aa)
+  →(ERR=0)⍴CONNOK
+  ⎕FIO[4] SOCK                  ⍝ ⎕FIO's socket and file handles share one
+                                 ⍝ table; FUN[4] closes either.
+  Z←JErr 'connect() failed'
+  →0
+CONNOK:
+  ⍝ F_SETFL O_NONBLOCK (4 2048 on Linux): ConnRecv below polls this
+  ⍝ socket with recv() itself rather than ⎕FIO[40] select(), whose
+  ⍝ dyadic (readfds writefds exceptfds timeout) argument -- despite
+  ⍝ matching Quad_FIO.cc's documented shape exactly (verified with ⍴/≡/
+  ⍝ ⊃ before ever reaching select()) -- reliably raised DOMAIN ERROR in
+  ⍝ this GNU APL 2.0 build; recv() itself does not have that problem.
+  (4 2048) ⎕FIO[59] SOCK
+  Z←'k' ('p' SOCK)
+  →0
+TLS:
+  R←CONVEXTLS[1] BytesOfStr HOST,' ',⍕PORT
+  →('K'=1⊃R)⍴TLSOK
+  Z←JErr 2↓R
+  →0
+TLSOK:
+  Z←'k' ('t' (⍎2↓R))
+∇
+
+∇Z←CONN ConnSend BYTES;KIND;HANDLE;R
+  KIND←1⊃CONN
+  HANDLE←2⊃CONN
+  →('t'≡KIND)⍴TLS
+  Z←BYTES ⎕FIO[38] HANDLE       ⍝ returns bytes sent, or negative on error
+  →0
+TLS:
+  R←BYTES CONVEXTLS[2] HANDLE
+  →('K'=1⊃R)⍴OK
+  Z←¯1
+  →0
+OK:
+  Z←⍎2↓R
+∇
+
+⍝ Sends the whole byte vector, looping over short writes. Returns
+⍝ ('k' totalSent) or ('e' message).
+∇Z←CONN ConnSendAll BYTES;SENT;N;TOTAL
+  TOTAL←⍴BYTES
+  SENT←0
+LOOP:
+  →(SENT≥TOTAL)⍴DONE
+  N←CONN ConnSend (SENT↓BYTES)
+  →(N>0)⍴PROGRESS
+  Z←JErr 'send made no progress'
+  →0
+PROGRESS:
+  SENT←SENT+N
+  →LOOP
+DONE:
+  Z←'k' SENT
+∇
+
+⍝ Reads up to MAXBYTES with a bound of TIMEOUTMS. Returns a tagged
+⍝ value: ('d' bytes) | ('t' ⍬) timed out | ('c' ⍬) closed | ('e' msg).
+⍝
+⍝ The plain-socket path polls a non-blocking recv() in a short ⎕DL
+⍝ sleep loop (see ConnConnect's comment on why, instead of select()).
+⍝ ⎕FIO[37] recv() returns a byte vector (possibly empty, meaning EOF)
+⍝ on success and a *negative scalar* -errno on failure; EAGAIN/EWOULDBLOCK
+⍝ (errno 11 on Linux) means "no data yet", not an error.
+∇Z←CONN ConnRecv PARAMS;KIND;HANDLE;MAXBYTES;TIMEOUTMS;R;DEADLINE
+  KIND←1⊃CONN
+  HANDLE←2⊃CONN
+  MAXBYTES←1⊃PARAMS
+  TIMEOUTMS←2⊃PARAMS
+  →('t'≡KIND)⍴TLS
+  DEADLINE←NowMs+TIMEOUTMS
+PLAINPOLL:
+  R←MAXBYTES ⎕FIO[37] HANDLE
+  →(0=⍴⍴R)⍴PLAINERR
+  →((⍴R)>0)⍴GOTDATA
+  Z←'c' ⍬                       ⍝ 0-length vector: peer closed
+  →0
+PLAINERR:
+  →(R=¯11)⍴PLAINWOULDBLOCK
+  Z←JErr 'recv() failed'
+  →0
+PLAINWOULDBLOCK:
+  →(NowMs>DEADLINE)⍴PLAINTIMEOUT
+  ⎕DL 0.02
+  →PLAINPOLL
+PLAINTIMEOUT:
+  Z←'t' ⍬
+  →0
+GOTDATA:
+  Z←'d' R
+  →0
+TLS:
+  R←(MAXBYTES TIMEOUTMS) CONVEXTLS[3] HANDLE
+  →('D'=1⊃R)⍴TLSDATA
+  →('T'=1⊃R)⍴TLSTIME
+  →('C'=1⊃R)⍴TLSCLOSED
+  Z←JErr 2↓R
+  →0
+TLSDATA:
+  Z←'d' (⎕UCS 2↓R)
+  →0
+TLSTIME:
+  Z←'t' ⍬
+  →0
+TLSCLOSED:
+  Z←'c' ⍬
+∇
+
+∇Z←ConnClose CONN;KIND;HANDLE
+  KIND←1⊃CONN
+  HANDLE←2⊃CONN
+  →('t'≡KIND)⍴TLS
+  ⎕FIO[4] HANDLE
+  Z←0
+  →0
+TLS:
+  CONVEXTLS[4] HANDLE
+  Z←0
+∇
+
+⍝ ================================================================
+⍝ Timing
+⍝
+⍝ ⎕AI[3] is GNU APL's session elapsed time in milliseconds (ISO APL2's
+⍝ ⎕AI: [1] user id [2] computation time [3] session/connect time [4]
+⍝ keying time) -- real wall-clock elapsed time since the interpreter
+⍝ started, unlike a CPU-time counter that would barely advance while
+⍝ blocked in a socket read.
+⍝ ================================================================
+
+∇Z←NowMs
+  Z←3⊃⎕AI
+∇
+
+⍝ ================================================================
+⍝ HTTP/1.1
+⍝ ================================================================
+
+⍝ Splits a Convex base URL into (useTls host port). Accepts
+⍝ scheme://host[:port] with no path.
+∇Z←UrlParse URL;SCHEMEEND;REST;COLON;USETLS;HOST;PORT
+  SCHEMEEND←(URL⍳'://')-1
+  →(SCHEMEEND<⍴URL)⍴HASSCHEME
+  Z←JErr 'URL missing scheme'
+  →0
+HASSCHEME:
+  USETLS←('https'≡SCHEMEEND↑URL)∨('wss'≡SCHEMEEND↑URL)
+  REST←(SCHEMEEND+3)↓URL
+  COLON←REST⍳':'
+  →(COLON≤⍴REST)⍴HASPORT
+  HOST←REST
+  →(USETLS≠0)⍴DEFHTTPS
+  PORT←80
+  →DONE
+DEFHTTPS:
+  PORT←443
+  →DONE
+HASPORT:
+  HOST←(COLON-1)↑REST
+  PORT←⍎(COLON)↓REST
+DONE:
+  Z←'k' (USETLS HOST PORT)
+∇
+
+⍝ Builds a POST /api/<op> request. BODYSTR is the JSON body as a
+⍝ character vector; returns the full request as a byte vector.
+∇Z←HttpBuildRequest PARAMS;OP;PATHTEXT;HOST;BODYSTR;TOKEN;REQ;CRLF
+  OP←1⊃PARAMS
+  BODYSTR←2⊃PARAMS
+  HOST←3⊃PARAMS
+  TOKEN←4⊃PARAMS
+  CRLF←(⎕UCS 13),(⎕UCS 10)
+  REQ←'POST /api/',OP,' HTTP/1.1',CRLF
+  REQ←REQ,'Host: ',HOST,CRLF
+  REQ←REQ,'Content-Type: application/json',CRLF
+  REQ←REQ,'Accept: application/json',CRLF
+  REQ←REQ,'Convex-Client: apl-0.1.0',CRLF
+  →(0=⍴TOKEN)⍴NOAUTH
+  REQ←REQ,'Authorization: Bearer ',TOKEN,CRLF
+NOAUTH:
+  REQ←REQ,'Content-Length: ',(⍕⍴BODYSTR),CRLF
+  REQ←REQ,'Connection: close',CRLF,CRLF
+  REQ←REQ,BODYSTR
+  Z←BytesOfStr REQ
+∇
+
+⍝ Reads a full HTTP response (status line, headers, body) from CONN,
+⍝ honouring Content-Length or chunked transfer-encoding, bounded by an
+⍝ 8 MiB budget and a 15-second deadline. Returns ('k' (statusCode
+⍝ bodyChars)) or ('e' message).
+∇Z←HttpReadResponse CONN;BUF;DEADLINE;R;HEADEREND;HEADERTEXT;BODYSOFAR;STATUSLINE;RESTHEADERS;CONTENTLENGTH;CHUNKED;HEADERLINE;COLONPOS;HNAME;HVALUE;MAXBYTES;DECODED
+  MAXBYTES←8388608
+  DEADLINE←NowMs+15000
+  BUF←⍬
+  HEADEREND←0
+HDRLOOP:
+  →(HEADEREND>0)⍴HDRDONE
+  →(NowMs>DEADLINE)⍴HDRTIMEOUT
+  R←CONN ConnRecv (65536 5000)
+  →('d'≡1⊃R)⍴HDRDATA
+  →('t'≡1⊃R)⍴HDRLOOP
+  →('c'≡1⊃R)⍴HDRCLOSED
+  Z←R
+  →0
+HDRDATA:
+  BUF←BUF,2⊃R
+  →((⍴BUF)>MAXBYTES)⍴HDRTOOBIG
+  HEADEREND←((13 10 13 10)⍷BUF)⍳1
+  →(HEADEREND≤(⍴BUF)-3)⍴HDRLOOP  ⍝ a real match leaves room for all 4 bytes
+  HEADEREND←0                    ⍝ ⍳1's "not found" value; keep looping
+  →HDRLOOP
+HDRCLOSED:
+  Z←JErr 'connection closed before headers completed'
+  →0
+HDRTIMEOUT:
+  Z←JErr 'timed out reading response headers'
+  →0
+HDRTOOBIG:
+  Z←JErr 'response headers exceeded budget'
+  →0
+HDRDONE:
+  HEADERTEXT←StrOfBytes (HEADEREND-1)↑BUF
+  BODYSOFAR←(HEADEREND+3)↓BUF
+  R←HEADERTEXT HeaderSplitFirstLine 0
+  STATUSLINE←1⊃R
+  RESTHEADERS←2⊃R
+  CONTENTLENGTH←¯1
+  CHUNKED←0
+HPARSE:
+  →(0=⍴RESTHEADERS)⍴HPARSEDONE
+  R←RESTHEADERS HeaderSplitFirstLine 0
+  HEADERLINE←1⊃R
+  RESTHEADERS←2⊃R
+  COLONPOS←HEADERLINE⍳':'
+  →(COLONPOS>⍴HEADERLINE)⍴HPARSE
+  HNAME←UpperStr HStrip (COLONPOS-1)↑HEADERLINE
+  HVALUE←HStrip COLONPOS↓HEADERLINE
+  →('CONTENT-LENGTH'≡HNAME)⍴SETLEN
+  →('TRANSFER-ENCODING'≡HNAME)⍴SETCHUNK
+  →HPARSE
+SETLEN:
+  CONTENTLENGTH←⍎HVALUE
+  →HPARSE
+SETCHUNK:
+  →(~'CHUNKED'≡UpperStr HVALUE)⍴HPARSE
+  CHUNKED←1
+  →HPARSE
+HPARSEDONE:
+  →(CHUNKED≠0)⍴DOCHUNK
+  →(CONTENTLENGTH≥0)⍴READLEN
+  →READCLOSE
+DOCHUNK:
+  R←CONN HttpDechunk (BODYSOFAR DEADLINE)
+  →('k'≡1⊃R)⍴CHUNKOK
+  Z←R
+  →0
+CHUNKOK:
+  Z←'k' ((HttpStatusCode STATUSLINE) (StrOfBytes 2⊃R))
+  →0
+READLEN:
+  →((⍴BODYSOFAR)≥CONTENTLENGTH)⍴LENDONE
+  →(NowMs>DEADLINE)⍴BODYTIMEOUT
+  R←CONN ConnRecv (65536 5000)
+  →('d'≡1⊃R)⍴LENDATA
+  →('t'≡1⊃R)⍴READLEN
+  →('c'≡1⊃R)⍴LENDONE
+  Z←R
+  →0
+LENDATA:
+  BODYSOFAR←BODYSOFAR,2⊃R
+  →((⍴BODYSOFAR)>MAXBYTES)⍴BODYTOOBIG
+  →READLEN
+LENDONE:
+  Z←'k' ((HttpStatusCode STATUSLINE) (StrOfBytes CONTENTLENGTH↑BODYSOFAR))
+  →0
+READCLOSE:
+  →(NowMs>DEADLINE)⍴BODYTIMEOUT
+  R←CONN ConnRecv (65536 5000)
+  →('d'≡1⊃R)⍴CLOSEDATA
+  →('t'≡1⊃R)⍴READCLOSE
+  →('c'≡1⊃R)⍴CLOSEDONE
+  Z←R
+  →0
+CLOSEDATA:
+  BODYSOFAR←BODYSOFAR,2⊃R
+  →((⍴BODYSOFAR)>MAXBYTES)⍴BODYTOOBIG
+  →READCLOSE
+CLOSEDONE:
+  Z←'k' ((HttpStatusCode STATUSLINE) (StrOfBytes BODYSOFAR))
+  →0
+BODYTIMEOUT:
+  Z←JErr 'timed out reading response body'
+  →0
+BODYTOOBIG:
+  Z←JErr 'response body exceeded budget'
+∇
+
+∇Z←HttpStatusCode STATUSLINE
+  Z←⍎2⊃HStrSplitWords STATUSLINE
+∇
+
+⍝ Splits TEXT (a character vector) at the first CRLF, into that line
+⍝ (without the CRLF) and the remainder (also without it).
+∇Z←TEXT HeaderSplitFirstLine DUMMY;POS;CRLF
+  CRLF←⎕UCS 13 10
+  POS←(CRLF⍷TEXT)⍳1
+  →(POS≤(⍴TEXT)-1)⍴FOUND         ⍝ a real match leaves room for both bytes
+  Z←TEXT ''
+  →0
+FOUND:
+  Z←((POS-1)↑TEXT) ((POS+1)↓TEXT)
+∇
+
+∇Z←HStrip B;S;E
+  S←1
+  E←⍴B
+LSTRIP:
+  →(S>E)⍴EMPTY
+  →(~(S⊃B)∊' ',(⎕UCS 9))⍴RSTRIP
+  S←S+1
+  →LSTRIP
+RSTRIP:
+  →(~(E⊃B)∊' ',(⎕UCS 9))⍴DONE
+  E←E-1
+  →RSTRIP
+DONE:
+  Z←(S-1)↓(E↑B)
+  →0
+EMPTY:
+  Z←''
+∇
+
+∇Z←UpperStr B;ISLOWER
+ ⍝⍝ ASCII-only uppercase, used for case-insensitive HTTP header names.
+  ISLOWER←('a'≤B)∧(B≤'z')
+  Z←⎕UCS (⎕UCS B)-32×ISLOWER
+∇
+
+∇Z←HStrSplitWords B;PARTS;CUR;I;C
+  PARTS←⍬
+  CUR←''
+  I←1
+LOOP:
+  →(I>⍴B)⍴FLUSH
+  C←I⊃B
+  →(C=' ')⍴SPACE
+  CUR←CUR,C
+  I←I+1
+  →LOOP
+SPACE:
+  →(0=⍴CUR)⍴SKIP
+  PARTS←PARTS,⊂CUR
+  CUR←''
+SKIP:
+  I←I+1
+  →LOOP
+FLUSH:
+  →(0=⍴CUR)⍴Z1
+  PARTS←PARTS,⊂CUR
+Z1:
+  Z←PARTS
+∇
+
+⍝ Converts a hex character vector to a nonnegative integer.
+∇Z←HexToDec B;I;V;C
+  Z←0
+  I←1
+LOOP:
+  →(I>⍴B)⍴DONE
+  C←I⊃B
+  →((C≥'0')∧(C≤'9'))⍴DIGIT
+  →((C≥'a')∧(C≤'f'))⍴LOWER
+  →((C≥'A')∧(C≤'F'))⍴UPPER
+  →NEXT
+DIGIT:
+  V←(⎕UCS C)-⎕UCS '0'
+  →ADD
+LOWER:
+  V←10+(⎕UCS C)-⎕UCS 'a'
+  →ADD
+UPPER:
+  V←10+(⎕UCS C)-⎕UCS 'A'
+ADD:
+  Z←(16×Z)+V
+NEXT:
+  I←I+1
+  →LOOP
+DONE:
+∇
+
+⍝ Decodes an HTTP chunked body already partially buffered in
+⍝ (1⊃PARAMS), reading more from CONN as needed up to (2⊃PARAMS), a
+⍝ deadline in ms. Returns ('k' bytes) or ('e' message).
+∇Z←CONN HttpDechunk PARAMS;BUF;DEADLINE;OUT;R;LINEEND;SIZELINE;SIZE;SEMIPOS;CRLF
+  BUF←1⊃PARAMS
+  DEADLINE←2⊃PARAMS
+  OUT←⍬
+  CRLF←13 10
+LOOP:
+  LINEEND←(CRLF⍷BUF)⍳1
+  →(LINEEND≤(⍴BUF)-1)⍴GOTLINE
+  →(NowMs>DEADLINE)⍴TIMEOUTSIZE
+  R←CONN ConnRecv (65536 5000)
+  →('d'≡1⊃R)⍴MOREDATA
+  →('t'≡1⊃R)⍴LOOP
+  Z←JErr 'connection closed mid chunk'
+  →0
+MOREDATA:
+  BUF←BUF,2⊃R
+  →LOOP
+GOTLINE:
+  SIZELINE←(LINEEND-1)↑BUF
+  BUF←(LINEEND+1)↓BUF
+  SEMIPOS←SIZELINE⍳';'
+  →(SEMIPOS≤⍴SIZELINE)⍴HASSEMI
+  →SIZEOK
+HASSEMI:
+  SIZELINE←(SEMIPOS-1)↑SIZELINE
+SIZEOK:
+  SIZE←HexToDec StrOfBytes SIZELINE
+BODYWAIT:
+  →((⍴BUF)≥SIZE+2)⍴BODYOK
+  →(NowMs>DEADLINE)⍴TIMEOUTBODY
+  R←CONN ConnRecv (65536 5000)
+  →('d'≡1⊃R)⍴BODYMORE
+  →('t'≡1⊃R)⍴BODYWAIT
+  Z←JErr 'connection closed mid chunk body'
+  →0
+BODYMORE:
+  BUF←BUF,2⊃R
+  →BODYWAIT
+BODYOK:
+  →(SIZE=0)⍴FINAL
+  OUT←OUT,SIZE↑BUF
+  BUF←(SIZE+2)↓BUF
+  →LOOP
+FINAL:
+  Z←'k' OUT
+  →0
+TIMEOUTSIZE:
+  Z←JErr 'timed out reading chunk size'
+  →0
+TIMEOUTBODY:
+  Z←JErr 'timed out reading chunk body'
+∇
