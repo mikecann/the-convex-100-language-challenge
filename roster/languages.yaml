@@ -94,7 +94,7 @@ languages:
   - { rank: 87, id: odin, displayName: "Odin", selectionTier: curated_backfill, feasibility: { docker: G, https: G, json: G, websocket: A } }
   - { rank: 88, id: racket, displayName: "Racket", selectionTier: curated_backfill, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 89, id: lean, displayName: "Lean", selectionTier: curated_backfill, feasibility: { docker: G, https: A, json: G, websocket: A } }
-  - { rank: 90, id: hack, displayName: "Hack", selectionTier: curated_backfill, feasibility: { docker: G, https: G, json: G, websocket: A } }
+  - { rank: 90, id: verilog, displayName: "Verilog", selectionTier: curated_backfill, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 91, id: chapel, displayName: "Chapel", selectionTier: curated_backfill, feasibility: { docker: G, https: A, json: G, websocket: A } }
   - { rank: 92, id: pony, displayName: "Pony", selectionTier: curated_backfill, feasibility: { docker: G, https: G, json: G, websocket: A } }
   - { rank: 93, id: idris, displayName: "Idris", selectionTier: curated_backfill, feasibility: { docker: G, https: A, json: G, websocket: A } }

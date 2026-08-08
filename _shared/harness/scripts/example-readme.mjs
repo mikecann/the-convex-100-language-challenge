@@ -94,6 +94,7 @@ const fenceLanguages = {
   ".sno": "snobol4",
   ".sol": "solidity",
   ".st": "smalltalk",
+  ".sv": "verilog",
   ".swift": "swift",
   ".tcl": "tcl",
   ".ts": "typescript",
@@ -101,6 +102,7 @@ const fenceLanguages = {
   ".v": "v",
   ".vala": "vala",
   ".vb": "vbnet",
+  ".vh": "verilog",
   ".vhd": "vhdl",
   ".vhdl": "vhdl",
   ".zig": "zig",
@@ -114,6 +116,10 @@ const languageFenceOverrides = {
   mumps: "mumps",
   "objective-c": "objective-c",
   "wolfram-language": "mathematica",
+  // .v is already claimed by V (fenceLanguages below) for its own
+  // examples; Verilog's own examples resolve here first instead, the
+  // same collision-resolution shape the entries above use.
+  verilog: "verilog",
 };
 
 export function fenceLanguageFor(languageId, sourcePath) {

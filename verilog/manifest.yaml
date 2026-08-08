@@ -1,0 +1,131 @@
+schemaVersion: 1
+id: verilog
+displayName: "Verilog"
+rank: 90
+selectionTier: curated_backfill
+implementation:
+  status: working
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    A Convex client expressed as a simulated circuit: a free-running clock
+    process and a clocked request/acknowledge transport process
+    (client/convex_transport.v) calling into an Icarus Verilog VPI module
+    (client/native.c) that exposes exactly two system functions,
+    $cx_dispatch and $cx_now_ms - VHPIDIRECT's role on this toolchain.
+    The toolchain gate is proven inside Docker on the pinned toolchain: a
+    real TCP connection and a real certificate- and hostname-verified TLS
+    handshake to the approved test deployment, both driven from Verilog
+    through the VPI boundary. client/convex_buffer.v adds a JSON encoder
+    and decoder (a "smart buffer" combining byte storage with JSON
+    parsing of its own content, forced by this toolchain's lack of
+    by-reference array/queue task arguments), covering the
+    integral-decimal-number rule and proven with a language-local unit
+    suite. client/convex_http.v adds HTTP/1.1 request/response framing on
+    top of the transport and JSON layers, proven with a real POST
+    /api/query round trip to the shared demo:state query against the
+    approved test deployment. client/convex_sha1.v and
+    client/convex_base64.v add a pure-Verilog SHA-1 and base64 encoder (no
+    crypto library binding exists for this toolchain), proven against RFC
+    6455's own worked Sec-WebSocket-Accept example. client/convex_websocket.v
+    adds RFC 6455 WebSocket framing: masking every client-to-server frame
+    with a fresh random key (native.c's CMD_RANDOM_BYTE, backed by OpenSSL
+    RAND_bytes), reassembling fragmented messages while correctly handling
+    a control frame interleaved mid-fragmentation, and validating UTF-8
+    exactly once over the fully reassembled message - proven against a
+    fixture peer that independently verifies the client's own PONG and
+    CLOSE frames arrived masked with the right content.
+    client/convex_sync.v adds the /api/sync Live state machine (the pinned
+    convex-rs-0.10.4-unversioned-sync profile) on top of that: a
+    subscription table, the initial value and later external updates, five
+    real reconnects through an adapter-facing debugDisconnect hook with an
+    unchanged rehydration correctly suppressed and a genuine mutation
+    still delivered on every one, QueryFailed followed by recovery on the
+    same subscription, connectionCount/lastCloseReason/maxObservedTimestamp
+    carried correctly, and exponential backoff that doubles on repeated
+    failure and resets after every successful handshake - proven end to
+    end against a fixture peer that independently checks each connection's
+    connectionCount and lastCloseReason. client/convex.v is the public
+    call() facade (query/mutation/action plus an embedded convex_sync
+    instance for Live), proven against the real deployment: a successful
+    query, a successful mutation, and a function-level failure carrying
+    structured errorData. client/tests/conformance/adapter.v is the NDJSON
+    adapter protocol v1 executable: stdin/stdout and ADAPTER_LISTEN TCP
+    modes, a bounded MAX_SUBS-sized mailbox (one current value per
+    subscription, never a growing queue) for Live delivery, proven under a
+    real stopped reader (a genuinely blocked stdout pipe, 4000 unpaced
+    Live updates, peak VmRSS sampled at 1.4 MB against the shared 128 MiB
+    limit). examples/basics/main.v is the canonical example, proven both
+    to fail loudly with no configuration and, against a real fixture (and
+    separately against the live hosted deployment), to produce the exact
+    transcript _shared/examples/basics.expected.txt records. runtime and
+    example-runtime images ship only vvp (Icarus's separate bytecode
+    interpreter) plus this client's own native.vpi and vvp's own small
+    default VPI plugin set - never iverilog/ivl/ivlpp, the compiler front
+    end and code generator, which live in the exact same Debian package.
+    Two genuine Icarus 11.0 bugs were found and fixed while wiring the
+    adapter and the example end to end, both beyond the string-literal-
+    escape and inline-function-call-in-concatenation bugs found earlier
+    while building the transport/HTTP/WebSocket layers: (1) `disable
+    main;` inside a recursively self-nested parse_object or parse_array
+    call (an object whose value is itself an object, or an array whose
+    element is itself an array) does not only exit the inner frame the
+    way IEEE 1800 automatic-task reentrancy requires - it also abandons
+    the OUTER frame's own remaining statements, so an ordinary "args":{}
+    envelope was rejected as malformed even though it was well-formed
+    JSON; fixed by rewriting both tasks to thread a `failed` flag through
+    nested if/else instead of ever calling disable from a frame that may
+    be recursing. (2) the canonical example's own wait_for_live_update
+    task waited for `sub_version == 0` unconditionally, which only ever
+    holds on the very first call; its second call (after the mutation)
+    raced whatever value happened to already be in the buffer instead of
+    actually waiting for the new one, fixed by capturing each call's own
+    baseline version and waiting for it to advance.
+toolchain:
+  name: Icarus Verilog
+  version: "11.0 (stable), Debian package 11.0-1.1+b1"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    client/convex_sync.v does not validate Convex's real
+    startVersion/endVersion state-version continuity - only endVersion.ts
+    itself, for maxObservedTimestamp. See that file's own header comment
+    for the reasoning; the fixture peer never sends an invalid one.
+  - >-
+    JSON string decoding does not combine a \uD800-\uDBFF/\uDC00-\uDFFF
+    surrogate pair into one astral codepoint; it rejects the lone
+    surrogate half instead. A Basic Multilingual Plane character (the
+    overwhelming majority of real text, and everything Convex's own
+    protocol control fields ever contain) decodes correctly; an emoji or
+    rare CJK extension character in user data would not.
+  - >-
+    Live delivery is a bounded mailbox, not a queue: conv.sync keeps only
+    the latest value per subscription, and the adapter's own "have I
+    emitted the current version yet" tracking is the same fixed,
+    MAX_SUBS-sized shape - a slow consumer sees the newest value next, not
+    a backlog of every intermediate one.
+  - >-
+    The pinned iverilog does not support passing an unpacked array, a ref
+    port, or a dynamic byte queue into a task or function; every buffer in
+    this client is module state reached only through a hierarchical name.
+    The same toolchain also expands a literal `\"` or a lone `\\` inside a
+    SystemVerilog string literal into that escape's own multi-character
+    spelling instead of the single byte it should produce - every string
+    literal needing a literal quote or backslash spells it as an explicit
+    byte constant instead (see client/convex_chars.vh).
+capabilities:
+  - http
+  - live
