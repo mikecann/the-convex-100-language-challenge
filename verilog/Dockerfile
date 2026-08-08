@@ -973,3 +973,261 @@ RUN set -eu; \
     grep -Fq '"type":"result"' /tmp/scenario-a.out; \
     grep -Fq '"count":5' /tmp/scenario-a.out; \
     grep -Fq '"type":"closed"' /tmp/scenario-a.out
+
+# adapterlivefix.c: a Live fixture for the adapter's own subscribe/
+# debugDisconnect/unsubscribe wiring specifically -- deliberately NOT a
+# repeat of syncfix.c's own six-connection reconnect proof above (that
+# already proves convex_sync.v's reconnect semantics in full); this one
+# only has to prove the ADAPTER carries a subscription value out over
+# NDJSON and that debugDisconnect actually produces a second real TCP
+# connection, so two connections and one value change are enough.
+RUN <<'ADAPTERLIVEFIX_EOF'
+set -eu
+cat > /tmp/adapterlivefix.c <<'CEOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <openssl/sha.h>
+#include <openssl/evp.h>
+
+static int read_full(int fd, void *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t r = read(fd, (char *)buf + off, n - off);
+        if (r <= 0) return -1;
+        off += (size_t)r;
+    }
+    return 0;
+}
+
+static void write_full(int fd, const void *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, (const char *)buf + off, n - off);
+        if (w <= 0) { fprintf(stderr, "adapterlivefix: write failed\n"); exit(1); }
+        off += (size_t)w;
+    }
+}
+
+static void read_handshake(int fd, char *key_out, size_t key_cap) {
+    char buf[8192];
+    size_t len = 0;
+    key_out[0] = '\0';
+    for (;;) {
+        if (len >= sizeof(buf) - 1) exit(1);
+        ssize_t r = read(fd, buf + len, 1);
+        if (r <= 0) exit(1);
+        len += (size_t)r;
+        buf[len] = '\0';
+        if (len >= 4 && memcmp(buf + len - 4, "\r\n\r\n", 4) == 0) break;
+    }
+    char *line = buf;
+    for (;;) {
+        char *eol = strstr(line, "\r\n");
+        if (!eol) break;
+        *eol = '\0';
+        if (strncasecmp(line, "Sec-WebSocket-Key:", 18) == 0) {
+            char *v = line + 18;
+            while (*v == ' ') v++;
+            snprintf(key_out, key_cap, "%s", v);
+        }
+        if (eol == line) break;
+        line = eol + 2;
+    }
+    if (key_out[0] == '\0') exit(1);
+}
+
+static void compute_accept(const char *key, char *accept_out) {
+    static const char guid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    char joined[256];
+    snprintf(joined, sizeof(joined), "%s%s", key, guid);
+    unsigned char digest[SHA_DIGEST_LENGTH];
+    SHA1((const unsigned char *)joined, strlen(joined), digest);
+    int n = EVP_EncodeBlock((unsigned char *)accept_out, digest, SHA_DIGEST_LENGTH);
+    accept_out[n] = '\0';
+}
+
+static void send_text_frame(int fd, const char *text) {
+    size_t len = strlen(text);
+    unsigned char hdr[4];
+    size_t hlen = 0;
+    hdr[hlen++] = 0x81;
+    if (len < 126) {
+        hdr[hlen++] = (unsigned char)len;
+    } else {
+        hdr[hlen++] = 126;
+        hdr[hlen++] = (unsigned char)((len >> 8) & 0xFF);
+        hdr[hlen++] = (unsigned char)(len & 0xFF);
+    }
+    write_full(fd, hdr, hlen);
+    write_full(fd, text, len);
+}
+
+static void read_masked_text_frame(int fd, char *out, size_t cap) {
+    unsigned char hdr[2];
+    if (read_full(fd, hdr, 2) < 0) exit(1);
+    uint64_t plen = hdr[1] & 0x7F;
+    if (plen == 126) {
+        unsigned char ext[2];
+        if (read_full(fd, ext, 2) < 0) exit(1);
+        plen = ((uint64_t)ext[0] << 8) | ext[1];
+    }
+    unsigned char mkey[4];
+    if (read_full(fd, mkey, 4) < 0) exit(1);
+    if (plen >= cap) exit(1);
+    if (plen > 0 && read_full(fd, out, plen) < 0) exit(1);
+    for (uint64_t i = 0; i < plen; i++) out[i] = (char)((unsigned char)out[i] ^ mkey[i % 4]);
+    out[plen] = '\0';
+}
+
+
+static void ts_b64(uint64_t v, char *out) {
+    unsigned char bytes[8];
+    for (int i = 0; i < 8; i++) { bytes[i] = (unsigned char)(v & 0xFF); v >>= 8; }
+    int n = EVP_EncodeBlock((unsigned char *)out, bytes, 8);
+    out[n] = '\0';
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "usage: adapterlivefix port\n"); return 1; }
+    int port = atoi(argv[1]);
+
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
+    listen(listen_fd, 2);
+
+    uint64_t ts_counter = 1;
+    int qs_counter = 0;
+
+    for (int conn_num = 0; conn_num < 2; conn_num++) {
+        int fd = accept(listen_fd, NULL, NULL);
+        if (fd < 0) { perror("accept"); return 1; }
+        fprintf(stderr, "adapterlivefix: accepted connection %d\n", conn_num);
+        char key[512], accept_val[64], resp[512];
+        read_handshake(fd, key, sizeof(key));
+        compute_accept(key, accept_val);
+        int rn = snprintf(resp, sizeof(resp),
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: %s\r\n\r\n", accept_val);
+        write_full(fd, resp, (size_t)rn);
+
+        char msg[8192];
+        read_masked_text_frame(fd, msg, sizeof(msg)); /* Connect */
+        read_masked_text_frame(fd, msg, sizeof(msg)); /* ModifyQuerySet Add */
+        int query_id = 1;
+        (void)query_id;
+
+        char ts1[16], text[1024];
+        ts_b64(ts_counter, ts1); ts_counter++;
+        snprintf(text, sizeof(text),
+            "{\"type\":\"Transition\","
+            "\"startVersion\":{\"querySet\":%d,\"identity\":0,\"ts\":\"%s\"},"
+            "\"endVersion\":{\"querySet\":%d,\"identity\":0,\"ts\":\"%s\"},"
+            "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":1,\"value\":{\"count\":%d}}]}",
+            qs_counter, ts1, qs_counter + 1, ts1, conn_num);
+        qs_counter++;
+        send_text_frame(fd, text);
+
+        if (conn_num == 0) {
+            /* One genuine external mutation on the first connection only,
+             * so the transcript shows two distinct delivered values
+             * (0, then 1) before the debugDisconnect this scenario's
+             * own script drives next. */
+            char ts2[16];
+            ts_b64(ts_counter, ts2); ts_counter++;
+            snprintf(text, sizeof(text),
+                "{\"type\":\"Transition\","
+                "\"startVersion\":{\"querySet\":%d,\"identity\":0,\"ts\":\"%s\"},"
+                "\"endVersion\":{\"querySet\":%d,\"identity\":0,\"ts\":\"%s\"},"
+                "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":1,\"value\":{\"count\":1}}]}",
+                qs_counter, ts2, qs_counter + 1, ts2);
+            qs_counter++;
+            send_text_frame(fd, text);
+        }
+
+        char discard[64];
+        read(fd, discard, sizeof(discard)); /* blocks until debugDisconnect (EOF) or teardown */
+        close(fd);
+    }
+    close(listen_fd);
+    fprintf(stderr, "adapterlivefix: PASS both connections completed\n");
+    return 0;
+}
+CEOF
+gcc -O2 -Wall -Wextra -o /tmp/adapterlivefix /tmp/adapterlivefix.c -lssl -lcrypto
+ADAPTERLIVEFIX_EOF
+
+# Scenario B: a Live subscription, an asynchronous subscription event
+# delivered with no new command pending, a debugDisconnect (a real second
+# TCP connection to adapterlivefix, proving the command actually reaches
+# convex_sync.v's own force_disconnect rather than only being acked), and
+# the post-reconnect value -- fed through a FIFO so the adapter's stdin
+# genuinely blocks between commands instead of a regular file's always-
+# ready poll semantics reporting EOF the instant static input runs out.
+RUN set -eu; \
+    timeout 25 /tmp/adapterlivefix 44211 2>/tmp/adapterlivefix.log & \
+    sleep 1; \
+    mkfifo /tmp/scenario-b.fifo; \
+    ( \
+      exec 3> /tmp/scenario-b.fifo; \
+      printf '%s\n' '{"protocolVersion":1,"id":"h1","op":"hello"}' >&3; \
+      printf '%s\n' '{"id":"s1","op":"subscribe","subscriptionId":"sub1","path":"demo:state","args":{}}' >&3; \
+      sleep 3; \
+      printf '%s\n' '{"id":"d1","op":"debugDisconnect"}' >&3; \
+      sleep 3; \
+      printf '%s\n' '{"id":"u1","op":"unsubscribe","subscriptionId":"sub1"}' >&3; \
+      printf '%s\n' '{"id":"c1","op":"close"}' >&3; \
+      exec 3>&-; \
+    ) & \
+    CONVEX_URL=http://127.0.0.1:44211 timeout 30 vvp -M. -mnative /tmp/adapter.vvp \
+      < /tmp/scenario-b.fifo > /tmp/scenario-b.out 2>/tmp/scenario-b.err; \
+    code=$?; \
+    wait; \
+    echo "adapter exit: $code"; cat /tmp/scenario-b.out; cat /tmp/scenario-b.err >&2; cat /tmp/adapterlivefix.log >&2; \
+    test "$code" -eq 0; \
+    grep -Fq '"type":"ready"' /tmp/scenario-b.out; \
+    grep -Fq '"type":"subscription","subscriptionId":"sub1","value":{"count":0}' /tmp/scenario-b.out; \
+    grep -Fq '"type":"subscription","subscriptionId":"sub1","value":{"count":1}' /tmp/scenario-b.out; \
+    grep -Fq '"id":"d1","type":"ack"' /tmp/scenario-b.out; \
+    grep -Fq '"id":"u1","type":"ack"' /tmp/scenario-b.out; \
+    grep -Fq '"id":"c1","type":"closed"' /tmp/scenario-b.out; \
+    grep -Fq 'adapterlivefix: PASS both connections completed' /tmp/adapterlivefix.log
+
+# Scenario C: ADAPTER_LISTEN's TCP mode, proving CMD_LISTEN/CMD_ACCEPT
+# actually carry the adapter protocol, not only stdin/stdout. hello/close
+# need no CONVEX_URL, so no fixture backend is needed here. Uses bash
+# explicitly for its /dev/tcp pseudo-device, which this image's default
+# /bin/sh (dash) does not support.
+RUN bash -c '\
+    set -eu; \
+    ADAPTER_LISTEN=127.0.0.1:44212 timeout 20 vvp -M. -mnative /tmp/adapter.vvp \
+      > /tmp/scenario-c.out 2>/tmp/scenario-c.err & \
+    server_pid=$!; \
+    sleep 1; \
+    exec 3<>/dev/tcp/127.0.0.1/44212; \
+    printf "%s\n" "{\"protocolVersion\":1,\"id\":\"h1\",\"op\":\"hello\"}" >&3; \
+    timeout 5 head -n1 <&3 > /tmp/scenario-c.client.out; \
+    printf "%s\n" "{\"id\":\"c1\",\"op\":\"close\"}" >&3; \
+    timeout 5 head -n1 <&3 >> /tmp/scenario-c.client.out; \
+    exec 3>&-; \
+    wait "$server_pid"; \
+    code=$?; \
+    echo "adapter exit: $code"; cat /tmp/scenario-c.client.out; cat /tmp/scenario-c.err >&2; \
+    test "$code" -eq 0; \
+    grep -Fq "\"type\":\"ready\"" /tmp/scenario-c.client.out; \
+    grep -Fq "\"type\":\"closed\"" /tmp/scenario-c.client.out \
+'
