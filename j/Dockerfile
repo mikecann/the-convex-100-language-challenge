@@ -57,6 +57,14 @@ RUN /src/jlibrary/bin/jconsole client/tests/transport_test.ijs
 RUN /src/jlibrary/bin/jconsole client/tests/convex_test.ijs
 RUN /src/jlibrary/bin/jconsole client/tests/websocket_test.ijs
 
+# adapter_id_valid/adapter_error/adapter_result direct coverage: the
+# ADAPTER_LISTEN crash a live conformance run found (a stale numeric-to-
+# character reconversion of already-character id data) was reachable only
+# once any adapter_error response carried a request id, which the hello/close
+# smoke test below never exercises. ADAPTER_AUTOEXEC=: 0 inside the test file
+# itself loads adapter.ijs as a library instead of running adapter_main.
+RUN /src/jlibrary/bin/jconsole client/tests/conformance/adapter_test.ijs
+
 # The adapter answers a hello/close session over stdin and stdout before any
 # runtime image is built from it.
 RUN printf '%s\n' \
@@ -186,6 +194,7 @@ RUN printf '%s\n' \
       '$J client/tests/transport_test.ijs' \
       '$J client/tests/convex_test.ijs' \
       '$J client/tests/websocket_test.ijs' \
+      '$J client/tests/conformance/adapter_test.ijs' \
       > /usr/local/bin/run-language-tests \
     && chmod 0555 /usr/local/bin/run-language-tests
 CMD ["/usr/local/bin/run-language-tests"]
