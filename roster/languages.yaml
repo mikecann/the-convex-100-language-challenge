@@ -57,7 +57,7 @@ languages:
   - { rank: 50, id: gleam, displayName: "Gleam", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: A } }
   - { rank: 51, id: mojo, displayName: "Mojo", selectionTier: ranked, feasibility: { docker: A, https: A, json: G, websocket: A } }
   - { rank: 52, id: oz, displayName: "Oz", selectionTier: ranked, feasibility: { docker: A, https: A, json: A, websocket: A } }
-  - { rank: 53, id: raku, displayName: "Raku", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
+  - { rank: 53, id: clean, displayName: "Clean", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 54, id: standard-ml, displayName: "Standard ML", selectionTier: ranked, feasibility: { docker: G, https: A, json: G, websocket: A } }
   - { rank: 55, id: ats, displayName: "ATS2", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 56, id: harbour, displayName: "Harbour", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
