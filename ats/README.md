@@ -31,7 +31,7 @@ mutation, the idempotency key, and the final reactive assertion.
 ## Basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.dats -->
-```c
+```text
 (*
 ** Convex from ATS: the canonical shared counter demonstration.
 **

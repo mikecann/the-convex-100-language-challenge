@@ -29,7 +29,7 @@ over real TLS.
 ## The basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.rexx -->
-```rexx
+```text
 #!/usr/local/bin/regina
 /* Convex from Rexx: the canonical shared-counter walk. This is the exact
  * source shown in the README and on the website, and it is also what

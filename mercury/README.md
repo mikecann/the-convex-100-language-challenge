@@ -30,7 +30,7 @@ idempotency key, and the final reactive assertion.
 ## Basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.m -->
-```mercury
+```objective-c
 %-----------------------------------------------------------------------------%
 % Convex from Mercury: the canonical shared counter demonstration.
 %
