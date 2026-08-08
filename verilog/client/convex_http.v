@@ -45,6 +45,21 @@ module convex_http #(
 
   integer handle;
 
+  // Scratch accumulators used only by parse_endpoint and header_value
+  // below. Icarus 11.0's automatic-task runtime aborts
+  // (vthread.cc:212, peek_str) on a self-referential string
+  // concatenation (`x = {x, ...}`) accumulated inside a loop when `x` is
+  // an automatic-scoped variable - a task-local `string` or an `output
+  // string` port - even though the identical accumulation works fine
+  // when `x` is a persistent module-level signal (confirmed with a
+  // minimal repro outside this file: repro6 vs. repro4/repro5). Every
+  // loop-accumulated string here therefore builds into one of these two
+  // module-level scratch variables and is copied out with a single
+  // assignment once, never accumulated directly into a task-local
+  // variable or an output port.
+  string port_str_scratch;
+  string hv_scratch;
+
   // Parses a Convex deployment URL into ep_tls/ep_host/ep_port/
   // ep_base_path. Only http, https, ws and wss schemes are accepted
   // (ws/wss are equivalent to http/https here: the Live sync endpoint is
@@ -56,9 +71,18 @@ module convex_http #(
     integer host_start;
     integer p;
     string scheme;
-    string port_str;
     integer pv;
     integer path_start;
+    // Icarus 11.0 aborts elaboration (eval_string.c:113, string_ex_select)
+    // whenever a `string[index]` select appears directly inside a `{...}`
+    // concatenation RHS, even though the identical select works fine as a
+    // task argument or in a comparison (confirmed with a minimal repro
+    // outside this file). Every append below therefore copies the
+    // selected character into this plain `byte` first and concatenates
+    // that instead - the same reason convex_buffer.v's callers copy
+    // decode_str_next's output byte-by-byte rather than concatenating a
+    // decoded string directly.
+    byte c;
     begin : main
       ok = 1'b0;
       ep_tls = 1'b0;
@@ -82,23 +106,25 @@ module convex_http #(
 
       p = host_start;
       while (p < url.len() && url[p] != ":" && url[p] != "/") begin
-        ep_host = {ep_host, url[p]};
+        c = url[p];
+        ep_host = {ep_host, c};
         p = p + 1;
       end
       if (ep_host.len() == 0) disable main;
 
       if (p < url.len() && url[p] == ":") begin
         p = p + 1;
-        port_str = "";
+        port_str_scratch = "";
         while (p < url.len() && url[p] != "/") begin
           if (url[p] < "0" || url[p] > "9") disable main;
-          port_str = {port_str, url[p]};
+          c = url[p];
+          port_str_scratch = {port_str_scratch, c};
           p = p + 1;
         end
-        if (port_str.len() == 0) disable main;
+        if (port_str_scratch.len() == 0) disable main;
         pv = 0;
-        for (i = 0; i < port_str.len(); i = i + 1) begin
-          pv = pv * 10 + (port_str[i] - "0");
+        for (i = 0; i < port_str_scratch.len(); i = i + 1) begin
+          pv = pv * 10 + (port_str_scratch[i] - "0");
         end
         if (pv < 1 || pv > 65535) disable main;
         ep_port = pv;
@@ -113,7 +139,8 @@ module convex_http #(
       if (path_start >= 0) begin
         p = path_start;
         while (p < url.len()) begin
-          ep_base_path = {ep_base_path, url[p]};
+          c = url[p];
+          ep_base_path = {ep_base_path, c};
           p = p + 1;
         end
         if (ep_base_path.len() > 0 && ep_base_path[ep_base_path.len()-1] == "/") begin
@@ -254,6 +281,13 @@ module convex_http #(
   task automatic header_value(input string name, output string value, output bit found);
     integer hl, line_start, line_end, colon, j;
     integer value_start, value_end;
+    // See the scratch-variable header comment above: this concatenation
+    // also needs its source byte extracted into a plain local first - a
+    // function call result concatenated inline (`{hv_scratch,
+    // resp_headers.get_byte(j)}`) hits the identical vthread.cc:212
+    // peek_str abort at run time that a raw `[]` select hits at compile
+    // time, confirmed with a second minimal repro.
+    byte c;
     begin : main
       found = 1'b0;
       value = "";
@@ -282,8 +316,17 @@ module convex_http #(
           while (value_start < line_end && resp_headers.get_byte(value_start) == " ") value_start = value_start + 1;
           value_end = line_end;
           while (value_end > value_start && resp_headers.get_byte(value_end-1) == " ") value_end = value_end - 1;
-          value = "";
-          for (j = value_start; j < value_end; j = j + 1) value = {value, resp_headers.get_byte(j)};
+          // Accumulated into the module-level hv_scratch, not directly
+          // into `value` (an automatic task's output port): see this
+          // module's scratch-variable header comment for why a
+          // self-referential concatenation loop must not target an
+          // automatic-scoped string.
+          hv_scratch = "";
+          for (j = value_start; j < value_end; j = j + 1) begin
+            c = resp_headers.get_byte(j);
+            hv_scratch = {hv_scratch, c};
+          end
+          value = hv_scratch;
           found = 1'b1;
           disable main;
         end

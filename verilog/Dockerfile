@@ -17,15 +17,18 @@ ARG BUILD_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa04
 #       to the approved test deployment usable-reindeer-44.convex.cloud:443,
 #       through the same VPI boundary and OpenSSL in the same native.c.
 #
-# CHECKPOINT NOTE: this client has the toolchain gate and a JSON codec
-# (client/convex_buffer.v) so far. HTTP/1.1 framing, the canonical
-# examples/basics program, the RFC 6455 WebSocket layer, the /api/sync
-# Live state machine and the conformance adapter do not exist yet, so no
-# capability is claimed; see verilog/README.md. This mirrors
-# vhdl/Dockerfile's own incremental, checkpoint-commented structure for
-# the same reason: each layer is proven against a real peer (or, for pure
-# JSON encode/decode, a thorough language-local unit suite) before the
-# next is built on top of it.
+# CHECKPOINT NOTE: this client has the toolchain gate, a JSON codec
+# (client/convex_buffer.v) and now HTTP/1.1 request/response framing
+# (client/convex_http.v, proven with a real POST /api/query round trip
+# to the shared demo:state query - see the http_smoke stage below) so
+# far. The canonical examples/basics program, the RFC 6455 WebSocket
+# layer, the /api/sync Live state machine and the conformance adapter do
+# not exist yet, so no capability is claimed; see verilog/README.md. This
+# stage is built up incrementally and checkpoint-commented for the same
+# reason vhdl/ - still unimplemented itself (status: planned) - would be
+# organised the same way once it exists: each layer is proven against a
+# real peer (or, for pure JSON encode/decode, a thorough language-local
+# unit suite) before the next is built on top of it.
 # ---------------------------------------------------------------------------
 FROM --platform=linux/amd64 ${BUILD_IMAGE} AS test
 WORKDIR /project
@@ -173,6 +176,24 @@ RUN set -eu; \
       -o /tmp/tls_smoke.vvp client/convex_transport.v client/tests/tls_smoke.v; \
     timeout 20 vvp -M. -mnative /tmp/tls_smoke.vvp | tee /tmp/tls_smoke.out; \
     grep -Fq 'PASS tls_smoke' /tmp/tls_smoke.out
+
+# ---------------------------------------------------------------------------
+# http_smoke: a real HTTP/1.1 POST /api/query round trip against the
+# approved test deployment, over the same TLS-verified channel tls_smoke
+# proves above, driven through convex_http.v's request/response framing
+# and convex_buffer.v's JSON encode/decode - the first proof those two
+# layers work together against the real backend, not merely that they
+# compile. It calls the shared demo module's demo:state query for a
+# scratch room and checks the real envelope shape Convex's HTTP API
+# returns (status/value/errorMessage/logLines), including the returned
+# count.
+# ---------------------------------------------------------------------------
+RUN set -eu; \
+    iverilog -g2012 -L. -mnative -I. \
+      -o /tmp/http_smoke.vvp client/convex_transport.v client/convex_buffer.v \
+      client/convex_http.v client/tests/http_smoke.v; \
+    timeout 20 vvp -M. -mnative /tmp/http_smoke.vvp | tee /tmp/http_smoke.out; \
+    grep -Fq 'PASS http_smoke' /tmp/http_smoke.out
 
 # ---------------------------------------------------------------------------
 # json_test: convex_buffer.v's JSON encoder/decoder, including the

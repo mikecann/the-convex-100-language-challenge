@@ -8,20 +8,29 @@ implementation:
   notes: >-
     A Convex client expressed as a simulated circuit: a free-running clock
     process and a clocked request/acknowledge transport process
-    (client/convex_transport.v), the same shape vhdl/ uses through
-    VHPIDIRECT but here through an Icarus Verilog VPI module
+    (client/convex_transport.v) calling into an Icarus Verilog VPI module
     (client/native.c) that exposes exactly two system functions,
-    $cx_dispatch and $cx_now_ms. Only the toolchain gate exists so far,
-    proven inside Docker on the pinned toolchain: a real TCP connection and
-    a real certificate- and hostname-verified TLS handshake to the approved
-    test deployment, both driven from Verilog through the VPI boundary.
-    client/convex_buffer.v adds a JSON encoder and decoder (a "smart
-    buffer" combining byte storage with JSON parsing of its own content,
-    forced by this toolchain's lack of by-reference array/queue task
-    arguments), covering the integral-decimal-number rule and proven with
-    a language-local unit suite. HTTP/1.1 framing, examples/basics, the
-    RFC 6455 WebSocket layer, the /api/sync Live state machine and the
-    conformance adapter do not exist yet.
+    $cx_dispatch and $cx_now_ms - VHPIDIRECT's role on this toolchain,
+    though vhdl/ itself remains unimplemented (status: planned) so there
+    is no working VHDL sibling to compare against yet. The toolchain gate
+    is proven inside Docker on the pinned toolchain: a real TCP
+    connection and a real certificate- and hostname-verified TLS
+    handshake to the approved test deployment, both driven from Verilog
+    through the VPI boundary. client/convex_buffer.v adds a JSON encoder
+    and decoder (a "smart buffer" combining byte storage with JSON
+    parsing of its own content, forced by this toolchain's lack of
+    by-reference array/queue task arguments), covering the
+    integral-decimal-number rule and proven with a language-local unit
+    suite. client/convex_http.v now adds HTTP/1.1 request/response
+    framing (status line, headers, Content-Length and chunked body
+    decoding) on top of the transport and JSON layers, proven with a real
+    POST /api/query round trip to the shared demo:state query against the
+    approved test deployment (client/tests/http_smoke.v). Two Icarus 11.0
+    elaboration/runtime bugs around string concatenation were found and
+    worked around while building it (see convex_http.v's own comments).
+    examples/basics, the RFC 6455 WebSocket layer, the /api/sync Live
+    state machine and the conformance adapter do not exist yet, so no
+    capability is claimed.
 toolchain:
   name: Icarus Verilog
   version: "11.0 (stable), Debian package 11.0-1.1+b1"
