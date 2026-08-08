@@ -47,8 +47,24 @@ SSL_CTX_free ctx w = code { ccall SSL_CTX_free "p:V:A" }
 // afterward via `SSL_get_verify_result`), so the callback argument is a
 // literal null passed as a plain `I` — the ccall type string must list
 // every real C argument, or the callee reads an unset register/stack slot.
+//
+// `tlsConnect` calls the SSL-level `SSL_set_verify` below instead of this
+// CTX-level function — see that binding's comment for why: a `clm` 3.1
+// code-generation defect means this exact shape (`"...:V:A"`, a
+// void-returning ccall) corrupts the *next* String-argument ccall's
+// marshaled pointer when both appear in one function. Kept here, unused by
+// `tlsConnect`, only because `FoundationTest` still links it as part of
+// proving every declared OpenSSL symbol in this file resolves.
 SSL_CTX_set_verify :: !Pointer !Int !Int !*World -> *World
 SSL_CTX_set_verify ctx mode callback w = code { ccall SSL_CTX_set_verify "pII:V:A" }
+
+// SSL-level equivalent of `SSL_CTX_set_verify`, applied to a session
+// instead of a context. Real signature is identical modulo the first
+// argument. `tlsConnect` uses this one, called *after* `SSL_set1_host`/
+// `SSL_ctrl` rather than `SSL_CTX_set_verify` called before `SSL_new` — see
+// its own call site for the measured reason.
+SSL_set_verify :: !Pointer !Int !Int !*World -> *World
+SSL_set_verify ssl mode callback w = code { ccall SSL_set_verify "pII:V:A" }
 
 SSL_CTX_set_default_verify_paths :: !Pointer !*World -> (!Int, !*World)
 SSL_CTX_set_default_verify_paths ctx w = code { ccall SSL_CTX_set_default_verify_paths "p:I:A" }
