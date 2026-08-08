@@ -142,6 +142,19 @@ diagnostics), since it also needs to open a path outside any WORKDIR.
 `/usr/local/bin/convex-adapter`) does not exist yet -- see Remaining
 work below.
 
+Through the project's own `./run` harness rather than a manual `docker`
+invocation: `./run test rebol` and `./run verify-example rebol` (against
+a real self-hosted local backend deployment) both pass:
+
+```
+PASS rebol basic example returned the expected 0 -> 1 update against self-hosted
+```
+
+`./run verify` / `verify-hosted` / `verify-all` cannot pass yet --
+`image_policy` requires the default (non-`--target`) build to be the
+`runtime` stage with entrypoint `/usr/local/bin/convex-adapter`, which
+does not exist.
+
 ## Toolchain
 
 Rebol/Bulk 3.22.1, tag `3.22.1` from
