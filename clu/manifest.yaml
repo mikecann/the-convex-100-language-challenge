@@ -9,20 +9,28 @@ implementation:
   version: 0.1.0
   notes: >-
     Native Portable CLU (pclu) implementation of Convex's documented HTTP
-    JSON API and the pinned /api/sync protocol, in progress. pclu has no
-    sockets and no TLS visible from CLU source out of the box: raw BSD
-    sockets already exist as hand-written C bound into the builtin _chan
-    cluster (code/sysasm/Opt/_chan.c) and are used by this client's local
-    profile, byte-packed from CLU with _wordvec; TLS does not exist at
-    all upstream, so this client adds one small reviewed C file,
+    JSON API and the pinned /api/sync protocol. pclu has no sockets and no
+    TLS visible from CLU source out of the box: raw BSD sockets already
+    exist as hand-written C bound into the builtin _chan cluster
+    (code/sysasm/Opt/_chan.c) and are used by this client's local profile,
+    byte-packed from CLU with _wordvec; TLS does not exist at all
+    upstream, so this client adds one small reviewed C file,
     client/convexrt-tls.c, as a brand-new builtin cluster (_tls) the same
     way pclu's own primitives are added: a .spc interface file plus a
     hand-authored C file the linker resolves by naming convention, with
     no HTTP, WebSocket, JSON, or Convex protocol knowledge inside it.
     Every deadline, retry, and protocol decision is enforced in CLU
-    source. A genuine upstream 64-bit-port bug in _wordvec's byte/word
-    addressing (see client/wordvec-64bit-word-size.patch) is also
-    patched here; it is unrelated to Convex and worth reporting upstream.
+    source. pclu has no threads, so the /api/sync state machine
+    (client/convex-sync.clu) and the conformance adapter are both a
+    single bounded poll loop rather than an owner goroutine/thread; see
+    those files' own header comments. A genuine upstream 64-bit-port bug
+    in _wordvec's byte/word addressing (see
+    client/wordvec-64bit-word-size.patch) is also patched here, and
+    pclu's own bundled DNS client (lib/clu/_resolve.clu) silently fails
+    against a modern (Docker-generated) resolv.conf, worked around with
+    this client's own small resolver, client/convex-dns.clu -- see that
+    file's own header comment. Both are unrelated to Convex and worth
+    reporting upstream independently of this project.
 toolchain:
   name: pclu
   version: "1a8ad7603ea20b9744942182a52810441182f6a6"
@@ -42,41 +50,57 @@ adapter:
     - debugDisconnect
 limitations:
   - >-
-    This is an early, honest checkpoint, not a working client. `./run
-    test clu` passes: it builds pclu from source at the pinned commit,
-    applies client/wordvec-64bit-word-size.patch, adds the _tls builtin
-    cluster, boots a hello-world smoke test, and compiles and runs four
-    language-local unit suites -- client/tests/json_test.clu (the JSON
-    codec, including the AGENTS.md-required integral-decimal
-    regression), client/tests/bitops_test.clu (the arithmetic bitwise
-    helpers WebSocket masking and its handshake SHA-1 will need, since
-    CLU's own int cluster has no bitwise operators at all),
-    client/tests/transport_test.clu, and client/tests/http_test.clu. The
-    latter two are real loopback TCP coverage against
-    client/tests/fixtures/{echo,http}_fixture.clu -- genuine peer
-    processes, not mocks -- proving client/convex-transport.clu's conn
-    type (dial/send/recv/close, unifying the plain _chan profile and the
-    new _tls builtin behind one oneof, with poll-gated bounded reads on
-    both so an idle peer is told apart from a closed one) and
-    client/convex-http.clu's full HTTP/1.1 request/response framing
-    against Convex's documented "format":"json" envelope
-    (Content-Length, chunked transfer-encoding, and structured
-    FunctionError/TransportError/ProtocolError classification) all the
-    way through to a decoded field. Nothing further has been built: no
-    RFC 6455 WebSocket framing, no /api/sync state machine, no
-    conformance adapter, no canonical example, and no runtime images.
-    `intendedCapabilities` above states the goal, not anything earned;
     `capabilities` below is empty and stays empty until root-owned local
-    and hosted conformance both pass.
+    and hosted conformance both pass; `intendedCapabilities` states the
+    goal, not anything earned. `./run test clu` passes: it builds pclu
+    from source at the pinned commit, applies
+    client/wordvec-64bit-word-size.patch, adds the _tls builtin cluster,
+    boots a hello-world smoke test, checks source style, and compiles
+    and runs the full language-local unit suite -- the JSON codec
+    (client/tests/json_test.clu, including json$array_items and the
+    AGENTS.md-required integral-decimal regression), the arithmetic
+    bitwise helpers (client/tests/bitops_test.clu, since CLU's own int
+    cluster has no bitwise operators at all), SHA-1
+    (client/tests/sha1_test.clu, against FIPS 180-4 vectors and RFC
+    6455's own worked handshake example), base64
+    (client/tests/base64_test.clu, against RFC 4648 vectors), this
+    client's own DNS resolver (client/tests/dns_test.clu, against
+    hand-assembled DNS packets), and real loopback-TCP/WebSocket/sync
+    coverage against genuine peer processes, not mocks
+    (client/tests/transport_test.clu, http_test.clu, websocket_test.clu,
+    sync_test.clu) -- then compiles and links the canonical example and
+    the conformance adapter and proves the adapter's own hello/close
+    NDJSON lifecycle. The canonical example and both runtime images
+    (uid 65532:65532, read-only filesystem, all capabilities dropped)
+    have been manually verified end to end against both the local
+    backend and the hosted deployment; `./run verify-example`,
+    `./run verify`, `./run verify-hosted`, and `./run verify-all` are
+    the root-owned evidence this manifest's capabilities award still
+    waits on.
   - >-
-    client/convex-transport.clu's plain-profile dial() only resolves a
-    host as a literal dotted-quad address (inet_address, no network
-    access) or via DNS (pclu's own _resolve library) -- this is
-    sufficient for this client's actual traffic (the local profile's
-    CONVEX_URL always names the compose service "backend", which
-    resolves through Docker's own embedded DNS) but is not a general
-    getaddrinfo-equivalent; there is no /etc/hosts consultation, since
-    pclu's _resolve speaks raw DNS UDP only.
+    client/convex-websocket.clu's delivery model is one buffered event
+    per subscription in client/convex-sync.clu, not a queue: a fresh
+    QueryUpdated/QueryFailed overwrites whatever that subscription's own
+    previous undelivered value was, matching the pinned Go pilot's own
+    "reactive queries represent current state" rationale. The
+    conformance adapter never batches an event either -- it writes each
+    one to stdout the moment it is produced -- so a stopped reader
+    applies ordinary pipe backpressure to the adapter's single poll loop
+    rather than either layer ever accumulating an unbounded backlog of
+    its own. See convex-sync.clu's and the adapter's own header comments
+    for the full reasoning.
+  - >-
+    Backoff-reset-after-a-valid-Transition is implemented
+    (client/convex-sync.clu's handle_transition sets next_backoff_ms
+    back to its initial value on every successful Transition) but is not
+    independently proven by a dedicated timing unit test in
+    client/tests/sync_test.clu, which instead proves five real
+    debugDisconnect reconnects end to end, each with unchanged
+    rehydration suppressed and the next real change still delivered.
+    The shared conformance harness's own timing-based proof is the
+    authoritative evidence for this behaviour, consistent with
+    AGENTS.md's layered test model (language-local tests prove
+    mechanics; shared conformance is the capability's real evidence).
   - >-
     Two real pclu compiler/toolchain quirks were found and worked around
     while building this: (1) a return statement's expression list is
@@ -90,8 +114,8 @@ limitations:
     by an unguarded second statement before the `except` silently leaves
     that second statement's own signals uncaught -- multiple statements
     that need one shared handler have to be wrapped in an explicit
-    `begin ... end` first. Both are documented at their call sites in
-    client/convex-http.clu.
+    `begin ... end` first. Both are documented at their call sites
+    throughout this client (first found in client/convex-http.clu).
   - >-
     client/convex-json.clu is a minimal codec, not a general JSON-to-CLU
     value decoder: json$field walks a JSON document just far enough to
@@ -101,10 +125,9 @@ limitations:
     way, so a same-named field nested inside an unrelated value is never
     mistaken for the field being searched for); a caller that wants the
     value interprets it with json$uint32, json$field again if it is
-    itself an object, and so on. This keeps the codec small while still
-    being a real scanner rather than a toy; it has not yet been exercised
-    against real Convex response shapes beyond the unit fixtures in
-    client/tests/json_test.clu.
+    itself an object, and so on. json$array_items applies the same
+    approach to walking a Transition's own modifications array one
+    element at a time.
   - >-
     A genuine, previously unreported latent bug was found and fixed in
     pclu's own _wordvec.c on 64-bit builds: CLUREF's size is 8 bytes here
@@ -114,13 +137,17 @@ limitations:
     written for 4-byte words and, unpatched, can only ever address the
     first four bytes of every eight-byte storage slot -- discovered
     because building a raw sockaddr_in by hand for a plain TCP connect
-    always produced a null address. pclu's own standard library
-    (lib/clu/_resolve.clu, its DNS client) uses the exact same
-    byte-packing pattern this client's local-profile transport does, so
-    it likely also silently miscompiles on 64-bit builds; that was not
-    chased down further since it is out of this client's scope. See
+    always produced a null address. See
     client/wordvec-64bit-word-size.patch for the full writeup and fix.
   - >-
-    Capability badges remain empty until the root-owned local and hosted
-    conformance gates pass.
+    A second genuine bug was found in pclu's own bundled DNS client,
+    lib/clu/_resolve.clu: its resolv.conf reader only recognises ';' as
+    a comment character (an Ultrix/BSD convention from its 1985/1989 MIT
+    copyright header), not the '#' every modern Linux resolv.conf
+    (including Docker's own generated one) uses, so it silently ends up
+    querying the untouched default of 127.0.0.1 and every real hostname
+    lookup times out. client/convex-dns.clu is this client's own small,
+    from-scratch A-record resolver, used in place of _resolve for
+    exactly this reason -- see that file's own header comment for the
+    full writeup.
 capabilities: []
