@@ -1,0 +1,653 @@
+comment convex-http.sim - Convex documented JSON HTTP functions, in Simula.
+   One POST to /api/query, /api/mutation or /api/action carries
+   {path, args, format}. Convex reports a failing function inside an
+   ordinary looking response body rather than through the HTTP status
+   alone, so the status field of that body, not the HTTP status code,
+   decides whether a call succeeded, and the HTTP status only colours a
+   FunctionError versus a TransportError. Every response is bounded - the
+   status line, each header line, the header block, and the body, whether
+   it is Content-Length delimited, chunked, or read to end of stream, all
+   answer to the same absolute millisecond deadline;
+
+procedure httpclientversion(buf, cap, len);
+   name len;
+   integer array buf;
+   integer cap, len;
+begin
+   integer discard;
+   discard := bufputstr(buf, cap, len, "simula-0.1.0")
+end httpclientversion;
+
+comment ---------------------------------------------------------------
+   Deployment URL parsing - scheme, host, and port.
+   ------------------------------------------------------------------;
+
+procedure deploymentparse(url, urllen, tls, host, hostcap, hostlen,
+      port, portcap, portlen, errbuf, errbuflen, errkind);
+   name tls, hostlen, portlen, errbuflen, errkind;
+   integer array url, host, port, errbuf;
+   integer urllen, tls, hostcap, hostlen, portcap, portlen, errbuflen, errkind;
+begin
+   integer i, hstart, hend, colon, discard;
+   errkind := 0;
+   hostlen := 0;
+   portlen := 0;
+   if urllen >= 8 and bufeqstr(url, 0, 8, "https://") then begin
+      tls := 1; hstart := 8
+   end
+   else if urllen >= 7 and bufeqstr(url, 0, 7, "http://") then begin
+      tls := 0; hstart := 7
+   end
+   else begin
+      tls := 0;
+      hstart := -1;
+      jsonfail("deployment URL must begin with http:// or https://", errbuf, errbuflen, errkind)
+   end;
+   if errkind = 0 then begin
+      hend := urllen;
+      for i := hstart step 1 until urllen - 1 do
+         if hend = urllen then
+            if url(i) = 47 or url(i) = 58 then hend := i;
+      if hend = hstart then
+         jsonfail("deployment URL has no host", errbuf, errbuflen, errkind)
+      else begin
+         if bufputbytes(host, hostcap, hostlen, url, hstart, hend - hstart) = 1 then
+            jsonfail("deployment host is too long", errbuf, errbuflen, errkind)
+      end
+   end;
+   if errkind = 0 then begin
+      if hend < urllen and url(hend) = 58 then begin
+         colon := hend + 1;
+         begin
+            integer stop, pend;
+            stop := 0;
+            pend := colon;
+            while stop = 0 do begin
+               if pend >= urllen then stop := 1
+               else if url(pend) = 47 then stop := 1
+               else pend := pend + 1
+            end;
+            if pend = colon then
+               jsonfail("deployment URL has a colon but no port", errbuf, errbuflen, errkind)
+            else if bufputbytes(port, portcap, portlen, url, colon, pend - colon) = 1 then
+               jsonfail("deployment port is too long", errbuf, errbuflen, errkind)
+         end
+      end
+      else begin
+         if tls <> 0 then discard := bufputstr(port, portcap, portlen, "443")
+         else discard := bufputstr(port, portcap, portlen, "80")
+      end
+   end
+end deploymentparse;
+
+comment ---------------------------------------------------------------
+   Building a request.
+   ------------------------------------------------------------------;
+
+integer procedure httpvalidpath(path, pathlen);
+   comment a Convex function reference is module colon function. Rejecting
+   anything else turns a typo into a clear client error instead of a
+   puzzling not-found;
+   integer array path;
+   integer pathlen;
+begin
+   integer colon, ok;
+   colon := bufindexof(path, 0, pathlen, 58);
+   ok := if pathlen >= 3 and colon > 0 and colon < pathlen - 1 then 1 else 0;
+   if ok = 1 then
+      if bufindexof(path, colon + 1, pathlen - colon - 1, 58) >= 0 then ok := 0;
+   httpvalidpath := ok
+end httpvalidpath;
+
+procedure httpbuildbody(bodybuf, bodycap, bodylen, opname, path, pathlen,
+      argsbuf, argsoff, argslen);
+   name bodylen;
+   integer array bodybuf, path, argsbuf;
+   integer bodycap, bodylen, pathlen, argsoff, argslen;
+   text opname;
+begin
+   integer discard;
+   bodylen := 0;
+   discard := bufputbyte(bodybuf, bodycap, bodylen, 123);
+   discard := bufputstr(bodybuf, bodycap, bodylen, """path"":");
+   discard := jsonwritestring(bodybuf, bodycap, bodylen, path, 0, pathlen);
+   discard := bufputstr(bodybuf, bodycap, bodylen, ",""args"":");
+   discard := bufputbytes(bodybuf, bodycap, bodylen, argsbuf, argsoff, argslen);
+   discard := bufputstr(bodybuf, bodycap, bodylen, ",""format"":""json""}")
+end httpbuildbody;
+
+procedure httpbuildrequest(reqbuf, reqcap, reqlen, opname, host, hostlen,
+      port, portlen, tls, authbuf, authlen, bodybuf, bodylen);
+   name reqlen;
+   integer array reqbuf, host, port, authbuf, bodybuf;
+   integer reqcap, reqlen, hostlen, portlen, tls, authlen, bodylen;
+   text opname;
+begin
+   integer discard, defaultport;
+   reqlen := 0;
+   discard := bufputstr(reqbuf, reqcap, reqlen, "POST /api/");
+   discard := bufputstr(reqbuf, reqcap, reqlen, opname);
+   discard := bufputstr(reqbuf, reqcap, reqlen, " HTTP/1.1");
+   discard := bufputcrlf(reqbuf, reqcap, reqlen);
+   discard := bufputstr(reqbuf, reqcap, reqlen, "Host: ");
+   discard := bufputbytes(reqbuf, reqcap, reqlen, host, 0, hostlen);
+   if tls <> 0 then defaultport := if bufeqstr(port, 0, portlen, "443") then 1 else 0
+   else defaultport := if bufeqstr(port, 0, portlen, "80") then 1 else 0;
+   if defaultport = 0 then begin
+      discard := bufputbyte(reqbuf, reqcap, reqlen, 58);
+      discard := bufputbytes(reqbuf, reqcap, reqlen, port, 0, portlen)
+   end;
+   discard := bufputcrlf(reqbuf, reqcap, reqlen);
+   discard := bufputstr(reqbuf, reqcap, reqlen, "Content-Type: application/json");
+   discard := bufputcrlf(reqbuf, reqcap, reqlen);
+   discard := bufputstr(reqbuf, reqcap, reqlen, "Accept: application/json");
+   discard := bufputcrlf(reqbuf, reqcap, reqlen);
+   discard := bufputstr(reqbuf, reqcap, reqlen, "Connection: close");
+   discard := bufputcrlf(reqbuf, reqcap, reqlen);
+   discard := bufputstr(reqbuf, reqcap, reqlen, "Convex-Client: ");
+   httpclientversion(reqbuf, reqcap, reqlen);
+   if authlen > 0 then begin
+      discard := bufputcrlf(reqbuf, reqcap, reqlen);
+      discard := bufputstr(reqbuf, reqcap, reqlen, "Authorization: Bearer ");
+      discard := bufputbytes(reqbuf, reqcap, reqlen, authbuf, 0, authlen)
+   end;
+   discard := bufputcrlf(reqbuf, reqcap, reqlen);
+   discard := bufputstr(reqbuf, reqcap, reqlen, "Content-Length: ");
+   discard := bufputint(reqbuf, reqcap, reqlen, bodylen);
+   discard := bufputcrlf(reqbuf, reqcap, reqlen);
+   discard := bufputcrlf(reqbuf, reqcap, reqlen);
+   discard := bufputbytes(reqbuf, reqcap, reqlen, bodybuf, 0, bodylen)
+end httpbuildrequest;
+
+comment ---------------------------------------------------------------
+   A small buffered reader over one transport handle, bounded by an
+   absolute millisecond deadline taken from cxnowms.
+   ------------------------------------------------------------------;
+
+procedure streamcompact(rbuf, rcap, rlen, roff);
+   name rlen, roff;
+   integer array rbuf;
+   integer rcap, rlen, roff;
+begin
+   integer i;
+   if roff > 0 then begin
+      for i := 0 step 1 until rlen - roff - 1 do
+         rbuf(i) := rbuf(roff + i);
+      rlen := rlen - roff;
+      roff := 0
+   end
+end streamcompact;
+
+procedure streamfill(handle, rbuf, rcap, rlen, roff, deadlinems, errbuf, errbuflen, errkind);
+   comment reads at least one more byte into rbuf, waiting on the handles
+   readiness and honouring deadlinems. Sets a TransportError if the
+   deadline passes or the connection fails or closes;
+   name rlen, roff, errbuflen, errkind;
+   integer array rbuf, errbuf;
+   integer handle, rcap, rlen, roff, deadlinems, errbuflen, errkind;
+begin
+   integer remaining, mask, got, done, discard;
+   streamcompact(rbuf, rcap, rlen, roff);
+   if rlen >= rcap then begin
+      errbuflen := 0;
+      errkind := 2;
+      discard := bufputstr(errbuf, 256, errbuflen, "HTTP response exceeds the client buffer")
+   end
+   else begin
+      done := 0;
+      while done = 0 and errkind = 0 do begin
+         remaining := deadlinems - cxnowms;
+         if remaining <= 0 then begin
+            errbuflen := 0;
+            errkind := 3;
+            discard := bufputstr(errbuf, 256, errbuflen, "HTTP response timed out");
+            done := 1
+         end
+         else begin
+            mask := cxpoll(handle, 0, -1, 0, -1, 0, remaining);
+            if mask < 0 then begin
+               errbuflen := 0;
+               errkind := 3;
+               discard := bufputstr(errbuf, 256, errbuflen, "HTTP connection failed while waiting");
+               done := 1
+            end
+            else begin
+               got := cxread(handle, rbuf, rcap - rlen);
+               if got > 0 then begin rlen := rlen + got; done := 1 end
+               else if got = 0 then begin
+                  errbuflen := 0;
+                  errkind := 3;
+                  discard := bufputstr(errbuf, 256, errbuflen, "HTTP connection closed unexpectedly");
+                  done := 1
+               end
+               else if got = -2 then begin
+                  errbuflen := 0;
+                  errkind := 3;
+                  discard := bufputstr(errbuf, 256, errbuflen, "HTTP connection failed while reading");
+                  done := 1
+               end
+               comment got = -1 not ready yet loops back to poll again;
+            end
+         end
+      end
+   end
+end streamfill;
+
+comment note - cxread writes starting at rbuf(0), not rbuf(rlen), so
+   streamfill above is only correct once rbuf has been compacted to
+   offset 0. httpexchange below always keeps roff at 0 between fills for
+   exactly that reason, and treats roff purely as a consumed-count that
+   streamcompact folds back to zero before every read;
+
+procedure streamneed(handle, rbuf, rcap, rlen, roff, deadlinems, needbytes, errbuf, errbuflen, errkind);
+   name rlen, roff, errbuflen, errkind;
+   integer array rbuf, errbuf;
+   integer handle, rcap, rlen, roff, deadlinems, needbytes, errbuflen, errkind;
+begin
+   while rlen - roff < needbytes and errkind = 0 do
+      streamfill(handle, rbuf, rcap, rlen, roff, deadlinems, errbuf, errbuflen, errkind)
+end streamneed;
+
+procedure streamline(handle, rbuf, rcap, rlen, roff, deadlinems, linebuf, linecap, linelen, errbuf, errbuflen, errkind);
+   comment reads one CRLF or LF terminated line, excluding the
+   terminator, appending it to linebuf at linelen;
+   name rlen, roff, linelen, errbuflen, errkind;
+   integer array rbuf, linebuf, errbuf;
+   integer handle, rcap, rlen, roff, deadlinems, linecap, linelen, errbuflen, errkind;
+begin
+   integer nlpos, done, contentlen, dropcr, discard;
+   done := 0;
+   while done = 0 and errkind = 0 do begin
+      nlpos := bufindexof(rbuf, roff, rlen - roff, 10);
+      if nlpos >= 0 then begin
+         contentlen := nlpos - roff;
+         dropcr := if contentlen > 0 and rbuf(nlpos - 1) = 13 then 1 else 0;
+         if bufputbytes(linebuf, linecap, linelen, rbuf, roff, contentlen - dropcr) = 1 then begin
+            errbuflen := 0;
+            errkind := 2;
+            discard := bufputstr(errbuf, 256, errbuflen, "HTTP header line is too long")
+         end;
+         roff := nlpos + 1;
+         done := 1
+      end
+      else
+         streamfill(handle, rbuf, rcap, rlen, roff, deadlinems, errbuf, errbuflen, errkind)
+   end
+end streamline;
+
+procedure streamreadexact(handle, rbuf, rcap, rlen, roff, deadlinems, dst, dstcap, dstlen, count, errbuf, errbuflen,
+   errkind);
+   comment appends exactly count bytes, read from the handle if not
+   already buffered, to dst at dstlen;
+   name rlen, roff, dstlen, errbuflen, errkind;
+   integer array rbuf, dst, errbuf;
+   integer handle, rcap, rlen, roff, deadlinems, dstcap, dstlen, count, errbuflen, errkind;
+begin
+   integer discard;
+   streamneed(handle, rbuf, rcap, rlen, roff, deadlinems, count, errbuf, errbuflen, errkind);
+   if errkind = 0 then begin
+      if bufputbytes(dst, dstcap, dstlen, rbuf, roff, count) = 1 then begin
+         errbuflen := 0;
+         errkind := 2;
+         discard := bufputstr(errbuf, 256, errbuflen, "HTTP response body exceeds the client buffer")
+      end
+      else
+         roff := roff + count
+   end
+end streamreadexact;
+
+comment ---------------------------------------------------------------
+   The status line and header block.
+   ------------------------------------------------------------------;
+
+integer procedure httpstatuscode(linebuf, linelen, errbuf, errbuflen, errkind);
+   name errbuflen, errkind;
+   integer array linebuf, errbuf;
+   integer linelen, errbuflen, errkind;
+begin
+   integer statuscodeval, discard;
+   statuscodeval := 0;
+   if linelen < 12 then begin
+      errbuflen := 0; errkind := 3;
+      discard := bufputstr(errbuf, 256, errbuflen, "HTTP status line is too short")
+   end
+   else if not bufeqstr(linebuf, 0, 7, "HTTP/1.") then begin
+      errbuflen := 0; errkind := 3;
+      discard := bufputstr(errbuf, 256, errbuflen, "HTTP response is not HTTP/1.x")
+   end
+   else begin
+      statuscodeval := bufparseuint(linebuf, 9, 3);
+      if statuscodeval < 0 then begin
+         errbuflen := 0; errkind := 3;
+         discard := bufputstr(errbuf, 256, errbuflen, "HTTP status code is not numeric");
+         statuscodeval := 0
+      end
+   end;
+   httpstatuscode := statuscodeval
+end httpstatuscode;
+
+comment reads the header block, reporting the declared body length
+   through contentlength (negative one when absent) and whether the body
+   is chunked;
+procedure httpreadheaders(handle, rbuf, rcap, rlen, roff, deadlinems,
+      linebuf, linecap, contentlength, chunked, errbuf, errbuflen, errkind);
+   name rlen, roff, contentlength, chunked, errbuflen, errkind;
+   integer array rbuf, linebuf, errbuf;
+   integer handle, rcap, rlen, roff, deadlinems, linecap,
+      contentlength, chunked, errbuflen, errkind;
+begin
+   integer linelen, lines, done, colon, valoff, valtrim, vallen, discard;
+   contentlength := -1;
+   chunked := 0;
+   lines := 0;
+   done := 0;
+   while done = 0 and errkind = 0 do begin
+      linelen := 0;
+      streamline(handle, rbuf, rcap, rlen, roff, deadlinems, linebuf, linecap, linelen, errbuf, errbuflen, errkind);
+      if errkind = 0 then begin
+         if linelen = 0 then done := 1
+         else begin
+            lines := lines + 1;
+            if lines > 200 then begin
+               errbuflen := 0; errkind := 3;
+               discard := bufputstr(errbuf, 256, errbuflen, "too many HTTP response headers");
+               done := 1
+            end
+            else begin
+               colon := bufindexof(linebuf, 0, linelen, 58);
+               if colon >= 0 then begin
+                  integer nameoff, namelen, trimoff, trimlen;
+                  nameoff := 0; namelen := colon;
+                  buftrim(linebuf, colon + 1, linelen - colon - 1, trimoff, trimlen);
+                  if bufieqstr(linebuf, nameoff, namelen, "Content-Length") then begin
+                     contentlength := bufparseuint(linebuf, trimoff, trimlen);
+                     if contentlength < 0 then begin
+                        errbuflen := 0; errkind := 3;
+                        discard := bufputstr(errbuf, 256, errbuflen, "HTTP Content-Length is not numeric");
+                        done := 1
+                     end
+                  end;
+                  if bufieqstr(linebuf, nameoff, namelen, "Transfer-Encoding") then begin
+                     if bufieqstr(linebuf, trimoff, trimlen, "chunked") then chunked := 1
+                     else begin
+                        errbuflen := 0; errkind := 3;
+                        discard := bufputstr(errbuf, 256, errbuflen, "unsupported HTTP transfer encoding");
+                        done := 1
+                     end
+                  end
+               end
+            end
+         end
+      end
+   end
+end httpreadheaders;
+
+procedure httpreadchunked(handle, rbuf, rcap, rlen, roff, deadlinems, bodybuf, bodycap, bodylen, linebuf, linecap,
+   errbuf, errbuflen, errkind);
+   name rlen, roff, bodylen, errbuflen, errkind;
+   integer array rbuf, bodybuf, linebuf, errbuf;
+   integer handle, rcap, rlen, roff, deadlinems, bodycap, bodylen, linecap, errbuflen, errkind;
+begin
+   integer done, linelen, semi, size, discard;
+   bodylen := 0;
+   done := 0;
+   while done = 0 and errkind = 0 do begin
+      linelen := 0;
+      streamline(handle, rbuf, rcap, rlen, roff, deadlinems, linebuf, linecap, linelen, errbuf, errbuflen, errkind);
+      if errkind = 0 then begin
+         semi := bufindexof(linebuf, 0, linelen, 59);
+         size := bufparsehex(linebuf, 0, if semi >= 0 then semi else linelen);
+         if size < 0 then begin
+            errbuflen := 0; errkind := 3;
+            discard := bufputstr(errbuf, 256, errbuflen, "HTTP chunk size is not hexadecimal");
+            done := 1
+         end
+         else if bodylen + size > bodycap then begin
+            errbuflen := 0; errkind := 2;
+            discard := bufputstr(errbuf, 256, errbuflen, "HTTP response body exceeds the client buffer");
+            done := 1
+         end
+         else if size = 0 then
+            done := 1
+         else begin
+            streamreadexact(handle, rbuf, rcap, rlen, roff, deadlinems, bodybuf, bodycap, bodylen, size, errbuf,
+               errbuflen, errkind);
+            if errkind = 0 then begin
+               integer trail;
+               trail := 0;
+               streamline(handle, rbuf, rcap, rlen, roff, deadlinems, linebuf, linecap, trail, errbuf, errbuflen,
+                  errkind);
+               if errkind = 0 and trail <> 0 then begin
+                  errbuflen := 0; errkind := 3;
+                  discard := bufputstr(errbuf, 256, errbuflen, "HTTP chunk was not terminated correctly");
+                  done := 1
+               end
+            end
+         end
+      end
+   end;
+   if errkind = 0 then begin
+      integer trailerdone, trailerlen;
+      trailerdone := 0;
+      while trailerdone = 0 and errkind = 0 do begin
+         trailerlen := 0;
+         streamline(handle, rbuf, rcap, rlen, roff, deadlinems, linebuf, linecap, trailerlen, errbuf, errbuflen,
+            errkind);
+         if errkind = 0 and trailerlen = 0 then trailerdone := 1
+      end
+   end
+end httpreadchunked;
+
+procedure httpreadbody(handle, rbuf, rcap, rlen, roff, deadlinems, contentlength, chunked,
+      bodybuf, bodycap, bodylen, linebuf, linecap, errbuf, errbuflen, errkind);
+   name rlen, roff, bodylen, errbuflen, errkind;
+   integer array rbuf, bodybuf, linebuf, errbuf;
+   integer handle, rcap, rlen, roff, deadlinems, contentlength, chunked, bodycap, bodylen, linecap, errbuflen, errkind;
+begin
+   bodylen := 0;
+   if chunked <> 0 then
+      httpreadchunked(handle, rbuf, rcap, rlen, roff, deadlinems, bodybuf, bodycap, bodylen, linebuf, linecap, errbuf,
+         errbuflen, errkind)
+   else if contentlength >= 0 then begin
+      if contentlength > bodycap then begin
+         integer discard;
+         errbuflen := 0; errkind := 2;
+         discard := bufputstr(errbuf, 256, errbuflen, "HTTP response body exceeds the client buffer")
+      end
+      else
+         streamreadexact(handle, rbuf, rcap, rlen, roff, deadlinems, bodybuf, bodycap, bodylen, contentlength, errbuf,
+            errbuflen, errkind)
+   end
+   else begin
+      comment no declared length - the request asked for Connection#
+         close, so read to end of stream under the same deadline;
+      integer done, got;
+      done := 0;
+      while done = 0 and errkind = 0 do begin
+         if rlen > roff then begin
+            if bufputbytes(bodybuf, bodycap, bodylen, rbuf, roff, rlen - roff) = 1 then begin
+               errbuflen := 0; errkind := 2;
+               got := bufputstr(errbuf, 256, errbuflen, "HTTP response body exceeds the client buffer");
+               done := 1
+            end
+            else
+               roff := rlen
+         end;
+         if done = 0 and errkind = 0 then begin
+            integer remaining, mask;
+            remaining := deadlinems - cxnowms;
+            if remaining <= 0 then begin
+               errbuflen := 0; errkind := 3;
+               got := bufputstr(errbuf, 256, errbuflen, "HTTP response timed out");
+               done := 1
+            end
+            else begin
+               streamcompact(rbuf, rcap, rlen, roff);
+               mask := cxpoll(handle, 0, -1, 0, -1, 0, remaining);
+               got := cxread(handle, rbuf, rcap - rlen);
+               if got > 0 then rlen := rlen + got
+               else if got = 0 then done := 1
+               else if got = -2 then begin
+                  errbuflen := 0; errkind := 3;
+                  got := bufputstr(errbuf, 256, errbuflen, "HTTP connection failed while reading");
+                  done := 1
+               end
+            end
+         end
+      end
+   end
+end httpreadbody;
+
+comment ---------------------------------------------------------------
+   The envelope. Convex reports a failing function inside a
+   successful-looking response body, so the JSON status field decides
+   the outcome and the HTTP status code only colours the message.
+   ------------------------------------------------------------------;
+
+procedure httpdecodeenvelope(bodybuf, bodylen, statuscode,
+      kind, valoff, vallen, haslogs, logsoff, logslen,
+      msgbuf, msgcap, msglen, hasdata, dataoff, datalen,
+      errbuf, errbuflen, errkind);
+   comment kind is set to 0 for a Convex success envelope, or left
+   nonzero (matching the FunctionError adapter error kind, 1) when the
+   function itself failed;
+   name kind, valoff, vallen, haslogs, logsoff, logslen, msglen, hasdata, dataoff, datalen, errbuflen, errkind;
+   integer array bodybuf, msgbuf, errbuf;
+   integer bodylen, statuscode, kind, valoff, vallen, haslogs, logsoff, logslen,
+      msgcap, msglen, hasdata, dataoff, datalen, errbuflen, errkind;
+begin
+   integer rootlen, discard, statusoff, statuslen, found, logsfound, discard2;
+   errkind := 0;
+   haslogs := 0;
+   hasdata := 0;
+   msglen := 0;
+   jsonskipvalue(bodybuf, 0, bodylen, 1, rootlen, errbuf, errbuflen, errkind);
+   if errkind = 0 and rootlen <> bodylen then begin
+      errbuflen := 0; errkind := 2;
+      discard2 := bufputstr(errbuf, 256, errbuflen, "HTTP response was not exactly one JSON value")
+   end;
+   if errkind = 0 and (bodylen < 1 or bodybuf(0) <> 123) then begin
+      errbuflen := 0; errkind := 2;
+      discard2 := bufputstr(errbuf, 256, errbuflen, "HTTP response was not a Convex envelope")
+   end;
+   if errkind = 0 then
+      jsonfindfield(bodybuf, 0, bodylen, "logLines", logsoff, logslen, logsfound, errbuf, errbuflen, errkind);
+   if errkind = 0 and logsfound <> 0 then haslogs := 1;
+   if errkind = 0 then
+      jsonfindfield(bodybuf, 0, bodylen, "status", statusoff, statuslen, found, errbuf, errbuflen, errkind);
+   if errkind = 0 and found = 0 then begin
+      errbuflen := 0; errkind := 2;
+      discard2 := bufputstr(errbuf, 256, errbuflen, "Convex response has no status")
+   end;
+   if errkind = 0 then begin
+      if bufeqstr(bodybuf, statusoff + 1, statuslen - 2, "success") then begin
+         kind := 0;
+         jsonfindfield(bodybuf, 0, bodylen, "value", valoff, vallen, found, errbuf, errbuflen, errkind);
+         if errkind = 0 and found = 0 then begin
+            errbuflen := 0; errkind := 2;
+            discard2 := bufputstr(errbuf, 256, errbuflen, "Convex success envelope has no value")
+         end
+      end
+      else if bufeqstr(bodybuf, statusoff + 1, statuslen - 2, "error") then begin
+         integer msgoff, msglenraw;
+         kind := 1;
+         jsonfindfield(bodybuf, 0, bodylen, "errorMessage", msgoff, msglenraw, found, errbuf, errbuflen, errkind);
+         if errkind = 0 and found <> 0 then
+            discard2 := jsonstringcontent(bodybuf, msgoff, msgoff + msglenraw, msgbuf, msgcap, msglen)
+         else if errkind = 0 then
+            discard2 := bufputstr(msgbuf, msgcap, msglen, "Convex function failed");
+         if errkind = 0 then
+            jsonfindfield(bodybuf, 0, bodylen, "errorData", dataoff, datalen, hasdata, errbuf, errbuflen, errkind)
+      end
+      else begin
+         errbuflen := 0; errkind := 2;
+         discard2 := bufputstr(errbuf, 256, errbuflen, "Convex response has an unknown status")
+      end
+   end
+end httpdecodeenvelope;
+
+comment ---------------------------------------------------------------
+   One Convex call, host to decoded envelope.
+   ------------------------------------------------------------------;
+
+procedure convexcall(opname, host, hostlen, port, portlen, tls, authbuf, authlen,
+      path, pathlen, argsbuf, argsoff, argslen, deadlinems,
+      statuscode, kind, valoff, vallen, msgbuf, msgcap, msglen,
+      hasdata, dataoff, datalen, haslogs, logsoff, logslen, bodybuf, bodycap,
+      errbuf, errbuflen, errkind);
+   name statuscode, kind, valoff, vallen, msglen, hasdata, dataoff, datalen, haslogs, logsoff, logslen,
+      errbuflen, errkind;
+   integer array host, port, authbuf, path, argsbuf, msgbuf, bodybuf, errbuf;
+   integer hostlen, portlen, tls, authlen, pathlen, argsoff, argslen, deadlinems,
+      statuscode, kind, valoff, vallen, msgcap, msglen,
+      hasdata, dataoff, datalen, haslogs, logsoff, logslen, bodycap, errbuflen, errkind;
+   text opname;
+begin
+   integer array reqbuf(0:4095);
+   integer array bodyreq(0:4095);
+   integer array rbuf(0:8191);
+   integer array linebuf(0:2047);
+   integer reqlen, bodyreqlen, handle, rlen, roff, contentlength, chunked, bodylen, discard;
+   errkind := 0;
+   if httpvalidpath(path, pathlen) = 0 then begin
+      errbuflen := 0; errkind := 2;
+      discard := bufputstr(errbuf, 256, errbuflen, "function path must be module:function")
+   end;
+   if errkind = 0 then
+      httpbuildbody(bodyreq, 4096, bodyreqlen, opname, path, pathlen, argsbuf, argsoff, argslen);
+   if errkind = 0 then
+      httpbuildrequest(reqbuf, 4096, reqlen, opname, host, hostlen, port, portlen, tls, authbuf, authlen, bodyreq,
+         bodyreqlen);
+   if errkind = 0 then begin
+      handle := cxopen(host, hostlen, port, portlen, tls, deadlinems);
+      if handle < 0 then begin
+         errbuflen := 0; errkind := 3;
+         discard := bufputstr(errbuf, 256, errbuflen, "could not connect to the Convex deployment")
+      end
+   end;
+   if errkind = 0 then begin
+      integer written, mask, remaining, done;
+      written := 0;
+      done := 0;
+      while done = 0 and errkind = 0 do begin
+         if written >= reqlen then done := 1
+         else begin
+            remaining := deadlinems - cxnowms;
+            if remaining <= 0 then begin
+               errbuflen := 0; errkind := 3;
+               discard := bufputstr(errbuf, 256, errbuflen, "HTTP request timed out while sending");
+               done := 1
+            end
+            else begin
+               mask := cxpoll(-1, 0, handle, 1, -1, 0, remaining);
+               discard := cxwrite(handle, reqbuf, written, reqlen - written);
+               if discard > 0 then written := written + discard
+               else if discard = -2 then begin
+                  errbuflen := 0; errkind := 3;
+                  discard := bufputstr(errbuf, 256, errbuflen, "HTTP connection failed while sending");
+                  done := 1
+               end
+            end
+         end
+      end
+   end;
+   rlen := 0;
+   roff := 0;
+   if errkind = 0 then begin
+      integer statuslinelen;
+      statuslinelen := 0;
+      streamline(handle, rbuf, 8192, rlen, roff, deadlinems, linebuf, 2048, statuslinelen, errbuf, errbuflen, errkind);
+      if errkind = 0 then
+         statuscode := httpstatuscode(linebuf, statuslinelen, errbuf, errbuflen, errkind)
+   end;
+   if errkind = 0 then
+      httpreadheaders(handle, rbuf, 8192, rlen, roff, deadlinems, linebuf, 2048, contentlength, chunked, errbuf,
+         errbuflen, errkind);
+   if errkind = 0 then
+      httpreadbody(handle, rbuf, 8192, rlen, roff, deadlinems, contentlength, chunked, bodybuf, bodycap, bodylen,
+         linebuf, 2048, errbuf, errbuflen, errkind);
+   if handle >= 0 then discard := cxclose(handle);
+   if errkind = 0 then
+      httpdecodeenvelope(bodybuf, bodylen, statuscode, kind, valoff, vallen, haslogs, logsoff, logslen,
+         msgbuf, msgcap, msglen, hasdata, dataoff, datalen, errbuf, errbuflen, errkind)
+end convexcall;

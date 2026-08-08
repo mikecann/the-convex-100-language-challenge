@@ -1,0 +1,365 @@
+comment convex-ws.sim - RFC 6455 WebSocket framing, in Simula.
+   Standard Simula has no bitwise operators - only the logical operators
+   and, or and not, which apply to boolean operands only - so masking and
+   demasking, which RFC 6455 defines as a byte-by-byte exclusive or, is
+   written here as an eight-bit arithmetic loop (bytexor) rather than as a
+   native bitwise operation, the same approach this projects ALGOL 60
+   client uses for the same reason. Every frame this client sends is
+   masked, as RFC 6455 requires of a client, and every payload length form
+   - the 7-bit, 16-bit and 64-bit extended forms - is built and parsed
+   through plain division and multiplication by 256. Fragmented messages
+   are reassembled up to a bounded limit, and control frames are
+   recognised and returned to the caller rather than silently consumed;
+
+integer procedure wsopcodecontinuation; wsopcodecontinuation := 0;
+integer procedure wsopcodetext; wsopcodetext := 1;
+integer procedure wsopcodebinary; wsopcodebinary := 2;
+integer procedure wsopcodeclose; wsopcodeclose := 8;
+integer procedure wsopcodeping; wsopcodeping := 9;
+integer procedure wsopcodepong; wsopcodepong := 10;
+
+integer procedure bytexor(a, b);
+   comment the exclusive or of two bytes, each 0 through 255, computed
+   bit by bit because Simula has no bitwise operator;
+   integer a, b;
+begin
+   integer i, av, bv, power, result, abit, bbit;
+   av := a;
+   bv := b;
+   power := 1;
+   result := 0;
+   for i := 1 step 1 until 8 do begin
+      abit := av - (av // 2) * 2;
+      bbit := bv - (bv // 2) * 2;
+      if abit + bbit = 1 then result := result + power;
+      av := av // 2;
+      bv := bv // 2;
+      power := power * 2
+   end;
+   bytexor := result
+end bytexor;
+
+comment ---------------------------------------------------------------
+   Sending a frame. Every client-to-server frame is masked with a
+   freshly random four-byte key, as RFC 6455 requires.
+   ------------------------------------------------------------------;
+
+procedure wsbuildframe(outbuf, outcap, outlen, opcode, fin, payload, payloadoff, payloadlen);
+   name outlen;
+   integer array outbuf, payload;
+   integer outcap, outlen, opcode, fin, payloadoff, payloadlen;
+begin
+   integer array maskkey(0:3);
+   integer i, discard, first;
+   discard := cxrandom(maskkey, 4);
+   first := (if fin <> 0 then 128 else 0) + opcode;
+   discard := bufputbyte(outbuf, outcap, outlen, first);
+   if payloadlen < 126 then
+      discard := bufputbyte(outbuf, outcap, outlen, 128 + payloadlen)
+   else if payloadlen < 65536 then begin
+      discard := bufputbyte(outbuf, outcap, outlen, 128 + 126);
+      discard := bufputbyte(outbuf, outcap, outlen, payloadlen // 256);
+      discard := bufputbyte(outbuf, outcap, outlen, intmod(payloadlen, 256))
+   end
+   else begin
+      discard := bufputbyte(outbuf, outcap, outlen, 128 + 127);
+      for i := 1 step 1 until 4 do
+         discard := bufputbyte(outbuf, outcap, outlen, 0);
+      discard := bufputbyte(outbuf, outcap, outlen, payloadlen // 16777216);
+      discard := bufputbyte(outbuf, outcap, outlen, intmod(payloadlen, 16777216) // 65536);
+      discard := bufputbyte(outbuf, outcap, outlen, intmod(payloadlen, 65536) // 256);
+      discard := bufputbyte(outbuf, outcap, outlen, intmod(payloadlen, 256))
+   end;
+   for i := 0 step 1 until 3 do
+      discard := bufputbyte(outbuf, outcap, outlen, maskkey(i));
+   for i := 0 step 1 until payloadlen - 1 do
+      discard := bufputbyte(outbuf, outcap, outlen,
+         bytexor(payload(payloadoff + i), maskkey(intmod(i, 4))))
+end wsbuildframe;
+
+procedure wswriteall(handle, buf, buflen, deadlinems, errbuf, errbuflen, errkind);
+   comment writes every byte of buf, waiting for writability and
+   honouring deadlinems, exactly like the request writer in
+   convex-http.sim;
+   name errbuflen, errkind;
+   integer array buf, errbuf;
+   integer handle, buflen, deadlinems, errbuflen, errkind;
+begin
+   integer written, remaining, mask, got, done, discard;
+   written := 0;
+   done := 0;
+   while done = 0 and errkind = 0 do begin
+      if written >= buflen then done := 1
+      else begin
+         remaining := deadlinems - cxnowms;
+         if remaining <= 0 then begin
+            errbuflen := 0; errkind := 3;
+            discard := bufputstr(errbuf, 256, errbuflen, "WebSocket write timed out");
+            done := 1
+         end
+         else begin
+            mask := cxpoll(-1, 0, handle, 1, -1, 0, remaining);
+            got := cxwrite(handle, buf, written, buflen - written);
+            if got > 0 then written := written + got
+            else if got = -2 then begin
+               errbuflen := 0; errkind := 3;
+               discard := bufputstr(errbuf, 256, errbuflen, "WebSocket connection failed while sending");
+               done := 1
+            end
+         end
+      end
+   end
+end wswriteall;
+
+procedure wssendtext(handle, payload, payloadoff, payloadlen, deadlinems, errbuf, errbuflen, errkind);
+   name errbuflen, errkind;
+   integer array payload, errbuf;
+   integer handle, payloadoff, payloadlen, deadlinems, errbuflen, errkind;
+begin
+   integer array framebuf(0:8199);
+   integer framelen;
+   framelen := 0;
+   wsbuildframe(framebuf, 8200, framelen, 1, 1, payload, payloadoff, payloadlen);
+   wswriteall(handle, framebuf, framelen, deadlinems, errbuf, errbuflen, errkind)
+end wssendtext;
+
+procedure wssendcontrol(handle, opcode, payload, payloadoff, payloadlen, deadlinems, errbuf, errbuflen, errkind);
+   name errbuflen, errkind;
+   integer array payload, errbuf;
+   integer handle, opcode, payloadoff, payloadlen, deadlinems, errbuflen, errkind;
+begin
+   integer array framebuf(0:139);
+   integer framelen;
+   framelen := 0;
+   wsbuildframe(framebuf, 140, framelen, opcode, 1, payload, payloadoff, payloadlen);
+   wswriteall(handle, framebuf, framelen, deadlinems, errbuf, errbuflen, errkind)
+end wssendcontrol;
+
+comment ---------------------------------------------------------------
+   Receiving frames. Uses the same buffered-reader shape as
+   convex-http.sim's stream procedures, over a handle already upgraded to
+   WebSocket.
+   ------------------------------------------------------------------;
+
+integer procedure wsmaxframe;
+   comment the largest single WebSocket frame payload this client will
+   accept, matching the bound documented in the manifest;
+   wsmaxframe := 1048576;
+
+integer procedure wsmaxmessage;
+   comment the largest reassembled message, across every fragment of one
+   logical message, this client will accept;
+   wsmaxmessage := 2097152;
+
+procedure wsreadframe(handle, rbuf, rcap, rlen, roff, deadlinems,
+      fin, opcode, payload, payloadcap, payloadlen, errbuf, errbuflen, errkind);
+   comment reads exactly one WebSocket frame, unmasking its payload if
+   masked, and appends the payload to payload at payloadlen;
+   name rlen, roff, fin, opcode, payloadlen, errbuflen, errkind;
+   integer array rbuf, payload, errbuf;
+   integer handle, rcap, rlen, roff, deadlinems, fin, opcode,
+      payloadcap, payloadlen, errbuflen, errkind;
+begin
+   integer b0, b1, masked, len7, len, i, discard;
+   integer array maskkey(0:3);
+   streamneed(handle, rbuf, rcap, rlen, roff, deadlinems, 2, errbuf, errbuflen, errkind);
+   if errkind = 0 then begin
+      b0 := rbuf(roff);
+      b1 := rbuf(roff + 1);
+      roff := roff + 2;
+      fin := if b0 >= 128 then 1 else 0;
+      opcode := intmod(intmod(b0, 128), 16);
+      masked := if b1 >= 128 then 1 else 0;
+      len7 := intmod(b1, 128);
+      if len7 = 126 then begin
+         streamneed(handle, rbuf, rcap, rlen, roff, deadlinems, 2, errbuf, errbuflen, errkind);
+         if errkind = 0 then begin
+            len := rbuf(roff) * 256 + rbuf(roff + 1);
+            roff := roff + 2
+         end
+      end
+      else if len7 = 127 then begin
+         streamneed(handle, rbuf, rcap, rlen, roff, deadlinems, 8, errbuf, errbuflen, errkind);
+         if errkind = 0 then begin
+            if rbuf(roff) <> 0 or rbuf(roff + 1) <> 0 or rbuf(roff + 2) <> 0 or rbuf(roff + 3) <> 0 then begin
+               errbuflen := 0; errkind := 2;
+               discard := bufputstr(errbuf, 256, errbuflen, "WebSocket frame is too large")
+            end
+            else
+               len := ((rbuf(roff + 4) * 256 + rbuf(roff + 5)) * 256 + rbuf(roff + 6)) * 256 + rbuf(roff + 7);
+            roff := roff + 8
+         end
+      end
+      else
+         len := len7
+   end;
+   if errkind = 0 and len > wsmaxframe then begin
+      errbuflen := 0; errkind := 2;
+      discard := bufputstr(errbuf, 256, errbuflen, "WebSocket frame exceeds the clients frame limit")
+   end;
+   if errkind = 0 and masked <> 0 then begin
+      streamneed(handle, rbuf, rcap, rlen, roff, deadlinems, 4, errbuf, errbuflen, errkind);
+      if errkind = 0 then begin
+         for i := 0 step 1 until 3 do maskkey(i) := rbuf(roff + i);
+         roff := roff + 4
+      end
+   end;
+   if errkind = 0 then begin
+      if payloadlen + len > payloadcap then begin
+         errbuflen := 0; errkind := 2;
+         discard := bufputstr(errbuf, 256, errbuflen, "WebSocket payload exceeds the client buffer")
+      end
+      else begin
+         streamneed(handle, rbuf, rcap, rlen, roff, deadlinems, len, errbuf, errbuflen, errkind);
+         if errkind = 0 then begin
+            if masked <> 0 then begin
+               for i := 0 step 1 until len - 1 do
+                  discard := bufputbyte(payload, payloadcap, payloadlen,
+                     bytexor(rbuf(roff + i), maskkey(intmod(i, 4))))
+            end
+            else
+               discard := bufputbytes(payload, payloadcap, payloadlen, rbuf, roff, len);
+            roff := roff + len
+         end
+      end
+   end
+end wsreadframe;
+
+comment reassembles one logical message, following continuation frames
+   until fin is set. A control frame that arrives between fragments is
+   returned immediately instead of being folded into the data message,
+   because RFC 6455 allows control frames to interleave a fragmented
+   message and this client must still decode them correctly;
+procedure wsreadmessage(handle, rbuf, rcap, rlen, roff, deadlinems,
+      msgtype, msgbuf, msgcap, msglen, errbuf, errbuflen, errkind);
+   name rlen, roff, msgtype, msglen, errbuflen, errkind;
+   integer array rbuf, msgbuf, errbuf;
+   integer handle, rcap, rlen, roff, deadlinems, msgtype, msgcap, msglen, errbuflen, errkind;
+begin
+   integer fin, opcode, done, first, dummy;
+   msglen := 0;
+   first := 1;
+   done := 0;
+   while done = 0 and errkind = 0 do begin
+      wsreadframe(handle, rbuf, rcap, rlen, roff, deadlinems, fin, opcode, msgbuf, msgcap, msglen, errbuf, errbuflen,
+         errkind);
+      if errkind = 0 then begin
+         if opcode = wsopcodeclose or opcode = wsopcodeping or opcode = wsopcodepong then begin
+            msgtype := opcode;
+            done := 1
+         end
+         else begin
+            if first <> 0 then begin
+               if opcode = wsopcodetext then msgtype := wsopcodetext
+               else if opcode = wsopcodebinary then msgtype := wsopcodebinary
+               else begin
+                  errbuflen := 0; errkind := 2;
+                  dummy := bufputstr(errbuf, 256, errbuflen, "WebSocket message did not start with a data frame")
+               end;
+               first := 0
+            end
+            else if opcode <> wsopcodecontinuation then begin
+               errbuflen := 0; errkind := 2;
+               dummy := bufputstr(errbuf, 256, errbuflen, "WebSocket continuation frame had the wrong opcode")
+            end;
+            if errkind = 0 and msglen > wsmaxmessage then begin
+               errbuflen := 0; errkind := 2;
+               dummy := bufputstr(errbuf, 256, errbuflen, "WebSocket message exceeds the clients message limit")
+            end;
+            if errkind = 0 and fin <> 0 then done := 1
+         end
+      end
+   end
+end wsreadmessage;
+
+comment ---------------------------------------------------------------
+   The handshake. Verifies the 101 status and the Upgrade and Connection
+   headers. It does not verify Sec-WebSocket-Accept cryptographically -
+   see the READMEs limitations section for why.
+   ------------------------------------------------------------------;
+
+procedure wsbuildkey(keybuf, keycap, keylen);
+   name keylen;
+   integer array keybuf;
+   integer keycap, keylen;
+begin
+   integer array raw(0:15);
+   integer discard;
+   discard := cxrandom(raw, 16);
+   keylen := 0;
+   discard := b64encode(raw, 0, 16, keybuf, keycap, keylen)
+end wsbuildkey;
+
+procedure wshandshake(handle, host, hostlen, port, portlen, syncpath, syncpathlen,
+      rbuf, rcap, rlen, roff, deadlinems, errbuf, errbuflen, errkind);
+   comment sends the WebSocket upgrade request over an already open
+   handle and confirms a 101 Switching Protocols response with the
+   Upgrade and Connection headers present;
+   name rlen, roff, errbuflen, errkind;
+   integer array host, port, syncpath, rbuf, errbuf;
+   integer handle, hostlen, portlen, syncpathlen, rcap, rlen, roff, deadlinems, errbuflen, errkind;
+begin
+   integer array reqbuf(0:1023);
+   integer array keybuf(0:63);
+   integer array linebuf(0:2047);
+   integer reqlen, keylen, discard, statuslinelen, statuscode;
+   integer sawupgrade, sawconnection;
+   reqlen := 0;
+   wsbuildkey(keybuf, 64, keylen);
+   discard := bufputstr(reqbuf, 1024, reqlen, "GET ");
+   discard := bufputbytes(reqbuf, 1024, reqlen, syncpath, 0, syncpathlen);
+   discard := bufputstr(reqbuf, 1024, reqlen, " HTTP/1.1");
+   discard := bufputcrlf(reqbuf, 1024, reqlen);
+   discard := bufputstr(reqbuf, 1024, reqlen, "Host: ");
+   discard := bufputbytes(reqbuf, 1024, reqlen, host, 0, hostlen);
+   discard := bufputcrlf(reqbuf, 1024, reqlen);
+   discard := bufputstr(reqbuf, 1024, reqlen, "Upgrade: websocket");
+   discard := bufputcrlf(reqbuf, 1024, reqlen);
+   discard := bufputstr(reqbuf, 1024, reqlen, "Connection: Upgrade");
+   discard := bufputcrlf(reqbuf, 1024, reqlen);
+   discard := bufputstr(reqbuf, 1024, reqlen, "Sec-WebSocket-Key: ");
+   discard := bufputbytes(reqbuf, 1024, reqlen, keybuf, 0, keylen);
+   discard := bufputcrlf(reqbuf, 1024, reqlen);
+   discard := bufputstr(reqbuf, 1024, reqlen, "Sec-WebSocket-Version: 13");
+   discard := bufputcrlf(reqbuf, 1024, reqlen);
+   discard := bufputcrlf(reqbuf, 1024, reqlen);
+   wswriteall(handle, reqbuf, reqlen, deadlinems, errbuf, errbuflen, errkind);
+   if errkind = 0 then begin
+      statuslinelen := 0;
+      streamline(handle, rbuf, rcap, rlen, roff, deadlinems, linebuf, 2048, statuslinelen, errbuf, errbuflen, errkind)
+   end;
+   if errkind = 0 then
+      statuscode := httpstatuscode(linebuf, statuslinelen, errbuf, errbuflen, errkind);
+   if errkind = 0 and statuscode <> 101 then begin
+      errbuflen := 0; errkind := 3;
+      discard := bufputstr(errbuf, 256, errbuflen, "WebSocket handshake did not return 101")
+   end;
+   sawupgrade := 0;
+   sawconnection := 0;
+   if errkind = 0 then begin
+      integer done, linelen, colon;
+      done := 0;
+      while done = 0 and errkind = 0 do begin
+         linelen := 0;
+         streamline(handle, rbuf, rcap, rlen, roff, deadlinems, linebuf, 2048, linelen, errbuf, errbuflen, errkind);
+         if errkind = 0 then begin
+            if linelen = 0 then done := 1
+            else begin
+               colon := bufindexof(linebuf, 0, linelen, 58);
+               if colon >= 0 then begin
+                  integer trimoff, trimlen;
+                  buftrim(linebuf, colon + 1, linelen - colon - 1, trimoff, trimlen);
+                  if bufieqstr(linebuf, 0, colon, "Upgrade") and bufieqstr(linebuf, trimoff, trimlen, "websocket") then
+                     sawupgrade := 1;
+                  if bufieqstr(linebuf, 0, colon, "Connection") then
+                     sawconnection := 1
+               end
+            end
+         end
+      end
+   end;
+   if errkind = 0 and (sawupgrade = 0 or sawconnection = 0) then begin
+      errbuflen := 0; errkind := 3;
+      discard := bufputstr(errbuf, 256, errbuflen, "WebSocket handshake response was missing Upgrade or Connection")
+   end
+end wshandshake;

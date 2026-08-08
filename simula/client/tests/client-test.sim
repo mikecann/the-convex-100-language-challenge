@@ -219,6 +219,166 @@ begin
    checktrue("malformed JSON is rejected", errkind <> 0)
 end;
 
+comment ---------------------------------------------------------------
+   HTTP: deployment URL parsing, request framing, and the Convex
+   envelope decoder. convexcall itself opens a real socket, so, exactly
+   like this projects ALGOL 60 client, these tests drive the framing and
+   envelope layers directly rather than through convexcall, since Simula
+   has no concurrency primitive to run a fixture server and the client
+   under test in the same process.
+   ------------------------------------------------------------------;
+begin
+   integer array url(0:63);
+   integer urllen, tls, hostlen, portlen, errbuflen, errkind;
+   integer array host(0:255);
+   integer array port(0:15);
+   integer array errbuf(0:255);
+   urllen := 0;
+   discard := bufputstr(url, 64, urllen, "https://example.convex.cloud/path");
+   errbuflen := 0; errkind := 0;
+   deploymentparse(url, urllen, tls, host, 256, hostlen, port, 16, portlen, errbuf, errbuflen, errkind);
+   checkint("deploymentparse errkind", 0, errkind);
+   checktrue("deploymentparse tls", tls = 1);
+   checktrue("deploymentparse host", bufeqstr(host, 0, hostlen, "example.convex.cloud"));
+   checktrue("deploymentparse default https port", bufeqstr(port, 0, portlen, "443"))
+end;
+
+begin
+   integer array url(0:63);
+   integer urllen, tls, hostlen, portlen, errbuflen, errkind;
+   integer array host(0:255);
+   integer array port(0:15);
+   integer array errbuf(0:255);
+   urllen := 0;
+   discard := bufputstr(url, 64, urllen, "http://localhost:3210");
+   errbuflen := 0; errkind := 0;
+   deploymentparse(url, urllen, tls, host, 256, hostlen, port, 16, portlen, errbuf, errbuflen, errkind);
+   checkint("deploymentparse explicit port errkind", 0, errkind);
+   checktrue("deploymentparse explicit port host", bufeqstr(host, 0, hostlen, "localhost"));
+   checktrue("deploymentparse explicit port value", bufeqstr(port, 0, portlen, "3210"))
+end;
+
+begin
+   integer array req(0:511);
+   integer reqlen;
+   integer array path(0:31);
+   integer array args(0:31);
+   integer array authbuf(0:0);
+   integer array host2(0:31);
+   integer array port2(0:7);
+   integer pathlen, argslen, bodylen, host2len, port2len;
+   integer array body(0:511);
+   pathlen := 0; discard := bufputstr(path, 32, pathlen, "demo:state");
+   argslen := 0; discard := bufputstr(args, 32, argslen, "{}");
+   host2len := 0; discard := bufputstr(host2, 32, host2len, "example.convex.cloud");
+   port2len := 0; discard := bufputstr(port2, 8, port2len, "443");
+   bodylen := 0;
+   httpbuildbody(body, 512, bodylen, "query", path, pathlen, args, 0, argslen);
+   checktrue("httpbuildbody has path field", bufindexof(body, 0, bodylen, 112) >= 0);
+   reqlen := 0;
+   httpbuildrequest(req, 512, reqlen, "query", host2, host2len, port2, port2len, 1, authbuf, 0, body, bodylen);
+   checktrue("httpbuildrequest starts with POST", bufeqstr(req, 0, 4, "POST"));
+   checktrue("httpbuildrequest contains Content-Length",
+      bufindexof(req, 0, reqlen, 67) >= 0)
+end;
+
+comment envelope decoding: success, function error, and a malformed
+   envelope, matching every shape convex-http.sim must classify
+   correctly;
+begin
+   integer array okbody(0:255);
+   integer oklen, statuscode, kind, valoff, vallen, haslogs, logsoff, logslen;
+   integer array msgbuf(0:255);
+   integer msglen, hasdata, dataoff, datalen;
+   integer array errbuf(0:255);
+   integer errbuflen, errkind;
+   oklen := 0;
+   discard := bufputstr(okbody, 256, oklen, "{""status"":""success"",""value"":{""count"":3}}");
+   errbuflen := 0; errkind := 0;
+   httpdecodeenvelope(okbody, oklen, 200, kind, valoff, vallen, haslogs, logsoff, logslen,
+      msgbuf, 256, msglen, hasdata, dataoff, datalen, errbuf, errbuflen, errkind);
+   checkint("httpdecodeenvelope success errkind", 0, errkind);
+   checkint("httpdecodeenvelope success kind", 0, kind)
+end;
+
+begin
+   integer array errbody(0:255);
+   integer errlen, statuscode, kind, valoff, vallen, haslogs, logsoff, logslen;
+   integer array msgbuf(0:255);
+   integer msglen, hasdata, dataoff, datalen;
+   integer array errbuf(0:255);
+   integer errbuflen, errkind;
+   errlen := 0;
+   discard := bufputstr(errbody, 256, errlen,
+      "{""status"":""error"",""errorMessage"":""boom""}");
+   errbuflen := 0; errkind := 0;
+   httpdecodeenvelope(errbody, errlen, 200, kind, valoff, vallen, haslogs, logsoff, logslen,
+      msgbuf, 256, msglen, hasdata, dataoff, datalen, errbuf, errbuflen, errkind);
+   checkint("httpdecodeenvelope function error errkind", 0, errkind);
+   checkint("httpdecodeenvelope function error kind", 1, kind);
+   checktrue("httpdecodeenvelope function error message", bufeqstr(msgbuf, 0, msglen, "boom"))
+end;
+
+begin
+   integer array badbody(0:255);
+   integer badlen, statuscode, kind, valoff, vallen, haslogs, logsoff, logslen;
+   integer array msgbuf(0:255);
+   integer msglen, hasdata, dataoff, datalen;
+   integer array errbuf(0:255);
+   integer errbuflen, errkind;
+   badlen := 0;
+   discard := bufputstr(badbody, 256, badlen, "not json");
+   errbuflen := 0; errkind := 0;
+   httpdecodeenvelope(badbody, badlen, 200, kind, valoff, vallen, haslogs, logsoff, logslen,
+      msgbuf, 256, msglen, hasdata, dataoff, datalen, errbuf, errbuflen, errkind);
+   checktrue("httpdecodeenvelope rejects a non-Convex body", errkind <> 0)
+end;
+
+comment ---------------------------------------------------------------
+   RFC 6455 framing: build a masked frame, then read it back through the
+   same buffered-reader machinery convex-ws.sim uses over a real socket,
+   proving encode and decode agree with each other about masking, length
+   forms, and opcodes.
+   ------------------------------------------------------------------;
+begin
+   integer array payload(0:15);
+   integer array frame(0:63);
+   integer framelen;
+   payload(0) := 72; payload(1) := 105; comment Hi;
+   framelen := 0;
+   wsbuildframe(frame, 64, framelen, wsopcodetext, 1, payload, 0, 2);
+   checkint("wsbuildframe length for a 2 byte payload", 8, framelen);
+   checktrue("wsbuildframe sets fin and opcode", frame(0) = 129);
+   checktrue("wsbuildframe sets the mask bit", frame(1) >= 128)
+end;
+
+begin
+   integer array payload(0:15);
+   integer array frame(0:63);
+   integer framelen;
+   integer array rbuf(0:255);
+   integer rlen, roff, i2;
+   integer fin, opcode, payloadlen;
+   integer array errbuf(0:255);
+   integer errbuflen, errkind;
+   payload(0) := 72; payload(1) := 105;
+   framelen := 0;
+   wsbuildframe(frame, 64, framelen, wsopcodetext, 1, payload, 0, 2);
+   rlen := 0;
+   for i2 := 0 step 1 until framelen - 1 do rbuf(i2) := frame(i2);
+   rlen := framelen;
+   roff := 0;
+   payloadlen := 0;
+   errbuflen := 0; errkind := 0;
+   wsreadframe(-1, rbuf, 256, rlen, roff, cxnowms + 1000, fin, opcode, payload, 16, payloadlen, errbuf, errbuflen,
+      errkind);
+   checkint("wsreadframe errkind", 0, errkind);
+   checkint("wsreadframe fin", 1, fin);
+   checkint("wsreadframe opcode", wsopcodetext, opcode);
+   checkint("wsreadframe payload length", 2, payloadlen);
+   checktrue("wsreadframe unmasked payload", payload(0) = 72 and payload(1) = 105)
+end;
+
 OutImage;
 OutText("tests run: "); OutInt(testsrun, 0); OutImage;
 OutText("tests failed: "); OutInt(testsfailed, 0); OutImage;

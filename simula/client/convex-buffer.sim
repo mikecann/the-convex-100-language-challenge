@@ -343,6 +343,21 @@ begin
    b64decode := result
 end b64decode;
 
+integer procedure bufputcrlf(buf, cap, len);
+   comment appends one CRLF (bytes 13, 10) to buf at position len, the
+   HTTP line terminator. Written as two bufputbyte calls rather than
+   embedded in a text literal, because Simula text literals have no
+   escape for a raw control character;
+   name len;
+   integer array buf;
+   integer cap, len;
+begin
+   integer result;
+   result := bufputbyte(buf, cap, len, 13);
+   if result = 0 then result := bufputbyte(buf, cap, len, 10);
+   bufputcrlf := result
+end bufputcrlf;
+
 comment hexadecimal encoding, lower case, used for the Live session id;
 integer procedure hexencode(src, srcoff, srclen, dst, cap, dstlen);
    name dstlen;
