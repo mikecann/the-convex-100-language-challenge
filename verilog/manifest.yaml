@@ -15,9 +15,13 @@ implementation:
     proven inside Docker on the pinned toolchain: a real TCP connection and
     a real certificate- and hostname-verified TLS handshake to the approved
     test deployment, both driven from Verilog through the VPI boundary.
-    The JSON codec, HTTP/1.1 framing, examples/basics, the RFC 6455
-    WebSocket layer, the /api/sync Live state machine and the conformance
-    adapter do not exist yet.
+    client/convex_buffer.v adds a JSON encoder and decoder (a "smart
+    buffer" combining byte storage with JSON parsing of its own content,
+    forced by this toolchain's lack of by-reference array/queue task
+    arguments), covering the integral-decimal-number rule and proven with
+    a language-local unit suite. HTTP/1.1 framing, examples/basics, the
+    RFC 6455 WebSocket layer, the /api/sync Live state machine and the
+    conformance adapter do not exist yet.
 toolchain:
   name: Icarus Verilog
   version: "11.0 (stable), Debian package 11.0-1.1+b1"

@@ -17,14 +17,15 @@ ARG BUILD_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa04
 #       to the approved test deployment usable-reindeer-44.convex.cloud:443,
 #       through the same VPI boundary and OpenSSL in the same native.c.
 #
-# CHECKPOINT NOTE: this client is at the toolchain-gate stage only. The
-# JSON codec, HTTP/1.1 framing, the canonical examples/basics program, the
-# RFC 6455 WebSocket layer, the /api/sync Live state machine and the
-# conformance adapter do not exist yet, so this stage compiles and runs
-# only the two gate smoke tests below. No capability is claimed; see
-# verilog/README.md. This mirrors vhdl/Dockerfile's own incremental,
-# checkpoint-commented structure for the same reason: each layer is proven
-# against a real peer before the next is built on top of it.
+# CHECKPOINT NOTE: this client has the toolchain gate and a JSON codec
+# (client/convex_buffer.v) so far. HTTP/1.1 framing, the canonical
+# examples/basics program, the RFC 6455 WebSocket layer, the /api/sync
+# Live state machine and the conformance adapter do not exist yet, so no
+# capability is claimed; see verilog/README.md. This mirrors
+# vhdl/Dockerfile's own incremental, checkpoint-commented structure for
+# the same reason: each layer is proven against a real peer (or, for pure
+# JSON encode/decode, a thorough language-local unit suite) before the
+# next is built on top of it.
 # ---------------------------------------------------------------------------
 FROM --platform=linux/amd64 ${BUILD_IMAGE} AS test
 WORKDIR /project
@@ -145,7 +146,7 @@ gcc -O2 -Wall -Wextra -o /tmp/tcpfix /tmp/tcpfix.c
 TCPFIX_EOF
 
 RUN set -eu; \
-    iverilog -g2005 -L. -mnative -I. \
+    iverilog -g2012 -L. -mnative -I. \
       -o /tmp/tcp_smoke.vvp client/convex_transport.v client/tests/tcp_smoke.v; \
     /tmp/tcpfix 44201 & \
     fixture_pid=$!; \
@@ -168,7 +169,20 @@ RUN set -eu; \
 # only "the handshake bit was set".
 # ---------------------------------------------------------------------------
 RUN set -eu; \
-    iverilog -g2005 -L. -mnative -I. \
+    iverilog -g2012 -L. -mnative -I. \
       -o /tmp/tls_smoke.vvp client/convex_transport.v client/tests/tls_smoke.v; \
     timeout 20 vvp -M. -mnative /tmp/tls_smoke.vvp | tee /tmp/tls_smoke.out; \
     grep -Fq 'PASS tls_smoke' /tmp/tls_smoke.out
+
+# ---------------------------------------------------------------------------
+# json_test: convex_buffer.v's JSON encoder/decoder, including the
+# integral-decimal-number regression AGENTS.md requires ("0.0"/"1.0" must
+# decode as the integers 0/1; fractional, quoted, non-finite and
+# overflowing values must be rejected). No transport is involved here, so
+# this does not need the VPI module or -mnative.
+# ---------------------------------------------------------------------------
+RUN set -eu; \
+    iverilog -g2012 -I. \
+      -o /tmp/json_test.vvp client/convex_buffer.v client/tests/json_test.v; \
+    vvp /tmp/json_test.vvp | tee /tmp/json_test.out; \
+    grep -Fq 'PASS json_test' /tmp/json_test.out

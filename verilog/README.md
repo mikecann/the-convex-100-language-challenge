@@ -8,12 +8,16 @@ it is not published as a package.
 
 ## Status
 
-Only the toolchain gate exists so far: proof, inside Docker on the pinned
-toolchain, that a Verilog program can drive a real TCP connection and a
-real certificate- and hostname-verified TLS handshake through a small VPI
-(Verilog Procedural Interface) C module. No Convex protocol code has been
-written yet, so there is no canonical example, no conformance adapter, and
-no capability is claimed.
+The toolchain gate and a JSON codec exist so far. The gate proves, inside
+Docker on the pinned toolchain, that a Verilog program can drive a real
+TCP connection and a real certificate- and hostname-verified TLS
+handshake through a small VPI (Verilog Procedural Interface) C module.
+`client/convex_buffer.v` adds a hand-written JSON encoder and decoder,
+covering AGENTS.md's integral-decimal-number rule (`0.0`/`1.0` decode as
+integers; fractional, quoted, non-finite and overflowing values are
+rejected), proven with a language-local unit suite. No HTTP, WebSocket or
+Convex-protocol code has been written yet, so there is no canonical
+example, no conformance adapter, and no capability is claimed.
 
 The design follows the same shape as this repository's `vhdl/` client
 (also in progress): standard HDL has no sockets, no TLS and no clock
@@ -42,7 +46,7 @@ symbol.
 | --- | --- |
 | Real TCP connection driven from Verilog through the VPI boundary | Proven in Docker (`tcp_smoke`) |
 | Real TLS handshake with certificate and hostname verification | Proven in Docker (`tls_smoke`), against `usable-reindeer-44.convex.cloud:443` |
-| JSON codec | Not started |
+| JSON codec (encode, parse, integral-decimal rule) | Proven in Docker (`json_test`), language-local unit suite |
 | HTTP/1.1 request/response framing | Not started |
 | Canonical `examples/basics` | Not started |
 | RFC 6455 WebSocket framing | Not started |
@@ -90,3 +94,22 @@ outside the `test` stage until the client above the transport layer exists.
   listen/accept pair are not implemented yet and will be added, mirroring
   `vhdl/client/native.c`'s equivalent set, as the layers that need them are
   built.
+- The pinned `iverilog` does not support passing an unpacked array, a
+  `ref` port, or even a dynamic `byte queue[$]`, into a task or function -
+  confirmed directly against the toolchain rather than assumed. Every
+  buffer in this client is therefore module state reached only through a
+  hierarchical name, and `client/convex_buffer.v` combines byte storage
+  with JSON parsing of its own content in one module rather than two
+  separate packages the way `vhdl/` splits them.
+- The same toolchain also expands a `\"` or a lone `\\` inside a
+  SystemVerilog `string` literal into that escape's own four-character
+  spelling instead of the single byte it should produce (`"a\"b".len()`
+  reports 6, not 3) - documented in `client/convex_chars.vh`. Every
+  string literal in this client that needs a literal quote or backslash
+  spells it as an explicit byte constant instead.
+- JSON string decoding does not combine a `\uD800`-`\uDBFF` /
+  `\uDC00`-`\uDFFF` surrogate pair into one astral codepoint; it rejects
+  the lone surrogate half instead. A Basic Multilingual Plane character
+  (the overwhelming majority of real text, and everything Convex's own
+  protocol control fields ever contain) decodes correctly; an emoji or
+  rare CJK extension character in user data would not.
