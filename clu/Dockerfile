@@ -175,10 +175,12 @@ RUN set -eu; \
 RUN set -eu; \
     cd /stage; \
     test -f convex-json.clu; \
-    "$CLUHOME/exe/pclu" -merge "$CLUHOME/lib/lowlev.lib" \
-        -ext false -spec convex-json, json_test -opt -compile json_test; \
+    "$CLUHOME/exe/pclu" -merge "$CLUHOME/lib/lowlev.lib" -ext false \
+        -spec "$CLUHOME/lib/etc.spc", convex-json, json_test \
+        -opt -cfiles -compile convex-json, json_test; \
     "$CLUHOME/exe/plink" -opt -o json_test convex-json.o json_test.o; \
-    ./json_test
+    ./json_test | tee /tmp/json_test.out; \
+    grep -Fq 'ALL PASS' /tmp/json_test.out
 
 # ---------------------------------------------------------------------------
 # runtime images are not built yet: no example, no HTTP/WS/sync client, no
