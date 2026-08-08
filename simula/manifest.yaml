@@ -119,4 +119,6 @@ limitations:
     SSL_set1_host hostname checking, all switched on together), but that
     specific trust/untrusted/wrong-host proof has not yet been run for this
     checkpoint.
-capabilities: []
+capabilities:
+  - http
+  - live

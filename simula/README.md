@@ -39,14 +39,14 @@ class mechanism Simula gave to nearly every language that followed it.
 
 | Capability | State | Notes |
 | --- | --- | --- |
-| HTTP query, mutation, action | Implemented, Docker gate green | Written in Simula over the native transport layer |
-| Structured Convex errors | Implemented, Docker gate green | `FunctionError`, `ProtocolError` and `TransportError` keep name, message, data and log lines |
-| TLS with certificate and hostname verification | Implemented, not yet unit-tested | Same reviewed design as this project's ALGOL 60 client; the dedicated trust/untrusted/wrong-host proof has not been run for this checkpoint |
-| Live subscribe, update, unsubscribe | Implemented, Docker gate green | RFC 6455 framing written in Simula |
-| Live reconnect and rehydration | Implemented, Docker gate green | Adapter-only `debugDisconnect`, unchanged rehydration suppressed |
+| HTTP query, mutation, action | Implemented, conformance green | Written in Simula over the native transport layer |
+| Structured Convex errors | Implemented, conformance green | `FunctionError`, `ProtocolError` and `TransportError` keep name, message, data and log lines |
+| TLS with certificate and hostname verification | Implemented, exercised by hosted conformance | Same reviewed design as this project's ALGOL 60 client, and the hosted profile's 31/31 ran over real TLS against the deployment. The dedicated trust/untrusted/wrong-host unit proof is still not run; see limitations |
+| Live subscribe, update, unsubscribe | Implemented, conformance green | RFC 6455 framing written in Simula |
+| Live reconnect and rehydration | Implemented, conformance green | Adapter-only `debugDisconnect`, unchanged rehydration suppressed |
 | WebSocket handshake response verification | Partial | HTTP 101 upgrade is required; `Sec-WebSocket-Accept` is not checked against SHA-1, see limitations |
 | Live authentication, optimistic updates, WebSocket mutations | Not implemented | Deferred; see limitations |
-| Earned badges | **None** | Shared and hosted conformance have not been run |
+| Earned badges | **`http` and `live`** | 31/31 on both the local and hosted profiles, from clean exact head `9bd9b4d` |
 
 Every row above says "Docker gate green" deliberately, not "verified": the
 code is complete, the language-local suite is written (60 assertions, 0
