@@ -1,0 +1,117 @@
+%   convex-base64.clu -- RFC 4648 base64 (standard alphabet, "=" padding).
+%   This client needs exactly two round trips through it: encoding the
+%   16 random bytes of a WebSocket handshake's Sec-WebSocket-Key nonce,
+%   and encoding the 20-byte SHA-1 digest that becomes the expected
+%   Sec-WebSocket-Accept value the server's own answer is checked
+%   against. decode is included alongside it (rather than left
+%   unimplemented) because base64$decode(base64$encode(x)) = x is the
+%   most direct correctness check this module's own tests can make, and
+%   because a cluster that only ever offers half of a well-known
+%   encoding's pair invites exactly the kind of surprise CLU's data
+%   abstraction is meant to prevent.
+
+base64 = cluster is encode, decode
+
+rep = null
+
+ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+PAD = '='
+
+	byte_at = proc (s: string, i: int) returns (int)
+	    return(char$c2i(s[i]))
+	    end byte_at
+
+%   decode_char(c) -> the 6-bit value ALPHABET assigns to c.
+	decode_char = proc (c: char) returns (int) signals (bad_format)
+	    i: int := string$indexc(c, ALPHABET)
+	    if i = 0 then signal bad_format end
+	    return(i - 1)
+	    end decode_char
+
+%   encode(raw) -> the base64 text of raw, grouping three input bytes
+%   into four output characters and padding the final group with "="
+%   when raw's length is not a multiple of three, exactly as RFC 4648
+%   section 4 specifies.
+	encode = proc (raw: string) returns (string)
+	    n: int := string$size(raw)
+	    out: string := ""
+	    i: int := 1
+	    while i <= n do
+		b0: int := byte_at(raw, i)
+		have2: bool := i + 1 <= n
+		have3: bool := i + 2 <= n
+		b1: int := 0
+		if have2 then b1 := byte_at(raw, i + 1) end
+		b2: int := 0
+		if have3 then b2 := byte_at(raw, i + 2) end
+
+		c0: int := b0 / 4
+		c1: int := (b0 // 4) * 16 + b1 / 16
+		c2: int := (b1 // 16) * 4 + b2 / 64
+		c3: int := b2 // 64
+
+		out := out || string$c2s(ALPHABET[c0 + 1])
+			   || string$c2s(ALPHABET[c1 + 1])
+		if have2
+		   then out := out || string$c2s(ALPHABET[c2 + 1])
+		   else out := out || string$c2s(PAD)
+		   end
+		if have3
+		   then out := out || string$c2s(ALPHABET[c3 + 1])
+		   else out := out || string$c2s(PAD)
+		   end
+		i := i + 3
+		end
+	    return(out)
+	    end encode
+
+%   decode(text) -> the raw bytes text's base64 encoded, ignoring no
+%   whitespace (the two call sites this client has -- a handshake header
+%   value and this module's own tests -- never carry any). Signals
+%   bad_format on a length that is not a multiple of four, on a
+%   character outside the alphabet or "=", or on "=" appearing anywhere
+%   but the final one or two positions of the last group.
+	decode = proc (text: string) returns (string) signals (bad_format)
+	    n: int := string$size(text)
+	    if n // 4 ~= 0 then signal bad_format end
+	    out: string := ""
+	    i: int := 1
+	    while i <= n do
+		is_last_group: bool := i + 4 > n
+		pad_count: int := 0
+		if is_last_group then
+		    if text[i + 3] = PAD then pad_count := 1 end
+		    if pad_count = 1 cand text[i + 2] = PAD then pad_count := 2
+			end
+		    end
+
+		v0: int := decode_char(text[i])
+		    resignal bad_format
+		v1: int := decode_char(text[i + 1])
+		    resignal bad_format
+		v2: int := 0
+		if pad_count < 2 then
+		    v2 := decode_char(text[i + 2])
+			resignal bad_format
+		    end
+		v3: int := 0
+		if pad_count < 1 then
+		    v3 := decode_char(text[i + 3])
+			resignal bad_format
+		    end
+
+		byte0: int := v0 * 4 + v1 / 16
+		byte1: int := (v1 // 16) * 16 + v2 / 4
+		byte2: int := (v2 // 4) * 64 + v3
+
+		out := out || string$c2s(char$i2c(byte0))
+		if pad_count < 2 then out := out || string$c2s(char$i2c(byte1))
+		    end
+		if pad_count < 1 then out := out || string$c2s(char$i2c(byte2))
+		    end
+		i := i + 4
+		end
+	    return(out)
+	    end decode
+
+end base64

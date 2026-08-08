@@ -1,0 +1,167 @@
+%   convex-transport.clu -- unifies the local profile's plain transport
+%   (pclu's own builtin _chan, raw BSD sockets) and the hosted profile's
+%   TLS transport (_tls, this client's own new builtin, see
+%   client/convexrt-tls.c) behind one small type, "conn", so the HTTP
+%   and WebSocket framing code above it never has to know which one it is
+%   talking to.
+%
+%   _tls$connect resolves DNS, opens the socket, and completes the TLS
+%   handshake with real chain and hostname verification all inside its
+%   one C builtin, using OpenSSL's/libc's own resolver -- unaffected by
+%   the bug described next, since it never goes through CLU code at
+%   all. The plain profile has no such all-in-one primitive, so dial()
+%   resolves the host itself and builds the sockaddr_in by hand with
+%   _wordvec, exactly the pattern the feasibility spike proved end to
+%   end over a real TCP round trip.
+%
+%   Resolving a real hostname (this client's own local-profile traffic
+%   always names the compose service "backend") goes through
+%   client/convex-dns.clu, this client's own small DNS resolver, not
+%   pclu's bundled one (lib/clu/_resolve.clu): that one's resolv.conf
+%   reader only recognises ';' comments, not modern Linux's/Docker's
+%   '#', so it silently mistakes the first comment line for the
+%   domain/nameserver line, fails to parse it as an address, swallows
+%   that failure, and is left querying the untouched default of
+%   127.0.0.1 -- where nothing is listening -- until it times out. See
+%   convex-dns.clu's own header comment for the full write-up; this was
+%   found running this client's own dial() against the docker-compose
+%   "backend" hostname, the exact case the local verification profile
+%   needs.
+
+conn = cluster is dial, send, recv, close
+
+rep = oneof[chan: _chan, tls: _tls]
+
+AF_INET = 2
+SOCK_STREAM = 1
+CHAN_RECV_WORDS = 4096		% generous fixed buffer; _chan$recv fills
+				% whatever is available up to its capacity,
+				% there is no separate max-length argument
+
+%   dial(scheme, host, port) -> a connected conn. "https"/"wss" go over
+%   _tls (DNS, connect, and the TLS handshake -- with real chain and
+%   hostname verification -- all happen inside that one builtin);
+%   "http"/"ws" dial a raw _chan socket by hand. host is tried first as a
+%   literal dotted-quad address (inet_address, no network access) and
+%   only resolved over DNS (client/convex-dns.clu, this client's own
+%   resolver -- see this file's own header comment for why not pclu's
+%   bundled one) if that fails -- the local profile's real traffic
+%   always names the compose service "backend" and takes the DNS path,
+%   but a literal address is what this client's own loopback test
+%   fixtures dial.
+	dial = proc (scheme, host: string, port: int) returns (cvt)
+					      signals (not_possible(string))
+	    if string$equal(scheme, "https") cor string$equal(scheme, "wss")
+	       then t: _tls := _tls$connect(host, port)
+			resignal not_possible
+		    return(rep$make_tls(t))
+	       end
+
+	    l, r: int := inet_address(host)
+		except when bad_format:
+			    l, r := dns$resolve(host)
+				except when not_found:
+					    signal not_possible(
+						"host not found: " || host)
+				       when no_server:
+					    signal not_possible(
+						"no DNS server configured " ||
+						"(missing /etc/resolv.conf)")
+				       when timeout:
+					    signal not_possible(
+						"DNS resolution timed out " ||
+						"for " || host)
+				       end
+		       end
+
+	    addr: _wordvec := _wordvec$create(4)
+	    _wordvec$wstore(addr, 1, AF_INET)
+	    _wordvec$wstore(addr, 3, (port / 2**8) + (port * 2**8))
+	    _wordvec$wstore(addr, 5, r)
+	    _wordvec$wstore(addr, 7, l)
+
+	    ch: _chan := _chan$socket(AF_INET, SOCK_STREAM, 0)
+		except when not_possible (msg: string): signal not_possible(
+				"socket: " || msg) end
+	    _chan$connect(ch, addr, 16)
+		except when not_possible (msg: string):
+			    _chan$close(ch)
+			       except others: end
+			    signal not_possible("connect: " || msg)
+		       when bounds:
+			    signal not_possible("connect: bad address length")
+		       end
+	    return(rep$make_chan(ch))
+	    end dial
+
+%   send(c, s) -> writes all of s over the connection.
+	send = proc (c: cvt, s: string) signals (not_possible(string))
+	    tagcase c
+	       tag tls (t: _tls):
+		    _tls$send(t, s)
+		       resignal not_possible
+	       tag chan (ch: _chan):
+		    n: int := string$size(s)
+		    if n = 0 then return end
+		    buf: _wordvec := _wordvec$create((n + 3) / 4)
+		    _wordvec$move_b2w(_cvt[string, _bytevec](s), 1, buf, 1, n)
+		    _chan$send(ch, buf, n, 0)
+			except when not_possible (msg: string):
+					signal not_possible("send: " || msg)
+			       when bounds:
+					signal not_possible("send: bad length")
+			       end
+	       end
+	    end send
+
+%   recv(c, maxlen, timeout_ms) -> up to maxlen bytes (each transport
+%   caps this internally at a fixed chunk size well above any HTTP/
+%   WebSocket read this client issues). Waits up to timeout_ms for data
+%   to arrive; signals timeout if the wait expires with the connection
+%   still open, or end_of_file on a clean close. Gating on a bounded wait
+%   before ever calling the transport's own blocking read -- rather than
+%   trusting a read-level timeout -- is what lets a caller tell "peer is
+%   idle" apart from "peer is gone": recv() alone cannot make that
+%   distinction the way a poll-first read can.
+	recv = proc (c: cvt, maxlen, timeout_ms: int) returns (string)
+			signals (not_possible(string), end_of_file, timeout)
+	    tagcase c
+	       tag tls (t: _tls):
+		    return(_tls$recv(t, maxlen, timeout_ms))
+		       resignal not_possible, end_of_file, timeout
+	       tag chan (ch: _chan):
+		    ready: bool := _chan$read_wait(ch, timeout_ms)
+			except when not_possible (msg: string):
+					signal not_possible("read_wait: " ||
+							     msg)
+			       end
+		    if ~ready then signal timeout end
+		    buf: _wordvec := _wordvec$create(CHAN_RECV_WORDS)
+		    n: int := _chan$recv(ch, buf, 0)
+			except when not_possible (msg: string):
+					signal not_possible("recv: " || msg)
+			       end
+		    if n = 0 then signal end_of_file end
+		    rbytes: _bytevec := _bytevec$create(n)
+		    _wordvec$move_w2b(buf, 1, rbytes, 1, n)
+		    return(_cvt[_bytevec, string](rbytes))
+	       end
+	    end recv
+
+%   close(c) -> shuts down and frees the connection. Best-effort: a
+%   connection that is already gone (peer closed, or an earlier op already
+%   signalled not_possible) is not itself an error for the caller trying
+%   to tidy up after that.
+	close = proc (c: cvt) signals (not_possible(string))
+	    tagcase c
+	       tag tls (t: _tls):
+		    _tls$close(t)
+		       resignal not_possible
+	       tag chan (ch: _chan):
+		    _chan$close(ch)
+			except when permanent: end
+			       resignal not_possible
+	       end
+	    end close
+
+end conn

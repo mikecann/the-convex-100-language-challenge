@@ -1,0 +1,453 @@
+%   adapter.clu -- the shared NDJSON adapter protocol v1 conformance
+%   executable. This is test infrastructure (AGENTS.md: "not public
+%   client code"), not part of the educational client: it exists so the
+%   shared controller can drive every capability this client claims
+%   through one uniform protocol, the same as every other language in
+%   this repository.
+%
+%   pclu has no threads (see client/convex-sync.clu's own header
+%   comment), so there is no per-subscription relay thread the way a
+%   language with real concurrency would write one. Instead this whole
+%   file is one loop: read one command if a full line is already
+%   buffered; otherwise wait briefly for more input; if nothing arrived
+%   in that wait, give the Live layer (client/convex-sync.clu's own
+%   poll(), already designed for exactly this) one chance to check its
+%   socket and deliver at most one subscription event. Every event this
+%   loop produces is written to stdout immediately, one line at a time,
+%   never batched -- so a stopped reader on the other end of this
+%   process's own stdout applies ordinary pipe backpressure to this
+%   same loop (the write blocks, so nothing further gets read off the
+%   WebSocket either) rather than this process ever accumulating an
+%   unbounded backlog of its own. That is this client's whole answer to
+%   AGENTS.md's "bounded queue under a stopped reader": there is no
+%   separate queue to bound, because there is no separate writer to
+%   race the loop that would fill one.
+
+AF_INET = 2
+SOCK_STREAM = 1
+HALF_SLICE_MS = 75
+READ_CHUNK = 16384
+
+	byte_at = proc (s: string, i: int) returns (int)
+	    return(char$c2i(s[i]))
+	    end byte_at
+
+%   -- line-buffered I/O over a plain _chan (stdin/stdout are exposed
+%   as _chan objects too via _chan$primary_input/_chan$primary_output,
+%   so the same read/write helpers work whether this adapter is running
+%   in stdio mode or ADAPTER_LISTEN's single-accepted-socket mode).
+
+%   send_line/fill_more use _chan\$putb/getb (plain read(2)/write(2)
+%   semantics), not \$send/\$recv (which wrap send(2)/recv(2) and only
+%   work on an actual socket -- exactly the ENOTSOCK trap
+%   convex-dns.clu's own random_bytes already hit reading /dev/urandom,
+%   caught again here the first time this adapter ran with its stdin as
+%   a plain shell pipe rather than a socket). getb/putb work
+%   identically whether ch is stdin/stdout or the one accepted
+%   ADAPTER_LISTEN socket, so this adapter needs no separate code path
+%   for the two modes.
+	send_line = proc (ch: _chan, line: string)
+	    out: string := line || "\n"
+	    n: int := string$size(out)
+	    obytes: _bytevec := _cvt[string, _bytevec](out)
+	    _chan$putb(ch, obytes, 1, n, false)
+		except others: end
+	    end send_line
+
+%   try_take_line(buf) -> (found, line, rest) -- the first complete
+%   "\n"-terminated line already sitting in buf, if any, without
+%   touching the channel at all.
+	try_take_line = proc (buf: string) returns (bool, string, string)
+	    nl: int := string$indexc('\n', buf)
+	    if nl = 0 then return(false, "", buf) end
+	    line: string := string$substr(buf, 1, nl - 1)
+	    if string$size(line) > 0 cand line[string$size(line)] = '\r'
+	       then line := string$substr(line, 1, string$size(line) - 1) end
+	    return(true, line, string$rest(buf, nl + 1))
+	    end try_take_line
+
+%   fill_more(ch, buf, timeout_ms) -> (alive, new_buf) -- buf with
+%   whatever arrived within timeout_ms appended; alive is false only on
+%   a clean close (the peer hung up), never on a plain timeout.
+	fill_more = proc (ch: _chan, buf: string, timeout_ms: int)
+						 returns (bool, string)
+	    ready: bool := _chan$read_wait(ch, timeout_ms)
+		except when not_possible (ignored: string): return(false, buf) end
+	    if ~ready then return(true, buf) end
+	    rbytes: _bytevec := _bytevec$create(READ_CHUNK)
+	    got: int := _chan$getb(ch, rbytes)
+		except when end_of_file: return(false, buf)
+		       when not_possible (ignored: string): return(false, buf)
+		       when bounds: return(false, buf)
+		       end
+	    if got = 0 then return(false, buf) end
+	    return(true, buf || string$substr(_cvt[_bytevec, string](rbytes),
+					      1, got))
+	    end fill_more
+
+%   -- event JSON builders. Every optional field is only ever appended
+%   when there is something real to put there, matching
+%   _shared/schemas/adapter.schema.json's own requirement that an
+%   absent optional field (id, subscriptionId, value, logs, error) is
+%   omitted, never serialized as null.
+
+	field_str = proc (name, value: string) returns (string)
+	    return("\"" || name || "\":" || json$qs(value))
+	    end field_str
+
+	error_obj = proc (name, message, data_raw: string, has_data: bool)
+							     returns (string)
+	    out: string := "{" || field_str("name", name) || ","
+			   || field_str("message", message)
+	    if has_data then out := out || ",\"data\":" || data_raw end
+	    return(out || "}")
+	    end error_obj
+
+%   emit(ch, type, id, has_id, subscription_id, has_subscription_id,
+%   has_value, value_raw, has_error, err_name, err_message, err_data_raw,
+%   has_err_data, has_logs, logs_raw, hello_fields, has_hello) -> writes
+%   one event line. This one builder covers every event shape the
+%   schema allows (ready/result/error/ack/subscription/closed) so each
+%   call site only has to say which optional pieces it actually has.
+	emit = proc (ch: _chan, etype, id: string, has_id: bool,
+		    subscription_id: string, has_subscription_id: bool,
+		    value_raw: string, has_value: bool,
+		    err_name, err_message, err_data_raw: string,
+		    has_error, has_err_data: bool,
+		    logs_raw: string, has_logs: bool,
+		    hello_fields: string, has_hello: bool)
+	    out: string := "{\"type\":" || json$qs(etype)
+	    if has_id then out := out || "," || field_str("id", id) end
+	    if has_subscription_id then
+		out := out || "," || field_str("subscriptionId", subscription_id)
+		end
+	    if has_value then out := out || ",\"value\":" || value_raw end
+	    if has_error then
+		out := out || ",\"error\":"
+		       || error_obj(err_name, err_message, err_data_raw,
+				    has_err_data)
+		end
+	    if has_logs then out := out || ",\"logs\":" || logs_raw end
+	    if has_hello then out := out || hello_fields end
+	    send_line(ch, out || "}")
+	    end emit
+
+	emit_ready = proc (ch: _chan, id: string)
+	    hello: string := ",\"protocolVersion\":1,"
+			      || field_str("language", "clu") || ","
+			      || field_str("implementation",
+					   "native-pclu-openssl-websocket-json")
+			      || "," || field_str("runtime",
+						  "pclu 1a8ad7603 (linux/amd64)")
+	    emit(ch, "ready", id, true, "", false, "", false, "", "", "",
+		 false, false, "", false, hello, true)
+	    end emit_ready
+
+	emit_ack = proc (ch: _chan, id: string)
+	    emit(ch, "ack", id, true, "", false, "", false, "", "", "", false,
+		 false, "", false, "", false)
+	    end emit_ack
+
+	emit_closed = proc (ch: _chan, id: string)
+	    emit(ch, "closed", id, true, "", false, "", false, "", "", "",
+		 false, false, "", false, "", false)
+	    end emit_closed
+
+	emit_result = proc (ch: _chan, id, value_raw: string, has_logs: bool,
+			    logs_raw: string)
+	    emit(ch, "result", id, true, "", false, value_raw, true, "", "",
+		 "", false, false, logs_raw, has_logs, "", false)
+	    end emit_result
+
+	emit_call_error = proc (ch: _chan, id, err_name, err_message,
+				err_data_raw: string, has_err_data: bool)
+	    emit(ch, "error", id, true, "", false, "", false, err_name,
+		 err_message, err_data_raw, true, has_err_data, "", false, "",
+		 false)
+	    end emit_call_error
+
+	emit_sub_value = proc (ch: _chan, subscription_id, value_raw: string,
+			       has_logs: bool, logs_raw: string)
+	    emit(ch, "subscription", "", false, subscription_id, true,
+		 value_raw, true, "", "", "", false, false, logs_raw, has_logs,
+		 "", false)
+	    end emit_sub_value
+
+	emit_sub_error = proc (ch: _chan, subscription_id, err_name,
+			       err_message, err_data_raw: string,
+			       has_err_data, has_logs: bool, logs_raw: string)
+	    emit(ch, "subscription", "", false, subscription_id, true, "",
+		 false, err_name, err_message, err_data_raw, true, has_err_data,
+		 logs_raw, has_logs, "", false)
+	    end emit_sub_error
+
+	emit_protocol_error = proc (ch: _chan, id: string, message: string)
+	    has_id: bool := string$size(id) > 0
+	    emit(ch, "error", id, has_id, "", false, "", false,
+		 "ProtocolError", message, "", true, false, "", false, "",
+		 false)
+	    end emit_protocol_error
+
+%   -- incoming command field extraction. cmd is one already-parsed
+%   line's raw JSON text; every accessor here is best-effort, since a
+%   malformed or partial command must still produce a clear
+%   ProtocolError event rather than an uncaught signal.
+
+	str_field = proc (cmd, name: string) returns (string, bool)
+	    raw: string := json$field(cmd, name)
+		except when not_found, bad_format: return("", false) end
+	    value: string := json$unqs(raw)
+		except when bad_format: return("", false) end
+	    return(value, true)
+	    end str_field
+
+	raw_field = proc (cmd, name: string) returns (string, bool)
+	    raw: string := json$field(cmd, name)
+		except when not_found, bad_format: return("", false) end
+	    return(raw, true)
+	    end raw_field
+
+%   -- the subscriptionId <-> queryId table.
+
+subrec = record[ext_id: string, query_id: int, active: bool]
+subarr = array[subrec]
+
+	find_sub = proc (subs: subarr, ext_id: string) returns (int)
+	    i: int := subarr$low(subs)
+	    hi: int := subarr$high(subs)
+	    while i <= hi do
+		rec: subrec := subarr$fetch(subs, i)
+		if rec.active cand string$equal(rec.ext_id, ext_id) then
+		    return(i)
+		    end
+		i := i + 1
+		end
+	    return(0)
+	    end find_sub
+
+	find_sub_by_query = proc (subs: subarr, query_id: int) returns (int)
+	    i: int := subarr$low(subs)
+	    hi: int := subarr$high(subs)
+	    while i <= hi do
+		rec: subrec := subarr$fetch(subs, i)
+		if rec.active cand rec.query_id = query_id then return(i) end
+		i := i + 1
+		end
+	    return(0)
+	    end find_sub_by_query
+
+start_up = proc ()
+    eo: stream := stream$error_output()
+
+    base_url: string := _environ("CONVEX_URL")
+	except when not_found:
+		    stream$putl(eo, "CONVEX_URL is required")
+		    _exit(2)
+	       end
+
+    in_ch: _chan := _chan$primary_input()
+    out_ch: _chan := _chan$primary_output()
+    listen_addr: string := _environ("ADAPTER_LISTEN")
+	except when not_found: listen_addr := "" end
+    if string$size(listen_addr) > 0 then
+	colon: int := string$indexc(':', listen_addr)
+	if colon = 0 then
+	    stream$putl(eo, "ADAPTER_LISTEN must be host:port")
+	    _exit(1)
+	    end
+	listen_host: string := string$substr(listen_addr, 1, colon - 1)
+	listen_port: int := int$parse(string$rest(listen_addr, colon + 1))
+	    except when bad_format, overflow:
+			stream$putl(eo, "ADAPTER_LISTEN has an invalid port")
+			_exit(1)
+		   end
+	l: int, r: int := inet_address(listen_host)
+	    except when bad_format:
+			stream$putl(eo, "ADAPTER_LISTEN host must be an " ||
+				    "IPv4 address")
+			_exit(1)
+		   end
+	addr: _wordvec := _wordvec$create(4)
+	_wordvec$wstore(addr, 1, AF_INET)
+	_wordvec$wstore(addr, 3, (listen_port / 2**8) + (listen_port * 2**8))
+	_wordvec$wstore(addr, 5, r)
+	_wordvec$wstore(addr, 7, l)
+	lch: _chan := _chan$socket(AF_INET, SOCK_STREAM, 0)
+	_chan$bind(lch, addr, 16)
+	_chan$listen(lch, 1)
+	peeraddr: _wordvec := _wordvec$create(4)
+	ch: _chan, alen: int := _chan$accept(lch, peeraddr)
+	in_ch := ch
+	out_ch := ch
+	end
+
+    client_token: string := ""
+    sock: maybe[sync] := maybe[sync]$none()
+    subs: subarr := subarr$create(1)
+    in_buf: string := ""
+    running: bool := true
+
+    while running do
+	found: bool, line: string, rest: string := try_take_line(in_buf)
+	in_buf := rest
+	if found then
+	    if string$size(line) = 0 then continue end
+	    cmd: string := line
+	    id: string, has_id: bool := str_field(cmd, "id")
+	    op: string, has_op: bool := str_field(cmd, "op")
+	    if ~has_op then
+		emit_protocol_error(out_ch, id, "malformed adapter command")
+
+	    elseif string$equal(op, "hello") then
+		version_raw: string, has_version: bool := raw_field(cmd,
+							 "protocolVersion")
+		version: int := json$uint32(version_raw)
+		    except when bad_format: version := -1 end
+		if ~has_version cor version ~= 1 then
+		    emit_protocol_error(out_ch, id,
+					"unsupported adapter protocol version")
+		    else emit_ready(out_ch, id)
+		    end
+
+	    elseif string$equal(op, "query") cor string$equal(op, "mutation")
+		   cor string$equal(op, "action") then
+		path: string, has_path: bool := str_field(cmd, "path")
+		args_raw: string, has_args: bool := raw_field(cmd, "args")
+		if ~has_args then args_raw := "{}" end
+		kind: string, value_raw: string, err_name: string,
+		    err_message: string, err_data: string,
+		    has_err_data: bool, logs_raw: string,
+		    has_logs: bool := chttp$call(op, path, args_raw,
+						 base_url, client_token)
+		if string$equal(kind, "result")
+		   then emit_result(out_ch, id, value_raw, has_logs, logs_raw)
+		   else emit_call_error(out_ch, id, err_name, err_message,
+					err_data, has_err_data)
+		   end
+
+	    elseif string$equal(op, "setAuth") then
+		token: string, has_token: bool := str_field(cmd, "token")
+		client_token := token
+		emit_ack(out_ch, id)
+
+	    elseif string$equal(op, "subscribe") then
+		ext_id: string, has_ext_id: bool := str_field(cmd, "subscriptionId")
+		path: string, has_path: bool := str_field(cmd, "path")
+		args_raw: string, has_args: bool := raw_field(cmd, "args")
+		if ~has_args then args_raw := "{}" end
+		old_idx: int := find_sub(subs, ext_id)
+		if old_idx ~= 0 cand maybe[sync]$exists(sock) then
+		    old_rec: subrec := subarr$fetch(subs, old_idx)
+		    old_s: sync := maybe[sync]$value(sock)
+		    sync$remove(old_s, old_rec.query_id)
+			except when not_possible (ignored: string): end
+		    old_rec.active := false
+		    subarr$store(subs, old_idx, old_rec)
+		    end
+		if ~maybe[sync]$exists(sock) then
+		    new_s: sync := sync$create(base_url, "clu-0.1.0")
+			except when not_possible (msg: string):
+				    emit_protocol_error(out_ch, id, msg)
+				    new_s := sync$create(base_url, "clu-0.1.0")
+			       end
+		    sock := maybe[sync]$make(new_s)
+		    end
+		s: sync := maybe[sync]$value(sock)
+		query_id: int := sync$add(s, path, args_raw)
+		subarr$addh(subs, subrec${ext_id: ext_id, query_id: query_id,
+					  active: true})
+		emit_ack(out_ch, id)
+
+	    elseif string$equal(op, "unsubscribe") then
+		ext_id: string, has_ext_id: bool := str_field(cmd, "subscriptionId")
+		idx: int := find_sub(subs, ext_id)
+		if idx ~= 0 cand maybe[sync]$exists(sock) then
+		    rec: subrec := subarr$fetch(subs, idx)
+		    s2: sync := maybe[sync]$value(sock)
+		    sync$remove(s2, rec.query_id)
+			except when not_possible (ignored: string): end
+		    rec.active := false
+		    subarr$store(subs, idx, rec)
+		    end
+		emit_ack(out_ch, id)
+
+	    elseif string$equal(op, "debugDisconnect") then
+		if ~maybe[sync]$exists(sock)
+		   then emit_protocol_error(out_ch, id,
+					    "Live WebSocket is not connected")
+		   else s3: sync := maybe[sync]$value(sock)
+			sync$debug_disconnect(s3)
+			    except when not_possible (msg: string):
+					emit_protocol_error(out_ch, id, msg)
+					continue
+				   end
+			emit_ack(out_ch, id)
+		   end
+
+	    elseif string$equal(op, "close") then
+		if maybe[sync]$exists(sock) then
+		    s4: sync := maybe[sync]$value(sock)
+		    i: int := subarr$low(subs)
+		    hi: int := subarr$high(subs)
+		    while i <= hi do
+			rec2: subrec := subarr$fetch(subs, i)
+			if rec2.active then
+			    sync$remove(s4, rec2.query_id)
+				except when not_possible (ignored: string): end
+			    end
+			i := i + 1
+			end
+		    sync$close(s4) except when not_possible (ignored: string): end
+		    end
+		emit_closed(out_ch, id)
+		running := false
+
+	    else
+		emit_protocol_error(out_ch, id, "unknown adapter operation")
+		end
+	    continue
+	    end
+
+	% Give input and the Live socket (if any) each roughly half of one
+	% loop tick's own budget: fill_more(HALF_SLICE_MS) is a real bounded
+	% wait for new input, and sync$poll needs an equally real, nonzero
+	% budget of its own -- passing it 0 looks like "check without
+	% waiting" but actually means every call's own internal deadline is
+	% already in the past by the time it is first compared against
+	% _real_time(), so it would signal a timeout before ever attempting
+	% a single read, live socket or not. This was caught the first time
+	% this adapter ran end to end: every ack and result line appeared,
+	% but not one "subscription" event ever did.
+	alive: bool, new_buf: string := fill_more(in_ch, in_buf, HALF_SLICE_MS)
+	in_buf := new_buf
+	if ~alive then
+	    if maybe[sync]$exists(sock) then
+		s5: sync := maybe[sync]$value(sock)
+		sync$close(s5) except when not_possible (ignored: string): end
+		end
+	    running := false
+	    continue
+	    end
+	if ~found cand maybe[sync]$exists(sock) then
+	    s6: sync := maybe[sync]$value(sock)
+	    got: bool, kind2: string, query_id2: int, value2: string,
+		ename2: string, emsg2: string, edata2: string, hed2: bool,
+		hlogs2: bool, logs2: string := sync$poll(s6, HALF_SLICE_MS)
+		except when not_possible (msg: string):
+			    got := false
+		       end
+	    if got then
+		sidx: int := find_sub_by_query(subs, query_id2)
+		if sidx ~= 0 then
+		    rec3: subrec := subarr$fetch(subs, sidx)
+		    if string$equal(kind2, "update")
+		       then emit_sub_value(out_ch, rec3.ext_id, value2, hlogs2,
+					   logs2)
+		       else emit_sub_error(out_ch, rec3.ext_id, ename2, emsg2,
+					   edata2, hed2, hlogs2, logs2)
+		       end
+		    end
+		end
+	    end
+	end
+    end start_up

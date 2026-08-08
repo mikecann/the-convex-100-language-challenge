@@ -1,0 +1,296 @@
+# wordvec-64bit-word-size.patch
+#
+# Fixes a real, upstream, unreported latent bug in pclu commit 1a8ad76's
+# _wordvec.c on 64-bit builds. CLUREF (pclu_sys.h) is a tagged union whose
+# largest member is `long`/`char *`, so `CLUREFSZ = sizeof(CLUREF)` is 8 on
+# this platform. _wordvec's whole-word ops (fetch/store, word_size()
+# reporting 64) correctly use that 8-byte stride. But the byte- and
+# half-word-addressed ops (bfetch/bstore, wfetch/wstore, lfetch/lstore,
+# get_byte/set_byte) were written for 4-byte words -- the arithmetic makes
+# this unambiguous (`wi = bi / CLUREFSZ`, a `case 1..4` switch, and a
+# `wi + 1` "spill into the next word" pattern for values crossing a word
+# boundary) -- i.e. for the original 32-bit CLUREF. On this 64-bit port
+# they still divide by 8 but only ever handle sub-word byte offsets 1-4;
+# offsets 5-8 fall through the switch as silent no-ops, and every write to
+# offsets 1-4 truncates the value to `int` and reassigns the *entire*
+# 8-byte slot, zeroing bytes 5-8 as a side effect. Net effect: _wordvec
+# byte/word/long store can only ever address the first four bytes of every
+# eight-byte slot.
+#
+# Discovered building a raw `struct sockaddr_in` (family + port + addr) by
+# hand in a _wordvec for this client's local-profile TCP transport: the
+# address bytes (offsets 5-8) silently came out zero every time --
+# `connect()` reached the right port but always the null address --
+# confirmed with `strace`. pclu's own standard library
+# (lib/clu/_resolve.clu, its hand-rolled DNS client) uses the exact same
+# `wstore(addr, 5, r); wstore(addr, 7, l)` pattern to build a sockaddr, so
+# this almost certainly also silently miscompiles pclu's own DNS client on
+# 64-bit builds; that was out of scope here and not chased down further.
+#
+# Fix: alias the actual byte buffer as a true int32_t* instead of aliasing
+# through the 8-byte `long`-strided `.vec->data` view, and divide/mod by 4
+# (not CLUREFSZ), restoring the 4-byte-word addressing the switch logic
+# already assumed. No CLU-visible interface change; this is a runtime
+# library fix, safe to apply on top of any checkout of this pinned commit.
+# Upstream: https://hg.sr.ht/~nbuwe/pclu (not yet reported there).
+#
+diff --git a/code/libasm/Opt/_wordvec.c b/code/libasm/Opt/_wordvec.c
+index 6347a4f..b45ac65 100644
+--- a/code/libasm/Opt/_wordvec.c
++++ b/code/libasm/Opt/_wordvec.c
+@@ -13,6 +13,7 @@
+ #include "pclu_err.h"
+ #include "pclu_sys.h"
+ 
++#include <stdint.h>
+ #include <stdio.h>
+ 
+ errcode gcd_tabOPinsert(CLUREF tab, CLUREF z, CLUREF inf, CLUREF x, CLUREF *ans);
+@@ -199,10 +200,22 @@ _wordvecOPbfetch(CLUREF wv, CLUREF i, CLUREF *ans)
+ 	signal(ERR_bounds);
+ 
+ #if 1
+-    int wi = bi / CLUREFSZ;
+-    int sub_index = bi - (wi * CLUREFSZ) + 1;
+-
+-    int temp = wv.vec->data[wi];
++    /* PATCH(convex-spike): CLUREFSZ is sizeof(CLUREF) == 8 on 64-bit
++     * builds, but this sub-word addressing scheme was written for 4-byte
++     * "words" (see the wi+1 neighbor-word arithmetic below, and
++     * word_size()'s original VAX-era doc comment "returns 32"). Aliasing
++     * through wv.vec->data (a long[] view) truncated every read to its
++     * low 4 bytes and, worse, zeroed the high 4 bytes of the underlying
++     * 8-byte slot on every write, because switch only had cases for
++     * sub_index 1-4 (byte offsets 5-8 within each 8-byte slot were
++     * silently unreachable). Alias the *actual* byte buffer as int32_t
++     * instead, so word/byte addressing is 4-byte-int-array based again,
++     * independent of sizeof(CLUREF). */
++    int32_t *idata = (int32_t *)(void *)wv.str->data;
++    int wi = bi / 4;
++    int sub_index = bi - (wi * 4) + 1;
++
++    int temp = idata[wi];
+     switch (sub_index) {
+     case 1:
+ 	temp = temp & 0xff;
+@@ -241,10 +254,12 @@ _wordvecOPbstore(CLUREF wv, CLUREF i, CLUREF c)
+ 
+ #if 1
+     c.num = c.num & 0xff;
+-    int wi = bi / CLUREFSZ;
+-    int sub_index = bi - (wi * CLUREFSZ) + 1;
++    /* PATCH(convex-spike): see _wordvecOPbfetch. */
++    int32_t *idata = (int32_t *)(void *)wv.str->data;
++    int wi = bi / 4;
++    int sub_index = bi - (wi * 4) + 1;
+ 
+-    int temp = wv.vec->data[wi];
++    int temp = idata[wi];
+     switch (sub_index) {
+     case 1:
+ 	temp = temp & ~0xff;
+@@ -263,7 +278,7 @@ _wordvecOPbstore(CLUREF wv, CLUREF i, CLUREF c)
+ 	temp = temp | (c.num << 24);
+ 	break;
+     }
+-    wv.vec->data[wi] = temp;
++    idata[wi] = temp;
+ #else
+     temp.num = c.num & 0xff;
+     wv.str->data[bi] = (char)temp.num;
+@@ -284,10 +299,12 @@ _wordvecOPwfetch(CLUREF wv, CLUREF i, CLUREF *ans)
+ 	signal(ERR_bounds);
+ #if 1
+     int temp, temp2;
+-    int wi = bi / CLUREFSZ;
+-    int sub_index = bi - (wi * CLUREFSZ) + 1;
++    /* PATCH(convex-spike): see _wordvecOPbfetch. */
++    int32_t *idata = (int32_t *)(void *)wv.str->data;
++    int wi = bi / 4;
++    int sub_index = bi - (wi * 4) + 1;
+ 
+-    temp = wv.vec->data[wi];
++    temp = idata[wi];
+     switch (sub_index) {
+     case 1:
+ 	temp = temp & 0xffff;
+@@ -306,7 +323,7 @@ _wordvecOPwfetch(CLUREF wv, CLUREF i, CLUREF *ans)
+     case 4:
+ 	temp = temp & ~0xff000000;
+ 	temp = temp >> 24;
+-	temp2 = wv.vec->data[wi + 1];
++	temp2 = idata[wi + 1];
+ 	temp2 = (temp2 & 0xff) << 8;
+ 	temp = temp2 | temp;
+ 	ans->num = temp;
+@@ -333,34 +350,36 @@ _wordvecOPwstore(CLUREF wv, CLUREF i, CLUREF n)
+ #if 1
+     int temp;
+     n.num = n.num & 0xffff;
+-    int wi = bi / CLUREFSZ;
+-    int sub_index = bi - (wi * CLUREFSZ) + 1;
++    /* PATCH(convex-spike): see _wordvecOPbfetch. */
++    int32_t *idata = (int32_t *)(void *)wv.str->data;
++    int wi = bi / 4;
++    int sub_index = bi - (wi * 4) + 1;
+ 
+-    temp = wv.vec->data[wi];
++    temp = idata[wi];
+     switch (sub_index) {
+     case 1:
+ 	temp = temp & ~0xffff;
+ 	temp = temp | n.num;
+-	wv.vec->data[wi] = temp;
++	idata[wi] = temp;
+ 	break;
+     case 2:
+ 	temp = temp & ~0xffff00;
+ 	temp = temp | (n.num << 8);
+-	wv.vec->data[wi] = temp;
++	idata[wi] = temp;
+ 	break;
+     case 3:
+ 	temp = temp & ~0xffff0000;
+ 	temp = temp | (n.num << 16);
+-	wv.vec->data[wi] = temp;
++	idata[wi] = temp;
+ 	break;
+     case 4:
+ 	temp = temp & ~0xff000000;
+ 	temp = temp | (n.num << 24);
+-	wv.vec->data[wi] = temp;
+-	temp = wv.vec->data[wi + 1];
++	idata[wi] = temp;
++	temp = idata[wi + 1];
+ 	temp = temp & ~0x000000ff;
+ 	temp = temp | ((n.num & 0xff00) >> 8);
+-	wv.vec->data[wi+1] = temp;
++	idata[wi+1] = temp;
+ 	break;
+     }
+ #else
+@@ -383,10 +402,12 @@ _wordvecOPlfetch(CLUREF wv, CLUREF i, CLUREF *ans)
+ 	signal(ERR_bounds);
+ 
+     int temp, temp2;
+-    int wi = bi / CLUREFSZ;
+-    int sub_index = bi - (wi * CLUREFSZ) + 1;
++    /* PATCH(convex-spike): see _wordvecOPbfetch. */
++    int32_t *idata = (int32_t *)(void *)wv.str->data;
++    int wi = bi / 4;
++    int sub_index = bi - (wi * 4) + 1;
+ 
+-    temp = wv.vec->data[wi];
++    temp = idata[wi];
+     switch (sub_index) {
+     case 1:
+ 	ans->num = temp;
+@@ -394,21 +415,21 @@ _wordvecOPlfetch(CLUREF wv, CLUREF i, CLUREF *ans)
+     case 2:
+ 	temp = temp & 0xffffff00;
+ 	temp = temp >> 8;
+-	temp2 = wv.vec->data[wi+1];
++	temp2 = idata[wi+1];
+ 	temp2 = (temp2 & 0xff) << 24;
+ 	ans->num = temp | temp2;
+ 	break;
+     case 3:
+ 	temp = temp & 0xffff0000;
+ 	temp = temp >> 16;
+-	temp2 = wv.vec->data[wi + 1];
++	temp2 = idata[wi + 1];
+ 	temp2 = (temp2 & 0xffff) << 16;
+ 	ans->num = temp | temp2;
+ 	break;
+     case 4:
+ 	temp = temp & ~0xff000000;
+ 	temp = temp >> 24;
+-	temp2 = wv.vec->data[wi + 1];
++	temp2 = idata[wi + 1];
+ 	temp2 = (temp2 & 0xff) << 8;
+ 	ans->num = temp | temp2;
+ 	break;
+@@ -429,40 +450,42 @@ _wordvecOPlstore(CLUREF wv, CLUREF i, CLUREF n)
+ 	signal(ERR_bounds);
+ 
+     int temp;
+-    int wi = bi / CLUREFSZ;
+-    int sub_index = bi - (wi * CLUREFSZ) + 1;
++    /* PATCH(convex-spike): see _wordvecOPbfetch. */
++    int32_t *idata = (int32_t *)(void *)wv.str->data;
++    int wi = bi / 4;
++    int sub_index = bi - (wi * 4) + 1;
+ 
+-    temp = wv.vec->data[wi];
++    temp = idata[wi];
+     switch (sub_index) {
+     case 1:
+-	wv.vec->data[wi] = n.num;
++	idata[wi] = n.num;
+ 	break;
+     case 2:
+ 	temp = temp & ~0xffffff00;
+ 	temp = temp | (n.num << 8);
+-	wv.vec->data[wi] = temp;
+-	temp = wv.vec->data[wi + 1];
++	idata[wi] = temp;
++	temp = idata[wi + 1];
+ 	temp = temp & ~0xff;
+ 	temp = temp | ((n.num & 0xff000000) >> 24);
+-	wv.vec->data[wi + 1] = temp;
++	idata[wi + 1] = temp;
+ 	break;
+     case 3:
+ 	temp = temp & ~0xffff0000;
+ 	temp = temp | (n.num << 16);
+-	wv.vec->data[wi] = temp;
+-	temp = wv.vec->data[wi + 1];
++	idata[wi] = temp;
++	temp = idata[wi + 1];
+ 	temp = temp & ~0xffff;
+ 	temp = temp | ((n.num & 0xffff0000) >> 16);
+-	wv.vec->data[wi + 1] = temp;
++	idata[wi + 1] = temp;
+ 	break;
+     case 4:
+ 	temp = temp & ~0xff000000;
+ 	temp = temp | (n.num << 24);
+-	wv.vec->data[wi] = temp;
+-	temp = wv.vec->data[wi + 1];
++	idata[wi] = temp;
++	temp = idata[wi + 1];
+ 	temp = temp & ~0x00ffffff;
+ 	temp = temp | ((n.num & 0xffffff00) >> 8);
+-	wv.vec->data[wi + 1] = temp;
++	idata[wi + 1] = temp;
+ 	break;
+     }
+     signal(ERR_ok);
+@@ -678,7 +701,8 @@ _wordvecOPget_byte(CLUREF wv, CLUREF wrd, CLUREF bit, CLUREF len, CLUREF *ans)
+ 	signal(ERR_bounds);
+ 
+     int result, mask;
+-    result = wv.vec->data[wrd.num - 1];
++    /* PATCH(convex-spike): see _wordvecOPbfetch. */
++    result = ((int32_t *)(void *)wv.str->data)[wrd.num - 1];
+     result = result >> (32 - bit.num);
+ 
+     mask =  (1 << len.num) - 1;
+@@ -709,13 +733,15 @@ _wordvecOPset_byte(CLUREF wv, CLUREF byte, CLUREF wrd, CLUREF bit, CLUREF len)
+ 	signal(ERR_bounds);
+ 
+     int slot, new_field, field_mask;
++    /* PATCH(convex-spike): see _wordvecOPbfetch. */
++    int32_t *idata = (int32_t *)(void *)wv.str->data;
+     field_mask = (1 << len.num) - 1;
+     new_field = (byte.num & field_mask) << (32 - bit.num);
+     field_mask = field_mask << (32 - bit.num);
+-    slot = wv.vec->data[wrd.num - 1];
++    slot = idata[wrd.num - 1];
+     slot = slot & ~field_mask;
+     slot |= new_field;
+-    wv.vec->data[wrd.num - 1] = slot;
++    idata[wrd.num - 1] = slot;
+     signal(ERR_ok);
+ }
+ 

@@ -1,0 +1,674 @@
+%   convex-websocket.clu -- RFC 6455 WebSocket handshake and framing over
+%   the conn transport (client/convex-transport.clu), for Convex's
+%   /api/sync endpoint. This module owns everything below "a reassembled,
+%   UTF-8-checked message" -- masking, fragmentation, and interleaved
+%   control frames -- so the sync state machine above it (not written
+%   yet) only ever has to react to one text or binary message at a time.
+%
+%   wsconn is a cluster, not a stateless namespace like chttp: unlike an
+%   HTTP request/response, a WebSocket connection is read many times
+%   over its life, and conn$recv can hand back more bytes than the
+%   frame currently being parsed needs (a server that writes two frames
+%   back to back may arrive as one TCP segment). Those extra bytes have
+%   to survive from one recv_message call to the next, so wsconn keeps
+%   its own read buffer (rep.inbuf) the way a real WebSocket library
+%   would, rather than discarding whatever a single call did not
+%   consume.
+%
+%   AGENTS.md's Live-acceptance rules ask for exactly this module's
+%   scope: mask every client-to-server frame with a fresh random key
+%   (RFC 6455 section 5.3), reassemble fragmented messages (opcode 0x0
+%   continuation frames) while still answering interleaved ping/close
+%   control frames, and validate UTF-8 exactly once, after reassembly,
+%   never per fragment (a multi-byte UTF-8 code point can legally split
+%   across a fragment boundary).
+
+wsconn = cluster is connect, send_text, send_binary, send_close,
+			     recv_message, close, utf8_valid
+
+rep = record[c: conn, inbuf: string]
+
+GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+OP_CONTINUATION = 0
+OP_TEXT = 1
+OP_BINARY = 2
+OP_CLOSE = 8
+OP_PING = 9
+OP_PONG = 10
+
+RECV_CHUNK = 16384		% matches convex-transport.clu's own fixed
+				% internal buffer size for the plain _chan
+				% profile, which silently ignores whatever
+				% maxlen its caller passes and always fills
+				% up to that many bytes -- see this client's
+				% own convex-http.clu, which sizes its
+				% RECV_CHUNK the same way for the same reason.
+MAX_CONTROL_PAYLOAD = 125	% RFC 6455 section 5.5: control frames are
+				% never fragmented and carry at most 125
+				% bytes of payload.
+MAX_MESSAGE_BYTES = 4194304	% generous bound on one reassembled
+				% message (Convex sync payloads are JSON
+				% text, ordinarily well under this), so a
+				% peer that never sends a final fragment
+				% cannot grow this client's memory without
+				% bound.
+HANDSHAKE_DEADLINE_MS = 15000
+FRAME_DEADLINE_MS = 30000
+
+	byte_at = proc (s: string, i: int) returns (int)
+	    return(char$c2i(s[i]))
+	    end byte_at
+
+	byte_c = proc (v: int) returns (string)
+	    return(string$c2s(char$i2c(v)))
+	    end byte_c
+
+%   random_bytes(n) -> n bytes read from /dev/urandom -- real kernel
+%   entropy, not pclu's own seeded `random` library, since both the
+%   handshake's Sec-WebSocket-Key nonce and every frame's masking key
+%   are meant to be unpredictable to an observer, and a PRNG seeded from
+%   a value as guessable as the wall clock (the only seed convex-sha1's
+%   own build has ever needed) would not give that.
+	random_bytes = proc (n: int) returns (string)
+					     signals (not_possible(string))
+	    fn: file_name := file_name$parse("/dev/urandom")
+	    ch: _chan := _chan$open(fn, "read", 0)
+		except when not_possible (msg: string):
+			    signal not_possible("open /dev/urandom: " || msg)
+		       end
+	    % /dev/urandom is a character device, not a socket: _chan$recv
+	    % (this client's usual way to read a _chan, see
+	    % convex-transport.clu) issues a recv(2) syscall, which only
+	    % works on sockets and fails a device file with ENOTSOCK
+	    % ("Socket operation on non-socket") -- caught the first time
+	    % this file ran. _chan$getb, the same plain-file read
+	    % client/tests/fixtures/http_fixture.clu already uses to load
+	    % its canned response body, is the right op for a file _chan.
+	    rbytes: _bytevec := _bytevec$create(n)
+	    got: int := _chan$getb(ch, rbytes)
+		except when not_possible (msg: string):
+			    _chan$close(ch) except others: end
+			    signal not_possible("read /dev/urandom: " || msg)
+		       end
+	    _chan$close(ch) except others: end
+	    if got < n then
+		signal not_possible("short read from /dev/urandom")
+		end
+	    return(_cvt[_bytevec, string](rbytes))
+	    end random_bytes
+
+%   -- handshake header helpers -----------------------------------------
+
+	lower = proc (s: string) returns (string)
+	    out: string := ""
+	    i: int := 1
+	    n: int := string$size(s)
+	    while i <= n do
+		c: char := s[i]
+		if c >= 'A' cand c <= 'Z'
+		   then out := out || byte_c(char$c2i(c) + 32)
+		   else out := out || string$c2s(c)
+		   end
+		i := i + 1
+		end
+	    return(out)
+	    end lower
+
+	is_ws = proc (c: char) returns (bool)
+	    return(c = ' ' cor c = '\t' cor c = '\r' cor c = '\n')
+	    end is_ws
+
+	trim = proc (s: string) returns (string)
+	    n: int := string$size(s)
+	    lo: int := 1
+	    hi: int := n
+	    while lo <= hi cand is_ws(s[lo]) do lo := lo + 1 end
+	    while hi >= lo cand is_ws(s[hi]) do hi := hi - 1 end
+	    if lo > hi then return("") end
+	    return(string$substr(s, lo, hi - lo + 1))
+	    end trim
+
+%   header_value(headers, name) -> the trimmed value of the first header
+%   named name (case-insensitively), signalling not_found if absent.
+	header_value = proc (headers, name: string) returns (string)
+						     signals (not_found)
+	    target: string := lower(name)
+	    pos: int := 1
+	    n: int := string$size(headers)
+	    while pos <= n do
+		nl: int := string$indexs("\r\n", string$rest(headers, pos))
+		line: string
+		if nl = 0
+		   then line := string$rest(headers, pos)
+			pos := n + 1
+		   else line := string$substr(headers, pos, nl - 1)
+			pos := pos + nl + 1
+		   end
+		colon: int := string$indexc(':', line)
+		if colon ~= 0 then
+		    hname: string := lower(string$substr(line, 1, colon - 1))
+		    if string$equal(hname, target)
+		       then return(trim(string$rest(line, colon + 1)))
+		       end
+		    end
+		end
+	    signal not_found
+	    end header_value
+
+%   -- frame header encode/decode ----------------------------------------
+
+%   encode_len(payload_len) -> the length-field bytes of a frame header,
+%   with the client's mask bit (0x80) already set into the second byte,
+%   per RFC 6455 section 5.2's three-way length encoding (7 bits, or a
+%   16-bit, or a 64-bit extended length).
+	encode_len = proc (payload_len: int) returns (string)
+	    if payload_len < 126 then return(byte_c(payload_len + 128)) end
+	    if payload_len <= 65535 then
+		hi: int := payload_len / 256
+		lo: int := payload_len // 256
+		return(byte_c(126 + 128) || byte_c(hi) || byte_c(lo))
+		end
+	    out: string := byte_c(127 + 128)
+	    i: int := 7
+	    while i >= 0 do
+		out := out || byte_c((payload_len / (256 ** i)) // 256)
+		i := i - 1
+		end
+	    return(out)
+	    end encode_len
+
+%   mask(payload, key) -> payload XORed byte-by-byte against the
+%   4-byte mask key, cycling the key every 4 bytes (RFC 6455 section
+%   5.3). The same operation un-masks, so this module never needs a
+%   separate unmask -- it never has to unmask anything, since a
+%   compliant server's frames are never masked in the first place
+%   (verified by recv_frame below, which treats a masked server frame
+%   as a protocol error rather than silently unmasking it).
+	mask = proc (payload, key: string) returns (string)
+	    n: int := string$size(payload)
+	    out: string := ""
+	    i: int := 1
+	    while i <= n do
+		k: int := byte_at(key, ((i - 1) // 4) + 1)
+		out := out || byte_c(bitops$xor_byte(byte_at(payload, i), k))
+		i := i + 1
+		end
+	    return(out)
+	    end mask
+
+%   build_frame(opcode, payload, fin) -> a complete, masked frame ready
+%   to write to the wire.
+	build_frame = proc (opcode: int, payload: string, fin: bool)
+							returns (string)
+					   signals (not_possible(string))
+	    b0: int := opcode
+	    if fin then b0 := b0 + 128 end
+	    key: string := random_bytes(4)
+		resignal not_possible
+	    return(byte_c(b0) || encode_len(string$size(payload)) || key
+		   || mask(payload, key))
+	    end build_frame
+
+%   read_exact(w, n, deadline) -> exactly n bytes, reading more from the
+%   underlying conn as needed and leaving any surplus in w.inbuf for the
+%   next call. Signals failed("__eof__") on a clean close (this
+%   module's own sentinel, as convex-http.clu's next_chunk already
+%   establishes) and failed(msg) for a timeout or transport error.
+	read_exact = proc (w: cvt, n: int, deadline: int) returns (string)
+						  signals (failed(string))
+	    while string$size(w.inbuf) < n do
+		remaining: int := deadline - _real_time()
+		if remaining <= 0 then signal failed("timed out reading frame")
+		    end
+		chunk: string := conn$recv(w.c, RECV_CHUNK, remaining)
+		    except when timeout: signal failed("timed out reading frame")
+			   when end_of_file: signal failed("__eof__")
+			   when not_possible (msg: string): signal failed(msg)
+			   end
+		w.inbuf := w.inbuf || chunk
+		end
+	    out: string := string$substr(w.inbuf, 1, n)
+	    w.inbuf := string$rest(w.inbuf, n + 1)
+	    return(out)
+	    end read_exact
+
+%   recv_frame(w, deadline) -> one raw frame (fin, opcode, payload),
+%   unmasked already if the (non-compliant) peer masked it. Signals
+%   failed("__protocol__: " || detail) for any framing rule this client
+%   enforces: a nonzero RSV bit (no extension is negotiated), a control
+%   frame that is fragmented or exceeds 125 bytes, or -- the one most
+%   worth calling out, since it is easy to omit -- a masked frame from
+%   the server, which RFC 6455 section 5.1 forbids outright.
+	recv_frame = proc (w: cvt, deadline: int)
+					returns (bool, int, string)
+					signals (failed(string))
+	    % up(w) re-converts this operation's own cvt parameter back to
+	    % the abstract wsconn type before handing it to another
+	    % cvt-taking operation of this same cluster: within an
+	    % operation, a cvt parameter is already treated as rep (that
+	    % is what lets w.inbuf work below), so passing it straight on
+	    % as another operation's own cvt argument is a type mismatch
+	    % pclu reports as "expected type: wsconn, actual type:
+	    % record[..2..]" -- a quirk this client's build hit for the
+	    % first time here, since no earlier module had one cvt-taking
+	    % operation call a sibling cvt-taking operation of its own
+	    % cluster.
+	    hdr: string := read_exact(up(w), 2, deadline)
+		resignal failed
+	    b0: int := byte_at(hdr, 1)
+	    b1: int := byte_at(hdr, 2)
+	    fin: bool := (b0 / 128) = 1
+	    rsv: int := (b0 // 128) / 16
+	    opcode: int := b0 // 16
+	    if rsv ~= 0 then
+		signal failed("__protocol__: nonzero RSV bits, no " ||
+			      "extension negotiated")
+		end
+	    is_masked: bool := (b1 / 128) = 1
+	    if is_masked then
+		signal failed("__protocol__: server sent a masked frame")
+		end
+	    len7: int := b1 // 128
+	    payload_len: int := len7
+	    if len7 = 126 then
+		ext: string := read_exact(up(w), 2, deadline)
+		    resignal failed
+		payload_len := byte_at(ext, 1) * 256 + byte_at(ext, 2)
+	    elseif len7 = 127 then
+		ext: string := read_exact(up(w), 8, deadline)
+		    resignal failed
+		payload_len := 0
+		i: int := 1
+		while i <= 8 do
+		    payload_len := payload_len * 256 + byte_at(ext, i)
+		    i := i + 1
+		    end
+		end
+	    is_control: bool := opcode = OP_CLOSE cor opcode = OP_PING
+				 cor opcode = OP_PONG
+	    if is_control cand (~fin cor payload_len > MAX_CONTROL_PAYLOAD)
+	       then signal failed("__protocol__: fragmented or oversized " ||
+				  "control frame")
+	       end
+	    if payload_len > MAX_MESSAGE_BYTES then
+		signal failed("__protocol__: frame payload exceeded budget")
+		end
+	    payload: string := ""
+	    if payload_len > 0 then
+		payload := read_exact(up(w), payload_len, deadline)
+		    resignal failed
+		end
+	    return(fin, opcode, payload)
+	    end recv_frame
+
+%   -- UTF-8 validation ----------------------------------------------
+
+%   utf8_valid(s) -> true iff s is well-formed UTF-8: every multi-byte
+%   sequence has the right number of 0x80..0xBF continuation bytes, and
+%   the three cases that "looks like the right shape but is not real
+%   UTF-8" are rejected too -- overlong encodings (a code point spelled
+%   with more bytes than its value needs), UTF-16 surrogate halves
+%   (U+D800..U+DFFF, which are not valid Unicode scalar values on their
+%   own), and any code point past U+10FFFF. Called once on a fully
+%   reassembled text message, per this module's own header comment.
+	utf8_valid = proc (s: string) returns (bool)
+	    n: int := string$size(s)
+	    i: int := 1
+	    while i <= n do
+		b0: int := byte_at(s, i)
+		need: int := 0
+		lo_bound: int := 128
+		hi_bound: int := 191
+		if b0 <= 127
+		   then i := i + 1
+			continue
+		   elseif b0 >= 194 cand b0 <= 223 then need := 1
+		   elseif b0 = 224 then need := 2
+			lo_bound2: int := 160
+		   elseif b0 >= 225 cand b0 <= 236 then need := 2
+		   elseif b0 = 237 then need := 2
+			hi_bound2: int := 159
+		   elseif b0 >= 238 cand b0 <= 239 then need := 2
+		   elseif b0 = 240 then need := 3
+			lo_bound3: int := 144
+		   elseif b0 >= 241 cand b0 <= 243 then need := 3
+		   elseif b0 = 244 then need := 3
+			hi_bound3: int := 143
+		   else return(false)
+		   end
+
+		if i + need > n then return(false) end
+
+		j: int := 1
+		while j <= need do
+		    bc: int := byte_at(s, i + j)
+		    lo: int := lo_bound
+		    hi: int := hi_bound
+		    if b0 = 224 cand j = 1 then lo := 160 end
+		    if b0 = 237 cand j = 1 then hi := 159 end
+		    if b0 = 240 cand j = 1 then lo := 144 end
+		    if b0 = 244 cand j = 1 then hi := 143 end
+		    if bc < lo cor bc > hi then return(false) end
+		    j := j + 1
+		    end
+		i := i + need + 1
+		end
+	    return(true)
+	    end utf8_valid
+
+%   -- public operations -----------------------------------------------
+
+%   connect(scheme, host, port, path) -> a wsconn with the RFC 6455
+%   handshake already completed and its Sec-WebSocket-Accept verified.
+%   scheme is "ws" (plain, dials a raw _chan the same as convex-http.clu)
+%   or "wss" (TLS via _tls, real chain and hostname verification, same
+%   as the hosted HTTP profile).
+	connect = proc (scheme, host: string, port: int, path: string)
+					   returns (cvt)
+			     signals (not_possible(string), failed(string))
+	    c: conn := conn$dial(scheme, host, port)
+		resignal not_possible
+	    nonce: string := random_bytes(16)
+		except when not_possible (msg: string):
+			    conn$close(c) except others: end
+			    signal not_possible(msg)
+		       end
+	    key: string := base64$encode(nonce)
+
+	    req: string := "GET " || path || " HTTP/1.1\r\n"
+	    req := req || "Host: " || host || "\r\n"
+	    req := req || "Upgrade: websocket\r\n"
+	    req := req || "Connection: Upgrade\r\n"
+	    req := req || "Sec-WebSocket-Key: " || key || "\r\n"
+	    req := req || "Sec-WebSocket-Version: 13\r\n\r\n"
+
+	    conn$send(c, req)
+		except when not_possible (msg: string):
+			    conn$close(c) except others: end
+			    signal not_possible("send: " || msg)
+		       end
+
+	    % A plain rep-typed local, not a cvt-typed one: cvt is only
+	    % legal as this operation's OWN parameter/return annotation,
+	    % not as an arbitrary local variable's declared type (pclu
+	    % rejects that as "illegal use of 'cvt'"). return(w) below
+	    % still satisfies this operation's own returns(cvt), the same
+	    % way convex-transport.clu's dial() returns a plain
+	    % rep-typed rep$make_chan(...)/rep$make_tls(...) value
+	    % against its own returns(cvt) without needing up() -- up()
+	    % is only for handing a cvt-context value to an *argument*
+	    % position, as recv_frame's own read_exact(up(w), ...) calls
+	    % above have to.
+	    w: rep := rep${c: c, inbuf: ""}
+	    deadline: int := _real_time() + HANDSHAKE_DEADLINE_MS
+	    buf: string := ""
+	    header_end: int := 0
+	    while header_end = 0 do
+		remaining: int := deadline - _real_time()
+		if remaining <= 0 then
+		    conn$close(c) except others: end
+		    signal failed("timed out reading handshake response")
+		    end
+		chunk: string := conn$recv(c, RECV_CHUNK, remaining)
+		    except when timeout:
+				conn$close(c) except others: end
+				signal failed("timed out reading handshake " ||
+					      "response")
+			   when end_of_file:
+				conn$close(c) except others: end
+				signal failed("connection closed during " ||
+					      "handshake")
+			   when not_possible (msg: string):
+				conn$close(c) except others: end
+				signal failed(msg)
+			   end
+		buf := buf || chunk
+		header_end := string$indexs("\r\n\r\n", buf)
+		end
+
+	    header_text: string := string$substr(buf, 1, header_end + 3)
+	    w.inbuf := string$rest(buf, header_end + 4)
+
+	    line_end: int := string$indexs("\r\n", header_text)
+	    status_line: string := string$substr(header_text, 1, line_end - 1)
+	    rest_headers: string := string$rest(header_text, line_end + 2)
+
+	    sp1: int := string$indexc(' ', status_line)
+	    if sp1 = 0 then
+		conn$close(c) except others: end
+		signal failed("malformed handshake status line")
+		end
+	    after_sp1: string := string$rest(status_line, sp1 + 1)
+	    sp2: int := string$indexc(' ', after_sp1)
+	    code_s: string := after_sp1
+	    if sp2 ~= 0 then code_s := string$substr(after_sp1, 1, sp2 - 1) end
+	    status: int := int$parse(code_s)
+		except when bad_format, overflow:
+			    conn$close(c) except others: end
+			    signal failed("malformed handshake status code")
+		       end
+	    if status ~= 101 then
+		conn$close(c) except others: end
+		signal failed("server refused the WebSocket upgrade " ||
+			      "(HTTP " || int$unparse(status) || ")")
+		end
+
+	    upgrade_hdr: string := header_value(rest_headers, "Upgrade")
+		except when not_found:
+			    conn$close(c) except others: end
+			    signal failed("101 response omitted Upgrade header")
+		       end
+	    if ~string$equal(lower(upgrade_hdr), "websocket") then
+		conn$close(c) except others: end
+		signal failed("101 response's Upgrade header was not " ||
+			      "\"websocket\"")
+		end
+
+	    accept_hdr: string := header_value(rest_headers,
+						"Sec-WebSocket-Accept")
+		except when not_found:
+			    conn$close(c) except others: end
+			    signal failed("101 response omitted " ||
+					  "Sec-WebSocket-Accept")
+		       end
+	    expected: string := base64$encode(sha1$digest(key || GUID))
+	    if ~string$equal(accept_hdr, expected) then
+		conn$close(c) except others: end
+		signal failed("Sec-WebSocket-Accept did not match the " ||
+			      "expected value -- the server, or something " ||
+			      "between this client and it, tampered with " ||
+			      "the handshake")
+		end
+
+	    return(w)
+	    end connect
+
+%   send_text(w, payload) -> sends payload (already UTF-8 encoded text)
+%   as one unfragmented, masked text frame.
+	send_text = proc (w: cvt, payload: string)
+					   signals (not_possible(string))
+	    frame: string := build_frame(OP_TEXT, payload, true)
+		resignal not_possible
+	    conn$send(w.c, frame)
+		resignal not_possible
+	    end send_text
+
+%   send_binary(w, payload) -> sends payload as one unfragmented, masked
+%   binary frame. (Convex's own sync protocol is JSON text end to end;
+%   this exists so the module is not artificially text-only, and so its
+%   own tests can cover the binary opcode path.)
+	send_binary = proc (w: cvt, payload: string)
+					   signals (not_possible(string))
+	    frame: string := build_frame(OP_BINARY, payload, true)
+		resignal not_possible
+	    conn$send(w.c, frame)
+		resignal not_possible
+	    end send_binary
+
+%   send_close(w, code, reason) -> sends a Close control frame carrying
+%   the given status code and (UTF-8) reason text. Per RFC 6455 section
+%   5.5.1 this does not itself close the TCP connection; a well-behaved
+%   peer answers with its own Close frame, which recv_message surfaces
+%   to the caller as a peer_close signal so it can then call close().
+	send_close = proc (w: cvt, code: int, reason: string)
+					   signals (not_possible(string))
+	    payload: string := byte_c(code / 256) || byte_c(code // 256)
+				|| reason
+	    frame: string := build_frame(OP_CLOSE, payload, true)
+		resignal not_possible
+	    conn$send(w.c, frame)
+		resignal not_possible
+	    end send_close
+
+%   recv_message(w, timeout_ms) -> the next reassembled application
+%   message as (kind, payload), kind being "text" (UTF-8 validated) or
+%   "binary". Answers ping frames with pong and simply continues past
+%   pong frames without surfacing either to the caller; a Close frame
+%   is echoed back (RFC 6455 section 5.5.1's required close handshake)
+%   and reported as peer_close rather than as a message.
+	recv_message = proc (w: cvt, timeout_ms: int)
+					     returns (string, string)
+			 signals (timeout, end_of_file, not_possible(string),
+				  protocol_error(string),
+				  peer_close(int, string))
+	    deadline: int := _real_time() + timeout_ms
+	    if deadline - _real_time() > FRAME_DEADLINE_MS
+	       then deadline := _real_time() + FRAME_DEADLINE_MS end
+
+	    assembling: bool := false
+	    msg_opcode: int := 0
+	    msg_payload: string := ""
+
+	    while true do
+		fin: bool, opcode: int, payload: string :=
+		    recv_frame(up(w), deadline)
+			except when failed (msg: string):
+					if string$equal(msg, "__eof__")
+					   then signal end_of_file
+					   end
+					if string$size(msg) > 14 cand
+					   string$equal(
+					       string$substr(msg, 1, 14),
+					       "__protocol__: ")
+					   then signal protocol_error(
+						    string$rest(msg, 15))
+					   end
+					if string$equal(msg,
+						"timed out reading frame")
+					   then signal timeout
+					   end
+					signal not_possible(msg)
+				   end
+
+		if opcode = OP_PING then
+		    pong: string := build_frame(OP_PONG, payload, true)
+			resignal not_possible
+		    conn$send(w.c, pong)
+			resignal not_possible
+		elseif opcode = OP_PONG then
+		    % nothing to do; this client never sends an
+		    % application-level ping of its own, only replies to
+		    % the server's, but a compliant client still has to
+		    % tolerate an unsolicited pong without erroring.
+		elseif opcode = OP_CLOSE then
+		    code: int := 1005	% RFC 6455 section 7.4.1's "no
+					% status code was present" default
+		    reason: string := ""
+		    if string$size(payload) >= 2 then
+			code := byte_at(payload, 1) * 256 + byte_at(payload, 2)
+			reason := string$rest(payload, 3)
+			end
+		    % Best-effort: failing to echo the Close frame back
+		    % should not stop this client from still reporting
+		    % peer_close below. build_frame and conn$send share one
+		    % begin...end block (rather than each getting its own
+		    % except) so a failure in build_frame cannot leave echo
+		    % unassigned and then read by conn$send -- and, since
+		    % except binds only to the single statement immediately
+		    % before it, protecting both calls at once needs exactly
+		    % this shape, the same lesson convex-http.clu's classify
+		    % already recorded. pclu also requires the except clause
+		    % to bind exactly as many values as its signal declares,
+		    % even when they are then ignored: plain "when
+		    % not_possible:" fails to compile against a signal
+		    % declared not_possible(string).
+		    begin
+			echo: string := build_frame(OP_CLOSE, payload, true)
+			conn$send(w.c, echo)
+			end
+			except when not_possible (ignored: string): end
+		    signal peer_close(code, reason)
+		elseif opcode = OP_TEXT cor opcode = OP_BINARY then
+		    if assembling then
+			signal protocol_error(
+			    "new message started before the previous " ||
+			    "fragmented message finished")
+			end
+		    msg_opcode := opcode
+		    msg_payload := payload
+		    if fin
+		       then
+			    % A return statement's expression list is
+			    % positional, one value per slot (see
+			    % convex-http.clu's call for the first time
+			    % this client hit that): kind_of's own two
+			    % return values have to land in named locals
+			    % first, not be forwarded straight out of a
+			    % single-expression return(kind_of(...)).
+			    kind: string, out_payload: string :=
+				kind_of(msg_opcode, msg_payload)
+				resignal protocol_error
+			    return(kind, out_payload)
+		       else assembling := true
+		       end
+		elseif opcode = OP_CONTINUATION then
+		    if ~assembling then
+			signal protocol_error(
+			    "continuation frame with no message in progress")
+			end
+		    msg_payload := msg_payload || payload
+		    if string$size(msg_payload) > MAX_MESSAGE_BYTES then
+			signal protocol_error(
+			    "reassembled message exceeded budget")
+			end
+		    if fin
+		       then assembling := false
+			    kind: string, out_payload: string :=
+				kind_of(msg_opcode, msg_payload)
+				resignal protocol_error
+			    return(kind, out_payload)
+		       end
+		else
+		    signal protocol_error(
+			"unknown WebSocket opcode " || int$unparse(opcode))
+		    end
+		end
+	    end recv_message
+
+%   kind_of(opcode, payload) -> ("text", payload) with payload's UTF-8
+%   checked, or ("binary", payload) unchecked. Factored out of
+%   recv_message's two return points (the unfragmented case and the
+%   final-fragment case) so the UTF-8 rule only has to be written once.
+	kind_of = proc (opcode: int, payload: string) returns (string, string)
+						   signals (protocol_error(string))
+	    if opcode = OP_TEXT then
+		if ~utf8_valid(payload) then
+		    signal protocol_error("text message was not valid UTF-8")
+		    end
+		return("text", payload)
+		end
+	    return("binary", payload)
+	    end kind_of
+
+%   close(w) -> best-effort teardown of the underlying connection. Does
+%   not send a Close frame first (call send_close for a graceful
+%   shutdown); this exists for the abrupt case -- debugDisconnect, or
+%   giving up after a transport error -- where there is no well-formed
+%   connection left to send a frame over.
+	close = proc (w: cvt) signals (not_possible(string))
+	    conn$close(w.c)
+		resignal not_possible
+	    end close
+
+end wsconn

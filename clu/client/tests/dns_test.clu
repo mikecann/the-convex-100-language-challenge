@@ -1,0 +1,124 @@
+%   dns_test.clu -- language-local unit coverage for convex-dns.clu's
+%   own packet encoding and decoding (client/convex-dns.clu), built from
+%   hand-assembled DNS bytes rather than a real network round trip: this
+%   test suite runs inside the isolated "test" image, which has no
+%   "backend" hostname to resolve. The real resolve() path -- reading
+%   /etc/resolv.conf and completing a UDP round trip against Docker's
+%   own embedded DNS server -- is proven separately, by the canonical
+%   example (examples/basics/main.clu) itself successfully looking up
+%   "backend" against the real docker-compose network during
+%   ./run verify.
+
+check = cluster is ok, fail_count
+
+rep = null
+
+own failures: int := 0
+
+	ok = proc (name: string, got: bool)
+	    po: stream := stream$primary_output()
+	    if got
+	       then stream$putl(po, "PASS " || name)
+	       else stream$putl(po, "FAIL " || name)
+		    failures := failures + 1
+	       end
+	    end ok
+
+	fail_count = proc () returns (int)
+	    return(failures)
+	    end fail_count
+
+end check
+
+b = proc (v: int) returns (string)
+    return(string$c2s(char$i2c(v)))
+    end b
+
+%   fixed_response(rtype2, rdata) -> a synthetic but wire-correct DNS
+%   response to a one-question "backend" A query: a 12-byte header
+%   (QDCOUNT=1, ANCOUNT=1), the echoed question, then one answer whose
+%   name is a compression pointer back to the question (byte offset 12,
+%   the usual shape a real server sends) and whose TYPE is rtype2's own
+%   two bytes and RDATA is rdata -- letting each test below choose
+%   whether that one answer looks like an A record or something else.
+fixed_response = proc (rtype2: string, rdata: string) returns (string)
+    header: string := b(0) || b(1)		% transaction ID
+    header := header || b(1) || b(0)		% flags (matches a query's
+						% own RD=1, harmless either
+						% way since parse_a_record
+						% never inspects flags)
+    header := header || b(0) || b(1)		% QDCOUNT=1
+    header := header || b(0) || b(1)		% ANCOUNT=1
+    header := header || b(0) || b(0)		% NSCOUNT=0
+    header := header || b(0) || b(0)		% ARCOUNT=0
+    question: string := dns$encode_qname("backend") || b(0) || b(1)
+			 || b(0) || b(1)
+    answer: string := b(192) || b(12)		% name: pointer to offset 12
+    answer := answer || rtype2
+    answer := answer || b(0) || b(1)		% CLASS=IN
+    answer := answer || b(0) || b(0) || b(0) || b(60)	% TTL=60
+    answer := answer || b(0) || b(string$size(rdata))	% RDLENGTH
+    answer := answer || rdata
+    return(header || question || answer)
+    end fixed_response
+
+start_up = proc ()
+    po: stream := stream$primary_output()
+
+    % encode_qname: "backend" (one label) becomes a single
+    % length-prefixed label ([7]backend) followed by the zero
+    % terminator -- 9 bytes total, and the exact bytes matter, not just
+    % the length, since a wrong length byte would silently desync every
+    % later read.
+    qname: string := dns$encode_qname("backend")
+    check$ok("encode_qname('backend') has the right total length",
+	     string$size(qname) = 9)
+    check$ok("encode_qname('backend') starts with the label length byte",
+	     char$c2i(qname[1]) = 7)
+    check$ok("encode_qname('backend') carries the label bytes verbatim",
+	     string$equal(string$substr(qname, 2, 7), "backend"))
+    check$ok("encode_qname('backend') ends with the zero terminator",
+	     char$c2i(qname[9]) = 0)
+
+    % encode_qname: two labels ("a.b") become two length-prefixed
+    % labels back to back, proving the '.' splitting itself, not just
+    % the single-label case above.
+    qname2: string := dns$encode_qname("a.b")
+    check$ok("encode_qname('a.b') has the right total length (1+1+1+1+1)",
+	     string$size(qname2) = 5)
+    check$ok("encode_qname('a.b') first label is length 1, 'a'",
+	     char$c2i(qname2[1]) = 1 cand string$equal(
+		 string$substr(qname2, 2, 1), "a"))
+    check$ok("encode_qname('a.b') second label is length 1, 'b'",
+	     char$c2i(qname2[3]) = 1 cand string$equal(
+		 string$substr(qname2, 4, 1), "b"))
+
+    % parse_a_record: a realistic response whose one answer is a real
+    % A record (TYPE=1) with a compression-pointer name -- the shape a
+    % real server actually sends -- must decode to the right dotted quad.
+    good_response: string := fixed_response(b(0) || b(1),
+					    b(10) || b(20) || b(30) || b(40))
+    good_ip: string := dns$parse_a_record(good_response)
+	except when not_found, bad_format: good_ip := "<error>" end
+    check$ok("parse_a_record decodes a real A answer",
+	     string$equal(good_ip, "10.20.30.40"))
+
+    % parse_a_record: an answer whose TYPE is not A (5 = CNAME here)
+    % must not be mistaken for one -- with no second answer to fall
+    % through to, this must report not_found rather than misreading the
+    % CNAME's own RDATA as if it were four address bytes.
+    cname_response: string := fixed_response(b(0) || b(5), b(1) || b(2))
+    cname_signalled: bool := false
+    dns$parse_a_record(cname_response)
+	except when not_found: cname_signalled := true
+	       when bad_format: cname_signalled := false
+	       end
+    check$ok("parse_a_record does not mistake a non-A answer for one",
+	     cname_signalled)
+
+    if check$fail_count() > 0
+       then stream$putl(po, int$unparse(check$fail_count()) || " FAILED")
+	    _exit(1)
+       else stream$putl(po, "ALL PASS")
+       end
+    end start_up

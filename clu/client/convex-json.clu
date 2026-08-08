@@ -1,0 +1,369 @@
+%   convex-json.clu -- a minimal JSON codec for the Convex client.
+%
+%   This is not a general JSON-to-CLU-value decoder. json$field walks
+%   just enough of a JSON document's text to find one top-level object
+%   field and hand back that field's own JSON text unparsed; a caller
+%   that wants the value interprets it with json$uint32, json$field
+%   again (if it is itself an object), and so on. This "parse only as
+%   far as you need to" shape keeps the codec small while still being a
+%   real, general JSON scanner: it correctly skips strings (with
+%   escapes), numbers, true/false/null, and arbitrarily nested objects
+%   and arrays it is not asked to look inside, so a field two levels
+%   deep in an unrelated part of the document can never be mistaken for
+%   the field being searched for.
+%
+%   The cluster showcases CLU's own cluster abstraction the way the
+%   language's own built-in types are written (see cmp/basic.types in
+%   pclu): "json" has no interesting per-instance state of its own, so
+%   its rep is null and every operation is really just a namespaced
+%   procedure, but grouping them under json$... is exactly how a CLU
+%   programmer is meant to organise a related family of operations.
+
+json = cluster is field, uint32, qs, unqs, object1, object2, object3,
+			  array_items
+
+rep = null
+
+%   skip_ws(s, i) -> the index of the first non-whitespace character at
+%   or after i (JSON whitespace is space, tab, newline, carriage return).
+	skip_ws = proc (s: string, i: int) returns (int)
+	    n: int := string$size(s)
+	    while i <= n do
+		c: char := s[i]
+		if c ~= ' ' cand c ~= '\t' cand c ~= '\n' cand c ~= '\r'
+		   then return(i) end
+		i := i + 1
+		end
+	    return(i)
+	    end skip_ws
+
+%   skip_string(s, i) -> the index one past the closing quote of the
+%   JSON string literal that starts at s[i] (s[i] must be '"').
+%   Handles \" and every other backslash escape by skipping the escaped
+%   character without interpreting it, since skip_value never needs the
+%   string's decoded value, only where it ends.
+	skip_string = proc (s: string, i: int) returns (int)
+					       signals (bad_format)
+	    n: int := string$size(s)
+	    j: int := i + 1
+	    while true do
+		if j > n then signal bad_format end
+		c: char := s[j]
+		if c = '"' then return(j + 1) end
+		if c = '\\'
+		   then j := j + 2
+		   else j := j + 1
+		   end
+		end
+	    end skip_string
+
+%   skip_value(s, i) -> the index one past the JSON value that starts
+%   at the first non-whitespace character at or after i: a string, a
+%   number, true, false, null, or a balanced (possibly nested) object
+%   or array. This is the one primitive every other operation in this
+%   module is built from.
+	skip_value = proc (s: string, i: int) returns (int)
+					      signals (bad_format)
+	    n: int := string$size(s)
+	    j: int := skip_ws(s, i)
+	    if j > n then signal bad_format end
+	    c: char := s[j]
+	    if c = '"'
+	       then return(skip_string(s, j))
+			resignal bad_format
+	       end
+	    if c = '{' cor c = '['
+	       then close: char := '}'
+		    if c = '[' then close := ']' end
+		    depth: int := 1
+		    j := j + 1
+		    while depth > 0 do
+			if j > n then signal bad_format end
+			d: char := s[j]
+			if d = '"'
+			   then j := skip_string(s, j)
+				   resignal bad_format
+			   elseif d = '{' cor d = '['
+			   then depth := depth + 1
+				j := j + 1
+			   elseif d = '}' cor d = ']'
+			   then depth := depth - 1
+				j := j + 1
+			   else j := j + 1
+			   end
+			end
+		    return(j)
+	       end
+	    % true, false, null, or a number: run to the next structural
+	    % character (, } ] or whitespace.
+	    while j <= n do
+		d: char := s[j]
+		if d = ',' cor d = '}' cor d = ']'
+		   cor d = ' ' cor d = '\t' cor d = '\n' cor d = '\r'
+		   then return(j) end
+		j := j + 1
+		end
+	    return(j)
+	    end skip_value
+
+%   field(obj_text, key) -> the raw JSON text of "key"'s value in the
+%   top-level object obj_text, signals not_found if there is no such
+%   key at the top level, signals bad_format if obj_text is not an
+%   object or is truncated. Only the top level is searched: a field
+%   named "key" nested inside some other field's value is correctly
+%   never matched, because that value is skipped whole by skip_value.
+	field = proc (obj_text: string, key: string) returns (string)
+					      signals (not_found, bad_format)
+	    n: int := string$size(obj_text)
+	    i: int := skip_ws(obj_text, 1)
+	    if i > n cor obj_text[i] ~= '{' then signal bad_format end
+	    i := i + 1
+	    while true do
+		i := skip_ws(obj_text, i)
+		if i > n then signal bad_format end
+		if obj_text[i] = '}' then signal not_found end
+		if obj_text[i] ~= '"' then signal bad_format end
+		key_end: int := skip_string(obj_text, i)
+		   resignal bad_format
+		this_key: string := string$substr(obj_text, i + 1,
+						   key_end - i - 2)
+		i := skip_ws(obj_text, key_end)
+		if i > n cor obj_text[i] ~= ':' then signal bad_format end
+		value_start: int := skip_ws(obj_text, i + 1)
+		value_end: int := skip_value(obj_text, value_start)
+		   resignal bad_format
+		if string$equal(this_key, key)
+		   then return(string$substr(obj_text, value_start,
+					      value_end - value_start))
+		   end
+		i := skip_ws(obj_text, value_end)
+		if i <= n cand obj_text[i] = ','
+		   then i := i + 1
+		   else if i <= n cand obj_text[i] = '}'
+			   then signal not_found
+			   else signal bad_format
+			   end
+		   end
+		end
+	    end field
+
+%   uint32(raw) -> the whole number raw's JSON text denotes, as a CLU
+%   int, accepting an integral decimal form such as "0.0" or "12.00"
+%   the way Convex may spell a whole number, and rejecting a fractional
+%   part, a quoted number, a sign, leading '+', exponent notation, and
+%   anything outside a uint32's range (0 .. 4294967295). raw is
+%   trimmed of surrounding whitespace first since json$field's return
+%   value is never re-trimmed by its caller.
+	uint32 = proc (raw: string) returns (int) signals (bad_format)
+	    n: int := string$size(raw)
+	    lo: int := skip_ws(raw, 1)
+	    hi: int := n
+	    while hi >= lo cand
+		  (raw[hi] = ' ' cor raw[hi] = '\t'
+		   cor raw[hi] = '\n' cor raw[hi] = '\r')
+	       do hi := hi - 1 end
+	    if hi < lo then signal bad_format end
+	    trimmed: string := string$substr(raw, lo, hi - lo + 1)
+	    dot: int := string$indexc('.', trimmed)
+	    digits: string := trimmed
+	    if dot ~= 0
+	       then digits := string$substr(trimmed, 1, dot - 1)
+		    frac: string := string$rest(trimmed, dot + 1)
+		    fi: int := 1
+		    while fi <= string$size(frac) do
+			if frac[fi] ~= '0' then signal bad_format end
+			fi := fi + 1
+			end
+	       end
+	    if string$empty(digits) then signal bad_format end
+	    di: int := 1
+	    while di <= string$size(digits) do
+		d: char := digits[di]
+		if d < '0' cor d > '9' then signal bad_format end
+		di := di + 1
+		end
+	    value: int := int$parse(digits)
+		resignal bad_format
+		except when overflow: signal bad_format end
+	    if value < 0 cor value > 4294967295 then signal bad_format end
+	    return(value)
+	    end uint32
+
+%   qs(s) -> s as a JSON string literal: quoted, with '"', '\\' and the
+%   control characters JSON requires escaped (\n \r \t) backslash
+%   escaped. Convex's own JSON never needs the fuller \uXXXX escapes
+%   for this client's field and room names, so they are not produced
+%   here; a value containing an unescaped control character other than
+%   the three above is rejected rather than emitted as invalid JSON.
+	qs = proc (s: string) returns (string) signals (bad_format)
+	    out: string := "\""
+	    i: int := 1
+	    n: int := string$size(s)
+	    while i <= n do
+		c: char := s[i]
+		if c = '"' then out := out || "\\\""
+		elseif c = '\\' then out := out || "\\\\"
+		elseif c = '\n' then out := out || "\\n"
+		elseif c = '\r' then out := out || "\\r"
+		elseif c = '\t' then out := out || "\\t"
+		elseif c < ' ' then signal bad_format
+		else out := out || string$c2s(c)
+		end
+		i := i + 1
+		end
+	    return(out || "\"")
+	    end qs
+
+%   unqs(raw) -> the decoded string a JSON string literal (including its
+%   surrounding quotes, e.g. the direct output of json$field on a string
+%   field) denotes: backslash escapes are interpreted, everything else is
+%   passed through byte for byte. This client only ever unqs's protocol
+%   plumbing this client itself is responsible for moving verbatim (an
+%   auth token on its way into an Authorization header, an op/id/path
+%   read from the adapter's own incoming NDJSON commands), never a value
+%   handed onward to a person, so \uXXXX is decoded to UTF-8 the same way
+%   json$qs would have escaped it, but no attempt is made to be a fully
+%   general display-quality unescaper.
+	unqs = proc (raw: string) returns (string) signals (bad_format)
+	    n: int := string$size(raw)
+	    if n < 2 cor raw[1] ~= '"' cor raw[n] ~= '"' then
+		signal bad_format
+		end
+	    out: string := ""
+	    i: int := 2
+	    while i < n do
+		c: char := raw[i]
+		if c = '\\'
+		   then i := i + 1
+			if i >= n then signal bad_format end
+			e: char := raw[i]
+			if e = '"' then out := out || "\""
+			elseif e = '\\' then out := out || "\\"
+			elseif e = '/' then out := out || "/"
+			elseif e = 'n' then out := out || "\n"
+			elseif e = 'r' then out := out || "\r"
+			elseif e = 't' then out := out || "\t"
+			elseif e = 'b' then out := out || byte_s(8)
+			elseif e = 'f' then out := out || byte_s(12)
+			elseif e = 'u'
+			   then if i + 4 >= n then signal bad_format end
+				hex: string := string$substr(raw, i + 1, 4)
+				cp: int := hex_val(hex)
+				   resignal bad_format
+				out := out || utf8_of(cp)
+				i := i + 4
+			   else signal bad_format
+			   end
+		   else out := out || string$c2s(c)
+		   end
+		i := i + 1
+		end
+	    return(out)
+	    end unqs
+
+%   hex_val(hex) -> the int a 4-digit hex string denotes.
+	hex_val = proc (hex: string) returns (int) signals (bad_format)
+	    v: int := 0
+	    i: int := 1
+	    while i <= 4 do
+		c: char := hex[i]
+		d: int
+		if c >= '0' cand c <= '9' then d := char$c2i(c) - char$c2i('0')
+		elseif c >= 'a' cand c <= 'f'
+		   then d := char$c2i(c) - char$c2i('a') + 10
+		elseif c >= 'A' cand c <= 'F'
+		   then d := char$c2i(c) - char$c2i('A') + 10
+		else signal bad_format
+		end
+		v := v * 16 + d
+		i := i + 1
+		end
+	    return(v)
+	    end hex_val
+
+%   byte_s(b) -> a one-character string holding the raw byte value b
+%   (0 .. 255). char$i2c can signal illegal_char for a codepoint outside
+%   char's representable range, which never actually happens here (every
+%   caller below only ever passes an arithmetically-derived byte 0..255),
+%   so that signal is handled by substituting '?' rather than by
+%   threading a signal this cluster's public interface has no need to
+%   declare.
+	byte_s = proc (b: int) returns (string)
+	    return(string$c2s(char$i2c(b)))
+	       except when illegal_char: return("?") end
+	    end byte_s
+
+%   utf8_of(cp) -> the UTF-8 encoding of a codepoint in the Basic
+%   Multilingual Plane (0 .. 0xFFFF; this client never needs to encode a
+%   surrogate pair, since it never unqs's arbitrary user text).
+	utf8_of = proc (cp: int) returns (string)
+	    if cp <= 127 then return(byte_s(cp)) end
+	    if cp <= 2047
+	       then b0: int := 192 + (cp / 64)
+		    b1: int := 128 + (cp // 64)
+		    return(byte_s(b0) || byte_s(b1))
+	       end
+	    b0: int := 224 + (cp / 4096)
+	    b1: int := 128 + ((cp / 64) // 64)
+	    b2: int := 128 + (cp // 64)
+	    return(byte_s(b0) || byte_s(b1) || byte_s(b2))
+	    end utf8_of
+
+%   array_items(raw) -> the raw JSON text of each top-level element of
+%   the JSON array raw, in order (an empty sequence for "[]"). Needed by
+%   convex-sync.clu to walk a Transition's "modifications" array one
+%   element at a time; signals bad_format if raw is not an array or is
+%   truncated, using the same depth-tracking skip_value that already
+%   proves correct for field's own object walk, just applied to a
+%   '[' ... ']' pair instead of a '{' ... '}' one.
+	array_items = proc (raw: string) returns (sequence[string])
+						 signals (bad_format)
+	    n: int := string$size(raw)
+	    i: int := skip_ws(raw, 1)
+	    if i > n cor raw[i] ~= '[' then signal bad_format end
+	    i := skip_ws(raw, i + 1)
+	    items: sequence[string] := sequence[string]$new()
+	    if i <= n cand raw[i] = ']' then return(items) end
+	    while true do
+		i := skip_ws(raw, i)
+		if i > n then signal bad_format end
+		item_end: int := skip_value(raw, i)
+		    resignal bad_format
+		items := sequence[string]$addh(items,
+						string$substr(raw, i,
+							      item_end - i))
+		i := skip_ws(raw, item_end)
+		if i > n then signal bad_format end
+		if raw[i] = ','
+		   then i := i + 1
+		   elseif raw[i] = ']'
+		   then return(items)
+		   else signal bad_format
+		   end
+		end
+	    end array_items
+
+%   object1/object2/object3(k1, v1, ...) -> a JSON object's text from
+%   already-JSON-encoded values (each vN is expected to already be a
+%   valid JSON value's text, e.g. the output of json$qs or int$unparse
+%   for a whole number), used to build small, fixed-shape request
+%   bodies without a general encoder for CLU's own record/table types.
+	object1 = proc (k1, v1: string) returns (string)
+	    return("{" || qs(k1) || ":" || v1 || "}")
+	    end object1
+
+	object2 = proc (k1, v1, k2, v2: string) returns (string)
+					       signals (bad_format)
+	    return("{" || qs(k1) || ":" || v1 || "," || qs(k2) || ":" || v2
+		   || "}")
+	       resignal bad_format
+	    end object2
+
+	object3 = proc (k1, v1, k2, v2, k3, v3: string) returns (string)
+						       signals (bad_format)
+	    return("{" || qs(k1) || ":" || v1 || "," || qs(k2) || ":" || v2
+		   || "," || qs(k3) || ":" || v3 || "}")
+	       resignal bad_format
+	    end object3
+
+end json

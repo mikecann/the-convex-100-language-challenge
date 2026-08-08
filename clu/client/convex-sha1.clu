@@ -1,0 +1,200 @@
+%   convex-sha1.clu -- SHA-1 (FIPS 180-4), built entirely on top of
+%   convex-bitops.clu's arithmetic xor32/and32/or32/not32/rotl32, because
+%   CLU's own int cluster has no bitwise operators to reach for directly.
+%   This client's only use of SHA-1 is the RFC 6455 WebSocket handshake:
+%   Sec-WebSocket-Accept is base64(SHA1(client_key || GUID)), a string
+%   at most a couple hundred bytes long, so this favours a plainly
+%   correct textbook implementation over a fast one -- it runs once per
+%   Live connection (and once more per reconnect), never in a hot loop.
+%
+%   CLU strings already hold arbitrary byte values 0..255 (char$c2i and
+%   char$i2c both range over UCHAR_MAX, and convex-transport.clu already
+%   moves raw socket bytes through strings this same way), so the whole
+%   algorithm -- padding, block splitting, the message schedule, the
+%   compression rounds -- works directly on "string as byte vector"
+%   without a separate byte-array type.
+
+sha1 = cluster is digest, hex
+
+rep = null
+
+%   pclu resolves identifiers case-insensitively (a real quirk this
+%   client's own build never had to notice until this file: HTTP-DA and
+%   JSON's names never differed only by case). SHA1_H0..SHA1_H4 and
+%   SHA1_K0..SHA1_K3 below would otherwise collide with the lowercase
+%   h0..h4 locals process_block and digest both need for the working
+%   hash state -- and did, the first time this file compiled: pclu
+%   reported "redeclaration of 'h0'" pointing at the *local variable*,
+%   not the constant, which is what makes this quirk easy to mistake for
+%   an unrelated bug the first time it is hit.
+SHA1_H0 = 1732584193	% 0x67452301
+SHA1_H1 = 4023233417	% 0xEFCDAB89
+SHA1_H2 = 2562383102	% 0x98BADCFE
+SHA1_H3 = 271733878	% 0x10325476
+SHA1_H4 = 3285377520	% 0xC3D2E1F0
+
+SHA1_K0 = 1518500249	% 0x5A827999, rounds 0-19
+SHA1_K1 = 1859775393	% 0x6ED9EBA1, rounds 20-39
+SHA1_K2 = 2400959708	% 0x8F1BBCDC, rounds 40-59
+SHA1_K3 = 3395469782	% 0xCA62C1D6, rounds 60-79
+
+TWO_32 = 4294967296
+
+wt = array[int]
+
+	mod32 = proc (x: int) returns (int)
+	    return(x // TWO_32)
+	    end mod32
+
+	add32 = proc (a, b: int) returns (int)
+	    return(mod32(a + b))
+	    end add32
+
+%   byte_at(s, i) -> the unsigned byte value of s's i'th character
+%   (1-based), i.e. char$c2i(s[i]) spelled out once so every caller below
+%   reads the same way.
+	byte_at = proc (s: string, i: int) returns (int)
+	    return(char$c2i(s[i]))
+	    end byte_at
+
+%   word_be(s, pos) -> the big-endian 32-bit unsigned value of the four
+%   bytes s[pos .. pos+3] (1-based, as SHA-1's own spec numbers bytes
+%   within a block).
+	word_be = proc (s: string, pos: int) returns (int)
+	    return(byte_at(s, pos) * 16777216 + byte_at(s, pos + 1) * 65536
+		   + byte_at(s, pos + 2) * 256 + byte_at(s, pos + 3))
+	    end word_be
+
+%   bytes_be(w) -> the four-character big-endian encoding of the unsigned
+%   32-bit value w.
+	bytes_be = proc (w: int) returns (string)
+	    b0: int := (w / 16777216) // 256
+	    b1: int := (w / 65536) // 256
+	    b2: int := (w / 256) // 256
+	    b3: int := w // 256
+	    return(string$c2s(char$i2c(b0)) || string$c2s(char$i2c(b1))
+		   || string$c2s(char$i2c(b2)) || string$c2s(char$i2c(b3)))
+	    end bytes_be
+
+%   pad(msg) -> msg with the standard SHA-1 padding appended: a single
+%   0x80 byte, then as many 0x00 bytes as needed to bring the total
+%   length to 56 (mod 64), then the original message's bit length as an
+%   8-byte big-endian integer. The result's length is always a multiple
+%   of 64.
+	pad = proc (msg: string) returns (string)
+	    bit_len: int := string$size(msg) * 8
+	    out: string := msg || string$c2s(char$i2c(128))
+	    while string$size(out) // 64 ~= 56 do
+		out := out || string$c2s(char$i2c(0))
+		end
+	    i: int := 7
+	    while i >= 0 do
+		b: int := (bit_len / (256 ** i)) // 256
+		out := out || string$c2s(char$i2c(b))
+		i := i - 1
+		end
+	    return(out)
+	    end pad
+
+%   f_k(round, b, c, d) -> the two values SHA-1's compression function
+%   needs at "round" (0..79): the round function f applied to b, c, d,
+%   and the round constant K, both selected by which 20-round band round
+%   falls in.
+	f_of = proc (round, b, c, d: int) returns (int)
+	    if round < 20
+	       then return(bitops$or32(bitops$and32(b, c),
+					bitops$and32(bitops$not32(b), d)))
+	       end
+	    if round < 40 then return(bitops$xor32(bitops$xor32(b, c), d)) end
+	    if round < 60
+	       then t1: int := bitops$or32(bitops$and32(b, c),
+					   bitops$and32(b, d))
+		    return(bitops$or32(t1, bitops$and32(c, d)))
+	       end
+	    return(bitops$xor32(bitops$xor32(b, c), d))
+	    end f_of
+
+	k_of = proc (round: int) returns (int)
+	    if round < 20 then return(SHA1_K0) end
+	    if round < 40 then return(SHA1_K1) end
+	    if round < 60 then return(SHA1_K2) end
+	    return(SHA1_K3)
+	    end k_of
+
+%   process_block(blk, h0, h1, h2, h3, h4) -> the five working-state words
+%   after folding one 64-byte block blk into the running hash state.
+	process_block = proc (blk: string, h0, h1, h2, h3, h4: int)
+					   returns (int, int, int, int, int)
+	    w: wt := wt$fill(0, 80, 0)
+	    i: int := 0
+	    while i < 16 do
+		wt$store(w, i, word_be(blk, i * 4 + 1))
+		i := i + 1
+		end
+	    while i < 80 do
+		v: int := bitops$xor32(
+			      bitops$xor32(wt$fetch(w, i - 3), wt$fetch(w, i - 8)),
+			      bitops$xor32(wt$fetch(w, i - 14), wt$fetch(w, i - 16)))
+		wt$store(w, i, bitops$rotl32(v, 1))
+		i := i + 1
+		end
+
+	    a: int := h0
+	    b: int := h1
+	    c: int := h2
+	    d: int := h3
+	    e: int := h4
+	    i := 0
+	    while i < 80 do
+		temp: int := add32(add32(bitops$rotl32(a, 5), f_of(i, b, c, d)),
+				   add32(add32(e, k_of(i)), wt$fetch(w, i)))
+		e := d
+		d := c
+		c := bitops$rotl32(b, 30)
+		b := a
+		a := temp
+		i := i + 1
+		end
+
+	    return(add32(h0, a), add32(h1, b), add32(h2, c), add32(h3, d),
+		   add32(h4, e))
+	    end process_block
+
+%   digest(msg) -> the 20-byte raw (binary, not hex) SHA-1 digest of msg.
+	digest = proc (msg: string) returns (string)
+	    padded: string := pad(msg)
+	    h0: int := SHA1_H0
+	    h1: int := SHA1_H1
+	    h2: int := SHA1_H2
+	    h3: int := SHA1_H3
+	    h4: int := SHA1_H4
+	    n: int := string$size(padded)
+	    pos: int := 1
+	    while pos <= n do
+		blk: string := string$substr(padded, pos, 64)
+		h0, h1, h2, h3, h4 := process_block(blk, h0, h1, h2, h3, h4)
+		pos := pos + 64
+		end
+	    return(bytes_be(h0) || bytes_be(h1) || bytes_be(h2) || bytes_be(h3)
+		   || bytes_be(h4))
+	    end digest
+
+%   hex(raw) -> the lowercase hex encoding of a raw byte string (used
+%   only by this module's own tests, to compare against the standard
+%   FIPS 180-4 / RFC 3174 test vectors, which are conventionally quoted
+%   in hex rather than base64).
+	hex = proc (raw: string) returns (string)
+	    digits: string := "0123456789abcdef"
+	    out: string := ""
+	    i: int := 1
+	    n: int := string$size(raw)
+	    while i <= n do
+		v: int := byte_at(raw, i)
+		out := out || string$c2s(digits[(v / 16) + 1])
+			   || string$c2s(digits[(v // 16) + 1])
+		i := i + 1
+		end
+	    return(out)
+	    end hex
+
+end sha1

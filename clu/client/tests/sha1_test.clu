@@ -1,0 +1,62 @@
+%   sha1_test.clu -- unit coverage for convex-sha1.clu against the
+%   standard FIPS 180-4 / RFC 3174 test vectors (empty string, "abc", and
+%   the two-block 56-byte alphabet string), plus the exact handshake
+%   computation RFC 6455 section 1.3 walks through by hand: this is the
+%   same sha1$digest + base64$encode pairing convex-websocket.clu's own
+%   handshake code calls, so a regression in either module that still
+%   left digest() "plausible" would still be caught here.
+
+check = cluster is ok, fail_count
+
+rep = null
+
+own failures: int := 0
+
+	ok = proc (name: string, got: bool)
+	    po: stream := stream$primary_output()
+	    if got
+	       then stream$putl(po, "PASS " || name)
+	       else stream$putl(po, "FAIL " || name)
+		    failures := failures + 1
+	       end
+	    end ok
+
+	fail_count = proc () returns (int)
+	    return(failures)
+	    end fail_count
+
+end check
+
+start_up = proc ()
+    po: stream := stream$primary_output()
+
+    check$ok("SHA-1('') matches FIPS 180-4",
+	     string$equal(sha1$hex(sha1$digest("")),
+			  "da39a3ee5e6b4b0d3255bfef95601890afd80709"))
+
+    check$ok("SHA-1('abc') matches FIPS 180-4",
+	     string$equal(sha1$hex(sha1$digest("abc")),
+			  "a9993e364706816aba3e25717850c26c9cd0d89d"))
+
+    two_block: string := "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+    check$ok("SHA-1 two-block input matches FIPS 180-4",
+	     string$equal(sha1$hex(sha1$digest(two_block)),
+			  "84983e441c3bd26ebaae4aa1f95129e5e54670f1"))
+
+    % RFC 6455 section 1.3's own worked example: a client key of
+    % "dGhlIHNhbXBsZSBub25jZQ==" concatenated with the WebSocket GUID,
+    % SHA-1'd, then base64'd, must equal "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" --
+    % exactly the computation convex-websocket.clu's handshake code does
+    % to check a real server's Sec-WebSocket-Accept header.
+    guid: string := "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    key: string := "dGhlIHNhbXBsZSBub25jZQ=="
+    accept: string := base64$encode(sha1$digest(key || guid))
+    check$ok("RFC 6455 worked handshake example",
+	     string$equal(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="))
+
+    if check$fail_count() > 0
+       then stream$putl(po, int$unparse(check$fail_count()) || " FAILED")
+	    _exit(1)
+       else stream$putl(po, "ALL PASS")
+       end
+    end start_up

@@ -1,0 +1,123 @@
+%   websocket_test.clu -- real loopback coverage for wsconn
+%   (client/convex-websocket.clu) against client/tests/fixtures/
+%   websocket_fixture.clu, a genuine RFC 6455 peer, not a mock. One
+%   scripted exchange exercises the handshake (a wrong
+%   Sec-WebSocket-Accept would make connect() itself signal failed),
+%   real masking (the fixture unmasks this client's frame for real
+%   before echoing it, so a masking bug would corrupt the echoed text),
+%   fragmentation reassembly across two continuation frames, a Ping
+%   control frame interleaved between those fragments, and the RFC
+%   6455 section 5.5.1 close handshake.
+
+check = cluster is ok, fail_count
+
+rep = null
+
+own failures: int := 0
+
+	ok = proc (name: string, got: bool)
+	    po: stream := stream$primary_output()
+	    if got
+	       then stream$putl(po, "PASS " || name)
+	       else stream$putl(po, "FAIL " || name)
+		    failures := failures + 1
+	       end
+	    end ok
+
+	fail_count = proc () returns (int)
+	    return(failures)
+	    end fail_count
+
+end check
+
+%   b(v) -> a one-character string holding raw byte value v. The UTF-8
+%   validation cases below build exact byte sequences by hand -- rather
+%   than embedding literal multi-byte characters in this source file --
+%   so each test can hit an exact boundary (an overlong encoding, a
+%   UTF-16 surrogate half, a truncated sequence) on purpose.
+b = proc (v: int) returns (string)
+    return(string$c2s(char$i2c(v)))
+    end b
+
+start_up = proc ()
+    po: stream := stream$primary_output()
+    args: sequence[string] := get_argv()
+    port: int := int$parse(sequence[string]$fetch(args, 1))
+
+    % -- UTF-8 validation: pure, no network needed. Covers one valid
+    % sequence of each length RFC 3629 defines, then the shapes that
+    % look plausible but are not real UTF-8: a lone continuation byte,
+    % an overlong encoding of NUL, a truncated multi-byte sequence, a
+    % UTF-16 surrogate half smuggled in as a bare 3-byte sequence, and a
+    % continuation byte outside 0x80..0xBF.
+    check$ok("utf8_valid accepts plain ASCII",
+	     wsconn$utf8_valid("hello"))
+    check$ok("utf8_valid accepts a 2-byte sequence (U+00E9, e-acute)",
+	     wsconn$utf8_valid(b(195) || b(169)))
+    check$ok("utf8_valid accepts a 3-byte sequence (U+20AC, euro sign)",
+	     wsconn$utf8_valid(b(226) || b(130) || b(172)))
+    check$ok("utf8_valid accepts a 4-byte sequence (U+1F600, an emoji)",
+	     wsconn$utf8_valid(b(240) || b(159) || b(152) || b(128)))
+    check$ok("utf8_valid rejects a lone continuation byte",
+	     ~wsconn$utf8_valid(b(128)))
+    check$ok("utf8_valid rejects an overlong 2-byte encoding of NUL",
+	     ~wsconn$utf8_valid(b(192) || b(128)))
+    check$ok("utf8_valid rejects a truncated 3-byte sequence",
+	     ~wsconn$utf8_valid(b(226) || b(130)))
+    check$ok("utf8_valid rejects a UTF-16 surrogate half (U+D800)",
+	     ~wsconn$utf8_valid(b(237) || b(160) || b(128)))
+    check$ok("utf8_valid rejects an out-of-range continuation byte",
+	     ~wsconn$utf8_valid(b(226) || b(255) || b(172)))
+
+    begin
+	w: wsconn := wsconn$connect("ws", "127.0.0.1", port, "/sync")
+	check$ok("handshake completes and Sec-WebSocket-Accept verifies",
+		 true)
+
+	wsconn$send_text(w, "hello websocket")
+
+	kind: string, payload: string := wsconn$recv_message(w, 5000)
+	check$ok("reassembled fragmented reply has kind \"text\"",
+		 string$equal(kind, "text"))
+	check$ok("reassembled fragmented reply survived an interleaved " ||
+		 "Ping and round-tripped the masked request text",
+		 string$equal(payload, "echo:hello websocket"))
+
+	closed: bool := false
+	close_code: int := 0
+	close_reason: string := ""
+	wsconn$recv_message(w, 5000)
+	    except when peer_close (code: int, reason: string):
+			closed := true
+			close_code := code
+			close_reason := reason
+		   end
+	check$ok("server Close frame is reported as peer_close",
+		 closed)
+	check$ok("peer_close carries the server's status code",
+		 close_code = 1000)
+	check$ok("peer_close carries the server's reason text",
+		 string$equal(close_reason, "bye"))
+
+	wsconn$close(w)
+	end
+       except when not_possible (msg: string):
+		   check$ok("websocket exchange (not_possible: " || msg || ")",
+			    false)
+	      when failed (msg: string):
+		   check$ok("websocket exchange (failed: " || msg || ")", false)
+	      when timeout:
+		   check$ok("websocket exchange (timeout)", false)
+	      when end_of_file:
+		   check$ok("websocket exchange (unexpected eof)", false)
+	      when protocol_error (msg: string):
+		   check$ok("websocket exchange (protocol_error: " || msg ||
+			    ")", false)
+	      end
+
+    if check$fail_count() > 0
+       then stream$putl(po, int$unparse(check$fail_count()) || " FAILED")
+	    _exit(1)
+       else stream$putl(po, "ALL PASS")
+       end
+    end start_up

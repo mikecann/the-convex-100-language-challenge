@@ -1,0 +1,60 @@
+%   bitops_test.clu -- unit coverage for convex-bitops.clu, the arithmetic
+%   bitwise helpers WebSocket masking and the WebSocket handshake's SHA-1
+%   will need. Checked against known bit patterns picked so a
+%   sign/off-by-one error in the div/mod arithmetic (rather than a real
+%   bitwise operator, which CLU's own int cluster does not have) would
+%   show up: the top bit alone, an alternating pattern, and self-XOR.
+
+check = cluster is ok, fail_count
+
+rep = null
+
+own failures: int := 0
+
+	ok = proc (name: string, got: bool)
+	    po: stream := stream$primary_output()
+	    if got
+	       then stream$putl(po, "PASS " || name)
+	       else stream$putl(po, "FAIL " || name)
+		    failures := failures + 1
+	       end
+	    end ok
+
+	fail_count = proc () returns (int)
+	    return(failures)
+	    end fail_count
+
+end check
+
+start_up = proc ()
+    po: stream := stream$primary_output()
+
+    check$ok("xor_byte(0x5A, 0x0F) = 0x55", bitops$xor_byte(90, 15) = 85)
+
+    check$ok("rotl32(1, 1) = 2", bitops$rotl32(1, 1) = 2)
+
+    top_bit: int := 2 ** 31
+    check$ok("rotl32(top bit, 1) wraps to 1", bitops$rotl32(top_bit, 1) = 1)
+    check$ok("rotl32(1, 31) sets the top bit", bitops$rotl32(1, 31) = top_bit)
+    check$ok("rotl32(v, 0) is the identity", bitops$rotl32(12345, 0) = 12345)
+
+    % 0xFF00FF00 and 0x0F0F0F0F = 0x0F000F00
+    check$ok("and32 on an alternating pattern",
+	     bitops$and32(4278255360, 252645135) = 251662080)
+
+    check$ok("not32(0) = 0xFFFFFFFF", bitops$not32(0) = 4294967295)
+    check$ok("not32(0xFFFFFFFF) = 0", bitops$not32(4294967295) = 0)
+
+    check$ok("xor32 of a value with itself is 0",
+	     bitops$xor32(4294967295, 4294967295) = 0)
+    check$ok("xor32 with 0 is the identity", bitops$xor32(305419896, 0) = 305419896)
+
+    check$ok("or32 of a value with itself is itself",
+	     bitops$or32(2863311530, 2863311530) = 2863311530)
+
+    if check$fail_count() > 0
+       then stream$putl(po, int$unparse(check$fail_count()) || " FAILED")
+	    _exit(1)
+       else stream$putl(po, "ALL PASS")
+       end
+    end start_up

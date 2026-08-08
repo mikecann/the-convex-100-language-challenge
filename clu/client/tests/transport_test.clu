@@ -1,0 +1,71 @@
+%   transport_test.clu -- real loopback coverage for conn$dial/send/recv/
+%   close (client/convex-transport.clu). client/tests/fixtures/
+%   echo_fixture.clu is a genuine TCP peer (not a mock): it accepts one
+%   connection, echoes back whatever it receives, and closes. The
+%   Dockerfile starts one echo_fixture per port this test is given
+%   (pclu has no async-subprocess-spawn primitive a CLU program could use
+%   to start its own fixture the way some of this repository's other
+%   language tests do, so the fixtures are started by the shell that
+%   invokes this binary instead) before running this test.
+
+check = cluster is ok, fail_count
+
+rep = null
+
+own failures: int := 0
+
+	ok = proc (name: string, got: bool)
+	    po: stream := stream$primary_output()
+	    if got
+	       then stream$putl(po, "PASS " || name)
+	       else stream$putl(po, "FAIL " || name)
+		    failures := failures + 1
+	       end
+	    end ok
+
+	fail_count = proc () returns (int)
+	    return(failures)
+	    end fail_count
+
+end check
+
+start_up = proc ()
+    po: stream := stream$primary_output()
+    args: sequence[string] := get_argv()
+    echo_port: int := int$parse(sequence[string]$fetch(args, 1))
+    refused_port: int := int$parse(sequence[string]$fetch(args, 2))
+
+    % A real round trip: connect, send, receive the same bytes back,
+    % close cleanly.
+    begin
+	c: conn := conn$dial("http", "127.0.0.1", echo_port)
+	conn$send(c, "hello transport")
+	reply: string := conn$recv(c, 64, 5000)
+	conn$close(c)
+	check$ok("echo round trip returns the same bytes",
+		 string$equal(reply, "hello transport"))
+	end
+       except when not_possible (msg: string):
+		   check$ok("echo round trip returns the same bytes (" ||
+			    msg || ")", false)
+	      when timeout:
+		   check$ok("echo round trip returns the same bytes (timeout)",
+			    false)
+	      when end_of_file:
+		   check$ok("echo round trip returns the same bytes (eof)",
+			    false)
+	      end
+
+    % Connecting to a closed port must surface as not_possible, not hang
+    % or crash -- this is the same failure shape a dead backend produces.
+    refused: bool := false
+    conn$dial("http", "127.0.0.1", refused_port)
+	except when not_possible (msg: string): refused := true end
+    check$ok("dialing a closed port signals not_possible", refused)
+
+    if check$fail_count() > 0
+       then stream$putl(po, int$unparse(check$fail_count()) || " FAILED")
+	    _exit(1)
+       else stream$putl(po, "ALL PASS")
+       end
+    end start_up

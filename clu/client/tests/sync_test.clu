@@ -1,0 +1,148 @@
+%   sync_test.clu -- real loopback coverage for the /api/sync state
+%   machine (client/convex-sync.clu) against client/tests/fixtures/
+%   sync_fixture.clu, a scripted but genuine convex-rs-0.10.4-
+%   unversioned-sync peer. Proves, against real WebSocket traffic: Add
+%   assigns a queryId and works before any connection exists yet; the
+%   initial QueryUpdated; a later external update; QueryFailed surfaced
+%   as a structured FunctionError; recovery afterwards; and five real
+%   debugDisconnect-driven reconnects, each of which resends the active
+%   subscription, suppresses an unchanged rehydration, and still
+%   delivers the next real change -- AGENTS.md's own "initial value,
+%   disconnect acknowledgement, external mutation, then the new value"
+%   sequence, five times over.
+
+check = cluster is ok, fail_count
+
+rep = null
+
+own failures: int := 0
+
+	ok = proc (name: string, got: bool)
+	    po: stream := stream$primary_output()
+	    if got
+	       then stream$putl(po, "PASS " || name)
+	       else stream$putl(po, "FAIL " || name)
+		    failures := failures + 1
+	       end
+	    end ok
+
+	fail_count = proc () returns (int)
+	    return(failures)
+	    end fail_count
+
+end check
+
+%   drain_until_event(s, deadline) -> the first delivered poll() event
+%   at or before the absolute deadline (an _real_time() millisecond
+%   value), polling in short slices in between: a false has_event from
+%   any one poll() call is routine (dialling, handshaking, and waiting
+%   for the fixture's next Transition all take more than one call), not
+%   a failure, so this loop is what a real adapter's own drive loop
+%   would do too.
+drain_until_event = proc (s: sync, deadline: int)
+				  returns (bool, string, int, string, string,
+					   string, string, bool, bool, string)
+    while _real_time() < deadline do
+	found: bool, kind: string, qid: int, value: string, ename: string,
+	    emsg: string, edata: string, hed: bool, hlogs: bool,
+	    logs: string := sync$poll(s, 2000)
+	    except when not_possible (msg: string):
+			return(false, "<not_possible: " || msg || ">", 0, "",
+			       "", "", "", false, false, "")
+		   end
+	if found then
+	    return(found, kind, qid, value, ename, emsg, edata, hed, hlogs, logs)
+	    end
+	end
+    return(false, "<deadline exceeded>", 0, "", "", "", "", false, false, "")
+    end drain_until_event
+
+start_up = proc ()
+    po: stream := stream$primary_output()
+    args: sequence[string] := get_argv()
+    port: int := int$parse(sequence[string]$fetch(args, 1))
+    base_url: string := "http://127.0.0.1:" || int$unparse(port)
+
+    s: sync := sync$create(base_url, "clu-test-0.1.0")
+	except when not_possible (msg: string):
+		    check$ok("sync$create (" || msg || ")", false)
+		    stream$putl(po, "1 FAILED")
+		    _exit(1)
+	       end
+
+    query_id: int := sync$add(s, "test:get", "{}")
+    check$ok("add() assigns queryId 0 before any connection exists",
+	     query_id = 0)
+
+    ROUND_DEADLINE_MS: int := 20000
+
+    has1: bool, kind1: string, qid1: int, value1: string, ename1: string,
+	emsg1: string, edata1: string, hed1: bool, hlogs1: bool,
+	logs1: string := drain_until_event(s, _real_time() + ROUND_DEADLINE_MS)
+    check$ok("initial QueryUpdated is delivered", has1)
+    check$ok("initial QueryUpdated has kind \"update\"",
+	     string$equal(kind1, "update"))
+    check$ok("initial QueryUpdated targets queryId 0", qid1 = 0)
+    check$ok("initial QueryUpdated value is 1", string$equal(value1, "1"))
+
+    has2: bool, kind2: string, qid2: int, value2: string, ename2: string,
+	emsg2: string, edata2: string, hed2: bool, hlogs2: bool,
+	logs2: string := drain_until_event(s, _real_time() + ROUND_DEADLINE_MS)
+    check$ok("external update is delivered", has2)
+    check$ok("external update value is 2", string$equal(value2, "2"))
+
+    has3: bool, kind3: string, qid3: int, value3: string, ename3: string,
+	emsg3: string, edata3: string, hed3: bool, hlogs3: bool,
+	logs3: string := drain_until_event(s, _real_time() + ROUND_DEADLINE_MS)
+    check$ok("QueryFailed is delivered", has3)
+    check$ok("QueryFailed has kind \"error\"", string$equal(kind3, "error"))
+    check$ok("QueryFailed reports FunctionError", string$equal(ename3,
+							       "FunctionError"))
+    check$ok("QueryFailed carries the server's error message",
+	     string$equal(emsg3, "boom"))
+    check$ok("QueryFailed carries structured error data", hed3)
+
+    has4: bool, kind4: string, qid4: int, value4: string, ename4: string,
+	emsg4: string, edata4: string, hed4: bool, hlogs4: bool,
+	logs4: string := drain_until_event(s, _real_time() + ROUND_DEADLINE_MS)
+    check$ok("recovery QueryUpdated is delivered after QueryFailed", has4)
+    check$ok("recovery value is 3", string$equal(value4, "3"))
+
+    % -- five real reconnects, each proving rehydration suppression then
+    % a real subsequent delivery.
+    expected: int := 3
+    round: int := 1
+    while round <= 5 do
+	sync$debug_disconnect(s)
+	    except when not_possible (msg: string):
+			check$ok("debugDisconnect round " ||
+				 int$unparse(round) || " (" || msg || ")",
+				 false)
+		   end
+
+	expected := expected + 1
+	found: bool, kind: string, qid: int, value: string, ename: string,
+	    emsg: string, edata: string, hed: bool, hlogs: bool,
+	    logs: string := drain_until_event(s,
+					       _real_time() + ROUND_DEADLINE_MS)
+	check$ok("reconnect round " || int$unparse(round) ||
+		 ": the unchanged rehydration was suppressed and the next " ||
+		 "delivered event is the real change",
+		 found cand string$equal(kind, "update") cand
+		 string$equal(value, int$unparse(expected)))
+	round := round + 1
+	end
+
+    sync$remove(s, query_id)
+	except when not_possible (msg: string):
+		    check$ok("remove() (" || msg || ")", false)
+	       end
+
+    sync$close(s) except when not_possible (ignored: string): end
+
+    if check$fail_count() > 0
+       then stream$putl(po, int$unparse(check$fail_count()) || " FAILED")
+	    _exit(1)
+       else stream$putl(po, "ALL PASS")
+       end
+    end start_up

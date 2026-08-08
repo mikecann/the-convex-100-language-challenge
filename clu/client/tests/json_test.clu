@@ -1,0 +1,162 @@
+%   json_test.clu -- language-local unit coverage for convex-json.clu.
+%   Run directly (not through the conformance adapter): exits 0 and
+%   prints nothing but "PASS" lines on success, exits 1 and prints a
+%   "FAIL ..." line identifying the first failing case otherwise.
+
+check = cluster is ok, fail_count
+
+	rep = null
+
+	own failures: int := 0
+
+	ok = proc (name: string, got: bool)
+	    po: stream := stream$primary_output()
+	    if got
+	       then stream$putl(po, "PASS " || name)
+	       else stream$putl(po, "FAIL " || name)
+		    failures := failures + 1
+	       end
+	    end ok
+
+	fail_count = proc () returns (int)
+	    return(failures)
+	    end fail_count
+
+end check
+
+start_up = proc ()
+    po: stream := stream$primary_output()
+
+    %   field() finds a top-level key and hands back its raw JSON text,
+    %   unaffected by another field earlier in the object whose own
+    %   value contains a nested object with a same-named key.
+    doc: string := "{\"nested\":{\"count\":99},\"count\":1,\"name\":\"room a\"}"
+    v: string := json$field(doc, "count")
+	except when not_found, bad_format: v := "<error>" end
+    check$ok("field finds a top-level key past a nested same-named one",
+	     string$equal(v, "1"))
+
+    name_v: string := json$field(doc, "name")
+	except when not_found, bad_format: name_v := "<error>" end
+    check$ok("field finds a string value verbatim (still quoted)",
+	     string$equal(name_v, "\"room a\""))
+
+    missing_signalled: bool := false
+    json$field(doc, "nope")
+	except when not_found: missing_signalled := true
+	       when bad_format: missing_signalled := false
+	       end
+    check$ok("field signals not_found for an absent key", missing_signalled)
+
+    bad_signalled: bool := false
+    json$field("not an object", "count")
+	except when bad_format: bad_signalled := true
+	       when not_found: bad_signalled := false
+	       end
+    check$ok("field signals bad_format for a non-object", bad_signalled)
+
+    %   uint32(): the AGENTS.md regression -- Convex may spell a whole
+    %   number as an integral decimal such as "0.0" or "1.0"; that must
+    %   be accepted, while a genuine fraction, a quoted number, a
+    %   negative sign, and an out-of-range value must all be rejected.
+    n0: int := json$uint32("0")
+	except when bad_format: n0 := -1 end
+    check$ok("uint32 accepts a plain whole number", n0 = 0)
+
+    n1: int := json$uint32("0.0")
+	except when bad_format: n1 := -1 end
+    check$ok("uint32 accepts an integral decimal (0.0)", n1 = 0)
+
+    n2: int := json$uint32("1.00")
+	except when bad_format: n2 := -1 end
+    check$ok("uint32 accepts an integral decimal with extra zeros (1.00)",
+	     n2 = 1)
+
+    n3: int := json$uint32(" 42 ")
+	except when bad_format: n3 := -1 end
+    check$ok("uint32 accepts surrounding whitespace", n3 = 42)
+
+    rejected_fraction: bool := false
+    json$uint32("1.5")
+	except when bad_format: rejected_fraction := true end
+    check$ok("uint32 rejects a genuine fraction (1.5)", rejected_fraction)
+
+    rejected_quoted: bool := false
+    json$uint32("\"1\"")
+	except when bad_format: rejected_quoted := true end
+    check$ok("uint32 rejects a quoted number", rejected_quoted)
+
+    rejected_negative: bool := false
+    json$uint32("-1")
+	except when bad_format: rejected_negative := true end
+    check$ok("uint32 rejects a negative number", rejected_negative)
+
+    rejected_overflow: bool := false
+    json$uint32("4294967296")
+	except when bad_format: rejected_overflow := true end
+    check$ok("uint32 rejects a value above the uint32 range",
+	     rejected_overflow)
+
+    %   qs() / object1() / object2() / object3(): the request-body
+    %   encoder side.
+    check$ok("qs quotes and escapes",
+	     string$equal(json$qs("a \"quote\"\nline"),
+			  "\"a \\\"quote\\\"\\nline\""))
+
+    check$ok("object1 builds a one-field object",
+	     string$equal(json$object1("room", json$qs("a")),
+			  "{\"room\":\"a\"}"))
+
+    check$ok("object3 builds a three-field object",
+	     string$equal(json$object3("room", json$qs("a"),
+					"language", json$qs("CLU"),
+					"runId", json$qs("x")),
+			  "{\"room\":\"a\",\"language\":\"CLU\",\"runId\":\"x\"}"))
+
+    %   Round trip: encoding a value with object1 and then reading it
+    %   back out with field must agree.
+    encoded: string := json$object2("count", "7", "room", json$qs("b"))
+    round: string := json$field(encoded, "count")
+	except when not_found, bad_format: round := "<error>" end
+    check$ok("object2 + field round trip", string$equal(round, "7"))
+
+    %   array_items(): needed to walk a Transition's "modifications"
+    %   array one element at a time. Covers an empty array, a flat array
+    %   of objects (each element's raw text handed back untouched, so a
+    %   caller can json$field into it), and an array element that itself
+    %   contains a nested array/object -- proving depth tracking, not
+    %   just comma-splitting, decides where each element ends.
+    empty_items: sequence[string] := json$array_items("[]")
+	except when bad_format: empty_items := sequence[string]$new() end
+    check$ok("array_items('[]') is empty",
+	     sequence[string]$size(empty_items) = 0)
+
+    obj_items: sequence[string] := json$array_items(
+	"[{\"a\":1},{\"a\":2}]")
+	except when bad_format: obj_items := sequence[string]$new() end
+    check$ok("array_items splits a two-element array",
+	     sequence[string]$size(obj_items) = 2)
+    check$ok("array_items' first element is its own raw object text",
+	     string$equal(sequence[string]$fetch(obj_items, 1), "{\"a\":1}"))
+    check$ok("array_items' second element is its own raw object text",
+	     string$equal(sequence[string]$fetch(obj_items, 2), "{\"a\":2}"))
+
+    nested_items: sequence[string] := json$array_items(
+	"[{\"nested\":[1,2,3]},7]")
+	except when bad_format: nested_items := sequence[string]$new() end
+    check$ok("array_items does not split inside a nested array",
+	     sequence[string]$size(nested_items) = 2)
+    check$ok("array_items' second element after a nested array is correct",
+	     string$equal(sequence[string]$fetch(nested_items, 2), "7"))
+
+    array_bad_format: bool := false
+    json$array_items("{\"not\":\"an array\"}")
+	except when bad_format: array_bad_format := true end
+    check$ok("array_items rejects a non-array", array_bad_format)
+
+    if check$fail_count() > 0
+       then stream$putl(po, int$unparse(check$fail_count()) || " FAILED")
+	    _exit(1)
+       else stream$putl(po, "ALL PASS")
+       end
+    end start_up
