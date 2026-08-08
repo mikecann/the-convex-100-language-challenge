@@ -11,13 +11,13 @@ ARG BUILD_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa04
 # boundary primitives (native.c), the request/acknowledge circuit
 # (convex_native.vhdl, convex_transport.vhdl), the byte-buffer helpers
 # (convex_buffer.vhdl), a JSON codec (convex_json.vhdl), an HTTP/1.1 client
-# (convex_http.vhdl) and an RFC 6455 WebSocket layer (convex_ws.vhdl)
-# exist so far, proven here by buffer_test, transport_smoke, json_test,
-# http_test and ws_test. convex_sync, the conformance adapter and
-# examples/basics do not exist yet, so this stage does not yet compile a
-# canonical example or a conformance executable and no `runtime` or
-# `example-runtime` stage exists below. No capability is claimed; see
-# vhdl/README.md.
+# (convex_http.vhdl), an RFC 6455 WebSocket layer (convex_ws.vhdl) and the
+# pinned /api/sync Live protocol (convex_sync.vhdl) exist so far, proven
+# here by buffer_test, transport_smoke, json_test, http_test, ws_test and
+# sync_test. The conformance adapter and examples/basics do not exist
+# yet, so this stage does not yet compile a canonical example or a
+# conformance executable and no `runtime` or `example-runtime` stage
+# exists below. No capability is claimed; see vhdl/README.md.
 # ---------------------------------------------------------------------------
 FROM --platform=linux/amd64 ${BUILD_IMAGE} AS test
 WORKDIR /project
@@ -350,3 +350,157 @@ RUN set -eu; \
     timeout 20 ./ws_test | tee /tmp/ws_test.out; \
     wait; \
     grep -Fq 'PASS ws_test' /tmp/ws_test.out
+
+# sync_test proves convex_sync.vhdl's Connect/ModifyQuerySet/Transition
+# handling, including a real reconnect: syncfix.c accepts two
+# connections in sequence, answers each subscription's Add with a
+# Transition whose value differs by connection, and this stage forces
+# the client through debugDisconnect between them, so seeing the second
+# connection's different value is genuine end-to-end proof that
+# reconnect resends Add rather than only that the code compiles.
+RUN <<'SYNCFIX_EOF'
+set -eu
+cat > /tmp/syncfix.c <<'CEOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+static int conn;
+
+static void send_frame(const char *payload, int len) {
+    unsigned char hdr[4];
+    int hlen = 0;
+    hdr[hlen++] = 0x81;
+    if (len <= 125) {
+        hdr[hlen++] = (unsigned char)len;
+    } else {
+        hdr[hlen++] = 126;
+        hdr[hlen++] = (unsigned char)((len >> 8) & 0xff);
+        hdr[hlen++] = (unsigned char)(len & 0xff);
+    }
+    write(conn, hdr, (size_t)hlen);
+    write(conn, payload, (size_t)len);
+}
+
+static int read_client_frame(unsigned char *out, int cap) {
+    unsigned char head[2];
+    if (read(conn, head, 2) != 2) return -1;
+    int masked = (head[1] & 0x80) != 0;
+    int plen = head[1] & 0x7f;
+    if (plen == 126) {
+        unsigned char ext[2];
+        if (read(conn, ext, 2) != 2) return -1;
+        plen = (ext[0] << 8) | ext[1];
+    }
+    unsigned char mask[4] = {0, 0, 0, 0};
+    if (masked) {
+        if (read(conn, mask, 4) != 4) return -1;
+    }
+    if (plen > cap) return -1;
+    int total = 0;
+    while (total < plen) {
+        ssize_t n = read(conn, out + total, (size_t)(plen - total));
+        if (n <= 0) return -1;
+        total += (int)n;
+    }
+    if (masked) {
+        for (int i = 0; i < plen; i++) out[i] = (unsigned char)(out[i] ^ mask[i % 4]);
+    }
+    return plen;
+}
+
+static int extract_query_id(const unsigned char *buf, int len) {
+    const char *needle = "\"queryId\":";
+    for (int i = 0; i + (int)strlen(needle) < len; i++) {
+        if (memcmp(buf + i, needle, strlen(needle)) == 0) {
+            return atoi((const char *)buf + i + (int)strlen(needle));
+        }
+    }
+    return -1;
+}
+
+static int contains(const unsigned char *buf, int len, const char *needle) {
+    int nlen = (int)strlen(needle);
+    for (int i = 0; i + nlen <= len; i++) {
+        if (memcmp(buf + i, needle, (size_t)nlen) == 0) return 1;
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "usage: syncfix port\n"); return 1; }
+    int port = atoi(argv[1]);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
+    listen(fd, 2);
+
+    for (int seq = 0; seq < 2; seq++) {
+        conn = accept(fd, NULL, NULL);
+        if (conn < 0) { perror("accept"); return 1; }
+        fprintf(stderr, "syncfix: accepted connection %d\n", seq);
+
+        unsigned char drain[8192];
+        int total = 0;
+        while (total < (int)sizeof(drain)) {
+            unsigned char b;
+            ssize_t n = read(conn, &b, 1);
+            if (n <= 0) { fprintf(stderr, "syncfix: handshake drain failed\n"); return 1; }
+            drain[total++] = b;
+            if (total >= 4 && drain[total-4]=='\r' && drain[total-3]=='\n' &&
+                drain[total-2]=='\r' && drain[total-1]=='\n') break;
+        }
+        const char *resp =
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "\r\n";
+        write(conn, resp, strlen(resp));
+
+        int query_id = -1;
+        unsigned char frame[8192];
+        for (;;) {
+            int n = read_client_frame(frame, (int)sizeof(frame));
+            if (n < 0) { fprintf(stderr, "syncfix: connection %d ended\n", seq); break; }
+            if (contains(frame, n, "\"type\":\"ModifyQuerySet\"") && contains(frame, n, "\"Add\"")) {
+                query_id = extract_query_id(frame, n);
+                fprintf(stderr, "syncfix: saw Add for queryId=%d on connection %d\n", query_id, seq);
+
+                char body[512];
+                int blen = snprintf(body, sizeof(body),
+                    "{\"type\":\"Transition\","
+                    "\"startVersion\":{\"querySet\":0,\"identity\":0,\"ts\":\"AAAAAAAAAAA=\"},"
+                    "\"endVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"AQAAAAAAAAA=\"},"
+                    "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":%d,\"value\":{\"count\":%d}}]}",
+                    query_id, seq);
+                send_frame(body, blen);
+            }
+        }
+    }
+
+    close(fd);
+    return 0;
+}
+CEOF
+gcc -O2 -Wall -Wextra -o /tmp/syncfix /tmp/syncfix.c
+SYNCFIX_EOF
+
+RUN set -eu; \
+    /tmp/syncfix 44304 & \
+    sleep 1; \
+    ghdl -a --std=08 --workdir=/project/work client/convex_sync.vhdl; \
+    ghdl -a --std=08 --workdir=/project/work client/tests/sync_test.vhdl; \
+    ghdl -e --std=08 --workdir=/project/work \
+      -Wl,/project/native.o -Wl,-lssl -Wl,-lcrypto sync_test; \
+    timeout 30 ./sync_test | tee /tmp/sync_test.out; \
+    wait; \
+    grep -Fq 'PASS sync_test' /tmp/sync_test.out
