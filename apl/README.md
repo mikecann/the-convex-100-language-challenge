@@ -19,8 +19,8 @@ re-querying. The block below is generated from that exact runnable file.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Verified (`./run verify apl` awarded it) | Query, mutation, and action calls, the `format:"json"` envelope, structured `FunctionError`/`TransportError`/`ProtocolError` classification, response `logs`, and structured `error.data` are implemented in `client/convex.apl` and pass both language-local tests and the shared black-box conformance pilot against the approved local backend. |
-| Live | Verified (`./run verify apl` awarded it) | The WebSocket `/api/sync` state machine -- RFC 6455 handshake/framing/masking/fragmentation, Connect, ModifyQuerySet (Add/Remove), Transition application, `QueryFailed`-then-recovery, and reconnect with exponential backoff reset -- is implemented in `client/convexlive.apl` and passes the shared conformance pilot's `client/live/*` cases, including five real reconnects via `debugDisconnect`. `./run verify-hosted apl` (the dedicated hosted protocol-drift target) has not been run yet as of this note. |
+| HTTP | Verified (`./run verify-all apl` awarded it on both profiles) | Query, mutation, and action calls, the `format:"json"` envelope, structured `FunctionError`/`TransportError`/`ProtocolError` classification, response `logs`, and structured `error.data` are implemented in `client/convex.apl` and pass both language-local tests and the shared black-box conformance pilot against the approved local self-hosted backend and the dedicated hosted protocol-drift target. |
+| Live | Verified (`./run verify-all apl` awarded it on both profiles) | The WebSocket `/api/sync` state machine -- RFC 6455 handshake/framing/masking/fragmentation, Connect, ModifyQuerySet (Add/Remove), Transition application, `QueryFailed`-then-recovery, and reconnect with exponential backoff reset -- is implemented in `client/convexlive.apl` and passes the shared conformance pilot's `client/live/*` cases, including five real reconnects via `debugDisconnect`, against both deployment profiles. |
 
 ## The basic example
 
@@ -288,8 +288,10 @@ document-ID strings, actions, structured errors with `error.data`, UTF-8,
 and bearer-token lifecycle), all `client/live/*` cases (initial result,
 external update, unsubscribe, five real reconnects via `debugDisconnect`,
 and query-error-recovery), and `client/adapter/clean-close` -- and prints
-`Earned capabilities: http, live`. `./run verify-hosted apl` (the dedicated
-hosted protocol-drift target) has not been run yet as of this note.
+`Earned capabilities: http, live`. `./run verify-hosted apl` repeats example
+and conformance verification against the dedicated hosted protocol-drift
+target instead, and `./run verify-all apl` runs both deployment profiles
+from the same built source; all 31 pilot cases pass on both.
 
 ## Toolchain
 

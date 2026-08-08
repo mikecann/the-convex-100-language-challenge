@@ -65,13 +65,14 @@ limitations:
     round-trip and escaping, object field lookup, whole-number
     acceptance, URL parsing, HTTP status-line/header helpers, chunked
     hex sizes, EnvGet, HttpClassify's four envelope shapes) pass from a
-    clean build. `./run verify-example apl` and `./run verify apl`
-    both pass against the approved local self-hosted backend: the
-    shared black-box conformance pilot (client/adapter/hello,
-    client/http/*, client/live/*, client/adapter/clean-close) reports
-    "Earned capabilities: http, live" for both the reference oracle and
-    this client. `./run verify-hosted apl` (the dedicated hosted
-    protocol-drift target) has not been run yet as of this note.
+    clean build. `./run test apl`, `./run verify-example apl`, and
+    `./run verify-all apl` (both the local self-hosted and the
+    dedicated hosted deployment profiles) all pass from a clean,
+    exact-HEAD commit: the shared black-box conformance pilot
+    (client/adapter/hello, client/http/*, client/live/*,
+    client/adapter/clean-close -- 31 cases) reports "Earned
+    capabilities: http, live" for both the reference oracle and this
+    client, on both profiles.
   - >-
     The native function (client/shim.cc) is deliberately narrow: TCP
     connect/send/recv/close for TLS, SHA-1, CSPRNG bytes, and DNS
