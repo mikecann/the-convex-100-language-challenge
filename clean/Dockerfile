@@ -57,7 +57,12 @@ RUN printf '%s\n' 'module hello' '' 'Start :: Int' 'Start = 1' > /tmp/hello.icl 
 # `Convex.HTTP.parseEndpoint`, the only pure (transport-free) surface of
 # the HTTP layer; request/response framing itself is exercised by
 # `./run verify` and `./run verify-hosted` against a real deployment.
-RUN for t in FoundationTest WireTest HTTPTest; do \
+# `ConvexCallTest` is a real end-to-end demo:state/demo:increment round
+# trip, but only when CONVEX_URL is set (matching every other client's
+# equivalent regression, see hare/client/convex.ha); this offline `test`
+# stage never sets it, so it runs here as a documented no-op and only does
+# real network I/O under `./run verify`/`verify-hosted`.
+RUN for t in FoundationTest WireTest HTTPTest ConvexCallTest; do \
       (cd /project/client/Convex && clm -nt -IL Platform -I /project/client "$t" -o "/tmp/$t-bin") \
       && "/tmp/$t-bin" \
       || exit 1; \
