@@ -9,13 +9,13 @@ ARG BUILD_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa04
 #
 # CHECKPOINT NOTE: this client is still under construction. Only the
 # foreign-boundary primitives (native.c), the request/acknowledge circuit
-# (convex_native.vhdl, convex_transport.vhdl) and the byte-buffer helpers
-# (convex_buffer.vhdl) exist so far, proven here by buffer_test and
-# transport_smoke. convex_json, convex_http, convex_ws, convex_sync, the
-# conformance adapter and examples/basics do not exist yet, so this stage
-# does not yet compile a canonical example or a conformance executable and
-# no `runtime` or `example-runtime` stage exists below. No capability is
-# claimed; see vhdl/README.md.
+# (convex_native.vhdl, convex_transport.vhdl), the byte-buffer helpers
+# (convex_buffer.vhdl) and a JSON codec (convex_json.vhdl) exist so far,
+# proven here by buffer_test, transport_smoke and json_test. convex_http,
+# convex_ws, convex_sync, the conformance adapter and examples/basics do
+# not exist yet, so this stage does not yet compile a canonical example or
+# a conformance executable and no `runtime` or `example-runtime` stage
+# exists below. No capability is claimed; see vhdl/README.md.
 # ---------------------------------------------------------------------------
 FROM --platform=linux/amd64 ${BUILD_IMAGE} AS test
 WORKDIR /project
@@ -78,21 +78,28 @@ RUN set -eu; \
 
 # Analyze every unit into GHDL's work library, in dependency order: the
 # bus and foreign declarations first, then the transport process that
-# drives them, then the buffer helpers, which depend on neither.
+# drives them, then the buffer helpers and the JSON codec built on them.
 RUN set -eu; \
     mkdir -p /project/work; \
     ghdl -a --std=08 --workdir=/project/work client/convex_native.vhdl; \
     ghdl -a --std=08 --workdir=/project/work client/convex_transport.vhdl; \
     ghdl -a --std=08 --workdir=/project/work client/convex_buffer.vhdl; \
+    ghdl -a --std=08 --workdir=/project/work client/convex_json.vhdl; \
     echo "PASS vhdl analyze"
 
-# buffer_test needs no transport, no network and no native call beyond
-# elaboration itself.
+# buffer_test and json_test need no transport, no network and no native
+# call beyond elaboration itself.
 RUN set -eu; \
     ghdl -a --std=08 --workdir=/project/work client/tests/buffer_test.vhdl; \
     ghdl -e --std=08 --workdir=/project/work buffer_test; \
     ./buffer_test | tee /tmp/buffer_test.out; \
     grep -Fq 'PASS buffer_test' /tmp/buffer_test.out
+
+RUN set -eu; \
+    ghdl -a --std=08 --workdir=/project/work client/tests/json_test.vhdl; \
+    ghdl -e --std=08 --workdir=/project/work json_test; \
+    ./json_test | tee /tmp/json_test.out; \
+    grep -Fq 'PASS json_test' /tmp/json_test.out
 
 # transport_smoke drives a real connection through the req/ack circuit,
 # native.c and OpenSSL, so it needs a real TLS peer -- a local
