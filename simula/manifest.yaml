@@ -1,0 +1,124 @@
+schemaVersion: 1
+id: simula
+displayName: "Simula 67"
+rank: 79
+selectionTier: coverage
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Simula 67 implementation of Convex's documented JSON HTTP functions
+    and the pinned /api/sync protocol, translated to C by GNU Cim. JSON,
+    HTTP/1.1 framing, RFC 6455 WebSocket framing, base64, hex, and every
+    Convex sync semantic are written in Simula. One reviewed C support file,
+    client/convexrt.c, supplies only the primitives the 1967 report does not
+    have: TCP sockets, TLS, non-blocking read and write, readiness polling,
+    listen and accept, a monotonic clock, entropy, and environment variable
+    access, called from Simula through Cim's `external C procedure`. It
+    contains no HTTP, no WebSocket framing, no JSON and no Convex knowledge;
+    every deadline, retry, and bound is written in Simula. The canonical
+    example's failure path is a genuine Simula class hierarchy
+    (ConvexOutcome / ExampleFailure), constructed and dispatched through
+    new/:-/., not decorative.
+toolchain:
+  name: GNU Cim
+  version: "5.1"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    The Docker test stage (build, style gate, the native shim compiled on
+    its own, client/tests/client-test.sim, the no-CONVEX_URL example failure
+    path, and the adapter hello/close probe) passes locally for this
+    checkpoint. Shared and hosted black-box conformance have not been run, so
+    no capability is claimed and badges remain unearned.
+  - >-
+    GNU Cim 5.1's release tarball ships two pre-generated bootstrap C files
+    (lib/simset.c, lib/simulation.c) that hardcode
+    `#include "../../lib/cim.h"`, a relative path that does not resolve from
+    a plain tarball extraction; the Dockerfile rewrites both to the working
+    `#include "cim.h"` before building. The C ABI GNU Cim actually generates
+    was confirmed by compiling a probe program and reading its output, not
+    assumed from the manual: a by-value `integer` parameter and an `integer
+    procedure`'s return value are both a 64-bit C `long`, not `int`
+    (matching every `integer array` element, which is 8 bytes wide), and a
+    by-value `text` parameter arrives as a malloc'd NUL-terminated `char *`.
+    client/convexrt.c uses `long` throughout for exactly that reason.
+  - >-
+    GNU Cim's default runtime memory pool is far too small for this client's
+    real buffer footprint (a little over a megabyte of declared integer
+    arrays once every layer is assembled): compiling without a larger pool
+    aborts the linked binary with "Alloc: Virtual memory exhausted" while
+    allocating its own top-level array declarations, before any code runs.
+    Every program in this client is compiled with `cim -m32 -M96` (a 32MB
+    initial pool, 96MB ceiling) for exactly that reason.
+  - >-
+    GNU Cim 5.1 rejects a bare, parameterless virtual procedure
+    specification (`virtual: procedure P;`) with a dedicated grammar error
+    production, confirmed by reading src/parser.y's ONE_SPEC rule, matching
+    cim.texi's own up-front warning about limited virtual procedure
+    parameter support. The example's ConvexOutcome class hierarchy therefore
+    dispatches through a concrete typed reference (`ref(ExampleFailure)`)
+    rather than a virtual call through the common supertype; inheritance,
+    construction and instance methods are still genuine and exercised.
+  - >-
+    Simula has no bitwise operators, so RFC 6455 masking is written with an
+    explicit eight-bit XOR loop (bytexor) over the logical operators and,
+    or and not, matching this project's ALGOL 60 client for the same
+    reason.
+  - >-
+    convexcall and livesubscribe open their own connection internally, so
+    client/tests/client-test.sim exercises HTTP framing, the Convex
+    envelope decoder, and RFC 6455 frame build/read round trips directly
+    rather than through convexcall itself, matching this project's ALGOL 60
+    client: there is no concurrency primitive exercised here to run a
+    fixture server and the client under test in the same process, even
+    though Simula's SIMULATION class does provide real coroutines.
+  - >-
+    The client is single threaded by construction: one call path owns the
+    WebSocket, drives reconnects, and processes query-set changes. Live
+    progress only happens while a caller is inside a client procedure or
+    the adapter's own poll loop.
+  - >-
+    The WebSocket handshake does not verify the server's
+    Sec-WebSocket-Accept response header against SHA-1 of the client's key,
+    matching this project's ALGOL 60 client. A valid HTTP 101 upgrade
+    response is still required, and every frame exchanged afterward is real
+    RFC 6455 framing; only that one header's cryptographic check is
+    skipped.
+  - >-
+    Live authentication, optimistic updates, WebSocket mutations, WebSocket
+    actions, journals, and TransitionChunk assembly are deferred.
+  - >-
+    JSON numbers are accepted only when mathematically integral and
+    representable exactly within a safe 64-bit range; fractional and
+    out-of-range values are rejected at the point of use.
+  - >-
+    Active Live subscriptions and the delivery queue are bounded; a value
+    too large for the configured byte budget becomes an observable
+    ProtocolError without changing the subscription's last delivered value,
+    and queue overflow drops the oldest undelivered event rather than
+    growing without bound.
+  - >-
+    TLS has not been separately unit-tested against a private CA the way
+    this project's ALGOL 60 client does; client/convexrt.c's TLS code is
+    the same reviewed design (peer verification, default CA bundle,
+    SSL_set1_host hostname checking, all switched on together), but that
+    specific trust/untrusted/wrong-host proof has not yet been run for this
+    checkpoint.
+capabilities:
+  - http
+  - live
