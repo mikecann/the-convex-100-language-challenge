@@ -1,20 +1,32 @@
 %   convex-transport.clu -- unifies the local profile's plain transport
-%   (pclu's own builtin _chan, raw BSD sockets, the same cluster
-%   pclu's own DNS client lib/clu/_resolve.clu already uses) and the
-%   hosted profile's TLS transport (_tls, this client's own new builtin,
-%   see client/convexrt-tls.c) behind one small type, "conn", so the HTTP
+%   (pclu's own builtin _chan, raw BSD sockets) and the hosted profile's
+%   TLS transport (_tls, this client's own new builtin, see
+%   client/convexrt-tls.c) behind one small type, "conn", so the HTTP
 %   and WebSocket framing code above it never has to know which one it is
 %   talking to.
 %
 %   _tls$connect resolves DNS, opens the socket, and completes the TLS
 %   handshake with real chain and hostname verification all inside its
-%   one C builtin. The plain profile has no such all-in-one primitive, so
-%   dial() resolves the host itself with _resolve (pclu's own DNS client,
-%   proven working by this client's wordvec-64bit-word-size.patch: see
-%   that patch's own writeup for why _resolve's byte-packed sockaddr
-%   construction was silently broken before the fix) and builds the
-%   sockaddr_in by hand with _wordvec, exactly the pattern the
-%   feasibility spike proved end to end over a real TCP round trip.
+%   one C builtin, using OpenSSL's/libc's own resolver -- unaffected by
+%   the bug described next, since it never goes through CLU code at
+%   all. The plain profile has no such all-in-one primitive, so dial()
+%   resolves the host itself and builds the sockaddr_in by hand with
+%   _wordvec, exactly the pattern the feasibility spike proved end to
+%   end over a real TCP round trip.
+%
+%   Resolving a real hostname (this client's own local-profile traffic
+%   always names the compose service "backend") goes through
+%   client/convex-dns.clu, this client's own small DNS resolver, not
+%   pclu's bundled one (lib/clu/_resolve.clu): that one's resolv.conf
+%   reader only recognises ';' comments, not modern Linux's/Docker's
+%   '#', so it silently mistakes the first comment line for the
+%   domain/nameserver line, fails to parse it as an address, swallows
+%   that failure, and is left querying the untouched default of
+%   127.0.0.1 -- where nothing is listening -- until it times out. See
+%   convex-dns.clu's own header comment for the full write-up; this was
+%   found running this client's own dial() against the docker-compose
+%   "backend" hostname, the exact case the local verification profile
+%   needs.
 
 conn = cluster is dial, send, recv, close
 
@@ -31,10 +43,12 @@ CHAN_RECV_WORDS = 4096		% generous fixed buffer; _chan$recv fills
 %   hostname verification -- all happen inside that one builtin);
 %   "http"/"ws" dial a raw _chan socket by hand. host is tried first as a
 %   literal dotted-quad address (inet_address, no network access) and
-%   only resolved over DNS (_resolve, pclu's own DNS client) if that
-%   fails -- the local profile's real traffic always names the compose
-%   service "backend" and takes the DNS path, but a literal address is
-%   what this client's own loopback test fixtures dial.
+%   only resolved over DNS (client/convex-dns.clu, this client's own
+%   resolver -- see this file's own header comment for why not pclu's
+%   bundled one) if that fails -- the local profile's real traffic
+%   always names the compose service "backend" and takes the DNS path,
+%   but a literal address is what this client's own loopback test
+%   fixtures dial.
 	dial = proc (scheme, host: string, port: int) returns (cvt)
 					      signals (not_possible(string))
 	    if string$equal(scheme, "https") cor string$equal(scheme, "wss")
@@ -45,7 +59,7 @@ CHAN_RECV_WORDS = 4096		% generous fixed buffer; _chan$recv fills
 
 	    l, r: int := inet_address(host)
 		except when bad_format:
-			    l, r := _resolve$n2a(host)
+			    l, r := dns$resolve(host)
 				except when not_found:
 					    signal not_possible(
 						"host not found: " || host)

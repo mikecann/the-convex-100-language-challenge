@@ -174,50 +174,61 @@ RUN set -eu; \
     cp client/*.clu /stage/ 2>/dev/null || true; \
     cp client/tests/*.clu /stage/ 2>/dev/null || true; \
     cp client/tests/fixtures/*.clu /stage/ 2>/dev/null || true; \
+    cp examples/basics/main.clu /stage/main.clu; \
     ls /stage
 
-# language-local unit tests. The WebSocket framing, the /api/sync state
-# machine, the conformance adapter, and the canonical example are not
-# implemented yet -- see manifest.yaml limitations. What exists and is
-# proven here: the JSON codec, the arithmetic bitwise helpers WebSocket
-# masking and its handshake SHA-1 will need (CLU's own int cluster has no
-# bitwise operators at all), the conn transport (dial/send/recv/close
-# unifying the plain _chan profile and the new _tls builtin behind one
-# oneof, with poll-gated bounded reads on both), and full HTTP/1.1
-# request/response framing against Convex's documented "format":"json"
-# envelope (Content-Length, chunked transfer-encoding, and structured
-# FunctionError/TransportError/ProtocolError classification). The
-# transport and HTTP tests are real loopback TCP coverage against
-# client/tests/fixtures/{echo,http}_fixture.clu -- genuine peer
-# processes, not mocks -- started here by the shell rather than by the
-# test binaries themselves, since pclu has no async-subprocess-spawn
+# language-local unit tests, real loopback-TCP/WebSocket/sync coverage,
+# and a compiled-and-linked build of the canonical example. Proven here:
+# the JSON codec (incl. array_items, for walking a Transition's own
+# modifications array); the arithmetic bitwise helpers WebSocket masking
+# and its handshake SHA-1 need (CLU's own int cluster has no bitwise
+# operators at all); base64; the conn transport (dial/send/recv/close
+# unifying the plain _chan profile and the new _tls builtin, plus this
+# client's own DNS resolver -- see convex-dns.clu's header comment for
+# why pclu's bundled one silently fails against Docker's resolv.conf);
+# full HTTP/1.1 request/response framing against Convex's documented
+# "format":"json" envelope; RFC 6455 WebSocket framing (masking,
+# fragmentation, interleaved control frames, UTF-8 validated once after
+# reassembly); and the convex-rs-0.10.4-unversioned-sync /api/sync state
+# machine (Connect, ModifyQuerySet, Transition, backoff, rehydration
+# suppression). The transport/HTTP/WebSocket/sync tests are real
+# loopback TCP coverage against client/tests/fixtures/*.clu -- genuine
+# peer processes, not mocks -- started here by the shell rather than by
+# the test binaries themselves, since pclu has no async-subprocess-spawn
 # primitive a CLU program could use to start its own fixture the way
-# some of this repository's other language tests do.
+# some of this repository's other language tests do. example_main.clu
+# (examples/basics/main.clu) is compiled and linked here to prove it
+# builds; running it against a real deployment is verify-example's job,
+# not this image's.
 RUN set -eu; \
     cd /stage; \
     test -f convex-json.clu; \
     "$CLUHOME/exe/pclu" -merge "$CLUHOME/lib/lowlev.lib" -ext false \
         -spec "$CLUHOME/lib/etc.spc", "$CLUHOME/lib/_tls.spc", \
               "$CLUHOME/lib/maybe.spc", \
-              convex-json, convex-bitops, convex-sha1, convex-base64, \
+              convex-dns, convex-json, convex-bitops, convex-sha1, \
+              convex-base64, \
               convex-transport, convex-http, convex-websocket, \
               convex-sync, \
-              json_test, bitops_test, sha1_test, base64_test, \
+              json_test, bitops_test, sha1_test, base64_test, dns_test, \
               transport_test, http_test, websocket_test, sync_test, \
-              echo_fixture, http_fixture, websocket_fixture, sync_fixture \
+              echo_fixture, http_fixture, websocket_fixture, sync_fixture, \
+              main \
         -opt -cfiles \
-        -compile convex-json, convex-bitops, convex-sha1, convex-base64, \
+        -compile convex-dns, convex-json, convex-bitops, convex-sha1, \
+                 convex-base64, \
                  convex-transport, convex-http, convex-websocket, \
                  convex-sync, \
-                 json_test, bitops_test, sha1_test, base64_test, \
+                 json_test, bitops_test, sha1_test, base64_test, dns_test, \
                  transport_test, http_test, websocket_test, sync_test, \
                  echo_fixture, http_fixture, websocket_fixture, \
-                 sync_fixture; \
+                 sync_fixture, main; \
     "$CLUHOME/exe/plink" -opt -o json_test convex-json.o json_test.o; \
     "$CLUHOME/exe/plink" -opt -o bitops_test convex-bitops.o bitops_test.o; \
     "$CLUHOME/exe/plink" -opt -o sha1_test convex-sha1.o convex-bitops.o \
         sha1_test.o convex-base64.o; \
     "$CLUHOME/exe/plink" -opt -o base64_test convex-base64.o base64_test.o; \
+    "$CLUHOME/exe/plink" -opt -o dns_test convex-dns.o dns_test.o; \
     "$CLUHOME/exe/plink" -opt -o echo_fixture echo_fixture.o; \
     "$CLUHOME/exe/plink" -opt -o http_fixture http_fixture.o; \
     "$CLUHOME/exe/plink" -opt -o websocket_fixture websocket_fixture.o \
@@ -232,6 +243,8 @@ RUN set -eu; \
     grep -Fq 'ALL PASS' /tmp/sha1_test.out; \
     ./base64_test | tee /tmp/base64_test.out; \
     grep -Fq 'ALL PASS' /tmp/base64_test.out; \
+    ./dns_test | tee /tmp/dns_test.out; \
+    grep -Fq 'ALL PASS' /tmp/dns_test.out; \
     # conn's oneof rep always references both _chan and _tls, so any
     # binary linking convex-transport.o needs libssl/libcrypto even when
     # (as here) only its plain _chan path is ever exercised; plink's own
@@ -239,20 +252,27 @@ RUN set -eu; \
     # line for a static archive to resolve against, so gcc is invoked
     # directly, matching the ordering this client's feasibility spike
     # already proved for _tls itself (see manifest.yaml/README.md). \
-    gcc transport_test.o convex-transport.o \
+    gcc transport_test.o convex-transport.o convex-dns.o \
         -L"$CLUHOME/code" -lpclu_opt -lssl -lcrypto -lm -lgc \
         -o transport_test; \
-    gcc http_test.o convex-http.o convex-transport.o convex-json.o \
+    gcc http_test.o convex-http.o convex-transport.o convex-dns.o \
+        convex-json.o \
         -L"$CLUHOME/code" -lpclu_opt -lssl -lcrypto -lm -lgc \
         -o http_test; \
     gcc websocket_test.o convex-websocket.o convex-transport.o \
-        convex-sha1.o convex-base64.o convex-bitops.o \
+        convex-dns.o convex-sha1.o convex-base64.o convex-bitops.o \
         -L"$CLUHOME/code" -lpclu_opt -lssl -lcrypto -lm -lgc \
         -o websocket_test; \
     gcc sync_test.o convex-sync.o convex-websocket.o convex-transport.o \
-        convex-sha1.o convex-base64.o convex-bitops.o convex-json.o \
+        convex-dns.o convex-sha1.o convex-base64.o convex-bitops.o \
+        convex-json.o \
         -L"$CLUHOME/code" -lpclu_opt -lssl -lcrypto -lm -lgc \
         -o sync_test; \
+    gcc main.o convex-sync.o convex-websocket.o convex-transport.o \
+        convex-http.o convex-dns.o convex-sha1.o convex-base64.o \
+        convex-bitops.o convex-json.o \
+        -L"$CLUHOME/code" -lpclu_opt -lssl -lcrypto -lm -lgc \
+        -o convex-example; \
     ./echo_fixture 19001 >/tmp/echo_fixture.log 2>&1 & \
     ECHO_PID=$!; \
     printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{"status":"success","value":{"count":0}}' \
@@ -284,10 +304,11 @@ RUN set -eu; \
     grep -Fq 'ALL PASS' /tmp/websocket_test.out
 
 # ---------------------------------------------------------------------------
-# runtime images are not built yet: no example, no WebSocket/sync client, no
-# conformance adapter exist to ship. Adding runtime-base/example-runtime/
-# runtime stages ahead of real behaviour would let a minimal image exist
-# without anything working behind it, which is exactly what this
-# repository's evidence rules forbid. They land once client/*.clu and
-# client/tests/conformance/adapter.clu are real. See manifest.yaml.
+# runtime images are not built yet: the conformance adapter
+# (client/tests/conformance/) does not exist. The canonical example
+# above is compiled and linked here (convex-example) and proven for real
+# against a deployment by ./run verify-example; example-runtime and
+# runtime stages land together once the adapter is real too, so both
+# entrypoints this repository's Docker interface requires ship at the
+# same time. See manifest.yaml.
 # ---------------------------------------------------------------------------
