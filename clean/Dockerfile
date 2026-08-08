@@ -37,6 +37,7 @@ RUN test "$(uname -m)" = x86_64 \
 FROM clean-toolchain AS test
 WORKDIR /project
 COPY client ./client
+COPY examples ./examples
 RUN clm -V
 RUN printf '%s\n' 'module hello' '' 'Start :: Int' 'Start = 1' > /tmp/hello.icl \
     && cd /tmp && clm -nt hello -o /tmp/hello-bin \
@@ -78,3 +79,115 @@ RUN test "$(uname -m)" = x86_64 \
     && file /tmp/FoundationTest-bin | grep -Eq 'ELF 64-bit.*x86-64' \
     && readelf -d /tmp/FoundationTest-bin | grep -q 'libssl\.so' \
     && ldd /tmp/FoundationTest-bin | grep -q 'libcrypto\.so'
+# The canonical example and the test-only NDJSON adapter, built here so the
+# `test` gate proves they compile even offline; `example-runtime`/`runtime`
+# below copy these exact binaries rather than rebuilding them.
+RUN mkdir -p /out \
+    && (cd /project/examples/basics && clm -nt -IL Platform -IL ArgEnv -I /project/client main -o /out/convex-example) \
+    && (cd /project/client/tests/conformance && clm -nt -IL Platform -I /project/client main -o /out/convex-adapter) \
+    && test "$(uname -m)" = x86_64 \
+    && file /out/convex-example | grep -Eq 'ELF 64-bit.*x86-64' \
+    && file /out/convex-adapter | grep -Eq 'ELF 64-bit.*x86-64'
+# Proves the real adapter binary's hello/close NDJSON lifecycle at build
+# time, against the exact binary shipped in /out. CONVEX_URL is a dummy
+# value scoped to this one RUN: neither hello nor close ever calls
+# ensureClient, so the adapter never opens a network connection here.
+RUN printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' \
+    | CONVEX_URL=http://127.0.0.1:9 /out/convex-adapter >/tmp/convex-adapter-hello.ndjson \
+    && grep -Fq '"language":"clean"' /tmp/convex-adapter-hello.ndjson \
+    && grep -Fq '"type":"closed"' /tmp/convex-adapter-hello.ndjson
+# KNOWN BROKEN, not wired into this build: a real TLS handshake that
+# actually completes (SSL_connect returning success, whether verification
+# then accepts or rejects the certificate) reliably crashes the Clean
+# runtime with "Run Time Warning: cycle in spine detected" and exit 255 —
+# reproduced directly against Convex.TLS.tlsConnect alone (no HTTP/
+# Live/adapter code involved), against both a same-container and a
+# separate-container self-signed TLS peer, and independent of every
+# variable this session could isolate: certificate verification outcome
+# (pass, fail, or skipped entirely), which cleanup calls run afterward (or
+# none — the crash reproduces even leaking the SSL/CTX/fd rather than
+# freeing anything), the retry loop's deadline source, disabling the
+# socket BIO's own close-on-free (see tlsConnect's own comment), CA bundle
+# loading, SNI, heap/stack size, and whether Convex.Wire is linked at all.
+# A hand-rolled reimplementation of the exact same call sequence
+# (TLS_client_method/SSL_CTX_new/SSL_CTX_set_verify/loadCaBundle/SSL_new/
+# SSL_set_fd/the SSL_connect retry loop/SSL_get_verify_result), inlined in
+# one file with no separate .dcl, does NOT crash under any of the same
+# variations — the one remaining difference this session could not rule
+# out is calling through Convex.TLS's own separately-compiled module
+# boundary itself, which would make this a Clean 3.1 toolchain issue
+# rather than a bug in this file's own logic. This blocks TLS entirely:
+# every hosted (https://) deployment, so `./run verify-hosted clean` is
+# not expected to pass until this is root-caused. The plain-HTTP local
+# backend `./run verify clean` targets is unaffected — TPlain never
+# touches Convex.TLS at all, and every other layer (HTTP, WebSocket, Live,
+# the five-reconnect sequence, the adapter, the example) is verified
+# end-to-end against it.
+
+FROM test AS runtime-rootfs
+RUN set -eu; \
+    root=/runtime; \
+    mkdir -p "$root/bin" "$root/usr/bin" "$root/usr/local/bin" "$root/etc" \
+      "$root/usr/lib/x86_64-linux-gnu"; \
+    cp /bin/dash "$root/bin/sh"; \
+    cp /usr/bin/id "$root/usr/bin/id"; \
+    cp /usr/bin/grep "$root/usr/bin/grep"; \
+    cp /out/convex-example "$root/usr/local/bin/convex-example"; \
+    cp /out/convex-adapter "$root/usr/local/bin/convex-adapter"; \
+    libraries="$({ for binary in /bin/dash /usr/bin/id /usr/bin/grep /out/convex-example /out/convex-adapter; do ldd "$binary"; done; } | awk '$3 ~ /^\// {print $3} $1 ~ /^\// {print $1}' | sort -u)"; \
+    for library in $libraries; do \
+      cp --parents -L "$library" "$root"; \
+    done; \
+    # glibc's NSS modules (nss_dns/nss_files, for gethostbyname's real
+    # hostname resolution against a hosted deployment) are dlopen'd at
+    # runtime rather than linked, so `ldd` above never finds them; copied
+    # explicitly here instead.
+    for nss in /usr/lib/x86_64-linux-gnu/libnss_dns.so.2 /usr/lib/x86_64-linux-gnu/libnss_files.so.2 /usr/lib/x86_64-linux-gnu/libresolv.so.2; do \
+      test -e "$nss" && cp --parents -L "$nss" "$root" || true; \
+    done; \
+    cp -a /etc/ssl "$root/etc/ssl"; \
+    cp -a /usr/lib/ssl "$root/usr/lib/ssl" 2>/dev/null || true; \
+    cp -a /usr/lib/x86_64-linux-gnu/engines-3 "$root/usr/lib/x86_64-linux-gnu/" 2>/dev/null || true; \
+    cp -a /usr/lib/x86_64-linux-gnu/ossl-modules "$root/usr/lib/x86_64-linux-gnu/" 2>/dev/null || true; \
+    cp /etc/nsswitch.conf /etc/hosts "$root/etc/"
+RUN set -eu; \
+    test -r /runtime/etc/ssl/certs/ca-certificates.crt; \
+    events="$(printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | chroot /runtime /usr/local/bin/convex-adapter)"; \
+    echo "$events" | /usr/bin/grep -Fq '"language":"clean"'; \
+    echo "$events" | /usr/bin/grep -Fq '"type":"closed"'
+
+FROM --platform=linux/amd64 ${DEBIAN_IMAGE} AS runtime-base
+# Keep the Debian provenance required by the shared verifier, but replace
+# its filesystem with the individually allowlisted shell, text tools,
+# client executables, and their complete runtime closure assembled above —
+# matching this project's other dynamically-linked native clients (see
+# odin/Dockerfile).
+RUN set -eu; \
+    for entry in /etc/*; do \
+      case "$entry" in \
+        /etc/hostname|/etc/hosts|/etc/resolv.conf) ;; \
+        *) /usr/bin/rm -rf "$entry" ;; \
+      esac; \
+    done; \
+    /usr/bin/rm -rf /bin /sbin /usr /lib /lib64 /var /opt /root /home /tmp
+COPY --from=runtime-rootfs /runtime /
+RUN set -eu; \
+    for command in sh id grep; do command -v "$command" >/dev/null; done; \
+    for candidate in /bin/* /usr/bin/* /usr/local/bin/*; do \
+      case "$candidate" in \
+        /bin/sh|/usr/bin/id|/usr/bin/grep|/usr/local/bin/convex-example|/usr/local/bin/convex-adapter) ;; \
+        *) test ! -x "$candidate" ;; \
+      esac; \
+    done; \
+    for command in apk apt apt-get dpkg gcc g++ cc clang clang++ make cmake cocl clm cg cpm htoclean cargo rustc node npm npx python python3 pip pip3 curl wget nc convex; do \
+      ! command -v "$command" >/dev/null 2>&1; \
+    done
+USER 65532:65532
+
+FROM runtime-base AS example-runtime
+ENTRYPOINT ["/usr/local/bin/convex-example"]
+
+# Keep the adapter runtime last because ./run's default build target
+# selects the last stage.
+FROM runtime-base AS runtime
+ENTRYPOINT ["/usr/local/bin/convex-adapter"]

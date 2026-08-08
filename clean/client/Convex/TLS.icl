@@ -68,6 +68,16 @@ SSL_free ssl w = code { ccall SSL_free "p:V:A" }
 SSL_set_fd :: !Pointer !Int !*World -> (!Int, !*World)
 SSL_set_fd ssl fd w = code { ccall SSL_set_fd "pI:I:A" }
 
+SSL_get_rbio :: !Pointer !*World -> (!Pointer, !*World)
+SSL_get_rbio ssl w = code { ccall SSL_get_rbio "p:p:A" }
+
+// `BIO_set_close` is a macro around this in OpenSSL's own headers; called
+// directly here since this client has no C preprocessor. `BIO_CTRL_SET_CLOSE`
+// (9) and `BIO_NOCLOSE` (0) are both long-stable OpenSSL constants,
+// unchanged across the 1.0/1.1/3.x line.
+BIO_ctrl :: !Pointer !Int !Int !Int !*World -> (!Int, !*World)
+BIO_ctrl bio cmd larg parg w = code { ccall BIO_ctrl "pIII:I:A" }
+
 SSL_set1_host :: !Pointer !String !*World -> (!Int, !*World)
 SSL_set1_host ssl name w = code { ccall SSL_set1_host "ps:I:A" }
 
@@ -139,18 +149,45 @@ waitSocket fd forWrite d w
 	# (remaining, w) = remainingMs d w
 	= pollReady fd forWrite remaining w
 
+// `tlsConnect` owns closing `fd` on every one of its own failure paths, so
+// a caller must never also call `Convex.Socket.closeRaw` after a `RErr`
+// here (a real bug this project's own build-time TLS regression caught:
+// closing the same fd a second time did not fail loudly but reliably
+// corrupted a later garbage collection into "cycle in spine detected").
+// Before `SSL_set_fd` runs, `fd` is not yet owned by any OpenSSL BIO, so
+// these two early failures close it directly; every failure after that
+// point goes through `tlsFreeOnly`/`SSL_free`, whose BIO close-on-free
+// already closes it (see `tlsClose`'s own comment on the same ownership).
 tlsConnect :: !Int !String !Deadline !*World -> (!Result TlsConn, !*World)
 tlsConnect fd hostname d w
 	# (method, w) = TLS_client_method w
 	# (ctx, w) = SSL_CTX_new method w
-	| ctx == 0 = (RErr "could not create TLS context", w)
+	| ctx == 0
+		# w = closeRaw fd w
+		= (RErr "could not create TLS context", w)
 	# w = SSL_CTX_set_verify ctx def_SSL_VERIFY_PEER 0 w
 	# w = loadCaBundle ctx w
 	# (ssl, w) = SSL_new ctx w
 	| ssl == 0
 		# w = SSL_CTX_free ctx w
+		# w = closeRaw fd w
 		= (RErr "could not create TLS session", w)
 	# (_, w) = SSL_set_fd ssl fd w
+	// `SSL_set_fd` wraps `fd` in a socket BIO with OpenSSL's own default
+	// close-on-free ownership. Measured directly against this toolchain:
+	// letting that automatic close run (whether from a single `SSL_free`
+	// or, worse, a second explicit `closeRaw` on top of it) reliably
+	// corrupted a later Clean garbage collection into reporting "cycle in
+	// spine detected" and aborting — reproduced with a minimal
+	// Convex.Socket + Convex.TLS program with no HTTP/adapter code
+	// involved, immediately on a handshake that completes but then fails
+	// certificate verification. Disabling the BIO's own close here and
+	// having every one of this file's own cleanup paths call `closeRaw`
+	// explicitly instead makes fd ownership fully deterministic in Clean
+	// source rather than depending on an OpenSSL-internal close this
+	// runtime cannot observe.
+	# (rbio, w) = SSL_get_rbio ssl w
+	# (_, w) = BIO_ctrl rbio 9 0 0 w
 	# (_, w) = SSL_set1_host ssl (toCString hostname) w
 	# (_, w) = SSL_ctrl ssl def_SSL_CTRL_SET_TLSEXT_HOSTNAME def_TLSEXT_NAMETYPE_HOST_NAME (toCString hostname) w
 	= handshakeLoop { ctx = ctx, ssl = ssl, fd = fd } d w
@@ -181,10 +218,15 @@ verifyAndFinish conn w
 		= (RErr "TLS peer certificate verification failed", w)
 	= (ROk conn, w)
 
+// Used on every `tlsConnect` failure path reached after `SSL_set_fd` (the
+// handshake itself, or certificate verification). Closes `fd` explicitly
+// (see `tlsConnect`'s own comment on why the BIO's automatic close is
+// disabled instead of relied on).
 tlsFreeOnly :: !TlsConn !*World -> *World
 tlsFreeOnly conn w
 	# w = SSL_free conn.ssl w
 	# w = SSL_CTX_free conn.ctx w
+	# w = closeRaw conn.fd w
 	= w
 
 tlsRead :: !TlsConn !Int !Deadline !*World -> (!Result String, !*World)
@@ -255,21 +297,17 @@ where
 tlsFd :: !TlsConn -> Int
 tlsFd conn = conn.fd
 
-// Deliberately does NOT also call `closeRaw` on the underlying file
-// descriptor: `SSL_set_fd` wraps it in a socket `BIO` with OpenSSL's
-// default close-on-free ownership, so `SSL_free` already closes it.
-// Measured directly against this toolchain: closing the same fd number a
-// second time here did not fail loudly (`close` on an already-closed fd is
-// harmless in isolation) but reliably corrupted a later Clean garbage
-// collection into reporting "cycle in spine detected" and aborting —
-// almost certainly because the fd number was already reissued to
-// something the Clean runtime itself relies on internally by the time this
-// function's own `close` ran. `Convex.Socket.closeRaw` is still used
-// directly for the plain (non-TLS) HTTP path, which never goes through
-// OpenSSL at all.
+// `tlsConnect` disables the socket BIO's own close-on-free (see its
+// comment for the measured "cycle in spine detected" corruption that
+// caused), so this calls `closeRaw` on `fd` itself, exactly once, here on
+// the success path — the same explicit ownership `tlsFreeOnly` uses on
+// every failure path after `SSL_set_fd`. `Convex.Socket.closeRaw` is also
+// used directly for the plain (non-TLS) HTTP path, which never goes
+// through OpenSSL at all.
 tlsClose :: !TlsConn !*World -> *World
 tlsClose conn w
 	# (_, w) = SSL_shutdown conn.ssl w
 	# w = SSL_free conn.ssl w
 	# w = SSL_CTX_free conn.ctx w
+	# w = closeRaw conn.fd w
 	= w

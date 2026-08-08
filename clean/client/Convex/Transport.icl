@@ -14,10 +14,14 @@ connectTransport tls host port d w
 		ROk fd
 			| not tls = (ROk (TPlain fd), w)
 			# (session, w) = tlsConnect fd host d w
+			// `tlsConnect` already closes `fd` on every one of its own
+			// failure paths (see its own comment) — calling `closeRaw`
+			// here too would double-close it, which this project's own
+			// build-time TLS regression caught corrupting a later
+			// garbage collection ("cycle in spine detected") rather than
+			// failing loudly.
 			= case session of
-				RErr e
-					# w = closeRaw fd w
-					= (RErr e, w)
+				RErr e = (RErr e, w)
 				ROk conn = (ROk (TTls conn), w)
 
 transportFd :: !Transport -> Int
