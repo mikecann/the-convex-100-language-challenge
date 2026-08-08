@@ -89,16 +89,28 @@ limitations:
     reading the next NDJSON command with servicing the Live connection,
     since GNU APL has no threads to run them concurrently.
   - >-
-    Two further landmines found only once Live was driven against a
+    Three further landmines found only once Live was driven against a
     real backend end to end, beyond the ones already listed in
     README.md: a GNU APL function header cannot destructure a
     parenthesized left-argument strand like `(A B) Fn C` into two
     formal names -- it silently produces a DEFN ERROR and the whole
     body falls through to top-level immediate execution instead of
-    ever running as a function, with no compile-time warning; and the
-    sync protocol's very first Transition on a fresh connection must be
+    ever running as a function, with no compile-time warning; the sync
+    protocol's very first Transition on a fresh connection must be
     matched against startVersion.ts "AAAAAAAAAAA=" (timestamp zero,
-    confirmed against a real backend), not an empty string.
+    confirmed against a real backend), not an empty string; and
+    client/shim.cc's TLS handle parameter, once round-tripped through
+    convex.apl's `⍎` into a genuine APL numeric scalar, arrives at the
+    native function as that number's raw codepoint (e.g. handle 1 as
+    the SOH control character), not as ASCII decimal text -- the
+    previous atoi()-based handle_of() silently misread every non-zero
+    handle as 0, invisible with only one TLS connection ever open at a
+    time (Live and HTTP never ran concurrently until this work) and
+    surfaced only once Live's own persistent connection (slot 0) and a
+    concurrent HTTP call's connection (slot 1) were open at once against
+    the dedicated hosted target: the HTTP call's bytes were silently
+    misrouted onto Live's socket instead. Fixed by reading the cell's
+    numeric value directly.
   - >-
     GNU APL's own script-exit path (")OFF", required to leave the
     interpreter cleanly) appends one unsuppressible bare blank line to

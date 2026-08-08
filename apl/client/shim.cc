@@ -224,7 +224,28 @@ static Token op_connect(Value_P B) {
     return ret_ok_text(handleBuf);
 }
 
+/* Reads a handle argument (CONVEXTLS[2..4]'s Bh). op_connect returns a
+ * handle as ASCII decimal text ("K:<n>"), but client/convex.apl's
+ * ConnConnect immediately `⍎`-evaluates that text into a genuine APL
+ * numeric scalar before storing it in the CONN tuple -- every later
+ * CONVEXTLS[2..4] call therefore passes a *number*, not the original
+ * text, as B. A real APL integer cell's raw codepoint is its numeric
+ * value (e.g. handle 1 arrives as codepoint 1, the SOH control
+ * character, not the ASCII digit '1' = codepoint 49), so the previous
+ * atoi()-over-value_to_bytes() implementation silently parsed every
+ * non-zero handle as 0 -- invisible with only one TLS connection ever
+ * open at a time (handle 0 every time), and only surfaced once Live
+ * held slot 0 open while a concurrent HTTP call's slot 1 connection
+ * got misrouted onto it, confirmed end to end against a real hosted
+ * backend. Reading the cell's numeric value directly, the same way
+ * op_recv/op_send already read maxBytes/timeoutMs, is exact for that
+ * real case; falling back to the old ASCII-text parse only if a
+ * character cell ever arrives keeps this compatible with any future
+ * caller that does pass a handle as text. */
 static int handle_of(Value_P B) {
+    if (B->element_count() < 1) return -1;
+    const Cell &first = B->get_cravel(0);
+    if (!first.is_character_cell()) return (int)first.get_int_value();
     unsigned char raw[32];
     size_t n = value_to_bytes(B, raw, sizeof(raw) - 1);
     raw[n] = 0;

@@ -384,6 +384,31 @@ Debian-adjacent GNU APL 2.0 with a runtime library closure of just
   initial `LVREMOTETS` made every first `Transition` fail validation
   silently (no error surfaced to the operator; the subscription just
   never delivered).
+- The most serious landmine here: `client/shim.cc`'s `handle_of()` parsed
+  a TLS handle argument with `atoi()` over its raw bytes, assuming ASCII
+  decimal text -- correct for what `CONVEXTLS[1]` (connect) *returns*
+  ("K:1"), wrong for what it later *receives*, since `client/convex.apl`'s
+  `ConnConnect` immediately `⍎`-evaluates that text into a genuine APL
+  numeric scalar before storing it. A real integer cell's raw codepoint
+  *is* its numeric value (handle 1 arrives as the SOH control character,
+  codepoint 1, not the ASCII digit `'1'`, codepoint 49), so `atoi()` over
+  that byte silently parsed every non-zero handle as 0. This was
+  completely invisible through every check so far, local and hosted,
+  hand-run and shared-conformance, because only one TLS connection was
+  ever open at a time (Live and HTTP never ran concurrently until this
+  work) -- handle 0 was always correct by coincidence. It surfaced only
+  once Live's own persistent connection held slot 0 open while a
+  concurrent HTTP call's connection (correctly assigned slot 1 by
+  `client/shim.cc`'s own bookkeeping) got silently misrouted onto slot 0
+  instead: the HTTP request bytes went out on Live's socket, and the
+  reply never came, reported as `TransportError: connection closed
+  before headers completed`. Reproduced deterministically against the
+  dedicated hosted target (not against the local backend, since that
+  target is plain HTTP and never touches this native function at all) --
+  a targeted native-level trace pinned it to the exact `SSL_write` call
+  before the fix went in. Fixed by reading the argument cell's numeric
+  value directly, the same way `maxBytes`/`timeoutMs` already are, rather
+  than assuming text.
 - GNU APL's own script-exit path (`)OFF`, required to leave the
   interpreter cleanly -- omitting it drops the process into an
   interactive `^D`/end-of-input prompt loop instead) appends one
