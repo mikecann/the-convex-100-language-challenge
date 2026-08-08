@@ -9,10 +9,15 @@ questions, and several machines let verification runs proceed in parallel — on
 
 So the project rents a small fleet on demand. **It is not running now.**
 
-## Status: torn down (2026-08-08)
+## Status: torn down (2026-08-09) — the roster is complete
 
-Five servers were deleted after a session took the roster from 57 to 83 verified
-languages. They were costing **€1,233.60/month, about €41/day**, and nothing on
+The roster reached **100/100 verified languages** in this session. Five servers
+were deleted immediately once the last PR merged and `./run validate` confirmed
+every manifest clean — they were costing **€1,233.60/month, about €41/day**, and
+with the roster complete there is no further build work to do.
+
+Prior teardown, for reference: the same five servers were also deleted after an
+earlier session took the roster from 57 to 83 verified languages, and nothing on
 them was needed once every branch was pushed.
 
 Note that **powering a Hetzner server off does not stop billing** — only
