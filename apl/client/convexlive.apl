@@ -163,7 +163,15 @@ NONEMPTY:
 ⍝ Builds one complete client-to-server frame (always masked, per RFC
 ⍝ 6455 5.1) carrying PAYLOAD (an integer byte vector) with the given
 ⍝ OPCODE and FIN bit. A fresh CSPRNG mask key is drawn for every frame.
-∇Z←(OPCODE FIN) WsBuildFrame PAYLOAD;LEN;HDR;MASK
+⍝ Left argument is (opcode fin): a GNU APL function header cannot
+⍝ destructure a parenthesized strand into two formal names directly
+⍝ ("DEFN ERROR", discovered by an end-to-end run against a real
+⍝ backend -- everything inside the ∇ silently fell through to
+⍝ immediate execution instead), so OPCODE/FIN are picked out of the
+⍝ single left-argument name LEFT in the body instead.
+∇Z←LEFT WsBuildFrame PAYLOAD;OPCODE;FIN;LEN;HDR;MASK
+  OPCODE←1⊃LEFT
+  FIN←2⊃LEFT
   LEN←⍴PAYLOAD
   HDR←,(128×FIN)+OPCODE
   MASK←RandomBytes 4
@@ -573,11 +581,17 @@ URLOK:
   LVFRAGACTIVE←0
   LVFRAGBYTES←⍬
   LVCONNECTIONCOUNT←0
-  LVLASTCLOSEREASON←''
+  LVLASTCLOSEREASON←'InitialConnect'
   LVMAXOBSERVEDTS←''
   LVREMOTEQS←0
   LVREMOTEID←0
-  LVREMOTETS←''
+  ⍝ "AAAAAAAAAAA=" is the sync protocol's own encoding of timestamp
+  ⍝ zero -- every fresh connection's Transition stream starts here
+  ⍝ (querySet 0, identity 0, ts "AAAAAAAAAAA=") regardless of
+  ⍝ maxObservedTimestamp, which is a separate staleness hint. Confirmed
+  ⍝ against a real backend: an empty LVREMOTETS made
+  ⍝ TransitionVersionMatches reject the very first Transition outright.
+  LVREMOTETS←'AAAAAAAAAAA='
   LVSUBS←⍬
   LVNEXTQUERYID←1
   LVLOCALQSV←0
@@ -631,7 +645,7 @@ NOCONN:
   LVLASTCLOSEREASON←REASON
   LVREMOTEQS←0
   LVREMOTEID←0
-  LVREMOTETS←''
+  LVREMOTETS←'AAAAAAAAAAA='          ⍝ see LiveReset's comment on this sentinel
   I←1
 LOOP:
   →(I≤⍴LVSUBS)⍴MARK

@@ -43,6 +43,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY client ./client
 COPY examples ./examples
+RUN test -f client/convexlive.apl
 
 # The C++ native function is the only part of this client that is not
 # APL: DNS resolution, the OpenSSL TLS handshake, and SHA-1 (needed only
@@ -119,6 +120,7 @@ COPY --from=test /usr/bin/uname /usr/bin/uname
 COPY --from=test --chmod=0555 /tmp/apl-src/src/apl /usr/local/bin/apl
 COPY --from=test --chmod=0555 /opt/convex/client/shim.so /opt/convex/client/shim.so
 COPY --from=test --chmod=0444 /opt/convex/client/convex.apl /opt/convex/client/convex.apl
+COPY --from=test --chmod=0444 /opt/convex/client/convexlive.apl /opt/convex/client/convexlive.apl
 ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     PATH=/usr/local/bin:/usr/bin:/bin

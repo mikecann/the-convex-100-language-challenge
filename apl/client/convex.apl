@@ -1088,7 +1088,7 @@ READOK:
 ⍝ status:"success" is a result; 200 with status:"error", or HTTP 560
 ⍝ (Convex's function-threw status), is a structured FunctionError;
 ⍝ everything else is a ProtocolError.
-∇Z←HttpClassify PARAMS;STATUSCODE;BODYTEXT;DOC;STATUSFIELD;MESSAGE;MSGFIELD;VALUEFIELD
+∇Z←HttpClassify PARAMS;STATUSCODE;BODYTEXT;DOC;STATUSFIELD;MESSAGE;MSGFIELD;VALUEFIELD;LOGSJSON;LOGSFIELD;DATAJSON;DATAFIELD
   STATUSCODE←1⊃PARAMS
   BODYTEXT←2⊃PARAMS
   →((STATUSCODE=200)∨(STATUSCODE=560))⍴MAYBEJSON
@@ -1117,25 +1117,51 @@ SUCCESS:
   →0
 HASVALUE:
   VALUEFIELD←'value' JGet DOC
-  Z←'{"type":"result","value":',(JStringify VALUEFIELD),'}'
+  ⍝ logLines (present on a successful call whenever the function
+  ⍝ itself logged anything) becomes this event's own "logs" array,
+  ⍝ matching the reference JS adapter's { ..., logs: [] } shape --
+  ⍝ an empty array, not an omitted field, when the response carried
+  ⍝ none.
+  LOGSJSON←'[]'
+  →('logLines' JHas DOC)⍴HASLOGS
+  →BUILDRESULT
+HASLOGS:
+  LOGSFIELD←'logLines' JGet DOC
+  →('a'≡1⊃LOGSFIELD)⍴USELOGS
+  →BUILDRESULT
+USELOGS:
+  LOGSJSON←JStringify LOGSFIELD
+BUILDRESULT:
+  Z←'{"type":"result","value":',(JStringify VALUEFIELD),',"logs":',LOGSJSON,'}'
   →0
 FUNCERROR:
   MESSAGE←'Convex function failed'
   →('errorMessage' JHas DOC)⍴HASERRMSG
   →('message' JHas DOC)⍴HASMSG
-  →BUILDERR
+  →HASMESSAGE
 HASERRMSG:
   MSGFIELD←'errorMessage' JGet DOC
   →('s'≡1⊃MSGFIELD)⍴USEMSG
-  →BUILDERR
+  →HASMESSAGE
 HASMSG:
   MSGFIELD←'message' JGet DOC
   →('s'≡1⊃MSGFIELD)⍴USEMSG
-  →BUILDERR
+  →HASMESSAGE
 USEMSG:
   MESSAGE←2⊃MSGFIELD
+HASMESSAGE:
+  ⍝ errorData (a Convex function can throw a ConvexError carrying an
+  ⍝ arbitrary JSON payload) is surfaced as this event's error.data,
+  ⍝ null when the function threw a plain error with no payload --
+  ⍝ again matching the reference adapter's data: error?.data ?? null.
+  DATAJSON←'null'
+  →('errorData' JHas DOC)⍴HASERRDATA
+  →BUILDERR
+HASERRDATA:
+  DATAFIELD←'errorData' JGet DOC
+  DATAJSON←JStringify DATAFIELD
 BUILDERR:
-  Z←'{"type":"error","error":{"name":"FunctionError","message":',(JEscapeString MESSAGE),'}}'
+  Z←'{"type":"error","error":{"name":"FunctionError","message":',(JEscapeString MESSAGE),',"data":',DATAJSON,'}}'
 ∇
 
 ⍝ Reads environment variable NAME. ⎕ENV NAME returns a 1x2 matrix

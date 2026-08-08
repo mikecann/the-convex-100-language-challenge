@@ -8,30 +8,40 @@ implementation:
   provenance: native
   version: 0.1.0
   notes: >-
-    Native GNU APL implementation of the Convex HTTP API. JSON encoding
-    and decoding, HTTP/1.1 request/response framing (status line,
-    headers, Content-Length and chunked bodies), and the
-    "format":"json" envelope classification are all written in APL
-    (client/convex.apl), loaded by the conformance adapter and the
-    canonical example the same way GNU APL's own shipped wslib5
-    libraries are loaded, with dyadic )COPY. GNU APL's built-in ⎕FIO
-    (Quad-FIO[32..42]) supplies raw sockets natively for the plain
-    (ws://, http://) transport -- no shim needed. TLS (wss://,
-    https://) uses a small native function, client/shim.cc, compiled
-    against GNU APL's own internal headers and loaded at runtime with
-    dyadic ⎕FX, the documented mechanism GNU APL's own lib_file_io.so
-    uses. The same native function also supplies SHA-1 (needed only
-    for the RFC 6455 WebSocket handshake) and DNS resolution (⎕FIO's
-    own connect() takes an already-resolved address; GNU APL has no
-    getaddrinfo of its own). Toolchain built from source (the official
-    GNU APL 2.0 release tarball, pinned by URL and sha256) rather than
-    installed from Debian's own .deb: Debian packages GNU APL only in
-    sid (not yet in trixie/bookworm) and only with --with-gtk3 enabled,
-    which pulls in the full GTK/cairo/pango stack for a headless
-    network client that never touches ⎕GTK/⎕PLOT/⎕PNG; the plain
-    upstream tarball's default build (--with-gtk3 is off by default)
-    gets the same GPL, Debian-adjacent GNU APL 2.0 with a runtime
-    closure of just libstdc++/libm/libc/libgcc_s.
+    Native GNU APL implementation of both the Convex HTTP API and Live
+    (the WebSocket /api/sync subscription protocol). JSON encoding and
+    decoding, HTTP/1.1 request/response framing (status line, headers,
+    Content-Length and chunked bodies), the "format":"json" envelope
+    classification (client/convex.apl), RFC 6455 WebSocket framing
+    (handshake, masking, fragmentation reassembly, interleaved control
+    frames), and the sync-protocol state machine (Connect,
+    ModifyQuerySet, Transition, reconnect with backoff, the
+    subscription table -- client/convexlive.apl) are all written in
+    APL, loaded by the conformance adapter and the canonical example
+    the same way GNU APL's own shipped wslib5 libraries are loaded,
+    with dyadic )COPY. GNU APL's built-in ⎕FIO (Quad-FIO[32..42])
+    supplies raw sockets natively for the plain (ws://, http://)
+    transport -- no shim needed. TLS (wss://, https://) uses a small
+    native function, client/shim.cc, compiled against GNU APL's own
+    internal headers and loaded at runtime with dyadic ⎕FX, the
+    documented mechanism GNU APL's own lib_file_io.so uses. The same
+    native function also supplies SHA-1 and CSPRNG bytes (both needed
+    only for the RFC 6455 handshake and frame masking) and DNS
+    resolution (⎕FIO's own connect() takes an already-resolved
+    address; GNU APL has no getaddrinfo of its own). GNU APL has no
+    threads, so Live's WebSocket reader is not a background worker:
+    the whole adapter process is the one worker, polling the socket
+    non-blockingly once per command-loop pass and interleaving that
+    with reading the next NDJSON command. Toolchain built from source
+    (the official GNU APL 2.0 release tarball, pinned by URL and
+    sha256) rather than installed from Debian's own .deb: Debian
+    packages GNU APL only in sid (not yet in trixie/bookworm) and only
+    with --with-gtk3 enabled, which pulls in the full GTK/cairo/pango
+    stack for a headless network client that never touches
+    ⎕GTK/⎕PLOT/⎕PNG; the plain upstream tarball's default build
+    (--with-gtk3 is off by default) gets the same GPL, Debian-adjacent
+    GNU APL 2.0 with a runtime closure of just
+    libstdc++/libm/libc/libgcc_s.
 toolchain:
   name: GNU APL
   version: "2.0"
@@ -51,37 +61,52 @@ adapter:
     - debugDisconnect
 limitations:
   - >-
-    Live (the WebSocket /api/sync subscription protocol -- Connect,
-    ModifyQuerySet, Transition, reconnect) is not implemented. The
-    adapter answers subscribe/unsubscribe/debugDisconnect with a
-    structured ProtocolError rather than a fabricated ack, so shared
-    conformance fails those cleanly instead of hanging or reporting a
-    false pass. The canonical example therefore demonstrates only the
-    HTTP half of the shared counter walk (initial query, mutation with
-    an idempotency key, follow-up query) and its stdout does not match
-    _shared/examples/basics.expected.txt, which requires both
-    transports.
-  - >-
     Language-local Docker tests (client/tests/selftest.apl: JSON
     round-trip and escaping, object field lookup, whole-number
     acceptance, URL parsing, HTTP status-line/header helpers, chunked
-    hex sizes, EnvGet, HttpClassify's three envelope shapes) pass from
-    a clean build, and the client has been verified by hand against
-    both a real internet endpoint (TLS) and this project's real local
-    self-hosted backend (plain HTTP: a genuine 0 -> 1 query/mutation/
-    query round trip, and the compiled conformance adapter driving
-    hello/query/mutation/close end to end). Shared
-    ./run verify-example/verify/verify-hosted have not been run yet,
-    so the capability list below reflects no evaluator award.
+    hex sizes, EnvGet, HttpClassify's four envelope shapes) pass from a
+    clean build. `./run verify-example apl` and `./run verify apl`
+    both pass against the approved local self-hosted backend: the
+    shared black-box conformance pilot (client/adapter/hello,
+    client/http/*, client/live/*, client/adapter/clean-close) reports
+    "Earned capabilities: http, live" for both the reference oracle and
+    this client. `./run verify-hosted apl` (the dedicated hosted
+    protocol-drift target) has not been run yet as of this note.
   - >-
     The native function (client/shim.cc) is deliberately narrow: TCP
-    connect/send/recv/close for TLS, SHA-1, and DNS resolution only. No
-    HTTP, JSON, or Convex protocol behaviour lives in C++.
+    connect/send/recv/close for TLS, SHA-1, CSPRNG bytes, and DNS
+    resolution only. No HTTP, JSON, WebSocket framing, or Convex sync
+    protocol behaviour lives in C++.
   - >-
     GNU APL's Quad-FIO[40] (select) reliably raised DOMAIN ERROR in
     this build even when its argument's shape and nesting exactly
     matched Quad_FIO.cc's own documented expectations (checked with
-    rho/depth/pick before it ever reached select()). The plain-socket
-    path works around this with a non-blocking fcntl + Quad-FIO[37]
-    recv() poll loop instead, which does not have the same problem.
+    rho/depth/pick before it ever reached select()). Both the HTTP
+    transport and the Live WebSocket reader work around this with a
+    non-blocking fcntl + Quad-FIO[37]/[41] recv()/read() poll loop
+    instead, which does not have the same problem; the conformance
+    adapter's own command loop uses the identical pattern to interleave
+    reading the next NDJSON command with servicing the Live connection,
+    since GNU APL has no threads to run them concurrently.
+  - >-
+    Two further landmines found only once Live was driven against a
+    real backend end to end, beyond the ones already listed in
+    README.md: a GNU APL function header cannot destructure a
+    parenthesized left-argument strand like `(A B) Fn C` into two
+    formal names -- it silently produces a DEFN ERROR and the whole
+    body falls through to top-level immediate execution instead of
+    ever running as a function, with no compile-time warning; and the
+    sync protocol's very first Transition on a fresh connection must be
+    matched against startVersion.ts "AAAAAAAAAAA=" (timestamp zero,
+    confirmed against a real backend), not an empty string.
+  - >-
+    GNU APL's own script-exit path (")OFF", required to leave the
+    interpreter cleanly) appends one unsuppressible bare blank line to
+    stdout after a script's last real line of output, independent of
+    anything this client prints -- on top of the already-documented
+    per-)COPY "DUMPED <mtime>" banner. Both example/entrypoint.sh and
+    client/tests/conformance/entrypoint.sh filter it at the shell
+    boundary (holding the most recently read line back by one step so
+    a genuine trailing empty line can be dropped instead of printed),
+    since neither is suppressible from inside the language.
 capabilities: []

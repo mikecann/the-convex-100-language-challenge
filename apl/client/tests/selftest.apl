@@ -55,8 +55,10 @@ AssertEq (HexToDec '1a2b') 6699 'hex to dec multi digit'
 AssertEq (EnvGet 'CONVEX_CLIENT_SELFTEST_UNSET_VAR') '' 'env get unset variable'
 
 ⍝ ---- HttpClassify: success and structured error envelopes ----
-AssertEq (HttpClassify (200 '{"status":"success","value":{"count":1}}')) '{"type":"result","value":{"count":1}}' 'http classify success'
-AssertEq (HttpClassify (200 '{"status":"error","errorMessage":"boom"}')) '{"type":"error","error":{"name":"FunctionError","message":"boom"}}' 'http classify function error'
+AssertEq (HttpClassify (200 '{"status":"success","value":{"count":1}}')) '{"type":"result","value":{"count":1},"logs":[]}' 'http classify success'
+AssertEq (HttpClassify (200 '{"status":"success","value":{"count":1},"logLines":["log one"]}')) '{"type":"result","value":{"count":1},"logs":["log one"]}' 'http classify success with logs'
+AssertEq (HttpClassify (200 '{"status":"error","errorMessage":"boom"}')) '{"type":"error","error":{"name":"FunctionError","message":"boom","data":null}}' 'http classify function error'
+AssertEq (HttpClassify (200 '{"status":"error","errorMessage":"boom","errorData":{"code":"X"}}')) '{"type":"error","error":{"name":"FunctionError","message":"boom","data":{"code":"X"}}}' 'http classify function error with data'
 AssertEq (HttpClassify (500 '')) '{"type":"error","error":{"name":"TransportError","message":"unexpected HTTP status 500"}}' 'http classify transport error'
 
 ⍝ Top-level (non-function) script code apparently can't use labels/

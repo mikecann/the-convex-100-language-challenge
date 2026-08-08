@@ -16,19 +16,49 @@
 ⍝ controller connection, and uses that one accepted socket handle for
 ⍝ both directions instead. ⎕FIO[41]/[42] (read/write) work identically
 ⍝ on a plain fd or an accepted socket fd, so one pair of helpers below
-⍝ serves both modes -- no Conn* wrapper needed here, and no
-⍝ non-blocking polling either, since this adapter (Live not yet
-⍝ implemented) only ever does one blocking read at a time between
-⍝ commands.
+⍝ serves both modes.
+⍝
+⍝ Live needs command reads and WebSocket delivery to interleave on one
+⍝ thread (see convexlive.apl's header comment on why this whole process
+⍝ is the one worker), so INHANDLE is set non-blocking (the same fcntl
+⍝ F_SETFL/O_NONBLOCK pattern client/convex.apl's own ConnConnect uses,
+⍝ for the same ⎕FIO[40]-select-crashes reason) and RunAdapter's loop
+⍝ polls it once per pass rather than blocking on a full line: a partial
+⍝ command is carried in BUF across passes, and LiveServiceTick runs
+⍝ once every pass so a query update is written out promptly instead of
+⍝ waiting for the next command. WriteBytes tolerates EAGAIN (retrying
+⍝ instead of truncating) because ADAPTER_LISTEN mode's OUTHANDLE is the
+⍝ same fd as INHANDLE and therefore shares its non-blocking flag.
 
 )COPY /opt/convex/client/convex.apl
+)COPY /opt/convex/client/convexlive.apl
 ConvexInit '/opt/convex/client/shim.so'
 
-∇Z←ReadBytes HANDLE
-  Z←65536 ⎕FIO[41] HANDLE
+⍝ One non-blocking read attempt (never loops, never sleeps -- the
+⍝ caller interleaves this with LiveServiceTick). Returns
+⍝ ('d' bytes) | ('t' ⍬) no data available right now | ('c' ⍬) peer
+⍝ closed | ('e' msg) a real read error.
+∇Z←TryReadOnce HANDLE;R
+  R←65536 ⎕FIO[41] HANDLE
+  →(0=⍴⍴R)⍴ERRCASE
+  →((⍴R)>0)⍴GOTDATA
+  Z←'c' ⍬
+  →0
+ERRCASE:
+  →(R=¯11)⍴WOULDBLOCK
+  Z←JErr 'read() failed'
+  →0
+WOULDBLOCK:
+  Z←'t' ⍬
+  →0
+GOTDATA:
+  Z←'d' R
 ∇
 
-∇WriteBytes PARAMS;HANDLE;BYTES;SENT;TOTAL;N
+⍝ Retries on EAGAIN (-11) instead of giving up, since ADAPTER_LISTEN
+⍝ mode's OUTHANDLE shares INHANDLE's non-blocking flag (they are the
+⍝ same accepted-socket fd) -- see this file's header comment.
+∇WriteBytes PARAMS;HANDLE;BYTES;SENT;TOTAL;N;IGNORED
   HANDLE←1⊃PARAMS
   BYTES←2⊃PARAMS
   TOTAL←⍴BYTES
@@ -37,7 +67,11 @@ LOOP:
   →(SENT≥TOTAL)⍴DONE
   N←(SENT↓BYTES) ⎕FIO[42] HANDLE
   →(N>0)⍴PROGRESS
+  →(N=¯11)⍴WOULDBLOCK
   →DONE                          ⍝ write failed: nothing more we can do
+WOULDBLOCK:
+  IGNORED←⎕DL 0.005              ⍝ unassigned would auto-echo the seconds slept
+  →LOOP
 PROGRESS:
   SENT←SENT+N
   →LOOP
@@ -50,22 +84,16 @@ DONE:
   WriteBytes (OUTHANDLE (BytesOfStr TEXT,⎕UCS 10))
 ∇
 
-⍝ Reads one NDJSON line (without its trailing LF) from INHANDLE, using
-⍝ BUF as carried-over bytes from the previous call. Returns
-⍝ ('k' (line newBuf)) | ('c' newBuf) closed | ('e' msg).
-∇Z←INHANDLE ReadLine BUF;POS;R;LINE
-LOOP:
+⍝ Pulls at most one complete NDJSON line (without its trailing LF) out
+⍝ of the front of BUF. Pure: never touches a handle. Returns
+⍝ ('k' (line newBuf)) one line consumed | ('n' ⍬) BUF holds no full
+⍝ line yet -- keep accumulating.
+∇Z←ExtractLine BUF;POS;LINE
   POS←(,10)⍷BUF
   POS←POS⍳1
   →(POS≤⍴BUF)⍴GOTLINE
-  R←ReadBytes INHANDLE
-  →((⍴R)>0)⍴MORE
-  →(0=⍴BUF)⍴CLOSED
-  Z←'k' ((StrOfBytes BUF) ⍬)      ⍝ final partial line before EOF
+  Z←'n' ⍬
   →0
-MORE:
-  BUF←BUF,R
-  →LOOP
 GOTLINE:
   LINE←StrOfBytes (POS-1)↑BUF
   ⍝ Tolerate a trailing CR (CRLF-terminated controller stream).
@@ -74,9 +102,6 @@ GOTLINE:
   →0
 TRIMCR:
   Z←'k' (((⍴LINE)-1)↑LINE) ((POS)↓BUF)
-  →0
-CLOSED:
-  Z←'c' BUF
 ∇
 
 ∇Z←RawGetString PARAMS;DOC;KEY;FIELD
@@ -170,14 +195,124 @@ ACKIT:
   Emit (OUTHANDLE ('{"id":',(JEscapeString ID),',"type":"ack"}'))
 ∇
 
-⍝ Live is not yet implemented in this client: subscribe/unsubscribe/
-⍝ debugDisconnect answer honestly with a structured error rather than
-⍝ a fabricated ack, so shared conformance fails those tests cleanly
-⍝ instead of hanging or reporting a false success.
-∇HandleLiveUnsupported PARAMS;OUTHANDLE;ID
+⍝ Live: subscribe/unsubscribe/debugDisconnect are backed by the real
+⍝ WebSocket /api/sync client in client/convexlive.apl. LIVEACTIVE (a
+⍝ RunAdapter-scope global, 0 until the first Live command) gates
+⍝ whether the main loop's per-tick LiveServiceTick call runs at all --
+⍝ a pure-HTTP conformance run never opens a socket it does not need.
+∇EnsureLiveInit;OK
+  →(LIVEACTIVE≠0)⍴0
+  OK←LiveInit CONVEXURL
+  →(OK≠0)⍴INITOK
+  LIVEACTIVE←0
+  →0
+INITOK:
+  LIVEACTIVE←1
+∇
+
+⍝ Registers the subscription and acks immediately, matching the
+⍝ reference JS adapter: the ack means "tracked", not "first value
+⍝ delivered" -- the value itself arrives later as a separate
+⍝ {"type":"subscription",...} event, from EmitLiveEvents below.
+∇HandleSubscribe PARAMS;OUTHANDLE;ID;DOC;SUBIDR;PATHR;ARGSR;ARGSJSON
   OUTHANDLE←1⊃PARAMS
   ID←2⊃PARAMS
-  Emit (OUTHANDLE ('{"id":',(JEscapeString ID),',"type":"error","error":{"name":"ProtocolError","message":"Live is not implemented in this client"}}'))
+  DOC←3⊃PARAMS
+  SUBIDR←RawGetString (DOC 'subscriptionId')
+  →('k'≡1⊃SUBIDR)⍴HASSUBID
+  EmitProtocolError (OUTHANDLE ID 'subscribe command omitted subscriptionId')
+  →0
+HASSUBID:
+  PATHR←RawGetString (DOC 'path')
+  →('k'≡1⊃PATHR)⍴HASPATH
+  EmitProtocolError (OUTHANDLE ID 'subscribe command omitted a valid path')
+  →0
+HASPATH:
+  ARGSJSON←'{}'
+  →('args' JHas DOC)⍴HASARGS
+  →CALLIT
+HASARGS:
+  ARGSR←'args' JGet DOC
+  →('o'≡1⊃ARGSR)⍴ARGSOBJ
+  →CALLIT
+ARGSOBJ:
+  ARGSJSON←JStringify ARGSR
+CALLIT:
+  EnsureLiveInit
+  →(LIVEACTIVE≠0)⍴LIVEOK
+  EmitProtocolError (OUTHANDLE ID 'CONVEX_URL is not a usable Live endpoint')
+  →0
+LIVEOK:
+  LiveSubscribe ((2⊃SUBIDR) (2⊃PATHR) ARGSJSON)
+  Emit (OUTHANDLE ('{"id":',(JEscapeString ID),',"type":"ack"}'))
+∇
+
+∇HandleUnsubscribe PARAMS;OUTHANDLE;ID;DOC;SUBIDR
+  OUTHANDLE←1⊃PARAMS
+  ID←2⊃PARAMS
+  DOC←3⊃PARAMS
+  SUBIDR←RawGetString (DOC 'subscriptionId')
+  →('k'≡1⊃SUBIDR)⍴HASSUBID
+  EmitProtocolError (OUTHANDLE ID 'unsubscribe command omitted subscriptionId')
+  →0
+HASSUBID:
+  →(LIVEACTIVE≠0)⍴LIVEOK
+  Emit (OUTHANDLE ('{"id":',(JEscapeString ID),',"type":"ack"}'))
+  →0
+LIVEOK:
+  LiveUnsubscribe (2⊃SUBIDR)
+  Emit (OUTHANDLE ('{"id":',(JEscapeString ID),',"type":"ack"}'))
+∇
+
+⍝ Acks only after the old connection is fully retired and the next
+⍝ reconnect attempt is scheduled (both happen synchronously inside
+⍝ LiveDebugDisconnect -- see its header comment in convexlive.apl) so a
+⍝ controller that has already seen this ack can safely require the
+⍝ next Connect to observe the new connectionCount.
+∇HandleDebugDisconnect PARAMS;OUTHANDLE;ID
+  OUTHANDLE←1⊃PARAMS
+  ID←2⊃PARAMS
+  EnsureLiveInit
+  →(LIVEACTIVE≠0)⍴LIVEOK
+  EmitProtocolError (OUTHANDLE ID 'CONVEX_URL is not a usable Live endpoint')
+  →0
+LIVEOK:
+  LiveDebugDisconnect
+  Emit (OUTHANDLE ('{"id":',(JEscapeString ID),',"type":"ack"}'))
+∇
+
+⍝ Writes out every (subscriptionId kind payload) triple LiveServiceTick
+⍝ just produced, as {"type":"subscription",...} events -- 'v' becomes a
+⍝ value delivery, 'e' a structured FunctionError.
+∇EmitLiveEvents PARAMS;OUTHANDLE;EVENTS;I;EV;SUBID;KIND;PAYLOAD;NAME;MSG;HASDATA;DATATEXT
+  OUTHANDLE←1⊃PARAMS
+  EVENTS←2⊃PARAMS
+  I←1
+LOOP:
+  →(I≤⍴EVENTS)⍴ONE
+  →0
+ONE:
+  EV←I⊃EVENTS
+  SUBID←1⊃EV
+  KIND←2⊃EV
+  PAYLOAD←3⊃EV
+  →('v'≡KIND)⍴DOVALUE
+  →DOERROR
+DOVALUE:
+  Emit (OUTHANDLE ('{"type":"subscription","subscriptionId":',(JEscapeString SUBID),',"value":',(JStringify PAYLOAD),',"logs":[]}'))
+  →NEXT
+DOERROR:
+  NAME←1⊃PAYLOAD
+  MSG←2⊃PAYLOAD
+  HASDATA←3⊃PAYLOAD
+  DATATEXT←'null'
+  →(HASDATA=0)⍴NEXTDATA
+  DATATEXT←JStringify 4⊃PAYLOAD
+NEXTDATA:
+  Emit (OUTHANDLE ('{"type":"subscription","subscriptionId":',(JEscapeString SUBID),',"error":{"name":',(JEscapeString NAME),',"message":',(JEscapeString MSG),',"data":',DATATEXT,'}}'))
+NEXT:
+  I←I+1
+  →LOOP
 ∇
 
 ∇Z←HandleClose PARAMS;OUTHANDLE;ID
@@ -218,7 +353,9 @@ HASOP:
   →('hello'≡OP)⍴DOHELLO
   →(('query'≡OP)∨('mutation'≡OP)∨('action'≡OP))⍴DOCALL
   →('setAuth'≡OP)⍴DOAUTH
-  →(('subscribe'≡OP)∨('unsubscribe'≡OP)∨('debugDisconnect'≡OP))⍴DOLIVE
+  →('subscribe'≡OP)⍴DOSUB
+  →('unsubscribe'≡OP)⍴DOUNSUB
+  →('debugDisconnect'≡OP)⍴DODEBUG
   →('close'≡OP)⍴DOCLOSE
   EmitProtocolError (OUTHANDLE ID 'unrecognised op ',OP)
   →0
@@ -231,16 +368,28 @@ DOCALL:
 DOAUTH:
   HandleSetAuth (OUTHANDLE ID DOC)
   →0
-DOLIVE:
-  HandleLiveUnsupported (OUTHANDLE ID)
+DOSUB:
+  HandleSubscribe (OUTHANDLE ID DOC)
+  →0
+DOUNSUB:
+  HandleUnsubscribe (OUTHANDLE ID DOC)
+  →0
+DODEBUG:
+  HandleDebugDisconnect (OUTHANDLE ID)
   →0
 DOCLOSE:
+  →(LIVEACTIVE≠0)⍴DOCLOSELIVE
+  Z←HandleClose (OUTHANDLE ID)
+  →0
+DOCLOSELIVE:
+  LiveClose
   Z←HandleClose (OUTHANDLE ID)
 ∇
 
-∇RunAdapter;LISTENSPEC;INHANDLE;OUTHANDLE;BUF;R;CLOSEDFLAG;LISTENHANDLE;COLONPOS;BINDPORT;ACCEPTR;IGNORED
+∇RunAdapter;LISTENSPEC;INHANDLE;OUTHANDLE;BUF;R;CLOSEDFLAG;LISTENHANDLE;COLONPOS;BINDPORT;ACCEPTR;IGNORED;ER;RR
   CONVEXURL←EnvGet 'CONVEX_URL'
   AUTHTOKEN←''
+  LIVEACTIVE←0
   LISTENSPEC←EnvGet 'ADAPTER_LISTEN'
   →(0=⍴LISTENSPEC)⍴STDIO
   COLONPOS←LISTENSPEC⍳':'          ⍝ single-char search: fine as-is
@@ -257,18 +406,44 @@ STDIO:
   INHANDLE←0
   OUTHANDLE←1
 SETUP:
+  ⍝ F_SETFL O_NONBLOCK (4 2048 on Linux) -- see this file's header
+  ⍝ comment. Harmless in the pure-HTTP case too: EAGAIN just means
+  ⍝ "no command yet", handled the same as a slow controller.
+  IGNORED←(4 2048) ⎕FIO[59] INHANDLE   ⍝ unassigned would auto-echo
   BUF←⍬
   CLOSEDFLAG←0
 LOOP:
   →(CLOSEDFLAG≠0)⍴DONE
-  R←INHANDLE ReadLine BUF
-  →('k'≡1⊃R)⍴GOTLINE
-  →DONE                          ⍝ 'c' (closed) or 'e': stop the loop
+  ⍝ Drain every complete command already sitting in BUF before asking
+  ⍝ for more bytes, so a controller that pipelines several lines in one
+  ⍝ write doesn't wait a whole tick per line.
+EXTRACT:
+  ER←ExtractLine BUF
+  →('k'≡1⊃ER)⍴GOTLINE
+  →READMORE
 GOTLINE:
-  BUF←2⊃2⊃R
-  CLOSEDFLAG←DispatchLine (OUTHANDLE (1⊃2⊃R))
+  BUF←2⊃2⊃ER
+  CLOSEDFLAG←DispatchLine (OUTHANDLE (1⊃2⊃ER))
+  →(CLOSEDFLAG≠0)⍴DONE
+  →EXTRACT
+READMORE:
+  RR←TryReadOnce INHANDLE
+  →('d'≡1⊃RR)⍴GOTDATA
+  →('t'≡1⊃RR)⍴TICK
+  →DONE                          ⍝ 'c' closed or 'e' error: stop
+GOTDATA:
+  BUF←BUF,2⊃RR
+  →EXTRACT
+TICK:
+  →(LIVEACTIVE=0)⍴IDLE
+  EmitLiveEvents (OUTHANDLE LiveServiceTick)
+  →LOOP
+IDLE:
+  IGNORED←⎕DL 0.01               ⍝ unassigned would auto-echo the seconds slept
   →LOOP
 DONE:
+  →(LIVEACTIVE=0)⍴0
+  LiveClose
 ∇
 
 RunAdapter

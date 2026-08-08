@@ -1,7 +1,8 @@
 # Convex from APL
 
 This demonstration uses GNU APL -- an implementation of the array language
-itself, not a descendant -- to call Convex's documented JSON HTTP endpoints.
+itself, not a descendant -- to call Convex's documented JSON HTTP API and its
+WebSocket `/api/sync` Live subscription protocol.
 
 It is an educational, unofficial experiment. It is not a production SDK, an
 officially sanctioned Convex client, or a package intended for publication.
@@ -9,21 +10,17 @@ officially sanctioned Convex client, or a package intended for publication.
 ## Start here
 
 [`examples/basics/main.apl`](examples/basics/main.apl) is the canonical
-example. It queries a fresh counter room over HTTP, applies an idempotent
-mutation, and queries again to prove the `0 -> 1` journey landed. The block
-below is generated from that exact runnable file.
-
-**This example is HTTP-only right now.** Live (the WebSocket `/api/sync`
-subscription this project's other clients use) is not implemented, so the
-example's output does not match this project's shared expected transcript,
-which requires both transports -- see "What works" below.
+example. It queries a fresh counter room over HTTP, opens a Live subscription
+on that same room, applies an idempotent mutation, and observes the `0 -> 1`
+journey land reactively over the WebSocket subscription rather than by
+re-querying. The block below is generated from that exact runnable file.
 
 ## What works
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Not yet verified | Query, mutation, and action calls, the `format:"json"` envelope, and structured `FunctionError`/`TransportError`/`ProtocolError` classification are implemented and pass language-local tests and hand-run checks against a real backend (see below), but shared `./run verify`/`verify-hosted` black-box conformance has not been run. No badge is claimed. |
-| Live | Not implemented | The WebSocket `/api/sync` state machine (Connect, ModifyQuerySet, Transition, reconnect) does not exist yet. The conformance adapter answers `subscribe`/`unsubscribe`/`debugDisconnect` with a structured `ProtocolError` rather than a fabricated acknowledgement. |
+| HTTP | Verified (`./run verify apl` awarded it) | Query, mutation, and action calls, the `format:"json"` envelope, structured `FunctionError`/`TransportError`/`ProtocolError` classification, response `logs`, and structured `error.data` are implemented in `client/convex.apl` and pass both language-local tests and the shared black-box conformance pilot against the approved local backend. |
+| Live | Verified (`./run verify apl` awarded it) | The WebSocket `/api/sync` state machine -- RFC 6455 handshake/framing/masking/fragmentation, Connect, ModifyQuerySet (Add/Remove), Transition application, `QueryFailed`-then-recovery, and reconnect with exponential backoff reset -- is implemented in `client/convexlive.apl` and passes the shared conformance pilot's `client/live/*` cases, including five real reconnects via `debugDisconnect`. `./run verify-hosted apl` (the dedicated hosted protocol-drift target) has not been run yet as of this note. |
 
 ## The basic example
 
@@ -36,31 +33,24 @@ which requires both transports -- see "What works" below.
 ⍝ no separate "test" copy of this file.
 ⍝
 ⍝ It reuses the same client library the conformance adapter calls
-⍝ into, client/convex.apl, installed at /opt/convex/client/convex.apl.
-⍝ convex.apl implements the Convex HTTP protocol itself in APL (JSON
-⍝ encoding/decoding and HTTP/1.1 request/response framing); the only
-⍝ things it delegates outside APL are raw TCP/TLS bytes and one hash
-⍝ primitive, via a small native function (client/shim.cc) loaded with
-⍝ dyadic ⎕FX -- GNU APL's documented foreign-function mechanism.
-⍝
-⍝ LIMITATION, stated up front rather than hidden in a comment at the
-⍝ bottom: Live (the WebSocket /api/sync subscription this project's
-⍝ other clients use for their "live initial count"/"live updated
-⍝ count" lines) is not implemented yet. This example demonstrates the
-⍝ HTTP half of the walk only -- the initial query, the mutation and
-⍝ its idempotency key, and a follow-up query proving the mutation
-⍝ landed -- and its output does not (yet) match this project's shared
-⍝ basics.expected.txt, which requires both transports. See the
-⍝ project's manifest.yaml/README for the honest capability list.
+⍝ into: client/convex.apl (the Convex HTTP protocol itself, in APL --
+⍝ JSON encoding/decoding and HTTP/1.1 request/response framing) and
+⍝ client/convexlive.apl (RFC 6455 WebSocket framing and the Convex
+⍝ /api/sync sync-protocol state machine, also in APL), both installed
+⍝ under /opt/convex/client/. The only things either delegates outside
+⍝ APL are raw TCP/TLS bytes, SHA-1, and CSPRNG bytes, via a small
+⍝ native function (client/shim.cc) loaded with dyadic ⎕FX -- GNU APL's
+⍝ documented foreign-function mechanism.
 
 )COPY /opt/convex/client/convex.apl
+)COPY /opt/convex/client/convexlive.apl
 ConvexInit '/opt/convex/client/shim.so'
 
 ⍝ GNU APL's top-level (non-function) script statements cannot use
 ⍝ labels/branches ("Illegal : in immediate execution" -- discovered
 ⍝ while writing this client's own tests), so all of this example's
 ⍝ control flow lives in one function, Main, called at the bottom.
-∇Main;CONVEXURL;ROOM;CURRENT;CURRENTCOUNT;RUNID;MUTATION;MUTVALUE;APPLIED;MUTATIONCOUNT;FOLLOWUP;FOLLOWUPCOUNT;FIELDNAMES;FIELDVALUES;I
+∇Main;CONVEXURL;ROOM;CURRENT;CURRENTCOUNT;RUNID;MUTATION;MUTVALUE;APPLIED;MUTATIONCOUNT;SUBID;LIVEINITIAL
   CONVEXURL←EnvGet 'CONVEX_URL'
   →(0<⍴CONVEXURL)⍴HASURL
   'CONVEX_URL is required' StdErr 0
@@ -71,12 +61,7 @@ HASURL:
   ROOM←'apl-example'
 HASROOM:
 
-  ⍝ The initial HTTP query, decoded into an idiomatic APL value: rather
-  ⍝ than picking just "count" back out of the JSON object, FieldTable
-  ⍝ lays every field of the room's state out as a small two-column
-  ⍝ nested array (names down one side, values down the other) -- the
-  ⍝ array-language habit of keeping related data together in one
-  ⍝ structured value instead of a clutch of separate scalars.
+  ⍝ The initial HTTP query.
   CURRENT←HttpCall ('query' 'demo:state' (StateArgs ROOM) CONVEXURL '')
   →(ResultOk CURRENT)⍴CURRENTOK
   RequireResult CURRENT 'current query'
@@ -88,6 +73,24 @@ CURRENTOK:
   →0
 CURRENTZEROOK:
   'current count: ',⍕CURRENTCOUNT
+
+  ⍝ Live is started before the mutation, exactly like this project's
+  ⍝ other clients, so no reactive update can land before this process
+  ⍝ is subscribed to see it. LiveInit opens no socket by itself --
+  ⍝ ConnectNow (inside the first LiveServiceTick call, driven from
+  ⍝ WaitForLiveValue below) does the real TCP/TLS connect, the RFC 6455
+  ⍝ handshake, and the initial Connect/ModifyQuerySet messages.
+  →(LiveInit CONVEXURL)⍴LIVEINITOK
+  'could not start Live: CONVEX_URL was not a usable endpoint' StdErr 0
+  →0
+LIVEINITOK:
+  SUBID←'apl-example-state'
+  LiveSubscribe (SUBID 'demo:state' (StateArgs ROOM))
+  LIVEINITIAL←WaitForLiveValue (SUBID 0 'live initial value')
+  →(LIVEINITIAL≠¯1)⍴LIVEINITIALOK
+  →0
+LIVEINITIALOK:
+  'live initial count: ',⍕LIVEINITIAL
 
   ⍝ A unique runId is the mutation's idempotency key: retrying this
   ⍝ exact logical request would not double-increment the room.
@@ -111,36 +114,20 @@ APPLIEDOK:
 MUTATIONONEOK:
   'mutation count: ',⍕MUTATIONCOUNT
 
-  ⍝ A follow-up query proves the mutation is durably visible over HTTP.
-  ⍝ (The other language clients in this project prove the same thing
-  ⍝ over Live instead, without a second request; that transport is not
-  ⍝ implemented here yet -- see the limitation noted at the top.)
-  FOLLOWUP←HttpCall ('query' 'demo:state' (StateArgs ROOM) CONVEXURL '')
-  →(ResultOk FOLLOWUP)⍴FOLLOWUPOK
-  RequireResult FOLLOWUP 'follow-up query'
+  ⍝ Rather than a follow-up HTTP query, the mutation's durability is
+  ⍝ proven by the same Live subscription observing the change reactively
+  ⍝ -- the array-language habit above of keeping "current state" as one
+  ⍝ value applies just as well here: the subscription already tracks
+  ⍝ demo:state for this room, so its next delivered update is simply
+  ⍝ awaited, not re-queried.
+  →(¯1≠WaitForLiveValue (SUBID 1 'live updated value'))⍴LIVEUPDATEDOK
   →0
-FOLLOWUPOK:
-  FOLLOWUPCOUNT←RequireWholeCount (ResultValue FOLLOWUP) 'follow-up query'
-  →(FOLLOWUPCOUNT=1)⍴FOLLOWUPONEOK
-  ('follow-up count was ',(⍕FOLLOWUPCOUNT),', expected 1') StdErr 0
-  →0
-FOLLOWUPONEOK:
+LIVEUPDATEDOK:
+  'live updated count: 1'
+  LiveUnsubscribe SUBID
+  LiveClose
 
-  ⍝ The room's whole state, laid out as one small array: FieldTable
-  ⍝ turns the decoded JSON object into parallel name/value vectors so
-  ⍝ printing "every field" is one indexed walk, not five separate
-  ⍝ lines of hand-picked JGet calls.
-  FIELDNAMES←1⊃FieldTable FOLLOWUP
-  FIELDVALUES←2⊃FieldTable FOLLOWUP
-  I←1
-PRINTLOOP:
-  →(I>⍴FIELDNAMES)⍴PRINTDONE
-  (I⊃FIELDNAMES),': ',⍕I⊃FIELDVALUES
-  I←I+1
-  →PRINTLOOP
-PRINTDONE:
-
-  'verified count: 0 -> ',⍕FOLLOWUPCOUNT
+  'verified count: 0 -> 1'
 ∇
 
 ⍝ ---- helpers ----
@@ -211,32 +198,51 @@ GOOD:
   Z←N
 ∇
 
-⍝ Lays a decoded 'o' (object) tagged value out as parallel name/value
-⍝ vectors, values formatted for printing (JStringify for nested
-⍝ structure, otherwise the field's own JStringify text with its
-⍝ surrounding quotes stripped for a plain string field).
-∇Z←FieldTable ENVELOPE;VALUE;PAIRS;NAMES;VALUES;I;PAIR;TAG;TEXT
-  VALUE←ResultValue ENVELOPE
-  PAIRS←2⊃VALUE
-  NAMES←⍬
-  VALUES←⍬
-  I←1
+⍝ Polls Live (one LiveServiceTick per pass -- the same non-blocking
+⍝ single-worker pattern the adapter uses, documented in convexlive.apl)
+⍝ until SUBID's tracked subscription delivers a value whose count
+⍝ matches EXPECTED, a delivery error, or a 10-second deadline passes.
+⍝ Returns EXPECTED on a match, ¯1 (StdErr already told the operator
+⍝ why) otherwise.
+∇Z←WaitForLiveValue PARAMS;SUBID;EXPECTED;LABEL;DEADLINE;EVENTS;I;EV;COUNT;IGNORED
+  SUBID←1⊃PARAMS
+  EXPECTED←2⊃PARAMS
+  LABEL←3⊃PARAMS
+  DEADLINE←NowMs+10000
 LOOP:
-  →(I>⍴PAIRS)⍴DONE
-  PAIR←I⊃PAIRS
-  NAMES←NAMES,⊂1⊃PAIR
-  TAG←1⊃2⊃PAIR
-  TEXT←JStringify 2⊃PAIR
-  →('s'≡TAG)⍴ISSTR
-  VALUES←VALUES,⊂TEXT
-  →NEXT
-ISSTR:
-  VALUES←VALUES,⊂(¯2+⍴TEXT)↑1↓TEXT ⍝ drop the leading quote, take up to (not including) the trailing one
-NEXT:
+  →(NowMs≤DEADLINE)⍴TRYTICK
+  (LABEL,' timed out waiting for a Live update') StdErr 0
+  Z←¯1
+  →0
+TRYTICK:
+  EVENTS←LiveServiceTick
+  I←1
+SCAN:
+  →(I≤⍴EVENTS)⍴CHK
+  →SLEEP
+CHK:
+  EV←I⊃EVENTS
+  →(SUBID≡1⊃EV)⍴MATCHSUB
   I←I+1
+  →SCAN
+MATCHSUB:
+  →('v'≡2⊃EV)⍴GOTVALUE
+  (LABEL,' received a Live error instead of a value') StdErr 0
+  Z←¯1
+  →0
+GOTVALUE:
+  COUNT←RequireWholeCount (3⊃EV) LABEL
+  Z←¯1                            ⍝ default result: failure (Z is reassigned below on a match)
+  →(COUNT=¯1)⍴0                  ⍝ RequireWholeCount already reported why
+  →(COUNT=EXPECTED)⍴MATCHOK
+  (LABEL,' live count was ',(⍕COUNT),', expected ',⍕EXPECTED) StdErr 0
+  →0
+MATCHOK:
+  Z←COUNT
+  →0
+SLEEP:
+  IGNORED←⎕DL 0.02                ⍝ unassigned would auto-echo the seconds slept
   →LOOP
-DONE:
-  Z←NAMES VALUES
 ∇
 
 Main
@@ -266,18 +272,24 @@ this build does not need or want -- see "Toolchain" below), compiles the
 native transport function with `-Wall -Wextra -Werror`, runs
 `client/tests/selftest.apl` (JSON round-trip/escaping, object field lookup,
 whole-number acceptance, URL parsing, HTTP status-line/header helpers,
-chunked hex sizes, environment-variable handling, and the three
+chunked hex sizes, environment-variable handling, and the four
 `HttpClassify` envelope shapes -- all with no network dependency), and a
 smoke check of the conformance adapter and the canonical example's
 `CONVEX_URL is required` error path.
 
-Beyond that automated stage, this client has also been hand-verified end to
-end against a real backend during development: a genuine `0 -> 1` query /
-mutation / query round trip over plain HTTP against this project's local
-self-hosted backend, the compiled conformance adapter driving
-`hello` / `query` / `mutation` / `close` correctly in order, and a TLS
-connection to a real internet host. `./run verify-example`/`verify` have not
-been run yet, so none of that is an evaluator-awarded badge.
+`./run verify-example apl` runs the example above -- both transports, the
+whole `0 -> 1` journey -- against a unique room on the local self-hosted
+backend and diffs its stdout byte-for-byte against
+`_shared/examples/basics.expected.txt`. `./run verify apl` additionally runs
+the shared black-box conformance pilot: for both the reference JS oracle and
+this client it reports `client/adapter/hello`, all `client/http/*` cases
+(query, nested JSON round-trip with `logs`, mutation, idempotent mutation,
+document-ID strings, actions, structured errors with `error.data`, UTF-8,
+and bearer-token lifecycle), all `client/live/*` cases (initial result,
+external update, unsubscribe, five real reconnects via `debugDisconnect`,
+and query-error-recovery), and `client/adapter/clean-close` -- and prints
+`Earned capabilities: http, live`. `./run verify-hosted apl` (the dedicated
+hosted protocol-drift target) has not been run yet as of this note.
 
 ## Toolchain
 
@@ -294,15 +306,17 @@ Debian-adjacent GNU APL 2.0 with a runtime library closure of just
 ## Conformance and protocol notes
 
 - The client speaks the pinned `convex-rs@6f1df8a8` sync profile at
-  `/api/sync` for the parts it implements (HTTP query/mutation/action);
-  Live is not implemented, so nothing here yet exercises that endpoint's
-  WebSocket upgrade.
-- `client/convex.apl` is a GNU APL library workspace file, loaded by the
-  adapter and the example with `)COPY '/opt/convex/client/convex.apl'` --
-  the same mechanism GNU APL's own shipped `wslib5` standard-library files
-  use, and, like them, `convex.apl` starts with the `⍝!` marker GNU APL's
-  file-format check requires to recognise a plain-text file as a library
-  rather than a `)DUMP`/XML workspace.
+  `/api/sync` for both HTTP (query/mutation/action) and Live (the
+  WebSocket subscription protocol).
+- `client/convex.apl` (HTTP) and `client/convexlive.apl` (RFC 6455
+  WebSocket framing and the sync-protocol state machine) are GNU APL
+  library workspace files, loaded by the adapter and the example with
+  `)COPY '/opt/convex/client/convex.apl'` then
+  `)COPY '/opt/convex/client/convexlive.apl'` -- the same mechanism GNU
+  APL's own shipped `wslib5` standard-library files use, and, like them,
+  both files start with the `⍝!` marker GNU APL's file-format check
+  requires to recognise a plain-text file as a library rather than a
+  `)DUMP`/XML workspace.
 - GNU APL's own `⎕FIO` (`Quad-FIO[32..42]`) supplies raw TCP sockets
   natively -- `socket`/`connect`/`send`/`recv`/`read`/`write`/`fcntl` --
   for the plain (`ws://`, `http://`) transport; no native function is
@@ -311,39 +325,72 @@ Debian-adjacent GNU APL 2.0 with a runtime library closure of just
   internal headers (`Native_interface.hh` and friends) and loaded at
   runtime with dyadic `⎕FX` -- the documented mechanism GNU APL's own
   shipped `lib_file_io.so` uses for exactly this. The same native
-  function also supplies SHA-1 (needed only for the RFC 6455 WebSocket
-  handshake, once Live exists) and DNS resolution (`⎕FIO`'s own
-  `connect()` takes an address that is already resolved to a 32-bit
-  integer; GNU APL has no `getaddrinfo` of its own). No HTTP, JSON, or
-  Convex protocol logic lives in the native function.
+  function also supplies SHA-1 and CSPRNG bytes (both needed only for the
+  RFC 6455 WebSocket handshake and per-frame masking) and DNS resolution
+  (`⎕FIO`'s own `connect()` takes an address that is already resolved to
+  a 32-bit integer; GNU APL has no `getaddrinfo` of its own). No HTTP,
+  JSON, WebSocket framing, or Convex sync-protocol logic lives in the
+  native function.
+- GNU APL has no threads (there is no way to call a function through a
+  runtime-computed pointer, which a thread's entry point would need), so
+  Live's WebSocket reader is not a background worker. The whole adapter
+  process is the one worker: `client/tests/conformance/adapter.apl`'s
+  command loop does one non-blocking read of the next NDJSON command and
+  one non-blocking poll of the Live connection per pass, so a subscribed
+  query's update is written out promptly without a second thread ever
+  touching the connection concurrently.
 - `client/tests/conformance/adapter.apl` implements NDJSON adapter
   protocol v1 over both stdin/stdout and the `ADAPTER_LISTEN` TCP mode
   (`⎕FIO[41]`/`[42]`, read/write, work identically on a plain fd or an
-  accepted socket fd), and declares `debugDisconnect` as its one
-  adapter-only command -- currently answered with a structured
-  `ProtocolError`, since Live does not exist yet to actually reconnect.
+  accepted socket fd), with real `subscribe`/`unsubscribe`/
+  `debugDisconnect` handlers backed by `client/convexlive.apl` --
+  `debugDisconnect` is its one adapter-only command, acknowledged only
+  after the old connection is retired and the next reconnect is
+  scheduled.
 - GNU APL's CLI has no way to run a script from a bare positional
   filename argument, only via `-f file`; `/usr/local/bin/convex-example`
   and `/usr/local/bin/convex-adapter` are therefore tiny `#!/bin/sh`
-  launchers that `exec apl -s -f <script> -- "$@"`, the same shape
+  launchers that run `apl -s -f <script> -- "$@"`, the same shape
   `unicon -o`'s own generated launcher uses for this project's Icon
   client.
 
 ## Limitations
 
-- **Live is not implemented.** No WebSocket handshake, RFC 6455 framing,
-  or `/api/sync` state machine (Connect/ModifyQuerySet/Transition/
-  reconnect) exists yet. This is the main gap before this client could
-  earn either badge, since the shared canonical example requires both
-  transports.
-- Bearer-token authentication (`setAuth`) is accepted by the adapter and
-  threaded into the HTTP `Authorization` header, but has not been
-  exercised against a deployment that actually requires it.
+- Bearer-token authentication (`setAuth`) is accepted by the adapter,
+  threaded into the HTTP `Authorization` header, and exercised by the
+  shared conformance pilot's `client/http/bearer-token-lifecycle` case
+  against the approved local backend.
 - The native function is deliberately narrow: TCP connect/send/recv/close
-  for TLS, SHA-1, and DNS resolution only.
+  for TLS, SHA-1, CSPRNG bytes, and DNS resolution only. No HTTP, JSON,
+  WebSocket framing, or Convex sync-protocol behaviour lives in C++.
 - `⎕FIO[40]` (`select`) reliably raised `DOMAIN ERROR` in this build even
   when its argument's shape and nesting exactly matched `Quad_FIO.cc`'s
   own documented expectations (checked directly with `⍴`/`≡`/`⊃` before
-  it ever reached `select()`). The plain-socket transport works around
-  this with a non-blocking `fcntl` + `⎕FIO[37]` `recv()` poll loop
-  instead, which does not have the same problem.
+  it ever reached `select()`). Both the HTTP transport and the Live
+  WebSocket reader work around this with a non-blocking `fcntl` +
+  `⎕FIO[37]`/`[41]` `recv()`/`read()` poll loop instead, which does not
+  have the same problem.
+- A GNU APL function header cannot destructure a parenthesized left
+  argument into two formal names, e.g. `Z←(A B) Fn C` -- it silently
+  produces a `DEFN ERROR` at definition time and the whole body then
+  falls through to top-level immediate execution the moment the function
+  is called, rather than ever running as a function, with no compile-time
+  warning that anything is wrong. Found only once Live was driven against
+  a real backend end to end (`WsBuildFrame`'s original header); the fix
+  is a single left-argument name, destructured inside the body instead.
+- The sync protocol's very first `Transition` on a fresh connection must
+  be matched against `startVersion.ts` `"AAAAAAAAAAA="` (timestamp zero),
+  not an empty string -- confirmed against a real backend after an empty
+  initial `LVREMOTETS` made every first `Transition` fail validation
+  silently (no error surfaced to the operator; the subscription just
+  never delivered).
+- GNU APL's own script-exit path (`)OFF`, required to leave the
+  interpreter cleanly -- omitting it drops the process into an
+  interactive `^D`/end-of-input prompt loop instead) appends one
+  unsuppressible bare blank line to stdout after a script's last real
+  line of output, on top of the already-present per-`)COPY` `DUMPED
+  <mtime>` banner. Both `examples/basics/entrypoint.sh` and
+  `client/tests/conformance/entrypoint.sh` filter it at the shell
+  boundary (holding the most recently read line back by one step so a
+  genuine trailing empty line is dropped instead of printed), since
+  neither is suppressible from inside the language.

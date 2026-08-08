@@ -5,31 +5,24 @@
 ⍝ no separate "test" copy of this file.
 ⍝
 ⍝ It reuses the same client library the conformance adapter calls
-⍝ into, client/convex.apl, installed at /opt/convex/client/convex.apl.
-⍝ convex.apl implements the Convex HTTP protocol itself in APL (JSON
-⍝ encoding/decoding and HTTP/1.1 request/response framing); the only
-⍝ things it delegates outside APL are raw TCP/TLS bytes and one hash
-⍝ primitive, via a small native function (client/shim.cc) loaded with
-⍝ dyadic ⎕FX -- GNU APL's documented foreign-function mechanism.
-⍝
-⍝ LIMITATION, stated up front rather than hidden in a comment at the
-⍝ bottom: Live (the WebSocket /api/sync subscription this project's
-⍝ other clients use for their "live initial count"/"live updated
-⍝ count" lines) is not implemented yet. This example demonstrates the
-⍝ HTTP half of the walk only -- the initial query, the mutation and
-⍝ its idempotency key, and a follow-up query proving the mutation
-⍝ landed -- and its output does not (yet) match this project's shared
-⍝ basics.expected.txt, which requires both transports. See the
-⍝ project's manifest.yaml/README for the honest capability list.
+⍝ into: client/convex.apl (the Convex HTTP protocol itself, in APL --
+⍝ JSON encoding/decoding and HTTP/1.1 request/response framing) and
+⍝ client/convexlive.apl (RFC 6455 WebSocket framing and the Convex
+⍝ /api/sync sync-protocol state machine, also in APL), both installed
+⍝ under /opt/convex/client/. The only things either delegates outside
+⍝ APL are raw TCP/TLS bytes, SHA-1, and CSPRNG bytes, via a small
+⍝ native function (client/shim.cc) loaded with dyadic ⎕FX -- GNU APL's
+⍝ documented foreign-function mechanism.
 
 )COPY /opt/convex/client/convex.apl
+)COPY /opt/convex/client/convexlive.apl
 ConvexInit '/opt/convex/client/shim.so'
 
 ⍝ GNU APL's top-level (non-function) script statements cannot use
 ⍝ labels/branches ("Illegal : in immediate execution" -- discovered
 ⍝ while writing this client's own tests), so all of this example's
 ⍝ control flow lives in one function, Main, called at the bottom.
-∇Main;CONVEXURL;ROOM;CURRENT;CURRENTCOUNT;RUNID;MUTATION;MUTVALUE;APPLIED;MUTATIONCOUNT;FOLLOWUP;FOLLOWUPCOUNT;FIELDNAMES;FIELDVALUES;I
+∇Main;CONVEXURL;ROOM;CURRENT;CURRENTCOUNT;RUNID;MUTATION;MUTVALUE;APPLIED;MUTATIONCOUNT;SUBID;LIVEINITIAL
   CONVEXURL←EnvGet 'CONVEX_URL'
   →(0<⍴CONVEXURL)⍴HASURL
   'CONVEX_URL is required' StdErr 0
@@ -40,12 +33,7 @@ HASURL:
   ROOM←'apl-example'
 HASROOM:
 
-  ⍝ The initial HTTP query, decoded into an idiomatic APL value: rather
-  ⍝ than picking just "count" back out of the JSON object, FieldTable
-  ⍝ lays every field of the room's state out as a small two-column
-  ⍝ nested array (names down one side, values down the other) -- the
-  ⍝ array-language habit of keeping related data together in one
-  ⍝ structured value instead of a clutch of separate scalars.
+  ⍝ The initial HTTP query.
   CURRENT←HttpCall ('query' 'demo:state' (StateArgs ROOM) CONVEXURL '')
   →(ResultOk CURRENT)⍴CURRENTOK
   RequireResult CURRENT 'current query'
@@ -57,6 +45,24 @@ CURRENTOK:
   →0
 CURRENTZEROOK:
   'current count: ',⍕CURRENTCOUNT
+
+  ⍝ Live is started before the mutation, exactly like this project's
+  ⍝ other clients, so no reactive update can land before this process
+  ⍝ is subscribed to see it. LiveInit opens no socket by itself --
+  ⍝ ConnectNow (inside the first LiveServiceTick call, driven from
+  ⍝ WaitForLiveValue below) does the real TCP/TLS connect, the RFC 6455
+  ⍝ handshake, and the initial Connect/ModifyQuerySet messages.
+  →(LiveInit CONVEXURL)⍴LIVEINITOK
+  'could not start Live: CONVEX_URL was not a usable endpoint' StdErr 0
+  →0
+LIVEINITOK:
+  SUBID←'apl-example-state'
+  LiveSubscribe (SUBID 'demo:state' (StateArgs ROOM))
+  LIVEINITIAL←WaitForLiveValue (SUBID 0 'live initial value')
+  →(LIVEINITIAL≠¯1)⍴LIVEINITIALOK
+  →0
+LIVEINITIALOK:
+  'live initial count: ',⍕LIVEINITIAL
 
   ⍝ A unique runId is the mutation's idempotency key: retrying this
   ⍝ exact logical request would not double-increment the room.
@@ -80,36 +86,20 @@ APPLIEDOK:
 MUTATIONONEOK:
   'mutation count: ',⍕MUTATIONCOUNT
 
-  ⍝ A follow-up query proves the mutation is durably visible over HTTP.
-  ⍝ (The other language clients in this project prove the same thing
-  ⍝ over Live instead, without a second request; that transport is not
-  ⍝ implemented here yet -- see the limitation noted at the top.)
-  FOLLOWUP←HttpCall ('query' 'demo:state' (StateArgs ROOM) CONVEXURL '')
-  →(ResultOk FOLLOWUP)⍴FOLLOWUPOK
-  RequireResult FOLLOWUP 'follow-up query'
+  ⍝ Rather than a follow-up HTTP query, the mutation's durability is
+  ⍝ proven by the same Live subscription observing the change reactively
+  ⍝ -- the array-language habit above of keeping "current state" as one
+  ⍝ value applies just as well here: the subscription already tracks
+  ⍝ demo:state for this room, so its next delivered update is simply
+  ⍝ awaited, not re-queried.
+  →(¯1≠WaitForLiveValue (SUBID 1 'live updated value'))⍴LIVEUPDATEDOK
   →0
-FOLLOWUPOK:
-  FOLLOWUPCOUNT←RequireWholeCount (ResultValue FOLLOWUP) 'follow-up query'
-  →(FOLLOWUPCOUNT=1)⍴FOLLOWUPONEOK
-  ('follow-up count was ',(⍕FOLLOWUPCOUNT),', expected 1') StdErr 0
-  →0
-FOLLOWUPONEOK:
+LIVEUPDATEDOK:
+  'live updated count: 1'
+  LiveUnsubscribe SUBID
+  LiveClose
 
-  ⍝ The room's whole state, laid out as one small array: FieldTable
-  ⍝ turns the decoded JSON object into parallel name/value vectors so
-  ⍝ printing "every field" is one indexed walk, not five separate
-  ⍝ lines of hand-picked JGet calls.
-  FIELDNAMES←1⊃FieldTable FOLLOWUP
-  FIELDVALUES←2⊃FieldTable FOLLOWUP
-  I←1
-PRINTLOOP:
-  →(I>⍴FIELDNAMES)⍴PRINTDONE
-  (I⊃FIELDNAMES),': ',⍕I⊃FIELDVALUES
-  I←I+1
-  →PRINTLOOP
-PRINTDONE:
-
-  'verified count: 0 -> ',⍕FOLLOWUPCOUNT
+  'verified count: 0 -> 1'
 ∇
 
 ⍝ ---- helpers ----
@@ -180,32 +170,51 @@ GOOD:
   Z←N
 ∇
 
-⍝ Lays a decoded 'o' (object) tagged value out as parallel name/value
-⍝ vectors, values formatted for printing (JStringify for nested
-⍝ structure, otherwise the field's own JStringify text with its
-⍝ surrounding quotes stripped for a plain string field).
-∇Z←FieldTable ENVELOPE;VALUE;PAIRS;NAMES;VALUES;I;PAIR;TAG;TEXT
-  VALUE←ResultValue ENVELOPE
-  PAIRS←2⊃VALUE
-  NAMES←⍬
-  VALUES←⍬
-  I←1
+⍝ Polls Live (one LiveServiceTick per pass -- the same non-blocking
+⍝ single-worker pattern the adapter uses, documented in convexlive.apl)
+⍝ until SUBID's tracked subscription delivers a value whose count
+⍝ matches EXPECTED, a delivery error, or a 10-second deadline passes.
+⍝ Returns EXPECTED on a match, ¯1 (StdErr already told the operator
+⍝ why) otherwise.
+∇Z←WaitForLiveValue PARAMS;SUBID;EXPECTED;LABEL;DEADLINE;EVENTS;I;EV;COUNT;IGNORED
+  SUBID←1⊃PARAMS
+  EXPECTED←2⊃PARAMS
+  LABEL←3⊃PARAMS
+  DEADLINE←NowMs+10000
 LOOP:
-  →(I>⍴PAIRS)⍴DONE
-  PAIR←I⊃PAIRS
-  NAMES←NAMES,⊂1⊃PAIR
-  TAG←1⊃2⊃PAIR
-  TEXT←JStringify 2⊃PAIR
-  →('s'≡TAG)⍴ISSTR
-  VALUES←VALUES,⊂TEXT
-  →NEXT
-ISSTR:
-  VALUES←VALUES,⊂(¯2+⍴TEXT)↑1↓TEXT ⍝ drop the leading quote, take up to (not including) the trailing one
-NEXT:
+  →(NowMs≤DEADLINE)⍴TRYTICK
+  (LABEL,' timed out waiting for a Live update') StdErr 0
+  Z←¯1
+  →0
+TRYTICK:
+  EVENTS←LiveServiceTick
+  I←1
+SCAN:
+  →(I≤⍴EVENTS)⍴CHK
+  →SLEEP
+CHK:
+  EV←I⊃EVENTS
+  →(SUBID≡1⊃EV)⍴MATCHSUB
   I←I+1
+  →SCAN
+MATCHSUB:
+  →('v'≡2⊃EV)⍴GOTVALUE
+  (LABEL,' received a Live error instead of a value') StdErr 0
+  Z←¯1
+  →0
+GOTVALUE:
+  COUNT←RequireWholeCount (3⊃EV) LABEL
+  Z←¯1                            ⍝ default result: failure (Z is reassigned below on a match)
+  →(COUNT=¯1)⍴0                  ⍝ RequireWholeCount already reported why
+  →(COUNT=EXPECTED)⍴MATCHOK
+  (LABEL,' live count was ',(⍕COUNT),', expected ',⍕EXPECTED) StdErr 0
+  →0
+MATCHOK:
+  Z←COUNT
+  →0
+SLEEP:
+  IGNORED←⎕DL 0.02                ⍝ unassigned would auto-echo the seconds slept
   →LOOP
-DONE:
-  Z←NAMES VALUES
 ∇
 
 Main
