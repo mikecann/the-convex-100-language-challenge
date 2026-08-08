@@ -4,20 +4,80 @@ displayName: "VHDL"
 rank: 41
 selectionTier: ranked
 implementation:
-  status: planned
+  status: attempting
+  provenance: native
+  version: 0.1.0
   notes: >-
-    A Convex client expressed as a simulated circuit: processes, signals and
-    a clock, rather than VHDL used procedurally with `wait` statements
-    sprinkled in. Only the foreign-boundary primitives (client/native.c),
-    the clocked request/acknowledge bus that exposes them
-    (client/convex_native.vhdl, client/convex_transport.vhdl) and byte
-    buffer helpers (client/convex_buffer.vhdl) exist so far, each proven
-    inside Docker on the pinned toolchain: analyzed and elaborated with
-    GHDL, then run for real, including a genuine TLS-verified handshake
-    through the req/ack circuit and native.c's OpenSSL boundary.
-    convex_json, convex_http, convex_ws, convex_sync, the conformance
-    adapter and examples/basics do not exist yet.
+    A Convex client expressed as a simulated circuit -- processes, signals
+    and a clock -- rather than VHDL used procedurally with `wait`
+    statements sprinkled through it. client/native.c supplies exactly the
+    foreign primitives standard VHDL has none of (sockets, TLS, a
+    monotonic clock, entropy, environment access, process exit status) as
+    two VHPIDIRECT-callable C functions; every byte of HTTP, WebSocket and
+    JSON protocol text, and every deadline and retry, stays in VHDL.
+    convex_native.vhdl's clocked request/acknowledge bus connects the two:
+    convex_transport's process is the sole owner of the foreign boundary,
+    and every caller drives it through the xport_call procedure chain.
+    convex_buffer.vhdl (fixed-capacity byte buffers, decimal/base64/hex),
+    convex_json.vhdl (a bounded token-array JSON codec), convex_http.vhdl
+    (a hand-written HTTP/1.1 client), convex_ws.vhdl (RFC 6455 WebSocket
+    framing), convex_sync.vhdl (the pinned /api/sync Live protocol) and
+    convex.vhdl (the public call facade) are built on that bus. Real
+    OpenSSL certificate- and hostname-verified TLS runs through native.c's
+    boundary. GHDL requires an unresolved signal's complete set of drivers
+    to come from one process (or one procedure-call chain rooted in one
+    process); two different processes may each drive a different field of
+    the same record signal, but not the same unresolved scalar, and GHDL
+    only rejects the latter at simulation-elaboration, not at `ghdl -a`/
+    `-e`. client/convex_native.vhdl's split of the bus into `xport_req`
+    (driven only by the caller-side chain) and `xport_ack` (driven only by
+    convex_transport's process) is the minimal shape that satisfies this,
+    proven both positively and with a negative-control entity.
 toolchain:
   name: GHDL
   version: "2.0.0 (Debian 2.0.0+dfsg-6.2+b2, llvm code generator)"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    Live authentication, optimistic updates, WebSocket mutations, WebSocket
+    actions, and TransitionChunk assembly are deferred.
+  - >-
+    The WebSocket handshake does not verify the server's
+    Sec-WebSocket-Accept response header against SHA-1 of the client's key.
+    A valid HTTP 101 upgrade response is still required, and every frame
+    exchanged afterward is real RFC 6455 framing; only that one header's
+    cryptographic check is skipped.
+  - >-
+    convex_sync.vhdl's own delivery queue holds at most SYNC_MAX_PENDING
+    (8) already-decoded events between caller steps and drops the oldest
+    undelivered event on overflow rather than growing without bound; it is
+    a deliberately bounded queue, not a demand-driven stream, and its
+    overflow behaviour is exercised by client-local tests.
+  - >-
+    JSON numbers are accepted only when mathematically integral and
+    representable exactly within a safe range; fractional, quoted,
+    non-finite, and out-of-range values are rejected at the point of use.
+  - >-
+    The client is single threaded by construction: convex_transport's one
+    process owns the foreign boundary end to end, so Live progress and any
+    concurrent HTTP call are interleaved by that process's own request
+    queue rather than by OS-level concurrency.
+  - >-
+    GHDL's LLVM backend links a genuine standalone native ELF with no
+    GHDL simulation runtime shared library; the design elaborates once at
+    process start and then runs as ordinary compiled code, not as a
+    long-lived simulator kernel.
 capabilities: []
