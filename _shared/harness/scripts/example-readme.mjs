@@ -103,6 +103,7 @@ const fenceLanguages = {
 // retaining the simple extension table for unambiguous examples.
 const languageFenceOverrides = {
   matlab: "matlab",
+  mumps: "mumps",
   "objective-c": "objective-c",
   "wolfram-language": "mathematica",
 };
