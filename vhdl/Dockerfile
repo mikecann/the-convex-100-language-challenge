@@ -815,7 +815,14 @@ int main(int argc, char **argv) {
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
     listen(fd, 8);
 
-    for (int i = 0; i < 6; i++) {
+    /* The canonical example makes exactly three TCP connections against
+       this fixture: one plain HTTP /api/query, one WebSocket connection
+       that stays open for the whole Live subscription (initial value,
+       then the post-mutation update on the same socket), and one plain
+       HTTP /api/mutation. Accepting more than that here blocks this
+       process in accept() forever, which then blocks the shell's
+       trailing "wait" on this backgrounded fixture indefinitely. */
+    for (int i = 0; i < 3; i++) {
         int c = accept(fd, NULL, NULL);
         if (c < 0) continue;
         pid_t pid = fork();
