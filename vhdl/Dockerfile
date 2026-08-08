@@ -7,15 +7,17 @@ ARG BUILD_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa04
 # test: build native.c, analyze and elaborate every VHDL unit this client
 # ships with GHDL, and run every language-local suite.
 #
-# CHECKPOINT NOTE: this client is still under construction. Only the
-# foreign-boundary primitives (native.c), the request/acknowledge circuit
+# CHECKPOINT NOTE: this client is still under construction. The foreign-
+# boundary primitives (native.c), the request/acknowledge circuit
 # (convex_native.vhdl, convex_transport.vhdl), the byte-buffer helpers
-# (convex_buffer.vhdl) and a JSON codec (convex_json.vhdl) exist so far,
-# proven here by buffer_test, transport_smoke and json_test. convex_http,
-# convex_ws, convex_sync, the conformance adapter and examples/basics do
-# not exist yet, so this stage does not yet compile a canonical example or
-# a conformance executable and no `runtime` or `example-runtime` stage
-# exists below. No capability is claimed; see vhdl/README.md.
+# (convex_buffer.vhdl), a JSON codec (convex_json.vhdl), an HTTP/1.1 client
+# (convex_http.vhdl) and an RFC 6455 WebSocket layer (convex_ws.vhdl)
+# exist so far, proven here by buffer_test, transport_smoke, json_test,
+# http_test and ws_test. convex_sync, the conformance adapter and
+# examples/basics do not exist yet, so this stage does not yet compile a
+# canonical example or a conformance executable and no `runtime` or
+# `example-runtime` stage exists below. No capability is claimed; see
+# vhdl/README.md.
 # ---------------------------------------------------------------------------
 FROM --platform=linux/amd64 ${BUILD_IMAGE} AS test
 WORKDIR /project
@@ -216,3 +218,135 @@ RUN set -eu; \
     timeout 20 ./http_test | tee /tmp/http_test.out; \
     wait; \
     grep -Fq 'PASS http_test' /tmp/http_test.out
+
+# ws_test proves convex_ws.vhdl's handshake, masked encode, unmasked
+# decode, fragmentation reassembly and transparent Ping/Pong against a
+# real TCP peer. wsfix.c is another one-shot fixture server, playing the
+# same test-infrastructure-only role as httpfix.c above; it also verifies
+# (in C, independently of this client's own logic) that the Pong this
+# client sends back for its Ping is masked and carries the exact payload
+# it pinged with, printing "wsfix: PONG verified" to stderr when it does.
+RUN <<'WSFIX_EOF'
+set -eu
+cat > /tmp/wsfix.c <<'CEOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+static int conn;
+
+static void send_frame(int fin, int opcode, const char *payload, int len) {
+    unsigned char hdr[10];
+    int hlen = 0;
+    hdr[hlen++] = (unsigned char)((fin ? 0x80 : 0x00) | (opcode & 0x0f));
+    if (len <= 125) {
+        hdr[hlen++] = (unsigned char)len;
+    } else {
+        hdr[hlen++] = 126;
+        hdr[hlen++] = (unsigned char)((len >> 8) & 0xff);
+        hdr[hlen++] = (unsigned char)(len & 0xff);
+    }
+    write(conn, hdr, (size_t)hlen);
+    if (len > 0) write(conn, payload, (size_t)len);
+}
+
+static void read_full(unsigned char *buf, int n) {
+    int total = 0;
+    while (total < n) {
+        ssize_t r = read(conn, buf + total, (size_t)(n - total));
+        if (r <= 0) { fprintf(stderr, "wsfix: read_full failed\n"); exit(1); }
+        total += (int)r;
+    }
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "usage: wsfix port\n"); return 1; }
+    int port = atoi(argv[1]);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
+    listen(fd, 1);
+    conn = accept(fd, NULL, NULL);
+    if (conn < 0) { perror("accept"); return 1; }
+
+    unsigned char drain[8192];
+    int total = 0;
+    while (total < (int)sizeof(drain)) {
+        unsigned char b;
+        ssize_t n = read(conn, &b, 1);
+        if (n <= 0) { fprintf(stderr, "wsfix: request drain failed\n"); return 1; }
+        drain[total++] = b;
+        if (total >= 4 && drain[total-4]=='\r' && drain[total-3]=='\n' &&
+            drain[total-2]=='\r' && drain[total-1]=='\n') break;
+    }
+
+    const char *resp =
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "\r\n";
+    write(conn, resp, strlen(resp));
+
+    send_frame(1, 0x1, "hello", 5);
+
+    send_frame(0, 0x1, "foo", 3);
+    send_frame(1, 0x0, "bar", 3);
+
+    send_frame(1, 0x9, "pingdata", 8);
+    unsigned char head[2];
+    read_full(head, 2);
+    int fin = (head[0] & 0x80) != 0;
+    int opcode = head[0] & 0x0f;
+    int masked = (head[1] & 0x80) != 0;
+    int plen = head[1] & 0x7f;
+    if (!fin || opcode != 0xa || !masked) {
+        fprintf(stderr, "wsfix: expected a single masked PONG frame, got fin=%d opcode=%d masked=%d\n",
+                fin, opcode, masked);
+        return 1;
+    }
+    if (plen == 126) {
+        unsigned char ext[2];
+        read_full(ext, 2);
+        plen = (ext[0] << 8) | ext[1];
+    }
+    unsigned char mask[4];
+    read_full(mask, 4);
+    unsigned char payload[256];
+    if (plen > (int)sizeof(payload)) { fprintf(stderr, "wsfix: PONG payload too large\n"); return 1; }
+    read_full(payload, plen);
+    for (int i = 0; i < plen; i++) payload[i] = (unsigned char)(payload[i] ^ mask[i % 4]);
+    if (plen != 8 || memcmp(payload, "pingdata", 8) != 0) {
+        fprintf(stderr, "wsfix: PONG payload mismatch (len=%d)\n", plen);
+        return 1;
+    }
+    fprintf(stderr, "wsfix: PONG verified\n");
+
+    send_frame(1, 0x8, NULL, 0);
+
+    close(conn);
+    close(fd);
+    return 0;
+}
+CEOF
+gcc -O2 -Wall -Wextra -o /tmp/wsfix /tmp/wsfix.c
+WSFIX_EOF
+
+RUN set -eu; \
+    /tmp/wsfix 44303 & \
+    sleep 1; \
+    ghdl -a --std=08 --workdir=/project/work client/convex_ws.vhdl; \
+    ghdl -a --std=08 --workdir=/project/work client/tests/ws_test.vhdl; \
+    ghdl -e --std=08 --workdir=/project/work \
+      -Wl,/project/native.o -Wl,-lssl -Wl,-lcrypto ws_test; \
+    timeout 20 ./ws_test | tee /tmp/ws_test.out; \
+    wait; \
+    grep -Fq 'PASS ws_test' /tmp/ws_test.out
