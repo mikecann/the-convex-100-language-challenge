@@ -4,5 +4,64 @@ displayName: "Delphi/Object Pascal"
 rank: 25
 selectionTier: ranked
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Object Pascal client written in Free Pascal's `-Mdelphi` mode.
+    Query, Mutation, and Action always go over HTTP through the bundled
+    fphttpclient unit; Subscribe opens (or reuses) one WebSocket connection,
+    hand-framed over fpc's own ssockets/sslsockets/opensslsockets units,
+    carrying only query-set add/remove and reactive updates. TLS transport,
+    certificate and hostname verification, and OpenSSL-backed entropy are
+    all ordinary fpc library calls, not hand-rolled OpenSSL bindings, with
+    one documented exception: fpc's TOpenSSLSocketHandler never calls
+    SSL_CTX_set_default_verify_paths, so this client resolves the distro CA
+    bundle itself before every TLS connect (see ConvexSocket.DefaultCaBundlePath)
+    or verification would silently pass with nothing to check against. Language-
+    local Docker tests, the canonical example, and shared local and hosted
+    black-box conformance all passed from a clean exact-head build; the
+    capability list reflects the shared result evaluator's award from those
+    runs (31/31 both profiles).
+toolchain:
+  name: Free Pascal
+  version: "3.2.2"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Free Pascal has no API to report its own version at run time, so the
+    adapter's `hello` response reports a hardcoded runtime string
+    ("Free Pascal 3.2.2 (Delphi mode)") matching the pinned toolchain
+    instead of an introspected value.
+  - The Live subscription's pending-event list (ConvexSync.PendingEvents) is
+    an ordinary TObjectList rather than a queue with a documented count or
+    byte bound. The shared conformance and hosted runs, including five real
+    reconnects and every Live scenario, passed cleanly under the runtime
+    image's real 128 MiB container limit, but no test here specifically
+    drives a stopped or slow consumer with near-maximum messages, so that
+    extreme is not proven the way it is for a client with an explicit
+    bounded queue.
+  - Live authentication against an already-open subscription, WebSocket
+    mutations and actions, and optimistic updates are not implemented and
+    fail closed.
+  - fpjson emits compact JSON and treats AnsiString as UTF-8 only because
+    this client sets `TJSONData.CompressedJSON` and `DefaultSystemCodePage`
+    globally in ConvexJsonUtil's initialization section; any new program
+    entrypoint added later must still pull in that unit before touching
+    JSON or the wire, or it silently reverts to fpjson's spaced-out,
+    codepage-lossy defaults.
+capabilities:
+  - http
+  - live
