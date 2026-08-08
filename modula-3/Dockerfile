@@ -379,6 +379,13 @@ RUN cm3 -build && ./AMD64_LINUX/gatecheck
 # each scenario's wire still long enough to observe the client's reaction.
 # ---------------------------------------------------------------------------
 FROM toolchain AS test
+# busybox-static supplies the one pruning tool runtime-base's own RUN
+# step below needs (rm, applied via a bind-mounted single binary) after
+# it has already deleted every ordinary coreutils path from a fresh base
+# image -- see that stage's own comment.
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes busybox-static \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /work
 COPY client ./client
 
@@ -504,3 +511,197 @@ if [ "$overall" -ne 0 ]; then
 fi
 echo "PASS all LiveTest/WsFixture scenarios"
 EOF
+# ---------------------------------------------------------------------------
+# The conformance adapter and the canonical example, each built the same
+# flat-copy way as the test binaries above. The adapter gets a stdio-mode
+# smoke test here (hello -> ready, an unrecognized op -> ProtocolError,
+# close -> closed) against a deployment URL that refuses the connection
+# immediately (127.0.0.1:9, the discard port) -- this proves the NDJSON
+# framing and command dispatch without needing a real backend; the ADAPTER_
+# LISTEN TCP mode and every query/mutation/subscribe path are exercised
+# for real by `./run verify-example`/`./run verify`, which run against the
+# approved local and hosted deployments and are not duplicated here.
+# ---------------------------------------------------------------------------
+COPY examples ./examples
+
+RUN set -eu; \
+    mkdir -p /work/bin/adapter /work/bin/example; \
+    cp client/*.i3 client/*.m3 client/*.c /work/bin/adapter/; \
+    cp client/tests/conformance/Adapter.m3 /work/bin/adapter/; \
+    cp client/*.i3 client/*.m3 client/*.c /work/bin/example/; \
+    cp examples/basics/main.m3 /work/bin/example/
+
+COPY <<'EOF' /work/bin/adapter/m3makefile
+import("libm3")
+import("tcp")
+interface("TlsShim")
+c_source("shim")
+import_lib("ssl", "/usr/lib/x86_64-linux-gnu")
+import_lib("crypto", "/usr/lib/x86_64-linux-gnu")
+interface("ConvexJson") implementation("ConvexJson")
+interface("ConvexUrl") implementation("ConvexUrl")
+interface("ConvexTransport") implementation("ConvexTransport")
+interface("ConvexWire") implementation("ConvexWire")
+interface("ConvexHttp") implementation("ConvexHttp")
+interface("ConvexBase64") implementation("ConvexBase64")
+interface("ConvexSha1") implementation("ConvexSha1")
+interface("ConvexRandom") implementation("ConvexRandom")
+interface("ConvexUtf8") implementation("ConvexUtf8")
+interface("ConvexWebSocket") implementation("ConvexWebSocket")
+interface("ConvexLive") implementation("ConvexLive")
+implementation("Adapter")
+program("convex-adapter")
+EOF
+
+COPY <<'EOF' /work/bin/example/m3makefile
+import("libm3")
+import("tcp")
+interface("TlsShim")
+c_source("shim")
+import_lib("ssl", "/usr/lib/x86_64-linux-gnu")
+import_lib("crypto", "/usr/lib/x86_64-linux-gnu")
+interface("ConvexJson") implementation("ConvexJson")
+interface("ConvexUrl") implementation("ConvexUrl")
+interface("ConvexTransport") implementation("ConvexTransport")
+interface("ConvexWire") implementation("ConvexWire")
+interface("ConvexHttp") implementation("ConvexHttp")
+interface("ConvexBase64") implementation("ConvexBase64")
+interface("ConvexSha1") implementation("ConvexSha1")
+interface("ConvexRandom") implementation("ConvexRandom")
+interface("ConvexUtf8") implementation("ConvexUtf8")
+interface("ConvexWebSocket") implementation("ConvexWebSocket")
+interface("ConvexLive") implementation("ConvexLive")
+implementation("main")
+program("convex-example")
+EOF
+
+RUN cd /work/bin/adapter && cm3 -build \
+    && test "$(uname -m)" = x86_64 \
+    && readelf -h AMD64_LINUX/convex-adapter | grep -Fq 'Advanced Micro Devices X86-64'
+RUN cd /work/bin/example && cm3 -build \
+    && test "$(uname -m)" = x86_64 \
+    && readelf -h AMD64_LINUX/convex-example | grep -Fq 'Advanced Micro Devices X86-64'
+
+RUN set -eu; \
+    actual=$(printf '%s\n' \
+        '{"protocolVersion":1,"id":"hello","op":"hello"}' \
+        '{"id":"bogus","op":"not-a-real-op"}' \
+        '{"id":"close","op":"close"}' \
+      | CONVEX_URL=http://127.0.0.1:9 /work/bin/adapter/AMD64_LINUX/convex-adapter); \
+    printf '%s\n' "$actual"; \
+    printf '%s\n' "$actual" | grep -Fq '"id":"hello","type":"ready"'; \
+    printf '%s\n' "$actual" | grep -Fq '"language":"modula-3"'; \
+    printf '%s\n' "$actual" | grep -Fq '"id":"bogus","type":"error"'; \
+    printf '%s\n' "$actual" | grep -Fq '"name":"ProtocolError"'; \
+    printf '%s\n' "$actual" | grep -Fqx '{"id":"close","type":"closed"}'
+
+# ---------------------------------------------------------------------------
+# Stage exactly the runtime closure (CM3's own libm3/libm3core/libm3tcp
+# shared runtime libraries -- not apt-installable, since CM3 is not
+# packaged for this base image -- plus OpenSSL, glibc's DNS resolver
+# modules, CA certificates, and the handful of POSIX text tools the
+# shared policy and example verifier require) while this stage's own full
+# toolset (cp, ldd, awk, mkdir) is still available. runtime-base below
+# deletes everything in a *fresh* base image first, so this staging work
+# has to happen here and arrive as one COPY --from=test /staging /
+# afterwards, matching this project's other from-source native clients
+# (see setl/Dockerfile's own comment on why the order cannot run the
+# other way).
+# ---------------------------------------------------------------------------
+RUN set -eu; \
+    mkdir -p /staging/bin /staging/usr/bin /staging/etc/ssl/certs; \
+    cp -a /bin/dash /staging/bin/sh; \
+    for tool in cat cut basename dirname env find grep head id sed sort tail tr true uname uniq wc; do \
+      cp -a "/usr/bin/$tool" "/staging/usr/bin/$tool"; \
+    done; \
+    cp -a /usr/bin/mawk /staging/usr/bin/awk; \
+    for object in /work/bin/adapter/AMD64_LINUX/convex-adapter /work/bin/example/AMD64_LINUX/convex-example \
+                  /staging/usr/bin/*; do \
+      ldd "$object" 2>/dev/null \
+        | awk '{ for (f = 1; f <= NF; f++) if ($f ~ /^\//) print $f }' \
+        | while read -r library; do \
+            mkdir -p "/staging$(dirname "$library")"; \
+            cp -aL "$library" "/staging$library"; \
+          done; \
+    done; \
+    cp -aL /etc/ssl/certs/ca-certificates.crt /staging/etc/ssl/certs/ca-certificates.crt; \
+    cp -aL /etc/ssl/openssl.cnf /staging/etc/ssl/openssl.cnf; \
+    cp -aL /etc/nsswitch.conf /staging/etc/nsswitch.conf; \
+    for resolver in libnss_dns.so.2 libnss_files.so.2 libresolv.so.2; do \
+      cp -aL "/lib/x86_64-linux-gnu/$resolver" "/staging/lib/x86_64-linux-gnu/$resolver"; \
+    done; \
+    mkdir -p /staging-example/usr/local/bin /staging-adapter/usr/local/bin; \
+    cp -a /work/bin/example/AMD64_LINUX/convex-example /staging-example/usr/local/bin/convex-example; \
+    cp -a /work/bin/adapter/AMD64_LINUX/convex-adapter /staging-adapter/usr/local/bin/convex-adapter; \
+    chmod 0555 /staging-example/usr/local/bin/convex-example /staging-adapter/usr/local/bin/convex-adapter
+
+# ---------------------------------------------------------------------------
+# runtime-base: a fresh, minimal image carrying only the staged closure
+# above -- no compiler, no package manager, no CM3 toolchain beyond its
+# three required runtime .so files (a "language-runtime library" this
+# runtime needs to boot, per AGENTS.md, not an optional toolchain).
+# ---------------------------------------------------------------------------
+FROM --platform=linux/amd64 ${BUILD_IMAGE} AS runtime-base
+RUN --mount=type=bind,from=test,source=/bin/busybox,target=/busybox,readonly \
+    set -eu; \
+    pruner=/busybox; \
+    for path in /bin /boot /home /lib /lib64 /media /mnt /opt /root \
+                /run /sbin /srv /usr /var; do \
+      "$pruner" rm -rf "$path"; \
+    done; \
+    for path in /etc/*; do \
+      case "$path" in \
+        /etc/hosts|/etc/resolv.conf) ;; \
+        *) "$pruner" rm -rf "$path" ;; \
+      esac; \
+    done; \
+    "$pruner" rm -rf /etc/.pwd.lock; \
+    exec "$pruner" rm -rf /tmp
+COPY --from=test /staging /
+ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    PATH=/usr/local/bin:/usr/bin:/bin \
+    LC_ALL=C
+USER 65532:65532
+RUN test "$(id -u):$(id -g)" = 65532:65532 \
+    && test -s "$SSL_CERT_FILE" \
+    && test "$(uname -m)" = x86_64 \
+    && test "$(printf 'ok\n' | cat)" = ok \
+    && test "$(printf 'a:b\n' | cut -d: -f2)" = b \
+    && test "$(printf 'first\nsecond\n' | head -n 1)" = first \
+    && test "$(printf 'first\nsecond\n' | tail -n 1)" = second
+
+RUN test ! -e /etc/dpkg \
+    && test ! -e /etc/apt \
+    && test ! -e /var \
+    && test ! -e /usr/share \
+    && test ! -e /usr/include \
+    && test ! -e /usr/src \
+    && test ! -e /busybox \
+    && for command_name in cc gcc g++ clang make ld as ar cmake apt apt-get dpkg \
+         apk rpm curl wget nc netcat socat busybox node npm npx python \
+         python3 pip pip3 perl ruby php java go rustc cargo convex jq cm3; do \
+         ! command -v "$command_name" >/dev/null 2>&1 || exit 1; \
+       done
+
+FROM runtime-base AS example-runtime
+COPY --from=test /staging-example /
+RUN test -x /usr/local/bin/convex-example \
+    && test ! -e /usr/local/bin/convex-adapter
+ENTRYPOINT ["/usr/local/bin/convex-example"]
+
+# Keep the adapter last: `./run build modula-3` uses the default target.
+FROM runtime-base AS runtime
+COPY --from=test /staging-adapter /
+RUN set -eu; \
+    test -x /usr/local/bin/convex-adapter; \
+    test ! -e /usr/local/bin/convex-example; \
+    probe=$(printf '%s\n' \
+      '{"protocolVersion":1,"id":"hello","op":"hello"}' \
+      '{"id":"close","op":"close"}' \
+      | CONVEX_URL=http://127.0.0.1:9 /usr/local/bin/convex-adapter); \
+    case "$probe" in \
+      *'"type":"closed"'*) ;; \
+      *) printf '%s\n' "$probe" >&2; exit 1 ;; \
+    esac
+ENTRYPOINT ["/usr/local/bin/convex-adapter"]
