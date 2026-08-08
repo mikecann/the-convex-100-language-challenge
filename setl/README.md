@@ -2,13 +2,31 @@
 
 This language client is planned as roster entry 45.
 
-No client library exists yet and no capabilities have been earned. What
-exists so far is the from-source interpreter build this client depends on,
-with its native TLS boundary proven against a real host from inside Docker.
+No capabilities have been earned yet and no shared conformance has run.
+What exists so far, all proven inside the Dockerfile's `test` stage against
+real network peers (a well-known public host, not the Convex backend yet):
+the from-source interpreter build with its native TLS boundary, a JSON
+codec, an HTTP/1.1 client over both the plain-TCP and TLS transports
+(including chunked response bodies), and a Convex query/mutation/action
+wrapper over the documented HTTP envelope.
 
 - Selection tier: `ranked`
 - Implementation status: `planned`
 - Earned capabilities: none
+
+## What works so far
+
+| Piece | Status |
+| --- | --- |
+| GNU SETL interpreter + TLS boundary build | Proven in Docker |
+| `client/json.setl` (JSON codec) | Tested, 26 checks |
+| `client/tcp.setl` / `client/tls.setl` / `client/stream.setl` (transports) | Tested against real hosts |
+| `client/http.setl` (HTTP/1.1 framing) | Tested against real hosts, both transports |
+| `client/convex.setl` (query/mutation/action + envelope classification) | Unit-tested against synthetic responses |
+| RFC 6455 WebSocket framing | Not started |
+| `/api/sync` Live state machine | Not started |
+| NDJSON conformance adapter (`debugDisconnect`) | Not started |
+| `examples/basics/main.setl` | Not started |
 
 ## Build recipe (proven)
 
@@ -60,9 +78,25 @@ this: GNU SETL's native `open(f, "tcp-client")` opens a real socket
 directly, so the local profile never touches `callout()` or OpenSSL at
 all. Only the hosted (TLS) profile does.
 
+## Other GNU SETL lessons learned along the way
+
+- A source unit's mainline (executable) statements must all precede its
+  `proc` definitions, with no interleaving -- confirmed by hitting the
+  syntax error directly, not from documentation. Every proc-only module in
+  `client/` is therefore meant to be `#include`d (via `setl --cpp`) near
+  the end of a file, after that file's own mainline code.
+- Several plausible identifiers are reserved words: `wr`, `reads`, `ok`,
+  `is_float`, `host`, `port`, `body`, `status`, `hostname`, `op`, among
+  others hit while writing this client. There is no single documented list
+  to check against; `src/lexicon` in the GNU SETL source tree is the
+  ground truth.
+- GNU SETL map assignment `m(k) := om` does not store an entry (`om` is
+  also what a missing-key lookup returns), so this client's JSON decoder
+  cannot tell an object's `{"k":null}` apart from `{}` -- see the module
+  comments in `client/json.setl` and `client/convex.setl`.
+
 ## What's left
 
-The client library itself (`client/`), the JSON codec, HTTP/1.1 framing,
 RFC 6455 WebSocket framing over the hex-encoded TLS boundary, the
 `/api/sync` Live state machine, the NDJSON conformance adapter (with
 `debugDisconnect`), the canonical example, and every test layer in
