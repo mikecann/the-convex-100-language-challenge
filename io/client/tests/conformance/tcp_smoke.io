@@ -88,4 +88,20 @@ ConvexTcpSmoke := Object clone do(
     )
 )
 
-System exit(ConvexTcpSmoke run)
+// try() plus an explicit exit(1) on the caught branch, not a bare
+// `System exit(ConvexTcpSmoke run)`: this pinned Io VM's own default
+// top-level exception handler prints a backtrace and still exits 0 (proven
+// directly with `io -e 'Exception raise("boom")'` against this exact build),
+// so any of the Exception raise() calls above escaping uncaught - which is
+// their only way of reporting a failure - would otherwise report this smoke
+// check as passing. See the identical fix and its comment in run.io.
+outcome := try(ConvexTcpSmoke run)
+if(outcome,
+    Convex writeDiagnostic(
+        File standardError,
+        "convex-io: tcp smoke check aborted on an uncaught exception: " .. \
+        Convex errorMessage(outcome) .. "\n"
+    )
+    System exit(1)
+)
+System exit(0)

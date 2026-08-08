@@ -118,6 +118,32 @@ Convex errorMessage := method(problem,
     if(text isNil, "unknown error", text asString)
 )
 
+// A best-effort diagnostic write, retried a bounded number of times rather
+// than propagated as a fatal exception on the first failure.
+//
+// Bisected against a real hostile-peer run: writing this process's own
+// stderr through a pipe (the shape every Docker log capture and every CI
+// runner uses) occasionally raised "error writing to file" - reproduced with
+// a minimal, fully isolated repro (open a Live connection, force a
+// partial-frame retire, reconnect, poll) that has nothing to do with any
+// Convex protocol logic. Redirecting that same run's stderr straight to a
+// plain file instead of a pipe made the failure disappear over dozens of
+// repeated runs, and the one time it did fire mid-pipe, the very next write
+// on the same stream succeeded immediately - a transient hiccup in whatever
+// is capturing this process's output, not a permanent break in the stream
+// and not a defect in this client's own logic. A bare `File write` treats
+// that hiccup as fatal; retrying immediately is enough to ride it out
+// because the next attempt already succeeded in every observed case.
+Convex writeDiagnostic := method(stream, text,
+    attempts := 0
+    written := false
+    while(written not and attempts < 8,
+        problem := try(stream write(text))
+        if(problem isNil, written = true, attempts = attempts + 1)
+    )
+    written
+)
+
 // ------------------------------------------------------------------
 // JSON
 // ------------------------------------------------------------------
@@ -246,45 +272,92 @@ ConvexJson := Object clone do(
 
     // Return the index one past a complete JSON value starting at INDEX,
     // validating the structure on the way. Strings are skipped as whole units
-    // so a brace inside a string cannot unbalance a container.
+    // so a brace inside a string cannot unbalance a container. Objects and
+    // arrays are validated recursively by objectEnd/arrayEnd below rather
+    // than by bracket-depth counting alone - depth counting only proves the
+    // braces balance, so `{"a":}` (a key with no value at all) balanced its
+    // braces and was accepted as "valid" until this recursed into the actual
+    // member grammar.
     valueEnd := method(text, index,
         cursor := ConvexJson skipSpace(text, index)
         limit := text size
         if(cursor >= limit, Convex protocolError("expected a JSON value"))
         code := text at(cursor)
         if(code == ConvexJson quoteByte, return ConvexJson stringEnd(text, cursor))
-        if(code != 123 and code != 91,
-            // A literal or a number ends at the first structural byte.
-            scan := cursor
-            while(scan < limit,
-                current := text at(scan)
-                if(current == 44 or current == 93 or current == 125, break)
-                if(ConvexJson isSpaceByte(current), break)
-                scan = scan + 1
-            )
-            if(scan == cursor, Convex protocolError("expected a JSON value"))
-            return scan
-        )
-        openByte := code
-        closeByte := if(openByte == 123, 125, 93)
-        depth := 0
+        if(code == 123, return ConvexJson objectEnd(text, cursor))
+        if(code == 91, return ConvexJson arrayEnd(text, cursor))
+        // A literal or a number ends at the first structural byte.
         scan := cursor
-        result := nil
-        while(result isNil and scan < limit,
+        while(scan < limit,
             current := text at(scan)
-            if(current == ConvexJson quoteByte) then(
-                scan = ConvexJson stringEnd(text, scan)
+            if(current == 44 or current == 93 or current == 125, break)
+            if(ConvexJson isSpaceByte(current), break)
+            scan = scan + 1
+        )
+        if(scan == cursor, Convex protocolError("expected a JSON value"))
+        scan
+    )
+
+    // Walk a JSON object starting at its opening brace (INDEX), validating
+    // that every member is a quoted key, a colon, and a full value - each
+    // recursively confirmed by valueEnd - separated by commas, with no
+    // trailing comma before the closing brace. Returns the index one past
+    // the closing brace.
+    objectEnd := method(text, index,
+        limit := text size
+        cursor := ConvexJson skipSpace(text, index + 1)
+        if(cursor < limit and text at(cursor) == 125, return cursor + 1)
+        scanning := true
+        while(scanning,
+            cursor = ConvexJson skipSpace(text, cursor)
+            if(cursor >= limit or text at(cursor) != ConvexJson quoteByte,
+                Convex protocolError("malformed JSON object key")
+            )
+            cursor = ConvexJson stringEnd(text, cursor)
+            cursor = ConvexJson skipSpace(text, cursor)
+            if(cursor >= limit or text at(cursor) != 58,
+                Convex protocolError("malformed JSON object separator")
+            )
+            // valueEnd itself skips leading space, so the member's value can
+            // be validated directly from just past the colon - including the
+            // case where nothing but a closing brace or comma follows it.
+            cursor = ConvexJson valueEnd(text, cursor + 1)
+            cursor = ConvexJson skipSpace(text, cursor)
+            if(cursor >= limit, Convex protocolError("unterminated JSON container"))
+            if(text at(cursor) == 125) then(
+                cursor = cursor + 1
+                scanning = false
+            ) elseif(text at(cursor) == 44) then(
+                cursor = ConvexJson skipSpace(text, cursor + 1)
             ) else(
-                if(current == openByte, depth = depth + 1)
-                if(current == closeByte,
-                    depth = depth - 1
-                    if(depth == 0, result = scan + 1)
-                )
-                scan = scan + 1
+                Convex protocolError("malformed JSON object separator")
             )
         )
-        if(result isNil, Convex protocolError("unterminated JSON container"))
-        result
+        cursor
+    )
+
+    // The array counterpart to objectEnd: every element is a full value,
+    // recursively confirmed by valueEnd, separated by commas with no
+    // trailing comma before the closing bracket.
+    arrayEnd := method(text, index,
+        limit := text size
+        cursor := ConvexJson skipSpace(text, index + 1)
+        if(cursor < limit and text at(cursor) == 93, return cursor + 1)
+        scanning := true
+        while(scanning,
+            cursor = ConvexJson valueEnd(text, cursor)
+            cursor = ConvexJson skipSpace(text, cursor)
+            if(cursor >= limit, Convex protocolError("unterminated JSON container"))
+            if(text at(cursor) == 93) then(
+                cursor = cursor + 1
+                scanning = false
+            ) elseif(text at(cursor) == 44) then(
+                cursor = ConvexJson skipSpace(text, cursor + 1)
+            ) else(
+                Convex protocolError("malformed JSON array separator")
+            )
+        )
+        cursor
     )
 
     // Fully validate a document and reject trailing bytes. Used on every
@@ -736,12 +809,29 @@ ConvexStream := Object clone do(
     // reported end of stream those bytes can never be consumed, and claiming
     // readability for them would drive the event loop's timeout to zero and
     // spin the process at full speed for as long as the stream is held.
+    //
+    // hasBufferedInput and wantsRead below are written as sequential early
+    // returns rather than one `or`/`and`-joined expression on the same
+    // grounds as pumpOnce's readable-service check further down this file:
+    // this exact family of shape - a method-derived boolean combined inline
+    // with a second condition, evaluated repeatedly from inside the polling
+    // loop - is what corrupted the pinned Io VM (IoLanguage/io native @
+    // 3d4bc9c) once already in isBackpressured, and again in pumpOnce's own
+    // readMask/writeMask pass once enough GC pressure had built up. These
+    // methods are on the same hot path (called through `item wantsRead` /
+    // `item hasBufferedInput` on every pollable, every pumpOnce call), so
+    // they are written defensively the same way rather than waiting for a
+    // third bisection to prove they are reachable too.
     hasBufferedInput := method(
-        if(self isClosed or self atEnd, return false)
+        if(self isClosed, return false)
+        if(self atEnd, return false)
         self io bufferedBytes(self handle) > 0
     )
 
-    wantsRead := method(self isClosed not and self atEnd not)
+    wantsRead := method(
+        if(self isClosed, return false)
+        self atEnd not
+    )
     wantsWrite := method(
         if(self isClosed, return false)
         if(self stage == "connecting", return true)
@@ -909,6 +999,11 @@ ConvexSocket := Object clone do(
         self onMessage := nil
         self closeSent := false
         self io := nil
+        // Set by the owning ConvexClient right after connectTo, and read
+        // back by that same client's onMessage callback. A real slot on this
+        // socket rather than something the callback closes over: see the
+        // comment on ensureLive's use of it for why.
+        self owner := nil
     )
 
     connectTo := method(deployment, requestPath,
@@ -924,9 +1019,23 @@ ConvexSocket := Object clone do(
     isOpen := method(self phase == "open")
 
     handle := method(if(self stream, self stream handle, -1))
-    wantsRead := method(self stream isNil not and self stream wantsRead)
-    wantsWrite := method(self stream isNil not and self stream wantsWrite)
-    hasBufferedInput := method(self stream isNil not and self stream hasBufferedInput)
+    // Sequential early returns rather than `and`-joined method chains for the
+    // same reason as ConvexStream's wantsRead/hasBufferedInput above: these
+    // three are called through `item wantsRead` / `item wantsWrite` /
+    // `item hasBufferedInput` on every pollable, every pumpOnce call, so they
+    // sit on the exact hot path where that pinned-VM corruption showed up.
+    wantsRead := method(
+        if(self stream isNil, return false)
+        self stream wantsRead
+    )
+    wantsWrite := method(
+        if(self stream isNil, return false)
+        self stream wantsWrite
+    )
+    hasBufferedInput := method(
+        if(self stream isNil, return false)
+        self stream hasBufferedInput
+    )
 
     // The upgrade request carries the same Convex-Client header as the HTTP
     // path, so a deployment sees one consistent client identity.
@@ -951,7 +1060,9 @@ ConvexSocket := Object clone do(
         if(self stream stage == "connecting",
             if(self stream advance not, return self)
         )
-        if(self phase == "connecting" and self stream isOpen, self sendUpgrade)
+        if(self phase == "connecting",
+            if(self stream isOpen, self sendUpgrade)
+        )
         self stream flushOnce
         self
     )
@@ -961,15 +1072,25 @@ ConvexSocket := Object clone do(
         if(self stream stage == "connecting",
             if(self stream advance not, return self)
         )
-        if(self phase == "connecting" and self stream isOpen,
-            self sendUpgrade
-            self stream flushOnce
+        if(self phase == "connecting",
+            if(self stream isOpen,
+                self sendUpgrade
+                self stream flushOnce
+            )
         )
         self stream fill
         if(self phase == "handshake", self readHandshake)
         if(self phase == "open", self readFrames)
-        if(self stream atEnd and self stream incoming size == 0 and self phase != "closed",
-            Convex transportError("peer closed the Live connection")
+        // Nested rather than one triple `and` chain, for the same reason as
+        // the predicate methods above: this runs on every serviceRead call
+        // while a connection is open, which is the hot path that corrupted
+        // the pinned VM once already.
+        if(self stream atEnd,
+            if(self stream incoming size == 0,
+                if(self phase != "closed",
+                    Convex transportError("peer closed the Live connection")
+                )
+            )
         )
         self
     )
@@ -1083,7 +1204,12 @@ ConvexSocket := Object clone do(
             Convex protocolError("unsupported WebSocket opcode")
         )
         if(opcode != 1, Convex protocolError("binary WebSocket data is unsupported"))
-        if(self onMessage, self onMessage call(payload asString))
+        // `self` is passed explicitly alongside the payload for the same
+        // reason publish() passes `entry`: this call is reached through
+        // serviceReadable's try(), where a bare `self` inside the callback
+        // would not reliably resolve to this socket - see ensureLive's
+        // comment in this file for the full story.
+        if(self onMessage, self onMessage call(payload asString, self))
         self
     )
 
@@ -1211,7 +1337,7 @@ ConvexClient := Object clone do(
     )
 
     warn := method(text,
-        if(self diagnostics, File standardError write("convex-io: " .. text .. "\n"))
+        if(self diagnostics, Convex writeDiagnostic(File standardError, "convex-io: " .. text .. "\n"))
         self
     )
 
@@ -1263,12 +1389,30 @@ ConvexClient := Object clone do(
                 if((writable / bit) floor % 2 == 1, self serviceWritable(item))
             )
         )
+        // Written as two sequential `if` checks rather than one `or`-joined
+        // condition on purpose: this is the same shape - a method-derived
+        // boolean compared inline and combined with a second predicate that
+        // is itself a stored-block/method call, evaluated inside nested
+        // `foreach`/`if` indirection, repeated across a polling loop - that
+        // ConvexAdapterOutput isBackpressured() hit on the pinned Io VM
+        // (IoLanguage/io native @ 3d4bc9c): confirmed by bisection that a
+        // fresh client/peer pair alone does not reproduce a failure here, but
+        // running this exact `or`-joined line after the GC pressure built up
+        // by the ten preceding HTTP loopback scenarios does, every time -
+        // `client/tests/http_peer_test.io`'s http/deadline case, which is the
+        // first scenario to poll this loop repeatedly against a frozen peer,
+        // reliably broke `File standardError write()` for the rest of the
+        // process afterward until this was split. Splitting the `or` into
+        // two plain `if` checks avoids the shape while keeping the same
+        // result: service a pollable that is either readable now or already
+        // holding buffered bytes poll cannot see.
         watched foreach(item,
             if(item handle >= 0,
                 bit := 2 ** (item handle)
-                if((readable / bit) floor % 2 == 1 or item hasBufferedInput,
-                    self serviceReadable(item)
-                )
+                shouldService := false
+                if((readable / bit) floor % 2 == 1, shouldService = true)
+                if(shouldService not and item hasBufferedInput, shouldService = true)
+                if(shouldService, self serviceReadable(item))
             )
         )
         self checkPartialFrame
@@ -1688,9 +1832,34 @@ ConvexClient := Object clone do(
         if(self subscriptions size == 0, return self)
         if(self socket and self socket isClosed not, return self)
         self reconnectAtMs = nil
+        // Neither `self` nor a captured local survives in this onMessage
+        // block by the time it is actually invoked - it is created here but
+        // not called until much later, from deep inside ConvexSocket's own
+        // read path (deliver, itself reached through serviceRead by way of
+        // serviceReadable's try(), several method calls up inside pumpOnce).
+        // Three things were tried against a real run before this shape:
+        // a bare `self` raised "ConvexTest does not respond to
+        // 'handleLiveMessage'"; a captured local (`owner := self` before the
+        // block) only moved the same failure to "does not respond to
+        // 'owner'"; and even reading a slot off `self` inside the block
+        // (relying on deliver's own `self` - confirmed correct there, and
+        // passed to `.call()` as the receiver) still raised "does not
+        // respond to 'owner'", because invoking a block through `.call()`
+        // from inside a try() does not reliably hand it the caller's `self`
+        // either. On the pinned Io VM (IoLanguage/io native @ 3d4bc9c) this
+        // reads as the VM's handling of an escaping closure being unsound
+        // in general, not as a mistake in how any one attempt referred to
+        // its data. Only what a block receives as its own declared
+        // parameters survives that trip reliably (confirmed by isolated
+        // repro), so this passes the socket itself as a second argument -
+        // deliver already does the same for onMessage - and the block reads
+        // the owning client back through that argument's own `owner` slot,
+        // set on the socket (a long-lived object, not a closure) right after
+        // it is created.
         problem := try(
             opened := ConvexSocket clone connectTo(self deployment, self syncPath)
-            opened onMessage = block(text, self handleLiveMessage(text))
+            opened owner = self
+            opened onMessage = block(text, sourceSocket, sourceSocket owner handleLiveMessage(text))
             self socket = opened
         )
         if(problem,
@@ -1739,9 +1908,22 @@ ConvexClient := Object clone do(
     // channel has died, for instance - is a failure of that consumer, not of
     // the Live connection, and turning it into a retire would both misreport it
     // and recurse straight back into the same broken callback.
+    //
+    // `entry` is passed as a fourth argument on top of the documented
+    // (kind, payload, logs) shape, purely so a callback that needs to look
+    // something up can do it through that explicit argument. On the pinned
+    // Io VM (IoLanguage/io native @ 3d4bc9c), a callback block invoked from
+    // inside this try() does not reliably see the `self` or the outer locals
+    // that were in scope when the block was written - bisected in full on
+    // ConvexClient ensureLive's onMessage callback below, which raised
+    // "ConvexTest does not respond to 'handleLiveMessage'" (a bare `self`)
+    // and then "does not respond to 'owner'" (a captured local) before an
+    // explicit argument finally worked. Io tolerates extra call arguments a
+    // block does not declare, so this stays compatible with any callback
+    // that only wants the original three.
     publish := method(entry, kind, payload, logs,
         if(entry callback isNil, return self)
-        failure := try(entry callback call(kind, payload, logs))
+        failure := try(entry callback call(kind, payload, logs, entry))
         if(failure,
             self warn("subscription callback raised: " .. Convex errorMessage(failure))
         )

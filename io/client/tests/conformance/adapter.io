@@ -641,13 +641,17 @@ ConvexAdapter := Object clone do(
     // quietly died. Say so as a protocol event, then stop with a non-zero
     // status so the harness sees a failed client rather than a silent one.
     abandon := method(detail,
-        File standardError write("convex-io: adapter loop failed: " .. detail .. "\n")
+        // See Convex writeDiagnostic in convex.io: retried rather than a bare
+        // File write, so a transient hiccup in whatever is capturing this
+        // process's stderr cannot itself abort the loop that is already in
+        // the middle of reporting a real failure to the controller.
+        Convex writeDiagnostic(File standardError, "convex-io: adapter loop failed: " .. detail .. "\n")
         reported := try(
             self respondError(nil, "ProtocolError", "adapter loop failed: " .. detail, nil, nil)
             self output drain
         )
         if(reported,
-            File standardError write("convex-io: the failure could not be reported\n")
+            Convex writeDiagnostic(File standardError, "convex-io: the failure could not be reported\n")
         )
         self exitStatus = 1
         self done = true
@@ -658,7 +662,8 @@ ConvexAdapter := Object clone do(
         self input onLine = block(line,
             failure := try(ConvexAdapter handleLine(line))
             if(failure,
-                File standardError write(
+                Convex writeDiagnostic(
+                    File standardError,
                     "convex-io: adapter command failed: " .. Convex errorMessage(failure) .. "\n"
                 )
             )
@@ -685,7 +690,8 @@ ConvexAdapter := Object clone do(
                         self done = true
                     ) else(
                         if(self io monotonicMs > closeDeadline,
-                            File standardError write(
+                            Convex writeDiagnostic(
+                                File standardError,
                                 "convex-io: adapter close response could not drain in time\n"
                             )
                             self exitStatus = 1
@@ -717,5 +723,30 @@ if(System getEnvironmentVariable("CONVEX_ADAPTER_TEST_ONLY") isNil,
     ) else(
         ConvexAdapter useStdio
     )
-    System exit(ConvexAdapter run)
+    // ConvexAdapter run already converts every failure it anticipates into
+    // self exitStatus by way of abandon() above, but try() plus an explicit
+    // exit(1) on the caught branch guards against anything that still
+    // escapes uncaught - a bug here, or the same class of pinned-VM defect
+    // this client hit and fixed elsewhere (see the long comment on
+    // ConvexClient ensureLive in convex.io). This VM's own default top-level
+    // exception handler prints a backtrace and still exits 0 (proven
+    // directly with `io -e 'Exception raise("boom")'` against this exact
+    // build), which would otherwise report the real conformance executable -
+    // the one the shared harness actually runs against a live deployment -
+    // as having succeeded. try() itself always evaluates to nil on success
+    // (confirmed directly against this build), not to the wrapped
+    // expression's own value, so the exit status has to be captured into an
+    // outer local from inside the try rather than read off its result.
+    exitStatus := 1
+    outcome := try(exitStatus = ConvexAdapter run)
+    if(outcome,
+        Convex writeDiagnostic(
+            File standardError,
+            "convex-io: adapter aborted on an uncaught exception: " .. \
+            Convex errorMessage(outcome) .. "\n"
+        )
+        System exit(1)
+    ,
+        System exit(exitStatus)
+    )
 )

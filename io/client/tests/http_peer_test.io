@@ -152,7 +152,15 @@ ConvexHttpPeerTest := Object clone do(
                 )
             )
             ConvexTest equals(declared, seenBody size, "Content-Length matches the byte count")
-            ConvexTest ok(seenBody containsSeq("👋"), "the multi-byte argument arrives intact")
+            // seenBody is a raw byte Sequence read straight off the socket.
+            // "👋" here is an Io string literal, which the VM stores as
+            // codepoints rather than bytes, so containsSeq on the two as-is
+            // compares incompatible item types and can never match; asUTF8
+            // gives the literal the same byte-level view seenBody already has.
+            ConvexTest ok(
+                seenBody containsSeq("👋" asUTF8),
+                "the multi-byte argument arrives intact"
+            )
         ))
 
         ConvexTest begin("http/structured-error")

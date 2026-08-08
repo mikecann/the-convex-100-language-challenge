@@ -215,7 +215,14 @@ ConvexBasics := Object clone do(
         if(subscriptionId isNil not, client unsubscribe(subscriptionId))
         client close
         if(problem,
-            File standardError write("convex-io example failed: " .. Convex errorMessage(problem) .. "\n")
+            // See Convex writeDiagnostic in convex.io: retried rather than a
+            // bare File write, so a transient hiccup in whatever is capturing
+            // this process's stderr cannot mask the real failure this is
+            // trying to report before exiting non-zero.
+            Convex writeDiagnostic(
+                File standardError,
+                "convex-io example failed: " .. Convex errorMessage(problem) .. "\n"
+            )
             System exit(1)
         )
         0

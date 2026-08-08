@@ -17,6 +17,25 @@ ConvexStyle := Object clone do(
         if(script isNil, ".", script pathComponent)
     )
 
+    // A best-effort diagnostic write, retried a bounded number of times
+    // rather than propagated as a fatal exception on the first failure. This
+    // script runs standalone, before convex.io is known to parse cleanly, so
+    // it cannot depend on Convex writeDiagnostic there; see that method's
+    // comment for why a bare File write is not enough on its own - a write to
+    // this process's own stderr through a pipe (the shape every Docker log
+    // capture uses) can occasionally raise "error writing to file" for a
+    // transient reason unrelated to this script's own correctness, and an
+    // immediate retry was enough to clear it in every observed case.
+    writeStderr := method(text,
+        attempts := 0
+        written := false
+        while(written not and attempts < 8,
+            problem := try(File standardError write(text))
+            if(problem isNil, written = true, attempts = attempts + 1)
+        )
+        written
+    )
+
     sources := method(
         list(
             "../convex.io",
@@ -36,7 +55,7 @@ ConvexStyle := Object clone do(
 
     complain := method(path, detail,
         ConvexStyle failures = ConvexStyle failures + 1
-        File standardError write("STYLE " .. path .. ": " .. detail .. "\n")
+        ConvexStyle writeStderr("STYLE " .. path .. ": " .. detail .. "\n")
         false
     )
 
@@ -78,7 +97,7 @@ ConvexStyle := Object clone do(
     run := method(
         ConvexStyle sources foreach(relative, ConvexStyle check(relative))
         if(ConvexStyle failures == 0,
-            File standardError write(
+            ConvexStyle writeStderr(
                 "style: " .. ConvexStyle sources size asString .. " Io sources are clean\n"
             )
         )

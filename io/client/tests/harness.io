@@ -23,7 +23,14 @@ ConvexTest := Object clone do(
         ConvexTest checks = ConvexTest checks + 1
         if(passed not,
             ConvexTest failures = ConvexTest failures + 1
-            File standardError write("FAIL " .. ConvexTest currentName .. ": " .. label .. "\n")
+            // See Convex writeDiagnostic in convex.io: retried rather than a
+            // bare File write, so a transient hiccup in whatever is capturing
+            // this process's stderr cannot turn a real, reportable test
+            // failure into an unrelated fatal exception here instead.
+            Convex writeDiagnostic(
+                File standardError,
+                "FAIL " .. ConvexTest currentName .. ": " .. label .. "\n"
+            )
         )
         passed
     )
@@ -51,7 +58,8 @@ ConvexTest := Object clone do(
     )
 
     report := method(
-        File standardError write(
+        Convex writeDiagnostic(
+            File standardError,
             "ran " .. ConvexTest checks asString .. " checks, " .. \
             ConvexTest failures asString .. " failures\n"
         )

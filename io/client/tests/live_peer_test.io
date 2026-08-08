@@ -10,14 +10,40 @@
 ConvexLivePeerTest := Object clone do(
     // A recorder shaped like the client's subscription callback, so a test can
     // assert on what a real consumer would have observed and in what order.
+    //
+    // `relay` cannot reach `seen` (or `self`) through the closure the way it
+    // looks like it should: a block that publish() invokes later, from deep
+    // inside pumpOnce by way of a `try()` that isolates a raising consumer
+    // callback, does not reliably see the `self` or the outer locals that
+    // were live when the block was written - see the long comment on
+    // ConvexClient ensureLive in convex.io for how that was bisected down to
+    // a real defect in the pinned Io VM (IoLanguage/io native @ 3d4bc9c)
+    // rather than a mistake in how this block referred to `seen`. Only a
+    // block's own declared parameters survive that trip reliably, so
+    // publish() passes the subscription entry itself as a fourth argument,
+    // and `watcher` below reaches the recorder through that explicit
+    // argument instead of through closure state. attach(client, queryId)
+    // must be called right after subscribe() returns, before any event can
+    // be delivered, so the entry always carries its watcher by the time
+    // relay needs it.
     recorder := method(
         seen := Object clone
         seen events := list()
         seen values := list()
         seen errors := list()
-        seen relay := block(kind, payload, logs,
-            seen events append(list(kind, payload, logs))
-            if(kind == "value", seen values append(payload), seen errors append(payload))
+        seen relay := block(kind, payload, logs, entry,
+            watcher := entry watcher
+            watcher events append(list(kind, payload, logs))
+            if(kind == "value", watcher values append(payload), watcher errors append(payload))
+        )
+        // A plain method, not a block: called immediately and synchronously
+        // right after subscribe() returns, never through the delayed
+        // try()-wrapped dispatch that makes relay's own outer-scope access
+        // unreliable, so `self` here is simply the receiver (this recorder)
+        // exactly as ordinary Io method dispatch promises.
+        seen attach := method(client, queryId,
+            (client subscriptions at(queryId asString)) watcher := self
+            self
         )
         seen
     )
@@ -34,6 +60,7 @@ ConvexLivePeerTest := Object clone do(
         session queryId := session client subscribe(
             "demo:state", session arguments, session watcher relay
         )
+        session watcher attach(session client, session queryId)
         session messages := ConvexTest collect(session peer, session client, 2, 1500)
         session
     )
@@ -236,9 +263,16 @@ ConvexLivePeerTest := Object clone do(
             1,
             "a fragmented message is reassembled and published"
         )
+        // Convex text() decodes to a raw byte Sequence, but "charlie-👋" here
+        // is an Io string literal (a wider itemType - see the note on
+        // ConvexJson quote() above), so a plain == would compare incompatible
+        // item types and always read false regardless of what the client
+        // actually reassembled; asUTF8 gives the literal the same byte-level
+        // view the decoded value already has, the same fix as the identical
+        // trap in http_peer_test.io's utf8-length case.
         ConvexTest equals(
             Convex text(Convex field(fragmented watcher values at(0), "room")),
-            "charlie-👋",
+            "charlie-👋" asUTF8,
             "the multi-byte character survives the fragment boundary"
         )
         pongs := fragmented peer drainClientMessages select(frame, frame opcode == 10)
@@ -338,10 +372,15 @@ ConvexLivePeerTest := Object clone do(
         rudeClient := Convex clientForUrl(rude url)
         rudeWatch := Object clone
         rudeWatch deliveries := 0
-        rudeQuery := rudeClient subscribe("demo:state", "{}", block(kind, payload, logs,
-            rudeWatch deliveries = rudeWatch deliveries + 1
+        // See the comment on ConvexLivePeerTest recorder above: this callback
+        // is invoked through publish()'s try(), so it reaches rudeWatch
+        // through the explicit entry argument rather than through closure
+        // state, the same way the recorder's relay does.
+        rudeQuery := rudeClient subscribe("demo:state", "{}", block(kind, payload, logs, entry,
+            entry watcher deliveries = entry watcher deliveries + 1
             Exception raise("this consumer is broken")
         ))
+        (rudeClient subscriptions at(rudeQuery asString)) watcher := rudeWatch
         ConvexTest collect(rude, rudeClient, 2, 1500)
         rude sendText(ConvexTest transition(
             ConvexTest version(0, Convex initialTimestamp),
@@ -387,7 +426,8 @@ ConvexLivePeerTest := Object clone do(
         wrong onRequest = block(p, p rejectUpgrade)
         wrongClient := Convex clientForUrl(wrong url)
         wrongWatcher := ConvexLivePeerTest recorder
-        wrongClient subscribe("demo:state", "{}", wrongWatcher relay)
+        wrongQuery := wrongClient subscribe("demo:state", "{}", wrongWatcher relay)
+        wrongWatcher attach(wrongClient, wrongQuery)
         ConvexTest drive(wrong, wrongClient, block(wrongWatcher errors size > 0), 1500)
         ConvexTest equals(
             wrongWatcher errors size > 0,
@@ -410,7 +450,8 @@ ConvexLivePeerTest := Object clone do(
         idle shutdown
         backoffClient := Convex clientForUrl("http://127.0.0.1:" .. idlePort asString)
         backoffWatcher := ConvexLivePeerTest recorder
-        backoffClient subscribe("demo:state", "{}", backoffWatcher relay)
+        backoffQuery := backoffClient subscribe("demo:state", "{}", backoffWatcher relay)
+        backoffWatcher attach(backoffClient, backoffQuery)
         for(round, 1, 200, backoffClient pumpOnce(2))
         ConvexTest ok(
             backoffClient reconnectDelayMs > Convex initialReconnectMs,

@@ -34,10 +34,29 @@ Lobby ConvexExampleLoadOnly := true
 ConvexTestRunner load("../../examples/basics/main.io")
 ConvexTestRunner load("../../examples/basics/main_test.io")
 
-ConvexUnitTest run
-ConvexHttpPeerTest run
-ConvexLivePeerTest run
-ConvexAdapterTest run
-ConvexExampleTest run
+// Every suite call is wrapped in one try(): an uncaught exception escaping
+// any of them must fail this process, but the pinned Io VM's own default
+// top-level exception handler prints a backtrace and still exits 0 - proven
+// directly with `io -e 'Exception raise("boom")'` against this exact build,
+// which prints the exception and reports success. Without this wrapper, a
+// real crash anywhere in the suite (several were found and fixed during this
+// client's development, and there is no guarantee none remain) would still
+// report the Docker test stage as passing. try() plus an explicit
+// System exit(1) is what actually makes an uncaught failure fail the build.
+outcome := try(
+    ConvexUnitTest run
+    ConvexHttpPeerTest run
+    ConvexLivePeerTest run
+    ConvexAdapterTest run
+    ConvexExampleTest run
+)
+if(outcome,
+    Convex writeDiagnostic(
+        File standardError,
+        "convex-io: test suite aborted on an uncaught exception: " .. \
+        Convex errorMessage(outcome) .. "\n"
+    )
+    System exit(1)
+)
 
 System exit(if(ConvexTest report > 0, 1, 0))
