@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: visual-foxpro
-displayName: "Visual FoxPro"
-rank: 75
-selectionTier: coverage
-implementation:
-  status: planned
-capabilities: []

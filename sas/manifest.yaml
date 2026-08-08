@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: sas
-displayName: "SAS"
-rank: 39
-selectionTier: ranked
-implementation:
-  status: planned
-capabilities: []

@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: oz
-displayName: "Oz"
-rank: 52
-selectionTier: ranked
-implementation:
-  status: planned
-capabilities: []

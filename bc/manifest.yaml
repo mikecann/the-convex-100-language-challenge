@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: bc
-displayName: "bc"
-rank: 79
-selectionTier: coverage
-implementation:
-  status: planned
-capabilities: []

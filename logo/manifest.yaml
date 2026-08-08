@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: logo
-displayName: "Logo"
-rank: 66
-selectionTier: coverage
-implementation:
-  status: planned
-capabilities: []

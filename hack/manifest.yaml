@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: hack
-displayName: "Hack"
-rank: 90
-selectionTier: curated_backfill
-implementation:
-  status: planned
-capabilities: []

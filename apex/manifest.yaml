@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: apex
-displayName: "Apex"
-rank: 42
-selectionTier: ranked
-implementation:
-  status: planned
-capabilities: []

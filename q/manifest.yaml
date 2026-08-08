@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: q
-displayName: "Q"
-rank: 69
-selectionTier: coverage
-implementation:
-  status: planned
-capabilities: []

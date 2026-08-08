@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: raku
-displayName: "Raku"
-rank: 53
-selectionTier: ranked
-implementation:
-  status: planned
-capabilities: []

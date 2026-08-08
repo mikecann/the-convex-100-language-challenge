@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: scratch
-displayName: "Scratch"
-rank: 47
-selectionTier: ranked
-implementation:
-  status: planned
-capabilities: []

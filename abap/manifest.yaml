@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: abap
-displayName: "ABAP"
-rank: 35
-selectionTier: ranked
-implementation:
-  status: planned
-capabilities: []
