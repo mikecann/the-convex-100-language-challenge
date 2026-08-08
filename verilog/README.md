@@ -94,8 +94,8 @@ package and the exact same directory.
 | NDJSON conformance adapter (stdin/stdout, `ADAPTER_LISTEN`, Live, bounded mailbox) | Proven in Docker (Scenarios A-D) |
 | Canonical `examples/basics` | Proven in Docker, exact transcript match |
 | `example-runtime` / `runtime` Docker stages | Built, policy-checked (uid 65532, read-only, no compiler), and run against the real deployment |
-| HTTP capability | See shared evidence |
-| Live capability | See shared evidence |
+| HTTP capability | Verified (`./run verify-all verilog` awarded it on both profiles) |
+| Live capability | Verified (`./run verify-all verilog` awarded it on both profiles) |
 
 ## The canonical example
 

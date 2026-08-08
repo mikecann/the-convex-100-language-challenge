@@ -126,4 +126,6 @@ limitations:
     spelling instead of the single byte it should produce - every string
     literal needing a literal quote or backslash spells it as an explicit
     byte constant instead (see client/convex_chars.vh).
-capabilities: []
+capabilities:
+  - http
+  - live
