@@ -1,0 +1,473 @@
+-- Minimal RFC 6455 WebSocket client over client/stream.setl, built to
+-- carry exactly what the pinned `convex-rs-0.10.4-unversioned-sync'
+-- profile needs on /api/sync: the HTTP Upgrade handshake with a real
+-- Sec-WebSocket-Accept check, one unfragmented masked text frame per
+-- outbound send, and inbound fragmented-message reassembly with
+-- transparent ping/pong replies, peer-close handling, and a single
+-- UTF-8 validation pass over the reassembled message. Binary frames
+-- and extensions are out of scope -- the sync profile never sends them.
+--
+-- Every raw byte this module reads or writes crosses client/tls.setl's
+-- callout() boundary hex-encoded when the underlying transport is TLS
+-- (client/stream.setl already hides that from here); this module only
+-- ever sees plain SETL strings.
+--
+-- A connection is a map (see ws_connect) threaded explicitly through
+-- every call and reassigned by the caller -- the same style
+-- client/http.setl uses for its own read buffer -- because GNU SETL has
+-- no reference/object semantics to hide that mutation behind. Fields:
+--   "stream"            the client/stream.setl handle
+--   "buf"               bytes read from the socket but not yet parsed
+--                        into a complete frame
+--   "open"              whether the connection is still usable
+--   "last_close_reason" the most recent close reason: a peer close
+--                        frame's reason text, "transport error", or
+--                        "InitialConnect" before any connection has
+--                        ended yet
+--   "last_error"        set alongside "open" := false on a transport
+--                        failure
+--
+-- This module is proc-only (no top-level statements) and is meant to be
+-- #include'd (via `setl --cpp') after its own file's mainline code,
+-- alongside client/http.setl (for find_substring/http_trim/downcase/
+-- http_fill_until) and client/stream.setl -- see the module comment at
+-- the top of client/json.setl for why GNU SETL requires that ordering.
+
+proc ws_connect(scheme, target_host, port_num, path, timeout_ms);
+  deadline := clock + timeout_ms;
+  [success, s] := stream_connect(scheme, target_host, port_num, timeout_ms);
+  if not success then
+    return [false, s];
+  end if;
+
+  -- RFC 6455 does not require the handshake key to be cryptographically
+  -- random: the server only hashes it back to prove it understood the
+  -- request, and this client never reuses a connection across origins.
+  key_bytes := "";
+  for i in [1..16] loop
+    key_bytes +:= char(random(255));
+  end loop;
+  key := base64_encode(key_bytes);
+
+  req := "GET " + path + " HTTP/1.1\r\n";
+  req +:= "Host: " + target_host + "\r\n";
+  req +:= "Upgrade: websocket\r\n";
+  req +:= "Connection: Upgrade\r\n";
+  req +:= "Sec-WebSocket-Key: " + key + "\r\n";
+  req +:= "Sec-WebSocket-Version: 13\r\n\r\n";
+
+  [success, info] := stream_write(s, req);
+  if not success then
+    stream_close(s);
+    return [false, "handshake write failed: " + str(info)];
+  end if;
+
+  [success, buf] := http_fill_until(s, "", "\r\n\r\n", deadline, om);
+  if not success then
+    stream_close(s);
+    return [false, "handshake read failed: " + str(buf)];
+  end if;
+
+  header_end := find_substring(buf, "\r\n\r\n", 1);
+  head := buf(1..header_end + 1);
+  leftover := buf(header_end + 4..);
+
+  lines := split(head, "\r\n");
+  status_line := lines(1);
+  if find_substring(status_line, "101", 1) = 0 then
+    stream_close(s);
+    return [false, "unexpected handshake outcome: " + status_line];
+  end if;
+
+  accept_value := om;
+  for idx in [2..#lines] loop
+    line := lines(idx);
+    colon := find_substring(line, ":", 1);
+    if colon /= 0 then
+      name := downcase(http_trim(line(1..colon - 1)));
+      if name = "sec-websocket-accept" then
+        accept_value := http_trim(line(colon + 1..));
+      end if;
+    end if;
+  end loop;
+  if accept_value = om then
+    stream_close(s);
+    return [false, "handshake response is missing Sec-WebSocket-Accept"];
+  end if;
+
+  expected := ws_accept_token(key);
+  if accept_value /= expected then
+    stream_close(s);
+    return [false, "Sec-WebSocket-Accept mismatch: expected " + expected + ", got " + accept_value];
+  end if;
+
+  ws := {};
+  ws("stream") := s;
+  ws("buf") := leftover;
+  ws("open") := true;
+  ws("last_close_reason") := "InitialConnect";
+  return [true, ws];
+end proc;
+
+-- The handshake's proof step (RFC 6455 4.2.2): SHA-1 of the client's
+-- key concatenated with the RFC's fixed GUID, then base64. SHA-1 itself
+-- runs across the callout() boundary (service 5, client/callskel.c)
+-- rather than being hand-rolled in SETL source; see that file's module
+-- comment for why.
+proc ws_accept_token(key);
+  material := key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+  digest_reply := callout(5, om, [hex material]);
+  if #digest_reply < 3 or digest_reply(1..3) /= "OK:" then
+    return "";
+  end if;
+  return base64_encode(unhex digest_reply(4..));
+end proc;
+
+-- Inverse of base64_encode. Used by client/sync.setl's ts_compare to
+-- decode a Convex sync-protocol timestamp (base64 of a little-endian
+-- uint64) back to raw bytes without ever materializing it as a SETL
+-- integer -- GNU SETL integers are exact, but round-tripping through one
+-- is needless work this comparison never needs. Malformed input (wrong
+-- alphabet, wrong padding) is not expected on this wire and is not
+-- specially guarded against, matching base64_encode's own scope.
+proc base64_decode(text);
+  alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  out := "";
+  n := #text;
+  i := 1;
+  while i + 3 <= n loop
+    v0 := find_substring(alphabet, text(i), 1) - 1;
+    v1 := find_substring(alphabet, text(i + 1), 1) - 1;
+    has2 := text(i + 2) /= "=";
+    has3 := has2 and text(i + 3) /= "=";
+    v2 := 0;
+    if has2 then
+      v2 := find_substring(alphabet, text(i + 2), 1) - 1;
+    end if;
+    v3 := 0;
+    if has3 then
+      v3 := find_substring(alphabet, text(i + 3), 1) - 1;
+    end if;
+    triple := v0 * 262144 + v1 * 4096 + v2 * 64 + v3;
+    out +:= char(triple div 65536 mod 256);
+    if has2 then
+      out +:= char(triple div 256 mod 256);
+    end if;
+    if has3 then
+      out +:= char(triple mod 256);
+    end if;
+    i +:= 4;
+  end loop;
+  return out;
+end proc;
+
+proc base64_encode(bytes);
+  alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  out := "";
+  n := #bytes;
+  i := 1;
+  while i <= n loop
+    b0 := ichar(bytes(i));
+    if i + 1 <= n then
+      b1 := ichar(bytes(i + 1));
+    else
+      b1 := 0;
+    end if;
+    if i + 2 <= n then
+      b2 := ichar(bytes(i + 2));
+    else
+      b2 := 0;
+    end if;
+    triple := b0 * 65536 + b1 * 256 + b2;
+    out +:= alphabet((triple div 262144 mod 64) + 1);
+    out +:= alphabet((triple div 4096 mod 64) + 1);
+    if i + 1 <= n then
+      out +:= alphabet((triple div 64 mod 64) + 1);
+    else
+      out +:= "=";
+    end if;
+    if i + 2 <= n then
+      out +:= alphabet((triple mod 64) + 1);
+    else
+      out +:= "=";
+    end if;
+    i +:= 3;
+  end loop;
+  return out;
+end proc;
+
+-- Sends AText as one unfragmented, masked text frame. Every
+-- client-to-server frame must be masked (RFC 6455 5.1); the mask itself
+-- does not need to be unpredictable, only present.
+proc ws_send_text(ws, text);
+  frame := ws_encode_frame(1, text);
+  [success, info] := stream_write(ws("stream"), frame);
+  if not success then
+    ws("open") := false;
+    ws("last_error") := str(info);
+    return [false, ws];
+  end if;
+  return [true, ws];
+end proc;
+
+proc ws_encode_frame(opcode, payload);
+  mask_bytes := [random(255), random(255), random(255), random(255)];
+  payload_len := #payload;
+  frame := char(128 + opcode);
+  if payload_len <= 125 then
+    frame +:= char(128 + payload_len);
+  elseif payload_len <= 65535 then
+    frame +:= char(128 + 126);
+    frame +:= char(payload_len div 256 mod 256);
+    frame +:= char(payload_len mod 256);
+  else
+    frame +:= char(128 + 127);
+    frame +:= char(0) + char(0) + char(0) + char(0);
+    frame +:= char(payload_len div 16777216 mod 256);
+    frame +:= char(payload_len div 65536 mod 256);
+    frame +:= char(payload_len div 256 mod 256);
+    frame +:= char(payload_len mod 256);
+  end if;
+  for b in mask_bytes loop
+    frame +:= char(b);
+  end loop;
+  idx := 0;
+  for c in payload loop
+    m := mask_bytes(idx mod 4 + 1);
+    frame +:= char(ichar(c) bit_xor m);
+    idx +:= 1;
+  end loop;
+  return frame;
+end proc;
+
+-- Reads and reassembles the next complete message, transparently
+-- answering pings and the peer's close handshake, bounded by one
+-- deadline shared across every fragment: once any byte of a message has
+-- been consumed, this either finishes within timeout_ms or reports
+-- "timeout" without discarding ws -- the caller decides whether to
+-- retry (staying on the same, now-partially-read connection is not
+-- safe; the caller of ws_recv is expected to treat a "timeout" the same
+-- as any other stall and reconnect if it needs to keep going) or give
+-- up. A reassembled text message is validated as UTF-8 exactly once,
+-- after every fragment has been joined -- RFC 6455 8.1 forbids
+-- validating fragment-by-fragment, since a multi-byte code point can
+-- legally split across a fragment boundary. An invalid message is
+-- reported as a protocol close (RFC 6455 7.4.1 code 1007) rather than
+-- surfaced as data. Returns [outcome, ws, message]:
+--   "message"  message is the reassembled text payload
+--   "timeout"  no complete message arrived within timeout_ms
+--   "closed"   the peer closed the connection (see ws("last_close_reason"))
+--   "error"    a transport failure or invalid UTF-8 (see ws("last_error"))
+proc ws_recv(ws, timeout_ms);
+  deadline := clock + timeout_ms;
+  message := "";
+  first_opcode := -1;
+  loop
+    [outcome, ws, fin, opcode, payload] := ws_parse_frame(ws, deadline);
+    if outcome = "timeout" then
+      return ["timeout", ws, ""];
+    elseif outcome = "eof" then
+      ws("last_close_reason") := "transport error";
+      return ["closed", ws, ""];
+    elseif outcome = "error" then
+      return ["error", ws, ""];
+    end if;
+
+    if opcode = 8 then
+      -- Close: the payload is a 2-byte outcome code followed by an
+      -- optional UTF-8 reason.
+      if #payload > 2 then
+        ws("last_close_reason") := payload(3..);
+      else
+        ws("last_close_reason") := "closed by peer";
+      end if;
+      ack := ws_encode_frame(8, char(3) + char(232) + "ack");
+      stream_write(ws("stream"), ack);
+      ws("open") := false;
+      stream_close(ws("stream"));
+      return ["closed", ws, ""];
+    elseif opcode = 9 then
+      -- Ping: answer with the same payload as a pong and keep waiting
+      -- for the message this call is actually after. A ping is a
+      -- control frame and RFC 6455 5.4 allows it between the fragments
+      -- of a larger data message, so this branch must leave `message`
+      -- and `first_opcode` untouched.
+      [success, info] := stream_write(ws("stream"), ws_encode_frame(10, payload));
+      if not success then
+        ws("open") := false;
+        ws("last_error") := str(info);
+        return ["error", ws, ""];
+      end if;
+    elseif opcode = 0 or opcode = 1 or opcode = 2 then
+      -- Continuation, text, or binary: accumulate. This profile only
+      -- ever sends text, so a binary first frame is rejected once the
+      -- message completes rather than mid-stream, keeping the
+      -- reassembly loop itself opcode-agnostic.
+      if first_opcode = -1 then
+        first_opcode := opcode;
+      end if;
+      message +:= payload;
+      if fin then
+        if first_opcode /= 1 then
+          return ["error", ws, ""];
+        end if;
+        if not utf8_valid(message) then
+          ws("last_close_reason") := "invalid UTF-8";
+          ws("last_error") := "reassembled text message is not valid UTF-8";
+          close_frame := ws_encode_frame(8, char(3) + char(239) + "invalid utf-8");
+          stream_write(ws("stream"), close_frame);
+          ws("open") := false;
+          stream_close(ws("stream"));
+          return ["error", ws, ""];
+        end if;
+        return ["message", ws, message];
+      end if;
+    end if;
+    -- Any other opcode (a lone pong, or a reserved/unknown one) carries
+    -- no message content; loop back for the next frame.
+  end loop;
+end proc;
+
+-- Validates AText as well-formed UTF-8 (RFC 3629): every lead byte's
+-- declared continuation-byte count is present and each continuation
+-- byte is in range 0x80-0xBF, and the assembled code point is neither
+-- overlong (encoded in more bytes than the shortest valid form), a
+-- surrogate half (0xD800-0xDFFF, reserved for UTF-16 and never legal in
+-- UTF-8), nor above the Unicode ceiling U+10FFFF. GNU SETL strings are
+-- plain byte sequences with no native encoding awareness, so this is
+-- the only thing standing between a malformed reassembled WebSocket
+-- message and the caller's decoder.
+proc utf8_valid(text);
+  n := #text;
+  i := 1;
+  while i <= n loop
+    b0 := ichar(text(i));
+    if b0 <= 127 then
+      i +:= 1;
+    elseif b0 >= 194 and b0 <= 223 then
+      if i + 1 > n then return false; end if;
+      b1 := ichar(text(i + 1));
+      if b1 < 128 or b1 > 191 then return false; end if;
+      i +:= 2;
+    elseif b0 >= 224 and b0 <= 239 then
+      if i + 2 > n then return false; end if;
+      b1 := ichar(text(i + 1));
+      b2 := ichar(text(i + 2));
+      if b1 < 128 or b1 > 191 or b2 < 128 or b2 > 191 then return false; end if;
+      cp := (b0 bit_and 15) * 4096 + (b1 bit_and 63) * 64 + (b2 bit_and 63);
+      if cp < 2048 or (cp >= 55296 and cp <= 57343) then return false; end if;
+      i +:= 3;
+    elseif b0 >= 240 and b0 <= 244 then
+      if i + 3 > n then return false; end if;
+      b1 := ichar(text(i + 1));
+      b2 := ichar(text(i + 2));
+      b3 := ichar(text(i + 3));
+      if b1 < 128 or b1 > 191 or b2 < 128 or b2 > 191 or b3 < 128 or b3 > 191 then
+        return false;
+      end if;
+      cp := (b0 bit_and 7) * 262144 + (b1 bit_and 63) * 4096 + (b2 bit_and 63) * 64 + (b3 bit_and 63);
+      if cp < 65536 or cp > 1114111 then return false; end if;
+      i +:= 4;
+    else
+      return false;
+    end if;
+  end loop;
+  return true;
+end proc;
+
+-- Parses exactly one frame (header and payload together -- never just
+-- the header) from ws("buf"), reading more from the socket as needed.
+-- Bytes are only ever removed from the buffer once a whole frame is
+-- confirmed present, so a call that cannot complete within `deadline`
+-- leaves ws("buf") exactly as it found it: a later call safely resumes
+-- from those same bytes plus whatever has since arrived, instead of
+-- mistaking an already-consumed frame's leftover payload for the start
+-- of the next header.
+proc ws_parse_frame(ws, deadline);
+  [outcome, ws] := ws_fill(ws, 2, deadline);
+  if outcome /= "ok" then
+    return [outcome, ws, false, 0, ""];
+  end if;
+  buf := ws("buf");
+  byte0 := ichar(buf(1));
+  byte1 := ichar(buf(2));
+  base_len := byte1 bit_and 127;
+  if base_len = 126 then
+    header_size := 4;
+  elseif base_len = 127 then
+    header_size := 10;
+  else
+    header_size := 2;
+  end if;
+
+  [outcome, ws] := ws_fill(ws, header_size, deadline);
+  if outcome /= "ok" then
+    return [outcome, ws, false, 0, ""];
+  end if;
+  buf := ws("buf");
+  if base_len = 126 then
+    payload_len := ichar(buf(3)) * 256 + ichar(buf(4));
+  elseif base_len = 127 then
+    -- This client's own frames, and every reply the sync profile
+    -- expects, stay far below 2^32 bytes; only the low-order 4 bytes
+    -- of the 8-byte extended length are honoured.
+    payload_len := 0;
+    for pos in [7..10] loop
+      payload_len := payload_len * 256 + ichar(buf(pos));
+    end loop;
+  else
+    payload_len := base_len;
+  end if;
+
+  total_size := header_size + payload_len;
+  [outcome, ws] := ws_fill(ws, total_size, deadline);
+  if outcome /= "ok" then
+    return [outcome, ws, false, 0, ""];
+  end if;
+  buf := ws("buf");
+  fin := byte0 bit_and 128 /= 0;
+  opcode := byte0 bit_and 15;
+  payload := buf(header_size + 1..total_size);
+  ws("buf") := buf(total_size + 1..);
+  return ["ok", ws, fin, opcode, payload];
+end proc;
+
+-- Ensures ws("buf") holds at least min_len bytes, reading more from the
+-- stream as needed. Returns ["ok", ws], ["timeout", ws], ["eof", ws], or
+-- ["error", ws] (with ws("last_error") set on the last two).
+proc ws_fill(ws, min_len, deadline);
+  loop
+    if #ws("buf") >= min_len then
+      return ["ok", ws];
+    end if;
+    remaining := deadline - clock;
+    if remaining <= 0 then
+      return ["timeout", ws];
+    end if;
+    [read_status, payload] := stream_read(ws("stream"), 8192, remaining);
+    if read_status = "data" then
+      ws("buf") +:= payload;
+    elseif read_status = "eof" then
+      ws("open") := false;
+      return ["eof", ws];
+    elseif read_status = "error" then
+      ws("open") := false;
+      ws("last_error") := str(payload);
+      return ["error", ws];
+    end if;
+    -- read_status = "timeout": loop back around and recheck the deadline.
+  end loop;
+end proc;
+
+-- Sends a close frame carrying AReason (outcome code 1000, normal
+-- closure) and shuts the connection down. Idempotent; safe to call
+-- after the peer has already closed.
+proc ws_close(ws, reason);
+  if ws("open") then
+    frame := ws_encode_frame(8, char(3) + char(232) + reason);
+    stream_write(ws("stream"), frame);
+    ws("open") := false;
+  end if;
+  stream_close(ws("stream"));
+  return ws;
+end proc;

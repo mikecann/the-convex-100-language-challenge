@@ -1,0 +1,162 @@
+-- Real end-to-end proof for client/websocket.setl, run against a public
+-- WebSocket echo service (not the Convex backend -- that is exercised
+-- later by the client's own conformance tests once they exist). Proves:
+-- the HTTP Upgrade handshake including a verified Sec-WebSocket-Accept
+-- token (which exercises the SHA-1 callout service), one short masked
+-- text frame round-tripped exactly, one frame past the 125-byte small-
+-- length encoding (exercising the 126 extended-length header), and a
+-- clean close handshake.
+--
+-- A second block below drives a real connection's `buf` field directly
+-- with hand-built frames instead of waiting on the network, to test
+-- fragmentation reassembly, an interleaved control frame, and invalid
+-- UTF-8 rejection deterministically -- properties a public echo service
+-- cannot be relied on to reproduce, since it only ever echoes back
+-- whatever this client itself already sent it. This is the same
+-- synthetic-input style client/tests/convex_test.setl uses to test
+-- protocol shapes without a live fixture server.
+
+fail_count := 0;
+
+[success, ws] := ws_connect("tls", "ws.postman-echo.com", 443, "/raw", 8000);
+if not success then
+  print("FAIL handshake: " + str(ws));
+  fail_count +:= 1;
+else
+  print("handshake ok");
+
+  short_text := "setl-ws-smoke";
+  [success, ws] := ws_send_text(ws, short_text);
+  if not success then
+    print("FAIL send short text: " + str(ws("last_error")));
+    fail_count +:= 1;
+  else
+    [outcome, ws, message] := ws_recv(ws, 8000);
+    if outcome /= "message" then
+      print("FAIL receive short echo: " + outcome);
+      fail_count +:= 1;
+    elseif message /= short_text then
+      print("FAIL short echo mismatch: got " + message);
+      fail_count +:= 1;
+    else
+      print("short echo ok: " + message);
+    end if;
+  end if;
+
+  -- 200 bytes forces the 126 extended-length header (base length 125 is
+  -- the largest value the single-byte length field can hold on its own).
+  long_text := "";
+  for i in [1..200] loop
+    long_text +:= "x";
+  end loop;
+  [success, ws] := ws_send_text(ws, long_text);
+  if not success then
+    print("FAIL send long text: " + str(ws("last_error")));
+    fail_count +:= 1;
+  else
+    [outcome, ws, message] := ws_recv(ws, 8000);
+    if outcome /= "message" then
+      print("FAIL receive long echo: " + outcome);
+      fail_count +:= 1;
+    elseif message /= long_text then
+      print("FAIL long echo mismatch: length " + str(#message));
+      fail_count +:= 1;
+    else
+      print("long echo ok: " + str(#message) + " bytes");
+    end if;
+  end if;
+
+  ws := ws_close(ws, "smoke test done");
+  if ws("open") then
+    print("FAIL close did not clear open");
+    fail_count +:= 1;
+  else
+    print("close ok");
+  end if;
+end if;
+
+-- Synthetic protocol-shape tests: a second real connection supplies a
+-- genuine writable stream (so ws_recv's transparent pong replies have
+-- somewhere real to go), but its `buf` is pre-loaded by hand so every
+-- ws_recv call below resolves entirely from those bytes with no
+-- dependence on what the peer actually does.
+[success, synth] := ws_connect("tls", "ws.postman-echo.com", 443, "/raw", 8000);
+if not success then
+  print("FAIL synthetic setup handshake: " + str(synth));
+  fail_count +:= 1;
+else
+  -- Fragmentation reassembly: "Hel" (fin=false, text) followed by "lo"
+  -- (fin=true, continuation) must reassemble to exactly "Hello".
+  synth("buf") := raw_frame(false, 1, "Hel") + raw_frame(true, 0, "lo");
+  [outcome, synth, message] := ws_recv(synth, 4000);
+  if outcome /= "message" or message /= "Hello" then
+    print("FAIL fragmentation reassembly: outcome=" + outcome + " message=" + message);
+    fail_count +:= 1;
+  else
+    print("fragmentation reassembly ok: " + message);
+  end if;
+
+  -- A ping between fragments (RFC 6455 5.4) must be answered
+  -- transparently and must not appear in, or interrupt, the message
+  -- being reassembled around it.
+  synth("buf") := raw_frame(false, 1, "Hel") + raw_frame(true, 9, "hb") + raw_frame(true, 0, "lo");
+  [outcome, synth, message] := ws_recv(synth, 4000);
+  if outcome /= "message" or message /= "Hello" then
+    print("FAIL interleaved ping: outcome=" + outcome + " message=" + message);
+    fail_count +:= 1;
+  else
+    print("interleaved ping ok: " + message);
+  end if;
+
+  -- A lone continuation byte (0x80) is never valid as the start of a
+  -- UTF-8 sequence; ws_recv must reject the reassembled message instead
+  -- of handing invalid bytes to the caller, and must mark the
+  -- connection closed rather than leaving it usable.
+  synth("buf") := raw_frame(true, 1, char(128));
+  [outcome, synth, message] := ws_recv(synth, 4000);
+  if outcome /= "error" or synth("open") then
+    print("FAIL invalid UTF-8 rejection: outcome=" + outcome);
+    fail_count +:= 1;
+  else
+    print("invalid UTF-8 rejection ok");
+  end if;
+end if;
+
+if fail_count = 0 then
+  print("WEBSOCKET CLIENT: ALL CHECKS PASSED");
+else
+  print("WEBSOCKET CLIENT: " + str(fail_count) + " CHECK(S) FAILED");
+  stop 1;
+end if;
+
+-- Builds one raw, unmasked frame by hand (server-to-client frames are
+-- never masked) for injection directly into a connection's `buf`.
+proc raw_frame(fin, opcode, payload);
+  payload_len := #payload;
+  byte0 := opcode;
+  if fin then
+    byte0 +:= 128;
+  end if;
+  frame := char(byte0);
+  if payload_len <= 125 then
+    frame +:= char(payload_len);
+  elseif payload_len <= 65535 then
+    frame +:= char(126);
+    frame +:= char(payload_len div 256 mod 256);
+    frame +:= char(payload_len mod 256);
+  else
+    frame +:= char(127) + char(0) + char(0) + char(0) + char(0);
+    frame +:= char(payload_len div 16777216 mod 256);
+    frame +:= char(payload_len div 65536 mod 256);
+    frame +:= char(payload_len div 256 mod 256);
+    frame +:= char(payload_len mod 256);
+  end if;
+  frame +:= payload;
+  return frame;
+end proc;
+
+#include "tcp.setl"
+#include "tls.setl"
+#include "stream.setl"
+#include "http.setl"
+#include "websocket.setl"

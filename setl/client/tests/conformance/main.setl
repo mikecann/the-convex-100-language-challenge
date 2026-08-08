@@ -1,0 +1,478 @@
+-- NDJSON adapter protocol v1 for the shared conformance controller.
+--
+-- Test infrastructure, not public client code (see setl/README.md and
+-- AGENTS.md's "Conformance executable" section): it wraps client/convex.setl
+-- and client/live.setl and speaks the shared harness's line-oriented
+-- protocol over stdin/stdout, or over a single TCP connection when
+-- ADAPTER_LISTEN names a listen address. Reserves stdout (or the
+-- controller socket) for protocol events; every diagnostic goes to
+-- stderr. It is single threaded, so the main loop below interleaves
+-- pumping the Live connection (client/live.setl's single owner of that
+-- socket) with reading one controller command at a time -- the same
+-- shape client/live.setl's own module comment describes as "exclusive
+-- ownership" for an interpreter with no concurrent callers to race
+-- against in the first place.
+--
+-- Every read here -- of the controller's commands, whether over stdin or
+-- the accepted TCP socket -- goes through client/tcp.setl's tcp_read,
+-- which already implements the drain-one-byte-behind-select pattern
+-- client/tcp.setl's own module comment documents (GNU SETL's getn(fd,n)
+-- blocks for exactly n bytes or EOF, which would hang this adapter's
+-- reads exactly as it would have hung a long-lived plain-TCP /api/sync
+-- connection). stdin (fd 0) and an accept()ed TCP peer are both plain GNU
+-- SETL stream fds, so the same proc serves both transports.
+--
+-- The adapter state below is threaded explicitly through every proc call
+-- and reassigned by the caller (an `ad` map), the same style every other
+-- connection-shaped value in this client uses. Fields:
+--   "deployment_url"   the Convex deployment this process talks to
+--   "live"             the client/live.setl session (its own reconnect
+--                      state, desired subscriptions, and delivered
+--                      results/revisions)
+--   "token"            the current setAuth bearer token, "" for none
+--   "read_fd"/"write_fd"  the transport: stdin/stdout, or one accepted
+--                      TCP peer fd used for both directions
+--   "listen_fd"        the TCP-server fd in ADAPTER_LISTEN mode, closed
+--                      on shutdown; om in stdin/stdout mode
+--   "read_buf"         bytes read from the transport but not yet split
+--                      into a complete NDJSON line
+--   "queue"/"queue_bytes"  the bounded output queue (see ad_emit)
+--   "published"        subscriptionId -> the client/live.setl revision
+--                      number already turned into a queued subscription
+--                      event, so a repeated poll of an unchanged
+--                      revision does not re-enqueue it
+--   "done"             set once a "close" command has been handled, or
+--                      the transport reports EOF/error
+
+deployment_url := getenv("CONVEX_URL");
+if deployment_url = om or deployment_url = "" then
+  printa(stderr, "CONVEX_URL is required");
+  stop 1;
+end if;
+
+ad := ad_init(deployment_url);
+[ad, opened] := ad_open_io(ad);
+if not opened then
+  stop 1;
+end if;
+
+loop
+  if ad("done") then
+    quit;
+  end if;
+
+  pump_deadline := clock + 15;
+  ad("live") := live_pump(ad("live"), ad_remaining(pump_deadline));
+  ad := ad_publish_subscriptions(ad);
+
+  read_deadline := clock + 15;
+  [outcome, ad, line] := ad_read_command(ad, ad_remaining(read_deadline));
+  if outcome = "ok" then
+    ad := ad_dispatch(ad, line);
+  elseif outcome = "eof" or outcome = "error" then
+    ad("done") := true;
+  end if;
+  -- outcome = "timeout": nothing arrived within this pass's slice; loop
+  -- back around to pump Live again rather than blocking further here.
+
+  ad := ad_flush(ad);
+end loop;
+
+ad("live") := live_close(ad("live"), "adapter shutdown");
+if ad("listen_fd") /= om then
+  close(ad("listen_fd"));
+end if;
+
+-- ===========================================================================
+-- Setup and transport
+-- ===========================================================================
+
+proc ad_init(deployment_url);
+  ad := {};
+  ad("deployment_url") := deployment_url;
+  ad("live") := live_open(deployment_url, "setl-0.1.0");
+  ad("token") := "";
+  ad("read_fd") := om;
+  ad("write_fd") := om;
+  ad("listen_fd") := om;
+  ad("read_buf") := "";
+  ad("queue") := [];
+  ad("queue_bytes") := 0;
+  ad("published") := {};
+  ad("done") := false;
+  return ad;
+end proc;
+
+-- Opens stdin/stdout, or -- when ADAPTER_LISTEN names a "host:port" -- a
+-- TCP server socket that accepts exactly one controller connection and
+-- uses it for both directions, matching the shared harness's TCP mode.
+-- Returns [ad, opened]; on failure a diagnostic already went to stderr.
+proc ad_open_io(ad);
+  listen_spec := getenv("ADAPTER_LISTEN");
+  if listen_spec = om or listen_spec = "" then
+    ad("read_fd") := stdin;
+    ad("write_fd") := stdout;
+    return [ad, true];
+  end if;
+
+  listen_fd := open(listen_spec, "tcp-server");
+  if listen_fd = om then
+    printa(stderr, "listen failed on " + listen_spec + ": " + last_error);
+    return [ad, false];
+  end if;
+  ready := select([{listen_fd}], 120000);
+  if #ready(1) = 0 then
+    printa(stderr, "no controller connected within 120s");
+    close(listen_fd);
+    return [ad, false];
+  end if;
+  peer := accept(listen_fd);
+  if peer = om then
+    printa(stderr, "accept failed: " + last_error);
+    close(listen_fd);
+    return [ad, false];
+  end if;
+  ad("listen_fd") := listen_fd;
+  ad("read_fd") := peer;
+  ad("write_fd") := peer;
+  return [ad, true];
+end proc;
+
+proc ad_remaining(deadline);
+  left := deadline - clock;
+  if left < 0 then
+    return 0;
+  end if;
+  return left;
+end proc;
+
+-- Reads and returns exactly one NDJSON line (newline stripped, and a
+-- trailing \r if present, defensively -- this adapter never writes \r\n
+-- itself), bounded by timeout_ms. Returns [outcome, ad, line]:
+--   "ok"       line is the next complete command
+--   "timeout"  no complete line arrived within timeout_ms
+--   "eof"      the transport closed
+proc ad_read_command(ad, timeout_ms);
+  deadline := clock + timeout_ms;
+  loop
+    nl := find_substring(ad("read_buf"), (char 10), 1);
+    if nl /= 0 then
+      line := ad("read_buf")(1..nl - 1);
+      if #line > 0 and line(#line..#line) = (char 13) then
+        line := line(1..#line - 1);
+      end if;
+      ad("read_buf") := ad("read_buf")(nl + 1..);
+      return ["ok", ad, line];
+    end if;
+    remaining := deadline - clock;
+    if remaining <= 0 then
+      return ["timeout", ad, ""];
+    end if;
+    [read_status, payload] := tcp_read(ad("read_fd"), 65536, remaining);
+    if read_status = "data" then
+      ad("read_buf") +:= payload;
+    elseif read_status = "eof" then
+      return ["eof", ad, ""];
+    end if;
+    -- read_status = "timeout": loop back and recheck the deadline.
+  end loop;
+end proc;
+
+proc ad_write_line(ad, text);
+  [success, info] := tcp_write(ad("write_fd"), text + (char 10));
+  if not success then
+    printa(stderr, "write failed: " + str(info));
+    ad("done") := true;
+  end if;
+  return ad;
+end proc;
+
+-- ===========================================================================
+-- The bounded output queue. Subscription events are droppable (oldest
+-- first, see ad_drop_oldest); hello/result/error/ack/closed responses are
+-- not, and if the budget cannot be freed without dropping one, the
+-- adapter fails loudly instead of growing without bound. 8 slots and a
+-- 4 MiB byte budget, comfortably inside the shared 128 MiB adapter limit
+-- even under a stopped reader with near-maximum messages.
+-- ===========================================================================
+
+proc ad_queue_max_count();
+  return 8;
+end proc;
+
+proc ad_queue_max_bytes();
+  return 4194304;
+end proc;
+
+proc ad_charge(text);
+  return #text + 64;
+end proc;
+
+proc ad_emit(ad, text, droppable);
+  charge := ad_charge(text);
+  q := ad("queue");
+  bytes := ad("queue_bytes");
+  loop
+    if bytes + charge <= ad_queue_max_bytes() and #q < ad_queue_max_count() then
+      quit;
+    end if;
+    [dropped, q, bytes] := ad_drop_oldest(q, bytes);
+    if not dropped then
+      quit;
+    end if;
+  end loop;
+
+  if bytes + charge > ad_queue_max_bytes() or #q >= ad_queue_max_count() then
+    ad("queue") := q;
+    ad("queue_bytes") := bytes;
+    if not droppable then
+      printa(stderr, "output budget exhausted by undroppable responses");
+      ad("done") := true;
+    end if;
+    return ad;
+  end if;
+
+  entry := {};
+  entry("text") := text;
+  entry("droppable") := droppable;
+  q with:= entry;
+  ad("queue") := q;
+  ad("queue_bytes") := bytes + charge;
+  return ad;
+end proc;
+
+-- Drops the oldest droppable entry to make room; returns [true, q, bytes]
+-- with it removed, or [false, q, bytes] unchanged if nothing droppable
+-- remains.
+proc ad_drop_oldest(q, bytes);
+  n := #q;
+  i := 1;
+  while i <= n loop
+    if q(i)("droppable") then
+      charge := ad_charge(q(i)("text"));
+      return [true, q(1..i - 1) + q(i + 1..n), bytes - charge];
+    end if;
+    i +:= 1;
+  end loop;
+  return [false, q, bytes];
+end proc;
+
+proc ad_flush(ad);
+  q := ad("queue");
+  for entry in q loop
+    ad := ad_write_line(ad, entry("text"));
+  end loop;
+  ad("queue") := [];
+  ad("queue_bytes") := 0;
+  return ad;
+end proc;
+
+-- ===========================================================================
+-- Event construction. Optional fields are omitted rather than serialized
+-- as null (matching the shared adapter schema) by simply never assigning
+-- that map key -- GNU SETL's map assignment m(k) := om does not store an
+-- entry, so json_encode_object naturally emits nothing for it (see
+-- client/json.setl's module comment). "value" and a structured error's
+-- "data" are different: both are legitimately JSON null sometimes, so
+-- those two are composed directly with json_encode(value) rather than
+-- through a map, which would silently drop the key entirely when the
+-- value is om instead of encoding an explicit null.
+-- ===========================================================================
+
+proc ad_ready_event(id);
+  e := {};
+  e("protocolVersion") := 1;
+  e("id") := id;
+  e("type") := "ready";
+  e("language") := "setl";
+  e("implementation") := "native-setl-0.1.0";
+  e("runtime") := "GNU SETL 8.13.22";
+  return json_encode(e);
+end proc;
+
+proc ad_result_event(id, value, logs);
+  return "{" + json_encode_string("id") + ":" + json_encode_string(id)
+       + "," + json_encode_string("type") + ":" + json_encode_string("result")
+       + "," + json_encode_string("value") + ":" + json_encode(value)
+       + "," + json_encode_string("logs") + ":" + json_encode(logs)
+       + "}";
+end proc;
+
+proc ad_error_object(name, message, data);
+  return "{" + json_encode_string("name") + ":" + json_encode_string(name)
+       + "," + json_encode_string("message") + ":" + json_encode_string(message)
+       + "," + json_encode_string("data") + ":" + json_encode(data)
+       + "}";
+end proc;
+
+proc ad_error_event(id, name, message, data);
+  id_part := "";
+  if id /= om and id /= "" then
+    id_part := json_encode_string("id") + ":" + json_encode_string(id) + ",";
+  end if;
+  return "{" + id_part + json_encode_string("type") + ":" + json_encode_string("error")
+       + "," + json_encode_string("error") + ":" + ad_error_object(name, message, data)
+       + "}";
+end proc;
+
+proc ad_ack_event(id);
+  e := {};
+  e("id") := id;
+  e("type") := "ack";
+  return json_encode(e);
+end proc;
+
+proc ad_closed_event(id);
+  e := {};
+  e("id") := id;
+  e("type") := "closed";
+  return json_encode(e);
+end proc;
+
+proc ad_subscription_value_event(sub_id, value, logs);
+  return "{" + json_encode_string("type") + ":" + json_encode_string("subscription")
+       + "," + json_encode_string("subscriptionId") + ":" + json_encode_string(sub_id)
+       + "," + json_encode_string("value") + ":" + json_encode(value)
+       + "," + json_encode_string("logs") + ":" + json_encode(logs)
+       + "}";
+end proc;
+
+proc ad_subscription_error_event(sub_id, name, message, data, logs);
+  return "{" + json_encode_string("type") + ":" + json_encode_string("subscription")
+       + "," + json_encode_string("subscriptionId") + ":" + json_encode_string(sub_id)
+       + "," + json_encode_string("error") + ":" + ad_error_object(name, message, data)
+       + "," + json_encode_string("logs") + ":" + json_encode(logs)
+       + "}";
+end proc;
+
+-- ===========================================================================
+-- Dispatch
+-- ===========================================================================
+
+proc ad_dispatch(ad, line);
+  parsed := json_decode(line);
+  if parsed = om or not is_map(parsed) then
+    return ad_emit(ad, ad_error_event("", "ProtocolError", "the controller sent invalid JSON", om), false);
+  end if;
+  id := parsed("id");
+  if id = om or not is_string(id) then
+    id := "";
+  end if;
+  command_op := parsed("op");
+
+  if command_op = "hello" then
+    return ad_emit(ad, ad_ready_event(id), false);
+  end if;
+  if command_op = "query" or command_op = "mutation" or command_op = "action" then
+    return ad_call(ad, id, command_op, parsed);
+  end if;
+  if command_op = "subscribe" then
+    return ad_subscribe(ad, id, parsed);
+  end if;
+  if command_op = "unsubscribe" then
+    return ad_unsubscribe(ad, id, parsed);
+  end if;
+  if command_op = "setAuth" then
+    return ad_set_auth(ad, id, parsed);
+  end if;
+  if command_op = "debugDisconnect" then
+    ad("live") := live_debug_disconnect(ad("live"));
+    return ad_emit(ad, ad_ack_event(id), false);
+  end if;
+  if command_op = "close" then
+    ad("live") := live_close(ad("live"), "adapter close");
+    ad := ad_emit(ad, ad_closed_event(id), false);
+    ad("done") := true;
+    return ad;
+  end if;
+  return ad_emit(ad, ad_error_event(id, "ProtocolError", "command does not match adapter protocol v1", om), false);
+end proc;
+
+proc ad_call(ad, id, command_op, root);
+  path := root("path");
+  args_value := root("args");
+  if path = om or not is_string(path) or args_value = om or not is_map(args_value) then
+    return ad_emit(ad, ad_error_event(id, "ProtocolError", "command does not match adapter protocol v1", om), false);
+  end if;
+  response := convex_call(ad("deployment_url"), command_op, path, args_value, ad("token"), 15000);
+  if response("kind") = "result" then
+    return ad_emit(ad, ad_result_event(id, response("value"), response("logLines")), false);
+  end if;
+  return ad_emit(ad, ad_error_event(id, response("errName"), response("errMessage"), response("errData")), false);
+end proc;
+
+proc ad_subscribe(ad, id, root);
+  sub_id := root("subscriptionId");
+  path := root("path");
+  args_value := root("args");
+  if sub_id = om or not is_string(sub_id) or path = om or not is_string(path)
+      or args_value = om or not is_map(args_value) then
+    return ad_emit(ad, ad_error_event(id, "ProtocolError", "command does not match adapter protocol v1", om), false);
+  end if;
+  ad("live") := live_add(ad("live"), sub_id, path, args_value);
+  return ad_emit(ad, ad_ack_event(id), false);
+end proc;
+
+proc ad_unsubscribe(ad, id, root);
+  sub_id := root("subscriptionId");
+  if sub_id = om or not is_string(sub_id) then
+    return ad_emit(ad, ad_error_event(id, "ProtocolError", "command does not match adapter protocol v1", om), false);
+  end if;
+  ad("live") := live_remove(ad("live"), sub_id);
+  published := ad("published")(sub_id);
+  if published /= om then
+    ad("published") := ad("published") less [sub_id, published];
+  end if;
+  return ad_emit(ad, ad_ack_event(id), false);
+end proc;
+
+proc ad_set_auth(ad, id, root);
+  token := root("token");
+  if token = om or not is_string(token) then
+    return ad_emit(ad, ad_error_event(id, "ProtocolError", "command does not match adapter protocol v1", om), false);
+  end if;
+  ad("token") := token;
+  return ad_emit(ad, ad_ack_event(id), false);
+end proc;
+
+-- Publishes, as droppable subscription events, every active subscription
+-- whose client/live.setl revision has advanced past what this adapter has
+-- already queued. Runs once per pass through the main loop, right after
+-- live_pump.
+proc ad_publish_subscriptions(ad);
+  live := ad("live");
+  for [sub_id, subscription] in live("desired") loop
+    latest := live("revisions")(sub_id);
+    if latest = om then
+      continue;
+    end if;
+    published := ad("published")(sub_id);
+    if published = om then
+      published := 0;
+    end if;
+    if latest <= published then
+      continue;
+    end if;
+    ad("published")(sub_id) := latest;
+
+    outcome := live("results")(sub_id);
+    if outcome("kind") = "error" then
+      ad := ad_emit(ad,
+          ad_subscription_error_event(sub_id, "FunctionError", outcome("errMessage"), outcome("errData"), outcome("logLines")),
+          true);
+    else
+      ad := ad_emit(ad, ad_subscription_value_event(sub_id, outcome("value"), outcome("logLines")), true);
+    end if;
+  end loop;
+  return ad;
+end proc;
+
+#include "tcp.setl"
+#include "tls.setl"
+#include "stream.setl"
+#include "http.setl"
+#include "json.setl"
+#include "websocket.setl"
+#include "convex.setl"
+#include "sync.setl"
+#include "live.setl"

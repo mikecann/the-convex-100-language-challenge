@@ -1,0 +1,296 @@
+-- Minimal HTTP/1.1 client built on client/stream.setl. Every request is
+-- sent with "Connection: close" and a fresh connection, matching the
+-- shared conformance harness's expectation of one request per HTTP call;
+-- keep-alive / connection reuse is a deferred limitation.
+--
+-- http_request(scheme, target_host, port_num, method, path, headers, body_text, timeout_ms)
+--   scheme is "tcp" (local self-hosted, plain) or "tls" (hosted).
+--   headers is a map of extra request headers (string -> string).
+--   body_text is a string to send as the request body_text, or om for no body_text.
+--   Returns [true, response] where response is a map with "read_status"
+--   (integer), "headers" (map, header names lower-cased), and "body_text"
+--   (string); or [false, message] on any transport or framing failure.
+
+proc http_request(scheme, target_host, port_num, method, path, headers, body_text, timeout_ms);
+  deadline := clock + timeout_ms;
+
+  [success, s] := stream_connect(scheme, target_host, port_num, timeout_ms);
+  if not success then
+    return [false, "connect failed: " + str(s)];
+  end if;
+
+  req := method + " " + path + " HTTP/1.1\r\n";
+  req +:= "Host: " + target_host + "\r\n";
+  req +:= "Connection: close\r\n";
+  req +:= "Accept: application/json\r\n";
+  for [k, v] in headers loop
+    req +:= k + ": " + v + "\r\n";
+  end loop;
+  if body_text /= om then
+    req +:= "Content-Type: application/json\r\n";
+    req +:= "Content-Length: " + str(#body_text) + "\r\n";
+  end if;
+  req +:= "\r\n";
+  if body_text /= om then
+    req +:= body_text;
+  end if;
+
+  [success, info] := stream_write(s, req);
+  if not success then
+    stream_close(s);
+    return [false, "write failed: " + str(info)];
+  end if;
+
+  [success, result] := http_read_response(s, deadline);
+  stream_close(s);
+  return [success, result];
+end proc;
+
+proc http_read_response(s, deadline);
+  buf := "";
+  loop
+    header_end := find_substring(buf, "\r\n\r\n", 1);
+    if header_end /= 0 then
+      quit;
+    end if;
+    remaining := deadline - clock;
+    if remaining <= 0 then
+      return [false, "timed out reading response headers"];
+    end if;
+    [read_status, payload] := stream_read(s, 8192, remaining);
+    if read_status = "data" then
+      buf +:= payload;
+    elseif read_status = "eof" then
+      return [false, "connection closed before response headers completed"];
+    elseif read_status = "error" then
+      return [false, "read failed: " + str(payload)];
+    end if;
+    -- read_status = "timeout": loop back around and recheck the deadline.
+  end loop;
+
+  head := buf(1..header_end + 1);
+  after_headers := buf(header_end + 4..);
+
+  [success, status_code, resp_headers] := http_parse_head(head);
+  if not success then
+    return [false, status_code];
+  end if;
+
+  transfer_encoding := http_header(resp_headers, "transfer-encoding");
+  content_length := http_header(resp_headers, "content-length");
+
+  if transfer_encoding /= om and downcase(transfer_encoding) = "chunked" then
+    [success, body_text] := http_read_chunked(s, after_headers, deadline);
+  elseif content_length /= om then
+    [success, body_text] := http_read_fixed(s, after_headers, val content_length, deadline);
+  else
+    [success, body_text] := http_read_until_close(s, after_headers, deadline);
+  end if;
+  if not success then
+    return [false, body_text];
+  end if;
+
+  response := {};
+  response("read_status") := status_code;
+  response("headers") := resp_headers;
+  response("body_text") := body_text;
+  return [true, response];
+end proc;
+
+proc http_parse_head(head);
+  lines := split(head, "\r\n");
+  if #lines = 0 then
+    return [false, "empty response", om];
+  end if;
+  status_line := lines(1);
+  parts := split(status_line, " ");
+  if #parts < 2 then
+    return [false, "malformed read_status line: " + status_line, om];
+  end if;
+  code := val parts(2);
+  if code = om or not is_integer(code) then
+    return [false, "malformed read_status code: " + status_line, om];
+  end if;
+
+  resp_headers := {};
+  for idx in [2..#lines] loop
+    line := lines(idx);
+    if line /= "" then
+      colon := find_substring(line, ":", 1);
+      if colon /= 0 then
+        name := downcase(http_trim(line(1..colon - 1)));
+        value := http_trim(line(colon + 1..));
+        resp_headers(name) := value;
+      end if;
+    end if;
+  end loop;
+  return [true, code, resp_headers];
+end proc;
+
+proc http_header(headers, name);
+  return headers(downcase(name));
+end proc;
+
+proc http_trim(s);
+  i := 1;
+  n := #s;
+  while i <= n and (s(i) = " " or s(i) = "\t") loop
+    i +:= 1;
+  end loop;
+  j := n;
+  while j >= i and (s(j) = " " or s(j) = "\t") loop
+    j -:= 1;
+  end loop;
+  if j < i then
+    return "";
+  end if;
+  return s(i..j);
+end proc;
+
+proc downcase(s);
+  out := "";
+  for c in s loop
+    code := ichar(c);
+    if code >= 65 and code <= 90 then
+      out +:= char(code + 32);
+    else
+      out +:= c;
+    end if;
+  end loop;
+  return out;
+end proc;
+
+proc find_substring(haystack, needle, start);
+  hn := #haystack;
+  nn := #needle;
+  if nn = 0 then
+    return start;
+  end if;
+  i := start;
+  while i + nn - 1 <= hn loop
+    if haystack(i..i + nn - 1) = needle then
+      return i;
+    end if;
+    i +:= 1;
+  end loop;
+  return 0;
+end proc;
+
+-- Reads exactly `want` more body_text bytes, given the bytes already buffered
+-- from the header read in `already`.
+proc http_read_fixed(s, already, want, deadline);
+  body_text := already;
+  loop
+    if #body_text >= want then
+      quit;
+    end if;
+    remaining := deadline - clock;
+    if remaining <= 0 then
+      return [false, "timed out reading response body_text"];
+    end if;
+    [read_status, payload] := stream_read(s, want - #body_text, remaining);
+    if read_status = "data" then
+      body_text +:= payload;
+    elseif read_status = "eof" then
+      return [false, "connection closed before response body_text completed"];
+    elseif read_status = "error" then
+      return [false, "read failed: " + str(payload)];
+    end if;
+  end loop;
+  return [true, body_text(1..want)];
+end proc;
+
+-- Reads until the peer closes the connection (only used when the response
+-- declares neither Content-Length nor chunked Transfer-Encoding).
+proc http_read_until_close(s, already, deadline);
+  body_text := already;
+  loop
+    remaining := deadline - clock;
+    if remaining <= 0 then
+      return [false, "timed out reading response body_text"];
+    end if;
+    [read_status, payload] := stream_read(s, 8192, remaining);
+    if read_status = "data" then
+      body_text +:= payload;
+    elseif read_status = "eof" then
+      quit;
+    elseif read_status = "error" then
+      return [false, "read failed: " + str(payload)];
+    end if;
+  end loop;
+  return [true, body_text];
+end proc;
+
+-- Decodes an HTTP/1.1 chunked body_text. `already` holds whatever bytes were
+-- pulled in past the header terminator by the header read; more are
+-- fetched as needed. Chunk extensions (after ";") are accepted and
+-- ignored; the optional trailer section after the terminating 0-length
+-- chunk is consumed but discarded.
+proc http_read_chunked(s, already, deadline);
+  buf := already;
+  body_text := "";
+  loop
+    [success, buf] := http_fill_until(s, buf, "\r\n", deadline, om);
+    if not success then
+      return [false, buf];
+    end if;
+    line_end := find_substring(buf, "\r\n", 1);
+    size_line := buf(1..line_end - 1);
+    semi := find_substring(size_line, ";", 1);
+    if semi /= 0 then
+      size_line := size_line(1..semi - 1);
+    end if;
+    chunk_size := val("16#" + http_trim(size_line));
+    if chunk_size = om or not is_integer(chunk_size) or chunk_size < 0 then
+      return [false, "malformed chunk size: " + size_line];
+    end if;
+    buf := buf(line_end + 2..);
+
+    if chunk_size = 0 then
+      -- The terminating 0-size chunk is followed by an optional trailer
+      -- section and a final blank line, but the body is already complete
+      -- at this point, and the connection is about to be closed by the
+      -- caller regardless (every request sends "Connection: close"). Do
+      -- not attempt to parse or wait for the trailer: with zero trailer
+      -- headers it is a single "\r\n" immediately after the size line,
+      -- but distinguishing that from "one or more trailer header lines
+      -- followed by \r\n\r\n" needs real line-by-line trailer parsing
+      -- this client does not implement. Trailer headers are deferred;
+      -- this client never reads them either way.
+      return [true, body_text];
+    end if;
+
+    [success, buf] := http_fill_until(s, buf, om, deadline, chunk_size + 2);
+    if not success then
+      return [false, buf];
+    end if;
+    body_text +:= buf(1..chunk_size);
+    buf := buf(chunk_size + 3..);  -- skip the chunk's own trailing \r\n
+  end loop;
+end proc;
+
+-- Ensures `buf` contains at least `min_len` bytes (when given) or contains
+-- `marker` (when given instead), reading more from the stream as needed.
+-- Returns [true, buf] or [false, message].
+proc http_fill_until(s, buf, marker, deadline, min_len);
+  loop
+    if marker /= om and find_substring(buf, marker, 1) /= 0 then
+      return [true, buf];
+    end if;
+    if min_len /= om and #buf >= min_len then
+      return [true, buf];
+    end if;
+    remaining := deadline - clock;
+    if remaining <= 0 then
+      return [false, "timed out reading chunked response body_text"];
+    end if;
+    [read_status, payload] := stream_read(s, 8192, remaining);
+    if read_status = "data" then
+      buf +:= payload;
+    elseif read_status = "eof" then
+      return [false, "connection closed mid-chunk"];
+    elseif read_status = "error" then
+      return [false, "read failed: " + str(payload)];
+    end if;
+  end loop;
+end proc;

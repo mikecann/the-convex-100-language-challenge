@@ -1,0 +1,42 @@
+-- A single helper shared by examples/basics/main.setl and its regression
+-- test (examples/basics/tests/count_test.setl): extracting and
+-- validating the "count" field of a decoded demo:state/demo:increment
+-- state object. Convex JSON may encode an integral number as a bare
+-- integer (0) or as a real with a trailing fractional part that happens
+-- to be zero (0.0); AGENTS.md requires accepting both while rejecting a
+-- fractional, quoted, negative, or out-of-range value instead of
+-- silently coercing it.
+--
+-- This module is proc-only and is meant to be #include'd (via
+-- `setl --cpp') after client/http.setl (for find_substring) -- see the
+-- module comment at the top of client/json.setl for why GNU SETL
+-- requires mainline statements to precede every proc definition.
+
+proc convex_state_count(value, operation);
+  if value = om or not is_map(value) then
+    return [false, om, operation + " did not return a Convex object"];
+  end if;
+  raw := value("count");
+  if is_integer(raw) then
+    if raw < 0 or raw > 9007199254740991 then
+      return [false, om, operation + " returned an out-of-range count"];
+    end if;
+    return [true, raw, ""];
+  end if;
+  if is_real(raw) then
+    if raw < 0 or raw > 9007199254740991 then
+      return [false, om, operation + " returned an out-of-range count"];
+    end if;
+    -- GNU SETL's str() drops the fractional part of a whole-valued real
+    -- (str 0.0 = "0"), so the presence of "." or an exponent marker in
+    -- the formatted text is exactly the "this was not a whole number"
+    -- signal this check needs.
+    text := str(raw);
+    if find_substring(text, ".", 1) /= 0 or find_substring(text, "e", 1) /= 0
+        or find_substring(text, "E", 1) /= 0 then
+      return [false, om, operation + " returned a non-integral count"];
+    end if;
+    return [true, val text, ""];
+  end if;
+  return [false, om, operation + " returned no integral count"];
+end proc;

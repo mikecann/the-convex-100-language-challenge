@@ -1,0 +1,454 @@
+-- JSON codec for the Convex client.
+--
+-- Value mapping between JSON and SETL:
+--   null            <-> om
+--   true / false    <-> true / false
+--   number          <-> integer (no "." or exponent) or real (otherwise)
+--   string          <-> string
+--   array           <-> tuple
+--   object          <-> map (a set of [key, value] pairs; keys are strings)
+--
+-- json_decode returns om both for a literal top-level JSON null and for a
+-- string that fails to parse; callers that need to tell "null" apart from
+-- "malformed" should use json_try_decode, which returns [true, value] or
+-- [false, om].
+--
+-- A *nested* null (inside an object's value or an array's element) cannot
+-- use om the same way om itself is used for "absent": GNU SETL's map
+-- assignment m(k) := om does not store an entry at all (om is also what a
+-- map lookup returns for "no such key"), so an object field mapped
+-- straight to om would vanish from the decoded map exactly like a field
+-- that was never present -- confirmed to matter for real: Convex's own
+-- documented response shapes send explicit nulls for absent optional
+-- fields (demo:state's lastLanguage/latestRunId/updatedAt before any
+-- mutation has run), and losing those keys broke exact-shape comparison
+-- in shared conformance. json_parse_value instead decodes a nested "null"
+-- to a fresh newat() atom, which -- unlike om -- a map or tuple assignment
+-- does store; json_encode recognizes any atom as "null" on the way back
+-- out (is_atom is a general type test, not tied to one specific atom, so
+-- this needs no shared sentinel threaded between decode and encode calls).
+-- json_try_decode converts a bare *top-level* "null" back to om before
+-- returning, preserving this module's original documented top-level
+-- contract; only a nested null is ever represented as an atom in a value
+-- callers actually see.
+--
+-- This module is proc-only (no top-level statements), so it is meant to be
+-- pulled in near the end of a file's #include list, after that file's own
+-- mainline statements -- see the comment at the top of examples/basics/main.setl
+-- for why that order matters.
+
+-- Converts a nested-null atom (see this module's own comment above) back
+-- to om; passes any other value through unchanged. Callers use this at a
+-- value's own "top level" -- a query/mutation/action result, or an error's
+-- data payload -- so that value continues to satisfy `= om` the same way
+-- it always has, restoring comparability (an atom from one json_decode
+-- call is never `=` to an atom from another, even when both represent
+-- "null") for a caller that only cares whether that specific value is
+-- null, not what is nested inside it. Nothing nested deeper is affected:
+-- an atom further inside an object or tuple this proc is handed stays
+-- exactly as json_parse_value decoded it, and still round-trips correctly
+-- through json_encode later.
+proc json_null_to_om(v);
+  if is_atom(v) then
+    return om;
+  end if;
+  return v;
+end proc;
+
+proc json_encode(v);
+  if v = om then
+    return "null";
+  end if;
+  if is_atom(v) then
+    -- A nested null decoded by json_parse_value (see this module's own
+    -- comment above); any atom means "null" here, since nothing else in
+    -- this client ever produces one.
+    return "null";
+  end if;
+  if is_boolean(v) then
+    if v then
+      return "true";
+    else
+      return "false";
+    end if;
+  end if;
+  if is_integer(v) then
+    return str(v);
+  end if;
+  if is_real(v) then
+    return json_encode_real(v);
+  end if;
+  if is_string(v) then
+    return json_encode_string(v);
+  end if;
+  if is_tuple(v) then
+    return json_encode_array(v);
+  end if;
+  if is_map(v) then
+    return json_encode_object(v);
+  end if;
+  printa(stderr, "json_encode: unsupported SETL value of type " + (type v));
+  stop 1;
+end proc;
+
+-- GNU SETL's str() drops the fractional part of a whole-valued real (str
+-- 3.0 = "3"), which would silently turn a Convex float into a JSON integer
+-- literal. Force a decimal point onto every real so the wire form always
+-- says "this came from a float", matching AGENTS.md's note that Convex
+-- itself may send an integral value like "1.0". NaN and infinite values
+-- have no JSON representation; this client never produces them itself, and
+-- a Convex response containing one would already have failed to decode as
+-- JSON on the wire, so they are not specially guarded against here.
+proc json_encode_real(r);
+  if fix(r) = r and abs(r) < 1.0e15 then
+    return str(fix(r)) + ".0";
+  end if;
+  return str(r);
+end proc;
+
+proc json_encode_string(s);
+  out := "\"";
+  for c in s loop
+    code := ichar(c);
+    if c = "\"" then
+      out +:= "\\\"";
+    elseif c = "\\" then
+      out +:= "\\\\";
+    elseif code = 8 then
+      out +:= "\\b";
+    elseif code = 12 then
+      out +:= "\\f";
+    elseif code = 10 then
+      out +:= "\\n";
+    elseif code = 13 then
+      out +:= "\\r";
+    elseif code = 9 then
+      out +:= "\\t";
+    elseif code < 32 then
+      out +:= "\\u" + hex_pad4(code);
+    else
+      -- Bytes 32..126 are literal ASCII; 127..255 are passed through as
+      -- the raw UTF-8 bytes they already are in a SETL string (SETL
+      -- strings are byte strings, and this client only ever builds them
+      -- from UTF-8 source, so no re-encoding is needed here).
+      out +:= c;
+    end if;
+  end loop;
+  return out + "\"";
+end proc;
+
+proc hex_pad4(n);
+  h := hex char (n / 256) + hex char (n mod 256);
+  return h;
+end proc;
+
+proc json_encode_array(t);
+  out := "[";
+  first := true;
+  for v in t loop
+    if not first then
+      out +:= ",";
+    end if;
+    first := false;
+    out +:= json_encode(v);
+  end loop;
+  return out + "]";
+end proc;
+
+proc json_encode_object(m);
+  out := "{";
+  first := true;
+  for [k, v] in m loop
+    if not is_string(k) then
+      printa(stderr, "json_encode: object keys must be strings");
+      stop 1;
+    end if;
+    if not first then
+      out +:= ",";
+    end if;
+    first := false;
+    out +:= json_encode_string(k) + ":" + json_encode(v);
+  end loop;
+  return out + "}";
+end proc;
+
+-- json_try_decode(s) : [success, value]
+--   success = true,  value = the decoded SETL value (possibly om for JSON null)
+--   success = false, value = om, meaning s is not a single well-formed JSON text
+proc json_try_decode(s);
+  n := #s;
+  i := json_skip_ws(s, 1, n);
+  if i > n then
+    return [false, om];
+  end if;
+  [success, value, next_i] := json_parse_value(s, i, n);
+  if not success then
+    return [false, om];
+  end if;
+  next_i := json_skip_ws(s, next_i, n);
+  if next_i <= n then
+    return [false, om];  -- trailing garbage after the one JSON value
+  end if;
+  if is_atom(value) then
+    -- A bare top-level "null": convert the nested-null atom (see this
+    -- module's own comment) back to om, preserving this proc's documented
+    -- top-level contract.
+    value := om;
+  end if;
+  return [true, value];
+end proc;
+
+-- Convenience wrapper for call sites that treat "null" and "malformed" the
+-- same way (most Convex call sites do: both mean "there is no value here").
+proc json_decode(s);
+  [success, value] := json_try_decode(s);
+  if not success then
+    return om;
+  end if;
+  return value;
+end proc;
+
+proc json_skip_ws(s, i, n);
+  while i <= n and (s(i) = " " or s(i) = "\t" or s(i) = "\n" or s(i) = "\r") loop
+    i +:= 1;
+  end loop;
+  return i;
+end proc;
+
+-- Every json_parse_* proc returns [success, value, next_i]; next_i is the index
+-- just past the value on success, and unspecified (the caller must not use
+-- it) when success is false.
+proc json_parse_value(s, i, n);
+  if i > n then
+    return [false, om, i];
+  end if;
+  c := s(i);
+  if c = "\"" then
+    return json_parse_string(s, i, n);
+  elseif c = "{" then
+    return json_parse_object(s, i, n);
+  elseif c = "[" then
+    return json_parse_array(s, i, n);
+  elseif c = "t" then
+    return json_parse_literal(s, i, n, "true", true);
+  elseif c = "f" then
+    return json_parse_literal(s, i, n, "false", false);
+  elseif c = "n" then
+    -- A fresh atom, not om: see this module's own comment on why a
+    -- *nested* null cannot be om the way an absent field is.
+    return json_parse_literal(s, i, n, "null", newat());
+  elseif c = "-" or (c >= "0" and c <= "9") then
+    return json_parse_number(s, i, n);
+  else
+    return [false, om, i];
+  end if;
+end proc;
+
+proc json_parse_literal(s, i, n, word, value);
+  wn := #word;
+  if i + wn - 1 > n then
+    return [false, om, i];
+  end if;
+  if s(i..i + wn - 1) /= word then
+    return [false, om, i];
+  end if;
+  return [true, value, i + wn];
+end proc;
+
+proc json_parse_string(s, i, n);
+  -- s(i) = '"' on entry
+  j := i + 1;
+  out := "";
+  loop
+    if j > n then
+      return [false, om, i];
+    end if;
+    c := s(j);
+    if c = "\"" then
+      return [true, out, j + 1];
+    elseif c = "\\" then
+      if j + 1 > n then
+        return [false, om, i];
+      end if;
+      e := s(j + 1);
+      if e = "\"" then
+        out +:= "\""; j +:= 2;
+      elseif e = "\\" then
+        out +:= "\\"; j +:= 2;
+      elseif e = "/" then
+        out +:= "/"; j +:= 2;
+      elseif e = "b" then
+        out +:= char 8; j +:= 2;
+      elseif e = "f" then
+        out +:= char 12; j +:= 2;
+      elseif e = "n" then
+        out +:= char 10; j +:= 2;
+      elseif e = "r" then
+        out +:= char 13; j +:= 2;
+      elseif e = "t" then
+        out +:= char 9; j +:= 2;
+      elseif e = "u" then
+        if j + 5 > n then
+          return [false, om, i];
+        end if;
+        digits := s(j + 2..j + 5);
+        cp := json_hex4(digits);
+        if cp = om then
+          return [false, om, i];
+        end if;
+        j +:= 6;
+        -- A UTF-16 surrogate pair spans two consecutive \uXXXX escapes;
+        -- combine them into one codepoint before encoding to UTF-8.
+        if cp >= 16#D800 and cp <= 16#DBFF and j + 5 <= n
+            and s(j) = "\\" and s(j + 1) = "u" then
+          lo_digits := s(j + 2..j + 5);
+          lo := json_hex4(lo_digits);
+          if lo /= om and lo >= 16#DC00 and lo <= 16#DFFF then
+            cp := 16#10000 + (cp - 16#D800) * 1024 + (lo - 16#DC00);
+            j +:= 6;
+          end if;
+        end if;
+        out +:= utf8_encode(cp);
+      else
+        return [false, om, i];
+      end if;
+    else
+      out +:= c; j +:= 1;
+    end if;
+  end loop;
+end proc;
+
+proc json_hex4(digits);
+  n := val("16#" + digits);
+  if n = om or not is_integer(n) or n < 0 or n > 16#FFFF then
+    return om;
+  end if;
+  return n;
+end proc;
+
+proc utf8_encode(cp);
+  if cp < 16#80 then
+    return char cp;
+  elseif cp < 16#800 then
+    return char (16#C0 + cp / 64) + char (16#80 + cp mod 64);
+  elseif cp < 16#10000 then
+    return char (16#E0 + cp / 4096)
+         + char (16#80 + (cp / 64) mod 64)
+         + char (16#80 + cp mod 64);
+  else
+    return char (16#F0 + cp / 262144)
+         + char (16#80 + (cp / 4096) mod 64)
+         + char (16#80 + (cp / 64) mod 64)
+         + char (16#80 + cp mod 64);
+  end if;
+end proc;
+
+proc json_parse_number(s, i, n);
+  j := i;
+  if j <= n and s(j) = "-" then
+    j +:= 1;
+  end if;
+  start_digits := j;
+  while j <= n and s(j) >= "0" and s(j) <= "9" loop
+    j +:= 1;
+  end loop;
+  if j = start_digits then
+    return [false, om, i];  -- no digits at all
+  end if;
+  has_frac := false;
+  if j <= n and s(j) = "." then
+    has_frac := true;
+    j +:= 1;
+    frac_start := j;
+    while j <= n and s(j) >= "0" and s(j) <= "9" loop
+      j +:= 1;
+    end loop;
+    if j = frac_start then
+      return [false, om, i];  -- "." with no following digits
+    end if;
+  end if;
+  if j <= n and (s(j) = "e" or s(j) = "E") then
+    has_frac := true;
+    j +:= 1;
+    if j <= n and (s(j) = "+" or s(j) = "-") then
+      j +:= 1;
+    end if;
+    exp_start := j;
+    while j <= n and s(j) >= "0" and s(j) <= "9" loop
+      j +:= 1;
+    end loop;
+    if j = exp_start then
+      return [false, om, i];
+    end if;
+  end if;
+  text := s(i..j - 1);
+  if has_frac then
+    return [true, float val text, j];
+  else
+    return [true, val text, j];
+  end if;
+end proc;
+
+proc json_parse_array(s, i, n);
+  j := json_skip_ws(s, i + 1, n);
+  items := [];
+  if j <= n and s(j) = "]" then
+    return [true, items, j + 1];
+  end if;
+  loop
+    [success, value, next_j] := json_parse_value(s, j, n);
+    if not success then
+      return [false, om, i];
+    end if;
+    items with:= value;
+    j := json_skip_ws(s, next_j, n);
+    if j > n then
+      return [false, om, i];
+    end if;
+    if s(j) = "]" then
+      return [true, items, j + 1];
+    end if;
+    if s(j) /= "," then
+      return [false, om, i];
+    end if;
+    j := json_skip_ws(s, j + 1, n);
+  end loop;
+end proc;
+
+proc json_parse_object(s, i, n);
+  j := json_skip_ws(s, i + 1, n);
+  obj := {};
+  if j <= n and s(j) = "}" then
+    return [true, obj, j + 1];
+  end if;
+  loop
+    if j > n or s(j) /= "\"" then
+      return [false, om, i];
+    end if;
+    [success, key, next_j] := json_parse_string(s, j, n);
+    if not success then
+      return [false, om, i];
+    end if;
+    j := json_skip_ws(s, next_j, n);
+    if j > n or s(j) /= ":" then
+      return [false, om, i];
+    end if;
+    j := json_skip_ws(s, j + 1, n);
+    [success, value, next_j] := json_parse_value(s, j, n);
+    if not success then
+      return [false, om, i];
+    end if;
+    obj(key) := value;
+    j := json_skip_ws(s, next_j, n);
+    if j > n then
+      return [false, om, i];
+    end if;
+    if s(j) = "}" then
+      return [true, obj, j + 1];
+    end if;
+    if s(j) /= "," then
+      return [false, om, i];
+    end if;
+    j := json_skip_ws(s, j + 1, n);
+  end loop;
+end proc;

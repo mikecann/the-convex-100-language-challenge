@@ -4,5 +4,81 @@ displayName: "SETL"
 rank: 45
 selectionTier: ranked
 implementation:
-  status: planned
-capabilities: []
+  status: working
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native GNU SETL implementation of the Convex HTTP API and the pinned
+    /api/sync Live protocol. GNU SETL 8.13.22 is built from source (it is
+    not packaged for Debian); TLS is a real OpenSSL handshake reached
+    through callout(), SETL2's fixed-signature, strings-only C dispatcher
+    (client/callskel.c replaces the interpreter's own overridable stub, and
+    every payload crosses that boundary hex-encoded, since callout()'s
+    argument and return types are limited to strings). Plain TCP for the
+    local self-hosted profile uses GNU SETL's own native
+    open(f,"tcp-client")/"tcp-server"/accept() socket support directly --
+    no callout() involved. JSON encoding and decoding
+    (client/json.setl), HTTP/1.1 request and chunked-response framing
+    (client/http.setl), RFC 6455 WebSocket handshake and frame codec with
+    UTF-8 validation (client/websocket.setl; SHA-1 for the handshake also
+    runs across the callout() boundary), the Convex HTTP envelope
+    (client/convex.setl), a single sync-protocol connection
+    (client/sync.setl), and the reconnecting Live layer on top of it --
+    exponential backoff, resubscribing the whole active query set, and
+    unchanged-rehydration suppression (client/live.setl) -- are all
+    written in SETL. A real toolchain bug was found and fixed along the
+    way: GNU SETL's getn(fd,n) blocks until it reads exactly n bytes or
+    hits EOF (confirmed against the interpreter's own src/run/lib.c), which
+    would hang forever the first time a long-lived plain-TCP /api/sync
+    connection needed to read; client/tcp.setl instead drains one byte at a
+    time behind zero-timeout select() polls, a pattern the conformance
+    adapter's own reads reuse too.
+toolchain:
+  name: GNU SETL
+  version: 8.13.22
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    setltran (GNU SETL's compiler) and setlcpp (its preprocessor) are
+    required boot dependencies staged alongside the interpreter in the
+    runtime images -- `setl` always shells out to setlcpp once a source
+    file contains '#' (confirmed directly against the interpreter, not
+    just when --cpp is passed) and to setltran to translate every program
+    before running it. Neither is placed on PATH; both are reachable only
+    as required siblings of /opt/convex/bin/setl, which each launcher
+    invokes by absolute path.
+  - >-
+    The client keeps only the latest delivered value per subscription (no
+    unbounded queue): client/live.setl overwrites the prior result in
+    place, and a consumer that has not yet read it simply sees the newest
+    one next. Backpressure toward the conformance controller is instead
+    handled by the adapter's own bounded output queue
+    (client/tests/conformance/main.setl): 8 slots, a 4 MiB byte budget,
+    subscription events droppable oldest-first, and hello/result/error/
+    ack/closed responses never dropped.
+  - >-
+    Live authentication, WebSocket-issued mutations and actions, and
+    TransitionChunk assembly are deferred; receiving a TransitionChunk (an
+    unrecognized Transition modification) is reported as a ProtocolError
+    and the connection reconnects.
+  - >-
+    tcp_connect has no per-call connect-timeout of its own (GNU SETL's
+    open() for tcp-client exposes none); a connect that hangs at the TCP
+    level rather than failing or refusing is not separately bounded beyond
+    the overall operation deadline that wraps it.
+capabilities:
+  - http
+  - live

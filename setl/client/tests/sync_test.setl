@@ -1,0 +1,179 @@
+-- Protocol-shape unit tests for client/sync.setl, following the same
+-- synthetic-input style client/tests/convex_test.setl uses for the HTTP
+-- envelope: no live deployment is needed to prove that Transition
+-- messages are decoded, versioned, and dispatched correctly, since
+-- client/tests/websocket_test.setl and client/tests/tls_smoke.setl
+-- already prove the transport and framing underneath this layer against
+-- real network peers. Every "connection" here is a plain map with `buf`
+-- pre-loaded by hand -- no socket involved -- built the same way
+-- client/tests/websocket_test.setl's synthetic block drives ws_recv.
+--
+-- Covers: an initial QueryUpdated, a subsequent external update whose
+-- startVersion chains onto the previous endVersion, QueryFailed followed
+-- by a recovering QueryUpdated on the same subscription, and rejection
+-- of a Transition whose startVersion does not match the locally tracked
+-- version.
+
+fail_count := 0;
+
+sync := fresh_sync();
+
+-- Initial QueryUpdated: startVersion must equal the zero version this
+-- connection begins with.
+count0 := {};
+count0("count") := 0;
+v0 := sync("remote_version");
+v1 := version_of(1, "AQAAAAAAAAA=");
+sync("ws")("buf") := raw_text_frame(transition_json(v0, v1, [query_updated(0, count0)]));
+[outcome, sync, result] := sync_wait_next(sync, 0, 4000);
+if outcome /= "ok" or result("kind") /= "value" or result("value")("count") /= 0 then
+  print("FAIL initial QueryUpdated: outcome=" + outcome + " lasterr=" + str(sync("last_error")));
+  fail_count +:= 1;
+else
+  print("initial QueryUpdated ok");
+end if;
+
+-- External update: a second Transition chained onto the first, moving
+-- the count from 0 to 1.
+count1 := {};
+count1("count") := 1;
+v2 := version_of(2, "AgAAAAAAAAA=");
+sync("ws")("buf") := raw_text_frame(transition_json(v1, v2, [query_updated(0, count1)]));
+[outcome, sync, result] := sync_wait_next(sync, 0, 4000);
+if outcome /= "ok" or result("value")("count") /= 1 then
+  print("FAIL external update: outcome=" + outcome);
+  fail_count +:= 1;
+else
+  print("external update ok");
+end if;
+
+-- QueryFailed, then recovery: the same subscription must still deliver a
+-- later valid value rather than being permanently stranded.
+v3 := version_of(3, "AwAAAAAAAAA=");
+sync("ws")("buf") := raw_text_frame(transition_json(v2, v3, [query_failed(0, "synthetic failure")]));
+[outcome, sync, result] := sync_wait_next(sync, 0, 4000);
+if outcome /= "ok" or result("kind") /= "error" or result("errMessage") /= "synthetic failure" then
+  print("FAIL QueryFailed: outcome=" + outcome);
+  fail_count +:= 1;
+else
+  print("QueryFailed ok");
+end if;
+
+count2 := {};
+count2("count") := 2;
+v4 := version_of(4, "BAAAAAAAAAA=");
+sync("ws")("buf") := raw_text_frame(transition_json(v3, v4, [query_updated(0, count2)]));
+[outcome, sync, result] := sync_wait_next(sync, 0, 4000);
+if outcome /= "ok" or result("kind") /= "value" or result("value")("count") /= 2 then
+  print("FAIL recovery after QueryFailed: outcome=" + outcome);
+  fail_count +:= 1;
+else
+  print("recovery after QueryFailed ok");
+end if;
+
+-- A Transition whose startVersion does not match the locally tracked
+-- version is a protocol violation, not data to deliver.
+wrong_start := version_of(99, "//////////8=");
+v5 := version_of(5, "BQAAAAAAAAA=");
+sync("ws")("buf") := raw_text_frame(transition_json(wrong_start, v5, [query_updated(0, count2)]));
+[outcome, sync, result] := sync_wait_next(sync, 0, 4000);
+if outcome /= "error" then
+  print("FAIL version mismatch rejection: outcome=" + outcome);
+  fail_count +:= 1;
+else
+  print("version mismatch rejection ok");
+end if;
+
+if fail_count = 0 then
+  print("SYNC CLIENT: ALL CHECKS PASSED");
+else
+  print("SYNC CLIENT: " + str(fail_count) + " CHECK(S) FAILED");
+  stop 1;
+end if;
+
+proc fresh_sync();
+  sync := {};
+  sync("ws") := {};
+  sync("ws")("open") := true;
+  sync("ws")("buf") := "";
+  sync("ws")("last_close_reason") := "InitialConnect";
+  sync("session_id") := "test-session";
+  sync("query_set_version") := 1;
+  sync("remote_version") := sync_zero_version();
+  sync("max_observed_timestamp") := "";
+  sync("next_query_id") := 1;
+  sync("subscriptions") := {};
+  sync("results") := {};
+  sync("revisions") := {};
+  return sync;
+end proc;
+
+-- Builds one raw, unmasked text frame (server-to-client frames are never
+-- masked) carrying AText, for injection directly into a connection's
+-- `buf`. A Transition message routinely exceeds 125 bytes, so this still
+-- needs the 126 extended-length header client/tests/websocket_test.setl's
+-- own raw_frame helper handles; unlike that helper this one is always
+-- FIN and always text (opcode 1), which is all these tests need.
+proc raw_text_frame(text);
+  payload_len := #text;
+  frame := char(128 + 1);
+  if payload_len <= 125 then
+    frame +:= char(payload_len);
+  elseif payload_len <= 65535 then
+    frame +:= char(126);
+    frame +:= char(payload_len div 256 mod 256);
+    frame +:= char(payload_len mod 256);
+  else
+    frame +:= char(127) + char(0) + char(0) + char(0) + char(0);
+    frame +:= char(payload_len div 16777216 mod 256);
+    frame +:= char(payload_len div 65536 mod 256);
+    frame +:= char(payload_len div 256 mod 256);
+    frame +:= char(payload_len mod 256);
+  end if;
+  return frame + text;
+end proc;
+
+proc version_of(query_set, ts);
+  v := {};
+  v("querySet") := query_set;
+  v("identity") := 0;
+  v("ts") := ts;
+  return v;
+end proc;
+
+proc transition_json(start_version, end_version, modifications);
+  msg := {};
+  msg("type") := "Transition";
+  msg("startVersion") := start_version;
+  msg("endVersion") := end_version;
+  msg("modifications") := modifications;
+  return json_encode(msg);
+end proc;
+
+proc query_updated(query_id, value_map);
+  m := {};
+  m("type") := "QueryUpdated";
+  m("queryId") := query_id;
+  m("value") := value_map;
+  m("logLines") := [];
+  return m;
+end proc;
+
+proc query_failed(query_id, error_message);
+  m := {};
+  m("type") := "QueryFailed";
+  m("queryId") := query_id;
+  m("errorMessage") := error_message;
+  m("errorData") := om;
+  m("logLines") := [];
+  return m;
+end proc;
+
+#include "tcp.setl"
+#include "tls.setl"
+#include "stream.setl"
+#include "http.setl"
+#include "json.setl"
+#include "websocket.setl"
+#include "convex.setl"
+#include "sync.setl"

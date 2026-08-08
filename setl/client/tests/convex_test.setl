@@ -1,0 +1,84 @@
+fail_count := 0;
+
+-- convex_parse_url
+[success, target] := convex_parse_url("https://example.convex.cloud");
+fail_count +:= expect_eq("https scheme", target("scheme"), "tls");
+fail_count +:= expect_eq("https host", target("host"), "example.convex.cloud");
+fail_count +:= expect_eq("https default port", target("port"), 443);
+
+[success, target] := convex_parse_url("http://127.0.0.1:3210");
+fail_count +:= expect_eq("http scheme", target("scheme"), "tcp");
+fail_count +:= expect_eq("http host", target("host"), "127.0.0.1");
+fail_count +:= expect_eq("http explicit port", target("port"), 3210);
+
+[success, message] := convex_parse_url("not-a-url");
+fail_count +:= expect_eq("missing scheme rejected", success, false);
+
+-- convex_classify: success envelope
+value_obj := {};
+value_obj("count") := 0;
+body_text := "{\"status\":\"success\",\"value\":" + json_encode(value_obj) + "}";
+result := convex_classify(200, body_text);
+fail_count +:= expect_eq("success kind", result("kind"), "result");
+fail_count +:= expect_eq("success value", result("value"), value_obj);
+
+-- convex_classify: success with explicit null value
+body_text := "{\"status\":\"success\",\"value\":null}";
+result := convex_classify(200, body_text);
+fail_count +:= expect_eq("success null kind", result("kind"), "result");
+fail_count +:= expect_eq("success null value", result("value"), om);
+
+-- convex_classify: function error (HTTP 200)
+body_text := "{\"status\":\"error\",\"errorMessage\":\"boom\"}";
+result := convex_classify(200, body_text);
+fail_count +:= expect_eq("function error kind", result("kind"), "error");
+fail_count +:= expect_eq("function error name", result("errName"), "FunctionError");
+fail_count +:= expect_eq("function error message", result("errMessage"), "boom");
+
+-- convex_classify: function error via HTTP 560
+body_text := "{\"status\":\"error\",\"errorMessage\":\"threw\"}";
+result := convex_classify(560, body_text);
+fail_count +:= expect_eq("560 error kind", result("kind"), "error");
+fail_count +:= expect_eq("560 error name", result("errName"), "FunctionError");
+
+-- convex_classify: malformed 200 envelope
+result := convex_classify(200, "not json");
+fail_count +:= expect_eq("malformed envelope kind", result("kind"), "error");
+fail_count +:= expect_eq("malformed envelope name", result("errName"), "ProtocolError");
+
+-- convex_classify: missing status field
+result := convex_classify(200, "{\"value\":1}");
+fail_count +:= expect_eq("missing status kind", result("kind"), "error");
+fail_count +:= expect_eq("missing status name", result("errName"), "ProtocolError");
+
+-- convex_classify: transport-level failure (503)
+result := convex_classify(503, "{\"message\":\"overloaded\"}");
+fail_count +:= expect_eq("503 kind", result("kind"), "error");
+fail_count +:= expect_eq("503 name", result("errName"), "TransportError");
+
+-- convex_classify: transport-level failure with no JSON body_text at all
+result := convex_classify(500, "internal error");
+fail_count +:= expect_eq("500 kind", result("kind"), "error");
+fail_count +:= expect_eq("500 name", result("errName"), "TransportError");
+
+if fail_count = 0 then
+  print("CONVEX CLASSIFY: ALL CHECKS PASSED");
+else
+  print("CONVEX CLASSIFY: " + str(fail_count) + " CHECK(S) FAILED");
+  stop 1;
+end if;
+
+proc expect_eq(label, actual, expected);
+  if actual /= expected then
+    print("FAIL " + label + ": got " + str(actual) + " want " + str(expected));
+    return 1;
+  end if;
+  return 0;
+end proc;
+
+#include "json.setl"
+#include "tcp.setl"
+#include "tls.setl"
+#include "stream.setl"
+#include "http.setl"
+#include "convex.setl"

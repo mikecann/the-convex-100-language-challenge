@@ -1,0 +1,48 @@
+-- Transport-agnostic byte stream over either client/tcp.setl (scheme
+-- "tcp", the local self-hosted profile) or client/tls.setl (scheme "tls",
+-- the hosted profile). Everything above this module -- HTTP framing, the
+-- WebSocket layer once it exists -- talks only to stream_connect/
+-- stream_write/stream_read/stream_close and never touches either
+-- transport or callout() directly.
+
+proc stream_connect(scheme, target_host, port_num, timeout_ms);
+  s := {};
+  if scheme = "tls" then
+    [success, info] := tls_connect(target_host, port_num, timeout_ms);
+    if not success then
+      return [false, info];
+    end if;
+    s("kind") := "tls";
+    s("handle") := info;
+  else
+    [success, info] := tcp_connect(target_host, port_num, timeout_ms);
+    if not success then
+      return [false, info];
+    end if;
+    s("kind") := "tcp";
+    s("fd") := info;
+  end if;
+  return [true, s];
+end proc;
+
+proc stream_write(s, bytes);
+  if s("kind") = "tls" then
+    return tls_write(s("handle"), bytes);
+  end if;
+  return tcp_write(s("fd"), bytes);
+end proc;
+
+proc stream_read(s, max_bytes, timeout_ms);
+  if s("kind") = "tls" then
+    return tls_read(s("handle"), max_bytes, timeout_ms);
+  end if;
+  return tcp_read(s("fd"), max_bytes, timeout_ms);
+end proc;
+
+proc stream_close(s);
+  if s("kind") = "tls" then
+    tls_close(s("handle"));
+  else
+    tcp_close(s("fd"));
+  end if;
+end proc;

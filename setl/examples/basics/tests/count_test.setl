@@ -1,0 +1,72 @@
+-- Focused regression for examples/basics/count.setl's integral-count
+-- decoding, per AGENTS.md: Convex JSON may encode an integral value as
+-- 0 or as 0.0, and this must accept both while rejecting anything
+-- fractional, quoted, negative, non-finite, or out of range. No live
+-- deployment or fixture server is needed for this: it exercises the
+-- decoding rule directly against synthetic values, not mocked HTTP
+-- responses.
+--
+-- check() returns 1 on failure and 0 on success rather than touching a
+-- shared counter directly: GNU SETL procs have no closure over their
+-- caller's variables (confirmed directly -- a bare identifier inside a
+-- proc that is not one of its own parameters is a fresh local, not the
+-- mainline's), so a helper that tried to `fail_count +:= 1` would only
+-- ever increment a copy nobody outside it can see.
+
+fail_count := 0;
+fail_count +:= check("bare integer zero", 0, true, 0);
+fail_count +:= check("whole real zero", 0.0, true, 0);
+fail_count +:= check("bare integer one", 1, true, 1);
+fail_count +:= check("whole real five", 5.0, true, 5);
+fail_count +:= check("fractional real", 1.5, false, om);
+fail_count +:= check("negative integer", -1, false, om);
+fail_count +:= check("negative real", -1.0, false, om);
+fail_count +:= check("quoted number", "0", false, om);
+fail_count +:= check("boolean", true, false, om);
+-- 2^53, the first integer a JSON-number-typed double can no longer
+-- represent exactly; this client's own encoder never produces one, but
+-- a value this large from elsewhere is treated as out of range rather
+-- than trusted.
+fail_count +:= check("integer overflow", 9007199254740992, false, om);
+
+-- A map with no "count" key at all: map assignment m(k) := om does not
+-- store an entry in GNU SETL (om is also what a missing-key lookup
+-- returns -- see client/json.setl's module comment), so this exercises
+-- the same code path a JSON object missing the field, or one explicitly
+-- mapping it to null, would take.
+missing := {};
+[decoded, count, message] := convex_state_count(missing, "test");
+if decoded then
+  print("FAIL missing count: unexpectedly accepted");
+  fail_count +:= 1;
+else
+  print("missing count ok");
+end if;
+
+if fail_count = 0 then
+  print("COUNT DECODING: ALL CHECKS PASSED");
+else
+  print("COUNT DECODING: " + str(fail_count) + " CHECK(S) FAILED");
+  stop 1;
+end if;
+
+proc check(label, value, want_ok, want_count);
+  m := {};
+  m("count") := value;
+  [decoded, count, message] := convex_state_count(m, "test");
+  if decoded /= want_ok then
+    print("FAIL " + label + ": decoded=" + str(decoded) + " message=" + message);
+    return 1;
+  elseif decoded and count /= want_count then
+    print("FAIL " + label + ": count=" + str(count) + " want=" + str(want_count));
+    return 1;
+  end if;
+  print(label + " ok");
+  return 0;
+end proc;
+
+#include "tcp.setl"
+#include "tls.setl"
+#include "stream.setl"
+#include "http.setl"
+#include "count.setl"

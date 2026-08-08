@@ -1,0 +1,80 @@
+-- Native plain-TCP transport for the local self-hosted HTTP profile. Uses
+-- GNU SETL's own socket support directly (open(f, "tcp-client")) -- no
+-- callout(), no OpenSSL. Only the hosted (TLS) profile needs client/tls.setl.
+--
+-- Every proc here returns a [read_status, payload] pair so callers never branch
+-- on a raised error: connect/write return [true, info] or [false, message];
+-- read returns ["data", bytes], ["timeout", om], ["eof", om], or
+-- ["error", message] -- the same four-way shape client/tls.setl uses, so
+-- client/stream.setl can dispatch between the two transports uniformly.
+
+proc tcp_connect(target_host, port_num, timeout_ms);
+  -- GNU SETL's open() for tcp-client has no per-call connect-timeout knob
+  -- of its own; timeout_ms is accepted here only for symmetry with
+  -- tls_connect. Bounding connect() itself is a deferred limitation --
+  -- see setl/README.md.
+  fd := open([target_host, port_num], "tcp-client");
+  if fd = om then
+    return [false, "connect failed: " + last_error];
+  end if;
+  return [true, fd];
+end proc;
+
+proc tcp_write(fd, bytes);
+  putc(fd, bytes);
+  flush(fd);
+  if last_error /= no_error then
+    return [false, last_error];
+  end if;
+  return [true, #bytes];
+end proc;
+
+proc tcp_read(fd, max_bytes, timeout_ms);
+  ready := select([{fd}], timeout_ms);
+  if #ready(1) = 0 then
+    return ["timeout", om];
+  end if;
+  -- GNU SETL's getn(fd, n) blocks until it has read exactly n bytes or
+  -- hit EOF (confirmed directly against src/run/lib.c's get_chars,
+  -- which loops get_char() up to n times with no short-read return): a
+  -- short-lived HTTP/1.1 exchange that closes the connection after
+  -- responding never exposed this, because EOF eventually satisfies a
+  -- getn(fd, max_bytes) call started after the response arrived. A
+  -- long-lived connection -- a WebSocket that sends one small frame and
+  -- then goes quiet without closing -- does not: requesting max_bytes
+  -- in one getn() call would block past whatever the peer actually
+  -- sent, waiting for bytes that are never coming, regardless of the
+  -- timeout this proc was asked to honour.
+  --
+  -- select() already proved this fd is readable, so one byte is always
+  -- safe to take. After that, drain whatever is already sitting in the
+  -- kernel socket buffer one byte at a time (each guarded by its own
+  -- zero-timeout select(), so this never blocks on a byte that has not
+  -- actually arrived), stopping at max_bytes or the first sign nothing
+  -- more is immediately available.
+  data := getn(fd, 1);
+  if data = "" then
+    -- select() said readable, so an empty read here means EOF, not "no
+    -- data yet".
+    return ["eof", om];
+  end if;
+  draining := true;
+  while draining and #data < max_bytes loop
+    poll_ready := select([{fd}], 0);
+    if #poll_ready(1) = 0 then
+      draining := false;
+    else
+      more := getn(fd, 1);
+      if more = "" then
+        draining := false;
+      else
+        data +:= more;
+      end if;
+    end if;
+  end loop;
+  return ["data", data];
+end proc;
+
+proc tcp_close(fd);
+  close(fd);
+end proc;
