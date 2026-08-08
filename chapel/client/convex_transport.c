@@ -1117,8 +1117,14 @@ failed:
 #define CT_WS_YIELD_INTERVAL_MS 200
 
 static void maybe_yield_idle(chapel_ws *socket) {
-  (void)socket;
-  // TEMP EXPERIMENT: disabled to isolate thread-count-only fix.
+  if (socket->frame_deadline_ms)
+    return;
+  int64_t now = ct_monotonic_ms();
+  if (socket->last_yield_ms &&
+      now - socket->last_yield_ms < CT_WS_YIELD_INTERVAL_MS)
+    return;
+  socket->last_yield_ms = now;
+  chpl_task_yield();
 }
 
 static int wait_socket(CURL *curl, short events, int64_t deadline_ms) {
