@@ -69,7 +69,24 @@
 class NativeFunction;
 
 #define MAX_SLOTS 64
-#define MAX_MESSAGE 8388608 /* 8 MiB: comfortably above one Convex frame. */
+/* 1 MiB: comfortably above the largest single send/recv call
+ * client/convex.apl and client/convexlive.apl actually make (every
+ * ConnRecv call site in this project passes maxBytes 65536; HTTP
+ * requests and WebSocket frames built by this client are small JSON
+ * bodies, nowhere near this). Previously 8 MiB, times three separate
+ * static buffers below (op_send, op_recv, op_sha1) -- 24 MiB of fixed
+ * BSS a plain client/http/adapter build never needed. Found and
+ * shrunk while chasing a real OOM kill under a long conformance run
+ * against the hosted target (client/tests/conformance/adapter.apl's
+ * own header comment has the actual root cause, an unthrottled
+ * busy-spin once Live went active); this reclaims a meaningful slice
+ * of the shared 128 MiB budget but was not, on its own, what was
+ * actually driving that OOM. */
+#define MAX_MESSAGE 1048576
+/* op_sha1's input is only ever a short ASCII string (the RFC 6455
+ * handshake key plus its fixed GUID, on the order of 60 bytes) -- this
+ * just needs headroom, not MAX_MESSAGE's transport-sized bound. */
+#define MAX_SHA1_INPUT 4096
 
 typedef struct {
     int inUse;
@@ -325,7 +342,7 @@ static Token op_recv(Value_P A, Value_P B) {
  * of written in APL. */
 static Token op_sha1(Value_P B) {
     ensure_init();
-    static unsigned char buf[MAX_MESSAGE];
+    static unsigned char buf[MAX_SHA1_INPUT];
     size_t len = value_to_bytes(B, buf, sizeof(buf));
     unsigned char digest[EVP_MAX_MD_SIZE];
     unsigned int digestLen = 0;

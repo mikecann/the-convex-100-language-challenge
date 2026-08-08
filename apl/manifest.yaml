@@ -112,6 +112,18 @@ limitations:
     misrouted onto Live's socket instead. Fixed by reading the cell's
     numeric value directly.
   - >-
+    The adapter's own command loop had an unthrottled busy-spin bug:
+    once any Live command made LIVEACTIVE true, the tick branch called
+    LiveServiceTick and looped straight back to the top without ever
+    reaching the idle branch's sleep, previously reserved for when Live
+    was not yet active. Confirmed with a cgroup memory trace against a
+    real backend: flat around 22 MiB through every HTTP test and the
+    first Live test, then climbing continuously (not one spike) past a
+    128 MiB limit within about two seconds of Live going active,
+    OOM-killing the adapter mid-conformance-run. Fixed by falling
+    through to the same one-tick-per-pass sleep regardless of
+    LIVEACTIVE.
+  - >-
     GNU APL's own script-exit path (")OFF", required to leave the
     interpreter cleanly) appends one unsuppressible bare blank line to
     stdout after a script's last real line of output, independent of

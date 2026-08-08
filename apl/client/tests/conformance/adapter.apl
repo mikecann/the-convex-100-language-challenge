@@ -435,9 +435,22 @@ GOTDATA:
   BUF←BUF,2⊃RR
   →EXTRACT
 TICK:
+  ⍝ BUG FOUND (and fixed) only under a long sustained conformance run
+  ⍝ against the hosted target: this used to `→LOOP` straight back to
+  ⍝ EXTRACT/READMORE without ever reaching IDLE's sleep whenever
+  ⍝ LIVEACTIVE was set, turning the whole loop into an unthrottled
+  ⍝ busy-spin the instant any Live command had been issued -- tens of
+  ⍝ thousands of TryReadOnce/LiveServiceTick passes per second, each a
+  ⍝ handful of small APL allocations that add up under that much
+  ⍝ churn. Confirmed with a cgroup memory trace: flat around 22 MiB
+  ⍝ through every HTTP and the first Live test, then climbing
+  ⍝ continuously (not one spike) to past a 128 MiB limit within about
+  ⍝ two seconds of Live going active, OOM-killing the adapter
+  ⍝ mid-pilot-run. Falling through to IDLE's sleep here regardless of
+  ⍝ LIVEACTIVE, the same one-tick-per-pass cadence the rest of this
+  ⍝ loop already uses, fixed it.
   →(LIVEACTIVE=0)⍴IDLE
   EmitLiveEvents (OUTHANDLE LiveServiceTick)
-  →LOOP
 IDLE:
   IGNORED←⎕DL 0.01               ⍝ unassigned would auto-echo the seconds slept
   →LOOP

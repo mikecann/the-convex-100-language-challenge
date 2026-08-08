@@ -409,6 +409,21 @@ Debian-adjacent GNU APL 2.0 with a runtime library closure of just
   before the fix went in. Fixed by reading the argument cell's numeric
   value directly, the same way `maxBytes`/`timeoutMs` already are, rather
   than assuming text.
+- A second landmine, found chasing a real OOM kill on the same dedicated
+  hosted target once the handle bug above was fixed: the conformance
+  adapter's own command loop looped straight back to the top of its
+  read/tick cycle without ever reaching its idle branch's sleep, the
+  moment any Live command had been issued -- an unthrottled busy-spin,
+  tens of thousands of `LiveServiceTick` passes per second, each a
+  handful of small APL allocations that add up under that much churn. A
+  cgroup memory trace against the real target showed it plainly: flat
+  around 22 MiB through every HTTP test and the first Live test, then
+  climbing continuously (not one spike) past the shared 128 MiB budget
+  within about two seconds of Live going active, killing the adapter
+  mid-conformance-run with no application-level error at all (the
+  harness only ever saw "adapter TCP connection closed"). Fixed by
+  falling through to the loop's existing one-tick-per-pass sleep
+  regardless of whether Live was active.
 - GNU APL's own script-exit path (`)OFF`, required to leave the
   interpreter cleanly -- omitting it drops the process into an
   interactive `^D`/end-of-input prompt loop instead) appends one
