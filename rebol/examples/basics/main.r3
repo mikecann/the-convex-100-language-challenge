@@ -16,21 +16,26 @@ Rebol [
         failure via QUIT/RETURN 1, never a printed warning.
 
         stdout carries only the six lines the website and video are meant
-        to show; every diagnostic goes to stderr instead. REBOL's own
-        ports collapse stdout and stdin into a single `console` scheme
-        with no separate stderr port, so `secure [file allow]` below
-        unlocks just enough of the language's own security sandbox to
-        open the real OS file %/dev/stderr for that -- every other
-        security category (network access included) keeps its
-        restrictive default.
+        to show; every diagnostic goes to stderr instead, opened as a
+        plain OS file below since REBOL's own ports collapse stdout and
+        stdin into a single `console` scheme with no separate stderr
+        port.
     }
 ]
+
+;; Widens the file-access category of REBOL's own security sandbox from
+;; whatever its ambient default happens to be (observed to vary with
+;; whether the process could establish a writable data folder) to a
+;; known "allow", before anything else touches a file: loading
+;; client/convex.r3 below needs to read it and client/ca-bundle/*.pem,
+;; and `diagnose` later needs to open %/dev/stderr for writing. Every
+;; other security category (network access included) keeps its
+;; restrictive default.
+secure [file allow]
 
 ;; client-dir is wherever THIS script lives; convex.r3 needs to be found
 ;; relative to it regardless of the caller's own working directory.
 do %../../client/convex.r3
-
-secure [file allow]
 
 ;; diagnose(message) -> writes one line to the real OS stderr, kept
 ;; entirely separate from the six lines of stdout the shared verifier

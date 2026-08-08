@@ -9,9 +9,17 @@ This is educational and unofficial. It is not a production Convex SDK.
 
 ## Status
 
-Implementation is in progress. The canonical example, the HTTP client, Live
-sync, and the conformance adapter are not yet complete, so no capability has
-been earned yet -- see `manifest.yaml`'s `capabilities: []`.
+Implementation is in progress. `client/convex.r3` already implements the
+HTTP query/mutation/action calls, RFC 6455 WebSocket framing, and the
+`/api/sync` Live state machine (`Connect` / `ModifyQuerySet` /
+`Transition`, reconnect-with-backoff, and `debugDisconnect`) over
+`client/x509.r3`'s verified TLS transport, and `examples/basics/main.r3`
+exercises all of it end to end against a real deployment. The shared
+conformance adapter (`client/tests/conformance/`) does not exist yet, so
+no capability has been earned yet -- see `manifest.yaml`'s
+`capabilities: []`. `Dockerfile` has verified `test` and
+`example-runtime` targets; `runtime` (the conformance adapter's own
+image) does not exist yet either.
 
 ## What is proven so far
 
@@ -63,8 +71,8 @@ Run it yourself:
 docker run --rm --platform linux/amd64 -v $(pwd)/client:/work/client rebol-spike:3.22.1 --quiet /work/client/tests/x509-verify-test.r3
 ```
 
-(against the pinned spike image; the language's own `Dockerfile` will
-supersede this once the rest of the client is built).
+(against the pinned spike image the language's own `Dockerfile` now
+supersedes for `test` and `example-runtime`; see below).
 
 Two implementation notes worth recording honestly, since they were real
 correctness traps while building this:
@@ -83,6 +91,57 @@ correctness traps while building this:
   capture the exact bytes as they pass through, with no re-encoding
   involved.
 
+## The canonical example, and the Dockerfile
+
+`examples/basics/main.r3` runs the shared-counter 0 -> 1 journey every
+client in this repository proves: an HTTP query, a Live subscription
+started before a mutation, the mutation itself with its idempotency key,
+and the resulting Live update -- entirely through `client/convex.r3`'s
+public `convex-*` functions. Its stdout has been byte-diffed against
+`_shared/examples/basics.expected.txt` and matches exactly; two failure
+paths (a missing `CONVEX_URL`, an unreachable deployment) were checked
+separately and exit non-zero with stdout empty, as required.
+
+`Dockerfile`'s `test` and `example-runtime` targets are built and
+verified, including under the exact conditions the shared verifier itself
+uses (`--read-only --cap-drop ALL --user 65532:65532`, no `--tmpfs`):
+
+- `test` fetches and sha256-verifies the pinned Rebol/Bulk release,
+  asserts the unpacked binary is a genuine linux/amd64 ELF, and then runs
+  `json-test.r3`, `x509-verify-test.r3`, `smoke-live.r3`, and the
+  canonical example itself, live, inside the build.
+- `example-runtime` is `gcr.io/distroless/base-debian12:nonroot` (pinned
+  by digest) plus the interpreter binary (renamed to
+  `/usr/local/bin/convex-example`, with the example script wired into
+  `ENTRYPOINT`'s own argument vector, so no shell is needed to glue them
+  together -- this base has none) and nothing else. No compiler, package
+  manager, or delegated runtime is present.
+
+One real bug surfaced and fixed while proving that: this Rebol/Bulk build
+always tries to create `~/.rebol/` once at process start, and prints one
+uncontrollable warning line to stdout -- even under `--quiet` -- if it
+cannot (which it never can here: read-only root filesystem, no writable
+`$HOME`, no `--tmpfs /tmp` from the shared verifier's own client
+container). That would have broken the exact-match stdout contract
+non-deterministically. The fix is to pre-create that directory, empty,
+owned by `65532:65532`, as an image layer in the `toolchain` stage and
+copy it into `example-runtime`, so REBOL never tries to create it at all.
+
+A second, unrelated finding: this build's default file-security policy is
+scoped to the process's *current working directory*, not a global
+allow/deny -- a `read` against an absolute path is allowed from
+`WORKDIR /work` and denied from anywhere else, independent of the
+filesystem's own permissions or of `$HOME`. `test` copies `client/` and
+`examples/` under `WORKDIR /work` for exactly this reason, matching what
+the manual command above already relied on.
+`examples/basics/main.r3` instead calls `secure [file allow]` once at its
+own top (before loading `client/convex.r3` or opening `%/dev/stderr` for
+diagnostics), since it also needs to open a path outside any WORKDIR.
+
+`runtime` (the conformance adapter's own image, entrypoint
+`/usr/local/bin/convex-adapter`) does not exist yet -- see Remaining
+work below.
+
 ## Toolchain
 
 Rebol/Bulk 3.22.1, tag `3.22.1` from
@@ -92,18 +151,28 @@ asset `rebol3-bulk-linux-x64.gz`, sha256
 
 ## Remaining work
 
-- Canonical `examples/basics/main.r3` and the HTTP query/mutation/action
-  client built on `client/x509.r3`'s verified transport.
-- JSON encoding (this fork's `to-json` mezzanine mis-encodes booleans and
-  `none`; a small correct encoder is needed the same way several other
-  language clients in this repo hand-roll their own rather than trust a
-  stdlib one that does not fit).
-- RFC 6455 WebSocket framing and the `/api/sync` `Connect` /
-  `ModifyQuerySet` / `Transition` state machine over the same verified
-  transport.
-- The NDJSON conformance adapter (`client/tests/conformance/`), including
-  `debugDisconnect`.
-- `Dockerfile` exposing the house `test` / `example-runtime` / `runtime`
-  targets, on a distroless base proven earlier in the feasibility spike to
-  run clean as uid 65532, read-only root filesystem, all capabilities
-  dropped.
+- The NDJSON conformance adapter (`client/tests/conformance/`): protocol
+  v1, `ADAPTER_LISTEN` TCP listen mode, strict schema compliance, and a
+  `runtime` Dockerfile target (entrypoint `/usr/local/bin/convex-adapter`)
+  to run it in. `client/convex.r3` already exposes everything the adapter
+  needs (subscribe/unsubscribe, wait-for-update, `convex-debug-disconnect`
+  for the shared controller's forced-reconnect proof), but nothing yet
+  speaks the adapter's own NDJSON request/response protocol over a
+  listening socket.
+- Once the adapter exists: the fuller reconnect/backpressure proof the
+  project asks for (five real reconnects via `debugDisconnect` with
+  unchanged-value rehydration suppressed and observed, backoff reset after
+  a good handshake, a bounded queue under a stopped reader) -- today only
+  `client/tests/smoke-live.r3`'s single forced reconnect is proven.
+  `client/convex.r3`'s `live-transition` already implements rehydration
+  suppression and `live-maybe-reconnect` already implements backoff, but
+  neither has a dedicated regression exercising it under repeated,
+  scripted failures yet.
+- `./run test rebol`, `./run verify-example rebol`, `./run verify rebol`,
+  and `./run verify-all rebol` have not been run through the project's
+  own harness yet (the Docker builds and live-backend checks above were
+  run directly, not through `./run`); until the adapter and `runtime`
+  target exist, `./run verify`/`verify-all` cannot pass regardless.
+- `manifest.yaml`'s `capabilities: []` and the roster swap
+  (`actionscript` -> `rebol` at rank 58) stay unearned/unmerged until the
+  above passes the shared evaluator -- no capability is claimed here.
