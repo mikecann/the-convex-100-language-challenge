@@ -29,6 +29,22 @@ ADAPTER_DONE=: 0
 ADAPTER_STATUS=: 0
 ADAPTER_OUT=: 0 3 $ a: NB. rows: text, droppable(0/1), size
 
+NB. A test file loads this module to reach adapter_id_valid, adapter_error,
+NB. and friends directly, without wanting adapter_main's real stdin/stdout or
+NB. ADAPTER_LISTEN session to start. ADAPTER_AUTOEXEC lets such a test predefine
+NB. the name as 0 before loading this file; the real entrypoint (jconsole run
+NB. with no prior definition) always finds the name undefined here (name
+NB. class -1) and defaults it to 1. if./do./end. only parse inside an
+NB. explicit definition, hence the tiny verb rather than bare top-level
+NB. control words (the same constraint the Dockerfile's TLS probe documents).
+adapter_init_autoexec=: 3 : 0
+if. _1 = 4!:0 <'ADAPTER_AUTOEXEC' do.
+  ADAPTER_AUTOEXEC=: 1
+end.
+EMPTY
+)
+adapter_init_autoexec ''
+
 NB. Written straight to fd 2 through the same libc write() binding stdio
 NB. transport uses, rather than J's own file-write foreign, so this needs
 NB. no separate convention for "where stderr is".
@@ -240,13 +256,27 @@ NB. ---------------------------------------------------------------------------
 NB. Command dispatch
 NB. ---------------------------------------------------------------------------
 
-NB. A valid id is 1-128 UTF-8 code points and valid UTF-8.
+NB. A valid id is 1-128 UTF-8 code points and valid UTF-8. ws_utf8_valid
+NB. is websocket.ijs's numeric byte-value convention, so `value` (a plain
+NB. character string here, matching json.ijs's convention) is converted with
+NB. `a. i.` for that call. `9 u:` decodes a character string directly, so
+NB. the codepoint count below must reuse `value` as-is: an earlier version
+NB. wrongly re-applied `a. {~` (the numeric-to-character conversion) to
+NB. already-character data, which is out of domain and raised a raw error
+NB. instead of returning a status -- crashing every adapter error response.
 adapter_id_valid=: 3 : 0
   value=. y
   if. 0 = # value do. 0 return. end.
   if. -. ws_utf8_valid a. i. value do. 0 return. end.
-  cps=. 3 u: 9 u: a. {~ value
-  (0 < #cps) *. #cps <: 128
+  cps=. 3 u: 9 u: value
+  NB. `#cps <: 128` parses as `# (cps <: 128)` (tally of the elementwise
+  NB. comparison, not a comparison of the tally), because the unparenthesized
+  NB. monadic # does not bind the way infix notation would suggest -- reachable
+  NB. only once the crash above stopped masking it, and only visibly wrong
+  NB. once an id exceeds 128 codepoints (every ASCII codepoint is already
+  NB. <: 128, so `cps <: 128` is all 1s and its tally just echoes back #cps,
+  NB. silently "passing" any length).
+  (0 < #cps) *. 128 >: #cps
 )
 
 adapter_call=: 3 : 0
@@ -453,4 +483,11 @@ adapter_main=: 3 : 0
   ADAPTER_STATUS
 )
 
-exit adapter_main ''
+NB. Same if./do./end.-needs-an-explicit-definition constraint as
+NB. adapter_init_autoexec above, so this is a tiny verb rather than a bare
+NB. top-level control word.
+adapter_maybe_run=: 3 : 0
+if. ADAPTER_AUTOEXEC do. exit adapter_main '' end.
+EMPTY
+)
+adapter_maybe_run ''
