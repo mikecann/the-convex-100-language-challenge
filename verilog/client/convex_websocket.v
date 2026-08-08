@@ -84,12 +84,29 @@ module convex_websocket #(
   // frame bytes have been consumed from the transport yet.
   integer last_read_error;
 
+  // read_frame's own per-byte read deadline, separate from TIMEOUT_MS
+  // (which stays the handshake's deadline, in hs.read_response above).
+  // Defaults to TIMEOUT_MS but is independently adjustable via
+  // set_frame_timeout_ms below - convex_sync.v's poll loop needs a much
+  // shorter deadline than a one-off handshake ever would, without
+  // changing read_frame's own signature (so every already-proven caller
+  // - ws_smoke.v included - is unaffected and keeps TIMEOUT_MS's
+  // default behavior unless it opts in).
+  integer frame_timeout_ms;
+
+  task automatic set_frame_timeout_ms(input integer t);
+    begin
+      frame_timeout_ms = t;
+    end
+  endtask
+
   initial begin
     ws_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     msg_opcode = -1;
     msg_utf8_ok = 1'b0;
     close_received = 1'b0;
     last_read_error = 0;
+    frame_timeout_ms = TIMEOUT_MS;
   end
 
   function automatic integer message_opcode;
@@ -274,11 +291,11 @@ module convex_websocket #(
       ok = 1'b0;
       recv_frame.reset;
 
-      hs.transport.xport_call(`CMD_READ_BYTE, hs.handle, TIMEOUT_MS, r);
+      hs.transport.xport_call(`CMD_READ_BYTE, hs.handle, frame_timeout_ms, r);
       last_read_error = r; // whatever it is, before any header is parsed
       if (r < 0) disable main;
       hb0 = r;
-      hs.transport.xport_call(`CMD_READ_BYTE, hs.handle, TIMEOUT_MS, r);
+      hs.transport.xport_call(`CMD_READ_BYTE, hs.handle, frame_timeout_ms, r);
       if (r < 0) disable main;
       hb1 = r;
 
@@ -288,17 +305,17 @@ module convex_websocket #(
       if (masked_reg) disable main; // server MUST NOT mask (RFC 6455 SS5.1)
 
       if (hb1[6:0] == 7'd126) begin
-        hs.transport.xport_call(`CMD_READ_BYTE, hs.handle, TIMEOUT_MS, r);
+        hs.transport.xport_call(`CMD_READ_BYTE, hs.handle, frame_timeout_ms, r);
         if (r < 0) disable main;
         ext16[15:8] = r;
-        hs.transport.xport_call(`CMD_READ_BYTE, hs.handle, TIMEOUT_MS, r);
+        hs.transport.xport_call(`CMD_READ_BYTE, hs.handle, frame_timeout_ms, r);
         if (r < 0) disable main;
         ext16[7:0] = r;
         plen = ext16;
       end else if (hb1[6:0] == 7'd127) begin
         ext64 = 64'd0;
         for (i = 0; i < 8; i = i + 1) begin
-          hs.transport.xport_call(`CMD_READ_BYTE, hs.handle, TIMEOUT_MS, r);
+          hs.transport.xport_call(`CMD_READ_BYTE, hs.handle, frame_timeout_ms, r);
           if (r < 0) disable main;
           ext64 = (ext64 << 8) | r;
         end
@@ -311,7 +328,7 @@ module convex_websocket #(
       if (plen > FRAME_CAP) disable main;
 
       for (i = 0; i < plen; i = i + 1) begin
-        hs.transport.xport_call(`CMD_READ_BYTE, hs.handle, TIMEOUT_MS, r);
+        hs.transport.xport_call(`CMD_READ_BYTE, hs.handle, frame_timeout_ms, r);
         if (r < 0) disable main;
         recv_frame.put_byte(r[7:0]);
       end

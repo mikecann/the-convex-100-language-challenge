@@ -79,4 +79,17 @@ module convex_transport;
     end
   endtask
 
+  // The wall-clock time (native.c's CLOCK_MONOTONIC, milliseconds) as
+  // of the most recently completed xport_call, for a caller that needs
+  // a timestamp for scheduling (convex_sync.v's reconnect backoff)
+  // without itself calling $cx_now_ms - this file stays the only
+  // Verilog file that calls either system function, per its own header
+  // comment. A caller that needs a genuinely fresh timestamp rather
+  // than "as of the last bus transaction" issues a cheap CMD_NOP
+  // xport_call immediately first; result_time_r updates on every
+  // dispatch, not just ones a caller cares about the return value of.
+  function automatic real now_ms;
+    return result_time_r;
+  endfunction
+
 endmodule
