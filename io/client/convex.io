@@ -121,19 +121,35 @@ Convex errorMessage := method(problem,
 // A best-effort diagnostic write, retried a bounded number of times rather
 // than propagated as a fatal exception on the first failure.
 //
-// Bisected against a real hostile-peer run: writing this process's own
-// stderr through a pipe (the shape every Docker log capture and every CI
-// runner uses) occasionally raised "error writing to file" - reproduced with
-// a minimal, fully isolated repro (open a Live connection, force a
-// partial-frame retire, reconnect, poll) that has nothing to do with any
-// Convex protocol logic. Redirecting that same run's stderr straight to a
-// plain file instead of a pipe made the failure disappear over dozens of
-// repeated runs, and the one time it did fire mid-pipe, the very next write
-// on the same stream succeeded immediately - a transient hiccup in whatever
-// is capturing this process's output, not a permanent break in the stream
-// and not a defect in this client's own logic. A bare `File write` treats
-// that hiccup as fatal; retrying immediately is enough to ride it out
-// because the next attempt already succeeded in every observed case.
+// Session 2 bisected the original version of this against a real
+// hostile-peer run as a transient pipe hiccup on `stream` (in practice
+// always `File standardError`), worth riding out with an immediate retry.
+// Session 3 found that account incomplete: on this pinned Io VM,
+// `File standardError` wraps a persistent, shared underlying C stream
+// opened once by the VM, and once something upstream corrupts it (a
+// distinct pinned-VM defect from the one documented on ConvexStream's
+// hasBufferedInput/wantsRead below, not characterized to the same standard),
+// `stream write(text)` keeps reporting success - try() sees no exception,
+// `problem` stays nil - without the bytes ever reaching the real
+// descriptor. A retry loop keyed on catching an exception can never detect
+// that kind of failure. Proven directly: a debug build with a raw,
+// unwrapped write to a *separately opened* stdout handle captured
+// everything this retry loop was silently dropping on stderr, including
+// the run's actual fatal exception message, in the exact runs where
+// retrying `stream write()` kept reporting clean success.
+//
+// The fix keeps retrying `stream` first (still correct for the transient
+// case session 2 found, and the right descriptor semantically), but also
+// unconditionally mirrors every attempt to a freshly opened handle on
+// stdout - proven reliable across dozens of writes, including in runs
+// where `File standardError` had already gone silent, whereas the same
+// approach against a fresh `/dev/stderr` path raised "No such device or
+// address" inside this exact Docker build stage even though it worked
+// under plain `docker run`, so stdout is the only descriptor confirmed
+// reliable in the environment this diagnostic path actually has to survive.
+// This is diagnostic-only output on a best-effort path already reserved
+// for reporting something having gone wrong; it never runs on any success
+// path a stdout-matching contract depends on.
 Convex writeDiagnostic := method(stream, text,
     attempts := 0
     written := false
@@ -141,6 +157,13 @@ Convex writeDiagnostic := method(stream, text,
         problem := try(stream write(text))
         if(problem isNil, written = true, attempts = attempts + 1)
     )
+    mirrorProblem := try(
+        mirror := File clone setPath("/dev/stdout")
+        mirror openForAppending
+        mirror write("[diagnostic] " .. text)
+        mirror close
+    )
+    if(mirrorProblem isNil, written = true)
     written
 )
 
