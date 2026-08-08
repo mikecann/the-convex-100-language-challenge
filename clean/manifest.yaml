@@ -22,15 +22,18 @@ implementation:
     (client/Convex/Live.icl) is a single call stack owning the connection
     at all times, threaded explicitly as a LiveManager record through every
     function rather than a mutable pointer, so the "one worker, exclusive
-    ownership" rule holds structurally. VERIFIED end-to-end against the
-    real local self-hosted backend, including the full HTTP query/mutation
-    round trip and the complete five-reconnect debugDisconnect sequence
-    with correct rehydration suppression and connection counting — but TLS
-    itself is currently broken (see limitations): a real handshake that
-    actually completes reliably crashes the Clean runtime, blocking every
-    https:// deployment and therefore verify-hosted. No capability badge is
-    claimed until that is resolved and the full verify-all ladder runs
-    clean.
+    ownership" rule holds structurally. VERIFIED end-to-end against both
+    the local self-hosted backend and the dedicated hosted deployment: the
+    full HTTP query/mutation round trip, the complete five-reconnect
+    debugDisconnect sequence with correct rehydration suppression and
+    connection counting, and real TLS 1.3 with full certificate and
+    hostname verification. TLS previously crashed the Clean runtime on
+    every hosted run; root-caused and fixed (see client/Convex/TLS.icl's
+    own comments on `SSL_CTX_free`) as a `clm` 3.1 code-generation defect
+    that corrupts Clean's own heap when any void-returning OpenSSL ccall is
+    followed by another ccall later in a connection's lifetime, worked
+    around by declaring every such binding as returning a discarded `Int`
+    instead of `void`.
 toolchain:
   name: Clean
   version: "3.1"
@@ -49,25 +52,6 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - >-
-    TLS is broken: a real handshake that actually completes (SSL_connect
-    returning success, regardless of what certificate verification then
-    decides) reliably crashes the Clean runtime with "Run Time Warning:
-    cycle in spine detected" and exit 255. Reproduced directly against
-    Convex.TLS.tlsConnect alone, with no HTTP/Live/adapter code involved,
-    against both a same-container and a separate-container self-signed TLS
-    peer. Roughly twenty isolation attempts (certificate verification
-    outcome, every cleanup ordering, CA bundle loading, SNI, the retry
-    loop's deadline source, disabling the TLS socket's own close-on-free,
-    heap/stack size, whether Convex.Wire is even linked) neither reproduced
-    nor fixed it in a hand-rolled single-file reimplementation of the
-    identical OpenSSL call sequence, which never crashes under any of the
-    same variations — the one remaining difference is calling through
-    Convex.TLS's own separately-compiled module boundary, which would make
-    this a Clean 3.1 toolchain issue rather than a bug in this file's own
-    logic, but that is not confirmed. This blocks every https://
-    deployment; the plain-HTTP local backend path is unaffected and fully
-    verified.
   - >-
     Convex.WebSocket's UTF-8 validator is a pragmatic well-formedness check
     (every leading byte's declared sequence length is followed by exactly
@@ -91,4 +75,6 @@ limitations:
     resulting latency bound (up to ~100ms to notice either a new command or
     a new Live frame) is the same order as this project's other native
     clients' own poll timeout.
-capabilities: []
+capabilities:
+  - http
+  - live

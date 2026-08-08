@@ -96,34 +96,6 @@ RUN printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"clos
     | CONVEX_URL=http://127.0.0.1:9 /out/convex-adapter >/tmp/convex-adapter-hello.ndjson \
     && grep -Fq '"language":"clean"' /tmp/convex-adapter-hello.ndjson \
     && grep -Fq '"type":"closed"' /tmp/convex-adapter-hello.ndjson
-# KNOWN BROKEN, not wired into this build: a real TLS handshake that
-# actually completes (SSL_connect returning success, whether verification
-# then accepts or rejects the certificate) reliably crashes the Clean
-# runtime with "Run Time Warning: cycle in spine detected" and exit 255 —
-# reproduced directly against Convex.TLS.tlsConnect alone (no HTTP/
-# Live/adapter code involved), against both a same-container and a
-# separate-container self-signed TLS peer, and independent of every
-# variable this session could isolate: certificate verification outcome
-# (pass, fail, or skipped entirely), which cleanup calls run afterward (or
-# none — the crash reproduces even leaking the SSL/CTX/fd rather than
-# freeing anything), the retry loop's deadline source, disabling the
-# socket BIO's own close-on-free (see tlsConnect's own comment), CA bundle
-# loading, SNI, heap/stack size, and whether Convex.Wire is linked at all.
-# A hand-rolled reimplementation of the exact same call sequence
-# (TLS_client_method/SSL_CTX_new/SSL_CTX_set_verify/loadCaBundle/SSL_new/
-# SSL_set_fd/the SSL_connect retry loop/SSL_get_verify_result), inlined in
-# one file with no separate .dcl, does NOT crash under any of the same
-# variations — the one remaining difference this session could not rule
-# out is calling through Convex.TLS's own separately-compiled module
-# boundary itself, which would make this a Clean 3.1 toolchain issue
-# rather than a bug in this file's own logic. This blocks TLS entirely:
-# every hosted (https://) deployment, so `./run verify-hosted clean` is
-# not expected to pass until this is root-caused. The plain-HTTP local
-# backend `./run verify clean` targets is unaffected — TPlain never
-# touches Convex.TLS at all, and every other layer (HTTP, WebSocket, Live,
-# the five-reconnect sequence, the adapter, the example) is verified
-# end-to-end against it.
-
 FROM test AS runtime-rootfs
 RUN set -eu; \
     root=/runtime; \

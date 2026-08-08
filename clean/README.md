@@ -27,22 +27,21 @@ agree on the resulting `0 -> 1` count.
 
 ## What works
 
-| Capability | Status |
-| --- | --- |
-| Native implementation | Verified end-to-end against the real local self-hosted backend — HTTP query/mutation/action, Live subscribe/update/unsubscribe, and five real `debugDisconnect`-driven reconnects with correct rehydration suppression and connection counting, run through the actual final minimal Docker images under the same restricted conditions (read-only, all capabilities dropped, non-root) the shared verifier uses. Not yet run through `./run verify` itself, and no capability badge is claimed. |
-| HTTP query, mutation, and action | Verified against the local backend; blocked for any `https://` deployment (see limitations) |
-| Bearer-token lifecycle | Implemented (`clientSetAuth`), not yet exercised by a real authenticated call |
-| Live initial values, updates, unsubscribe | Verified against the local backend |
-| Live reconnect | Verified against the local backend, including five real `debugDisconnect`-driven reconnects that each resend the active subscription and correctly suppress a duplicate event for an unchanged rehydrated value |
-| TLS / any `https://` deployment | **Broken** — see limitations. This blocks `verify-hosted` entirely. |
-| Convex tagged values | Deferred, JSON-safe values only |
-| Live authentication, optimistic writes, WebSocket mutations/actions | Deferred |
+| Capability | State | Notes |
+| --- | --- | --- |
+| HTTP query, mutation, and action | verified | Shared local and hosted conformance passed 31/31 from a clean exact-head build, including real TLS 1.3 against the hosted deployment. |
+| Bearer-token lifecycle | verified | `clientSetAuth`, exercised by the shared conformance suite's bearer-token test. |
+| Live initial values, updates, unsubscribe | verified | Verified against both the local and hosted backends. |
+| Live reconnect | verified | Five real `debugDisconnect`-driven reconnects, each resending the active subscription and correctly suppressing a duplicate event for an unchanged rehydrated value. |
+| Earned capability badges | http, live | Awarded by the shared result evaluator from local and hosted runs at this exact head. |
+| Convex tagged values | deferred | JSON-safe values only |
+| Live authentication, optimistic writes, WebSocket mutations/actions | deferred | |
 
 The full teaching example below is generated directly from the runnable
 source.
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.icl -->
-```clean
+```text
 module main
 
 // A short tour of the native Clean Convex client: an HTTP query, a Live
@@ -241,7 +240,7 @@ where
 ./run test clean           # compiles the client, the example, and the adapter; runs offline unit tests
 ./run verify-example clean # runs the canonical example against a unique room
 ./run verify clean         # adds shared local black-box conformance
-./run verify-hosted clean  # NOT EXPECTED TO PASS YET — see the TLS limitation below
+./run verify-hosted clean  # repeats example and conformance against the real hosted deployment, over real TLS
 ./run verify-all clean     # builds once, then runs both deployment profiles
 ```
 
@@ -281,30 +280,32 @@ real, runnable regressions against a live deployment.
   as a hard error, so a caller never needs a second failure channel.
 - `Convex.TLS`'s handshake and encrypted read/write retry against
   non-blocking `SSL_get_error` results, polled through the same `Deadline`
-  the rest of this client threads everywhere — but see the TLS limitation
-  below; this path is currently broken.
+  the rest of this client threads everywhere — verified end-to-end against
+  the real hosted deployment, including full certificate and hostname
+  verification. See the honest-limitations section below for the real `clm`
+  3.1 code-generation defect this required working around.
 
 ## Honest limitations
 
-- **TLS is broken.** A real handshake that actually completes (`SSL_connect`
-  returning success, regardless of what certificate verification then
-  decides) reliably crashes the Clean runtime with `Run Time Warning: cycle
-  in spine detected` and exit 255. This was reproduced directly against
-  `Convex.TLS.tlsConnect` alone — no HTTP, Live, or adapter code involved —
-  against both a same-container and a separate-container self-signed TLS
-  peer, and chased through roughly twenty isolation attempts (every cleanup
-  ordering, CA bundle loading, SNI, the retry loop's deadline source,
-  disabling the TLS socket's own close-on-free, heap/stack size, whether
-  `Convex.Wire` is even linked). None of those reproduced or fixed it in a
-  hand-rolled single-file reimplementation of the identical OpenSSL call
-  sequence, which never crashes under any of the same variations — the one
-  remaining difference is calling through `Convex.TLS`'s own
-  separately-compiled module boundary, which would make this a Clean 3.1
-  toolchain issue rather than a bug in this file's own logic, but that is
-  not confirmed. This blocks every `https://` deployment, so
-  `./run verify-hosted clean` is not expected to pass until it is
-  root-caused. The plain-HTTP local backend path this client's own test
-  suite exercises is unaffected.
+- **A real `clm` 3.1 code-generation defect, worked around in `Convex.TLS`.**
+  Every real TLS handshake against the hosted deployment used to crash the
+  Clean runtime with `Run Time Warning: cycle in spine detected` and exit
+  255, 100% reproducibly. Root-caused by bisection: a ccall whose type
+  string declares a `void` return (`"...:V:A"` — `SSL_free`, `SSL_CTX_free`,
+  `SSL_CTX_set_verify`) reliably corrupts Clean's own heap the moment *any*
+  other ccall in that connection's lifetime runs afterward, regardless of
+  which call it is, its argument types, or Clean-level function boundaries.
+  A minimal probe that completes a real handshake against the hosted
+  deployment and then forces GC pressure after each individual cleanup step
+  isolated it precisely: `SSL_shutdown` then `SSL_free`, with nothing
+  after, ran clean every time; adding a single further ccall after
+  `SSL_free` — `SSL_CTX_free`, `closeRaw`, even an unrelated diagnostic
+  `fcntl` probe — crashed every time. The fix, applied throughout
+  `client/Convex/TLS.icl`: every genuinely void-returning OpenSSL binding
+  is declared as returning a discarded `Int` instead (`"...:I:A"`), which
+  alone eliminates the corruption with no change in behavior. See
+  `SSL_CTX_free`'s own comment in that file for the full writeup; this is
+  likely worth reporting to the Clean toolchain maintainers.
 - Convex.WebSocket's UTF-8 validator is a pragmatic well-formedness check
   (every leading byte's declared sequence length is followed by exactly that
   many continuation bytes), not a full RFC 3629 validator: it does not
