@@ -333,7 +333,16 @@ ConvexAdapter := Object clone do(
 
     errorObject := method(name, message, data,
         fields := list("name", Convex string(name), "message", Convex string(message))
-        if(self presentData(data), fields append("data"); fields append(data))
+        // A method-call condition combined with a semicolon-chained
+        // true branch corrupts this pinned Io VM's argument list -
+        // confirmed with a two-line isolated repro outside any loop or
+        // sustained allocation, so this is not the previously found
+        // GC-pressure shape, just a narrower case of the same general
+        // method-call-condition defect documented on ConvexStream's
+        // hasBufferedInput/wantsRead in convex.io. Precomputing the
+        // condition into a local before if() avoids the shape.
+        dataPresent := self presentData(data)
+        if(dataPresent, fields append("data"); fields append(data))
         Convex object(fields)
     )
 
@@ -368,7 +377,16 @@ ConvexAdapter := Object clone do(
             "type", Convex string("result"),
             "value", value
         )
-        if(self logsPresent(logs), fields append("logs"); fields append(logs))
+        // A method-call condition combined with a semicolon-chained
+        // true branch corrupts this pinned Io VM's argument list -
+        // confirmed with a two-line isolated repro outside any loop or
+        // sustained allocation, so this is not the previously found
+        // GC-pressure shape, just a narrower case of the same general
+        // method-call-condition defect documented on ConvexStream's
+        // hasBufferedInput/wantsRead in convex.io. Precomputing the
+        // condition into a local before if() avoids the shape.
+        logsAreVisible := self logsPresent(logs)
+        if(logsAreVisible, fields append("logs"); fields append(logs))
         self emitControl(Convex object(fields))
     )
 
@@ -395,7 +413,16 @@ ConvexAdapter := Object clone do(
         fields append(Convex string("error"))
         fields append("error")
         fields append(self errorObject(name, message, data))
-        if(self logsPresent(logs), fields append("logs"); fields append(logs))
+        // A method-call condition combined with a semicolon-chained
+        // true branch corrupts this pinned Io VM's argument list -
+        // confirmed with a two-line isolated repro outside any loop or
+        // sustained allocation, so this is not the previously found
+        // GC-pressure shape, just a narrower case of the same general
+        // method-call-condition defect documented on ConvexStream's
+        // hasBufferedInput/wantsRead in convex.io. Precomputing the
+        // condition into a local before if() avoids the shape.
+        logsAreVisible := self logsPresent(logs)
+        if(logsAreVisible, fields append("logs"); fields append(logs))
         self emitControl(Convex object(fields))
     )
 
@@ -449,7 +476,16 @@ ConvexAdapter := Object clone do(
                 Convex optionalField(payload, "data")
             ))
         )
-        if(self logsPresent(logs), fields append("logs"); fields append(logs))
+        // A method-call condition combined with a semicolon-chained
+        // true branch corrupts this pinned Io VM's argument list -
+        // confirmed with a two-line isolated repro outside any loop or
+        // sustained allocation, so this is not the previously found
+        // GC-pressure shape, just a narrower case of the same general
+        // method-call-condition defect documented on ConvexStream's
+        // hasBufferedInput/wantsRead in convex.io. Precomputing the
+        // condition into a local before if() avoids the shape.
+        logsAreVisible := self logsPresent(logs)
+        if(logsAreVisible, fields append("logs"); fields append(logs))
         // This runs inside a subscription callback, so a write failure here
         // must be recorded rather than raised: the client deliberately refuses
         // to let a consumer's failure retire its Live connection.

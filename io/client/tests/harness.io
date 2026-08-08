@@ -410,9 +410,25 @@ ConvexTest drive := method(peer, client, condition, rounds,
     condition isNil
 )
 
-// Drive until COUNT client-to-server WebSocket messages have been collected,
-// returning whatever arrived. Bounded so a stuck client fails rather than
-// hangs.
+// Drive until COUNT client-to-server WebSocket protocol messages have been
+// collected, returning whatever arrived. Bounded so a stuck client fails
+// rather than hangs.
+//
+// Filtered to opcode 1 (text data) only. ConvexSocket close() deliberately
+// and correctly sends a real WebSocket Close(1000) frame ahead of tearing
+// down a retiring connection (see its own comment: "Announce the close
+// before dropping the socket"), so debugDisconnect - used by every
+// reconnect scenario below - leaves that Close frame sitting in the peer's
+// receive buffer right where a caller expects the new connection's first
+// protocol envelopes. An unfiltered drain intermittently handed that
+// 2-byte, non-JSON close-status payload to a caller expecting a Convex
+// envelope: found via a raw byte dump on the "expected a JSON object"
+// crash in live/reconnect-five-times, which decoded to [3, 232] = 1000,
+// the exact "Normal Closure" status ConvexSocket close() sends. Every
+// caller here wants actual protocol traffic; a test that wants a specific
+// control frame already asks for it explicitly via
+// `drainClientMessages select(frame, frame opcode == ...)`, as the ping
+// and close-frame scenarios elsewhere in this file do.
 ConvexTest collect := method(peer, client, count, rounds,
     found := list()
     index := 0
@@ -420,7 +436,7 @@ ConvexTest collect := method(peer, client, count, rounds,
         peer service
         client pumpOnce(2)
         peer service
-        found appendSeq(peer drainClientMessages)
+        found appendSeq(peer drainClientMessages select(frame, frame opcode == 1))
         index = index + 1
     )
     found
