@@ -31,24 +31,40 @@ typedef struct {
   int fd;
 } tls_handle;
 
+/* Every failure path below funnels through here so the caller's fd is
+   never leaked: a caller that gets NULL back owns nothing and must not
+   (cannot) call TlsShim__close, so this is the only place that can
+   ever release "fd" on a failed handshake. An earlier version of this
+   function returned NULL from several places without this cleanup --
+   each failed handshake (e.g. a reconnect racing a momentarily
+   unreachable peer) leaked one fd, and enough of them in a row
+   starved SSL_CTX_set_default_verify_paths itself of the fds it needs
+   to open the CA directory, turning one transient failure into a
+   permanent one. */
+static void *fail_closing(SSL *ssl, SSL_CTX *ctx, tls_handle *h, int fd) {
+  if (ssl) SSL_free(ssl);
+  if (ctx) SSL_CTX_free(ctx);
+  if (fd >= 0) close(fd);
+  if (h) free(h);
+  return NULL;
+}
+
 void *TlsShim__connect(int fd, const char *host) {
   tls_handle *h = calloc(1, sizeof(tls_handle));
-  if (!h) return NULL;
+  if (!h) { close(fd); return NULL; }
 
   h->fd = fd;
   h->ctx = SSL_CTX_new(TLS_client_method());
-  if (!h->ctx) { free(h); return NULL; }
+  if (!h->ctx) return fail_closing(NULL, NULL, h, fd);
 
   SSL_CTX_set_min_proto_version(h->ctx, TLS1_2_VERSION);
   SSL_CTX_set_verify(h->ctx, SSL_VERIFY_PEER, NULL);
   if (!SSL_CTX_set_default_verify_paths(h->ctx)) {
-    SSL_CTX_free(h->ctx);
-    free(h);
-    return NULL;
+    return fail_closing(NULL, h->ctx, h, fd);
   }
 
   h->ssl = SSL_new(h->ctx);
-  if (!h->ssl) { SSL_CTX_free(h->ctx); free(h); return NULL; }
+  if (!h->ssl) return fail_closing(NULL, h->ctx, h, fd);
 
   SSL_set_fd(h->ssl, fd);
   /* SNI: tell the server which hostname we want a certificate for. */
@@ -78,10 +94,7 @@ void *TlsShim__connect(int fd, const char *host) {
       fprintf(stderr, "tls: handshake failed (SSL error %d)\n", err);
       ERR_print_errors_fp(stderr);
     }
-    SSL_free(h->ssl);
-    SSL_CTX_free(h->ctx);
-    free(h);
-    return NULL;
+    return fail_closing(h->ssl, h->ctx, h, fd);
   }
 
   long vr = SSL_get_verify_result(h->ssl);
@@ -89,10 +102,7 @@ void *TlsShim__connect(int fd, const char *host) {
     fprintf(stderr, "tls: certificate/hostname verification failed: %s\n",
             X509_verify_cert_error_string(vr));
     SSL_shutdown(h->ssl);
-    SSL_free(h->ssl);
-    SSL_CTX_free(h->ctx);
-    free(h);
-    return NULL;
+    return fail_closing(h->ssl, h->ctx, h, fd);
   }
 
   return h;

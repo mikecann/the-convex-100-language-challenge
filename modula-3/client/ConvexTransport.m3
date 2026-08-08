@@ -38,6 +38,11 @@ PROCEDURE Connect(host: TEXT; port: INTEGER; useTls: BOOLEAN): T RAISES {Error} 
         M3toC.FreeCopiedS(hostC);
       END;
       IF t.tls = NIL THEN
+        (* TlsShim.Connect already closed "pub.fd" itself on every
+           failure path (see shim.c's fail_closing): the caller here
+           never gets a T back to call Close() on, so the shim is the
+           only place that can release it. Do not also call
+           conn.close() -- that would just double-close the same fd. *)
         RAISE Error("TLS handshake or certificate/hostname verification failed for " & host);
       END;
     END;
@@ -87,7 +92,13 @@ PROCEDURE Write(t: T; data: TEXT) RAISES {Error} =
 PROCEDURE Close(t: T) =
   BEGIN
     IF t.isTls THEN
+      (* TlsShim.Close tears down the TLS session and closes the
+         underlying fd itself (see shim.c) -- the fd was handed to
+         OpenSSL for the whole lifetime of the connection, so the shim
+         is the one place that knows both when SSL_shutdown has run
+         and when it is safe to actually close(2) it. *)
       IF t.tls # NIL THEN TlsShim.Close(t.tls); t.tls := NIL; END;
+      t.plain := NIL;
     ELSE
       IF t.plain # NIL THEN t.plain.close(); END;
     END;
