@@ -78,6 +78,7 @@ const fenceLanguages = {
   ".purs": "purescript",
   ".py": "python",
   ".r": "r",
+  ".r3": "rebol",
   ".raku": "raku",
   ".rb": "ruby",
   ".res": "rescript",
