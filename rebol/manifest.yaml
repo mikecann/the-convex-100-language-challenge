@@ -1,0 +1,66 @@
+schemaVersion: 1
+id: rebol
+displayName: "REBOL"
+rank: 58
+selectionTier: coverage
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native REBOL client for Convex's HTTP function-call API and Live sync
+    protocol, built on Rebol/Bulk 3.22.1 (the Oldes/Rebol3 fork)'s own
+    tcp:// and tls:// port schemes -- no OpenSSL, no FFI, no delegated
+    runtime. The fork's own TLS scheme completes a genuine TLS 1.2/1.3
+    handshake but performs no certificate chain-of-trust or hostname
+    verification at all (proved directly: it accepts self-signed, expired,
+    and wrong-hostname certificates with no error). client/x509.r3 supplies
+    that missing verification in REBOL itself -- DER tbsCertificate
+    extraction, RSA/ECDSA signature checks up a chain to a small bundled
+    trust-anchor set, RFC 6125-style hostname/SAN matching, and validity-
+    window checks -- hooked into the TLS port's own post-handshake event so
+    an untrusted peer is rejected before any application data is trusted.
+    Proven against four live hosts, not fixtures: the real Convex
+    production chain is accepted, and self-signed.badssl.com,
+    expired.badssl.com, and wrong.host.badssl.com are each rejected for
+    their own distinct, correctly identified reason (untrusted issuer,
+    expired certificate, hostname mismatch). This replaces actionscript in
+    roster slot 58, which had no practical clean Linux-container route.
+toolchain:
+  name: Rebol/Bulk (Oldes/Rebol3 fork)
+  version: 3.22.1
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    Rebol/Bulk 3.22.1's own tls scheme performs no certificate chain-of-
+    trust or hostname verification at all; client/x509.r3 adds both,
+    checked in this order so each rejection reason is precise rather than
+    one generic failure: hostname/SAN, then validity window, then
+    signature chain to a bundled trust anchor. The trust bundle is a small
+    curated set (GTS Root R1, GTS Root R4, ISRG Root X1, GlobalSign Root
+    CA -- the last one specifically because Google Trust Services' GTS
+    roots are sometimes served cross-signed by it for legacy client
+    compatibility, observed live against the real Convex host), sha256-
+    verified against each publisher's own listing at the time it was
+    bundled -- not the full system trust store. Trust is checked at every
+    hop in the presented chain, not only the final certificate, precisely
+    to handle that cross-signing case correctly.
+  - >-
+    Implementation is still in progress: HTTP query/mutation/action,
+    Live/WebSocket, the adapter, and the canonical example are not yet
+    complete. Capabilities remain unearned until shared conformance
+    passes.
+capabilities: []

@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: actionscript
-displayName: "ActionScript"
-rank: 58
-selectionTier: coverage
-implementation:
-  status: planned
-capabilities: []

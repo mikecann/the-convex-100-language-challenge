@@ -62,7 +62,7 @@ languages:
   - { rank: 55, id: ats, displayName: "ATS2", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 56, id: harbour, displayName: "Harbour", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 57, id: ballerina, displayName: "Ballerina", selectionTier: coverage, feasibility: { docker: G, https: G, json: G, websocket: G } }
-  - { rank: 58, id: actionscript, displayName: "ActionScript", selectionTier: coverage, feasibility: { docker: R, https: G, json: G, websocket: G } }
+  - { rank: 58, id: rebol, displayName: "REBOL", selectionTier: coverage, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 59, id: awk, displayName: "Awk", selectionTier: coverage, feasibility: { docker: G, https: A, json: A, websocket: A } }
   - { rank: 60, id: bcpl, displayName: "BCPL", selectionTier: coverage, feasibility: { docker: A, https: A, json: A, websocket: A } }
   - { rank: 61, id: blitzmax, displayName: "BlitzMax", selectionTier: coverage, feasibility: { docker: A, https: G, json: G, websocket: A } }
