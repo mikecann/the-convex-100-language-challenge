@@ -4,7 +4,7 @@ displayName: "SETL"
 rank: 45
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -79,4 +79,6 @@ limitations:
     open() for tcp-client exposes none); a connect that hangs at the TCP
     level rather than failing or refusing is not separately bounded beyond
     the overall operation deadline that wraps it.
-capabilities: []
+capabilities:
+  - http
+  - live

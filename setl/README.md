@@ -9,17 +9,17 @@ This is an educational demonstration for the 100 Convex Clients project, not
 an official Convex SDK and not a package meant for publication.
 
 - Selection tier: `ranked`
-- Implementation status: `attempting`
-- Earned capabilities: none yet -- see "Where this stands" below.
+- Implementation status: `working`
+- Earned capabilities: `http`, `live` -- see `_shared/results/` for the
+  evidence and "Docker verification" below for the exact commands.
 
 ## Start here
 
 `examples/basics/main.setl` is the canonical example: it reads a room's
 counter over Convex's documented HTTP API, opens a Live subscription over
 `/api/sync`, increments the counter once, and proves the Live subscription
-reported the same change without polling again. Run manually against the
-local self-hosted backend, it produces exactly the shared project's
-universal happy-path transcript:
+reported the same change without polling again. It produces exactly the
+shared project's universal happy-path transcript, byte for byte:
 
 ```
 current count: 0
@@ -30,27 +30,21 @@ live updated count: 1
 verified count: 0 -> 1
 ```
 
-That run has been proven by hand, byte for byte against
-`_shared/examples/basics.expected.txt`. `example-runtime` and `runtime`
-Docker stages now exist too (see "Docker verification"); this README does
-not claim a badge until the shared conformance evidence in
-`_shared/results/` says so.
-
-## What works so far
+## What works
 
 | Piece | Status |
 | --- | --- |
 | GNU SETL interpreter + TLS boundary build | Proven in Docker |
-| `client/json.setl` (JSON codec) | Tested, 26 checks |
+| `client/json.setl` (JSON codec) | Tested, including nested/trailing JSON `null` round-tripping |
 | `client/tcp.setl` / `client/tls.setl` / `client/stream.setl` (transports) | Tested against real hosts, including a long-lived (non-closing) connection |
 | `client/http.setl` (HTTP/1.1 framing) | Tested against real hosts, both transports |
-| `client/convex.setl` (query/mutation/action + envelope classification) | Unit-tested against synthetic responses |
+| `client/convex.setl` (query/mutation/action + envelope classification) | Unit-tested; full HTTP conformance verified |
 | `client/websocket.setl` (RFC 6455 framing, masking, fragmentation, UTF-8) | Tested against a real echo service, real and synthetic frames |
 | `client/sync.setl` (`/api/sync` Connect/ModifyQuerySet/Transition) | Single-connection primitive; unit-tested against synthetic Transition messages |
-| `client/live.setl` (reconnect, backoff, rehydration suppression) | Unit-tested synthetically; a real end-to-end reconnect is proven by `./run verify` |
-| `examples/basics/main.setl` | Runs correctly by hand against the real local backend; Docker-buildable via `example-runtime` |
-| NDJSON conformance adapter (`client/tests/conformance/main.setl`) | Builds and answers `hello`/`close` in Docker; full conformance pending `./run verify` |
-| `example-runtime` / `runtime` Docker stages | Built, pruned, and policy-checked; pending the verification ladder below |
+| `client/live.setl` (reconnect, backoff, rehydration suppression) | Unit-tested synthetically; full Live conformance verified end to end |
+| `examples/basics/main.setl` | Verified against both deployment profiles via `./run verify-example`/`verify-all` |
+| NDJSON conformance adapter (`client/tests/conformance/main.setl`) | Full shared conformance verified, both deployment profiles |
+| `example-runtime` / `runtime` Docker stages | Built, pruned, policy-checked, and verified |
 
 ## The canonical example
 
@@ -273,40 +267,31 @@ non-root, read-only, all-capabilities-dropped image for each, staging only
 GNU SETL's own runtime closure (the `setl` interpreter plus its required
 `setltran`/`setlcpp` siblings, found and copied via `ldd`, never placed on
 `PATH`) and this client's `.setl` source -- and run the example and the
-shared conformance controller against it. Only the shared result evaluator
-computes the `http`/`live` capability badges from that evidence; this
-README does not round up ahead of it.
+shared conformance controller against it. `./run verify-all setl` is the
+evidence in `_shared/results/local/setl-pilot-result.json` and
+`_shared/results/hosted/setl-pilot-result.json`: every required HTTP and
+Live test passing on both deployment profiles from the same built image,
+`dirty: false`, at the exact commit this README was updated alongside.
+Only the shared result evaluator computes the `http`/`live` capability
+badges from that evidence; this README does not round up ahead of it.
 
-## Where this stands
+## Known limitations
 
-1. Interpreter build, TLS boundary, JSON, HTTP, and the Convex HTTP
-   envelope -- done and Docker-tested.
-2. RFC 6455 WebSocket framing -- done and Docker-tested (masking,
-   fragmentation reassembly, interleaved control frames, UTF-8
-   validation).
-3. A single-connection `/api/sync` primitive (`client/sync.setl`) and a
-   reconnecting Live layer on top of it (`client/live.setl`): automatic
-   reconnection with exponential backoff (reset after a good handshake),
-   resubscribing the whole active query set on every reconnect,
-   unchanged-rehydration suppression, and `connectionCount`/
-   `lastCloseReason`/`maxObservedTimestamp` tracked across reconnects --
-   done and Docker-tested against everything a live deployment is not
-   needed to prove (see "`/api/sync` Live" below); a full end-to-end
-   reconnect against a real backend is what `./run verify`'s shared
-   conformance run proves next.
-4. The canonical example -- written and manually verified end to end
-   against the real local backend (see "Start here"), and now Docker-buildable
-   via `example-runtime`.
-5. The NDJSON conformance adapter (`client/tests/conformance/main.setl`):
-   `hello`, `query`/`mutation`/`action`, `subscribe`/`unsubscribe`,
-   `setAuth`, `debugDisconnect`, and `close`, both over stdin/stdout and
-   over `ADAPTER_LISTEN`'s TCP mode, with a bounded droppable output queue
-   for subscription events. Builds and passes a `hello`/`close` smoke
-   check in Docker; full shared conformance is what `./run verify` proves
-   next.
-6. Still to run: the verification ladder above, on a clean commit, on
-   both deployment profiles. No capability badge is claimed before that
-   evidence exists.
+- `setltran` (GNU SETL's compiler) and `setlcpp` (its preprocessor) are
+  required boot dependencies staged alongside the interpreter in the
+  runtime images -- `setl` always shells out to setlcpp once a source
+  file contains `#`, and to setltran to translate every program before
+  running it. Neither is placed on `PATH`.
+- The client keeps only the latest delivered value per subscription (no
+  unbounded queue); the conformance adapter's own bounded output queue
+  (8 slots, 4 MiB) is what bounds memory toward a slow or stopped
+  consumer.
+- Live authentication, WebSocket-issued mutations and actions, and
+  `TransitionChunk` assembly are deferred; an unrecognized Transition
+  modification is reported as a `ProtocolError` and the connection
+  reconnects.
+- `tcp_connect` has no per-call connect timeout of its own (GNU SETL's
+  `open()` for `tcp-client` exposes none).
 
 ## The `callout()` boundary
 
@@ -483,15 +468,35 @@ messages.
   among others hit while writing this client. There is no single
   documented list to check against; `src/lexicon` in the GNU SETL source
   tree is the ground truth.
-- GNU SETL map assignment `m(k) := om` does not store an entry (`om` is
-  also what a missing-key lookup returns), so this client's JSON decoder
-  cannot tell an object's `{"k":null}` apart from `{}` -- see the module
-  comments in `client/json.setl` and `client/convex.setl`. The conformance
-  adapter turns this into a feature for omitting optional protocol fields
-  (never assign the key, and it is simply absent from the encoded JSON),
-  but had to route around it for `value` and a structured error's `data`,
-  which are both sometimes legitimately JSON `null` rather than absent --
-  see `client/tests/conformance/main.setl`'s own module comment.
+- GNU SETL map assignment `m(k) := om` does not store an entry at all
+  (`om` is also what a missing-key lookup returns), and a tuple's length
+  is defined as the index of its *last non-om* element -- so a naive JSON
+  decoder that maps a literal `null` straight to `om` silently drops an
+  object key entirely (`{"k":null}` decodes the same as `{}`) and can
+  silently shorten an array with a trailing null. This was not just a
+  theoretical gap: shared conformance failed two required HTTP tests on
+  the first real run, because Convex's own documented `demo:state`
+  response sends explicit nulls for unset optional fields
+  (`lastLanguage`, `latestRunId`, `updatedAt`), and this client was
+  quietly dropping them instead of echoing them back. The fix decodes a
+  *nested* null to a fresh `newat()` atom instead of `om` (a map or tuple
+  assignment does store an atom), and `json_encode` treats any atom as
+  `null` on the way back out; `json_null_to_om` (used by
+  `client/convex.setl` and `client/sync.setl` wherever a value's own "top
+  level" is extracted) converts it back to `om` at that one boundary, so
+  a call result or a Live value still compares equal to `om` -- and to
+  another connection's null value -- the way it always has, which
+  `client/live.setl`'s rehydration suppression depends on. See
+  `client/json.setl`'s module comment for the full reasoning.
+- The conformance adapter turns the same om-omission behavior into a
+  feature for its own outgoing protocol messages: an optional field is
+  omitted by simply never assigning that map key, matching the shared
+  schema's "omit rather than serialize null" rule for free -- except for
+  a result's `value` and a structured error's `data`, which are
+  sometimes legitimately JSON `null` rather than absent, and are composed
+  directly with `json_encode(value)` instead of through a map for exactly
+  that reason (see `client/tests/conformance/main.setl`'s own module
+  comment).
 - `for x in t loop ... end loop;` supports `continue;` (next iteration) and
   `quit;` (leave the loop) inside its body, the same way a `while`/`loop`
   does -- undocumented in either texinfo manual shipped with this release,
