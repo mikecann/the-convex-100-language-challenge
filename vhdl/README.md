@@ -22,8 +22,12 @@ exact runnable file.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Not yet verified | Implemented -- `client/convex.vhdl`'s `client_call` builds the request envelope, sends it over `convex_http.vhdl`, and decodes both the success and structured function-error response shapes -- and exercised by `./run test vhdl`'s language-local suites, but shared black-box conformance has not run yet, so no badge is earned. |
-| Live | Not yet verified | Implemented -- `client/convex_sync.vhdl`'s subscription manager drives Convex's `/api/sync` protocol, including reconnect and `debugDisconnect` -- and exercised by `./run test vhdl`'s language-local suites, but shared black-box conformance has not run yet, so no badge is earned. |
+| HTTP | Badge earned | `client/convex.vhdl`'s `client_call` implements query, mutation, action, bearer-token auth, logs, and structured function errors, and passes shared local and hosted black-box conformance. |
+| Live | Badge earned | `client/convex_sync.vhdl`'s subscription manager implements subscribe/unsubscribe, five-reconnect-capable backoff, and reactive error recovery (including a QueryFailed's structured `errorData`), and passes shared local and hosted black-box conformance, including a `debugDisconnect`-triggered reconnect cycle. |
+
+The shared evaluator awarded both badges from a clean exact-head build: 31 of
+31 checks against a local backend and 31 of 31 against the hosted deployment
+over real TLS.
 
 ## The basic example
 
@@ -443,6 +447,3 @@ including a real TLS handshake.
   process owns the foreign boundary end to end, so Live progress and any
   concurrent HTTP call are interleaved by that process's own request queue
   rather than by OS-level concurrency.
-- Only the Docker `test` stage has run so far. Shared and hosted black-box
-  conformance have not yet been attempted, so no capability is claimed and
-  no badge is earned.

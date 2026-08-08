@@ -80,4 +80,6 @@ limitations:
     GHDL simulation runtime shared library; the design elaborates once at
     process start and then runs as ordinary compiled code, not as a
     long-lived simulator kernel.
-capabilities: []
+capabilities:
+  - http
+  - live
