@@ -4,8 +4,9 @@ displayName: "Modula-3"
 rank: 52
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
+  version: 0.1.0
   notes: >-
     Native CM3 (Critical Mass Modula-3) implementation. Plain TCP comes
     from Modula-3's own long-stable standard-library socket interfaces
@@ -14,10 +15,14 @@ implementation:
     same file descriptor the standard TCP connection already opened,
     verifying both the certificate chain and the hostname -- no
     FFI-generation tooling, no vendored code-dump step, just a stable
-    procedure boundary. Replaces oz (rank 52), ruled infeasible on a
-    reproducible memory-safety bug in Mozart 2's own unmaintained
-    2016-era AST-dump code generator while extending the VM for TLS; see
-    INFEASIBLE.md.
+    procedure boundary. A JSON codec, HTTP/1.1 client (query/mutation/
+    action), and an RFC 6455 WebSocket layer support the pinned
+    /api/sync Live protocol (client/ConvexLive.{i3,m3}): reconnect with
+    exponential backoff reset on a good handshake, unchanged-rehydration
+    suppression, and query-error recovery. Replaces oz (rank 52), ruled
+    infeasible on a reproducible memory-safety bug in Mozart 2's own
+    unmaintained 2016-era AST-dump code generator while extending the VM
+    for TLS; see INFEASIBLE.md.
 toolchain:
   name: CM3
   version: d5.12.0
@@ -30,4 +35,29 @@ intendedCapabilities:
   - live
 platforms:
   - linux/amd64
-capabilities: []
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    Live authentication (the Authenticate sync-protocol message) is not
+    implemented; setAuth affects only HTTP query/mutation/action calls.
+  - >-
+    TransitionChunk (an unrecognized, chunked Transition modification)
+    is reported as a ProtocolError and the connection reconnects, rather
+    than being reassembled.
+  - >-
+    ConvexLive's in-process pending-event queue is bounded by count (256
+    events) rather than by a separate byte budget; the conformance
+    adapter's own queue (8 slots, 4 MiB) is what actually bounds memory
+    toward a slow or stopped consumer, per the shared 128 MiB limit.
+  - >-
+    ConvexTransport.Connect has no connect-level timeout of its own
+    (Modula-3's TCP.Connect exposes none); a connect that hangs at the
+    TCP level rather than failing or refusing is not separately bounded
+    beyond each caller's own overall operation deadline.
+capabilities:
+  - http
+  - live
