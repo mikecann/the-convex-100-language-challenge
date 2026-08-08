@@ -18,6 +18,8 @@ module sha1_test;
 
   convex_sha1   #(.MAXLEN(128)) sha1 ();
   convex_base64 #(.MAXLEN(32))  b64 ();
+  convex_base64 #(.MAXLEN(8))   rt_enc ();
+  convex_base64 #(.MAXLEN(8))   rt_dec ();
 
   integer failed;
   integer i;
@@ -58,6 +60,68 @@ module sha1_test;
     end
   endtask
 
+  // Round-trips three byte strings through encode then decode (lengths
+  // 1, 2 and 5, so every one of the three padding cases - one '=', two
+  // '=', none - is exercised), including bytes with the high bit set
+  // (0x80+) to prove decode's `reg [5:0]` locals sidestep the same
+  // signed-`byte` hazard encode's own header comment describes - a
+  // sign-extension bug here would only show up on a byte >= 0x80, not
+  // on ASCII test data. convex_sync.v decodes `maxObservedTimestamp`
+  // this same way; a decode bug would silently miscompare timestamps
+  // rather than crash, so this needs a real known-answer check, not
+  // just a successful compile.
+  task automatic check_base64_roundtrip;
+    byte src1 [0:0];
+    byte src2 [0:1];
+    byte src5 [0:4];
+    integer n;
+    bit ok;
+    begin
+      src1[0] = 8'hFF;
+      src2[0] = 8'h00; src2[1] = 8'h80;
+      src5[0] = "h"; src5[1] = "i"; src5[2] = 8'hFE; src5[3] = 8'h01; src5[4] = 8'h7F;
+
+      ok = 1'b1;
+
+      rt_enc.reset;
+      rt_enc.put_byte(src1[0]);
+      rt_enc.encode;
+      rt_dec.reset;
+      for (i = 0; i < rt_enc.length(); i = i + 1) rt_dec.put_byte(rt_enc.get_byte(i));
+      rt_dec.decode;
+      if (rt_dec.length() != 1 || rt_dec.get_byte(0) != src1[0]) ok = 1'b0;
+
+      rt_enc.reset;
+      rt_enc.put_byte(src2[0]);
+      rt_enc.put_byte(src2[1]);
+      rt_enc.encode;
+      rt_dec.reset;
+      for (i = 0; i < rt_enc.length(); i = i + 1) rt_dec.put_byte(rt_enc.get_byte(i));
+      rt_dec.decode;
+      if (rt_dec.length() != 2 || rt_dec.get_byte(0) != src2[0] || rt_dec.get_byte(1) != src2[1]) ok = 1'b0;
+
+      rt_enc.reset;
+      for (n = 0; n < 5; n = n + 1) rt_enc.put_byte(src5[n]);
+      rt_enc.encode;
+      rt_dec.reset;
+      for (i = 0; i < rt_enc.length(); i = i + 1) rt_dec.put_byte(rt_enc.get_byte(i));
+      rt_dec.decode;
+      if (rt_dec.length() != 5) ok = 1'b0;
+      else begin
+        for (n = 0; n < 5; n = n + 1) begin
+          if (rt_dec.get_byte(n) != src5[n]) ok = 1'b0;
+        end
+      end
+
+      if (!ok) begin
+        $display("FAIL sha1_test: base64 encode/decode round trip did not reproduce the original bytes");
+        failed = 1;
+      end else begin
+        $display("sha1_test: base64 encode/decode round trip OK (1, 2 and 5 bytes, including 0x80+)");
+      end
+    end
+  endtask
+
   task automatic check_rfc6455_accept;
     bit match;
     begin
@@ -92,6 +156,7 @@ module sha1_test;
     rfc_expected_accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
 
     check_sha1_abc;
+    check_base64_roundtrip;
     check_rfc6455_accept;
 
     if (failed == 0) begin

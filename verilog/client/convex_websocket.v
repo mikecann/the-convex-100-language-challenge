@@ -70,11 +70,26 @@ module convex_websocket #(
   integer opcode_reg;
   bit masked_reg;
 
+  // The native.c CMD_READ_BYTE result (see native.c's handle_read_byte:
+  // -1 timeout, -2 clean close, -3 transport error) from the very first
+  // byte read_frame attempted this call, captured before any header is
+  // interpreted. convex_sync.v's poll loop reads this after a failed
+  // read_frame/receive_message to tell "nothing arrived yet, the
+  // connection is still fine" (-1, with zero bytes of this frame
+  // consumed) apart from every other failure, which it treats as a
+  // dead connection needing a reconnect - the same "timeout is
+  // recoverable, everything else abandons the connection" rule
+  // AGENTS.md's Live-acceptance section describes, applied at the one
+  // point in a frame where recovering costs nothing because no partial
+  // frame bytes have been consumed from the transport yet.
+  integer last_read_error;
+
   initial begin
     ws_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     msg_opcode = -1;
     msg_utf8_ok = 1'b0;
     close_received = 1'b0;
+    last_read_error = 0;
   end
 
   function automatic integer message_opcode;
@@ -260,6 +275,7 @@ module convex_websocket #(
       recv_frame.reset;
 
       hs.transport.xport_call(`CMD_READ_BYTE, hs.handle, TIMEOUT_MS, r);
+      last_read_error = r; // whatever it is, before any header is parsed
       if (r < 0) disable main;
       hb0 = r;
       hs.transport.xport_call(`CMD_READ_BYTE, hs.handle, TIMEOUT_MS, r);

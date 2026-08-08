@@ -598,6 +598,24 @@ module convex_buffer #(
     end
   endfunction
 
+  // Raw (un-escape-decoded) byte span of tok within THIS buffer's own
+  // data, for a caller that needs to copy a token's exact source text
+  // verbatim - e.g. convex_sync.v comparing two Live values byte-for-
+  // byte for the rehydration-suppression rule, where re-encoding
+  // through decode_str_next and back would risk normalizing away a
+  // difference that should have suppressed (or not suppressed) an
+  // event. Copy with `for (i = tok_span_start(t); i < tok_span_stop(t);
+  // i = i + 1) dest.put_byte(get_byte(i));` - a plain function-argument
+  // use, not a `{...}` concatenation, so none of convex_http.v's
+  // string-concatenation workarounds apply to it.
+  function automatic integer tok_span_start(input integer tok);
+    return tok_start[tok];
+  endfunction
+
+  function automatic integer tok_span_stop(input integer tok);
+    return tok_stop[tok];
+  endfunction
+
   function automatic bit json_bool_value(input integer tok);
     return tok_bool[tok];
   endfunction
