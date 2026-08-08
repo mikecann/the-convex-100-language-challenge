@@ -1,0 +1,84 @@
+schemaVersion: 1
+id: harbour
+displayName: "Harbour"
+rank: 56
+selectionTier: ranked
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Harbour (xBase / Clipper lineage) implementation of Convex's
+    documented JSON HTTP functions and the pinned /api/sync protocol.
+    hb_jsonEncode()/hb_jsonDecode() (core Harbour RTL, not a contrib) supply
+    JSON; contrib/hbssl binds OpenSSL directly onto Harbour's own hb_inet*
+    sockets for TCP and TLS. HTTP/1.1 request and response framing and RFC
+    6455 WebSocket handshake and frame encode/decode are hand-written in
+    Harbour on top of that socket boundary, because neither has a normal
+    Harbour library of its own. The Live sync protocol runs on a dedicated
+    hb_threadStart() worker thread that exclusively owns the WebSocket,
+    coordinated with the controller thread through hb_mutexNotify()/
+    hb_mutexSubscribe() channels -- real OS threads, not a cooperative
+    poll loop. TLS hostname verification is RFC 6125-ordered: it checks a
+    certificate's subjectAltName DNS entries first and only falls back to
+    the legacy Subject CN when a certificate has no subjectAltName at all.
+    contrib/hbssl exposes no accessor for X.509 extensions, so
+    client/convextls_native.c (~65 lines) reaches libssl's own
+    X509_get_ext_d2i()/GENERAL_NAME API directly for that one missing
+    accessor -- the same OpenSSL library hbssl already links, and no
+    Convex-specific logic, just the generic TLS primitive contrib/hbssl
+    itself forgot to wrap.
+toolchain:
+  name: Harbour (harbour-project.org)
+  version: "3.2.0"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    When a certificate carries no subjectAltName at all, hostname
+    verification falls back to pattern-matching the Subject CN (via
+    X509_name_oneline()), and a certificate with neither is a best-effort
+    skip of the name check specifically, rather than being rejected
+    outright. Chain verification itself (SSL_get_verify_result() against
+    the system trust store or $SSL_CERT_FILE) is always full strength and
+    rejects an untrusted or self-signed peer regardless of this narrowing.
+  - >-
+    A WebSocket control frame (close/ping/pong) arriving while a data
+    message is still being reassembled from continuation frames is treated
+    as a protocol failure that triggers a reconnect, rather than being
+    returned to the caller mid-reassembly and resumed afterward. Convex's
+    own sync protocol never fragments an application message, so this can
+    only be reached by a broken or hostile peer.
+  - >-
+    Live authentication, optimistic updates, WebSocket mutations, WebSocket
+    actions, and TransitionChunk assembly are deferred.
+  - >-
+    Live values cover Convex's JSON-safe subset; tagged Convex value
+    conversions are deferred.
+  - >-
+    The client keeps no in-memory Live delivery queue: convexlive.prg's
+    DeliverValue()/DeliverError() call the caller's event codeblock
+    directly from the Live worker thread, with no intermediate buffer.
+    The adapter's own codeblock writes straight to stdout (or the
+    ADAPTER_LISTEN TCP socket) under one mutex; a slow or stopped
+    consumer therefore blocks that single write against the OS pipe or
+    socket buffer rather than growing process memory.
+  - >-
+    JSON numbers are accepted only when mathematically integral and within
+    a signed 64-bit range; fractional and out-of-range values are rejected
+    at the point of use.
+capabilities:
+  - http
+  - live
