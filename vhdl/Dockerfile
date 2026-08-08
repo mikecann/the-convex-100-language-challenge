@@ -536,3 +536,98 @@ RUN set -eu; \
     timeout 30 ./sync_test | tee /tmp/sync_test.out; \
     wait; \
     grep -Fq 'PASS sync_test' /tmp/sync_test.out
+
+# The NDJSON adapter protocol v1 executable. Analyzed and elaborated
+# here; exercised below against three scenarios covering stdin/stdout
+# calls, the TCP ADAPTER_LISTEN mode, and asynchronous Live delivery
+# interleaved with commands.
+RUN set -eu; \
+    ghdl -a --std=08 --workdir=/project/work client/convex.vhdl; \
+    ghdl -a --std=08 --workdir=/project/work client/tests/conformance/adapter.vhdl; \
+    ghdl -e --std=08 --workdir=/project/work \
+      -Wl,/project/native.o -Wl,-lssl -Wl,-lcrypto adapter; \
+    echo "PASS adapter elaborate"
+
+# Scenario A: a real query call through the adapter, over stdin/stdout.
+RUN set -eu; \
+    printf '{"status":"success","value":{"count":5},"logLines":[]}' > /tmp/a-body.txt; \
+    aclen=$(wc -c < /tmp/a-body.txt | tr -d ' '); \
+    { \
+      printf 'HTTP/1.1 200 OK\r\n'; \
+      printf 'Content-Length: %s\r\n\r\n' "$aclen"; \
+      cat /tmp/a-body.txt; \
+    } > /tmp/a-resp.bin; \
+    /tmp/httpfix 44307 /tmp/a-resp.bin & \
+    sleep 1; \
+    printf '%s\n' \
+      '{"protocolVersion":1,"id":"h1","op":"hello"}' \
+      '{"id":"q1","op":"query","path":"demo:state","args":{}}' \
+      '{"id":"c1","op":"close"}' \
+    > /tmp/scenario-a.in; \
+    CONVEX_URL=http://127.0.0.1:44307 timeout 20 ./adapter \
+      < /tmp/scenario-a.in > /tmp/scenario-a.out 2>/tmp/scenario-a.err; \
+    code=$?; \
+    echo "adapter exit: $code"; cat /tmp/scenario-a.out; cat /tmp/scenario-a.err >&2; \
+    test "$code" -eq 0; \
+    grep -Fq '"type":"ready"' /tmp/scenario-a.out; \
+    grep -Fq '"type":"result"' /tmp/scenario-a.out; \
+    grep -Fq '"count":5' /tmp/scenario-a.out; \
+    grep -Fq '"type":"closed"' /tmp/scenario-a.out
+
+# Scenario B: a Live subscription, an asynchronous subscription event
+# delivered with no new command pending, a debugDisconnect, and the
+# post-reconnect value -- fed through a FIFO (not a plain redirected
+# file) so the adapter's stdin genuinely blocks between commands instead
+# of a regular file's always-ready poll semantics reporting EOF the
+# instant the static input would otherwise run out.
+RUN set -eu; \
+    /tmp/syncfix 44308 & \
+    sleep 1; \
+    mkfifo /tmp/scenario-b.fifo; \
+    ( \
+      exec 3> /tmp/scenario-b.fifo; \
+      printf '%s\n' '{"protocolVersion":1,"id":"h1","op":"hello"}' >&3; \
+      printf '%s\n' '{"id":"s1","op":"subscribe","subscriptionId":"sub1","path":"demo:state","args":{}}' >&3; \
+      sleep 3; \
+      printf '%s\n' '{"id":"d1","op":"debugDisconnect"}' >&3; \
+      sleep 3; \
+      printf '%s\n' '{"id":"u1","op":"unsubscribe","subscriptionId":"sub1"}' >&3; \
+      printf '%s\n' '{"id":"c1","op":"close"}' >&3; \
+      exec 3>&-; \
+    ) & \
+    CONVEX_URL=http://127.0.0.1:44308 timeout 30 ./adapter \
+      < /tmp/scenario-b.fifo > /tmp/scenario-b.out 2>/tmp/scenario-b.err; \
+    code=$?; \
+    wait; \
+    echo "adapter exit: $code"; cat /tmp/scenario-b.out; cat /tmp/scenario-b.err >&2; \
+    test "$code" -eq 0; \
+    grep -Fq '"type":"ready"' /tmp/scenario-b.out; \
+    grep -Fq '"type":"subscription","subscriptionId":"sub1","value":{"count":0}' /tmp/scenario-b.out; \
+    grep -Fq '"type":"subscription","subscriptionId":"sub1","value":{"count":1}' /tmp/scenario-b.out; \
+    grep -Fq '"id":"d1","type":"ack"' /tmp/scenario-b.out; \
+    grep -Fq '"id":"u1","type":"ack"' /tmp/scenario-b.out; \
+    grep -Fq '"id":"c1","type":"closed"' /tmp/scenario-b.out
+
+# Scenario C: ADAPTER_LISTEN's TCP mode, proving CMD_LISTEN/CMD_ACCEPT
+# actually carry the adapter protocol, not only stdin/stdout. Uses
+# bash explicitly for its /dev/tcp pseudo-device, which this image's
+# default /bin/sh (dash) does not support.
+RUN bash -c '\
+    set -eu; \
+    ADAPTER_LISTEN=127.0.0.1:44309 timeout 20 ./adapter \
+      > /tmp/scenario-c.out 2>/tmp/scenario-c.err & \
+    server_pid=$!; \
+    sleep 1; \
+    exec 3<>/dev/tcp/127.0.0.1/44309; \
+    printf "%s\n" "{\"protocolVersion\":1,\"id\":\"h1\",\"op\":\"hello\"}" >&3; \
+    timeout 5 head -n1 <&3 > /tmp/scenario-c.client.out; \
+    printf "%s\n" "{\"id\":\"c1\",\"op\":\"close\"}" >&3; \
+    timeout 5 head -n1 <&3 >> /tmp/scenario-c.client.out; \
+    exec 3>&-; \
+    wait "$server_pid"; \
+    code=$?; \
+    echo "adapter exit: $code"; cat /tmp/scenario-c.client.out; cat /tmp/scenario-c.err >&2; \
+    test "$code" -eq 0; \
+    grep -Fq "\"type\":\"ready\"" /tmp/scenario-c.client.out; \
+    grep -Fq "\"type\":\"closed\"" /tmp/scenario-c.client.out \
+'
