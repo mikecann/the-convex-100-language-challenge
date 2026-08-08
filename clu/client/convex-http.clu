@@ -28,7 +28,11 @@ convex_result = record[kind: string,		% "result" or "error"
 						% "ProtocolError"
 			err_message: string,	% kind=error
 			err_data: string,	% raw JSON text, kind=error
-			has_err_data: bool]
+			has_err_data: bool,
+			logs_raw: string,	% raw JSON text of a
+						% "logLines" array, when the
+						% server actually sent one
+			has_logs: bool]
 
 chttp = cluster is call
 
@@ -281,16 +285,29 @@ parsed_url = record[scheme: string, host: string, port: int, path: string]
 	    return("no Convex error envelope")
 	    end error_message_of
 
+%   logs_of(raw_body) -> (logs_raw, has_logs): the raw JSON text of a
+%   top-level "logLines" array, when Convex's own response actually sent
+%   one -- every response this client's caller might see (success or
+%   FunctionError) can carry console.log output from the function that
+%   ran, and the schema's own "logs" event field expects it verbatim.
+	logs_of = proc (raw_body: string) returns (string, bool)
+	    raw: string := json$field(raw_body, "logLines")
+		except when not_found, bad_format: return("", false) end
+	    return(raw, true)
+	    end logs_of
+
 	transport_error = proc (message: string) returns (convex_result)
 	    return(convex_result${kind: "error", err_name: "TransportError",
 				  err_message: message, err_data: "",
-				  has_err_data: false, value: ""})
+				  has_err_data: false, value: "",
+				  logs_raw: "", has_logs: false})
 	    end transport_error
 
 	protocol_error = proc (message: string) returns (convex_result)
 	    return(convex_result${kind: "error", err_name: "ProtocolError",
 				  err_message: message, err_data: "",
-				  has_err_data: false, value: ""})
+				  has_err_data: false, value: "",
+				  logs_raw: "", has_logs: false})
 	    end protocol_error
 
 %   classify(status, raw_body) -> a convex_result, per the documented
@@ -314,10 +331,13 @@ parsed_url = record[scheme: string, host: string, port: int, path: string]
 					    "HTTP success response omitted " ||
 					    "value"))
 				   end
+			logs_raw: string, has_logs: bool := logs_of(raw_body)
 			return(convex_result${kind: "result", value: value_raw,
 					      err_name: "", err_message: "",
 					      err_data: "",
-					      has_err_data: false})
+					      has_err_data: false,
+					      logs_raw: logs_raw,
+					      has_logs: has_logs})
 		   end
 
 		if string$equal(top_status, "\"error\"") cor status = 560
@@ -337,12 +357,15 @@ parsed_url = record[scheme: string, host: string, port: int, path: string]
 					data_raw := ""
 					has_data := false
 				   end
+			logs_raw: string, has_logs: bool := logs_of(raw_body)
 			return(convex_result${kind: "error",
 					      err_name: "FunctionError",
 					      err_message: msg,
 					      err_data: data_raw,
 					      has_err_data: has_data,
-					      value: ""})
+					      value: "",
+					      logs_raw: logs_raw,
+					      has_logs: has_logs})
 		   end
 
 		return(protocol_error("HTTP response had unknown status"))
@@ -385,7 +408,8 @@ parsed_url = record[scheme: string, host: string, port: int, path: string]
 	    end parse_url
 
 %   call(op, path, args_raw, base_url, token) -> (kind, value, err_name,
-%   err_message, err_data, has_err_data) -- the fields of a convex_result,
+%   err_message, err_data, has_err_data, logs_raw, has_logs) -- the fields
+%   of a convex_result,
 %   spread into a plain multi-value return rather than the record itself.
 %   (CLU's record types are generative: two files that each spell out the
 %   same record[...] shape under the same equate name still get distinct,
@@ -405,7 +429,7 @@ parsed_url = record[scheme: string, host: string, port: int, path: string]
 %   Authorization header.
 	call = proc (op, path, args_raw, base_url, token: string)
 			     returns (string, string, string, string, string,
-				      bool)
+				      bool, string, bool)
 	    u: parsed_url := parse_url(base_url)
 	    body: string := "{\"path\":" || json$qs(path)
 			    || ",\"args\":" || args_raw
@@ -429,7 +453,7 @@ parsed_url = record[scheme: string, host: string, port: int, path: string]
 			    r: convex_result := transport_error(
 				"connect failed: " || msg)
 			    return(r.kind, r.value, r.err_name, r.err_message,
-				   r.err_data, r.has_err_data)
+				   r.err_data, r.has_err_data, r.logs_raw, r.has_logs)
 		       end
 	    conn$send(c, req)
 		except when not_possible (msg: string):
@@ -437,7 +461,7 @@ parsed_url = record[scheme: string, host: string, port: int, path: string]
 			    r: convex_result := transport_error(
 				"send failed: " || msg)
 			    return(r.kind, r.value, r.err_name, r.err_message,
-				   r.err_data, r.has_err_data)
+				   r.err_data, r.has_err_data, r.logs_raw, r.has_logs)
 		       end
 
 	    deadline: int := _real_time() + READ_DEADLINE_MS
@@ -446,13 +470,14 @@ parsed_url = record[scheme: string, host: string, port: int, path: string]
 			    conn$close(c) except others: end
 			    r: convex_result := transport_error(msg)
 			    return(r.kind, r.value, r.err_name, r.err_message,
-				   r.err_data, r.has_err_data)
+				   r.err_data, r.has_err_data, r.logs_raw, r.has_logs)
 		       end
 	    conn$close(c) except others: end
 
 	    result: convex_result := classify(status, rbody)
 	    return(result.kind, result.value, result.err_name,
-		   result.err_message, result.err_data, result.has_err_data)
+		   result.err_message, result.err_data, result.has_err_data,
+		   result.logs_raw, result.has_logs)
 	    end call
 
 end chttp

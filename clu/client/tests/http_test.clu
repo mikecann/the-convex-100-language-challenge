@@ -43,7 +43,9 @@ start_up = proc ()
 	base: string := "http://127.0.0.1:" || int$unparse(success_port)
 	kind, value, en, em, ed: string
 	hed: bool
-	kind, value, en, em, ed, hed :=
+	logs_raw: string
+	has_logs: bool
+	kind, value, en, em, ed, hed, logs_raw, has_logs :=
 	    chttp$call("query", "demo:state",
 		       json$object1("room", json$qs("a")), base, "")
 	check$ok("Content-Length response classifies as a result",
@@ -58,7 +60,9 @@ start_up = proc ()
 	base: string := "http://127.0.0.1:" || int$unparse(chunked_port)
 	kind, value, en, em, ed: string
 	hed: bool
-	kind, value, en, em, ed, hed :=
+	logs_raw: string
+	has_logs: bool
+	kind, value, en, em, ed, hed, logs_raw, has_logs :=
 	    chttp$call("query", "demo:state",
 		       json$object1("room", json$qs("a")), base, "")
 	check$ok("chunked response classifies as a result",
@@ -75,7 +79,9 @@ start_up = proc ()
 	base: string := "http://127.0.0.1:" || int$unparse(error_port)
 	kind, value, en, em, ed: string
 	hed: bool
-	kind, value, en, em, ed, hed :=
+	logs_raw: string
+	has_logs: bool
+	kind, value, en, em, ed, hed, logs_raw, has_logs :=
 	    chttp$call("query", "demo:state",
 		       json$object1("room", json$qs("a")), base, "")
 	check$ok("HTTP 560 response classifies as an error",

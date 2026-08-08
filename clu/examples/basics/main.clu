@@ -143,7 +143,8 @@ start_up = proc ()
     % chttp (client/convex-http.clu), this client's own cluster for
     % Convex's documented "format":"json" /api/query endpoint.
     kind: string, value_raw: string, err_name: string, err_message: string,
-	err_data: string, has_err_data: bool :=
+	err_data: string, has_err_data: bool, logs_raw: string,
+	has_logs: bool :=
 	chttp$call("query", "demo:state", query_args, base_url, "")
     check_result("current query", kind, err_name, err_message)
     % Decoding {"count": N} into a plain CLU int is this step's "idiomatic
@@ -180,8 +181,9 @@ start_up = proc ()
 					  json$qs(run_id))
     mut_kind: string, mut_value: string, mut_err_name: string,
 	mut_err_message: string, mut_err_data: string,
-	mut_has_err_data: bool := chttp$call("mutation", "demo:increment",
-					     mutation_args, base_url, "")
+	mut_has_err_data: bool, mut_logs_raw: string,
+	mut_has_logs: bool := chttp$call("mutation", "demo:increment",
+					 mutation_args, base_url, "")
     check_result("mutation", mut_kind, mut_err_name, mut_err_message)
     applied_raw: string := json$field(mut_value, "applied")
 	except when not_found, bad_format:

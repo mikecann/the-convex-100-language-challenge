@@ -316,10 +316,11 @@ start_up = proc ()
 		if ~has_args then args_raw := "{}" end
 		kind: string, value_raw: string, err_name: string,
 		    err_message: string, err_data: string,
-		    has_err_data: bool := chttp$call(op, path, args_raw,
-						     base_url, client_token)
+		    has_err_data: bool, logs_raw: string,
+		    has_logs: bool := chttp$call(op, path, args_raw,
+						 base_url, client_token)
 		if string$equal(kind, "result")
-		   then emit_result(out_ch, id, value_raw, false, "")
+		   then emit_result(out_ch, id, value_raw, has_logs, logs_raw)
 		   else emit_call_error(out_ch, id, err_name, err_message,
 					err_data, has_err_data)
 		   end
