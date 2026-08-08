@@ -126,11 +126,21 @@ where
 
 // --- handshake and I/O -------------------------------------------------
 
-waitSocket :: !Int !Bool !*World -> (!Result Bool, !*World)
-waitSocket fd forWrite w = pollReady fd forWrite 10000 w
+// Bounded by the caller's own `Deadline` rather than a fixed internal
+// timeout: `remainingMs` already returns 0 once `d` has passed, and
+// `pollReady`'s own 0-timeout behaviour (an immediate non-blocking check)
+// is exactly "not ready" for a deadline that is already due. This is what
+// lets a close or unsubscribe issued against a stalled TLS peer stay
+// bounded by the caller's real deadline instead of this module's own
+// internal wait, which used to be a fixed 10 seconds per retry regardless
+// of how little time the caller actually had left.
+waitSocket :: !Int !Bool !Deadline !*World -> (!Result Bool, !*World)
+waitSocket fd forWrite d w
+	# (remaining, w) = remainingMs d w
+	= pollReady fd forWrite remaining w
 
-tlsConnect :: !Int !String !*World -> (!Result TlsConn, !*World)
-tlsConnect fd hostname w
+tlsConnect :: !Int !String !Deadline !*World -> (!Result TlsConn, !*World)
+tlsConnect fd hostname d w
 	# (method, w) = TLS_client_method w
 	# (ctx, w) = SSL_CTX_new method w
 	| ctx == 0 = (RErr "could not create TLS context", w)
@@ -143,17 +153,17 @@ tlsConnect fd hostname w
 	# (_, w) = SSL_set_fd ssl fd w
 	# (_, w) = SSL_set1_host ssl (toCString hostname) w
 	# (_, w) = SSL_ctrl ssl def_SSL_CTRL_SET_TLSEXT_HOSTNAME def_TLSEXT_NAMETYPE_HOST_NAME (toCString hostname) w
-	= handshakeLoop { ctx = ctx, ssl = ssl, fd = fd } w
+	= handshakeLoop { ctx = ctx, ssl = ssl, fd = fd } d w
 
-handshakeLoop :: !TlsConn !*World -> (!Result TlsConn, !*World)
-handshakeLoop conn w
+handshakeLoop :: !TlsConn !Deadline !*World -> (!Result TlsConn, !*World)
+handshakeLoop conn d w
 	# (rc, w) = SSL_connect conn.ssl w
 	| rc == 1 = verifyAndFinish conn w
 	# (errCode, w) = SSL_get_error conn.ssl rc w
 	| errCode == def_SSL_ERROR_WANT_READ || errCode == def_SSL_ERROR_WANT_WRITE
-		# (waited, w) = waitSocket conn.fd (errCode == def_SSL_ERROR_WANT_WRITE) w
+		# (waited, w) = waitSocket conn.fd (errCode == def_SSL_ERROR_WANT_WRITE) d w
 		= case waited of
-			ROk True = handshakeLoop conn w
+			ROk True = handshakeLoop conn d w
 			ROk False
 				# w = tlsFreeOnly conn w
 				= (RErr "TLS handshake timed out", w)
@@ -177,8 +187,8 @@ tlsFreeOnly conn w
 	# w = SSL_CTX_free conn.ctx w
 	= w
 
-tlsRead :: !TlsConn !Int !*World -> (!Result String, !*World)
-tlsRead conn maxLen w
+tlsRead :: !TlsConn !Int !Deadline !*World -> (!Result String, !*World)
+tlsRead conn maxLen d w
 	| maxLen == 0 = (ROk "", w)
 	# (buf, w) = mallocW maxLen w
 	# (result, w) = readLoop conn buf maxLen w
@@ -203,7 +213,7 @@ where
 		# (errCode, w) = SSL_get_error conn.ssl rc w
 		| errCode == def_SSL_ERROR_ZERO_RETURN = (ROk 0, w)
 		| errCode == def_SSL_ERROR_WANT_READ || errCode == def_SSL_ERROR_WANT_WRITE
-			# (waited, w) = waitSocket conn.fd (errCode == def_SSL_ERROR_WANT_WRITE) w
+			# (waited, w) = waitSocket conn.fd (errCode == def_SSL_ERROR_WANT_WRITE) d w
 			= case waited of
 				ROk True = readLoop conn buf maxLen w
 				ROk False = (RErr "TLS read timed out", w)
@@ -225,8 +235,8 @@ where
 		# (rest, w) = walk (i + 1) w
 		= ([toChar b : rest], w)
 
-tlsWriteAll :: !TlsConn !String !*World -> (!Result Int, !*World)
-tlsWriteAll conn data w = writeLoop conn data 0 (size data) w
+tlsWriteAll :: !TlsConn !String !Deadline !*World -> (!Result Int, !*World)
+tlsWriteAll conn data d w = writeLoop conn data 0 (size data) w
 where
 	writeLoop conn data sent total w
 		| sent >= total = (ROk total, w)
@@ -235,7 +245,7 @@ where
 		| rc > 0 = writeLoop conn data (sent + rc) total w
 		# (errCode, w) = SSL_get_error conn.ssl rc w
 		| errCode == def_SSL_ERROR_WANT_READ || errCode == def_SSL_ERROR_WANT_WRITE
-			# (waited, w) = waitSocket conn.fd (errCode == def_SSL_ERROR_WANT_WRITE) w
+			# (waited, w) = waitSocket conn.fd (errCode == def_SSL_ERROR_WANT_WRITE) d w
 			= case waited of
 				ROk True = writeLoop conn data sent total w
 				ROk False = (RErr "TLS write timed out", w)

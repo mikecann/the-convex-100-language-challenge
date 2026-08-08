@@ -20,16 +20,20 @@ definition module Convex.TLS
 // own effects is enforced by the type checker regardless.
 
 from Convex.Result import :: Result
+from Convex.Deadline import :: Deadline
 
 :: TlsConn = { ctx :: Int, ssl :: Int, fd :: Int }
 
 // Wraps an already-connected, blocking TCP file descriptor in a TLS session
 // and performs the handshake, verifying the peer certificate against the
 // system CA bundle and the given hostname (SNI and certificate hostname
-// verification both use it).
-tlsConnect :: !Int !String !*World -> (!Result TlsConn, !*World)
+// verification both use it). Every WANT_READ/WANT_WRITE retry inside the
+// handshake, a read, or a write is bounded by `d`: a caller with very
+// little time left (a close or unsubscribe racing a stalled peer) gets a
+// prompt timeout instead of waiting out an internal fixed interval.
+tlsConnect :: !Int !String !Deadline !*World -> (!Result TlsConn, !*World)
 
-tlsRead :: !TlsConn !Int !*World -> (!Result String, !*World)
-tlsWriteAll :: !TlsConn !String !*World -> (!Result Int, !*World)
+tlsRead :: !TlsConn !Int !Deadline !*World -> (!Result String, !*World)
+tlsWriteAll :: !TlsConn !String !Deadline !*World -> (!Result Int, !*World)
 tlsFd :: !TlsConn -> Int
 tlsClose :: !TlsConn !*World -> *World
