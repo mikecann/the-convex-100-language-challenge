@@ -453,9 +453,33 @@ ConvexAdapter := Object clone do(
         self
     )
 
-    relayFor := method(subscriptionId, generation,
-        block(kind, payload, logs,
-            ConvexAdapter deliver(subscriptionId, generation, kind, payload, logs)
+    // Builds the callback ConvexClient subscribe() stores on a
+    // ConvexSubscription and later invokes as
+    // `entry callback call(kind, payload, logs, entry)` (see convex.io
+    // ConvexClient publish). This cannot close over subscriptionId/generation
+    // as captured locals of an enclosing method the way an ordinary Io
+    // closure would: convex.io's own onMessage fix documents, with a full
+    // bisection, that neither `self` nor a captured local survives on this
+    // pinned Io VM (IoLanguage/io native @ 3d4bc9c) when a block is invoked
+    // through `.call()` from inside a `try()` - only a block's own declared
+    // parameters do. Confirmed directly here too: with subscriptionId and
+    // generation as relayFor's own method parameters (captured locals of the
+    // block below, the exact shape onMessage's comment warns about), every
+    // real subscription hung forever with "subscription callback raised:
+    // ConvexAdapter does not respond to 'subscriptionId'" in the container
+    // logs - the ack came back, but the block invoked later from inside
+    // ConvexClient publish's try() could not see either captured local, so
+    // deliver() was never reached at all. Fixed the same way onMessage was:
+    // the adapter stamps its own subscriptionId/generation as slots on the
+    // entry object right after subscribe() returns it (a long-lived object
+    // that outlives this activation, not a closure), and the block reads
+    // them back through `sourceEntry`, its own declared fourth parameter.
+    relayFor := method(
+        block(kind, payload, logs, sourceEntry,
+            ConvexAdapter deliver(
+                sourceEntry adapterSubscriptionId, sourceEntry adapterGeneration,
+                kind, payload, logs
+            )
         )
     )
 
@@ -593,9 +617,17 @@ ConvexAdapter := Object clone do(
                 self invalidate(subscriptionId)
             )
             generation := self generationFor(subscriptionId)
-            queryId := self ensureClient subscribe(
-                path, args, self relayFor(subscriptionId, generation)
-            )
+            queryId := self ensureClient subscribe(path, args, self relayFor)
+            // Stamped onto the entry - a long-lived object the client keeps
+            // in its own subscriptions map for as long as this subscription
+            // is active - rather than closed over by the callback block
+            // above. See the long comment on relayFor for why: a captured
+            // local does not survive to when this callback is actually
+            // invoked on this pinned Io VM, but a slot read back through the
+            // block's own declared parameter does.
+            entry := self ensureClient subscriptions at(queryId asString)
+            entry adapterSubscriptionId := subscriptionId
+            entry adapterGeneration := generation
             self subscriptions atPut(subscriptionId, queryId)
             return self respondAck(id)
         )
