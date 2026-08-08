@@ -93,6 +93,7 @@ package body convex is
     variable status_tok, t, logs_tok : integer;
     variable found : boolean;
     variable r : integer;
+    variable raw_start, raw_stop : natural;
   begin
     ok := false;
     is_function_error := false;
@@ -177,7 +178,21 @@ package body convex is
       end if;
       json_object_get(body_buf, toks, ntoks, toks'low, "errorData", t, found);
       if found then
-        buf_put_slice(error_data_json, error_data_len, body_buf, toks(t).start, toks(t).stop - toks(t).start);
+        -- A JSON_STRING token's start/stop span its content only (the
+        -- quotes themselves are not part of the token, per
+        -- convex_json.vhdl's alloc_tok); widen by one byte on each side
+        -- so a bare string errorData is re-embedded as valid JSON
+        -- rather than as unquoted text. Matches convex_sync.vhdl's
+        -- handle_transition, which needs the identical adjustment for
+        -- the same reason.
+        if toks(t).kind = JSON_STRING then
+          raw_start := toks(t).start - 1;
+          raw_stop := toks(t).stop + 1;
+        else
+          raw_start := toks(t).start;
+          raw_stop := toks(t).stop;
+        end if;
+        buf_put_slice(error_data_json, error_data_len, body_buf, raw_start, raw_stop - raw_start);
       end if;
       ok := true;
       return;
@@ -189,7 +204,17 @@ package body convex is
     if not found then
       return;
     end if;
-    buf_put_slice(value_json, value_len, body_buf, toks(t).start, toks(t).stop - toks(t).start);
+    -- Same JSON_STRING quote-widening as above: a query or mutation that
+    -- returns a bare string (for example a document ID) must be
+    -- re-embedded with its quotes intact.
+    if toks(t).kind = JSON_STRING then
+      raw_start := toks(t).start - 1;
+      raw_stop := toks(t).stop + 1;
+    else
+      raw_start := toks(t).start;
+      raw_stop := toks(t).stop;
+    end if;
+    buf_put_slice(value_json, value_len, body_buf, raw_start, raw_stop - raw_start);
     ok := true;
   end procedure client_call;
 
