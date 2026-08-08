@@ -116,16 +116,25 @@ module main;
   // subscription) until an actual new value or error arrives, or ten
   // seconds pass without one, then decodes its count. Shared by both
   // waits below: the initial snapshot and the post-mutation update.
+  // Waits for a version STRICTLY AFTER whatever this subscription already
+  // had when this task was called, not for version zero specifically -
+  // the initial snapshot (called with baseline 0) and the post-mutation
+  // update (called again with baseline already 1, since the first call
+  // already advanced it) are both "wait for the next new value", and a
+  // baseline captured fresh on every call is what makes that the same
+  // check both times, rather than a hardcoded ==0 that would only ever
+  // wait on the very first call.
   task automatic wait_for_live_update(output integer result_count);
-    integer idx, attempts;
+    integer idx, attempts, baseline_version;
     bit got;
     integer root_tok;
     string err_scratch, value_scratch;
     begin
       idx = conv.sync.find_sub_by_tag("example");
       if (idx < 0) fatal("subscription was not registered");
+      baseline_version = conv.sync.sub_version[idx];
       attempts = 0;
-      while (conv.sync.sub_version[idx] == 0) begin
+      while (conv.sync.sub_version[idx] == baseline_version) begin
         conv.sync.pump(100, got);
         attempts = attempts + 1;
         if (attempts >= 100) fatal("timed out waiting for a Live update");

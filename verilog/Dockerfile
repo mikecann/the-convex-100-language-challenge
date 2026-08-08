@@ -1485,3 +1485,261 @@ RUN bash -c '\
     echo "peak VmRSS while stdout was unread: ${peak_kb} kB (bound: 131072 kB = 128 MiB)"; \
     test "$peak_kb" -lt 131072 \
 '
+
+# ---------------------------------------------------------------------------
+# The canonical example. Compiled once, first proven to fail loudly (nothing
+# on stdout, "CONVEX_URL is required" on stderr, exit 1) with no deployment
+# configured, matching this project's other native clients' no-configuration
+# failure path.
+# ---------------------------------------------------------------------------
+RUN set -eu; \
+    iverilog -g2012 -L. -mnative -I. \
+      -o /tmp/example.vvp client/convex_transport.v client/convex_buffer.v \
+      client/convex_http.v client/convex_sha1.v client/convex_base64.v \
+      client/convex_websocket.v client/convex_sync.v client/convex.v \
+      examples/basics/main.v; \
+    code=0; \
+    vvp -M. -mnative /tmp/example.vvp >/tmp/example-noconfig.out 2>/tmp/example-noconfig.err || code=$?; \
+    test "$code" -eq 1; \
+    test ! -s /tmp/example-noconfig.out; \
+    grep -Fq 'CONVEX_URL is required' /tmp/example-noconfig.err
+
+# Then proven against a real deployment: examplefix.c answers /api/query,
+# /api/mutation and the /api/sync WebSocket upgrade on one port (forking a
+# handler per accepted connection so the persistent Live connection and the
+# one-shot HTTP calls run concurrently), and only sends the post-mutation
+# Live Transition after a delay generous enough for the example's own HTTP
+# mutation call to have already completed on its own separate connection --
+# so "live updated count" is a real, separately arriving Live event, not a
+# value already known from the mutation response. The exact transcript is
+# checked against this project's shared expected output (the same six lines
+# _shared/examples/basics.expected.txt records), not merely "did it exit 0".
+RUN <<'EXAMPLEFIX_EOF'
+set -eu
+cat > /tmp/examplefix.c <<'CEOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <netinet/in.h>
+#include <openssl/sha.h>
+#include <openssl/evp.h>
+
+static void send_http_response(int c, const char *body) {
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n",
+        (int)strlen(body));
+    write(c, hdr, (size_t)hlen);
+    write(c, body, strlen(body));
+}
+
+static int read_full(int fd, void *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t r = read(fd, (char *)buf + off, n - off);
+        if (r <= 0) return -1;
+        off += (size_t)r;
+    }
+    return 0;
+}
+static void write_full(int fd, const void *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, (const char *)buf + off, n - off);
+        if (w <= 0) exit(1);
+        off += (size_t)w;
+    }
+}
+static void compute_accept(const char *key, char *accept_out) {
+    static const char guid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    char joined[256];
+    snprintf(joined, sizeof(joined), "%s%s", key, guid);
+    unsigned char digest[SHA_DIGEST_LENGTH];
+    SHA1((const unsigned char *)joined, strlen(joined), digest);
+    int n = EVP_EncodeBlock((unsigned char *)accept_out, digest, SHA_DIGEST_LENGTH);
+    accept_out[n] = '\0';
+}
+static void send_text_frame(int fd, const char *text) {
+    size_t len = strlen(text);
+    unsigned char hdr[4];
+    size_t hlen = 0;
+    hdr[hlen++] = 0x81;
+    if (len < 126) {
+        hdr[hlen++] = (unsigned char)len;
+    } else {
+        hdr[hlen++] = 126;
+        hdr[hlen++] = (unsigned char)((len >> 8) & 0xFF);
+        hdr[hlen++] = (unsigned char)(len & 0xFF);
+    }
+    write_full(fd, hdr, hlen);
+    write_full(fd, text, len);
+}
+static void read_masked_text_frame(int fd, char *out, size_t cap) {
+    unsigned char hdr[2];
+    if (read_full(fd, hdr, 2) < 0) exit(1);
+    uint64_t plen = hdr[1] & 0x7F;
+    if (plen == 126) {
+        unsigned char ext[2];
+        if (read_full(fd, ext, 2) < 0) exit(1);
+        plen = ((uint64_t)ext[0] << 8) | ext[1];
+    }
+    unsigned char mkey[4];
+    if (read_full(fd, mkey, 4) < 0) exit(1);
+    if (plen >= cap) exit(1);
+    if (plen > 0 && read_full(fd, out, plen) < 0) exit(1);
+    for (uint64_t i = 0; i < plen; i++) out[i] = (char)((unsigned char)out[i] ^ mkey[i % 4]);
+    out[plen] = '\0';
+}
+static void ts_b64(uint64_t v, char *out) {
+    unsigned char bytes[8];
+    for (int i = 0; i < 8; i++) { bytes[i] = (unsigned char)(v & 0xFF); v >>= 8; }
+    int n = EVP_EncodeBlock((unsigned char *)out, bytes, 8);
+    out[n] = '\0';
+}
+static int contains(const unsigned char *buf, int len, const char *needle) {
+    int nlen = (int)strlen(needle);
+    for (int i = 0; i + nlen <= len; i++) {
+        if (memcmp(buf + i, needle, (size_t)nlen) == 0) return 1;
+    }
+    return 0;
+}
+
+static void handle_connection(int c) {
+    unsigned char req[8192];
+    int total = 0;
+    while (total < (int)sizeof(req)) {
+        unsigned char b;
+        ssize_t n = read(c, &b, 1);
+        if (n <= 0) { close(c); _exit(0); }
+        req[total++] = b;
+        if (total >= 4 && req[total-4]=='\r' && req[total-3]=='\n' &&
+            req[total-2]=='\r' && req[total-1]=='\n') break;
+    }
+    if (contains(req, total, "Upgrade: websocket") || contains(req, total, "Upgrade: WebSocket")) {
+        /* The generic header loop above already consumed the whole
+         * handshake up to CRLFCRLF into req[], so the Sec-WebSocket-Key
+         * is parsed out of that same buffer here rather than re-reading
+         * it from the socket a second time. */
+        char key[512] = {0};
+        char *line = (char *)req;
+        req[total] = '\0';
+        for (;;) {
+            char *eol = strstr(line, "\r\n");
+            if (!eol) break;
+            *eol = '\0';
+            if (strncasecmp(line, "Sec-WebSocket-Key:", 18) == 0) {
+                char *v = line + 18;
+                while (*v == ' ') v++;
+                snprintf(key, sizeof(key), "%s", v);
+            }
+            if (eol == line) break;
+            line = eol + 2;
+        }
+        char accept_val[64], resp[512];
+        compute_accept(key, accept_val);
+        int rn = snprintf(resp, sizeof(resp),
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+            "Connection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", accept_val);
+        write_full(c, resp, (size_t)rn);
+
+        char msg[8192];
+        read_masked_text_frame(c, msg, sizeof(msg)); /* Connect */
+        read_masked_text_frame(c, msg, sizeof(msg)); /* ModifyQuerySet Add */
+
+        char ts1[16], text[512];
+        ts_b64(1, ts1);
+        snprintf(text, sizeof(text),
+            "{\"type\":\"Transition\","
+            "\"startVersion\":{\"querySet\":0,\"identity\":0,\"ts\":\"%s\"},"
+            "\"endVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"%s\"},"
+            "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":1,\"value\":{\"count\":0}}]}",
+            ts1, ts1);
+        send_text_frame(c, text);
+
+        sleep(3);
+
+        char ts2[16];
+        ts_b64(2, ts2);
+        snprintf(text, sizeof(text),
+            "{\"type\":\"Transition\","
+            "\"startVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"%s\"},"
+            "\"endVersion\":{\"querySet\":1,\"identity\":1,\"ts\":\"%s\"},"
+            "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":1,\"value\":{\"count\":1}}]}",
+            ts1, ts2);
+        send_text_frame(c, text);
+
+        char discard[64];
+        read(c, discard, sizeof(discard));
+    } else if (contains(req, total, "/api/query")) {
+        send_http_response(c, "{\"status\":\"success\",\"value\":{\"count\":0},\"logLines\":[]}");
+    } else if (contains(req, total, "/api/mutation")) {
+        send_http_response(c,
+            "{\"status\":\"success\","
+            "\"value\":{\"applied\":true,\"state\":{\"count\":1}},"
+            "\"logLines\":[]}");
+    }
+    close(c);
+    _exit(0);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "usage: examplefix port\n"); return 1; }
+    int port = atoi(argv[1]);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
+    listen(fd, 8);
+
+    /* Exactly three TCP connections: one plain HTTP /api/query, one
+     * WebSocket connection that stays open for the whole Live
+     * subscription, and one plain HTTP /api/mutation. */
+    for (int i = 0; i < 3; i++) {
+        int c = accept(fd, NULL, NULL);
+        if (c < 0) continue;
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(fd);
+            handle_connection(c);
+            _exit(0);
+        }
+        close(c);
+    }
+    while (wait(NULL) > 0) {}
+    close(fd);
+    return 0;
+}
+CEOF
+gcc -O2 -Wall -Wextra -o /tmp/examplefix /tmp/examplefix.c -lssl -lcrypto
+EXAMPLEFIX_EOF
+
+RUN set -eu; \
+    printf '%s\n' \
+      'current count: 0' \
+      'live initial count: 0' \
+      'mutation applied: true' \
+      'mutation count: 1' \
+      'live updated count: 1' \
+      'verified count: 0 -> 1' \
+    > /tmp/example-expected.txt; \
+    timeout 25 /tmp/examplefix 44214 & \
+    sleep 1; \
+    CONVEX_URL=http://127.0.0.1:44214 \
+      timeout 20 vvp -M. -mnative /tmp/example.vvp +room=verilog-docker-test > /tmp/example.out; \
+    code=$?; \
+    wait; \
+    echo "example exit: $code"; cat /tmp/example.out; \
+    test "$code" -eq 0; \
+    diff /tmp/example.out /tmp/example-expected.txt; \
+    echo "PASS example transcript matches the fixture's expected values"
