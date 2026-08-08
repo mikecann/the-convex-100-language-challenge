@@ -1,0 +1,87 @@
+schemaVersion: 1
+id: apl
+displayName: "APL"
+rank: 69
+selectionTier: ranked
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native GNU APL implementation of the Convex HTTP API. JSON encoding
+    and decoding, HTTP/1.1 request/response framing (status line,
+    headers, Content-Length and chunked bodies), and the
+    "format":"json" envelope classification are all written in APL
+    (client/convex.apl), loaded by the conformance adapter and the
+    canonical example the same way GNU APL's own shipped wslib5
+    libraries are loaded, with dyadic )COPY. GNU APL's built-in ⎕FIO
+    (Quad-FIO[32..42]) supplies raw sockets natively for the plain
+    (ws://, http://) transport -- no shim needed. TLS (wss://,
+    https://) uses a small native function, client/shim.cc, compiled
+    against GNU APL's own internal headers and loaded at runtime with
+    dyadic ⎕FX, the documented mechanism GNU APL's own lib_file_io.so
+    uses. The same native function also supplies SHA-1 (needed only
+    for the RFC 6455 WebSocket handshake) and DNS resolution (⎕FIO's
+    own connect() takes an already-resolved address; GNU APL has no
+    getaddrinfo of its own). Toolchain built from source (the official
+    GNU APL 2.0 release tarball, pinned by URL and sha256) rather than
+    installed from Debian's own .deb: Debian packages GNU APL only in
+    sid (not yet in trixie/bookworm) and only with --with-gtk3 enabled,
+    which pulls in the full GTK/cairo/pango stack for a headless
+    network client that never touches ⎕GTK/⎕PLOT/⎕PNG; the plain
+    upstream tarball's default build (--with-gtk3 is off by default)
+    gets the same GPL, Debian-adjacent GNU APL 2.0 with a runtime
+    closure of just libstdc++/libm/libc/libgcc_s.
+toolchain:
+  name: GNU APL
+  version: "2.0"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    Live (the WebSocket /api/sync subscription protocol -- Connect,
+    ModifyQuerySet, Transition, reconnect) is not implemented. The
+    adapter answers subscribe/unsubscribe/debugDisconnect with a
+    structured ProtocolError rather than a fabricated ack, so shared
+    conformance fails those cleanly instead of hanging or reporting a
+    false pass. The canonical example therefore demonstrates only the
+    HTTP half of the shared counter walk (initial query, mutation with
+    an idempotency key, follow-up query) and its stdout does not match
+    _shared/examples/basics.expected.txt, which requires both
+    transports.
+  - >-
+    Language-local Docker tests (client/tests/selftest.apl: JSON
+    round-trip and escaping, object field lookup, whole-number
+    acceptance, URL parsing, HTTP status-line/header helpers, chunked
+    hex sizes, EnvGet, HttpClassify's three envelope shapes) pass from
+    a clean build, and the client has been verified by hand against
+    both a real internet endpoint (TLS) and this project's real local
+    self-hosted backend (plain HTTP: a genuine 0 -> 1 query/mutation/
+    query round trip, and the compiled conformance adapter driving
+    hello/query/mutation/close end to end). Shared
+    ./run verify-example/verify/verify-hosted have not been run yet,
+    so the capability list below reflects no evaluator award.
+  - >-
+    The native function (client/shim.cc) is deliberately narrow: TCP
+    connect/send/recv/close for TLS, SHA-1, and DNS resolution only. No
+    HTTP, JSON, or Convex protocol behaviour lives in C++.
+  - >-
+    GNU APL's Quad-FIO[40] (select) reliably raised DOMAIN ERROR in
+    this build even when its argument's shape and nesting exactly
+    matched Quad_FIO.cc's own documented expectations (checked with
+    rho/depth/pick before it ever reached select()). The plain-socket
+    path works around this with a non-blocking fcntl + Quad-FIO[37]
+    recv() poll loop instead, which does not have the same problem.
+capabilities: []

@@ -42,11 +42,14 @@
 ⍝ next to this file, and remembers its own directory (⎕FIO[26] cannot
 ⍝ resolve a relative path once the caller's own cwd has changed) so it
 ⍝ only has to be found once per process.
-∇ConvexInit B;SOPATH
+∇ConvexInit B;SOPATH;IGNORED
  ⍝⍝ B: path to shim.cc's compiled shared object. Call this once, before
  ⍝⍝ any Conn*/Live* function.
+ ⍝⍝ IGNORED←: an unassigned ⎕FX result auto-displays the created
+ ⍝⍝ function's name (its normal REPL-echo behaviour), which would
+ ⍝⍝ otherwise land on stdout in front of every NDJSON protocol event.
   SOPATH←B
-  SOPATH ⎕FX 'CONVEXTLS'
+  IGNORED←SOPATH ⎕FX 'CONVEXTLS'
 ∇
 
 ⍝ ================================================================
@@ -539,7 +542,7 @@ OK:
   Z←'k' (⍎2↓R)
 ∇
 
-∇Z←USETLS ConnConnect HOSTPORT;HOST;PORT;R;IP;SOCK;ADDR;ERR
+∇Z←USETLS ConnConnect HOSTPORT;HOST;PORT;R;IP;SOCK;ADDR;ERR;IGNORED
  ⍝⍝ HOSTPORT is (host port), port a number. USETLS is 1 for TLS.
   HOST←1⊃HOSTPORT
   PORT←2⊃HOSTPORT
@@ -558,8 +561,9 @@ SOCKOK:
   ADDR←2 IP PORT
   ERR←ADDR ⎕FIO[36] SOCK        ⍝ connect(Bh, Aa)
   →(ERR=0)⍴CONNOK
-  ⎕FIO[4] SOCK                  ⍝ ⎕FIO's socket and file handles share one
-                                 ⍝ table; FUN[4] closes either.
+  IGNORED←⎕FIO[4] SOCK           ⍝ ⎕FIO's socket and file handles share one
+                                 ⍝ table; FUN[4] closes either. Unassigned
+                                 ⍝ would auto-echo to stdout.
   Z←JErr 'connect() failed'
   →0
 CONNOK:
@@ -569,7 +573,7 @@ CONNOK:
   ⍝ matching Quad_FIO.cc's documented shape exactly (verified with ⍴/≡/
   ⍝ ⊃ before ever reaching select()) -- reliably raised DOMAIN ERROR in
   ⍝ this GNU APL 2.0 build; recv() itself does not have that problem.
-  (4 2048) ⎕FIO[59] SOCK
+  IGNORED←(4 2048) ⎕FIO[59] SOCK   ⍝ unassigned would auto-echo to stdout
   Z←'k' ('p' SOCK)
   →0
 TLS:
@@ -622,7 +626,7 @@ DONE:
 ⍝ ⎕FIO[37] recv() returns a byte vector (possibly empty, meaning EOF)
 ⍝ on success and a *negative scalar* -errno on failure; EAGAIN/EWOULDBLOCK
 ⍝ (errno 11 on Linux) means "no data yet", not an error.
-∇Z←CONN ConnRecv PARAMS;KIND;HANDLE;MAXBYTES;TIMEOUTMS;R;DEADLINE
+∇Z←CONN ConnRecv PARAMS;KIND;HANDLE;MAXBYTES;TIMEOUTMS;R;DEADLINE;IGNORED
   KIND←1⊃CONN
   HANDLE←2⊃CONN
   MAXBYTES←1⊃PARAMS
@@ -641,7 +645,7 @@ PLAINERR:
   →0
 PLAINWOULDBLOCK:
   →(NowMs>DEADLINE)⍴PLAINTIMEOUT
-  ⎕DL 0.02
+  IGNORED←⎕DL 0.02              ⍝ unassigned would auto-echo the seconds slept
   →PLAINPOLL
 PLAINTIMEOUT:
   Z←'t' ⍬
@@ -666,15 +670,15 @@ TLSCLOSED:
   Z←'c' ⍬
 ∇
 
-∇Z←ConnClose CONN;KIND;HANDLE
+∇Z←ConnClose CONN;KIND;HANDLE;IGNORED
   KIND←1⊃CONN
   HANDLE←2⊃CONN
   →('t'≡KIND)⍴TLS
-  ⎕FIO[4] HANDLE
+  IGNORED←⎕FIO[4] HANDLE         ⍝ unassigned would auto-echo to stdout
   Z←0
   →0
 TLS:
-  CONVEXTLS[4] HANDLE
+  IGNORED←CONVEXTLS[4] HANDLE
   Z←0
 ∇
 
@@ -1036,7 +1040,7 @@ TIMEOUTBODY:
   Z←'{"type":"error","error":{"name":"ProtocolError","message":',(JEscapeString MSG),'}}'
 ∇
 
-∇Z←HttpCall PARAMS;OP;PATH;ARGSJSON;BASEURL;TOKEN;U;USETLS;HOST;PORT;BODYSTR;REQBYTES;CR;CONN;SR;RR;STATUSCODE;BODYTEXT
+∇Z←HttpCall PARAMS;OP;PATH;ARGSJSON;BASEURL;TOKEN;U;USETLS;HOST;PORT;BODYSTR;REQBYTES;CR;CONN;SR;RR;STATUSCODE;BODYTEXT;IGNORED
   OP←1⊃PARAMS
   PATH←2⊃PARAMS
   ARGSJSON←3⊃PARAMS
@@ -1064,12 +1068,12 @@ CONNOK:
 
   SR←CONN ConnSendAll REQBYTES
   →('k'≡1⊃SR)⍴SENDOK
-  ConnClose CONN
+  IGNORED←ConnClose CONN         ⍝ unassigned would auto-echo to stdout
   Z←TransportError 'send failed: ',2⊃SR
   →0
 SENDOK:
   RR←HttpReadResponse CONN
-  ConnClose CONN
+  IGNORED←ConnClose CONN
   →('k'≡1⊃RR)⍴READOK
   Z←TransportError 2⊃RR
   →0
