@@ -149,4 +149,6 @@ limitations:
     boundary (holding the most recently read line back by one step so
     a genuine trailing empty line can be dropped instead of printed),
     since neither is suppressible from inside the language.
-capabilities: []
+capabilities:
+  - http
+  - live
