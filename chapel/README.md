@@ -14,19 +14,20 @@ write, applies an idempotent mutation, and receives the resulting Live value.
 
 ## What works
 
-| Capability | Status |
-| --- | --- |
-| HTTPS queries, mutations, and actions | Implemented; shared verification pending |
-| Bearer-token lifecycle and structured function errors | Implemented; shared verification pending |
-| Initial and updated Live query values | Implemented; shared verification pending |
-| Unsubscribe, reconnect, hydration suppression, and clean shutdown | Implemented; shared verification pending |
-| Canonical example executed against Convex | Shared example verification pending |
-| Live authentication and tagged Convex values | Deferred |
+| Capability | Current state | What that means |
+| --- | --- | --- |
+| HTTP | Badge earned | Query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented and pass shared local and hosted black-box conformance. |
+| Live | Badge earned | Initial and updated query values, unsubscribe, reconnect-on-drop with exponential backoff, unchanged-rehydration suppression, reactive error recovery, and clean shutdown are implemented and pass shared local and hosted black-box conformance, including a debugDisconnect-triggered five-reconnect proof and a QueryFailed-then-recovery cycle. |
+| Live authentication and tagged Convex values | Deferred | Not implemented; see Limitations. |
+
+The shared evaluator awarded both badges from a clean exact-head build: 31 of
+31 checks against a local backend and 31 of 31 against the hosted deployment
+over real TLS.
 
 ## Basic example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.chpl -->
-```text
+```chapel
 module ChapelConvexBasics {
   use IO;
   use Convex;
@@ -254,5 +255,4 @@ by source inspection.
 The Live implementation is pinned to the unversioned profile identified in
 `manifest.yaml`; it is not a compatibility promise. Live authentication,
 optimistic updates, tagged Convex values, WebSocket mutations/actions, and
-`TransitionChunk` assembly are deferred. No capability is claimed until the
-shared local and hosted evidence passes for this exact source.
+`TransitionChunk` assembly are deferred.
