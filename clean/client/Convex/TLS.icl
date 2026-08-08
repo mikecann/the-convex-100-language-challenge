@@ -8,6 +8,16 @@ import Convex.Wire
 import Convex.Deadline
 import Convex.Socket
 
+// Every `ccall` below resolves against libssl/libcrypto at link time, not
+// against anything in Clean's own distribution. `import code from library`
+// is the same directive the distribution's own optional database bindings
+// use for their native libraries (see data/Platform/Database/SQL/_MySQL.icl,
+// "-lmariadb"); it appends the named linker flag to clm's link step so the
+// final binary is linked against the system OpenSSL shared libraries
+// without a build-time `-sl` flag on every clm invocation.
+import code from library "-lssl"
+import code from library "-lcrypto"
+
 // --- OpenSSL FFI -----------------------------------------------------------
 
 def_SSL_ERROR_WANT_READ :: Int
