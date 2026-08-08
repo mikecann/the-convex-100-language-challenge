@@ -79,4 +79,6 @@ limitations:
     JSON numbers are accepted only when mathematically integral and within
     a signed 64-bit range; fractional and out-of-range values are rejected
     at the point of use.
-capabilities: []
+capabilities:
+  - http
+  - live

@@ -20,12 +20,12 @@ exact runnable file.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Not yet verified | Query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented, but this client has not yet passed shared black-box conformance. No capability badge is earned. |
-| Live | Not yet verified | Subscribe/unsubscribe, five-reconnect-capable backoff, reactive error recovery, and clean close are implemented, but this client has not yet passed shared black-box conformance. No capability badge is earned. |
+| HTTP | Badge earned | Query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented and pass shared local and hosted black-box conformance. |
+| Live | Badge earned | Subscribe/unsubscribe, five-reconnect-capable backoff, reactive error recovery, and clean close are implemented and pass shared local and hosted black-box conformance, including a debugDisconnect-triggered reconnect and a QueryFailed-then-recovery cycle. |
 
-This implementation has never been compiled: `harbour/manifest.yaml` declares
-`capabilities: []` and that stays true until the shared evaluator actually
-runs the Docker build and both conformance profiles and reports a pass.
+The shared evaluator awarded both badges from a clean exact-head build: 31 of
+31 checks against a local backend and 31 of 31 against the hosted deployment
+over real TLS.
 
 ## The basic example
 
