@@ -18,7 +18,7 @@
  * the natural boundary for a capability pclu has no notion of at all:
  * TLS. It contains no HTTP, no WebSocket framing, no JSON and no Convex
  * protocol knowledge; every deadline, retry, and protocol decision for
- * the hosted profile is enforced in CLU source, in client/*.clu.
+ * the hosted profile is enforced in CLU source, in the client/ .clu files.
  */
 
 #include "pclu_err.h"

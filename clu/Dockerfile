@@ -11,7 +11,7 @@ ARG BUILD_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa04
 ARG PCLU_REPO=https://github.com/nbuwe/pclu.git
 ARG PCLU_COMMIT=1a8ad7603ea20b9744942182a52810441182f6a6
 ARG GC_URL=https://www.hboehm.info/gc/gc_source/gc-7.2f.tar.gz
-ARG GC_SHA256=2074f75ea225967b407b7c31da4d68d1b1c4267b60d0eb9d7e6ac1f5a058fbf
+ARG GC_SHA256=265ce3167273cff1d77081ad7dd86ca1269a0ec2ae0324f9ad8070ccc23d3d85
 
 # ---------------------------------------------------------------------------
 # test: build pclu from source, apply this client's runtime fix and new
@@ -36,6 +36,7 @@ RUN apt-get update \
        make \
        binutils \
        patch \
+       m4 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eu; test "$(uname -m)" = x86_64
@@ -124,10 +125,17 @@ RUN set -eu; \
     ranlib "$CLUHOME/code/libpclu_opt.a"
 
 RUN set -eu; \
-    printf '    output = "boot ok"\nend\n' > /tmp/boot.clu; \
-    "$CLUHOME/exe/pclu" -ext false -spec /tmp/boot -opt -compile /tmp/boot 2>&1; \
-    "$CLUHOME/exe/plink" -opt -o /tmp/boot /tmp/boot.o; \
-    /tmp/boot | grep -Fq 'boot ok'
+    mkdir -p /tmp/boot-test; \
+    cd /tmp/boot-test; \
+    printf '%s\n' \
+      'start_up = proc ()' \
+      '    po: stream := stream$primary_output()' \
+      '    stream$putl(po, "boot ok")' \
+      '    end start_up' \
+      > boot.clu; \
+    "$CLUHOME/exe/pclu" -ext false -spec boot -opt -compile boot; \
+    "$CLUHOME/exe/plink" -opt -o boot boot.o; \
+    ./boot | grep -Fq 'boot ok'
 
 COPY client ./client
 COPY examples ./examples
