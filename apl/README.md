@@ -358,6 +358,20 @@ Debian-adjacent GNU APL 2.0 with a runtime library closure of just
 
 ## Limitations
 
+- `client/tests/selftest.apl` (the offline, no-network Docker `test` stage)
+  covers HTTP-side behaviour only. It does not include a local mock
+  WebSocket fixture server exercising Live's edge cases deterministically
+  and offline -- fragmentation/control-frame interleaving under an
+  adversarial peer, five reconnects with an explicit backoff-reset
+  assertion, a stopped-reader queue bound, and so on -- the way some other
+  languages in this project do for their own `test` target. Every one of
+  those scenarios this client actually implements is instead exercised
+  against a real backend by the shared conformance pilot's `client/live/*`
+  cases (`reconnect-five-times` genuinely reconnects five times over real
+  TLS; `query-error-recovery` genuinely recovers from a real
+  `FunctionError`) and, for the bugs a real run alone surfaced, by hand --
+  real evidence, but not the fully offline, adversarial local coverage
+  AGENTS.md's Live acceptance section asks for.
 - Bearer-token authentication (`setAuth`) is accepted by the adapter,
   threaded into the HTTP `Authorization` header, and exercised by the
   shared conformance pilot's `client/http/bearer-token-lifecycle` case

@@ -61,11 +61,26 @@ adapter:
     - debugDisconnect
 limitations:
   - >-
-    Language-local Docker tests (client/tests/selftest.apl: JSON
+    client/tests/selftest.apl (the Docker `test` stage's offline
+    language-local suite) covers HTTP-side behaviour only: JSON
     round-trip and escaping, object field lookup, whole-number
     acceptance, URL parsing, HTTP status-line/header helpers, chunked
-    hex sizes, EnvGet, HttpClassify's four envelope shapes) pass from a
-    clean build. `./run test apl`, `./run verify-example apl`, and
+    hex sizes, EnvGet, and HttpClassify's four envelope shapes. It does
+    not include a local mock WebSocket fixture server exercising Live's
+    edge cases deterministically and offline (fragmentation/control-
+    frame interleaving, five reconnects with backoff-reset assertions,
+    a stopped-reader queue bound, etc.) the way some other languages in
+    this project do for their own `test` target. Every one of those
+    scenarios this client actually implements is instead exercised
+    against a real backend by the shared conformance pilot's
+    `client/live/*` cases (reconnect-five-times genuinely reconnects
+    five times over real TLS; query-error-recovery genuinely recovers
+    from a real FunctionError) and, for the two bugs a real run alone
+    could catch, by hand -- but that is real-backend evidence, not the
+    fully offline, adversarial local coverage AGENTS.md's Live
+    acceptance section asks for.
+  - >-
+    `./run test apl`, `./run verify-example apl`, and
     `./run verify-all apl` (both the local self-hosted and the
     dedicated hosted deployment profiles) all pass from a clean,
     exact-HEAD commit: the shared black-box conformance pilot
