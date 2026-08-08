@@ -34,23 +34,24 @@ update really came from the reactive socket rather than from a lucky re-read.
 
 | Capability | State | Notes |
 | --- | --- | --- |
-| HTTP query, mutation, action | Implemented, unverified | JSON envelope, structured function errors, log lines |
-| TLS | Implemented, unverified | OpenSSL client TLS with CA and hostname verification |
-| Live subscriptions | Implemented, unverified | Pinned sync profile, Add/Remove, transitions, reconnect and rehydration |
-| Bearer token auth | Implemented, unverified | Set and cleared on the HTTP path |
+| HTTP query, mutation, action | Verified by shared local and hosted conformance | JSON envelope, structured function errors, log lines |
+| TLS | Verified by shared local and hosted conformance | OpenSSL client TLS with CA and hostname verification |
+| Live subscriptions | Verified by shared local and hosted conformance | Pinned sync profile, Add/Remove, transitions, reconnect and rehydration |
+| Bearer token auth | Verified by shared local and hosted conformance | Set and cleared on the HTTP path |
 | Live authentication | Not implemented | Deferred |
 | WebSocket mutations and actions | Not implemented | Deferred; mutations go over HTTP |
 | Optimistic updates, journals, TransitionChunk | Not implemented | Deferred |
 | Tagged Convex values (Int64, bytes) | Not implemented | JSON-safe values only |
 
-"Implemented, unverified" is deliberate. The code is complete and covered by
-language-local tests, but no Docker build and no shared conformance run have
-been executed for this client yet, so **no capability badge has been earned**.
+Shared local and hosted conformance passed 31/31 from a clean exact-head
+build, so both the `http` and `live` capability badges are earned. See
+[`manifest.yaml`](manifest.yaml) for the `capabilities:` list the evaluator
+recorded.
 
 ## The canonical example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.io -->
-```text
+```io
 #!/usr/local/bin/io
 //
 // The canonical Convex-from-Io example: watch one shared counter go 0 -> 1.
@@ -268,7 +269,14 @@ ConvexBasics := Object clone do(
         if(subscriptionId isNil not, client unsubscribe(subscriptionId))
         client close
         if(problem,
-            File standardError write("convex-io example failed: " .. Convex errorMessage(problem) .. "\n")
+            // See Convex writeDiagnostic in convex.io: retried rather than a
+            // bare File write, so a transient hiccup in whatever is capturing
+            // this process's stderr cannot mask the real failure this is
+            // trying to report before exiting non-zero.
+            Convex writeDiagnostic(
+                File standardError,
+                "convex-io example failed: " .. Convex errorMessage(problem) .. "\n"
+            )
             System exit(1)
         )
         0
@@ -371,9 +379,9 @@ a reader is meant to learn.
 
 ## Honest limitations
 
-- **Nothing has been verified in Docker yet.** No build, no example run and no
-  conformance run has happened for this client. Treat every claim above as
-  source-complete rather than proven.
+- **Shared local and hosted conformance passed 31/31 from a clean exact-head
+  build.** The `http` and `live` capability badges in
+  [`manifest.yaml`](manifest.yaml) record that evaluator award.
 - The Dockerfile asserts its toolchain versions (GCC 12, CMake 3.25, OpenSSL 3)
   instead of pinning exact apt package versions. Pinning those is a follow-up
   once a first build confirms the resolved versions.

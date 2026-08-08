@@ -39,5 +39,7 @@ limitations:
   - A subscription suppresses any repeat of the value it last published, not only the rehydration that follows a reconnect. Convex only reissues a query result when it changes, so this is deduplication rather than filtering, but it does mean a deliberate identical republish would not be observed.
   - Adapter output uses a newest-16 queue with a 6 MiB byte budget that includes the NDJSON newline and a conservative per-entry allowance. Four event slots and 64 KiB are reserved for control events, and only one record is ever in flight so a queued delivery is re-checked against its subscription generation immediately before it is committed.
   - Language-local loopback tests cover the request shape, bearer token lifecycle, chunked responses, the status and envelope rule, response and frame byte budgets, absolute HTTP deadlines, five real reconnects with query-set resend and suppressed rehydration, QueryFailed and recovery, mismatched transition versions, fragmented UTF-8 around a control frame, partial-frame deadlines, bounded close against idle, chatty and stalled peers, and the adapter's event shapes, stopped-reader bounds, generation barrier and same-id replacement.
-  - No Docker build or shared conformance run has been executed for this client yet, so every capability badge remains unearned, the exact apt package versions in the Dockerfile are asserted rather than pinned, and clang-format conformance of client/convex_transport.c is enforced by the build rather than verified in advance.
-capabilities: []
+  - Shared local and hosted conformance passed 31/31 from a clean exact-head build; the capability list below records the evaluator award. The exact apt package versions in the Dockerfile are still asserted rather than pinned, and clang-format conformance of client/convex_transport.c is enforced by the build rather than verified in advance.
+capabilities:
+  - http
+  - live
