@@ -69,4 +69,16 @@ begin
     raise EConvexJson.CreateFmt('missing JSON field "%s"', [FieldName]);
 end;
 
+initialization
+  // fpjson's TJSONData.AsJSON defaults to inserting a space after every
+  // `:' and `,' (CompressedJSON = False). Every wire format this project
+  // emits, NDJSON adapter events, HTTP request bodies, and outgoing Live
+  // frames, is expected to be ordinary compact JSON, and the shared
+  // conformance byte budget charges every byte on the wire. This class
+  // property is process-global, so setting it once here, in the one unit
+  // every other Convex unit already uses, is enough to make every AsJSON
+  // call in this client compact without repeating the assignment in each
+  // program's initialization.
+  TJSONData.CompressedJSON := True;
+
 end.
