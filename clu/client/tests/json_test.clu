@@ -120,6 +120,40 @@ start_up = proc ()
 	except when not_found, bad_format: round := "<error>" end
     check$ok("object2 + field round trip", string$equal(round, "7"))
 
+    %   array_items(): needed to walk a Transition's "modifications"
+    %   array one element at a time. Covers an empty array, a flat array
+    %   of objects (each element's raw text handed back untouched, so a
+    %   caller can json$field into it), and an array element that itself
+    %   contains a nested array/object -- proving depth tracking, not
+    %   just comma-splitting, decides where each element ends.
+    empty_items: sequence[string] := json$array_items("[]")
+	except when bad_format: empty_items := sequence[string]$new() end
+    check$ok("array_items('[]') is empty",
+	     sequence[string]$size(empty_items) = 0)
+
+    obj_items: sequence[string] := json$array_items(
+	"[{\"a\":1},{\"a\":2}]")
+	except when bad_format: obj_items := sequence[string]$new() end
+    check$ok("array_items splits a two-element array",
+	     sequence[string]$size(obj_items) = 2)
+    check$ok("array_items' first element is its own raw object text",
+	     string$equal(sequence[string]$fetch(obj_items, 1), "{\"a\":1}"))
+    check$ok("array_items' second element is its own raw object text",
+	     string$equal(sequence[string]$fetch(obj_items, 2), "{\"a\":2}"))
+
+    nested_items: sequence[string] := json$array_items(
+	"[{\"nested\":[1,2,3]},7]")
+	except when bad_format: nested_items := sequence[string]$new() end
+    check$ok("array_items does not split inside a nested array",
+	     sequence[string]$size(nested_items) = 2)
+    check$ok("array_items' second element after a nested array is correct",
+	     string$equal(sequence[string]$fetch(nested_items, 2), "7"))
+
+    array_bad_format: bool := false
+    json$array_items("{\"not\":\"an array\"}")
+	except when bad_format: array_bad_format := true end
+    check$ok("array_items rejects a non-array", array_bad_format)
+
     if check$fail_count() > 0
        then stream$putl(po, int$unparse(check$fail_count()) || " FAILED")
 	    _exit(1)

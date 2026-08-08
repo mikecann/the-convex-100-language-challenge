@@ -19,7 +19,8 @@
 %   procedure, but grouping them under json$... is exactly how a CLU
 %   programmer is meant to organise a related family of operations.
 
-json = cluster is field, uint32, qs, unqs, object1, object2, object3
+json = cluster is field, uint32, qs, unqs, object1, object2, object3,
+			  array_items
 
 rep = null
 
@@ -307,6 +308,40 @@ rep = null
 	    b2: int := 128 + (cp // 64)
 	    return(byte_s(b0) || byte_s(b1) || byte_s(b2))
 	    end utf8_of
+
+%   array_items(raw) -> the raw JSON text of each top-level element of
+%   the JSON array raw, in order (an empty sequence for "[]"). Needed by
+%   convex-sync.clu to walk a Transition's "modifications" array one
+%   element at a time; signals bad_format if raw is not an array or is
+%   truncated, using the same depth-tracking skip_value that already
+%   proves correct for field's own object walk, just applied to a
+%   '[' ... ']' pair instead of a '{' ... '}' one.
+	array_items = proc (raw: string) returns (sequence[string])
+						 signals (bad_format)
+	    n: int := string$size(raw)
+	    i: int := skip_ws(raw, 1)
+	    if i > n cor raw[i] ~= '[' then signal bad_format end
+	    i := skip_ws(raw, i + 1)
+	    items: sequence[string] := sequence[string]$new()
+	    if i <= n cand raw[i] = ']' then return(items) end
+	    while true do
+		i := skip_ws(raw, i)
+		if i > n then signal bad_format end
+		item_end: int := skip_value(raw, i)
+		    resignal bad_format
+		items := sequence[string]$addh(items,
+						string$substr(raw, i,
+							      item_end - i))
+		i := skip_ws(raw, item_end)
+		if i > n then signal bad_format end
+		if raw[i] = ','
+		   then i := i + 1
+		   elseif raw[i] = ']'
+		   then return(items)
+		   else signal bad_format
+		   end
+		end
+	    end array_items
 
 %   object1/object2/object3(k1, v1, ...) -> a JSON object's text from
 %   already-JSON-encoded values (each vN is expected to already be a
