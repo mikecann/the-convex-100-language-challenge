@@ -1,0 +1,225 @@
+comment client-test.sim - language-local unit tests for the buffer and
+   JSON layers. Not mocked: every assertion below drives the real
+   procedures in client/convex-buffer.sim and client/convex-json.sim, the
+   same code the HTTP and Live layers call. Assembled by the Docker build
+   together with convex-native.sim, convex-buffer.sim and convex-json.sim
+   inside one shared begin block, exactly like every other test entry
+   point in this client;
+
+integer testsrun, testsfailed, discard;
+
+procedure checktrue(casename, cond);
+   boolean cond;
+   text casename;
+begin
+   testsrun := testsrun + 1;
+   if cond then begin
+      OutText("ok   "); OutText(casename); OutImage
+   end
+   else begin
+      testsfailed := testsfailed + 1;
+      OutText("FAIL "); OutText(casename); OutImage
+   end
+end checktrue;
+
+procedure checkint(casename, expected, actual);
+   integer expected, actual;
+   text casename;
+begin
+   testsrun := testsrun + 1;
+   if expected = actual then begin
+      OutText("ok   "); OutText(casename); OutImage
+   end
+   else begin
+      testsfailed := testsfailed + 1;
+      OutText("FAIL "); OutText(casename); OutText(" expected ");
+      OutInt(expected, 0); OutText(" got "); OutInt(actual, 0); OutImage
+   end
+end checkint;
+
+testsrun := 0;
+testsfailed := 0;
+
+comment ---------------------------------------------------------------
+   Buffer basics.
+   ------------------------------------------------------------------;
+begin
+   integer array buf(0:63);
+   integer len;
+   len := 0;
+   discard := bufputstr(buf, 64, len, "abc");
+   discard := bufputint(buf, 64, len, -42);
+   checkint("bufputint length", 6, len);
+   checktrue("bufeqstr matches prefix", bufeqstr(buf, 0, 3, "abc"));
+   checktrue("bufeqstr rejects wrong text", not bufeqstr(buf, 0, 3, "abd"));
+   checktrue("bufieqstr is case-insensitive", bufieqstr(buf, 0, 3, "ABC"));
+   checkint("bufindexof finds a byte", 3, bufindexof(buf, 0, len, 45));
+   checkint("bufindexof reports absent", -1, bufindexof(buf, 0, len, 90))
+end;
+
+comment overflow must be refused, not silently truncated;
+begin
+   integer array tiny(0:1);
+   integer len, r;
+   len := 0;
+   r := bufputstr(tiny, 2, len, "abc");
+   checkint("bufputstr refuses overflow", 1, r);
+   checkint("bufputstr leaves len unset on overflow", 0, len)
+end;
+
+comment ---------------------------------------------------------------
+   Base 64 and hex round trips.
+   ------------------------------------------------------------------;
+begin
+   integer array raw(0:15);
+   integer array enc(0:31);
+   integer array dec(0:15);
+   integer enclen, declen, i, same;
+   raw(0) := 0; raw(1) := 1; raw(2) := 254; raw(3) := 255;
+   enclen := 0;
+   discard := b64encode(raw, 0, 4, enc, 32, enclen);
+   declen := 0;
+   discard := b64decode(enc, 0, 4, dec, 16, declen);
+   checkint("b64 round trip length", 3, declen);
+   same := 1;
+   for i := 0 step 1 until 2 do if dec(i) <> raw(i) then same := 0;
+   checktrue("b64 round trip bytes", same = 1);
+
+   begin
+      integer array hexbuf(0:31);
+      integer hexlen;
+      hexlen := 0;
+      discard := hexencode(raw, 0, 4, hexbuf, 32, hexlen);
+      checkint("hexencode length", 8, hexlen);
+      checktrue("hexencode content", bufeqstr(hexbuf, 0, 8, "0001feff"))
+   end
+end;
+
+comment ---------------------------------------------------------------
+   JSON: strict parsing, field lookup, string escaping.
+   ------------------------------------------------------------------;
+begin
+   integer array doc(0:255);
+   integer doclen;
+   doclen := 0;
+   discard := bufputstr(doc, 256, doclen,
+      "{""count"":0,""casename"":""ab\""c"",""nested"":{""x"":1},""arr"":[10,20,30]}");
+
+   begin
+      integer voff, vlen, found, ok, val;
+      integer array errbuf(0:255);
+      integer errbuflen, errkind;
+      errbuflen := 0; errkind := 0;
+      jsonfindfield(doc, 0, doclen, "count", voff, vlen, found, errbuf, errbuflen, errkind);
+      checkint("jsonfindfield errkind", 0, errkind);
+      checktrue("jsonfindfield finds count", found <> 0);
+      val := jsonparseint(doc, voff, vlen, ok);
+      checktrue("jsonparseint ok for plain 0", ok = 1);
+      checkint("jsonparseint value for plain 0", 0, val)
+   end;
+
+   begin
+      integer voff, vlen, found;
+      integer array errbuf(0:255);
+      integer errbuflen, errkind;
+      errbuflen := 0; errkind := 0;
+      jsonfindfield(doc, 0, doclen, "missing", voff, vlen, found, errbuf, errbuflen, errkind);
+      checkint("jsonfindfield errkind on absent key", 0, errkind);
+      checktrue("jsonfindfield reports absent key", found = 0)
+   end;
+
+   begin
+      integer voff, vlen, found, nvoff, nvlen, nfound, val, ok;
+      integer array errbuf(0:255);
+      integer errbuflen, errkind;
+      errbuflen := 0; errkind := 0;
+      jsonfindfield(doc, 0, doclen, "nested", voff, vlen, found, errbuf, errbuflen, errkind);
+      checktrue("jsonfindfield finds nested object", found <> 0);
+      jsonfindfield(doc, voff, voff + vlen, "x", nvoff, nvlen, nfound, errbuf, errbuflen, errkind);
+      checktrue("jsonfindfield descends into nested object", nfound <> 0);
+      val := jsonparseint(doc, nvoff, nvlen, ok);
+      checkint("nested field value", 1, val)
+   end;
+
+   begin
+      integer voff, vlen, found, elemoff, elemlen, elfound, val, ok;
+      integer array errbuf(0:255);
+      integer errbuflen, errkind;
+      errbuflen := 0; errkind := 0;
+      jsonfindfield(doc, 0, doclen, "arr", voff, vlen, found, errbuf, errbuflen, errkind);
+      checktrue("jsonfindfield finds arr", found <> 0);
+      jsonarrayelementat(doc, voff, voff + vlen, 1, elemoff, elemlen, elfound, errbuf, errbuflen, errkind);
+      checktrue("jsonarrayelementat finds element 1", elfound <> 0);
+      val := jsonparseint(doc, elemoff, elemlen, ok);
+      checkint("jsonarrayelementat element 1 value", 20, val)
+   end;
+
+   begin
+      integer voff, vlen, found, dstlen;
+      integer array errbuf(0:255);
+      integer array dst(0:31);
+      integer errbuflen, errkind;
+      errbuflen := 0; errkind := 0;
+      jsonfindfield(doc, 0, doclen, "casename", voff, vlen, found, errbuf, errbuflen, errkind);
+      checktrue("jsonfindfield finds casename", found <> 0);
+      dstlen := 0;
+      discard := jsonstringcontent(doc, voff, voff + vlen, dst, 32, dstlen);
+      checktrue("jsonstringcontent unescapes a quote", bufeqstr(dst, 0, dstlen, "ab""c"))
+   end
+end;
+
+comment integral-decimal JSON numbers, per this projects rule that 0.0 and
+   1.0 must be accepted as integers while fractional, oversized or
+   malformed numbers must not be;
+begin
+   integer array n1(0:15);
+   integer array n2(0:15);
+   integer array n3(0:15);
+   integer array n4(0:15);
+   integer array n5(0:15);
+   integer len1, len2, len3, len4, len5;
+   integer v, ok;
+   len1 := 0; discard := bufputstr(n1, 16, len1, "0.0");
+   len2 := 0; discard := bufputstr(n2, 16, len2, "1.0");
+   len3 := 0; discard := bufputstr(n3, 16, len3, "1.5");
+   len4 := 0; discard := bufputstr(n4, 16, len4, "1e1");
+   len5 := 0; discard := bufputstr(n5, 16, len5, "1.23e2");
+
+   v := jsonparseint(n1, 0, len1, ok);
+   checktrue("0.0 parses as an integer", ok = 1);
+   checkint("0.0 value", 0, v);
+
+   v := jsonparseint(n2, 0, len2, ok);
+   checktrue("1.0 parses as an integer", ok = 1);
+   checkint("1.0 value", 1, v);
+
+   v := jsonparseint(n3, 0, len3, ok);
+   checktrue("1.5 is rejected as fractional", ok = 0);
+
+   v := jsonparseint(n4, 0, len4, ok);
+   checktrue("1e1 parses as an integer", ok = 1);
+   checkint("1e1 value", 10, v);
+
+   v := jsonparseint(n5, 0, len5, ok);
+   checktrue("1.23e2 parses as an integer", ok = 1);
+   checkint("1.23e2 value", 123, v)
+end;
+
+comment malformed JSON is reported as a ProtocolError, not silently
+   accepted;
+begin
+   integer array bad(0:15);
+   integer badlen, endoff;
+   integer array errbuf(0:255);
+   integer errbuflen, errkind;
+   badlen := 0;
+   discard := bufputstr(bad, 16, badlen, "{""a"":}");
+   errbuflen := 0; errkind := 0;
+   jsonskipvalue(bad, 0, badlen, 1, endoff, errbuf, errbuflen, errkind);
+   checktrue("malformed JSON is rejected", errkind <> 0)
+end;
+
+OutImage;
+OutText("tests run: "); OutInt(testsrun, 0); OutImage;
+OutText("tests failed: "); OutInt(testsfailed, 0); OutImage;
+if testsfailed > 0 then cxexit(1);

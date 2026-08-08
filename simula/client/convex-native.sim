@@ -1,0 +1,72 @@
+comment convex-native.sim - external C procedure headings for every native
+   primitive this client calls. Standard Simula has no sockets, no TLS, no
+   monotonic clock, no entropy source and no environment variable access, so
+   client/convexrt.c supplies exactly those, and nothing else: no HTTP, no
+   WebSocket framing, no JSON and no Convex protocol knowledge lives in that
+   file. Every heading below was confirmed against GNU the Cim compilers own generated C
+   (cim -S on a throwaway probe program, then reading the .c it produced)
+   rather than assumed from the manual: a by-value integer parameter and an
+   integer procedure return value are both plain 64-bit C long, an
+   integer array parameter arrives as long * pointing at its first
+   element, and a by-value text parameter arrives as a mallocd
+   NUL-terminated char * that the callee must not free. This is a simpler
+   boundary than GNU MARSTs ALGOL 60, which needs a thunk to evaluate a
+   by-value scalar and a dope vector to describe an array, since the Cim
+   compilers C output uses the C calling convention directly, confirmed
+   the same way;
+
+external C procedure cxopen is
+   integer procedure cxopen(host, hostlen, port, portlen, tls, deadlinems);
+      integer array host, port;
+      integer hostlen, portlen, tls, deadlinems;;
+
+external C procedure cxadopt is
+   integer procedure cxadopt(fd); integer fd;;
+
+external C procedure cxlisten is
+   integer procedure cxlisten(host, hostlen, port, portlen);
+      integer array host, port;
+      integer hostlen, portlen;;
+
+external C procedure cxaccept is
+   integer procedure cxaccept(handle, timeoutms); integer handle, timeoutms;;
+
+external C procedure cxread is
+   integer procedure cxread(handle, buf, cap);
+      integer array buf;
+      integer handle, cap;;
+
+external C procedure cxwrite is
+   integer procedure cxwrite(handle, buf, offset, length);
+      integer array buf;
+      integer handle, offset, length;;
+
+external C procedure cxpoll is
+   integer procedure cxpoll(h0, w0, h1, w1, h2, w2, timeoutms);
+      integer h0, w0, h1, w1, h2, w2, timeoutms;;
+
+external C procedure cxnowms is
+   integer procedure cxnowms;;
+
+external C procedure cxerrtext is
+   integer procedure cxerrtext(buf, cap); integer array buf; integer cap;;
+
+external C procedure cxclose is
+   integer procedure cxclose(handle); integer handle;;
+
+external C procedure cxexit is
+   procedure cxexit(code); integer code;;
+
+external C procedure cxrandom is
+   integer procedure cxrandom(buf, n); integer array buf; integer n;;
+
+external C procedure cxtextbytes is
+   integer procedure cxtextbytes(s, buf, cap);
+      text s;
+      integer array buf;
+      integer cap;;
+
+external C procedure cxgetenv is
+   integer procedure cxgetenv(envname, envnamelen, buf, cap);
+      integer array envname, buf;
+      integer envnamelen, cap;;

@@ -1,0 +1,93 @@
+schemaVersion: 1
+id: simula
+displayName: "Simula 67"
+rank: 79
+selectionTier: coverage
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Simula 67 implementation of Convex's documented JSON HTTP functions
+    and the pinned /api/sync protocol, translated to C by GNU Cim. JSON,
+    HTTP/1.1 framing, RFC 6455 WebSocket framing, base64, hex, and every
+    Convex sync semantic are written in Simula. One reviewed C support file,
+    client/convexrt.c, supplies only the primitives the 1967 report does not
+    have: TCP sockets, TLS, non-blocking read and write, readiness polling,
+    listen and accept, a monotonic clock, entropy, and environment variable
+    access, called from Simula through Cim's `external C procedure`. It
+    contains no HTTP, no WebSocket framing, no JSON and no Convex knowledge;
+    every deadline, retry, and bound is written in Simula.
+toolchain:
+  name: GNU Cim
+  version: "5.1"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    This checkpoint is an in-progress bring-up, not a finished client. GNU Cim
+    5.1 was confirmed to build from source inside the pinned Docker test image
+    and to compile a Simula program that calls an `external C procedure`
+    linked from a separately compiled C translation unit, proving the build
+    shape INFEASIBLE.md proposed for this slot. Along the way, a genuine
+    upstream packaging bug was found and fixed: GNU Cim 5.1's release tarball
+    ships two pre-generated bootstrap C files (lib/simset.c, lib/simulation.c)
+    that hardcode `#include "../../lib/cim.h"`, a relative path that does not
+    resolve from a plain tarball extraction; the Dockerfile rewrites both to
+    the working `#include "cim.h"` before building.
+  - >-
+    The C ABI GNU Cim actually generates was confirmed by compiling a probe
+    program and reading its output, not assumed from the manual: a by-value
+    `integer` parameter and an `integer procedure`'s return value are both a
+    64-bit C `long`, not `int` (matching every `integer array` element, which
+    is 8 bytes wide), and a by-value `text` parameter arrives as a malloc'd
+    NUL-terminated `char *`. client/convexrt.c uses `long` throughout for
+    exactly that reason.
+  - >-
+    client/convex-native.sim (the external C procedure headings),
+    client/convex-buffer.sim (byte buffers, base 64, hex) and
+    client/convex-json.sim (a strict JSON reader and writer, including the
+    integral-decimal-form rule for values like 0.0 and 1.0) are complete,
+    translated from this project's merged ALGOL 60 client's proven design,
+    and covered by real language-local unit tests in
+    client/tests/client-test.sim (36 assertions, 0 mocked). The Docker test
+    stage builds GNU Cim, the style gate, the native shim compiled on its
+    own, and this suite, and all of it is green. One genuine algorithm bug
+    was found and fixed while writing that suite's exponent-notation cases
+    (not merely translated): the ALGOL 60 source this client's JSON reader
+    was translated from counts fractional digits and flags whether any are
+    nonzero, but never folds their value into the parsed result, so an input
+    like "1.23e2" silently returned 1 instead of 123. This client's
+    jsonparseint folds each fractional digit into the mantissa as it is
+    scanned instead, verified against 0.0, 1.0, 1.5 (correctly rejected),
+    1e1 and 1.23e2.
+  - >-
+    HTTP/1.1 framing and Convex's documented JSON HTTP functions, RFC 6455
+    WebSocket framing, the Live sync state machine, the conformance adapter,
+    and the canonical example are not yet written. Because the shared
+    canonical example transcript in _shared/examples/basics.expected.txt
+    requires Live output ("live initial count", "live updated count"), an
+    HTTP-only client cannot satisfy this project's required `test` Docker
+    interface (which must also compile the canonical example and the
+    conformance executable) or produce a passing `verify-example` run;
+    reaching either needs the WebSocket and Live layers first, not only the
+    HTTP layer.
+  - >-
+    No Docker verify-example, verify, verify-hosted or verify-all evidence
+    exists yet, so no capability is claimed and the roster swap from bc to
+    simula has not been made: recording it now, ahead of a directory that
+    satisfies this project's required Docker interface, would overstate how
+    far this checkpoint has landed.
+capabilities: []
