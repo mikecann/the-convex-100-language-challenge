@@ -17,8 +17,28 @@
 `define CMD_WRITE_FLUSH       6
 `define CMD_READ_BYTE         7
 `define CMD_RANDOM_BYTE       8
+
+// Added for the conformance adapter and canonical example, which (unlike
+// every gate proof and unit test before them) must read commands from a
+// real stdin or an accepted ADAPTER_LISTEN connection, read CONVEX_URL
+// from the environment, and shut down with a real process exit code -
+// mirroring vhdl/client/convex_native.vhdl's CMD_GETENV_*/CMD_WAIT_READY*/
+// CMD_STDIN_READ_BYTE/CMD_EXIT/CMD_LISTEN/CMD_ACCEPT set exactly, opcode
+// numbers included, since nothing about their shape is Verilog-specific.
+`define CMD_GETENV_RESET      9
+`define CMD_GETENV_PUSH       10
+`define CMD_GETENV_LOOKUP     11
+`define CMD_GETENV_BYTE       12
+`define CMD_WAIT_READY        13
+`define CMD_WAIT_READY_STDIN  14
+`define CMD_STDIN_READ_BYTE   15
+
 `define CMD_STDOUT_WRITE_BYTE 16
 `define CMD_STDOUT_FLUSH      17
 `define CMD_STDERR_WRITE_BYTE 18
+
+`define CMD_EXIT              19
+`define CMD_LISTEN            20
+`define CMD_ACCEPT            21
 
 `endif

@@ -76,19 +76,29 @@ enum {
     CMD_WRITE_FLUSH = 6,
     CMD_READ_BYTE = 7,
     CMD_RANDOM_BYTE = 8,
+
+    /* Added for the conformance adapter and canonical example: reading
+       CONVEX_URL (and ADAPTER_LISTEN) from the environment, peeking
+       whether a command is ready without blocking, reading stdin, and
+       exiting with a real process status. Numbered and shaped exactly
+       like vhdl/client/native.c's identical set - nothing about any of
+       these is Verilog-specific, so there was no reason to invent a
+       different boundary. */
+    CMD_GETENV_RESET = 9,
+    CMD_GETENV_PUSH = 10,
+    CMD_GETENV_LOOKUP = 11,
+    CMD_GETENV_BYTE = 12,
+    CMD_WAIT_READY = 13,
+    CMD_WAIT_READY_STDIN = 14,
+    CMD_STDIN_READ_BYTE = 15,
+
     CMD_STDOUT_WRITE_BYTE = 16,
     CMD_STDOUT_FLUSH = 17,
-    CMD_STDERR_WRITE_BYTE = 18
-    /* GETENV_*, WAIT_READY*, STDIN_READ_BYTE, EXIT, LISTEN and ACCEPT are
-       not implemented yet - this gate stage only has to prove a real TCP
-       connection and a real TLS handshake through this boundary. They
-       will be added, matching vhdl/client/native.c's set, when the
-       sync layer above needs them. CMD_RANDOM_BYTE was added now,
-       ahead of that set, because the RFC 6455 WebSocket layer needs a
-       source of entropy for the Sec-WebSocket-Key nonce and each
-       frame's client-to-server masking key (RFC 6455 SS5.3) - the same
-       "no array ever crosses the boundary" byte-at-a-time shape as
-       every other opcode here: one call returns one random byte. */
+    CMD_STDERR_WRITE_BYTE = 18,
+
+    CMD_EXIT = 19,
+    CMD_LISTEN = 20,
+    CMD_ACCEPT = 21
 };
 
 /* ------------------------------------------------------------------ */
@@ -120,6 +130,17 @@ static SSL_CTX *g_ssl_ctx = NULL;
 #define HOST_CAP 256
 static char g_host[HOST_CAP];
 static int g_host_len = 0;
+
+/* Accumulator for the environment variable name the next lookup reads, */
+/* and the buffered value of the most recent successful lookup - the   */
+/* same reset/push/lookup/byte shape g_host uses above, applied to     */
+/* CMD_GETENV_* instead of CMD_HOST_*.                                 */
+#define ENV_NAME_CAP 128
+#define ENV_VALUE_CAP 4096
+static char g_env_name[ENV_NAME_CAP];
+static int g_env_name_len = 0;
+static char g_env_value[ENV_VALUE_CAP];
+static int g_env_value_len = 0;
 
 #define STDOUT_BUF_CAP 8192
 static unsigned char g_stdout_buf[STDOUT_BUF_CAP];
@@ -209,6 +230,81 @@ static int handle_connect(int port, int use_tls) {
         }
         c->ssl = ssl;
     }
+    return slot;
+}
+
+/* ------------------------------------------------------------------ */
+/* The adapter's TCP mode: listen on the accumulated host (ADAPTER_LISTEN's */
+/* address; an empty host means "any interface") and port, then accept   */
+/* one controller connection into the same handle table CMD_CONNECT uses -*/
+/* an accepted connection is indistinguishable from an outbound one to    */
+/* every other opcode, so no separate read/write/close path is needed for */
+/* it. There is only ever one listening socket, matching the adapter's    */
+/* own single-controller-connection contract. Mirrors vhdl/client/       */
+/* native.c's handle_listen/handle_accept exactly.                        */
+/* ------------------------------------------------------------------ */
+static int g_listen_fd = -1;
+
+static int handle_listen(int port) {
+    if (g_listen_fd >= 0) { close(g_listen_fd); g_listen_fd = -1; }
+    if (g_host_len < 0 || g_host_len >= HOST_CAP) return -5;
+    g_host[g_host_len] = '\0';
+
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    const char *node = (g_host_len > 0) ? g_host : NULL;
+    if (getaddrinfo(node, portstr, &hints, &res) != 0 || res == NULL) {
+        return -1; /* bind-address resolution failure */
+    }
+
+    int fd = -1;
+    struct addrinfo *rp;
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) continue;
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        if (bind(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) return -2; /* bind failure */
+    if (listen(fd, 1) != 0) { close(fd); return -3; }
+
+    g_listen_fd = fd;
+    return 0;
+}
+
+static int handle_accept(int timeout_ms) {
+    if (g_listen_fd < 0) return -4; /* CMD_LISTEN was never called or failed */
+    int slot = -1;
+    for (int i = 0; i < MAX_CONN; i++) {
+        if (!g_conn[i].in_use) { slot = i; break; }
+    }
+    if (slot < 0) return -4; /* table full */
+
+    struct pollfd pfd;
+    pfd.fd = g_listen_fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int rc = poll(&pfd, 1, timeout_ms);
+    if (rc < 0) return -3;
+    if (rc == 0) return -1; /* timeout: no controller connected yet */
+
+    int fd = accept(g_listen_fd, NULL, NULL);
+    if (fd < 0) return -3;
+
+    conn_t *c = &g_conn[slot];
+    memset(c, 0, sizeof(*c));
+    c->in_use = 1;
+    c->fd = fd;
     return slot;
 }
 
@@ -328,6 +424,60 @@ static int handle_random_byte(void) {
     return (int)b;
 }
 
+/* Bitmask 1 = the connection handle h has a byte ready; bitmask 2 = stdin
+ * has a byte ready (only checked when include_stdin is set). h < 0 skips
+ * the connection side entirely, matching CMD_WAIT_READY_STDIN's use of
+ * h = -1 to mean "stdin only" when the adapter has not accepted a
+ * controller connection at all (stdin/stdout mode). A TLS connection may
+ * already hold a decoded record in OpenSSL's own buffer with nothing new
+ * on the raw fd; that is reported ready immediately rather than polling a
+ * socket that will not wake until more ciphertext arrives.
+ */
+static int wait_ready(int h, int timeout_ms, int include_stdin) {
+    struct pollfd pfds[2];
+    int nfds = 0;
+    int hidx = -1, sidx = -1;
+    if (h >= 0 && h < MAX_CONN && g_conn[h].in_use) {
+        if (g_conn[h].ssl && SSL_pending(g_conn[h].ssl) > 0) {
+            return include_stdin ? 1 : 1;
+        }
+        pfds[nfds].fd = g_conn[h].fd;
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        hidx = nfds;
+        nfds++;
+    }
+    if (include_stdin) {
+        pfds[nfds].fd = 0;
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        sidx = nfds;
+        nfds++;
+    }
+    if (nfds == 0) return 0;
+    int rc = poll(pfds, nfds, timeout_ms);
+    if (rc < 0) return -1;
+    int mask = 0;
+    if (hidx >= 0 && (pfds[hidx].revents & (POLLIN | POLLHUP | POLLERR))) mask |= 1;
+    if (sidx >= 0 && (pfds[sidx].revents & (POLLIN | POLLHUP | POLLERR))) mask |= 2;
+    return mask;
+}
+
+/* Unbuffered stdin reader: the adapter reads a full NDJSON line at a
+ * time and the OS pipe buffer already absorbs bursts, so no internal
+ * buffering is needed here beyond what poll_readable/read already give
+ * every other opcode. */
+static int stdin_read_byte(int timeout_ms) {
+    int ready = poll_readable(0, timeout_ms);
+    if (ready < 0) return -3;
+    if (ready == 0) return -1;
+    unsigned char b;
+    ssize_t n = read(0, &b, 1);
+    if (n < 0) return -3;
+    if (n == 0) return -2;
+    return b;
+}
+
 /* ------------------------------------------------------------------ */
 /* The single dispatcher. Verilog never reaches the outside world any   */
 /* other way.                                                           */
@@ -357,6 +507,33 @@ static int32_t cx_dispatch(int32_t cmd, int32_t a0, int32_t a1) {
         case CMD_RANDOM_BYTE:
             return handle_random_byte();
 
+        case CMD_GETENV_RESET:
+            g_env_name_len = 0;
+            return 0;
+        case CMD_GETENV_PUSH:
+            if (g_env_name_len < ENV_NAME_CAP - 1) g_env_name[g_env_name_len++] = (char)a0;
+            return 0;
+        case CMD_GETENV_LOOKUP: {
+            g_env_name[g_env_name_len] = '\0';
+            const char *v = getenv(g_env_name);
+            if (!v) { g_env_value_len = 0; return -1; }
+            size_t vlen = strlen(v);
+            if (vlen > ENV_VALUE_CAP) vlen = ENV_VALUE_CAP;
+            memcpy(g_env_value, v, vlen);
+            g_env_value_len = (int)vlen;
+            return g_env_value_len;
+        }
+        case CMD_GETENV_BYTE:
+            if (a0 < 0 || a0 >= g_env_value_len) return -1;
+            return (unsigned char)g_env_value[a0];
+
+        case CMD_WAIT_READY:
+            return wait_ready(a0, a1, 0);
+        case CMD_WAIT_READY_STDIN:
+            return wait_ready(a0, a1, 1);
+        case CMD_STDIN_READ_BYTE:
+            return stdin_read_byte(a0);
+
         case CMD_STDOUT_WRITE_BYTE:
             if (g_stdout_len >= STDOUT_BUF_CAP) stdout_flush();
             g_stdout_buf[g_stdout_len++] = (unsigned char)(a0 & 0xff);
@@ -370,6 +547,16 @@ static int32_t cx_dispatch(int32_t cmd, int32_t a0, int32_t a1) {
             (void)rc;
             return 1;
         }
+
+        case CMD_EXIT:
+            stdout_flush();
+            exit(a0);
+            return 0; /* unreachable */
+
+        case CMD_LISTEN:
+            return handle_listen(a0);
+        case CMD_ACCEPT:
+            return handle_accept(a0);
 
         default:
             return -100; /* unknown opcode */

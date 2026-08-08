@@ -104,6 +104,18 @@ module convex_sync #(
   bit     sub_is_error             [0:MAX_SUBS-1];
   string  sub_value_json           [0:MAX_SUBS-1];
   string  sub_error_msg            [0:MAX_SUBS-1];
+  // Raw (un-decoded) JSON span of a QueryFailed modification's own
+  // "errorData" member, when the server sent one - the same structured
+  // payload demo:fail/demo:requiresNonzero attach a "code" field to over
+  // HTTP (see client/convex.v's identical errorData handling for the
+  // one-shot call path). Absent from this module until this comment was
+  // added: only errorMessage was captured, which happened to be enough
+  // for this file's own sync_smoke.v fixture (it never asserts
+  // errorData) but not for AGENTS.md's structured-error requirement -
+  // cross-checked against delphi-object-pascal/client/ConvexSync.pas's
+  // and mumps/client/convex.m's identical extraction of this field.
+  bit     sub_has_error_data        [0:MAX_SUBS-1];
+  string  sub_error_data_json       [0:MAX_SUBS-1];
   integer sub_version              [0:MAX_SUBS-1];
   bit     sub_awaiting_rehydration [0:MAX_SUBS-1];
 
@@ -596,6 +608,8 @@ module convex_sync #(
       sub_is_error[idx] = 1'b0;
       sub_value_json[idx] = "";
       sub_error_msg[idx] = "";
+      sub_has_error_data[idx] = 1'b0;
+      sub_error_data_json[idx] = "";
       sub_version[idx] = 0;
       sub_awaiting_rehydration[idx] = 1'b0;
 
@@ -624,6 +638,8 @@ module convex_sync #(
       sub_args_json[idx] = "";
       sub_value_json[idx] = "";
       sub_error_msg[idx] = "";
+      sub_has_error_data[idx] = 1'b0;
+      sub_error_data_json[idx] = "";
       sub_has_value[idx] = 1'b0;
       sub_is_error[idx] = 1'b0;
       sub_awaiting_rehydration[idx] = 1'b0;
@@ -636,8 +652,8 @@ module convex_sync #(
   // unrecognised queryId (already removed locally, or stale) is
   // silently ignored, matching every peer client's identical choice.
   task automatic dispatch_one_modification(input integer mod_tok);
-    integer type_tok, qid_tok, val_tok, errmsg_tok;
-    bit found, is_updated, is_failed, is_removed;
+    integer type_tok, qid_tok, val_tok, errmsg_tok, errdata_tok;
+    bit found, is_updated, is_failed, is_removed, has_errdata;
     integer qid, idx;
     bit suppress;
     begin : main
@@ -675,6 +691,8 @@ module convex_sync #(
           sub_has_value[idx] = 1'b1;
           sub_is_error[idx] = 1'b0;
           sub_error_msg[idx] = "";
+          sub_has_error_data[idx] = 1'b0;
+          sub_error_data_json[idx] = "";
           sub_version[idx] = sub_version[idx] + 1;
         end
       end else if (is_failed) begin
@@ -682,9 +700,18 @@ module convex_sync #(
         if (!found || ws.msg.json_kind(errmsg_tok) != JK_STRING) disable main;
         capture_decoded_string(errmsg_tok);
         // An error is never suppressed: the caller must still learn
-        // that a reconnect reproduced a failing query.
+        // that a reconnect reproduced a failing query. errorData is
+        // optional on the wire (a QueryFailed from an unstructured
+        // throw carries none) - captured as a raw JSON span, the same
+        // "copy the exact source bytes" choice capture_raw_span makes
+        // for an ordinary value, so a caller re-keying it (e.g. into an
+        // adapter event's own "data" field) never re-encodes it.
+        ws.msg.json_object_get(mod_tok, "errorData", errdata_tok, has_errdata);
+        if (has_errdata) capture_raw_span(errdata_tok);
         sub_awaiting_rehydration[idx] = 1'b0;
         sub_error_msg[idx] = decoded_scratch;
+        sub_has_error_data[idx] = has_errdata;
+        sub_error_data_json[idx] = has_errdata ? raw_scratch : "";
         sub_has_value[idx] = 1'b1;
         sub_is_error[idx] = 1'b1;
         sub_value_json[idx] = "";
