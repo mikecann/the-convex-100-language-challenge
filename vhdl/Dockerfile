@@ -128,3 +128,91 @@ RUN set -eu; \
     SSL_CERT_FILE=/tmp/tls/ca.crt timeout 20 ./transport_smoke | tee /tmp/transport_smoke.out; \
     kill "$server_pid" 2>/dev/null || true; \
     grep -Fq 'PASS transport_smoke' /tmp/transport_smoke.out
+
+# http_test proves convex_http.vhdl's response decoding (plain
+# Content-Length and chunked Transfer-Encoding) against a real TCP peer
+# rather than a mocked transport. httpfix.c is a tiny one-shot fixture
+# server -- test infrastructure only, never linked into the client itself
+# -- that drains one request and replays exactly one canned response byte
+# for byte, the same role this client's openssl s_server plays for TLS
+# above. Written with a native Dockerfile heredoc (this Dockerfile already
+# pins the 1.7 syntax that supports it) rather than the `\`-continued
+# shell style used elsewhere in this file, because that continuation
+# style joins lines together and would corrupt a real multi-line heredoc.
+RUN <<'HTTPFIX_EOF'
+set -eu
+cat > /tmp/httpfix.c <<'CEOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+int main(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: httpfix port responsefile\n"); return 1; }
+    int port = atoi(argv[1]);
+    FILE *rf = fopen(argv[2], "rb");
+    if (!rf) { perror("fopen"); return 1; }
+    fseek(rf, 0, SEEK_END);
+    long rlen = ftell(rf);
+    fseek(rf, 0, SEEK_SET);
+    char *resp = malloc((size_t)rlen);
+    if (fread(resp, 1, (size_t)rlen, rf) != (size_t)rlen) { return 1; }
+    fclose(rf);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
+    listen(fd, 1);
+    int c = accept(fd, NULL, NULL);
+    char drain[8192];
+    int total = 0;
+    while (total < (int)sizeof(drain)) {
+        char b;
+        ssize_t n = read(c, &b, 1);
+        if (n <= 0) break;
+        drain[total++] = b;
+        if (total >= 4 && drain[total-4]=='\r' && drain[total-3]=='\n' &&
+            drain[total-2]=='\r' && drain[total-1]=='\n') break;
+    }
+    ssize_t off = 0;
+    while (off < rlen) {
+        ssize_t n = write(c, resp + off, (size_t)(rlen - off));
+        if (n <= 0) break;
+        off += n;
+    }
+    close(c);
+    close(fd);
+    return 0;
+}
+CEOF
+gcc -O2 -Wall -Wextra -o /tmp/httpfix /tmp/httpfix.c
+HTTPFIX_EOF
+
+RUN set -eu; \
+    printf '{"status":"success","value":{"count":7}}' > /tmp/clen-body.txt; \
+    clen=$(wc -c < /tmp/clen-body.txt | tr -d ' '); \
+    { \
+      printf 'HTTP/1.1 200 OK\r\n'; \
+      printf 'Content-Type: application/json\r\n'; \
+      printf 'Content-Length: %s\r\n\r\n' "$clen"; \
+      cat /tmp/clen-body.txt; \
+    } > /tmp/clen-response.bin; \
+    { \
+      printf 'HTTP/1.1 200 OK\r\n'; \
+      printf 'Transfer-Encoding: chunked\r\n\r\n'; \
+      printf '5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n'; \
+    } > /tmp/chunked-response.bin; \
+    /tmp/httpfix 44301 /tmp/clen-response.bin & \
+    /tmp/httpfix 44302 /tmp/chunked-response.bin & \
+    sleep 1; \
+    ghdl -a --std=08 --workdir=/project/work client/convex_http.vhdl; \
+    ghdl -a --std=08 --workdir=/project/work client/tests/http_test.vhdl; \
+    ghdl -e --std=08 --workdir=/project/work \
+      -Wl,/project/native.o -Wl,-lssl -Wl,-lcrypto http_test; \
+    timeout 20 ./http_test | tee /tmp/http_test.out; \
+    wait; \
+    grep -Fq 'PASS http_test' /tmp/http_test.out
