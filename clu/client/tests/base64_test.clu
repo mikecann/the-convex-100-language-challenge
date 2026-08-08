@@ -1,0 +1,88 @@
+%   base64_test.clu -- unit coverage for convex-base64.clu against RFC
+%   4648 section 10's own test vectors, in both directions (encode and
+%   its decode inverse), plus a longer round trip through raw bytes
+%   spanning the full 0..255 range so a nibble-order bug that the short
+%   RFC vectors happen not to exercise would still show up.
+
+check = cluster is ok, fail_count
+
+rep = null
+
+own failures: int := 0
+
+	ok = proc (name: string, got: bool)
+	    po: stream := stream$primary_output()
+	    if got
+	       then stream$putl(po, "PASS " || name)
+	       else stream$putl(po, "FAIL " || name)
+		    failures := failures + 1
+	       end
+	    end ok
+
+	fail_count = proc () returns (int)
+	    return(failures)
+	    end fail_count
+
+end check
+
+start_up = proc ()
+    po: stream := stream$primary_output()
+
+    check$ok("encode('')", string$equal(base64$encode(""), ""))
+    check$ok("encode('f')", string$equal(base64$encode("f"), "Zg=="))
+    check$ok("encode('fo')", string$equal(base64$encode("fo"), "Zm8="))
+    check$ok("encode('foo')", string$equal(base64$encode("foo"), "Zm9v"))
+    check$ok("encode('foob')", string$equal(base64$encode("foob"), "Zm9vYg=="))
+    check$ok("encode('fooba')", string$equal(base64$encode("fooba"), "Zm9vYmE="))
+    check$ok("encode('foobar')", string$equal(base64$encode("foobar"), "Zm9vYmFy"))
+
+    check$ok("decode('') = ''", string$equal(base64$decode(""), ""))
+    check$ok("decode('Zg==') = 'f'", string$equal(base64$decode("Zg=="), "f"))
+    check$ok("decode('Zm8=') = 'fo'", string$equal(base64$decode("Zm8="), "fo"))
+    check$ok("decode('Zm9v') = 'foo'", string$equal(base64$decode("Zm9v"), "foo"))
+    check$ok("decode('Zm9vYg==') = 'foob'",
+	     string$equal(base64$decode("Zm9vYg=="), "foob"))
+    check$ok("decode('Zm9vYmE=') = 'fooba'",
+	     string$equal(base64$decode("Zm9vYmE="), "fooba"))
+    check$ok("decode('Zm9vYmFy') = 'foobar'",
+	     string$equal(base64$decode("Zm9vYmFy"), "foobar"))
+
+    check$ok("decode rejects a length not a multiple of four",
+	     ~decode_ok("Zg="))
+
+    % every byte value 0..255 in one buffer, round-tripped, catches a
+    % sign-extension or nibble-order bug the short RFC strings above (all
+    % printable ASCII) would never expose.
+    all_bytes: string := ""
+    i: int := 0
+    while i <= 255 do
+	all_bytes := all_bytes || string$c2s(char$i2c(i))
+	i := i + 1
+	end
+    round_tripped: string := base64$decode(base64$encode(all_bytes))
+    check$ok("round trip over all 256 byte values",
+	     string$equal(round_tripped, all_bytes))
+
+    if check$fail_count() > 0
+       then stream$putl(po, int$unparse(check$fail_count()) || " FAILED")
+	    _exit(1)
+       else stream$putl(po, "ALL PASS")
+       end
+    end start_up
+
+%   decode_ok(s) -> true iff base64$decode(s) succeeds without signalling
+%   bad_format; a plain helper proc (not a cluster member) since this
+%   file's only other top-level entity is start_up itself. The call and
+%   its return have to share one begin...end block: an except clause
+%   binds only to the single statement immediately before it (see
+%   convex-http.clu's classify for the first time this client hit that),
+%   so attaching except straight after "return(true)" would guard only
+%   that unfailable return and let decode's own bad_format signal
+%   escape uncaught.
+decode_ok = proc (s: string) returns (bool)
+    begin
+	base64$decode(s)
+	return(true)
+	end
+	except when bad_format: return(false) end
+    end decode_ok
