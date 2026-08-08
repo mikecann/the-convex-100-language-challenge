@@ -694,12 +694,13 @@ TLS:
 
 ⍝ Splits a Convex base URL into (useTls host port). Accepts
 ⍝ scheme://host[:port] with no path.
-∇Z←UrlParse URL;SCHEMEEND;REST;COLON;USETLS;HOST;PORT
-  SCHEMEEND←(URL⍳'://')-1
-  →(SCHEMEEND<⍴URL)⍴HASSCHEME
+∇Z←UrlParse URL;SCHEMEEND;REST;COLON;USETLS;HOST;PORT;SCHEMEPOS
+  SCHEMEPOS←('://'⍷URL)⍳1        ⍝ index where "://" starts
+  →(SCHEMEPOS≤(⍴URL)-2)⍴HASSCHEME  ⍝ a real match leaves room for all 3 bytes
   Z←JErr 'URL missing scheme'
   →0
 HASSCHEME:
+  SCHEMEEND←SCHEMEPOS-1           ⍝ length of the scheme prefix
   USETLS←('https'≡SCHEMEEND↑URL)∨('wss'≡SCHEMEEND↑URL)
   REST←(SCHEMEEND+3)↓URL
   COLON←REST⍳':'
@@ -998,4 +999,122 @@ TIMEOUTSIZE:
   →0
 TIMEOUTBODY:
   Z←JErr 'timed out reading chunk body'
+∇
+
+⍝ ================================================================
+⍝ http_call: query / mutation / action
+⍝
+⍝ PARAMS = (op path argsJsonText baseUrl token), op one of "query",
+⍝ "mutation", "action"; argsJsonText is already-encoded JSON object
+⍝ text; token is '' for none. Returns one JSON envelope as a character
+⍝ vector:
+⍝   {"type":"result","value":<json>}
+⍝   {"type":"error","error":{"name":...,"message":...}}
+⍝ matching the adapter protocol's own result/error shape.
+⍝ ================================================================
+
+∇Z←TransportError MSG
+  Z←'{"type":"error","error":{"name":"TransportError","message":',(JEscapeString MSG),'}}'
+∇
+
+∇Z←ProtocolError MSG
+  Z←'{"type":"error","error":{"name":"ProtocolError","message":',(JEscapeString MSG),'}}'
+∇
+
+∇Z←HttpCall PARAMS;OP;PATH;ARGSJSON;BASEURL;TOKEN;U;USETLS;HOST;PORT;BODYSTR;REQBYTES;CR;CONN;SR;RR;STATUSCODE;BODYTEXT
+  OP←1⊃PARAMS
+  PATH←2⊃PARAMS
+  ARGSJSON←3⊃PARAMS
+  BASEURL←4⊃PARAMS
+  TOKEN←5⊃PARAMS
+
+  U←UrlParse BASEURL
+  →('k'≡1⊃U)⍴URLOK
+  Z←ProtocolError 'invalid CONVEX_URL'
+  →0
+URLOK:
+  USETLS←1⊃2⊃U
+  HOST←2⊃2⊃U
+  PORT←3⊃2⊃U
+
+  BODYSTR←'{"path":',(JEscapeString PATH),',"args":',ARGSJSON,',"format":"json"}'
+  REQBYTES←HttpBuildRequest (OP BODYSTR HOST TOKEN)
+
+  CR←USETLS ConnConnect (HOST PORT)
+  →('k'≡1⊃CR)⍴CONNOK
+  Z←TransportError 'connect failed: ',2⊃CR
+  →0
+CONNOK:
+  CONN←2⊃CR
+
+  SR←CONN ConnSendAll REQBYTES
+  →('k'≡1⊃SR)⍴SENDOK
+  ConnClose CONN
+  Z←TransportError 'send failed: ',2⊃SR
+  →0
+SENDOK:
+  RR←HttpReadResponse CONN
+  ConnClose CONN
+  →('k'≡1⊃RR)⍴READOK
+  Z←TransportError 2⊃RR
+  →0
+READOK:
+  STATUSCODE←1⊃2⊃RR
+  BODYTEXT←2⊃2⊃RR
+  Z←HttpClassify (STATUSCODE BODYTEXT)
+∇
+
+⍝ Classifies a raw HTTP status + JSON body into the adapter-style
+⍝ envelope, per the documented "format":"json" contract: 200 with
+⍝ status:"success" is a result; 200 with status:"error", or HTTP 560
+⍝ (Convex's function-threw status), is a structured FunctionError;
+⍝ everything else is a ProtocolError.
+∇Z←HttpClassify PARAMS;STATUSCODE;BODYTEXT;DOC;STATUSFIELD;MESSAGE;MSGFIELD;VALUEFIELD
+  STATUSCODE←1⊃PARAMS
+  BODYTEXT←2⊃PARAMS
+  →((STATUSCODE=200)∨(STATUSCODE=560))⍴MAYBEJSON
+  Z←TransportError 'unexpected HTTP status ',(⍕STATUSCODE)
+  →0
+MAYBEJSON:
+  DOC←JParseDocument BODYTEXT
+  →('e'≡1⊃DOC)⍴BADJSON
+  →('o'≡1⊃DOC)⍴ISOBJ
+  Z←ProtocolError 'HTTP response body was not a JSON object'
+  →0
+BADJSON:
+  Z←ProtocolError 'HTTP response body was not valid JSON'
+  →0
+ISOBJ:
+  →('status' JHas DOC)⍴HASSTATUS
+  Z←ProtocolError 'HTTP response omitted status'
+  →0
+HASSTATUS:
+  STATUSFIELD←'status' JGet DOC
+  →(('s'≡1⊃STATUSFIELD)∧('success'≡2⊃STATUSFIELD)∧(STATUSCODE=200))⍴SUCCESS
+  →FUNCERROR
+SUCCESS:
+  →('value' JHas DOC)⍴HASVALUE
+  Z←ProtocolError 'HTTP success response omitted value'
+  →0
+HASVALUE:
+  VALUEFIELD←'value' JGet DOC
+  Z←'{"type":"result","value":',(JStringify VALUEFIELD),'}'
+  →0
+FUNCERROR:
+  MESSAGE←'Convex function failed'
+  →('errorMessage' JHas DOC)⍴HASERRMSG
+  →('message' JHas DOC)⍴HASMSG
+  →BUILDERR
+HASERRMSG:
+  MSGFIELD←'errorMessage' JGet DOC
+  →('s'≡1⊃MSGFIELD)⍴USEMSG
+  →BUILDERR
+HASMSG:
+  MSGFIELD←'message' JGet DOC
+  →('s'≡1⊃MSGFIELD)⍴USEMSG
+  →BUILDERR
+USEMSG:
+  MESSAGE←2⊃MSGFIELD
+BUILDERR:
+  Z←'{"type":"error","error":{"name":"FunctionError","message":',(JEscapeString MESSAGE),'}}'
 ∇
