@@ -38,9 +38,9 @@ adapter:
     - debugDisconnect
 limitations:
   - No Docker build has been run against this source yet, so every claim
-    below the source level is unverified: the apt package pins, the fpc
-    `-Mdelphi -O2` build flags, the readelf amd64 assertions, and the
-    runtime-image pruning list are all unexercised.
+    below the source level is unverified, including the apt package pins,
+    the fpc `-Mdelphi -O2` build flags, the readelf amd64 assertions, and
+    the runtime-image pruning list.
   - Free Pascal has no API to report its own version at run time, so the
     adapter's `hello` response reports a hardcoded runtime string
     ("Free Pascal 3.2.2 (Delphi mode)") matching the pinned toolchain
