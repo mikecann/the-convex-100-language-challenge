@@ -4,5 +4,42 @@ displayName: "XPL"
 rank: 77
 selectionTier: coverage
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: Native XPL implementation of documented HTTP and Live, built entirely
+    from EXTERNAL-declared POSIX socket and OpenSSL calls; sockaddr_in,
+    addrinfo, and the WebSocket frame header are all built and read with
+    corebyte()/coreword()/corelongword() memory pokes instead of any
+    inline() struct declaration. The adapter's Live surface (subscribe,
+    unsubscribe, debugDisconnect, and multi-subscription delivery) runs on a
+    single poll(2)-driven reactor rather than threads, since XPL cannot call
+    a function through a runtime-computed pointer.
+toolchain:
+  name: XPL (sergev/xpl-compiler)
+  version: 1.0 (commit 5b725ef5f486873ee821f4370310f2eaa65b2e55) + gcc 14
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - The educational client supports the JSON-safe Convex value subset only;
+    values are relayed as exact source spans rather than decoded into a
+    general XPL value type.
+  - Bearer tokens, function paths, and adapter-visible strings are escaped
+    and unescaped by a hand written JSON scanner - XPL has no recursion, so
+    it tracks object/array nesting with an integer depth counter instead of
+    a parse tree.
+capabilities:
+  - http
+  - live
