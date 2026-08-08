@@ -1147,3 +1147,22 @@ BUILDERR:
 NOTFOUND:
   Z←''
 ∇
+
+⍝ Writes TEXT plus a trailing newline to stderr (handle 2), looping
+⍝ over short writes via ⎕FIO[42] (a plain write() syscall, unlike the
+⍝ printf-style ⎕FIO[22], whose left-argument shape this project's own
+⍝ testing found error-prone for a simple diagnostic line).
+∇TEXT StdErr DUMMY;BYTES;SENT;TOTAL;N
+  BYTES←BytesOfStr TEXT,⎕UCS 10
+  TOTAL←⍴BYTES
+  SENT←0
+LOOP:
+  →(SENT≥TOTAL)⍴DONE
+  N←(SENT↓BYTES) ⎕FIO[42] 2
+  →(N>0)⍴PROGRESS
+  →DONE
+PROGRESS:
+  SENT←SENT+N
+  →LOOP
+DONE:
+∇
