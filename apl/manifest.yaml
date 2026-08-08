@@ -2,7 +2,7 @@ schemaVersion: 1
 id: apl
 displayName: "APL"
 rank: 69
-selectionTier: ranked
+selectionTier: coverage
 implementation:
   status: attempting
   provenance: native
