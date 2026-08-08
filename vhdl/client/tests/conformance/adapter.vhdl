@@ -321,7 +321,8 @@ begin
     procedure emit_subscription_error(
       sub_id : in byte_array; sub_id_len : in natural;
       err_name : in byte_array; err_name_len : in natural;
-      err_message : in byte_array; err_message_len : in natural
+      err_message : in byte_array; err_message_len : in natural;
+      err_data : in byte_array; err_data_len : in natural
     ) is
     begin
       out_len := 0;
@@ -344,6 +345,12 @@ begin
       json_put_string(out_buf, out_len, "message");
       buf_put_byte(out_buf, out_len, character'pos(':'));
       json_put_string_bytes(out_buf, out_len, err_message, 0, err_message_len);
+      if err_data_len > 0 then
+        buf_put_byte(out_buf, out_len, character'pos(','));
+        json_put_string(out_buf, out_len, "data");
+        buf_put_byte(out_buf, out_len, character'pos(':'));
+        buf_put_slice(out_buf, out_len, err_data, 0, err_data_len);
+      end if;
       buf_put_byte(out_buf, out_len, character'pos('}'));
       buf_put_byte(out_buf, out_len, character'pos('}'));
       emit_line;
@@ -592,20 +599,24 @@ begin
       variable err_name_len : natural;
       variable err_message : byte_array(0 to 255);
       variable err_message_len : natural;
+      variable err_data : byte_array(0 to 1023);
+      variable err_data_len : natural;
       variable step_ok : boolean;
     begin
       if not have_client then
         return;
       end if;
       sync_step(xport_req, sm, 50, has_event, kind, sub_id, sub_id_len, value_json, value_len,
-                logs_json, logs_len, err_name, err_name_len, err_message, err_message_len, step_ok);
+                logs_json, logs_len, err_name, err_name_len, err_message, err_message_len,
+                err_data, err_data_len, step_ok);
       if not has_event then
         return;
       end if;
       if kind = SYNC_UPDATED then
         emit_subscription_value(sub_id, sub_id_len, value_json, value_len, logs_json, logs_len);
       else
-        emit_subscription_error(sub_id, sub_id_len, err_name, err_name_len, err_message, err_message_len);
+        emit_subscription_error(sub_id, sub_id_len, err_name, err_name_len, err_message, err_message_len,
+                                 err_data, err_data_len);
       end if;
     end procedure drain_live_event;
 

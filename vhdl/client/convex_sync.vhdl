@@ -34,6 +34,7 @@ package convex_sync is
   constant SYNC_REASON_CAP    : natural := 32;
   constant SYNC_ERRNAME_CAP   : natural := 16;
   constant SYNC_ERRMSG_CAP    : natural := 256;
+  constant SYNC_ERRDATA_CAP  : natural := 1024;
   constant SYNC_FRAME_DEADLINE_MS : integer := 5000;
   constant SYNC_INITIAL_BACKOFF_MS : integer := 100;
   constant SYNC_MAX_BACKOFF_MS     : integer := 8000;
@@ -70,6 +71,8 @@ package convex_sync is
     error_name_len : natural;
     error_message : byte_array(0 to SYNC_ERRMSG_CAP - 1);
     error_message_len : natural;
+    error_data    : byte_array(0 to SYNC_ERRDATA_CAP - 1);
+    error_data_len : natural;
   end record sync_pending_t;
 
   type sync_pending_array_t is array (0 to SYNC_MAX_PENDING - 1) of sync_pending_t;
@@ -157,6 +160,8 @@ package convex_sync is
     error_name_len    : out natural;
     error_message     : inout byte_array;
     error_message_len : out natural;
+    error_data        : inout byte_array;
+    error_data_len    : out natural;
     ok                : out boolean
   );
 
@@ -308,6 +313,7 @@ package body convex_sync is
         buf_put_str(ev.error_name, ev.error_name_len, name);
         ev.error_message_len := 0;
         buf_put_str(ev.error_message, ev.error_message_len, message);
+        ev.error_data_len := 0;
         push_pending(m, ev);
       end if;
     end loop;
@@ -628,7 +634,9 @@ package body convex_sync is
     error_name        : inout byte_array;
     error_name_len    : out natural;
     error_message     : inout byte_array;
-    error_message_len : out natural
+    error_message_len : out natural;
+    error_data        : inout byte_array;
+    error_data_len    : out natural
   ) is
     variable ev : sync_pending_t;
   begin
@@ -653,6 +661,8 @@ package body convex_sync is
     buf_put_slice(error_name, error_name_len, ev.error_name, 0, ev.error_name_len);
     error_message_len := 0;
     buf_put_slice(error_message, error_message_len, ev.error_message, 0, ev.error_message_len);
+    error_data_len := 0;
+    buf_put_slice(error_data, error_data_len, ev.error_data, 0, ev.error_data_len);
     has_event := true;
   end procedure deliver_first_pending;
 
@@ -834,6 +844,7 @@ package body convex_sync is
             end if;
             ev.error_name_len := 0;
             ev.error_message_len := 0;
+            ev.error_data_len := 0;
             push_pending(m, ev);
           end if;
         elsif json_tok_eq_str(buf, toks, type_tok, "QueryFailed") then
@@ -860,6 +871,21 @@ package body convex_sync is
           else
             buf_put_str(ev.logs_json, ev.logs_len, "[]");
           end if;
+          ev.error_data_len := 0;
+          json_object_get(buf, toks, ntoks, mod_tok, "errorData", val_tok, found);
+          if found then
+            -- Same JSON_STRING quote-widening as the value extraction
+            -- above: a ConvexError's structured data payload may itself
+            -- be a bare string, not just an object.
+            if toks(val_tok).kind = JSON_STRING then
+              raw_start := toks(val_tok).start - 1;
+              raw_stop := toks(val_tok).stop + 1;
+            else
+              raw_start := toks(val_tok).start;
+              raw_stop := toks(val_tok).stop;
+            end if;
+            buf_put_slice(ev.error_data, ev.error_data_len, buf, raw_start, raw_stop - raw_start);
+          end if;
           push_pending(m, ev);
         elsif not json_tok_eq_str(buf, toks, type_tok, "QueryRemoved") then
           return; -- unrecognized modification type
@@ -885,6 +911,8 @@ package body convex_sync is
     error_name_len    : out natural;
     error_message     : inout byte_array;
     error_message_len : out natural;
+    error_data        : inout byte_array;
+    error_data_len    : out natural;
     ok                : out boolean
   ) is
     variable any_active : boolean;
@@ -905,7 +933,8 @@ package body convex_sync is
   begin
     ok := true;
     deliver_first_pending(m, has_event, kind, sub_id, sub_id_len, value_json, value_len,
-                           logs_json, logs_len, error_name, error_name_len, error_message, error_message_len);
+                           logs_json, logs_len, error_name, error_name_len, error_message, error_message_len,
+                           error_data, error_data_len);
     if has_event then
       return;
     end if;
@@ -946,7 +975,8 @@ package body convex_sync is
       close_socket(rq, m, "poll failed");
       publish_owner_error(m, "TransportError", "poll failed while waiting for the Live socket");
       deliver_first_pending(m, has_event, kind, sub_id, sub_id_len, value_json, value_len,
-                             logs_json, logs_len, error_name, error_name_len, error_message, error_message_len);
+                             logs_json, logs_len, error_name, error_name_len, error_message, error_message_len,
+                             error_data, error_data_len);
       return;
     end if;
     if ready_mask = 0 then
@@ -958,14 +988,16 @@ package body convex_sync is
       close_socket(rq, m, "read failed");
       publish_owner_error(m, "TransportError", "Live frame read failed");
       deliver_first_pending(m, has_event, kind, sub_id, sub_id_len, value_json, value_len,
-                             logs_json, logs_len, error_name, error_name_len, error_message, error_message_len);
+                             logs_json, logs_len, error_name, error_name_len, error_message, error_message_len,
+                             error_data, error_data_len);
       return;
     end if;
     if frame_opcode = WS_CLOSE then
       close_socket(rq, m, "ServerClose");
       publish_owner_error(m, "TransportError", "ServerClose");
       deliver_first_pending(m, has_event, kind, sub_id, sub_id_len, value_json, value_len,
-                             logs_json, logs_len, error_name, error_name_len, error_message, error_message_len);
+                             logs_json, logs_len, error_name, error_name_len, error_message, error_message_len,
+                             error_data, error_data_len);
       return;
     end if;
 
@@ -974,7 +1006,8 @@ package body convex_sync is
       close_socket(rq, m, "malformed Live JSON frame");
       publish_owner_error(m, "ProtocolError", "malformed Live JSON frame");
       deliver_first_pending(m, has_event, kind, sub_id, sub_id_len, value_json, value_len,
-                             logs_json, logs_len, error_name, error_name_len, error_message, error_message_len);
+                             logs_json, logs_len, error_name, error_name_len, error_message, error_message_len,
+                             error_data, error_data_len);
       return;
     end if;
     json_object_get(frame_payload, toks, ntoks, toks'low, "type", type_tok, found);
@@ -982,7 +1015,8 @@ package body convex_sync is
       close_socket(rq, m, "malformed Live JSON frame");
       publish_owner_error(m, "ProtocolError", "malformed Live JSON frame");
       deliver_first_pending(m, has_event, kind, sub_id, sub_id_len, value_json, value_len,
-                             logs_json, logs_len, error_name, error_name_len, error_message, error_message_len);
+                             logs_json, logs_len, error_name, error_name_len, error_message, error_message_len,
+                             error_data, error_data_len);
       return;
     end if;
 
@@ -992,7 +1026,8 @@ package body convex_sync is
         close_socket(rq, m, "write failed");
         publish_owner_error(m, "TransportError", "could not answer a Live Ping");
         deliver_first_pending(m, has_event, kind, sub_id, sub_id_len, value_json, value_len,
-                               logs_json, logs_len, error_name, error_name_len, error_message, error_message_len);
+                               logs_json, logs_len, error_name, error_name_len, error_message, error_message_len,
+                               error_data, error_data_len);
       end if;
       return;
     end if;
@@ -1001,7 +1036,8 @@ package body convex_sync is
       close_socket(rq, m, "unexpected Live message type");
       publish_owner_error(m, "ProtocolError", "unexpected Live message type");
       deliver_first_pending(m, has_event, kind, sub_id, sub_id_len, value_json, value_len,
-                             logs_json, logs_len, error_name, error_name_len, error_message, error_message_len);
+                             logs_json, logs_len, error_name, error_name_len, error_message, error_message_len,
+                             error_data, error_data_len);
       return;
     end if;
 
@@ -1011,7 +1047,8 @@ package body convex_sync is
       publish_owner_error(m, "ProtocolError", "malformed Live transition");
     end if;
     deliver_first_pending(m, has_event, kind, sub_id, sub_id_len, value_json, value_len,
-                           logs_json, logs_len, error_name, error_name_len, error_message, error_message_len);
+                           logs_json, logs_len, error_name, error_name_len, error_message, error_message_len,
+                           error_data, error_data_len);
   end procedure sync_step;
 
 end package body convex_sync;

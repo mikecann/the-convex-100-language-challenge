@@ -154,6 +154,8 @@ begin
     variable ev_err_name_len : natural;
     variable ev_err_message : byte_array(0 to 255);
     variable ev_err_message_len : natural;
+    variable ev_err_data : byte_array(0 to 511);
+    variable ev_err_data_len : natural;
     variable step_ok : boolean;
     variable live_count : integer;
 
@@ -171,7 +173,8 @@ begin
         sync_step(xport_req, sm, 100, has_event, ev_kind, ev_sub_id,
                    ev_sub_id_len, ev_value, ev_value_len, ev_logs,
                    ev_logs_len, ev_err_name, ev_err_name_len,
-                   ev_err_message, ev_err_message_len, step_ok);
+                   ev_err_message, ev_err_message_len,
+                   ev_err_data, ev_err_data_len, step_ok);
         if not step_ok then
           fatal("Live step failed");
         end if;

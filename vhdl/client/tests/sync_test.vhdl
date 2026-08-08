@@ -39,6 +39,8 @@ begin
     variable error_name_len : natural;
     variable error_message : byte_array(0 to 255);
     variable error_message_len : natural;
+    variable error_data : byte_array(0 to 1023);
+    variable error_data_len : natural;
     variable step_ok : boolean;
 
     variable args_buf : byte_array(0 to 15);
@@ -60,7 +62,8 @@ begin
     attempts := 0;
     loop
       sync_step(xport_req, m, 100, has_event, kind, sub_id, sub_id_len, value_json, value_len,
-                logs_json, logs_len, error_name, error_name_len, error_message, error_message_len, step_ok);
+                logs_json, logs_len, error_name, error_name_len, error_message, error_message_len,
+                error_data, error_data_len, step_ok);
       assert step_ok report "sync_step reported an internal failure" severity failure;
       exit when has_event;
       attempts := attempts + 1;
@@ -82,7 +85,8 @@ begin
     attempts := 0;
     loop
       sync_step(xport_req, m, 100, has_event, kind, sub_id, sub_id_len, value_json, value_len,
-                logs_json, logs_len, error_name, error_name_len, error_message, error_message_len, step_ok);
+                logs_json, logs_len, error_name, error_name_len, error_message, error_message_len,
+                error_data, error_data_len, step_ok);
       assert step_ok report "sync_step reported an internal failure after reconnect" severity failure;
       exit when has_event;
       attempts := attempts + 1;
