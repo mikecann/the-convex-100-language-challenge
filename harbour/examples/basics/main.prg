@@ -47,7 +47,11 @@ PROCEDURE Main( cRoomArg )
     * current bearer token, and the Live worker thread's subscription
     * pump. Every delivered Live value or error for this example's one
     * subscription arrives on cUpdateChan, notified from the worker
-    * thread, because only one thread here ever calls ?/OutStd(). */
+    * thread, because only one thread here ever calls OutStd(). Harbour's
+    * "?" command is QOut(), which writes the line terminator before the
+    * expression rather than after it, so this example calls OutStd()
+    * directly with an explicit trailing hb_eol() to keep stdout in the
+    * ordinary content-then-newline order the transcript check expects. */
    cUpdateChan := hb_mutexCreate()
    bOnEvent := {| cSubId, xVal, hErr, xLogs | ;
       hb_mutexNotify( cUpdateChan, { "value" => xVal, "error" => hErr } ) }
@@ -64,7 +68,7 @@ PROCEDURE Main( cRoomArg )
    IF !hResult[ "ok" ] .OR. CountOf( hResult[ "value" ] ) != 0
       Die( "unexpected initial query value" )
    ENDIF
-   ? "current count: 0"
+   OutStd( "current count: 0" + hb_eol() )
 
    /* Starting Live before the mutation: subscribing first means no
     * reactive update, including the one the mutation below is about to
@@ -78,7 +82,7 @@ PROCEDURE Main( cRoomArg )
       hUpdate[ "error" ] != NIL .OR. CountOf( hUpdate[ "value" ] ) != 0
       Die( "unexpected initial Live value" )
    ENDIF
-   ? "live initial count: 0"
+   OutStd( "live initial count: 0" + hb_eol() )
 
    /* The mutation and its idempotency key: runId is deterministic per
     * room, so re-running this example against a room it already touched
@@ -93,8 +97,8 @@ PROCEDURE Main( cRoomArg )
       CountOf( xValue[ "state" ] ) != 1
       Die( "unexpected mutation result" )
    ENDIF
-   ? "mutation applied: true"
-   ? "mutation count: 1"
+   OutStd( "mutation applied: true" + hb_eol() )
+   OutStd( "mutation count: 1" + hb_eol() )
 
    /* Receiving the same change reactively: the Live subscription
     * delivers the mutation's result with no second HTTP request at
@@ -103,11 +107,11 @@ PROCEDURE Main( cRoomArg )
       hUpdate[ "error" ] != NIL .OR. CountOf( hUpdate[ "value" ] ) != 1
       Die( "unexpected updated Live value" )
    ENDIF
-   ? "live updated count: 1"
+   OutStd( "live updated count: 1" + hb_eol() )
 
    /* Only now, with the HTTP query, the initial Live value, the mutation
     * and the updated Live value all agreeing, print the proof line. */
-   ? "verified count: 0 -> 1"
+   OutStd( "verified count: 0 -> 1" + hb_eol() )
 
    /* Cleanup: unsubscribe and close before the process exits. */
    oClient:Unsubscribe( "state" )
