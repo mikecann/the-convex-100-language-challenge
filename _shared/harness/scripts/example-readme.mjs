@@ -20,6 +20,7 @@ const fenceLanguages = {
   ".cc": "cpp",
   ".chpl": "chapel",
   ".clj": "clojure",
+  ".clu": "clu",
   ".cob": "cobol",
   ".coffee": "coffeescript",
   ".cr": "crystal",
