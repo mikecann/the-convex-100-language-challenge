@@ -13,10 +13,18 @@ send = proc (t: cvt, s: string) signals (not_possible(string))
 	% write all of s over the TLS connection
 	end send
 
-recv = proc (t: cvt, maxlen: int) returns (string)
-				  signals (not_possible(string), end_of_file)
-	% read up to maxlen bytes (capped internally) from the TLS
-	% connection; signals end_of_file on a clean close
+recv = proc (t: cvt, maxlen: int, timeout_ms: int) returns (string)
+				  signals (not_possible(string), end_of_file,
+					   timeout)
+	% Waits up to timeout_ms for data with poll(2) on the connection's
+	% own file descriptor, then reads up to maxlen bytes (capped
+	% internally). Signals timeout (connection still open, nothing
+	% arrived in time) if the wait expires, or end_of_file on a clean
+	% close. The poll-then-read split (rather than an SSL-level
+	% timeout) matters here: OpenSSL's SSL_read cannot itself
+	% distinguish "peer is merely idle" from "peer closed", so gating
+	% on poll(2) first is what lets a caller tell a live-but-quiet
+	% connection apart from one that is actually gone.
 	end recv
 
 close = proc (t: cvt) signals (not_possible(string))

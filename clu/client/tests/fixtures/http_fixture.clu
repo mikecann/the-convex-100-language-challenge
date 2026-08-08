@@ -1,0 +1,48 @@
+% Loopback HTTP fixture: listens on 127.0.0.1:<port>, accepts one
+% connection, reads and discards the request, writes back the exact
+% bytes of the file named in argv[2] verbatim, then closes.
+start_up = proc ()
+    po: stream := stream$primary_output()
+    AF_INET: int := 2
+    SOCK_STREAM: int := 1
+    args: sequence[string] := get_argv()
+    port: int := int$parse(sequence[string]$fetch(args, 1))
+    response_file: string := sequence[string]$fetch(args, 2)
+    fch: _chan := _chan$open(file_name$parse(response_file), "read", 0)
+    fbuf: _wordvec := _wordvec$create(4096)
+    flen: int := _chan$getw(fch, fbuf)
+    _chan$close(fch)
+    fbytes: _bytevec := _bytevec$create(flen)
+    _wordvec$move_w2b(fbuf, 1, fbytes, 1, flen)
+    response: string := _cvt[_bytevec, string](fbytes)
+
+    addr: _wordvec := _wordvec$create(4)
+    _wordvec$wstore(addr, 1, AF_INET)
+    _wordvec$wstore(addr, 3, (port / 2**8) + (port * 2**8))
+    l, r: int := inet_address("127.0.0.1")
+    _wordvec$wstore(addr, 5, r)
+    _wordvec$wstore(addr, 7, l)
+
+    lch: _chan := _chan$socket(AF_INET, SOCK_STREAM, 0)
+    _chan$bind(lch, addr, 16)
+    _chan$listen(lch, 1)
+    stream$putl(po, "READY")
+
+    peeraddr: _wordvec := _wordvec$create(4)
+    ch: _chan, alen: int := _chan$accept(lch, peeraddr)
+
+    % Drain whatever the client sent (up to a generous fixed budget) so
+    % close() below is a clean finish rather than a reset with unread
+    % bytes still sitting in the kernel receive buffer.
+    _chan$read_wait(ch, 2000)
+    rbuf: _wordvec := _wordvec$create(4096)
+    _chan$recv(ch, rbuf, 0)
+
+    sbuf: _wordvec := _wordvec$create((string$size(response) + 3) / 4)
+    _wordvec$move_b2w(_cvt[string, _bytevec](response), 1, sbuf, 1,
+		       string$size(response))
+    _chan$send(ch, sbuf, string$size(response), 0)
+
+    _chan$close(ch)
+    _chan$close(lch)
+    end start_up

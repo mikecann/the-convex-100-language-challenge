@@ -1,0 +1,97 @@
+%   convex-bitops.clu -- bitwise helpers for the WebSocket masking XOR and
+%   the WebSocket handshake's SHA-1, built entirely from arithmetic (/, //,
+%   2**n). CLU's own int cluster (see cmp/basic.types in pclu) has no
+%   bitwise operators at all -- no AND, OR, XOR, or shift -- unlike, say,
+%   Icon's iand/ixor/ishift, so every bit operation this client needs is
+%   assembled here from division and modulus. Everything here works one
+%   bit at a time; that is intentionally simple rather than fast, since
+%   the heaviest caller (SHA-1) runs at most a handful of times per Live
+%   connection, on a message under 200 bytes, and WebSocket masking XORs
+%   at most a few tens of kilobytes per frame.
+
+bitops = cluster is xor32, and32, or32, not32, rotl32, xor_byte
+
+rep = null
+
+comb_t = proctype (int, int) returns (int)
+
+%   one_bit(v, n) -> the value of bit n (0 = least significant) of v,
+%   which must already be in 0 .. 2**width - 1 for whatever width the
+%   caller cares about; bits beyond v's own magnitude read as 0.
+	one_bit = proc (v: int, n: int) returns (int)
+	    d: int := v / (2 ** n)
+	    return(d // 2)
+	    end one_bit
+
+	xor_bit = proc (x, y: int) returns (int)
+	    if x = y then return(0) end
+	    return(1)
+	    end xor_bit
+
+	and_bit = proc (x, y: int) returns (int)
+	    if x = 1 cand y = 1 then return(1) end
+	    return(0)
+	    end and_bit
+
+	or_bit = proc (x, y: int) returns (int)
+	    if x = 1 cor y = 1 then return(1) end
+	    return(0)
+	    end or_bit
+
+%   combine(a, b, width, combiner) -> a and b combined bit by bit, each
+%   bit computed by combiner(abit, bbit) -> 0 or 1, reassembled into an
+%   integer 0 .. 2**width - 1.
+	combine = proc (a, b, width: int, combiner: comb_t) returns (int)
+	    result: int := 0
+	    place: int := 1
+	    i: int := 0
+	    while i < width do
+		abit: int := one_bit(a, i)
+		bbit: int := one_bit(b, i)
+		if combiner(abit, bbit) = 1 then result := result + place end
+		place := place * 2
+		i := i + 1
+		end
+	    return(result)
+	    end combine
+
+%   xor32(a, b) -> a xor b, treating both as unsigned 32-bit values.
+	xor32 = proc (a, b: int) returns (int)
+	    return(combine(a, b, 32, xor_bit))
+	    end xor32
+
+%   and32(a, b) -> a and b, treating both as unsigned 32-bit values.
+	and32 = proc (a, b: int) returns (int)
+	    return(combine(a, b, 32, and_bit))
+	    end and32
+
+%   or32(a, b) -> a or b, treating both as unsigned 32-bit values.
+	or32 = proc (a, b: int) returns (int)
+	    return(combine(a, b, 32, or_bit))
+	    end or32
+
+%   not32(a) -> bitwise complement of a within 32 bits (a must already be
+%   0 .. 2**32 - 1). Two's-complement bitwise-not of an unsigned N-bit
+%   value is exactly (2**N - 1 - a), no bit-by-bit loop needed.
+	not32 = proc (a: int) returns (int)
+	    return(4294967295 - a)
+	    end not32
+
+%   rotl32(v, n) -> v (an unsigned 32-bit value) rotated left by n bits
+%   (0 <= n <= 31), by splitting off the top n bits and reassembling them
+%   at the bottom -- exact integer arithmetic, no bit-by-bit loop.
+	rotl32 = proc (v: int, n: int) returns (int)
+	    if n = 0 then return(v) end
+	    high: int := v / (2 ** (32 - n))
+	    low: int := v // (2 ** (32 - n))
+	    return((low * (2 ** n)) + high)
+	    end rotl32
+
+%   xor_byte(a, b) -> a xor b, treating both as unsigned 8-bit values
+%   (used for WebSocket frame masking, where every byte is XORed against
+%   one of four mask-key bytes).
+	xor_byte = proc (a, b: int) returns (int)
+	    return(combine(a, b, 8, xor_bit))
+	    end xor_byte
+
+end bitops

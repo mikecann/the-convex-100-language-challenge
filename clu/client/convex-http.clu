@@ -1,0 +1,458 @@
+%   convex-http.clu -- HTTP/1.1 request/response framing for Convex's
+%   documented /api/{query,mutation,action} JSON API, over the conn
+%   transport (client/convex-transport.clu), which is itself either a
+%   plain _chan socket (local profile) or the new _tls builtin (hosted
+%   profile). This file knows HTTP and Convex's "format":"json" envelope;
+%   it does not know WebSocket or the sync protocol.
+%
+%   Response bodies are kept as raw JSON text and picked apart field by
+%   field with convex-json.clu's json$field/json$qs -- there is no
+%   general JSON value type in this client, so a caller that wants a
+%   whole number out of a response value still calls json$field then
+%   json$uint32 itself; this module's job stops at handing back the
+%   right raw text for "value" or "errorData" and classifying success
+%   from failure the way every other client in this repository does.
+%
+%   Every proc below is defined before its first use within this
+%   cluster body: pclu resolves an intra-cluster call's return arity
+%   against whatever has been declared so far, not the eventual full
+%   file, so a genuinely forward call to a multi-value-returning proc
+%   silently mistypes it instead of failing to compile (see this
+%   client's own commit history for the bug this caused before the
+%   helpers below were reordered bottom-up).
+
+convex_result = record[kind: string,		% "result" or "error"
+			value: string,		% raw JSON text (kind=result)
+			err_name: string,	% kind=error: "FunctionError",
+						% "TransportError", or
+						% "ProtocolError"
+			err_message: string,	% kind=error
+			err_data: string,	% raw JSON text, kind=error
+			has_err_data: bool]
+
+chttp = cluster is call
+
+rep = null
+
+READ_DEADLINE_MS = 15000
+RECV_CHUNK = 16384
+MAX_HEADER_BYTES = 1048576
+MAX_BODY_BYTES = 8388608
+
+parsed_url = record[scheme: string, host: string, port: int, path: string]
+
+	lower = proc (s: string) returns (string)
+	    out: string := ""
+	    i: int := 1
+	    n: int := string$size(s)
+	    while i <= n do
+		c: char := s[i]
+		if c >= 'A' cand c <= 'Z'
+		   then out := out || string$c2s(char$i2c(char$c2i(c) + 32))
+		   else out := out || string$c2s(c)
+		   end
+		i := i + 1
+		end
+	    return(out)
+	    end lower
+
+	is_ws = proc (c: char) returns (bool)
+	    return(c = ' ' cor c = '\t' cor c = '\r' cor c = '\n')
+	    end is_ws
+
+	trim = proc (s: string) returns (string)
+	    n: int := string$size(s)
+	    lo: int := 1
+	    hi: int := n
+	    while lo <= hi cand is_ws(s[lo]) do lo := lo + 1 end
+	    while hi >= lo cand is_ws(s[hi]) do hi := hi - 1 end
+	    if lo > hi then return("") end
+	    return(string$substr(s, lo, hi - lo + 1))
+	    end trim
+
+%   hex_prefix(s) -> the int a leading run of hex digits in s denotes
+%   (chunk-size lines may carry ignorable extensions after a ';', which
+%   this only needs to stop at, not interpret).
+	hex_prefix = proc (s: string) returns (int) signals (failed(string))
+	    n: int := string$size(s)
+	    i: int := 1
+	    v: int := 0
+	    saw_digit: bool := false
+	    while i <= n do
+		c: char := s[i]
+		d: int := -1
+		if c >= '0' cand c <= '9' then d := char$c2i(c) - char$c2i('0')
+		elseif c >= 'a' cand c <= 'f'
+		   then d := char$c2i(c) - char$c2i('a') + 10
+		elseif c >= 'A' cand c <= 'F'
+		   then d := char$c2i(c) - char$c2i('A') + 10
+		   else break
+		   end
+		v := v * 16 + d
+		saw_digit := true
+		i := i + 1
+		end
+	    if ~saw_digit then signal failed("malformed chunk size") end
+	    return(v)
+	    end hex_prefix
+
+%   parse_status(status_line) -> the numeric status code from a line like
+%   "HTTP/1.1 200 OK".
+	parse_status = proc (status_line: string) returns (int)
+						  signals (failed(string))
+	    sp1: int := string$indexc(' ', status_line)
+	    if sp1 = 0 then signal failed("malformed status line") end
+	    rest: string := string$rest(status_line, sp1 + 1)
+	    sp2: int := string$indexc(' ', rest)
+	    code_s: string := rest
+	    if sp2 ~= 0 then code_s := string$substr(rest, 1, sp2 - 1) end
+	    return(int$parse(code_s))
+		except when bad_format, overflow:
+			    signal failed("malformed status code")
+		       end
+	    end parse_status
+
+%   scan_headers(text) -> (content_length, chunked): content_length is -1
+%   if no Content-Length header was present, and chunked is true iff a
+%   Transfer-Encoding: chunked header was present.
+	scan_headers = proc (text: string) returns (int, bool)
+	    content_length: int := -1
+	    chunked: bool := false
+	    pos: int := 1
+	    n: int := string$size(text)
+	    while pos <= n do
+		nl: int := string$indexs("\r\n", string$rest(text, pos))
+		line: string
+		if nl = 0
+		   then line := string$rest(text, pos)
+			pos := n + 1
+		   else line := string$substr(text, pos, nl - 1)
+			pos := pos + nl + 1
+		   end
+		colon: int := string$indexc(':', line)
+		if colon ~= 0
+		   then hname: string := lower(string$substr(line, 1, colon - 1))
+			hvalue: string := trim(string$rest(line, colon + 1))
+			if string$equal(hname, "content-length")
+			   then content_length := int$parse(hvalue)
+				   except when bad_format, overflow: end
+			   end
+			if string$equal(hname, "transfer-encoding") cand
+			   string$equal(lower(hvalue), "chunked")
+			   then chunked := true
+			   end
+		   end
+		end
+	    return(content_length, chunked)
+	    end scan_headers
+
+%   next_chunk(c, deadline) -> the next batch of bytes available before
+%   deadline. Signals failed("__eof__") on a clean close (a sentinel this
+%   module's own callers recognise, not a message meant for a human) and
+%   failed(msg) for a timeout or transport error.
+	next_chunk = proc (c: conn, deadline: int) returns (string)
+						   signals (failed(string))
+	    remaining: int := deadline - _real_time()
+	    if remaining <= 0 then signal failed("timed out reading response")
+		end
+	    return(conn$recv(c, RECV_CHUNK, remaining))
+		except when timeout: signal failed("timed out reading response")
+		       when end_of_file: signal failed("__eof__")
+		       when not_possible (msg: string): signal failed(msg)
+		       end
+	    end next_chunk
+
+%   dechunk(c, buf, deadline) -> the decoded body of a chunked response,
+%   given buf (already-received bytes right after the header block) and
+%   reading more as needed.
+	dechunk = proc (c: conn, buf: string, deadline: int) returns (string)
+						      signals (failed(string))
+	    out: string := ""
+	    while true do
+		line_end: int := string$indexs("\r\n", buf)
+		while line_end = 0 do
+		    buf := buf || next_chunk(c, deadline)
+			resignal failed
+		    line_end := string$indexs("\r\n", buf)
+		    if string$size(buf) > MAX_HEADER_BYTES then
+			signal failed("chunk size line exceeded budget")
+			end
+		    end
+		size_line: string := string$substr(buf, 1, line_end - 1)
+		buf := string$rest(buf, line_end + 2)
+		size: int := hex_prefix(size_line)
+		   resignal failed
+		while string$size(buf) < size + 2 do
+		    buf := buf || next_chunk(c, deadline)
+			resignal failed
+		    if string$size(buf) > MAX_BODY_BYTES then
+			signal failed("chunk body exceeded budget")
+			end
+		    end
+		if size = 0 then return(out) end
+		out := out || string$substr(buf, 1, size)
+		buf := string$rest(buf, size + 3)
+		if string$size(out) > MAX_BODY_BYTES then
+		    signal failed("response body exceeded budget")
+		    end
+		end
+	    end dechunk
+
+%   read_response(c, deadline) -> the numeric status code and decoded
+%   body, honouring Content-Length, chunked transfer encoding, or a
+%   close-terminated body, all within deadline (an absolute _real_time()
+%   millisecond value). Signals failed(msg) for any transport or framing
+%   problem; the caller turns that into a TransportError/ProtocolError
+%   result rather than propagating a raw signal past this module.
+	read_response = proc (c: conn, deadline: int) returns (int, string)
+						      signals (failed(string))
+	    buf: string := ""
+	    header_end: int := 0
+	    while header_end = 0 do
+		buf := buf || next_chunk(c, deadline)
+		   resignal failed
+		header_end := string$indexs("\r\n\r\n", buf)
+		if string$size(buf) > MAX_HEADER_BYTES then
+		    signal failed("response headers exceeded budget")
+		    end
+		end
+
+	    header_text: string := string$substr(buf, 1, header_end + 3)
+	    body_so_far: string := string$rest(buf, header_end + 4)
+
+	    line_end: int := string$indexs("\r\n", header_text)
+	    status_line: string := string$substr(header_text, 1, line_end - 1)
+	    status: int := parse_status(status_line)
+		resignal failed
+	    rest_headers: string := string$rest(header_text, line_end + 2)
+
+	    content_length: int, chunked: bool := scan_headers(rest_headers)
+
+	    if chunked then
+		dechunked: string := dechunk(c, body_so_far, deadline)
+		   resignal failed
+		return(status, dechunked)
+		end
+
+	    if content_length >= 0 then
+		while string$size(body_so_far) < content_length do
+		    body_so_far := body_so_far || next_chunk(c, deadline)
+			except when failed (msg: string):
+				    if string$equal(msg, "__eof__")
+				       then break
+				       else signal failed(msg)
+				       end
+				end
+		    if string$size(body_so_far) > MAX_BODY_BYTES then
+			signal failed("response body exceeded budget")
+			end
+		    end
+		return(status, string$substr(body_so_far, 1, content_length))
+		end
+
+	    while true do
+		body_so_far := body_so_far || next_chunk(c, deadline)
+		    except when failed (msg: string):
+				if string$equal(msg, "__eof__")
+				   then break
+				   else signal failed(msg)
+				   end
+			   end
+		if string$size(body_so_far) > MAX_BODY_BYTES then
+		    signal failed("response body exceeded budget")
+		    end
+		end
+	    return(status, body_so_far)
+	    end read_response
+
+%   error_message_of(raw_body) -> a best-effort human-readable message:
+%   "errorMessage" if present, else "message", else a fixed fallback --
+%   never fails, since it is called from error paths that must not
+%   themselves fail.
+	error_message_of = proc (raw_body: string) returns (string)
+	    m: string := json$field(raw_body, "errorMessage")
+		except when not_found, bad_format: m := "" end
+	    if string$size(m) > 0 then return(json$unqs(m))
+		except when bad_format: return(m) end end
+	    m2: string := json$field(raw_body, "message")
+		except when not_found, bad_format: m2 := "" end
+	    if string$size(m2) > 0 then return(json$unqs(m2))
+		except when bad_format: return(m2) end end
+	    return("no Convex error envelope")
+	    end error_message_of
+
+	transport_error = proc (message: string) returns (convex_result)
+	    return(convex_result${kind: "error", err_name: "TransportError",
+				  err_message: message, err_data: "",
+				  has_err_data: false, value: ""})
+	    end transport_error
+
+	protocol_error = proc (message: string) returns (convex_result)
+	    return(convex_result${kind: "error", err_name: "ProtocolError",
+				  err_message: message, err_data: "",
+				  has_err_data: false, value: ""})
+	    end protocol_error
+
+%   classify(status, raw_body) -> a convex_result, per the documented
+%   "format":"json" contract: 200 with status:"success" is a result; 200
+%   with status:"error" (or HTTP 560, Convex's function-threw status) is
+%   a structured FunctionError; other 5xx/408/429 are retryable
+%   TransportErrors; everything else is a ProtocolError.
+	classify = proc (status: int, raw_body: string) returns (convex_result)
+	    if status = 200 cor status = 560 then
+		top_status: string := json$field(raw_body, "status")
+		    except when not_found, bad_format:
+				return(protocol_error(
+				    "HTTP response omitted or malformed " ||
+				    "status"))
+			   end
+
+		if string$equal(top_status, "\"success\"") cand status = 200
+		   then value_raw: string := json$field(raw_body, "value")
+			    except when not_found, bad_format:
+					return(protocol_error(
+					    "HTTP success response omitted " ||
+					    "value"))
+				   end
+			return(convex_result${kind: "result", value: value_raw,
+					      err_name: "", err_message: "",
+					      err_data: "",
+					      has_err_data: false})
+		   end
+
+		if string$equal(top_status, "\"error\"") cor status = 560
+		   then msg: string := error_message_of(raw_body)
+			% except only ever binds to the single statement
+			% immediately before it, not to a run of statements,
+			% so the fallible json$field call and the flag it
+			% sets on success both have to live inside one begin
+			% block for a shared handler to actually cover both.
+			data_raw: string
+			has_data: bool
+			begin
+			    data_raw := json$field(raw_body, "errorData")
+			    has_data := true
+			    end
+			   except when not_found, bad_format:
+					data_raw := ""
+					has_data := false
+				   end
+			return(convex_result${kind: "error",
+					      err_name: "FunctionError",
+					      err_message: msg,
+					      err_data: data_raw,
+					      has_err_data: has_data,
+					      value: ""})
+		   end
+
+		return(protocol_error("HTTP response had unknown status"))
+		end
+
+	    detail: string := error_message_of(raw_body)
+	    message: string := "HTTP " || int$unparse(status) ||
+				" from Convex: " || detail
+
+	    if status = 500 cor status = 502 cor status = 503 cor status = 504
+	       cor status = 408 cor status = 429
+	       then return(transport_error(message))
+	       end
+	    return(protocol_error(message))
+	    end classify
+
+%   parse_url(url) -> a parsed_url. Convex deployment URLs are always
+%   bare scheme://host[:port], never with a path of their own, so this
+%   only needs to split on "://" and an optional trailing ":port".
+	parse_url = proc (url: string) returns (parsed_url)
+	    p: int := string$indexs("://", url)
+	    if p = 0 then return(parsed_url${scheme: "http", host: url,
+					     port: 80, path: "/"}) end
+	    scheme: string := string$substr(url, 1, p - 1)
+	    rest: string := string$rest(url, p + 3)
+	    default_port: int := 80
+	    if string$equal(scheme, "https") cor string$equal(scheme, "wss")
+	       then default_port := 443 end
+	    colon: int := string$indexc(':', rest)
+	    if colon = 0
+	       then return(parsed_url${scheme: scheme, host: rest,
+					port: default_port, path: "/"})
+	       end
+	    host: string := string$substr(rest, 1, colon - 1)
+	    port_s: string := string$rest(rest, colon + 1)
+	    port: int := int$parse(port_s)
+		except when bad_format, overflow: port := default_port end
+	    return(parsed_url${scheme: scheme, host: host, port: port,
+				path: "/"})
+	    end parse_url
+
+%   call(op, path, args_raw, base_url, token) -> (kind, value, err_name,
+%   err_message, err_data, has_err_data) -- the fields of a convex_result,
+%   spread into a plain multi-value return rather than the record itself.
+%   (CLU's record types are generative: two files that each spell out the
+%   same record[...] shape under the same equate name still get distinct,
+%   incompatible types once compiled as separate translation units and
+%   linked back together, so convex_result only travels within this one
+%   file; every other module in this client receives its fields
+%   individually. And a return statement's expression list is positional
+%   one-value-per-slot -- a single nested call that itself yields several
+%   values can never fill several of those slots at once -- so every exit
+%   below spreads a convex_result's own fields out by hand rather than
+%   forwarding a multi-value helper call.) op is "query", "mutation", or
+%   "action"; path is a bare Convex function path (this proc does the
+%   JSON-string quoting); args_raw is already-valid JSON text for the
+%   args object (the caller built it, e.g. with json$object1/2/3, or is
+%   passing an incoming adapter command's own args straight through);
+%   token is the raw (already-unquoted) bearer token, or "" for no
+%   Authorization header.
+	call = proc (op, path, args_raw, base_url, token: string)
+			     returns (string, string, string, string, string,
+				      bool)
+	    u: parsed_url := parse_url(base_url)
+	    body: string := "{\"path\":" || json$qs(path)
+			    || ",\"args\":" || args_raw
+			    || ",\"format\":\"json\"}"
+
+	    req: string := "POST /api/" || op || " HTTP/1.1\r\n"
+	    req := req || "Host: " || u.host || "\r\n"
+	    req := req || "Content-Type: application/json\r\n"
+	    req := req || "Accept: application/json\r\n"
+	    req := req || "Convex-Client: clu-0.1.0\r\n"
+	    if string$size(token) > 0
+	       then req := req || "Authorization: Bearer " || token || "\r\n"
+	       end
+	    req := req || "Content-Length: " || int$unparse(string$size(body))
+			  || "\r\n"
+	    req := req || "Connection: close\r\n\r\n"
+	    req := req || body
+
+	    c: conn := conn$dial(u.scheme, u.host, u.port)
+		except when not_possible (msg: string):
+			    r: convex_result := transport_error(
+				"connect failed: " || msg)
+			    return(r.kind, r.value, r.err_name, r.err_message,
+				   r.err_data, r.has_err_data)
+		       end
+	    conn$send(c, req)
+		except when not_possible (msg: string):
+			    conn$close(c) except others: end
+			    r: convex_result := transport_error(
+				"send failed: " || msg)
+			    return(r.kind, r.value, r.err_name, r.err_message,
+				   r.err_data, r.has_err_data)
+		       end
+
+	    deadline: int := _real_time() + READ_DEADLINE_MS
+	    status: int, rbody: string := read_response(c, deadline)
+		except when failed (msg: string):
+			    conn$close(c) except others: end
+			    r: convex_result := transport_error(msg)
+			    return(r.kind, r.value, r.err_name, r.err_message,
+				   r.err_data, r.has_err_data)
+		       end
+	    conn$close(c) except others: end
+
+	    result: convex_result := classify(status, rbody)
+	    return(result.kind, result.value, result.err_name,
+		   result.err_message, result.err_data, result.has_err_data)
+	    end call
+
+end chttp

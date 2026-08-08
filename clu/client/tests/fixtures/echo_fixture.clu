@@ -1,0 +1,37 @@
+% Minimal loopback echo fixture for smoke-testing conn$dial's plain _chan
+% path: listens on 127.0.0.1:<port>, accepts one connection, reads
+% whatever the peer sends, echoes it back verbatim, then closes.
+start_up = proc ()
+    po: stream := stream$primary_output()
+    AF_INET: int := 2
+    SOCK_STREAM: int := 1
+    port: int := int$parse(sequence[string]$fetch(get_argv(), 1))
+
+    addr: _wordvec := _wordvec$create(4)
+    _wordvec$wstore(addr, 1, AF_INET)
+    _wordvec$wstore(addr, 3, (port / 2**8) + (port * 2**8))
+    l, r: int := inet_address("127.0.0.1")
+    _wordvec$wstore(addr, 5, r)
+    _wordvec$wstore(addr, 7, l)
+
+    lch: _chan := _chan$socket(AF_INET, SOCK_STREAM, 0)
+    _chan$bind(lch, addr, 16)
+    _chan$listen(lch, 1)
+    stream$putl(po, "READY")
+
+    peeraddr: _wordvec := _wordvec$create(4)
+    ch: _chan, alen: int := _chan$accept(lch, peeraddr)
+
+    rbuf: _wordvec := _wordvec$create(4096)
+    n: int := _chan$recv(ch, rbuf, 0)
+    rbytes: _bytevec := _bytevec$create(n)
+    _wordvec$move_w2b(rbuf, 1, rbytes, 1, n)
+    msg: string := _cvt[_bytevec, string](rbytes)
+
+    sbuf: _wordvec := _wordvec$create((string$size(msg) + 3) / 4)
+    _wordvec$move_b2w(_cvt[string, _bytevec](msg), 1, sbuf, 1, string$size(msg))
+    _chan$send(ch, sbuf, string$size(msg), 0)
+
+    _chan$close(ch)
+    _chan$close(lch)
+    end start_up

@@ -26,6 +26,7 @@
 
 #include <errno.h>
 #include <netdb.h>
+#include <poll.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -258,11 +259,22 @@ _tlsOPsend(CLUREF t, CLUREF s)
 }
 
 /*
- * recv = proc (t: cvt, maxlen: int) returns (string)
- *				     signals (not_possible(string), end_of_file)
+ * recv = proc (t: cvt, maxlen: int, timeout_ms: int) returns (string)
+ *		signals (not_possible(string), end_of_file, timeout)
+ *
+ * OpenSSL may already be holding decrypted application data in its own
+ * internal buffer (SSL_pending()) from a previous underlying read that
+ * pulled in more than one TLS record's worth of bytes; that data must be
+ * drained with SSL_read() first, without polling, or it can sit unseen
+ * until more bytes happen to arrive on the wire. Only once SSL_pending()
+ * is empty does this wait on the raw fd with poll(2) -- gating on the
+ * socket, not on an SSL-level timeout, is what lets a caller tell a
+ * live-but-idle connection (signal timeout, connection still open) apart
+ * from one the peer actually closed (signal end_of_file): SSL_read alone
+ * cannot make that distinction under a timeout the way poll(2) can.
  */
 errcode
-_tlsOPrecv(CLUREF t, CLUREF maxlen, CLUREF *ans)
+_tlsOPrecv(CLUREF t, CLUREF maxlen, CLUREF timeout_ms, CLUREF *ans)
 {
     static char errbuf[128];
     int idx = (int)t.num - 1;
@@ -278,6 +290,24 @@ _tlsOPrecv(CLUREF t, CLUREF maxlen, CLUREF *ans)
     want = maxlen.num;
     if (want <= 0 || want > TLS_RECV_CHUNK)
 	want = TLS_RECV_CHUNK;
+
+    if (SSL_pending(h->ssl) <= 0) {
+	struct pollfd pfd;
+	pfd.fd = h->fd;
+	pfd.events = POLLIN;
+	pfd.revents = 0;
+	int timeout = (int)timeout_ms.num;
+	if (timeout < 0)
+	    timeout = 0;
+	int pr = poll(&pfd, 1, timeout);
+	if (pr < 0) {
+	    snprintf(errbuf, sizeof(errbuf), "poll failed: %s", strerror(errno));
+	    elist[0] = tls_make_string(errbuf, strlen(errbuf));
+	    signal(ERR_not_possible);
+	}
+	if (pr == 0)
+	    signal(ERR_timeout);
+    }
 
     int n = SSL_read(h->ssl, buf, (int)want);
     if (n < 0) {

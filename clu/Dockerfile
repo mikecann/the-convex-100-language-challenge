@@ -165,33 +165,90 @@ RUN set -eu; \
 # The client library is spec'd once here (per-module .spc-equivalent
 # interface knowledge lives in the .clu source itself -- ordinary CLU
 # clusters, not hand-written C, from this point on) and compiled together
-# with its unit tests.
+# with its unit tests. Everything lands in one flat /stage directory
+# because pclu's -spec/-compile take bare module names resolved by the
+# current working directory, not paths.
 COPY client/_tls.spc "$CLUHOME/lib/_tls.spc"
 RUN set -eu; \
     mkdir -p /stage; \
     cp client/*.clu /stage/ 2>/dev/null || true; \
     cp client/tests/*.clu /stage/ 2>/dev/null || true; \
+    cp client/tests/fixtures/*.clu /stage/ 2>/dev/null || true; \
     ls /stage
 
-# language-local unit tests: currently just the JSON codec module. HTTP
-# framing, WebSocket framing, the /api/sync state machine, the
-# conformance adapter and the canonical example are not implemented yet
-# -- see manifest.yaml limitations. This stage intentionally has nothing
-# further to run until those land; it exists so the pclu-plus-patches
-# build itself is proven inside this repository's own Docker gate rather
-# than only in a throwaway spike container.
+# language-local unit tests. The WebSocket framing, the /api/sync state
+# machine, the conformance adapter, and the canonical example are not
+# implemented yet -- see manifest.yaml limitations. What exists and is
+# proven here: the JSON codec, the arithmetic bitwise helpers WebSocket
+# masking and its handshake SHA-1 will need (CLU's own int cluster has no
+# bitwise operators at all), the conn transport (dial/send/recv/close
+# unifying the plain _chan profile and the new _tls builtin behind one
+# oneof, with poll-gated bounded reads on both), and full HTTP/1.1
+# request/response framing against Convex's documented "format":"json"
+# envelope (Content-Length, chunked transfer-encoding, and structured
+# FunctionError/TransportError/ProtocolError classification). The
+# transport and HTTP tests are real loopback TCP coverage against
+# client/tests/fixtures/{echo,http}_fixture.clu -- genuine peer
+# processes, not mocks -- started here by the shell rather than by the
+# test binaries themselves, since pclu has no async-subprocess-spawn
+# primitive a CLU program could use to start its own fixture the way
+# some of this repository's other language tests do.
 RUN set -eu; \
     cd /stage; \
     test -f convex-json.clu; \
     "$CLUHOME/exe/pclu" -merge "$CLUHOME/lib/lowlev.lib" -ext false \
-        -spec "$CLUHOME/lib/etc.spc", convex-json, json_test \
-        -opt -cfiles -compile convex-json, json_test; \
+        -spec "$CLUHOME/lib/etc.spc", "$CLUHOME/lib/_tls.spc", \
+              convex-json, convex-bitops, convex-transport, convex-http, \
+              json_test, bitops_test, transport_test, http_test, \
+              echo_fixture, http_fixture \
+        -opt -cfiles \
+        -compile convex-json, convex-bitops, convex-transport, convex-http, \
+                 json_test, bitops_test, transport_test, http_test, \
+                 echo_fixture, http_fixture; \
     "$CLUHOME/exe/plink" -opt -o json_test convex-json.o json_test.o; \
+    "$CLUHOME/exe/plink" -opt -o bitops_test convex-bitops.o bitops_test.o; \
+    "$CLUHOME/exe/plink" -opt -o echo_fixture echo_fixture.o; \
+    "$CLUHOME/exe/plink" -opt -o http_fixture http_fixture.o; \
     ./json_test | tee /tmp/json_test.out; \
-    grep -Fq 'ALL PASS' /tmp/json_test.out
+    grep -Fq 'ALL PASS' /tmp/json_test.out; \
+    ./bitops_test | tee /tmp/bitops_test.out; \
+    grep -Fq 'ALL PASS' /tmp/bitops_test.out; \
+    # conn's oneof rep always references both _chan and _tls, so any
+    # binary linking convex-transport.o needs libssl/libcrypto even when
+    # (as here) only its plain _chan path is ever exercised; plink's own
+    # trailing "-lpclu_opt -lm -lgc" places those too late in the link
+    # line for a static archive to resolve against, so gcc is invoked
+    # directly, matching the ordering this client's feasibility spike
+    # already proved for _tls itself (see manifest.yaml/README.md). \
+    gcc transport_test.o convex-transport.o \
+        -L"$CLUHOME/code" -lpclu_opt -lssl -lcrypto -lm -lgc \
+        -o transport_test; \
+    gcc http_test.o convex-http.o convex-transport.o convex-json.o \
+        -L"$CLUHOME/code" -lpclu_opt -lssl -lcrypto -lm -lgc \
+        -o http_test; \
+    ./echo_fixture 19001 >/tmp/echo_fixture.log 2>&1 & \
+    ECHO_PID=$!; \
+    printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{"status":"success","value":{"count":0}}' \
+        > /tmp/http_resp_cl.bin; \
+    printf 'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n28\r\n{"status":"success","value":{"count":0}}\r\n0\r\n\r\n' \
+        > /tmp/http_resp_chunked.bin; \
+    printf 'HTTP/1.1 560 OK\r\nContent-Type: application/json\r\nContent-Length: 49\r\nConnection: close\r\n\r\n{"status":"error","errorMessage":"boom","code":1}' \
+        > /tmp/http_resp_error.bin; \
+    ./http_fixture 19002 /tmp/http_resp_cl.bin >/tmp/http_fixture_cl.log 2>&1 & \
+    HF1_PID=$!; \
+    ./http_fixture 19003 /tmp/http_resp_chunked.bin >/tmp/http_fixture_chunked.log 2>&1 & \
+    HF2_PID=$!; \
+    ./http_fixture 19004 /tmp/http_resp_error.bin >/tmp/http_fixture_error.log 2>&1 & \
+    HF3_PID=$!; \
+    sleep 1; \
+    ./transport_test 19001 19099 | tee /tmp/transport_test.out; \
+    ./http_test 19002 19003 19004 | tee /tmp/http_test.out; \
+    wait $ECHO_PID $HF1_PID $HF2_PID $HF3_PID 2>/dev/null || true; \
+    grep -Fq 'ALL PASS' /tmp/transport_test.out; \
+    grep -Fq 'ALL PASS' /tmp/http_test.out
 
 # ---------------------------------------------------------------------------
-# runtime images are not built yet: no example, no HTTP/WS/sync client, no
+# runtime images are not built yet: no example, no WebSocket/sync client, no
 # conformance adapter exist to ship. Adding runtime-base/example-runtime/
 # runtime stages ahead of real behaviour would let a minimal image exist
 # without anything working behind it, which is exactly what this

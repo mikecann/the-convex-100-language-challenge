@@ -19,7 +19,7 @@
 %   procedure, but grouping them under json$... is exactly how a CLU
 %   programmer is meant to organise a related family of operations.
 
-json = cluster is field, uint32, qs, object1, object2, object3
+json = cluster is field, uint32, qs, unqs, object1, object2, object3
 
 rep = null
 
@@ -212,6 +212,101 @@ rep = null
 		end
 	    return(out || "\"")
 	    end qs
+
+%   unqs(raw) -> the decoded string a JSON string literal (including its
+%   surrounding quotes, e.g. the direct output of json$field on a string
+%   field) denotes: backslash escapes are interpreted, everything else is
+%   passed through byte for byte. This client only ever unqs's protocol
+%   plumbing this client itself is responsible for moving verbatim (an
+%   auth token on its way into an Authorization header, an op/id/path
+%   read from the adapter's own incoming NDJSON commands), never a value
+%   handed onward to a person, so \uXXXX is decoded to UTF-8 the same way
+%   json$qs would have escaped it, but no attempt is made to be a fully
+%   general display-quality unescaper.
+	unqs = proc (raw: string) returns (string) signals (bad_format)
+	    n: int := string$size(raw)
+	    if n < 2 cor raw[1] ~= '"' cor raw[n] ~= '"' then
+		signal bad_format
+		end
+	    out: string := ""
+	    i: int := 2
+	    while i < n do
+		c: char := raw[i]
+		if c = '\\'
+		   then i := i + 1
+			if i >= n then signal bad_format end
+			e: char := raw[i]
+			if e = '"' then out := out || "\""
+			elseif e = '\\' then out := out || "\\"
+			elseif e = '/' then out := out || "/"
+			elseif e = 'n' then out := out || "\n"
+			elseif e = 'r' then out := out || "\r"
+			elseif e = 't' then out := out || "\t"
+			elseif e = 'b' then out := out || byte_s(8)
+			elseif e = 'f' then out := out || byte_s(12)
+			elseif e = 'u'
+			   then if i + 4 >= n then signal bad_format end
+				hex: string := string$substr(raw, i + 1, 4)
+				cp: int := hex_val(hex)
+				   resignal bad_format
+				out := out || utf8_of(cp)
+				i := i + 4
+			   else signal bad_format
+			   end
+		   else out := out || string$c2s(c)
+		   end
+		i := i + 1
+		end
+	    return(out)
+	    end unqs
+
+%   hex_val(hex) -> the int a 4-digit hex string denotes.
+	hex_val = proc (hex: string) returns (int) signals (bad_format)
+	    v: int := 0
+	    i: int := 1
+	    while i <= 4 do
+		c: char := hex[i]
+		d: int
+		if c >= '0' cand c <= '9' then d := char$c2i(c) - char$c2i('0')
+		elseif c >= 'a' cand c <= 'f'
+		   then d := char$c2i(c) - char$c2i('a') + 10
+		elseif c >= 'A' cand c <= 'F'
+		   then d := char$c2i(c) - char$c2i('A') + 10
+		else signal bad_format
+		end
+		v := v * 16 + d
+		i := i + 1
+		end
+	    return(v)
+	    end hex_val
+
+%   byte_s(b) -> a one-character string holding the raw byte value b
+%   (0 .. 255). char$i2c can signal illegal_char for a codepoint outside
+%   char's representable range, which never actually happens here (every
+%   caller below only ever passes an arithmetically-derived byte 0..255),
+%   so that signal is handled by substituting '?' rather than by
+%   threading a signal this cluster's public interface has no need to
+%   declare.
+	byte_s = proc (b: int) returns (string)
+	    return(string$c2s(char$i2c(b)))
+	       except when illegal_char: return("?") end
+	    end byte_s
+
+%   utf8_of(cp) -> the UTF-8 encoding of a codepoint in the Basic
+%   Multilingual Plane (0 .. 0xFFFF; this client never needs to encode a
+%   surrogate pair, since it never unqs's arbitrary user text).
+	utf8_of = proc (cp: int) returns (string)
+	    if cp <= 127 then return(byte_s(cp)) end
+	    if cp <= 2047
+	       then b0: int := 192 + (cp / 64)
+		    b1: int := 128 + (cp // 64)
+		    return(byte_s(b0) || byte_s(b1))
+	       end
+	    b0: int := 224 + (cp / 4096)
+	    b1: int := 128 + ((cp / 64) // 64)
+	    b2: int := 128 + (cp // 64)
+	    return(byte_s(b0) || byte_s(b1) || byte_s(b2))
+	    end utf8_of
 
 %   object1/object2/object3(k1, v1, ...) -> a JSON object's text from
 %   already-JSON-encoded values (each vN is expected to already be a
