@@ -356,17 +356,29 @@ ConvexAdapterTest := Object clone do(
         for(round, 1, 4000,
             capture output serviceWrite
             capture peer service
-            // Defensive precaution, not a confirmed fix: this if() has the
-            // same shape as the logsPresent/presentData sites in adapter.io
-            // that the pinned Io VM is confirmed to corrupt (a method-call
-            // condition combined with a semicolon-chained true branch), so
-            // it is precomputed the same way on general principle. Doing so
-            // did not resolve this scenario's actual failure - the queue
-            // still ends with a delivery event after the reserved "c-final"
-            // close event even with this change in place - so that failure
-            // has a separate, not yet identified cause. Left in place
-            // because it is still the safer shape and costs nothing.
-            finishedDraining := capture output isDrained
+            // Root cause of this scenario's actual failure, isolated with a
+            // standalone instrumented repro of this exact sequence: the
+            // adapter's own isDrained proves only that every byte has been
+            // handed to the kernel, not that the peer on the far end of this
+            // loopback socket has actually read them. The OS accepts a write
+            // into its send buffer well before the peer's own read() calls
+            // catch up, so isDrained alone let this loop stop many rounds
+            // before capture peer inbox actually held the full backlog -
+            // measured directly: isDrained went true as early as round 10
+            // while the peer had read only 655360 of the eventual 1500659
+            // bytes, and genuinely finished only at round 23. Breaking early
+            // left an unterminated fragment of the earlier, correctly
+            // ordered big delivery sitting at the end of the peer's inbox;
+            // events() (a plain newline split) then reported that fragment
+            // as "the last event", which looked exactly like a delivery
+            // landing after the reserved close event even though the close
+            // event - and every ack ahead of it - had not reached the peer
+            // at all yet. Waiting for the peer's own inbox to end on a
+            // complete line proves the peer, not just the adapter, is
+            // caught up before this loop trusts what it has read.
+            adapterHandedOffEverything := capture output isDrained
+            peerHasReadTheFinalByte := capture peer inbox endsWithSeq("\n")
+            finishedDraining := adapterHandedOffEverything and peerHasReadTheFinalByte
             if(finishedDraining, drained = true; break)
         )
         ConvexTest ok(drained, "the backlog drains once the reader resumes")
