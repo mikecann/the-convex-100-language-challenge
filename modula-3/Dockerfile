@@ -361,3 +361,146 @@ implementation("GateCheck")
 program("gatecheck")
 EOF
 RUN cm3 -build && ./AMD64_LINUX/gatecheck
+
+# ---------------------------------------------------------------------------
+# test: compile the whole client library on its own, then compile and run
+# every language-local unit test against it. WebsocketTest exercises
+# ConvexWebSocket's pure framing logic directly (masking, the RFC 6455
+# worked Sec-WebSocket-Accept example, every length encoding TryParseFrame
+# understands, rejection of a masked "server" frame) with no network at
+# all. LiveTest exercises the behaviour that only shows up once frames
+# travel through a real socket and ConvexLive's own frame-draining loop --
+# fragmentation reassembly, a Ping answered correctly while a message is
+# only half-reassembled, UTF-8 validated once a message is fully
+# reassembled (both a valid codepoint split across the frame boundary and
+# an invalid one), and a deliberately wrong Sec-WebSocket-Accept being
+# rejected before any application data is trusted -- against WsFixture, a
+# scripted, one-shot loopback WebSocket server that exists only to hold
+# each scenario's wire still long enough to observe the client's reaction.
+# ---------------------------------------------------------------------------
+FROM toolchain AS test
+WORKDIR /work
+COPY client ./client
+
+# The whole-client compilation gate: cm3 -build here type-checks and
+# compiles every interface and implementation across all 15 modules on
+# its own, independent of any one test or example program's narrower
+# reachability graph.
+RUN cd client && cm3 -build
+
+# Every language-local test binary below links the same client modules,
+# copied flat into its own build directory (cm3's non-package "-build"
+# mode resolves units from the current directory) alongside its own
+# Main-exporting test module.
+RUN set -eu; \
+    for d in websockettest wsfixture livetest; do \
+      mkdir -p "/work/bin/$d"; \
+      cp client/*.i3 client/*.m3 client/*.c "/work/bin/$d/"; \
+    done; \
+    cp client/tests/WebsocketTest.m3 /work/bin/websockettest/; \
+    cp client/tests/WsFixture.m3 /work/bin/wsfixture/; \
+    cp client/tests/LiveTest.m3 /work/bin/livetest/
+
+COPY <<'EOF' /work/bin/websockettest/m3makefile
+import("libm3")
+import("tcp")
+interface("TlsShim")
+c_source("shim")
+import_lib("ssl", "/usr/lib/x86_64-linux-gnu")
+import_lib("crypto", "/usr/lib/x86_64-linux-gnu")
+interface("ConvexJson") implementation("ConvexJson")
+interface("ConvexUrl") implementation("ConvexUrl")
+interface("ConvexTransport") implementation("ConvexTransport")
+interface("ConvexWire") implementation("ConvexWire")
+interface("ConvexHttp") implementation("ConvexHttp")
+interface("ConvexBase64") implementation("ConvexBase64")
+interface("ConvexSha1") implementation("ConvexSha1")
+interface("ConvexRandom") implementation("ConvexRandom")
+interface("ConvexUtf8") implementation("ConvexUtf8")
+interface("ConvexWebSocket") implementation("ConvexWebSocket")
+interface("ConvexLive") implementation("ConvexLive")
+implementation("WebsocketTest")
+program("websockettest")
+EOF
+
+COPY <<'EOF' /work/bin/wsfixture/m3makefile
+import("libm3")
+import("tcp")
+interface("TlsShim")
+c_source("shim")
+import_lib("ssl", "/usr/lib/x86_64-linux-gnu")
+import_lib("crypto", "/usr/lib/x86_64-linux-gnu")
+interface("ConvexJson") implementation("ConvexJson")
+interface("ConvexUrl") implementation("ConvexUrl")
+interface("ConvexTransport") implementation("ConvexTransport")
+interface("ConvexWire") implementation("ConvexWire")
+interface("ConvexHttp") implementation("ConvexHttp")
+interface("ConvexBase64") implementation("ConvexBase64")
+interface("ConvexSha1") implementation("ConvexSha1")
+interface("ConvexRandom") implementation("ConvexRandom")
+interface("ConvexUtf8") implementation("ConvexUtf8")
+interface("ConvexWebSocket") implementation("ConvexWebSocket")
+interface("ConvexLive") implementation("ConvexLive")
+implementation("WsFixture")
+program("wsfixture")
+EOF
+
+COPY <<'EOF' /work/bin/livetest/m3makefile
+import("libm3")
+import("tcp")
+interface("TlsShim")
+c_source("shim")
+import_lib("ssl", "/usr/lib/x86_64-linux-gnu")
+import_lib("crypto", "/usr/lib/x86_64-linux-gnu")
+interface("ConvexJson") implementation("ConvexJson")
+interface("ConvexUrl") implementation("ConvexUrl")
+interface("ConvexTransport") implementation("ConvexTransport")
+interface("ConvexWire") implementation("ConvexWire")
+interface("ConvexHttp") implementation("ConvexHttp")
+interface("ConvexBase64") implementation("ConvexBase64")
+interface("ConvexSha1") implementation("ConvexSha1")
+interface("ConvexRandom") implementation("ConvexRandom")
+interface("ConvexUtf8") implementation("ConvexUtf8")
+interface("ConvexWebSocket") implementation("ConvexWebSocket")
+interface("ConvexLive") implementation("ConvexLive")
+implementation("LiveTest")
+program("livetest")
+EOF
+
+RUN cd /work/bin/websockettest && cm3 -build \
+    && ./AMD64_LINUX/websockettest | tee /tmp/websockettest.out \
+    && grep -Fq 'PASS WebsocketTest' /tmp/websockettest.out \
+    && ! grep -Fq 'FAIL:' /tmp/websockettest.out
+
+RUN cd /work/bin/wsfixture && cm3 -build
+RUN cd /work/bin/livetest && cm3 -build
+
+RUN <<'EOF'
+set -u
+overall=0
+for entry in happy:44321 wrongaccept:44322 invalidutf8:44323; do
+  s="${entry%%:*}"
+  p="${entry##*:}"
+  echo "=== LiveTest/WsFixture scenario: $s (port $p) ==="
+  /work/bin/wsfixture/AMD64_LINUX/wsfixture "$s" "$p" > "/tmp/fixture-$s.log" 2>&1 &
+  fpid=$!
+  sleep 1
+  /work/bin/livetest/AMD64_LINUX/livetest "$s" "$p" > "/tmp/livetest-$s.log" 2>&1
+  lstatus=$?
+  wait "$fpid"
+  fstatus=$?
+  echo "--- fixture ($s) output ---"
+  cat "/tmp/fixture-$s.log"
+  echo "--- livetest ($s) output ---"
+  cat "/tmp/livetest-$s.log"
+  if [ "$lstatus" -ne 0 ]; then echo "livetest $s exited $lstatus" >&2; overall=1; fi
+  if [ "$fstatus" -ne 0 ]; then echo "wsfixture $s exited $fstatus" >&2; overall=1; fi
+  if ! grep -Fq "PASS LiveTest $s" "/tmp/livetest-$s.log"; then echo "livetest $s missing its PASS line" >&2; overall=1; fi
+  if grep -Fq "FAIL:" "/tmp/livetest-$s.log"; then echo "livetest $s reported at least one FAIL line" >&2; overall=1; fi
+done
+if [ "$overall" -ne 0 ]; then
+  echo "one or more LiveTest/WsFixture scenarios failed" >&2
+  exit 1
+fi
+echo "PASS all LiveTest/WsFixture scenarios"
+EOF

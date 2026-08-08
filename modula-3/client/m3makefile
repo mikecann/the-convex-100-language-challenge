@@ -43,3 +43,13 @@ implementation("ConvexUtf8")
 
 interface("ConvexWebSocket")
 implementation("ConvexWebSocket")
+
+interface("ConvexLive")
+implementation("ConvexLive")
+
+% Building this as a library (rather than only ever compiling client
+% modules as a side effect of some program() elsewhere) is the "test"
+% stage's whole-client compilation gate: cm3 -build here type-checks
+% and compiles every interface and implementation above on its own,
+% independent of any one test program's dependency graph.
+library("Convex")

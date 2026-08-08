@@ -45,6 +45,12 @@ TYPE
 PROCEDURE Handshake(t: ConvexTransport.T; host: TEXT; path: TEXT; deadline: LONGREAL): TEXT
   RAISES {Error};
 
+(* The RFC 6455 section 1.3 accept-key computation, pulled out of
+   Handshake so it can be driven directly against the RFC's own worked
+   example ("dGhlIHNhbXBsZSBub25jZQ==" ->
+   "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") without needing a live handshake. *)
+PROCEDURE ComputeAccept(key: TEXT): TEXT;
+
 (* Build one complete, unfragmented, masked frame ready to write to the
    transport. This client never needs to fragment an outgoing message:
    every sync-protocol message it sends fits in one frame. *)

@@ -43,13 +43,18 @@ PROCEDURE Handshake(t: ConvexTransport.T; host: TEXT; path: TEXT; deadline: LONG
     accept := ConvexWire.HeaderValue(hb.headerText, "sec-websocket-accept");
     IF accept = NIL THEN RAISE Error("handshake response omitted Sec-WebSocket-Accept"); END;
 
-    expected := ConvexBase64.Encode(ConvexSha1.Digest(key & GUID));
+    expected := ComputeAccept(key);
     IF NOT Text.Equal(accept, expected) THEN
       RAISE Error("Sec-WebSocket-Accept mismatch");
     END;
 
     RETURN hb.leftover;
   END Handshake;
+
+PROCEDURE ComputeAccept(key: TEXT): TEXT =
+  BEGIN
+    RETURN ConvexBase64.Encode(ConvexSha1.Digest(key & GUID));
+  END ComputeAccept;
 
 PROCEDURE PutU16BE(wr: Wr.T; n: INTEGER) =
   BEGIN
