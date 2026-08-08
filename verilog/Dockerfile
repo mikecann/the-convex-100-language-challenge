@@ -865,3 +865,111 @@ RUN set -eu; \
       client/tests/convex_test.v; \
     timeout 30 vvp -M. -mnative /tmp/convex_test.vvp | tee /tmp/convex_test.out; \
     grep -Fq 'PASS convex_test' /tmp/convex_test.out
+
+# ---------------------------------------------------------------------------
+# The NDJSON adapter protocol v1 executable (test infrastructure, not part
+# of the educational client API -- AGENTS.md's "Conformance executable"
+# section). Compiled once here; every scenario below reuses this same
+# /tmp/adapter.vvp, the same "elaborate once, exercise repeatedly" shape
+# vhdl/Dockerfile uses for its own adapter.
+# ---------------------------------------------------------------------------
+RUN set -eu; \
+    iverilog -g2012 -L. -mnative -I. \
+      -o /tmp/adapter.vvp client/convex_transport.v client/convex_buffer.v \
+      client/convex_http.v client/convex_sha1.v client/convex_base64.v \
+      client/convex_websocket.v client/convex_sync.v client/convex.v \
+      client/tests/conformance/adapter.v; \
+    echo "PASS adapter elaborate"
+
+# adapterhttpfix.c: a one-shot HTTP fixture for the adapter's plain
+# query/mutation/action calls -- the same drain-request-then-replay-one-
+# canned-response role tcpfix.c plays above, factored out under its own
+# name because this one speaks real HTTP framing (Content-Length) rather
+# than tcpfix's fixed two-line exchange.
+RUN <<'ADAPTERHTTPFIX_EOF'
+set -eu
+cat > /tmp/adapterhttpfix.c <<'CEOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+int main(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: adapterhttpfix port responsefile\n"); return 1; }
+    int port = atoi(argv[1]);
+    FILE *rf = fopen(argv[2], "rb");
+    if (!rf) { perror("fopen"); return 1; }
+    fseek(rf, 0, SEEK_END);
+    long rlen = ftell(rf);
+    fseek(rf, 0, SEEK_SET);
+    char *resp = malloc((size_t)rlen);
+    if (fread(resp, 1, (size_t)rlen, rf) != (size_t)rlen) return 1;
+    fclose(rf);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
+    listen(fd, 1);
+    int c = accept(fd, NULL, NULL);
+    if (c < 0) { perror("accept"); return 1; }
+
+    char drain[8192];
+    int total = 0;
+    while (total < (int)sizeof(drain)) {
+        char b;
+        ssize_t n = read(c, &b, 1);
+        if (n <= 0) break;
+        drain[total++] = b;
+        if (total >= 4 && drain[total-4]=='\r' && drain[total-3]=='\n' &&
+            drain[total-2]=='\r' && drain[total-1]=='\n') break;
+    }
+    ssize_t off = 0;
+    while (off < rlen) {
+        ssize_t n = write(c, resp + off, (size_t)(rlen - off));
+        if (n <= 0) break;
+        off += n;
+    }
+    close(c);
+    close(fd);
+    return 0;
+}
+CEOF
+gcc -O2 -Wall -Wextra -o /tmp/adapterhttpfix /tmp/adapterhttpfix.c
+ADAPTERHTTPFIX_EOF
+
+# Scenario A: a real query call through the adapter, over stdin/stdout.
+RUN set -eu; \
+    printf '{"status":"success","value":{"count":5},"logLines":[]}' > /tmp/a-body.txt; \
+    aclen=$(wc -c < /tmp/a-body.txt | tr -d ' '); \
+    { \
+      printf 'HTTP/1.1 200 OK\r\n'; \
+      printf 'Content-Type: application/json\r\n'; \
+      printf 'Content-Length: %s\r\n\r\n' "$aclen"; \
+      cat /tmp/a-body.txt; \
+    } > /tmp/a-resp.bin; \
+    /tmp/adapterhttpfix 44210 /tmp/a-resp.bin & \
+    sleep 1; \
+    printf '%s\n' \
+      '{"protocolVersion":1,"id":"h1","op":"hello"}' \
+      '{"id":"q1","op":"query","path":"demo:state","args":{}}' \
+      '{"id":"c1","op":"close"}' \
+    > /tmp/scenario-a.in; \
+    CONVEX_URL=http://127.0.0.1:44210 timeout 20 vvp -M. -mnative /tmp/adapter.vvp \
+      < /tmp/scenario-a.in > /tmp/scenario-a.out 2>/tmp/scenario-a.err; \
+    code=$?; \
+    wait; \
+    echo "adapter exit: $code"; cat /tmp/scenario-a.out; cat /tmp/scenario-a.err >&2; \
+    test "$code" -eq 0; \
+    grep -Fq '"type":"ready"' /tmp/scenario-a.out; \
+    grep -Fq '"language":"verilog"' /tmp/scenario-a.out; \
+    grep -Fq '"type":"result"' /tmp/scenario-a.out; \
+    grep -Fq '"count":5' /tmp/scenario-a.out; \
+    grep -Fq '"type":"closed"' /tmp/scenario-a.out
