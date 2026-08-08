@@ -197,16 +197,20 @@ HASNEG:
 ∇
 
 ∇Z←JEscapeString B;I;C;OUT
+ ⍝⍝ B←,B: a single-character argument like 'x' is an APL SCALAR (rank
+ ⍝⍝ 0), not a length-1 vector, and ⍴ of a scalar is empty -- ravelling
+ ⍝⍝ first guarantees a real vector so ⍴B/I⊃B behave as this loop needs.
+  B←,B
   OUT←,'"'
   I←1
 LOOP:
   →(I>⍴B)⍴DONE
   C←I⊃B
-  →(C=34)⍴Q
-  →(C=92)⍴BS
-  →(C=10)⍴NL
-  →(C=13)⍴CR
-  →(C=9)⍴TB
+  →(C='"')⍴Q
+  →(C='\')⍴BS
+  →(C=⎕UCS 10)⍴NL
+  →(C=⎕UCS 13)⍴CR
+  →(C=⎕UCS 9)⍴TB
   →((⎕UCS C)<32)⍴CTRL
   OUT←OUT,C
   →NEXT
@@ -226,7 +230,7 @@ TB:
   OUT←OUT,'\t'
   →NEXT
 CTRL:
-  OUT←OUT,'\u',4↑(4-⍴,⍕⎕UCS C)⍴'0',⍕⎕UCS C
+  OUT←OUT,'\u',HexPad4 (⎕UCS C)
   →NEXT
 NEXT:
   I←I+1
@@ -920,6 +924,8 @@ Z1:
 
 ⍝ Converts a hex character vector to a nonnegative integer.
 ∇Z←HexToDec B;I;V;C
+ ⍝⍝ B←,B: see JEscapeString's comment on scalar vs. vector characters.
+  B←,B
   Z←0
   I←1
 LOOP:
@@ -943,6 +949,15 @@ NEXT:
   I←I+1
   →LOOP
 DONE:
+∇
+
+⍝ Formats a non-negative integer B (0..65535) as exactly 4 lowercase
+⍝ hex digits, using ⊤ (encode) into base 16 -- an array-language way to
+⍝ do fixed-width radix conversion without a manual digit loop.
+∇Z←HexPad4 B;DIGITS;HEXCHARS
+  HEXCHARS←'0123456789abcdef'
+  DIGITS←(4⍴16)⊤B
+  Z←HEXCHARS[DIGITS+1]
 ∇
 
 ⍝ Decodes an HTTP chunked body already partially buffered in
