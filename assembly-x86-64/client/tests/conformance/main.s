@@ -578,8 +578,8 @@ emit_subscription_value:
     test rax, rax
     jz .no_logs
     mov rdi, [rbp-40]
-    lea rsi, [rel k_log_lines]
-    mov edx, k_log_lines_len
+    lea rsi, [rel k_logs]
+    mov edx, k_logs_len
     mov rcx, rax
     call json_object_set
 .no_logs:
@@ -1215,8 +1215,8 @@ handle_call:
     test rax, rax
     jz .no_logs
     mov rdi, [rbp-136]
-    lea rsi, [rel k_log_lines]
-    mov edx, k_log_lines_len
+    lea rsi, [rel k_logs]
+    mov edx, k_logs_len
     mov rcx, rax
     call json_object_set
 .no_logs:
@@ -2207,8 +2207,8 @@ section .rodata
     k_token_len equ $ - k_token
     k_value: db "value"
     k_value_len equ $ - k_value
-    k_log_lines: db "logLines"
-    k_log_lines_len equ $ - k_log_lines
+    k_logs: db "logs"
+    k_logs_len equ $ - k_logs
     k_name: db "name"
     k_name_len equ $ - k_name
     k_message: db "message"
