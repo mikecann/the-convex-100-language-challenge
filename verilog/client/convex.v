@@ -97,6 +97,19 @@ module convex #(
   // instance's tasks are only reachable hierarchically, and this
   // module has no reference to convex_sync.v's own instance-local
   // capture_raw_span).
+  // Confirmed bug (found via the shared conformance suite's own
+  // document-id-string case, not local testing - every local fixture's
+  // "value" happened to be an object): a JSON STRING token's own span
+  // (convex_buffer.v's parse_string) covers only the bytes BETWEEN the
+  // quotes, not the quotes themselves - correct for decode_str_start's
+  // own escape-decoding, which needs to know exactly where content
+  // begins, but wrong for a raw span copy meant to re-emit valid JSON.
+  // Copying a bare Convex document ID's span verbatim therefore produced
+  // an UNQUOTED bareword where the adapter's own NDJSON output needed a
+  // quoted string, corrupting every downstream line. Every other JSON
+  // kind's own span already includes its own delimiters (an object's
+  // '{'..'}', an array's '['..']', a number's/bool's/null's own text),
+  // so only the KIND_STRING case needs the quotes added back.
   task automatic capture_value_span(input integer tok);
     integer i, start, stop;
     byte c;
@@ -104,10 +117,12 @@ module convex #(
       start = http.resp_body.tok_span_start(tok);
       stop = http.resp_body.tok_span_stop(tok);
       span_scratch = "";
+      if (http.resp_body.json_kind(tok) == KIND_STRING) span_scratch = {span_scratch, `DQUOTE};
       for (i = start; i < stop; i = i + 1) begin
         c = http.resp_body.get_byte(i);
         span_scratch = {span_scratch, c};
       end
+      if (http.resp_body.json_kind(tok) == KIND_STRING) span_scratch = {span_scratch, `DQUOTE};
     end
   endtask
 

@@ -48,6 +48,7 @@
 // growing queue.
 `timescale 1ns / 1ps
 `include "client/convex_opcodes.vh"
+`include "client/convex_chars.vh"
 
 module convex_sync #(
   parameter MAX_SUBS = 8,
@@ -230,9 +231,21 @@ module convex_sync #(
     end
   endtask
 
+  // convex_buffer.v's own KIND_STRING localparam (4), redeclared here
+  // per this project's established convention (see client/convex.v's
+  // identical redeclaration).
+  localparam KIND_STRING = 4;
+
   // Copies ws.msg's raw source bytes for tok (no escape decoding -
   // this is used for a JSON VALUE, which may be an object, array,
-  // number or bool, not only a string) into raw_scratch.
+  // number, bool, or string) into raw_scratch. A JSON STRING token's own
+  // span covers only the bytes BETWEEN the quotes (correct for
+  // decode_str_start's own escape-decoding elsewhere in this file, but
+  // not for a raw copy meant to re-emit valid JSON), so the KIND_STRING
+  // case adds the quotes back - the identical fix client/convex.v's own
+  // capture_value_span needed once the shared conformance suite's
+  // document-id-string case exposed it there; a Live query that returns
+  // a bare string value would hit the same corruption here otherwise.
   task automatic capture_raw_span(input integer tok);
     integer i, start, stop;
     byte c;
@@ -240,10 +253,12 @@ module convex_sync #(
       start = ws.msg.tok_span_start(tok);
       stop = ws.msg.tok_span_stop(tok);
       raw_scratch = "";
+      if (ws.msg.json_kind(tok) == KIND_STRING) raw_scratch = {raw_scratch, `DQUOTE};
       for (i = start; i < stop; i = i + 1) begin
         c = ws.msg.get_byte(i);
         raw_scratch = {raw_scratch, c};
       end
+      if (ws.msg.json_kind(tok) == KIND_STRING) raw_scratch = {raw_scratch, `DQUOTE};
     end
   endtask
 
