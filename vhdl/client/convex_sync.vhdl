@@ -388,6 +388,7 @@ package body convex_sync is
     json_put_int(buf, len, next_v);
     buf_put_byte(buf, len, character'pos(','));
     json_put_string(buf, len, "modifications");
+    buf_put_byte(buf, len, character'pos(':'));
     buf_put_byte(buf, len, character'pos('['));
     buf_put_byte(buf, len, character'pos('{'));
     json_put_string(buf, len, "type");
@@ -408,6 +409,7 @@ package body convex_sync is
       json_put_string_bytes(buf, len, m.subs(slot).path, 0, m.subs(slot).path_len);
       buf_put_byte(buf, len, character'pos(','));
       json_put_string(buf, len, "args");
+      buf_put_byte(buf, len, character'pos(':'));
       buf_put_byte(buf, len, character'pos('['));
       buf_put_slice(buf, len, m.subs(slot).args_json, 0, m.subs(slot).args_len);
       buf_put_byte(buf, len, character'pos(']'));
