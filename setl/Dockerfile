@@ -203,3 +203,19 @@ RUN set -eu; \
     cd /stage; \
     /opt/setl-src/src/run/setl --cpp sync_test.setl | tee /tmp/sync_test.out; \
     grep -Fq 'SYNC CLIENT: ALL CHECKS PASSED' /tmp/sync_test.out
+
+# examples/basics/count.setl decodes and validates the "count" field the
+# canonical example reads from demo:state/demo:increment, accepting a
+# Convex JSON integral value encoded as either a bare integer (0) or a
+# real with a whole value (0.0) while rejecting anything fractional,
+# quoted, negative, or out of range (AGENTS.md's integral-decoding rule).
+# examples/basics/tests/count_test.setl is the focused regression that
+# rule calls for -- synthetic values only, no live deployment needed,
+# the same style client/tests/convex_test.setl uses for the HTTP
+# envelope.
+COPY examples/basics/count.setl /stage/count.setl
+COPY examples/basics/tests/count_test.setl /stage/count_test.setl
+RUN set -eu; \
+    cd /stage; \
+    /opt/setl-src/src/run/setl --cpp count_test.setl | tee /tmp/count_test.out; \
+    grep -Fq 'COUNT DECODING: ALL CHECKS PASSED' /tmp/count_test.out

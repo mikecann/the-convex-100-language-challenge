@@ -1,0 +1,185 @@
+-- Convex from SETL: the shared counter journey.
+--
+-- Reads a room's counter over Convex's documented HTTP API, starts a
+-- Live subscription, increments the counter once, and proves that the
+-- Live subscription reported the same change without polling. This is
+-- an educational demonstration of a hand-written, from-scratch Convex
+-- client (see ../../README.md), not an official Convex SDK.
+--
+-- Run it with:
+--   CONVEX_URL=https://<deployment>.convex.cloud setl --cpp main.setl <room>
+--
+-- This file's own executable statements all come first, and every
+-- helper it defines -- along with every client module it pulls in via
+-- #include -- follows them: GNU SETL requires a source unit's mainline
+-- statements to precede every proc definition, with no interleaving.
+-- See client/json.setl's module comment for more on why this client is
+-- laid out that way throughout.
+
+-- Configuration: the deployment URL is required. The room comes from
+-- the verifier's first command-line argument (so repeated runs never
+-- collide), an EXAMPLE_ROOM environment variable for a convenient hand
+-- run, or a literal fallback so this still does something either way.
+deployment_url := getenv("CONVEX_URL");
+if deployment_url = om or deployment_url = "" then
+  printa(stderr, "SETL example failed: CONVEX_URL is required");
+  stop 1;
+end if;
+
+room := om;
+if #command_line >= 1 then
+  room := command_line(1);
+end if;
+if room = om or room = "" then
+  room := getenv("EXAMPLE_ROOM");
+end if;
+if room = om or room = "" then
+  room := "setl-example";
+end if;
+
+query_args := {};
+query_args("room") := room;
+
+-- The HTTP query: reads the room's current counter through Convex's
+-- documented POST /api/query envelope, before anything reactive is
+-- involved, so the Live subscription below has a known value to agree
+-- with.
+response := convex_query(deployment_url, "demo:state", query_args, om, 10000);
+if response("kind") /= "result" then
+  printa(stderr, "SETL example failed: query: " + str(response("errMessage")));
+  stop 1;
+end if;
+-- Decoding into an idiomatic value: Convex JSON may encode an integral
+-- count as 0 or as 0.0 (see examples/basics/count.setl), and either
+-- other shape is a bug this example must fail loudly on, not paper over.
+[decoded, current, decode_message] := convex_state_count(response("value"), "current query");
+if not decoded then
+  printa(stderr, "SETL example failed: " + decode_message);
+  stop 1;
+end if;
+print("current count: " + str(current));
+
+-- Client creation: opens the WebSocket handshake to /api/sync and sends
+-- the Connect message (client/sync.setl). No query has been added yet.
+[connected, sync] := sync_connect(deployment_url, "setl-0.1.0", 10000);
+if not connected then
+  printa(stderr, "SETL example failed: sync connect: " + str(sync));
+  stop 1;
+end if;
+
+-- Starting Live before the mutation: subscribing first is what makes
+-- the update received below an observation of a real change, rather
+-- than a race against one that already happened.
+[subscribed, sync, query_id] := sync_add(sync, "demo:state", query_args);
+if not subscribed then
+  printa(stderr, "SETL example failed: subscribe: " + str(sync("last_error")));
+  sync_close(sync, "example failed");
+  stop 1;
+end if;
+
+-- The initial Live value: the same state the HTTP query above already
+-- read, delivered this time as the subscription's first Transition.
+[outcome, sync, result] := sync_wait_next(sync, query_id, 10000);
+if outcome /= "ok" or result("kind") /= "value" then
+  printa(stderr, "SETL example failed: initial Live value: " + str(sync("last_error")));
+  sync_close(sync, "example failed");
+  stop 1;
+end if;
+[decoded, live_initial, decode_message] := convex_state_count(result("value"), "initial Live value");
+if not decoded then
+  printa(stderr, "SETL example failed: " + decode_message);
+  sync_close(sync, "example failed");
+  stop 1;
+end if;
+if live_initial /= current then
+  printa(stderr, "SETL example failed: the initial Live count disagreed with HTTP");
+  sync_close(sync, "example failed");
+  stop 1;
+end if;
+print("live initial count: " + str(live_initial));
+
+-- The mutation and its idempotency key: runId lets Convex recognize a
+-- retried request and return the previous result instead of
+-- incrementing twice. A fresh random key means this run really applies
+-- its increment rather than replaying an old one.
+mutation_args := {};
+mutation_args("room") := room;
+mutation_args("language") := "setl";
+mutation_args("runId") := random_hex(16);
+mutation_response := convex_mutation(deployment_url, "demo:increment", mutation_args, om, 10000);
+if mutation_response("kind") /= "result" then
+  printa(stderr, "SETL example failed: mutation: " + str(mutation_response("errMessage")));
+  sync_close(sync, "example failed");
+  stop 1;
+end if;
+mutation_value := mutation_response("value");
+if mutation_value = om or mutation_value("applied") /= true then
+  printa(stderr, "SETL example failed: the mutation was not applied");
+  sync_close(sync, "example failed");
+  stop 1;
+end if;
+[decoded, mutation_count, decode_message] := convex_state_count(mutation_value("state"), "mutation");
+if not decoded then
+  printa(stderr, "SETL example failed: " + decode_message);
+  sync_close(sync, "example failed");
+  stop 1;
+end if;
+expected := current + 1;
+if mutation_count /= expected then
+  printa(stderr, "SETL example failed: the mutation returned an unexpected count");
+  sync_close(sync, "example failed");
+  stop 1;
+end if;
+print("mutation applied: true");
+print("mutation count: " + str(mutation_count));
+
+-- The resulting Live update: received over the same subscription,
+-- without polling HTTP again.
+[outcome, sync, result] := sync_wait_next(sync, query_id, 10000);
+if outcome /= "ok" or result("kind") /= "value" then
+  printa(stderr, "SETL example failed: updated Live value: " + str(sync("last_error")));
+  sync_close(sync, "example failed");
+  stop 1;
+end if;
+[decoded, live_updated, decode_message] := convex_state_count(result("value"), "updated Live value");
+if not decoded then
+  printa(stderr, "SETL example failed: " + decode_message);
+  sync_close(sync, "example failed");
+  stop 1;
+end if;
+if live_updated /= expected then
+  printa(stderr, "SETL example failed: the updated Live count disagreed with the mutation");
+  sync_close(sync, "example failed");
+  stop 1;
+end if;
+print("live updated count: " + str(live_updated));
+
+-- Every operation above agreed before this proof line is printed.
+print("verified count: " + str(current) + " -> " + str(live_updated));
+
+-- Cleanup: close the Live connection cleanly before exiting.
+sync_close(sync, "example complete");
+
+-- Generates AByteCount random bytes as lowercase hex, for the mutation's
+-- idempotency key above. It does not need to be unpredictable, only
+-- unique enough that this run's key has never been sent before.
+proc random_hex(byte_count);
+  hex_digits := "0123456789abcdef";
+  out := "";
+  for i in [1..byte_count] loop
+    b := random(255);
+    out +:= hex_digits(b div 16 + 1);
+    out +:= hex_digits(b mod 16 + 1);
+  end loop;
+  return out;
+end proc;
+
+#include "tcp.setl"
+#include "tls.setl"
+#include "stream.setl"
+#include "http.setl"
+#include "json.setl"
+#include "websocket.setl"
+#include "convex.setl"
+#include "sync.setl"
+#include "count.setl"
