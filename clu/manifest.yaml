@@ -1,0 +1,89 @@
+schemaVersion: 1
+id: clu
+displayName: "CLU"
+rank: 66
+selectionTier: coverage
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Portable CLU (pclu) implementation of Convex's documented HTTP
+    JSON API and the pinned /api/sync protocol, in progress. pclu has no
+    sockets and no TLS visible from CLU source out of the box: raw BSD
+    sockets already exist as hand-written C bound into the builtin _chan
+    cluster (code/sysasm/Opt/_chan.c) and are used by this client's local
+    profile, byte-packed from CLU with _wordvec; TLS does not exist at
+    all upstream, so this client adds one small reviewed C file,
+    client/convexrt-tls.c, as a brand-new builtin cluster (_tls) the same
+    way pclu's own primitives are added: a .spc interface file plus a
+    hand-authored C file the linker resolves by naming convention, with
+    no HTTP, WebSocket, JSON, or Convex protocol knowledge inside it.
+    Every deadline, retry, and protocol decision is enforced in CLU
+    source. A genuine upstream 64-bit-port bug in _wordvec's byte/word
+    addressing (see client/wordvec-64bit-word-size.patch) is also
+    patched here; it is unrelated to Convex and worth reporting upstream.
+toolchain:
+  name: pclu
+  version: "1a8ad7603ea20b9744942182a52810441182f6a6"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    This is an early, honest checkpoint, not a working client. Only the
+    build infrastructure and a JSON codec exist so far. `./run test clu`
+    passes: it builds pclu from source at the pinned commit, applies
+    client/wordvec-64bit-word-size.patch, adds the _tls builtin cluster,
+    boots a hello-world smoke test, and compiles and runs
+    client/tests/json_test.clu (16 assertions, all passing, including the
+    AGENTS.md-required regression that Convex whole numbers may arrive as
+    an integral decimal such as "0.0" or "1.0"). Nothing further has been
+    built: no HTTP/1.1 framing, no RFC 6455 WebSocket framing, no
+    /api/sync state machine, no conformance adapter, no canonical
+    example, and no runtime images. `intendedCapabilities` above states
+    the goal, not anything earned; `capabilities` below is empty and
+    stays empty until root-owned local and hosted conformance both pass.
+  - >-
+    client/convex-json.clu is a minimal codec, not a general JSON-to-CLU
+    value decoder: json$field walks a JSON document just far enough to
+    find one top-level object field and return that field's own JSON
+    text unparsed (correctly skipping strings with escapes, numbers,
+    true/false/null, and arbitrarily nested objects or arrays along the
+    way, so a same-named field nested inside an unrelated value is never
+    mistaken for the field being searched for); a caller that wants the
+    value interprets it with json$uint32, json$field again if it is
+    itself an object, and so on. This keeps the codec small while still
+    being a real scanner rather than a toy; it has not yet been exercised
+    against real Convex response shapes beyond the unit fixtures in
+    client/tests/json_test.clu.
+  - >-
+    A genuine, previously unreported latent bug was found and fixed in
+    pclu's own _wordvec.c on 64-bit builds: CLUREF's size is 8 bytes here
+    (sizeof of a tagged union whose largest member is a long/pointer),
+    but _wordvec's byte- and half-word-addressed operations (bfetch,
+    bstore, wfetch, wstore, lfetch, lstore, get_byte, set_byte) were
+    written for 4-byte words and, unpatched, can only ever address the
+    first four bytes of every eight-byte storage slot -- discovered
+    because building a raw sockaddr_in by hand for a plain TCP connect
+    always produced a null address. pclu's own standard library
+    (lib/clu/_resolve.clu, its DNS client) uses the exact same
+    byte-packing pattern this client's local-profile transport does, so
+    it likely also silently miscompiles on 64-bit builds; that was not
+    chased down further since it is out of this client's scope. See
+    client/wordvec-64bit-word-size.patch for the full writeup and fix.
+  - >-
+    Capability badges remain empty until the root-owned local and hosted
+    conformance gates pass.
+capabilities: []
