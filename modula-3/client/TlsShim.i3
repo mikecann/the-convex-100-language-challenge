@@ -29,4 +29,10 @@ PROCEDURE Write(h: ADDRESS; buf: ADDRESS; len: int): int;
 <*EXTERNAL "TlsShim__close"*>
 PROCEDURE Close(h: ADDRESS);
 
+(* Fill "buf" with "len" cryptographically unpredictable bytes (OpenSSL's
+   RAND_bytes), for WebSocket frame masking keys and the sync protocol's
+   sessionId. Returns FALSE on the vanishingly rare entropy failure. *)
+<*EXTERNAL "TlsShim__randomBytes"*>
+PROCEDURE RandomBytes(buf: ADDRESS; len: int): int;
+
 END TlsShim.

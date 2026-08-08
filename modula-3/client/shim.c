@@ -3,16 +3,22 @@
  *
  * Modula-3's standard library (TCP.i3, IP.i3, in the "tcp" package) opens
  * the plain TCP connection and hands back a POSIX file descriptor
- * (TCPPosix.Public.fd). This file supplies exactly the one thing the
- * standard library does not: TLS, via a real TLS 1.2+ handshake over
- * that same fd, using OpenSSL directly through CM3's EXTERNAL procedure
- * mechanism -- no code generator, no vendored FFI tooling, just C
- * functions named to match TlsShim.i3's <*EXTERNAL*> declarations.
+ * (TCPPosix.Public.fd). This file supplies exactly what the standard
+ * library does not: TLS, via a real TLS 1.2+ handshake over that same
+ * fd, using OpenSSL directly through CM3's EXTERNAL procedure mechanism
+ * -- no code generator, no vendored FFI tooling, just C functions named
+ * to match TlsShim.i3's <*EXTERNAL*> declarations. Since OpenSSL is
+ * already linked for TLS, this file also exposes OpenSSL's own CSPRNG
+ * for the one other place this client needs unpredictable bytes: RFC
+ * 6455 WebSocket frame masking keys and the Connect message's
+ * sessionId. Nothing here knows about HTTP, JSON, or WebSocket framing
+ * itself -- that all stays in Modula-3.
  */
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509v3.h>
+#include <openssl/rand.h>
 #include <poll.h>
 #include <string.h>
 #include <stdlib.h>
@@ -134,6 +140,14 @@ int TlsShim__write(void *handle, const void *buf, int len) {
     return -2;
   }
   return written;
+}
+
+/* Fill "buf" with "len" cryptographically unpredictable bytes, for
+   WebSocket frame masking keys and the sync protocol's sessionId.
+   Returns 1 on success, 0 on failure (OpenSSL's own entropy-not-ready
+   signal, vanishingly rare on a real OS but checked anyway). */
+int TlsShim__randomBytes(void *buf, int len) {
+  return RAND_bytes((unsigned char *)buf, len) == 1 ? 1 : 0;
 }
 
 void TlsShim__close(void *handle) {

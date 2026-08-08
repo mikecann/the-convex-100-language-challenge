@@ -28,3 +28,18 @@ implementation("ConvexWire")
 
 interface("ConvexHttp")
 implementation("ConvexHttp")
+
+interface("ConvexBase64")
+implementation("ConvexBase64")
+
+interface("ConvexSha1")
+implementation("ConvexSha1")
+
+interface("ConvexRandom")
+implementation("ConvexRandom")
+
+interface("ConvexUtf8")
+implementation("ConvexUtf8")
+
+interface("ConvexWebSocket")
+implementation("ConvexWebSocket")
