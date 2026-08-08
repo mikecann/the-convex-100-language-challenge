@@ -1,0 +1,80 @@
+schemaVersion: 1
+id: mumps
+displayName: "MUMPS"
+rank: 35
+selectionTier: ranked
+implementation:
+  status: working
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native YottaDB M implementation of the Convex HTTP API and the pinned
+    /api/sync protocol. Sockets are opened with M's own OPEN/USE/READ/WRITE
+    device syntax (device type "SOCKET"), never a foreign process; TLS is
+    negotiated in-process too, through YottaDB's own WRITE /TLS device
+    extension, backed by its OpenSSL plugin (libgtmtls.so, built from source
+    with the installer's --encplugin option), plus one small LD_PRELOAD C
+    shim (client/sni_shim.c) that adds TLS Server Name Indication, which
+    YottaDB's TLS plugin never sends on its own -- confirmed by reading its
+    source and by reproducing an identical handshake failure directly against
+    the hosted deployment with `openssl s_client -noservername`. The shim is
+    pure transport plumbing (no Convex, HTTP, JSON, or WebSocket logic), the
+    same narrow pattern as icon/client/shim.c. JSON encoding and decoding
+    (client/convex.m's own recursive-descent parser and a small arena-style
+    node pool), HTTP/1.1 request and chunked-response handling, RFC 6455
+    WebSocket framing and masking, SHA-1 and base64 for the WebSocket
+    handshake, and the full Live sync state machine (Connect, ModifyQuerySet
+    Add/Remove, Transition validation, reconnect-on-drop with exponential
+    backoff, and unchanged-rehydration suppression) are all written in M.
+    Session state (the JSON node pool, the Live subscription table,
+    connection bookkeeping) lives entirely in routine-local M variables --
+    never in a `^global` -- so the client never touches a database region and
+    the runtime image can stay read-only. YottaDB still attaches a database
+    region at process startup regardless, so one is created once at build
+    time and baked into the runtime images unused.
+toolchain:
+  name: YottaDB
+  version: r2.06
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    Live authentication, WebSocket-issued mutations and actions, journals,
+    and TransitionChunk assembly are deferred; receiving a TransitionChunk is
+    reported as protocol drift and the connection reconnects.
+  - >-
+    The client keeps only the latest delivered value per subscription (no
+    unbounded queue): a Transition overwrites the prior value in place, and a
+    consumer that has not yet read it simply sees the newest one on its next
+    poll. Backpressure toward the conformance controller is instead handled
+    by the adapter's own bounded output queue (client/tests/conformance/
+    adapter.m): 8 slots, a 4 MiB byte budget, with subscription events
+    droppable oldest-first and hello/result/error/ack/closed responses never
+    dropped.
+  - >-
+    YottaDB always attaches a database region at process startup even though
+    this client never references a `^global`; the region is created once at
+    build time (mupip create) and shipped read-only, never written again by
+    the runtime images.
+  - >-
+    A YottaDB process always runs in byte-oriented M mode here (`ydb_chset=M`
+    for every stage), not UTF-8 mode: every string operation is a raw byte
+    operation, which is what lets UTF-8 JSON payloads pass through untouched
+    without depending on ICU or a UTF-8 locale. `--utf8` is deliberately
+    never passed to the installer, since it would only add a second,
+    ICU-linked engine variant this client never selects.
+capabilities:
+  - http
+  - live
