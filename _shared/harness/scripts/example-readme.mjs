@@ -62,6 +62,8 @@ const fenceLanguages = {
   ".mli": "ocaml",
   ".mbt": "moonbit",
   ".mod": "modula2",
+  ".m3": "modula3",
+  ".i3": "modula3",
   ".mojo": "mojo",
   ".pli": "pli",
   ".nim": "nim",
