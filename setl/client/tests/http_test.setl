@@ -1,0 +1,56 @@
+-- Real end-to-end proof for both transports, run against a stable public
+-- host reachable from any Docker build environment (not the Convex
+-- backend -- that is exercised later by the client's own conformance
+-- tests once they exist). Proves: plain TCP HTTP on port 80, and TLS HTTP
+-- on port 443, both through the same http_request() entry point.
+
+fail_count := 0;
+
+[success, resp] := http_request("tcp", "example.com", 80, "GET", "/", {}, om, 5000);
+if not success then
+  print("FAIL plain-HTTP request: " + str(resp));
+  fail_count +:= 1;
+else
+  print("plain HTTP status: " + str(resp("read_status")));
+  if resp("read_status") < 200 or resp("read_status") >= 400 then
+    print("FAIL plain-HTTP unexpected status");
+    fail_count +:= 1;
+  end if;
+  if #resp("body_text") = 0 then
+    print("FAIL plain-HTTP empty body");
+    fail_count +:= 1;
+  end if;
+end if;
+
+[success, resp] := http_request("tls", "example.com", 443, "GET", "/", {}, om, 5000);
+if not success then
+  print("FAIL TLS request: " + str(resp));
+  fail_count +:= 1;
+else
+  print("TLS status: " + str(resp("read_status")));
+  if resp("read_status") /= 200 then
+    print("FAIL TLS unexpected status");
+    fail_count +:= 1;
+  end if;
+  if #resp("body_text") = 0 then
+    print("FAIL TLS empty body");
+    fail_count +:= 1;
+  end if;
+  ctype := http_header(resp("headers"), "content-type");
+  if ctype = om then
+    print("FAIL TLS missing content-type header");
+    fail_count +:= 1;
+  end if;
+end if;
+
+if fail_count = 0 then
+  print("HTTP CLIENT: ALL CHECKS PASSED");
+else
+  print("HTTP CLIENT: " + str(fail_count) + " CHECK(S) FAILED");
+  stop 1;
+end if;
+
+#include "tcp.setl"
+#include "tls.setl"
+#include "stream.setl"
+#include "http.setl"

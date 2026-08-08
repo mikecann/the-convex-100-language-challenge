@@ -130,3 +130,23 @@ RUN set -eu; \
     cd /stage; \
     /opt/setl-src/src/run/setl --cpp json_test.setl | tee /tmp/json_test.out; \
     grep -Eq '^([0-9]+)/\1 json checks passed$' /tmp/json_test.out
+
+# The transport layer: client/tcp.setl (native open(f,"tcp-client")) for
+# the local plain-HTTP profile, client/tls.setl (the callout() boundary)
+# for the hosted profile, client/stream.setl unifying the two behind one
+# [status,payload] shape, and client/http.setl framing HTTP/1.1 requests
+# and responses (status line, headers, Content-Length and chunked bodies)
+# over either. client/tests/http_test.setl proves both transports for
+# real against a stable public host -- not the Convex backend, which the
+# client's own conformance tests exercise once they exist -- covering a
+# plain HTTP round trip on port 80 and a TLS round trip (with a chunked
+# response body, exercising that decoder) on port 443.
+COPY client/tcp.setl /stage/tcp.setl
+COPY client/tls.setl /stage/tls.setl
+COPY client/stream.setl /stage/stream.setl
+COPY client/http.setl /stage/http.setl
+COPY client/tests/http_test.setl /stage/http_test.setl
+RUN set -eu; \
+    cd /stage; \
+    /opt/setl-src/src/run/setl --cpp http_test.setl | tee /tmp/http_test.out; \
+    grep -Fq 'HTTP CLIENT: ALL CHECKS PASSED' /tmp/http_test.out
