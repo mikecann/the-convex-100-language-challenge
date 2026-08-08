@@ -48,21 +48,27 @@ RUN set -eu; \
     test -s /project/runtime-version
 
 COPY client ./client
+COPY examples ./examples
 
 # VHDL has no standard formatter, so the style gate is explicit: spaces
 # only, no trailing blanks, a final newline, and a column limit -- the
 # same discipline this project's ALGOL 60 client uses for the same reason.
+# The canonical example is held to 80 columns because it is rendered
+# verbatim in the README and on the website; everything else is held to
+# 120.
 RUN set -eu; \
-    files=$(find client -name '*.vhdl'); \
+    files=$(find client examples -name '*.vhdl'); \
     test -n "$files"; \
     for f in $files; do \
       if awk '/\t/ { exit 0 } END { exit 1 }' "$f"; then \
         echo "tab in $f" >&2; exit 1; \
       fi; \
       if grep -q ' $' "$f"; then echo "trailing space in $f" >&2; exit 1; fi; \
-      if awk 'length > 120 { print FILENAME ":" NR; found = 1 } \
+      case "$f" in examples/*) width=80 ;; *) width=120 ;; esac; \
+      if awk -v width="$width" \
+             'length > width { print FILENAME ":" NR; found = 1 } \
               END { exit !found }' "$f"; then \
-        echo "line over 120 columns in $f" >&2; exit 1; \
+        echo "line over $width columns in $f" >&2; exit 1; \
       fi; \
       if [ "$(tail -c 1 "$f" | wc -l)" -ne 1 ]; then \
         echo "no final newline in $f" >&2; exit 1; \
@@ -631,3 +637,421 @@ RUN bash -c '\
     grep -Fq "\"type\":\"ready\"" /tmp/scenario-c.client.out; \
     grep -Fq "\"type\":\"closed\"" /tmp/scenario-c.client.out \
 '
+
+# The canonical example. Analyzed, elaborated, and first proven to fail
+# loudly (nothing on stdout, "CONVEX_URL is required" on stderr, exit 1)
+# with no deployment configured, matching this project's other native
+# clients' no-configuration failure path.
+RUN set -eu; \
+    ghdl -a --std=08 --workdir=/project/work examples/basics/main.vhdl; \
+    ghdl -e --std=08 --workdir=/project/work \
+      -Wl,/project/native.o -Wl,-lssl -Wl,-lcrypto main; \
+    code=0; \
+    ./main >/tmp/example-noconfig.out 2>/tmp/example-noconfig.err || code=$?; \
+    test "$code" -eq 1; \
+    test ! -s /tmp/example-noconfig.out; \
+    grep -Fq 'CONVEX_URL is required' /tmp/example-noconfig.err
+
+# Then proven against a real deployment: examplefix.c is a third fixture
+# server, playing httpfix.c and syncfix.c's combined role -- it answers
+# /api/query, /api/mutation and the /api/sync WebSocket upgrade on one
+# port (forking a handler per accepted connection so the persistent Live
+# connection and the one-shot HTTP calls run concurrently), and only
+# sends the post-mutation Live Transition after a delay generous enough
+# for the example's own HTTP mutation call to have already completed on
+# its own separate connection -- so "live updated count" is a real,
+# separately arriving Live event, not a value already known from the
+# mutation response. The exact transcript is checked against this
+# project's shared expected output, not merely "did it exit 0".
+RUN <<'EXAMPLEFIX_EOF'
+set -eu
+cat > /tmp/examplefix.c <<'CEOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <netinet/in.h>
+
+static void send_http_response(int c, const char *body) {
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n",
+        (int)strlen(body));
+    write(c, hdr, (size_t)hlen);
+    write(c, body, strlen(body));
+}
+
+static void send_ws_frame(int c, const char *payload, int len) {
+    unsigned char hdr[4];
+    int hlen = 0;
+    hdr[hlen++] = 0x81;
+    if (len <= 125) {
+        hdr[hlen++] = (unsigned char)len;
+    } else {
+        hdr[hlen++] = 126;
+        hdr[hlen++] = (unsigned char)((len >> 8) & 0xff);
+        hdr[hlen++] = (unsigned char)(len & 0xff);
+    }
+    write(c, hdr, (size_t)hlen);
+    write(c, payload, (size_t)len);
+}
+
+static int read_client_ws_frame(int c, unsigned char *out, int cap) {
+    unsigned char head[2];
+    if (read(c, head, 2) != 2) return -1;
+    int masked = (head[1] & 0x80) != 0;
+    int plen = head[1] & 0x7f;
+    if (plen == 126) {
+        unsigned char ext[2];
+        if (read(c, ext, 2) != 2) return -1;
+        plen = (ext[0] << 8) | ext[1];
+    }
+    unsigned char mask[4] = {0, 0, 0, 0};
+    if (masked) {
+        if (read(c, mask, 4) != 4) return -1;
+    }
+    if (plen > cap) return -1;
+    int total = 0;
+    while (total < plen) {
+        ssize_t n = read(c, out + total, (size_t)(plen - total));
+        if (n <= 0) return -1;
+        total += (int)n;
+    }
+    if (masked) {
+        for (int i = 0; i < plen; i++) out[i] = (unsigned char)(out[i] ^ mask[i % 4]);
+    }
+    return plen;
+}
+
+static int extract_query_id(const unsigned char *buf, int len) {
+    const char *needle = "\"queryId\":";
+    for (int i = 0; i + (int)strlen(needle) < len; i++) {
+        if (memcmp(buf + i, needle, strlen(needle)) == 0) {
+            return atoi((const char *)buf + i + (int)strlen(needle));
+        }
+    }
+    return -1;
+}
+
+static int contains(const unsigned char *buf, int len, const char *needle) {
+    int nlen = (int)strlen(needle);
+    for (int i = 0; i + nlen <= len; i++) {
+        if (memcmp(buf + i, needle, (size_t)nlen) == 0) return 1;
+    }
+    return 0;
+}
+
+static void handle_connection(int c) {
+    unsigned char req[8192];
+    int total = 0;
+    while (total < (int)sizeof(req)) {
+        unsigned char b;
+        ssize_t n = read(c, &b, 1);
+        if (n <= 0) { close(c); _exit(0); }
+        req[total++] = b;
+        if (total >= 4 && req[total-4]=='\r' && req[total-3]=='\n' &&
+            req[total-2]=='\r' && req[total-1]=='\n') break;
+    }
+
+    if (contains(req, total, "Upgrade: websocket") || contains(req, total, "Upgrade: WebSocket")) {
+        const char *resp =
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "\r\n";
+        write(c, resp, strlen(resp));
+
+        int query_id = -1;
+        unsigned char frame[8192];
+        for (;;) {
+            int n = read_client_ws_frame(c, frame, (int)sizeof(frame));
+            if (n < 0) { close(c); _exit(0); }
+            if (contains(frame, n, "\"type\":\"ModifyQuerySet\"") && contains(frame, n, "\"Add\"")) {
+                query_id = extract_query_id(frame, n);
+                char body0[512];
+                int b0len = snprintf(body0, sizeof(body0),
+                    "{\"type\":\"Transition\","
+                    "\"startVersion\":{\"querySet\":0,\"identity\":0,\"ts\":\"AAAAAAAAAAA=\"},"
+                    "\"endVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"AQAAAAAAAAA=\"},"
+                    "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":%d,\"value\":{\"count\":0}}]}",
+                    query_id);
+                send_ws_frame(c, body0, b0len);
+                sleep(3);
+                char body1[512];
+                int b1len = snprintf(body1, sizeof(body1),
+                    "{\"type\":\"Transition\","
+                    "\"startVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"AQAAAAAAAAA=\"},"
+                    "\"endVersion\":{\"querySet\":1,\"identity\":1,\"ts\":\"AgAAAAAAAAA=\"},"
+                    "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":%d,\"value\":{\"count\":1}}]}",
+                    query_id);
+                send_ws_frame(c, body1, b1len);
+            }
+        }
+    } else if (contains(req, total, "/api/query")) {
+        send_http_response(c, "{\"status\":\"success\",\"value\":{\"count\":0},\"logLines\":[]}");
+    } else if (contains(req, total, "/api/mutation")) {
+        send_http_response(c,
+            "{\"status\":\"success\","
+            "\"value\":{\"applied\":true,\"state\":{\"count\":1}},"
+            "\"logLines\":[]}");
+    }
+    close(c);
+    _exit(0);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "usage: examplefix port\n"); return 1; }
+    int port = atoi(argv[1]);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
+    listen(fd, 8);
+
+    for (int i = 0; i < 6; i++) {
+        int c = accept(fd, NULL, NULL);
+        if (c < 0) continue;
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(fd);
+            handle_connection(c);
+            _exit(0);
+        }
+        close(c);
+    }
+    while (wait(NULL) > 0) {}
+    close(fd);
+    return 0;
+}
+CEOF
+gcc -O2 -Wall -Wextra -o /tmp/examplefix /tmp/examplefix.c
+EXAMPLEFIX_EOF
+
+# _shared/examples/basics.expected.txt itself is outside this build's
+# context (./run test scopes the build context to vhdl/ alone; the real
+# diff against that shared file happens on the host in
+# ./run verify-example against a real backend), so the exact six lines
+# this fixture's canned values are known to produce are embedded here
+# instead, as a fixture-level transcript check.
+RUN set -eu; \
+    printf '%s\n' \
+      'current count: 0' \
+      'live initial count: 0' \
+      'mutation applied: true' \
+      'mutation count: 1' \
+      'live updated count: 1' \
+      'verified count: 0 -> 1' \
+    > /tmp/example-expected.txt; \
+    /tmp/examplefix 44310 & \
+    sleep 1; \
+    CONVEX_URL=http://127.0.0.1:44310 EXAMPLE_ROOM=vhdl-docker-test \
+      timeout 20 ./main > /tmp/example.out; \
+    code=$?; \
+    wait; \
+    echo "example exit: $code"; cat /tmp/example.out; \
+    test "$code" -eq 0; \
+    diff /tmp/example.out /tmp/example-expected.txt; \
+    echo "PASS example transcript matches the fixture's expected values"
+
+# Stages convex-adapter and convex-example under their public names.
+# GHDL's LLVM backend links a genuine standalone native ELF binary with
+# no GHDL simulation-runtime shared library at all -- confirmed by ldd
+# above -- so the runtime closure below is exactly the same shape this
+# project's other from-C-boundary native clients need: OpenSSL, libc,
+# and the small NSS/resolver set TLS hostname resolution actually loads.
+RUN set -eu; \
+    mkdir -p /build; \
+    cp adapter /build/convex-adapter; \
+    cp main /build/convex-example
+
+# The example must fail loudly without a deployment, and must print
+# nothing on stdout when it does; already proven above. The adapter's
+# own probe (hello, then close) is proven here from the exact binary
+# that will ship, not only the elaboration unit still sitting in
+# /project/work.
+RUN set -eu; \
+    printf '%s\n' \
+      '{"protocolVersion":1,"id":"hello","op":"hello"}' \
+      '{"id":"close","op":"close"}' \
+    > /tmp/adapter-probe.in; \
+    code=0; \
+    CONVEX_URL=http://127.0.0.1:1 /build/convex-adapter \
+      < /tmp/adapter-probe.in > /tmp/adapter-probe.out 2>/tmp/adapter-probe.err \
+      || code=$?; \
+    echo "adapter exit code: $code"; \
+    echo "--- stdout ---"; cat /tmp/adapter-probe.out; \
+    echo "--- stderr ---"; cat /tmp/adapter-probe.err; \
+    echo "--- end ---"; \
+    test "$code" -eq 0; \
+    grep -Fq '"type":"ready"' /tmp/adapter-probe.out; \
+    grep -Fq '"language":"vhdl"' /tmp/adapter-probe.out; \
+    grep -Fq '"type":"closed"' /tmp/adapter-probe.out
+
+# Stage the shared part of the runtime closure -- everything except the
+# two program binaries themselves, which are copied separately into
+# their own final stage below so that convex-example never ships beside
+# convex-adapter or vice versa. Both are genuine native ELF binaries --
+# no GHDL runtime, interpreter or libc cache travels with them, unlike an
+# interpreted language client -- and ldd resolves the small, fixed set of
+# shared libraries each one actually needs. ldd is run once per binary
+# rather than on the whole tree at once, because a multi-file ldd
+# invocation prints one header line per binary ahead of its dependency
+# list, which a naive parse would otherwise treat as a library path.
+#
+# The shared policy and example verifier currently require /bin/sh and
+# basic POSIX text tools in every runtime image, so a small set of
+# individual coreutils binaries (never a multicall BusyBox, whose applet
+# table would reintroduce exactly the surface this image is trying to
+# not have) is copied in even though neither convex-example nor
+# convex-adapter themselves call out to a shell or a text tool.
+RUN set -eu; \
+    mkdir -p /closure/bin /closure/usr/bin /closure/usr/local/bin \
+             /closure/etc/ssl/certs \
+             /closure/usr/lib/x86_64-linux-gnu/ossl-modules \
+             /closure/usr/lib/x86_64-linux-gnu \
+             /closure/tmp; \
+    chmod 1777 /closure/tmp; \
+    for name in cat cut head tail tr sort uniq wc uname grep sed id; do \
+      cp -aL "$(command -v "$name")" /closure/usr/bin/"$name"; \
+    done; \
+    cp -aL /usr/bin/mawk /closure/usr/bin/awk; \
+    cp -aL /bin/dash /closure/bin/sh; \
+    cp -aL /etc/ssl/certs/ca-certificates.crt /closure/etc/ssl/certs/; \
+    cp -aL /etc/ssl/openssl.cnf /closure/etc/ssl/openssl.cnf; \
+    cp -aL /etc/nsswitch.conf /closure/etc/nsswitch.conf; \
+    cp -aL /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so \
+           /closure/usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so; \
+    for lib in libnss_dns.so.2 libnss_files.so.2 libresolv.so.2; do \
+      cp -aL /lib/x86_64-linux-gnu/"$lib" \
+             /closure/usr/lib/x86_64-linux-gnu/"$lib"; \
+    done; \
+    for round in 1 2 3; do \
+      for elf in /build/convex-example \
+                 /build/convex-adapter \
+                 /closure/bin/sh \
+                 /closure/usr/bin/*; do \
+        ldd "$elf" 2>/dev/null \
+          | awk '{ for (i = 1; i <= NF; i++) \
+                     if (substr($i, 1, 1) == "/") print $i }'; \
+      done \
+        | sort -u \
+        | while read -r lib; do \
+            test -e "/closure$lib" || { \
+              mkdir -p "/closure$(dirname "$lib")"; \
+              cp -aL "$lib" "/closure$(dirname "$lib")/"; \
+            }; \
+          done; \
+    done
+
+# The two entrypoints are staged separately so each minimal image carries
+# only its own program. The room argument reaches the example through
+# EXAMPLE_ROOM, matching every other native client in this project: GHDL
+# generates and validates its own standalone executable's argv as its own
+# simulator command-line options, so a real host argv passthrough to the
+# VHDL design itself does not exist -- confirmed empirically ("unknown
+# run option") before settling on this wrapper, the same shape algol60's
+# entrypoint already uses for an unrelated reason.
+RUN set -eu; \
+    mkdir -p /entry; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      '# The verifier passes a unique room as the first argument.' \
+      'if [ "$#" -gt 0 ]; then' \
+      '  EXAMPLE_ROOM="$1"' \
+      '  export EXAMPLE_ROOM' \
+      'fi' \
+      'exec /usr/local/bin/convex-example' \
+      > /entry/convex-example; \
+    chmod 755 /entry/convex-example
+
+# ---------------------------------------------------------------------------
+# runtime-base: the pinned image with its filesystem removed and only the
+# declared closure copied back
+# ---------------------------------------------------------------------------
+FROM --platform=linux/amd64 ${BUILD_IMAGE} AS runtime-base
+RUN set -eu; \
+    set -- /bin /boot /home /lib /lib64 /media /mnt /opt /root \
+           /run /sbin /srv /usr /var /etc/.pwd.lock; \
+    for path in /etc/*; do \
+      case "$path" in \
+        /etc/hosts|/etc/resolv.conf) ;; \
+        *) set -- "$@" "$path" ;; \
+      esac; \
+    done; \
+    rm -rf "$@"
+COPY --from=test /closure/ /
+ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
+    OPENSSL_MODULES=/usr/lib/x86_64-linux-gnu/ossl-modules \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu \
+    PATH=/usr/local/bin:/usr/bin:/bin
+USER 65532:65532
+
+# Prove the policy the shared verifier depends on from inside the final
+# filesystem, not from the build stage that produced it.
+RUN set -eu; \
+    test "$(id -u):$(id -g)" = 65532:65532; \
+    test -s "$SSL_CERT_FILE"; \
+    test "$(uname -m)" = x86_64; \
+    test "$(printf 'ok\n' | cat)" = ok; \
+    test "$(printf 'a:b\n' | cut -d: -f2)" = b; \
+    test "$(printf 'first\nsecond\n' | head -n 1)" = first; \
+    test "$(printf 'first\nsecond\n' | tail -n 1)" = second; \
+    test "$(printf 'a\n' | tr a A)" = A; \
+    test "$(printf 'b\na\n' | sort | head -n 1)" = a; \
+    test "$(printf 'a\na\n' | uniq | wc -l | tr -d ' ')" = 1; \
+    printf 'needle\n' | grep -Fqx needle; \
+    test "$(printf 'before\n' | sed 's/before/after/')" = after; \
+    test "$(printf 'value\n' | awk '{print $1}')" = value; \
+    test ! -e /etc/dpkg; \
+    test ! -e /var; \
+    test ! -e /usr/share/doc; \
+    test ! -e /usr/include; \
+    test ! -e /usr/src; \
+    set -- /bin/*; test "$#" -eq 1; test "$1" = /bin/sh; \
+    for command_name in ghdl gcc cc clang ld make cmake libtool apt apt-get \
+        dpkg curl wget nc netcat ssh openssl node python python3 ruby perl \
+        java php go rustc cargo npm pip convex; do \
+      if command -v "$command_name" >/dev/null 2>&1; then \
+        echo "unexpected command in runtime image: $command_name" >&2; \
+        exit 1; \
+      fi; \
+    done
+
+# ---------------------------------------------------------------------------
+# example-runtime
+# ---------------------------------------------------------------------------
+FROM runtime-base AS example-runtime
+COPY --from=test --chmod=755 /build/convex-example /usr/local/bin/convex-example
+COPY --from=test --chmod=755 /entry/convex-example /usr/local/bin/convex-example-entry
+USER 65532:65532
+RUN set -eu; \
+    test -x /usr/local/bin/convex-example-entry; \
+    test -x /usr/local/bin/convex-example; \
+    test ! -e /usr/local/bin/convex-adapter
+ENTRYPOINT ["/usr/local/bin/convex-example-entry"]
+
+# ---------------------------------------------------------------------------
+# runtime: last, because `./run build vhdl` uses the default target
+# ---------------------------------------------------------------------------
+FROM runtime-base AS runtime
+COPY --from=test --chmod=755 /build/convex-adapter /usr/local/bin/convex-adapter
+USER 65532:65532
+RUN set -eu; \
+    test -x /usr/local/bin/convex-adapter; \
+    printf '%s\n' \
+      '{"protocolVersion":1,"id":"hello","op":"hello"}' \
+      '{"id":"close","op":"close"}' \
+    > /tmp/adapter-probe.in; \
+    CONVEX_URL=http://127.0.0.1:1 /usr/local/bin/convex-adapter \
+      < /tmp/adapter-probe.in > /tmp/adapter-probe.out; \
+    cat /tmp/adapter-probe.out; \
+    grep -Fq '"type":"closed"' /tmp/adapter-probe.out
+ENTRYPOINT ["/usr/local/bin/convex-adapter"]
