@@ -50,6 +50,8 @@ package convex_native is
   constant CMD_STDOUT_FLUSH      : integer := 17;
   constant CMD_STDERR_WRITE_BYTE : integer := 18;
   constant CMD_EXIT              : integer := 19;
+  constant CMD_LISTEN            : integer := 20;
+  constant CMD_ACCEPT            : integer := 21;
 
   -- The two foreign functions. Both are impure: they read and mutate
   -- state on the C side (the connection table, the stdout buffer, the

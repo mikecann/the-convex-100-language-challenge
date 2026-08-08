@@ -8,12 +8,14 @@ ARG BUILD_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa04
 # ships with GHDL, and run every language-local suite.
 #
 # CHECKPOINT NOTE: this client is still under construction. The foreign-
-# boundary primitives (native.c), the request/acknowledge circuit
+# boundary primitives (native.c, including the CMD_LISTEN/CMD_ACCEPT pair
+# the adapter's TCP mode needs), the request/acknowledge circuit
 # (convex_native.vhdl, convex_transport.vhdl), the byte-buffer helpers
 # (convex_buffer.vhdl), a JSON codec (convex_json.vhdl), an HTTP/1.1 client
-# (convex_http.vhdl), an RFC 6455 WebSocket layer (convex_ws.vhdl) and the
-# pinned /api/sync Live protocol (convex_sync.vhdl) exist so far, proven
-# here by buffer_test, transport_smoke, json_test, http_test, ws_test and
+# (convex_http.vhdl), the public call facade (convex.vhdl), an RFC 6455
+# WebSocket layer (convex_ws.vhdl) and the pinned /api/sync Live protocol
+# (convex_sync.vhdl) exist so far, proven here by buffer_test,
+# transport_smoke, json_test, http_test, convex_test, ws_test and
 # sync_test. The conformance adapter and examples/basics do not exist
 # yet, so this stage does not yet compile a canonical example or a
 # conformance executable and no `runtime` or `example-runtime` stage
@@ -218,6 +220,36 @@ RUN set -eu; \
     timeout 20 ./http_test | tee /tmp/http_test.out; \
     wait; \
     grep -Fq 'PASS http_test' /tmp/http_test.out
+
+# convex_test proves convex.vhdl's client_call: the request envelope it
+# builds, and both response envelope shapes Convex's HTTP API returns
+# (success and function error), reusing httpfix.c's one-shot replay role
+# again.
+RUN set -eu; \
+    printf '{"status":"success","value":{"count":3},"logLines":["log one"]}' > /tmp/s-body.txt; \
+    sclen=$(wc -c < /tmp/s-body.txt | tr -d ' '); \
+    { \
+      printf 'HTTP/1.1 200 OK\r\n'; \
+      printf 'Content-Length: %s\r\n\r\n' "$sclen"; \
+      cat /tmp/s-body.txt; \
+    } > /tmp/s-resp.bin; \
+    printf '{"status":"error","errorMessage":"room is full","errorData":{"code":429},"logLines":[]}' > /tmp/e-body.txt; \
+    eclen=$(wc -c < /tmp/e-body.txt | tr -d ' '); \
+    { \
+      printf 'HTTP/1.1 200 OK\r\n'; \
+      printf 'Content-Length: %s\r\n\r\n' "$eclen"; \
+      cat /tmp/e-body.txt; \
+    } > /tmp/e-resp.bin; \
+    /tmp/httpfix 44305 /tmp/s-resp.bin & \
+    /tmp/httpfix 44306 /tmp/e-resp.bin & \
+    sleep 1; \
+    ghdl -a --std=08 --workdir=/project/work client/convex.vhdl; \
+    ghdl -a --std=08 --workdir=/project/work client/tests/convex_test.vhdl; \
+    ghdl -e --std=08 --workdir=/project/work \
+      -Wl,/project/native.o -Wl,-lssl -Wl,-lcrypto convex_test; \
+    timeout 20 ./convex_test | tee /tmp/convex_test.out; \
+    wait; \
+    grep -Fq 'PASS convex_test' /tmp/convex_test.out
 
 # ws_test proves convex_ws.vhdl's handshake, masked encode, unmasked
 # decode, fragmentation reassembly and transparent Ping/Pong against a

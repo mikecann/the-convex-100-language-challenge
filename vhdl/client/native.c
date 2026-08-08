@@ -66,7 +66,9 @@ enum {
     CMD_STDOUT_WRITE_BYTE = 16,
     CMD_STDOUT_FLUSH = 17,
     CMD_STDERR_WRITE_BYTE = 18,
-    CMD_EXIT = 19
+    CMD_EXIT = 19,
+    CMD_LISTEN = 20,
+    CMD_ACCEPT = 21
 };
 
 /* ------------------------------------------------------------------ */
@@ -195,6 +197,80 @@ static int handle_connect(int port, int use_tls) {
         }
         c->ssl = ssl;
     }
+    return slot;
+}
+
+/* ------------------------------------------------------------------ */
+/* The adapter's TCP mode: listen on the accumulated host (ADAPTER_LISTEN's */
+/* address; an empty host means "any interface") and port, then accept    */
+/* one controller connection into the same handle table CMD_CONNECT uses  */
+/* -- an accepted connection is indistinguishable from an outbound one to */
+/* every other opcode, so no separate read/write/close path is needed for */
+/* it. There is only ever one listening socket, matching the adapter's    */
+/* own single-controller-connection contract.                             */
+/* ------------------------------------------------------------------ */
+static int g_listen_fd = -1;
+
+static int handle_listen(int port) {
+    if (g_listen_fd >= 0) { close(g_listen_fd); g_listen_fd = -1; }
+    if (g_host_len < 0 || g_host_len >= HOST_CAP) return -5;
+    g_host[g_host_len] = '\0';
+
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    const char *node = (g_host_len > 0) ? g_host : NULL;
+    if (getaddrinfo(node, portstr, &hints, &res) != 0 || res == NULL) {
+        return -1; /* bind-address resolution failure */
+    }
+
+    int fd = -1;
+    struct addrinfo *rp;
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) continue;
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        if (bind(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) return -2; /* bind failure */
+    if (listen(fd, 1) != 0) { close(fd); return -3; }
+
+    g_listen_fd = fd;
+    return 0;
+}
+
+static int handle_accept(int timeout_ms) {
+    if (g_listen_fd < 0) return -4; /* CMD_LISTEN was never called or failed */
+    int slot = -1;
+    for (int i = 0; i < MAX_CONN; i++) {
+        if (!g_conn[i].in_use) { slot = i; break; }
+    }
+    if (slot < 0) return -4; /* table full */
+
+    struct pollfd pfd;
+    pfd.fd = g_listen_fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int rc = poll(&pfd, 1, timeout_ms);
+    if (rc < 0) return -3;
+    if (rc == 0) return -1; /* timeout: no controller connected yet */
+
+    int fd = accept(g_listen_fd, NULL, NULL);
+    if (fd < 0) return -3;
+
+    conn_t *c = &g_conn[slot];
+    memset(c, 0, sizeof(*c));
+    c->in_use = 1;
+    c->fd = fd;
     return slot;
 }
 
@@ -429,6 +505,11 @@ int32_t cx_dispatch(int32_t cmd, int32_t a0, int32_t a1) {
             stdout_flush();
             exit(a0);
             return 0; /* unreachable */
+
+        case CMD_LISTEN:
+            return handle_listen(a0);
+        case CMD_ACCEPT:
+            return handle_accept(a0);
 
         default:
             return -100; /* unknown opcode */
