@@ -97,6 +97,8 @@ const fenceLanguages = {
   ".v": "v",
   ".vala": "vala",
   ".vb": "vbnet",
+  ".vhd": "vhdl",
+  ".vhdl": "vhdl",
   ".zig": "zig",
 };
 
