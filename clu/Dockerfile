@@ -175,6 +175,7 @@ RUN set -eu; \
     cp client/tests/*.clu /stage/ 2>/dev/null || true; \
     cp client/tests/fixtures/*.clu /stage/ 2>/dev/null || true; \
     cp examples/basics/main.clu /stage/main.clu; \
+    cp client/tests/conformance/adapter.clu /stage/adapter.clu; \
     ls /stage
 
 # language-local unit tests, real loopback-TCP/WebSocket/sync coverage,
@@ -213,7 +214,7 @@ RUN set -eu; \
               json_test, bitops_test, sha1_test, base64_test, dns_test, \
               transport_test, http_test, websocket_test, sync_test, \
               echo_fixture, http_fixture, websocket_fixture, sync_fixture, \
-              main \
+              main, adapter \
         -opt -cfiles \
         -compile convex-dns, convex-json, convex-bitops, convex-sha1, \
                  convex-base64, \
@@ -222,7 +223,7 @@ RUN set -eu; \
                  json_test, bitops_test, sha1_test, base64_test, dns_test, \
                  transport_test, http_test, websocket_test, sync_test, \
                  echo_fixture, http_fixture, websocket_fixture, \
-                 sync_fixture, main; \
+                 sync_fixture, main, adapter; \
     "$CLUHOME/exe/plink" -opt -o json_test convex-json.o json_test.o; \
     "$CLUHOME/exe/plink" -opt -o bitops_test convex-bitops.o bitops_test.o; \
     "$CLUHOME/exe/plink" -opt -o sha1_test convex-sha1.o convex-bitops.o \
@@ -273,6 +274,11 @@ RUN set -eu; \
         convex-bitops.o convex-json.o \
         -L"$CLUHOME/code" -lpclu_opt -lssl -lcrypto -lm -lgc \
         -o convex-example; \
+    gcc adapter.o convex-sync.o convex-websocket.o convex-transport.o \
+        convex-http.o convex-dns.o convex-sha1.o convex-base64.o \
+        convex-bitops.o convex-json.o \
+        -L"$CLUHOME/code" -lpclu_opt -lssl -lcrypto -lm -lgc \
+        -o convex-adapter; \
     ./echo_fixture 19001 >/tmp/echo_fixture.log 2>&1 & \
     ECHO_PID=$!; \
     printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{"status":"success","value":{"count":0}}' \
@@ -303,12 +309,139 @@ RUN set -eu; \
     grep -Fq 'ALL PASS' /tmp/http_test.out; \
     grep -Fq 'ALL PASS' /tmp/websocket_test.out
 
+# Prove the real adapter binary's hello/close NDJSON lifecycle at build
+# time. CONVEX_URL is a dummy value scoped to this one RUN: hello and
+# close never open a network connection, so the adapter only needs the
+# variable to be present.
+RUN set -eu; \
+    cd /stage; \
+    printf '%s\n' \
+      '{"protocolVersion":1,"id":"hello","op":"hello"}' \
+      '{"id":"close","op":"close"}' \
+      | CONVEX_URL=http://127.0.0.1:9 ./convex-adapter \
+      > /tmp/convex-adapter-hello.ndjson; \
+    grep -Fq '"language":"clu"' /tmp/convex-adapter-hello.ndjson; \
+    grep -Fq '"type":"closed"' /tmp/convex-adapter-hello.ndjson
+
+RUN mkdir -p /out; \
+    cp /stage/convex-example /stage/convex-adapter /out/
+
 # ---------------------------------------------------------------------------
-# runtime images are not built yet: the conformance adapter
-# (client/tests/conformance/) does not exist. The canonical example
-# above is compiled and linked here (convex-example) and proven for real
-# against a deployment by ./run verify-example; example-runtime and
-# runtime stages land together once the adapter is real too, so both
-# entrypoints this repository's Docker interface requires ship at the
-# same time. See manifest.yaml.
+# runtime images: the two compiled, self-contained native ELF binaries
+# above (~1.1MB each, no CLUHOME needed at runtime) plus exactly the
+# shared libraries and CA bundle they load -- nothing else. runtime-tools
+# keeps an unmodified copy of the same pinned base image purely as a COPY
+# source; runtime-base starts fresh from that same pinned image and is
+# wiped down to nothing before copying back only the named files below,
+# an allow-list rather than a deny-list, so nothing the pinned image
+# happened to ship (a package manager, a second shell, a compiler) can
+# survive by omission from a deletion list. libssl.so.3/libcrypto.so.3
+# and the OpenSSL CA bundle/config come from the test stage's own
+# ca-certificates/libssl-dev install (bookworm-slim itself ships
+# neither); every other library and the coreutils/dash the shared
+# policy's own verifier requires come from runtime-tools, unmodified.
 # ---------------------------------------------------------------------------
+FROM --platform=linux/amd64 ${BUILD_IMAGE} AS runtime-tools
+
+FROM --platform=linux/amd64 ${BUILD_IMAGE} AS runtime-base
+# bookworm-slim has no findutils, and /bin is a symlink into /usr, so
+# rm itself becomes unreachable via PATH the moment a *separate* rm
+# invocation deletes /usr out from under the running shell -- caught
+# the first time this ran, on the second (per-/etc/entry) rm call, with
+# a bare "rm: not found". Fixed by making this exactly one rm process:
+# the /etc allow-list exclusion is computed with echo (a shell builtin,
+# no PATH lookup) inside a command substitution that runs to completion
+# before rm itself is ever invoked, so rm is resolved via PATH exactly
+# once, while everything it needs (including itself) still exists.
+RUN set -eu; \
+    rm -rf /bin /sbin /usr /lib /lib64 /var /root /home /opt /media \
+           /mnt /srv \
+        $(for f in /etc/*; do \
+              case "$f" in \
+                  /etc/resolv.conf|/etc/hosts) ;; \
+                  *) echo "$f" ;; \
+              esac; \
+          done)
+# No mkdir here: mkdir itself lived under the /usr this RUN step just
+# deleted, so (like rm above) it would already be unreachable via PATH
+# by the time this same shell tried to call it. Every directory below
+# is created implicitly by COPY, which -- unlike a shell command run
+# inside the image -- is a build-time Docker operation, not a process
+# that has to resolve anything through this image's own now-empty PATH.
+COPY --from=runtime-tools /lib64/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
+COPY --from=runtime-tools /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+COPY --from=runtime-tools /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/libc.so.6
+COPY --from=runtime-tools /lib/x86_64-linux-gnu/libm.so.6 /lib/x86_64-linux-gnu/libm.so.6
+COPY --from=runtime-tools /lib/x86_64-linux-gnu/libnss_dns.so.2 /lib/x86_64-linux-gnu/libnss_dns.so.2
+COPY --from=runtime-tools /lib/x86_64-linux-gnu/libnss_files.so.2 /lib/x86_64-linux-gnu/libnss_files.so.2
+COPY --from=runtime-tools /lib/x86_64-linux-gnu/libresolv.so.2 /lib/x86_64-linux-gnu/libresolv.so.2
+COPY --from=runtime-tools /lib/x86_64-linux-gnu/libselinux.so.1 /lib/x86_64-linux-gnu/libselinux.so.1
+COPY --from=runtime-tools /lib/x86_64-linux-gnu/libpcre2-8.so.0 /lib/x86_64-linux-gnu/libpcre2-8.so.0
+COPY --from=runtime-tools /lib/x86_64-linux-gnu/libacl.so.1 /lib/x86_64-linux-gnu/libacl.so.1
+COPY --from=runtime-tools /etc/nsswitch.conf /etc/nsswitch.conf
+COPY --from=runtime-tools /bin/dash /bin/sh
+COPY --from=runtime-tools /usr/bin/id /usr/bin/id
+COPY --from=runtime-tools /usr/bin/cat /usr/bin/cat
+COPY --from=runtime-tools /usr/bin/cut /usr/bin/cut
+COPY --from=runtime-tools /usr/bin/head /usr/bin/head
+COPY --from=runtime-tools /usr/bin/tail /usr/bin/tail
+COPY --from=runtime-tools /usr/bin/tr /usr/bin/tr
+COPY --from=runtime-tools /usr/bin/sort /usr/bin/sort
+COPY --from=runtime-tools /usr/bin/uniq /usr/bin/uniq
+COPY --from=runtime-tools /usr/bin/wc /usr/bin/wc
+COPY --from=runtime-tools /usr/bin/uname /usr/bin/uname
+COPY --from=runtime-tools /usr/bin/grep /usr/bin/grep
+COPY --from=runtime-tools /usr/bin/sed /usr/bin/sed
+COPY --from=runtime-tools /usr/bin/mawk /usr/bin/awk
+COPY --from=test /lib/x86_64-linux-gnu/libssl.so.3 /lib/x86_64-linux-gnu/libssl.so.3
+COPY --from=test /lib/x86_64-linux-gnu/libcrypto.so.3 /lib/x86_64-linux-gnu/libcrypto.so.3
+COPY --from=test /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=test /usr/lib/ssl/openssl.cnf /usr/lib/ssl/openssl.cnf
+# convexrt-tls.c calls SSL_CTX_set_default_verify_paths(), which trusts
+# OpenSSL's own compiled-in OPENSSLDIR ("/usr/lib/ssl", confirmed with
+# `openssl version -d` in the test image) to hold cert.pem -- on Debian
+# that path is actually a symlink to /etc/ssl/certs/ca-certificates.crt,
+# which this stage never copied, so the hosted (wss://) profile's first
+# real handshake failed verification outright ("certificate verify
+# failed") until the CA bundle was placed at this exact default location
+# too, not only its own /etc/ssl/certs/ path.
+COPY --from=test /etc/ssl/certs/ca-certificates.crt /usr/lib/ssl/cert.pem
+ENV PATH=/usr/local/bin:/usr/bin:/bin
+USER 65532:65532
+RUN test "$(id -u):$(id -g)" = 65532:65532 \
+    && test "$(printf 'ok\n' | cat)" = ok \
+    && test "$(printf 'a:b\n' | cut -d: -f2)" = b \
+    && test "$(printf 'first\nsecond\n' | head -n 1)" = first \
+    && test "$(printf 'first\nsecond\n' | tail -n 1)" = second \
+    && test "$(printf 'a\n' | tr a A)" = A \
+    && test "$(printf 'b\na\n' | sort | head -n 1)" = a \
+    && test "$(printf 'a\na\n' | uniq | wc -l | tr -d ' ')" = 1 \
+    && test "$(uname -m)" = x86_64 \
+    && printf 'needle\n' | grep -Fqx needle \
+    && test "$(printf 'before\n' | sed 's/before/after/')" = after \
+    && test "$(printf 'value\n' | awk '{print $1}')" = value \
+    && test ! -e /var && test ! -e /usr/share && test ! -e /usr/include \
+    && test ! -e /usr/src && test ! -e /etc/dpkg \
+    && test ! -e /bin/bash && test ! -e /usr/bin/bash \
+    && test ! -e /usr/bin/perl && test ! -e /usr/bin/debconf \
+    && test ! -e /usr/bin/ldd && test ! -e /usr/sbin/chroot \
+    && test ! -e /usr/sbin/debugfs && test ! -e /usr/sbin/mke2fs \
+    && set -- /bin/* && test "$#" -eq 1 && test "$1" = /bin/sh \
+    && for command in bash busybox perl debconf ldd chroot debugfs \
+         mke2fs mkfs fdisk mount umount su passwd groupadd useradd \
+         apk apt apt-get dpkg dpkg-query wget nc telnet openssl \
+         gcc cc make cmake node python python3 npm pip curl convex \
+         pclu plink; do \
+         ! command -v "$command" >/dev/null 2>&1; \
+       done
+
+FROM runtime-base AS example-runtime
+COPY --from=test /out/convex-example /usr/local/bin/convex-example
+ENTRYPOINT ["/usr/local/bin/convex-example"]
+
+# Keep the adapter runtime last: the root build command selects the
+# default Docker target when it builds a language, and that default
+# must be the conformance adapter, not the example.
+FROM runtime-base AS runtime
+COPY --from=test /out/convex-adapter /usr/local/bin/convex-adapter
+ENTRYPOINT ["/usr/local/bin/convex-adapter"]
