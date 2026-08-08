@@ -1,0 +1,67 @@
+check_count := 0;
+fail_count := 0;
+
+check_count +:= 1; fail_count +:= expect_eq("integer", json_decode(json_encode(42)), 42);
+check_count +:= 1; fail_count +:= expect_eq("negative integer", json_decode(json_encode(-7)), -7);
+check_count +:= 1; fail_count +:= expect_eq("zero", json_decode(json_encode(0)), 0);
+check_count +:= 1; fail_count +:= expect_eq("real", json_decode(json_encode(1.5)), 1.5);
+check_count +:= 1; fail_count +:= expect_eq("integral real", json_decode(json_encode(3.0)), 3.0);
+check_count +:= 1; fail_count +:= expect_eq("string", json_decode(json_encode("hello world")), "hello world");
+check_count +:= 1; fail_count +:= expect_eq("string with quote", json_decode(json_encode("a\"b")), "a\"b");
+check_count +:= 1; fail_count +:= expect_eq("string with backslash", json_decode(json_encode("a\\b")), "a\\b");
+check_count +:= 1; fail_count +:= expect_eq("string with newline", json_decode(json_encode("a\nb")), "a\nb");
+check_count +:= 1; fail_count +:= expect_eq("empty string", json_decode(json_encode("")), "");
+check_count +:= 1; fail_count +:= expect_eq("true", json_decode(json_encode(true)), true);
+check_count +:= 1; fail_count +:= expect_eq("false", json_decode(json_encode(false)), false);
+check_count +:= 1; fail_count +:= expect_eq("null", json_decode(json_encode(om)), om);
+check_count +:= 1; fail_count +:= expect_eq("empty array", json_decode(json_encode([])), []);
+check_count +:= 1; fail_count +:= expect_eq("array", json_decode(json_encode([1, 2, 3])), [1, 2, 3]);
+check_count +:= 1; fail_count +:= expect_eq("nested array", json_decode(json_encode([1, [2, 3], "x"])), [1, [2, 3], "x"]);
+
+obj := {};
+obj("count") := 0;
+obj("name") := "room-1";
+check_count +:= 1; fail_count +:= expect_eq("object", json_decode(json_encode(obj)), obj);
+
+nested := {};
+nested("a") := [1, 2];
+inner := {};
+inner("c") := true;
+nested("b") := inner;
+check_count +:= 1; fail_count +:= expect_eq("nested object", json_decode(json_encode(nested)), nested);
+
+-- decode-only checks against literal JSON text (things an encoder would
+-- never produce itself, like whitespace variety or \u escapes)
+obj2 := {};
+obj2("x") := 1;
+check_count +:= 1; fail_count +:= expect_eq("decode with whitespace", json_decode(" { \"x\" : 1 } "), obj2);
+check_count +:= 1; fail_count +:= expect_eq("decode exponent", json_decode("1e2"), 100.0);
+check_count +:= 1; fail_count +:= expect_eq("decode negative exponent", json_decode("1.5e1"), 15.0);
+check_count +:= 1; fail_count +:= expect_eq("decode unicode escape", json_decode("\"\\u0041\""), "A");
+check_count +:= 1; fail_count +:= expect_eq("malformed returns null via json_decode", json_decode("{not json"), om);
+
+[success, value] := json_try_decode("{not json");
+check_count +:= 1; fail_count +:= expect_eq("json_try_decode reports failure", success, false);
+
+[success2, value2] := json_try_decode("null");
+check_count +:= 1; fail_count +:= expect_eq("json_try_decode true for real null", success2, true);
+check_count +:= 1; fail_count +:= expect_eq("json_try_decode value for real null", value2, om);
+
+print(str(check_count - fail_count) + "/" + str(check_count) + " json checks passed");
+if fail_count > 0 then
+  stop 1;
+end if;
+
+-- expect_eq returns 1 (fail) or 0 (pass), printing a diagnostic on failure;
+-- the mainline block above accumulates the result itself rather than this
+-- proc mutating a shared counter, keeping every proc a pure function of its
+-- arguments.
+proc expect_eq(label, actual, expected);
+  if actual /= expected then
+    print("FAIL " + label + ": got " + str(actual) + " want " + str(expected));
+    return 1;
+  end if;
+  return 0;
+end proc;
+
+#include "json.setl"

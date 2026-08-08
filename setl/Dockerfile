@@ -114,3 +114,19 @@ COPY client/tests/tls_smoke.setl /tmp/tls_smoke.setl
 RUN set -eu; \
     src/run/setl /tmp/tls_smoke.setl | tee /tmp/tls_smoke.out; \
     grep -Fq 'TLS HANDSHAKE AND HTTP ROUND TRIP: OK' /tmp/tls_smoke.out
+
+# The JSON codec (client/json.setl) is a proc-only module, meant to be
+# #include'd near the end of a file, after that file's own mainline
+# statements -- GNU SETL requires every source unit's executable statements
+# to precede its procedure definitions (confirmed directly against this
+# interpreter: a bare `proc` before any statement, or a statement after one,
+# is a syntax error). setlcpp resolves a quoted #include relative to the
+# current working directory, so the module and its test are staged side by
+# side rather than left in their separate repository directories.
+RUN mkdir -p /stage
+COPY client/json.setl /stage/json.setl
+COPY client/tests/json_test.setl /stage/json_test.setl
+RUN set -eu; \
+    cd /stage; \
+    /opt/setl-src/src/run/setl --cpp json_test.setl | tee /tmp/json_test.out; \
+    grep -Eq '^([0-9]+)/\1 json checks passed$' /tmp/json_test.out
