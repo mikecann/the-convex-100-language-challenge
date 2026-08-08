@@ -1,0 +1,24 @@
+schemaVersion: 1
+id: verilog
+displayName: "Verilog"
+rank: 90
+selectionTier: curated_backfill
+implementation:
+  status: attempting
+  notes: >-
+    A Convex client expressed as a simulated circuit: a free-running clock
+    process and a clocked request/acknowledge transport process
+    (client/convex_transport.v), the same shape vhdl/ uses through
+    VHPIDIRECT but here through an Icarus Verilog VPI module
+    (client/native.c) that exposes exactly two system functions,
+    $cx_dispatch and $cx_now_ms. Only the toolchain gate exists so far,
+    proven inside Docker on the pinned toolchain: a real TCP connection and
+    a real certificate- and hostname-verified TLS handshake to the approved
+    test deployment, both driven from Verilog through the VPI boundary.
+    The JSON codec, HTTP/1.1 framing, examples/basics, the RFC 6455
+    WebSocket layer, the /api/sync Live state machine and the conformance
+    adapter do not exist yet.
+toolchain:
+  name: Icarus Verilog
+  version: "11.0 (stable), Debian package 11.0-1.1+b1"
+capabilities: []
