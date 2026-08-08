@@ -12,6 +12,13 @@
 -- fails to parse; callers that need to tell "null" apart from "malformed"
 -- should use json_try_decode, which returns [true, value] or [false, om].
 --
+-- A decoded object also cannot distinguish a key explicitly mapped to
+-- JSON null from that key being entirely absent: GNU SETL's map
+-- assignment m(k) := om does not store an entry (om is also what a map
+-- lookup returns for "no such key"), so {"k":null} and {} decode to the
+-- same empty map. Callers that must tell those two apart need a
+-- different representation than this module provides.
+--
 -- This module is proc-only (no top-level statements), so it is meant to be
 -- pulled in near the end of a file's #include list, after that file's own
 -- mainline statements -- see the comment at the top of examples/basics/main.setl

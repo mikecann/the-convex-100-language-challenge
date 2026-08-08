@@ -150,3 +150,18 @@ RUN set -eu; \
     cd /stage; \
     /opt/setl-src/src/run/setl --cpp http_test.setl | tee /tmp/http_test.out; \
     grep -Fq 'HTTP CLIENT: ALL CHECKS PASSED' /tmp/http_test.out
+
+# client/convex.setl implements query/mutation/action over the documented
+# POST /api/{query,mutation,action} "format":"json" envelope, classifying
+# every response into a result or one of FunctionError/ProtocolError/
+# TransportError. client/tests/convex_test.setl unit-tests the envelope
+# classification and deployment-URL parsing directly with synthetic
+# inputs -- no live deployment or fixture server needed for this layer,
+# since client/tests/http_test.setl already proves the transport and
+# framing underneath it against real servers.
+COPY client/convex.setl /stage/convex.setl
+COPY client/tests/convex_test.setl /stage/convex_test.setl
+RUN set -eu; \
+    cd /stage; \
+    /opt/setl-src/src/run/setl --cpp convex_test.setl | tee /tmp/convex_test.out; \
+    grep -Fq 'CONVEX CLASSIFY: ALL CHECKS PASSED' /tmp/convex_test.out
