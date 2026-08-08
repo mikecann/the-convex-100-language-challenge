@@ -250,91 +250,140 @@ module convex_buffer #(
     end
   endtask
 
+  // Confirmed Icarus 11.0 bug (found while an "args":{} envelope was
+  // rejected by the adapter's own real conformance scenario, then
+  // minimised to `{"a":{}}` and `[[]]` against this task in isolation):
+  // `disable main;` inside a recursively self-nested parse_object call -
+  // an object whose value is itself an object, e.g. the outer object in
+  // `{"a":{}}` - does not just exit the INNER frame the way IEEE 1800
+  // automatic-task reentrancy requires; it also silently abandons the
+  // OUTER frame's own remaining statements (tok_value assignment, the
+  // trailing comma/`}` handling, and the outer object's own tok_stop),
+  // leaving parse_pos short and the whole document rejected as malformed
+  // even though every byte was well-formed. parse_array has the exact
+  // same shape and reproduces the same failure for `[[]]`. Reproduced
+  // with disable-vs-no-disable as the only variable, confirmed the bug
+  // is specific to two live frames of the SAME task sharing a block
+  // literally named "main" (parse_object calling parse_array, a
+  // DIFFERENT task, never triggers it - see e.g. `{"a":[]}`, which
+  // parses correctly). Both this task and parse_array below are
+  // therefore written without `disable` at all: a `failed` flag threads
+  // through nested `if`/`else` in its place, so no named block is ever
+  // disabled from a possibly-recursing frame.
   task automatic parse_object(input integer parent, output integer out_tok, output bit ok);
     integer obj_tok, key_tok, val_tok;
     bit step_ok;
     byte c;
     bit looping;
-    begin : main
+    bit failed;
+    begin
       out_tok = -1;
       ok = 1'b0;
+      failed = 1'b0;
       alloc_tok(KIND_OBJECT, parse_pos, parse_pos, parent, obj_tok, step_ok);
-      if (!step_ok) disable main;
-      parse_pos = parse_pos + 1; // consume '{'
-      skip_ws;
-      if (parse_pos < len && data[parse_pos] == "}") begin
+      if (!step_ok) failed = 1'b1;
+      if (!failed) begin
+        parse_pos = parse_pos + 1; // consume '{'
+        skip_ws;
+      end
+      if (!failed && parse_pos < len && data[parse_pos] == "}") begin
         parse_pos = parse_pos + 1;
         tok_stop[obj_tok] = parse_pos;
         out_tok = obj_tok;
         ok = 1'b1;
-        disable main;
-      end
-      looping = 1'b1;
-      while (looping) begin
-        skip_ws;
-        if (parse_pos >= len || data[parse_pos] != "\"") disable main;
-        parse_string(obj_tok, key_tok, step_ok);
-        if (!step_ok) disable main;
-        skip_ws;
-        if (parse_pos >= len || data[parse_pos] != ":") disable main;
-        parse_pos = parse_pos + 1;
-        parse_value(key_tok, val_tok, step_ok);
-        if (!step_ok) disable main;
-        tok_value[key_tok] = val_tok;
-        skip_ws;
-        if (parse_pos >= len) disable main;
-        c = data[parse_pos];
-        if (c == ",") begin
-          parse_pos = parse_pos + 1;
-        end else if (c == "}") begin
-          parse_pos = parse_pos + 1;
-          tok_stop[obj_tok] = parse_pos;
-          out_tok = obj_tok;
-          ok = 1'b1;
-          looping = 1'b0;
-        end else begin
-          disable main;
+      end else if (!failed) begin
+        looping = 1'b1;
+        while (looping && !failed) begin
+          skip_ws;
+          if (parse_pos >= len || data[parse_pos] != "\"") begin
+            failed = 1'b1;
+          end else begin
+            parse_string(obj_tok, key_tok, step_ok);
+            if (!step_ok) failed = 1'b1;
+          end
+          if (!failed) begin
+            skip_ws;
+            if (parse_pos >= len || data[parse_pos] != ":") begin
+              failed = 1'b1;
+            end else begin
+              parse_pos = parse_pos + 1;
+              parse_value(key_tok, val_tok, step_ok);
+              if (!step_ok) failed = 1'b1;
+            end
+          end
+          if (!failed) begin
+            tok_value[key_tok] = val_tok;
+            skip_ws;
+            if (parse_pos >= len) begin
+              failed = 1'b1;
+            end else begin
+              c = data[parse_pos];
+              if (c == ",") begin
+                parse_pos = parse_pos + 1;
+              end else if (c == "}") begin
+                parse_pos = parse_pos + 1;
+                tok_stop[obj_tok] = parse_pos;
+                out_tok = obj_tok;
+                ok = 1'b1;
+                looping = 1'b0;
+              end else begin
+                failed = 1'b1;
+              end
+            end
+          end
         end
       end
     end
   endtask
 
+  // Same disable-vs-recursion bug as parse_object above, reproduced
+  // directly for `[[]]` - see that task's own header comment for the
+  // full write-up. Written the same disable-free, `failed`-flag way.
   task automatic parse_array(input integer parent, output integer out_tok, output bit ok);
     integer arr_tok, el_tok;
     bit step_ok;
     byte c;
     bit looping;
-    begin : main
+    bit failed;
+    begin
       out_tok = -1;
       ok = 1'b0;
+      failed = 1'b0;
       alloc_tok(KIND_ARRAY, parse_pos, parse_pos, parent, arr_tok, step_ok);
-      if (!step_ok) disable main;
-      parse_pos = parse_pos + 1; // consume '['
-      skip_ws;
-      if (parse_pos < len && data[parse_pos] == "]") begin
+      if (!step_ok) failed = 1'b1;
+      if (!failed) begin
+        parse_pos = parse_pos + 1; // consume '['
+        skip_ws;
+      end
+      if (!failed && parse_pos < len && data[parse_pos] == "]") begin
         parse_pos = parse_pos + 1;
         tok_stop[arr_tok] = parse_pos;
         out_tok = arr_tok;
         ok = 1'b1;
-        disable main;
-      end
-      looping = 1'b1;
-      while (looping) begin
-        parse_value(arr_tok, el_tok, step_ok);
-        if (!step_ok) disable main;
-        skip_ws;
-        if (parse_pos >= len) disable main;
-        c = data[parse_pos];
-        if (c == ",") begin
-          parse_pos = parse_pos + 1;
-        end else if (c == "]") begin
-          parse_pos = parse_pos + 1;
-          tok_stop[arr_tok] = parse_pos;
-          out_tok = arr_tok;
-          ok = 1'b1;
-          looping = 1'b0;
-        end else begin
-          disable main;
+      end else if (!failed) begin
+        looping = 1'b1;
+        while (looping && !failed) begin
+          parse_value(arr_tok, el_tok, step_ok);
+          if (!step_ok) failed = 1'b1;
+          if (!failed) begin
+            skip_ws;
+            if (parse_pos >= len) begin
+              failed = 1'b1;
+            end else begin
+              c = data[parse_pos];
+              if (c == ",") begin
+                parse_pos = parse_pos + 1;
+              end else if (c == "]") begin
+                parse_pos = parse_pos + 1;
+                tok_stop[arr_tok] = parse_pos;
+                out_tok = arr_tok;
+                ok = 1'b1;
+                looping = 1'b0;
+              end else begin
+                failed = 1'b1;
+              end
+            end
+          end
         end
       end
     end
