@@ -50,3 +50,26 @@ parseEndpoint :: !String -> Maybe Endpoint
 // reconnecting per call is simpler than pooling, matching this project's
 // other native clients.
 httpCall :: !Endpoint !(Maybe String) !String !String !JSON !Deadline !*World -> (!Result CallResult, !*World)
+
+// --- shared with Convex.WebSocket -----------------------------------------
+//
+// The WebSocket upgrade handshake is still an HTTP/1.1 request/response, so
+// Convex.WebSocket reuses this module's own header reading and lookup
+// helpers rather than duplicating them.
+
+// Searches `hay` for `needle`, starting the search at or after `start`.
+findSubstrFrom :: !String !String !Int -> Maybe Int
+
+trimStr :: !String -> String
+
+// Looks up one header's value, case-insensitively, from header text shaped
+// like `readHeaders`'s own first result (status line plus each header line,
+// separated by bare "\r\n", none trailing the last one).
+headerValue :: !String !String -> Maybe String
+
+parseStatusLine :: !String -> Maybe Int
+
+// Reads until the blank-line header terminator is seen, returning the
+// header text and whatever body (or, for a WebSocket upgrade, first frame)
+// bytes were already read past it.
+readHeaders :: !Transport !String !Deadline !*World -> (!Result (!String, !String), !*World)

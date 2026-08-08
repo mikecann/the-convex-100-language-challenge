@@ -62,7 +62,7 @@ RUN printf '%s\n' 'module hello' '' 'Start :: Int' 'Start = 1' > /tmp/hello.icl 
 # equivalent regression, see hare/client/convex.ha); this offline `test`
 # stage never sets it, so it runs here as a documented no-op and only does
 # real network I/O under `./run verify`/`verify-hosted`.
-RUN for t in FoundationTest WireTest HTTPTest ConvexCallTest; do \
+RUN for t in FoundationTest WireTest HTTPTest ConvexCallTest WebSocketTest; do \
       (cd /project/client/Convex && clm -nt -IL Platform -I /project/client "$t" -o "/tmp/$t-bin") \
       && "/tmp/$t-bin" \
       || exit 1; \
