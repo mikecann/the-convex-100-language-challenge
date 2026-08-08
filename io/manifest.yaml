@@ -4,5 +4,42 @@ displayName: "Io"
 rank: 64
 selectionTier: coverage
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Io client. The HTTP envelope, RFC 6455 framing, SHA-1, base64
+    handling, JSON scanning, the pinned sync state machine, reconnect and
+    rehydration are all written in Io. A single purpose-built C file supplies
+    the byte-level transport Io's VM does not have at all: sockets, OpenSSL
+    client TLS, readiness polling, CSPRNG bytes and a monotonic clock.
+toolchain:
+  name: Io
+  version: "20260302"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Io's reference VM ships no networking. Upstream's master branch targets WebAssembly and removed the addon system, and the historical Socket and SecureSocket addons are unmaintained and predate OpenSSL 3, so client/convex_transport.c provides a small native transport boundary of sockets, OpenSSL client TLS, readiness polling, CSPRNG bytes and a monotonic clock. It carries no Convex, HTTP, WebSocket, SHA-1 or JSON behaviour. Whether that boundary still sits inside the native label rather than binding is a judgement this client documents rather than assumes.
+  - The VM is built from a pinned commit of the upstream native branch because no distribution packages Io. The build needs network access to fetch that commit and the pinned parson submodule, and the runtime stage completes one outbound TLS handshake to api.convex.dev so a missing CA bundle or OpenSSL provider fails the build rather than hosted verification. An air-gapped build cannot produce this image.
+  - Live authentication, optimistic updates, WebSocket mutations and actions, journals, and TransitionChunk assembly are deferred.
+  - The educational API covers Convex's JSON-safe values. Full tagged Convex values, including Int64 and bytes, are deferred.
+  - A Convex response envelope is authoritative on any HTTP status. A body that is not an envelope is a ProtocolError on a 2xx status and a TransportError otherwise, so a gateway failure in front of the deployment is never reported as Convex protocol drift. HTTP bodies and WebSocket frames are capped at 2 MiB, upgrade and response headers at 32 KiB, and one HTTP exchange at an absolute 15 second monotonic deadline.
+  - A subscription suppresses any repeat of the value it last published, not only the rehydration that follows a reconnect. Convex only reissues a query result when it changes, so this is deduplication rather than filtering, but it does mean a deliberate identical republish would not be observed.
+  - Adapter output uses a newest-16 queue with a 6 MiB byte budget that includes the NDJSON newline and a conservative per-entry allowance. Four event slots and 64 KiB are reserved for control events, and only one record is ever in flight so a queued delivery is re-checked against its subscription generation immediately before it is committed.
+  - Language-local loopback tests cover the request shape, bearer token lifecycle, chunked responses, the status and envelope rule, response and frame byte budgets, absolute HTTP deadlines, five real reconnects with query-set resend and suppressed rehydration, QueryFailed and recovery, mismatched transition versions, fragmented UTF-8 around a control frame, partial-frame deadlines, bounded close against idle, chatty and stalled peers, and the adapter's event shapes, stopped-reader bounds, generation barrier and same-id replacement.
+  - Shared local and hosted conformance passed 31/31 from a clean exact-head build; the capability list below records the evaluator award. The exact apt package versions in the Dockerfile are still asserted rather than pinned, and clang-format conformance of client/convex_transport.c is enforced by the build rather than verified in advance.
+capabilities:
+  - http
+  - live
