@@ -541,39 +541,49 @@ ad-publish-subscriptions: function [/local sub-id qid sub already] [
 ;; enough to keep Live push latency low without busy-spinning.
 ad-loop-slice-ms: 5000
 
-deployment-url: get-env "CONVEX_URL"
-if any [none? deployment-url empty? deployment-url] [
-    diagnose "CONVEX_URL is required"
-    quit/return 2
-]
-
-unless convex-open deployment-url "rebol-0.1.0" [
-    diagnose convex-error-message
-    quit/return 1
-]
-
-ad/published: make map! []
-
-unless ad-open-transport [quit/return 1]
-
-outcome: none
-cmd-line: none
-until [
-    live-pump ad-loop-slice-ms
-    ad-publish-subscriptions
-    ad-flush
-    set [outcome cmd-line] ad-read-command ad-loop-slice-ms
-    case [
-        outcome = 'ok [ad-dispatch cmd-line]
-        outcome = 'eof [ad/done: true]
-        true [none]
+;; The whole connect-transport-loop-cleanup driver, wrapped in one function
+;; rather than left as bare top-level statements, specifically so a unit
+;; test can `do` this file (loading every ad-* function and the `ad`
+;; state object above) without also dialing a real deployment or blocking
+;; on a transport -- see client/tests/conformance/queue-test.r3, which
+;; tests ad-emit's bounded output queue directly this way. Called
+;; unconditionally at the bottom UNLESS ADAPTER_NO_AUTORUN is set, which
+;; only that test file ever sets.
+ad-main: function [/local outcome cmd-line deployment-url] [
+    deployment-url: get-env "CONVEX_URL"
+    if any [none? deployment-url empty? deployment-url] [
+        diagnose "CONVEX_URL is required"
+        quit/return 2
     ]
-    ad-flush
-    ad/done
+
+    unless convex-open deployment-url "rebol-0.1.0" [
+        diagnose convex-error-message
+        quit/return 1
+    ]
+
+    ad/published: make map! []
+
+    unless ad-open-transport [quit/return 1]
+
+    until [
+        live-pump ad-loop-slice-ms
+        ad-publish-subscriptions
+        ad-flush
+        set [outcome cmd-line] ad-read-command ad-loop-slice-ms
+        case [
+            outcome = 'ok [ad-dispatch cmd-line]
+            outcome = 'eof [ad/done: true]
+            true [none]
+        ]
+        ad-flush
+        ad/done
+    ]
+
+    convex-close-live 2000
+    if ad/mode = 'tcp [
+        if ad/peer [sock-close ad/peer]
+        if ad/listen [try [close ad/listen]]
+    ]
 ]
 
-convex-close-live 2000
-if ad/mode = 'tcp [
-    if ad/peer [sock-close ad/peer]
-    if ad/listen [try [close ad/listen]]
-]
+unless get-env "ADAPTER_NO_AUTORUN" [ad-main]
