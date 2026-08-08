@@ -92,4 +92,6 @@ limitations:
   - Each HTTP call opens a fresh TCP/TLS connection (no keep-alive/pooling),
     matching the reference C client's own per-call curl_easy_init/cleanup
     behavior.
-capabilities: []
+capabilities:
+  - http
+  - live
