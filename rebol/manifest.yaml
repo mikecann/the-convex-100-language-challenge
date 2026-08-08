@@ -4,7 +4,7 @@ displayName: "REBOL"
 rank: 58
 selectionTier: coverage
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -26,6 +26,15 @@ implementation:
     their own distinct, correctly identified reason (untrusted issuer,
     expired certificate, hostname mismatch). This replaces actionscript in
     roster slot 58, which had no practical clean Linux-container route.
+    client/convex.r3 implements HTTP query/mutation/action, RFC 6455
+    WebSocket framing, and the /api/sync Live state machine (reconnect
+    with exponential backoff, unchanged-rehydration suppression, and the
+    adapter-only debugDisconnect hook) over that verified TLS transport.
+    client/tests/conformance/main.r3 speaks the shared NDJSON adapter
+    protocol v1 over stdin/stdout or one ADAPTER_LISTEN TCP connection.
+    Both capabilities are earned: the shared pilot controller's full
+    31-check suite passes on both the local self-hosted and hosted
+    deployment profiles from the same built image.
 toolchain:
   name: Rebol/Bulk (Oldes/Rebol3 fork)
   version: 3.22.1
@@ -59,8 +68,27 @@ limitations:
     hop in the presented chain, not only the final certificate, precisely
     to handle that cross-signing case correctly.
   - >-
-    Implementation is still in progress: HTTP query/mutation/action,
-    Live/WebSocket, the adapter, and the canonical example are not yet
-    complete. Capabilities remain unearned until shared conformance
-    passes.
-capabilities: []
+    Rebol/Bulk 3.22.1's stdin console port (system/ports/input) does not
+    participate in this build's async wait/awake event model at all --
+    confirmed directly: `wait` on it always burns its full requested
+    timeout and returns none regardless of whether data is already
+    sitting in the pipe. A plain synchronous `read` works and blocks
+    correctly, but with no way to bound it. Because of this, the
+    conformance adapter's stdin/stdout transport mode cannot interleave
+    pumping the Live connection with waiting for the next controller
+    command the way its ADAPTER_LISTEN TCP mode does (a real tcp:// port
+    both for the accepted controller connection and for Live); a Live
+    push that arrives while stdin is blocked is delivered as soon as
+    control returns to the Live pump, not necessarily the instant it
+    arrives. The shared harness's own conformance run uses ADAPTER_LISTEN,
+    where this gap does not apply; stdin/stdout mode still fully
+    implements protocol v1 for any other caller that wants a plain pipe.
+  - >-
+    The adapter's own output queue is bounded (8 slots, a 4 MiB byte
+    budget): subscription push events are dropped oldest-first under
+    backpressure, while hello/result/error/ack/closed responses are never
+    dropped -- the adapter fails loudly instead if the budget cannot be
+    freed for one of those.
+capabilities:
+  - http
+  - live
