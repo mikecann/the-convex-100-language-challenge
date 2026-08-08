@@ -81,4 +81,18 @@ initialization
   // program's initialization.
   TJSONData.CompressedJSON := True;
 
+  // fpc's `string' is AnsiString, tagged with whatever DefaultSystemCodePage
+  // happens to be. On a minimal Linux container with no locale installed
+  // that defaults to a codepage with no real conversion table, so any
+  // WideString-to-AnsiString conversion silently replaces every character
+  // outside plain ASCII with `?'. jsonscanner.pp's own `\uXXXX' escape
+  // decoder takes the correct UTF-8 path only "if (joUTF8 in Options) or
+  // (DefaultSystemCodePage=CP_UTF8)", and every other WideChar/AnsiString
+  // conversion in the RTL (including the one behind Convex request bodies
+  // and adapter output) consults the very same global. Setting it once
+  // here, before any string touches JSON or the wire, makes AnsiString
+  // mean UTF-8 everywhere in this client, which is what Convex's JSON
+  // protocol actually requires.
+  DefaultSystemCodePage := CP_UTF8;
+
 end.
