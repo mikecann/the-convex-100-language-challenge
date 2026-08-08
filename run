@@ -180,7 +180,7 @@ toolchain_policy() {
   forbidden='cc gcc g++ clang make ld as ar cmake rustc cargo javac
     apt apt-get apt-cache dpkg dpkg-deb apk rpm yum dnf
     busybox wget nc netcat telnet ftpget ftpput ftpd tftp httpd inetd
-    gdb strace ltrace perl lua'
+    gdb strace ltrace perl lua hhvm'
 
   # A language whose execution model IS process composition — a shell — cannot
   # express a transport any other way, so it may declare the tools it genuinely
