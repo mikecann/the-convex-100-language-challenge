@@ -1869,7 +1869,13 @@ RUN set -eu; \
       'exec /usr/bin/vvp -M/usr/lib/x86_64-linux-gnu/ivl -mnative \' \
       '  /usr/local/lib/convex-example.vvp' \
       > /entry/convex-example; \
-    chmod 755 /entry/convex-example
+    chmod 755 /entry/convex-example; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'exec /usr/bin/vvp -M/usr/lib/x86_64-linux-gnu/ivl -mnative \' \
+      '  /usr/local/lib/convex-adapter.vvp "$@"' \
+      > /entry/convex-adapter; \
+    chmod 755 /entry/convex-adapter
 
 # ---------------------------------------------------------------------------
 # runtime-base: the pinned image with its filesystem removed and only the
@@ -1950,15 +1956,15 @@ ENTRYPOINT ["/usr/local/bin/convex-example-entry"]
 # ---------------------------------------------------------------------------
 FROM runtime-base AS runtime
 COPY --from=test --chmod=644 --chown=65532:65532 /build/convex-adapter.vvp /usr/local/lib/convex-adapter.vvp
+COPY --from=test --chmod=755 --chown=65532:65532 /entry/convex-adapter /usr/local/bin/convex-adapter
 USER 65532:65532
 RUN set -eu; \
+    test -x /usr/local/bin/convex-adapter; \
     printf '%s\n' \
       '{"protocolVersion":1,"id":"hello","op":"hello"}' \
       '{"id":"close","op":"close"}' \
     > /tmp/adapter-probe.in; \
-    CONVEX_URL=http://127.0.0.1:1 \
-      /usr/bin/vvp -M/usr/lib/x86_64-linux-gnu/ivl -mnative \
-      /usr/local/lib/convex-adapter.vvp < /tmp/adapter-probe.in > /tmp/adapter-probe.out; \
+    /usr/local/bin/convex-adapter < /tmp/adapter-probe.in > /tmp/adapter-probe.out; \
     cat /tmp/adapter-probe.out; \
     grep -Fq '"type":"closed"' /tmp/adapter-probe.out
-ENTRYPOINT ["/usr/bin/vvp", "-M/usr/lib/x86_64-linux-gnu/ivl", "-mnative", "/usr/local/lib/convex-adapter.vvp"]
+ENTRYPOINT ["/usr/local/bin/convex-adapter"]
