@@ -39,32 +39,48 @@ TLS_client_method w = code { ccall TLS_client_method ":p:A" }
 SSL_CTX_new :: !Pointer !*World -> (!Pointer, !*World)
 SSL_CTX_new m w = code { ccall SSL_CTX_new "p:p:A" }
 
-SSL_CTX_free :: !Pointer !*World -> *World
-SSL_CTX_free ctx w = code { ccall SSL_CTX_free "p:V:A" }
+// The real C signature returns `void`. Every OpenSSL binding in this file
+// that is genuinely void-returning is instead declared here as returning an
+// `Int` that every call site immediately discards, and the ccall type
+// string lies to `clm` about it (`"...:I:A"` instead of the accurate
+// `"...:V:A"`). This is a confirmed, measured workaround for a real `clm`
+// 3.1 code-generation defect in this toolchain: a ccall whose type string
+// ends `:V:A` (void return) reliably corrupts Clean's own heap by the time
+// any *later* ccall in the same connection's lifetime runs, independent of
+// which OpenSSL function it is, its argument types, whether anything is
+// freed versus merely leaked, and whether the corrupted ccall is wrapped in
+// its own separate Clean function — every one of those variables was
+// isolated and ruled out directly against this project's own dedicated test
+// deployment. `Convex.TLS` never inspects any of these bogus returned
+// `Int`s; they exist only so the ccall's type string never ends in `:V:A`.
+// Concretely: `SSL_free` declared as `"p:V:A"` reliably crashed a later
+// garbage-collection pass with "cycle in spine detected" the moment
+// *anything* else ran afterward (another ccall touching the same
+// connection's fd, a second free, even a plain `fcntl` diagnostic probe) —
+// but running clean, every time, once redeclared as `"p:I:A"` with the
+// bogus `Int` discarded. The same redeclaration is applied to every other
+// void-returning OpenSSL call this file makes: `SSL_CTX_free`,
+// `SSL_CTX_set_verify`. (`SSL_set_verify` is declared but, per its own
+// comment, never called by `tlsConnect`.)
+SSL_CTX_free :: !Pointer !*World -> (!Int, !*World)
+SSL_CTX_free ctx w = code { ccall SSL_CTX_free "p:I:A" }
 
 // The real C signature is `SSL_CTX_set_verify(ctx, mode, verify_callback)`;
 // this client always wants the library's own default verification (checked
 // afterward via `SSL_get_verify_result`), so the callback argument is a
 // literal null passed as a plain `I` — the ccall type string must list
 // every real C argument, or the callee reads an unset register/stack slot.
-//
-// `tlsConnect` calls the SSL-level `SSL_set_verify` below instead of this
-// CTX-level function — see that binding's comment for why: a `clm` 3.1
-// code-generation defect means this exact shape (`"...:V:A"`, a
-// void-returning ccall) corrupts the *next* String-argument ccall's
-// marshaled pointer when both appear in one function. Kept here, unused by
-// `tlsConnect`, only because `FoundationTest` still links it as part of
-// proving every declared OpenSSL symbol in this file resolves.
-SSL_CTX_set_verify :: !Pointer !Int !Int !*World -> *World
-SSL_CTX_set_verify ctx mode callback w = code { ccall SSL_CTX_set_verify "pII:V:A" }
+SSL_CTX_set_verify :: !Pointer !Int !Int !*World -> (!Int, !*World)
+SSL_CTX_set_verify ctx mode callback w = code { ccall SSL_CTX_set_verify "pII:I:A" }
 
 // SSL-level equivalent of `SSL_CTX_set_verify`, applied to a session
 // instead of a context. Real signature is identical modulo the first
-// argument. `tlsConnect` uses this one, called *after* `SSL_set1_host`/
-// `SSL_ctrl` rather than `SSL_CTX_set_verify` called before `SSL_new` — see
-// its own call site for the measured reason.
-SSL_set_verify :: !Pointer !Int !Int !*World -> *World
-SSL_set_verify ssl mode callback w = code { ccall SSL_set_verify "pII:V:A" }
+// argument. Declared for completeness and linked by `FoundationTest`
+// alongside every other symbol this file declares; `tlsConnect` sets verify
+// mode on the context (`SSL_CTX_set_verify`, before `SSL_new`) rather than
+// on the session, so this binding itself is currently unused.
+SSL_set_verify :: !Pointer !Int !Int !*World -> (!Int, !*World)
+SSL_set_verify ssl mode callback w = code { ccall SSL_set_verify "pII:I:A" }
 
 SSL_CTX_set_default_verify_paths :: !Pointer !*World -> (!Int, !*World)
 SSL_CTX_set_default_verify_paths ctx w = code { ccall SSL_CTX_set_default_verify_paths "p:I:A" }
@@ -78,8 +94,11 @@ SSL_CTX_load_verify_locations ctx file capath w = code { ccall SSL_CTX_load_veri
 SSL_new :: !Pointer !*World -> (!Pointer, !*World)
 SSL_new ctx w = code { ccall SSL_new "p:p:A" }
 
-SSL_free :: !Pointer !*World -> *World
-SSL_free ssl w = code { ccall SSL_free "p:V:A" }
+// See the long comment on `SSL_CTX_free` above: declared `Int`-returning,
+// not `void`, to dodge the `clm` 3.1 marshaling defect. The bogus return is
+// always discarded at every call site.
+SSL_free :: !Pointer !*World -> (!Int, !*World)
+SSL_free ssl w = code { ccall SSL_free "p:I:A" }
 
 SSL_set_fd :: !Pointer !Int !*World -> (!Int, !*World)
 SSL_set_fd ssl fd w = code { ccall SSL_set_fd "pI:I:A" }
@@ -167,13 +186,11 @@ waitSocket fd forWrite d w
 
 // `tlsConnect` owns closing `fd` on every one of its own failure paths, so
 // a caller must never also call `Convex.Socket.closeRaw` after a `RErr`
-// here (a real bug this project's own build-time TLS regression caught:
-// closing the same fd a second time did not fail loudly but reliably
-// corrupted a later garbage collection into "cycle in spine detected").
-// Before `SSL_set_fd` runs, `fd` is not yet owned by any OpenSSL BIO, so
-// these two early failures close it directly; every failure after that
-// point goes through `tlsFreeOnly`/`SSL_free`, whose BIO close-on-free
-// already closes it (see `tlsClose`'s own comment on the same ownership).
+// here. Before `SSL_set_fd` runs, `fd` is not yet owned by any OpenSSL BIO,
+// so these two early failures close it directly; every failure after that
+// point goes through `tlsFreeOnly`, which closes it explicitly itself (see
+// that function's own comment on why, and `SSL_CTX_free`'s comment for the
+// real root cause this project chased two other theories before finding).
 tlsConnect :: !Int !String !Deadline !*World -> (!Result TlsConn, !*World)
 tlsConnect fd hostname d w
 	# (method, w) = TLS_client_method w
@@ -181,27 +198,19 @@ tlsConnect fd hostname d w
 	| ctx == 0
 		# w = closeRaw fd w
 		= (RErr "could not create TLS context", w)
-	# w = SSL_CTX_set_verify ctx def_SSL_VERIFY_PEER 0 w
+	# (_, w) = SSL_CTX_set_verify ctx def_SSL_VERIFY_PEER 0 w
 	# w = loadCaBundle ctx w
 	# (ssl, w) = SSL_new ctx w
 	| ssl == 0
-		# w = SSL_CTX_free ctx w
+		# (_, w) = SSL_CTX_free ctx w
 		# w = closeRaw fd w
 		= (RErr "could not create TLS session", w)
 	# (_, w) = SSL_set_fd ssl fd w
 	// `SSL_set_fd` wraps `fd` in a socket BIO with OpenSSL's own default
-	// close-on-free ownership. Measured directly against this toolchain:
-	// letting that automatic close run (whether from a single `SSL_free`
-	// or, worse, a second explicit `closeRaw` on top of it) reliably
-	// corrupted a later Clean garbage collection into reporting "cycle in
-	// spine detected" and aborting — reproduced with a minimal
-	// Convex.Socket + Convex.TLS program with no HTTP/adapter code
-	// involved, immediately on a handshake that completes but then fails
-	// certificate verification. Disabling the BIO's own close here and
-	// having every one of this file's own cleanup paths call `closeRaw`
-	// explicitly instead makes fd ownership fully deterministic in Clean
-	// source rather than depending on an OpenSSL-internal close this
-	// runtime cannot observe.
+	// close-on-free ownership. Disabling that here and having every one of
+	// this file's own cleanup paths call `closeRaw` explicitly instead
+	// makes fd ownership fully deterministic in Clean source rather than
+	// depending on an OpenSSL-internal close this runtime cannot observe.
 	# (rbio, w) = SSL_get_rbio ssl w
 	# (_, w) = BIO_ctrl rbio 9 0 0 w
 	# (_, w) = SSL_set1_host ssl (toCString hostname) w
@@ -240,8 +249,8 @@ verifyAndFinish conn w
 // disabled instead of relied on).
 tlsFreeOnly :: !TlsConn !*World -> *World
 tlsFreeOnly conn w
-	# w = SSL_free conn.ssl w
-	# w = SSL_CTX_free conn.ctx w
+	# (_, w) = SSL_free conn.ssl w
+	# (_, w) = SSL_CTX_free conn.ctx w
 	# w = closeRaw conn.fd w
 	= w
 
@@ -313,17 +322,15 @@ where
 tlsFd :: !TlsConn -> Int
 tlsFd conn = conn.fd
 
-// `tlsConnect` disables the socket BIO's own close-on-free (see its
-// comment for the measured "cycle in spine detected" corruption that
-// caused), so this calls `closeRaw` on `fd` itself, exactly once, here on
-// the success path — the same explicit ownership `tlsFreeOnly` uses on
-// every failure path after `SSL_set_fd`. `Convex.Socket.closeRaw` is also
-// used directly for the plain (non-TLS) HTTP path, which never goes
-// through OpenSSL at all.
+// `tlsConnect` disables the socket BIO's own close-on-free, so this calls
+// `closeRaw` on `fd` itself, exactly once, here on the success path — the
+// same explicit ownership `tlsFreeOnly` uses on every failure path after
+// `SSL_set_fd`. `Convex.Socket.closeRaw` is also used directly for the
+// plain (non-TLS) HTTP path, which never goes through OpenSSL at all.
 tlsClose :: !TlsConn !*World -> *World
 tlsClose conn w
 	# (_, w) = SSL_shutdown conn.ssl w
-	# w = SSL_free conn.ssl w
-	# w = SSL_CTX_free conn.ctx w
+	# (_, w) = SSL_free conn.ssl w
+	# (_, w) = SSL_CTX_free conn.ctx w
 	# w = closeRaw conn.fd w
 	= w
