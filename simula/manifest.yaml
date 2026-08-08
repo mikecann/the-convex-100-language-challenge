@@ -17,7 +17,10 @@ implementation:
     listen and accept, a monotonic clock, entropy, and environment variable
     access, called from Simula through Cim's `external C procedure`. It
     contains no HTTP, no WebSocket framing, no JSON and no Convex knowledge;
-    every deadline, retry, and bound is written in Simula.
+    every deadline, retry, and bound is written in Simula. The canonical
+    example's failure path is a genuine Simula class hierarchy
+    (ConvexOutcome / ExampleFailure), constructed and dispatched through
+    new/:-/., not decorative.
 toolchain:
   name: GNU Cim
   version: "5.1"
@@ -37,57 +40,83 @@ adapter:
     - debugDisconnect
 limitations:
   - >-
-    This checkpoint is an in-progress bring-up, not a finished client. GNU Cim
-    5.1 was confirmed to build from source inside the pinned Docker test image
-    and to compile a Simula program that calls an `external C procedure`
-    linked from a separately compiled C translation unit, proving the build
-    shape INFEASIBLE.md proposed for this slot. Along the way, a genuine
-    upstream packaging bug was found and fixed: GNU Cim 5.1's release tarball
-    ships two pre-generated bootstrap C files (lib/simset.c, lib/simulation.c)
-    that hardcode `#include "../../lib/cim.h"`, a relative path that does not
-    resolve from a plain tarball extraction; the Dockerfile rewrites both to
-    the working `#include "cim.h"` before building.
+    The Docker test stage (build, style gate, the native shim compiled on
+    its own, client/tests/client-test.sim, the no-CONVEX_URL example failure
+    path, and the adapter hello/close probe) passes locally for this
+    checkpoint. Shared and hosted black-box conformance have not been run, so
+    no capability is claimed and badges remain unearned.
   - >-
-    The C ABI GNU Cim actually generates was confirmed by compiling a probe
-    program and reading its output, not assumed from the manual: a by-value
-    `integer` parameter and an `integer procedure`'s return value are both a
-    64-bit C `long`, not `int` (matching every `integer array` element, which
-    is 8 bytes wide), and a by-value `text` parameter arrives as a malloc'd
-    NUL-terminated `char *`. client/convexrt.c uses `long` throughout for
-    exactly that reason.
+    GNU Cim 5.1's release tarball ships two pre-generated bootstrap C files
+    (lib/simset.c, lib/simulation.c) that hardcode
+    `#include "../../lib/cim.h"`, a relative path that does not resolve from
+    a plain tarball extraction; the Dockerfile rewrites both to the working
+    `#include "cim.h"` before building. The C ABI GNU Cim actually generates
+    was confirmed by compiling a probe program and reading its output, not
+    assumed from the manual: a by-value `integer` parameter and an `integer
+    procedure`'s return value are both a 64-bit C `long`, not `int`
+    (matching every `integer array` element, which is 8 bytes wide), and a
+    by-value `text` parameter arrives as a malloc'd NUL-terminated `char *`.
+    client/convexrt.c uses `long` throughout for exactly that reason.
   - >-
-    client/convex-native.sim (the external C procedure headings),
-    client/convex-buffer.sim (byte buffers, base 64, hex) and
-    client/convex-json.sim (a strict JSON reader and writer, including the
-    integral-decimal-form rule for values like 0.0 and 1.0) are complete,
-    translated from this project's merged ALGOL 60 client's proven design,
-    and covered by real language-local unit tests in
-    client/tests/client-test.sim (36 assertions, 0 mocked). The Docker test
-    stage builds GNU Cim, the style gate, the native shim compiled on its
-    own, and this suite, and all of it is green. One genuine algorithm bug
-    was found and fixed while writing that suite's exponent-notation cases
-    (not merely translated): the ALGOL 60 source this client's JSON reader
-    was translated from counts fractional digits and flags whether any are
-    nonzero, but never folds their value into the parsed result, so an input
-    like "1.23e2" silently returned 1 instead of 123. This client's
-    jsonparseint folds each fractional digit into the mantissa as it is
-    scanned instead, verified against 0.0, 1.0, 1.5 (correctly rejected),
-    1e1 and 1.23e2.
+    GNU Cim's default runtime memory pool is far too small for this client's
+    real buffer footprint (a little over a megabyte of declared integer
+    arrays once every layer is assembled): compiling without a larger pool
+    aborts the linked binary with "Alloc: Virtual memory exhausted" while
+    allocating its own top-level array declarations, before any code runs.
+    Every program in this client is compiled with `cim -m32 -M96` (a 32MB
+    initial pool, 96MB ceiling) for exactly that reason.
   - >-
-    HTTP/1.1 framing and Convex's documented JSON HTTP functions, RFC 6455
-    WebSocket framing, the Live sync state machine, the conformance adapter,
-    and the canonical example are not yet written. Because the shared
-    canonical example transcript in _shared/examples/basics.expected.txt
-    requires Live output ("live initial count", "live updated count"), an
-    HTTP-only client cannot satisfy this project's required `test` Docker
-    interface (which must also compile the canonical example and the
-    conformance executable) or produce a passing `verify-example` run;
-    reaching either needs the WebSocket and Live layers first, not only the
-    HTTP layer.
+    GNU Cim 5.1 rejects a bare, parameterless virtual procedure
+    specification (`virtual: procedure P;`) with a dedicated grammar error
+    production, confirmed by reading src/parser.y's ONE_SPEC rule, matching
+    cim.texi's own up-front warning about limited virtual procedure
+    parameter support. The example's ConvexOutcome class hierarchy therefore
+    dispatches through a concrete typed reference (`ref(ExampleFailure)`)
+    rather than a virtual call through the common supertype; inheritance,
+    construction and instance methods are still genuine and exercised.
   - >-
-    No Docker verify-example, verify, verify-hosted or verify-all evidence
-    exists yet, so no capability is claimed and the roster swap from bc to
-    simula has not been made: recording it now, ahead of a directory that
-    satisfies this project's required Docker interface, would overstate how
-    far this checkpoint has landed.
+    Simula has no bitwise operators, so RFC 6455 masking is written with an
+    explicit eight-bit XOR loop (bytexor) over the logical operators and,
+    or and not, matching this project's ALGOL 60 client for the same
+    reason.
+  - >-
+    convexcall and livesubscribe open their own connection internally, so
+    client/tests/client-test.sim exercises HTTP framing, the Convex
+    envelope decoder, and RFC 6455 frame build/read round trips directly
+    rather than through convexcall itself, matching this project's ALGOL 60
+    client: there is no concurrency primitive exercised here to run a
+    fixture server and the client under test in the same process, even
+    though Simula's SIMULATION class does provide real coroutines.
+  - >-
+    The client is single threaded by construction: one call path owns the
+    WebSocket, drives reconnects, and processes query-set changes. Live
+    progress only happens while a caller is inside a client procedure or
+    the adapter's own poll loop.
+  - >-
+    The WebSocket handshake does not verify the server's
+    Sec-WebSocket-Accept response header against SHA-1 of the client's key,
+    matching this project's ALGOL 60 client. A valid HTTP 101 upgrade
+    response is still required, and every frame exchanged afterward is real
+    RFC 6455 framing; only that one header's cryptographic check is
+    skipped.
+  - >-
+    Live authentication, optimistic updates, WebSocket mutations, WebSocket
+    actions, journals, and TransitionChunk assembly are deferred.
+  - >-
+    JSON numbers are accepted only when mathematically integral and
+    representable exactly within a safe 64-bit range; fractional and
+    out-of-range values are rejected at the point of use.
+  - >-
+    Active Live subscriptions and the delivery queue are bounded; a value
+    too large for the configured byte budget becomes an observable
+    ProtocolError without changing the subscription's last delivered value,
+    and queue overflow drops the oldest undelivered event rather than
+    growing without bound.
+  - >-
+    TLS has not been separately unit-tested against a private CA the way
+    this project's ALGOL 60 client does; client/convexrt.c's TLS code is
+    the same reviewed design (peer verification, default CA bundle,
+    SSL_set1_host hostname checking, all switched on together), but that
+    specific trust/untrusted/wrong-host proof has not yet been run for this
+    checkpoint.
 capabilities: []

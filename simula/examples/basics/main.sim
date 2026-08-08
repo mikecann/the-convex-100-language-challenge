@@ -70,7 +70,8 @@ begin
    integer array errbuf(0:255);
    integer errbuflen, errkind;
    errbuflen := 0; errkind := 0;
-   jsonfindfield(buf, off, limit, "count", voff, vlen, found, errbuf, errbuflen, errkind);
+   jsonfindfield(buf, off, limit, "count", voff, vlen, found, errbuf, errbuflen,
+      errkind);
    if errkind <> 0 or found = 0 then
       ok := 0
    else
@@ -135,7 +136,8 @@ comment ---------------------------------------------------------------
    room, the shared counters identity, so this is written once and
    reused for the query, the subscribe, and the mutation.
    ------------------------------------------------------------------;
-procedure examplebuildargs(argsbuf, argscap, argslen, includemutationfields, runidbuf, runidlen);
+procedure examplebuildargs(argsbuf, argscap, argslen, includemutationfields,
+      runidbuf, runidlen);
    name argslen;
    integer array argsbuf, runidbuf;
    integer argscap, argslen, includemutationfields, runidlen;
@@ -144,10 +146,13 @@ begin
    argslen := 0;
    discard := bufputbyte(argsbuf, argscap, argslen, 123);
    discard := bufputstr(argsbuf, argscap, argslen, """room"":");
-   discard := jsonwritestring(argsbuf, argscap, argslen, exampleroombuf, 0, exampleroomlen);
+   discard := jsonwritestring(argsbuf, argscap, argslen, exampleroombuf, 0,
+      exampleroomlen);
    if includemutationfields <> 0 then begin
-      discard := bufputstr(argsbuf, argscap, argslen, ",""language"":""simula"",""runId"":");
-      discard := jsonwritestring(argsbuf, argscap, argslen, runidbuf, 0, runidlen)
+      discard := bufputstr(argsbuf, argscap, argslen,
+         ",""language"":""simula"",""runId"":");
+      discard := jsonwritestring(argsbuf, argscap, argslen, runidbuf, 0,
+         runidlen)
    end;
    discard := bufputbyte(argsbuf, argscap, argslen, 125)
 end examplebuildargs;
@@ -213,13 +218,15 @@ begin
       discard := bufputstr(pathbuf, 32, pathlen, "demo:state");
       examplebuildargs(argsbuf, 512, argslen, 0, argsbuf, 0);
       errbuflen := 0; errkind := 0;
-      convexcall("query", examplehost, examplehostlen, exampleport, exampleportlen, exampletls,
+      convexcall("query", examplehost, examplehostlen, exampleport,
+         exampleportlen, exampletls,
          exampleauth, 0, pathbuf, pathlen, argsbuf, 0, argslen, cxnowms + 10000,
          statuscode, kind, valoff, vallen, msgbuf, 512, msglen,
          hasdata, dataoff, datalen, haslogs, logsoff, logslen, bodybuf, 8192,
          errbuf, errbuflen, errkind);
       if errkind <> 0 then givingup("the HTTP query failed");
-      if kind = 1 then givingup("the HTTP query returned a Convex function error");
+      if kind = 1 then
+         givingup("the HTTP query returned a Convex function error");
 
       comment decoding into an idiomatic value: Convexs JSON is parsed
          only as far as the one field this example promises;
@@ -236,8 +243,10 @@ begin
             reading and watching;
          examplebuildargs(argsbuf, 512, argslen, 0, argsbuf, 0);
          errbuflen := 0; errkind := 0;
-         livesubscribe(examplehost, examplehostlen, exampleport, exampleportlen, exampletls,
-            pathbuf, pathlen, argsbuf, 0, argslen, cxnowms + 10000, sub, errbuf, errbuflen, errkind);
+         livesubscribe(examplehost, examplehostlen, exampleport, exampleportlen,
+            exampletls,
+            pathbuf, pathlen, argsbuf, 0, argslen, cxnowms + 10000, sub, errbuf,
+               errbuflen, errkind);
          if errkind <> 0 then givingup("the Live subscribe failed");
 
          begin
@@ -250,13 +259,18 @@ begin
                query above just read, over the WebSocket sync protocol
                rather than a second HTTP request;
             initialkind := livenext(sub, 10000);
-            if initialkind = 0 then givingup("the initial Live value did not arrive before the deadline");
-            if initialkind = 2 then givingup("the initial Live value was a Convex function error");
+            if initialkind = 0 then
+               givingup("the initial Live value did not arrive "
+                  & "before the deadline");
+            if initialkind = 2 then
+               givingup("the initial Live value was a Convex "
+                  & "function error");
             valuelen := 0;
             livetakencopyvalue(valuecopy, 2048, valuelen);
             livereleasetaken;
             initial := examplecount(valuecopy, 0, valuelen, initialok);
-            if initialok = 0 or initial <> current then givingup("the initial Live count disagreed with HTTP");
+            if initialok = 0 or initial <> current then
+               givingup("the initial Live count disagreed with HTTP");
             printline("live initial count: ", initial);
 
             begin
@@ -278,24 +292,31 @@ begin
                   discard := hexencode(randbytes, 0, 16, runid, 32, runidlen)
                end;
                mutationpathlen := 0;
-               discard := bufputstr(mutationpath, 32, mutationpathlen, "demo:increment");
+               discard := bufputstr(mutationpath, 32, mutationpathlen,
+                  "demo:increment");
                examplebuildargs(argsbuf, 512, argslen, 1, runid, runidlen);
                errbuflen := 0; errkind := 0;
-               convexcall("mutation", examplehost, examplehostlen, exampleport, exampleportlen, exampletls,
-                  exampleauth, 0, mutationpath, mutationpathlen, argsbuf, 0, argslen, cxnowms + 10000,
+               convexcall("mutation", examplehost, examplehostlen, exampleport,
+                  exampleportlen, exampletls,
+                  exampleauth, 0, mutationpath, mutationpathlen, argsbuf, 0,
+                     argslen, cxnowms + 10000,
                   statuscode, kind, valoff, vallen, msgbuf, 512, msglen,
-                  hasdata, dataoff, datalen, haslogs, logsoff, logslen, bodybuf, 8192,
+                  hasdata, dataoff, datalen, haslogs, logsoff, logslen, bodybuf,
+                     8192,
                   errbuf, errbuflen, errkind);
                if errkind <> 0 then givingup("the mutation failed");
-               if kind = 1 then givingup("the mutation returned a Convex function error");
+               if kind = 1 then
+                  givingup("the mutation returned a Convex function error");
                expected := current + 1;
-               jsonfindfield(bodybuf, valoff, valoff + vallen, "applied", appliedoff, appliedlen, afound, errbuf,
-                  errbuflen, errkind);
-               applied := if afound <> 0 and bufeqstr(bodybuf, appliedoff, appliedlen, "true") then 1 else 0;
+               jsonfindfield(bodybuf, valoff, valoff + vallen, "applied",
+                  appliedoff, appliedlen, afound, errbuf, errbuflen, errkind);
+               applied := if afound <> 0 and bufeqstr(bodybuf, appliedoff,
+                  appliedlen, "true") then 1 else 0;
                if applied = 0 then givingup("the mutation was not applied");
-               jsonfindfield(bodybuf, valoff, valoff + vallen, "state", countoff, countlen, cfound, errbuf,
-                  errbuflen, errkind);
-               count := if cfound <> 0 then examplecount(bodybuf, countoff, countoff + countlen, countok) else 0;
+               jsonfindfield(bodybuf, valoff, valoff + vallen, "state",
+                  countoff, countlen, cfound, errbuf, errbuflen, errkind);
+               count := if cfound <> 0 then examplecount(bodybuf, countoff,
+                  countoff + countlen, countok) else 0;
                if cfound = 0 or countok = 0 or count <> expected then
                   givingup("the mutation returned an unexpected count");
                comment printline always prints a trailing integer, and
@@ -313,14 +334,20 @@ begin
                      Live subscription delivers the mutations result
                      with no second HTTP request at all;
                   updatedkind := livenext(sub, 10000);
-                  if updatedkind = 0 then givingup("the updated Live value did not arrive before the deadline");
-                  if updatedkind = 2 then givingup("the updated Live value was a Convex function error");
+                  if updatedkind = 0 then
+                     givingup("the updated Live value did not arrive "
+                        & "before the deadline");
+                  if updatedkind = 2 then
+                     givingup("the updated Live value was a Convex "
+                        & "function error");
                   updatedlen := 0;
                   livetakencopyvalue(updatedcopy, 2048, updatedlen);
                   livereleasetaken;
-                  updated := examplecount(updatedcopy, 0, updatedlen, updatedok);
+                  updated := examplecount(updatedcopy, 0, updatedlen,
+                     updatedok);
                   if updatedok = 0 or updated <> expected then
-                     givingup("the updated Live count disagreed with the mutation");
+                     givingup("the updated Live count disagreed "
+                        & "with the mutation");
                   printline("live updated count: ", updated);
 
                   comment only now, with the HTTP query, the initial
@@ -330,7 +357,8 @@ begin
                      integer array line(0:255);
                      integer linelen, discard2;
                      linelen := 0;
-                     discard2 := bufputstr(line, 256, linelen, "verified count: ");
+                     discard2 := bufputstr(line, 256, linelen,
+                        "verified count: ");
                      discard2 := bufputint(line, 256, linelen, current);
                      discard2 := bufputstr(line, 256, linelen, " -> ");
                      discard2 := bufputint(line, 256, linelen, updated);
