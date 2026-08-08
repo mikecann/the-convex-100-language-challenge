@@ -71,6 +71,7 @@ const fenceLanguages = {
   ".php": "php",
   ".pike": "pike",
   ".pony": "pony",
+  ".prg": "harbour",
   ".prolog": "prolog",
   ".ps1": "powershell",
   ".purs": "purescript",
