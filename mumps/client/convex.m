@@ -551,7 +551,14 @@ open(url,version)
  set cxLiveSocket=""
  set cxLiveNextQueryId=0
  set cxLiveBad=0
- kill subPath,subArgs,subTag,subValue,subLogs,subErrName,subErrMsg,subErrData,subHasValue,subVersion,tagToQid
+ ; Reconnect-on-drop backoff: cxLiveBackoffMs is the delay liveMaybeReconnect
+ ; waits before the next attempt after a failure, doubling (capped) on each
+ ; consecutive failure and resetting to the base once a handshake succeeds.
+ ; cxLiveRetryAt=0 lets the very first connection attempt happen immediately.
+ set cxLiveBackoffBaseMs=250,cxLiveBackoffMaxMs=30000
+ set cxLiveBackoffMs=cxLiveBackoffBaseMs
+ set cxLiveRetryAt=0
+ kill subPath,subArgs,subTag,subValue,subLogs,subErrName,subErrMsg,subErrData,subHasValue,subVersion,subAwaitingRehydration,tagToQid
  quit 1
  ;
 setAuth(token)
@@ -1081,11 +1088,13 @@ wsRecvMessage(handle,deadline,opcode,payload)
  ; Live: the Convex sync protocol state machine.
  ;
  ; Scope: a single connection that is brought up on the first subscribe and
- ; torn down on close. Reconnect-on-drop, exponential backoff and the
- ; adapter-only debugDisconnect command are handled by liveReconnect/
- ; debugDisconnect below; this section owns the wire protocol itself --
- ; Connect, ModifyQuerySet (Add/Remove), and validating a Transition before
- ; publishing any part of it.
+ ; torn down on close. This section owns the wire protocol itself -- Connect,
+ ; ModifyQuerySet (Add/Remove), and validating a Transition before publishing
+ ; any part of it -- plus liveMaybeReconnect, which the adapter's main loop
+ ; polls every pass to bring a dropped connection back with exponential
+ ; backoff (see liveMaybeReconnect below). The adapter-only debugDisconnect
+ ; command itself just calls liveRetire directly; liveMaybeReconnect is what
+ ; notices the empty socket afterwards and re-establishes it.
  ; ===========================================================================
  ;
 liveConnectMessage()
@@ -1108,11 +1117,17 @@ liveConnect()
  set deadline=$$nowMs()+cxLiveConnectMs
  set handle=$$wsHandshake(deadline)
  if handle="" do  quit 0
- . set cxLiveConnectionCount=cxLiveConnectionCount+1
+ . ; A handshake that never completed never became a connection the server
+ . ; saw, so it must not inflate connectionCount -- only cxLiveLastClose (the
+ . ; reason reported in the *next* attempt's Connect message) is updated.
  . set cxLiveLastClose=cxErrMsg
  set cxLiveSocket=handle
  set cxLiveRemoteQuerySet=0,cxLiveRemoteIdentity=0,cxLiveRemoteTimestamp=cxLiveInitialTimestamp
  set cxLiveQuerySetVersion=0
+ ; A successful handshake is what resets backoff, per Convex client
+ ; convention: a healthy connection must not inherit a stale maximum delay
+ ; from an earlier run of failures.
+ set cxLiveBackoffMs=cxLiveBackoffBaseMs,cxLiveRetryAt=0
  ;
  new wok set wok=$$wsSend(handle,1,$$liveConnectMessage(),$$remaining(deadline))
  set cxLiveConnectionCount=cxLiveConnectionCount+1
@@ -1123,6 +1138,12 @@ liveConnect()
  . if count>0 set modifications=modifications_","
  . set modifications=modifications_$$liveAddModification(qid)
  . set count=count+1
+ . ; Every resent Add is a candidate for an unchanged rehydration, but only
+ . ; when the subscription's last delivery was a real value: a subscription
+ . ; that has never delivered anything yet (freshly registered, mid drop) or
+ . ; whose last delivery was an error still wants its next value delivered
+ . ; unconditionally, so only arm suppression on a prior success.
+ . set subAwaitingRehydration(qid)=($get(subHasValue(qid))=1)&('$data(subErrName(qid)))
  if count>0 do
  . set message="{""type"":""ModifyQuerySet"",""baseVersion"":0,""newVersion"":1,"
  . set message=message_"""modifications"":["_modifications_"]}"
@@ -1179,6 +1200,7 @@ unsubscribe(tag)
  . if wok set cxLiveQuerySetVersion=cxLiveQuerySetVersion+1
  kill subPath(queryId),subArgs(queryId),subTag(queryId),subValue(queryId),subLogs(queryId)
  kill subErrName(queryId),subErrMsg(queryId),subErrData(queryId),subHasValue(queryId),tagToQid(tag)
+ kill subAwaitingRehydration(queryId)
  quit 1
  ;
  ; ---------------------------------------------------------------------------
@@ -1260,13 +1282,23 @@ liveTransition(root)
  if $$tsCmp(endTs,cxLiveMaxTimestamp)>0 set cxLiveMaxTimestamp=endTs
  for order=1:1:count do
  . set queryId=cxChangeOrder(order)
- . new isUpdated,isFailed
+ . new isUpdated,isFailed,rehydrating,suppress
  . set isUpdated=(cxChangeKind(queryId)="QueryUpdated")
  . set isFailed=(cxChangeKind(queryId)="QueryFailed")
- . if isUpdated set subValue(queryId)=cxChangeValue(queryId)
- . if isUpdated set subLogs(queryId)=cxChangeLogs(queryId)
- . if isUpdated kill subErrName(queryId),subErrMsg(queryId),subErrData(queryId)
- . if isUpdated set subHasValue(queryId)=1,subVersion(queryId)=$get(subVersion(queryId),0)+1
+ . set rehydrating=$get(subAwaitingRehydration(queryId))=1
+ . ; A reconnect resends the whole active query set, so the server's first
+ . ; Transition after it is exactly as likely to be a genuine rehydration of
+ . ; the value the subscriber already has as a real change. Only a
+ . ; byte-identical QueryUpdated during that one rehydration window is
+ . ; suppressed; an error is never suppressed (the caller must still learn a
+ . ; reconnect reproduced a failing query), and any later Transition on this
+ . ; subscription is a normal update again.
+ . set suppress=isUpdated&rehydrating&($get(subValue(queryId))=cxChangeValue(queryId))
+ . if isUpdated!isFailed kill subAwaitingRehydration(queryId)
+ . if isUpdated,'suppress set subValue(queryId)=cxChangeValue(queryId)
+ . if isUpdated,'suppress set subLogs(queryId)=cxChangeLogs(queryId)
+ . if isUpdated,'suppress kill subErrName(queryId),subErrMsg(queryId),subErrData(queryId)
+ . if isUpdated,'suppress set subHasValue(queryId)=1,subVersion(queryId)=$get(subVersion(queryId),0)+1
  . if isFailed set subErrName(queryId)="FunctionError",subErrMsg(queryId)=cxChangeMessage(queryId)
  . if isFailed set subErrData(queryId)=cxChangeData(queryId),subLogs(queryId)=cxChangeLogs(queryId)
  . if isFailed kill subValue(queryId)
@@ -1297,8 +1329,13 @@ liveChange(change,kind,queryId)
  quit 0
  ;
  ; A transport or protocol fault retires the socket but keeps every
- ; subscription: liveEnsureConnection() (via subscribe or the pump) replays
- ; the whole active set on the next connect.
+ ; subscription: liveMaybeReconnect() (polled from livePump on every adapter
+ ; loop tick) replays the whole active set on the next successful connect.
+ ; cxLiveRetryAt is reset to "now" so the very next reconnect attempt is
+ ; immediate, at the base backoff -- a drop from a previously healthy
+ ; connection should not inherit a stale, grown delay from some earlier,
+ ; unrelated run of failures (liveConnect() already resets cxLiveBackoffMs
+ ; itself on the next success; this only controls the timing of that attempt).
 liveRetire(name,message)
  if cxLiveSocket'="" do sockClose(cxLiveSocket)
  set cxLiveSocket=""
@@ -1306,13 +1343,40 @@ liveRetire(name,message)
  set cxLiveQuerySetVersion=0
  set cxLiveLastClose=message
  set cxErrTransport=$$fail(name,message)
+ set cxLiveRetryAt=$$nowMs()
  quit
  ;
- ; Pump the Live socket for up to timeoutMs. Returns "ok" if a message was
- ; processed, "timeout" if nothing arrived, "retired" if the connection just
- ; failed (subscriptions remain registered for the next connect attempt).
+ ; Reconnect-on-drop with exponential backoff. Only attempts a connection
+ ; when one is actually wanted (at least one subscription is registered) and
+ ; the backoff window has elapsed; a fresh subscribe() with no active
+ ; connection still goes straight through liveEnsureConnection() rather than
+ ; waiting on this schedule. A failed attempt here reuses liveConnect()'s own
+ ; failure bookkeeping and only advances the backoff timer -- it never
+ ; surfaces an error to a caller, since nothing is waiting synchronously on a
+ ; background reconnect.
+liveMaybeReconnect()
+ new qid,ok
+ if cxLiveSocket'="" quit
+ if $$nowMs()<cxLiveRetryAt quit
+ set qid=$order(subPath(""))
+ if qid="" quit
+ set ok=$$liveConnect()
+ if ok quit
+ ; liveConnect() already recorded the failure reason in cxLiveLastClose;
+ ; this only schedules the next attempt, doubling the wait up to the cap.
+ set cxLiveRetryAt=$$nowMs()+cxLiveBackoffMs
+ set cxLiveBackoffMs=cxLiveBackoffMs*2
+ if cxLiveBackoffMs>cxLiveBackoffMaxMs set cxLiveBackoffMs=cxLiveBackoffMaxMs
+ quit
+ ;
+ ; Pump the Live socket for up to timeoutMs, first giving a dropped
+ ; connection a chance to reconnect. Returns "ok" if a message was
+ ; processed, "timeout" if nothing arrived (including while merely waiting
+ ; out backoff), "retired" if the connection just failed (subscriptions
+ ; remain registered for the next connect attempt).
 livePump(timeoutMs)
  new deadline,outcome,opcode,payload
+ do liveMaybeReconnect()
  if cxLiveSocket="" quit "timeout"
  set deadline=$$nowMs()+timeoutMs
  set outcome=$$wsRecvMessage(cxLiveSocket,deadline,.opcode,.payload)
@@ -1353,5 +1417,6 @@ closeLive(timeoutMs)
  . new qid set qid=tagToQid(tag)
  . kill subPath(qid),subArgs(qid),subTag(qid),subValue(qid),subLogs(qid)
  . kill subErrName(qid),subErrMsg(qid),subErrData(qid),subHasValue(qid),subVersion(qid)
+ . kill subAwaitingRehydration(qid)
  kill tagToQid
  quit
