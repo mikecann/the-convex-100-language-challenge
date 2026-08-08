@@ -711,7 +711,8 @@ module convex_sync #(
         sub_awaiting_rehydration[idx] = 1'b0;
         sub_error_msg[idx] = decoded_scratch;
         sub_has_error_data[idx] = has_errdata;
-        sub_error_data_json[idx] = has_errdata ? raw_scratch : "";
+        if (has_errdata) sub_error_data_json[idx] = raw_scratch;
+        else sub_error_data_json[idx] = "";
         sub_has_value[idx] = 1'b1;
         sub_is_error[idx] = 1'b1;
         sub_value_json[idx] = "";
