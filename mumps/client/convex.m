@@ -1175,9 +1175,20 @@ subscribe(tag,path,arguments)
  set tagToQid(tag)=queryId
  set subHasValue(queryId)=0
  ;
- if cxLiveSocket="" do  quit:'$$liveEnsureConnection() $$fail("TransportError","Live connection failed: "_cxLiveLastClose)
+ ; Whether a connection was already up has to be captured *before* calling
+ ; liveEnsureConnection(): that call itself flips cxLiveSocket from "" to a
+ ; real handle on a successful cold start, so testing cxLiveSocket again
+ ; afterwards can no longer tell the two cases apart. Get this wrong (as an
+ ; earlier version of this function did) and the branch below -- sending
+ ; this subscription's own incremental Add -- silently never runs at all:
+ ; a cold start's Add was already sent by liveConnect()'s replay, but every
+ ; later subscribe() on an already-open connection needs its own Add sent
+ ; here, and skipping that leaves the subscription registered locally with
+ ; nothing ever asked of the server.
+ new wasConnected set wasConnected=(cxLiveSocket'="")
+ if 'wasConnected do  quit:'$$liveEnsureConnection() $$fail("TransportError","Live connection failed: "_cxLiveLastClose)
  . ; liveConnect() below replays every active subscription, this one included
- if cxLiveSocket'="" quit 1
+ if 'wasConnected quit 1
  ;
  set message="{""type"":""ModifyQuerySet"",""baseVersion"":"_cxLiveQuerySetVersion
  set message=message_",""newVersion"":"_(cxLiveQuerySetVersion+1)
