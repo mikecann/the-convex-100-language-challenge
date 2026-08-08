@@ -39,7 +39,7 @@ languages:
   - { rank: 32, id: julia, displayName: "Julia", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 33, id: ocaml, displayName: "OCaml", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 34, id: elixir, displayName: "Elixir", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
-  - { rank: 35, id: abap, displayName: "ABAP", selectionTier: ranked, feasibility: { docker: R, https: G, json: G, websocket: A } }
+  - { rank: 35, id: mumps, displayName: "MUMPS", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 36, id: haskell, displayName: "Haskell", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
   - { rank: 37, id: zig, displayName: "Zig", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: A } }
   - { rank: 38, id: erlang, displayName: "Erlang", selectionTier: ranked, feasibility: { docker: G, https: G, json: G, websocket: G } }
