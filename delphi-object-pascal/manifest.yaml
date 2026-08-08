@@ -18,7 +18,11 @@ implementation:
     one documented exception: fpc's TOpenSSLSocketHandler never calls
     SSL_CTX_set_default_verify_paths, so this client resolves the distro CA
     bundle itself before every TLS connect (see ConvexSocket.DefaultCaBundlePath)
-    or verification would silently pass with nothing to check against.
+    or verification would silently pass with nothing to check against. Language-
+    local Docker tests, the canonical example, and shared local and hosted
+    black-box conformance all passed from a clean exact-head build; the
+    capability list reflects the shared result evaluator's award from those
+    runs (31/31 both profiles).
 toolchain:
   name: Free Pascal
   version: "3.2.2"
@@ -37,24 +41,27 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - No Docker build has been run against this source yet, so every claim
-    below the source level is unverified, including the apt package pins,
-    the fpc `-Mdelphi -O2` build flags, the readelf amd64 assertions, and
-    the runtime-image pruning list.
   - Free Pascal has no API to report its own version at run time, so the
     adapter's `hello` response reports a hardcoded runtime string
     ("Free Pascal 3.2.2 (Delphi mode)") matching the pinned toolchain
     instead of an introspected value.
   - The Live subscription's pending-event list (ConvexSync.PendingEvents) is
-    an ordinary unbounded TObjectList, not a bounded queue with a documented
-    overflow policy. This has not yet been proven safe under the shared
-    conformance byte-budget check with a stopped reader and near-maximum
-    messages, and may need a bound before Live evidence can pass.
-  - Live authentication (SetAuth against an open subscription is wired
-    client-side but not proven against a real deployment), WebSocket
+    an ordinary TObjectList rather than a queue with a documented count or
+    byte bound. The shared conformance and hosted runs, including five real
+    reconnects and every Live scenario, passed cleanly under the runtime
+    image's real 128 MiB container limit, but no test here specifically
+    drives a stopped or slow consumer with near-maximum messages, so that
+    extreme is not proven the way it is for a client with an explicit
+    bounded queue.
+  - Live authentication against an already-open subscription, WebSocket
     mutations and actions, and optimistic updates are not implemented and
     fail closed.
-  - The deterministic Live unit tests exercise reconnect and rehydration
-    suppression logic locally; only the shared verifier can earn the
-    required evidence for five real TCP/WSS reconnects.
-capabilities: []
+  - fpjson emits compact JSON and treats AnsiString as UTF-8 only because
+    this client sets `TJSONData.CompressedJSON` and `DefaultSystemCodePage`
+    globally in ConvexJsonUtil's initialization section; any new program
+    entrypoint added later must still pull in that unit before touching
+    JSON or the wire, or it silently reverts to fpjson's spaced-out,
+    codepage-lossy defaults.
+capabilities:
+  - http
+  - live

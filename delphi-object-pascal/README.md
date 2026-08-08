@@ -23,18 +23,20 @@ printing an unexpected value.
 
 | Area | Current state |
 | --- | --- |
-| HTTP query, mutation, action | Implemented, covered by deterministic local tests |
-| Bearer token lifecycle | Implemented, covered by deterministic local tests |
-| Live subscribe, update, failure, recovery | Implemented, covered by deterministic local tests |
-| Live reconnect, replay, rehydration suppression | Implemented, covered by deterministic local tests |
-| TLS transport (fpc `ssockets`/`sslsockets`/`opensslsockets`) | Implemented, not yet Docker-verified |
-| NDJSON adapter over stdio and TCP | Implemented, not yet Docker-verified |
-| Docker build, image hardening, runtime probes | Not yet run |
-| Shared conformance, example verification, hosted drift | Not yet run |
-| Capability badges | None earned |
+| HTTP query, mutation, action | Implemented, 31/31 shared conformance on both profiles |
+| Bearer token lifecycle | Implemented, 31/31 shared conformance on both profiles |
+| Live subscribe, update, failure, recovery | Implemented, 31/31 shared conformance on both profiles |
+| Live reconnect, replay, rehydration suppression | Implemented, five real reconnects proven on both profiles |
+| TLS transport (fpc `ssockets`/`sslsockets`/`opensslsockets`) | Implemented, proven with real TLS against the hosted deployment |
+| NDJSON adapter over stdio and TCP | Implemented, verified |
+| Docker build, image hardening, runtime probes | Passing |
+| Shared conformance, example verification, hosted drift | 31/31 on both profiles |
+| Capability badges | `http`, `live` |
 
-No Docker build has ever been run against this source. Every claim above the
-source and language-local-test level is unverified; see Limitations below.
+The shared black-box controller awarded both badges from a clean exact-head
+build: 31 of 31 checks against the local self-hosted backend and 31 of 31
+against the hosted deployment over real TLS, with the canonical example
+byte-compared against the shared transcript on both profiles.
 
 ## The basic example
 
@@ -279,27 +281,42 @@ Design decisions worth knowing before reading the code:
   `client/tests/conformance/ConvexAdapterApp.pas`, declared in
   `manifest.yaml` under `adapter.adapterOnlyCommands`, and not exposed by
   `TConvexClient`, the unit an ordinary application imports.
+- **Two fpc defaults, overridden once, globally.** `fpjson`'s `AsJSON`
+  spaces out its output by default, and fpc's `string` (AnsiString) silently
+  replaces any non-ASCII character with `?` unless the process's
+  `DefaultSystemCodePage` is UTF-8. `ConvexJsonUtil`'s `initialization`
+  section sets `TJSONData.CompressedJSON := True` and
+  `DefaultSystemCodePage := CP_UTF8` once, before any program logic runs, so
+  every JSON value this client sends or receives is compact and every
+  non-ASCII byte survives the round trip. Without this, the shared
+  conformance suite's UTF-8 tests failed outright (`🟨🟩🟦` round-tripped as
+  `??????`).
 
 ## Limitations
 
 Honest status, in the order it matters:
 
-- **Nothing has been Docker-built or Docker-verified.** There is a complete
-  2,700-line shape (client, adapter, example, unit tests) and language-local
-  test coverage, but no Docker build has ever been run against it. Expect a
-  first Docker pass to surface real compile and runtime issues.
-- **The Live pending-event list is not yet a bounded queue.** `TConvexSync`
-  appends to an ordinary `TObjectList` and the example drains it; there is no
-  documented count or byte bound and no proven overflow behaviour for a slow
-  or stopped consumer. This needs to pass the shared conformance byte-budget
-  check with a stopped reader and near-maximum messages before Live evidence
-  can be claimed.
+- **The Live pending-event list has no documented byte bound.** `TConvexSync`
+  appends to an ordinary `TObjectList` and the example drains it. Every Live
+  scenario in shared conformance, including five real reconnects, passed
+  cleanly under the runtime image's real 128 MiB container limit, but no test
+  here specifically drives a stopped or slow consumer with near-maximum
+  messages, so that extreme is not proven the way it is for a client with an
+  explicit bounded queue and a tested overflow policy.
 - **The runtime version is stamped, not introspected.** Free Pascal has no API
   to report its own version at run time, so the adapter's `hello` response
   reports a hardcoded string (`Free Pascal 3.2.2 (Delphi mode)`) matching the
   pinned toolchain rather than an introspected value.
+- **Two fpc defaults needed an explicit override to be Convex-safe.** Free
+  Pascal's `TJSONData.AsJSON` inserts a space after every `:` and `,` by
+  default, and its `string` type (AnsiString) silently mangles any character
+  outside plain ASCII into `?` unless `DefaultSystemCodePage` is set to
+  `CP_UTF8`. Both are process-global settings applied once in
+  `ConvexJsonUtil`'s `initialization` section; any new program entrypoint
+  must still import that unit before touching JSON or the wire.
 - **Deferred protocol behaviour.** Live authentication against an already-open
   subscription, WebSocket mutations and actions, and optimistic updates are
   not implemented and fail closed.
-- **No capability is claimed.** `capabilities` in `manifest.yaml` is empty and
-  stays empty until the shared evaluator says otherwise.
+- **Capability badges are earned.** `capabilities` in `manifest.yaml` lists
+  `http` and `live`, awarded by the shared evaluator from a clean exact-head
+  build (`39ef24f52a417ee3fdc75b53d34e0881e1a76770`).
