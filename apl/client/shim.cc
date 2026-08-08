@@ -15,13 +15,17 @@
  * lib_file_io.so. That is what this file is: it wraps OpenSSL's
  * SSL_connect/SSL_read/SSL_write/SSL_shutdown behind one native
  * function, CONVEXTLS, selected by axis the same way file_io.cc's own
- * FUN[n] dispatch works. It also exposes one non-transport primitive,
+ * FUN[n] dispatch works. It also exposes two non-transport primitives:
  * SHA-1 (axis 5), needed only for the RFC 6455 handshake's
  * Sec-WebSocket-Accept response -- delegated to OpenSSL (already linked
  * in for TLS) rather than hand-rolled 32-bit modular arithmetic, on the
- * same reasoning that puts TLS itself here instead of in APL. Base64,
- * HTTP, JSON, RFC 6455 framing/masking/fragmentation, and the whole
- * Convex sync protocol are not delegated: every one of those lives in
+ * same reasoning that puts TLS itself here instead of in APL -- and DNS
+ * resolution (axis 6), because ⎕FIO[36]'s own connect() takes an
+ * already-resolved 32-bit address and GNU APL has no getaddrinfo of its
+ * own; the plain (non-TLS) path resolves a hostname here and then calls
+ * ⎕FIO's real socket/connect/send/recv itself. Base64, HTTP, JSON,
+ * RFC 6455 framing/masking/fragmentation, and the whole Convex sync
+ * protocol are not delegated: every one of those lives in
  * client/convex.apl, in APL.
  *
  * Wire convention (mirrors the byte-vector convention ⎕FIO[37]/[38]
@@ -307,6 +311,35 @@ static Token op_sha1(Value_P B) {
     return ret_tagged('K', digest, digestLen);
 }
 
+/* CONVEXTLS[6] Bs : resolve(hostname) -> "K:<uint32 host-byte-order decimal>"
+ *
+ * client/convex.apl's plain (non-TLS) path needs this too: ⎕FIO[36]'s
+ * own connect(Bh, Aa) takes Aa as (family ip32 port) with the IP
+ * already resolved to a 32-bit integer -- GNU APL has no getaddrinfo
+ * of its own to produce that. */
+static Token op_resolve(Value_P B) {
+    ensure_init();
+    unsigned char raw[256];
+    size_t n = value_to_bytes(B, raw, sizeof(raw) - 1);
+    raw[n] = 0;
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo((const char *)raw, NULL, &hints, &res) != 0 || res == NULL) {
+        return ret_err("dns resolution failed");
+    }
+    struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
+    unsigned long hostOrder = ntohl(sin->sin_addr.s_addr);
+    freeaddrinfo(res);
+
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%lu", hostOrder);
+    return ret_ok_text(buf);
+}
+
 /* CONVEXTLS[4] Bh : close(Bh) -> "K:" always */
 static Token op_close(Value_P B) {
     ensure_init();
@@ -327,7 +360,9 @@ static Token list_functions() {
         "  Zh <- CONVEXTLS[1] Bs        connect, Bs = \"host port\"\n"
         "  Zi <- Ab CONVEXTLS[2] Bh     send byte-vector Ab\n"
         "  Zb <- Ai CONVEXTLS[3] Bh     recv, Ai = maxBytes timeoutMs\n"
-        "  Zk <- CONVEXTLS[4] Bh        close\n");
+        "  Zk <- CONVEXTLS[4] Bh        close\n"
+        "  Zd <- CONVEXTLS[5] Bb        sha1 digest of byte-vector Bb\n"
+        "  Zh <- CONVEXTLS[6] Bs        resolve hostname Bs to a uint32\n");
 }
 
 static Token eval_B(Value_P B, const NativeFunction *caller) {
@@ -343,6 +378,7 @@ static Token eval_XB(Value_P X, Value_P B, const NativeFunction *caller) {
         case 1: return op_connect(B);
         case 4: return op_close(B);
         case 5: return op_sha1(B);
+        case 6: return op_resolve(B);
         default: return ret_err("unknown axis (send/recv need a left argument)");
     }
 }
