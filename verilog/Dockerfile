@@ -1743,3 +1743,222 @@ RUN set -eu; \
     test "$code" -eq 0; \
     diff /tmp/example.out /tmp/example-expected.txt; \
     echo "PASS example transcript matches the fixture's expected values"
+
+# ---------------------------------------------------------------------------
+# Stage the two shipped bytecode programs and probe the adapter's own
+# probe (hello, then close) from the exact bytecode that will ship.
+# Icarus is a compile-then-interpret toolchain: `iverilog` (the front end)
+# turns Verilog source into a `.vvp` bytecode file, and `vvp` (a completely
+# separate binary, the actual runtime executor) interprets that bytecode --
+# there is no linked native ELF the way GHDL's LLVM backend produces for
+# vhdl/. The runtime images below therefore ship `vvp` plus this client's
+# own `native.vpi` plus the two `.vvp` bytecode files, and never ship
+# `iverilog`/`ivl`/`ivlpp` (the compiler front end and code generator) --
+# `vvp` genuinely cannot compile a design, only execute one already
+# compiled, so shipping it is not shipping a toolchain the way shipping
+# `iverilog` itself would be.
+# ---------------------------------------------------------------------------
+RUN set -eu; \
+    mkdir -p /build; \
+    cp /tmp/adapter.vvp /build/convex-adapter.vvp; \
+    cp /tmp/example.vvp /build/convex-example.vvp; \
+    cp /project/native.vpi /build/native.vpi
+
+RUN set -eu; \
+    printf '%s\n' \
+      '{"protocolVersion":1,"id":"hello","op":"hello"}' \
+      '{"id":"close","op":"close"}' \
+    > /tmp/adapter-probe.in; \
+    code=0; \
+    CONVEX_URL=http://127.0.0.1:1 vvp -M/build -mnative /build/convex-adapter.vvp \
+      < /tmp/adapter-probe.in > /tmp/adapter-probe.out 2>/tmp/adapter-probe.err \
+      || code=$?; \
+    echo "adapter exit code: $code"; \
+    echo "--- stdout ---"; cat /tmp/adapter-probe.out; \
+    echo "--- stderr ---"; cat /tmp/adapter-probe.err; \
+    test "$code" -eq 0; \
+    grep -Fq '"type":"ready"' /tmp/adapter-probe.out; \
+    grep -Fq '"language":"verilog"' /tmp/adapter-probe.out; \
+    grep -Fq '"runtime":"iverilog-11.0-stable-debian-11.0-1.1+b1"' /tmp/adapter-probe.out; \
+    grep -Fq '"type":"closed"' /tmp/adapter-probe.out
+
+# ---------------------------------------------------------------------------
+# Build the runtime closure: `vvp` itself, the small subset of Icarus's own
+# default VPI plugins vvp needs for ordinary system tasks ($display,
+# $finish, $value$plusargs and friends -- system.vpi/v2005_math.vpi/
+# v2009.vpi/va_math.vpi, plus vvp's own module-search .conf files), and
+# this client's own native.vpi and its OpenSSL/libc closure -- deliberately
+# NOT the compiler-only files that live in the exact same package and the
+# exact same directory (ivl, ivlpp, every *.tgt code-generator backend,
+# vhdlpp, cadpli.vpl, and the C headers under include/), which are never
+# copied into /closure at all. iverilog-vpi (the build helper script) is
+# similarly never copied; native.vpi was already built once above, in the
+# test stage, and ships as a prebuilt artifact instead.
+#
+# AGENTS.md requires /bin/sh and basic POSIX text tools in every runtime
+# image until the shared example verifier is redesigned (see vhdl/Dockerfile
+# for the identical requirement and the identical small coreutils set),
+# even though neither convex-adapter nor convex-example themselves call out
+# to a shell or a text tool.
+# ---------------------------------------------------------------------------
+RUN set -eu; \
+    mkdir -p /closure/bin /closure/usr/bin /closure/usr/lib/x86_64-linux-gnu/ivl \
+             /closure/etc/ssl/certs \
+             /closure/usr/lib/x86_64-linux-gnu/ossl-modules \
+             /closure/usr/lib/x86_64-linux-gnu \
+             /closure/usr/local/bin /closure/usr/local/lib \
+             /closure/tmp; \
+    chmod 1777 /closure/tmp; \
+    chmod 755 /closure/usr/local /closure/usr/local/bin /closure/usr/local/lib; \
+    cp -aL /usr/bin/vvp /closure/usr/bin/vvp; \
+    for name in system.vpi v2005_math.vpi v2009.vpi va_math.vpi \
+                vhdl_sys.vpi vhdl_textio.vpi vvp.conf vvp-s.conf; do \
+      cp -aL /usr/lib/x86_64-linux-gnu/ivl/"$name" \
+             /closure/usr/lib/x86_64-linux-gnu/ivl/"$name"; \
+    done; \
+    for name in cat cut head tail tr sort uniq wc uname grep sed id; do \
+      cp -aL "$(command -v "$name")" /closure/usr/bin/"$name"; \
+    done; \
+    cp -aL /usr/bin/mawk /closure/usr/bin/awk; \
+    cp -aL /bin/dash /closure/bin/sh; \
+    cp -aL /etc/ssl/certs/ca-certificates.crt /closure/etc/ssl/certs/; \
+    cp -aL /etc/ssl/openssl.cnf /closure/etc/ssl/openssl.cnf; \
+    cp -aL /etc/nsswitch.conf /closure/etc/nsswitch.conf; \
+    cp -aL /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so \
+           /closure/usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so; \
+    for lib in libnss_dns.so.2 libnss_files.so.2 libresolv.so.2; do \
+      cp -aL /lib/x86_64-linux-gnu/"$lib" \
+             /closure/usr/lib/x86_64-linux-gnu/"$lib"; \
+    done; \
+    for round in 1 2 3; do \
+      for elf in /closure/usr/bin/vvp \
+                 /closure/usr/lib/x86_64-linux-gnu/ivl/*.vpi \
+                 /build/native.vpi \
+                 /closure/bin/sh \
+                 /closure/usr/bin/*; do \
+        ldd "$elf" 2>/dev/null \
+          | awk '{ for (i = 1; i <= NF; i++) \
+                     if (substr($i, 1, 1) == "/") print $i }'; \
+      done \
+        | sort -u \
+        | while read -r lib; do \
+            test -e "/closure$lib" || { \
+              mkdir -p "/closure$(dirname "$lib")"; \
+              cp -aL "$lib" "/closure$(dirname "$lib")/"; \
+            }; \
+          done; \
+    done; \
+    cp -aL /build/native.vpi /closure/usr/lib/x86_64-linux-gnu/ivl/native.vpi
+
+# The room argument reaches the example through Icarus's own real plusarg
+# passthrough (`vvp script.vvp +room=...`), unlike vhdl/'s GHDL-generated
+# standalone executable, which does not accept a real host argv the same
+# way (see vhdl/Dockerfile's own comment on why it uses EXAMPLE_ROOM
+# instead) -- Icarus's vvp genuinely forwards its own trailing `+...` argv
+# into the running design's $value$plusargs/$test$plusargs calls, confirmed
+# directly against this exact toolchain rather than assumed.
+RUN set -eu; \
+    mkdir -p /entry; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      '# The verifier passes a unique room as the first argument.' \
+      'if [ "$#" -gt 0 ]; then' \
+      '  exec /usr/bin/vvp -M/usr/lib/x86_64-linux-gnu/ivl -mnative \' \
+      '    /usr/local/lib/convex-example.vvp "+room=$1"' \
+      'fi' \
+      'exec /usr/bin/vvp -M/usr/lib/x86_64-linux-gnu/ivl -mnative \' \
+      '  /usr/local/lib/convex-example.vvp' \
+      > /entry/convex-example; \
+    chmod 755 /entry/convex-example
+
+# ---------------------------------------------------------------------------
+# runtime-base: the pinned image with its filesystem removed and only the
+# declared closure copied back.
+# ---------------------------------------------------------------------------
+FROM --platform=linux/amd64 ${BUILD_IMAGE} AS runtime-base
+RUN set -eu; \
+    set -- /bin /boot /home /lib /lib64 /media /mnt /opt /root \
+           /run /sbin /srv /usr /var /etc/.pwd.lock; \
+    for path in /etc/*; do \
+      case "$path" in \
+        /etc/hosts|/etc/resolv.conf) ;; \
+        *) set -- "$@" "$path" ;; \
+      esac; \
+    done; \
+    rm -rf "$@"
+COPY --from=test /closure/ /
+ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
+    OPENSSL_MODULES=/usr/lib/x86_64-linux-gnu/ossl-modules \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu \
+    PATH=/usr/local/bin:/usr/bin:/bin
+USER 65532:65532
+
+# Prove the policy the shared verifier depends on from inside the final
+# filesystem, not from the build stage that produced it: `/bin/sh` and a
+# small POSIX text-tool set exist only because AGENTS.md currently requires
+# them in every runtime image; no compiler, package manager, or `iverilog`/
+# `ivl` compiler front end exists anywhere in this image, so there is no
+# boot-time or run-time path from the shipped `/bin/sh` back to a compiler
+# -- `vvp` can only interpret bytecode already handed to it, never produce
+# new bytecode from source.
+RUN set -eu; \
+    test "$(id -u):$(id -g)" = 65532:65532; \
+    test -s "$SSL_CERT_FILE"; \
+    test "$(uname -m)" = x86_64; \
+    test "$(printf 'ok\n' | cat)" = ok; \
+    test "$(printf 'a:b\n' | cut -d: -f2)" = b; \
+    test "$(printf 'first\nsecond\n' | head -n 1)" = first; \
+    test "$(printf 'first\nsecond\n' | tail -n 1)" = second; \
+    test "$(printf 'a\n' | tr a A)" = A; \
+    test "$(printf 'b\na\n' | sort | head -n 1)" = a; \
+    test "$(printf 'a\na\n' | uniq | wc -l | tr -d ' ')" = 1; \
+    printf 'needle\n' | grep -Fqx needle; \
+    test "$(printf 'before\n' | sed 's/before/after/')" = after; \
+    test "$(printf 'value\n' | awk '{print $1}')" = value; \
+    test ! -e /etc/dpkg; \
+    test ! -e /var; \
+    test ! -e /usr/share/doc; \
+    test ! -e /usr/include; \
+    test ! -e /usr/src; \
+    set -- /bin/*; test "$#" -eq 1; test "$1" = /bin/sh; \
+    for command_name in iverilog ivl ivlpp iverilog-vpi vhdlpp gcc cc clang \
+        ld make cmake libtool apt apt-get dpkg curl wget nc netcat ssh \
+        openssl node python python3 ruby perl java php go rustc cargo \
+        npm pip convex bash; do \
+      if command -v "$command_name" >/dev/null 2>&1; then \
+        echo "unexpected command in runtime image: $command_name" >&2; \
+        exit 1; \
+      fi; \
+    done
+
+# ---------------------------------------------------------------------------
+# example-runtime
+# ---------------------------------------------------------------------------
+FROM runtime-base AS example-runtime
+COPY --from=test --chmod=644 --chown=65532:65532 /build/convex-example.vvp /usr/local/lib/convex-example.vvp
+COPY --from=test --chmod=755 --chown=65532:65532 /entry/convex-example /usr/local/bin/convex-example-entry
+USER 65532:65532
+RUN set -eu; \
+    test -x /usr/local/bin/convex-example-entry; \
+    test -s /usr/local/lib/convex-example.vvp; \
+    test ! -e /usr/local/lib/convex-adapter.vvp
+ENTRYPOINT ["/usr/local/bin/convex-example-entry"]
+
+# ---------------------------------------------------------------------------
+# runtime: last, because `./run build verilog` uses the default target
+# ---------------------------------------------------------------------------
+FROM runtime-base AS runtime
+COPY --from=test --chmod=644 --chown=65532:65532 /build/convex-adapter.vvp /usr/local/lib/convex-adapter.vvp
+USER 65532:65532
+RUN set -eu; \
+    printf '%s\n' \
+      '{"protocolVersion":1,"id":"hello","op":"hello"}' \
+      '{"id":"close","op":"close"}' \
+    > /tmp/adapter-probe.in; \
+    CONVEX_URL=http://127.0.0.1:1 \
+      /usr/bin/vvp -M/usr/lib/x86_64-linux-gnu/ivl -mnative \
+      /usr/local/lib/convex-adapter.vvp < /tmp/adapter-probe.in > /tmp/adapter-probe.out; \
+    cat /tmp/adapter-probe.out; \
+    grep -Fq '"type":"closed"' /tmp/adapter-probe.out
+ENTRYPOINT ["/usr/bin/vvp", "-M/usr/lib/x86_64-linux-gnu/ivl", "-mnative", "/usr/local/lib/convex-adapter.vvp"]
