@@ -1,0 +1,8 @@
+package convex-tests-tls
+
+version = 0.1.0
+sourcedir = "tests/tls"
+depends = convex
+
+main = Main
+executable = "convex-tests-tls"

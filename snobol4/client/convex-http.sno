@@ -1,0 +1,269 @@
+*   convex-http.sno - Convex's documented HTTP/1.1 JSON API: POST
+*   /api/query, /api/mutation, /api/action with a bearer token, classified
+*   into a value, a FunctionError from the deployment, a ProtocolError for a
+*   response this client cannot make sense of, or a TransportError for
+*   everything that means "the attempt itself did not complete". One
+*   connection is opened per call; Convex's API does not require keep-alive
+*   and a single client here never has two calls in flight at once.
+-include 'convex-io.sno'
+-include 'convex-json.sno'
+-include 'convex-error.sno'
+
+    http.max.response.bytes = 2097152
+    http.connect.deadline.ms = 10000
+    http.total.deadline.ms = 20000
+
+*   cvx.configure(url, token) - the only client "instance" this file keeps
+*   is a single global one: the adapter and the canonical example each ever
+*   need exactly one Convex connection at a time, so a table of instances
+*   would add a dimension no caller here exercises. Splits url into the
+*   parts io.open needs and fails on anything that is not an absolute
+*   http(s) URL.
+    define('cvx.configure(url,token)scheme,rest,hostport,path,colon') :(cvx.configure.end)
+cvx.configure
+        url break(":") . scheme len(3) rem . rest         :f(cvx.configure.badurl)
+        ident(scheme, "http")                             :s(cvx.configure.plain)
+        ident(scheme, "https")                            :f(cvx.configure.badurl)
+        cvx.tls = 1                                        :(cvx.configure.splitpath)
+cvx.configure.plain
+        cvx.tls = 0
+cvx.configure.splitpath
+        rest break("/") . hostport rem . path              :s(cvx.configure.splithost)
+        hostport = rest
+cvx.configure.splithost
+        gt(size(hostport), 0)                              :f(cvx.configure.badurl)
+        hostport break(":") . cvx.host len(1) rem . cvx.port  :s(cvx.configure.gothost)
+        cvx.host = hostport
+        cvx.port = 443
+        ident(cvx.tls, 1)                                   :s(cvx.configure.gothost)
+        cvx.port = 80
+cvx.configure.gothost
+        gt(size(cvx.host), 0)                               :f(cvx.configure.badurl)
+        cvx.url = scheme "://" hostport
+        cvx.auth = token
+        cvx.closed = 0
+        cvx.version = "snobol4-0.1.0"
+        :(return)
+cvx.configure.badurl
+        error.set("ProtocolError", "Convex deployment URL must be an absolute HTTP(S) URL", "")
+        :(freturn)
+cvx.configure.end
+
+*   cvx.set_auth(token) - replaces the bearer token used by every later HTTP
+*   call and the next WebSocket Connect. An empty token clears
+*   authentication, matching the adapter's setAuth contract.
+    define('cvx.set_auth(token)') :(cvx.set_auth.end)
+cvx.set_auth cvx.auth = token                                :(return)
+cvx.set_auth.end
+
+*   http.envelope_status(raw) -> the decoded "status" field's string value,
+*   or fails when the response is not even a JSON object with a string
+*   status - the shape a proxy or gateway error page would have.
+    define('http.envelope_status(raw)field') :(http.envelope_status.end)
+http.envelope_status
+        field = json.field(raw, "status")                  :f(freturn)
+        http.envelope_status = json.decode_string(field)   :s(return)
+        :(freturn)
+http.envelope_status.end
+
+*   http.envelope_message(raw) -> "errorMessage" or "message" from an
+*   envelope, decoded, or a fallback when neither is a valid JSON string.
+    define('http.envelope_message(raw,fallback)field') :(http.envelope_message.end)
+http.envelope_message
+        field = json.field(raw, "errorMessage")             :f(http.envelope_message.try2)
+        http.envelope_message = json.decode_string(field)   :s(return)
+http.envelope_message.try2
+        field = json.field(raw, "message")                  :f(http.envelope_message.fallback)
+        http.envelope_message = json.decode_string(field)   :s(return)
+http.envelope_message.fallback
+        http.envelope_message = fallback                    :(return)
+http.envelope_message.end
+
+*   http.call(operation, path, argsraw) -> the raw JSON "value" subtree on
+*   success. Sets http.logs to the raw "logLines" array (or "[]"). Fails
+*   with cvx.err.* set to FunctionError (the deployment ran the function and
+*   it failed), ProtocolError (a response this client cannot interpret), or
+*   TransportError (the HTTP attempt itself did not complete; safe to
+*   retry).
+    define('http.call(operation,path,argsraw)body,headers,handle,deadline,request,response,status,code,detail,data') :(http.call.end)
+http.call
+        http.logs = "[]"
+        gt(size(path), 2)                                   :f(http.call.protoerr)
+        json.is_object(argsraw)                             :f(http.call.protoerr)
+        body = json.object3("path", json.qs(path), "args", argsraw, "format", json.qs("json"))
+        headers = "Content-Type: application/json" char(13) char(10)
+        headers = headers "Accept: application/json" char(13) char(10)
+        headers = headers "Convex-Client: " cvx.version char(13) char(10)
+        gt(size(cvx.auth), 0)                                :f(http.call.noauth)
+        headers = headers "Authorization: Bearer " cvx.auth char(13) char(10)
+http.call.noauth
+        deadline = io.now() + http.total.deadline.ms
+        handle = io.open(cvx.host, cvx.port, cvx.tls, io.now() + http.connect.deadline.ms)  :f(http.call.transporterr)
+        request = "POST /api/" operation " HTTP/1.1" char(13) char(10)
+        request = request "Host: " cvx.host char(13) char(10)
+        request = request headers
+        request = request "Content-Length: " size(body) char(13) char(10)
+        request = request "Connection: close" char(13) char(10) char(13) char(10)
+        request = request body
+        io.write_all(handle, request, deadline)             :f(http.call.closeandtransport)
+        response = http.read_response(handle, deadline)     :f(http.call.closeandtransport)
+        io.close(handle)
+        code = http.response.code
+        status = http.envelope_status(response)             :f(http.call.checkcode)
+        ident(status, "success")                            :f(http.call.notsuccess)
+        eq(code, 200)                                        :f(http.call.protoerr2)
+        data = json.field(response, "value")                :f(http.call.protoerr3)
+        http.call = data
+        detail = json.field(response, "logLines")           :f(return)
+        http.logs = detail                                   :(return)
+http.call.notsuccess
+        ident(status, "error")                               :s(http.call.functionerr)
+        eq(code, 560)                                         :s(http.call.functionerr)
+        :(http.call.checkcode)
+http.call.functionerr
+* errorData and logLines are each independently optional; a missing one
+* must not discard the other.
+        data = json.field(response, "errorData")              :f(http.call.functionerr.nodata)
+        :(http.call.functionerr.checklogs)
+http.call.functionerr.nodata
+        data = ""
+http.call.functionerr.checklogs
+        detail = json.field(response, "logLines")              :f(http.call.functionerr.report)
+        http.logs = detail
+http.call.functionerr.report
+        error.set("FunctionError", http.envelope_message(response, "Convex function failed"), data)
+        :(freturn)
+http.call.checkcode
+* A 560 with no readable JSON "status" field is still Convex reporting that
+* the function itself failed, just without the 200-envelope shape.
+        eq(code, 560)                                         :s(http.call.functionerr)
+        eq(code, 200)                                         :s(http.call.protoerr4)
+        eq(code, 500)                                         :s(http.call.retryable)
+        eq(code, 502)                                         :s(http.call.retryable)
+        eq(code, 503)                                         :s(http.call.retryable)
+        eq(code, 504)                                         :s(http.call.retryable)
+        eq(code, 408)                                         :s(http.call.retryable)
+        eq(code, 429)                                         :s(http.call.retryable)
+        :(http.call.protoerr5)
+http.call.retryable
+        error.set("TransportError", "HTTP " code " from Convex: " http.envelope_message(response, "no Convex error envelope"), "")
+        :(freturn)
+http.call.protoerr
+        error.set("ProtocolError", "Convex function path and arguments are required", "")
+        :(freturn)
+http.call.protoerr2
+        error.set("ProtocolError", "HTTP " code " response claimed success", "")
+        :(freturn)
+http.call.protoerr3
+        error.set("ProtocolError", "HTTP success response omitted value", "")
+        :(freturn)
+http.call.protoerr4
+        error.set("ProtocolError", "HTTP response had unknown status", "")
+        :(freturn)
+http.call.protoerr5
+        error.set("ProtocolError", "HTTP " code " from Convex: " http.envelope_message(response, "no Convex error envelope"), "")
+        :(freturn)
+http.call.closeandtransport
+        io.close(handle)                                      :(freturn)
+http.call.transporterr
+        :(freturn)
+http.call.end
+
+    define('cvx.query(path,argsraw)') :(cvx.query.end)
+cvx.query cvx.query = http.call("query", path, argsraw)        :s(return)
+        :(freturn)
+cvx.query.end
+
+    define('cvx.mutation(path,argsraw)') :(cvx.mutation.end)
+cvx.mutation cvx.mutation = http.call("mutation", path, argsraw)  :s(return)
+        :(freturn)
+cvx.mutation.end
+
+    define('cvx.action(path,argsraw)') :(cvx.action.end)
+cvx.action cvx.action = http.call("action", path, argsraw)      :s(return)
+        :(freturn)
+cvx.action.end
+
+*   http.read_response(handle, deadlineMs) -> the complete response body
+*   text. Reads the status line and headers, classifies the status code
+*   into http.response.code, then reads exactly Content-Length bytes (or,
+*   lacking one, reads until the peer closes), abandoning the response the
+*   moment it would exceed http.max.response.bytes so an oversized reply is
+*   never fully buffered.
+    define('http.read_response(handle,deadlinems)buffer,headerend,statusline,headers,contentlength,bodystart,needed,chunk,line') :(http.read_response.end)
+http.read_response
+        buffer = ""
+http.read_response.headerloop
+        headerend = indexof4(buffer, char(13) char(10) char(13) char(10))
+        gt(headerend, 0)                                     :s(http.read_response.gotheaders)
+        gt(size(buffer), 65536)                               :s(http.read_response.badresp)
+        chunk = io.read_some(handle, 8192, deadlinems)        :f(freturn)
+        gt(size(chunk), 0)                                    :s(http.read_response.append)
+        eq(io.eof, 1)                                          :s(http.read_response.badresp)
+http.read_response.append
+        buffer = buffer chunk                                  :(http.read_response.headerloop)
+http.read_response.gotheaders
+        statusline = substr(buffer, 1, indexof4(buffer, char(13) char(10)) - 1)
+        headers = substr(buffer, 1, headerend - 1)
+        bodystart = headerend + 4
+        http.response.code = http.status_code(statusline)     :f(http.read_response.badresp)
+        contentlength = http.header_int(headers, "Content-Length")  :s(http.read_response.fixed)
+        contentlength = -1
+http.read_response.fixed
+        buffer = substr(buffer, bodystart, size(buffer) - bodystart + 1)
+        lt(contentlength, 0)                                   :s(http.read_response.untilclose)
+        gt(contentlength, http.max.response.bytes)              :s(http.read_response.badresp)
+http.read_response.needmore
+        ge(size(buffer), contentlength)                         :s(http.read_response.donefixed)
+        chunk = io.read_some(handle, 65536, deadlinems)          :f(freturn)
+        gt(size(chunk), 0)                                       :s(http.read_response.morebytes)
+        :(http.read_response.badresp)
+http.read_response.morebytes
+        buffer = buffer chunk                                    :(http.read_response.needmore)
+http.read_response.donefixed
+        http.read_response = substr(buffer, 1, contentlength)   :(return)
+http.read_response.untilclose
+http.read_response.moreuntil
+        gt(size(buffer), http.max.response.bytes)                :s(http.read_response.badresp)
+        chunk = io.read_some(handle, 65536, deadlinems)            :f(freturn)
+        gt(size(chunk), 0)                                         :s(http.read_response.appenduntil)
+        eq(io.eof, 1)                                              :s(http.read_response.doneuntil)
+        :(http.read_response.moreuntil)
+http.read_response.appenduntil
+        buffer = buffer chunk                                      :(http.read_response.moreuntil)
+http.read_response.doneuntil
+        http.read_response = buffer                                :(return)
+http.read_response.badresp
+        error.set("TransportError", "Convex HTTP response was malformed or exceeded the response budget", "")
+        :(freturn)
+http.read_response.end
+
+*   http.status_code(statusline) -> the numeric code from an HTTP/1.x status
+*   line, or fails when the line is not well formed.
+    define('http.status_code(statusline)a,b') :(http.status_code.end)
+http.status_code
+        statusline break(" ") . a span(" ") len(3) . b        :f(freturn)
+        b span("0123456789") rpos(0)                          :f(freturn)
+        http.status_code = b + 0                               :(return)
+http.status_code.end
+
+*   http.header_int(headers, name) -> the integer value of a header, or
+*   fails when it is absent or not a plain non-negative integer. Header
+*   matching is case-sensitive on the name this client itself sent
+*   ("Content-Length"), which is how Convex's own server sends it back.
+    define('http.header_int(headers,name)i,line,lines,value') :(http.header_int.end)
+http.header_int
+        lines = headers
+http.header_int.loop
+        gt(size(lines), 0)                                     :f(freturn)
+        lines break(char(13) char(10)) . line len(2) rem . lines  :s(http.header_int.gotline)
+        line = lines
+        lines = ""
+http.header_int.gotline
+        line len(size(name)) . i                                :f(http.header_int.loop)
+        ident(i, name)                                           :f(http.header_int.loop)
+        ident(substr(line, size(name) + 1, 2), ": ")             :f(http.header_int.loop)
+        value = substr(line, size(name) + 3, size(line) - size(name) - 2)
+        value span("0123456789") rpos(0)                        :f(freturn)
+        http.header_int = value + 0                              :(return)
+http.header_int.end

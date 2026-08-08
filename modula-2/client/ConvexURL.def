@@ -1,0 +1,17 @@
+(* ConvexURL parses the small subset of absolute URLs this client needs:
+   http/https/ws/wss with an optional port and path. *)
+
+DEFINITION MODULE ConvexURL;
+
+PROCEDURE Parse (url: ARRAY OF CHAR;
+                  VAR secure: BOOLEAN;
+                  VAR host: ARRAY OF CHAR;
+                  VAR port: INTEGER;
+                  VAR path: ARRAY OF CHAR) : BOOLEAN;
+(* Recognises "http://", "https://", "ws://" and "wss://" prefixes. secure is
+   TRUE for https/wss. host excludes any ":port" suffix. port defaults to 80
+   for http/ws and 443 for https/wss when no ":port" suffix is present. path
+   is everything from the first '/' after the host (including that '/'), or
+   "/" when the URL has no path. Returns FALSE for anything else. *)
+
+END ConvexURL.

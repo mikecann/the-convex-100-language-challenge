@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: solidity
-displayName: "Solidity"
-rank: 41
-selectionTier: ranked
-implementation:
-  status: planned
-capabilities: []

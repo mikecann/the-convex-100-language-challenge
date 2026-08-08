@@ -1,0 +1,27 @@
+(* ConvexHTTP performs one HTTP/1.1 request/response over CShim's raw
+   socket and TLS primitives. It knows nothing about Convex's JSON
+   envelope, function paths, or error shapes: Convex.mod decides success,
+   FunctionError, or ProtocolError from the body this module returns. This
+   module is the plain "send bytes shaped like an HTTP request, collect the
+   response" transport; RFC 7230 framing (status line, headers,
+   Content-Length body) is implemented here in Modula-2 because gm2 ships
+   no HTTP client of its own. *)
+
+DEFINITION MODULE ConvexHTTP;
+
+CONST
+  MaxBody = 2097152; (* 2 MiB, matching this client's documented HTTP cap *)
+
+(* Post sends a JSON POST request to url (an absolute http:// or https://
+   URL) with body payload, and an "Authorization: Bearer token" header when
+   token is non-empty. On a successful round trip (the peer returned a
+   complete, framed HTTP response, regardless of status code) ok is TRUE
+   and body holds the response body text. Otherwise ok is FALSE and
+   errorText explains the transport failure (DNS, connect, TLS, a
+   malformed or over-size response, or a timeout). timeoutMs bounds the
+   whole call: connect, TLS handshake, write and read. *)
+PROCEDURE Post (url: ARRAY OF CHAR; VAR payload: ARRAY OF CHAR; token: ARRAY OF CHAR;
+                 timeoutMs: INTEGER;
+                 VAR body: ARRAY OF CHAR; VAR ok: BOOLEAN; VAR errorText: ARRAY OF CHAR);
+
+END ConvexHTTP.

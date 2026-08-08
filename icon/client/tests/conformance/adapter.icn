@@ -1,0 +1,306 @@
+#
+# NDJSON adapter protocol v1 for the native Unicon Convex client.
+#
+# This is test infrastructure, not public client code: it is a thin
+# translator between the shared harness's newline-delimited JSON commands
+# and the real client operations in client/convex.icn (linked in below),
+# the same file the canonical example links against. Every actual HTTP
+# request and every actual Live/WebSocket operation happens inside that
+# file; this one only decodes commands, calls it, and encodes results,
+# reusing convex.icn's own JSON codec for both directions.
+#
+# stdout carries only NDJSON protocol events, one per line; diagnostics go
+# to stderr. Without ADAPTER_LISTEN this reads stdin/writes stdout; with
+# it, it binds that address, accepts exactly one controller connection,
+# and carries the same NDJSON stream over that socket instead.
+#
+# Unicon has no threads exposed to ordinary programs, so one loop owns the
+# input stream and the Live connection exclusively: each pass gives a
+# short timeout to "is there another command yet" and, if a Live
+# subscription is active, an equally short timeout to "did the server
+# send anything", so neither starves the other.
+#
+# unicon's `link` resolves an already-compiled `.u` file by looking in the
+# CURRENT WORKING DIRECTORY at compile time, not next to the file that
+# names it, and it never auto-compiles a sibling `.icn` -- so the build
+# always precompiles client/convex.icn once (from a fixed CWD) and every
+# dependent file links it back by that bare name.
+#
+link "convex"
+
+global authToken, liveState, liveUrl, outHandle, closed
+
+procedure main(args)
+   local convexUrl, listenSpec, sepPos, bindHost, bindPort
+   local listenResult, listenHandle, acceptResult, inHandle
+   local inBuffer, chunk, nlPos, line
+   local scheme, hostAndMore, events, evt
+
+   convex_init_ffi()
+
+   convexUrl := getenv("CONVEX_URL")
+   if /convexUrl then convexUrl := ""
+   listenSpec := getenv("ADAPTER_LISTEN")
+   if /listenSpec then listenSpec := ""
+
+   if *listenSpec = 0 then {
+      inHandle := 0
+      outHandle := 1
+   }
+   else {
+      sepPos := 0
+      every sepPos := find(":", listenSpec)
+      # find(":", listenSpec) returns the position OF the colon itself, so
+      # the host is everything strictly before it (listenSpec[1:sepPos],
+      # not sepPos + 1 -- that slice's exclusive upper bound needs to
+      # land ON the colon to exclude it, not past it) and the port is
+      # everything strictly after it (listenSpec[sepPos + 1:0], not
+      # sepPos + 2 -- that skipped the port's own first digit). The old
+      # off-by-ones turned "0.0.0.0:8080" into bindHost "0.0.0.0:" (colon
+      # still attached, so the bindHost == "0.0.0.0" check right below
+      # never matched and never cleared it to "" for ffi_listen's
+      # any-interface bind) and bindPort "080" (missing its leading "8"),
+      # so ffi_listen("0.0.0.0:", "080") always failed DNS/address
+      # resolution on that malformed host string -- the adapter exited
+      # immediately with "listen failed: bind address resolution
+      # failed" before ever accepting a connection, which is why every
+      # ADAPTER_LISTEN-mode pilot check failed to resolve the adapter's
+      # own container hostname (the container had already exited).
+      bindHost := listenSpec[1:sepPos]
+      bindPort := listenSpec[sepPos + 1 : 0]
+      if bindHost == "0.0.0.0" then bindHost := ""
+      listenResult := ffi_listen(bindHost, bindPort)
+      if tag_of(listenResult) ~== "K:" then {
+         write(&errout, "adapter: listen failed: " || payload_of(listenResult))
+         exit(1)
+      }
+      listenHandle := integer(payload_of(listenResult))
+      acceptResult := ffi_accept(listenHandle, 60000)
+      if tag_of(acceptResult) ~== "K:" then {
+         write(&errout, "adapter: accept failed: " || payload_of(acceptResult))
+         exit(1)
+      }
+      ffi_close(listenHandle)
+      inHandle := integer(payload_of(acceptResult))
+      outHandle := inHandle
+   }
+
+   authToken := ""
+   liveState := &null
+   liveUrl := ""
+   if *convexUrl > 0 then {
+      # convexUrl[1:6] is 5 characters (Icon's s[i:j] excludes j), so it
+      # must be compared against the 5-character "https", not the
+      # 6-character "https:" -- see the identical fix and full
+      # explanation in examples/basics/main.icn. Comparing against
+      # "https:" can never match, silently downgrading every deployment
+      # to plain ws:// and straight into Cloudflare's plain-HTTP-to-HTTPS
+      # redirect for the WebSocket upgrade request.
+      scheme := if map(convexUrl[1:6]) == "https" then "wss" else "ws"
+      hostAndMore := convexUrl[find("://", convexUrl) + 3 : 0]
+      liveUrl := scheme || "://" || hostAndMore || "/api/sync"
+   }
+
+   inBuffer := ""
+   closed := 0
+
+   while closed = 0 do {
+      chunk := ffi_recv(inHandle, 65536, 50)
+      case tag_of(chunk) of {
+         "D:": {
+            inBuffer ||:= payload_of(chunk)
+            if *inBuffer > 9437184 then {
+               write(&errout, "adapter: command frame exceeded 9 MiB budget")
+               inBuffer := ""
+            }
+         }
+         "T:": &null
+         default: closed := 1
+      }
+
+      while nlPos := find("\n", inBuffer) do {
+         line := inBuffer[1:nlPos]
+         # nlPos indexes the "\n" itself, so the rest of the buffer starts
+         # 1 position later, not 2 -- the +2 here was silently dropping
+         # the first character of every subsequent NDJSON line.
+         inBuffer := inBuffer[nlPos + 1 : 0]
+         if line[*line] == "\r" then line := line[1:*line]
+         if *trim_ws(line) > 0 then handle_command(line)
+         if closed = 1 then break
+      }
+
+      if closed = 0 & \liveState then {
+         events := convex_live_poll(liveState, 50)
+         every evt := !events do emit_subscription_event(evt)
+      }
+   }
+end
+
+procedure handle_command(line)
+   local cmd, op, id, hasId
+
+   cmd := json_decode(line)
+   if type(cmd) ~== "table" then {
+      emit_protocol_error(&null, 0, "command was not a JSON object")
+      return
+   }
+   op := if member(cmd, "op") then cmd["op"] else &null
+   # Icon's "&" binds tighter than ":=" -- "x := a & b & c" parses as
+   # "(x := a) & b & c", not "x := (a & b & c)" -- so the unparenthesized
+   # chain used to assign hasId whatever member() returned (the string
+   # "id") the moment it succeeded, discarding the type/length checks
+   # entirely and leaving hasId truthy even for a missing, non-string, or
+   # empty id. Wrapping it in an explicit if/then/else both fixes the
+   # precedence trap and gives hasId the definite 1-or-0 value the
+   # `hasId = 1` checks elsewhere in this file expect.
+   hasId := if member(cmd, "id") & type(cmd["id"]) == "string" & *cmd["id"] > 0 then 1 else 0
+   id := if hasId = 1 then cmd["id"] else &null
+
+   if /op then {
+      emit_protocol_error(id, hasId, "command omitted a valid op")
+      return
+   }
+
+   case op of {
+      "hello": op_hello(cmd, id, hasId)
+      "query": op_call(cmd, id, hasId, "query")
+      "mutation": op_call(cmd, id, hasId, "mutation")
+      "action": op_call(cmd, id, hasId, "action")
+      "setAuth": op_set_auth(cmd, id, hasId)
+      "subscribe": op_subscribe(cmd, id, hasId)
+      "unsubscribe": op_unsubscribe(cmd, id, hasId)
+      "debugDisconnect": op_debug_disconnect(id, hasId)
+      "close": op_close(id, hasId)
+      default: emit_protocol_error(id, hasId, "unrecognised op " || op)
+   }
+   return
+end
+
+procedure op_hello(cmd, id, hasId)
+   local pv
+   pv := if member(cmd, "protocolVersion") then cmd["protocolVersion"] else &null
+   if /pv | pv ~= 1 then {
+      emit_protocol_error(id, hasId, "unsupported protocolVersion")
+      return
+   }
+   # "language" must be the roster's canonical id (manifest.yaml's "icon",
+   # matched against CLIENT_LANGUAGE by the pilot harness), not "unicon" --
+   # the specific dialect/toolchain this client happens to be implemented
+   # in, which "implementation" and "runtime" already say on their own.
+   emit(table_of(["protocolVersion", 1, "id", id, "type", "ready", "language", "icon",
+      "implementation", "native-unicon-0.1.0", "runtime", "unicon-" || &version]))
+   return
+end
+
+procedure op_call(cmd, id, hasId, httpOp)
+   local path, argsValue, result, envelope
+   if hasId = 0 then {
+      emit_protocol_error(id, hasId, "command omitted valid id")
+      return
+   }
+   path := if member(cmd, "path") then cmd["path"] else &null
+   argsValue := if member(cmd, "args") then cmd["args"] else table()
+   if /path then {
+      emit_protocol_error(id, hasId, "command omitted valid path")
+      return
+   }
+   result := convex_http_call(httpOp, path, argsValue, getenv("CONVEX_URL"), authToken)
+   emit_call_result(id, result)
+   return
+end
+
+procedure op_set_auth(cmd, id, hasId)
+   authToken := if member(cmd, "token") then cmd["token"] else ""
+   /authToken := ""
+   emit(table_of(["id", id, "type", "ack"]))
+   return
+end
+
+procedure op_subscribe(cmd, id, hasId)
+   local subscriptionId, path, argsValue, events, evt
+   if hasId = 0 then {
+      emit_protocol_error(id, hasId, "command omitted valid id")
+      return
+   }
+   subscriptionId := if member(cmd, "subscriptionId") then cmd["subscriptionId"] else &null
+   path := if member(cmd, "path") then cmd["path"] else &null
+   argsValue := if member(cmd, "args") then cmd["args"] else table()
+   if /subscriptionId | /path then {
+      emit_protocol_error(id, hasId, "command omitted subscriptionId or path")
+      return
+   }
+   if /liveState then liveState := convex_live_new(liveUrl)
+   events := convex_live_add(liveState, subscriptionId, path, argsValue)
+   emit(table_of(["id", id, "type", "ack"]))
+   every evt := !events do emit_subscription_event(evt)
+   return
+end
+
+procedure op_unsubscribe(cmd, id, hasId)
+   local subscriptionId
+   if hasId = 0 then {
+      emit_protocol_error(id, hasId, "command omitted valid id")
+      return
+   }
+   subscriptionId := if member(cmd, "subscriptionId") then cmd["subscriptionId"] else &null
+   if /subscriptionId then {
+      emit_protocol_error(id, hasId, "command omitted subscriptionId")
+      return
+   }
+   if \liveState then convex_live_remove(liveState, subscriptionId)
+   emit(table_of(["id", id, "type", "ack"]))
+   return
+end
+
+procedure op_debug_disconnect(id, hasId)
+   if hasId = 0 then {
+      emit_protocol_error(id, hasId, "command omitted valid id")
+      return
+   }
+   if \liveState then convex_live_debug_disconnect(liveState)
+   emit(table_of(["id", id, "type", "ack"]))
+   return
+end
+
+procedure op_close(id, hasId)
+   local out
+   if \liveState then convex_live_close(liveState)
+   out := table_of(["type", "closed"])
+   if hasId = 1 then out["id"] := id
+   emit(out)
+   closed := 1
+   return
+end
+
+procedure emit_call_result(id, result)
+   local out, errTable
+   if result.kind == "result" then {
+      out := table_of(["id", id, "type", "result", "value", result.value])
+      if *result.logs > 0 then out["logs"] := result.logs
+   }
+   else {
+      errTable := table_of(["name", result.errName, "message", result.errMessage])
+      if result.hasErrData = 1 then errTable["data"] := result.errData
+      out := table_of(["id", id, "type", "error", "error", errTable])
+   }
+   emit(out)
+   return
+end
+
+procedure emit_subscription_event(evt)
+   emit(evt)
+   return
+end
+
+procedure emit_protocol_error(id, hasId, message)
+   local out
+   out := table_of(["type", "error", "error", table_of(["name", "ProtocolError", "message", message])])
+   if hasId = 1 then out["id"] := id
+   emit(out)
+   return
+end
+
+procedure emit(value)
+   ffi_send(outHandle, json_encode(value) || "\n")
+   return
+end

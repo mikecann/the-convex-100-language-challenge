@@ -1,0 +1,52 @@
+ /********************************************************************/
+ /* Replacement for the Iron Spring PL/I runtime's _pli_SigInit.      */
+ /*                                                                  */
+ /* The stock routine (lib/source/linux/siginit.pli in the 1.4.1      */
+ /* distribution, LGPL) installs a trap handler for 27 signals with   */
+ /* the legacy i386 sigaction syscall (number 67). Docker's default   */
+ /* seccomp profile does not allow that syscall for the i386 personal-*/
+ /* ity, so it returns EPERM and the stock routine calls PLIRETC(16)  */
+ /* and STOPs -- every PL/I binary dies before main() in a container. */
+ /*                                                                   */
+ /* This override installs no trap handlers at all and uses only      */
+ /* rt_sigaction (174), which the seccomp profile does allow, to set  */
+ /* SIGPIPE to SIG_IGN so a write to a closed socket returns EPIPE    */
+ /* instead of killing the process.                                   */
+ /********************************************************************/
+ SigInit: proc( pSave, pRest )
+          options( linkage(system) )
+          ext( '_pli_SigInit' );
+
+ dcl    (pSave,pRest)         ptr;
+
+ %replace SYS_RT_SIGACTION by 174;
+ %replace SIGPIPE          by  13;
+ %replace SIG_IGN          by   1;
+
+ /* i386 kernel struct sigaction as rt_sigaction expects it:         */
+ /* handler, flags, restorer, then a 64 bit mask.                    */
+ dcl   1 act,
+         5 sa_handler        fixed bin(31),
+         5 sa_flags          fixed bin(31),
+         5 sa_restorer       fixed bin(31),
+         5 sa_mask_lo        fixed bin(31),
+         5 sa_mask_hi        fixed bin(31);
+
+ dcl     rc                  fixed bin(31);
+
+ dcl     syscall             entry
+                             returns( fixed bin(31) )
+                             options( linkage(system) )
+                             ext( '_pli_Syscall' );
+
+ dcl    (addr)               builtin;
+
+ sa_handler  = SIG_IGN;
+ sa_flags    = 0;
+ sa_restorer = 0;
+ sa_mask_lo  = 0;
+ sa_mask_hi  = 0;
+
+ rc = syscall( SYS_RT_SIGACTION, SIGPIPE, addr(act), 0, 8 );
+
+ end SigInit;

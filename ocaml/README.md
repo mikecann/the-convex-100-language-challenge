@@ -17,7 +17,7 @@ Read the [canonical basic example](examples/basics/main.ml). It performs a query
 | Native Live query updates and reconnects | In verification | One socket-owner worker and the shared five-reconnect suite |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.ml -->
-```text
+```ocaml
 (* The example accepts the verifier's unique room as argv[1] so parallel runs
    never share mutable Convex demo state. *)
 let room = if Array.length Sys.argv > 1 then Sys.argv.(1) else "ocaml-example"

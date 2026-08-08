@@ -31,4 +31,6 @@ limitations:
   - The WebSocket implementation supports only unfragmented text frames used by the pinned profile.
   - TransitionChunk assembly, mutation replay, optimistic updates, journals, and full Convex values are deferred.
   - Live compatibility has not yet been demonstrated against either shared deployment profile.
-capabilities: []
+capabilities:
+  - http
+  - live

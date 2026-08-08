@@ -1,0 +1,57 @@
+schemaVersion: 1
+id: mercury
+displayName: "Mercury"
+rank: 75
+selectionTier: coverage
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Mercury implementation of the Convex HTTP API and the pinned
+    /api/sync protocol. JSON encoding and decoding, HTTP request/response
+    framing, the RFC 6455 WebSocket handshake and frame masking, and the
+    full sync state machine (Connect, ModifyQuerySet, Transition validation,
+    modification coalescing, reconnect-and-resubscribe on debugDisconnect
+    with rehydration suppression) are all written in Mercury with real
+    determinism and mode declarations on every predicate. Mercury has no
+    HTTP, TLS, or WebSocket library, so a small C shim
+    (client/convex_transport.m's foreign_decl block) supplies only
+    byte-level transport -- socket connect, the OpenSSL TLS handshake with
+    certificate verification, HTTP/1.1 response framing, WebSocket frame
+    send/recv, base64, and poll(2) -- reached through Mercury's C
+    foreign-language interface, the same mechanism every native client in
+    this project uses to reach its platform's sockets and TLS. The adapter
+    is a single-threaded reactor: one poll(2) call over the control channel
+    and the Live socket together, so there is exactly one owner of every
+    WebSocket read, write, and reconnect.
+toolchain:
+  name: Mercury (mmc)
+  version: 22.01.8-1~noble
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live reconnect uses immediate retry rather than the exponential backoff
+    a long-lived production client would want; the shared conformance
+    suite's five-real-reconnects test does not exercise sustained backoff
+    under repeated failures.
+  - Live message queuing is unbounded by count (bounded only by the shared
+    8 MiB per-frame limit enforced in client/convex_transport.m); a
+    dedicated slow-consumer queue budget like the Haskell/Prolog clients'
+    is not implemented.
+  - The educational client supports JSON-safe Convex values only.
+capabilities:
+  - http
+  - live

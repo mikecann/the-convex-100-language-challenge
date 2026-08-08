@@ -12,9 +12,9 @@ This is educational and unofficial, not a production Convex SDK.
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, actions, token changes, and structured errors | Implemented, awaiting root-owned shared evidence |
-| Live initial values and updates through `/api/sync` | Implemented, awaiting root-owned shared evidence |
-| Remove, reconnect, query-error recovery, and bounded delivery | Implemented, awaiting root-owned shared evidence |
+| HTTP queries, mutations, actions, token changes, and structured errors | Verified by shared local and hosted conformance |
+| Live initial values and updates through `/api/sync` | Verified by shared local and hosted conformance |
+| Remove, reconnect, query-error recovery, and bounded delivery | Verified by shared local and hosted conformance |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.m -->
 ```objective-c

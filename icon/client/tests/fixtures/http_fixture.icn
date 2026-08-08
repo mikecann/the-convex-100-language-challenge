@@ -1,0 +1,110 @@
+#
+# Loopback HTTP fixture for client/tests/http_test.icn.
+#
+# Listens on 127.0.0.1:<port>, accepts exactly one connection, reads and
+# discards the request (up to the blank line that ends the headers), then
+# writes back the exact bytes from <responseFile> verbatim. This is a
+# real TCP peer, not a mock of convex_http_call: it exercises the real
+# client's RXCONNECT/RXSEND/RXRECV-equivalent transport and HTTP response
+# parsing end to end.
+#
+# This is test-only infrastructure. It duplicates the shim loading step
+# because each program is its own OS process with its own loadfunc calls;
+# it does not duplicate any Convex protocol logic.
+#
+procedure main(args)
+   local listenf, acceptf, sendf, recvf, closef
+   local port, responseFile, listenResult, listenHandle
+   local acceptResult, handle, buf, chunk, responseBytes, f
+   local headerEnd, headerText, restHeaders, headerLine, colonAt, hname, hvalue
+   local contentLength, wantTotal
+
+   listenf := loadfunc("libconvexshim.so", "uconvexlisten")
+   acceptf := loadfunc("libconvexshim.so", "uconvexaccept")
+   sendf := loadfunc("libconvexshim.so", "uconvexsend")
+   recvf := loadfunc("libconvexshim.so", "uconvexrecv")
+   closef := loadfunc("libconvexshim.so", "uconvexclose")
+
+   port := args[1]
+   responseFile := args[2]
+
+   listenResult := listenf("127.0.0.1", port)
+   if listenResult[1:3] ~== "K:" then {
+      write(&errout, "http_fixture: listen failed: ", listenResult[3:0])
+      exit(1)
+   }
+   listenHandle := integer(listenResult[3:0])
+
+   write("READY")
+   flush(&output)
+
+   acceptResult := acceptf(listenHandle, 10000)
+   if acceptResult[1:3] ~== "K:" then {
+      write(&errout, "http_fixture: accept failed: ", acceptResult[3:0])
+      exit(1)
+   }
+   handle := integer(acceptResult[3:0])
+
+   #
+   # find() either succeeds with a position or fails outright -- it never
+   # returns &null -- so the loop condition has to be "not find(...)", not
+   # a comparison against &null (which would just make the whole
+   # comparison fail immediately and skip this loop on the first check,
+   # leaving the client's request unread and sitting in the kernel's
+   # receive buffer, which turns the reply's close() into a connection
+   # reset instead of a clean finish).
+   #
+   buf := ""
+   while not find("\r\n\r\n", buf) do {
+      chunk := recvf(handle, 65536, 5000)
+      if chunk[1:3] == "D:" then buf ||:= chunk[3:0]
+      else break
+   }
+
+   # Also drain the declared request body, not just the headers: leaving
+   # bytes the client already sent sitting unread in the kernel receive
+   # buffer is exactly what turns this fixture's close() below into a
+   # connection reset instead of a clean finish once convex_http_call
+   # sends a real body (every query/mutation/action does).
+   headerEnd := find("\r\n\r\n", buf)
+   if \headerEnd then {
+      headerText := buf[1 : headerEnd + 1]
+      restHeaders := headerText[find("\r\n", headerText) + 2 : 0]
+      contentLength := 0
+      restHeaders ? {
+         while not pos(0) do {
+            headerLine := tab(find("\r\n") | 0)
+            move(2) | &null
+            if colonAt := find(":", headerLine) then {
+               hname := map(headerLine[1:colonAt])
+               hvalue := trim_ws(headerLine[colonAt + 1 : 0])
+               if hname == "content-length" then contentLength := integer(hvalue)
+            }
+         }
+      }
+      wantTotal := headerEnd + 4 + contentLength
+      while *buf < wantTotal do {
+         chunk := recvf(handle, 65536, 5000)
+         if chunk[1:3] == "D:" then buf ||:= chunk[3:0]
+         else break
+      }
+   }
+
+   f := open(responseFile, "r")
+   responseBytes := reads(f, 10000000)
+   close(f)
+
+   sendf(handle, responseBytes)
+   closef(handle)
+   closef(listenHandle)
+end
+
+procedure trim_ws(s)
+   local start, stop
+   start := 1
+   stop := *s
+   while start <= stop & any(' \t\r\n', s[start]) do start +:= 1
+   while stop >= start & any(' \t\r\n', s[stop]) do stop -:= 1
+   if start > stop then return ""
+   return s[start : stop + 1]
+end

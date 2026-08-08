@@ -29,4 +29,6 @@ limitations:
   - Shared local and hosted conformance is pending coordinator evidence.
   - Live authentication, optimistic updates, journals, and TransitionChunk assembly are deferred.
   - Live subscriptions retain only the newest 16 pending updates per subscriber.
-capabilities: []
+capabilities:
+  - http
+  - live

@@ -42,6 +42,7 @@ await checkDirtyExit();
 // These are the ambiguous or easily mistyped additions. Keep the unit check
 // pure so `./run validate` can retain its read-only filesystem contract.
 assert.equal(fenceLanguageFor("assembly-x86-64", "main.asm"), "nasm");
+assert.equal(fenceLanguageFor("ballerina", "main.bal"), "ballerina");
 assert.equal(fenceLanguageFor("freebasic", "main.bas"), "freebasic");
 assert.equal(fenceLanguageFor("c", "main.c"), "c");
 assert.equal(fenceLanguageFor("groovy", "main.groovy"), "groovy");

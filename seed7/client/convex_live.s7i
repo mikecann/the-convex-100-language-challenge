@@ -1,0 +1,902 @@
+
+(********************************************************************)
+(*                                                                  *)
+(*  convex_live.s7i  Native Seed7 client for Convex's Live sync     *)
+(*                   protocol: a hand-rolled RFC 6455 WebSocket     *)
+(*                   layer plus the query-set/Transition state      *)
+(*                   machine, both driven from one single-threaded  *)
+(*                   event loop (Seed7 ships no thread library, so  *)
+(*                   "one worker owns the socket" is enforced here  *)
+(*                   by construction: there is only ever one).      *)
+(*                                                                  *)
+(*  tls.s7i's ''tlsFile'' does not implement ''inputReady'' or      *)
+(*  ''poll'' (only the plain ''socket'' type underneath does), so   *)
+(*  every connection here is dialled in two steps: the raw          *)
+(*  ''socket'' is kept for bounded readiness checks and the TLS     *)
+(*  file wrapped around it is used for the actual encrypted reads   *)
+(*  and writes. For a plain ''ws://'' connection the two are the    *)
+(*  same handle.                                                    *)
+(*                                                                  *)
+(********************************************************************)
+
+include "convex.s7i";
+include "tls.s7i";
+include "socket.s7i";
+include "poll.s7i";
+include "msgdigest.s7i";
+include "encoding.s7i";
+include "bin32.s7i";
+include "time.s7i";
+include "duration.s7i";
+
+
+const integer: WS_OPCODE_TEXT is 1;
+const integer: WS_OPCODE_CLOSE is 8;
+const integer: WS_OPCODE_PING is 9;
+const integer: WS_OPCODE_PONG is 10;
+const integer: LIVE_MAX_MESSAGE is 4194304; # 4 MiB per Live value, matching c/ada.
+const integer: LIVE_QUEUE_CAPACITY is 16;
+const duration: LIVE_READ_STEP is 20000 . MICRO_SECONDS;
+const duration: LIVE_MIN_BACKOFF is 100000 . MICRO_SECONDS;
+const duration: LIVE_MAX_BACKOFF is 15 . SECONDS;
+
+
+(**
+ *  A source of bytes good enough for a WebSocket masking key: RFC 6455
+ *  requires the client to mask every frame so naive proxies never see
+ *  attacker-chosen bytes that look like another protocol, but the mask
+ *  itself carries no application security, so /dev/urandom is read
+ *  directly rather than pulling in a full CSPRNG dependency.
+ *)
+var integer: someRandomFallbackCounter is 0;
+
+const func string: someRandomBytes (in integer: count) is func
+  result
+    var string: bytes is "";
+  local
+    var file: source is STD_NULL;
+  begin
+    source := open("/dev/urandom", "r");
+    if source <> STD_NULL then
+      bytes := gets(source, count);
+      close(source);
+    end if;
+    while length(bytes) < count do
+      # Only reached if /dev/urandom is unavailable, which none of this
+      # client's target containers do; the mask still has to exist.
+      someRandomFallbackCounter +:= 1;
+      bytes &:= str(chr(someRandomFallbackCounter mod 256));
+    end while;
+  end func;
+
+
+const func string: maskPayload (in string: payload, in string: mask) is func
+  result
+    var string: masked is "\0;" mult length(payload);
+  local
+    var integer: index is 0;
+    var integer: maskIndex is 0;
+  begin
+    for index range 1 to length(payload) do
+      maskIndex := succ(pred(index) mod 4);
+      masked @:= [index] chr(ord(bin32(ord(payload[index])) ><
+          bin32(ord(mask[maskIndex]))));
+    end for;
+  end func;
+
+
+const proc: sendWsFrame (inout file: sock, in integer: opcode, in string: payload) is func
+  local
+    var string: header is "";
+    var string: mask is "";
+    var integer: frameLen is 0;
+  begin
+    frameLen := length(payload);
+    header := str(chr(128 + opcode));
+    if frameLen <= 125 then
+      header &:= str(chr(128 + frameLen));
+    elsif frameLen <= 65535 then
+      header &:= str(chr(128 + 126));
+      header &:= str(chr((frameLen div 256) mod 256));
+      header &:= str(chr(frameLen mod 256));
+    else
+      header &:= str(chr(128 + 127));
+      header &:= "\0;" mult 4;
+      header &:= str(chr((frameLen div 16777216) mod 256));
+      header &:= str(chr((frameLen div 65536) mod 256));
+      header &:= str(chr((frameLen div 256) mod 256));
+      header &:= str(chr(frameLen mod 256));
+    end if;
+    mask := someRandomBytes(4);
+    header &:= mask;
+    write(sock, header & maskPayload(payload, mask));
+  end func;
+
+
+(**
+ *  Read exactly `count` bytes from `dataSock`, waiting for `pollSock`
+ *  (the raw TCP socket -- see the module comment) to report readiness
+ *  before every chunk, up to `deadline` total. Returns a string shorter
+ *  than `count` on timeout, EOF, or transport error; callers treat any
+ *  short read as "the connection is dead" rather than distinguishing
+ *  the cause, matching how the rest of this client folds transport
+ *  failures into a reconnect.
+ *)
+const func string: readExact (inout file: pollSock, inout file: dataSock,
+    in integer: count, in time: deadline) is func
+  result
+    var string: data is "\0;" mult 0;
+  local
+    var string: chunk is "";
+    var boolean: failed is FALSE;
+  begin
+    while length(data) < count and not failed do
+      if time(NOW) >= deadline then
+        failed := TRUE;
+      else
+        # Try the read directly before waiting on the raw socket: a TLS
+        # record decrypts as a whole, so one earlier read on this same
+        # message can leave the rest already sitting in tls.s7i's own
+        # buffer with nothing further ever arriving on the wire to make
+        # inputReady(pollSock, ...) true again (confirmed directly: gating
+        # every chunk behind it hung a real multi-frame TLS response for
+        # its full deadline with zero bytes ever read). inputReady is
+        # still what keeps an empty read from busy-looping.
+        chunk := gets(dataSock, count - length(data));
+        if chunk <> "" then
+          data &:= chunk;
+        elsif not inputReady(pollSock, LIVE_READ_STEP) then
+          failed := TRUE;
+        end if;
+      end if;
+    end while;
+    if failed then
+      data := "";
+    end if;
+  end func;
+
+
+const type: wsReadOutcome is new struct
+    var boolean: ok is FALSE;
+    var string: payload is "";
+  end struct;
+
+
+(**
+ *  Read one complete WebSocket text message. Control frames (ping/
+ *  pong/close) may legally arrive between the fragments of a larger
+ *  text message; this loop consumes them without disturbing the text
+ *  assembly and answers a ping in place, exactly as RFC 6455 allows.
+ *  UTF-8 validity is not checked here -- the JSON parser downstream
+ *  rejects anything that is not well-formed UTF-8 JSON, which is the
+ *  one reassembled message this protocol ever needs to accept.
+ *)
+const func wsReadOutcome: readWsMessage (inout file: pollSock, inout file: dataSock,
+    in time: deadline) is func
+  result
+    var wsReadOutcome: outcome is wsReadOutcome.value;
+  local
+    var string: assembled is "";
+    var boolean: done is FALSE;
+    var string: head is "";
+    var integer: firstByte is 0;
+    var integer: secondByte is 0;
+    var boolean: fin is FALSE;
+    var integer: opcode is 0;
+    var integer: frameLen is 0;
+    var string: extended is "";
+    var string: payload is "";
+  begin
+    while not done do
+      head := readExact(pollSock, dataSock, 2, deadline);
+      if length(head) <> 2 then
+        done := TRUE;
+      else
+        firstByte := ord(head[1]);
+        secondByte := ord(head[2]);
+        fin := firstByte >= 128;
+        opcode := firstByte mod 16;
+        frameLen := secondByte mod 128;
+        if frameLen = 126 then
+          extended := readExact(pollSock, dataSock, 2, deadline);
+          if length(extended) <> 2 then
+            done := TRUE;
+          else
+            frameLen := ord(extended[1]) * 256 + ord(extended[2]);
+          end if;
+        elsif frameLen = 127 then
+          extended := readExact(pollSock, dataSock, 8, deadline);
+          if length(extended) <> 8 then
+            done := TRUE;
+          else
+            frameLen := (ord(extended[5]) * 16777216) + (ord(extended[6]) * 65536) +
+                   (ord(extended[7]) * 256) + ord(extended[8]);
+          end if;
+        end if;
+        if not done then
+          if frameLen > LIVE_MAX_MESSAGE or length(assembled) > LIVE_MAX_MESSAGE - frameLen then
+            done := TRUE; # oversize frame: treat as a dead connection.
+          else
+            payload := readExact(pollSock, dataSock, frameLen, deadline);
+            if length(payload) <> frameLen then
+              done := TRUE;
+            elsif opcode = WS_OPCODE_PING then
+              sendWsFrame(dataSock, WS_OPCODE_PONG, payload);
+            elsif opcode = WS_OPCODE_CLOSE then
+              done := TRUE;
+            elsif opcode <> WS_OPCODE_PONG then
+              assembled &:= payload;
+              if fin then
+                outcome.ok := TRUE;
+                outcome.payload := assembled;
+                done := TRUE;
+              end if;
+            end if;
+          end if;
+        end if;
+      end if;
+    end while;
+  end func;
+
+
+const func string: wsAcceptKeyFor (in string: clientKey) is
+  return toBase64(sha1(clientKey & "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
+
+
+(**
+ *  Perform the WebSocket opening handshake on an already-connected TLS
+ *  or plain socket, leaving `dataSock` ready for [[sendWsFrame]] and
+ *  [[readWsMessage]] on success. The handshake itself is a small,
+ *  ordinary HTTP request/response, so it is read line-at-a-time with
+ *  the same `getln` the HTTP client above uses rather than through the
+ *  binary frame reader.
+ *)
+const func boolean: wsHandshake (inout file: dataSock, in string: hostHeader,
+    in string: path) is func
+  result
+    var boolean: okay is FALSE;
+  local
+    var string: wsKey is "";
+    var string: request is "";
+    var string: statusLine is "";
+    var string: headerLine is "";
+    var string: gotAccept is "";
+    var integer: colonPos is 0;
+  begin
+    wsKey := toBase64(someRandomBytes(16));
+    request := "GET " & path & " HTTP/1.1\r\n";
+    request &:= "Host: " & hostHeader & "\r\n";
+    request &:= "Upgrade: websocket\r\n";
+    request &:= "Connection: Upgrade\r\n";
+    request &:= "Sec-WebSocket-Key: " & wsKey & "\r\n";
+    request &:= "Sec-WebSocket-Version: 13\r\n";
+    request &:= "\r\n";
+    write(dataSock, request);
+    statusLine := getln(dataSock);
+    if startsWith(statusLine, "HTTP/1.1 101") or startsWith(statusLine, "HTTP/1.0 101") then
+      headerLine := getln(dataSock);
+      while headerLine <> "" and headerLine <> "\r" do
+        colonPos := pos(headerLine, ":");
+        if colonPos <> 0 and lower(headerLine[.. pred(colonPos)]) = "sec-websocket-accept" then
+          gotAccept := trim(headerLine[succ(colonPos) ..]);
+        end if;
+        headerLine := getln(dataSock);
+      end while;
+      okay := gotAccept <> "" and gotAccept = wsAcceptKeyFor(wsKey);
+    end if;
+  end func;
+
+
+(**
+ *  One Live subscription's local state: the pending Add/Remove
+ *  bookkeeping mirrors `c/client/convex.c` (see its module comment on
+ *  rehydration and the retiring-subscription race), because that state
+ *  machine -- not the transport underneath it -- is the part of
+ *  "native" this client actually has to get right independently.
+ *)
+const type: convexSubscriptionState is new struct
+    var integer: queryId is 0;
+    var string: path is "";
+    var jsonValue: args is jsonValue.value;
+    var boolean: active is TRUE;
+    var boolean: addPending is TRUE;
+    var boolean: removePending is FALSE;
+    var boolean: rehydrating is FALSE;
+    var boolean: hasLastValue is FALSE;
+    var jsonValue: lastValue is jsonValue.value;
+    var array convexOutcome: queue is 0 times convexOutcome.value;
+  end struct;
+
+
+const type: convexLive is new struct
+    var convexClient: client is convexClient.value;
+    var file: pollSock is STD_NULL;
+    var file: sock is STD_NULL;
+    var boolean: connected is FALSE;
+    var integer: nextQueryId is 1;
+    var integer: querySetVersion is 0;
+    var integer: remoteQuerySet is 0;
+    var integer: remoteIdentity is 0;
+    var string: remoteTs is "AAAAAAAAAAA=";
+    var string: maxObservedTimestamp is "";
+    var integer: connectionCount is 0;
+    var string: lastCloseReason is "InitialConnect";
+    var time: reconnectAt is time.value;
+    var duration: backoff is LIVE_MIN_BACKOFF;
+    var hash [string] convexSubscriptionState: subs is (hash [string] convexSubscriptionState).value;
+  end struct;
+
+
+const func convexLive: openConvexLive (in convexClient: client) is func
+  result
+    var convexLive: live is convexLive.value;
+  begin
+    live.client := client;
+  end func;
+
+
+const func convexOutcome: liveError (in string: errName, in string: errMessage) is func
+  result
+    var convexOutcome: outcome is convexOutcome.value;
+  begin
+    outcome.error := convexError(errName, errMessage);
+  end func;
+
+
+const proc: enqueueDelivery (inout convexSubscriptionState: subState, in convexOutcome: outcome) is func
+  begin
+    if length(subState.queue) >= LIVE_QUEUE_CAPACITY then
+      subState.queue := subState.queue[2 ..];
+    end if;
+    subState.queue &:= outcome;
+  end func;
+
+
+const proc: markAllRehydrating (inout convexLive: live) is func
+  local
+    var string: subId is "";
+  begin
+    for subId range keys(live.subs) do
+      if live.subs[subId].active and not live.subs[subId].removePending then
+        live.subs[subId].rehydrating := TRUE;
+      end if;
+    end for;
+  end func;
+
+
+const proc: publishToAllEstablished (inout convexLive: live, in convexOutcome: outcome) is func
+  local
+    var string: subId is "";
+  begin
+    for subId range keys(live.subs) do
+      if live.subs[subId].active and not live.subs[subId].removePending and
+          not live.subs[subId].addPending then
+        enqueueDelivery(live.subs[subId], outcome);
+      end if;
+    end for;
+  end func;
+
+
+(**
+ *  Tear down the transport without attempting a graceful WebSocket
+ *  close handshake: every call site here already knows the connection
+ *  is unusable (a read or write just failed, or a reconnect is being
+ *  forced), so a close frame would either never arrive or race the
+ *  socket teardown for no benefit.
+ *)
+const proc: disconnectLiveSocket (inout convexLive: live, in string: reason) is func
+  begin
+    if live.sock <> STD_NULL then
+      close(live.sock);
+    end if;
+    live.sock := STD_NULL;
+    live.pollSock := STD_NULL;
+    live.connected := FALSE;
+    live.connectionCount +:= 1;
+    live.lastCloseReason := reason;
+    live.querySetVersion := 0;
+    live.remoteQuerySet := 0;
+    live.remoteIdentity := 0;
+    live.remoteTs := "AAAAAAAAAAA=";
+    markAllRehydrating(live);
+  end func;
+
+
+(**
+ *  A random v4 UUID for the sync protocol's `sessionId`. Only
+ *  uniqueness matters -- Convex uses it to recognise the same logical
+ *  session across a reconnect, never as a security token -- so this
+ *  reuses the same /dev/urandom source as the WebSocket mask.
+ *)
+const func string: randomSessionId is func
+  result
+    var string: id is "";
+  local
+    var string: raw is "";
+    var integer: index is 0;
+    var string: hex is "";
+  begin
+    # Assigned here, not in the declaration above -- see the note on
+    # `waitForLiveValue`'s deadline for why an impure call belongs in
+    # `begin`, not in a `local` initializer, on this toolchain.
+    raw := someRandomBytes(16);
+    for index range 1 to 16 do
+      hex &:= ord(raw[index]) RADIX 16 lpad0 2;
+    end for;
+    hex := lower(hex);
+    # RFC 4122-shaped (version/variant nibbles fixed), which is all Convex
+    # needs: a value that is unique per connection, not a real UUIDv4.
+    id := hex[1 .. 8] & "-" & hex[9 .. 12] & "-4" & hex[14 .. 16] &
+        "-a" & hex[18 .. 20] & "-" & hex[21 .. 32];
+  end func;
+
+
+const func string: connectMessage (inout convexLive: live) is func
+  result
+    var string: message is "";
+  local
+    var jsonObject: obj is jsonObject.value;
+  begin
+    obj @:= ["type"] jsonValue("Connect");
+    obj @:= ["sessionId"] jsonValue(randomSessionId);
+    obj @:= ["connectionCount"] jsonValue(live.connectionCount);
+    obj @:= ["lastCloseReason"] jsonValue(live.lastCloseReason);
+    if live.maxObservedTimestamp <> "" then
+      obj @:= ["maxObservedTimestamp"] jsonValue(live.maxObservedTimestamp);
+    end if;
+    obj @:= ["clientTs"] jsonValue(0);
+    message := toUtf8(jsonEncode(jsonValue(obj)));
+  end func;
+
+
+(**
+ *  Build a `ModifyQuerySet` message. `only`, when given, restricts the
+ *  message to that one subscription (used for a lone late Add or a
+ *  Remove); otherwise every subscription that is active, not already
+ *  pending removal, and (for a fresh connection's initial snapshot) not
+ *  itself mid-removal is folded into one Add batch.
+ *)
+const func string: modifyQuerySetMessage (inout convexLive: live, in string: onlyId,
+    in boolean: removing) is func
+  result
+    var string: message is "";
+  local
+    var jsonObject: obj is jsonObject.value;
+    var jsonValueArray: mods is 0 times jsonValue.value;
+    var string: subId is "";
+    var jsonObject: mod is jsonObject.value;
+    var jsonValueArray: argsArray is 0 times jsonValue.value;
+  begin
+    obj @:= ["type"] jsonValue("ModifyQuerySet");
+    obj @:= ["baseVersion"] jsonValue(live.querySetVersion);
+    obj @:= ["newVersion"] jsonValue(succ(live.querySetVersion));
+    for subId range keys(live.subs) do
+      if (onlyId <> "" and subId = onlyId) or
+          (onlyId = "" and live.subs[subId].active and not live.subs[subId].removePending) then
+        mod := jsonObject.value;
+        if removing then
+          mod @:= ["type"] jsonValue("Remove");
+        else
+          mod @:= ["type"] jsonValue("Add");
+        end if;
+        mod @:= ["queryId"] jsonValue(live.subs[subId].queryId);
+        if not removing then
+          mod @:= ["udfPath"] jsonValue(live.subs[subId].path);
+          argsArray := 0 times jsonValue.value;
+          argsArray &:= live.subs[subId].args;
+          mod @:= ["args"] jsonValue(argsArray);
+        end if;
+        mods &:= jsonValue(mod);
+      end if;
+    end for;
+    obj @:= ["modifications"] jsonValue(mods);
+    message := toUtf8(jsonEncode(jsonValue(obj)));
+  end func;
+
+
+const func boolean: anyActiveSubscription (in convexLive: live) is func
+  result
+    var boolean: found is FALSE;
+  local
+    var string: subId is "";
+  begin
+    for subId range keys(live.subs) do
+      if live.subs[subId].active and not live.subs[subId].removePending then
+        found := TRUE;
+      end if;
+    end for;
+  end func;
+
+
+const proc: markAllAddsSent (inout convexLive: live) is func
+  local
+    var string: subId is "";
+  begin
+    for subId range keys(live.subs) do
+      if live.subs[subId].active and not live.subs[subId].removePending then
+        live.subs[subId].addPending := FALSE;
+      end if;
+    end for;
+  end func;
+
+
+(**
+ *  Dial the deployment's `/api/sync` endpoint and complete the sync
+ *  protocol's own opening handshake: the WebSocket upgrade, then a
+ *  `Connect` message, then -- if any subscription already exists from
+ *  before a reconnect -- one `ModifyQuerySet` batch re-adding all of
+ *  them as a single snapshot, exactly as `c/client/convex.c` does.
+ *  Every step can fail; any failure here just leaves `live.sock`
+ *  STD_NULL, which the caller reads as "try again after the backoff".
+ *)
+const func boolean: connectLiveSocket (inout convexLive: live) is func
+  result
+    var boolean: okay is FALSE;
+  local
+    var integer: defaultPort is 80;
+    var httpLocation: location is httpLocation.value;
+    var file: rawSocket is STD_NULL;
+    var file: dataSocket is STD_NULL;
+  begin
+    if live.client.useTls then
+      defaultPort := 443;
+    end if;
+    location := getHttpLocation(live.client.hostAndPort, defaultPort);
+    rawSocket := openInetSocket(location.hostName, location.portNumber);
+    if rawSocket <> STD_NULL then
+      if live.client.useTls then
+        dataSocket := openTlsSocket(rawSocket, location.hostName);
+      else
+        dataSocket := rawSocket;
+      end if;
+      if dataSocket <> STD_NULL and
+          wsHandshake(dataSocket, live.client.hostAndPort, "/api/sync") then
+        live.pollSock := rawSocket;
+        live.sock := dataSocket;
+        block
+          sendWsFrame(live.sock, WS_OPCODE_TEXT, connectMessage(live));
+          if anyActiveSubscription(live) then
+            sendWsFrame(live.sock, WS_OPCODE_TEXT, modifyQuerySetMessage(live, "", FALSE));
+            live.querySetVersion := succ(live.querySetVersion);
+            markAllAddsSent(live);
+          end if;
+          okay := TRUE;
+        exception
+          catch FILE_ERROR:
+            okay := FALSE;
+        end block;
+      end if;
+      if not okay then
+        if dataSocket <> STD_NULL and dataSocket <> rawSocket then
+          close(dataSocket);
+        end if;
+        close(rawSocket);
+        live.pollSock := STD_NULL;
+        live.sock := STD_NULL;
+      end if;
+    end if;
+  end func;
+
+
+const proc: subscribeLive (inout convexLive: live, in string: subscriptionId,
+    in string: path, in jsonValue: args) is func
+  local
+    var convexSubscriptionState: newSubState is convexSubscriptionState.value;
+  begin
+    newSubState.queryId := live.nextQueryId;
+    live.nextQueryId +:= 1;
+    newSubState.path := path;
+    newSubState.args := args;
+    # Overwriting the hash entry retires any same-ID subscription's relay
+    # immediately: the next Transition lookup only ever sees this new
+    # state, so no stale value from the old subscription can surface.
+    live.subs @:= [subscriptionId] newSubState;
+  end func;
+
+
+const proc: unsubscribeLive (inout convexLive: live, in string: subscriptionId) is func
+  begin
+    if subscriptionId in live.subs and live.subs[subscriptionId].active then
+      if live.sock <> STD_NULL then
+        live.subs[subscriptionId].removePending := TRUE;
+      else
+        live.subs[subscriptionId].active := FALSE;
+      end if;
+    end if;
+  end func;
+
+
+const func boolean: debugDisconnectLive (inout convexLive: live) is func
+  result
+    var boolean: okay is FALSE;
+  begin
+    if live.sock <> STD_NULL then
+      disconnectLiveSocket(live, "DebugDisconnect");
+      live.reconnectAt := time(NOW) + LIVE_MIN_BACKOFF;
+      live.backoff := LIVE_MIN_BACKOFF;
+      okay := TRUE;
+    end if;
+  end func;
+
+
+const proc: closeLive (inout convexLive: live) is func
+  begin
+    if live.sock <> STD_NULL then
+      disconnectLiveSocket(live, "ClientClosed");
+    end if;
+  end func;
+
+
+const func string: subIdByQueryId (in convexLive: live, in integer: queryId) is func
+  result
+    var string: found is "";
+  local
+    var string: subId is "";
+  begin
+    for subId range keys(live.subs) do
+      if live.subs[subId].queryId = queryId then
+        found := subId;
+      end if;
+    end for;
+  end func;
+
+
+const func convexOutcome: outcomeFromFailure (in jsonValue: modification) is func
+  result
+    var convexOutcome: outcome is convexOutcome.value;
+  local
+    var string: message is "Live query failed";
+  begin
+    if "errorMessage" in modification and category(modification["errorMessage"]) = JSON_STRING then
+      message := string(modification["errorMessage"]);
+    end if;
+    if "errorData" in modification then
+      outcome.error := convexError("FunctionError", message, modification["errorData"]);
+    else
+      outcome.error := convexError("FunctionError", message);
+    end if;
+  end func;
+
+
+(**
+ *  Apply one `Transition` message: update the local query-set version
+ *  and, for each `QueryUpdated`/`QueryFailed` modification whose
+ *  subscription is still active, enqueue a delivery. A `QueryUpdated`
+ *  is suppressed exactly once -- only immediately after a reconnect,
+ *  and only when the value did not actually change -- which is what
+ *  keeps a `debugDisconnect` sequence at initial `0`, ack, external
+ *  mutation, `1` instead of replaying a redundant `0`.
+ *)
+const proc: handleTransition (inout convexLive: live, in jsonValue: message) is func
+  local
+    var jsonValue: mods is jsonValue.value;
+    var jsonValue: modification is jsonValue.value;
+    var string: modType is "";
+    var integer: queryId is 0;
+    var string: subId is "";
+    var jsonValue: newValue is jsonValue.value;
+    var boolean: unchanged is FALSE;
+    var boolean: suppress is FALSE;
+    var convexOutcome: outcome is convexOutcome.value;
+    var jsonValue: endVersion is jsonValue.value;
+    var jsonValue: endTs is jsonValue.value;
+  begin
+    if "modifications" in message and category(message["modifications"]) = JSON_ARRAY then
+      mods := message["modifications"];
+      for modification range mods do
+        if category(modification) = JSON_OBJECT and "type" in modification and
+            "queryId" in modification and category(modification["queryId"]) = JSON_NUMBER then
+          modType := "";
+          if category(modification["type"]) = JSON_STRING then
+            modType := string(modification["type"]);
+          end if;
+          queryId := integer(modification["queryId"]);
+          subId := subIdByQueryId(live, queryId);
+          if subId <> "" and live.subs[subId].active and not live.subs[subId].removePending then
+            if modType = "QueryUpdated" then
+              newValue := jsonValue.value;
+              if "value" in modification then
+                newValue := modification["value"];
+              end if;
+              unchanged := live.subs[subId].hasLastValue and
+                  str(live.subs[subId].lastValue) = str(newValue);
+              suppress := live.subs[subId].rehydrating and unchanged;
+              live.subs[subId].lastValue := newValue;
+              live.subs[subId].hasLastValue := TRUE;
+              live.subs[subId].rehydrating := FALSE;
+              if not suppress then
+                outcome := convexOutcome.value;
+                outcome.ok := TRUE;
+                outcome.value := newValue;
+                enqueueDelivery(live.subs[subId], outcome);
+              end if;
+            elsif modType = "QueryFailed" then
+              live.subs[subId].hasLastValue := FALSE;
+              live.subs[subId].rehydrating := FALSE;
+              enqueueDelivery(live.subs[subId], outcomeFromFailure(modification));
+            end if;
+          end if;
+        end if;
+      end for;
+    end if;
+    if "endVersion" in message and category(message["endVersion"]) = JSON_OBJECT then
+      endVersion := message["endVersion"];
+      if "querySet" in endVersion and category(endVersion["querySet"]) = JSON_NUMBER then
+        live.remoteQuerySet := integer(endVersion["querySet"]);
+      end if;
+      if "identity" in endVersion and category(endVersion["identity"]) = JSON_NUMBER then
+        live.remoteIdentity := integer(endVersion["identity"]);
+      end if;
+      if "ts" in endVersion and category(endVersion["ts"]) = JSON_STRING then
+        endTs := endVersion["ts"];
+        live.remoteTs := string(endTs);
+        live.maxObservedTimestamp := live.remoteTs;
+      end if;
+    end if;
+  end func;
+
+
+const func boolean: sendOnePendingModification (inout convexLive: live) is func
+  result
+    var boolean: sent is FALSE;
+  local
+    var string: subId is "";
+    var string: pickedAdd is "";
+    var string: pickedRemove is "";
+  begin
+    for subId range keys(live.subs) do
+      if pickedAdd = "" and live.subs[subId].active and live.subs[subId].addPending and
+          not live.subs[subId].removePending then
+        pickedAdd := subId;
+      end if;
+    end for;
+    block
+      if pickedAdd <> "" then
+        sendWsFrame(live.sock, WS_OPCODE_TEXT, modifyQuerySetMessage(live, pickedAdd, FALSE));
+        live.querySetVersion +:= 1;
+        live.subs[pickedAdd].addPending := FALSE;
+        sent := TRUE;
+      else
+        for subId range keys(live.subs) do
+          if pickedRemove = "" and live.subs[subId].removePending then
+            pickedRemove := subId;
+          end if;
+        end for;
+        if pickedRemove <> "" then
+          sendWsFrame(live.sock, WS_OPCODE_TEXT, modifyQuerySetMessage(live, pickedRemove, TRUE));
+          live.querySetVersion +:= 1;
+          live.subs[pickedRemove].active := FALSE;
+          live.subs[pickedRemove].removePending := FALSE;
+          sent := TRUE;
+        end if;
+      end if;
+    exception
+      catch FILE_ERROR:
+        disconnectLiveSocket(live, "TransportError: write failed");
+        sent := TRUE; # nothing more to send this tick either way.
+    end block;
+  end func;
+
+
+(**
+ *  Advance the Live state machine by one step. This is the only place
+ *  that touches `live.sock`, so calling it from a single adapter loop
+ *  (rather than from a background thread Seed7 does not have) is what
+ *  gives this client the "one worker owns the socket" property the
+ *  shared conformance suite requires.
+ *
+ *  When disconnected, at most one reconnect attempt is made per call.
+ *  When connected, at most one pending Add/Remove is sent, or -- if
+ *  nothing was pending -- one read step is taken: a cheap `inputReady`
+ *  check first (so an idle connection never blocks this loop), and
+ *  only if that reports data does the bounded, blocking frame reader
+ *  actually run.
+ *)
+const proc: pumpLive (inout convexLive: live) is func
+  local
+    var string: subId is "";
+    var wsReadOutcome: received is wsReadOutcome.value;
+    var jsonValue: message is jsonValue.value;
+    var boolean: parsedOkay is FALSE;
+    var string: msgType is "";
+  begin
+    if live.sock = STD_NULL then
+      for subId range keys(live.subs) do
+        if live.subs[subId].removePending then
+          live.subs[subId].active := FALSE;
+          live.subs[subId].removePending := FALSE;
+        end if;
+      end for;
+      if anyActiveSubscription(live) and time(NOW) >= live.reconnectAt then
+        if not connectLiveSocket(live) then
+          live.reconnectAt := time(NOW) + live.backoff;
+          if live.backoff * 2 <= LIVE_MAX_BACKOFF then
+            live.backoff := live.backoff * 2;
+          else
+            live.backoff := LIVE_MAX_BACKOFF;
+          end if;
+        end if;
+      end if;
+    elsif not sendOnePendingModification(live) and live.sock <> STD_NULL and
+        inputReady(live.pollSock, LIVE_READ_STEP) then
+      received := readWsMessage(live.pollSock, live.sock, time(NOW) + 5 . SECONDS);
+      if received.ok then
+        parsedOkay := FALSE;
+        block
+          message := readJson(fromUtf8(received.payload));
+          parsedOkay := TRUE;
+        exception
+          catch RANGE_ERROR:
+            parsedOkay := FALSE;
+        end block;
+        msgType := "";
+        if parsedOkay and category(message) = JSON_OBJECT and "type" in message and
+            category(message["type"]) = JSON_STRING then
+          msgType := string(message["type"]);
+        end if;
+        if msgType = "Transition" then
+          handleTransition(live, message);
+        elsif msgType = "Ping" or msgType = "MutationResponse" or msgType = "ActionResponse" then
+          # Not used by this client's own calls (mutations/actions run over
+          # HTTP); harmless to see if the same connection ever receives one.
+        elsif not parsedOkay then
+          publishToAllEstablished(live, liveError("ProtocolError",
+              "Live server sent an undecodable message"));
+          disconnectLiveSocket(live, "ProtocolError: undecodable message");
+          live.reconnectAt := time(NOW);
+        else
+          publishToAllEstablished(live, liveError("ProtocolError",
+              "unexpected Live message type: " & msgType));
+          disconnectLiveSocket(live, "ProtocolError: unexpected message type");
+          live.reconnectAt := time(NOW);
+        end if;
+      else
+        publishToAllEstablished(live, liveError("TransportError",
+            "Live connection was lost"));
+        disconnectLiveSocket(live, "TransportError: read failed");
+        live.reconnectAt := time(NOW) + live.backoff;
+        if live.backoff * 2 <= LIVE_MAX_BACKOFF then
+          live.backoff := live.backoff * 2;
+        else
+          live.backoff := LIVE_MAX_BACKOFF;
+        end if;
+      end if;
+    end if;
+  end func;
+
+
+(**
+ *  Block (by repeatedly pumping the single-threaded state machine
+ *  above) until `subscriptionId` has a delivery or `timeout` elapses.
+ *  This is the ergonomic entry point [[examples/basics/main.sd7]]
+ *  uses; the conformance adapter calls [[pumpLive]] directly instead,
+ *  because it must service every subscription each tick rather than
+ *  block on one.
+ *)
+const func convexOutcome: waitForLiveValue (inout convexLive: live, in string: subscriptionId,
+    in duration: timeout) is func
+  result
+    var convexOutcome: outcome is convexOutcome.value;
+  local
+    var time: deadline is time.value;
+    var boolean: gotValue is FALSE;
+  begin
+    # Assigned here rather than in the declaration above: a `local`
+    # declaration's own initializer is evaluated too early for a call
+    # with a real-world side effect like the clock (confirmed directly
+    # against this toolchain -- `is time(NOW)` silently captured a
+    # stale moment, not the value at function entry).
+    deadline := time(NOW) + timeout;
+    while not gotValue and time(NOW) < deadline do
+      if subscriptionId in live.subs and length(live.subs[subscriptionId].queue) > 0 then
+        outcome := live.subs[subscriptionId].queue[1];
+        live.subs[subscriptionId].queue := live.subs[subscriptionId].queue[2 ..];
+        gotValue := TRUE;
+      else
+        pumpLive(live);
+      end if;
+    end while;
+    if not gotValue then
+      outcome := liveError("TransportError", "timed out waiting for a Live value");
+    end if;
+  end func;

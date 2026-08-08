@@ -4,5 +4,40 @@ displayName: "BlitzMax"
 rank: 61
 selectionTier: coverage
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native BlitzMax NG implementation. The Convex HTTP envelopes, the RFC 6455
+    WebSocket handshake and frame codec, the pinned /api/sync query-set
+    protocol, bounded JSON handling, and every deadline are written in
+    BlitzMax. Byte transport uses the stock Net.mbedtls module for TCP and TLS
+    and the stock Text.Json module for parsing and serialising values.
+toolchain:
+  name: BlitzMax NG
+  version: 0.165.3.61.202608020404
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication, optimistic updates, WebSocket mutations, WebSocket actions, journals, and TransitionChunk assembly are deferred; a TransitionChunk is treated as protocol drift and retires the connection.
+  - Name resolution and the TCP connect are bounded by the operating system's resolver and connect timeouts rather than by the client's absolute deadline, because mbed TLS exposes no incremental connect. Every later handshake, request, frame, and close step is bounded by one absolute monotonic deadline.
+  - Each Live relay is bounded to 16 reserved queued or in-flight events and to the 8 MiB retained-JSON bound plus a 64 KiB allowance of value, error, log, and runtime representation, so one maximal accepted value can be held exactly once; invalidation is an acknowledgement barrier and a relay never delivers re-entrantly.
+  - Untrusted JSON is scanned before it is parsed; a document whose retained tree would exceed 8 MiB or nest deeper than 64 levels is refused as a ProtocolError, so a wire-legal but node-dense value is rejected rather than delivered.
+  - HTTP bodies are capped at 2 MiB under one absolute deadline and must satisfy Content-Length or complete chunked framing. A response carrying neither framing header is read to a clean connection close, which is the one place truncation is indistinguishable from completion.
+  - Values use Convex's JSON-safe subset and are exposed as Text.Json nodes.
+  - The shared README and site generator has no BlitzMax fence mapping, so the canonical example renders as plain text rather than highlighted source. Changing that is a shared-infrastructure edit, not a language one.
+capabilities:
+  - http
+  - live

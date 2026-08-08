@@ -1,0 +1,20 @@
+import {
+  "convexdemo/moonbit/convex",
+  "moonbitlang/core/buffer",
+  "moonbitlang/core/encoding/utf8",
+  "moonbitlang/core/env",
+  "moonbitlang/core/json",
+  "moonbitlang/async",
+  "moonbitlang/async/cond_var",
+  "moonbitlang/async/io",
+  "moonbitlang/async/socket",
+  "moonbitlang/async/stdio",
+}
+
+import {
+  "moonbitlang/core/test",
+} for "wbtest"
+
+supported_targets = "+native"
+
+pkgtype(kind: "executable")

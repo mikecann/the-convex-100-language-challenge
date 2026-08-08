@@ -4,5 +4,41 @@ displayName: "Lean"
 rank: 89
 selectionTier: curated_backfill
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Lean 4 client. HTTP/1.1, RFC 6455 framing, and the pinned Convex
+    sync profile are implemented in Lean over one C shim that provides sockets,
+    OpenSSL, poll, a monotonic clock, SHA-1, and the CSPRNG.
+toolchain:
+  name: Lean
+  version: 4.23.0
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - The Docker test stage (build, unit suites and the example run) passes on a
+    remote builder for this source checkpoint. Shared and hosted conformance
+    have not been run, so no capability is claimed and badges remain unearned.
+  - Live authentication, optimistic updates, mutations and actions over the WebSocket, and TransitionChunk assembly are deferred.
+  - The client supports the JSON-safe Convex subset; tagged Convex value encodings are not converted into richer Lean types.
+  - HTTP uses one connection per request with Connection close; persistent and pipelined connections are deferred.
+  - Each subscription retains at most the newest 16 updates, and all subscriptions share a 16 MiB charged-byte budget from which the globally oldest intermediate state is dropped first.
+  - The adapter retains at most the newest 16 encoded events within 6 MiB including a write in flight; subscription events may be coalesced under pressure while acknowledgements and errors wait for room and then fail on an admission deadline.
+  - The client runs on one poll-driven thread, so a blocking HTTP call does not advance the Live loop for its duration.
+  - Capability badges are intentionally empty until root-owned local and hosted conformance evidence passes.
+capabilities:
+  - http
+  - live

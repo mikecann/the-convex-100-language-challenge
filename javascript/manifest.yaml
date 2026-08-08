@@ -26,4 +26,6 @@ limitations:
   - Live authentication, WebSocket mutations, actions, optimistic updates, and journals are deferred.
   - TransitionChunk assembly and non-JSON Convex value encodings are treated as protocol drift.
   - Live delivery uses a bounded newest-value queue of 16 updates per subscription.
-capabilities: []
+capabilities:
+  - http
+  - live

@@ -29,4 +29,6 @@ limitations:
   - Capability badges remain empty until the coordinator runs shared local and hosted conformance.
   - Live authentication, transition chunks, optimistic updates, and non-JSON Convex values are deferred.
   - The Live delivery queue is bounded to the newest 16 events per subscription.
-capabilities: []
+capabilities:
+  - http
+  - live

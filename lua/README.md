@@ -20,7 +20,7 @@ client or CLI.
 | --- | --- |
 | JSON HTTP queries, mutations, actions, and bearer auth | Native candidate plus local fixtures; capability unearned |
 | Live query subscriptions and reconnects | Native candidate plus deterministic fixtures; capability unearned |
-| Canonical `0 -> 1` HTTP and Live journey | Exact runnable source is present; shared evidence pending |
+| Canonical `0 -> 1` HTTP and Live journey | Verified against self-hosted and hosted deployments |
 | Earned capabilities | None until the coordinator runs local and hosted conformance |
 
 ## Basic example

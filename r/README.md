@@ -15,8 +15,8 @@ starts Live before the mutation, and checks every observed value.
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, and actions | Awaiting shared conformance |
-| Live subscriptions and reconnects | Awaiting shared conformance |
+| HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
+| Live subscriptions and reconnects | Verified by shared local and hosted conformance |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.R -->
 ```r

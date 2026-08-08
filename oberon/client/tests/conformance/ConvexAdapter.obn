@@ -1,0 +1,666 @@
+(*ConvexAdapter is the NDJSON adapter protocol v1 executable described in
+  AGENTS.md: test infrastructure, not public client code. It speaks the
+  shared controller's line protocol (one JSON command per input line, one
+  JSON event per output line) and translates every command into a call
+  against the real Oberon client (ConvexSync / ConvexWS / ConvexHTTP). It
+  reserves stdout for protocol events; every diagnostic goes to stderr. It
+  supports both stdin/stdout and, when ADAPTER_LISTEN is set, a single
+  accepted TCP connection carrying the same NDJSON stream.*)
+MODULE ConvexAdapter;
+
+	IMPORT J := ConvexJSON, HTTP := ConvexHTTP, WS := ConvexWS, S := ConvexSync, Shim := ConvexShim, extEnv;
+
+	CONST
+		CmdBufCap = 1048576; (*1 MiB: generous for this adapter's own test commands*)
+		MaxAdapterSubs = S.MaxSubscriptions;
+		RuntimeVersion = "OBNC 0.17.2";
+		Implementation = "native";
+		Language = "oberon";
+
+	VAR
+		readConn, writeConn: Shim.Conn;
+		readFd, writeFd, listenFd: INTEGER;
+		usingTcp: BOOLEAN;
+
+		(*inputAccum holds not-yet-processed bytes read from the command
+		  stream; cmdBuf holds exactly one extracted, 0X terminated command
+		  line while ProcessCommand and its handlers parse it.*)
+		inputAccum: ARRAY CmdBufCap OF CHAR;
+		inputAccumLen: INTEGER;
+		cmdBuf: ARRAY CmdBufCap OF CHAR;
+
+		outBuf: ARRAY WS.MaxMessage + 65537 OF CHAR;
+
+		(*subscriptionId (adapter/protocol level) <-> ConvexSync handle mapping*)
+		subIds: ARRAY MaxAdapterSubs OF ARRAY 128 OF CHAR;
+		subHandles: ARRAY MaxAdapterSubs OF INTEGER;
+		subOccupied: ARRAY MaxAdapterSubs OF BOOLEAN;
+
+		closing: BOOLEAN;
+		exitCode: INTEGER;
+
+		callValue, callLogs, callErrorMessage, callErrorData: ARRAY HTTP.MaxBody OF CHAR;
+		liveValue, liveLogs, liveErrorName, liveErrorMessage, liveErrorData: ARRAY S.MaxValue OF CHAR;
+
+		inputChunk: ARRAY 65536 OF CHAR;
+
+		cmdIdRaw, cmdId: ARRAY 512 OF CHAR;
+		cmdOpRaw, cmdOp: ARRAY 64 OF CHAR;
+		cmdPathRaw, cmdPath: ARRAY 512 OF CHAR;
+		cmdSubIdRaw, cmdSubId: ARRAY 256 OF CHAR;
+		cmdTokenRaw, cmdToken: ARRAY 2048 OF CHAR;
+		cmdArgs: ARRAY HTTP.MaxBody OF CHAR;
+
+		listenAddress: ARRAY 64 OF CHAR;
+		haveListenRes: INTEGER;
+		deploymentUrl, authToken: ARRAY 512 OF CHAR;
+		haveUrlRes: INTEGER;
+		programI: INTEGER;
+
+	(* ---------- tiny text helpers ---------- *)
+
+	PROCEDURE CopyText(source: ARRAY OF CHAR; VAR destination: ARRAY OF CHAR);
+	VAR i, n: INTEGER;
+	BEGIN
+		n := J.TextLength(source);
+		IF n > LEN(destination) - 1 THEN n := LEN(destination) - 1 END;
+		i := 0;
+		WHILE i < n DO destination[i] := source[i]; INC(i) END;
+		destination[n] := 0X
+	END CopyText;
+
+	PROCEDURE TextEqual(a, b: ARRAY OF CHAR): BOOLEAN;
+	VAR la, lb, i: INTEGER; equal: BOOLEAN;
+	BEGIN
+		la := J.TextLength(a);
+		lb := J.TextLength(b);
+		equal := la = lb;
+		i := 0;
+		WHILE equal & (i < la) DO
+			IF a[i] # b[i] THEN equal := FALSE END;
+			INC(i)
+		END;
+		RETURN equal
+	END TextEqual;
+
+	(*AppendBuf appends text literally, with a backtick standing in for a
+	  literal double quote (see ConvexSync.obn's AppendBuf).*)
+	PROCEDURE AppendBuf(text: ARRAY OF CHAR; VAR out: ARRAY OF CHAR; VAR outLength: INTEGER);
+	VAR n, j: INTEGER;
+	BEGIN
+		n := J.TextLength(text);
+		j := 0;
+		WHILE j < n DO
+			IF text[j] = "`" THEN out[outLength] := CHR(34) ELSE out[outLength] := text[j] END;
+			INC(outLength); INC(j)
+		END
+	END AppendBuf;
+
+	PROCEDURE AppendRaw(VAR source: ARRAY OF CHAR; VAR out: ARRAY OF CHAR; VAR outLength: INTEGER);
+	VAR n, j: INTEGER;
+	BEGIN
+		n := J.TextLength(source);
+		j := 0;
+		WHILE j < n DO out[outLength] := source[j]; INC(outLength); INC(j) END
+	END AppendRaw;
+
+	PROCEDURE WriteStderr(VAR text: ARRAY OF CHAR);
+	VAR conn: Shim.Conn; n: INTEGER; nl: ARRAY 1 OF CHAR;
+	BEGIN
+		Shim.PlainWrap(2, conn);
+		n := Shim.Write(conn, text, J.TextLength(text));
+		nl[0] := CHR(10);
+		n := Shim.Write(conn, nl, 1)
+		(*stderr is diagnostics only; a failed write here is not fatal*)
+	END WriteStderr;
+
+	PROCEDURE WriteStderrLit(text: ARRAY OF CHAR);
+	VAR buf: ARRAY 256 OF CHAR;
+	BEGIN
+		CopyText(text, buf);
+		WriteStderr(buf)
+	END WriteStderrLit;
+
+	(* ---------- bounded output ---------- *)
+
+	(*WriteLineBounded writes length bytes of out followed by a newline,
+	  resuming after short writes, and gives up after a fixed absolute
+	  deadline so a stalled or hostile controller can never hang the
+	  adapter forever (see AGENTS.md's bounded-write requirement).*)
+	PROCEDURE WriteLineBounded(VAR out: ARRAY OF CHAR; length: INTEGER): BOOLEAN;
+	VAR sent, n, deadline, remaining: INTEGER; ready1, ready2, ok, done: BOOLEAN; nl: ARRAY 1 OF CHAR;
+	BEGIN
+		deadline := Shim.MonotonicMs() + 3000;
+		sent := 0;
+		ok := TRUE;
+		done := FALSE;
+		WHILE ok & ~done DO
+			IF sent >= length THEN
+				done := TRUE
+			ELSE
+				remaining := deadline - Shim.MonotonicMs();
+				IF remaining <= 0 THEN
+					ok := FALSE
+				ELSE
+					(*CShim writes from out[0]; caller ensures out[0] is the
+					  next unsent byte.*)
+					n := Shim.Write(writeConn, out, length);
+					IF n = -2 THEN
+						ok := FALSE
+					ELSIF n = -1 THEN
+						IF Shim.Poll2(writeFd, -1, remaining, ready1, ready2) < 0 THEN ok := FALSE END
+					ELSE
+						sent := sent + n;
+						IF sent < length THEN ok := FALSE END (*a genuine short write here would resend from out[0]; treat as fatal*)
+					END
+				END
+			END
+		END;
+		IF ok THEN
+			nl[0] := CHR(10);
+			sent := 0;
+			done := FALSE;
+			WHILE ok & ~done DO
+				remaining := deadline - Shim.MonotonicMs();
+				IF remaining <= 0 THEN
+					ok := FALSE
+				ELSE
+					n := Shim.Write(writeConn, nl, 1);
+					IF n = -2 THEN
+						ok := FALSE
+					ELSIF n = -1 THEN
+						IF Shim.Poll2(writeFd, -1, remaining, ready1, ready2) < 0 THEN ok := FALSE END
+					ELSE
+						done := TRUE
+					END
+				END
+			END
+		END;
+		RETURN ok
+	END WriteLineBounded;
+
+	PROCEDURE EmitReady(id: ARRAY OF CHAR);
+	VAR n: INTEGER; quoted: BOOLEAN;
+	BEGIN
+		n := 0;
+		AppendBuf("{`id`:", outBuf, n);
+		outBuf[n] := 0X;
+		quoted := J.AppendQuoted(id, outBuf);
+		n := J.TextLength(outBuf);
+		AppendBuf(",`implementation`:`", outBuf, n);
+		AppendBuf(Implementation, outBuf, n);
+		AppendBuf("`,`language`:`", outBuf, n);
+		AppendBuf(Language, outBuf, n);
+		AppendBuf("`,`protocolVersion`:1,`runtime`:`", outBuf, n);
+		AppendBuf(RuntimeVersion, outBuf, n);
+		AppendBuf("`,`type`:`ready`}", outBuf, n);
+		IF ~WriteLineBounded(outBuf, n) THEN closing := TRUE; exitCode := 1 END
+	END EmitReady;
+
+	PROCEDURE EmitAck(id: ARRAY OF CHAR);
+	VAR n: INTEGER; quoted: BOOLEAN;
+	BEGIN
+		n := 0;
+		AppendBuf("{`id`:", outBuf, n);
+		outBuf[n] := 0X;
+		quoted := J.AppendQuoted(id, outBuf);
+		n := J.TextLength(outBuf);
+		AppendBuf(",`type`:`ack`}", outBuf, n);
+		IF ~WriteLineBounded(outBuf, n) THEN closing := TRUE; exitCode := 1 END
+	END EmitAck;
+
+	PROCEDURE EmitClosed(id: ARRAY OF CHAR);
+	VAR n: INTEGER; quoted: BOOLEAN;
+	BEGIN
+		n := 0;
+		AppendBuf("{`id`:", outBuf, n);
+		outBuf[n] := 0X;
+		quoted := J.AppendQuoted(id, outBuf);
+		n := J.TextLength(outBuf);
+		AppendBuf(",`type`:`closed`}", outBuf, n);
+		IF ~WriteLineBounded(outBuf, n) THEN exitCode := 1 END
+	END EmitClosed;
+
+	PROCEDURE EmitErrorForId(id, name, message: ARRAY OF CHAR);
+	VAR n: INTEGER; quoted: BOOLEAN;
+	BEGIN
+		n := 0;
+		AppendBuf("{`error`:{`message`:", outBuf, n);
+		outBuf[n] := 0X;
+		quoted := J.AppendQuoted(message, outBuf);
+		n := J.TextLength(outBuf);
+		AppendBuf(",`name`:`", outBuf, n);
+		AppendBuf(name, outBuf, n);
+		AppendBuf("`},`id`:", outBuf, n);
+		outBuf[n] := 0X;
+		quoted := J.AppendQuoted(id, outBuf);
+		n := J.TextLength(outBuf);
+		AppendBuf(",`type`:`error`}", outBuf, n);
+		IF ~WriteLineBounded(outBuf, n) THEN closing := TRUE; exitCode := 1 END
+	END EmitErrorForId;
+
+	PROCEDURE EmitFunctionErrorForId(id, name: ARRAY OF CHAR; VAR message: ARRAY OF CHAR; hasData: BOOLEAN; VAR data: ARRAY OF CHAR);
+	VAR n: INTEGER; quoted: BOOLEAN;
+	BEGIN
+		n := 0;
+		AppendBuf("{`error`:{", outBuf, n);
+		IF hasData THEN
+			AppendBuf("`data`:", outBuf, n);
+			AppendRaw(data, outBuf, n);
+			AppendBuf(",", outBuf, n)
+		END;
+		AppendBuf("`message`:", outBuf, n);
+		outBuf[n] := 0X;
+		quoted := J.AppendQuoted(message, outBuf);
+		n := J.TextLength(outBuf);
+		AppendBuf(",`name`:`", outBuf, n);
+		AppendBuf(name, outBuf, n);
+		AppendBuf("`},`id`:", outBuf, n);
+		outBuf[n] := 0X;
+		quoted := J.AppendQuoted(id, outBuf);
+		n := J.TextLength(outBuf);
+		AppendBuf(",`type`:`error`}", outBuf, n);
+		IF ~WriteLineBounded(outBuf, n) THEN closing := TRUE; exitCode := 1 END
+	END EmitFunctionErrorForId;
+
+	PROCEDURE EmitResult(id: ARRAY OF CHAR; VAR value, logs: ARRAY OF CHAR);
+	VAR n: INTEGER; quoted: BOOLEAN;
+	BEGIN
+		n := 0;
+		AppendBuf("{`id`:", outBuf, n);
+		outBuf[n] := 0X;
+		quoted := J.AppendQuoted(id, outBuf);
+		n := J.TextLength(outBuf);
+		AppendBuf(",`logs`:", outBuf, n);
+		AppendRaw(logs, outBuf, n);
+		AppendBuf(",`type`:`result`,`value`:", outBuf, n);
+		AppendRaw(value, outBuf, n);
+		AppendBuf("}", outBuf, n);
+		IF ~WriteLineBounded(outBuf, n) THEN closing := TRUE; exitCode := 1 END
+	END EmitResult;
+
+	PROCEDURE EmitSubscriptionValue(subId: ARRAY OF CHAR; VAR value, logs: ARRAY OF CHAR);
+	VAR n: INTEGER; quoted: BOOLEAN;
+	BEGIN
+		n := 0;
+		AppendBuf("{`logs`:", outBuf, n);
+		AppendRaw(logs, outBuf, n);
+		AppendBuf(",`subscriptionId`:", outBuf, n);
+		outBuf[n] := 0X;
+		quoted := J.AppendQuoted(subId, outBuf);
+		n := J.TextLength(outBuf);
+		AppendBuf(",`type`:`subscription`,`value`:", outBuf, n);
+		AppendRaw(value, outBuf, n);
+		AppendBuf("}", outBuf, n);
+		IF ~WriteLineBounded(outBuf, n) THEN closing := TRUE; exitCode := 1 END
+	END EmitSubscriptionValue;
+
+	PROCEDURE EmitSubscriptionError(subId, name: ARRAY OF CHAR; VAR message: ARRAY OF CHAR; hasData: BOOLEAN; VAR data, logs: ARRAY OF CHAR);
+	VAR n: INTEGER; quoted: BOOLEAN;
+	BEGIN
+		n := 0;
+		AppendBuf("{`error`:{", outBuf, n);
+		IF hasData THEN
+			AppendBuf("`data`:", outBuf, n);
+			AppendRaw(data, outBuf, n);
+			AppendBuf(",", outBuf, n)
+		END;
+		AppendBuf("`message`:", outBuf, n);
+		outBuf[n] := 0X;
+		quoted := J.AppendQuoted(message, outBuf);
+		n := J.TextLength(outBuf);
+		AppendBuf(",`name`:`", outBuf, n);
+		AppendBuf(name, outBuf, n);
+		AppendBuf("`},`logs`:", outBuf, n);
+		AppendRaw(logs, outBuf, n);
+		AppendBuf(",`subscriptionId`:", outBuf, n);
+		outBuf[n] := 0X;
+		quoted := J.AppendQuoted(subId, outBuf);
+		n := J.TextLength(outBuf);
+		AppendBuf(",`type`:`subscription`}", outBuf, n);
+		IF ~WriteLineBounded(outBuf, n) THEN closing := TRUE; exitCode := 1 END
+	END EmitSubscriptionError;
+
+	(* ---------- subscription id <-> handle table ---------- *)
+
+	PROCEDURE FindSubBySubId(VAR subId: ARRAY OF CHAR): INTEGER;
+	VAR i, result: INTEGER;
+	BEGIN
+		result := -1;
+		i := 0;
+		WHILE (result < 0) & (i < MaxAdapterSubs) DO
+			IF subOccupied[i] & TextEqual(subIds[i], subId) THEN result := i END;
+			INC(i)
+		END;
+		RETURN result
+	END FindSubBySubId;
+
+	PROCEDURE FindSubByHandle(handle: INTEGER): INTEGER;
+	VAR i, result: INTEGER;
+	BEGIN
+		result := -1;
+		i := 0;
+		WHILE (result < 0) & (i < MaxAdapterSubs) DO
+			IF subOccupied[i] & (subHandles[i] = handle) THEN result := i END;
+			INC(i)
+		END;
+		RETURN result
+	END FindSubByHandle;
+
+	(* ---------- command dispatch ---------- *)
+
+	PROCEDURE HandleCall;
+	VAR found, ok, hasErrorData: BOOLEAN; errorName: ARRAY 64 OF CHAR; transportError: ARRAY 256 OF CHAR;
+	BEGIN
+		ok := J.Member(cmdBuf, "path", cmdPathRaw, found) & found;
+		IF ~ok THEN
+			EmitErrorForId(cmdId, "ProtocolError", "command omitted path")
+		ELSE
+			ok := J.DecodeString(cmdPathRaw, cmdPath);
+			IF ~ok THEN
+				EmitErrorForId(cmdId, "ProtocolError", "command path was invalid")
+			ELSE
+				ok := J.Member(cmdBuf, "args", cmdArgs, found) & found;
+				IF ~ok THEN EmitErrorForId(cmdId, "ProtocolError", "command omitted args") END
+			END
+		END;
+		IF ok THEN
+			S.Call(cmdOp, cmdPath, cmdArgs, callValue, callLogs, errorName, callErrorMessage, callErrorData, hasErrorData, ok, transportError);
+			IF ~ok THEN
+				EmitErrorForId(cmdId, "TransportError", transportError)
+			ELSIF J.TextLength(errorName) > 0 THEN
+				EmitFunctionErrorForId(cmdId, errorName, callErrorMessage, hasErrorData, callErrorData)
+			ELSE
+				EmitResult(cmdId, callValue, callLogs)
+			END
+		END
+	END HandleCall;
+
+	PROCEDURE HandleSubscribe;
+	VAR found, ok: BOOLEAN; handle, slot, i: INTEGER; errorText: ARRAY 256 OF CHAR;
+	BEGIN
+		ok := J.Member(cmdBuf, "subscriptionId", cmdSubIdRaw, found) & found;
+		IF ~ok THEN
+			EmitErrorForId(cmdId, "ProtocolError", "subscribe omitted subscriptionId")
+		ELSE
+			ok := J.DecodeString(cmdSubIdRaw, cmdSubId);
+			IF ~ok THEN
+				EmitErrorForId(cmdId, "ProtocolError", "subscriptionId was invalid")
+			ELSE
+				ok := J.Member(cmdBuf, "path", cmdPathRaw, found) & found;
+				IF ~ok THEN
+					EmitErrorForId(cmdId, "ProtocolError", "subscribe omitted path")
+				ELSE
+					ok := J.DecodeString(cmdPathRaw, cmdPath);
+					IF ~ok THEN
+						EmitErrorForId(cmdId, "ProtocolError", "subscribe path was invalid")
+					ELSE
+						ok := J.Member(cmdBuf, "args", cmdArgs, found) & found;
+						IF ~ok THEN EmitErrorForId(cmdId, "ProtocolError", "subscribe omitted args") END
+					END
+				END
+			END
+		END;
+
+		IF ok THEN
+			(*Same-ID replacement: invalidate the old relay before the new
+			  ack, per this project's ordering rule.*)
+			slot := FindSubBySubId(cmdSubId);
+			IF slot >= 0 THEN
+				S.Unsubscribe(subHandles[slot]);
+				subOccupied[slot] := FALSE
+			END;
+
+			S.Subscribe(cmdPath, cmdArgs, handle, ok, errorText);
+			IF ~ok THEN
+				EmitErrorForId(cmdId, "ProtocolError", errorText)
+			ELSE
+				slot := -1;
+				i := 0;
+				WHILE i < MaxAdapterSubs DO
+					IF (slot < 0) & ~subOccupied[i] THEN slot := i END;
+					INC(i)
+				END;
+				IF slot < 0 THEN
+					S.Unsubscribe(handle);
+					EmitErrorForId(cmdId, "ProtocolError", "adapter subscription table is full")
+				ELSE
+					subOccupied[slot] := TRUE;
+					subHandles[slot] := handle;
+					CopyText(cmdSubId, subIds[slot]);
+					EmitAck(cmdId)
+				END
+			END
+		END
+	END HandleSubscribe;
+
+	PROCEDURE HandleUnsubscribe;
+	VAR found, ok: BOOLEAN; slot: INTEGER;
+	BEGIN
+		ok := J.Member(cmdBuf, "subscriptionId", cmdSubIdRaw, found) & found;
+		IF ~ok THEN
+			EmitErrorForId(cmdId, "ProtocolError", "unsubscribe omitted subscriptionId")
+		ELSE
+			ok := J.DecodeString(cmdSubIdRaw, cmdSubId);
+			IF ~ok THEN
+				EmitErrorForId(cmdId, "ProtocolError", "subscriptionId was invalid")
+			ELSE
+				slot := FindSubBySubId(cmdSubId);
+				IF slot >= 0 THEN
+					S.Unsubscribe(subHandles[slot]);
+					subOccupied[slot] := FALSE
+				END;
+				EmitAck(cmdId)
+			END
+		END
+	END HandleUnsubscribe;
+
+	PROCEDURE HandleSetAuth;
+	VAR found, ok: BOOLEAN;
+	BEGIN
+		ok := J.Member(cmdBuf, "token", cmdTokenRaw, found) & found;
+		IF ~ok THEN
+			EmitErrorForId(cmdId, "ProtocolError", "setAuth omitted token")
+		ELSE
+			ok := J.DecodeString(cmdTokenRaw, cmdToken);
+			IF ~ok THEN
+				EmitErrorForId(cmdId, "ProtocolError", "token was invalid")
+			ELSE
+				S.SetAuth(cmdToken);
+				EmitAck(cmdId)
+			END
+		END
+	END HandleSetAuth;
+
+	PROCEDURE HandleDebugDisconnect;
+	VAR ok: BOOLEAN; errorText: ARRAY 256 OF CHAR;
+	BEGIN
+		S.DebugDisconnect(ok, errorText);
+		IF ok THEN EmitAck(cmdId) ELSE EmitErrorForId(cmdId, "TransportError", errorText) END
+	END HandleDebugDisconnect;
+
+	PROCEDURE ProcessCommand;
+	VAR found, docOk, decoded: BOOLEAN;
+	BEGIN
+		cmdId[0] := 0X;
+		docOk := J.Member(cmdBuf, "id", cmdIdRaw, found);
+		IF docOk & found THEN
+			decoded := J.DecodeString(cmdIdRaw, cmdId);
+			IF ~decoded THEN cmdId[0] := 0X END
+		END;
+		docOk := J.Member(cmdBuf, "op", cmdOpRaw, found);
+		IF ~docOk OR ~found THEN
+			EmitErrorForId(cmdId, "ProtocolError", "command omitted op")
+		ELSIF ~J.DecodeString(cmdOpRaw, cmdOp) THEN
+			EmitErrorForId(cmdId, "ProtocolError", "command op was invalid")
+		ELSIF TextEqual(cmdOp, "hello") THEN
+			EmitReady(cmdId)
+		ELSIF TextEqual(cmdOp, "setAuth") THEN
+			HandleSetAuth
+		ELSIF TextEqual(cmdOp, "query") OR TextEqual(cmdOp, "mutation") OR TextEqual(cmdOp, "action") THEN
+			HandleCall
+		ELSIF TextEqual(cmdOp, "subscribe") THEN
+			HandleSubscribe
+		ELSIF TextEqual(cmdOp, "unsubscribe") THEN
+			HandleUnsubscribe
+		ELSIF TextEqual(cmdOp, "debugDisconnect") THEN
+			HandleDebugDisconnect
+		ELSIF TextEqual(cmdOp, "close") THEN
+			EmitClosed(cmdId);
+			closing := TRUE
+		ELSE
+			EmitErrorForId(cmdId, "ProtocolError", "unknown op")
+		END
+	END ProcessCommand;
+
+	(* ---------- input reading ---------- *)
+
+	(*PumpInput performs one non-blocking attempt to read more bytes from the
+	  command stream into inputAccum. Returns FALSE if the stream is closed
+	  or errored (the caller then treats the adapter as done) - which is not
+	  the same thing as "nothing to read yet". The non-blocking Poll2
+	  (timeoutMs=0) legitimately returns 0 on every cycle where the other
+	  side simply hasn't sent its next command yet, the normal steady state
+	  of a long-lived interactive TCP session like the pilot controller's,
+	  which sends one command, waits for a response, and only then sends the
+	  next. Only a genuine poll() error (Poll2 returning -1) or Shim.Read
+	  actually observing EOF/an error on a ready descriptor means the stream
+	  is done. An earlier version folded the 0 (timeout) and -1 (error)
+	  cases together via `<= 0`, so the adapter exited the instant it
+	  happened to poll between two commands - which a fast burst-then-EOF
+	  pipe (this client's own Dockerfile smoke tests) essentially never
+	  triggers, but a real interactive controller triggers on nearly every
+	  cycle. hasData tracks whether there is actually anything to read this
+	  cycle; ok tracks whether the stream is still alive. The caller's own
+	  PumpLive() call afterwards (S.Pump with a 20ms timeout) is what paces
+	  this loop, so returning TRUE with hasData FALSE here does not
+	  busy-spin.*)
+	PROCEDURE PumpInput(): BOOLEAN;
+	VAR n, cap, i, pollResult: INTEGER; ready1, ready2, ok, hasData: BOOLEAN;
+	BEGIN
+		ok := TRUE;
+		hasData := Shim.Pending(readConn);
+		IF ~hasData THEN
+			pollResult := Shim.Poll2(readFd, -1, 0, ready1, ready2);
+			IF pollResult < 0 THEN
+				ok := FALSE
+			ELSE
+				hasData := pollResult > 0
+			END
+		END;
+		IF ok & (inputAccumLen >= CmdBufCap - 1) THEN
+			WriteStderrLit("command line exceeded the adapter's input cap");
+			ok := FALSE
+		END;
+		IF ok & hasData THEN
+			cap := CmdBufCap - 1 - inputAccumLen;
+			IF cap > 65536 THEN cap := 65536 END;
+			n := Shim.Read(readConn, inputChunk, cap);
+			IF (n = -2) OR (n = 0) THEN
+				ok := FALSE
+			ELSIF n > 0 THEN
+				i := 0;
+				WHILE i < n DO inputAccum[inputAccumLen + i] := inputChunk[i]; INC(i) END;
+				INC(inputAccumLen, n)
+			END
+		END;
+		RETURN ok
+	END PumpInput;
+
+	(*ExtractLine pulls one newline terminated line (a trailing CR is
+	  stripped) out of the front of inputAccum into cmdBuf, compacting the
+	  remainder forward. Returns FALSE when no complete line is buffered.*)
+	PROCEDURE ExtractLine(): BOOLEAN;
+	VAR i, lineLen, rest, j: INTEGER; found: BOOLEAN;
+	BEGIN
+		i := 0;
+		WHILE (i < inputAccumLen) & (inputAccum[i] # CHR(10)) DO INC(i) END;
+		found := i < inputAccumLen;
+		IF found THEN
+			lineLen := i;
+			IF (lineLen > 0) & (inputAccum[lineLen - 1] = CHR(13)) THEN DEC(lineLen) END;
+			j := 0;
+			WHILE j < lineLen DO cmdBuf[j] := inputAccum[j]; INC(j) END;
+			cmdBuf[lineLen] := 0X;
+			rest := inputAccumLen - (i + 1);
+			j := 0;
+			WHILE j < rest DO inputAccum[j] := inputAccum[i + 1 + j]; INC(j) END;
+			inputAccumLen := rest
+		END;
+		RETURN found
+	END ExtractLine;
+
+	(* ---------- Live event delivery ---------- *)
+
+	PROCEDURE PumpLive;
+	VAR eventKind, handle, slot: INTEGER; hasErrorData: BOOLEAN;
+	BEGIN
+		S.Pump(20, eventKind, handle, liveValue, liveLogs, liveErrorName, liveErrorMessage, liveErrorData, hasErrorData);
+		IF eventKind # 0 THEN
+			slot := FindSubByHandle(handle);
+			IF slot >= 0 THEN (*else already unsubscribed locally; drop*)
+				IF eventKind = 1 THEN
+					EmitSubscriptionValue(subIds[slot], liveValue, liveLogs)
+				ELSE
+					EmitSubscriptionError(subIds[slot], liveErrorName, liveErrorMessage, hasErrorData, liveErrorData, liveLogs)
+				END
+			END
+		END
+	END PumpLive;
+
+	(* ---------- program body ---------- *)
+
+BEGIN
+	closing := FALSE;
+	exitCode := 0;
+	inputAccumLen := 0;
+	programI := 0;
+	WHILE programI < MaxAdapterSubs DO subOccupied[programI] := FALSE; INC(programI) END;
+
+	listenAddress[0] := 0X;
+	extEnv.Get("ADAPTER_LISTEN", listenAddress, haveListenRes);
+	IF haveListenRes >= 0 THEN
+		usingTcp := TRUE;
+		listenFd := Shim.Listen("0.0.0.0", 8080);
+		IF listenFd < 0 THEN
+			WriteStderrLit("failed to listen on 0.0.0.0:8080");
+			Shim.Exit(1)
+		END;
+		readFd := Shim.Accept(listenFd, 30000);
+		IF readFd < 0 THEN
+			WriteStderrLit("timed out waiting for the controller to connect");
+			Shim.Exit(1)
+		END;
+		writeFd := readFd;
+		Shim.PlainWrap(readFd, readConn);
+		writeConn := readConn
+	ELSE
+		usingTcp := FALSE;
+		readFd := 0;
+		writeFd := 1;
+		Shim.PlainWrap(0, readConn);
+		Shim.PlainWrap(1, writeConn)
+	END;
+
+	deploymentUrl[0] := 0X;
+	extEnv.Get("CONVEX_URL", deploymentUrl, haveUrlRes);
+	IF haveUrlRes < 0 THEN CopyText("http://127.0.0.1:9", deploymentUrl) END;
+	authToken[0] := 0X;
+	S.Init(deploymentUrl, authToken);
+
+	WHILE ~closing DO
+		WHILE (~closing) & ExtractLine() DO ProcessCommand END;
+		IF ~closing THEN
+			IF ~PumpInput() THEN
+				WriteStderrLit("command stream closed unexpectedly");
+				closing := TRUE;
+				exitCode := 1
+			END
+		END;
+		IF ~closing THEN PumpLive END
+	END;
+
+	Shim.CloseConn(readConn);
+	IF usingTcp THEN Shim.CloseFd(listenFd) ELSE Shim.CloseConn(writeConn) END;
+	Shim.Exit(exitCode)
+END ConvexAdapter.

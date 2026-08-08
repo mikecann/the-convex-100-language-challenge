@@ -1,0 +1,143 @@
+*   convex-sha1.sno - SHA-1 (FIPS 180-4), written in SNOBOL4 over the
+*   bitwise primitives in convex-bits.sno. Its only caller is the RFC 6455
+*   handshake in convex-ws.sno, which hashes the client's own key
+*   concatenated with the WebSocket GUID - well under one 64-byte block -
+*   to compute Sec-WebSocket-Accept. Nothing about Convex's own protocol
+*   needs a general-purpose hash, so this is deliberately not tuned for
+*   large inputs.
+-include 'convex-bits.sno'
+
+*   sha1.pad(message) -> message extended with the standard 0x80 marker,
+*   zero bytes up to a 56-byte block remainder, and a 64-bit big-endian bit
+*   length, so its size is always an exact multiple of 64 bytes.
+    define('sha1.pad(message)bitlen,padded,i') :(sha1.pad.end)
+sha1.pad
+        bitlen = size(message) * 8
+        padded = message char(128)
+sha1.pad.zeros
+        ne(remdr(size(padded), 64), 56)                 :f(sha1.pad.length)
+        padded = padded char(0)                          :(sha1.pad.zeros)
+sha1.pad.length
+* The 64-bit big-endian bit length. This client only ever hashes a short
+* WebSocket handshake key, so the high 4 bytes are always zero; encoding
+* them explicitly (rather than only handling the low 32 bits) keeps this
+* function a correct general SHA-1 padding routine rather than one that
+* silently assumes its own caller.
+        padded = padded char(0) char(0) char(0) char(0)
+        i = 0
+sha1.pad.lenloop
+        ge(i, 4)                                        :s(sha1.pad.done)
+        padded = padded char(bits.byte(bitlen, i))
+        i = i + 1                                       :(sha1.pad.lenloop)
+sha1.pad.done
+        sha1.pad = padded                               :(return)
+sha1.pad.end
+
+*   sha1.word(block, offset) -> the big-endian 32-bit word starting at the
+*   1-based byte offset within a 64-byte block.
+    define('sha1.word(block,offset)') :(sha1.word.end)
+sha1.word
+        sha1.word = ord(substr(block, offset, 1)) * 16777216
+        sha1.word = sha1.word + ord(substr(block, offset + 1, 1)) * 65536
+        sha1.word = sha1.word + ord(substr(block, offset + 2, 1)) * 256
+        sha1.word = sha1.word + ord(substr(block, offset + 3, 1))
+        :(return)
+sha1.word.end
+
+*   sha1.digest(message) -> the 20-byte raw SHA-1 digest of message.
+    define('sha1.digest(message)padded,blockstart,w,h0,h1,h2,h3,h4,a,b,c,d,e,i,f,k,t,digest') :(sha1.digest.end)
+sha1.digest
+        padded = sha1.pad(message)
+        h0 = 1732584193
+        h1 = 4023233417
+        h2 = 2562383102
+        h3 = 271733878
+        h4 = 3285377520
+        w = array(80)
+        blockstart = 1
+sha1.digest.block
+        gt(blockstart, size(padded))                    :s(sha1.digest.final)
+        i = 1
+sha1.digest.loadwords
+        gt(i, 16)                                       :s(sha1.digest.extend)
+        w<i> = sha1.word(padded, blockstart + (i - 1) * 4)
+        i = i + 1                                       :(sha1.digest.loadwords)
+sha1.digest.extend
+        gt(i, 80)                                       :s(sha1.digest.initrounds)
+        w<i> = bits.rol32(bits.xor32(bits.xor32(w<i - 3>, w<i - 8>), bits.xor32(w<i - 14>, w<i - 16>)), 1)
+        i = i + 1                                       :(sha1.digest.extend)
+sha1.digest.initrounds
+        a = h0
+        b = h1
+        c = h2
+        d = h3
+        e = h4
+        i = 1
+sha1.digest.round
+        gt(i, 80)                                       :s(sha1.digest.combine)
+        le(i, 20)                                       :s(sha1.digest.f1)
+        le(i, 40)                                       :s(sha1.digest.f2)
+        le(i, 60)                                       :s(sha1.digest.f3)
+        :(sha1.digest.f4)
+sha1.digest.f1
+        f = bits.or32(bits.and32(b, c), bits.and32(bits.not32(b), d))
+        k = 1518500249                                  :(sha1.digest.step)
+sha1.digest.f2
+        f = bits.xor32(bits.xor32(b, c), d)
+        k = 1859775393                                  :(sha1.digest.step)
+sha1.digest.f3
+        f = bits.or32(bits.or32(bits.and32(b, c), bits.and32(b, d)), bits.and32(c, d))
+        k = 2400959708                                  :(sha1.digest.step)
+sha1.digest.f4
+        f = bits.xor32(bits.xor32(b, c), d)
+        k = 3395469782
+sha1.digest.step
+        t = bits.add32(bits.add32(bits.rol32(a, 5), f), bits.add32(e, k))
+        t = bits.add32(t, w<i>)
+        e = d
+        d = c
+        c = bits.rol32(b, 30)
+        b = a
+        a = t
+        i = i + 1                                       :(sha1.digest.round)
+sha1.digest.combine
+        h0 = bits.add32(h0, a)
+        h1 = bits.add32(h1, b)
+        h2 = bits.add32(h2, c)
+        h3 = bits.add32(h3, d)
+        h4 = bits.add32(h4, e)
+        blockstart = blockstart + 64                    :(sha1.digest.block)
+sha1.digest.final
+        digest = ""
+        i = 0
+sha1.digest.pack
+        ge(i, 4)                                        :s(sha1.digest.pack1)
+        digest = digest char(bits.byte(h0, i))
+        i = i + 1                                       :(sha1.digest.pack)
+sha1.digest.pack1
+        i = 0
+sha1.digest.pack1loop
+        ge(i, 4)                                        :s(sha1.digest.pack2)
+        digest = digest char(bits.byte(h1, i))
+        i = i + 1                                       :(sha1.digest.pack1loop)
+sha1.digest.pack2
+        i = 0
+sha1.digest.pack2loop
+        ge(i, 4)                                        :s(sha1.digest.pack3)
+        digest = digest char(bits.byte(h2, i))
+        i = i + 1                                       :(sha1.digest.pack2loop)
+sha1.digest.pack3
+        i = 0
+sha1.digest.pack3loop
+        ge(i, 4)                                        :s(sha1.digest.pack4)
+        digest = digest char(bits.byte(h3, i))
+        i = i + 1                                       :(sha1.digest.pack3loop)
+sha1.digest.pack4
+        i = 0
+sha1.digest.pack4loop
+        ge(i, 4)                                        :s(sha1.digest.packdone)
+        digest = digest char(bits.byte(h4, i))
+        i = i + 1                                       :(sha1.digest.pack4loop)
+sha1.digest.packdone
+        sha1.digest = digest                            :(return)
+sha1.digest.end

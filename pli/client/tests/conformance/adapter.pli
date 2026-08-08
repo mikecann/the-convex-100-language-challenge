@@ -1,0 +1,449 @@
+ /********************************************************************/
+ /* Conformance adapter -- test infrastructure, not client code.     */
+ /*                                                                  */
+ /* Speaks NDJSON adapter protocol v1 over either standard in and    */
+ /* out or, when ADAPTER_LISTEN is set, one accepted TCP connection. */
+ /* Standard out carries protocol events and nothing else; anything  */
+ /* worth saying to a human goes to standard error.                  */
+ /*                                                                  */
+ /* Every operation is answered by calling the real client in        */
+ /* client/convexlib.inc. The debugDisconnect command exists only in */
+ /* this binary; the educational client never exposes it.            */
+ /********************************************************************/
+ adapter: proc options(main);
+
+ %include convex;
+
+ dcl     infd                fixed bin(31);
+ dcl     outfd               fixed bin(31);
+ dcl     listenfd            fixed bin(31);
+ dcl     running             fixed bin(31);
+ dcl     cmdroot             fixed bin(31);
+ dcl     cmdid               fixed bin(31);
+ dcl     envname             char(32);
+
+ call cvxinit();
+ listenfd = -1;
+ infd     = 0;
+ outfd    = 1;
+ running  = 1;
+
+ call adapterconfigure();
+ call adapterloop();
+ return;
+
+ /*------------------------------------------------------------------*/
+ /* Set-up                                                           */
+ /*------------------------------------------------------------------*/
+
+ /* CONVEX_URL names the deployment. ADAPTER_LISTEN, when present,   */
+ /* switches the same NDJSON stream onto one accepted TCP connection */
+ /* so the shared controller can drive a container it does not own   */
+ /* the standard input of.                                           */
+ adapterconfigure: proc;
+   dcl   value               ptr;
+   /* getenv wants a NUL terminated name; a PL/I fixed length string */
+   /* would otherwise carry blanks into the lookup.                   */
+   envname = 'CONVEX_URL' || '00'x;
+   value = c_getenv( addr(envname) );
+   if value = sysnull() then call panic( 'CONVEX_URL is required' );
+   if cvxseturl( value, c_strlen( value ) ) = 0 then
+     call panic( 'CONVEX_URL must be an http or https deployment URL' );
+   envname = 'ADAPTER_LISTEN' || '00'x;
+   value = c_getenv( addr(envname) );
+   if value ^= sysnull() then call adapterlisten( value, c_strlen(value) );
+   end adapterconfigure;
+
+ adapterlisten: proc( spec, speclen );
+   dcl   spec                ptr;
+   dcl   speclen             fixed bin(31);
+   dcl   port                fixed bin(31);
+   dcl   at                  fixed bin(31);
+   dcl   c                   fixed bin(31);
+   dcl   one                 fixed bin(31);
+   dcl   rc                  fixed bin(31);
+   dcl   accepted            fixed bin(31);
+   dcl 1 addrin,
+         5 sin_family        fixed bin(15),
+         5 sin_port          fixed bin(15),
+         5 sin_addr          fixed bin(31),
+         5 sin_zero          char(8);
+   port = 0;
+   do at = 0 to speclen - 1;
+     c = byteval( ptradd( spec, at ) );
+     if c = 58 then port = 0;
+     else if c >= 48 & c <= 57 then port = port * 10 + c - 48;
+     end;
+   listenfd = c_socket( AF_INET, SOCK_STREAM, 0 );
+   if listenfd < 0 then call panic( 'could not create the listening socket' );
+   one = 1;
+   rc = c_setsockopt( listenfd, SOL_SOCKET, SO_REUSEADDR, addr(one), 4 );
+   sin_family = AF_INET;
+   /* The port travels in network byte order; PL/I has no htons, so  */
+   /* the two bytes are placed by hand.                              */
+   substr( addr(sin_port)->byte2, 1, 1 ) = chrv( port / 256 );
+   substr( addr(sin_port)->byte2, 2, 1 ) = chrv( mod( port, 256 ) );
+   sin_addr = 0;
+   sin_zero = '00'x;
+   rc = c_bind( listenfd, addr(addrin), 16 );
+   if rc ^= 0 then call panic( 'could not bind the adapter listener' );
+   rc = c_listen( listenfd, 1 );
+   if rc ^= 0 then call panic( 'could not listen on the adapter port' );
+   accepted = c_accept( listenfd, sysnull(), sysnull() );
+   if accepted < 0 then call panic( 'no controller connected' );
+   infd  = accepted;
+   outfd = accepted;
+   end adapterlisten;
+
+ /*------------------------------------------------------------------*/
+ /* Command loop                                                     */
+ /*------------------------------------------------------------------*/
+
+ adapterloop: proc;
+   dcl   chunk               char(8192);
+   dcl   got                 fixed bin(31);
+   dcl   ready               fixed bin(31);
+   do while( running = 1 );
+     do while( takeline() = 1 );
+       call handleline();
+       if running = 0 then return;
+       end;
+     /* One worker owns the Live socket, and here it is the same    */
+     /* thread that reads the controller: livepump advances Live and */
+     /* reports whether the controller has spoken, so a WebSocket    */
+     /* read and a command can never be in flight at once.           */
+     ready = livepump( infd, 25 );
+     call drainsubscriptions();
+     if ready = 0 then iterate;
+     got = c_read( infd, addr(chunk), 8192 );
+     if got = 0 then leave;
+     if got < 0 then do;
+       if errno() = EAGAIN | errno() = EINTR then iterate;
+       leave;
+       end;
+     if blen(B_IN) + got > ADAPTER_MAX_LINE then
+       call panic( 'adapter input exceeded its line bound' );
+     call bput( B_IN, addr(chunk), got );
+     end;
+   end adapterloop;
+
+ /* Move one complete line out of the input buffer into B_LINE.      */
+ takeline: proc returns( fixed bin(31) );
+   dcl   i                   fixed bin(31);
+   dcl   rest                fixed bin(31);
+   dcl   ignore              ptr;
+   do i = 0 to blen(B_IN) - 1;
+     if byteval( ptradd( bdata(B_IN), i ) ) = 10 then do;
+       call bclear( B_LINE );
+       call bput( B_LINE, bdata(B_IN), i );
+       rest = blen(B_IN) - i - 1;
+       if rest > 0 then
+         ignore = c_memmove( bdata(B_IN),
+                             ptradd( bdata(B_IN), i + 1 ), rest );
+       blen(B_IN) = rest;
+       /* A carriage return before the newline is tolerated so the   */
+       /* adapter behaves the same on a pipe and on a socket.        */
+       if blen(B_LINE) > 0 then
+         if byteval( ptradd( bdata(B_LINE), blen(B_LINE)-1 ) ) = 13 then
+           blen(B_LINE) = blen(B_LINE) - 1;
+       return( 1 );
+       end;
+     end;
+   return( 0 );
+   end takeline;
+
+ handleline: proc;
+   dcl   op                  fixed bin(31);
+   if blen(B_LINE) = 0 then return;
+   cmdroot = jparse( D_CMD, bdata(B_LINE), blen(B_LINE) );
+   if cmdroot < 0 then do;
+     call emitnoid( 'ProtocolError', 'malformed adapter command' );
+     return;
+     end;
+   if nf( D_CMD, cmdroot, 0 ) ^= J_OBJECT then do;
+     call emitnoid( 'ProtocolError', 'adapter command must be an object' );
+     return;
+     end;
+   cmdid = jmember( D_CMD, cmdroot, 'id' );
+   if idvalid() = 0 then do;
+     call emitnoid( 'ProtocolError',
+                    'adapter command id must be 1 to 128 characters' );
+     return;
+     end;
+   op = jmember( D_CMD, cmdroot, 'op' );
+   if op < 0 then do;
+     call emiterror( 'ProtocolError', 'adapter command omitted op' );
+     return;
+     end;
+   select;
+     when( jtexteq( D_CMD, op, '"hello"' ) = 1 )    call ophello();
+     when( jtexteq( D_CMD, op, '"query"' ) = 1 )    call opcall( 'query' );
+     when( jtexteq( D_CMD, op, '"mutation"' ) = 1 ) call opcall( 'mutation' );
+     when( jtexteq( D_CMD, op, '"action"' ) = 1 )   call opcall( 'action' );
+     when( jtexteq( D_CMD, op, '"setAuth"' ) = 1 )  call opsetauth();
+     when( jtexteq( D_CMD, op, '"subscribe"' ) = 1 )   call opsubscribe();
+     when( jtexteq( D_CMD, op, '"unsubscribe"' ) = 1 ) call opunsubscribe();
+     when( jtexteq( D_CMD, op, '"debugDisconnect"' ) = 1 )
+       call opdebugdisconnect();
+     when( jtexteq( D_CMD, op, '"close"' ) = 1 )    call opclose();
+     otherwise call emiterror( 'ProtocolError', 'unknown adapter operation' );
+     end;
+   end handleline;
+
+ /* The schema bounds an id at 1 to 128 characters, and an event     */
+ /* must never carry an empty one.                                   */
+ idvalid: proc returns( fixed bin(31) );
+   dcl   n                   fixed bin(31);
+   if cmdid < 0 then return( 0 );
+   if nf( D_CMD, cmdid, 0 ) ^= J_STRING then return( 0 );
+   n = nf( D_CMD, cmdid, 2 ) - nf( D_CMD, cmdid, 1 ) - 2;
+   if n < 1 then return( 0 );
+   if n > 128 then return( 0 );
+   return( 1 );
+   end idvalid;
+
+ /*------------------------------------------------------------------*/
+ /* Operations                                                       */
+ /*------------------------------------------------------------------*/
+
+ ophello: proc;
+   dcl   version             fixed bin(31);
+   version = jmember( D_CMD, cmdroot, 'protocolVersion' );
+   if jtexteq( D_CMD, version, '1' ) = 0 then do;
+     call emiterror( 'ProtocolError',
+                     'unsupported adapter protocol version' );
+     return;
+     end;
+   call bclear( B_OUT );
+   call bputt( B_OUT, '{"protocolVersion":1,"id":' );
+   call jcopy( B_OUT, D_CMD, cmdid );
+   call bputt( B_OUT, ',"type":"ready","language":"pli"' );
+   call bputt( B_OUT, ',"implementation":"native-pli-0.1.0"' );
+   call bputt( B_OUT, ',"runtime":"Iron Spring PL/I 1.4.1"}' );
+   call emitline();
+   end ophello;
+
+ opcall: proc( op );
+   dcl   op                  char(16);
+   dcl   path                fixed bin(31);
+   dcl   args                fixed bin(31);
+   path = jmember( D_CMD, cmdroot, 'path' );
+   args = jmember( D_CMD, cmdroot, 'args' );
+   if path < 0 then do;
+     call emiterror( 'ProtocolError', 'adapter call omitted path' );
+     return;
+     end;
+   if args < 0 | nf( D_CMD, args, 0 ) ^= J_OBJECT then do;
+     call emiterror( 'ProtocolError', 'Convex arguments must be an object' );
+     return;
+     end;
+   /* The path arrives as a JSON string and Convex wants its decoded */
+   /* text, so it is unquoted once here rather than re-escaped by    */
+   /* the request builder.                                           */
+   call bclear( B_TMP );
+   call junquote( B_TMP, D_CMD, path );
+   call cvxcall( op, bdata(B_TMP), blen(B_TMP),
+                 ptradd( dtext(D_CMD), nf( D_CMD, args, 1 ) ),
+                 nf( D_CMD, args, 2 ) - nf( D_CMD, args, 1 ) );
+   if callok = 1 then call emitresult();
+   else call emitcallerror();
+   end opcall;
+
+ opsetauth: proc;
+   dcl   token               fixed bin(31);
+   token = jmember( D_CMD, cmdroot, 'token' );
+   if token < 0 | nf( D_CMD, token, 0 ) ^= J_STRING then do;
+     call emiterror( 'ProtocolError', 'setAuth requires a token string' );
+     return;
+     end;
+   call bclear( B_TOKEN );
+   call junquote( B_TOKEN, D_CMD, token );
+   call emitack();
+   end opsetauth;
+
+ /* Start a Live subscription. Re-using a subscription id retires   */
+ /* the previous one first, so no update from the old relay can      */
+ /* reach the controller after this acknowledgement.                 */
+ opsubscribe: proc;
+   dcl   name                fixed bin(31);
+   dcl   path                fixed bin(31);
+   dcl   args                fixed bin(31);
+   dcl   slot                fixed bin(31);
+   name = jmember( D_CMD, cmdroot, 'subscriptionId' );
+   path = jmember( D_CMD, cmdroot, 'path' );
+   args = jmember( D_CMD, cmdroot, 'args' );
+   if name < 0 | nf( D_CMD, name, 0 ) ^= J_STRING then do;
+     call emiterror( 'ProtocolError', 'subscribe requires a subscriptionId' );
+     return;
+     end;
+   if path < 0 then do;
+     call emiterror( 'ProtocolError', 'subscribe omitted path' );
+     return;
+     end;
+   if args < 0 | nf( D_CMD, args, 0 ) ^= J_OBJECT then do;
+     call emiterror( 'ProtocolError', 'Convex arguments must be an object' );
+     return;
+     end;
+   call bclear( B_TMP );
+   call junquote( B_TMP, D_CMD, name );
+   slot = findsub( bdata(B_TMP), blen(B_TMP) );
+   if slot > 0 then call liveunsub( slot );
+   call bclear( B_PATH );
+   call junquote( B_PATH, D_CMD, path );
+   slot = livesub( bdata(B_TMP), blen(B_TMP),
+                   bdata(B_PATH), blen(B_PATH),
+                   ptradd( dtext(D_CMD), nf( D_CMD, args, 1 ) ),
+                   nf( D_CMD, args, 2 ) - nf( D_CMD, args, 1 ) );
+   if slot < 0 then do;
+     call emiterror( 'Error', 'too many Live subscriptions' );
+     return;
+     end;
+   call emitack();
+   end opsubscribe;
+
+ opunsubscribe: proc;
+   dcl   name                fixed bin(31);
+   dcl   slot                fixed bin(31);
+   name = jmember( D_CMD, cmdroot, 'subscriptionId' );
+   if name < 0 | nf( D_CMD, name, 0 ) ^= J_STRING then do;
+     call emiterror( 'ProtocolError',
+                     'unsubscribe needs a subscriptionId' );
+     return;
+     end;
+   call bclear( B_TMP );
+   call junquote( B_TMP, D_CMD, name );
+   slot = findsub( bdata(B_TMP), blen(B_TMP) );
+   if slot > 0 then call liveunsub( slot );
+   call emitack();
+   end opunsubscribe;
+
+ /* Adapter-only. Retires the live connection so the shared          */
+ /* controller can prove a real reconnect; the client API never      */
+ /* exposes this.                                                    */
+ opdebugdisconnect: proc;
+   if livedebugdisconnect() = 0 then do;
+     call emiterror( 'TransportError', 'Live WebSocket is not connected' );
+     return;
+     end;
+   call emitack();
+   end opdebugdisconnect;
+
+ /* Publish every update the client has queued. Values and errors    */
+ /* both arrive as ready made JSON, so the adapter only frames them. */
+ drainsubscriptions: proc;
+   dcl   i                   fixed bin(31);
+   do i = 1 to MAX_SUBSCRIPTIONS;
+     do while( subused(i) = 1 );
+       if livetake( i ) = 0 then leave;
+       call bclear( B_OUT );
+       call bputt( B_OUT, '{"type":"subscription","subscriptionId":"' );
+       call bputesc( B_OUT, subnamep(i), subnamen(i) );
+       call bputb( B_OUT, '"' );
+       if liveiserror = 1 then call bputt( B_OUT, ',"error":' );
+       else call bputt( B_OUT, ',"value":' );
+       call bput( B_OUT, bdata(B_MSG), blen(B_MSG) );
+       call bputb( B_OUT, '}' );
+       call emitline();
+       end;
+     end;
+   end drainsubscriptions;
+
+ opclose: proc;
+   call liveshutdown();
+   call bclear( B_OUT );
+   call bputt( B_OUT, '{"id":' );
+   call jcopy( B_OUT, D_CMD, cmdid );
+   call bputt( B_OUT, ',"type":"closed"}' );
+   call emitline();
+   running = 0;
+   end opclose;
+
+ /*------------------------------------------------------------------*/
+ /* Events                                                           */
+ /*------------------------------------------------------------------*/
+
+ emitline: proc;
+   dcl   sent                fixed bin(31);
+   call bputb( B_OUT, '0a'x );
+   sent = tsendall( outfd, sysnull(), bdata(B_OUT), blen(B_OUT) );
+   if sent = 0 then call panic( 'could not write an adapter event' );
+   end emitline;
+
+ emitack: proc;
+   call bclear( B_OUT );
+   call bputt( B_OUT, '{"id":' );
+   call jcopy( B_OUT, D_CMD, cmdid );
+   call bputt( B_OUT, ',"type":"ack"}' );
+   call emitline();
+   end emitack;
+
+ emitresult: proc;
+   call bclear( B_OUT );
+   call bputt( B_OUT, '{"id":' );
+   call jcopy( B_OUT, D_CMD, cmdid );
+   call bputt( B_OUT, ',"type":"result","value":' );
+   call jcopy( B_OUT, D_HTTP, callvalue );
+   /* logLines is omitted rather than serialised as null when the    */
+   /* backend did not send one; the shared schema rejects a null.    */
+   if calllogs >= 0 then do;
+     call bputt( B_OUT, ',"logs":' );
+     call jcopy( B_OUT, D_HTTP, calllogs );
+     end;
+   call bputb( B_OUT, '}' );
+   call emitline();
+   end emitresult;
+
+ /* A failure that came back from the client, carrying whatever      */
+ /* structured payload the Convex function raised.                   */
+ emitcallerror: proc;
+   call bclear( B_OUT );
+   call bputt( B_OUT, '{"id":' );
+   call jcopy( B_OUT, D_CMD, cmdid );
+   call bputt( B_OUT, ',"type":"error","error":{"name":"' );
+   call bputt( B_OUT, callerrname );
+   call bputt( B_OUT, '","message":"' );
+   call bputesc( B_OUT, bdata(B_TMP2), blen(B_TMP2) );
+   call bputb( B_OUT, '"' );
+   if callerrdata >= 0 then do;
+     call bputt( B_OUT, ',"data":' );
+     call jcopy( B_OUT, D_HTTP, callerrdata );
+     end;
+   if calllogs >= 0 then do;
+     call bputt( B_OUT, ',"logs":' );
+     call jcopy( B_OUT, D_HTTP, calllogs );
+     end;
+   call bputt( B_OUT, '}}' );
+   call emitline();
+   end emitcallerror;
+
+ emiterror: proc( name, message );
+   dcl   name                char(32);
+   dcl   message             char(64);
+   call bclear( B_OUT );
+   call bputt( B_OUT, '{"id":' );
+   call jcopy( B_OUT, D_CMD, cmdid );
+   call bputt( B_OUT, ',"type":"error","error":{"name":"' );
+   call bputt( B_OUT, name );
+   call bputt( B_OUT, '","message":"' );
+   call bputt( B_OUT, message );
+   call bputt( B_OUT, '"}}' );
+   call emitline();
+   end emiterror;
+
+ /* Used when the command had no usable id. The schema forbids an    */
+ /* empty id, so the field is left out entirely.                     */
+ emitnoid: proc( name, message );
+   dcl   name                char(32);
+   dcl   message             char(64);
+   call bclear( B_OUT );
+   call bputt( B_OUT, '{"type":"error","error":{"name":"' );
+   call bputt( B_OUT, name );
+   call bputt( B_OUT, '","message":"' );
+   call bputt( B_OUT, message );
+   call bputt( B_OUT, '"}}' );
+   call emitline();
+   end emitnoid;
+
+ %include convexlib;
+
+ end adapter;

@@ -4,5 +4,62 @@ displayName: "Forth"
 rank: 85
 selectionTier: curated_backfill
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native gforth implementation of Convex's documented JSON HTTP functions and
+    the pinned sync profile. HTTP framing, RFC 6455 framing, SHA-1, base64,
+    strict JSON and every Convex semantic are written in Forth. One small
+    reviewed C support library, client/convexrt.c, supplies only the
+    primitives standard Forth cannot express: TCP connect, verified TLS,
+    non-blocking read and write, readiness polling, listen and accept, a
+    monotonic clock, and the process exit status. It contains no HTTP, no
+    WebSocket framing, no JSON and no Convex knowledge, and every deadline,
+    retry and bound is enforced in Forth.
+toolchain:
+  name: gforth
+  version: "0.7 (Debian bookworm)"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - The Docker test stage (build, unit suites and the example run) passes on a
+    remote builder for this source checkpoint. Shared and hosted conformance
+    have not been run, so no capability is claimed and badges remain unearned.
+  - The client is single threaded by design. One owner word set drives the
+    WebSocket, and callers pump that owner rather than sharing it with another
+    thread, so Live progress only happens while the caller is inside a client
+    word.
+  - Live authentication, optimistic updates, WebSocket mutations, WebSocket
+    actions, journals and TransitionChunk assembly are deferred.
+  - Live values cover Convex's JSON-safe subset; tagged Convex value
+    conversions are deferred.
+  - IPv6 literal deployment URLs are rejected rather than partially supported.
+  - JSON input is limited to 2 MiB, 128 nesting levels, 8192 nodes and 256 keys
+    per object; numbers are accepted only when mathematically integral and
+    inside a signed 64-bit cell.
+  - Active Live subscriptions are bounded to 64 entries and 8 MiB of
+    conservatively charged state. One manager-wide queue retains the newest 16
+    deliveries within a 20 MiB budget charged as encoded bytes plus a fixed
+    per-item overhead.
+  - The conformance adapter retains the newest 16 encoded events within 6 MiB,
+    including the event being written. Overflow drops the oldest subscription
+    update and records the drop; a reply to a command is never dropped.
+  - The exact gforth patch version is asserted to be in the 0.7 series at build
+    time and recorded into the image; it must be pinned exactly once a build
+    has reported it.
+capabilities:
+  - http
+  - live

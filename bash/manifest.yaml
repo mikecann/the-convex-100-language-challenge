@@ -21,8 +21,18 @@ adapter:
   protocolVersion: 1
   entrypoint: /usr/local/bin/convex-adapter
   adapterOnlyCommands: [debugDisconnect]
+# Bash cannot open a socket or speak TLS in-process; invoking a program is the
+# language's own execution model rather than a way around it. These are the
+# tools this client genuinely runs, declared so the shared toolchain gate can
+# tell a deliberate transport primitive from a toolbox nobody swept out. The
+# Convex protocol behaviour and the RFC 6455 framing are in Bash itself.
+runtimeTools:
+  - busybox
+  - wget
 limitations:
   - Live uses a direct Bash RFC6455 implementation. It supports the pinned sync profile only, with an intentionally bounded newest-16 delivery policy in the adapter.
   - WebSocket mutations, actions, Live authentication, optimistic updates, and TransitionChunk assembly are deferred.
   - The runtime deliberately includes jq, BusyBox wget, OpenSSL, and socat as low-level runtime tools.
-capabilities: []
+capabilities:
+  - http
+  - live

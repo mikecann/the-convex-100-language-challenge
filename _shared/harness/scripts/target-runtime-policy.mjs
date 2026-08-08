@@ -1,7 +1,14 @@
+// A language earns an entry here only when the named command is the interpreter
+// that genuinely executes that language's own client code. Languages that
+// compile to JavaScript have no other execution target, so node is that
+// interpreter for them exactly as it is for JavaScript itself; the Convex
+// protocol behaviour still has to be written in the target language.
 export const approvedTargetRuntimeCommands = new Map([
+  ["coffeescript", new Set(["node"])],
   ["javascript", new Set(["node"])],
   ["php", new Set(["php"])],
   ["python", new Set(["python", "python3"])],
+  ["rescript", new Set(["node"])],
   ["typescript", new Set(["node"])],
 ]);
 

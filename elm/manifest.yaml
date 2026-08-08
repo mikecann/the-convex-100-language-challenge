@@ -1,8 +1,0 @@
-schemaVersion: 1
-id: elm
-displayName: "Elm"
-rank: 83
-selectionTier: curated_backfill
-implementation:
-  status: planned
-capabilities: []

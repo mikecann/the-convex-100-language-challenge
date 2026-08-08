@@ -4,5 +4,45 @@ displayName: "GDScript"
 rank: 49
 selectionTier: ranked
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native GDScript client for Godot 4. HTTPClient provides ordinary HTTP and
+    TLS, WebSocketPeer provides RFC 6455 framing, and the Convex request and
+    response envelopes, the strict Live query set, transitions, reconnects, and
+    every deadline are implemented in GDScript. The client bundles its own
+    certificate trust store because Godot's own default one never loads under
+    this runtime's headless --script launch (see client/certs.gd). Both
+    capability badges are earned: the shared coordinator ran local and hosted
+    conformance against a clean exact-head build and both passed 31 of 31.
+toolchain:
+  name: Godot
+  version: 4.4.1-stable
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - The educational client supports the JSON-safe Convex value subset within
+    GDScript's exact numeric range; Godot's JSON parser decodes every number as
+    a float, so unsafe values fail closed.
+  - Standard input mode reads one byte at a time on a helper thread because Godot's stdin API blocks until a requested byte count arrives; the shared harness uses the TCP transport.
+  - Godot exposes neither partial WebSocket frames nor non-blocking stdout. A
+    complete-message deadline bounds hidden partial-frame dribbles but also
+    bounds idle connections, and stopped-reader memory evidence applies to the
+    TCP adapter transport rather than stdio.
+  - Live authentication, TransitionChunk assembly, optimistic updates, and WebSocket mutation replay are deferred.
+capabilities:
+  - http
+  - live

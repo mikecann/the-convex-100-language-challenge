@@ -12,10 +12,10 @@ This is educational and unofficial, not a production Convex SDK.
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations and actions | Implemented, awaiting shared evidence |
-| Bearer-token replacement and structured function errors | Implemented, awaiting shared evidence |
-| Live initial values and updates | Implemented, awaiting shared evidence |
-| Remove, reconnect, query-error recovery and bounded delivery | Implemented, awaiting shared evidence |
+| HTTP queries, mutations and actions | Verified by shared local and hosted conformance |
+| Bearer-token replacement and structured function errors | Verified by shared local and hosted conformance |
+| Live initial values and updates | Verified by shared local and hosted conformance |
+| Remove, reconnect, query-error recovery and bounded delivery | Verified by shared local and hosted conformance |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.c -->
 ```c

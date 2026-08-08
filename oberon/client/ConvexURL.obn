@@ -1,0 +1,95 @@
+(*ConvexURL parses the four URL schemes this client needs (http, https, ws,
+  wss) into a secure flag, host, port, and path. It knows nothing about
+  HTTP or WebSocket framing.*)
+MODULE ConvexURL;
+
+	IMPORT J := ConvexJSON;
+
+	PROCEDURE HasPrefix(text, prefix: ARRAY OF CHAR; VAR prefixLength: INTEGER): BOOLEAN;
+	VAR textLength, i: INTEGER; ok: BOOLEAN;
+	BEGIN
+		prefixLength := J.TextLength(prefix);
+		textLength := J.TextLength(text);
+		ok := textLength >= prefixLength;
+		i := 0;
+		WHILE ok & (i < prefixLength) DO
+			IF text[i] # prefix[i] THEN ok := FALSE END;
+			INC(i)
+		END;
+		RETURN ok
+	END HasPrefix;
+
+	PROCEDURE IsDigit(ch: CHAR): BOOLEAN;
+	BEGIN
+		RETURN (ch >= "0") & (ch <= "9")
+	END IsDigit;
+
+	(*Parse decomposes a deployment URL such as https://host:1234/path into
+	  its scheme's secure flag and default port, the host, and the path
+	  (defaulting to "/"). It accepts exactly the four schemes this client
+	  speaks: http, https, ws, wss.*)
+	PROCEDURE Parse*(url: ARRAY OF CHAR; VAR secure: BOOLEAN; VAR host: ARRAY OF CHAR; VAR port: INTEGER; VAR path: ARRAY OF CHAR): BOOLEAN;
+	VAR
+		prefixLength, urlLength, pos, hostStart, i, defaultPort: INTEGER;
+		ok: BOOLEAN;
+	BEGIN
+		host[0] := 0X;
+		path[0] := 0X;
+		port := 0;
+		secure := FALSE;
+		urlLength := J.TextLength(url);
+
+		IF HasPrefix(url, "https://", prefixLength) THEN
+			secure := TRUE; defaultPort := 443; ok := TRUE
+		ELSIF HasPrefix(url, "http://", prefixLength) THEN
+			secure := FALSE; defaultPort := 80; ok := TRUE
+		ELSIF HasPrefix(url, "wss://", prefixLength) THEN
+			secure := TRUE; defaultPort := 443; ok := TRUE
+		ELSIF HasPrefix(url, "ws://", prefixLength) THEN
+			secure := FALSE; defaultPort := 80; ok := TRUE
+		ELSE
+			ok := FALSE
+		END;
+
+		IF ok THEN
+			hostStart := prefixLength;
+			pos := hostStart;
+			WHILE (pos < urlLength) & (url[pos] # "/") & (url[pos] # ":") DO INC(pos) END;
+			ok := (pos > hostStart) & (pos - hostStart < LEN(host))
+		END;
+		IF ok THEN
+			i := 0;
+			WHILE i < pos - hostStart DO host[i] := url[hostStart + i]; INC(i) END;
+			host[pos - hostStart] := 0X
+		END;
+
+		IF ok & (pos < urlLength) & (url[pos] = ":") THEN
+			INC(pos);
+			port := 0;
+			ok := (pos < urlLength) & IsDigit(url[pos]);
+			WHILE ok & (pos < urlLength) & IsDigit(url[pos]) DO
+				port := port * 10 + (ORD(url[pos]) - ORD("0"));
+				INC(pos)
+			END
+		ELSIF ok THEN
+			port := defaultPort
+		END;
+
+		IF ok THEN
+			IF pos >= urlLength THEN
+				path[0] := "/"; path[1] := 0X
+			ELSIF url[pos] # "/" THEN
+				ok := FALSE
+			ELSIF urlLength - pos >= LEN(path) THEN
+				ok := FALSE
+			ELSE
+				i := 0;
+				WHILE i < urlLength - pos DO path[i] := url[pos + i]; INC(i) END;
+				path[urlLength - pos] := 0X
+			END
+		END;
+
+		RETURN ok
+	END Parse;
+
+END ConvexURL.

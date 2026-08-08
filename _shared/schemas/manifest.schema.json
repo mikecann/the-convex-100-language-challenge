@@ -87,6 +87,12 @@
       "type": "array",
       "items": { "type": "string" }
     },
+    "runtimeTools": {
+      "description": "Programs the client genuinely invokes at run time, declared so the shared toolchain gate can tell a deliberate transport primitive from a toolbox nobody swept out. Only for languages whose execution model is process composition and which therefore have no in-process alternative; a language that could link a library instead does not qualify.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string" }
+    },
     "capabilities": {
       "type": "array",
       "uniqueItems": true,

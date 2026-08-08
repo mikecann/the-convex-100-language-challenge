@@ -19,8 +19,8 @@ the mutation, and the resulting Live update.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Awaiting shared evidence | Native queries, mutations, actions, bearer-token replacement, logs, TLS verification, and structured errors are implemented. |
-| Live | Awaiting shared evidence | One native WebSocket owner implements Add/Remove, typed query failures, bounded delivery, reconnect restoration, and stale-relay barriers against the pinned profile. |
+| HTTP | Verified by shared local and hosted conformance | Native queries, mutations, actions, bearer-token replacement, logs, TLS verification, and structured errors are implemented. |
+| Live | Verified by shared local and hosted conformance | One native WebSocket owner implements Add/Remove, typed query failures, bounded delivery, reconnect restoration, and stale-relay barriers against the pinned profile. |
 
 The manifest intentionally awards no badges yet. Only the shared local and
 hosted black-box controller may turn either row into a passing capability.

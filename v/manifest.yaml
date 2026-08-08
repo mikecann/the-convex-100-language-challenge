@@ -4,5 +4,48 @@ displayName: "V"
 rank: 73
 selectionTier: coverage
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >
+    Native V client. Convex's documented JSON HTTP API and the pinned sync
+    profile are implemented in V in this directory, including HTTP/1.1 request
+    and response framing over net and net.ssl, envelope decoding, the Live
+    state machine, query-set versioning, reconnect replay, and bounded
+    delivery. V's standard library supplies ordinary sockets, TLS, JSON, SHA-1,
+    and base64; the bounded RFC 6455 transport is implemented here.
+    TcpConn's own read/write timeouts never bound OpenSSL's direct
+    SSL_read/SSL_write calls, so this client also sets SO_RCVTIMEO and
+    SO_SNDTIMEO on the raw file descriptor itself (see client/socket_deadline.c.v).
+    Both capability badges are earned: the shared coordinator ran local and
+    hosted conformance against a clean exact-head build and both passed 31
+    of 31.
+toolchain:
+  name: V
+  version: "0.4.9 (39534459885e916e2765b5b0c0ed66ce15f0ab86)"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - V's net.websocket is intentionally not used; this source owns bounded upgrade and frame parsing so peer-declared lengths are checked before allocation and read/write deadlines are cumulative.
+  - Live authentication, WebSocket mutations and actions, optimistic updates, journals, and TransitionChunk assembly are deferred.
+  - HTTP uses one bounded connection-close exchange per call; persistent connections and request compression are deferred.
+  - Live values cover Convex's JSON-safe subset; tagged Convex value conversions are deferred.
+  - JSON input is limited to 2 MiB, 128 nesting levels, and 8192 structural nodes. Active Live subscriptions are bounded to 64.
+  - Each subscription retains at most 16 deliveries within 4 MiB, and the whole client retains at most 16 deliveries within 8 MiB, charged on twice the encoded size plus 128 bytes per decoded JSON node and a fixed delivery overhead.
+  - The adapter's terminal writer independently retains at most 16 encoded events within 6 MiB, including an in-flight write.
+  - Raw WebSocket fixtures exercise real loopback network paths for fragmented UTF-8, controls, invalid kinds, a pre-allocation 1 GiB declaration, continuous dribble, and a stopped reader.
+capabilities:
+  - http
+  - live
