@@ -1244,6 +1244,27 @@ chapel_ws *ct_ws_connect(const char *url, size_t url_length,
     return NULL;
   }
   socket->curl = curl;
+  // CURLOPT_CONNECT_ONLY level 2 (set above) opts into libcurl's own
+  // connection-state gathering, which buffers internally any bytes it reads
+  // past the HTTP upgrade response while parsing the handshake -- a peer
+  // that pipelines its first WebSocket frame(s) immediately behind the 101
+  // reply (as a real server legitimately may) lands those bytes in curl's
+  // private buffer during this function's curl_easy_perform() above, never
+  // through our own curl_ws_recv() loop. ct_ws_receive's raw-fd poll() in
+  // wait_socket() cannot see that buffered data -- it watches the kernel
+  // socket for a *new* readability edge, and if the peer sends nothing
+  // further on this connection, no such edge ever arrives, so the first
+  // receive would poll forever until the peer eventually tears the
+  // connection down (observed: a peer with a ~50s idle-then-close timeout
+  // made this look like a ~50s client hang, though the client was never
+  // actually blocked -- see the hostile_peer.py "partial" fixture's
+  // TCP-teardown-visibility margin comment, which measures exactly this
+  // symptom from the peer's side). Seed the speculative-internal-buffer
+  // probe (the same one that already runs after a successful frame chunk,
+  // see the "may_have_internal" comment below in ct_ws_receive) so the very
+  // first receive attempt checks curl's internal buffer before ever waiting
+  // on the raw socket.
+  socket->may_have_internal = 1;
   return socket;
 }
 
