@@ -123,6 +123,44 @@ proc ws_accept_token(key);
   return base64_encode(unhex digest_reply(4..));
 end proc;
 
+-- Inverse of base64_encode. Used by client/sync.setl's ts_compare to
+-- decode a Convex sync-protocol timestamp (base64 of a little-endian
+-- uint64) back to raw bytes without ever materializing it as a SETL
+-- integer -- GNU SETL integers are exact, but round-tripping through one
+-- is needless work this comparison never needs. Malformed input (wrong
+-- alphabet, wrong padding) is not expected on this wire and is not
+-- specially guarded against, matching base64_encode's own scope.
+proc base64_decode(text);
+  alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  out := "";
+  n := #text;
+  i := 1;
+  while i + 3 <= n loop
+    v0 := find_substring(alphabet, text(i), 1) - 1;
+    v1 := find_substring(alphabet, text(i + 1), 1) - 1;
+    has2 := text(i + 2) /= "=";
+    has3 := has2 and text(i + 3) /= "=";
+    v2 := 0;
+    if has2 then
+      v2 := find_substring(alphabet, text(i + 2), 1) - 1;
+    end if;
+    v3 := 0;
+    if has3 then
+      v3 := find_substring(alphabet, text(i + 3), 1) - 1;
+    end if;
+    triple := v0 * 262144 + v1 * 4096 + v2 * 64 + v3;
+    out +:= char(triple div 65536 mod 256);
+    if has2 then
+      out +:= char(triple div 256 mod 256);
+    end if;
+    if has3 then
+      out +:= char(triple mod 256);
+    end if;
+    i +:= 4;
+  end loop;
+  return out;
+end proc;
+
 proc base64_encode(bytes);
   alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   out := "";

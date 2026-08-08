@@ -31,9 +31,10 @@ verified count: 0 -> 1
 ```
 
 That run has been proven by hand, byte for byte against
-`_shared/examples/basics.expected.txt`, but not yet through
-`./run verify-example setl` -- there is no `example-runtime` Docker stage to
-run it from yet (see "Where this stands").
+`_shared/examples/basics.expected.txt`. `example-runtime` and `runtime`
+Docker stages now exist too (see "Docker verification"); this README does
+not claim a badge until the shared conformance evidence in
+`_shared/results/` says so.
 
 ## What works so far
 
@@ -45,10 +46,11 @@ run it from yet (see "Where this stands").
 | `client/http.setl` (HTTP/1.1 framing) | Tested against real hosts, both transports |
 | `client/convex.setl` (query/mutation/action + envelope classification) | Unit-tested against synthetic responses |
 | `client/websocket.setl` (RFC 6455 framing, masking, fragmentation, UTF-8) | Tested against a real echo service, real and synthetic frames |
-| `client/sync.setl` (`/api/sync` Connect/ModifyQuerySet/Transition) | Single-connection subset; no reconnect/backoff/bounded queue yet |
-| `examples/basics/main.setl` | Runs correctly by hand against the real local backend; not yet Docker-verified |
-| NDJSON conformance adapter (`debugDisconnect`) | Not started |
-| `example-runtime` / `runtime` Docker stages | Not started |
+| `client/sync.setl` (`/api/sync` Connect/ModifyQuerySet/Transition) | Single-connection primitive; unit-tested against synthetic Transition messages |
+| `client/live.setl` (reconnect, backoff, rehydration suppression) | Unit-tested synthetically; a real end-to-end reconnect is proven by `./run verify` |
+| `examples/basics/main.setl` | Runs correctly by hand against the real local backend; Docker-buildable via `example-runtime` |
+| NDJSON conformance adapter (`client/tests/conformance/main.setl`) | Builds and answers `hello`/`close` in Docker; full conformance pending `./run verify` |
+| `example-runtime` / `runtime` Docker stages | Built, pruned, and policy-checked; pending the verification ladder below |
 
 ## The canonical example
 
@@ -251,33 +253,60 @@ end proc;
 builds GNU SETL from source and runs every unit-level test in this table
 inside the Dockerfile's `test` stage: the JSON codec, both transports, the
 HTTP envelope classifier, the WebSocket client (against a real public echo
-service plus synthetic protocol-shape tests), the `/api/sync` subset
-(synthetic Transition messages), and the example's integral-count decoding
-regression. None of this proves the example or shared conformance; those
-need `./run verify-example setl` and `./run verify setl`, which need the
-runtime Docker stages this client does not have yet.
+service plus synthetic protocol-shape tests), the `/api/sync` connection
+primitive and the reconnecting Live layer on top of it (synthetic Transition
+messages), the example's integral-count decoding regression, a parse-and-guard
+check of the canonical example, and a `hello`/`close` smoke check of the
+conformance adapter. `CMD` reruns this exact suite from the built image, so
+`./run test setl` re-verifies rather than only proving the build-time steps
+once.
+
+```
+./run verify-example setl   # the canonical example against the local backend
+./run verify setl           # + shared black-box conformance, local backend
+./run verify-hosted setl    # the same, against the hosted drift target
+./run verify-all setl       # both deployment profiles from one built image
+```
+
+build the `example-runtime` and `runtime` Docker stages -- a minimal,
+non-root, read-only, all-capabilities-dropped image for each, staging only
+GNU SETL's own runtime closure (the `setl` interpreter plus its required
+`setltran`/`setlcpp` siblings, found and copied via `ldd`, never placed on
+`PATH`) and this client's `.setl` source -- and run the example and the
+shared conformance controller against it. Only the shared result evaluator
+computes the `http`/`live` capability badges from that evidence; this
+README does not round up ahead of it.
 
 ## Where this stands
-
-This client is mid-build, not paused for a technical blocker. In order:
 
 1. Interpreter build, TLS boundary, JSON, HTTP, and the Convex HTTP
    envelope -- done and Docker-tested.
 2. RFC 6455 WebSocket framing -- done and Docker-tested (masking,
    fragmentation reassembly, interleaved control frames, UTF-8
    validation).
-3. A single-connection `/api/sync` Live subset -- done and Docker-tested,
-   but missing automatic reconnection, exponential backoff,
-   `connectionCount`/`lastCloseReason` tracking, rehydration suppression,
-   `debugDisconnect`, and the bounded delivery queue AGENTS.md requires.
-   These are exactly what full Live conformance needs next.
+3. A single-connection `/api/sync` primitive (`client/sync.setl`) and a
+   reconnecting Live layer on top of it (`client/live.setl`): automatic
+   reconnection with exponential backoff (reset after a good handshake),
+   resubscribing the whole active query set on every reconnect,
+   unchanged-rehydration suppression, and `connectionCount`/
+   `lastCloseReason`/`maxObservedTimestamp` tracked across reconnects --
+   done and Docker-tested against everything a live deployment is not
+   needed to prove (see "`/api/sync` Live" below); a full end-to-end
+   reconnect against a real backend is what `./run verify`'s shared
+   conformance run proves next.
 4. The canonical example -- written and manually verified end to end
-   against the real local backend (see "Start here"), but not yet run
-   through Docker.
-5. Still to build: the NDJSON conformance adapter, the
-   `example-runtime`/`runtime` Docker stages, and every verification layer
-   from `./run verify-example setl` through `./run verify-all setl`. No
-   capability badge can be claimed before those run and pass.
+   against the real local backend (see "Start here"), and now Docker-buildable
+   via `example-runtime`.
+5. The NDJSON conformance adapter (`client/tests/conformance/main.setl`):
+   `hello`, `query`/`mutation`/`action`, `subscribe`/`unsubscribe`,
+   `setAuth`, `debugDisconnect`, and `close`, both over stdin/stdout and
+   over `ADAPTER_LISTEN`'s TCP mode, with a bounded droppable output queue
+   for subscription events. Builds and passes a `hello`/`close` smoke
+   check in Docker; full shared conformance is what `./run verify` proves
+   next.
+6. Still to run: the verification ladder above, on a clean commit, on
+   both deployment profiles. No capability badge is claimed before that
+   evidence exists.
 
 ## The `callout()` boundary
 
@@ -329,28 +358,77 @@ continuation byte -- properties a public echo service cannot be relied on
 to reproduce, since it only ever echoes back whatever this client already
 sent it.
 
-## `/api/sync` Live state machine (single-connection subset)
+## `/api/sync` Live
 
-`client/sync.setl` implements the pinned `convex-rs-0.10.4-unversioned-sync`
-protocol's `Connect` handshake, `ModifyQuerySet` (`Add`/`Remove`), and
-`Transition` handling (`QueryUpdated`, `QueryFailed`, `QueryRemoved`) with
-the little-endian version/timestamp tracking the reference Go client's
-`protocol.go` documents (a one-element `args` array per query, and an
-omitted `maxObservedTimestamp` on the first connection). `client/tests/sync_test.setl`
-proves the decode and version-tracking logic by injecting hand-built
-`Transition` messages directly into a connection's read buffer (no live
-deployment needed for this layer, the same style `client/tests/convex_test.setl`
-uses for the HTTP envelope), covering an initial `QueryUpdated`, a chained
-external update, `QueryFailed` followed by a recovering `QueryUpdated` on
-the same subscription, and rejection of a `Transition` whose `startVersion`
-does not match.
+`client/sync.setl` implements one connection's whole lifetime against the
+pinned `convex-rs-0.10.4-unversioned-sync` protocol: the `Connect` handshake,
+`ModifyQuerySet` (`Add`/`Remove`), and `Transition` handling (`QueryUpdated`,
+`QueryFailed`, `QueryRemoved`) with the little-endian version/timestamp
+tracking the reference Go client's `protocol.go` documents (a one-element
+`args` array per query, and an omitted `maxObservedTimestamp` on a first
+connection). `client/tests/sync_test.setl` proves the decode and
+version-tracking logic by injecting hand-built `Transition` messages
+directly into a connection's read buffer (no live deployment needed for this
+layer, the same style `client/tests/convex_test.setl` uses for the HTTP
+envelope), covering an initial `QueryUpdated`, a chained external update,
+`QueryFailed` followed by a recovering `QueryUpdated` on the same
+subscription, and rejection of a `Transition` whose `startVersion` does not
+match.
 
-Not implemented yet: automatic reconnection with exponential backoff,
-`connectionCount`/`lastCloseReason` tracking across reconnects, rehydration
-suppression, the adapter-only `debugDisconnect` hook, and the bounded
-delivery queue AGENTS.md requires for a slow consumer. A transport failure
-or unexpected server message currently surfaces as an `"error"`/`"closed"`
-outcome instead of retrying.
+`client/live.setl` threads a sequence of those connections together across
+drops, and is the single owner of the Live socket: every read, write,
+reconnect attempt, and query-set change goes through its own small set of
+entry points (`live_pump`, `live_add`, `live_remove`, `live_debug_disconnect`),
+each threading the same session map through explicitly. It implements:
+
+- Automatic reconnection with exponential backoff (200ms base, capped at
+  5s), reset to the base the moment a handshake succeeds -- a healthy
+  connection never inherits a stale, grown delay from an earlier run of
+  failures.
+- Resubscribing the whole active query set on every reconnect, and
+  suppressing exactly one unchanged rehydration per subscription: a
+  reconnect's replayed `Add` naturally reproduces whatever value the
+  subscription already had, and delivering that as if it were a new update
+  would be wrong. Any later Transition -- changed or not -- delivers
+  normally again.
+- `connectionCount`, `lastCloseReason`, and the running maximum
+  `maxObservedTimestamp` across every connection in the session, all
+  resumed on the next `Connect`.
+- The adapter-only `debugDisconnect` hook: tears the active connection down
+  and schedules an immediate reconnect, acknowledged only after both have
+  happened.
+
+`client/tests/live_test.setl` proves the bookkeeping a live deployment is
+not needed for, in the same synthetic style `client/tests/sync_test.setl`
+uses one layer down: delivery, `QueryFailed` then recovery, an unchanged
+rehydration being suppressed versus a changed one being delivered normally,
+`live_remove`/`live_add` clearing every bit of state under a reused
+subscription ID, and exponential backoff growing then capping against a real
+(if instantly refused) local connection. A full end-to-end reconnect against
+a real backend -- five real reconnects, backoff actually resetting after a
+good handshake -- is what `./run verify`'s shared conformance run proves;
+AGENTS.md is explicit that only that shared evidence earns the Live badge.
+
+## The conformance adapter
+
+`client/tests/conformance/main.setl` is test infrastructure, not public
+client code (see AGENTS.md's "Conformance executable" section): it wraps
+`client/convex.setl` and `client/live.setl` and speaks the shared harness's
+NDJSON protocol v1, either over stdin/stdout or over one accepted TCP
+connection when `ADAPTER_LISTEN` names a listen address. It is single
+threaded, so its main loop interleaves pumping the Live connection with
+reading one controller command at a time -- the same shape `client/live.setl`
+itself describes as "exclusive ownership" for an interpreter with no
+concurrent callers to race against in the first place. Every read, whether
+of stdin or the accepted socket, goes through `client/tcp.setl`'s
+`tcp_read`, reusing the same drain-one-byte-behind-`select()` pattern
+described above rather than a second, adapter-specific implementation of it.
+
+Its own output is a bounded queue: 8 slots, a 4 MiB byte budget,
+subscription events droppable oldest-first, and `hello`/`result`/`error`/
+`ack`/`closed` responses never dropped -- comfortably inside the shared
+128 MiB adapter memory limit even under a stopped reader with near-maximum
+messages.
 
 ## GNU SETL lessons learned along the way
 
@@ -408,7 +486,24 @@ outcome instead of retrying.
 - GNU SETL map assignment `m(k) := om` does not store an entry (`om` is
   also what a missing-key lookup returns), so this client's JSON decoder
   cannot tell an object's `{"k":null}` apart from `{}` -- see the module
-  comments in `client/json.setl` and `client/convex.setl`.
+  comments in `client/json.setl` and `client/convex.setl`. The conformance
+  adapter turns this into a feature for omitting optional protocol fields
+  (never assign the key, and it is simply absent from the encoded JSON),
+  but had to route around it for `value` and a structured error's `data`,
+  which are both sometimes legitimately JSON `null` rather than absent --
+  see `client/tests/conformance/main.setl`'s own module comment.
+- `for x in t loop ... end loop;` supports `continue;` (next iteration) and
+  `quit;` (leave the loop) inside its body, the same way a `while`/`loop`
+  does -- undocumented in either texinfo manual shipped with this release,
+  but confirmed directly by running a small loop and confirmed present as
+  real grammar tokens (`src/tran/tokenize.c`, `parse.c`, and others).
+- `open(spec, "tcp-server")` plus `accept(fd)` is GNU SETL's own native
+  listening-socket support -- confirmed directly the same way as the
+  client-socket mode this client already used (`open(f, "tcp-client")`):
+  `accept` returns a new stream fd for the accepted peer, usable with the
+  same `select`/`getn`/`putc` primitives as any other stream. This is what
+  lets the conformance adapter implement `ADAPTER_LISTEN`'s TCP mode with
+  no native code beyond the existing TLS `callout()` boundary.
 
 ## Build recipe (proven)
 
@@ -432,8 +527,10 @@ comments:
   (confirmed by removing it and watching a trivial script fail), and
   `setlcpp` is invoked even without an explicit `--cpp` flag once a
   script uses the `#` length operator at all -- which is to say, in any
-  realistic SETL program. The planned runtime Docker stages will need to
-  ship all three binaries for exactly this reason.
+  realistic SETL program. `runtime-base` in `Dockerfile` ships all three
+  for exactly this reason, and keeps them off `PATH`: each launcher
+  invokes `/opt/convex/bin/setl` by absolute path, so `setltran`/`setlcpp`
+  are reachable only as its required siblings.
 
 `client/tests/tls_smoke.setl`, run as part of the same `test` stage, proves
 the point end to end: it calls the replaced `callskel.c` dispatcher through

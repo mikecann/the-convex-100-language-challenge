@@ -12,16 +12,10 @@ ARG SETL_SHA256=ee0475fd7e8f5c728a25db626286a8c8f62ad1751169ffb892170cdde271f207
 
 # ---------------------------------------------------------------------------
 # test: build GNU SETL from source with the Convex TLS boundary linked in,
-# and prove a real TLS handshake from inside the container.
-#
-# STATUS: this is the first, proven deliverable for the SETL client -- a
-# from-source interpreter build with the callout() TLS boundary wired up and
-# a real handshake against a live TLS host. No Convex client source exists
-# yet (see setl/README.md), so this Dockerfile intentionally has no
-# `example-runtime` or `runtime` stage: this repository's honesty rules
-# forbid shipping a runtime image that does not actually run a Convex
-# client. Do not add those stages until client/ has real code to put in
-# them.
+# prove a real TLS handshake from inside the container, and run every
+# language-local test suite. CMD reruns the same suite from the built
+# image (see the bottom of this stage), so `./run test setl` re-verifies
+# rather than only proving the build-time RUN steps once.
 # ---------------------------------------------------------------------------
 FROM --platform=linux/amd64 ${BUILD_IMAGE} AS test
 ARG SETL_URL
@@ -183,7 +177,7 @@ RUN set -eu; \
     /opt/setl-src/src/run/setl --cpp websocket_test.setl | tee /tmp/websocket_test.out; \
     grep -Fq 'WEBSOCKET CLIENT: ALL CHECKS PASSED' /tmp/websocket_test.out
 
-# client/sync.setl is a single-connection subset of the pinned
+# client/sync.setl is a single-connection primitive for the pinned
 # convex-rs-0.10.4-unversioned-sync /api/sync protocol: Connect,
 # ModifyQuerySet (Add/Remove), and Transition handling (QueryUpdated,
 # QueryFailed, QueryRemoved) with the little-endian version/timestamp
@@ -194,15 +188,35 @@ RUN set -eu; \
 # client/tests/convex_test.setl uses for the HTTP envelope -- covering an
 # initial QueryUpdated, a chained external update, QueryFailed followed
 # by a recovering QueryUpdated on the same subscription, and rejection of
-# a Transition whose startVersion does not match. Automatic reconnection,
-# backoff, and the bounded delivery queue are not implemented yet; see
-# setl/README.md.
+# a Transition whose startVersion does not match.
 COPY client/sync.setl /stage/sync.setl
 COPY client/tests/sync_test.setl /stage/sync_test.setl
 RUN set -eu; \
     cd /stage; \
     /opt/setl-src/src/run/setl --cpp sync_test.setl | tee /tmp/sync_test.out; \
     grep -Fq 'SYNC CLIENT: ALL CHECKS PASSED' /tmp/sync_test.out
+
+# client/live.setl threads a sequence of client/sync.setl connections
+# together across drops: exponential backoff, replaying the active query
+# set on every reconnect, and unchanged-rehydration suppression --
+# AGENTS.md's Live acceptance requirements. client/tests/live_test.setl
+# proves the bookkeeping a live deployment is not needed for, in the same
+# synthetic style client/tests/sync_test.setl uses one layer down:
+# delivery, QueryFailed then recovery, an unchanged rehydration being
+# suppressed versus a changed one being delivered normally, live_remove/
+# live_add clearing every bit of state under a reused subscription ID, and
+# exponential backoff growing then capping against a real (if instantly
+# refused) local connection. A full end-to-end reconnect against a real
+# backend -- five real reconnects, backoff actually resetting after a good
+# handshake -- is proven instead by `./run verify`'s shared conformance
+# run: AGENTS.md is explicit that only that shared evidence earns the
+# Live badge.
+COPY client/live.setl /stage/live.setl
+COPY client/tests/live_test.setl /stage/live_test.setl
+RUN set -eu; \
+    cd /stage; \
+    /opt/setl-src/src/run/setl --cpp live_test.setl | tee /tmp/live_test.out; \
+    grep -Fq 'LIVE CLIENT: ALL CHECKS PASSED' /tmp/live_test.out
 
 # examples/basics/count.setl decodes and validates the "count" field the
 # canonical example reads from demo:state/demo:increment, accepting a
@@ -219,3 +233,252 @@ RUN set -eu; \
     cd /stage; \
     /opt/setl-src/src/run/setl --cpp count_test.setl | tee /tmp/count_test.out; \
     grep -Fq 'COUNT DECODING: ALL CHECKS PASSED' /tmp/count_test.out
+
+# ---------------------------------------------------------------------------
+# Two flat source trees for the runtime images below: every shared client
+# module plus each runtime's own entrypoint. Kept separate from the
+# incremental /stage above, rather than merged into it, because
+# examples/basics/main.setl and client/tests/conformance/main.setl share a
+# filename -- setlcpp resolves a quoted #include relative to the current
+# working directory (see client/json.setl's module comment), so each
+# entrypoint needs its own directory of siblings, and each runtime image
+# below proves explicitly that it ships only its own entrypoint.
+# ---------------------------------------------------------------------------
+RUN mkdir -p /stage-example /stage-adapter
+COPY client/*.setl /stage-example/
+COPY examples/basics/main.setl examples/basics/count.setl /stage-example/
+COPY client/*.setl /stage-adapter/
+COPY client/tests/conformance/main.setl /stage-adapter/
+
+# examples/basics/main.setl is executed for real against the approved
+# local backend by ./run verify-example; this build stage has no network
+# path to that backend, so it is only proven here to parse correctly and
+# reach its own CONVEX_URL guard -- the same distinction
+# client/tests/tls_smoke.setl's own module comment draws between "the
+# transport works" and "the Convex host is reachable".
+RUN set -eu; \
+    cd /stage-example; \
+    if /opt/setl-src/src/run/setl --cpp main.setl >/tmp/example-guard.out 2>&1; then \
+      echo "expected the example to fail without CONVEX_URL" >&2; \
+      cat /tmp/example-guard.out >&2; \
+      exit 1; \
+    fi; \
+    grep -Fq 'CONVEX_URL is required' /tmp/example-guard.out
+
+# Parse-only proof already happened at every unit-test step above (a
+# syntax error fails those); this is the smoke check that the compiled
+# adapter actually answers hello/close over its own NDJSON protocol,
+# matching every other language's own build-time adapter probe (see
+# mumps/Dockerfile).
+RUN set -eu; \
+    cd /stage-adapter; \
+    printf '%s\n' \
+      '{"protocolVersion":1,"id":"hello","op":"hello"}' \
+      '{"id":"close","op":"close"}' \
+    | CONVEX_URL=http://example.invalid /opt/setl-src/src/run/setl --cpp main.setl \
+    | tee /tmp/adapter-probe.out; \
+    grep -Fq '"language":"setl"' /tmp/adapter-probe.out; \
+    grep -Fq '"type":"closed"' /tmp/adapter-probe.out
+
+# Stage exactly the runtime closure while this stage's own full toolset
+# (cp, ldd, awk, mkdir) is still available. runtime-base below deletes
+# everything in a *fresh* debian:bookworm-slim FIRST, including /bin/sh
+# itself, so any staging work has to happen here, in a stage that never
+# gets pruned, and arrive as one COPY --from=test /staging / afterwards --
+# not as RUN commands that execute after that deletion (see
+# mumps/Dockerfile's own comment on why the order cannot run the other
+# way; that Dockerfile is this one's template for the whole pattern).
+#
+# setltran (the compiler) and setlcpp (the preprocessor) are GNU SETL's
+# own required boot dependencies, not an optional toolchain: `setl` always
+# shells out to setlcpp once a '#' appears anywhere in a source file
+# (confirmed directly against this interpreter, not just when --cpp is
+# passed on the command line), and to setltran to translate every program
+# before running it -- every client module here uses #include, so both
+# run on every single invocation. This is the same "a runtime may retain a
+# language-runtime library named compiler only when the runtime itself
+# requires it to boot" exception AGENTS.md documents for exactly this
+# situation. Neither is placed on PATH: the launcher scripts below invoke
+# /opt/convex/bin/setl by its absolute path, so setltran and setlcpp are
+# reachable only as its required siblings next to it, never as a general
+# command anything else in the image could invoke.
+RUN set -eu; \
+    mkdir -p /staging/bin /staging/usr/bin /staging/opt/convex/bin \
+             /staging/opt/convex/example-src /staging/opt/convex/adapter-src \
+             /staging/etc/ssl/certs; \
+    cp -a /bin/dash /staging/bin/sh; \
+    for tool in id cat uname; do cp -a "/usr/bin/$tool" "/staging/usr/bin/$tool"; done; \
+    cp -aL /opt/setl-src/src/run/setl /staging/opt/convex/bin/setl; \
+    cp -aL /opt/setl-src/src/tran/setltran /staging/opt/convex/bin/setltran; \
+    cp -aL /opt/setl-src/src/cpp/setlcpp /staging/opt/convex/bin/setlcpp; \
+    for object in /staging/opt/convex/bin/* /staging/usr/bin/*; do \
+      ldd "$object" 2>/dev/null \
+        | awk '{ for (f = 1; f <= NF; f++) if ($f ~ /^\//) print $f }' \
+        | while read -r library; do \
+            mkdir -p "/staging$(dirname "$library")"; \
+            cp -aL "$library" "/staging$library"; \
+          done; \
+    done; \
+    cp -aL /etc/ssl/certs/ca-certificates.crt /staging/etc/ssl/certs/ca-certificates.crt; \
+    cp -aL /etc/ssl/openssl.cnf /staging/etc/ssl/openssl.cnf; \
+    cp -aL /etc/nsswitch.conf /staging/etc/nsswitch.conf; \
+    for resolver in libnss_dns.so.2 libnss_files.so.2 libresolv.so.2; do \
+      cp -aL "/lib/x86_64-linux-gnu/$resolver" "/staging/lib/x86_64-linux-gnu/$resolver"; \
+    done; \
+    cp -a /stage-example/*.setl /staging/opt/convex/example-src/; \
+    cp -a /stage-adapter/*.setl /staging/opt/convex/adapter-src/
+
+# The two entry-point launchers also have to be written here, as root,
+# rather than in the leaf stages below: runtime-base switches to USER
+# 65532:65532 before those leaf stages run, and that user cannot write
+# into /usr/local/bin (owned by root, from this same COPY). Each goes into
+# its own tree rather than the shared /staging closure above so
+# runtime-base -- the common ancestor of both leaf images -- never
+# contains either one; each leaf image ends up proving the OTHER
+# launcher's entrypoint and source directory are both absent, not just
+# that its own is present. Each launcher cd's into its own flat source
+# directory before invoking setl, since GNU SETL's #include resolves
+# relative to the current working directory rather than the entrypoint
+# file's own location.
+RUN mkdir -p /staging-example/usr/local/bin /staging-adapter/usr/local/bin \
+    && printf '%s\n' \
+      '#!/bin/sh' \
+      'set -eu' \
+      'cd /opt/convex/example-src' \
+      'exec /opt/convex/bin/setl --cpp main.setl "$@"' \
+      > /staging-example/usr/local/bin/convex-example \
+    && printf '%s\n' \
+      '#!/bin/sh' \
+      'set -eu' \
+      'cd /opt/convex/adapter-src' \
+      'exec /opt/convex/bin/setl --cpp main.setl' \
+      > /staging-adapter/usr/local/bin/convex-adapter \
+    && chmod 0555 /staging-example/usr/local/bin/convex-example \
+       /staging-adapter/usr/local/bin/convex-adapter
+
+# `./run test setl` reruns this exact suite from the built image (a plain
+# `docker run` on the `test` target otherwise only inherits the base
+# image's own default CMD, which proves nothing), so the evidence is not
+# limited to what happened during the build.
+RUN printf '%s\n' \
+      '#!/bin/sh' \
+      'set -eu' \
+      'SETL=/opt/setl-src/src/run/setl' \
+      'cd /stage' \
+      '"$SETL" --cpp json_test.setl | grep -Eq "^([0-9]+)/\1 json checks passed$"' \
+      '"$SETL" --cpp http_test.setl | grep -Fq "HTTP CLIENT: ALL CHECKS PASSED"' \
+      '"$SETL" --cpp convex_test.setl | grep -Fq "CONVEX CLASSIFY: ALL CHECKS PASSED"' \
+      '"$SETL" --cpp websocket_test.setl | grep -Fq "WEBSOCKET CLIENT: ALL CHECKS PASSED"' \
+      '"$SETL" --cpp sync_test.setl | grep -Fq "SYNC CLIENT: ALL CHECKS PASSED"' \
+      '"$SETL" --cpp live_test.setl | grep -Fq "LIVE CLIENT: ALL CHECKS PASSED"' \
+      '"$SETL" --cpp count_test.setl | grep -Fq "COUNT DECODING: ALL CHECKS PASSED"' \
+      'cd /stage-example' \
+      'if "$SETL" --cpp main.setl >/tmp/example-guard.out 2>&1; then' \
+      '  echo "expected the example to fail without CONVEX_URL" >&2' \
+      '  cat /tmp/example-guard.out >&2' \
+      '  exit 1' \
+      'fi' \
+      'grep -Fq "CONVEX_URL is required" /tmp/example-guard.out' \
+      'cd /stage-adapter' \
+      'probe=$(printf "%s\n" "{\"protocolVersion\":1,\"id\":\"hello\",\"op\":\"hello\"}" "{\"id\":\"close\",\"op\":\"close\"}" | CONVEX_URL=http://example.invalid "$SETL" --cpp main.setl)' \
+      'case "$probe" in' \
+      '  *"\"language\":\"setl\""*) ;;' \
+      '  *) printf "%s\n" "$probe" >&2; exit 1 ;;' \
+      'esac' \
+      'case "$probe" in' \
+      '  *"\"type\":\"closed\""*) ;;' \
+      '  *) printf "%s\n" "$probe" >&2; exit 1 ;;' \
+      'esac' \
+      > /usr/local/bin/run-language-tests \
+    && chmod 0555 /usr/local/bin/run-language-tests
+CMD ["/usr/local/bin/run-language-tests"]
+
+# ---------------------------------------------------------------------------
+# runtime-base: the pinned image with its broad filesystem removed, then
+# only GNU SETL's own runtime closure (found via ldd) and the staged
+# client source copied back. Both leaf images below add a real TLS
+# handshake proof from the pruned filesystem itself (AGENTS.md: "Exercise
+# TLS from the final image so hosted verification is not the first place
+# a missing provider or certificate path is discovered") -- OpenSSL's
+# default provider needs no engine or ossl-modules provider .so beyond
+# what is already linked into libcrypto for standard TLS 1.2/1.3
+# (confirmed against this base image: /etc/ssl/openssl.cnf ships its
+# [provider_sect] commented out by default, and client/callskel.c never
+# calls OSSL_PROVIDER_load), so none is staged.
+# ---------------------------------------------------------------------------
+FROM --platform=linux/amd64 ${BUILD_IMAGE} AS runtime-base
+RUN --mount=type=bind,from=test,source=/bin/busybox,target=/busybox,readonly \
+    set -eu; \
+    pruner=/busybox; \
+    for path in /bin /boot /home /lib /lib64 /media /mnt /opt /root \
+                /run /sbin /srv /usr /var; do \
+      "$pruner" rm -rf "$path"; \
+    done; \
+    for path in /etc/*; do \
+      case "$path" in \
+        /etc/hosts|/etc/resolv.conf) ;; \
+        *) "$pruner" rm -rf "$path" ;; \
+      esac; \
+    done; \
+    "$pruner" rm -rf /etc/.pwd.lock; \
+    exec "$pruner" rm -rf /tmp
+COPY --from=test /staging /
+ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    LC_ALL=C
+USER 65532:65532
+RUN test "$(id -u):$(id -g)" = 65532:65532 \
+    && test -s "$SSL_CERT_FILE" \
+    && test "$(uname -m)" = x86_64
+
+RUN test ! -e /etc/dpkg \
+    && test ! -e /etc/apt \
+    && test ! -e /var \
+    && test ! -e /usr/share \
+    && test ! -e /usr/include \
+    && test ! -e /usr/src \
+    && test ! -e /busybox \
+    && for command_name in cc gcc g++ clang make ld as ar cmake apt apt-get dpkg \
+         apk rpm curl wget nc netcat socat busybox node npm npx python \
+         python3 pip pip3 perl ruby php java go rustc cargo convex jq \
+         setltran setlcpp; do \
+         ! command -v "$command_name" >/dev/null 2>&1 || exit 1; \
+       done
+
+# A real TLS handshake and HTTP round trip from the pruned filesystem
+# itself, against the same stable well-known host client/tests/tls_smoke.setl
+# proves the boundary against during the test stage -- isolating "this
+# minimal image's own OpenSSL/cert/library closure works" from "the
+# client's own protocol code works", which the two leaf stages' own probes
+# below prove separately.
+COPY client/tests/tls_smoke.setl /opt/convex/tls-smoke-src/tls_smoke.setl
+RUN set -eu; \
+    cd /opt/convex/tls-smoke-src; \
+    /opt/convex/bin/setl tls_smoke.setl | tee /tmp/tls_smoke.out; \
+    grep -Fq 'TLS HANDSHAKE AND HTTP ROUND TRIP: OK' /tmp/tls_smoke.out
+
+# ---------------------------------------------------------------------------
+FROM runtime-base AS example-runtime
+COPY --from=test /staging-example /
+RUN test -x /usr/local/bin/convex-example \
+    && test ! -e /usr/local/bin/convex-adapter \
+    && test ! -e /opt/convex/adapter-src
+ENTRYPOINT ["/usr/local/bin/convex-example"]
+
+# ---------------------------------------------------------------------------
+# Keep the adapter last: `./run build setl` uses the default target.
+FROM runtime-base AS runtime
+COPY --from=test /staging-adapter /
+RUN set -eu; \
+    test -x /usr/local/bin/convex-adapter; \
+    test ! -e /usr/local/bin/convex-example; \
+    test ! -e /opt/convex/example-src; \
+    probe=$(printf '%s\n' \
+      '{"protocolVersion":1,"id":"hello","op":"hello"}' \
+      '{"id":"close","op":"close"}' \
+      | CONVEX_URL=http://example.invalid /usr/local/bin/convex-adapter); \
+    case "$probe" in \
+      *'"type":"closed"'*) ;; \
+      *) printf '%s\n' "$probe" >&2; exit 1 ;; \
+    esac
+ENTRYPOINT ["/usr/local/bin/convex-adapter"]

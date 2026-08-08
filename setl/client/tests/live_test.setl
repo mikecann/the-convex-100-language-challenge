@@ -1,0 +1,308 @@
+-- Unit coverage for client/live.setl's reconnect bookkeeping that does not
+-- need a live deployment, in the same synthetic style client/tests/sync_test.setl
+-- uses for the connection underneath it: a `live` map is built by hand with
+-- its "sync" field pre-populated exactly like sync_test.setl's fresh_sync(),
+-- and server messages are injected directly into that connection's buffer.
+--
+-- What real network coverage does NOT belong here: a live end-to-end
+-- reconnect (a fresh TCP/TLS/WebSocket handshake, backoff actually resetting
+-- after a real successful Connect, and five real reconnects surviving a real
+-- server) is what `./run verify` and `./run verify-hosted` prove against the
+-- real backend -- AGENTS.md is explicit that only that shared evidence earns
+-- the Live badge, and client/tests/sync_test.setl already draws this same
+-- line one layer down. This file's job is the bookkeeping around that: does
+-- a rehydration get suppressed exactly when it should, does removing and
+-- re-adding a subscription under the same ID start clean, and does the
+-- backoff schedule grow and cap correctly on a real (if instant) connection
+-- failure.
+--
+-- Covers: initial delivery, an external update, QueryFailed then recovery
+-- (mirroring client/tests/sync_test.setl one layer up), unchanged-rehydration
+-- suppression versus a genuine change arriving during the same rehydration
+-- window, live_remove/live_add clearing stale state under a reused subId,
+-- live_outcome_equal's three comparisons, and exponential backoff growth and
+-- capping against a real connection that a closed local port refuses fast.
+
+fail_count := 0;
+
+-- ---------------------------------------------------------------------------
+-- Delivery and rehydration-suppression bookkeeping (no network: `live` is
+-- built with its connection already "up", the same way sync_test.setl builds
+-- fresh_sync()).
+-- ---------------------------------------------------------------------------
+
+live := fresh_live();
+
+value0 := {};
+value0("count") := 0;
+v0 := live("sync")("remote_version");
+v1 := version_of(1, "AQAAAAAAAAA=");
+live("sync")("ws")("buf") := raw_text_frame(transition_json(v0, v1, [query_updated(0, value0)]));
+live := live_pump(live, 4000);
+fail_count +:= expect_eq("initial delivery revision", live("revisions")("s1"), 1);
+fail_count +:= expect_eq("initial delivery kind", live("results")("s1")("kind"), "value");
+fail_count +:= expect_eq("initial delivery value", live("results")("s1")("value")("count"), 0);
+
+value1 := {};
+value1("count") := 1;
+v2 := version_of(2, "AgAAAAAAAAA=");
+live("sync")("ws")("buf") := raw_text_frame(transition_json(v1, v2, [query_updated(0, value1)]));
+live := live_pump(live, 4000);
+fail_count +:= expect_eq("external update revision", live("revisions")("s1"), 2);
+fail_count +:= expect_eq("external update value", live("results")("s1")("value")("count"), 1);
+
+-- QueryFailed, then a recovering QueryUpdated on the same subscription --
+-- neither is ever suppressed, since pending_rehydration was never armed on
+-- this connection (only live_maybe_reconnect's replay does that).
+v3 := version_of(3, "AwAAAAAAAAA=");
+live("sync")("ws")("buf") := raw_text_frame(transition_json(v2, v3, [query_failed(0, "synthetic failure")]));
+live := live_pump(live, 4000);
+fail_count +:= expect_eq("QueryFailed revision", live("revisions")("s1"), 3);
+fail_count +:= expect_eq("QueryFailed kind", live("results")("s1")("kind"), "error");
+fail_count +:= expect_eq("QueryFailed message", live("results")("s1")("errMessage"), "synthetic failure");
+
+value2 := {};
+value2("count") := 2;
+v4 := version_of(4, "BAAAAAAAAAA=");
+live("sync")("ws")("buf") := raw_text_frame(transition_json(v3, v4, [query_updated(0, value2)]));
+live := live_pump(live, 4000);
+fail_count +:= expect_eq("recovery revision", live("revisions")("s1"), 4);
+fail_count +:= expect_eq("recovery kind", live("results")("s1")("kind"), "value");
+fail_count +:= expect_eq("recovery value", live("results")("s1")("value")("count"), 2);
+
+-- Simulate what live_maybe_reconnect's replay does right after a reconnect:
+-- arm pending_rehydration, then feed a Transition carrying the exact same
+-- value the subscription already had. This must be cached but NOT counted
+-- as a new revision -- the AGENTS.md sequence "initial 0, disconnect ack,
+-- external mutation, then 1" depends on exactly this suppression.
+live("pending_rehydration")("s1") := true;
+v5 := version_of(5, "BQAAAAAAAAA=");
+live("sync")("ws")("buf") := raw_text_frame(transition_json(v4, v5, [query_updated(0, value2)]));
+live := live_pump(live, 4000);
+fail_count +:= expect_eq("unchanged rehydration is suppressed", live("revisions")("s1"), 4);
+fail_count +:= expect_eq("suppressed rehydration still caches the value", live("results")("s1")("value")("count"), 2);
+fail_count +:= expect_eq("suppression clears the pending flag", live("pending_rehydration")("s1"), om);
+
+-- A rehydration that arrives with a DIFFERENT value (the external change
+-- happened to land before the reconnect's replay was answered) must be
+-- delivered normally, not suppressed, and must still clear the flag.
+live("pending_rehydration")("s1") := true;
+value3 := {};
+value3("count") := 3;
+v6 := version_of(6, "BgAAAAAAAAA=");
+live("sync")("ws")("buf") := raw_text_frame(transition_json(v5, v6, [query_updated(0, value3)]));
+live := live_pump(live, 4000);
+fail_count +:= expect_eq("changed rehydration is delivered", live("revisions")("s1"), 5);
+fail_count +:= expect_eq("changed rehydration value", live("results")("s1")("value")("count"), 3);
+fail_count +:= expect_eq("changed rehydration clears the pending flag", live("pending_rehydration")("s1"), om);
+
+-- ---------------------------------------------------------------------------
+-- live_remove / live_add bookkeeping under a reused subId (no network).
+-- ---------------------------------------------------------------------------
+
+live2 := live_open("http://127.0.0.1:1", "test-0.1.0");
+live2 := live_add(live2, "reused", "demo:state", {});
+-- Fake a delivered value and a stale rehydration flag directly, as if a
+-- connection had been up and had just replayed this subscription.
+value9 := {};
+value9("count") := 9;
+outcome9 := {};
+outcome9("kind") := "value";
+outcome9("value") := value9;
+live2("results")("reused") := outcome9;
+live2("revisions")("reused") := 7;
+live2("pending_rehydration")("reused") := true;
+
+live2 := live_remove(live2, "reused");
+fail_count +:= expect_eq("remove clears desired", live2("desired")("reused"), om);
+fail_count +:= expect_eq("remove clears results", live2("results")("reused"), om);
+fail_count +:= expect_eq("remove clears revisions", live2("revisions")("reused"), om);
+fail_count +:= expect_eq("remove clears pending_rehydration", live2("pending_rehydration")("reused"), om);
+
+live2 := live_add(live2, "reused", "demo:state", {});
+fail_count +:= expect_eq("re-add starts with no cached result", live2("results")("reused"), om);
+fail_count +:= expect_eq("re-add starts with no revision", live2("revisions")("reused"), om);
+fail_count +:= expect_eq("re-add is registered in desired", live2("desired")("reused")("path"), "demo:state");
+
+-- ---------------------------------------------------------------------------
+-- live_outcome_equal
+-- ---------------------------------------------------------------------------
+
+a_value := {};
+a_value("count") := 1;
+b_value := {};
+b_value("count") := 1;
+c_value := {};
+c_value("count") := 2;
+outcome_a := {};
+outcome_a("kind") := "value";
+outcome_a("value") := a_value;
+outcome_b := {};
+outcome_b("kind") := "value";
+outcome_b("value") := b_value;
+outcome_c := {};
+outcome_c("kind") := "value";
+outcome_c("value") := c_value;
+fail_count +:= expect_eq("equal values compare equal", live_outcome_equal(outcome_a, outcome_b), true);
+fail_count +:= expect_eq("different values compare unequal", live_outcome_equal(outcome_a, outcome_c), false);
+
+err_a := {};
+err_a("kind") := "error";
+err_a("errMessage") := "boom";
+err_a("errData") := om;
+err_b := {};
+err_b("kind") := "error";
+err_b("errMessage") := "boom";
+err_b("errData") := om;
+err_c := {};
+err_c("kind") := "error";
+err_c("errMessage") := "different";
+err_c("errData") := om;
+fail_count +:= expect_eq("equal errors compare equal", live_outcome_equal(err_a, err_b), true);
+fail_count +:= expect_eq("different errors compare unequal", live_outcome_equal(err_a, err_c), false);
+fail_count +:= expect_eq("value and error never compare equal", live_outcome_equal(outcome_a, err_a), false);
+
+-- ---------------------------------------------------------------------------
+-- Exponential backoff: a real (if instant) connection failure against a
+-- local port nothing listens on, so this stays fast without a fixture
+-- server. next_attempt_at is forced due by hand between attempts (a plain
+-- map write, since `live` is threaded explicitly like every other
+-- connection map in this client) rather than actually sleeping out each
+-- delay, which would make this suite minutes slower for no extra coverage.
+-- ---------------------------------------------------------------------------
+
+backoff_live := live_open("http://127.0.0.1:1", "test-0.1.0");
+backoff_live := live_add(backoff_live, "b1", "demo:state", {});
+fail_count +:= expect_eq("base backoff before any attempt", backoff_live("backoff_ms"), live_base_backoff_ms());
+
+backoff_live := live_maybe_reconnect(backoff_live);
+fail_count +:= expect_eq("failed attempt stays disconnected", backoff_live("sync"), om);
+fail_count +:= expect_eq("first failure doubles the backoff", backoff_live("backoff_ms"), live_base_backoff_ms() * 2);
+
+backoff_live("next_attempt_at") := clock;
+backoff_live := live_maybe_reconnect(backoff_live);
+fail_count +:= expect_eq("second failure doubles again", backoff_live("backoff_ms"), live_base_backoff_ms() * 4);
+
+-- Force the backoff to just below the cap and confirm the next failure
+-- clamps exactly at live_max_backoff_ms() rather than overshooting it.
+backoff_live("backoff_ms") := live_max_backoff_ms() - 100;
+backoff_live("next_attempt_at") := clock;
+backoff_live := live_maybe_reconnect(backoff_live);
+fail_count +:= expect_eq("backoff clamps at the cap", backoff_live("backoff_ms"), live_max_backoff_ms());
+
+if fail_count = 0 then
+  print("LIVE CLIENT: ALL CHECKS PASSED");
+else
+  print("LIVE CLIENT: " + str(fail_count) + " CHECK(S) FAILED");
+  stop 1;
+end if;
+
+proc expect_eq(label, actual, expected);
+  if actual /= expected then
+    print("FAIL " + label + ": got " + str(actual) + " want " + str(expected));
+    return 1;
+  end if;
+  return 0;
+end proc;
+
+-- Builds a `live` map with subscription "s1" already wired to queryId 0 on
+-- an already-"connected" synthetic sync connection, the same shape
+-- sync_test.setl's fresh_sync() builds one layer down.
+proc fresh_live();
+  live := live_open("http://example.invalid", "test-0.1.0");
+  live("desired")("s1") := subscription_of("demo:state", {});
+  live("query_id_of")("s1") := 0;
+  live("sub_id_of_query")(0) := "s1";
+
+  sync := {};
+  sync("ws") := {};
+  sync("ws")("open") := true;
+  sync("ws")("buf") := "";
+  sync("ws")("last_close_reason") := "InitialConnect";
+  sync("session_id") := "test-session";
+  sync("query_set_version") := 1;
+  sync("remote_version") := sync_zero_version();
+  sync("max_observed_timestamp") := "";
+  sync("next_query_id") := 1;
+  sync("subscriptions") := {};
+  sync("results") := {};
+  sync("revisions") := {};
+  live("sync") := sync;
+  return live;
+end proc;
+
+proc subscription_of(path, args_value);
+  s := {};
+  s("path") := path;
+  s("args") := args_value;
+  return s;
+end proc;
+
+-- Builds one raw, unmasked text frame carrying AText, for injection directly
+-- into a connection's `buf` -- see client/tests/sync_test.setl's own
+-- raw_text_frame for why each synthetic test file keeps its own copy of
+-- this small helper instead of sharing one.
+proc raw_text_frame(text);
+  payload_len := #text;
+  frame := char(128 + 1);
+  if payload_len <= 125 then
+    frame +:= char(payload_len);
+  elseif payload_len <= 65535 then
+    frame +:= char(126);
+    frame +:= char(payload_len div 256 mod 256);
+    frame +:= char(payload_len mod 256);
+  else
+    frame +:= char(127) + char(0) + char(0) + char(0) + char(0);
+    frame +:= char(payload_len div 16777216 mod 256);
+    frame +:= char(payload_len div 65536 mod 256);
+    frame +:= char(payload_len div 256 mod 256);
+    frame +:= char(payload_len mod 256);
+  end if;
+  return frame + text;
+end proc;
+
+proc version_of(query_set, ts);
+  v := {};
+  v("querySet") := query_set;
+  v("identity") := 0;
+  v("ts") := ts;
+  return v;
+end proc;
+
+proc transition_json(start_version, end_version, modifications);
+  msg := {};
+  msg("type") := "Transition";
+  msg("startVersion") := start_version;
+  msg("endVersion") := end_version;
+  msg("modifications") := modifications;
+  return json_encode(msg);
+end proc;
+
+proc query_updated(query_id, value_map);
+  m := {};
+  m("type") := "QueryUpdated";
+  m("queryId") := query_id;
+  m("value") := value_map;
+  m("logLines") := [];
+  return m;
+end proc;
+
+proc query_failed(query_id, error_message);
+  m := {};
+  m("type") := "QueryFailed";
+  m("queryId") := query_id;
+  m("errorMessage") := error_message;
+  m("errorData") := om;
+  m("logLines") := [];
+  return m;
+end proc;
+
+#include "tcp.setl"
+#include "tls.setl"
+#include "stream.setl"
+#include "http.setl"
+#include "json.setl"
+#include "websocket.setl"
+#include "convex.setl"
+#include "sync.setl"
+#include "live.setl"

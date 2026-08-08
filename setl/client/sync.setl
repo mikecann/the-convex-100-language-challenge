@@ -1,16 +1,14 @@
--- A single-connection subset of Convex's /api/sync Live protocol, pinned
--- to the `convex-rs-0.10.4-unversioned-sync' profile also referenced by
--- client/tests/tls_smoke.setl and client/websocket.setl. This module
--- covers what examples/basics/main.setl needs to demonstrate a real
--- reactive subscription: connect, add one or more queries, and observe
--- QueryUpdated/QueryFailed transitions as they arrive.
---
--- Deliberately NOT yet implemented (see setl/README.md's "What's left"):
--- automatic reconnection with exponential backoff, the bounded delivery
--- queue AGENTS.md requires for a slow consumer, and the adapter-only
--- debugDisconnect hook. A transport failure or unexpected server message
--- surfaces as an "error"/"closed" outcome instead of retrying, so callers
--- that need resilience must reconnect themselves for now.
+-- A single-connection primitive for Convex's /api/sync Live protocol,
+-- pinned to the `convex-rs-0.10.4-unversioned-sync' profile also
+-- referenced by client/tests/tls_smoke.setl and client/websocket.setl.
+-- This module covers one connection's whole lifetime: connect, add or
+-- remove queries, and observe QueryUpdated/QueryFailed transitions as
+-- they arrive. A transport failure or unexpected server message surfaces
+-- as an "error"/"closed" outcome rather than retrying -- automatic
+-- reconnection with exponential backoff, replaying the active query set,
+-- unchanged-rehydration suppression, and the adapter-only debugDisconnect
+-- hook all live one layer up, in client/live.setl, which threads a
+-- sequence of these single connections together across drops.
 --
 -- Wire shapes (client-to-server Connect/ModifyQuerySet, server-to-client
 -- Transition) match the reference Go client's protocol.go exactly; see
@@ -28,9 +26,12 @@
 --   "max_observed_timestamp" the highest Transition end ts seen so far,
 --                            base64, compared as little-endian bytes
 --   "next_query_id"         the next queryId sync_add will allocate
---   "subscriptions"         queryId -> {"path":.., "args":..}, so a
---                            reconnect could one day re-Add every active
---                            query (not yet implemented -- see above)
+--   "subscriptions"         queryId -> {"path":.., "args":..}; unused by
+--                            this module itself (client/live.setl keeps
+--                            its own desired-set map, since it spans
+--                            more than one connection), kept here only so
+--                            a caller working directly with one sync_*
+--                            connection can inspect what it asked for
 --   "results"                queryId -> {"kind":"value","value":..,
 --                            "logLines":..} or {"kind":"error",
 --                            "errMessage":..,"errData":..,"logLines":..},
@@ -47,7 +48,26 @@
 -- client/convex.setl (for convex_parse_url) -- see the module comment at
 -- the top of client/json.setl for why GNU SETL requires that ordering.
 
+-- A first connection: generates a fresh session, and reports connection 0
+-- with reason "InitialConnect" and no resume timestamp -- exactly what
+-- client/live.setl's own reconnect machinery also sends for its very
+-- first attempt, via sync_connect_ex below. Kept as the simple entry
+-- point examples/basics/main.setl and the language-local test suites use,
+-- where there is only ever one connection and nothing to resume.
 proc sync_connect(deployment_url, client_version, timeout_ms);
+  return sync_connect_ex(deployment_url, client_version, timeout_ms, om, 0, "InitialConnect", "");
+end proc;
+
+-- The full form client/live.setl's reconnect machinery uses for every
+-- attempt, including the first: session_id persists across reconnects
+-- (om generates a fresh one, for a first-ever connection), connection_count
+-- and last_close_reason report why the previous connection ended (per the
+-- pinned protocol's Connect message), and max_observed_timestamp -- when
+-- not "" or om -- resumes from the highest Transition end timestamp any
+-- prior connection on this session observed. Matches sync_connect's own
+-- comment on why a first connection omits maxObservedTimestamp entirely
+-- rather than sending an empty one.
+proc sync_connect_ex(deployment_url, client_version, timeout_ms, session_id, connection_count, last_close_reason, max_observed_timestamp);
   [success, target] := convex_parse_url(deployment_url);
   if not success then
     return [false, target];
@@ -58,15 +78,18 @@ proc sync_connect(deployment_url, client_version, timeout_ms);
     return [false, ws];
   end if;
 
-  session_id := sync_new_session_id();
+  if session_id = om then
+    session_id := sync_new_session_id();
+  end if;
   connect_msg := {};
   connect_msg("type") := "Connect";
   connect_msg("sessionId") := session_id;
-  connect_msg("connectionCount") := 0;
-  connect_msg("lastCloseReason") := "InitialConnect";
+  connect_msg("connectionCount") := connection_count;
+  connect_msg("lastCloseReason") := last_close_reason;
   connect_msg("clientTs") := 0;
-  -- maxObservedTimestamp is omitted entirely on a first connection (the
-  -- reference client marks it `omitempty'); there is nothing to resume.
+  if max_observed_timestamp /= om and max_observed_timestamp /= "" then
+    connect_msg("maxObservedTimestamp") := max_observed_timestamp;
+  end if;
 
   [success, info] := ws_send_text(ws, json_encode(connect_msg));
   if not success then
@@ -279,10 +302,54 @@ proc sync_apply_transition(sync, envelope);
 
   sync("remote_version") := end_version;
   end_ts := end_version("ts");
-  if sync("max_observed_timestamp") = "" then
+  -- The running maximum across every Transition this connection has seen,
+  -- not just the first: client/live.setl's reconnect machinery resumes
+  -- from this value, so a later, smaller ts (a valid situation -- ts only
+  -- has to be non-decreasing per AGENTS.md, and a fresh connection's first
+  -- Transition after a reconnect starts back at this session's own
+  -- previous maximum) must never overwrite a genuinely higher one already
+  -- observed.
+  if sync("max_observed_timestamp") = "" or ts_compare(end_ts, sync("max_observed_timestamp")) > 0 then
     sync("max_observed_timestamp") := end_ts;
   end if;
   return ["transition", sync];
+end proc;
+
+-- Three-way compare of two base64-encoded Convex sync-protocol timestamps
+-- (each the base64 of a little-endian uint64) as unsigned integers,
+-- without ever materializing either as a SETL number: -1, 0, or 1. The
+-- most significant byte is the *last* byte of the decoded string (little-
+-- endian), so the comparison walks from the end.
+proc ts_compare(a_b64, b_b64);
+  a_bytes := base64_decode(a_b64);
+  b_bytes := base64_decode(b_b64);
+  a_len := #a_bytes;
+  b_len := #b_bytes;
+  if a_len /= b_len then
+    -- Every timestamp this protocol produces decodes to the same 8 bytes;
+    -- a length mismatch only arises from a malformed input, which a
+    -- shorter-therefore-smaller ordering handles reasonably without
+    -- raising a separate error path here.
+    if a_len < b_len then
+      return -1;
+    else
+      return 1;
+    end if;
+  end if;
+  i := a_len;
+  while i >= 1 loop
+    xa := ichar(a_bytes(i));
+    xb := ichar(b_bytes(i));
+    if xa /= xb then
+      if xa < xb then
+        return -1;
+      else
+        return 1;
+      end if;
+    end if;
+    i -:= 1;
+  end loop;
+  return 0;
 end proc;
 
 -- Blocks until query_id's revision counter advances past whatever it was

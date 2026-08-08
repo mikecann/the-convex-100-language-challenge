@@ -1,0 +1,381 @@
+-- Reconnecting Live: threads a sequence of client/sync.setl connections
+-- together across drops so a caller's subscriptions survive a transport
+-- failure, a server-initiated close, or the adapter-only debugDisconnect
+-- hook (client/tests/conformance/main.setl's `debugDisconnect` command
+-- calls live_debug_disconnect directly).
+--
+-- This module is the single owner of the Live socket: every read, write,
+-- reconnect attempt, and query-set change goes through live_pump,
+-- live_add, live_remove, or live_debug_disconnect below, and every one of
+-- them threads the same `live` map through explicitly (the style this
+-- whole client uses instead of GNU SETL's by-value map semantics hiding
+-- mutation -- see client/websocket.setl's module comment). Nothing else
+-- in this codebase reaches into a sync connection's socket directly once
+-- live_open has been called; a caller (the conformance adapter, or a
+-- future example) drives everything through this module's own calls, one
+-- at a time, which is what "exclusive ownership" means for a
+-- single-threaded interpreter with no concurrent callers to race against
+-- in the first place.
+--
+-- A `live` session is a map (see live_open), threaded explicitly like
+-- every other connection map in this client. Fields:
+--   "deployment_url", "client_version"   passed to every (re)connect
+--   "session_id"          persists across reconnects; the server
+--                          correlates them by this, not by connection
+--   "sync"                the active client/sync.setl connection, or om
+--                          while disconnected/reconnecting
+--   "connection_count"     sent in the next Connect message, then
+--                          incremented after a successful handshake --
+--                          matches the pinned protocol's own counting
+--   "last_close_reason"    sent in the next Connect message, describing
+--                          why the previous connection ended
+--   "max_observed_timestamp" the running maximum end ts this session has
+--                          observed across every connection so far (see
+--                          client/sync.setl's ts_compare); resumed on
+--                          every reconnect attempt
+--   "backoff_ms"           the delay before the next reconnect attempt
+--                          after a failure, doubling up to
+--                          live_max_backoff_ms() and resetting to
+--                          live_base_backoff_ms() on the next successful
+--                          handshake
+--   "next_attempt_at"      a `clock` deadline; live_maybe_reconnect does
+--                          nothing until this passes
+--   "desired"              subId -> {"path":.., "args":..}: every
+--                          subscription the caller wants active, whether
+--                          or not a connection currently exists to carry
+--                          it. Replayed onto every fresh connection.
+--   "query_id_of"          subId -> this connection's queryId (cleared
+--                          and rebuilt on every reconnect)
+--   "sub_id_of_query"      the reverse of "query_id_of", used to route an
+--                          incoming Transition's queryId back to the
+--                          caller's own subId
+--   "results"              subId -> the last outcome delivered to the
+--                          caller, straight from client/sync.setl's own
+--                          "results" map entry: {"kind":"value","value":..,
+--                          "logLines":..} or {"kind":"error",
+--                          "errMessage":..,"errData":..,"logLines":..}
+--   "revisions"             subId -> a counter bumped only when "results"
+--                          actually changes for a caller -- an unchanged
+--                          rehydration after a reconnect leaves this
+--                          alone, which is exactly how a caller (the
+--                          adapter's adPublishSubscriptions-equivalent)
+--                          tells "there is a new value to publish" apart
+--                          from "the value happened to repeat"
+--   "pending_rehydration"   subId -> true for exactly one Transition:
+--                          set when a subscription is replayed onto a
+--                          fresh connection, cleared the moment its next
+--                          Transition (whether changed or not) arrives
+--
+-- This module is proc-only (no top-level statements), so it is meant to
+-- be #include'd (via `setl --cpp') after client/sync.setl, which it
+-- builds on, and after its own including file's mainline statements --
+-- see the module comment at the top of client/json.setl for why GNU
+-- SETL requires that ordering. The backoff and connect-timeout tunables
+-- below are nullary procs rather than top-level constants for the same
+-- reason: a bare top-level assignment here would be a statement, and
+-- GNU SETL requires every mainline statement in the whole concatenated
+-- source to precede every proc definition in it.
+proc live_base_backoff_ms();
+  return 200;
+end proc;
+
+proc live_max_backoff_ms();
+  return 5000;
+end proc;
+
+proc live_connect_timeout_ms();
+  return 8000;
+end proc;
+
+proc live_open(deployment_url, client_version);
+  live := {};
+  live("deployment_url") := deployment_url;
+  live("client_version") := client_version;
+  live("session_id") := om;
+  live("sync") := om;
+  live("connection_count") := 0;
+  live("last_close_reason") := "InitialConnect";
+  live("max_observed_timestamp") := "";
+  live("backoff_ms") := live_base_backoff_ms();
+  live("next_attempt_at") := clock;
+  live("desired") := {};
+  live("query_id_of") := {};
+  live("sub_id_of_query") := {};
+  live("results") := {};
+  live("revisions") := {};
+  live("pending_rehydration") := {};
+  return live;
+end proc;
+
+-- Registers (or replaces) a caller-facing subscription under sub_id.
+-- Always succeeds from the caller's point of view: if a connection is up,
+-- the Add is sent now; otherwise it joins "desired" and live_pump's next
+-- successful (re)connect sends it. A synchronous write failure on an
+-- already-open connection retires that connection (so a reconnect picks
+-- the Add back up) rather than dropping the subscription.
+proc live_add(live, sub_id, path, args_value);
+  live := live_forget_result(live, sub_id);
+  subscription := {};
+  subscription("path") := path;
+  subscription("args") := args_value;
+  live("desired")(sub_id) := subscription;
+
+  if live("sync") /= om then
+    [added, sy, query_id] := sync_add(live("sync"), path, args_value);
+    live("sync") := sy;
+    if added then
+      live("query_id_of")(sub_id) := query_id;
+      live("sub_id_of_query")(query_id) := sub_id;
+    else
+      live := live_retire(live, "Add write failed: " + str(sy("last_error")));
+    end if;
+  end if;
+  return live;
+end proc;
+
+-- Removes a caller-facing subscription. Idempotent: removing an unknown
+-- sub_id is a no-op. Everything this subscription owns -- the desired
+-- entry, the current connection's queryId mapping in both directions, and
+-- any cached result/revision/rehydration state -- is gone before this
+-- returns, so a same-ID live_add called immediately afterward starts
+-- completely fresh rather than comparing against stale state (AGENTS.md's
+-- "invalidate the old relay before the acknowledgement is published",
+-- satisfied here by plain synchronous ordering: nothing runs concurrently
+-- with this call in a single-threaded interpreter).
+proc live_remove(live, sub_id);
+  existing := live("desired")(sub_id);
+  if existing /= om then
+    live("desired") := live("desired") less [sub_id, existing];
+  end if;
+
+  query_id := live("query_id_of")(sub_id);
+  if query_id /= om then
+    if live("sync") /= om then
+      [removed, sy] := sync_remove(live("sync"), query_id);
+      live("sync") := sy;
+      if not removed then
+        live := live_retire(live, "Remove write failed: " + str(sy("last_error")));
+      end if;
+    end if;
+    live("query_id_of") := live("query_id_of") less [sub_id, query_id];
+    live("sub_id_of_query") := live("sub_id_of_query") less [query_id, sub_id];
+  end if;
+  return live_forget_result(live, sub_id);
+end proc;
+
+proc live_forget_result(live, sub_id);
+  existing_result := live("results")(sub_id);
+  if existing_result /= om then
+    live("results") := live("results") less [sub_id, existing_result];
+  end if;
+  existing_rev := live("revisions")(sub_id);
+  if existing_rev /= om then
+    live("revisions") := live("revisions") less [sub_id, existing_rev];
+  end if;
+  existing_pending := live("pending_rehydration")(sub_id);
+  if existing_pending /= om then
+    live("pending_rehydration") := live("pending_rehydration") less [sub_id, existing_pending];
+  end if;
+  return live;
+end proc;
+
+-- Adapter-only: simulates a transport drop by tearing down the active
+-- connection right now and scheduling an immediate reconnect attempt.
+-- Every desired subscription survives (see live_retire) and is replayed
+-- once live_maybe_reconnect brings a new connection up.
+proc live_debug_disconnect(live);
+  return live_retire(live, "debugDisconnect");
+end proc;
+
+-- The single entry point a caller polls on every pass of its own loop
+-- (the adapter's main loop, at the same tick as reading one controller
+-- command -- see client/tests/conformance/main.setl). Gives a dropped
+-- connection a chance to reconnect (bounded by its own
+-- live_connect_timeout_ms() when an attempt is actually due, not fragmented
+-- across calls), then reads at most one server message bounded by
+-- budget_ms. Never blocks past budget_ms plus, at most once per call, one
+-- full reconnect attempt.
+proc live_pump(live, budget_ms);
+  live := live_maybe_reconnect(live);
+  if live("sync") = om then
+    return live;
+  end if;
+
+  before_revisions := live("sync")("revisions");
+  [outcome, sy] := sync_poll(live("sync"), budget_ms);
+  live("sync") := sy;
+
+  if outcome = "transition" then
+    return live_absorb_transition(live, before_revisions);
+  elseif outcome = "closed" then
+    return live_retire(live, str(sy("ws")("last_close_reason")));
+  elseif outcome = "error" then
+    return live_retire(live, "transport error: " + str(sy("last_error")));
+  end if;
+  -- outcome = "timeout": nothing arrived within budget_ms; try again on
+  -- the next call.
+  return live;
+end proc;
+
+-- Only attempts a connection when the caller actually wants one (at
+-- least one desired subscription) and the backoff window has elapsed.
+-- On success: resets backoff, bumps connection_count, and replays every
+-- desired subscription onto the fresh connection, arming rehydration
+-- suppression for exactly the ones whose last known outcome was a real
+-- value (never for a subscription that has not delivered anything yet,
+-- and never for one whose last outcome was an error -- both still want
+-- their next value delivered unconditionally). On failure: records the
+-- reason as the next attempt's lastCloseReason and grows the backoff.
+proc live_maybe_reconnect(live);
+  if live("sync") /= om then
+    return live;
+  end if;
+  if #live("desired") = 0 then
+    return live;
+  end if;
+  if clock < live("next_attempt_at") then
+    return live;
+  end if;
+
+  [success, sy] := sync_connect_ex(
+      live("deployment_url"), live("client_version"), live_connect_timeout_ms(),
+      live("session_id"), live("connection_count"), live("last_close_reason"),
+      live("max_observed_timestamp"));
+  if not success then
+    live("last_close_reason") := "connect failed: " + str(sy);
+    live("next_attempt_at") := clock + live("backoff_ms");
+    grown := live("backoff_ms") * 2;
+    if grown > live_max_backoff_ms() then
+      grown := live_max_backoff_ms();
+    end if;
+    live("backoff_ms") := grown;
+    return live;
+  end if;
+
+  live("sync") := sy;
+  live("session_id") := sy("session_id");
+  live("connection_count") := live("connection_count") + 1;
+  live("backoff_ms") := live_base_backoff_ms();
+  live("next_attempt_at") := clock;
+  live("query_id_of") := {};
+  live("sub_id_of_query") := {};
+
+  for [sub_id, subscription] in live("desired") loop
+    [added, sy2, query_id] := sync_add(live("sync"), subscription("path"), subscription("args"));
+    live("sync") := sy2;
+    if not added then
+      -- The connection just came up; a write failing immediately means
+      -- it is already bad. Retire it (this also stops the loop from
+      -- sending further Adds over a socket live_retire is about to
+      -- close) and let the next live_pump call try again from scratch.
+      return live_retire(live, "Add write failed during reconnect replay: " + str(sy2("last_error")));
+    end if;
+    live("query_id_of")(sub_id) := query_id;
+    live("sub_id_of_query")(query_id) := sub_id;
+
+    previous := live("results")(sub_id);
+    if previous /= om and previous("kind") = "value" then
+      live("pending_rehydration")(sub_id) := true;
+    else
+      flag := live("pending_rehydration")(sub_id);
+      if flag /= om then
+        live("pending_rehydration") := live("pending_rehydration") less [sub_id, flag];
+      end if;
+    end if;
+  end loop;
+  return live;
+end proc;
+
+-- Applies whichever queryIds changed in the Transition sync_poll just
+-- merged into live("sync"). before_revisions is a snapshot of
+-- sync("revisions") taken before that call, so "changed" means this
+-- queryId's counter is higher now than it was then -- sync_apply_transition
+-- itself already resolved which modifications applied to which queryId,
+-- and bumps that counter once per queryId per Transition regardless of
+-- how many modifications named it.
+proc live_absorb_transition(live, before_revisions);
+  sy := live("sync");
+  live("max_observed_timestamp") := sy("max_observed_timestamp");
+  for [query_id, new_revision] in sy("revisions") loop
+    before := before_revisions(query_id);
+    if before = om then
+      before := 0;
+    end if;
+    if new_revision > before then
+      sub_id := live("sub_id_of_query")(query_id);
+      if sub_id /= om then
+        live := live_deliver(live, sub_id, sy("results")(query_id));
+      end if;
+    end if;
+  end loop;
+  return live;
+end proc;
+
+-- Records new_outcome as sub_id's latest result, bumping its revision --
+-- unless this is the one rehydration Transition being awaited for sub_id
+-- and new_outcome is identical to what was already delivered, in which
+-- case it is cached (so a later real comparison has the right baseline)
+-- but not counted as a new revision. Structural SETL equality (`=` on a
+-- map compares it as the set of pairs it actually is) is exact here,
+-- unlike comparing re-serialized JSON text, which could reorder object
+-- keys between two decodes of byte-identical input.
+proc live_deliver(live, sub_id, new_outcome);
+  pending := live("pending_rehydration")(sub_id);
+  if pending = true then
+    live("pending_rehydration") := live("pending_rehydration") less [sub_id, true];
+    previous := live("results")(sub_id);
+    if previous /= om and live_outcome_equal(previous, new_outcome) then
+      live("results")(sub_id) := new_outcome;
+      return live;
+    end if;
+  end if;
+
+  live("results")(sub_id) := new_outcome;
+  current_revision := live("revisions")(sub_id);
+  if current_revision = om then
+    current_revision := 0;
+  end if;
+  live("revisions")(sub_id) := current_revision + 1;
+  return live;
+end proc;
+
+proc live_outcome_equal(a, b);
+  if a("kind") /= b("kind") then
+    return false;
+  end if;
+  if a("kind") = "value" then
+    return a("value") = b("value");
+  end if;
+  return a("errMessage") = b("errMessage") and a("errData") = b("errData");
+end proc;
+
+-- Tears down the active connection (if any) without touching "desired":
+-- every subscription survives and live_maybe_reconnect replays it on the
+-- next successful connect. next_attempt_at is reset to now so a drop from
+-- a previously healthy connection retries immediately at the base
+-- backoff, rather than inheriting a stale grown delay from some earlier,
+-- unrelated run of failures (a successful live_maybe_reconnect already
+-- resets backoff_ms itself; this only controls the timing of the next
+-- attempt).
+proc live_retire(live, reason);
+  if live("sync") /= om then
+    sync_close(live("sync"), reason);
+  end if;
+  live("sync") := om;
+  live("last_close_reason") := reason;
+  live("query_id_of") := {};
+  live("sub_id_of_query") := {};
+  live("next_attempt_at") := clock;
+  return live;
+end proc;
+
+-- Final shutdown: closes the active connection (if any) with `reason` and
+-- leaves "desired" untouched, since a caller tearing down the whole
+-- session has no further use for reconnecting it.
+proc live_close(live, reason);
+  if live("sync") /= om then
+    sync_close(live("sync"), reason);
+    live("sync") := om;
+  end if;
+  return live;
+end proc;
