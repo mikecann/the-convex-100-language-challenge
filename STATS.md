@@ -11,9 +11,21 @@ Recorded for the video. Companion to `LESSONS.md` (what was learned) and
 
 | | |
 | --- | ---: |
-| Languages verified with **both** `http` and `live` badges | **83** |
-| Verified at the start of the final session | 57 |
+| Languages verified with **both** `http` and `live` badges | **100** |
+| Verified when this file was first written | 83 |
+| Verified at the start of the 57→83 session below | 57 |
 | Added in that one session | 26 |
+
+The roster reached 100 in a second push a day later — see "The 83 → 100
+push" further down. The figures immediately below (infeasible count,
+directory count, source-line count) are as measured at 83 and have not
+been recomputed since; nothing about them changed in a way that mattered
+enough to re-run the count, but treat the roster-size row above as the
+current truth and everything else in this section as a historical
+snapshot from that point.
+
+| | |
+| --- | ---: |
 | Recorded infeasible, with reasons | 22 |
 | Language directories in the repository | 107 |
 | Lines of client and example source, all languages | 355,755 |
@@ -162,6 +174,62 @@ cannot catch a TLS bug** — the self-hosted backend is plain HTTP, so a client
 with an empty or misplaced trust store passes every local check and fails only
 against the real deployment. Four languages hit it, four different ways. That
 is the entire argument for the hosted profile existing.
+
+## The 83 → 100 push
+
+A second session, roughly a day after the one above, resumed from its 83
+and carried the roster the rest of the way to complete.
+
+| | |
+| --- | ---: |
+| Wall clock | ~21.1 hours (02:13 → 23:19 UTC, 2026-08-08) |
+| Languages verified at the start | 83 |
+| Languages verified at the end | **100** |
+| Pull requests merged | 17 |
+| Commits to `main` | 21 |
+| Files touched | 321 |
+| Distinct agents and workflow-agents that reported in | 57 |
+| Session-limit mass-kills survived, zero work lost | 3 |
+
+Three of those 17 languages needed a replacement chosen mid-session, not
+just a build: Hack and Oz were ruled infeasible with full evidence
+(HHVM cannot offer an ECDSA-compatible ClientHello against the real
+deployment and has no FFI escape hatch; Mozart 2's own code generator
+crashes deterministically, 208 consecutive times, on the header carrying
+a hand-written TLS builtin) and replaced by Verilog and Modula-3
+respectively, both chosen, built and verified inside the same session.
+
+### Tokens
+
+Measured the same way as the table above: summed directly from the
+session transcript and all 57 subagent transcripts on disk, deduplicated
+by message id (a handful of entries are logged more than once with
+identical usage; each is counted once).
+
+| | Main thread | Subagents | Total |
+| --- | ---: | ---: | ---: |
+| Fresh input | 817 | 66,257 | 67,074 |
+| Cache creation | 2,656,904 | 28,305,070 | 30,961,974 |
+| Cache reads | 151,801,420 | 2,706,893,261 | 2,858,694,681 |
+| **Output** | **297,618** | **674,618** | **972,236** |
+| **Total** | 154,756,759 | 2,735,939,206 | **2,890,695,965** |
+
+Roughly **2.89 billion tokens moved to verify the last 17 languages**,
+against 43.25 billion for the 26 languages the session before it merged —
+a smaller push by design, not by ratio: this session spent most of its
+wall clock on debugging loops (Clean's real compiler bug, Io's
+five-session "segfault" that was never one, Modula-3's dependency wiring)
+rather than the wide parallel fan-out the earlier session ran.
+
+**98.9% of everything moved was a cache read.** Only 67,074 tokens were
+ever read fresh across the entire push — every remaining language, every
+repeated AGENTS.md read, every rebase, served from cache.
+
+**69% of output came from subagents**, lower than the first session's
+93%. The coordinator did more of its own investigative work this time —
+reading transcripts, diffing branches, reconciling forks after each
+mass-kill, root-causing the two forgotten-badge near-misses — rather than
+purely routing.
 
 ## Documentation produced
 
