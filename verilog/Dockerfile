@@ -827,3 +827,41 @@ RUN set -eu; \
     cat /tmp/syncfix.log >&2; \
     grep -Fq 'PASS sync_smoke' /tmp/sync_smoke.out; \
     grep -Fq 'PASS all 6 connections had the correct connectionCount and lastCloseReason' /tmp/syncfix.log
+
+COPY examples ./examples
+
+RUN set -eu; \
+    files=$(find examples -name '*.v' -o -name '*.vh'); \
+    test -n "$files"; \
+    for f in $files; do \
+      if awk '/\t/ { exit 0 } END { exit 1 }' "$f"; then \
+        echo "tab in $f" >&2; exit 1; \
+      fi; \
+      if grep -q ' $' "$f"; then echo "trailing space in $f" >&2; exit 1; fi; \
+      if awk 'length > 120 { print FILENAME ":" NR; found = 1 } \
+              END { exit !found }' "$f"; then \
+        echo "line over 120 columns in $f" >&2; exit 1; \
+      fi; \
+      if [ "$(tail -c 1 "$f" | wc -l)" -ne 1 ]; then \
+        echo "no final newline in $f" >&2; exit 1; \
+      fi; \
+    done; \
+    echo "PASS verilog examples style"
+
+# ---------------------------------------------------------------------------
+# convex_test: client/convex.v's call() facade -- the request envelope it
+# builds and both response shapes Convex's HTTP API returns (a successful
+# query/mutation and a function-level failure with structured errorData) --
+# against the approved test deployment, over the same TLS-verified channel
+# tls_smoke and http_smoke already prove above. Real network, not a fixture,
+# matching http_smoke's own already-approved precedent for this exact
+# deployment and demo module.
+# ---------------------------------------------------------------------------
+RUN set -eu; \
+    iverilog -g2012 -L. -mnative -I. \
+      -o /tmp/convex_test.vvp client/convex_transport.v client/convex_buffer.v \
+      client/convex_http.v client/convex_sha1.v client/convex_base64.v \
+      client/convex_websocket.v client/convex_sync.v client/convex.v \
+      client/tests/convex_test.v; \
+    timeout 30 vvp -M. -mnative /tmp/convex_test.vvp | tee /tmp/convex_test.out; \
+    grep -Fq 'PASS convex_test' /tmp/convex_test.out
