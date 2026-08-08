@@ -264,7 +264,15 @@ proc sync_apply_transition(sync, envelope);
     if mod_type = "QueryUpdated" then
       outcome := {};
       outcome("kind") := "value";
-      outcome("value") := modification("value");
+      -- json_null_to_om: a query's own value should compare equal to om
+      -- (and to another connection's null value) the same way it always
+      -- has, even though json_decode now represents a *nested* null as an
+      -- atom -- see client/json.setl's module comment and
+      -- client/convex.setl's identical treatment of a call's own result.
+      -- client/live.setl's rehydration suppression depends on this: two
+      -- independently decoded nulls must compare equal, which two
+      -- freshly generated atoms never would.
+      outcome("value") := json_null_to_om(modification("value"));
       outcome("logLines") := modification("logLines");
       sync("results")(query_id) := outcome;
       -- Inlined rather than delegated to a helper proc: GNU SETL passes
@@ -281,7 +289,7 @@ proc sync_apply_transition(sync, envelope);
       outcome := {};
       outcome("kind") := "error";
       outcome("errMessage") := modification("errorMessage");
-      outcome("errData") := modification("errorData");
+      outcome("errData") := json_null_to_om(modification("errorData"));
       outcome("logLines") := modification("logLines");
       sync("results")(query_id) := outcome;
       current_revision := sync("revisions")(query_id);

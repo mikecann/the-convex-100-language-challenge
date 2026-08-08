@@ -47,6 +47,45 @@ check_count +:= 1; fail_count +:= expect_eq("json_try_decode reports failure", s
 check_count +:= 1; fail_count +:= expect_eq("json_try_decode true for real null", success2, true);
 check_count +:= 1; fail_count +:= expect_eq("json_try_decode value for real null", value2, om);
 
+-- A *nested* null must survive a decode/re-encode round trip: unlike a
+-- bare top-level "null", an object key or array element mapped to null is
+-- data the caller is entitled to see (Convex's own documented responses
+-- send exactly this for an unset optional field), not something this
+-- decoder is allowed to quietly drop the way an absent key would be. See
+-- this module's own comment for why om alone cannot represent it.
+decoded_obj := json_decode("{\"a\":null,\"b\":1}");
+check_count +:= 1; fail_count +:= expect_eq("nested null key is present", decoded_obj("a") = om, false);
+check_count +:= 1; fail_count +:= expect_eq("nested null key is an atom", is_atom(decoded_obj("a")), true);
+check_count +:= 1; fail_count +:= expect_eq("sibling key is unaffected", decoded_obj("b"), 1);
+-- A single-key object keeps json_encode_object's key order deterministic
+-- (SETL map iteration order is otherwise unspecified across keys), so
+-- this round trip can compare the encoded text exactly.
+check_count +:= 1; fail_count +:= expect_eq("nested null re-encodes as null", json_encode(json_decode("{\"a\":null}")), "{\"a\":null}");
+
+decoded_arr := json_decode("[1,null,3]");
+check_count +:= 1; fail_count +:= expect_eq("nested null keeps array length", #decoded_arr, 3);
+check_count +:= 1; fail_count +:= expect_eq("nested null array element is an atom", is_atom(decoded_arr(2)), true);
+check_count +:= 1; fail_count +:= expect_eq("array element re-encodes as null", json_encode(decoded_arr), "[1,null,3]");
+
+-- A *trailing* null is its own separate trap for a tuple specifically: "a
+-- tuple's length is the index of its last non-om element" (per GNU
+-- SETL's own operator reference for #), so a trailing element that really
+-- was om -- not the atom this decoder now uses instead -- would have
+-- silently shortened the tuple by one. newat() sidesteps that the same
+-- way it sidesteps the map problem: an atom is never om, so it always
+-- counts.
+decoded_trailing := json_decode("[1,2,null]");
+check_count +:= 1; fail_count +:= expect_eq("trailing null keeps array length", #decoded_trailing, 3);
+check_count +:= 1; fail_count +:= expect_eq("trailing null re-encodes as null", json_encode(decoded_trailing), "[1,2,null]");
+
+-- json_null_to_om (client/convex.setl and client/sync.setl use this at a
+-- value's own "top level" so it keeps comparing equal to om): converts a
+-- nested-null atom back to om, and passes every other value through
+-- unchanged, including one with its own nested null still inside it.
+check_count +:= 1; fail_count +:= expect_eq("json_null_to_om converts an atom", json_null_to_om(decoded_arr(2)), om);
+check_count +:= 1; fail_count +:= expect_eq("json_null_to_om passes through a real value", json_null_to_om(decoded_obj), decoded_obj);
+check_count +:= 1; fail_count +:= expect_eq("json_null_to_om passes through om itself", json_null_to_om(om), om);
+
 print(str(check_count - fail_count) + "/" + str(check_count) + " json checks passed");
 if fail_count > 0 then
   stop 1;

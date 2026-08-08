@@ -8,24 +8,61 @@
 --   array           <-> tuple
 --   object          <-> map (a set of [key, value] pairs; keys are strings)
 --
--- json_decode returns om both for a literal JSON null and for a string that
--- fails to parse; callers that need to tell "null" apart from "malformed"
--- should use json_try_decode, which returns [true, value] or [false, om].
+-- json_decode returns om both for a literal top-level JSON null and for a
+-- string that fails to parse; callers that need to tell "null" apart from
+-- "malformed" should use json_try_decode, which returns [true, value] or
+-- [false, om].
 --
--- A decoded object also cannot distinguish a key explicitly mapped to
--- JSON null from that key being entirely absent: GNU SETL's map
--- assignment m(k) := om does not store an entry (om is also what a map
--- lookup returns for "no such key"), so {"k":null} and {} decode to the
--- same empty map. Callers that must tell those two apart need a
--- different representation than this module provides.
+-- A *nested* null (inside an object's value or an array's element) cannot
+-- use om the same way om itself is used for "absent": GNU SETL's map
+-- assignment m(k) := om does not store an entry at all (om is also what a
+-- map lookup returns for "no such key"), so an object field mapped
+-- straight to om would vanish from the decoded map exactly like a field
+-- that was never present -- confirmed to matter for real: Convex's own
+-- documented response shapes send explicit nulls for absent optional
+-- fields (demo:state's lastLanguage/latestRunId/updatedAt before any
+-- mutation has run), and losing those keys broke exact-shape comparison
+-- in shared conformance. json_parse_value instead decodes a nested "null"
+-- to a fresh newat() atom, which -- unlike om -- a map or tuple assignment
+-- does store; json_encode recognizes any atom as "null" on the way back
+-- out (is_atom is a general type test, not tied to one specific atom, so
+-- this needs no shared sentinel threaded between decode and encode calls).
+-- json_try_decode converts a bare *top-level* "null" back to om before
+-- returning, preserving this module's original documented top-level
+-- contract; only a nested null is ever represented as an atom in a value
+-- callers actually see.
 --
 -- This module is proc-only (no top-level statements), so it is meant to be
 -- pulled in near the end of a file's #include list, after that file's own
 -- mainline statements -- see the comment at the top of examples/basics/main.setl
 -- for why that order matters.
 
+-- Converts a nested-null atom (see this module's own comment above) back
+-- to om; passes any other value through unchanged. Callers use this at a
+-- value's own "top level" -- a query/mutation/action result, or an error's
+-- data payload -- so that value continues to satisfy `= om` the same way
+-- it always has, restoring comparability (an atom from one json_decode
+-- call is never `=` to an atom from another, even when both represent
+-- "null") for a caller that only cares whether that specific value is
+-- null, not what is nested inside it. Nothing nested deeper is affected:
+-- an atom further inside an object or tuple this proc is handed stays
+-- exactly as json_parse_value decoded it, and still round-trips correctly
+-- through json_encode later.
+proc json_null_to_om(v);
+  if is_atom(v) then
+    return om;
+  end if;
+  return v;
+end proc;
+
 proc json_encode(v);
   if v = om then
+    return "null";
+  end if;
+  if is_atom(v) then
+    -- A nested null decoded by json_parse_value (see this module's own
+    -- comment above); any atom means "null" here, since nothing else in
+    -- this client ever produces one.
     return "null";
   end if;
   if is_boolean(v) then
@@ -152,6 +189,12 @@ proc json_try_decode(s);
   if next_i <= n then
     return [false, om];  -- trailing garbage after the one JSON value
   end if;
+  if is_atom(value) then
+    -- A bare top-level "null": convert the nested-null atom (see this
+    -- module's own comment) back to om, preserving this proc's documented
+    -- top-level contract.
+    value := om;
+  end if;
   return [true, value];
 end proc;
 
@@ -191,7 +234,9 @@ proc json_parse_value(s, i, n);
   elseif c = "f" then
     return json_parse_literal(s, i, n, "false", false);
   elseif c = "n" then
-    return json_parse_literal(s, i, n, "null", om);
+    -- A fresh atom, not om: see this module's own comment on why a
+    -- *nested* null cannot be om the way an absent field is.
+    return json_parse_literal(s, i, n, "null", newat());
   elseif c = "-" or (c >= "0" and c <= "9") then
     return json_parse_number(s, i, n);
   else

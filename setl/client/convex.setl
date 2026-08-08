@@ -102,14 +102,20 @@ proc convex_classify(status_code, body_text);
     end if;
 
     if call_status = "success" and status_code = 200 then
-      -- json_decode cannot tell "value key present and JSON null" apart
-      -- from "value key absent": a SETL map assignment m(k) := om does
-      -- not store an entry (om is also how map lookup reports "no such
-      -- key"), so an object like {"value":null} decodes to a map with no
-      -- "value" key at all rather than one mapping "value" to om. Both
-      -- cases are accepted here as a legitimate null result; see
-      -- client/json.setl's module comment for the same limitation.
-      return convex_result(top("value"), convex_log_lines(top));
+      -- json_decode represents a *nested* JSON null (client/json.setl's
+      -- module comment explains why om alone cannot) as an atom rather
+      -- than om, so an explicit {"value":null} is no longer confused with
+      -- "value" being entirely absent inside the decoded envelope. Both
+      -- are still treated as a legitimate null RESULT here, though, via
+      -- json_null_to_om: a caller comparing this result's own value
+      -- against om (or against another call's result) should not have to
+      -- care which of the two the deployment actually sent, and two
+      -- separately decoded nulls need to compare equal to each other,
+      -- which two independently generated atoms never do. Anything
+      -- nested *inside* the value, at any depth, keeps whatever atoms
+      -- json_parse_value produced for it, and still round-trips correctly
+      -- through json_encode.
+      return convex_result(json_null_to_om(top("value")), convex_log_lines(top));
     end if;
 
     if call_status = "error" or status_code = 560 then
@@ -120,7 +126,7 @@ proc convex_classify(status_code, body_text);
       if message = om then
         message := "Convex function failed";
       end if;
-      err_data := top("errorData");
+      err_data := json_null_to_om(top("errorData"));
       return convex_error("FunctionError", message, err_data, convex_log_lines(top));
     end if;
 
