@@ -1,0 +1,30 @@
+% Convex client library package. Everything under client/ is compiled
+% together into the interfaces linked by examples/basics and by the
+% test-only conformance adapter under client/tests/conformance.
+
+import("libm3")
+import("tcp")
+
+% The only native code in this client: a narrow OpenSSL binding reached
+% through Modula-3's EXTERNAL procedure mechanism, used solely for TLS.
+% Plain sockets come entirely from the stdlib "tcp" package imported
+% above.
+interface("TlsShim")
+c_source("shim")
+import_lib("ssl", "/usr/lib/x86_64-linux-gnu")
+import_lib("crypto", "/usr/lib/x86_64-linux-gnu")
+
+interface("ConvexJson")
+implementation("ConvexJson")
+
+interface("ConvexUrl")
+implementation("ConvexUrl")
+
+interface("ConvexTransport")
+implementation("ConvexTransport")
+
+interface("ConvexWire")
+implementation("ConvexWire")
+
+interface("ConvexHttp")
+implementation("ConvexHttp")
