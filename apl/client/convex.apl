@@ -1118,3 +1118,17 @@ USEMSG:
 BUILDERR:
   Z←'{"type":"error","error":{"name":"FunctionError","message":',(JEscapeString MESSAGE),'}}'
 ∇
+
+⍝ Reads environment variable NAME. ⎕ENV NAME returns a 1x2 matrix
+⍝ (name value) when set, or an empty 0x2 matrix when not -- never a
+⍝ plain vector, so a bare `2⊃` on it raises RANK ERROR when set and
+⍝ INDEX ERROR when not; this normalises both cases to a character
+⍝ vector, empty when unset.
+∇Z←EnvGet NAME;X
+  X←⎕ENV NAME
+  →(0=1⊃⍴X)⍴NOTFOUND
+  Z←2⊃,X
+  →0
+NOTFOUND:
+  Z←''
+∇
