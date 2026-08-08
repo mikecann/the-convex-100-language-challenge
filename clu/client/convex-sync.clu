@@ -1,0 +1,869 @@
+%   convex-sync.clu -- the /api/sync WebSocket protocol state machine,
+%   pinned to the convex-rs-0.10.4-unversioned-sync profile this whole
+%   repository tests against: Connect, ModifyQuerySet (Add/Remove), and
+%   Transition (QueryUpdated/QueryFailed/QueryRemoved), layered on
+%   client/convex-websocket.clu.
+%
+%   pclu has no threads, coroutines, or async I/O of its own (see
+%   client/tests/fixtures/*.clu and this file's own poll() below, which
+%   is this client's entire concurrency story), so there is no separate
+%   "owner goroutine" the way a reference client with real concurrency
+%   would write one. Instead, this cluster's rep -- one sync object --
+%   *is* the exclusive owner AGENTS.md's Live-acceptance rules ask for:
+%   every operation below takes that same rep, mutates it in place, and
+%   nothing outside this file ever reaches into the WebSocket, the
+%   subscription table, or the query-set version directly. A caller
+%   (the not-yet-written conformance adapter) drives the state machine
+%   by calling poll() repeatedly with a short timeout, interleaving it
+%   with checks of its own command input; poll() itself does at most one
+%   bounded wsconn$recv_message per call, so it can never block the
+%   caller past the timeout it was given.
+%
+%   Delivery buffering is deliberately one slot per subscription, not a
+%   queue: a fresh QueryUpdated/QueryFailed overwrites whatever this
+%   subscription's previous undelivered value was (see qrec's has_pending
+%   fields below and set_pending's own comment). Reactive queries
+%   represent current state, not a log of every intermediate value, so a
+%   caller that has not yet drained an old update losing it to a newer
+%   one is correct, not a bug -- and it bounds this client's own memory
+%   independent of how many Transitions arrive while nobody is polling,
+%   which is what AGENTS.md's "bounded queue under a stopped reader"
+%   requirement is asking for.
+
+sync = cluster is create, add, remove, debug_disconnect, poll, close
+
+%   qrec -- one entry in the subscription table. path/args_raw/active
+%   are this client's own record of what should be subscribed;
+%   awaiting_rehydration/has_last_delivered/last_delivered_* are the
+%   server-facing bookkeeping handleTransition needs to suppress an
+%   unchanged value after a reconnect (AGENTS.md: "the exact sequence is
+%   initial 0, disconnect acknowledgement, external mutation, then 1");
+%   has_pending/pending_* are the one-slot delivery buffer poll() drains.
+qrec = record[query_id: int, path: string, args_raw: string, active: bool,
+	      awaiting_rehydration: bool,
+	      has_last_delivered: bool, last_delivered_success: bool,
+	      last_delivered_value: string,
+	      has_pending: bool, pending_kind: string, pending_value: string,
+	      pending_err_name: string, pending_err_message: string,
+	      pending_err_data: string, pending_has_err_data: bool,
+	      pending_has_logs: bool, pending_logs_raw: string]
+
+qarr = array[qrec]
+
+rep = record[scheme: string, host: string, port: int, path: string,
+	     client_version: string, session_id: string,
+	     sock: maybe[wsconn],
+	     subs: qarr, next_query_id: int,
+	     query_set_version: int,
+	     remote_qs: int, remote_id: int, remote_ts: string,
+	     max_observed_ts: string,
+	     connection_count: int, last_close_reason: string,
+	     next_backoff_ms: int, next_reconnect_at: int,
+	     last_server_response_at: int]
+
+INITIAL_BACKOFF_MS = 100
+MAX_BACKOFF_MS = 15000
+INACTIVITY_LIMIT_MS = 30000
+ZERO_TS = "AAAAAAAAAAA="		% base64 of eight 0x00 bytes: the
+					% protocol's zero timestamp, matching
+					% convex-rs's own initialTimestamp.
+
+	byte_c = proc (v: int) returns (string)
+	    return(string$c2s(char$i2c(v)))
+	    end byte_c
+
+%   random_bytes(n)/new_session_id -- duplicated from
+%   client/convex-websocket.clu's own private helpers of the same shape
+%   rather than exported from there: each module's session/nonce
+%   randomness is its own concern, the same way convex-http.clu and
+%   convex-websocket.clu each keep their own private lower/trim rather
+%   than sharing a general string-utility cluster neither of them
+%   otherwise needs.
+	random_bytes = proc (n: int) returns (string)
+					     signals (not_possible(string))
+	    fn: file_name := file_name$parse("/dev/urandom")
+	    ch: _chan := _chan$open(fn, "read", 0)
+		except when not_possible (msg: string):
+			    signal not_possible("open /dev/urandom: " || msg)
+		       end
+	    rbytes: _bytevec := _bytevec$create(n)
+	    got: int := _chan$getb(ch, rbytes)
+		except when not_possible (msg: string):
+			    _chan$close(ch) except others: end
+			    signal not_possible("read /dev/urandom: " || msg)
+		       end
+	    _chan$close(ch) except others: end
+	    if got < n then
+		signal not_possible("short read from /dev/urandom")
+		end
+	    return(_cvt[_bytevec, string](rbytes))
+	    end random_bytes
+
+%   new_session_id() -> a fresh RFC 4122 version-4 UUID string, the way
+%   convex-rs's own Connect message expects sessionId to be spelled
+%   ("dGhlIHNh..." is not one; the wire format is the familiar
+%   8-4-4-4-12 hex-with-dashes form). Builds the version/variant bits
+%   into 16 raw random bytes first, then reuses sha1$hex (already
+%   proven by sha1_test.clu) purely as a hex-of-bytes formatter, not a
+%   hash -- sha1$hex takes any raw byte string and hex-encodes it
+%   byte-for-byte, so calling it on these 16 UUID bytes directly (no
+%   digest step) is exactly the right shape of helper, and writing a
+%   second one would be pure duplication.
+	new_session_id = proc () returns (string) signals (not_possible(string))
+	    raw: string := random_bytes(16)
+		resignal not_possible
+	    b6: int := char$c2i(raw[7])
+	    b8: int := char$c2i(raw[9])
+	    b6 := (b6 // 16) + 64		% low nibble kept, high nibble 0100
+	    b8 := (b8 // 64) + 128		% low 6 bits kept, top 2 bits 10
+	    raw := string$substr(raw, 1, 6) || byte_c(b6)
+		   || string$substr(raw, 8, 1) || byte_c(b8)
+		   || string$substr(raw, 10, 7)
+	    hex: string := sha1$hex(raw)
+	    return(string$substr(hex, 1, 8) || "-" || string$substr(hex, 9, 4)
+		   || "-" || string$substr(hex, 13, 4) || "-"
+		   || string$substr(hex, 17, 4) || "-"
+		   || string$substr(hex, 21, 12))
+	    end new_session_id
+
+%   parse_ws_url(base_url) -> the WebSocket scheme/host/port to dial for
+%   a Convex deployment URL, and the fixed /api/sync path: http/https
+%   become ws/wss (a Convex deployment is never dialled directly as
+%   ws:// or wss:// by a caller of this client), and any path or query
+%   the caller's base_url happened to carry is discarded, since
+%   /api/sync is the only path this protocol ever uses.
+	parse_ws_url = proc (base_url: string) returns (string, string, int,
+							 string)
+					       signals (not_possible(string))
+	    p: int := string$indexs("://", base_url)
+	    if p = 0 then
+		signal not_possible("deployment URL missing scheme: " ||
+				    base_url)
+		end
+	    scheme: string := string$substr(base_url, 1, p - 1)
+	    rest: string := string$rest(base_url, p + 3)
+	    ws_scheme: string := "ws"
+	    default_port: int := 80
+	    if string$equal(scheme, "https")
+	       then ws_scheme := "wss"
+		    default_port := 443
+	       elseif ~string$equal(scheme, "http") then
+		    signal not_possible("deployment URL scheme must be " ||
+					"http or https: " || scheme)
+	       end
+	    slash: int := string$indexc('/', rest)
+	    hostport: string := rest
+	    if slash ~= 0 then hostport := string$substr(rest, 1, slash - 1) end
+	    colon: int := string$indexc(':', hostport)
+	    host: string := hostport
+	    port: int := default_port
+	    if colon ~= 0 then
+		host := string$substr(hostport, 1, colon - 1)
+		port := int$parse(string$rest(hostport, colon + 1))
+		    except when bad_format, overflow: port := default_port end
+		end
+	    return(ws_scheme, host, port, "/api/sync")
+	    end parse_ws_url
+
+%   ts_greater(a, b) -> true iff base64-encoded 8-byte little-endian
+%   timestamp a is strictly greater than b. Comparing the raw bytes from
+%   the most significant (last) byte down, rather than comparing the
+%   base64 text or a naive big-endian read, is required because the
+%   wire format is little-endian -- the same reasoning
+%   convex-rs-0.10.4-unversioned-sync's own Go pilot documents at
+%   compareTimestamps.
+	ts_greater = proc (a, b: string) returns (bool) signals (bad_format)
+	    araw: string := base64$decode(a)
+		except when bad_format: signal bad_format end
+	    braw: string := base64$decode(b)
+		except when bad_format: signal bad_format end
+	    if string$size(araw) ~= 8 cor string$size(braw) ~= 8 then
+		signal bad_format
+		end
+	    i: int := 8
+	    while i >= 1 do
+		ac: int := char$c2i(araw[i])
+		bc: int := char$c2i(braw[i])
+		if ac > bc then return(true) end
+		if ac < bc then return(false) end
+		i := i - 1
+		end
+	    return(false)
+	    end ts_greater
+
+%   -- outgoing message builders -----------------------------------------
+
+	build_connect = proc (s: rep) returns (string)
+	    body: string := "{\"type\":\"Connect\",\"sessionId\":"
+			     || json$qs(s.session_id)
+			     || ",\"connectionCount\":"
+			     || int$unparse(s.connection_count)
+			     || ",\"lastCloseReason\":"
+			     || json$qs(s.last_close_reason)
+	    if string$size(s.max_observed_ts) > 0 then
+		body := body || ",\"maxObservedTimestamp\":"
+			 || json$qs(s.max_observed_ts)
+		end
+	    return(body || ",\"clientTs\":0}")
+	    end build_connect
+
+	build_add_mod = proc (query_id: int, path, args_raw: string)
+							returns (string)
+	    return("{\"type\":\"Add\",\"queryId\":" || int$unparse(query_id)
+		   || ",\"udfPath\":" || json$qs(path) || ",\"args\":["
+		   || args_raw || "]}")
+	    end build_add_mod
+
+	build_remove_mod = proc (query_id: int) returns (string)
+	    return("{\"type\":\"Remove\",\"queryId\":" || int$unparse(query_id)
+		   || "}")
+	    end build_remove_mod
+
+	build_modify_query_set = proc (base_v, new_v: int, mods_joined: string)
+							     returns (string)
+	    return("{\"type\":\"ModifyQuerySet\",\"baseVersion\":"
+		   || int$unparse(base_v) || ",\"newVersion\":"
+		   || int$unparse(new_v) || ",\"modifications\":["
+		   || mods_joined || "]}")
+	    end build_modify_query_set
+
+%   -- subscription table helpers -----------------------------------------
+
+	find_index = proc (s: rep, query_id: int) returns (int)
+	    i: int := qarr$low(s.subs)
+	    hi: int := qarr$high(s.subs)
+	    while i <= hi do
+		rec: qrec := qarr$fetch(s.subs, i)
+		if rec.query_id = query_id then return(i) end
+		i := i + 1
+		end
+	    return(0)
+	    end find_index
+
+%   set_pending(s, index, kind, value, err_name, err_message, err_data,
+%   has_err_data, has_logs, logs_raw) -> overwrites index's one delivery
+%   slot (see this file's own header comment on why one slot, not a
+%   queue) and clears awaiting_rehydration, since any fresh delivery --
+%   successful or not -- answers whatever rehydration might have been
+%   pending for this query.
+	set_pending = proc (s: rep, index: int, kind, value, err_name,
+			    err_message, err_data: string, has_err_data,
+			    has_logs: bool, logs_raw: string)
+	    rec: qrec := qarr$fetch(s.subs, index)
+	    rec.awaiting_rehydration := false
+	    rec.has_pending := true
+	    rec.pending_kind := kind
+	    rec.pending_value := value
+	    rec.pending_err_name := err_name
+	    rec.pending_err_message := err_message
+	    rec.pending_err_data := err_data
+	    rec.pending_has_err_data := has_err_data
+	    rec.pending_has_logs := has_logs
+	    rec.pending_logs_raw := logs_raw
+	    qarr$store(s.subs, index, rec)
+	    end set_pending
+
+%   publish_error(s, err_name, err_message) -> delivers a connection-
+%   level failure (a malformed or fatal server message, never an
+%   ordinary transport hiccup -- see poll()'s own comment on that
+%   distinction) to every currently active subscription, and records it
+%   as their last delivered value so a later reconnect's rehydration
+%   check for these queries never wrongly suppresses the next real
+%   value on the strength of an error that was never a "value" to begin
+%   with (last_delivered_success stays false).
+	publish_error = proc (s: rep, err_name, err_message: string)
+	    i: int := qarr$low(s.subs)
+	    hi: int := qarr$high(s.subs)
+	    while i <= hi do
+		rec: qrec := qarr$fetch(s.subs, i)
+		if rec.active then
+		    set_pending(s, i, "error", "", err_name, err_message, "",
+				false, false, "")
+		    rec.has_last_delivered := true
+		    rec.last_delivered_success := false
+		    qarr$store(s.subs, i, rec)
+		    end
+		i := i + 1
+		end
+	    end publish_error
+
+%   -- connection lifecycle -----------------------------------------
+
+	schedule_reconnect = proc (s: rep, delay_ms: int, grow_backoff: bool)
+	    s.next_reconnect_at := _real_time() + delay_ms
+	    if grow_backoff then
+		s.next_backoff_ms := s.next_backoff_ms * 2
+		if s.next_backoff_ms > MAX_BACKOFF_MS then
+		    s.next_backoff_ms := MAX_BACKOFF_MS
+		    end
+		end
+	    end schedule_reconnect
+
+%   close_connection(s, reason, schedule) -> best-effort teardown of the
+%   current socket (if any) and reset of the per-connection protocol
+%   state (query set version, remote version, the server's notion of
+%   which queries it knows about). last_delivered/awaiting_rehydration
+%   deliberately survive this reset: they belong to a subscription's
+%   whole lifetime, not to one connection, which is what lets a
+%   reconnect's rehydration check compare against a value from a
+%   previous connection at all.
+	close_connection = proc (s: rep, reason: string, schedule: bool)
+	    if maybe[wsconn]$exists(s.sock) then
+		w: wsconn := maybe[wsconn]$value(s.sock)
+		wsconn$close(w) except when not_possible (ignored: string): end
+		s.connection_count := s.connection_count + 1
+		end
+	    s.sock := maybe[wsconn]$none()
+	    s.last_close_reason := reason
+	    s.query_set_version := 0
+	    s.remote_qs := 0
+	    s.remote_id := 0
+	    s.remote_ts := ZERO_TS
+	    if schedule cand any_active(s) then
+		schedule_reconnect(s, s.next_backoff_ms, true)
+		end
+	    end close_connection
+
+	any_active = proc (s: rep) returns (bool)
+	    i: int := qarr$low(s.subs)
+	    hi: int := qarr$high(s.subs)
+	    while i <= hi do
+		if qarr$fetch(s.subs, i).active then return(true) end
+		i := i + 1
+		end
+	    return(false)
+	    end any_active
+
+%   try_connect(s) -> dials a fresh WebSocket, sends Connect, then --
+%   if any subscription is active -- resends all of them as one
+%   ModifyQuerySet (baseVersion 0, newVersion 1), marking any of them
+%   that already have a last delivered value as awaiting rehydration.
+%   Signals failed(msg) for a dial or write failure; the caller (poll())
+%   treats that as an ordinary transport hiccup, not a published error
+%   (see poll()'s own comment).
+	try_connect = proc (s: rep) signals (failed(string))
+	    w: wsconn := wsconn$connect(s.scheme, s.host, s.port, s.path)
+		except when not_possible (msg: string): signal failed(msg)
+		       when failed (msg: string): signal failed(msg)
+		       end
+	    s.sock := maybe[wsconn]$make(w)
+	    s.remote_qs := 0
+	    s.remote_id := 0
+	    s.remote_ts := ZERO_TS
+	    s.query_set_version := 0
+	    s.last_server_response_at := _real_time()
+
+	    wsconn$send_text(w, build_connect(s))
+		except when not_possible (msg: string):
+			    wsconn$close(w) except when not_possible (ignored: string): end
+			    s.sock := maybe[wsconn]$none()
+			    signal failed(msg)
+		       end
+
+	    mods: string := ""
+	    i: int := qarr$low(s.subs)
+	    hi: int := qarr$high(s.subs)
+	    % "any" is CLU's own builtin universal type (rep = any appears
+	    % throughout pclu's own library, e.g. _job.spc), so a local
+	    % variable named any is not a name at all as far as the parser
+	    % is concerned -- it reads "any: bool := false" as a malformed
+	    % type expression, not a declaration, and reports the confusing
+	    % "expression used as statement" this file hit the first time
+	    % it compiled.
+	    any_active_found: bool := false
+	    while i <= hi do
+		rec: qrec := qarr$fetch(s.subs, i)
+		if rec.active then
+		    if any_active_found then mods := mods || "," end
+		    mods := mods || build_add_mod(rec.query_id, rec.path,
+						   rec.args_raw)
+		    if rec.has_last_delivered then
+			rec.awaiting_rehydration := true
+			qarr$store(s.subs, i, rec)
+			end
+		    any_active_found := true
+		    end
+		i := i + 1
+		end
+	    if any_active_found then
+		wsconn$send_text(w, build_modify_query_set(0, 1, mods))
+		    except when not_possible (msg: string):
+				wsconn$close(w) except when not_possible (ignored: string): end
+				s.sock := maybe[wsconn]$none()
+				signal failed(msg)
+			   end
+		s.query_set_version := 1
+		end
+	    end try_connect
+
+%   -- Transition handling -----------------------------------------
+
+%   apply_query_updated(s, item) -> decodes one "QueryUpdated"
+%   modification and, unless it is an unchanged rehydration this
+%   subscription is currently awaiting (AGENTS.md's suppression rule),
+%   queues it for delivery.
+	apply_query_updated = proc (s: rep, item: string)
+					 signals (protocol_error(string))
+	    query_id: int := json$uint32(json$field(item, "queryId"))
+		except when not_found, bad_format:
+			    signal protocol_error(
+				"QueryUpdated missing a valid queryId")
+		       end
+	    value: string := json$field(item, "value")
+		except when not_found, bad_format:
+			    signal protocol_error("QueryUpdated missing value")
+		       end
+	    has_logs: bool := false
+	    logs_raw: string := ""
+	    begin
+		logs_raw := json$field(item, "logLines")
+		has_logs := true
+		end
+		except when not_found, bad_format: end
+
+	    index: int := find_index(s, query_id)
+	    if index = 0 then return end	% not (or no longer) a query
+						% this client asked for
+	    rec: qrec := qarr$fetch(s.subs, index)
+	    if rec.awaiting_rehydration cand rec.has_last_delivered cand
+	       rec.last_delivered_success cand
+	       string$equal(rec.last_delivered_value, value) then
+		rec.awaiting_rehydration := false
+		qarr$store(s.subs, index, rec)
+		return
+		end
+	    set_pending(s, index, "update", value, "", "", "", false,
+			has_logs, logs_raw)
+	    rec := qarr$fetch(s.subs, index)
+	    rec.has_last_delivered := true
+	    rec.last_delivered_success := true
+	    rec.last_delivered_value := value
+	    qarr$store(s.subs, index, rec)
+	    end apply_query_updated
+
+	apply_query_failed = proc (s: rep, item: string)
+					 signals (protocol_error(string))
+	    query_id: int := json$uint32(json$field(item, "queryId"))
+		except when not_found, bad_format:
+			    signal protocol_error(
+				"QueryFailed missing a valid queryId")
+		       end
+	    message: string := json$unqs(json$field(item, "errorMessage"))
+		except when not_found, bad_format: message := "" end
+	    has_data: bool := false
+	    data_raw: string := ""
+	    begin
+		data_raw := json$field(item, "errorData")
+		has_data := true
+		end
+		except when not_found, bad_format: end
+	    has_logs: bool := false
+	    logs_raw: string := ""
+	    begin
+		logs_raw := json$field(item, "logLines")
+		has_logs := true
+		end
+		except when not_found, bad_format: end
+
+	    index: int := find_index(s, query_id)
+	    if index = 0 then return end
+	    set_pending(s, index, "error", "", "FunctionError", message,
+			data_raw, has_data, has_logs, logs_raw)
+	    rec: qrec := qarr$fetch(s.subs, index)
+	    rec.has_last_delivered := true
+	    rec.last_delivered_success := false
+	    qarr$store(s.subs, index, rec)
+	    end apply_query_failed
+
+	apply_query_removed = proc (s: rep, item: string)
+					 signals (protocol_error(string))
+	    query_id: int := json$uint32(json$field(item, "queryId"))
+		except when not_found, bad_format:
+			    signal protocol_error(
+				"QueryRemoved missing a valid queryId")
+		       end
+	    index: int := find_index(s, query_id)
+	    if index = 0 then return end
+	    rec: qrec := qarr$fetch(s.subs, index)
+	    rec.has_last_delivered := false
+	    rec.awaiting_rehydration := false
+	    qarr$store(s.subs, index, rec)
+	    end apply_query_removed
+
+%   handle_transition(s, raw) -> validates and applies one Transition
+%   message in full before any subscriber sees any of it (this file's
+%   own ordering guarantee, matching AGENTS.md's "commit the complete
+%   transition before notifying any subscriber"): startVersion must
+%   match this client's own remote version exactly, every modification
+%   must decode and apply, and only then does remote version/
+%   maxObservedTimestamp/backoff actually change.
+	handle_transition = proc (s: rep, raw: string)
+					 signals (protocol_error(string))
+	    start_raw: string := json$field(raw, "startVersion")
+		except when not_found, bad_format:
+			    signal protocol_error(
+				"Transition missing startVersion")
+		       end
+	    start_qs: int := json$uint32(json$field(start_raw, "querySet"))
+		except when not_found, bad_format:
+			    signal protocol_error(
+				"Transition startVersion missing querySet")
+		       end
+	    start_id: int := json$uint32(json$field(start_raw, "identity"))
+		except when not_found, bad_format:
+			    signal protocol_error(
+				"Transition startVersion missing identity")
+		       end
+	    start_ts: string := json$unqs(json$field(start_raw, "ts"))
+		except when not_found, bad_format:
+			    signal protocol_error(
+				"Transition startVersion missing ts")
+		       end
+	    if start_qs ~= s.remote_qs cor start_id ~= s.remote_id cor
+	       ~string$equal(start_ts, s.remote_ts) then
+		signal protocol_error(
+		    "Transition startVersion does not match local version")
+		end
+
+	    end_raw: string := json$field(raw, "endVersion")
+		except when not_found, bad_format:
+			    signal protocol_error("Transition missing endVersion")
+		       end
+	    end_qs: int := json$uint32(json$field(end_raw, "querySet"))
+		except when not_found, bad_format:
+			    signal protocol_error(
+				"Transition endVersion missing querySet")
+		       end
+	    end_id: int := json$uint32(json$field(end_raw, "identity"))
+		except when not_found, bad_format:
+			    signal protocol_error(
+				"Transition endVersion missing identity")
+		       end
+	    end_ts: string := json$unqs(json$field(end_raw, "ts"))
+		except when not_found, bad_format:
+			    signal protocol_error(
+				"Transition endVersion missing ts")
+		       end
+	    base64$decode(end_ts)
+		except when bad_format:
+			    signal protocol_error(
+				"Transition endVersion ts is not valid base64")
+		       end
+
+	    mods_raw: string := json$field(raw, "modifications")
+		except when not_found, bad_format:
+			    signal protocol_error(
+				"Transition missing modifications")
+		       end
+	    items: sequence[string] := json$array_items(mods_raw)
+		except when bad_format:
+			    signal protocol_error(
+				"Transition modifications is not an array")
+		       end
+
+	    i: int := 1
+	    n: int := sequence[string]$size(items)
+	    while i <= n do
+		item: string := sequence[string]$fetch(items, i)
+		kind: string := json$unqs(json$field(item, "type"))
+		    except when not_found, bad_format:
+				signal protocol_error(
+				    "Transition modification missing type")
+			   end
+		if string$equal(kind, "QueryUpdated")
+		   then apply_query_updated(s, item)
+			   resignal protocol_error
+		   elseif string$equal(kind, "QueryFailed")
+		   then apply_query_failed(s, item)
+			   resignal protocol_error
+		   elseif string$equal(kind, "QueryRemoved")
+		   then apply_query_removed(s, item)
+			   resignal protocol_error
+		   else signal protocol_error(
+			    "unknown Transition modification " || kind)
+		   end
+		i := i + 1
+		end
+
+	    s.remote_qs := end_qs
+	    s.remote_id := end_id
+	    s.remote_ts := end_ts
+	    if string$size(s.max_observed_ts) = 0
+	       then s.max_observed_ts := end_ts
+	       else greater: bool := ts_greater(end_ts, s.max_observed_ts)
+			except when bad_format: greater := false end
+		    if greater then s.max_observed_ts := end_ts end
+	       end
+	    s.next_backoff_ms := INITIAL_BACKOFF_MS
+	    end handle_transition
+
+%   -- draining one delivery -----------------------------------------
+
+%   take_pending(s) -> the lowest-indexed active subscription with a
+%   pending delivery, cleared, as (found, index); poll() turns a found
+%   index into its actual return values. Scanning by index (rather than,
+%   say, a separate ready-queue of indices) keeps delivery order
+%   deterministic across a batch Transition that touched several
+%   queries at once, which is what the Live-acceptance tests that count
+%   on a specific sequence need.
+	take_pending = proc (s: rep) returns (bool, int)
+	    i: int := qarr$low(s.subs)
+	    hi: int := qarr$high(s.subs)
+	    while i <= hi do
+		rec: qrec := qarr$fetch(s.subs, i)
+		if rec.active cand rec.has_pending then
+		    rec.has_pending := false
+		    qarr$store(s.subs, i, rec)
+		    return(true, i)
+		    end
+		i := i + 1
+		end
+	    return(false, 0)
+	    end take_pending
+
+%   -- public operations -----------------------------------------
+
+%   create(base_url, client_version) -> a fresh sync object with no
+%   connection yet -- the first add() is what actually schedules a
+%   dial, matching convex-rs-0.10.4-unversioned-sync's own pilot clients,
+%   none of which open the Live socket before the first Subscribe.
+	create = proc (base_url, client_version: string) returns (cvt)
+					   signals (not_possible(string))
+	    scheme: string, host: string, port: int, path: string :=
+		parse_ws_url(base_url)
+		resignal not_possible
+	    session_id: string := new_session_id()
+		resignal not_possible
+	    return(rep${scheme: scheme, host: host, port: port, path: path,
+			client_version: client_version, session_id: session_id,
+			sock: maybe[wsconn]$none(),
+			subs: qarr$create(1), next_query_id: 0,
+			query_set_version: 0,
+			remote_qs: 0, remote_id: 0, remote_ts: ZERO_TS,
+			max_observed_ts: "",
+			connection_count: 0, last_close_reason: "InitialConnect",
+			next_backoff_ms: INITIAL_BACKOFF_MS,
+			next_reconnect_at: 0,
+			last_server_response_at: _real_time()})
+	    end create
+
+%   add(s, path, args_raw) -> the new subscription's queryId. Always
+%   succeeds from the caller's point of view (matching the pinned Go
+%   pilot: a write failure here just falls back to a scheduled
+%   reconnect, which resends every active subscription's Add once
+%   reconnected, rather than surfacing as an error to this call).
+	add = proc (s: cvt, path, args_raw: string) returns (int)
+	    query_id: int := s.next_query_id
+	    s.next_query_id := s.next_query_id + 1
+	    rec: qrec := qrec${query_id: query_id, path: path,
+				args_raw: args_raw, active: true,
+				awaiting_rehydration: false,
+				has_last_delivered: false,
+				last_delivered_success: false,
+				last_delivered_value: "",
+				has_pending: false, pending_kind: "",
+				pending_value: "", pending_err_name: "",
+				pending_err_message: "", pending_err_data: "",
+				pending_has_err_data: false,
+				pending_has_logs: false, pending_logs_raw: ""}
+	    qarr$addh(s.subs, rec)
+
+	    if ~maybe[wsconn]$exists(s.sock) then
+		schedule_reconnect(s, 0, false)
+		return(query_id)
+		end
+	    w: wsconn := maybe[wsconn]$value(s.sock)
+	    base_v: int := s.query_set_version
+	    wsconn$send_text(w, build_modify_query_set(
+		base_v, base_v + 1, build_add_mod(query_id, path, args_raw)))
+		except when not_possible (msg: string):
+			    close_connection(s, msg, true)
+			    return(query_id)
+		       end
+	    s.query_set_version := base_v + 1
+	    return(query_id)
+	    end add
+
+%   remove(s, query_id) -> unsubscribes; unknown query_ids are a no-op,
+%   matching the pinned pilot's own idempotent Close/unsubscribe.
+	remove = proc (s: cvt, query_id: int) signals (not_possible(string))
+	    index: int := find_index(s, query_id)
+	    if index = 0 then return end
+	    rec: qrec := qarr$fetch(s.subs, index)
+	    rec.active := false
+	    rec.has_pending := false
+	    qarr$store(s.subs, index, rec)
+
+	    if maybe[wsconn]$exists(s.sock) then
+		w: wsconn := maybe[wsconn]$value(s.sock)
+		base_v: int := s.query_set_version
+		wsconn$send_text(w, build_modify_query_set(
+		    base_v, base_v + 1, build_remove_mod(query_id)))
+		    except when not_possible (msg: string):
+				close_connection(s, msg, true)
+				return
+			   end
+		s.query_set_version := base_v + 1
+		end
+	    end remove
+
+%   debug_disconnect(s) -> test-only forced reconnect (see manifest.yaml
+%   adapterOnlyCommands; never exposed as public client API). Retires
+%   the socket and schedules the reconnect before returning, so the
+%   caller's own acknowledgement -- sent only after this returns -- is
+%   never racing the reconnect it caused, per AGENTS.md's own ordering
+%   requirement for debugDisconnect.
+	debug_disconnect = proc (s: cvt) signals (not_possible(string))
+	    if ~maybe[wsconn]$exists(s.sock) then
+		signal not_possible("Live WebSocket is not connected")
+		end
+	    close_connection(s, "DebugDisconnect", true)
+	    end debug_disconnect
+
+%   poll(s, timeout_ms) -> drives the state machine for up to
+%   timeout_ms and returns at most one delivery: (has_event, kind
+%   ["update"/"error"], query_id, value_raw, err_name, err_message,
+%   err_data_raw, has_err_data, has_logs, logs_raw). A false has_event
+%   means nothing happened this call -- not an error -- so the caller
+%   (the conformance adapter) just calls poll() again, interleaving it
+%   with checks of its own command input.
+%
+%   Only a genuine protocol-level problem (malformed JSON in an
+%   otherwise-received message, an unknown or fatal server message, or
+%   handle_transition's own validation failing) is ever delivered to
+%   subscribers as an error. An ordinary transport hiccup -- a read
+%   timeout, a closed connection, a WebSocket framing violation, or the
+%   server's own Close frame -- only schedules a silent reconnect,
+%   exactly like convex-rs-0.10.4-unversioned-sync's own pilot clients:
+%   losing and regaining the socket is not itself something a
+%   subscriber should see as an error, only as (at most) a suppressed or
+%   real rehydration once reconnected.
+	poll = proc (s: cvt, timeout_ms: int)
+			   returns (bool, string, int, string, string, string,
+				    string, bool, bool, string)
+			   signals (not_possible(string))
+	    now: int := _real_time()
+
+	    if ~maybe[wsconn]$exists(s.sock) cand any_active(s) cand
+	       now >= s.next_reconnect_at then
+		try_connect(s)
+		    except when failed (msg: string):
+				s.last_close_reason := msg
+				s.connection_count := s.connection_count + 1
+				schedule_reconnect(s, s.next_backoff_ms, true)
+			   end
+		end
+
+%   Nothing to read yet: rather than return has_event=false immediately
+%   (which would make a caller's own poll() loop spin the CPU as fast
+%   as it can rather than actually waiting), sleep up to this call's own
+%   timeout_ms budget -- or less, if a reconnect is due sooner -- before
+%   returning. The connected branch below needs no equivalent sleep of
+%   its own: wsconn$recv_message(w, timeout_ms) already blocks for up
+%   to timeout_ms waiting on the socket.
+	    if ~maybe[wsconn]$exists(s.sock) then
+		wait_ms: int := timeout_ms
+		if any_active(s) then
+		    remaining: int := s.next_reconnect_at - _real_time()
+		    if remaining < wait_ms then wait_ms := remaining end
+		    end
+		if wait_ms > 0 then _sleep(wait_ms) end
+		return(false, "", 0, "", "", "", "", false, false, "")
+		end
+
+	    if maybe[wsconn]$exists(s.sock) then
+		w: wsconn := maybe[wsconn]$value(s.sock)
+		kind: string, payload: string := wsconn$recv_message(w,
+								      timeout_ms)
+		    except when timeout: kind := "__timeout__"
+			   when end_of_file:
+				close_connection(s, "connection closed", true)
+				kind := "__silent__"
+			   when not_possible (msg: string):
+				close_connection(s, msg, true)
+				kind := "__silent__"
+			   when protocol_error (msg: string):
+				close_connection(s, msg, true)
+				kind := "__silent__"
+			   when peer_close (code: int, reason: string):
+				close_connection(s, "server closed: " ||
+						 reason, true)
+				kind := "__silent__"
+			   end
+
+		if string$equal(kind, "text") then
+		    s.last_server_response_at := _real_time()
+		    envelope_type: string := json$unqs(json$field(payload,
+								   "type"))
+			except when not_found, bad_format:
+				    publish_error(s, "ProtocolError",
+						 "server message missing type")
+				    close_connection(s,
+						     "malformed server message",
+						     true)
+				    envelope_type := "__handled__"
+			       end
+		    if string$equal(envelope_type, "Transition") then
+			handle_transition(s, payload)
+			    except when protocol_error (msg: string):
+					publish_error(s, "ProtocolError", msg)
+					close_connection(s, msg, true)
+				   end
+		    elseif string$equal(envelope_type, "Ping") cor
+			   string$equal(envelope_type, "MutationResponse") cor
+			   string$equal(envelope_type, "ActionResponse") then
+			s.next_backoff_ms := INITIAL_BACKOFF_MS
+		    elseif string$equal(envelope_type, "FatalError") cor
+			   string$equal(envelope_type, "AuthError") then
+			err_text: string := json$unqs(json$field(payload,
+								  "error"))
+			    except when not_found, bad_format: err_text := ""
+				   end
+			publish_error(s, envelope_type, err_text)
+			close_connection(s, envelope_type, true)
+		    elseif string$equal(envelope_type, "TransitionChunk") then
+			publish_error(s, "ProtocolError",
+				     "TransitionChunk assembly is not " ||
+				     "implemented")
+			close_connection(s, "TransitionChunk", true)
+		    elseif string$equal(envelope_type, "__handled__") then
+			% already published and closed above
+		    else
+			publish_error(s, "ProtocolError",
+				     "unknown server message " ||
+				     envelope_type)
+			close_connection(s, "unknown server message", true)
+		    end
+		end
+		end
+
+	    if now - s.last_server_response_at > INACTIVITY_LIMIT_MS cand
+	       maybe[wsconn]$exists(s.sock) then
+		close_connection(s, "InactiveServer", true)
+		end
+
+	    found: bool, index: int := take_pending(s)
+	    if ~found then
+		return(false, "", 0, "", "", "", "", false, false, "")
+		end
+	    rec: qrec := qarr$fetch(s.subs, index)
+	    return(true, rec.pending_kind, rec.query_id, rec.pending_value,
+		   rec.pending_err_name, rec.pending_err_message,
+		   rec.pending_err_data, rec.pending_has_err_data,
+		   rec.pending_has_logs, rec.pending_logs_raw)
+	    end poll
+
+%   close(s) -> best-effort final teardown: sends a normal-closure Close
+%   frame if still connected, then closes the socket. Does not touch
+%   the subscription table -- the process is exiting either way once
+%   the adapter calls this from its own "close" command.
+	close = proc (s: cvt) signals (not_possible(string))
+	    if ~maybe[wsconn]$exists(s.sock) then return end
+	    w: wsconn := maybe[wsconn]$value(s.sock)
+	    wsconn$send_close(w, 1000, "client closed")
+		except when not_possible (ignored: string): end
+	    wsconn$close(w) except when not_possible (ignored: string): end
+	    s.sock := maybe[wsconn]$none()
+	    end close
+
+end sync

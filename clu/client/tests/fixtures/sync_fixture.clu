@@ -1,0 +1,272 @@
+%   sync_fixture.clu -- a scripted convex-rs-0.10.4-unversioned-sync
+%   peer (not a mock: a real WebSocket server speaking real frames) for
+%   sync_test.clu. Accepts six real TCP connections in turn -- the
+%   client's first connect plus five debugDisconnect-driven reconnects
+%   -- completing a real RFC 6455 handshake on each one, and scripts a
+%   realistic Transition sequence over each: an initial QueryUpdated,
+%   an external update, a QueryFailed and its recovery on the first
+%   connection, then on each reconnect an *unchanged* QueryUpdated
+%   (proving convex-sync.clu's rehydration suppression) immediately
+%   followed by a real changed one (proving the client is still live
+%   after suppressing it).
+
+	fx_byte_at = proc (s: string, i: int) returns (int)
+	    return(char$c2i(s[i]))
+	    end fx_byte_at
+
+	fx_byte_c = proc (v: int) returns (string)
+	    return(string$c2s(char$i2c(v)))
+	    end fx_byte_c
+
+	fx_fill = proc (ch: _chan, buf: string, n: int) returns (string)
+	    while string$size(buf) < n do
+		ready: bool := _chan$read_wait(ch, 5000)
+		if ~ready then return(buf) end
+		rbuf: _wordvec := _wordvec$create(4096)
+		got: int := _chan$recv(ch, rbuf, 0)
+		if got = 0 then return(buf) end
+		rbytes: _bytevec := _bytevec$create(got)
+		_wordvec$move_w2b(rbuf, 1, rbytes, 1, got)
+		buf := buf || _cvt[_bytevec, string](rbytes)
+		end
+	    return(buf)
+	    end fx_fill
+
+	fx_send = proc (ch: _chan, s: string)
+	    n: int := string$size(s)
+	    if n = 0 then return end
+	    buf: _wordvec := _wordvec$create((n + 3) / 4)
+	    _wordvec$move_b2w(_cvt[string, _bytevec](s), 1, buf, 1, n)
+	    _chan$send(ch, buf, n, 0)
+	    end fx_send
+
+%   fx_frame(opcode, payload, fin) -> a complete, unmasked server frame.
+%   Unlike websocket_fixture.clu's own fx_frame, this one does implement
+%   the 16-bit extended-length case: a real Transition message (its own
+%   two full version records plus a modification) routinely exceeds 125
+%   bytes, so a fixture that only ever wrote the 7-bit length form would
+%   silently truncate every payload at 125 bytes and corrupt everything
+%   after it in the stream, which is exactly the bug this file's own
+%   first version had.
+	fx_frame = proc (opcode: int, payload: string, fin: bool) returns (string)
+	    b0: int := opcode
+	    if fin then b0 := b0 + 128 end
+	    n: int := string$size(payload)
+	    len_bytes: string := fx_byte_c(n)
+	    if n >= 126 then
+		len_bytes := fx_byte_c(126) || fx_byte_c(n / 256) || fx_byte_c(n // 256)
+		end
+	    return(fx_byte_c(b0) || len_bytes || payload)
+	    end fx_frame
+
+	fx_unmask = proc (payload, key: string) returns (string)
+	    n: int := string$size(payload)
+	    out: string := ""
+	    i: int := 1
+	    while i <= n do
+		k: int := fx_byte_at(key, ((i - 1) // 4) + 1)
+		out := out || fx_byte_c(bitops$xor_byte(fx_byte_at(payload, i), k))
+		i := i + 1
+		end
+	    return(out)
+	    end fx_unmask
+
+%   fx_recv_text(ch, buf) -> the unmasked text of one client frame and
+%   buf advanced past it. Assumes a single, unfragmented text frame --
+%   true of every message this test's own client sends -- but does
+%   handle the 16-bit extended-length case: a real Connect message
+%   (a UUID sessionId plus several other fields) is routinely over 125
+%   bytes, and reading its length as a bare 7-bit field the way this
+%   file's first version did silently misreads both the length and
+%   everything that follows it.
+	fx_recv_text = proc (ch: _chan, buf: string) returns (string, string)
+	    buf := fx_fill(ch, buf, 2)
+	    len7: int := fx_byte_at(buf, 2) // 128
+	    header_len: int := 2
+	    payload_len: int := len7
+	    if len7 = 126 then
+		buf := fx_fill(ch, buf, 4)
+		payload_len := fx_byte_at(buf, 3) * 256 + fx_byte_at(buf, 4)
+		header_len := 4
+		end
+	    buf := string$rest(buf, header_len + 1)
+	    buf := fx_fill(ch, buf, 4 + payload_len)
+	    mkey: string := string$substr(buf, 1, 4)
+	    masked_payload: string := string$substr(buf, 5, payload_len)
+	    buf := string$rest(buf, 4 + payload_len + 1)
+	    return(fx_unmask(masked_payload, mkey), buf)
+	    end fx_recv_text
+
+	fx_header_value = proc (headers, name: string) returns (string)
+						       signals (not_found)
+	    pos: int := 1
+	    n: int := string$size(headers)
+	    while pos <= n do
+		nl: int := string$indexs("\r\n", string$rest(headers, pos))
+		line: string
+		if nl = 0
+		   then line := string$rest(headers, pos)
+			pos := n + 1
+		   else line := string$substr(headers, pos, nl - 1)
+			pos := pos + nl + 1
+		   end
+		if string$size(line) > string$size(name) cand
+		   string$equal(string$substr(line, 1, string$size(name)), name)
+		   then return(string$substr(line, string$size(name) + 1,
+					      string$size(line) -
+					      string$size(name)))
+		   end
+		end
+	    signal not_found
+	    end fx_header_value
+
+%   fx_handshake(ch) -> the leftover bytes (if any) after a real RFC
+%   6455 server-side handshake: reads the request, computes a real
+%   Sec-WebSocket-Accept the same way client/convex-websocket.clu's own
+%   connect() checks it, and answers with 101.
+	fx_handshake = proc (ch: _chan) returns (string)
+	    GUID: string := "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	    buf: string := ""
+	    header_end: int := 0
+	    while header_end = 0 do
+		buf := fx_fill(ch, buf, string$size(buf) + 1)
+		header_end := string$indexs("\r\n\r\n", buf)
+		end
+	    header_text: string := string$substr(buf, 1, header_end + 3)
+	    buf := string$rest(buf, header_end + 4)
+	    key: string := fx_header_value(header_text, "Sec-WebSocket-Key: ")
+	    accept: string := base64$encode(sha1$digest(key || GUID))
+	    fx_send(ch, "HTTP/1.1 101 Switching Protocols\r\n" ||
+			"Upgrade: websocket\r\n" ||
+			"Connection: Upgrade\r\n" ||
+			"Sec-WebSocket-Accept: " || accept || "\r\n\r\n")
+	    return(buf)
+	    end fx_handshake
+
+%   fx_ts(n) -> the base64 encoding of n as an 8-byte little-endian
+%   value, the same wire shape as a real Transition version's "ts" --
+%   this fixture's own stand-in for a server-assigned logical
+%   timestamp, monotonically increasing with n exactly the way a real
+%   deployment's timestamps do, so convex-sync.clu's own ts_greater
+%   comparisons see a realistic sequence.
+	fx_ts = proc (n: int) returns (string)
+	    bytes: string := ""
+	    i: int := 0
+	    while i < 8 do
+		bytes := bytes || fx_byte_c((n / (256 ** i)) // 256)
+		i := i + 1
+		end
+	    return(base64$encode(bytes))
+	    end fx_ts
+
+	fx_version = proc (qs, id: int, ts: string) returns (string)
+	    return("{\"querySet\":" || int$unparse(qs) || ",\"identity\":"
+		   || int$unparse(id) || ",\"ts\":\"" || ts || "\"}")
+	    end fx_version
+
+%   fx_send_transition(ch, start_json, end_json, mods_joined) -> sends
+%   one Transition message as a single unfragmented text frame.
+	fx_send_transition = proc (ch: _chan, start_json, end_json,
+				   mods_joined: string)
+	    text: string := "{\"type\":\"Transition\",\"startVersion\":"
+			     || start_json || ",\"endVersion\":" || end_json
+			     || ",\"modifications\":[" || mods_joined || "]}"
+	    fx_send(ch, fx_frame(1, text, true))
+	    end fx_send_transition
+
+	fx_query_updated = proc (query_id, value: int) returns (string)
+	    return("{\"type\":\"QueryUpdated\",\"queryId\":"
+		   || int$unparse(query_id) || ",\"value\":"
+		   || int$unparse(value) || "}")
+	    end fx_query_updated
+
+	fx_query_failed = proc (query_id: int, message: string) returns (string)
+	    return("{\"type\":\"QueryFailed\",\"queryId\":"
+		   || int$unparse(query_id) || ",\"errorMessage\":"
+		   || json$qs(message) || ",\"errorData\":{\"code\":1}}")
+	    end fx_query_failed
+
+start_up = proc ()
+    po: stream := stream$primary_output()
+    AF_INET: int := 2
+    SOCK_STREAM: int := 1
+    port: int := int$parse(sequence[string]$fetch(get_argv(), 1))
+
+    addr: _wordvec := _wordvec$create(4)
+    _wordvec$wstore(addr, 1, AF_INET)
+    _wordvec$wstore(addr, 3, (port / 2**8) + (port * 2**8))
+    l, r: int := inet_address("127.0.0.1")
+    _wordvec$wstore(addr, 5, r)
+    _wordvec$wstore(addr, 7, l)
+
+    lch: _chan := _chan$socket(AF_INET, SOCK_STREAM, 0)
+    _chan$bind(lch, addr, 16)
+    _chan$listen(lch, 1)
+    stream$putl(po, "READY")
+
+    last_value: int := 0
+    conn_num: int := 1
+    while conn_num <= 6 do
+	peeraddr: _wordvec := _wordvec$create(4)
+	ch: _chan, alen: int := _chan$accept(lch, peeraddr)
+	buf: string := fx_handshake(ch)
+
+	% every connection opens with Connect, then (since this test
+	% always has one active subscription by the time it connects)
+	% one bulk ModifyQuerySet -- this fixture does not need either
+	% message's own content, only to consume the right number of
+	% bytes before it starts writing its own scripted replies. Both
+	% targets here have to be plain (type-less) reassignments, not
+	% fresh declarations mixed into the same statement as buf's own
+	% reassignment -- pclu reads a bare "buf" beside a fresh "name:
+	% type" in one multi-target := as an incomplete declaration
+	% missing its own type, not a reassignment, so connect_text and
+	% mqs_text are declared on their own line first.
+	connect_text: string := ""
+	mqs_text: string := ""
+	connect_text, buf := fx_recv_text(ch, buf)
+	mqs_text, buf := fx_recv_text(ch, buf)
+
+	if conn_num = 1 then
+	    v0: string := fx_version(0, 0, "AAAAAAAAAAA=")
+	    v1: string := fx_version(1, 0, fx_ts(1))
+	    v2: string := fx_version(1, 0, fx_ts(2))
+	    v3: string := fx_version(1, 0, fx_ts(3))
+	    v4: string := fx_version(1, 0, fx_ts(4))
+	    fx_send_transition(ch, v0, v1, fx_query_updated(0, 1))
+	    fx_send_transition(ch, v1, v2, fx_query_updated(0, 2))
+	    fx_send_transition(ch, v2, v3, fx_query_failed(0, "boom"))
+	    fx_send_transition(ch, v3, v4, fx_query_updated(0, 3))
+	    last_value := 3
+	else
+	    base: int := conn_num * 10
+	    v0: string := fx_version(0, 0, "AAAAAAAAAAA=")
+	    v1: string := fx_version(1, 0, fx_ts(base))
+	    v2: string := fx_version(1, 0, fx_ts(base + 1))
+	    % the unchanged rehydration: same value the client already
+	    % holds. sync_test.clu's own job is to prove this one never
+	    % reaches its poll() caller.
+	    fx_send_transition(ch, v0, v1, fx_query_updated(0, last_value))
+	    last_value := last_value + 1
+	    fx_send_transition(ch, v1, v2, fx_query_updated(0, last_value))
+	    end
+
+	% Wait for the client to close this connection itself (a real
+	% debugDisconnect, driven from sync_test.clu) before accepting
+	% the next one.
+	drained: bool := false
+	while ~drained do
+	    ready: bool := _chan$read_wait(ch, 5000)
+	    if ~ready then drained := true
+	    else
+		rbuf: _wordvec := _wordvec$create(4096)
+		got: int := _chan$recv(ch, rbuf, 0)
+		if got = 0 then drained := true end
+		end
+	    end
+	_chan$close(ch)
+	conn_num := conn_num + 1
+	end
+
+    _chan$close(lch)
+    end start_up

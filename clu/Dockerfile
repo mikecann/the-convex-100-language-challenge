@@ -198,17 +198,21 @@ RUN set -eu; \
     test -f convex-json.clu; \
     "$CLUHOME/exe/pclu" -merge "$CLUHOME/lib/lowlev.lib" -ext false \
         -spec "$CLUHOME/lib/etc.spc", "$CLUHOME/lib/_tls.spc", \
+              "$CLUHOME/lib/maybe.spc", \
               convex-json, convex-bitops, convex-sha1, convex-base64, \
               convex-transport, convex-http, convex-websocket, \
+              convex-sync, \
               json_test, bitops_test, sha1_test, base64_test, \
-              transport_test, http_test, websocket_test, \
-              echo_fixture, http_fixture, websocket_fixture \
+              transport_test, http_test, websocket_test, sync_test, \
+              echo_fixture, http_fixture, websocket_fixture, sync_fixture \
         -opt -cfiles \
         -compile convex-json, convex-bitops, convex-sha1, convex-base64, \
                  convex-transport, convex-http, convex-websocket, \
+                 convex-sync, \
                  json_test, bitops_test, sha1_test, base64_test, \
-                 transport_test, http_test, websocket_test, \
-                 echo_fixture, http_fixture, websocket_fixture; \
+                 transport_test, http_test, websocket_test, sync_test, \
+                 echo_fixture, http_fixture, websocket_fixture, \
+                 sync_fixture; \
     "$CLUHOME/exe/plink" -opt -o json_test convex-json.o json_test.o; \
     "$CLUHOME/exe/plink" -opt -o bitops_test convex-bitops.o bitops_test.o; \
     "$CLUHOME/exe/plink" -opt -o sha1_test convex-sha1.o convex-bitops.o \
@@ -218,6 +222,8 @@ RUN set -eu; \
     "$CLUHOME/exe/plink" -opt -o http_fixture http_fixture.o; \
     "$CLUHOME/exe/plink" -opt -o websocket_fixture websocket_fixture.o \
         convex-bitops.o convex-sha1.o convex-base64.o; \
+    "$CLUHOME/exe/plink" -opt -o sync_fixture sync_fixture.o \
+        convex-bitops.o convex-sha1.o convex-base64.o convex-json.o; \
     ./json_test | tee /tmp/json_test.out; \
     grep -Fq 'ALL PASS' /tmp/json_test.out; \
     ./bitops_test | tee /tmp/bitops_test.out; \
@@ -243,6 +249,10 @@ RUN set -eu; \
         convex-sha1.o convex-base64.o convex-bitops.o \
         -L"$CLUHOME/code" -lpclu_opt -lssl -lcrypto -lm -lgc \
         -o websocket_test; \
+    gcc sync_test.o convex-sync.o convex-websocket.o convex-transport.o \
+        convex-sha1.o convex-base64.o convex-bitops.o convex-json.o \
+        -L"$CLUHOME/code" -lpclu_opt -lssl -lcrypto -lm -lgc \
+        -o sync_test; \
     ./echo_fixture 19001 >/tmp/echo_fixture.log 2>&1 & \
     ECHO_PID=$!; \
     printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{"status":"success","value":{"count":0}}' \
@@ -259,11 +269,16 @@ RUN set -eu; \
     HF3_PID=$!; \
     ./websocket_fixture 19005 >/tmp/websocket_fixture.log 2>&1 & \
     WSF_PID=$!; \
+    ./sync_fixture 19006 >/tmp/sync_fixture.log 2>&1 & \
+    SYNCF_PID=$!; \
     sleep 1; \
     ./transport_test 19001 19099 | tee /tmp/transport_test.out; \
     ./http_test 19002 19003 19004 | tee /tmp/http_test.out; \
     ./websocket_test 19005 | tee /tmp/websocket_test.out; \
-    wait $ECHO_PID $HF1_PID $HF2_PID $HF3_PID $WSF_PID 2>/dev/null || true; \
+    ./sync_test 19006 | tee /tmp/sync_test.out; \
+    wait $ECHO_PID $HF1_PID $HF2_PID $HF3_PID $WSF_PID $SYNCF_PID \
+        2>/dev/null || true; \
+    grep -Fq 'ALL PASS' /tmp/sync_test.out; \
     grep -Fq 'ALL PASS' /tmp/transport_test.out; \
     grep -Fq 'ALL PASS' /tmp/http_test.out; \
     grep -Fq 'ALL PASS' /tmp/websocket_test.out
