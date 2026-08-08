@@ -74,6 +74,7 @@ RUN set -eu; \
 RUN set -eu; \
     hb_flags="-static -gtcgi -mt"; \
     client_files="client/convexcore.prg client/convexjson.prg client/convextls.prg \
+      client/convextls_native.c \
       client/convexhttp.prg client/convexws.prg client/convexlive.prg client/convex.prg"; \
     mkdir -p /build; \
     cd /build; \

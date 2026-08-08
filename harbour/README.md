@@ -209,16 +209,28 @@ against actual peers rather than mocked.
   `OutStd()` directly with an explicit trailing `hb_eol()` instead, so its
   six-line stdout transcript matches `_shared/examples/basics.expected.txt`
   exactly rather than opening with a spurious blank line.
+- TLS hostname verification follows RFC 6125's ordering: a certificate's
+  `subjectAltName` DNS entries are checked first, and the legacy Subject
+  CN is only consulted when a certificate has no `subjectAltName` at all.
+  `contrib/hbssl` exposes no accessor for X.509 extensions, so
+  `client/convextls_native.c` (about 65 lines) reaches libssl's own
+  `X509_get_ext_d2i()`/`GENERAL_NAME` API directly for that one missing
+  accessor -- the same OpenSSL library `contrib/hbssl` already links, and
+  no Convex-specific logic, just the generic TLS primitive `contrib/hbssl`
+  itself forgot to wrap. This is not a cosmetic improvement over CN-only
+  matching: the hosted Convex deployment's own certificate has Subject CN
+  `convex.cloud` but `subjectAltName` `convex.cloud` and `*.convex.cloud`,
+  so a CN-only client cannot complete a hosted handshake at all.
 
 ## Limitations
 
-- `contrib/hbssl` exposes no Subject Alternative Name accessor, so TLS
-  hostname verification pattern-matches the peer certificate's Subject CN
-  (via `X509_name_oneline()`) when one is present, and falls through to
-  chain-trust-only when it is not, rather than rejecting outright. Chain
-  verification itself (`SSL_get_verify_result()` against the system trust
-  store or `$SSL_CERT_FILE`) is always full strength and rejects an
-  untrusted or self-signed peer regardless of this narrowing.
+- When a certificate carries no `subjectAltName` at all, hostname
+  verification falls back to pattern-matching the Subject CN (via
+  `X509_name_oneline()`), and a certificate with neither is a best-effort
+  skip of the name check specifically, rather than being rejected
+  outright. Chain verification itself (`SSL_get_verify_result()` against
+  the system trust store or `$SSL_CERT_FILE`) is always full strength and
+  rejects an untrusted or self-signed peer regardless of this narrowing.
 - A WebSocket control frame (close/ping/pong) arriving while a data message
   is still being reassembled from continuation frames is treated as a
   protocol failure that triggers a reconnect, rather than being returned to

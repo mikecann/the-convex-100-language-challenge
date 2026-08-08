@@ -18,13 +18,20 @@
 /* Opens host:port, and when lTls is .T. completes a real TLS handshake:
  * SNI is set from the host, the peer's certificate chain is verified
  * against the system trust store (or $SSL_CERT_FILE, matching every
- * other native client in this project), and the peer's certificate
- * name is checked when the certificate actually exposes a Subject CN.
- * hbssl exposes no Subject Alternative Name accessor (see the manifest's
- * limitations), so a certificate with no parseable CN falls through to
- * chain-only trust rather than being rejected outright -- a narrowed
- * hostname check, not a skipped one; chain verification is always full
- * strength and rejects an untrusted or self-signed peer outright.
+ * other native client in this project), and the peer's certificate name
+ * is checked per RFC 6125: subjectAltName DNS entries when the
+ * certificate carries any (contrib/hbssl exposes no accessor for X.509
+ * extensions, so convextls_native.c reaches libssl's own
+ * X509_get_ext_d2i() directly for this), falling back to the legacy
+ * Subject CN only when the certificate has no subjectAltName at all.
+ * Real certificates commonly carry a CN unrelated to any name they
+ * actually authorise (this project's own hosted Convex deployment does:
+ * CN "convex.cloud", subjectAltName "convex.cloud" and
+ * "*.convex.cloud"), so checking SAN first is not just more standards-
+ * correct than CN-only, it is required for this client to interoperate
+ * with the real hosted deployment at all. Chain verification is always
+ * full strength and rejects an untrusted or self-signed peer outright,
+ * independent of which name check applies.
  *
  * cVerifyHost, when given, is checked against the certificate instead of
  * cHost for SNI and the CN comparison, while cHost is still what is
@@ -99,17 +106,36 @@ FUNCTION ConvexSslErrorText()
    ENDIF
    RETURN ERR_error_string( nErr )
 
-/* .T. when the peer offered no CN to check at all (best-effort skip,
- * documented above) or when the CN matches the host, including one
- * leading wildcard label; .F. only when a CN is present and names some
- * other host. */
+/* RFC 6125 order of preference: when the certificate carries any
+ * subjectAltName DNS entry, only those count, even if none of them
+ * happen to match -- a certificate authority-issued SAN list is the
+ * actual scope the certificate was issued for, and a leftover or
+ * unrelated CN (this project's own hosted deployment has exactly this
+ * shape) must not silently override that. Only a certificate with no
+ * subjectAltName at all falls back to the legacy Subject CN, and only
+ * a certificate with neither is treated as a best-effort skip: chain
+ * verification (always full strength, checked separately) is the only
+ * thing standing between such a certificate and rejection. */
 FUNCTION ConvexCertNameOk( ssl, cHost )
-   LOCAL cert, cLine, nPos, cCn, nEnd
+   LOCAL cert, cSanList, aSan, i, cLine, nPos, cCn, nEnd
 
    cert := SSL_get_peer_certificate( ssl )
    IF cert == NIL
       RETURN .F.
    ENDIF
+   cHost := Lower( cHost )
+
+   cSanList := ConvexX509SanDnsNames( cert )
+   IF !Empty( cSanList )
+      aSan := hb_ATokens( cSanList, "," )
+      FOR i := 1 TO Len( aSan )
+         IF ConvexHostNameMatches( Lower( aSan[ i ] ), cHost )
+            RETURN .T.
+         ENDIF
+      NEXT
+      RETURN .F.
+   ENDIF
+
    cLine := X509_name_oneline( X509_get_subject_name( cert ), 0, 0 )
    nPos := At( "/CN=", cLine )
    IF nPos == 0
@@ -120,13 +146,19 @@ FUNCTION ConvexCertNameOk( ssl, cHost )
    IF nEnd > 0
       cCn := Left( cCn, nEnd - 1 )
    ENDIF
-   cCn := Lower( cCn )
-   cHost := Lower( cHost )
-   IF cCn == cHost
+   RETURN ConvexHostNameMatches( Lower( cCn ), cHost )
+
+/* .T. when cName (already lowercased) equals cHost (already lowercased)
+ * exactly, or is a single leading wildcard label ("*.example.com")
+ * covering cHost's own first label. Shared by both the subjectAltName
+ * and Subject CN checks above so a wildcard means the same thing in
+ * either place. */
+FUNCTION ConvexHostNameMatches( cName, cHost )
+   IF cName == cHost
       RETURN .T.
    ENDIF
-   IF Left( cCn, 2 ) == "*." .AND. At( ".", cHost ) > 0
-      RETURN SubStr( cCn, 3 ) == SubStr( cHost, At( ".", cHost ) + 1 )
+   IF Left( cName, 2 ) == "*." .AND. At( ".", cHost ) > 0
+      RETURN SubStr( cName, 3 ) == SubStr( cHost, At( ".", cHost ) + 1 )
    ENDIF
    RETURN .F.
 
