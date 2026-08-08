@@ -1,0 +1,94 @@
+schemaVersion: 1
+id: clean
+displayName: "Clean"
+rank: 53
+selectionTier: ranked
+implementation:
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Native Clean implementation of Convex's documented JSON HTTP endpoints
+    and the pinned /api/sync Live WebSocket profile. Clean's own
+    distribution has no HTTP, JSON, or WebSocket support, so all three are
+    hand-written directly in Clean (client/Convex/HTTP.icl,
+    client/Convex/Wire.icl, client/Convex/WebSocket.icl) against a
+    hand-rolled TCP socket layer (client/Convex/Socket.icl) reached through
+    Clean's own `ccall` C FFI. OpenSSL's libssl/libcrypto are reached the
+    same way, for the TLS record layer, SHA-1, Base64, and randomness
+    (client/Convex/TLS.icl) — the same kind of C-ABI boundary every other
+    native client in this project uses for its own language's TLS/crypto
+    story; everything Convex-specific stays in Clean. Convex.Live
+    (client/Convex/Live.icl) is a single call stack owning the connection
+    at all times, threaded explicitly as a LiveManager record through every
+    function rather than a mutable pointer, so the "one worker, exclusive
+    ownership" rule holds structurally. VERIFIED end-to-end against the
+    real local self-hosted backend, including the full HTTP query/mutation
+    round trip and the complete five-reconnect debugDisconnect sequence
+    with correct rehydration suppression and connection counting — but TLS
+    itself is currently broken (see limitations): a real handshake that
+    actually completes reliably crashes the Clean runtime, blocking every
+    https:// deployment and therefore verify-hosted. No capability badge is
+    claimed until that is resolved and the full verify-all ladder runs
+    clean.
+toolchain:
+  name: Clean
+  version: "3.1"
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - >-
+    TLS is broken: a real handshake that actually completes (SSL_connect
+    returning success, regardless of what certificate verification then
+    decides) reliably crashes the Clean runtime with "Run Time Warning:
+    cycle in spine detected" and exit 255. Reproduced directly against
+    Convex.TLS.tlsConnect alone, with no HTTP/Live/adapter code involved,
+    against both a same-container and a separate-container self-signed TLS
+    peer. Roughly twenty isolation attempts (certificate verification
+    outcome, every cleanup ordering, CA bundle loading, SNI, the retry
+    loop's deadline source, disabling the TLS socket's own close-on-free,
+    heap/stack size, whether Convex.Wire is even linked) neither reproduced
+    nor fixed it in a hand-rolled single-file reimplementation of the
+    identical OpenSSL call sequence, which never crashes under any of the
+    same variations — the one remaining difference is calling through
+    Convex.TLS's own separately-compiled module boundary, which would make
+    this a Clean 3.1 toolchain issue rather than a bug in this file's own
+    logic, but that is not confirmed. This blocks every https://
+    deployment; the plain-HTTP local backend path is unaffected and fully
+    verified.
+  - >-
+    Convex.WebSocket's UTF-8 validator is a pragmatic well-formedness check
+    (every leading byte's declared sequence length is followed by exactly
+    that many continuation bytes), not a full RFC 3629 validator: it does
+    not additionally reject overlong encodings, surrogate code points, or
+    codepoints above U+10FFFF.
+  - >-
+    Live authentication (setAuth against an active Live connection),
+    optimistic writes, and TransitionChunk assembly are deferred; only the
+    JSON-safe query/mutation/action profile is implemented, matching this
+    project's other native clients at this stage.
+  - >-
+    Reconnection has no exponential backoff; a Live bring-up that keeps
+    failing is retried on the very next liveStep call rather than after a
+    growing delay.
+  - >-
+    The adapter's own combined-input/Live-socket wait is a single 100ms
+    poll on the command input followed unconditionally by one non-blocking
+    liveStep 0, rather than a true combined poll on both file descriptors:
+    Client is an abstract type with no exposed file descriptor. The
+    resulting latency bound (up to ~100ms to notice either a new command or
+    a new Live frame) is the same order as this project's other native
+    clients' own poll timeout.
+capabilities: []
