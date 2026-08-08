@@ -56,3 +56,6 @@ lengthBytes :: !Int -> String
 maskPayload :: !String !String -> String
 isValidUtf8 :: !String -> Bool
 computeAcceptKey :: !String -> String
+
+// Also reused by Convex.Live for its session-ID UUID.
+randomBytesStr :: !Int !*World -> (!String, !*World)
