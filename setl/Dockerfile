@@ -165,3 +165,20 @@ RUN set -eu; \
     cd /stage; \
     /opt/setl-src/src/run/setl --cpp convex_test.setl | tee /tmp/convex_test.out; \
     grep -Fq 'CONVEX CLASSIFY: ALL CHECKS PASSED' /tmp/convex_test.out
+
+# RFC 6455 WebSocket framing (client/websocket.setl): the HTTP Upgrade
+# handshake with a verified Sec-WebSocket-Accept token (SHA-1 computed
+# via the new callout() service 5, see client/callskel.c), one masked
+# text frame per outbound send, and inbound fragmented-message
+# reassembly with transparent ping/pong and close handling. Tested for
+# real against a public WebSocket echo service -- not the Convex
+# backend, which is only reachable once the built image runs with real
+# network access (verify-example / verify), not during this isolated
+# build -- covering a short frame, a frame that forces the 126
+# extended-length header, and a clean close handshake.
+COPY client/websocket.setl /stage/websocket.setl
+COPY client/tests/websocket_test.setl /stage/websocket_test.setl
+RUN set -eu; \
+    cd /stage; \
+    /opt/setl-src/src/run/setl --cpp websocket_test.setl | tee /tmp/websocket_test.out; \
+    grep -Fq 'WEBSOCKET CLIENT: ALL CHECKS PASSED' /tmp/websocket_test.out

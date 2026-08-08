@@ -32,6 +32,17 @@
  *    2  TLS_WRITE     (handle, hexData)                    -> "OK:<nbytes>" | "ERR:<msg>"
  *    3  TLS_READ      (handle, maxBytes, readTimeoutMs)    -> "DATA:<hex>" | "TIMEOUT" | "EOF" | "ERR:<msg>"
  *    4  TLS_CLOSE     (handle)                             -> "OK" | "ERR:<msg>"
+ *    5  SHA1          (hexData)                             -> "OK:<hexDigest>" | "ERR:<msg>"
+ *
+ *  SHA1 has nothing to do with a connection handle: it is a stateless
+ *  digest primitive the WebSocket layer (client/websocket.setl) needs to
+ *  compute and verify the RFC 6455 handshake's Sec-WebSocket-Accept
+ *  token (SHA-1 of the client key concatenated with the RFC's fixed
+ *  GUID, then base64). Routing it through this same boundary -- rather
+ *  than hand-rolling SHA-1 in SETL source -- reuses the OpenSSL already
+ *  linked in for TLS and keeps the digest itself proven against a real
+ *  library implementation. Input and output are hex, matching every
+ *  other payload that crosses this boundary.
  *
  *  TLS_READ distinguishes three outcomes a Convex client must tell apart:
  *  data arrived, the deadline elapsed with the connection still healthy
@@ -60,6 +71,7 @@
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
 
 #define MAX_CONNS 16
 #define MAX_READ_BYTES 65536
@@ -464,6 +476,29 @@ static char *do_close(const char *handle_s) {
   return strdup("OK");
 }
 
+static char *do_sha1(const char *hex_data) {
+  size_t n = 0;
+  unsigned char *raw;
+  unsigned char digest[EVP_MAX_MD_SIZE];
+  unsigned int digest_len = 0;
+  char *hex_digest;
+  char *out;
+
+  raw = hex_decode(hex_data, &n);
+  if (!raw && n != 0) return strdup("ERR:malformed hex payload");
+
+  if (EVP_Digest(raw, n, digest, &digest_len, EVP_sha1(), NULL) != 1) {
+    free(raw);
+    return err_openssl("SHA1 digest failed");
+  }
+  free(raw);
+
+  hex_digest = hex_encode(digest, digest_len);
+  out = fmt("OK:%s", hex_digest ? hex_digest : "");
+  free(hex_digest);
+  return out;
+}
+
 char *setl2_callout(int service, unsigned argc, char *const argv[]) {
   switch (service) {
     case 0:
@@ -480,6 +515,9 @@ char *setl2_callout(int service, unsigned argc, char *const argv[]) {
     case 4:
       if (argc != 1) return strdup("ERR:TLS_CLOSE wants 1 arg");
       return do_close(argv[0]);
+    case 5:
+      if (argc != 1) return strdup("ERR:SHA1 wants 1 arg");
+      return do_sha1(argv[0]);
     default:
       return fmt("ERR:unknown service code %d", service);
   }
