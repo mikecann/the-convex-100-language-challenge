@@ -164,9 +164,11 @@ STR:
   Z←JEscapeString PAY
   →0
 BOOL:
-  Z←(PAY≠0)⍴¨⊂'true'
-  →(PAY≠0)⍴0
+  →(PAY≠0)⍴TRUEV
   Z←'false'
+  →0
+TRUEV:
+  Z←'true'
   →0
 NUL:
   Z←'null'
@@ -316,14 +318,14 @@ TRUE:
   Z←(JErr 'invalid literal') I
   →0
 TRUEOK:
-  Z←(JBool 1) I+4
+  Z←(JBool 1) (I+4)
   →0
 FALSE:
   →((5≤(⍴TEXT)-I+1)∧('false'≡TEXT[I+0 1 2 3 4]))⍴FALSEOK
   Z←(JErr 'invalid literal') I
   →0
 FALSEOK:
-  Z←(JBool 0) I+5
+  Z←(JBool 0) (I+5)
   →0
 NUL:
   →((4≤(⍴TEXT)-I+1)∧('null'≡TEXT[I+0 1 2 3]))⍴NULOK
@@ -418,7 +420,7 @@ UOK:
   I←I+5
   →LOOP
 DONE:
-  Z←(JStr OUT) I+1
+  Z←(JStr OUT) (I+1)
   →0
 UNTERM:
   Z←(JErr 'unterminated string') I
@@ -442,10 +444,10 @@ NEXT:
   I←TEXT JSkipWs I+1
   →LOOP
 DONE:
-  Z←(JArr ITEMS) I+1
+  Z←(JArr ITEMS) (I+1)
   →0
 EMPTY:
-  Z←(JArr ⍬) I+1
+  Z←(JArr ⍬) (I+1)
   →0
 UNTERM:
   Z←(JErr 'unterminated array') I
@@ -482,10 +484,10 @@ NEXT:
   I←TEXT JSkipWs I+1
   →LOOP
 DONE:
-  Z←(JObj PAIRS) I+1
+  Z←(JObj PAIRS) (I+1)
   →0
 EMPTY:
-  Z←(JObj ⍬) I+1
+  Z←(JObj ⍬) (I+1)
   →0
 UNTERM:
   Z←(JErr 'unterminated object') I
