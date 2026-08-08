@@ -428,7 +428,14 @@ adapter_main=: 3 : 0
       adapter_diagnostic 'cannot bind ', address
       1 return.
     end.
-    if. 0 ~: {. sdlisten listener;16 do.
+    NB. Explicit-backlog sdlisten (listener;16) mis-marshals a boxed pair
+    NB. into a mixed-boxing FFI argument and raises a raw domain error instead
+    NB. of returning a status code (reproduced outside this adapter too, so it
+    NB. is a jsource stock-library defect, not something specific to this
+    NB. call site). The atom-only form takes the library's own SOMAXCONN
+    NB. default and marshals cleanly, so use that instead of vendoring a fix
+    NB. into the shared socket.ijs.
+    if. 0 ~: {. sdlisten listener do.
       adapter_diagnostic 'cannot listen on ', address
       1 return.
     end.
