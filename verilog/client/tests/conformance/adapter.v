@@ -95,9 +95,13 @@ module adapter;
   // subscription, and this array never grows past MAX_SUBS entries - a
   // fixed, provable byte budget of MAX_SUBS * (one value's worth of
   // text), far under the shared 128 MiB limit, satisfying the
-  // requirement with a mailbox rather than a ring buffer. See
-  // client/tests/conformance/live_queue_test.v for the overflow
-  // (stopped-reader) proof.
+  // requirement with a mailbox rather than a ring buffer. Proven under
+  // an actual stopped reader (a real blocked stdout pipe, thousands of
+  // unpaced Live updates, and a peak-VmRSS assertion, not only a static
+  // argument) by verilog/Dockerfile's own Scenario D, since the proof
+  // needs a real OS pipe and a real subprocess to hold unread, which a
+  // plain simulation testbench like this client's other tests cannot
+  // set up on its own.
   localparam MAX_SUBS = 8;
   integer last_emitted_version [0:MAX_SUBS-1];
 

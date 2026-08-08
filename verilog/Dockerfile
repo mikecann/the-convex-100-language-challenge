@@ -1231,3 +1231,257 @@ RUN bash -c '\
     grep -Fq "\"type\":\"ready\"" /tmp/scenario-c.client.out; \
     grep -Fq "\"type\":\"closed\"" /tmp/scenario-c.client.out \
 '
+
+# ---------------------------------------------------------------------------
+# Scenario D: this adapter's own Live-delivery buffering choice, proven
+# under a stopped reader (AGENTS.md's "Conformance executable" section).
+# client/tests/conformance/adapter.v's own header comment explains the
+# design: conv.sync already stores at most one CURRENT value per active
+# subscription (client/convex_sync.v's sub_value_json, overwritten in
+# place, never a per-update history), so this adapter's own "queue" is
+# just a fixed MAX_SUBS=8-sized array of "have I emitted the CURRENT
+# version yet" flags. The conservative byte budget this proves: MAX_SUBS
+# (8) subscription mailbox slots at up to convex_websocket.v's own
+# MSG_CAP (1 MiB, the largest a single reassembled /api/sync message may
+# be) each, plus the adapter's own outbuf (1 MiB) and conv.sync's shared
+# ws.msg scratch (1 MiB) -- about 11 MiB, comfortably under the shared
+# 128 MiB adapter memory limit.
+#
+# adapterfloodfix connects once, completes the Add handshake, then sends
+# FLOOD_COUNT Transitions (~350 KB total, comfortably over a 64 KB pipe
+# buffer) back to back with no pacing at all while this stage
+# deliberately holds the adapter's own stdout unread for several
+# seconds: the pipe's read descriptor is opened (so the adapter's writes
+# do not block forever on open()) but nothing drains it, so the kernel
+# pipe buffer fills and every write past that point blocks the adapter's
+# own single I/O worker -- and because that same worker also owns the
+# WebSocket read loop (this file's own header comment, and the Live
+# acceptance section of AGENTS.md, require exactly this single-owner
+# shape), a blocked stdout write stalls new Live reads too, so the
+# fixture's own sends back up over real TCP flow control rather than
+# this client ever buffering an unbounded backlog to catch up on later.
+# This run's own unsubscribe/close commands race the flood (the same
+# single loop fairly interleaves a ready command with draining one more
+# Live event each tick), so the exact number of flood values delivered
+# before unsubscribe is not deterministic and this stage does not assert
+# one; what it does assert is the concrete, load-bearing claim: peak
+# VmRSS while the pipe was blocked stays far under the shared 128 MiB
+# adapter memory limit, at least one well-formed value was delivered,
+# and the session still ends in a clean ack/closed rather than a hang
+# or a crash.
+# ---------------------------------------------------------------------------
+RUN <<'ADAPTERFLOODFIX_EOF'
+set -eu
+cat > /tmp/adapterfloodfix.c <<'CEOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <openssl/sha.h>
+#include <openssl/evp.h>
+
+#define FLOOD_COUNT 4000
+
+static int read_full(int fd, void *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t r = read(fd, (char *)buf + off, n - off);
+        if (r <= 0) return -1;
+        off += (size_t)r;
+    }
+    return 0;
+}
+static void write_full(int fd, const void *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, (const char *)buf + off, n - off);
+        if (w <= 0) exit(1);
+        off += (size_t)w;
+    }
+}
+static void read_handshake(int fd, char *key_out, size_t key_cap) {
+    char buf[8192];
+    size_t len = 0;
+    key_out[0] = '\0';
+    for (;;) {
+        if (len >= sizeof(buf) - 1) exit(1);
+        ssize_t r = read(fd, buf + len, 1);
+        if (r <= 0) exit(1);
+        len += (size_t)r;
+        buf[len] = '\0';
+        if (len >= 4 && memcmp(buf + len - 4, "\r\n\r\n", 4) == 0) break;
+    }
+    char *line = buf;
+    for (;;) {
+        char *eol = strstr(line, "\r\n");
+        if (!eol) break;
+        *eol = '\0';
+        if (strncasecmp(line, "Sec-WebSocket-Key:", 18) == 0) {
+            char *v = line + 18;
+            while (*v == ' ') v++;
+            snprintf(key_out, key_cap, "%s", v);
+        }
+        if (eol == line) break;
+        line = eol + 2;
+    }
+    if (key_out[0] == '\0') exit(1);
+}
+static void compute_accept(const char *key, char *accept_out) {
+    static const char guid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    char joined[256];
+    snprintf(joined, sizeof(joined), "%s%s", key, guid);
+    unsigned char digest[SHA_DIGEST_LENGTH];
+    SHA1((const unsigned char *)joined, strlen(joined), digest);
+    int n = EVP_EncodeBlock((unsigned char *)accept_out, digest, SHA_DIGEST_LENGTH);
+    accept_out[n] = '\0';
+}
+static void send_text_frame(int fd, const char *text) {
+    size_t len = strlen(text);
+    unsigned char hdr[4];
+    size_t hlen = 0;
+    hdr[hlen++] = 0x81;
+    if (len < 126) {
+        hdr[hlen++] = (unsigned char)len;
+    } else {
+        hdr[hlen++] = 126;
+        hdr[hlen++] = (unsigned char)((len >> 8) & 0xFF);
+        hdr[hlen++] = (unsigned char)(len & 0xFF);
+    }
+    write_full(fd, hdr, hlen);
+    write_full(fd, text, len);
+}
+static void read_masked_text_frame(int fd, char *out, size_t cap) {
+    unsigned char hdr[2];
+    if (read_full(fd, hdr, 2) < 0) exit(1);
+    uint64_t plen = hdr[1] & 0x7F;
+    if (plen == 126) {
+        unsigned char ext[2];
+        if (read_full(fd, ext, 2) < 0) exit(1);
+        plen = ((uint64_t)ext[0] << 8) | ext[1];
+    }
+    unsigned char mkey[4];
+    if (read_full(fd, mkey, 4) < 0) exit(1);
+    if (plen >= cap) exit(1);
+    if (plen > 0 && read_full(fd, out, plen) < 0) exit(1);
+    for (uint64_t i = 0; i < plen; i++) out[i] = (char)((unsigned char)out[i] ^ mkey[i % 4]);
+    out[plen] = '\0';
+}
+static void ts_b64(uint64_t v, char *out) {
+    unsigned char bytes[8];
+    for (int i = 0; i < 8; i++) { bytes[i] = (unsigned char)(v & 0xFF); v >>= 8; }
+    int n = EVP_EncodeBlock((unsigned char *)out, bytes, 8);
+    out[n] = '\0';
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "usage: adapterfloodfix port\n"); return 1; }
+    int port = atoi(argv[1]);
+
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
+    listen(listen_fd, 1);
+
+    int fd = accept(listen_fd, NULL, NULL);
+    if (fd < 0) { perror("accept"); return 1; }
+    char key[512], accept_val[64], resp[512];
+    read_handshake(fd, key, sizeof(key));
+    compute_accept(key, accept_val);
+    int rn = snprintf(resp, sizeof(resp),
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: %s\r\n\r\n", accept_val);
+    write_full(fd, resp, (size_t)rn);
+
+    char msg[8192];
+    read_masked_text_frame(fd, msg, sizeof(msg)); /* Connect */
+    read_masked_text_frame(fd, msg, sizeof(msg)); /* ModifyQuerySet Add */
+
+    uint64_t ts_counter = 1;
+    for (int i = 0; i < FLOOD_COUNT; i++) {
+        char ts[16], text[256];
+        ts_b64(ts_counter, ts); ts_counter++;
+        snprintf(text, sizeof(text),
+            "{\"type\":\"Transition\","
+            "\"startVersion\":{\"querySet\":%d,\"identity\":0,\"ts\":\"%s\"},"
+            "\"endVersion\":{\"querySet\":%d,\"identity\":0,\"ts\":\"%s\"},"
+            "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":1,\"value\":{\"count\":%d}}]}",
+            i, ts, i + 1, ts, i);
+        send_text_frame(fd, text);
+    }
+    fprintf(stderr, "adapterfloodfix: sent %d Transitions with no pacing\n", FLOOD_COUNT);
+
+    char discard[64];
+    read(fd, discard, sizeof(discard));
+    close(fd);
+    close(listen_fd);
+    return 0;
+}
+CEOF
+gcc -O2 -Wall -Wextra -o /tmp/adapterfloodfix /tmp/adapterfloodfix.c -lssl -lcrypto
+ADAPTERFLOODFIX_EOF
+
+RUN bash -c '\
+    set -eu; \
+    timeout 25 /tmp/adapterfloodfix 44213 2>/tmp/adapterfloodfix.log & \
+    fixture_pid=$!; \
+    sleep 1; \
+    mkfifo /tmp/scenario-d-in.fifo /tmp/scenario-d-out.fifo; \
+    ( \
+      exec 3> /tmp/scenario-d-in.fifo; \
+      printf "%s\n" "{\"protocolVersion\":1,\"id\":\"h1\",\"op\":\"hello\"}" >&3; \
+      printf "%s\n" "{\"id\":\"s1\",\"op\":\"subscribe\",\"subscriptionId\":\"sub1\",\"path\":\"demo:state\",\"args\":{}}" >&3; \
+      sleep 12; \
+      printf "%s\n" "{\"id\":\"u1\",\"op\":\"unsubscribe\",\"subscriptionId\":\"sub1\"}" >&3; \
+      printf "%s\n" "{\"id\":\"c1\",\"op\":\"close\"}" >&3; \
+      exec 3>&-; \
+    ) & \
+    CONVEX_URL=http://127.0.0.1:44213 timeout 30 vvp -M. -mnative /tmp/adapter.vvp \
+      < /tmp/scenario-d-in.fifo > /tmp/scenario-d-out.fifo 2>/tmp/scenario-d.err & \
+    adapter_pid=$!; \
+    ( \
+      exec 4< /tmp/scenario-d-out.fifo; \
+      sleep 6; \
+      peak=0; \
+      for i in 1 2 3 4 5; do \
+        rss=$(awk "/VmRSS/{print \$2}" /proc/"$adapter_pid"/status 2>/dev/null || echo 0); \
+        test "$rss" -gt "$peak" 2>/dev/null && peak=$rss || true; \
+        sleep 1; \
+      done; \
+      echo "peak VmRSS while stdout was unread: ${peak} kB" > /tmp/scenario-d.rss; \
+      cat <&4 > /tmp/scenario-d.out; \
+    ) & \
+    reader_pid=$!; \
+    wait "$adapter_pid"; \
+    code=$?; \
+    wait "$reader_pid" "$fixture_pid" || true; \
+    echo "adapter exit: $code"; \
+    cat /tmp/scenario-d.rss; \
+    cat /tmp/adapterfloodfix.log >&2; \
+    wc -l /tmp/scenario-d.out; \
+    tail -c 4096 /tmp/scenario-d.out; \
+    cat /tmp/scenario-d.err >&2; \
+    test "$code" -eq 0; \
+    grep -Fq "adapterfloodfix: sent 4000 Transitions with no pacing" /tmp/adapterfloodfix.log; \
+    grep -Fq "\"id\":\"c1\",\"type\":\"closed\"" /tmp/scenario-d.out; \
+    sub_lines=$(grep -c "\"type\":\"subscription\"" /tmp/scenario-d.out); \
+    echo "subscription events actually emitted before unsubscribe: $sub_lines (of 4000 sent, ~350KB total, over a 64KB pipe buffer)"; \
+    test "$sub_lines" -gt 0; \
+    last_value=$(grep -o "\"subscriptionId\":\"sub1\",\"value\":{\"count\":[0-9]*}" /tmp/scenario-d.out | tail -n1); \
+    echo "last delivered value before unsubscribe: $last_value"; \
+    test -n "$last_value"; \
+    peak_kb=$(grep -oE "[0-9]+ kB" /tmp/scenario-d.rss | awk "{print \$1}"); \
+    test -n "$peak_kb"; \
+    echo "peak VmRSS while stdout was unread: ${peak_kb} kB (bound: 131072 kB = 128 MiB)"; \
+    test "$peak_kb" -lt 131072 \
+'
