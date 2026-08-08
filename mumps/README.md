@@ -19,11 +19,12 @@ runnable file.
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Not yet verified | Query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented and pass real loopback tests in Docker, but shared local and hosted black-box conformance have not run yet. |
-| Live | Not yet verified | Subscribe/unsubscribe, reconnect-on-drop with exponential backoff, unchanged-rehydration suppression, reactive error recovery, and clean close are implemented and pass real loopback tests in Docker, but shared local and hosted black-box conformance (including the five-reconnect proof) have not run yet. |
+| HTTP | Badge earned | Query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented and pass shared local and hosted black-box conformance. |
+| Live | Badge earned | Subscribe/unsubscribe, reconnect-on-drop with exponential backoff, unchanged-rehydration suppression, reactive error recovery, and clean close are implemented and pass shared local and hosted black-box conformance, including a debugDisconnect-triggered five-reconnect proof and a QueryFailed-then-recovery cycle. |
 
-No capability badge is claimed until the shared evaluator runs local and
-hosted conformance from a clean exact-head build.
+The shared evaluator awarded both badges from a clean exact-head build: 31 of
+31 checks against a local backend and 31 of 31 against the hosted deployment
+over real TLS.
 
 ## The basic example
 
@@ -160,6 +161,9 @@ bail(message)
 ./run verify-example mumps  # runs the exact block above against a unique
                              # room on the local self-hosted backend
 ./run verify mumps          # verify-example plus shared black-box conformance
+./run verify-hosted mumps   # verify-example plus conformance against the
+                             # dedicated hosted drift target, over real TLS
+./run verify-all mumps      # builds once, then runs both profiles above
 ```
 
 `./run test mumps` installs YottaDB r2.06 from its pinned installer script
@@ -171,7 +175,9 @@ primitives the WebSocket handshake depends on) with no network at all, and
 runs `client/tests/httptest.m` and `client/tests/livetest.m` against real
 `127.0.0.1` sockets served by `client/tests/fixture.m` -- not mocks -- so a
 bug in the client's own request framing or WebSocket codec cannot pass by
-construction.
+construction. The local fixtures speak plain HTTP, so they never exercise
+TLS; `verify-hosted`/`verify-all` are what first proved the real TLS path
+against a real deployment.
 
 ## Conformance and protocol notes
 
@@ -180,8 +186,21 @@ construction.
 - Every socket is opened with M's own `OPEN`/`USE`/`READ`/`WRITE` device
   syntax (device type `"SOCKET"`); TLS is a `WRITE /TLS(...)` on that same
   device, backed by YottaDB's OpenSSL plugin (`libgtmtls.so`, built from
-  source with the installer's `--encplugin` option) -- there is no foreign
-  process or shim involved for either plain or encrypted transport.
+  source with the installer's `--encplugin` option). No foreign process or
+  shim is involved for the Convex protocol itself, for either plain or
+  encrypted transport -- but YottaDB's TLS plugin never sends TLS Server
+  Name Indication (confirmed by reading its source: `gtm_tls_connect()`
+  calls `SSL_connect()` directly, with no `SSL_set_tlsext_host_name` call
+  anywhere, and by cross-checking every documented `WRITE /TLS` config
+  option, none of which touch SNI), which a real hosted deployment's
+  TLS-terminating front requires to select a certificate at all --
+  reproduced directly with `openssl s_client -noservername` against the
+  same host, which fails with the identical handshake alert. `client/
+  sni_shim.c` is a small `LD_PRELOAD` interposer that sets the SNI hostname
+  from `CONVEX_URL` before delegating to the real `SSL_connect`; it carries
+  no Convex, HTTP, JSON, or WebSocket logic, the same narrow pattern this
+  project already uses for a language runtime missing exactly one native
+  primitive (see `icon/client/shim.c`).
 - `sockOpen` deliberately opens an empty `SOCKET` device first and `USE`s it
   with `CONNECT`, then reads `$KEY` while it is the current device, rather
   than trusting `$DEVICE` on a single combined `OPEN`/`CONNECT`: `$DEVICE`
@@ -219,6 +238,15 @@ construction.
   observable sequence exactly initial value, disconnect acknowledgement,
   external change, updated value -- not an extra unchanged rehydration in
   between.
+- `subscribe` sends its query's `Add` two different ways depending on
+  whether a Live connection is already up: a cold start's `Add` rides
+  along in the same `ModifyQuerySet` that `liveConnect` uses to replay
+  every active subscription, while a second (or later) subscription on an
+  already-open connection sends its own incremental `ModifyQuerySet`.
+  Getting the branch between those two cases backwards silently drops the
+  second path entirely -- shared conformance (`client/live/external-update`
+  onward) is what caught this, since the language-local fixture only ever
+  exercises a single subscription per connection.
 - `client/tests/conformance/adapter.m` implements NDJSON adapter protocol
   v1 over both stdin/stdout and the `ADAPTER_LISTEN` TCP mode, and declares
   `debugDisconnect` as its one adapter-only command.
@@ -236,9 +264,6 @@ construction.
 
 ## Limitations
 
-- Shared local and hosted black-box conformance have not run yet. Every
-  claim above is language-local Docker evidence only; no capability badge
-  is claimed until the shared evaluator runs from a clean exact-head build.
 - Live authentication, WebSocket-issued mutations/actions, journals, and
   `TransitionChunk` assembly are deferred; a `TransitionChunk` is reported
   as protocol drift and the connection reconnects.

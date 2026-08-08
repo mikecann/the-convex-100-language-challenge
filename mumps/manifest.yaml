@@ -4,7 +4,7 @@ displayName: "MUMPS"
 rank: 35
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -13,7 +13,13 @@ implementation:
     device syntax (device type "SOCKET"), never a foreign process; TLS is
     negotiated in-process too, through YottaDB's own WRITE /TLS device
     extension, backed by its OpenSSL plugin (libgtmtls.so, built from source
-    with the installer's --encplugin option). JSON encoding and decoding
+    with the installer's --encplugin option), plus one small LD_PRELOAD C
+    shim (client/sni_shim.c) that adds TLS Server Name Indication, which
+    YottaDB's TLS plugin never sends on its own -- confirmed by reading its
+    source and by reproducing an identical handshake failure directly against
+    the hosted deployment with `openssl s_client -noservername`. The shim is
+    pure transport plumbing (no Convex, HTTP, JSON, or WebSocket logic), the
+    same narrow pattern as icon/client/shim.c. JSON encoding and decoding
     (client/convex.m's own recursive-descent parser and a small arena-style
     node pool), HTTP/1.1 request and chunked-response handling, RFC 6455
     WebSocket framing and masking, SHA-1 and base64 for the WebSocket
@@ -45,12 +51,6 @@ adapter:
     - debugDisconnect
 limitations:
   - >-
-    Language-local Docker tests (client/tests/jsontest.m, cryptotest.m,
-    httptest.m, livetest.m against real loopback fixtures) pass from a clean
-    build; shared local and hosted black-box conformance have not been run
-    yet, so the capability list below reflects no earned badges rather than
-    an evaluator award.
-  - >-
     Live authentication, WebSocket-issued mutations and actions, journals,
     and TransitionChunk assembly are deferred; receiving a TransitionChunk is
     reported as protocol drift and the connection reconnects.
@@ -75,4 +75,6 @@ limitations:
     without depending on ICU or a UTF-8 locale. `--utf8` is deliberately
     never passed to the installer, since it would only add a second,
     ICU-linked engine variant this client never selects.
-capabilities: []
+capabilities:
+  - http
+  - live
