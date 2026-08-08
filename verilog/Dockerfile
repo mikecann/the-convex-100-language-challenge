@@ -26,9 +26,13 @@ ARG BUILD_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa04
 # Sec-WebSocket-Accept example - see sha1_test below) and now RFC 6455
 # WebSocket framing (client/convex_websocket.v: masking, fragmentation
 # reassembly, interleaved control frames, one-shot post-reassembly UTF-8
-# validation - see ws_smoke below) so far. The canonical examples/basics
-# program, the /api/sync Live state machine and the conformance adapter
-# do not exist yet, so no capability is claimed; see verilog/README.md. This
+# validation - see ws_smoke below), and now the /api/sync Live state
+# machine (client/convex_sync.v: subscribe, five real debugDisconnect
+# reconnects with unchanged rehydration suppressed, QueryFailed and
+# recovery, connectionCount/lastCloseReason/maxObservedTimestamp,
+# exponential backoff - see sync_smoke below) so far. The canonical
+# examples/basics program and the conformance adapter do not exist yet,
+# so no capability is claimed; see verilog/README.md. This
 # stage is built up incrementally and checkpoint-commented for the same
 # reason vhdl/ - still unimplemented itself (status: planned) - would be
 # organised the same way once it exists: each layer is proven against a
@@ -473,3 +477,353 @@ RUN set -eu; \
     grep -Fq 'PASS ws_smoke' /tmp/ws_smoke.out; \
     grep -Fq 'PASS masked PONG echoed the PING payload correctly' /tmp/wsfix.log; \
     grep -Fq 'PASS client answered with a masked CLOSE frame' /tmp/wsfix.log
+
+# ---------------------------------------------------------------------------
+# /api/sync Live state machine: client/convex_sync.v, built on
+# convex_websocket.v. syncfix is a one-shot fixture peer (test
+# infrastructure only, never linked into the client itself - the same
+# role wsfix/tcpfix play above) that accepts six sequential connections
+# (one initial connect plus five debugDisconnect-triggered reconnects),
+# independently checks each one's connectionCount and lastCloseReason,
+# and drives an unchanged rehydration (must be suppressed) followed by
+# a genuine external mutation (must be delivered) on every one of them,
+# then, on the sixth connection only, a QueryFailed followed by
+# recovery on the same subscription - see syncfix.c and
+# client/tests/sync_smoke.v for the full choreography.
+# ---------------------------------------------------------------------------
+RUN <<'SYNCFIX_EOF'
+set -eu
+cat > /tmp/syncfix.c <<'CEOF'
+/* syncfix.c - a one-shot fixture peer for the /api/sync protocol,
+ * driving client/tests/sync_smoke.v through six sequential connections
+ * (one initial connect plus five debugDisconnect-triggered reconnects)
+ * over one listening socket. Test infrastructure only, never linked
+ * into the client itself - the same role wsfix.c/tcpfix.c play for
+ * their own gates (see verilog/Dockerfile).
+ *
+ * Each connection: completes the RFC 6455 handshake, reads the
+ * client's Connect message and independently checks connectionCount
+ * (0, 1, 2, 3, 4, 5) and lastCloseReason ("InitialConnect" on the
+ * first, "debugDisconnect" on every reconnect), reads the client's
+ * ModifyQuerySet (the rehydration replay of its one active
+ * subscription), then sends two Transition messages: first the
+ * CURRENT tracked value (a rehydration on every connection after the
+ * first - the client must suppress this, since nothing changed), then
+ * CURRENT+1 (a genuine external mutation the client must deliver).
+ * On the sixth and final connection only, two more Transitions follow
+ * the mutation: a QueryFailed, then a recovery QueryUpdated on the
+ * same queryId - proving a client handles a failing query and its
+ * later recovery, not only ordinary value updates.
+ *
+ * After all of that this fixture just blocks reading, which is how it
+ * learns the client called debugDisconnect (TCP EOF) and moves on to
+ * accept() the next connection - or, on the sixth and final
+ * connection, how it learns the test itself finished ($finish tears
+ * down the whole process, including this socket).
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <openssl/sha.h>
+#include <openssl/evp.h>
+
+#define TOTAL_CONNECTIONS 6
+
+static int accept_one(int listen_fd) {
+    int c = accept(listen_fd, NULL, NULL);
+    if (c < 0) { perror("syncfix: accept"); exit(1); }
+    return c;
+}
+
+static int read_full(int fd, void *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t r = read(fd, (char *)buf + off, n - off);
+        if (r <= 0) return -1;
+        off += (size_t)r;
+    }
+    return 0;
+}
+
+static void write_full(int fd, const void *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, (const char *)buf + off, n - off);
+        if (w <= 0) { fprintf(stderr, "syncfix: write failed\n"); exit(1); }
+        off += (size_t)w;
+    }
+}
+
+static void read_handshake(int fd, char *key_out, size_t key_cap) {
+    char buf[8192];
+    size_t len = 0;
+    key_out[0] = '\0';
+    for (;;) {
+        if (len >= sizeof(buf) - 1) { fprintf(stderr, "syncfix: handshake too large\n"); exit(1); }
+        ssize_t r = read(fd, buf + len, 1);
+        if (r <= 0) { fprintf(stderr, "syncfix: handshake read failed\n"); exit(1); }
+        len += (size_t)r;
+        buf[len] = '\0';
+        if (len >= 4 && memcmp(buf + len - 4, "\r\n\r\n", 4) == 0) break;
+    }
+    char *line = buf;
+    for (;;) {
+        char *eol = strstr(line, "\r\n");
+        if (!eol) break;
+        *eol = '\0';
+        if (strncasecmp(line, "Sec-WebSocket-Key:", 18) == 0) {
+            char *v = line + 18;
+            while (*v == ' ') v++;
+            snprintf(key_out, key_cap, "%s", v);
+        }
+        if (eol == line) break;
+        line = eol + 2;
+    }
+    if (key_out[0] == '\0') { fprintf(stderr, "syncfix: request had no Sec-WebSocket-Key\n"); exit(1); }
+}
+
+static void compute_accept(const char *key, char *accept_out) {
+    static const char guid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    char joined[256];
+    snprintf(joined, sizeof(joined), "%s%s", key, guid);
+    unsigned char digest[SHA_DIGEST_LENGTH];
+    SHA1((const unsigned char *)joined, strlen(joined), digest);
+    int n = EVP_EncodeBlock((unsigned char *)accept_out, digest, SHA_DIGEST_LENGTH);
+    accept_out[n] = '\0';
+}
+
+static void do_handshake(int fd) {
+    char key[512], accept_val[64], resp[512];
+    read_handshake(fd, key, sizeof(key));
+    compute_accept(key, accept_val);
+    int rn = snprintf(resp, sizeof(resp),
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: %s\r\n\r\n", accept_val);
+    write_full(fd, resp, (size_t)rn);
+}
+
+static void send_text_frame(int fd, const char *text) {
+    size_t len = strlen(text);
+    unsigned char hdr[4];
+    size_t hlen = 0;
+    hdr[hlen++] = 0x80 | 0x1; /* FIN, opcode 1 = text; server frames are never masked */
+    if (len < 126) {
+        hdr[hlen++] = (unsigned char)len;
+    } else {
+        hdr[hlen++] = 126;
+        hdr[hlen++] = (unsigned char)((len >> 8) & 0xFF);
+        hdr[hlen++] = (unsigned char)(len & 0xFF);
+    }
+    write_full(fd, hdr, hlen);
+    write_full(fd, text, len);
+}
+
+/* Reads one masked client->server text frame's payload into out (NUL
+ * terminated). Exits with a diagnostic if the frame was not masked -
+ * RFC 6455 SS5.1 requires every client-sent frame to be masked. */
+static void read_masked_text_frame(int fd, char *out, size_t cap) {
+    unsigned char hdr[2];
+    if (read_full(fd, hdr, 2) < 0) { fprintf(stderr, "syncfix: frame header read failed\n"); exit(1); }
+    int masked = (hdr[1] & 0x80) != 0;
+    if (!masked) { fprintf(stderr, "syncfix: FAIL client frame was NOT masked\n"); exit(1); }
+    uint64_t plen = hdr[1] & 0x7F;
+    if (plen == 126) {
+        unsigned char ext[2];
+        if (read_full(fd, ext, 2) < 0) exit(1);
+        plen = ((uint64_t)ext[0] << 8) | ext[1];
+    } else if (plen == 127) {
+        unsigned char ext[8];
+        if (read_full(fd, ext, 8) < 0) exit(1);
+        plen = 0;
+        for (int i = 0; i < 8; i++) plen = (plen << 8) | ext[i];
+    }
+    if (plen >= cap) { fprintf(stderr, "syncfix: client frame too large\n"); exit(1); }
+    unsigned char mkey[4];
+    if (read_full(fd, mkey, 4) < 0) { fprintf(stderr, "syncfix: mask key read failed\n"); exit(1); }
+    if (plen > 0 && read_full(fd, out, plen) < 0) { fprintf(stderr, "syncfix: masked payload read failed\n"); exit(1); }
+    for (uint64_t i = 0; i < plen; i++) out[i] = (char)((unsigned char)out[i] ^ mkey[i % 4]);
+    out[plen] = '\0';
+}
+
+/* Bare-bones field extraction: this fixture only ever parses JSON text
+ * this project's own convex_sync.v emitted, so a substring search for
+ * `"field":` is enough - it does not need to be a general JSON parser. */
+static int extract_int_field(const char *json, const char *field) {
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\":", field);
+    const char *p = strstr(json, needle);
+    if (!p) return -1;
+    p += strlen(needle);
+    return atoi(p);
+}
+
+static int extract_string_field(const char *json, const char *field, char *out, size_t cap) {
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\":\"", field);
+    const char *p = strstr(json, needle);
+    if (!p) return 0;
+    p += strlen(needle);
+    const char *end = strchr(p, '"');
+    if (!end) return 0;
+    size_t n = (size_t)(end - p);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return 1;
+}
+
+static void ts_b64(uint64_t v, char *out) {
+    unsigned char bytes[8];
+    for (int i = 0; i < 8; i++) { bytes[i] = (unsigned char)(v & 0xFF); v >>= 8; }
+    int n = EVP_EncodeBlock((unsigned char *)out, bytes, 8);
+    out[n] = '\0';
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "usage: syncfix port\n"); return 1; }
+    int port = atoi(argv[1]);
+
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("syncfix: bind"); return 1; }
+    listen(listen_fd, 1);
+
+    int value_counter = 0;
+    uint64_t ts_counter = 1;
+    int qs_counter = 0;
+    int failed = 0;
+
+    for (int conn_num = 0; conn_num < TOTAL_CONNECTIONS; conn_num++) {
+        int fd = accept_one(listen_fd);
+        do_handshake(fd);
+
+        char msg[8192];
+        read_masked_text_frame(fd, msg, sizeof(msg)); /* Connect */
+
+        int got_count = extract_int_field(msg, "connectionCount");
+        char reason[128];
+        extract_string_field(msg, "lastCloseReason", reason, sizeof(reason));
+        const char *want_reason = (conn_num == 0) ? "InitialConnect" : "debugDisconnect";
+        if (got_count != conn_num || strcmp(reason, want_reason) != 0) {
+            fprintf(stderr,
+                "syncfix: FAIL connection %d: connectionCount=%d (want %d), lastCloseReason=\"%s\" (want \"%s\")\n",
+                conn_num, got_count, conn_num, reason, want_reason);
+            failed = 1;
+        } else {
+            fprintf(stderr,
+                "syncfix: PASS connection %d: connectionCount=%d, lastCloseReason=\"%s\"\n",
+                conn_num, got_count, reason);
+        }
+
+        read_masked_text_frame(fd, msg, sizeof(msg)); /* ModifyQuerySet (rehydration Add) */
+        int query_id = extract_int_field(msg, "queryId");
+        if (query_id != 1) {
+            fprintf(stderr, "syncfix: FAIL connection %d: queryId=%d (want 1)\n", conn_num, query_id);
+            failed = 1;
+        }
+
+        /* Rehydration: the CURRENT value again, unchanged - the client
+         * must suppress this on every connection after the first. */
+        char ts1[16], ts2[16], text[1024];
+        ts_b64(ts_counter, ts1); ts_counter++;
+        snprintf(text, sizeof(text),
+            "{\"type\":\"Transition\","
+            "\"startVersion\":{\"querySet\":%d,\"identity\":0,\"ts\":\"%s\"},"
+            "\"endVersion\":{\"querySet\":%d,\"identity\":0,\"ts\":\"%s\"},"
+            "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":1,\"value\":%d}]}",
+            qs_counter, ts1, qs_counter + 1, ts1, value_counter);
+        qs_counter++;
+        send_text_frame(fd, text);
+
+        /* External mutation: a genuinely new value. */
+        value_counter++;
+        ts_b64(ts_counter, ts2); ts_counter++;
+        snprintf(text, sizeof(text),
+            "{\"type\":\"Transition\","
+            "\"startVersion\":{\"querySet\":%d,\"identity\":0,\"ts\":\"%s\"},"
+            "\"endVersion\":{\"querySet\":%d,\"identity\":0,\"ts\":\"%s\"},"
+            "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":1,\"value\":%d}]}",
+            qs_counter, ts2, qs_counter + 1, ts2, value_counter);
+        qs_counter++;
+        send_text_frame(fd, text);
+
+        /* On the final connection only, once the ordinary
+         * QueryUpdated path is already fully proven, also drive
+         * QueryFailed followed by recovery on the SAME subscription -
+         * the client must mark the subscription failed with the exact
+         * error message, then clear that failure and deliver the next
+         * real value once the query succeeds again. */
+        if (conn_num == TOTAL_CONNECTIONS - 1) {
+            char ts3[16], ts4[16];
+            ts_b64(ts_counter, ts3); ts_counter++;
+            snprintf(text, sizeof(text),
+                "{\"type\":\"Transition\","
+                "\"startVersion\":{\"querySet\":%d,\"identity\":0,\"ts\":\"%s\"},"
+                "\"endVersion\":{\"querySet\":%d,\"identity\":0,\"ts\":\"%s\"},"
+                "\"modifications\":[{\"type\":\"QueryFailed\",\"queryId\":1,"
+                "\"errorMessage\":\"Uncaught Error: boom\"}]}",
+                qs_counter, ts3, qs_counter + 1, ts3);
+            qs_counter++;
+            send_text_frame(fd, text);
+
+            value_counter++;
+            ts_b64(ts_counter, ts4); ts_counter++;
+            snprintf(text, sizeof(text),
+                "{\"type\":\"Transition\","
+                "\"startVersion\":{\"querySet\":%d,\"identity\":0,\"ts\":\"%s\"},"
+                "\"endVersion\":{\"querySet\":%d,\"identity\":0,\"ts\":\"%s\"},"
+                "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":1,\"value\":%d}]}",
+                qs_counter, ts4, qs_counter + 1, ts4, value_counter);
+            qs_counter++;
+            send_text_frame(fd, text);
+        }
+
+        /* Block until the client disconnects (debugDisconnect) or the
+         * whole test process tears down (the sixth connection's case).
+         * Either way this is a plain read that will fail once that
+         * happens; nothing else is expected on this connection past
+         * this point in the script. */
+        char discard[64];
+        read(fd, discard, sizeof(discard));
+        close(fd);
+    }
+
+    close(listen_fd);
+    if (failed) {
+        fprintf(stderr, "syncfix: FAIL one or more connections had the wrong connectionCount/lastCloseReason\n");
+        return 1;
+    }
+    fprintf(stderr, "syncfix: PASS all %d connections had the correct connectionCount and lastCloseReason\n",
+            TOTAL_CONNECTIONS);
+    return 0;
+}
+CEOF
+gcc -O2 -Wall -Wextra -o /tmp/syncfix /tmp/syncfix.c -lssl -lcrypto
+SYNCFIX_EOF
+
+RUN set -eu; \
+    iverilog -g2012 -L. -mnative -I. \
+      -o /tmp/sync_smoke.vvp client/convex_transport.v client/convex_buffer.v \
+      client/convex_http.v client/convex_sha1.v client/convex_base64.v \
+      client/convex_websocket.v client/convex_sync.v client/tests/sync_smoke.v; \
+    /tmp/syncfix 44203 2>/tmp/syncfix.log & \
+    fixture_pid=$!; \
+    sleep 1; \
+    timeout 60 vvp -M. -mnative /tmp/sync_smoke.vvp | tee /tmp/sync_smoke.out; \
+    wait "$fixture_pid" || true; \
+    cat /tmp/syncfix.log >&2; \
+    grep -Fq 'PASS sync_smoke' /tmp/sync_smoke.out; \
+    grep -Fq 'PASS all 6 connections had the correct connectionCount and lastCloseReason' /tmp/syncfix.log

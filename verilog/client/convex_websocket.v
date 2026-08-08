@@ -221,6 +221,18 @@ module convex_websocket #(
       end
       ws_key = ws_key_scratch;
 
+      // hs.req is a plain append-only buffer (see convex_http.v's own
+      // header comment); send_request never resets it after sending,
+      // since http_smoke.v only ever built one request per connection
+      // for its whole test run and never needed to. A reconnect
+      // reaching this task a second time on the SAME hs instance would
+      // otherwise start appending this handshake's request line right
+      // after the previous handshake's already-sent bytes, corrupting
+      // the wire text of every request after the first - found via a
+      // real reconnect in client/tests/sync_smoke.v, where it
+      // desynchronized the fixture's frame boundary on the very next
+      // read after the second handshake.
+      hs.req.reset;
       hs.write_request_line("GET", path);
       hs.write_header("Host", hs.ep_host);
       hs.write_header("Upgrade", "websocket");

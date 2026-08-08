@@ -26,9 +26,18 @@ builds RFC 6455 WebSocket framing on top of all of the above: masking,
 fragmentation reassembly, interleaved control frames, one-shot (post-
 reassembly) UTF-8 validation, and Sec-WebSocket-Accept verification,
 proven against a fixture peer that independently checks the client's own
-masked PONG and CLOSE frames. The `/api/sync` Live state machine and the
-conformance adapter do not exist yet, so there is still no canonical
-example and no capability is claimed.
+masked PONG and CLOSE frames. `client/convex_sync.v` adds the `/api/sync`
+Live state machine (the pinned `convex-rs-0.10.4-unversioned-sync`
+profile) on top of that: a subscription table, the initial value and
+later external updates, five real reconnects through an adapter-facing
+`debugDisconnect` hook with an unchanged rehydration correctly
+suppressed and a genuine mutation still delivered every time,
+`QueryFailed` followed by recovery on the same subscription,
+`connectionCount`/`lastCloseReason`/`maxObservedTimestamp` carried
+correctly, and exponential backoff that doubles on repeated failure and
+resets after every successful handshake. The conformance adapter does
+not exist yet, so there is still no canonical example and no capability
+is claimed.
 
 The design follows the same shape as this repository's `vhdl/` client
 (also in progress): standard HDL has no sockets, no TLS and no clock
@@ -61,8 +70,8 @@ symbol.
 | HTTP/1.1 request/response framing | Proven in Docker (`http_smoke`), real `POST /api/query` round trip |
 | SHA-1 + base64 (Sec-WebSocket-Accept) | Proven in Docker (`sha1_test`), RFC 6455's own worked example |
 | RFC 6455 WebSocket framing (mask, fragmentation, control frames, UTF-8) | Proven in Docker (`ws_smoke`), against a fixture peer |
+| `/api/sync` Live protocol (subscribe, reconnect, rehydration, backoff) | Proven in Docker (`sync_smoke`), against a fixture peer |
 | Canonical `examples/basics` | Not started |
-| `/api/sync` Live protocol | Not started |
 | Conformance adapter | Not started |
 | HTTP capability | Not earned |
 | Live capability | Not earned |
@@ -103,17 +112,38 @@ as a VPI module against `vpi_user.h`, and proves:
   one-shot UTF-8 validation over the fully reassembled message rather
   than per fragment - the fixture independently checks the client's PONG
   and CLOSE frames arrived masked with the right content.
+- **`sync_smoke`**: a real `/api/sync` session against a fixture peer
+  through six sequential connections (one initial connect plus five
+  `debugDisconnect`-triggered reconnects), proving the initial value, an
+  external mutation, `QueryFailed` followed by recovery on the same
+  subscription, and - on every one of the five reconnects - that an
+  unchanged rehydration is suppressed while a genuine mutation is still
+  delivered. The fixture independently checks each connection's own
+  `connectionCount` and `lastCloseReason`, and a separate deterministic
+  check proves exponential backoff actually doubles on repeated failure.
 
 No `runtime` or `example-runtime` stage exists yet; there is nothing to run
 outside the `test` stage until the client above the transport layer exists.
 
 ## Limitations and deferred work
 
-- No `/api/sync` or conformance-adapter code exists yet - the layers
-  built so far (transport, JSON, HTTP, WebSocket framing) have no Convex
-  protocol driving them end to end, so there is still no canonical
-  example.
-- The gate's TCP proof and the WebSocket proof both use a hermetic
+- No conformance-adapter code exists yet, so there is still no canonical
+  example driving these layers as a caller actually would.
+- `client/convex_sync.v` does not validate Convex's `startVersion`/
+  `endVersion` state-version continuity (a peer client,
+  `mumps/client/convex.m`, does) - only `endVersion.ts` itself, for
+  `maxObservedTimestamp`. See that file's own header comment for the
+  reasoning; AGENTS.md's Live-acceptance section requires carrying
+  `maxObservedTimestamp` correctly, not rejecting a state-version
+  discontinuity, and the fixture peer never sends an invalid one.
+- The bounded-under-a-stopped-reader pending-event queue AGENTS.md's
+  Conformance-executable section describes is not part of
+  `convex_sync.v`: that queue belongs to the NDJSON adapter (this
+  module's future caller, which does not exist yet), which is what
+  actually owns a slow or stopped consumer to buffer against.
+  `convex_sync.v`'s own per-subscription state is a single latest-
+  value slot with a version counter, not a growing queue.
+- The gate's TCP, WebSocket and sync proofs all use a hermetic
   Docker-local fixture server; only the TLS and HTTP proofs reach the
   real Convex deployment, matching this project's policy against pointing
   arbitrary build-time network access at a real backend for anything but

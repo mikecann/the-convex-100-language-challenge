@@ -43,9 +43,34 @@ implementation:
     content (client/tests/ws_smoke.v). A third instance of the same
     inline-function-call-in-concatenation Icarus 11.0 runtime abort
     (vthread.cc:212) was found and worked around while building the
-    Sec-WebSocket-Key nonce string. examples/basics, the /api/sync Live
-    state machine and the conformance adapter do not exist yet, so no
-    capability is claimed.
+    Sec-WebSocket-Key nonce string. client/convex_sync.v now adds the
+    /api/sync Live state machine (the pinned convex-rs-0.10.4-
+    unversioned-sync profile: Connect, ModifyQuerySet Add/Remove,
+    Transition) on top of the WebSocket layer: a subscription table, the
+    initial value and later external updates, five real reconnects
+    through an adapter-facing debugDisconnect hook with an unchanged
+    rehydration correctly suppressed and a genuine mutation still
+    delivered on every one, QueryFailed followed by recovery on the same
+    subscription, connectionCount/lastCloseReason/maxObservedTimestamp
+    carried correctly (the last of these needed base64 DECODE, added to
+    client/convex_base64.v, to compare two timestamps as an 8-byte
+    little-endian magnitude rather than as text), and exponential
+    backoff that doubles on repeated failure and resets after every
+    successful handshake - proven end to end against a fixture peer
+    that independently checks each connection's connectionCount and
+    lastCloseReason (client/tests/sync_smoke.v). Building it also found
+    a real bug in the already-proven WebSocket layer itself: convex_http.v's
+    request buffer was never reset between requests, which never mattered
+    when a client only ever connected once, but corrupted the wire bytes
+    of every request after the first once a real reconnect exercised the
+    same connection instance twice - fixed in convex_websocket.v's own
+    connect task. Deliberately out of scope for this module: Convex's
+    real Transition also carries a startVersion/endVersion pair for
+    strict state-version continuity checking, which this module does not
+    validate (only endVersion.ts itself, for maxObservedTimestamp) - see
+    convex_sync.v's own header comment for why that is a considered scope
+    limit, not an oversight. examples/basics and the conformance adapter
+    do not exist yet, so no capability is claimed.
 toolchain:
   name: Icarus Verilog
   version: "11.0 (stable), Debian package 11.0-1.1+b1"
