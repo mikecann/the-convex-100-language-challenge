@@ -982,6 +982,29 @@ static IoObject *IoConvexIO_openHandleCount(IoObject *self, IoObject *locals,
 /* Registration                                                        */
 /* ------------------------------------------------------------------ */
 
+/*
+ * `self` is a plain Object: it is built with IoObject_new() and never given
+ * its own IoTag, so it shares the interpreter's single built-in "Object" tag
+ * instance. It must NOT also be registered as a primitive proto via
+ * IoState_registerProtoWithId_()/registerProtoWithFunc_(). That call adds
+ * `self` to IoState's `primitives` PointerHash, and IoState_tagList() (used
+ * by IoState_done() at shutdown) walks every entry in that hash and collects
+ * IoObject_tag(proto) for each one with no de-duplication. With `self` added
+ * there, the shared Object tag is collected twice - once for the real
+ * "Object" proto, once for `self` - and IoState_done() frees it twice,
+ * corrupting the heap and crashing (segfault or a libc "double free"
+ * abort, depending on heap layout) during interpreter teardown. This was
+ * reproduced directly: the earlier revision of this file called
+ * IoState_registerProtoWithId_() here and every run of the test image
+ * segfaulted in IoTag_free() by way of IoState_done() -> IoState_free() at
+ * exit, confirmed with valgrind (invalid free of a block already freed by
+ * the same List_do_(tags, IoTag_free) traversal) and bisected by removing
+ * pieces of this function until the double free disappeared. Registration
+ * by id exists so IoState_protoWithId_() can look a proto back up later;
+ * nothing in this client ever calls it, so plainly setting `self` as a slot
+ * on `context` (done by the caller, IoConvexIOInit) is sufficient - no
+ * primitives-table registration is needed here at all.
+ */
 IoObject *IoConvexIO_proto(void *state) {
     IoMethodTable methodTable[] = {
         {"version", IoConvexIO_version},
@@ -1008,7 +1031,6 @@ IoObject *IoConvexIO_proto(void *state) {
     IoObject *self = IoObject_new(state);
 
     convexIO_initTable();
-    IoState_registerProtoWithId_((IoState *)state, self, protoId);
     /*
      * Tagless methods work on the proto and on anything cloned from it, so a
      * caller never trips the CFunction receiver-type check.

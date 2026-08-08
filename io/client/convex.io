@@ -143,8 +143,19 @@ ConvexJson := Object clone do(
     // Encode an Io Sequence as a JSON string literal. Bytes above 0x1f pass
     // through untouched, which keeps already valid UTF-8 exactly as it was and
     // avoids re-encoding text Convex will simply hand back.
+    //
+    // This scans by raw byte, so it needs a raw-byte view of `text`. An Io
+    // string literal is not one by default: the lexer stores it as UCS-2
+    // characters (itemType uint16, one code unit per Unicode character, `at()`
+    // returning the codepoint), not as UTF-8 bytes. Scanning that view with
+    // this method's byte-oriented logic silently drops the high byte of every
+    // multi-byte character on the way back out (each `é` became a single raw
+    // byte 233 instead of the two UTF-8 bytes 0xC3 0xA9). `asUTF8` forces the
+    // byte-level view (itemType uint8, `size`/`at()` counting encoded bytes)
+    // that the rest of this method assumes; it is a no-op for values that are
+    // already byte sequences, such as text decoded from the wire.
     quote := method(text,
-        source := text asString
+        source := text asUTF8
         out := Sequence clone
         out appendSeq("\"")
         start := 0
