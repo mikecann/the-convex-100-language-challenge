@@ -146,19 +146,27 @@ RUN set -eu; \
     grep -Fq '"type":"closed"' /tmp/adapter-probe.out
 
 # The same hello/close probe over the ADAPTER_LISTEN TCP mode the shared
-# harness actually drives the built image with.
+# harness actually drives the built image with. Polling /proc/net/tcp for
+# the listening port (18080 = 0x46A0) rather than a fixed sleep avoids
+# depending on how quickly the adapter happens to reach hb_inetServer(),
+# matching the same pattern already used by seed7/Dockerfile.
 RUN set -eu; \
     CONVEX_URL=http://127.0.0.1:1 ADAPTER_LISTEN=127.0.0.1:18080 /build/convex-adapter & \
     adapter_pid=$!; \
-    sleep 0.3; \
+    waited=0; \
+    until grep -Fq ':46A0 ' /proc/net/tcp 2>/dev/null; do \
+      waited=$((waited + 1)); test "$waited" -lt 50; sleep 0.1; \
+    done; \
     printf '%s\n' \
       '{"protocolVersion":1,"id":"tcp-hello","op":"hello"}' \
       '{"id":"tcp-close","op":"close"}' \
     > /tmp/adapter-tcp.in; \
     actual=$(cat /tmp/adapter-tcp.in | nc -w 2 127.0.0.1 18080); \
     wait "$adapter_pid"; \
-    printf '%s\n' "$actual" | grep -Fq '"id":"tcp-hello","type":"ready"'; \
-    printf '%s\n' "$actual" | grep -Fq '"id":"tcp-close","type":"closed"'
+    printf '%s\n' "$actual" | grep -Fq '"type":"ready"'; \
+    printf '%s\n' "$actual" | grep -Fq '"id":"tcp-hello"'; \
+    printf '%s\n' "$actual" | grep -Fq '"type":"closed"'; \
+    printf '%s\n' "$actual" | grep -Fq '"id":"tcp-close"'
 
 # Stage the shared part of the runtime closure -- everything except the two
 # program binaries themselves, which are copied separately into their own

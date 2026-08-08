@@ -193,7 +193,10 @@ against actual peers rather than mocked.
   runtime, not a cooperative poll loop.
 - `client/tests/conformance/adapter.prg` implements NDJSON adapter
   protocol v1 over both stdin/stdout and the `ADAPTER_LISTEN` TCP mode, and
-  declares `debugDisconnect` as its one adapter-only command.
+  declares `debugDisconnect` as its one adapter-only command. Its TCP mode
+  reads with `hb_inetRecv()` into its own bare-`\n` line buffer rather than
+  Harbour's `hb_inetRecvLine()`, which only recognises `\r\n` and would
+  block forever against a controller that never sends a trailing `\r`.
 - Every `hbmk2` link in the Dockerfile shares `-static -gtcgi -mt`:
   `-static` links Harbour's own runtime so the minimal runtime image needs
   no `libharbour.so`; `-gtcgi` selects Harbour's non-interactive console

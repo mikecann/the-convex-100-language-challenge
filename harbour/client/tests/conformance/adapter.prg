@@ -90,7 +90,7 @@ FUNCTION ConvexAdapterOpenTransport()
    nPort := Val( SubStr( cListen, nColon + 1 ) )
 
    sockSrv := hb_inetServer( nPort, NIL, cHost )
-   IF Empty( sockSrv )
+   IF Empty( sockSrv ) .OR. hb_inetErrorCode( sockSrv ) != 0
       RETURN NIL
    ENDIF
    hb_inetTimeout( sockSrv, 60000 )
@@ -99,45 +99,54 @@ FUNCTION ConvexAdapterOpenTransport()
    IF Empty( sockConn )
       RETURN NIL
    ENDIF
-   RETURN { "kind" => "tcp", "sock" => sockConn }
+   hb_inetTimeout( sockConn, 60000 )
+   RETURN { "kind" => "tcp", "sock" => sockConn, "buf" => "", "eof" => .F. }
 
-FUNCTION ConvexAdapterStdinLine( oSrc )
-   LOCAL nPos, cLine, cBuf, nGot
+/* Reads one NDJSON line from either transport, filling oTransport's own
+ * "buf" byte accumulator from the underlying source only when it does not
+ * already hold a complete line. This is deliberately not
+ * hb_inetRecvLine(): that RTL function only recognises Harbour's own
+ * "\r\n" end-of-line pattern, but NDJSON adapter protocol v1 terminates
+ * every line with bare "\n" (a trailing "\r" is trimmed here if a
+ * controller sends one anyway) -- calling hb_inetRecvLine() against a
+ * bare-LF peer blocks forever waiting for a CR that never arrives, which
+ * is exactly the hang this project's own conformance harness hit before
+ * this fix. Reading raw bytes with hb_inetRecv() and splitting on "\n"
+ * ourselves, the same way the stdin path already used FRead(), keeps both
+ * transports on one deliberately-chosen line ending instead of leaving it
+ * to whichever default the underlying read primitive happens to pick. */
+FUNCTION ConvexAdapterReadLine( oTransport )
+   LOCAL nPos, cLine, cChunk, nGot
 
    DO WHILE .T.
-      nPos := At( Chr( 10 ), oSrc[ "buf" ] )
+      nPos := At( Chr( 10 ), oTransport[ "buf" ] )
       IF nPos > 0
-         cLine := Left( oSrc[ "buf" ], nPos - 1 )
-         oSrc[ "buf" ] := SubStr( oSrc[ "buf" ], nPos + 1 )
+         cLine := Left( oTransport[ "buf" ], nPos - 1 )
+         oTransport[ "buf" ] := SubStr( oTransport[ "buf" ], nPos + 1 )
          IF Right( cLine, 1 ) == Chr( 13 )
             cLine := Left( cLine, Len( cLine ) - 1 )
          ENDIF
          RETURN cLine
       ENDIF
-      IF oSrc[ "eof" ]
+      IF oTransport[ "eof" ]
          RETURN NIL
       ENDIF
-      cBuf := Space( 4096 )
-      nGot := FRead( 0, @cBuf, 4096 )
-      IF nGot <= 0
-         oSrc[ "eof" ] := .T.
+      cChunk := Space( 4096 )
+      IF oTransport[ "kind" ] == "stdin"
+         nGot := FRead( 0, @cChunk, 4096 )
       ELSE
-         oSrc[ "buf" ] += Left( cBuf, nGot )
+         nGot := hb_inetRecv( oTransport[ "sock" ], @cChunk, 4096 )
+         IF nGot < 0 .OR. hb_inetErrorCode( oTransport[ "sock" ] ) != 0
+            nGot := 0
+         ENDIF
+      ENDIF
+      IF nGot <= 0
+         oTransport[ "eof" ] := .T.
+      ELSE
+         oTransport[ "buf" ] += Left( cChunk, nGot )
       ENDIF
    ENDDO
    RETURN NIL
-
-FUNCTION ConvexAdapterReadLine( oTransport )
-   LOCAL cLine
-
-   IF oTransport[ "kind" ] == "stdin"
-      RETURN ConvexAdapterStdinLine( oTransport )
-   ENDIF
-   cLine := hb_inetRecvLine( oTransport[ "sock" ] )
-   IF hb_inetErrorCode( oTransport[ "sock" ] ) != 0
-      RETURN NIL
-   ENDIF
-   RETURN cLine
 
 FUNCTION ConvexAdapterEmitEvent( oTransport, gWriteMutex, h )
    LOCAL cLine
