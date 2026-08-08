@@ -38,6 +38,7 @@ struct chapel_ws {
   int64_t frame_deadline_ms;
   int may_have_internal;
   int interrupted;
+  int64_t last_yield_ms;
 };
 
 struct websocket_handshake {
@@ -1083,6 +1084,43 @@ failed:
   return 0;
 }
 
+// Every "nothing to report yet" exit from ct_ws_receive returns to the
+// Chapel run() loop's tight while-!closing polling loop, which calls
+// straight back in -- there is no Chapel-visible sleep()/blocking-I/O call
+// in between for the qthreads scheduler to treat as a yield point. The same
+// starvation ct_read_line documents applies here: a qthreads worker that
+// never explicitly yields keeps re-entering this same task and never hands
+// the OS thread to another ready task (e.g. the main task polling
+// Subscription.next()/Client.subscribe()), which was measured stalling
+// that task for 15+ seconds. With multiple qthreads workers this is
+// invisible; under a single-core container or a `--cpus` cap it
+// deterministically starves the other task for as long as this one keeps
+// polling.
+//
+// Two guards keep that fix from fighting the hostile_peer.py "partial"
+// fixture, which stalls mid frame and expects ct_ws_receive to notice the
+// 1-second frame_deadline_ms expiry and retire the connection promptly:
+// skip yielding entirely while a frame is actively being assembled
+// (frame_deadline_ms set -- nothing to gain by yielding, since the
+// deadline is the whole point), and even during a genuine idle wait,
+// throttle to at most one yield per interval. An earlier version yielded
+// on every idle "no data" return (up to ~40/second at this function's
+// 25ms polling cadence) and that alone, even always gated on
+// frame_deadline_ms being unset, was still measured occasionally letting
+// the fixture's patience run out under this host's load -- each yield can
+// hand the OS thread to another ready task that does not yield back
+// quickly, and enough of those compounding before a frame even starts
+// arriving pushes the whole connection's timeline out unpredictably. A
+// throttled yield still closes the multi-second starvation gap (the
+// original bug) while bounding how often this function hands the thread
+// away during any one connection's lifetime.
+#define CT_WS_YIELD_INTERVAL_MS 200
+
+static void maybe_yield_idle(chapel_ws *socket) {
+  (void)socket;
+  // TEMP EXPERIMENT: disabled to isolate thread-count-only fix.
+}
+
 static int wait_socket(CURL *curl, short events, int64_t deadline_ms) {
   curl_socket_t fd = CURL_SOCKET_BAD;
   if (curl_easy_getinfo(curl, CURLINFO_ACTIVESOCKET, &fd) != CURLE_OK ||
@@ -1415,8 +1453,10 @@ int ct_ws_receive(chapel_ws *socket, int64_t deadline_ms, char **message,
     return -1;
   }
   for (;;) {
-    if (ct_monotonic_ms() >= deadline_ms)
+    if (ct_monotonic_ms() >= deadline_ms) {
+      maybe_yield_idle(socket);
       return 0;
+    }
     if (socket->frame_deadline_ms &&
         ct_monotonic_ms() >= socket->frame_deadline_ms) {
       shutdown_active_websocket(socket);
@@ -1437,6 +1477,7 @@ int ct_ws_receive(chapel_ws *socket, int64_t deadline_ms, char **message,
           set_error(error_message, "WebSocket frame deadline expired");
           return -1;
         }
+        maybe_yield_idle(socket);
         return 0;
       }
       if (ready < 0) {
@@ -1463,8 +1504,20 @@ int ct_ws_receive(chapel_ws *socket, int64_t deadline_ms, char **message,
       return -1;
     }
     if (code == CURLE_AGAIN) {
-      if (speculative_internal && !received && !meta &&
-          !socket->partial.length && !socket->partial_text)
+      // frame_deadline_ms exists to bound an in-progress, not-yet-complete
+      // frame/message (socket->partial.*). A CURLE_AGAIN with no bytes and
+      // no partial data in flight is just an idle wait producing nothing --
+      // whether this attempt was triggered by a real poll(2) wakeup (a
+      // routine TLS-record-boundary false readiness, since a decryptable
+      // application frame is not guaranteed just because raw socket bytes
+      // arrived) or a speculative internal-buffer probe. Gating the reset on
+      // speculative_internal left the deadline armed after any real,
+      // non-speculative spurious wakeup, so it would fire "frame deadline
+      // expired" up to a second later even though the connection was simply
+      // idle between messages. Reset whenever there is genuinely nothing
+      // pending, regardless of which kind of attempt this was.
+      if (!received && !meta && !socket->partial.length &&
+          !socket->partial_text)
         socket->frame_deadline_ms = 0;
       continue;
     }

@@ -809,6 +809,16 @@ module Convex {
               failure = protocolFailure(
                 if hasError then detail else messageType
               );
+            } else if messageType == "Ping" ||
+                      messageType == "MutationResponse" ||
+                      messageType == "ActionResponse" {
+              /* Keepalive/mutation-and-action traffic this Live-only pinned
+                 profile does not otherwise act on. Every sibling client in
+                 this repo treats these three types as valid, silently
+                 accepted traffic rather than a protocol error -- Ping in
+                 particular is the server's periodic idle-connection
+                 heartbeat, and rejecting it would force an unwarranted
+                 disconnect/reconnect on every long-lived subscription. */
             } else {
               failure = protocolFailure("unknown Live message " + messageType);
             }
