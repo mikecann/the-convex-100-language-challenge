@@ -4,5 +4,94 @@ displayName: "Assembly (x86-64 NASM)"
 rank: 24
 selectionTier: ranked
 implementation:
-  status: planned
-capabilities: []
+  status: attempting
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Hand-written x86-64 assembly (NASM, System V AMD64 calling convention)
+    implementing the Convex HTTP API and the WebSocket-based Live sync
+    protocol: request/response JSON envelope, query/mutation/action
+    routing, structured error decoding, RFC 6455 WebSocket framing (the
+    Upgrade handshake, client-side masking, fragmented-message reassembly
+    with interleaved control frames, and single-pass UTF-8 validation over
+    the reassembled message), and the Convex sync state machine (Connect,
+    ModifyQuerySet Add/Remove, Transition, reconnect with exponential
+    backoff and full Add resend, and rehydration suppression) are all
+    written in assembly. TLS is provided by calling libssl/libcrypto
+    directly through their C ABI (TLS_client_method, SSL_CTX_new,
+    SSL_connect, SSL_read/SSL_write, with full peer verification via
+    SSL_CTX_set_default_verify_paths and SSL_set1_host, plus SHA-1 for the
+    WebSocket handshake's Sec-WebSocket-Accept check) -- the one delegation
+    AGENTS.md explicitly calls legitimate. Sockets, DNS resolution
+    (getaddrinfo), poll() and memory allocation (malloc/realloc/free) are
+    the same OS/runtime primitives a C client would use. HTTP/1.1 request
+    framing, response parsing (status line, headers, Content-Length and
+    chunked-transfer body framing), the full JSON parser and serializer
+    (including exact 64-bit integer precision for Convex's nanosecond sync
+    timestamps, IEEE-754 double parsing, and string escape/unescape with
+    surrogate-pair UTF-8 encoding), base64 encoding, and the NDJSON adapter
+    protocol (a single poll()-driven event loop that owns the WebSocket
+    exclusively) are all hand-written assembly with no delegated client
+    runtime.
+toolchain:
+  name: NASM
+  version: 2.16.01
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication (sending the bearer token over the WebSocket) and
+    sending mutations or actions over the WebSocket are both deferred;
+    only query subscriptions use Live, matching this project's other
+    hand-rolled clients. `Ping`, `MutationResponse` and `ActionResponse`
+    server messages are still tolerated as no-ops.
+  - Each subscription's delivery queue is bounded to 8 entries and drops
+    the oldest queued update (freeing it) when a slow consumer falls more
+    than 8 updates behind, rather than growing without limit or blocking
+    the WebSocket reader.
+  - A reconnect always resends every active query's Add and always
+    receives a fresh QueryUpdated establishing its current value; an
+    unchanged rehydration (the new value serializes identically to the
+    last one actually delivered) is suppressed so a healthy reconnect
+    never looks like a spurious update to the caller.
+  - Live values cover the JSON-safe subset the rest of this client's JSON
+    layer already handles; Convex's richer tagged value types are not
+    specially decoded, matching the HTTP path.
+  - Reconnect backoff starts at 200ms and doubles up to a 10s cap; a
+    deliberate debugDisconnect resets it to the base delay so five rapid
+    test-driven reconnects do not inherit an old maximum delay.
+  - Double serialization uses a bounded fixed-point formatter (6
+    fractional digits, trailing zeros trimmed, with a rounded-integer
+    fallback above 1e12 magnitude) rather than a general shortest-round-trip
+    dtoa. Convex's own JSON encoding of whole numbers as e.g. "0.0" is
+    handled exactly; arbitrary irrational-looking doubles are not
+    guaranteed to round-trip to the same text.
+  - JSON parsing bounds nesting to 128 levels and total allocated nodes to
+    200000 as a safety valve against pathological input; it does not
+    otherwise limit input size.
+  - HTTP response header parsing accumulates up to 64 KiB looking for the
+    header terminator before giving up on a peer that never sends one.
+  - A lone UTF-16 high surrogate immediately followed by another \u escape
+    that is not its matching low surrogate consumes that escape as part of
+    resolving the surrogate rather than re-parsing it as a separate
+    character -- a documented simplification, not a crash or silent
+    truncation.
+  - IPv6 literal deployment URLs ("https://[::1]") are refused rather than
+    partially supported.
+  - Each HTTP call opens a fresh TCP/TLS connection (no keep-alive/pooling),
+    matching the reference C client's own per-call curl_easy_init/cleanup
+    behavior.
+capabilities:
+  - http
+  - live
