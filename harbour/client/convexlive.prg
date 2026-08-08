@@ -26,6 +26,7 @@
  */
 
 #include "hbclass.ch"
+#include "convexws.ch"
 
 #define CONVEX_LIVE_INITIAL_BACKOFF_MS 100
 #define CONVEX_LIVE_MAX_BACKOFF_MS 15000
@@ -193,7 +194,11 @@ METHOD ServiceTick() CLASS TConvexLive
       RETURN Self
    ENDIF
 
-   IF !hb_inetDataReady( ::conn[ "sock" ], 0 )
+   /* hb_inetDataReady() returns a number (1 = ready, 0 = not ready, -1 =
+    * error), not a logical, so it cannot be negated with "!" directly;
+    * both "not ready yet" and "error" mean there is nothing to read this
+    * tick. */
+   IF hb_inetDataReady( ::conn[ "sock" ], 0 ) <= 0
       RETURN Self
    ENDIF
 

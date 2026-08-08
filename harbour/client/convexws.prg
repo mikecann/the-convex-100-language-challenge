@@ -10,20 +10,7 @@
  */
 
 #include "hbclass.ch"
-
-#define CONVEX_WS_OP_CONTINUATION 0
-#define CONVEX_WS_OP_TEXT 1
-#define CONVEX_WS_OP_BINARY 2
-#define CONVEX_WS_OP_CLOSE 8
-#define CONVEX_WS_OP_PING 9
-#define CONVEX_WS_OP_PONG 10
-
-/* One 2^21-byte frame cap and one 2^22-byte reassembled-message cap: both
- * comfortably above any real Convex sync message, both small enough that
- * a hostile or broken peer cannot make this client allocate without
- * bound. */
-#define CONVEX_WS_MAX_FRAME 2097152
-#define CONVEX_WS_MAX_MESSAGE 4194304
+#include "convexws.ch"
 
 FUNCTION ConvexSha1( cData )
    LOCAL ctx, cDigest
