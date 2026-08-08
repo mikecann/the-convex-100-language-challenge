@@ -98,6 +98,16 @@ RUN set -eu; \
     file /build/o/convex.o | grep -Eq 'ELF 64-bit.*x86-64'
 ENV ydb_routines=/build/o(/build/o)
 
+# sni_shim.c is a small LD_PRELOAD interposer, not M source -- see its own
+# header comment for why it exists (YottaDB's TLS plugin never sends Server
+# Name Indication, which a real hosted deployment's TLS front requires) and
+# why interposing SSL_connect() is the fix. Built here, alongside the plugin
+# libraries above, from the same toolchain that already built libgtmtls.so.
+RUN set -eu; \
+    gcc -Wall -Wextra -Werror -shared -fPIC \
+      -o /build/sni_shim.so client/sni_shim.c -lssl -lcrypto; \
+    file /build/sni_shim.so | grep -Eq 'ELF 64-bit.*x86-64'
+
 # Parse-only checks already happened at compile time above (a syntax error
 # fails the `mumps -object` step); this is the smoke check that the compiled
 # adapter actually answers hello/close over its own NDJSON protocol.
@@ -170,8 +180,10 @@ RUN set -eu; \
     ln -s ./yottadb /staging/opt/yottadb/mumps; \
     cp -aL /opt/yottadb/libyottadb.so /staging/opt/yottadb/libyottadb.so; \
     cp -aL /opt/yottadb/plugin/libgtmtls.so /staging/opt/yottadb/plugin/libgtmtls.so; \
+    cp -aL /build/sni_shim.so /staging/opt/convex/sni_shim.so; \
     for object in /opt/yottadb/yottadb /opt/yottadb/libyottadb.so \
-                  /opt/yottadb/plugin/libgtmtls.so /staging/usr/bin/*; do \
+                  /opt/yottadb/plugin/libgtmtls.so /staging/opt/convex/sni_shim.so \
+                  /staging/usr/bin/*; do \
       ldd "$object" 2>/dev/null \
         | awk '{ for (f = 1; f <= NF; f++) if ($f ~ /^\//) print $f }' \
         | while read -r library; do \
@@ -206,13 +218,19 @@ RUN set -eu; \
 # common ancestor of both leaf images -- never contains either one; each leaf
 # image ends up proving the OTHER launcher and the other's entry object are
 # both absent, not just that its own is present.
+# LD_PRELOAD is exported here, in the launcher itself, rather than as an
+# image-wide ENV: it should apply only to the mumps process that actually
+# opens TLS connections, not to the handful of plain utilities (id, cat,
+# uname) staged alongside it for the runtime-base policy checks above.
 RUN mkdir -p /staging-example/usr/local/bin /staging-adapter/usr/local/bin \
     && printf '%s\n' \
       '#!/bin/sh' \
+      'export LD_PRELOAD=/opt/convex/sni_shim.so' \
       'exec /opt/yottadb/mumps -run main^main "$@"' \
       > /staging-example/usr/local/bin/convex-example \
     && printf '%s\n' \
       '#!/bin/sh' \
+      'export LD_PRELOAD=/opt/convex/sni_shim.so' \
       'exec /opt/yottadb/mumps -run main^adapter' \
       > /staging-adapter/usr/local/bin/convex-adapter \
     && chmod 0555 /staging-example/usr/local/bin/convex-example \
