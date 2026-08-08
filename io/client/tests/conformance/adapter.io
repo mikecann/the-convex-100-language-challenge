@@ -202,8 +202,28 @@ ConvexAdapterOutput := Object clone do(
     // count bound. The adapter stops reading commands while this holds, which
     // is what keeps that queue bounded: a controller that has stopped
     // collecting stops being answered rather than accumulating answers.
+    //
+    // Written as two sequential returns rather than one `or`-joined
+    // expression on purpose: this method runs behind a stored block
+    // (ConvexAdapterInput's `isPaused`, invoked through `paused` on every
+    // `wantsRead`/`hasBufferedInput` check), and the pinned Io VM
+    // (IoLanguage/io native @ 3d4bc9c) never returns once that exact
+    // shape - two `self <method-or-slot> >= self <method-or-slot>`
+    // comparisons joined by `or`, evaluated inside a block reached through
+    // two or more layers of method indirection, repeated across loop
+    // iterations - is evaluated a handful of times. Reproduced in complete
+    // isolation with a 20 line script that has no Convex code in it at all
+    // (Object clone, two comparisons joined by `or` inside a stored block,
+    // a `while` loop); confirmed with gdb that the process is not stuck but
+    // is genuinely still inside IoCoroutine_mark/Collector_collect each
+    // time it is sampled seconds apart, so this is a VM-level pathology
+    // (mark/collect cost that runs away for this exact call shape) rather
+    // than a logic bug in this method. Splitting the `or` into two plain
+    // `if`/`return` statements avoids the shape entirely while keeping the
+    // exact same result.
     isBackpressured := method(
-        self queue size >= self maxEvents or self controlBytes >= self controlReserve
+        if(self queue size >= self maxEvents, return true)
+        self controlBytes >= self controlReserve
     )
 )
 
