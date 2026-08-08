@@ -33,6 +33,7 @@ RUN apt-get update \
        make \
        file \
        binutils \
+       busybox-static \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eu; test "$(uname -m)" = x86_64
@@ -304,7 +305,6 @@ RUN set -eu; \
 # command anything else in the image could invoke.
 RUN set -eu; \
     mkdir -p /staging/bin /staging/usr/bin /staging/opt/convex/bin \
-             /staging/opt/convex/example-src /staging/opt/convex/adapter-src \
              /staging/etc/ssl/certs; \
     cp -a /bin/dash /staging/bin/sh; \
     for tool in id cat uname; do cp -a "/usr/bin/$tool" "/staging/usr/bin/$tool"; done; \
@@ -324,23 +324,25 @@ RUN set -eu; \
     cp -aL /etc/nsswitch.conf /staging/etc/nsswitch.conf; \
     for resolver in libnss_dns.so.2 libnss_files.so.2 libresolv.so.2; do \
       cp -aL "/lib/x86_64-linux-gnu/$resolver" "/staging/lib/x86_64-linux-gnu/$resolver"; \
-    done; \
-    cp -a /stage-example/*.setl /staging/opt/convex/example-src/; \
-    cp -a /stage-adapter/*.setl /staging/opt/convex/adapter-src/
+    done
 
-# The two entry-point launchers also have to be written here, as root,
-# rather than in the leaf stages below: runtime-base switches to USER
-# 65532:65532 before those leaf stages run, and that user cannot write
-# into /usr/local/bin (owned by root, from this same COPY). Each goes into
-# its own tree rather than the shared /staging closure above so
-# runtime-base -- the common ancestor of both leaf images -- never
-# contains either one; each leaf image ends up proving the OTHER
-# launcher's entrypoint and source directory are both absent, not just
-# that its own is present. Each launcher cd's into its own flat source
-# directory before invoking setl, since GNU SETL's #include resolves
-# relative to the current working directory rather than the entrypoint
-# file's own location.
-RUN mkdir -p /staging-example/usr/local/bin /staging-adapter/usr/local/bin \
+# The two entry-point launchers, and each runtime's own flat source tree,
+# also have to be written here, as root, rather than in the leaf stages
+# below: runtime-base switches to USER 65532:65532 before those leaf
+# stages run, and that user cannot write into /usr/local/bin (owned by
+# root, from the shared /staging COPY above). Each goes into its own tree
+# rather than the shared /staging closure above -- deliberately not
+# staged there -- so runtime-base, the common ancestor of both leaf
+# images, never contains either one; each leaf image ends up proving the
+# OTHER launcher's entrypoint and source directory are both genuinely
+# absent, not just that its own is present. Each launcher cd's into its
+# own flat source directory before invoking setl, since GNU SETL's
+# #include resolves relative to the current working directory rather
+# than the entrypoint file's own location.
+RUN mkdir -p /staging-example/usr/local/bin /staging-example/opt/convex/example-src \
+             /staging-adapter/usr/local/bin /staging-adapter/opt/convex/adapter-src \
+    && cp -a /stage-example/*.setl /staging-example/opt/convex/example-src/ \
+    && cp -a /stage-adapter/*.setl /staging-adapter/opt/convex/adapter-src/ \
     && printf '%s\n' \
       '#!/bin/sh' \
       'set -eu' \
@@ -395,8 +397,10 @@ CMD ["/usr/local/bin/run-language-tests"]
 
 # ---------------------------------------------------------------------------
 # runtime-base: the pinned image with its broad filesystem removed, then
-# only GNU SETL's own runtime closure (found via ldd) and the staged
-# client source copied back. Both leaf images below add a real TLS
+# only GNU SETL's own runtime closure (found via ldd) copied back --
+# deliberately not either runtime's own client source tree, which each
+# leaf stage below stages and proves the other lacks. Both leaf images add
+# a real TLS
 # handshake proof from the pruned filesystem itself (AGENTS.md: "Exercise
 # TLS from the final image so hosted verification is not the first place
 # a missing provider or certificate path is discovered") -- OpenSSL's
@@ -454,8 +458,12 @@ RUN test ! -e /etc/dpkg \
 COPY client/tests/tls_smoke.setl /opt/convex/tls-smoke-src/tls_smoke.setl
 RUN set -eu; \
     cd /opt/convex/tls-smoke-src; \
-    /opt/convex/bin/setl tls_smoke.setl | tee /tmp/tls_smoke.out; \
-    grep -Fq 'TLS HANDSHAKE AND HTTP ROUND TRIP: OK' /tmp/tls_smoke.out
+    output=$(/opt/convex/bin/setl tls_smoke.setl); \
+    printf '%s\n' "$output"; \
+    case "$output" in \
+      *'TLS HANDSHAKE AND HTTP ROUND TRIP: OK'*) ;; \
+      *) exit 1 ;; \
+    esac
 
 # ---------------------------------------------------------------------------
 FROM runtime-base AS example-runtime
