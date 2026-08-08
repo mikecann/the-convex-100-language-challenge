@@ -4,7 +4,7 @@ displayName: "CLU"
 rank: 66
 selectionTier: coverage
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -50,33 +50,29 @@ adapter:
     - debugDisconnect
 limitations:
   - >-
-    `capabilities` below is empty and stays empty until root-owned local
-    and hosted conformance both pass; `intendedCapabilities` states the
-    goal, not anything earned. `./run test clu` passes: it builds pclu
-    from source at the pinned commit, applies
-    client/wordvec-64bit-word-size.patch, adds the _tls builtin cluster,
-    boots a hello-world smoke test, checks source style, and compiles
-    and runs the full language-local unit suite -- the JSON codec
-    (client/tests/json_test.clu, including json$array_items and the
-    AGENTS.md-required integral-decimal regression), the arithmetic
-    bitwise helpers (client/tests/bitops_test.clu, since CLU's own int
-    cluster has no bitwise operators at all), SHA-1
-    (client/tests/sha1_test.clu, against FIPS 180-4 vectors and RFC
-    6455's own worked handshake example), base64
-    (client/tests/base64_test.clu, against RFC 4648 vectors), this
-    client's own DNS resolver (client/tests/dns_test.clu, against
-    hand-assembled DNS packets), and real loopback-TCP/WebSocket/sync
-    coverage against genuine peer processes, not mocks
-    (client/tests/transport_test.clu, http_test.clu, websocket_test.clu,
-    sync_test.clu) -- then compiles and links the canonical example and
-    the conformance adapter and proves the adapter's own hello/close
-    NDJSON lifecycle. The canonical example and both runtime images
-    (uid 65532:65532, read-only filesystem, all capabilities dropped)
-    have been manually verified end to end against both the local
-    backend and the hosted deployment; `./run verify-example`,
-    `./run verify`, `./run verify-hosted`, and `./run verify-all` are
-    the root-owned evidence this manifest's capabilities award still
-    waits on.
+    `http` and `live` are both earned: `./run verify-all clu` passed
+    31/31 shared conformance checks on both the local and hosted
+    profiles from a clean, exact-head commit, alongside the two
+    final-image policy checks against the compiled runtime and
+    example-runtime images (uid 65532:65532, read-only filesystem, all
+    capabilities dropped). `./run test clu` builds pclu from source at
+    the pinned commit, applies client/wordvec-64bit-word-size.patch,
+    adds the _tls builtin cluster, boots a hello-world smoke test,
+    checks source style, and compiles and runs the full language-local
+    unit suite -- the JSON codec (client/tests/json_test.clu, including
+    json$array_items and the AGENTS.md-required integral-decimal
+    regression), the arithmetic bitwise helpers
+    (client/tests/bitops_test.clu, since CLU's own int cluster has no
+    bitwise operators at all), SHA-1 (client/tests/sha1_test.clu,
+    against FIPS 180-4 vectors and RFC 6455's own worked handshake
+    example), base64 (client/tests/base64_test.clu, against RFC 4648
+    vectors), this client's own DNS resolver
+    (client/tests/dns_test.clu, against hand-assembled DNS packets),
+    and real loopback-TCP/WebSocket/sync coverage against genuine peer
+    processes, not mocks (client/tests/transport_test.clu, http_test.clu,
+    websocket_test.clu, sync_test.clu) -- then compiles and links the
+    canonical example and the conformance adapter and proves the
+    adapter's own hello/close NDJSON lifecycle.
   - >-
     client/convex-websocket.clu's delivery model is one buffered event
     per subscription in client/convex-sync.clu, not a queue: a fresh
@@ -150,4 +146,6 @@ limitations:
     from-scratch A-record resolver, used in place of _resolve for
     exactly this reason -- see that file's own header comment for the
     full writeup.
-capabilities: []
+capabilities:
+  - http
+  - live

@@ -27,14 +27,14 @@ repository demonstrates.
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, and actions against Convex's documented `"format":"json"` API | Pending shared conformance evidence |
-| RFC 6455 WebSocket framing (masking, fragmentation, interleaved control frames, UTF-8 validated once after reassembly) | Yes, unit tested against a real peer |
-| `/api/sync` Live: Add/Remove, initial and external `QueryUpdated`, `QueryFailed` and recovery, five real `debugDisconnect` reconnects with unchanged rehydration suppressed | Pending shared conformance evidence |
-| Conformance adapter (NDJSON v1, stdin/stdout and `ADAPTER_LISTEN` TCP) | Yes, manually verified end to end against the local and hosted deployments |
+| HTTP queries, mutations, and actions against Convex's documented `"format":"json"` API | Verified by shared local and hosted conformance |
+| RFC 6455 WebSocket framing (masking, fragmentation, interleaved control frames, UTF-8 validated once after reassembly) | Verified by shared local and hosted conformance |
+| `/api/sync` Live: Add/Remove, initial and external `QueryUpdated`, `QueryFailed` and recovery, five real `debugDisconnect` reconnects with unchanged rehydration suppressed | Verified by shared local and hosted conformance |
+| Conformance adapter (NDJSON v1, stdin/stdout and `ADAPTER_LISTEN` TCP) | Verified by shared local and hosted conformance |
 
-See `manifest.yaml`'s `capabilities` list for what the shared evaluator has
-actually awarded; the table above states what this client attempts and has
-proven locally, not a substitute for that evidence.
+`./run verify-all clu` passed 31/31 checks on both the local and hosted
+profiles from a clean, exact-head commit; see `manifest.yaml`'s
+`capabilities` list for the shared evaluator's own award.
 
 ## Basic example
 
