@@ -1,0 +1,330 @@
+-- A single-connection subset of Convex's /api/sync Live protocol, pinned
+-- to the `convex-rs-0.10.4-unversioned-sync' profile also referenced by
+-- client/tests/tls_smoke.setl and client/websocket.setl. This module
+-- covers what examples/basics/main.setl needs to demonstrate a real
+-- reactive subscription: connect, add one or more queries, and observe
+-- QueryUpdated/QueryFailed transitions as they arrive.
+--
+-- Deliberately NOT yet implemented (see setl/README.md's "What's left"):
+-- automatic reconnection with exponential backoff, the bounded delivery
+-- queue AGENTS.md requires for a slow consumer, and the adapter-only
+-- debugDisconnect hook. A transport failure or unexpected server message
+-- surfaces as an "error"/"closed" outcome instead of retrying, so callers
+-- that need resilience must reconnect themselves for now.
+--
+-- Wire shapes (client-to-server Connect/ModifyQuerySet, server-to-client
+-- Transition) match the reference Go client's protocol.go exactly; see
+-- that file's comments for why timestamps compare as little-endian bytes
+-- and why args is a one-element array rather than a bare object.
+--
+-- A sync session is a map (see sync_connect) threaded explicitly through
+-- every call and reassigned by the caller, the same style used
+-- throughout this client. Fields:
+--   "ws"                    the client/websocket.setl connection
+--   "session_id"            this connection's random RFC 4122 v4 UUID
+--   "query_set_version"     this client's last-sent querySet version
+--   "remote_version"        the last committed {querySet,identity,ts}
+--                            the server confirmed via Transition
+--   "max_observed_timestamp" the highest Transition end ts seen so far,
+--                            base64, compared as little-endian bytes
+--   "next_query_id"         the next queryId sync_add will allocate
+--   "subscriptions"         queryId -> {"path":.., "args":..}, so a
+--                            reconnect could one day re-Add every active
+--                            query (not yet implemented -- see above)
+--   "results"                queryId -> {"kind":"value","value":..,
+--                            "logLines":..} or {"kind":"error",
+--                            "errMessage":..,"errData":..,"logLines":..},
+--                            always the most recently observed outcome
+--   "revisions"              queryId -> a counter bumped on every
+--                            QueryUpdated/QueryFailed for that query, so
+--                            sync_wait_next can tell "a new transition
+--                            arrived" apart from "the value happened to
+--                            repeat" without needing value equality
+--   "last_error"             set alongside an "error" outcome
+--
+-- This module is proc-only and is meant to be #include'd (via
+-- `setl --cpp') after client/json.setl, client/websocket.setl, and
+-- client/convex.setl (for convex_parse_url) -- see the module comment at
+-- the top of client/json.setl for why GNU SETL requires that ordering.
+
+proc sync_connect(deployment_url, client_version, timeout_ms);
+  [success, target] := convex_parse_url(deployment_url);
+  if not success then
+    return [false, target];
+  end if;
+
+  [success, ws] := ws_connect(target("scheme"), target("host"), target("port"), "/api/sync", timeout_ms);
+  if not success then
+    return [false, ws];
+  end if;
+
+  session_id := sync_new_session_id();
+  connect_msg := {};
+  connect_msg("type") := "Connect";
+  connect_msg("sessionId") := session_id;
+  connect_msg("connectionCount") := 0;
+  connect_msg("lastCloseReason") := "InitialConnect";
+  connect_msg("clientTs") := 0;
+  -- maxObservedTimestamp is omitted entirely on a first connection (the
+  -- reference client marks it `omitempty'); there is nothing to resume.
+
+  [success, info] := ws_send_text(ws, json_encode(connect_msg));
+  if not success then
+    return [false, "Connect write failed: " + str(info)];
+  end if;
+
+  sync := {};
+  sync("ws") := ws;
+  sync("session_id") := session_id;
+  sync("query_set_version") := 0;
+  sync("remote_version") := sync_zero_version();
+  sync("max_observed_timestamp") := "";
+  sync("next_query_id") := 0;
+  sync("subscriptions") := {};
+  sync("results") := {};
+  sync("revisions") := {};
+  return [true, sync];
+end proc;
+
+proc sync_zero_version();
+  v := {};
+  v("querySet") := 0;
+  v("identity") := 0;
+  v("ts") := "AAAAAAAAAAA=";
+  return v;
+end proc;
+
+-- A random RFC 4122 version-4 UUID. Convex only uses this to correlate
+-- log lines with a connection; it does not need to be unpredictable, only
+-- unique enough to not collide within one test run.
+proc sync_new_session_id();
+  hex_digits := "0123456789abcdef";
+  bytes := [];
+  for i in [1..16] loop
+    bytes(i) := random(255);
+  end loop;
+  bytes(7) := (bytes(7) bit_and 15) + 64;   -- version 4
+  bytes(9) := (bytes(9) bit_and 63) + 128;  -- variant 10xxxxxx
+  out := "";
+  for i in [1..16] loop
+    if i = 5 or i = 7 or i = 9 or i = 11 then
+      out +:= "-";
+    end if;
+    b := bytes(i);
+    out +:= hex_digits(b div 16 + 1);
+    out +:= hex_digits(b mod 16 + 1);
+  end loop;
+  return out;
+end proc;
+
+-- Adds one reactive query to the query set: allocates a queryId, records
+-- the subscription, and sends ModifyQuerySet. The initial value arrives
+-- later as a Transition; call sync_wait_next(sync, query_id, ...) to
+-- receive it.
+proc sync_add(sync, path, args_value);
+  query_id := sync("next_query_id");
+  sync("next_query_id") := query_id + 1;
+
+  subscription := {};
+  subscription("path") := path;
+  subscription("args") := args_value;
+  sync("subscriptions")(query_id) := subscription;
+
+  base_version := sync("query_set_version");
+  new_version := base_version + 1;
+  modification := {};
+  modification("type") := "Add";
+  modification("queryId") := query_id;
+  modification("udfPath") := path;
+  modification("args") := [args_value];
+  message := {};
+  message("type") := "ModifyQuerySet";
+  message("baseVersion") := base_version;
+  message("newVersion") := new_version;
+  message("modifications") := [modification];
+
+  [success, ws] := ws_send_text(sync("ws"), json_encode(message));
+  sync("ws") := ws;
+  if not success then
+    sync("last_error") := "Add write failed: " + str(ws("last_error"));
+    return [false, sync, query_id];
+  end if;
+  sync("query_set_version") := new_version;
+  return [true, sync, query_id];
+end proc;
+
+-- Stops a reactive query: removes the subscription record and sends a
+-- Remove modification. AGENTS.md's stronger unsubscribe-ordering
+-- guarantees (invalidating an in-flight relay before the acknowledgement
+-- is published) do not apply here -- this single-connection module has
+-- no relay to invalidate -- but the wire message itself matches the
+-- pinned protocol.
+proc sync_remove(sync, query_id);
+  existing := sync("subscriptions")(query_id);
+  if existing /= om then
+    sync("subscriptions") := sync("subscriptions") less [query_id, existing];
+  end if;
+
+  base_version := sync("query_set_version");
+  new_version := base_version + 1;
+  modification := {};
+  modification("type") := "Remove";
+  modification("queryId") := query_id;
+  message := {};
+  message("type") := "ModifyQuerySet";
+  message("baseVersion") := base_version;
+  message("newVersion") := new_version;
+  message("modifications") := [modification];
+
+  [success, ws] := ws_send_text(sync("ws"), json_encode(message));
+  sync("ws") := ws;
+  if not success then
+    sync("last_error") := "Remove write failed: " + str(ws("last_error"));
+    return [false, sync];
+  end if;
+  sync("query_set_version") := new_version;
+  return [true, sync];
+end proc;
+
+-- Reads and applies exactly one server message. Returns [outcome, sync]:
+--   "transition"  one Transition was applied (see sync("results")/"revisions")
+--   "timeout"     no message arrived within timeout_ms
+--   "closed"      the peer closed the connection
+--   "error"       a transport failure or a protocol violation (see
+--                 sync("last_error"))
+proc sync_poll(sync, timeout_ms);
+  [outcome, ws, raw] := ws_recv(sync("ws"), timeout_ms);
+  sync("ws") := ws;
+  if outcome = "timeout" then
+    return ["timeout", sync];
+  elseif outcome = "closed" then
+    return ["closed", sync];
+  elseif outcome = "error" then
+    sync("last_error") := "transport error";
+    return ["error", sync];
+  end if;
+
+  envelope := json_decode(raw);
+  if envelope = om or not is_map(envelope) or envelope("type") = om then
+    sync("last_error") := "malformed server message: " + raw;
+    return ["error", sync];
+  end if;
+
+  msg_type := envelope("type");
+  if msg_type = "Transition" then
+    return sync_apply_transition(sync, envelope);
+  elseif msg_type = "FatalError" or msg_type = "AuthError" then
+    sync("last_error") := str(msg_type) + ": " + str(envelope("error"));
+    return ["error", sync];
+  else
+    sync("last_error") := "unexpected server message type: " + str(msg_type);
+    return ["error", sync];
+  end if;
+end proc;
+
+proc sync_apply_transition(sync, envelope);
+  start_version := envelope("startVersion");
+  end_version := envelope("endVersion");
+  modifications := envelope("modifications");
+  if start_version = om or end_version = om or modifications = om then
+    sync("last_error") := "Transition is missing a required field";
+    return ["error", sync];
+  end if;
+  if start_version /= sync("remote_version") then
+    sync("last_error") := "Transition start version does not match local version";
+    return ["error", sync];
+  end if;
+
+  for modification in modifications loop
+    mod_type := modification("type");
+    query_id := modification("queryId");
+    if mod_type = "QueryUpdated" then
+      outcome := {};
+      outcome("kind") := "value";
+      outcome("value") := modification("value");
+      outcome("logLines") := modification("logLines");
+      sync("results")(query_id) := outcome;
+      -- Inlined rather than delegated to a helper proc: GNU SETL passes
+      -- maps by value (see the module comment on client/websocket.setl's
+      -- connection map), so a helper called without capturing and
+      -- reassigning its return would only ever bump a copy of `sync`
+      -- that this loop immediately discards.
+      current_revision := sync("revisions")(query_id);
+      if current_revision = om then
+        current_revision := 0;
+      end if;
+      sync("revisions")(query_id) := current_revision + 1;
+    elseif mod_type = "QueryFailed" then
+      outcome := {};
+      outcome("kind") := "error";
+      outcome("errMessage") := modification("errorMessage");
+      outcome("errData") := modification("errorData");
+      outcome("logLines") := modification("logLines");
+      sync("results")(query_id) := outcome;
+      current_revision := sync("revisions")(query_id);
+      if current_revision = om then
+        current_revision := 0;
+      end if;
+      sync("revisions")(query_id) := current_revision + 1;
+    elseif mod_type = "QueryRemoved" then
+      existing := sync("results")(query_id);
+      if existing /= om then
+        sync("results") := sync("results") less [query_id, existing];
+      end if;
+    else
+      sync("last_error") := "unknown Transition modification: " + str(mod_type);
+      return ["error", sync];
+    end if;
+  end loop;
+
+  sync("remote_version") := end_version;
+  end_ts := end_version("ts");
+  if sync("max_observed_timestamp") = "" then
+    sync("max_observed_timestamp") := end_ts;
+  end if;
+  return ["transition", sync];
+end proc;
+
+-- Blocks until query_id's revision counter advances past whatever it was
+-- when this call started (sync_add itself counts as revision 0, so the
+-- very first Transition after subscribing already satisfies this),
+-- polling the connection for as many messages as it takes. Returns
+-- [outcome, sync, result] where result is sync("results")(query_id) (see
+-- the module comment for its shape) once outcome = "ok", or om otherwise.
+proc sync_wait_next(sync, query_id, timeout_ms);
+  deadline := clock + timeout_ms;
+  start_revision := sync("revisions")(query_id);
+  if start_revision = om then
+    start_revision := 0;
+  end if;
+  loop
+    remaining := deadline - clock;
+    if remaining <= 0 then
+      return ["timeout", sync, om];
+    end if;
+    [outcome, sync] := sync_poll(sync, remaining);
+    if outcome = "timeout" then
+      return ["timeout", sync, om];
+    elseif outcome = "closed" then
+      return ["closed", sync, om];
+    elseif outcome = "error" then
+      return ["error", sync, om];
+    end if;
+    current_revision := sync("revisions")(query_id);
+    if current_revision = om then
+      current_revision := 0;
+    end if;
+    if current_revision > start_revision then
+      return ["ok", sync, sync("results")(query_id)];
+    end if;
+    -- Some other query's Transition, or a transparently-handled control
+    -- frame inside ws_recv: loop back for the next message.
+  end loop;
+end proc;
+
+-- Closes the underlying connection. Idempotent, matching client/websocket.setl's
+-- ws_close.
+proc sync_close(sync, reason);
+  sync("ws") := ws_close(sync("ws"), reason);
+  return sync;
+end proc;

@@ -26,7 +26,7 @@ transparent ping/pong, close handling, and UTF-8 validation).
 | `client/http.setl` (HTTP/1.1 framing) | Tested against real hosts, both transports |
 | `client/convex.setl` (query/mutation/action + envelope classification) | Unit-tested against synthetic responses |
 | `client/websocket.setl` (RFC 6455 framing, masking, fragmentation, UTF-8) | Tested against a real echo service, real and synthetic frames |
-| `/api/sync` Live state machine | Not started |
+| `client/sync.setl` (`/api/sync` Connect/ModifyQuerySet/Transition) | Single-connection subset tested with synthetic Transitions; no reconnect/backoff/bounded queue yet |
 | NDJSON conformance adapter (`debugDisconnect`) | Not started |
 | `examples/basics/main.setl` | Not started |
 
@@ -125,11 +125,35 @@ client already sent it.
   synthetic frame builder; `payload_len` (already used elsewhere in this
   client) works fine.
 
+## `/api/sync` Live state machine (partial)
+
+`client/sync.setl` implements a single-connection subset of the pinned
+`convex-rs-0.10.4-unversioned-sync` protocol: the `Connect` handshake,
+`ModifyQuerySet` (`Add`/`Remove`), and `Transition` handling
+(`QueryUpdated`, `QueryFailed`, `QueryRemoved`) with the little-endian
+version/timestamp tracking the reference Go client's `protocol.go`
+documents. `client/tests/sync_test.setl` proves the decode and
+version-tracking logic by injecting hand-built `Transition` messages
+directly into a connection's read buffer (no live deployment needed for
+this layer, the same style `client/tests/convex_test.setl` uses),
+covering an initial `QueryUpdated`, a chained external update,
+`QueryFailed` followed by a recovering `QueryUpdated` on the same
+subscription, and rejection of a `Transition` whose `startVersion`
+doesn't match.
+
+Not implemented yet: automatic reconnection with exponential backoff,
+`connectionCount`/`lastCloseReason` tracking across reconnects, rehydration
+suppression, the adapter-only `debugDisconnect` hook, and the bounded
+delivery queue AGENTS.md requires for a slow consumer. A transport
+failure or unexpected server message currently surfaces as an
+`"error"`/`"closed"` outcome instead of retrying.
+
 ## What's left
 
-The `/api/sync` Live state machine, the NDJSON conformance adapter (with
-`debugDisconnect`), the canonical example, and every test layer in
-AGENTS.md are all still to be built. No `example-runtime` or `runtime`
-Docker stage exists yet -- adding one before there is real client code to
-run in it would ship a runtime image that does not actually run a Convex
-client, which this repository's honesty rules forbid.
+Full Live reconnect/backoff/bounded-queue behaviour (see above), the
+NDJSON conformance adapter (with `debugDisconnect`), the canonical
+example, and every test layer in AGENTS.md are all still to be built. No
+`example-runtime` or `runtime` Docker stage exists yet -- adding one
+before there is real client code to run in it would ship a runtime image
+that does not actually run a Convex client, which this repository's
+honesty rules forbid.

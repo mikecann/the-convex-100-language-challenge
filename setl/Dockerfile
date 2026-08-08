@@ -182,3 +182,24 @@ RUN set -eu; \
     cd /stage; \
     /opt/setl-src/src/run/setl --cpp websocket_test.setl | tee /tmp/websocket_test.out; \
     grep -Fq 'WEBSOCKET CLIENT: ALL CHECKS PASSED' /tmp/websocket_test.out
+
+# client/sync.setl is a single-connection subset of the pinned
+# convex-rs-0.10.4-unversioned-sync /api/sync protocol: Connect,
+# ModifyQuerySet (Add/Remove), and Transition handling (QueryUpdated,
+# QueryFailed, QueryRemoved) with the little-endian version/timestamp
+# tracking the reference Go client documents in protocol.go.
+# client/tests/sync_test.setl proves the decode/version-tracking logic
+# with hand-built Transition messages injected directly into a
+# connection's read buffer -- the same synthetic style
+# client/tests/convex_test.setl uses for the HTTP envelope -- covering an
+# initial QueryUpdated, a chained external update, QueryFailed followed
+# by a recovering QueryUpdated on the same subscription, and rejection of
+# a Transition whose startVersion does not match. Automatic reconnection,
+# backoff, and the bounded delivery queue are not implemented yet; see
+# setl/README.md.
+COPY client/sync.setl /stage/sync.setl
+COPY client/tests/sync_test.setl /stage/sync_test.setl
+RUN set -eu; \
+    cd /stage; \
+    /opt/setl-src/src/run/setl --cpp sync_test.setl | tee /tmp/sync_test.out; \
+    grep -Fq 'SYNC CLIENT: ALL CHECKS PASSED' /tmp/sync_test.out
