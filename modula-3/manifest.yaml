@@ -1,0 +1,33 @@
+schemaVersion: 1
+id: modula-3
+displayName: "Modula-3"
+rank: 52
+selectionTier: ranked
+implementation:
+  status: attempting
+  provenance: native
+  notes: >-
+    Native CM3 (Critical Mass Modula-3) implementation. Plain TCP comes
+    from Modula-3's own long-stable standard-library socket interfaces
+    (the "tcp" package: TCP.i3/IP.i3, DEC SRC heritage). TLS is a narrow
+    OpenSSL EXTERNAL-procedure C shim (client/shim.c), layered over the
+    same file descriptor the standard TCP connection already opened,
+    verifying both the certificate chain and the hostname -- no
+    FFI-generation tooling, no vendored code-dump step, just a stable
+    procedure boundary. Replaces oz (rank 52), ruled infeasible on a
+    reproducible memory-safety bug in Mozart 2's own unmaintained
+    2016-era AST-dump code generator while extending the VM for TLS; see
+    INFEASIBLE.md.
+toolchain:
+  name: CM3
+  version: d5.12.0
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+capabilities: []
