@@ -1,9 +1,13 @@
+-- buffer_test.vhdl - unit coverage for convex_buffer.vhdl's decimal,
+-- base64, hex and comparison helpers, checked against well-known test
+-- vectors rather than only round-tripping the client's own encoder
+-- against its own decoder.
 use work.convex_buffer.all;
 
-entity buffer_test_scratch is
-end entity buffer_test_scratch;
+entity buffer_test is
+end entity buffer_test;
 
-architecture behav of buffer_test_scratch is
+architecture behav of buffer_test is
 begin
   process is
     variable buf : byte_array(0 to 255);
@@ -51,7 +55,7 @@ begin
     buf_put_str(buf, len, "Content-Length");
     assert buf_eq_str_ci(buf, 0, len, "content-length") report "ci compare failed" severity failure;
 
-    report "PASS buffer_test_scratch";
+    report "PASS buffer_test";
     wait;
   end process;
 end architecture behav;

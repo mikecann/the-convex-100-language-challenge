@@ -5,4 +5,19 @@ rank: 41
 selectionTier: ranked
 implementation:
   status: planned
+  notes: >-
+    A Convex client expressed as a simulated circuit: processes, signals and
+    a clock, rather than VHDL used procedurally with `wait` statements
+    sprinkled in. Only the foreign-boundary primitives (client/native.c),
+    the clocked request/acknowledge bus that exposes them
+    (client/convex_native.vhdl, client/convex_transport.vhdl) and byte
+    buffer helpers (client/convex_buffer.vhdl) exist so far, each proven
+    inside Docker on the pinned toolchain: analyzed and elaborated with
+    GHDL, then run for real, including a genuine TLS-verified handshake
+    through the req/ack circuit and native.c's OpenSSL boundary.
+    convex_json, convex_http, convex_ws, convex_sync, the conformance
+    adapter and examples/basics do not exist yet.
+toolchain:
+  name: GHDL
+  version: "2.0.0 (Debian 2.0.0+dfsg-6.2+b2, llvm code generator)"
 capabilities: []
