@@ -84,6 +84,7 @@ const fenceLanguages = {
   ".scala": "scala",
   ".scm": "scheme",
   ".sh": "bash",
+  ".sim": "simula",
   ".sml": "sml",
   ".sno": "snobol4",
   ".sol": "solidity",
