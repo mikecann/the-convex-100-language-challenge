@@ -75,14 +75,20 @@ enum {
     CMD_WRITE_BYTE = 5,
     CMD_WRITE_FLUSH = 6,
     CMD_READ_BYTE = 7,
+    CMD_RANDOM_BYTE = 8,
     CMD_STDOUT_WRITE_BYTE = 16,
     CMD_STDOUT_FLUSH = 17,
     CMD_STDERR_WRITE_BYTE = 18
-    /* RANDOM_BYTE, GETENV_*, WAIT_READY*, STDIN_READ_BYTE, EXIT, LISTEN
-       and ACCEPT are not implemented yet - this gate stage only has to
-       prove a real TCP connection and a real TLS handshake through this
-       boundary. They will be added, matching vhdl/client/native.c's set,
-       when the JSON/HTTP/WS/sync layers above them are built. */
+    /* GETENV_*, WAIT_READY*, STDIN_READ_BYTE, EXIT, LISTEN and ACCEPT are
+       not implemented yet - this gate stage only has to prove a real TCP
+       connection and a real TLS handshake through this boundary. They
+       will be added, matching vhdl/client/native.c's set, when the
+       sync layer above needs them. CMD_RANDOM_BYTE was added now,
+       ahead of that set, because the RFC 6455 WebSocket layer needs a
+       source of entropy for the Sec-WebSocket-Key nonce and each
+       frame's client-to-server masking key (RFC 6455 SS5.3) - the same
+       "no array ever crosses the boundary" byte-at-a-time shape as
+       every other opcode here: one call returns one random byte. */
 };
 
 /* ------------------------------------------------------------------ */
@@ -309,6 +315,19 @@ static int handle_read_byte(int h, int timeout_ms) {
     }
 }
 
+/* Returns one cryptographically strong random byte (0-255) using
+   OpenSSL's RAND_bytes, the same TLS-grade entropy source already
+   linked in for handle_connect's SSL_CTX above - not rand()/time(),
+   which would make masking keys and the Sec-WebSocket-Key nonce
+   predictable. RAND_bytes' own failure (exhausted entropy, extremely
+   rare on a real OS) is reported as -1 so a caller building a key or
+   mask can fail loudly instead of silently using an unseeded byte. */
+static int handle_random_byte(void) {
+    unsigned char b;
+    if (RAND_bytes(&b, 1) != 1) return -1;
+    return (int)b;
+}
+
 /* ------------------------------------------------------------------ */
 /* The single dispatcher. Verilog never reaches the outside world any   */
 /* other way.                                                           */
@@ -335,6 +354,8 @@ static int32_t cx_dispatch(int32_t cmd, int32_t a0, int32_t a1) {
             return handle_write_flush(a0);
         case CMD_READ_BYTE:
             return handle_read_byte(a0, a1);
+        case CMD_RANDOM_BYTE:
+            return handle_random_byte();
 
         case CMD_STDOUT_WRITE_BYTE:
             if (g_stdout_len >= STDOUT_BUF_CAP) stdout_flush();

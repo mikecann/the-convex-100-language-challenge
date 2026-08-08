@@ -16,6 +16,7 @@
 `define CMD_WRITE_BYTE        5
 `define CMD_WRITE_FLUSH       6
 `define CMD_READ_BYTE         7
+`define CMD_RANDOM_BYTE       8
 `define CMD_STDOUT_WRITE_BYTE 16
 `define CMD_STDOUT_FLUSH      17
 `define CMD_STDERR_WRITE_BYTE 18

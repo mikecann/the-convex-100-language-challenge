@@ -28,7 +28,22 @@ implementation:
     approved test deployment (client/tests/http_smoke.v). Two Icarus 11.0
     elaboration/runtime bugs around string concatenation were found and
     worked around while building it (see convex_http.v's own comments).
-    examples/basics, the RFC 6455 WebSocket layer, the /api/sync Live
+    client/convex_sha1.v and client/convex_base64.v add a pure-Verilog
+    SHA-1 and base64 encoder (no crypto library binding exists for this
+    toolchain), proven against RFC 6455's own worked Sec-WebSocket-Accept
+    example (client/tests/sha1_test.v). client/convex_websocket.v now adds
+    RFC 6455 WebSocket framing on top of all of the above: masking every
+    client-to-server frame with a fresh random key (native.c gained
+    CMD_RANDOM_BYTE, backed by OpenSSL RAND_bytes, for this), reassembling
+    fragmented messages while correctly handling a control frame
+    (ping/pong/close) interleaved mid-fragmentation, and validating UTF-8
+    exactly once over the fully reassembled message rather than per
+    fragment - proven against a fixture peer that independently verifies
+    the client's own PONG and CLOSE frames arrived masked with the right
+    content (client/tests/ws_smoke.v). A third instance of the same
+    inline-function-call-in-concatenation Icarus 11.0 runtime abort
+    (vthread.cc:212) was found and worked around while building the
+    Sec-WebSocket-Key nonce string. examples/basics, the /api/sync Live
     state machine and the conformance adapter do not exist yet, so no
     capability is claimed.
 toolchain:
