@@ -1,0 +1,55 @@
+% Convex client library package. Everything under client/ is compiled
+% together into the interfaces linked by examples/basics and by the
+% test-only conformance adapter under client/tests/conformance.
+
+import("libm3")
+import("tcp")
+
+% The only native code in this client: a narrow OpenSSL binding reached
+% through Modula-3's EXTERNAL procedure mechanism, used solely for TLS.
+% Plain sockets come entirely from the stdlib "tcp" package imported
+% above.
+interface("TlsShim")
+c_source("shim")
+import_lib("ssl", "/usr/lib/x86_64-linux-gnu")
+import_lib("crypto", "/usr/lib/x86_64-linux-gnu")
+
+interface("ConvexJson")
+implementation("ConvexJson")
+
+interface("ConvexUrl")
+implementation("ConvexUrl")
+
+interface("ConvexTransport")
+implementation("ConvexTransport")
+
+interface("ConvexWire")
+implementation("ConvexWire")
+
+interface("ConvexHttp")
+implementation("ConvexHttp")
+
+interface("ConvexBase64")
+implementation("ConvexBase64")
+
+interface("ConvexSha1")
+implementation("ConvexSha1")
+
+interface("ConvexRandom")
+implementation("ConvexRandom")
+
+interface("ConvexUtf8")
+implementation("ConvexUtf8")
+
+interface("ConvexWebSocket")
+implementation("ConvexWebSocket")
+
+interface("ConvexLive")
+implementation("ConvexLive")
+
+% Building this as a library (rather than only ever compiling client
+% modules as a side effect of some program() elsewhere) is the "test"
+% stage's whole-client compilation gate: cm3 -build here type-checks
+% and compiles every interface and implementation above on its own,
+% independent of any one test program's dependency graph.
+library("Convex")

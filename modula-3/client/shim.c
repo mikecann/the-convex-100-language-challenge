@@ -1,0 +1,173 @@
+/*
+ * shim.c - the only native code in the Modula-3 Convex client's transport.
+ *
+ * Modula-3's standard library (TCP.i3, IP.i3, in the "tcp" package) opens
+ * the plain TCP connection and hands back a POSIX file descriptor
+ * (TCPPosix.Public.fd). This file supplies exactly what the standard
+ * library does not: TLS, via a real TLS 1.2+ handshake over that same
+ * fd, using OpenSSL directly through CM3's EXTERNAL procedure mechanism
+ * -- no code generator, no vendored FFI tooling, just C functions named
+ * to match TlsShim.i3's <*EXTERNAL*> declarations. Since OpenSSL is
+ * already linked for TLS, this file also exposes OpenSSL's own CSPRNG
+ * for the one other place this client needs unpredictable bytes: RFC
+ * 6455 WebSocket frame masking keys and the Connect message's
+ * sessionId. Nothing here knows about HTTP, JSON, or WebSocket framing
+ * itself -- that all stays in Modula-3.
+ */
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509v3.h>
+#include <openssl/rand.h>
+#include <poll.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+
+typedef struct {
+  SSL_CTX *ctx;
+  SSL *ssl;
+  int fd;
+} tls_handle;
+
+/* Every failure path below funnels through here so the caller's fd is
+   never leaked: a caller that gets NULL back owns nothing and must not
+   (cannot) call TlsShim__close, so this is the only place that can
+   ever release "fd" on a failed handshake. An earlier version of this
+   function returned NULL from several places without this cleanup --
+   each failed handshake (e.g. a reconnect racing a momentarily
+   unreachable peer) leaked one fd, and enough of them in a row
+   starved SSL_CTX_set_default_verify_paths itself of the fds it needs
+   to open the CA directory, turning one transient failure into a
+   permanent one. */
+static void *fail_closing(SSL *ssl, SSL_CTX *ctx, tls_handle *h, int fd) {
+  if (ssl) SSL_free(ssl);
+  if (ctx) SSL_CTX_free(ctx);
+  if (fd >= 0) close(fd);
+  if (h) free(h);
+  return NULL;
+}
+
+void *TlsShim__connect(int fd, const char *host) {
+  tls_handle *h = calloc(1, sizeof(tls_handle));
+  if (!h) { close(fd); return NULL; }
+
+  h->fd = fd;
+  h->ctx = SSL_CTX_new(TLS_client_method());
+  if (!h->ctx) return fail_closing(NULL, NULL, h, fd);
+
+  SSL_CTX_set_min_proto_version(h->ctx, TLS1_2_VERSION);
+  SSL_CTX_set_verify(h->ctx, SSL_VERIFY_PEER, NULL);
+  if (!SSL_CTX_set_default_verify_paths(h->ctx)) {
+    return fail_closing(NULL, h->ctx, h, fd);
+  }
+
+  h->ssl = SSL_new(h->ctx);
+  if (!h->ssl) return fail_closing(NULL, h->ctx, h, fd);
+
+  SSL_set_fd(h->ssl, fd);
+  /* SNI: tell the server which hostname we want a certificate for. */
+  SSL_set_tlsext_host_name(h->ssl, host);
+  /* Hostname verification: X509_check_host against this name is folded
+     into the standard chain verification once the target host is set. */
+  SSL_set1_host(h->ssl, host);
+  SSL_set_hostflags(h->ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+
+  /* CM3's own socket() calls leave the descriptor non-blocking (its
+     runtime multiplexes M3 threads over a handful of OS threads), so
+     SSL_connect must be retried across WANT_READ/WANT_WRITE exactly
+     like the read/write paths below, not called once as if blocking. */
+  for (;;) {
+    int rc = SSL_connect(h->ssl);
+    if (rc == 1) break;
+    int err = SSL_get_error(h->ssl, rc);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+      struct pollfd pfd;
+      pfd.fd = h->fd;
+      pfd.events = (err == SSL_ERROR_WANT_WRITE) ? POLLOUT : POLLIN;
+      pfd.revents = 0;
+      int pr = poll(&pfd, 1, 15000);
+      if (pr > 0) continue;
+      fprintf(stderr, "tls: handshake timed out waiting for socket readiness\n");
+    } else {
+      fprintf(stderr, "tls: handshake failed (SSL error %d)\n", err);
+      ERR_print_errors_fp(stderr);
+    }
+    return fail_closing(h->ssl, h->ctx, h, fd);
+  }
+
+  long vr = SSL_get_verify_result(h->ssl);
+  if (vr != X509_V_OK) {
+    fprintf(stderr, "tls: certificate/hostname verification failed: %s\n",
+            X509_verify_cert_error_string(vr));
+    SSL_shutdown(h->ssl);
+    return fail_closing(h->ssl, h->ctx, h, fd);
+  }
+
+  return h;
+}
+
+int TlsShim__read(void *handle, void *buf, int len, int timeoutMs) {
+  tls_handle *h = (tls_handle *)handle;
+  for (;;) {
+    int n = SSL_read(h->ssl, buf, len);
+    if (n > 0) return n;
+
+    int err = SSL_get_error(h->ssl, n);
+    if (err == SSL_ERROR_ZERO_RETURN) return 0;
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+      struct pollfd pfd;
+      pfd.fd = h->fd;
+      pfd.events = (err == SSL_ERROR_WANT_WRITE) ? POLLOUT : POLLIN;
+      pfd.revents = 0;
+      int pr = poll(&pfd, 1, timeoutMs);
+      if (pr == 0) return -1;   /* timeout */
+      if (pr < 0) return -2;    /* poll error */
+      continue;                 /* readiness changed, retry SSL_read */
+    }
+    return -2;
+  }
+}
+
+int TlsShim__write(void *handle, const void *buf, int len) {
+  tls_handle *h = (tls_handle *)handle;
+  int written = 0;
+  const char *p = (const char *)buf;
+  while (written < len) {
+    int n = SSL_write(h->ssl, p + written, len - written);
+    if (n > 0) { written += n; continue; }
+
+    int err = SSL_get_error(h->ssl, n);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+      struct pollfd pfd;
+      pfd.fd = h->fd;
+      pfd.events = (err == SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT;
+      pfd.revents = 0;
+      if (poll(&pfd, 1, -1) < 0) return -2;
+      continue;
+    }
+    return -2;
+  }
+  return written;
+}
+
+/* Fill "buf" with "len" cryptographically unpredictable bytes, for
+   WebSocket frame masking keys and the sync protocol's sessionId.
+   Returns 1 on success, 0 on failure (OpenSSL's own entropy-not-ready
+   signal, vanishingly rare on a real OS but checked anyway). */
+int TlsShim__randomBytes(void *buf, int len) {
+  return RAND_bytes((unsigned char *)buf, len) == 1 ? 1 : 0;
+}
+
+void TlsShim__close(void *handle) {
+  tls_handle *h = (tls_handle *)handle;
+  if (!h) return;
+  if (h->ssl) {
+    SSL_shutdown(h->ssl);
+    SSL_free(h->ssl);
+  }
+  if (h->ctx) SSL_CTX_free(h->ctx);
+  if (h->fd >= 0) close(h->fd);
+  free(h);
+}
