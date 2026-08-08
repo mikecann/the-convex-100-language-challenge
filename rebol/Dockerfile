@@ -158,12 +158,30 @@ RUN /usr/local/bin/rebol3 --quiet /work/examples/basics/main.r3 "rebol-dockerfil
 # separate from the system trust store this base image would otherwise
 # need staged in -- so, unlike setl/Dockerfile and mumps/Dockerfile
 # (both OpenSSL-backed), nothing under /etc/ssl is staged here at all.
+#
+# The shared image_policy check requires the runtime image's own
+# Config.Entrypoint to equal EXACTLY the single-element JSON array
+# ["/usr/local/bin/convex-adapter"] -- confirmed the hard way, the first
+# version of this stage used the same multi-element ENTRYPOINT array
+# example-runtime uses above (binary, then --quiet, then the script path,
+# needing no shell to glue them together) and failed that exact-string
+# check. /usr/local/bin/convex-adapter is therefore a #!/bin/sh launcher
+# script -- the real interpreter is staged at /opt/convex/bin/rebol3 --
+# matching setl/Dockerfile's and mumps/Dockerfile's own launcher-script
+# pattern for exactly this requirement.
 RUN set -eu; \
-    mkdir -p /staging-runtime/bin /staging-runtime/usr/bin /staging-runtime/usr/local/bin; \
+    mkdir -p /staging-runtime/bin /staging-runtime/usr/bin /staging-runtime/usr/local/bin \
+             /staging-runtime/opt/convex/bin; \
     cp -a /bin/dash /staging-runtime/bin/sh; \
     for tool in id cat uname; do cp -a "/usr/bin/$tool" "/staging-runtime/usr/bin/$tool"; done; \
-    cp -aL /usr/local/bin/rebol3 /staging-runtime/usr/local/bin/convex-adapter; \
-    for object in /staging-runtime/usr/local/bin/convex-adapter /staging-runtime/usr/bin/*; do \
+    cp -aL /usr/local/bin/rebol3 /staging-runtime/opt/convex/bin/rebol3; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'set -eu' \
+      'exec /opt/convex/bin/rebol3 --quiet /app/client/tests/conformance/main.r3' \
+      > /staging-runtime/usr/local/bin/convex-adapter; \
+    chmod 0555 /staging-runtime/usr/local/bin/convex-adapter; \
+    for object in /staging-runtime/opt/convex/bin/rebol3 /staging-runtime/usr/bin/*; do \
       ldd "$object" 2>/dev/null \
         | awk '{ for (f = 1; f <= NF; f++) if ($f ~ /^\//) print $f }' \
         | while read -r library; do \
@@ -257,7 +275,7 @@ RUN set -eu; \
     reply="$(printf '%s\n' \
       '{"protocolVersion":1,"id":"hello","op":"hello"}' \
       '{"id":"close","op":"close"}' \
-      | CONVEX_URL=http://example.invalid /usr/local/bin/convex-adapter --quiet /app/client/tests/conformance/main.r3)"; \
+      | CONVEX_URL=http://example.invalid /usr/local/bin/convex-adapter)"; \
     case "$reply" in \
       *'"language":"rebol"'*) ;; \
       *) printf '%s\n' "$reply" >&2; exit 1 ;; \
@@ -266,4 +284,4 @@ RUN set -eu; \
       *'"type":"closed"'*) ;; \
       *) printf '%s\n' "$reply" >&2; exit 1 ;; \
     esac
-ENTRYPOINT ["/usr/local/bin/convex-adapter", "--quiet", "/app/client/tests/conformance/main.r3"]
+ENTRYPOINT ["/usr/local/bin/convex-adapter"]
