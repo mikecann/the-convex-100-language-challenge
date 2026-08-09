@@ -4,7 +4,7 @@ displayName: "Pike"
 rank: 96
 selectionTier: curated_backfill
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >
@@ -33,8 +33,8 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - No Docker build, no final-runtime execution, and no shared verification have
-    been run against this source. Every claim below is a source-level claim.
+  - Docker build, final-runtime execution, and shared local and hosted
+    verification passed, earning HTTP and Live.
   - The base image is pinned by digest and every apt package is pinned to its
     exact bookworm revision, taken from the published Debian index rather than
     from a build. If any revision has since left the archive the first Docker
@@ -64,8 +64,7 @@ limitations:
   - Pike ships no canonical source formatter, so formatting is enforced by a
     language-local style gate covering tabs, trailing whitespace, line width,
     line endings, and non-ASCII source characters rather than by a tool.
-  - Capability badges stay empty until the root-owned local and hosted
-    conformance gates pass.
+  - Shared local and hosted conformance passed, earning HTTP and Live.
 capabilities:
   - http
   - live

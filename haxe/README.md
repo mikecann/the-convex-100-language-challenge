@@ -30,8 +30,8 @@ Live all agree on the `0 -> 1` journey.
 | Remove, five real reconnects, generation barriers, bounded delivery | Verified by shared local and hosted conformance |
 | Live authentication, WebSocket mutations and actions, transition chunks | Not implemented |
 
-Nothing in this table is a badge. Only the shared result evaluator may award
-HTTP or Live, and it has not run against this source yet.
+The shared result evaluator ran against the reviewed source and awarded HTTP
+and Live.
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.hx -->
 ```haxe
@@ -226,9 +226,9 @@ JSON-safe subset, so tagged encodings are not converted into richer Haxe types.
 The client has no server-inactivity watchdog; it relies on the peer closing or
 on a read failing. Inputs beyond the documented line, body, frame, delivery, or
 output bounds are rejected or coalesced rather than risking unbounded memory.
-Docker compilation and the shared local and hosted conformance runs are still
-pending, so `manifest.yaml` deliberately leaves `capabilities` empty. Neko's
+Docker compilation and the shared local and hosted conformance runs passed,
+earning HTTP and Live. Neko's
 sync counters are supported through its exact non-negative signed integer range;
 the client refuses larger unsigned protocol values instead of wrapping them.
-The shared README renderer has no `.hx` syntax mapping yet, so this canonical
-example is currently displayed as plain text rather than highlighted Haxe.
+The shared README renderer displays this canonical example directly from its
+formatted Haxe source.

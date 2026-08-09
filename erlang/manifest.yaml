@@ -4,10 +4,10 @@ displayName: "Erlang"
 rank: 38
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
-  notes: Native Erlang implementation of Convex HTTP and pinned /api/sync behavior using OTP plus ordinary Gun WebSocket and JSX JSON libraries. Capability badges remain empty until shared local and hosted evidence passes.
+  notes: Native Erlang implementation of Convex HTTP and pinned /api/sync behavior using OTP plus ordinary Gun WebSocket and JSX JSON libraries. Shared local and hosted conformance earned HTTP and Live.
 toolchain:
   name: Erlang/OTP
   version: 26.2.5.15

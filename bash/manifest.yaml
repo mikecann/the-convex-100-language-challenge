@@ -4,7 +4,7 @@ displayName: Bash
 rank: 9
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native Bash implementation of Convex JSON HTTP and the pinned Live sync profile. BusyBox wget, jq, OpenSSL, and socat provide ordinary transport, parsing, TLS, randomness, and TCP-listener primitives; Convex-specific behavior and RFC6455 framing remain in Bash.

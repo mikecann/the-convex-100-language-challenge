@@ -11,8 +11,8 @@ values, no records, no bitwise operators, and no identifier underscores.
 It is educational, unofficial, and not a production SDK. It exists to answer
 one question honestly: can a sixty-five-year-old language, translated to C by
 GNU MARST, support a useful Convex client? Nothing here is supported by
-Convex, and no capability is claimed until the shared black-box conformance
-suite says so.
+Convex. The shared local and hosted black-box conformance suites earned HTTP
+and Live for this educational implementation.
 
 ## Start here
 
@@ -43,14 +43,11 @@ Against a fresh room, that is the `0 -> 1` journey printed below.
 | Live reconnect and rehydration | Implemented, Docker gate green | Adapter-only `debugDisconnect`, unchanged rehydration suppressed |
 | WebSocket handshake response verification | Partial | HTTP 101 upgrade is required; `Sec-WebSocket-Accept` is not checked against SHA-1, see limitations |
 | Live authentication, optimistic updates, WebSocket mutations | Not implemented | Deferred; see limitations |
-| Earned badges | **None** | Shared and hosted conformance have not been run |
+| Earned badges | **HTTP and Live** | Shared local and hosted conformance passed |
 
-Every row above says "Docker gate green" deliberately, not "verified": the
-code is complete, the language-local suites are written, and the Docker test
-stage (build, every `client/tests/*.alg` suite, the TLS suite, and the
-example run) passes on a remote builder for this checkpoint — but the shared
-black-box conformance suite has not been run against it, so `capabilities` in
-`manifest.yaml` stays empty until that suite says so.
+The Docker test stage, language-local suites, TLS suite, canonical example,
+and shared local and hosted black-box conformance all passed. The manifest
+records the earned HTTP and Live result.
 
 ## The canonical example
 
@@ -557,10 +554,8 @@ protocol, and nothing here implies it is stable or officially supported.
 
 ## Limitations and deferred behaviour
 
-- **Shared conformance has not been run.** The Docker test stage — build,
-  every language-local suite and the example run — passes on a remote
-  builder for this checkpoint, but the shared black-box conformance suite has
-  not, so no capability is claimed.
+- Shared local and hosted conformance passed, earning HTTP and Live. The
+  limitations below remain deliberately outside those capabilities.
 - The WebSocket handshake does not verify the server's `Sec-WebSocket-Accept`
   response header against SHA-1 of the client's key. Implementing SHA-1
   through arithmetic emulation, with no bitwise operators available, was

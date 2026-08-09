@@ -4,7 +4,7 @@ displayName: "Groovy"
 rank: 28
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.2.0
   notes: Native Groovy implementation using the JDK HTTP/TLS/WebSocket APIs and Groovy's JSON parser. It is an educational protocol demonstration, not an SDK.
@@ -28,7 +28,7 @@ adapter:
 limitations:
   - Live authentication, optimistic updates, WebSocket mutations, and TransitionChunk assembly are deliberately deferred.
   - The undocumented sync profile is pinned as compatibility evidence and must not be treated as stable.
-  - Capability badges remain empty until root-owned local and hosted conformance evidence passes.
+  - Shared local and hosted conformance earned HTTP and Live.
 capabilities:
   - http
   - live

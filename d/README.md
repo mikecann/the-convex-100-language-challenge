@@ -160,4 +160,4 @@ Each subscription keeps the newest 16 updates. All subscriptions share an 8 MiB 
 
 ## Limitations
 
-The Live wire protocol is pinned experimental behavior, not a documented compatibility promise. Live authentication, `TransitionChunk`, optimistic updates, WebSocket mutation replay, and tagged non-JSON Convex values are deferred. Capability badges stay empty until the coordinator runs the shared local and hosted evidence gates from the reviewed commit.
+The Live wire protocol is pinned experimental behavior, not a documented compatibility promise. Live authentication, `TransitionChunk`, optimistic updates, WebSocket mutation replay, and tagged non-JSON Convex values are deferred. Shared local and hosted conformance passed, earning HTTP and Live.

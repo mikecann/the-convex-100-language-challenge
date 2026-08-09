@@ -4,7 +4,7 @@ displayName: "XPL"
 rank: 77
 selectionTier: coverage
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native XPL implementation of documented HTTP and Live, built entirely

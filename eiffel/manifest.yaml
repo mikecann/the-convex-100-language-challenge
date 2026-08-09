@@ -4,7 +4,7 @@ displayName: "Eiffel"
 rank: 99
 selectionTier: curated_backfill
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native Eiffel implementation. TCP, TLS, HTTP/1.1, and RFC 6455 WebSocket framing are hand-written over EiffelNet sockets and OpenSSL, called through Eiffel's C external interface from a small separately compiled support translation unit (convex_native.c) rather than EiffelStudio's own inline-C feature bodies, which this toolchain (25.02.9.8732) miscompiles once enough classes are in one project; see the client Dockerfile comments and README for the exact symptom. Design-by-contract preconditions, postconditions, and class invariants express the JSON value shape, the module:function path convention, and the sync protocol's connection/subscription bookkeeping.

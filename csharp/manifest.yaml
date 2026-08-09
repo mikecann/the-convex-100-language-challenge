@@ -4,10 +4,10 @@ displayName: "C#"
 rank: 5
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
-  notes: Native .NET 8 HTTP and pinned experimental WebSocket sync client. Capability badges remain empty pending shared evidence.
+  notes: Native .NET 8 HTTP and pinned experimental WebSocket sync client. Shared local and hosted conformance earned HTTP and Live.
 toolchain:
   name: .NET SDK
   version: 8.0.408

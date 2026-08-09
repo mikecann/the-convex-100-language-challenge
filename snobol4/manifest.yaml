@@ -4,7 +4,7 @@ displayName: "SNOBOL4"
 rank: 47
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -43,8 +43,7 @@ limitations:
     loopback protocol suites, the conformance adapter probe in both stdio
     and TCP mode, and the example's fast-fail path) passes on a remote
     builder for this source checkpoint. Shared local and hosted conformance
-    have not been run, so no capability is claimed and badges remain
-    unearned.
+    later passed, earning HTTP and Live.
   - >-
     CSNOBOL4's own -O3 default reproducibly crashes GCC's cc1 on this
     project's QEMU-emulated linux/amd64 build host - two independent
@@ -97,8 +96,7 @@ limitations:
     caller's own polling deadline so a slow peer cannot hold the connection
     with repeated short polls.
   - >-
-    Capability badges remain empty until the root-owned local and hosted
-    conformance gates pass.
+    Shared local and hosted conformance earned HTTP and Live.
 capabilities:
   - http
   - live

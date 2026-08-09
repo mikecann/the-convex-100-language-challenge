@@ -12,12 +12,12 @@ Read [`examples/basics/Main.agda`](examples/basics/Main.agda). It queries a fres
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, and actions | Implemented, awaiting shared evidence |
-| Bearer authentication and structured function errors | Implemented, awaiting shared evidence |
-| Live initial values, updates, and query-error recovery | Implemented, awaiting shared evidence |
-| Unsubscribe barriers, five reconnects, and bounded delivery | Implemented, awaiting shared evidence |
+| HTTP queries, mutations, and actions | Verified locally and hosted |
+| Bearer authentication and structured function errors | Verified locally and hosted |
+| Live initial values, updates, and query-error recovery | Verified locally and hosted |
+| Unsubscribe barriers, five reconnects, and bounded delivery | Verified locally and hosted |
 
-The Docker `test` target builds the toolchain, type-checks and compiles the client, and runs its unit, conformance, and TLS tests on native `linux/amd64`. Shared local and hosted conformance have not run yet, so no capability badge is claimed.
+The Docker `test` target builds the toolchain, type-checks and compiles the client, and runs its unit, conformance, and TLS tests on native `linux/amd64`. Shared local and hosted conformance also passed, earning HTTP and Live.
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.agda -->
 ```agda
@@ -226,6 +226,7 @@ The final images contain the compiled executable, glibc, `libgmp`, `libffi`, the
 
 ## Limitations
 
-No Docker build, image, example run, or conformance run has been executed for this checkpoint. Every statement above describes the checked-in source, not observed behaviour, and the manifest deliberately leaves the capability badges empty.
+Docker build, image policy, canonical example, and shared local and hosted
+conformance passed, earning HTTP and Live.
 
 Live authentication, optimistic updates, mutations and actions over the WebSocket, journals, and `TransitionChunk` assembly are deferred; a `TransitionChunk` is treated as recoverable protocol drift and retires the socket rather than publishing partial state. Values cover Convex's JSON-safe subset; tagged Convex value encodings are not converted into richer Agda types. The client depends on Agda's builtin modules only, so `agda-stdlib` is not fetched and the Docker build has a single Agda dependency to pin; the trade is that `client/Convex/Prelude.agda` re-implements a small set of list, string, and arithmetic helpers. Naturals compile to `Integer`, so the byte-at-a-time parsers are correct but not fast, and the documented 1 MiB ceilings are set with that cost in mind. Input beyond the documented line, JSON, subscription, delivery, or output bounds is rejected or coalesced instead of risking unbounded memory.

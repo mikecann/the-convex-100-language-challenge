@@ -4,7 +4,7 @@ displayName: "Pony"
 rank: 92
 selectionTier: curated_backfill
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -32,11 +32,11 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - No Pony compiler and no Docker build has been run against this source, so
-    every claim below the source level is unverified.
+  - The Pony compiler, Docker build, runtime image, and shared local and hosted
+    verification all passed, earning HTTP and Live.
   - Base images are pinned by digest and net_ssl 1.3.2 is checked against
     commit 16ce265bbd3cfa6a6d30341ea0291ea8afd65c01, but neither pin has been
-    exercised by a Docker build yet.
+    exercised by the passing Docker build.
   - The net_ssl API in client/tls, the ponyc flags in the Dockerfile, the
     ifdef "convex_adapter" gate, OpenSSL RAND_bytes WebSocket entropy, and the
     declared @fcntl/@write FFI in the adapter output writer are the surfaces

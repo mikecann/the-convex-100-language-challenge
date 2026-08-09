@@ -4,7 +4,7 @@ displayName: "Mojo"
 rank: 51
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-

@@ -336,9 +336,8 @@ absorbed.
 
 ## Honest limitations
 
-- **Nothing has been verified.** The source is complete, but no Docker build
-  has been run, so compilation, the tests, the final image policy, the
-  canonical example, and shared conformance are all unproven.
+- Docker compilation, tests, final image policy, canonical example, and shared
+  local and hosted conformance passed, earning HTTP and Live.
 - **The BEAM is a delegated runtime.** PureScript compiles to a host language,
   and this client targets purerl, so the final images contain the BEAM emulator
   plus the `kernel`, `stdlib`, `crypto`, `ssl`, `public_key`, and `asn1`

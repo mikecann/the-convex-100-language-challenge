@@ -4,7 +4,7 @@ displayName: "Icon"
 rank: 39
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -50,9 +50,8 @@ adapter:
     - debugDisconnect
 limitations:
   - >-
-    Language-local Docker tests pass from a clean build; shared local and
-    hosted black-box conformance have not been run yet, so the capability
-    list below reflects no earned badges rather than an evaluator award.
+    Language-local Docker tests pass from a clean build. Shared local and
+    hosted black-box conformance also passed, earning HTTP and Live.
   - >-
     The Unicon toolchain is built from source in the test stage (Debian
     does not package it), pinned to a specific upstream commit. Its

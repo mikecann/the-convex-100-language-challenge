@@ -4,7 +4,7 @@ displayName: "ATS2"
 rank: 55
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-

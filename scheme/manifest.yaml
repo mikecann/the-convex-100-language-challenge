@@ -4,7 +4,7 @@ displayName: "Scheme"
 rank: 72
 selectionTier: coverage
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native CHICKEN Scheme implementation of documented JSON HTTP functions and the pinned sync profile. HTTP and RFC6455 framing are implemented in Scheme over CHICKEN TCP and OpenSSL; JSON, SHA-1, base64, and SRFI eggs provide ordinary language facilities only.

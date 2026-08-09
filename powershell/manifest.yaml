@@ -4,10 +4,10 @@ displayName: "PowerShell"
 rank: 20
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.2.0
-  notes: Native PowerShell implementation using only System.Net.Http and System.Net.WebSockets for ordinary transport primitives. Capability badges stay empty until root-owned evidence passes.
+  notes: Native PowerShell implementation using only System.Net.Http and System.Net.WebSockets for ordinary transport primitives. Shared local and hosted conformance passed, earning HTTP and Live.
 toolchain:
   name: PowerShell
   version: 7.5.0

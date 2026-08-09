@@ -4,7 +4,7 @@ displayName: Scala
 rank: 17
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native Scala 3 client using JDK HTTP, TLS, JSON, and WebSocket primitives. Shared evidence is coordinator-owned.
@@ -26,7 +26,7 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - Shared local and hosted conformance is pending coordinator evidence.
+  - Shared local and hosted conformance earned HTTP and Live.
   - Live authentication, optimistic updates, journals, and TransitionChunk assembly are deferred.
   - Live subscriptions retain only the newest 16 pending updates per subscriber.
 capabilities:

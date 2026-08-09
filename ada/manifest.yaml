@@ -4,10 +4,10 @@ displayName: "Ada"
 rank: 26
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
-  notes: Native Ada implementation using pinned AWS/OpenSSL for HTTP and TLS, plus an Ada RFC 6455 and Convex sync-profile implementation. Badges remain unearned until root-owned conformance succeeds.
+  notes: Native Ada implementation using pinned AWS/OpenSSL for HTTP and TLS, plus an Ada RFC 6455 and Convex sync-profile implementation. Shared local and hosted conformance earned HTTP and Live.
 toolchain:
   name: GNAT
   version: 14.2.1

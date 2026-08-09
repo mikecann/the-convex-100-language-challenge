@@ -11,8 +11,8 @@ reviewed native shim for sockets and TLS.
 It is educational, unofficial, and not a production SDK. It exists to answer
 one question honestly: can a fifty-eight-year-old language that predates
 TCP/IP by over a decade, compiled by a small GNU project compiler, support a
-useful Convex client? Nothing here is supported by Convex, and no capability
-is claimed until the shared black-box conformance suite says so.
+useful Convex client? Nothing here is supported by Convex. Shared local and
+hosted black-box conformance earned HTTP and Live.
 
 ## Start here
 
@@ -49,12 +49,10 @@ class mechanism Simula gave to nearly every language that followed it.
 | Earned badges | **`http` and `live`** | 31/31 on both the local and hosted profiles, from clean exact head `9bd9b4d` |
 
 Every row above says "Docker gate green" deliberately, not "verified": the
-code is complete, the language-local suite is written (60 assertions, 0
-mocked), and the Docker test stage — build, the native shim compiled on its
-own, that suite, the example's required no-configuration failure path, and
-the adapter's hello/close probe — passes locally for this checkpoint. The
-shared black-box conformance suite has not been run against it, so
-`capabilities` in `manifest.yaml` stays empty until that suite says so.
+The language-local suite has 60 unmocked assertions. The Docker test stage,
+native shim build, canonical example, adapter probe, and shared local and
+hosted black-box conformance all passed. The manifest records the earned HTTP
+and Live result.
 
 ## The canonical example
 
@@ -610,10 +608,8 @@ supported.
 
 ## Limitations and deferred behaviour
 
-- **Shared conformance has not been run.** The Docker test stage — build,
-  the language-local suite, the example's required failure path, and the
-  adapter's hello/close probe — passes locally for this checkpoint, but the
-  shared black-box conformance suite has not, so no capability is claimed.
+- Shared local and hosted conformance passed, earning HTTP and Live. The
+  limitations below remain deliberately outside those capabilities.
 - TLS has not been separately unit-tested against a private CA the way this
   project's ALGOL 60 client does. `client/convexrt.c`'s TLS code is the same
   reviewed design (peer verification, the default CA bundle, and

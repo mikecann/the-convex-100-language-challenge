@@ -4,7 +4,7 @@ displayName: "Clojure"
 rank: 48
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native Clojure code owns the Convex HTTP and pinned sync-profile messages. It uses only the JDK HTTP/TLS/WebSocket transport and clojure.data.json for JSON.
@@ -26,7 +26,7 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - Capability badges remain empty until root runs the serial shared conformance evidence.
+  - Shared local and hosted conformance earned HTTP and Live.
   - Live authentication, optimistic updates, chunks, journals, and replay are deferred.
   - All subscriptions share one newest-16, 4 MiB encoded delivery budget; one slow subscription cannot multiply the allowance.
   - Adapter output, including an in-flight write, shares a separate newest-16, 4 MiB encoded budget and drops only stale subscription snapshots under pressure.

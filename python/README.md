@@ -20,7 +20,7 @@ performs one idempotent mutation, and checks the resulting `0 -> 1` journey.
 | HTTP | Verified by shared local and hosted conformance | Native stdlib JSON HTTP query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented. |
 | Live | Verified by shared local and hosted conformance | Native stdlib WebSocket subscription, bounded update delivery, reconnect attempt, unsubscribe, and clean close target the pinned profile. |
 
-No capability badge is earned until shared local and hosted black-box tests pass.
+Shared local and hosted black-box tests passed, earning HTTP and Live.
 
 ## The basic example
 

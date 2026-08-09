@@ -27,13 +27,11 @@ transcript.
 | Structured `ConvexError` data and log lines | Implemented, verified by shared conformance |
 | Live subscribe, unsubscribe, reconnect, replay | Implemented, verified by shared conformance |
 | Reactive query failure and recovery | Implemented, verified by shared conformance |
-| Earned capability badges | None |
+| Earned capability badges | HTTP and Live |
 
-Nothing in this table is a badge. The Docker `test` target formats, compiles,
-and runs the language-local unit and conformance suites on native
-`linux/amd64`. Shared local and hosted conformance (`verify` / `verify-hosted`)
-have not run yet, so only the shared result evaluator can award the HTTP or
-Live badge, and it has not run for ReScript.
+The Docker `test` target formats, compiles, and runs the language-local unit and
+conformance suites on native `linux/amd64`. The shared local and hosted result
+evaluator also passed, earning HTTP and Live.
 
 ## The canonical example
 
@@ -209,8 +207,8 @@ ConvexNode.catchError(main(), error => {
 
 ## Docker verification
 
-Every command runs from the repository root and builds inside Docker. None of
-them has been run for this client yet.
+Every command runs from the repository root and builds inside Docker. The
+language-local and shared verification commands passed for the reviewed source.
 
 ```sh
 ./run build rescript          # build the linux/amd64 image
@@ -320,9 +318,8 @@ of the educational client API.
 - **The Docker `test` target passes on native `linux/amd64`.** Format check,
   compilation, the language-local unit and conformance suites, the canonical
   example, and the adapter protocol smoke test all run green inside Docker.
-  `verify` and `verify-hosted` (the shared black-box HTTP and Live suites, run
-  against a real and then a hosted deployment) have not run yet, so the
-  manifest deliberately leaves the capability badges empty.
+  `verify` and `verify-hosted` also passed against local and hosted
+  deployments, so the manifest records the earned HTTP and Live capabilities.
 - **First-build fixes.** This checkpoint had never been compiled before its
   first Docker build, and several genuine defects surfaced: a recursive
   `sources` scan trying to compile the `rescript` package's own `.resi`-only

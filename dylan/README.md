@@ -11,8 +11,7 @@ C file.
 It is educational, unofficial, and not a production SDK. It exists to answer
 one question honestly: does a language most people have never run still hold
 up as a place to write a real network client? Nothing here is supported by
-Convex, and no capability is claimed until the shared black-box conformance
-suite says so.
+Convex. Shared local and hosted black-box conformance earned HTTP and Live.
 
 ## Start here
 

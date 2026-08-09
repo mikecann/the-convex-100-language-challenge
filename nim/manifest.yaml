@@ -4,7 +4,7 @@ displayName: "Nim"
 rank: 80
 selectionTier: curated_backfill
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.2.0
   notes: Native Nim HTTP and Live client plus a pinned native treeform/ws RFC6455 path. Shared local and hosted conformance passed 31/31 from clean exact-head builds; the capability list records the evaluator award.

@@ -4,7 +4,7 @@ displayName: "Crystal"
 rank: 81
 selectionTier: curated_backfill
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native Crystal JSON HTTP client and Convex sync WebSocket worker.

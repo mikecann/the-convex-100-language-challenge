@@ -4,7 +4,7 @@ displayName: "Zig"
 rank: 37
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native Zig implementation using std.http.Client, std.json, and a small in-language WebSocket frame/owner layer.

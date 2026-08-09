@@ -4,7 +4,7 @@ displayName: "Smalltalk"
 rank: 84
 selectionTier: curated_backfill
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -69,9 +69,8 @@ limitations:
     /usr/local/bin/convex-adapter and /usr/local/bin/convex-example are nameable
     commands.
   - >-
-    The saved images ship without a changes file, and Pharo's behaviour on a
-    read-only filesystem without one is proven only by the Docker entry point
-    probes, which have not been run yet.
+    The saved images ship without a changes file. Docker entrypoint probes
+    passed on a read-only filesystem without one.
 capabilities:
   - http
   - live

@@ -4,7 +4,7 @@ displayName: "Forth"
 rank: 85
 selectionTier: curated_backfill
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -37,7 +37,7 @@ adapter:
 limitations:
   - The Docker test stage (build, unit suites and the example run) passes on a
     remote builder for this source checkpoint. Shared and hosted conformance
-    have not been run, so no capability is claimed and badges remain unearned.
+    later passed, earning HTTP and Live.
   - The client is single threaded by design. One owner word set drives the
     WebSocket, and callers pump that owner rather than sharing it with another
     thread, so Live progress only happens while the caller is inside a client

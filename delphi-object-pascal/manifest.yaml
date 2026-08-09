@@ -4,7 +4,7 @@ displayName: "Delphi/Object Pascal"
 rank: 25
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-

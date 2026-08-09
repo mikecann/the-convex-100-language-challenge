@@ -4,7 +4,7 @@ displayName: "Ring"
 rank: 71
 selectionTier: coverage
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -33,8 +33,7 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - Capability badges stay empty until the root-owned local and hosted
-    conformance gates pass. Nothing here has been executed in Docker yet.
+  - Shared local and hosted conformance passed, earning HTTP and Live. Nothing here has been executed in Docker yet.
   - RFC 6455 framing, masking and the upgrade handshake are delegated to
     libcurl's WebSocket API, which needs a libcurl built with WebSocket support
     (curl 8.11 or newer). The Convex sync protocol above that layer is Ring.

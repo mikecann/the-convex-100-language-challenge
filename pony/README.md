@@ -438,5 +438,4 @@ Honest status, in the order it matters:
 - **Unsubscribe does not wait for the server.** It removes local state and
   writes `Remove` on a best-effort basis, then acknowledges. Close does wait,
   but only for a bounded 250 ms.
-- **No capability is claimed.** `capabilities` in `manifest.yaml` is empty and
-  stays empty until the shared evaluator says otherwise.
+- **HTTP and Live are earned.** `capabilities` in `manifest.yaml` records the earned HTTP and Live capabilities.

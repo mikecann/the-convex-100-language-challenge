@@ -4,7 +4,7 @@ displayName: TypeScript
 rank: 6
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native TypeScript implementation of Convex HTTP and sync behaviour. ws supplies WebSocket transport only; badges await root-owned conformance evidence.

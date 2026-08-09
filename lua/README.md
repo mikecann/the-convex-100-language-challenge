@@ -3,9 +3,8 @@
 This folder demonstrates a deliberately small native Lua client calling Convex
 queries, mutations, and actions through the documented JSON HTTP API.
 
-This is educational, unofficial, and not a production SDK. It is an honest
-work in progress: no capability badges are earned until the coordinator runs
-the shared local and hosted conformance suites.
+This is educational, unofficial, and not a production SDK. Shared local and
+hosted conformance passed, earning HTTP and Live.
 
 ## Start here
 
@@ -18,10 +17,10 @@ client or CLI.
 
 | Surface | Repository state |
 | --- | --- |
-| JSON HTTP queries, mutations, actions, and bearer auth | Native candidate plus local fixtures; capability unearned |
-| Live query subscriptions and reconnects | Native candidate plus deterministic fixtures; capability unearned |
+| JSON HTTP queries, mutations, actions, and bearer auth | Verified locally and hosted |
+| Live query subscriptions and reconnects | Verified locally and hosted |
 | Canonical `0 -> 1` HTTP and Live journey | Verified against self-hosted and hosted deployments |
-| Earned capabilities | None until the coordinator runs local and hosted conformance |
+| Earned capabilities | HTTP and Live |
 
 ## Basic example
 

@@ -4,10 +4,10 @@ displayName: "Kotlin"
 rank: 13
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
-  notes: Native Kotlin HTTP and experimental pinned-profile Live client. No capability badges are earned until shared local and hosted evidence passes.
+  notes: Native Kotlin HTTP and experimental pinned-profile Live client. Shared local and hosted evidence passed, earning HTTP and Live.
 toolchain:
   name: Kotlin and JDK
   version: 2.2.21 and 21

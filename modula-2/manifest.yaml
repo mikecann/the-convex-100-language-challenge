@@ -4,7 +4,7 @@ displayName: "Modula-2"
 rank: 70
 selectionTier: coverage
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -16,8 +16,8 @@ implementation:
     small foreign definition module (client/CShim.def, implemented in
     client/cshim.c) supplies only generic, Convex-unaware transport
     primitives: raw TCP sockets, OpenSSL for TLS, poll(), a monotonic clock,
-    CSPRNG bytes and SHA-1 for the WebSocket handshake key. Badges remain
-    unearned until root-owned local and hosted conformance succeed.
+    CSPRNG bytes and SHA-1 for the WebSocket handshake key. Root-owned local and
+    hosted conformance passed, earning HTTP and Live.
 toolchain:
   name: GNU Modula-2 (gm2)
   version: 14.2.0
@@ -86,8 +86,7 @@ limitations:
     every module uses a hand-written bounded length scan instead. These are
     documented at each call site in the source.
   - >-
-    Capabilities remain unearned until the root-owned shared local and
-    hosted conformance evidence passes from a clean exact-head build.
+    Shared local and hosted conformance earned HTTP and Live.
 capabilities:
   - http
   - live

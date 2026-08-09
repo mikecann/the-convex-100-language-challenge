@@ -4,10 +4,10 @@ displayName: "Lua"
 rank: 19
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
-  notes: Native Lua HTTP client using lua-http and dkjson, with a single-owner lua-http and cqueues Live implementation. Capability badges remain empty until shared local and hosted conformance pass.
+  notes: Native Lua HTTP client using lua-http and dkjson, with a single-owner lua-http and cqueues Live implementation. Shared local and hosted conformance earned HTTP and Live.
 toolchain:
   name: Lua
   version: 5.1.5

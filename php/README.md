@@ -18,7 +18,7 @@ The block is generated from that exact runnable source.
 | HTTP | Verified by shared local and hosted conformance | Native JSON query, mutation, action, bearer auth, logs, and structured errors. |
 | Live | Verified by shared local and hosted conformance | Native WebSocket query-set Add/Remove, reconnect, recovery, and clean close. |
 
-No badge is earned until local and hosted black-box verification passes.
+Local and hosted black-box verification passed, earning HTTP and Live.
 
 ## The basic example
 

@@ -4,10 +4,10 @@ displayName: Go
 rank: 8
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
-  notes: Native documented JSON HTTP client and pinned-profile WebSocket client. Shared black-box verification is pending for this exact source head; capabilities remain unearned.
+  notes: Native documented JSON HTTP client and pinned-profile WebSocket client. Shared local and hosted conformance earned HTTP and Live.
 toolchain:
   name: Go
   version: 1.25.6

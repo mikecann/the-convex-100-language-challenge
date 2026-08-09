@@ -4,7 +4,7 @@ displayName: "Awk"
 rank: 59
 selectionTier: coverage
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -34,7 +34,7 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - The language-local test gate now passes. The gawk source build, the extension, and every test suite run green in Docker. Shared conformance (verify, verify-hosted) has not run yet, so no capability is claimed.
+  - The language-local test gate now passes. The gawk source build, the extension, and every test suite run green in Docker. Shared local and hosted conformance passed, earning HTTP and Live.
   - RFC6455 framing, masking, and fragment reassembly live in the compiled extension rather than in Awk; the Live owner, state machine, replay, and protocol validation are Awk.
   - The client is single threaded by design. The adapter loop interleaves Live pumping with controller commands, so an in-flight HTTP call delays Live reads until its own deadline expires.
   - WebSocket mutations, WebSocket actions, Live authentication, optimistic updates, journals, and TransitionChunk assembly are deferred.

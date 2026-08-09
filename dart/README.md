@@ -19,7 +19,7 @@ cleans up its subscription and client.
 | Native Dart implementation | Verified by shared local and hosted conformance |
 | HTTP query, mutation, action, and bearer-token lifecycle | Verified by shared local and hosted conformance |
 | Experimental Live query and reconnect support | Verified by shared local and hosted conformance |
-| Earned capability badges | None yet |
+| Earned capability badges | HTTP and Live |
 
 ## Basic example
 

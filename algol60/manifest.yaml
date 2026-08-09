@@ -4,7 +4,7 @@ displayName: "ALGOL 60"
 rank: 78
 selectionTier: coverage
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -41,8 +41,7 @@ limitations:
     The Docker test stage (build, every client/tests/*.alg suite, the TLS
     trust/untrusted/wrong-host suite, and the example's no-configuration
     failure path) passes on a remote builder for this checkpoint. Shared and
-    hosted black-box conformance have not been run, so no capability is
-    claimed and badges remain unearned.
+    hosted black-box conformance later passed, earning HTTP and Live.
   - >-
     ALGOL 60 has no identifier underscores, no string values (only literal
     string constants), no record or struct types, and no bitwise operators.

@@ -4,7 +4,7 @@ displayName: "Common Lisp"
 rank: 31
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native SBCL implementation of documented JSON HTTP functions and the pinned sync profile using direct OpenSSL 3 transport.

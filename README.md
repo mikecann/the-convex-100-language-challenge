@@ -8,11 +8,18 @@ These implementations are made for the project, website, and video. They are
 not officially sanctioned Convex clients and are not intended to become
 published packages or production SDKs.
 
-The repository foundation and first native client pilot now exist. Go passes the
-shared HTTP and Live suites against both the pinned local backend and the
-dedicated hosted drift target. Its badges remain candidate evidence until the
-branch passes native `linux/amd64` CI and trusted-main publishes the result
-index.
+The roster is complete: all 100 language implementations passed the shared HTTP
+and Live suites against both the pinned local backend and the dedicated hosted
+drift target. Every language manifest on `main` records both capabilities. See
+[STATS.md](STATS.md) for the completion summary and [BUILD-FLEET.md](BUILD-FLEET.md)
+for the now-deleted remote build fleet.
+
+The final trusted-main website index is still outstanding. The language runs
+were completed on the remote build fleet and recorded in their merged pull
+requests, but the repository's GitHub Actions evidence publisher was never
+expanded beyond the Go pilot. Until that index is produced, `./run site` will
+correctly withhold trusted website badges rather than treating manifest claims
+as signed CI evidence.
 
 ## Capability badges
 

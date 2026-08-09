@@ -8,8 +8,8 @@ sockets.
 
 It is educational, unofficial, and not a production SDK. It exists to answer
 one question honestly: can Forth support a useful Convex client? Nothing here
-is supported by Convex, and no capability is claimed until the shared
-black-box conformance suite says so.
+is supported by Convex. The shared local and hosted black-box conformance
+suites earned HTTP and Live for this educational implementation.
 
 ## Start here
 
@@ -38,14 +38,11 @@ Against a fresh room, that is the `0 -> 1` journey printed below.
 | Live subscribe, update, unsubscribe | Implemented, Docker gate green | RFC 6455 framing written in Forth |
 | Live reconnect and rehydration | Implemented, Docker gate green | Adapter-only `debugDisconnect`, unchanged rehydration suppressed |
 | Live authentication, optimistic updates, WebSocket mutations | Not implemented | Deferred; see limitations |
-| Earned badges | **None** | Shared and hosted conformance have not been run |
+| Earned badges | **HTTP and Live** | Shared local and hosted conformance passed |
 
-Every row above says "Docker gate green" deliberately, not "verified": the
-code is complete, the language-local suites are written, and the Docker test
-stage (build, every `client/tests/*.fth` suite and the example run) passes on
-a remote builder for this checkpoint — but the shared black-box conformance
-suite has not been run against it, so `capabilities` in `manifest.yaml` stays
-empty until that suite says so.
+The Docker test stage, language-local suites, canonical example, and shared
+local and hosted black-box conformance all passed. The manifest records the
+earned HTTP and Live result.
 
 ## The canonical example
 
@@ -352,10 +349,8 @@ protocol, and nothing here implies it is stable or officially supported.
 
 ## Limitations and deferred behaviour
 
-- **Shared conformance has not been run.** The Docker test stage — build,
-  every language-local suite and the example run — passes on a remote builder
-  for this checkpoint, but the shared black-box conformance suite has not, so
-  no capability is claimed.
+- Shared local and hosted conformance passed, earning HTTP and Live. The
+  limitations below remain deliberately outside those capabilities.
 - Live is driven by the caller. Because the client is single threaded,
   reactive updates arrive while a caller is inside `convex-live-wait`, the
   adapter's event loop, or another client word — not on a background thread.
