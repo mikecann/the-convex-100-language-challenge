@@ -10,9 +10,9 @@ Read [`examples/basics/main.odin`](examples/basics/main.odin). It queries a fres
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, actions, bearer auth, and structured errors | Implemented locally, no earned badge |
-| Live initial values, updates, reconnect, unsubscribe, and clean close | Implemented locally, no earned badge |
-| Shared HTTP and Live conformance | Not yet run or earned |
+| HTTP queries, mutations, actions, bearer auth, and structured errors | Verified by shared local and hosted conformance |
+| Live initial values, updates, reconnect, unsubscribe, and clean close | Verified by shared local and hosted conformance |
+| Shared HTTP and Live conformance | Passed; both capabilities earned |
 
 ## Basic example
 
@@ -166,7 +166,7 @@ The pinned Docker build fetches Odin `dev-2026-08` at commit `ea5175d865c2034b03
 
 The language-local libcurl build carries one narrow source patch. In connect-only WebSocket mode, stock libcurl can consume the prefix of a second frame into its private decoder and then return `CURLE_AGAIN`, which otherwise looks identical to a genuinely idle socket. The patch extends the already-linked `curl_ws_meta` function only inside this private image so the client can distinguish those states without adding or exporting an ABI symbol. The build asserts the exact upstream source context before applying it, asserts the replacement context afterwards, and runs a C regression covering both partial-successor and true-idle `CURLE_AGAIN` behavior. The final runtime copies this patched library, not the Debian libcurl.
 
-I have deliberately left `capabilities: []` in the manifest. Source being present is not the same thing as passing root-owned shared verification.
+The root-owned shared verification passed locally and hosted, so the manifest records `http` and `live`.
 
 ## Client design
 
@@ -188,4 +188,4 @@ The `memory-probe` Docker target is deliberately not an ordinary build check. Ru
 
 ## Limitations
 
-Live authentication lifecycle, optimistic updates, mutations and actions over WebSocket, mutation replay, journals, and `TransitionChunk` assembly are deferred. A server `TransitionChunk` is treated as protocol drift and retires the connection. Public values remain bounded JSON text so an application can choose its own Odin types. These limits are explicit and are not claimed as earned capabilities.
+Live authentication lifecycle, optimistic updates, mutations and actions over WebSocket, mutation replay, journals, and `TransitionChunk` assembly are deferred. A server `TransitionChunk` is treated as protocol drift and retires the connection. Public values remain bounded JSON text so an application can choose its own Odin types. HTTP and Live are earned only for the pinned profile and limits described here.

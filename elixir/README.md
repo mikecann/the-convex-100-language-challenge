@@ -20,8 +20,8 @@ mutation, and the resulting Live update.
 | HTTP | Verified by shared local and hosted conformance | Native query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented. |
 | Live | Verified by shared local and hosted conformance | Native WebSocket subscriptions, unsubscribe, typed query failures, and reconnect restoration are implemented against the pinned profile. |
 
-The manifest intentionally awards no badges yet. Only the shared local and
-hosted black-box controller may turn either row into a passing capability.
+The shared local and hosted black-box controller passed both rows, and the
+manifest records the earned HTTP and Live capabilities.
 
 ## Basic example
 

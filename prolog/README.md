@@ -20,8 +20,8 @@ and the final reactive assertion.
 | HTTP | Verified by shared local and hosted conformance | Native documented JSON query, mutation, action, bearer token, logs, and typed failures are implemented. |
 | Live | Verified by shared local and hosted conformance | Native SWI WebSocket subscriptions, Add/Remove, typed query failures, and reconnect restoration are implemented for the pinned profile. |
 
-The manifest deliberately awards no badges. Only root-owned local and hosted
-black-box conformance can earn them.
+Root-owned local and hosted black-box conformance passed, and the manifest
+records the earned HTTP and Live capabilities.
 
 ## Basic example
 

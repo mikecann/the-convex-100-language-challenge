@@ -7,7 +7,7 @@ implementation:
   status: working
   provenance: native
   version: 0.1.0
-  notes: Native F#/.NET 8 implementation using built-in HttpClient, System.Text.Json, and ClientWebSocket. Badges remain empty until root-owned shared evidence passes.
+  notes: Native F#/.NET 8 implementation using built-in HttpClient, System.Text.Json, and ClientWebSocket. Root-owned shared local and hosted evidence passed, earning HTTP and Live.
 toolchain:
   name: .NET SDK
   version: 8.0.408

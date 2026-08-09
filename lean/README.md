@@ -172,7 +172,7 @@ def main (arguments : List String) : IO UInt32 := do
 ./run verify-all lean
 ```
 
-`test` compiles the C shim and the whole Lean tree inside Docker, enforces the checked-in source style, and then runs the language-local suites: the pure codecs and bounds, real TLS chain and hostname verification, raw HTTP framing, raw WebSocket framing, the Live engine against a scripted Convex sync peer, the adapter's own event shapes and output admission, and the exact canonical example binary. `verify-example` runs that same example from its minimal image against a unique room. The remaining commands add shared black-box conformance, locally and against the hosted drift target. Only the shared result evaluator awards HTTP or Live badges, so this directory claims none.
+`test` compiles the C shim and the whole Lean tree inside Docker, enforces the checked-in source style, and then runs the language-local suites: the pure codecs and bounds, real TLS chain and hostname verification, raw HTTP framing, raw WebSocket framing, the Live engine against a scripted Convex sync peer, the adapter's own event shapes and output admission, and the exact canonical example binary. `verify-example` runs that same example from its minimal image against a unique room. The remaining commands add shared black-box conformance, locally and against the hosted drift target. Those runs passed, and the shared result evaluator awarded HTTP and Live.
 
 ## Conformance and protocol notes
 

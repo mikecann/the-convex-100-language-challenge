@@ -206,7 +206,7 @@ main =
 ./run verify-all agda
 ```
 
-`test` builds the pinned Agda compiler from Hackage, type-checks the client, then compiles and runs the protocol, adapter, TLS, and Live fixture tests before saving the adapter and the canonical example as native `linux/amd64` executables. `verify-example` runs the example from its minimal image against a unique room. The remaining shared commands add local and hosted black-box conformance. Only the root result evaluator can award HTTP or Live badges, so this language branch does not claim them.
+`test` builds the pinned Agda compiler from Hackage, type-checks the client, then compiles and runs the protocol, adapter, TLS, and Live fixture tests before saving the adapter and the canonical example as native `linux/amd64` executables. `verify-example` runs the example from its minimal image against a unique room. The remaining shared commands add local and hosted black-box conformance. Those root-owned runs passed, and the shared result evaluator awarded HTTP and Live.
 
 ## Conformance and protocol notes
 

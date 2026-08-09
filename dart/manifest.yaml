@@ -29,7 +29,7 @@ limitations:
   - Live authentication and token rotation are deferred.
   - Full tagged Convex value types are deferred; this demonstration uses JSON-safe values.
   - WebSocket mutations, actions, query journals, optimistic updates, and TransitionChunk assembly are deferred.
-  - No HTTP or Live capability is claimed until shared local and hosted conformance evidence is recorded.
+  - Shared local and hosted conformance passed, earning HTTP and Live.
 capabilities:
   - http
   - live
