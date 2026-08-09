@@ -4,7 +4,7 @@ displayName: "Rexx"
 rank: 42
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -22,9 +22,8 @@ implementation:
     crypto/framing/HTTP-classification/state-surgery pure functions, plus
     real loopback fixtures in client/tests/fixtures/ for HTTP and Live
     including a debugDisconnect-triggered reconnect and a
-    QueryFailed-then-recovery cycle) pass locally in Docker. Shared local
-    and hosted conformance have not run yet, so no capability badge is
-    claimed.
+    QueryFailed-then-recovery cycle) pass locally in Docker. Shared local and
+    hosted conformance also passed, earning HTTP and Live.
 toolchain:
   name: Regina Rexx
   version: 3.6-2.4
@@ -45,9 +44,8 @@ adapter:
 limitations:
   - >-
     Language-local Docker tests (selftest, HTTP loopback, and Live loopback
-    against real fixture sockets) pass from a clean build; shared local and
-    hosted black-box conformance have not been run yet, so the capability
-    list below reflects no earned badges rather than an evaluator award.
+    against real fixture sockets) pass from a clean build. Shared local and
+    hosted black-box conformance also passed, earning HTTP and Live.
   - >-
     Classic Rexx's CALL statement has no variable indirection (no "call
     whatever this variable names"), so every caller of the client library

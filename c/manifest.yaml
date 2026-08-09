@@ -4,7 +4,7 @@ displayName: "C"
 rank: 10
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native C implementation of documented HTTP functions and the pinned sync profile using libcurl for HTTP, TLS, and WebSocket transport plus json-c for JSON.

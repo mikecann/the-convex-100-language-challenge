@@ -18,7 +18,7 @@ It is an educational, unofficial experiment, not a production SDK or a package i
 | Shared conformance | Not attempted |
 | Production SDK compatibility | Not claimed |
 
-Nothing in this directory has been compiled or executed. Every capability is unearned, and the shared evaluator is the only thing that can change that.
+Docker compilation and the shared local and hosted evaluator passed, earning HTTP and Live.
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.idr -->
 ```idris
@@ -150,4 +150,4 @@ The adapter under [`client/tests/conformance/`](client/tests/conformance) is tes
 
 ## Limitations
 
-Execution is unverified: no Docker build, test, example run, or conformance run has happened, and the Dockerfile keeps sentinel values for the Chez Scheme package version and the Idris 2 tarball digest so it fails loudly until both are pinned from a real build. The client is single-threaded and caller-driven rather than backed by a background thread. Values are limited to the documented JSON format, so Int64, bytes, and special floats are not claimed. Live authentication, optimistic updates, WebSocket mutations and actions, and `TransitionChunk` assembly are deferred, and a `TransitionChunk` is treated as profile drift that retires the connection. The shared evaluator, not this README, awards HTTP or Live badges.
+Docker build, language-local tests, canonical example, and shared local and hosted conformance passed, earning HTTP and Live. The client is single-threaded and caller-driven rather than backed by a background thread. Values are limited to the documented JSON format, so Int64, bytes, and special floats are not claimed. Live authentication, optimistic updates, WebSocket mutations and actions, and `TransitionChunk` assembly are deferred, and a `TransitionChunk` is treated as profile drift that retires the connection.

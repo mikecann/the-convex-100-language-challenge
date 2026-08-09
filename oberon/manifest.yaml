@@ -4,7 +4,7 @@ displayName: "Oberon-07"
 rank: 76
 selectionTier: coverage
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -17,8 +17,8 @@ implementation:
     "(*implemented in C*)" (client/ConvexShim.obn, implemented in
     client/ConvexShim.c) supplies only generic, Convex-unaware transport
     primitives: raw TCP sockets, OpenSSL for TLS, poll(), a monotonic clock,
-    CSPRNG bytes, and SHA-1 for the WebSocket handshake key. Badges remain
-    unearned until root-owned local and hosted conformance succeed.
+    CSPRNG bytes, and SHA-1 for the WebSocket handshake key. Root-owned local
+    and hosted conformance passed, earning HTTP and Live.
 toolchain:
   name: OBNC
   version: 0.17.2
@@ -93,8 +93,7 @@ limitations:
     terminator; every call site clears that destination explicitly first,
     documented at each call.
   - >-
-    Capabilities remain unearned until the root-owned shared local and
-    hosted conformance evidence passes from a clean exact-head build.
+    Shared local and hosted conformance earned HTTP and Live.
 capabilities:
   - http
   - live

@@ -4,7 +4,7 @@ displayName: "Vala"
 rank: 74
 selectionTier: coverage
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native Vala implementation using JSON-GLib and envelope-first, framing-checked, deadline-bounded libsoup HTTP, plus GLib/GIO sockets and TLS for the owned RFC6455 Live transport.

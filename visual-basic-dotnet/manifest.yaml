@@ -4,10 +4,10 @@ displayName: "Visual Basic .NET"
 rank: 22
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.2.0
-  notes: Native VB.NET implementation using only .NET HttpClient, System.Text.Json, and ClientWebSocket for ordinary transport and serialization. All Convex protocol behaviour is Visual Basic. Capability badges remain empty until root-owned shared evidence passes.
+  notes: Native VB.NET implementation using only .NET HttpClient, System.Text.Json, and ClientWebSocket for ordinary transport and serialization. All Convex protocol behaviour is Visual Basic. Shared local and hosted conformance earned HTTP and Live.
 toolchain:
   name: .NET SDK
   version: 8.0.408

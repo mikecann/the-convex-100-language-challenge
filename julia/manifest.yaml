@@ -4,10 +4,10 @@ displayName: "Julia"
 rank: 32
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
-  notes: Native Julia implementation of Convex JSON HTTP and the pinned unversioned /api/sync profile. Capability badges stay empty until final-image memory and minimality gates plus root-owned local and hosted black-box suites pass.
+  notes: Native Julia implementation of Convex JSON HTTP and the pinned unversioned /api/sync profile. Shared local and hosted conformance passed, earning HTTP and Live.
 toolchain:
   name: Julia
   version: 1.11.6
@@ -27,7 +27,7 @@ limitations:
   - A controller that stays connected but never reads retires the adapter on a cumulative one-second write deadline, with a stderr diagnostic and a nonzero exit rather than a clean close.
   - Live authentication, WebSocket mutations and actions, optimistic updates, journals, and TransitionChunk assembly are deferred.
   - The client accepts the JSON-safe Convex value subset used by this experiment.
-  - Capability badges remain unearned until root-owned shared verification passes.
+  - Shared local and hosted conformance earned HTTP and Live.
 capabilities:
   - http
   - live

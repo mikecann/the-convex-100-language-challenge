@@ -29,17 +29,16 @@ If any step disagrees, the example fails instead of printing a tidy transcript.
 
 | Capability | State | Notes |
 | --- | --- | --- |
-| HTTP query, mutation, action | Implemented, unverified | `POST /api/{query,mutation,action}` with the `format=json` encoding. |
-| Structured function errors | Implemented, unverified | Convex `errorData` is forwarded untouched, separately from protocol and transport failures. |
-| Bearer token auth | Implemented, unverified | Sent per request, so clearing it takes effect immediately. |
-| TLS | Implemented, unverified | Certificate chain and hostname verified against the system trust store. |
-| Live subscriptions | Implemented, unverified | Sync WebSocket, one owner, reconnect with rehydration suppression. |
+| HTTP query, mutation, action | Verified locally and hosted | `POST /api/{query,mutation,action}` with the `format=json` encoding. |
+| Structured function errors | Verified locally and hosted | Convex `errorData` is forwarded untouched, separately from protocol and transport failures. |
+| Bearer token auth | Verified locally and hosted | Sent per request, so clearing it takes effect immediately. |
+| TLS | Verified locally and hosted | Certificate chain and hostname verified against the system trust store. |
+| Live subscriptions | Verified locally and hosted | Sync WebSocket, one owner, reconnect with rehydration suppression. |
 | Live auth, optimistic updates, WebSocket mutations and actions | Not implemented | Deferred; see the limitations below. |
 | Tagged Convex value types | Not implemented | The JSON-safe subset only. |
 
-No capability badge has been earned. Nothing in this table is a claim about a
-passing conformance run; the badges are calculated only by the shared result
-evaluator from a root-owned verification run, and that has not happened yet.
+The root-owned shared result evaluator passed against local and hosted
+deployments, earning HTTP and Live.
 
 ## The canonical example
 

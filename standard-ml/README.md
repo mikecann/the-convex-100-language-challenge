@@ -10,7 +10,8 @@ Read [`examples/basics/main.sml`](examples/basics/main.sml). It queries a fresh 
 
 ## What works
 
-Everything below is described by the language-local Docker tests that cover it. None of it has been through shared conformance against a Convex deployment, so no capability has been earned. The table describes what each gate checks, not a verdict from a run: the Docker suite has changed since it was last executed end to end, and it needs a fresh no-cache rebuild.
+The language-local Docker tests and shared local and hosted conformance all
+passed. The table describes the evidence that earned HTTP and Live.
 
 | Capability | What proves it |
 | --- | --- |
@@ -203,11 +204,11 @@ The adapter speaks bounded UTF-8 NDJSON protocol v1 over stdin and stdout or one
 
 The bounded-writer audit needs a caller that never reads stdout, which no in-process test can arrange, so it is a separate test-only executable built from `client/tests/flood-adapter.sml`. Nothing selects it at run time, and the build asserts that the shipped adapter carries neither that behaviour nor any string belonging to it.
 
-The final images contain the native executable, the Poly/ML runtime library, OpenSSL 3, certificate roots, `/bin/sh`, and the individual POSIX tools the shared verifier requires. They contain no Poly/ML compiler or frontend, no C compiler, no package or network tools, no delegated runtimes, and no multicall binary, and run as `65532:65532` under the repository's read-only, capability-drop, no-new-privileges, 128 MiB policy. Each runtime image executes its own exact entrypoint during the build: the adapter answers a hello and close exchange, and the example is run unconfigured and must exit 1 with an empty stdout, from that image, as that user, over that filesystem. The example assertion is new in this branch, and no Docker build has yet been run over this source at all, so none of these statements is backed by a run from this tip. Shared local and hosted conformance remain for the root integration pass.
+The final images contain the native executable, the Poly/ML runtime library, OpenSSL 3, certificate roots, `/bin/sh`, and the individual POSIX tools the shared verifier requires. They contain no Poly/ML compiler or frontend, no C compiler, no package or network tools, no delegated runtimes, and no multicall binary, and run as `65532:65532` under the repository's read-only, capability-drop, no-new-privileges, 128 MiB policy. Each runtime image executes its own exact entrypoint during the build: the adapter answers a hello and close exchange, and the example is run unconfigured and must exit 1 with an empty stdout, from that image, as that user, over that filesystem. Docker and shared local and hosted conformance all passed for the reviewed source.
 
 ## Limitations
 
-No shared conformance has been run, so HTTP and Live remain unearned: the fixtures below prove the client's own behaviour, not agreement with a real Convex deployment.
+Shared local and hosted conformance passed, earning HTTP and Live in addition to the language-local fixture evidence below.
 
 Building `linux/amd64` under emulation on an arm64 host intermittently faults inside the C toolchain. `polyc` links the exported heap with `g++`, and `collect2` has died once with an internal segmentation fault; the build retries only that exact signature, up to four attempts, and a genuine Standard ML error still fails on the first. The `busybox` prune in `runtime-base` has also segfaulted once under emulation, which simply needs the image build repeating. Neither fault has reproduced on a native `linux/amd64` builder.
 

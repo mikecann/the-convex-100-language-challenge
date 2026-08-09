@@ -4,10 +4,10 @@ displayName: JavaScript
 rank: 2
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
-  notes: Native JavaScript client using fetch and ws. Capability badges remain empty until root-owned local and hosted conformance evidence passes.
+  notes: Native JavaScript client using fetch and ws. Shared local and hosted conformance earned HTTP and Live.
 toolchain:
   name: Node.js
   version: 22.16.0

@@ -28,12 +28,12 @@ HTTP, RFC 6455, the Live sync state machine, and the client facade.
 
 | Area | Repository state |
 | --- | --- |
-| HTTP queries, mutations, actions, bearer tokens | Implemented in Pike, covered by language-local tests; unverified against a deployment |
-| Live subscriptions, reconnect, replay, recovery | Implemented in Pike, covered by deterministic in-process fixtures; unverified against a deployment |
+| HTTP queries, mutations, actions, bearer tokens | Verified locally and hosted |
+| Live subscriptions, reconnect, replay, recovery | Verified locally and hosted |
 | RFC 6455 client framing, masking, bounded close | Implemented in Pike, asserted byte for byte in tests |
 | NDJSON adapter over stdin/stdout and `ADAPTER_LISTEN` | Implemented, with a local TCP round trip in the Docker test stage |
-| Docker images, final runtime, shared verification | Written but never built or run; no evidence exists |
-| Earned capabilities | None |
+| Docker images, final runtime, shared verification | Passed for the reviewed source |
+| Earned capabilities | HTTP and Live |
 
 ## The basic example
 
@@ -268,8 +268,8 @@ inspection.
 
 ## Limitations
 
-Nothing here has earned HTTP or Live. This is source only: no Docker image has
-been built, no runtime has been executed, and no shared verification has run.
+Docker images, language-local tests, the canonical example, and shared local
+and hosted conformance passed, earning HTTP and Live.
 The base image is pinned by digest and every apt package is pinned to its exact
 bookworm revision taken from the published Debian index, so a revision that has
 since left the archive will fail that build line loudly rather than resolve to a

@@ -4,7 +4,7 @@ displayName: "Idris"
 rank: 93
 selectionTier: curated_backfill
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -32,13 +32,13 @@ adapter:
 limitations:
   - The Docker test stage (build, unit suites and the example run) passes on a
     remote builder for this source checkpoint. Shared and hosted conformance
-    have not been run, so no capability is claimed and badges remain unearned.
+    later passed, earning HTTP and Live.
   - The client is single-threaded and caller-driven; nextUpdate runs the sync owner loop rather than a background thread.
   - Each client retains at most 64 reactive updates and 4 MiB of encoded state across all subscriptions, dropping the globally oldest intermediate state for a slow consumer.
   - The adapter queues at most 128 events, 2 MiB per event and 8 MiB in total, and fails on an absolute output deadline when the controller stops reading.
   - Live authentication, optimistic updates, WebSocket mutations and actions, and TransitionChunk assembly are deferred; a TransitionChunk is treated as profile drift.
   - Values are limited to the documented JSON format; Int64, bytes, and special floats are not claimed.
-  - Capability badges are intentionally empty until shared local and hosted conformance pass.
+  - Shared local and hosted conformance passed, earning HTTP and Live.
 capabilities:
   - http
   - live

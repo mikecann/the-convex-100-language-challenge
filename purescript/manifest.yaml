@@ -4,7 +4,7 @@ displayName: "PureScript"
 rank: 82
 selectionTier: curated_backfill
 implementation:
-  status: attempting
+  status: working
   provenance: transpiled
   version: 0.1.0
   notes: >-
@@ -16,8 +16,8 @@ implementation:
     emulator; that delegation is declared here and in the README rather than
     hidden. OTP supplies sockets, TLS, cryptography, the monotonic clock,
     processes, and the standard streams through three small FFI modules that
-    contain no Convex logic. The source has not yet been compiled or run in
-    Docker, so no capability is claimed and no evidence is recorded.
+    contain no Convex logic. The Docker build and both shared conformance
+    profiles later passed, earning HTTP and Live.
 toolchain:
   name: PureScript purs with the purerl Erlang backend on Erlang/OTP
   version: purs 0.15.14, purerl 0.0.24, OTP 26
@@ -37,9 +37,8 @@ adapter:
     - debugDisconnect
 limitations:
   - >-
-    Source readiness only. Docker has not been run, so compilation, the
-    language-local tests, the final image policy, the canonical example, and
-    shared conformance are all unproven and every capability stays unearned.
+    Docker compilation, language-local tests, final image policy, canonical
+    example, and shared local and hosted conformance all passed.
   - >-
     PureScript compiles to a host language rather than to a runtime of its own.
     This client targets purerl, so the final images contain the BEAM emulator

@@ -206,7 +206,7 @@ Everything above bytes is Janet: HTTP/1.1 request building and bounded response 
 
 ## Limitations
 
-- **No evidence yet.** This is reviewed source. No Docker image has been built, no test has executed, and no shared conformance has run, so every capability is unearned and the manifest lists none.
+- **Verification completed.** Docker tests plus shared local and hosted conformance earned HTTP and Live.
 - **Binding, not pure Janet.** TCP and TLS come from a local C module over OpenSSL, because Janet's core has no TLS. Everything else is Janet.
 - **Live scope.** Live covers query subscriptions. Live authentication, mutations and actions over the WebSocket, optimistic updates, journals, read-your-own-write commit timestamps, and `TransitionChunk` assembly are deferred. A `TransitionChunk` is treated as profile drift: the socket is retired and the subscription recovers on the next connection rather than guessing at the reassembly.
 - **Values.** Convex's JSON-safe subset is supported. Tagged Convex value encodings are not converted into richer Janet types.

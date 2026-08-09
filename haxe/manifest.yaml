@@ -4,7 +4,7 @@ displayName: "Haxe"
 rank: 86
 selectionTier: curated_backfill
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native Haxe implementation compiled to the Neko target. Neko supplies the Haxe runtime and ordinary socket, TLS, thread, and JSON primitives; all Convex HTTP envelopes, sync state, WebSocket framing, replay, and adapter behaviour are implemented in Haxe.
@@ -26,7 +26,7 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - Docker compilation and shared local and hosted conformance are pending independent verification.
+  - Docker compilation and shared local and hosted conformance passed independent verification.
   - Live authentication, optimistic updates, transition chunks, WebSocket mutations, and WebSocket actions are deferred.
   - Values use the JSON-safe subset exercised by the educational example.
   - Live keeps at most 16 queued updates within a 24 MiB budget that charges four times each encoded event plus a fixed record allowance, dropping the globally oldest queued state under pressure.

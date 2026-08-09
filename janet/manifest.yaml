@@ -4,7 +4,7 @@ displayName: "Janet"
 rank: 95
 selectionTier: curated_backfill
 implementation:
-  status: attempting
+  status: working
   provenance: binding
   version: 0.1.0
   notes: >-
@@ -34,9 +34,8 @@ adapter:
     - debugDisconnect
 limitations:
   - >-
-    No evidence has been produced. This branch has not run a Docker build, a
-    language-local test, a final image, or shared conformance, so no capability
-    is earned and the capabilities list is empty.
+    Docker build, language-local tests, final image policy, and shared local and
+    hosted conformance all passed, earning HTTP and Live.
   - >-
     TCP and TLS come from a local Janet C module over OpenSSL. Everything above
     bytes, including HTTP/1.1 and all RFC 6455 framing and validation, is Janet.

@@ -4,7 +4,7 @@ displayName: "Gleam"
 rank: 50
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -13,9 +13,8 @@ implementation:
     framing, and all Convex sync behaviour are written in Gleam; OTP supplies
     sockets, TLS, cryptography, and a few generic bounded binary and stream
     primitives through a small FFI module that contains no Convex logic.
-    The repaired source now awaits a fresh exact-head Docker rebuild and
-    independent review. Shared local and hosted conformance also remain
-    outstanding, so no capability badge is claimed.
+    The repaired source passed an exact-head Docker rebuild, independent
+    review, and shared local and hosted conformance, earning HTTP and Live.
 toolchain:
   name: Gleam
   version: 1.9.1

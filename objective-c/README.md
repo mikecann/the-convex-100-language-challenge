@@ -146,4 +146,4 @@ The final images keep the root filesystem read-only. Their `/tmp` points at Dock
 
 Live delivery keeps the newest 16 updates per subscription and also enforces a conservative shared 8 MiB encoded-byte budget. The adapter caps active subscriptions at 16. Controller output has one owner and a 500 ms write deadline, so a stopped stdin or TCP reader cannot leave generation invalidation, unsubscribe, replacement, EOF cleanup, or close blocked behind output.
 
-Live authentication, optimistic updates, tagged Convex values, WebSocket mutations/actions, and `TransitionChunk` assembly are intentionally deferred. The sync endpoint is an undocumented pinned profile and may drift. Capability badges remain empty until the root integration task runs the shared local and hosted evidence gates from the reviewed commit.
+Live authentication, optimistic updates, tagged Convex values, WebSocket mutations/actions, and `TransitionChunk` assembly are intentionally deferred. The sync endpoint is an undocumented pinned profile and may drift. Shared local and hosted conformance earned HTTP and Live.

@@ -4,10 +4,10 @@ displayName: "Racket"
 rank: 88
 selectionTier: curated_backfill
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
-  notes: Native Racket JSON HTTP and RFC 6455 Live client. Capability badges remain empty until root-owned local and hosted conformance pass.
+  notes: Native Racket JSON HTTP and RFC 6455 Live client. Shared local and hosted conformance earned HTTP and Live.
 toolchain:
   name: Racket BC conservative GC
   version: "8.10"

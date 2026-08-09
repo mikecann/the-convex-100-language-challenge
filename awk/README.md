@@ -30,8 +30,8 @@ the example fails rather than printing a transcript it did not earn.
 
 ## What works
 
-Capability badges are awarded only by the shared black-box controller, and this
-client has not been through it yet.
+The shared black-box controller passed against local and hosted deployments,
+earning HTTP and Live.
 
 | Capability | State | Notes |
 | --- | --- | --- |
@@ -39,7 +39,7 @@ client has not been through it yet.
 | HTTP query, mutation, action | Implemented, local tests pass | Verified by shared local and hosted conformance |
 | Live subscriptions | Implemented, local tests pass | Verified by shared local and hosted conformance |
 | Language-local tests | Passing | Seven suites drive the real socket path against an Awk fixture peer inside the `test` image. |
-| Earned capability badges | None | Nothing is claimed until `./run verify awk` and `./run verify-hosted awk` pass. |
+| Earned capability badges | HTTP and Live | Shared local and hosted conformance passed. |
 
 ## The canonical example
 
@@ -322,9 +322,8 @@ so the cases are deterministic rather than timed.
 
 `./run test awk` passes: the gawk source build, the extension, every
 language-local suite, and the runtime/example image policy probes all run
-green inside Docker. `./run verify-example awk`, `./run verify awk`, and
-`./run verify-hosted awk` against a real deployment have not been run yet, so
-no HTTP or Live capability badge is claimed.
+green inside Docker. The canonical example plus shared local and hosted
+conformance also passed, earning HTTP and Live.
 
 - The gawk tarball is pinned to 5.3.2, not the newer 5.4.x series. A
   from-source 5.4.1 build was tried first and miscompiled a common `if`

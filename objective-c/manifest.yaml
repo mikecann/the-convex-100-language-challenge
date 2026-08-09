@@ -4,7 +4,7 @@ displayName: "Objective-C"
 rank: 18
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.2.0
   notes: Native Objective-C Foundation API and ownership on GNUstep/libobjc. A single private owner implements Convex HTTP and pinned Live state, using checksum-pinned libcurl 8.21.0 for HTTP/TLS/WebSocket transport and json-c 0.16 for JSON. The read-only runtime maps /tmp to Docker's bounded /dev/shm tmpfs for GNUstep startup lock storage.

@@ -4,10 +4,10 @@ displayName: "Perl"
 rank: 23
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
-  notes: Native Perl HTTP client and RFC 6455 sync-profile implementation. Capability badges remain empty until coordinator-owned shared evidence passes.
+  notes: Native Perl HTTP client and RFC 6455 sync-profile implementation. Shared local and hosted conformance earned HTTP and Live.
 toolchain:
   name: Perl
   version: 5.42.0

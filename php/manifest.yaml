@@ -4,7 +4,7 @@ displayName: "PHP"
 rank: 7
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native PHP streams implementation of documented JSON HTTP and the pinned Convex sync profile; no official Convex client is used.

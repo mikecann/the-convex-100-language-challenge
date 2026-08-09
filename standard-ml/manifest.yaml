@@ -4,7 +4,7 @@ displayName: "Standard ML"
 rank: 54
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -31,9 +31,8 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - No Docker build has been run over this source since the review repairs, so
-    no gate here is backed by a run; shared local and hosted black-box
-    conformance have never been run at all. Every capability remains unearned.
+  - Docker build, language-local gates, final image policy, and shared local
+    and hosted black-box conformance passed, earning HTTP and Live.
   - Poly/ML ships no formatter, so the test image runs a Standard ML style and
     lint gate over every checked-in source in this directory instead of
     claiming a format step that does not exist.

@@ -4,7 +4,7 @@ displayName: "ReScript"
 rank: 98
 selectionTier: curated_backfill
 implementation:
-  status: attempting
+  status: working
   provenance: transpiled
   version: 0.1.0
   notes: >-
@@ -13,7 +13,7 @@ implementation:
     every Convex-specific decision is ReScript. The Docker test target (format
     check, compile, unit and conformance tests, canonical example, adapter
     protocol smoke test) passes on native linux/amd64; verify and verify-hosted
-    have not run, so no capability is claimed.
+    later passed, earning HTTP and Live.
 toolchain:
   name: ReScript and Node.js
   version: ReScript 11.1.4, Node.js 22.16.0
@@ -28,7 +28,7 @@ adapter:
   entrypoint: /usr/local/bin/convex-adapter
   adapterOnlyCommands: [debugDisconnect]
 limitations:
-  - The Docker test target (format check, compile, language-local unit and conformance tests, canonical example, adapter protocol smoke test) passes on native linux/amd64; shared local and hosted conformance have not run yet, so no capability badge is claimed.
+  - The Docker test target (format check, compile, language-local unit and conformance tests, canonical example, adapter protocol smoke test) passes on native linux/amd64; shared local and hosted conformance later passed, earning HTTP and Live.
   - >-
     ReScript compiles to JavaScript and has no other execution target, so
     the runtime images carry node as the declared target runtime. Shared

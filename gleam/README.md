@@ -29,11 +29,9 @@ room's shared counter from `0` to `1`:
 4. receive the new value over Live,
 5. print a single verification line once HTTP and Live agree.
 
-A previous checkpoint built both minimal linux/amd64 runtime images and ran the
-exact example, but independent review rejected that source. The repaired source
-now needs a fresh Docker build, language-local tests, final-image checks, and
-local and hosted black-box conformance. No capability has been earned or
-claimed.
+The repaired source passed a fresh Docker build, language-local tests,
+final-image checks, independent review, and local and hosted black-box
+conformance, earning HTTP and Live.
 
 ## What works
 

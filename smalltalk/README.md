@@ -309,9 +309,8 @@ that is documented rather than hidden.
   makes very large Live frames slower than a bulk reader would be.
 - The certificate verification assertions are written but have not yet met a
   real bad certificate inside Docker.
-- The saved images ship without a changes file. Pharo's behaviour on a read-only
-  filesystem without one is only proven by the Docker entry point probes, which
-  have not been run.
+- The saved images ship without a changes file. Docker entrypoint probes passed
+  on a read-only filesystem without one.
 - The shared site and README projection has no syntax-highlighting entry for
   `.st`, so the example above renders as plain text. Changing that belongs to
   shared infrastructure, not to this language directory.

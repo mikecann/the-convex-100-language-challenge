@@ -4,7 +4,7 @@ displayName: "Tcl"
 rank: 46
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native Tcl client using Tcllib HTTP, JSON, and TLS transport with a Tcl-owned RFC 6455 parser. Convex envelopes, HTTP status classification, TLS peer identity checking, transport deadlines, and the pinned sync state machine are Tcl.
@@ -28,11 +28,11 @@ adapter:
 limitations:
   - Live authentication, optimistic updates, WebSocket mutations/actions, journals, and TransitionChunk assembly are deferred.
   - The educational API covers Convex's JSON-safe values. Full tagged Convex values, including Int64 and bytes, are deferred.
-  - Capability badges remain empty until the root-owned local and hosted conformance gates pass.
+  - Shared local and hosted conformance earned HTTP and Live.
   - Adapter output uses a newest-16 queue with a 6 MiB global byte budget, including NDJSON newlines and conservative Tcl/channel overhead. It reserves four event slots and 64 KiB for control events, and retains accepted writes until Tcl drains them without duplication.
   - HTTP responses are bounded to 2 MiB and abandoned while they arrive, from the declared Content-Length or the accumulated bytes, with one 64 KiB block of overshoot. A chunked response is bounded by its current chunk because Tcl's http package reads a complete chunk before reporting progress.
   - TclTLS 1.7.22 verifies the certificate chain but not the host name, so this client checks the peer identity itself from the verify callback and refuses a connection when the certificate names nothing it can check. Real certificates are first exercised by hosted verification.
-  - Language-local loopback tests cover five real reconnects, strict uint32 state and query IDs, QueryFailed shape and rollback, structured Live recovery, ownership barriers, fragmented and timed-out partial frames, structured 560/500/400 HTTP envelopes, streaming response bounds, TLS chain and hostname refusals against a real handshake, absolute connect/dribble/write deadlines, pre-allocation frame limits, strict adapter command schemas, and genuine stopped-reader pending-output, memory, ordering, and close bounds. Root-owned local and hosted conformance remain required before capabilities can be awarded.
+  - Language-local loopback tests cover five real reconnects, strict uint32 state and query IDs, QueryFailed shape and rollback, structured Live recovery, ownership barriers, fragmented and timed-out partial frames, structured 560/500/400 HTTP envelopes, streaming response bounds, TLS chain and hostname refusals against a real handshake, absolute connect/dribble/write deadlines, pre-allocation frame limits, strict adapter command schemas, and genuine stopped-reader pending-output, memory, ordering, and close bounds. Shared local and hosted conformance passed, earning HTTP and Live.
 capabilities:
   - http
   - live

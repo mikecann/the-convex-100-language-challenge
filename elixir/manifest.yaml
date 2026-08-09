@@ -4,10 +4,10 @@ displayName: Elixir
 rank: 34
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
-  notes: Native documented JSON HTTP client and native OTP process targeting the pinned unversioned Convex Live profile. Capability badges remain empty until shared local and hosted evidence passes.
+  notes: Native documented JSON HTTP client and native OTP process targeting the pinned unversioned Convex Live profile. Shared local and hosted conformance earned HTTP and Live.
 toolchain:
   name: Elixir / Erlang OTP
   version: 1.17.3 / 26.2.5.15

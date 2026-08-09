@@ -4,10 +4,10 @@ displayName: "Dart"
 rank: 15
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
-  notes: Native Dart HTTP and WebSocket client. Capability badges remain empty until the coordinator's local and hosted black-box evidence passes.
+  notes: Native Dart HTTP and WebSocket client. Shared local and hosted conformance earned HTTP and Live.
 toolchain:
   name: Dart SDK
   version: 3.7.2

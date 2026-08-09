@@ -4,10 +4,10 @@ displayName: "Prolog"
 rank: 30
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.2.0
-  notes: Native SWI-Prolog HTTP and WebSocket implementation. Capability badges remain unearned until root-owned shared evidence passes.
+  notes: Native SWI-Prolog HTTP and WebSocket implementation. Shared local and hosted conformance earned HTTP and Live.
 toolchain:
   name: SWI-Prolog
   version: 9.2.8

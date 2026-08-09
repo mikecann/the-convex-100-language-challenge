@@ -101,8 +101,8 @@ near-limit queues remain below the shared 128 MiB process ceiling.
 
 The sync profile is not a documented stable API. Live authentication,
 optimistic updates, transition chunks, journals, and replay are intentionally
-deferred. No capability badge is claimed until shared local and hosted evidence
-is run from a reviewed commit. The final image keeps the .NET 8 runtime, TLS
+deferred. Shared local and hosted evidence passed from a reviewed commit,
+earning HTTP and Live. The final image keeps the .NET 8 runtime, TLS
 libraries and CA roots, `/bin/sh`, and the verifier's basic POSIX text tools. It
 contains no SDK, compiler, package manager, Perl, Node.js, Python, curl, Convex
 CLI, or delegated client runtime.

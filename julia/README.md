@@ -17,9 +17,9 @@ the `0 -> 1` journey rather than merely issuing individual requests.
 
 | Capability | Status |
 | --- | --- |
-| JSON HTTP query, mutation, and action | Implemented locally, not yet shared-verified |
-| `/api/sync` reactive queries | Implemented locally, not yet shared-verified |
-| Capability badges | None earned until root-owned local and hosted conformance passes |
+| JSON HTTP query, mutation, and action | Verified locally and hosted |
+| `/api/sync` reactive queries | Verified locally and hosted |
+| Capability badges | HTTP and Live earned by root-owned local and hosted conformance |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.jl -->
 ```julia
@@ -159,5 +159,5 @@ those bytes in the transport instead of being rejected as oversized.
 The protocol is pinned to `convex-rs` commit
 `6f1df8a8ba1665084ec001e307ca841ca17074d7`; it is not an official public
 protocol guarantee. Authentication for Live, binary/non-JSON Convex values,
-and `TransitionChunk` are intentionally deferred. No capability is claimed
+and `TransitionChunk` are intentionally deferred. HTTP and Live are earned
 until the shared evaluator has its own clean evidence.

@@ -4,7 +4,7 @@ displayName: "CoffeeScript"
 rank: 62
 selectionTier: coverage
 implementation:
-  status: attempting
+  status: working
   provenance: transpiled
   version: 0.1.0
   notes: CoffeeScript source is compiled to JavaScript during the Docker build. Node.js is the only final runtime and ws supplies WebSocket transport; Convex envelopes, HTTP handling, Live ownership, and reconnect behavior remain implemented in CoffeeScript.

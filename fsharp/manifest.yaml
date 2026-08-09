@@ -4,7 +4,7 @@ displayName: "F#"
 rank: 44
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native F#/.NET 8 implementation using built-in HttpClient, System.Text.Json, and ClientWebSocket. Badges remain empty until root-owned shared evidence passes.

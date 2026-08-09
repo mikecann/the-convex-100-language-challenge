@@ -4,7 +4,7 @@ displayName: "Rust"
 rank: 11
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: Native Rust HTTP client and pinned unversioned WebSocket sync profile.

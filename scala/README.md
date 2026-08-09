@@ -89,8 +89,8 @@ object Main:
 ```
 
 `test` compiles Scala and runs language-local checks inside Docker. `build`
-creates minimal amd64 runtime images. The latter two commands are coordinator-
-owned shared evidence, so no capability has been awarded here.
+creates minimal amd64 runtime images. The coordinator-owned local and hosted
+shared evidence commands passed, earning HTTP and Live.
 
 ## Protocol notes
 

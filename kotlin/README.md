@@ -20,7 +20,7 @@ idempotent mutation, and confirms the Live update agrees with the response.
 | Native HTTP query, mutation, and action implementation | Verified by shared local and hosted conformance |
 | Native Live query implementation | Verified by shared local and hosted conformance |
 | Docker test and final runtime image | Verified by shared local and hosted conformance |
-| Earned capability badges | None until shared local and hosted verification passes |
+| Earned capability badges | HTTP and Live |
 | Live authentication, WebSocket mutations/actions, optimistic updates, replay | Deferred |
 
 ## Basic example

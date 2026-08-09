@@ -4,10 +4,10 @@ displayName: "Odin"
 rank: 87
 selectionTier: curated_backfill
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
-  notes: Native Odin protocol implementation using Odin's checked-in libcurl binding and a private, regression-tested connect-only pending-frame patch for ordinary HTTP, TLS, and WebSocket transport. Shared verification is pending, so capabilities remain unearned.
+  notes: Native Odin protocol implementation using Odin's checked-in libcurl binding and a private, regression-tested connect-only pending-frame patch for ordinary HTTP, TLS, and WebSocket transport. Shared local and hosted conformance earned HTTP and Live.
 toolchain:
   name: Odin
   version: dev-2026-08
@@ -29,8 +29,8 @@ limitations:
   - The Docker test stage (build, the curl connect-only patch's own regression
     test, unit tests, the example run, and the process-driven adapter
     conformance script) passes on a remote builder for this source
-    checkpoint. Shared and hosted conformance have not been run, so no
-    capability is claimed and badges remain unearned.
+    checkpoint. Shared and hosted conformance later passed, earning HTTP and
+    Live.
   - Live authentication, WebSocket mutations/actions, optimistic updates, and mutation replay are deferred.
   - TransitionChunk assembly is deferred and treated as protocol drift that reconnects.
   - Public values are bounded strict JSON text so callers choose their own Odin application type.

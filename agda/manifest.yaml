@@ -4,7 +4,7 @@ displayName: "Agda"
 rank: 94
 selectionTier: curated_backfill
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -33,7 +33,7 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - The Docker test target (toolchain build, type-checking, unit, conformance, and TLS tests) passes on native linux/amd64; shared local and hosted conformance have not run yet, so no capability badge is claimed.
+  - The Docker test target (toolchain build, type-checking, unit, conformance, and TLS tests) passes on native linux/amd64; shared local and hosted conformance later passed, earning HTTP and Live.
   - Live authentication, optimistic updates, WebSocket mutations, WebSocket actions, journals, and TransitionChunk assembly are deferred.
   - Live values cover Convex's JSON-safe subset; tagged Convex value conversions are deferred.
   - JSON input is limited to 1 MiB, 64 nesting levels, and 4096 structural nodes; HTTP responses and Live messages share the same 1 MiB ceiling.

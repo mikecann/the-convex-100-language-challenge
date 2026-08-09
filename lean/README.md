@@ -10,14 +10,15 @@ Read [`examples/basics/Main.lean`](examples/basics/Main.lean). It queries a fres
 
 ## What works
 
-Nothing in this checkpoint has been compiled or run: the source is complete, but no Docker build, no language-local test, and no shared conformance run has been executed against it. The table below is therefore a statement of intent and of what the code implements, not of earned evidence.
+Docker build, language-local tests, canonical example, and shared local and
+hosted conformance passed, earning HTTP and Live.
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, and actions | Implemented in source, execution unverified |
-| Bearer authentication and structured function errors | Implemented in source, execution unverified |
-| Live initial values, external updates, and query-error recovery | Implemented in source, execution unverified |
-| Five reconnects with hydration, generation barriers, and bounded delivery | Implemented in source, execution unverified |
+| HTTP queries, mutations, and actions | Verified locally and hosted |
+| Bearer authentication and structured function errors | Verified locally and hosted |
+| Live initial values, external updates, and query-error recovery | Verified locally and hosted |
+| Five reconnects with hydration, generation barriers, and bounded delivery | Verified locally and hosted |
 | Convex value types beyond the JSON-safe subset | Not implemented |
 | Live authentication, WebSocket mutations, optimistic updates | Not implemented |
 
@@ -191,4 +192,4 @@ The final images contain the two native executables, the Lean runtime libraries,
 
 ## Limitations
 
-Execution is unverified: this is a source checkpoint. Live authentication, optimistic updates, mutations and actions over the WebSocket, journals, and `TransitionChunk` assembly are deferred; a `TransitionChunk` is treated as recoverable protocol drift that retires the connection rather than publishing partial state. HTTP opens one connection per request and closes it, so persistent and pipelined connections are deferred. Values cover Convex's JSON-safe subset; tagged Convex value encodings are not converted into richer Lean types. Because the client is single-threaded by design, a blocking HTTP call does not advance the Live loop while it is in flight — acceptable for a demonstration, and stated rather than hidden. Input beyond the documented line, JSON, subscription, delivery, or output bounds is rejected or coalesced instead of risking unbounded memory. The manifest deliberately leaves capability badges empty until root-owned shared evidence passes from a clean reviewed commit.
+Live authentication, optimistic updates, mutations and actions over the WebSocket, journals, and `TransitionChunk` assembly are deferred; a `TransitionChunk` is treated as recoverable protocol drift that retires the connection rather than publishing partial state. HTTP opens one connection per request and closes it, so persistent and pipelined connections are deferred. Values cover Convex's JSON-safe subset; tagged Convex value encodings are not converted into richer Lean types. Because the client is single-threaded by design, a blocking HTTP call does not advance the Live loop while it is in flight. Input beyond the documented line, JSON, subscription, delivery, or output bounds is rejected or coalesced instead of risking unbounded memory. Shared local and hosted conformance earned HTTP and Live from a clean reviewed commit.
