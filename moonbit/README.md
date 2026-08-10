@@ -1,31 +1,147 @@
-# Convex from MoonBit
+<img src="logo.png" alt="MoonBit logo" width="120">
+<!-- Logo source: https://www.moonbitlang.com/img/logo.png -->
 
-This is a small Convex client written in MoonBit and compiled with MoonBit's
-native backend. It talks to a Convex deployment two ways: it calls queries,
-mutations, and actions over Convex's documented HTTP function endpoints, and it
-subscribes to reactive queries over the Convex sync WebSocket, so a change made
-by anyone shows up without polling.
+# MoonBit
 
-It is educational and unofficial. It is not a Convex SDK, it is not published to
-any registry, and it is not supported. It exists to answer one question - can
-this language hold a useful Convex client? - and to show the answer as readable
-source.
+[MoonBit](https://www.moonbitlang.com/) is a young, general-purpose language
+and toolchain first released publicly in 2023. It began as a WebAssembly-first
+language for cloud and edge software, then grew JavaScript, native, and LLVM
+backends. Its Rust-like pattern matching and static types sit alongside a
+simpler, Go-influenced style, while memory management depends on the selected
+backend. The project is still in beta-preview, so it occupies an interesting
+niche for developers willing to explore a fast-moving language and its
+multi-backend toolchain.
 
-## Start here
+This repository uses MoonBit's native backend to build a real Convex client.
+It is an educational, unofficial demonstration, not a production SDK, not a
+published package, and not supported by Convex or the MoonBit team.
 
-Read [`examples/basics/main.mbt`](examples/basics/main.mbt). It takes one room
-from `0` to `1` and makes every surface agree about it:
+## Getting Started
 
-1. read the count over HTTP,
-2. open a Live subscription **before** changing anything, so the update cannot
-   be missed,
-3. apply a mutation with an idempotency key,
-4. wait for the reactive update the mutation caused,
-5. print the verified journey only once all of them agree.
+Start with [`examples/basics/main.mbt`](examples/basics/main.mbt). It reads a
+fresh counter over HTTP, subscribes before changing it, applies an idempotent
+mutation, waits for the Live update, and checks that every result agrees on the
+same `0 -> 1` journey.
 
-If any step disagrees, the example fails instead of printing a tidy transcript.
+From the repository root, Docker builds the exact canonical example and runs
+it against a unique room on the approved local test deployment:
 
-## What works
+```sh
+./run verify-example moonbit
+```
+
+Nothing from the MoonBit toolchain needs to be installed on your host.
+
+## Interesting Parts
+
+### A query returns honest JSON, not generated application types
+
+**TypeScript with React**
+
+```tsx
+import { api } from "../convex/_generated/api";
+import { useQuery } from "convex/react";
+
+export function QueryCounter() {
+  const state = useQuery(api.demo.state, { room: "moonbit-readme" });
+  if (state === undefined) return <p>Loading...</p>;
+
+  return <p>{state.count}</p>; // `state` and `count` are type-safe here.
+}
+```
+
+**MoonBit**
+
+```moonbit
+async fn query_counter() -> Unit {
+  guard @env.get_env_var("CONVEX_URL") is Some(deployment_url) else {
+    fail("CONVEX_URL is required")
+  }
+  guard deployment_url.length() > 0 else { fail("CONVEX_URL must not be empty") }
+
+  let arguments : Map[String, Json] = Map::new()
+  arguments["room"] = Json::string("moonbit-readme") // Build the Convex args object.
+
+  @convex.with_client(deployment_url, client => {
+    // This is one HTTP request, so it does not stay subscribed.
+    let result = client.query("demo:state", Json::object(arguments))
+    let count = @convex.integer_value(
+      @convex.required_field(result.value, "count", "demo:state"),
+      "demo:state count",
+    )
+    println(count) // The checked decoder has proved this is a whole Int64.
+  })
+}
+```
+
+Convex's React hooks use generated TypeScript types from the backend function.
+This small client deliberately supports the JSON-safe value subset instead, so
+MoonBit receives `Json` and validates fields at the application boundary. The
+helper accepts `0` and `0.0` as the same integer, but rejects fractions, strings,
+non-finite values, and overflow instead of silently coercing them.
+
+### React owns reactivity; this client gives you the subscription
+
+**TypeScript with React**
+
+```tsx
+import { api } from "../convex/_generated/api";
+import { useQuery } from "convex/react";
+
+export function LiveCounter() {
+  const state = useQuery(api.demo.state, { room: "moonbit-live-readme" });
+  if (state === undefined) return <p>Loading...</p>;
+
+  // React keeps the subscription alive and rerenders when `count` changes.
+  return <p>{state.count}</p>;
+}
+```
+
+**MoonBit**
+
+```moonbit
+async fn watch_counter() -> Unit {
+  guard @env.get_env_var("CONVEX_URL") is Some(deployment_url) else {
+    fail("CONVEX_URL is required")
+  }
+  guard deployment_url.length() > 0 else { fail("CONVEX_URL must not be empty") }
+
+  let arguments : Map[String, Json] = Map::new()
+  arguments["room"] = Json::string("moonbit-live-readme")
+
+  @convex.with_client(deployment_url, client => {
+    // The caller owns this subscription and decides when to read each update.
+    let subscription = client.subscribe("demo:state", Json::object(arguments))
+
+    guard subscription.next(timeout_ms=20000) is Some(initial) else {
+      fail("initial Live value timed out")
+    }
+    guard initial.value is Some(initial_value) else {
+      fail("initial Live query failed")
+    }
+    println(initial_value.stringify()) // The value current at subscription time.
+
+    guard subscription.next(timeout_ms=20000) is Some(changed) else {
+      fail("next Live value timed out")
+    }
+    guard changed.value is Some(changed_value) else {
+      fail("updated Live query failed")
+    }
+    println(changed_value.stringify()) // A later change, pushed without polling.
+
+    client.unsubscribe(subscription) // Retire it explicitly when finished.
+  })
+}
+```
+
+MoonBit supports asynchronous functions and callbacks. The blocking
+`Subscription::next` shape is a choice made by this command-line client, not a
+language limitation. It makes ownership and backpressure visible: React hides
+the subscription lifecycle behind component mounting and rerenders, while this
+caller waits for and disposes each stream itself. See the complete sequencing
+and failure checks in the [canonical example](examples/basics/main.mbt).
+
+## Status
 
 | Capability | State | Notes |
 | --- | --- | --- |
@@ -34,13 +150,13 @@ If any step disagrees, the example fails instead of printing a tidy transcript.
 | Bearer token auth | Verified locally and hosted | Sent per request, so clearing it takes effect immediately. |
 | TLS | Verified locally and hosted | Certificate chain and hostname verified against the system trust store. |
 | Live subscriptions | Verified locally and hosted | Sync WebSocket, one owner, reconnect with rehydration suppression. |
-| Live auth, optimistic updates, WebSocket mutations and actions | Not implemented | Deferred; see the limitations below. |
+| Live auth, optimistic updates, WebSocket mutations and actions | Not implemented | Deferred; see the known issues below. |
 | Tagged Convex value types | Not implemented | The JSON-safe subset only. |
 
 The root-owned shared result evaluator passed against local and hosted
 deployments, earning HTTP and Live.
 
-## The canonical example
+## Example
 
 This block is generated from the runnable source file, so the repository, the
 README, and the website always show the same code.
@@ -237,137 +353,66 @@ async fn main {
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verifying it in Docker
+## Implementation Notes
 
-Everything builds and runs inside Docker; nothing is installed on the host.
+This is a native MoonBit implementation, built with MoonBit
+`0.10.6+80dc50f24`. The ordinary networking pieces come from
+`moonbitlang/async` 0.20.3: TCP, TLS with system certificate and hostname
+verification, HTTP/1.1, and WebSocket framing. The Convex request envelopes,
+error categories, Live query tracking, reconnect behaviour, and value decoding
+are implemented in MoonBit rather than delegated to another Convex client.
 
-```sh
-./run test moonbit
-```
+`with_client` uses MoonBit's structured concurrency to keep the Live worker
+inside the client's lifetime, including when the callback fails. HTTP calls are
+fresh request/response exchanges. Function failures retain Convex's structured
+`errorData`, while malformed responses and network failures remain distinct
+protocol and transport errors.
 
-Formats, type checks, and runs the MoonBit test suite, then builds the
-conformance adapter and the canonical example. The suite includes hostile
-fixtures: HTTP peers that answer with the wrong status, an oversized body,
-invalid UTF-8, and a truncated envelope; WebSocket peers that answer the
-handshake with the wrong `Sec-WebSocket-Accept`, send a binary frame, send a
-message larger than the assembly limit, stop dead halfway through a frame, and
-never stop talking at all. A recording HTTP peer reads the raw request to prove
-that a configured token reaches the wire byte for byte as
-`Authorization: Bearer <token>` and that clearing it removes the header rather
-than blanking it. The same stage proves the real adapter binary stays far below
-the shared 128 MiB limit while a controller stops reading and near-maximum
-values keep arriving.
+Live is more involved. One worker exclusively owns the socket, connection
+state, and query-set version. Other tasks submit commands to it, which avoids
+concurrent reads or writes changing the order of reactive state. Reconnects
+resend active subscriptions, suppress an unchanged replay, and preserve a real
+change. Each subscription has a bounded queue; when a slow consumer fills it,
+the oldest value is dropped and the drop count remains visible.
 
-Peer-side checks are recorded and asserted after the client finishes, not
-asserted inside the fixture. A scripted peer has to tolerate the client tearing
-its connection down, and that tolerance would otherwise swallow a failed
-assertion, leaving a test that cannot fail.
+The client supports only MoonBit's native target because the selected async
+transport does. Its Docker build compiles through the native backend, then
+copies the executable and its runtime library closure into a pruned image that
+runs as an unprivileged user. The canonical example is a release build, so the
+test-only `debugDisconnect` reconnect hook cannot be included in it.
 
-```sh
-./run verify-example moonbit
-```
-
-Builds the minimal example image and runs the exact
-`/usr/local/bin/convex-example` entrypoint against a unique room on the approved
-local deployment, comparing stdout to the shared expected transcript.
+The language-local and shared checks have different jobs:
 
 ```sh
-./run verify moonbit
+./run test moonbit          # Format, type-check, test, and compile in Docker.
+./run verify moonbit        # Add local example, image-policy, and conformance checks.
+./run verify-hosted moonbit # Repeat against the hosted protocol-drift target.
+./run verify-all moonbit    # Run both deployment profiles from one build.
 ```
 
-Adds the final-image policy checks and the shared black-box conformance run:
-the same NDJSON adapter protocol every other language implements, driven by the
-shared controller over TCP.
-
-```sh
-./run verify-hosted moonbit
-./run verify-all moonbit
-```
-
-Repeat the same checks against the dedicated hosted drift target, and run both
-deployment profiles from one build.
-
-## Conformance and protocol notes
-
-The conformance executable under
+The adapter under
 [`client/tests/conformance/`](client/tests/conformance/) is test infrastructure,
-not client code. It implements NDJSON adapter protocol v1, reserves stdout for
-protocol events, sends diagnostics to stderr, and calls the real client for
-every operation. It serves stdin/stdout by default and a single controller
-connection over TCP when `ADAPTER_LISTEN` is set.
+not part of the educational client API. It lets the shared black-box controller
+drive this client in the same way as every other language. The Live encoding it
+exercises is an unpublished protocol profile pinned to an upstream revision in
+`manifest.yaml`; the pin is evidence for this demonstration, not a promise that
+the protocol is stable.
 
-- **One writer.** Command handlers and subscription relays produce events
-  concurrently; exactly one task writes them. The queue is bounded in bytes as
-  well as in count, so a controller that stops reading applies backpressure
-  instead of growing the process.
-- **No stale events.** Unsubscribing, or re-using a subscription id, invalidates
-  the old relay before the acknowledgement is even queued, and the writer checks
-  the subscription generation again before a line reaches the socket. A relay
-  paused anywhere between those points cannot publish across the
-  acknowledgement.
-- **Bounded input.** Commands are parsed incrementally. A line longer than
-  4 MiB is refused with a structured error and skipped without being retained,
-  and the stream resynchronises on the next newline.
-- **`debugDisconnect`** is declared in `manifest.yaml` under
-  `adapter.adapterOnlyCommands`. It is compiled into debug builds only. The
-  canonical example ships from a release build, and the Docker build proves the
-  hook is genuinely absent there by asserting that a release build of the
-  adapter fails to compile.
+## Known Issues
 
-The sync protocol is not a published, versioned API. `manifest.yaml` pins the
-upstream revision this encoding was read from under `syncProfile`. Do not read
-this client as evidence that the protocol is stable or officially supported.
-
-Live behaviour worth knowing:
-
-- One worker owns the socket, the query-set version counter, and the reconnect
-  schedule. Everything else sends it commands and waits for an acknowledgement.
-- Every connection starts from query-set version zero and resends the active
-  `Add` operations.
-- A transition whose start version does not chain onto the local version means
-  an update was lost, so the connection is abandoned and rebuilt rather than
-  applied from a guess.
-- After a reconnect, a replayed value identical to the one the consumer already
-  holds is suppressed; a replayed value after a failure is always delivered.
-- `connectionCount`, `lastCloseReason`, and `maxObservedTimestamp` are carried
-  into each `Connect`. Only a connection that completed its handshake is
-  numbered, so a refused attempt does not tell the server about a connection it
-  never saw. A close reason can quote text the peer chose, so an implausibly
-  long one is replaced rather than reflected back at the deployment.
-- Reconnect backoff resets after a successful handshake or a valid server
-  transition, so a healthy connection does not inherit a delay an earlier bad
-  run earned.
-- Writes, connects, command handoff, and command acknowledgements all run under
-  absolute deadlines, so an idle, chatty, or half-frame-stalled peer cannot make
-  `unsubscribe` or `close` hang. The tests assert those bounds rather than
-  trusting the fixture peer to close politely.
-
-## Limitations and deferred behaviour
-
-- Live authentication is deferred. `setAuth` affects HTTP calls only.
-- Optimistic updates, WebSocket mutations, and WebSocket actions are deferred.
-  Mutations and actions always use the HTTP endpoints.
-- Values are the JSON-safe subset requested with `format=json`. Tagged Convex
-  value types are deferred.
-- `TransitionChunk` assembly is deferred and treated as protocol drift that
-  reconnects.
-- Each subscription retains at most 16 updates and at most 1 Mi string units of
-  serialised payload, and the process retains at most 8 Mi across all
-  subscriptions. A MoonBit string unit is a UTF-16 code unit, so those ceilings
-  are 2 MiB and 16 MiB of memory in the worst case; measuring real UTF-8 bytes
-  would mean encoding every value twice, so the unit is stated rather than
-  hidden. The oldest update is dropped first, and the drop is counted rather
-  than hidden. A single update too large for the budget is replaced by a
-  structured refusal, so a consumer never waits forever for a value that was
-  silently discarded.
-- A Live message larger than 2 MiB, or an HTTP response body larger than 2 MiB,
-  is refused rather than assembled.
-- A read that stops part way through a WebSocket frame abandons the connection.
-  The parser is never resumed from a state it cannot trust, and it never
-  restarts at a false frame boundary.
-- Ordinary transport - sockets, TLS, HTTP/1.1, and WebSocket framing - comes
-  from `moonbitlang/async`, which is a normal library for this language. It is
-  named in `manifest.yaml`. No Convex client in any other language is involved.
-- MoonBit source has no syntax highlighting in the shared website generator
-  yet, so the block above renders as plain text. That is a shared-infrastructure
-  change, not a language one.
+1. Live authentication, optimistic updates, WebSocket mutations, and WebSocket
+   actions are deferred. `set_auth` affects HTTP, and mutations and actions use
+   the HTTP endpoints.
+2. Values use Convex's JSON-safe `format=json` subset. Tagged Convex value types
+   are not implemented.
+3. `TransitionChunk` assembly is not implemented. Receiving one is treated as
+   protocol drift and causes a reconnect.
+4. A subscription keeps at most 16 updates and 1 Mi MoonBit string units of
+   serialized payload, with 8 Mi units shared across all subscriptions. String
+   units are UTF-16 code units, so the worst-case in-memory ceilings are 2 MiB
+   and 16 MiB. Overflow drops the oldest update and increments a visible count.
+5. HTTP response bodies and Live messages larger than 2 MiB are refused rather
+   than assembled.
+6. If a read stops partway through a WebSocket frame, the client abandons that
+   connection and reconnects rather than attempting to resume uncertain parser
+   state.
