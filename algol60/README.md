@@ -1,55 +1,143 @@
-# Convex from ALGOL 60
+# ALGOL 60
 
-This is a Convex client written in ALGOL 60, the 1960 report language that is
-the direct ancestor of block structure, lexical scope, recursion and BNF
-grammar notation — ideas nearly every other language on this roster inherits.
-It reads a shared counter over Convex's documented JSON HTTP endpoint,
-subscribes to the same query over Convex Live, applies a mutation, and shows
-the change arriving reactively, all from a language with no strings as
-values, no records, no bitwise operators, and no identifier underscores.
+ALGOL 60 is the 1960 version of the international Algorithmic Language. It was
+created for numerical work and for publishing algorithms in a portable form,
+but its bigger legacy is the family of block-structured languages that followed
+it. Nested `begin ... end` blocks, lexical scope, recursion, and the grammar
+notation now called Backus-Naur form all feature in its defining
+[Revised Report](https://www.softwarepreservation.org/projects/ALGOL/report/Algol60_revised_report_CACM.pdf).
 
-It is educational, unofficial, and not a production SDK. It exists to answer
-one question honestly: can a sixty-five-year-old language, translated to C by
-GNU MARST, support a useful Convex client? Nothing here is supported by
-Convex. The shared local and hosted black-box conformance suites earned HTTP
-and Live for this educational implementation.
+Today ALGOL 60 is mainly a historical and teaching language. This repository
+uses [GNU MARST](https://www.gnu.org/software/marst/), which translates ALGOL
+60 to C, while [IFIP Working Group 2.1](https://www.cs.ox.ac.uk/jeremy.gibbons/wg21/algol.html)
+retains responsibility for the language. This client is an educational,
+unofficial experiment, not a production SDK and not supported by Convex.
 
-## Start here
+## Getting Started
 
-The whole demonstration is one file:
-[`examples/basics/main.alg`](examples/basics/main.alg).
+Start with [`examples/basics/main.alg`](examples/basics/main.alg). It queries a
+shared counter, starts a Live subscription before changing anything, runs the
+`demo:increment` mutation, and checks that the reactive update agrees with the
+mutation result.
 
-It walks a single journey and refuses to print its final line unless every
-step agrees:
+From the repository root, run the exact example in its Docker image:
 
-1. Query `demo:state` over HTTP and read the current count.
-2. Subscribe to the same query over Live, **before** mutating, so no update
-   can fall into the gap.
-3. Check that the first Live value hydrates the same count the HTTP query
-   returned.
-4. Apply `demo:increment` with a fresh idempotency key.
-5. Receive the new count over Live, with no second HTTP request.
+```sh
+./run verify-example algol60
+```
 
-Against a fresh room, that is the `0 -> 1` journey printed below.
+The command supplies a unique room and checks the example's complete `0 -> 1`
+output. Nothing needs to be installed on the host.
 
-## What works
+## Interesting Parts
 
-| Capability | State | Notes |
+### A Convex argument object becomes a byte buffer
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+function RoomCount() {
+  const state = useQuery(api.demo.state, { room: "readme-demo" });
+
+  // The result is a normal typed object, and count is type-safe here.
+  return <output>{state?.count ?? "Loading..."}</output>;
+}
+```
+
+**ALGOL 60**
+
+```algol
+integer array room[0:31];
+integer array argsbuf[0:63];
+integer roomlen, argslen, discard;
+
+comment ALGOL 60 cannot construct a string value, so the room is bytes;
+roomlen := 0;
+discard := bufputstr(room, 32, roomlen, "readme-demo");
+
+comment Build the same {"room":"readme-demo"} argument as JSON bytes;
+argslen := 0;
+discard := bufputbyte(argsbuf, 64, argslen, 123);
+discard := bufputstr(argsbuf, 64, argslen, "\"room\":");
+discard := jsonwritestring(argsbuf, 64, argslen, room, 0, roomlen);
+discard := bufputbyte(argsbuf, 64, argslen, 125)
+```
+
+The React hook accepts an ordinary object and returns a typed object. This
+client passes the `argsbuf` byte range to `convexcall`, then finds and decodes
+the returned `count` field explicitly. The complete HTTP call is in the
+[canonical example](examples/basics/main.alg).
+
+### React manages reactivity, this API asks the caller to drive it
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+function Counter() {
+  const room = "readme-demo";
+  const state = useQuery(api.demo.state, { room });
+
+  // React keeps the subscription alive and rerenders after any client updates it.
+  return <output>{state?.count ?? "Loading..."}</output>;
+}
+```
+
+**ALGOL 60**
+
+```algol
+procedure watchcounter(host, hostlen, port, portlen, tls,
+      pathbuf, pathlen, argsbuf, argslen);
+   value hostlen, portlen, tls, pathlen, argslen;
+   integer array host, port, pathbuf, argsbuf;
+   integer hostlen, portlen, tls, pathlen, argslen;
+begin
+   integer array errbuf[0:255];
+   integer sub, errbuflen, errkind, initialkind, updatedkind;
+
+   comment Subscribe to demo:state with {"room":"readme-demo"};
+   errbuflen := 0; errkind := 0;
+   livesubscribe(host, hostlen, port, portlen, tls,
+      pathbuf, pathlen, argsbuf, 0, argslen, cxnowms + 10000,
+      sub, errbuf, errbuflen, errkind);
+
+   comment Explicitly wait first for hydration, then for another update;
+   initialkind := livenext(sub, 10000);
+   updatedkind := livenext(sub, 10000);
+
+   comment Cleanup is also owned by this command-line program;
+   liveunsubscribe(sub, cxnowms + 5000)
+end watchcounter
+```
+
+The caller passes deployment details, the `demo:state` path, and the JSON
+argument bytes into `watchcounter`. `livenext` being blocking is a choice made
+by this small client API, not a general limit on reactive systems. React owns
+subscription setup, cleanup, and rerendering for `useQuery`; the ALGOL 60
+command-line program owns those steps and only makes Live progress while it is
+inside the client or its polling loop.
+
+## Status
+
+| Capability | Status | Evidence-backed scope |
 | --- | --- | --- |
-| HTTP query, mutation, action | Implemented, Docker gate green | Written in ALGOL 60 over the native transport layer |
-| Structured Convex errors | Implemented, Docker gate green | `FunctionError`, `ProtocolError` and `TransportError` keep name, message, data and log lines |
-| TLS with certificate and hostname verification | Implemented, Docker gate green | Verified against a private CA in the Docker test stage |
-| Live subscribe, update, unsubscribe | Implemented, Docker gate green | RFC 6455 framing written in ALGOL 60 |
-| Live reconnect and rehydration | Implemented, Docker gate green | Adapter-only `debugDisconnect`, unchanged rehydration suppressed |
-| WebSocket handshake response verification | Partial | HTTP 101 upgrade is required; `Sec-WebSocket-Accept` is not checked against SHA-1, see limitations |
-| Live authentication, optimistic updates, WebSocket mutations | Not implemented | Deferred; see limitations |
-| Earned badges | **HTTP and Live** | Shared local and hosted conformance passed |
+| HTTP query, mutation, and action | **Earned** | Native JSON HTTP implementation |
+| Structured errors | **Earned** | Function, protocol, and transport failures remain distinct |
+| Live subscribe, update, unsubscribe, and reconnect | **Earned** | Native WebSocket framing and a caller-driven Live manager |
+| TLS certificate and hostname verification | Implemented | Covered by the language-local Docker test stage |
+| WebSocket `Sec-WebSocket-Accept` verification | Partial | Requires HTTP 101 but does not validate this SHA-1-derived header |
+| Live auth, optimistic updates, WebSocket mutations and actions | Not implemented | Deferred in the manifest |
+| Capability badges | **HTTP and Live** | Recorded shared local and hosted conformance results |
 
-The Docker test stage, language-local suites, TLS suite, canonical example,
-and shared local and hosted black-box conformance all passed. The manifest
-records the earned HTTP and Live result.
+These are recorded results, not a claim that verification was rerun while this
+README was edited.
 
-## The canonical example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.alg -->
 ```algol
@@ -410,7 +498,9 @@ discard := cxexit(0)
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
+
+### Docker verification
 
 Everything builds and runs inside Docker; nothing is installed on the host.
 
@@ -442,11 +532,11 @@ Add shared black-box conformance against the approved local backend, then the
 hosted drift target, then both from the same built source. Only the shared
 result evaluator may award a badge.
 
-## How it is put together
+### Source assembly
 
 MARST has no linker for separately compiled ALGOL 60 units and no shared
-global state across outer-level procedures — only lexical nesting inside a
-`begin ... end` block shares variables — so the client is assembled from
+global state across outer-level procedures. Only lexical nesting inside a
+`begin ... end` block shares variables, so the client is assembled from
 layered source files at build time, innermost first:
 
 | File | Responsibility |
@@ -473,17 +563,17 @@ block. It is a little over six hundred lines and it contains no HTTP, no
 WebSocket framing, no JSON, no retry policy and no Convex knowledge. Every
 loop, deadline and bound is driven from ALGOL 60.
 
-The boundary between the two languages is MARST's own calling convention —
+The boundary between the two languages is MARST's own calling convention.
 scalar by-value arguments arrive as a `struct arg` thunk that must be
 evaluated against the caller's dynamic storage area, and `integer array`
-arguments arrive as a `struct dv*` dope vector — confirmed by reading the C
+arguments arrive as a `struct dv*` dope vector. This was confirmed by reading the C
 MARST itself generates, not assumed from documentation.
 
 TLS verification is switched on inside that file rather than from ALGOL 60,
 because a mistake there fails silently: peer verification, the default CA
 bundle and `SSL_set1_host` hostname checking are all set together. The Docker
-test stage proves it by connecting three ways to a local TLS server — trusted,
-untrusted issuer, and wrong hostname — and only the first may succeed.
+test stage proves it by connecting three ways to a local TLS server: trusted,
+untrusted issuer, and wrong hostname. Only the first may succeed.
 
 ### A language with no strings, records or bitwise operators
 
@@ -491,14 +581,14 @@ Every buffer in this client is a parallel `integer array` of bytes with an
 explicit length, never a string value: ALGOL 60 strings are literal constants
 that can be passed through a `code` procedure but never built, compared byte
 by byte, or returned. There are no record or struct types either, so a
-structured result — an HTTP response, a parsed JSON node, a WebSocket frame
-header — is a set of parallel scalar output parameters passed by name, not one
+structured result such as an HTTP response, parsed JSON node, or WebSocket frame
+header is a set of parallel scalar output parameters passed by name, not one
 aggregate value.
 
 There are no bitwise operators. Base64, hex and WebSocket masking are all
 written with explicit `div`-by-power-of-two and a hand-written `intmod`
 helper, because ALGOL 60's `%` operator is truncating integer division, not
-remainder — `intmod(a, b)` is `a - (a div b) * b`, spelled out because the
+remainder. `intmod(a, b)` is `a - (a div b) * b`, spelled out because the
 project's own style gate would otherwise let `%` silently mean the wrong
 thing in a base64 or WebSocket opcode calculation.
 
@@ -506,8 +596,8 @@ thing in a base64 or WebSocket opcode calculation.
 
 Exactly one call path may touch the WebSocket, change the query-set version
 or decide to reconnect: `client/convex-live.alg`'s procedures, driven by
-whichever caller — the example, a test, or the conformance adapter's poll
-loop — is currently inside one of them. ALGOL 60 has no concurrency of its
+whichever caller, whether the example, a test, or the conformance adapter's poll
+loop, is currently inside one of them. ALGOL 60 has no concurrency of its
 own, so this single-owner discipline is not a design choice on top of threads;
 it is the only shape the language allows.
 
@@ -529,7 +619,7 @@ payload byte is requested, so an inflated length header cannot make the
 client reserve memory on a peer's behalf. `client/tests/live-test.alg` stops
 in the middle of a frame, lets the deadline expire, and continues.
 
-## Conformance and protocol notes
+### Conformance and protocol notes
 
 `client/tests/conformance/adapter.alg` is test infrastructure, not public
 client code. It speaks NDJSON adapter protocol v1 over stdin and stdout, or
@@ -552,40 +642,22 @@ conformance.
 The pinned sync profile is recorded in `manifest.yaml`. It is an undocumented
 protocol, and nothing here implies it is stable or officially supported.
 
-## Limitations and deferred behaviour
+## Known Issues
 
-- Shared local and hosted conformance passed, earning HTTP and Live. The
-  limitations below remain deliberately outside those capabilities.
-- The WebSocket handshake does not verify the server's `Sec-WebSocket-Accept`
-  response header against SHA-1 of the client's key. Implementing SHA-1
-  through arithmetic emulation, with no bitwise operators available, was
-  judged out of scope for this checkpoint. A valid HTTP 101 upgrade response
-  is still required, and every frame exchanged afterward is real RFC 6455
-  framing; only that one header's cryptographic check is skipped.
-- `convexcall` and `livesubscribe` open their own connection internally, and
-  ALGOL 60 has no concurrency primitive to run a fixture server and the
-  client under test in the same process. `client/tests/client-test.alg`
-  therefore exercises the HTTP framing and envelope layers directly, and
-  `client/tests/live-test.alg` pre-seeds an already-open loopback WebSocket
-  handle rather than driving a real connect and handshake.
-- Live is driven by the caller. Because ALGOL 60 has no concurrency, reactive
-  updates arrive only while a caller is inside `livenext`, the adapter's
-  event loop, or another client procedure.
-- Live authentication, optimistic updates, WebSocket mutations, WebSocket
-  actions, journals and `TransitionChunk` assembly are deferred.
-- Live values cover Convex's JSON-safe subset; tagged Convex value
-  conversions are deferred.
-- JSON numbers are accepted only when mathematically integral and
-  representable exactly as a MARST `integer` (32-bit) or, for timestamps,
-  within the exact-integer range of a MARST `real` (an IEEE double, exact
-  through 2^53); fractional and out-of-range values are rejected at the point
-  of use.
-- Active Live subscriptions and the delivery queue are bounded; a value too
-  large for the configured byte budget becomes an observable `ProtocolError`
-  without changing the subscription's last delivered value, and queue
-  overflow drops the oldest undelivered event rather than growing without
-  bound.
-- MARST's own comment rule — a comment ends at the first semicolon, even
-  inside a sentence — means every doc comment in this client was written, and
-  is reviewed, to avoid a mid-sentence semicolon rather than to read as
-  naturally as a comment in a modern language could.
+1. The WebSocket handshake requires a valid HTTP 101 upgrade but does not
+   verify `Sec-WebSocket-Accept` against the SHA-1-derived expected value.
+2. Live only progresses while the caller is inside `livenext`, another client
+   procedure, or the adapter's poll loop. ALGOL 60 has no concurrency primitive
+   for a background reader.
+3. Live authentication, optimistic updates, WebSocket mutations and actions,
+   journals, and `TransitionChunk` assembly are deferred.
+4. Live values cover the JSON-safe subset of Convex values. Tagged Convex value
+   conversions are deferred, and ordinary integral numbers must fit a 32-bit
+   MARST `integer`.
+5. The client allows four active subscriptions and eight queued deliveries.
+   Oversized values become `ProtocolError`s; queue overflow drops the oldest
+   undelivered event.
+6. Because `convexcall` and `livesubscribe` open their own connections, the
+   single-threaded local suites test their framing layers through loopback
+   handles. End-to-end behavior is covered by the recorded shared conformance
+   evidence instead.
