@@ -1,0 +1,32 @@
+schemaVersion: 1
+id: hy
+displayName: "Hy"
+rank: 100
+selectionTier: curated_backfill
+implementation:
+  status: attempting
+  provenance: transpiled
+  version: 0.1.0
+  notes: Hy 1.3.1 source is transpiled ahead of time and genuinely executed by Python 3.13. Convex HTTP and Live protocol behaviour is implemented in Hy; websockets supplies RFC 6455 transport only.
+toolchain:
+  name: Hy on Python
+  version: "Hy 1.3.1; Python 3.13.5"
+targetRuntimeCommand: python3
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Live authentication is deferred.
+  - TransitionChunk assembly, mutation replay, optimistic updates, journals, and full Convex values are deferred.
+capabilities: []
