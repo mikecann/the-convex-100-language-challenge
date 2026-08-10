@@ -1,29 +1,119 @@
-# Convex from CLU
+# CLU
 
-This is a Convex client written in CLU, Barbara Liskov's 1975 language and
-the original home of the abstract data type: every non-trivial piece of
-state in this client (a `_tls` connection, the JSON scanner, the WebSocket
-frame reader, the `/api/sync` state machine) is built as a CLU `cluster` --
-data plus the operations on it, with no other code allowed to reach into its
-representation -- which is precisely the idea CLU introduced.
+CLU is a statically typed language created by Barbara Liskov and her group at
+MIT in the 1970s. Its work on data abstraction, iterators, parameterised types,
+and exception handling helped shape ideas that now feel ordinary in languages
+such as C++ and ML. It is mainly of historical and research interest today,
+but the community-maintained [Portable CLU project](https://hg.sr.ht/~nbuwe/pclu)
+still makes the original language usable on modern systems. MIT's
+[history of CLU](https://publications.csail.mit.edu/lcs/pubs/pdf/MIT-LCS-TR-561.pdf)
+is the best primary account of why it was designed.
 
-## This is educational, not a production SDK
+This client is an educational demonstration for a video and website. It is
+unofficial, unsupported, and not a production Convex SDK.
 
-This client is a demonstration for a video and a website, not an official
-Convex SDK. It is unofficial, unsupported, and not intended for production
-use. CLU itself has been unmaintained since the early 1990s; this uses
-[Portable CLU (pclu)](https://hg.sr.ht/~nbuwe/pclu), a 2021+ community
-fix-up that builds on modern 64-bit Linux.
+## Getting Started
 
-## Start here
+The [canonical example](examples/basics/main.clu) reads a fresh counter, starts
+a Live subscription, increments the counter once, and receives the reactive
+update. From the repository root, run it in its pinned Docker environment with:
 
-The [canonical basic example](examples/basics/main.clu) queries a shared
-counter over HTTP, starts a Live subscription before mutating it, applies the
-mutation with an idempotency key, and proves the Live update agrees with the
-mutation's own result -- the same `0 -> 1` journey every language in this
-repository demonstrates.
+```sh
+./run verify-example clu
+```
 
-## What works
+## Interesting Parts
+
+### A cluster hides the representation
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const state = useQuery(api.demo.state, { room: "clu-cluster-readme" });
+  return <p>{state?.count ?? "Loading..."}</p>; // state.count is type-safe here.
+}
+```
+
+**CLU**
+
+```clu
+base_url: string := _environ("CONVEX_URL") % Real deployment configuration.
+    except when not_found: signal failed("CONVEX_URL is required") end
+if string$empty(base_url) then signal failed("CONVEX_URL is required") end
+room: string := "clu-cluster-readme"
+args_raw: string := json$object1("room", json$qs(room))
+
+kind: string, value_raw: string, err_name: string, err_message: string,
+    err_data: string, has_err_data: bool, logs_raw: string, has_logs: bool :=
+    chttp$call("query", "demo:state", args_raw, base_url, "")
+
+count_raw: string := json$field(value_raw, "count")
+count: int := json$uint32(count_raw) % count is type-safe after explicit decoding.
+```
+
+The generated TypeScript API carries the function's argument and return types.
+This small CLU client instead receives raw JSON and decodes the field it needs.
+The React hook remains subscribed and rerenders on changes, while this focused
+CLU call is only a one-off HTTP snapshot; the explicit Live lifecycle below is
+the real reactive equivalent.
+The interesting bit is the `$`: `json$uint32` and `chttp$call` invoke operations
+exported by clusters. A cluster owns its hidden representation and exposes only
+named operations, much like a class with private state, although a stateless
+cluster such as `json` also works well as a module namespace.
+
+### Live is an explicit, iterator-driven lifecycle
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function LiveCounter() {
+  const state = useQuery(api.demo.state, { room: "clu-live-readme" });
+  return <p>{state?.count ?? "Loading..."}</p>; // React owns subscribe and cleanup.
+}
+```
+
+**CLU**
+
+```clu
+base_url: string := _environ("CONVEX_URL") % Real deployment configuration.
+    except when not_found: signal failed("CONVEX_URL is required") end
+if string$empty(base_url) then signal failed("CONVEX_URL is required") end
+room: string := "clu-live-readme"
+args_raw: string := json$object1("room", json$qs(room))
+s: sync := sync$create(base_url, "clu-0.1.0")
+    except when not_possible (msg: string): signal failed(msg) end
+query_id: int := sync$add(s, "demo:state", args_raw) % Start the subscription.
+
+for attempt: int in int$from_to(1, 20) do % The iterator supplies loop values.
+    found: bool, kind: string, ignored_id: int, value_raw: string,
+        err_name: string, err_message: string, err_data: string,
+        has_err_data: bool, has_logs: bool, logs_raw: string := sync$poll(s, 500)
+        except when not_possible (msg: string): signal failed(msg) end
+    if found cand string$equal(kind, "update") then
+        count: int := json$uint32(json$field(value_raw, "count"))
+        break % count is the latest reactive value, decoded as a CLU int.
+        end
+    end
+
+sync$remove(s, query_id) % This command-line client owns unsubscribe and cleanup.
+sync$close(s)
+```
+
+React's hook owns the subscription and rerenders the component when its value
+changes. The CLU API deliberately exposes a blocking `poll` operation because
+this Portable CLU runtime has no threads or async runtime. CLU's iterator drives
+the bounded polling loop, while declared signals and nearby `except` clauses
+make transport failures part of the control flow rather than magic return
+values. The iterator does not make the subscription reactive by itself.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -36,7 +126,7 @@ repository demonstrates.
 profiles from a clean, exact-head commit; see `manifest.yaml`'s
 `capabilities` list for the shared evaluator's own award.
 
-## Basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.clu -->
 ```clu
@@ -265,104 +355,54 @@ start_up = proc ()
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
+
+This is a native CLU implementation. HTTP framing, JSON scanning, WebSocket
+framing, reconnect behaviour, and the Convex-specific work all live in the
+checked-in `.clu` files. Portable CLU has raw sockets but no TLS API, so the
+hosted path adds a small `_tls` builtin in C using OpenSSL. That builtin handles
+DNS, TCP, certificate and hostname verification, and byte transport only. It
+does not know anything about HTTP, WebSockets, JSON, or Convex.
+
+The Live client is a `sync` cluster whose representation owns the connection,
+subscription table, reconnect state, and a one-value delivery slot per active
+query. With no runtime threads, both the example and test adapter advance that
+state machine by calling `sync$poll`. A newer update replaces an undelivered
+older one because a reactive query represents current state, not an event log.
+
+The JSON layer is intentionally small. It walks enough structure to extract a
+top-level field or array item as raw JSON, then callers decode only the values
+they need. The example accepts Convex whole numbers written as `0`, `0.0`, or
+`1.00`, while rejecting fractions, strings, non-finite values, and overflow.
+
+The Docker gates are:
 
 ```sh
 ./run test clu
-```
-
-Builds pclu 1a8ad7603ea20b9744942182a52810441182f6a6 from source (Boehm GC
-7.2f static, the `-fcommon` fix GCC 10+ needs, and
-`client/wordvec-64bit-word-size.patch`, a real 64-bit addressing bug fixed
-during development), adds the `_tls` builtin cluster, boots a hello-world
-smoke test, checks source style, compiles and runs the full language-local
-unit suite (JSON codec, arithmetic bitwise helpers, base64, this client's own
-DNS resolver, HTTP/1.1 framing, RFC 6455 WebSocket framing, and the
-`/api/sync` state machine -- the last four against real loopback-TCP peers,
-not mocks), compiles and links the canonical example and the conformance
-adapter, and proves the adapter's own hello/close NDJSON lifecycle.
-
-```sh
 ./run verify-example clu
 ./run verify clu
 ./run verify-hosted clu
 ./run verify-all clu
 ```
 
-Run the canonical example and the shared black-box conformance suite against
-the local backend, the hosted drift target, and both together, respectively.
+`test` builds pinned Portable CLU commit
+`1a8ad7603ea20b9744942182a52810441182f6a6` and Boehm GC 8.2.8, checks source
+style, runs the language-local tests, and compiles the example and adapter. GC
+8.2.8 replaces pclu's documented 7.2f because that older release faults during
+`GC_init` under Docker Desktop's amd64 Rosetta emulation. The remaining commands
+run the canonical example and shared conformance against the local deployment,
+hosted drift target, or both. The passing capability evidence reported above
+predates this prose-only README edit.
 
-## Lower-level notes
+## Known Issues
 
-- **pclu's C-boundary mechanism.** A `.spc` file declares a cluster's
-  operation signatures with empty bodies (interface only, never compiled to a
-  body); a separate hand-authored `.c` file supplies C functions named
-  `<type>OP<opname>` that the linker resolves by that naming convention when
-  `libpclu_opt.a` is linked. No dlopen, no FFI declarations, no glue-code
-  generator. pclu's own builtins (`_chan`, `_wordvec`, ...) are written this
-  way; `client/convexrt-tls.c` + `client/_tls.spc` add one more, the same
-  way. `_tls$recv` takes an explicit `timeout_ms` and waits with `poll(2)` on
-  the connection's own file descriptor before ever calling `SSL_read`, so a
-  caller can tell a live-but-idle connection (signals `timeout`) apart from
-  one the peer actually closed (signals `end_of_file`).
-- **The 64-bit `_wordvec` bug.** `client/wordvec-64bit-word-size.patch`
-  fixes a real, previously unreported bug: on 64-bit builds `_wordvec`'s
-  byte- and half-word-addressed operations could only ever address the first
-  four bytes of every eight-byte storage slot. See the patch file's own
-  header comment for the full write-up; it is likely worth reporting to
-  upstream pclu independently of this project.
-- **pclu's own bundled DNS client silently fails against Docker's
-  resolv.conf.** `lib/clu/_resolve.clu` only recognises `;` as a comment
-  character (an Ultrix/BSD convention from its 1985/1989 MIT copyright
-  header); every modern Linux resolv.conf, including the one Docker
-  generates, uses `#` instead. `_resolve` mistakes the first comment line
-  for the domain/nameserver line it expects, fails to parse it as an
-  address, silently swallows that failure, and is left querying the
-  untouched default of `127.0.0.1` until every real hostname lookup times
-  out. Rather than patch unfamiliar 1980s DNS wire-format C, this client
-  ships its own small resolver, `client/convex-dns.clu`: it reads the real
-  nameserver out of `/etc/resolv.conf` correctly, sends one A-record query
-  over UDP, and parses the answer (including DNS name compression
-  pointers). `convex-transport.clu`'s `dial()` calls it exactly where it
-  used to call `_resolve$n2a`, with the same three signals.
-- **Local vs. hosted transport.** `client/convex-transport.clu`'s `conn`
-  type is a `oneof[chan: _chan, tls: _tls]`: the local profile dials a raw
-  `_chan` socket by hand (a literal dotted-quad address via `inet_address`,
-  or `client/convex-dns.clu` if that fails); the hosted profile calls
-  `_tls$connect`, which does DNS (via OpenSSL/glibc, not this client's own
-  resolver), the TCP connect, and the TLS handshake (with real chain and
-  hostname verification) all inside one C builtin.
-- **`convex-sync.clu` has no owner thread, because pclu has no threads.**
-  Instead the whole `/api/sync` state machine lives behind one `poll()`
-  operation that does at most one bounded WebSocket read per call and
-  returns at most one delivery; a caller (the conformance adapter, or the
-  canonical example) drives it by calling `poll()` repeatedly. See
-  `convex-sync.clu`'s own header comment for the full reasoning, including
-  why this client's delivery buffering is deliberately one slot per
-  subscription rather than a queue.
-- **The conformance adapter is the same kind of loop.** It reads one
-  buffered NDJSON command line if one is ready; otherwise it waits briefly
-  for more input; if nothing arrived, it gives `sync$poll()` one chance to
-  check the Live socket and deliver at most one subscription event. Every
-  event is written the moment it is produced, never batched, which is this
-  client's whole answer to a stopped reader: ordinary pipe backpressure
-  stalls this same loop rather than it ever accumulating a backlog of its
-  own.
-- **Several real pclu quirks were found and are documented at their call
-  sites** (`convex-http.clu`, `convex-websocket.clu`, `convex-sync.clu`,
-  `convex-dns.clu`, the conformance adapter): a `return` statement's
-  expression list is positional, one value per slot; an `except` clause
-  binds only to the single statement immediately before it; identifiers are
-  resolved case-insensitively, so words like `any` and `has` that appear
-  inside pclu's own generic-type/where-clause syntax collide with an
-  ordinary local variable of the same name; a `cvt`-typed operation
-  parameter is already treated as `rep` inside its own operation, so
-  passing it on as another `cvt`-taking operation's own argument needs an
-  explicit `up()` conversion; and `_chan$recv`/`$send` only work on an
-  actual socket (`_chan$getb`/`$putb`, plain `read(2)`/`write(2)`, work on
-  a pipe, a character device, or a socket alike).
-
-## Known limitations
-
-See `manifest.yaml`'s `limitations` list, which is the source of truth and
-is kept current as this client progresses.
+1. Portable CLU has no threads or async runtime here, so callers must drive Live
+   explicitly with bounded `sync$poll` calls.
+2. The JSON codec is deliberately not a general JSON-to-CLU object mapper. New
+   result shapes need explicit field extraction and decoding.
+3. `TransitionChunk` is not implemented. The client reports it as a protocol
+   error and reconnects instead of silently accepting a partial transition.
+4. The build patches a Portable CLU 64-bit `_wordvec` addressing bug and uses a
+   small CLU DNS resolver because pclu's bundled resolver misreads modern
+   Docker-generated `resolv.conf` comments. These are runtime workarounds, not
+   Convex protocol behaviour.
