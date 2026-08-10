@@ -1,19 +1,96 @@
-# Convex from D
+<img src="logo.png" alt="D programming language logo" width="125">
+<!-- Logo source: https://dlang.org/images/dlogo.png -->
 
-This is a small D demonstration of Convex's documented JSON HTTP API and an experimental pinned Live protocol profile.
+# D
 
-It is educational, unofficial, and not a production SDK.
+[D](https://dlang.org/) is a statically typed, general-purpose systems and applications language. Walter Bright started it as a "better C++", and its syntax is intentionally familiar to C, C++, and Java programmers. It compiles to native code, offers low-level access when needed, and also includes higher-level tools such as garbage collection, associative arrays, and compile-time programming. The official [overview](https://dlang.org/overview.html), [history](https://dlang.org/foundation/about.html), and [usage survey](https://dlang.org/areas-of-d-usage.html) place it in a smaller modern niche spanning systems software, compilers, web applications, and numerical work.
 
-## Start here
+This client is an educational, unofficial demonstration. It is not a production SDK or an officially supported Convex client.
 
-[`examples/basics/main.d`](examples/basics/main.d) queries a fresh counter, starts Live before the write, applies one idempotent mutation, and checks that the WebSocket update agrees with HTTP.
+## Getting Started
 
-## What works
+The canonical [`examples/basics/main.d`](examples/basics/main.d) program queries a fresh counter, opens a Live subscription before changing it, applies one idempotent mutation, and checks that the reactive update agrees with the HTTP result.
+
+From the repository root, run:
+
+```sh
+./run verify-example d
+```
+
+That command builds and runs the exact example below inside Docker against a unique room on the approved test deployment. It proves the example journey, not the full shared conformance suite.
+
+## Interesting Parts
+
+### React owns the subscription; D gives you the handle
+
+**TypeScript with React**
+
+```tsx
+import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
+const room = `d-readme-${crypto.randomUUID()}`;
+
+function Counter() {
+  const state = useQuery(api.demo.state, { room });
+  if (state === undefined) return <span>Loading...</span>;
+  return <span>{state.count}</span>; // The generated API makes count a number.
+}
+
+export function App() {
+  return (
+    <ConvexProvider client={convex}>
+      <Counter />
+    </ConvexProvider>
+  );
+}
+```
+
+**D**
+
+```d
+import convex : ConvexClient;
+import std.json : JSONType, JSONValue;
+import std.process : environment;
+import std.uuid : randomUUID;
+
+void main()
+{
+    auto url = environment.get("CONVEX_URL", "");
+    if (url.length == 0)
+        throw new Exception("CONVEX_URL is required");
+    auto room = "d-readme-" ~ randomUUID().toString();
+    auto client = new ConvexClient(url);
+    scope (exit)
+        client.close(); // Always closes, including when an exception unwinds.
+
+    auto live = client.subscribe("demo:state", JSONValue([
+        "room": JSONValue(room) // D infers the associative-array type here.
+    ]));
+    scope (exit)
+        live.close(); // This command-line client owns its subscription lifetime.
+
+    auto initial = live.next(10_000); // Blocking next() is this client's API choice.
+    assert(initial !is null && initial.hasValue);
+    auto count = initial.value.object["count"];
+    assert(count.type == JSONType.integer || count.type == JSONType.float_);
+    // D knows this is JSONValue; this client checks its payload shape at runtime.
+}
+```
+
+React's `useQuery` starts, updates, and disposes the subscription with the component. The D language supports callbacks and delegates, but this small client instead exposes `subscribe`, blocking `next`, and `close` so ownership is obvious in a command-line example. D's [`scope (exit)`](https://dlang.org/spec/statement.html#ScopeGuardStatement) makes both cleanup paths reliable. Unlike the generated TypeScript API, the D client accepts function paths as strings and returns Phobos [`JSONValue`](https://dlang.org/library/std/json/json_value.html), so response shape checks remain explicit.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
 | HTTP queries, mutations, actions, auth replacement, errors, and logs | Verified by shared local and hosted conformance |
 | Live subscriptions, unsubscribe, failures, recovery, and reconnect | Verified by shared local and hosted conformance |
+
+These are existing evidence-backed awards. This README change did not rerun shared verification.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.d -->
 ```d
@@ -138,26 +215,19 @@ unittest
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-`./run test d` compiles the checked-in client, adapter, and exact example, then runs HTTP and real-WebSocket D tests inside pinned `linux/amd64` Docker. `./run build d` produces the restricted final adapter image and audits its runtime policy. The root-owned `verify-example`, `verify`, and `verify-hosted` gates remain the only way to award HTTP or Live capability badges.
+The public [`client/convex.d`](client/convex.d) implementation is native D. Phobos supplies JSON and HTTP support, while libcurl and OpenSSL handle network transport, TLS, and the WebSocket upgrade. The client itself owns the Convex request envelopes, Live state, reconnect behavior, and WebSocket framing. It does not delegate Convex behavior to another SDK. The Docker build pins LDC 1.40.0, the LLVM-based D compiler described on D's official [compiler page](https://dlang.org/download.html), and produces a `linux/amd64` runtime.
 
-For the final adapter's stopped-reader and memory proof, run this committed host-side orchestration from the repository root:
+The HTTP API is deliberately small: `query`, `mutation`, and `action` take a Convex function path plus a JSON object and return a value with captured logs. `setAuth` replaces or clears the bearer token between calls. Function failures, malformed responses, and transport failures stay distinct instead of becoming successful JSON values.
 
-```sh
-./d/client/tests/final_adapter_isolated_probe.sh
-```
+Live work belongs to one D owner thread. Subscription handles send it commands and read from bounded mailboxes rather than touching the socket themselves. Each subscription retains the newest 16 updates, all subscriptions share an 8 MiB encoded-value budget, and oversized messages are rejected at 2 MiB. The adapter-only `debugDisconnect` hook is test infrastructure, not part of the educational client API.
 
-It builds the exact D `test` and final `runtime` targets, then runs the adapter alone from the runtime image's default `/usr/local/bin/convex-adapter` entrypoint with a fresh 128 MiB cgroup. The real Live fixture and TCP controller stay in a larger sibling cgroup sharing only the adapter network namespace. The controller's small receive buffer and the adapter's bounded test-only send-buffer hook create physical backpressure. The adapter's test-only memory-peak hook writes fresh cgroup-v2 evidence to the probe bind mount; it does not add fixture dependencies to the final runtime. The probe asserts retained sequences `1, 3..18` and `101, 103..105`, exact close, and adapter-only `memory.peak < 96 MiB`. It cleans up only its own named containers and never mounts the Docker socket.
+The full Docker gates remain separate: `./run test d` checks formatting, unit behavior, compilation, and language-local fixtures; `./run verify d` exercises local example and conformance behavior; `./run verify-hosted d` checks the hosted drift target; and `./run verify-all d` runs both deployment profiles serially. Only the shared evaluator awards capabilities.
 
-## Protocol notes
+## Known Issues
 
-The public client owns Convex's HTTP envelopes and the pinned `convex-rs-0.10.4-unversioned-sync` profile at `/api/sync`. Phobos and libcurl provide JSON, HTTP, TLS, and the WebSocket upgrade. A stateful D RFC6455 parser then enforces masking, opcodes, canonical lengths, fragmentation, control frames, UTF-8, and a 2 MiB message cap.
-
-One D owner thread exclusively performs every WebSocket read, write, reconnect, query-set change, and socket retirement. It validates canonical Base64 little-endian `uint64` timestamps, commits each complete transition before publishing its query-ID-sorted final modifications, and preserves `maxObservedTimestamp` across reconnects. `debugDisconnect` exists only in the test adapter.
-
-Each subscription keeps the newest 16 updates. All subscriptions share an 8 MiB encoded-byte budget and evict the globally oldest intermediate update first. The adapter caps subscriptions at 16, serializes generation changes with physical NDJSON writes, and abandons a controller that cannot accept the one charged in-flight line within 500 ms.
-
-## Limitations
-
-The Live wire protocol is pinned experimental behavior, not a documented compatibility promise. Live authentication, `TransitionChunk`, optimistic updates, WebSocket mutation replay, and tagged non-JSON Convex values are deferred. Shared local and hosted conformance passed, earning HTTP and Live.
+1. Live uses the pinned experimental `convex-rs-0.10.4-unversioned-sync` profile at `/api/sync`, not a documented compatibility promise.
+2. Live authentication, optimistic updates, mutations over WebSocket, and `TransitionChunk` assembly are deferred.
+3. Values are limited to the JSON-safe format covered by the documented HTTP API, so tagged non-JSON Convex values are not supported.
+4. The blocking `next` API suits this teaching client, but an application-facing D library would likely want a higher-level callback, range, or stream abstraction.
