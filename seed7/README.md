@@ -1,18 +1,160 @@
-# Convex from Seed7
+<img src="logo.png" alt="Seed7 logo" width="50">
+<!-- Logo source: https://seed7.net/images/hearts7m.png -->
 
-A native Seed7 client that calls Convex functions over HTTP and keeps a
-query current over Convex's Live WebSocket sync protocol, hand-rolled
-directly on raw TCP/TLS sockets.
+# Seed7
 
-This is educational and unofficial, not a production Convex SDK.
+[Seed7](https://seed7.net/) is an open-source, general-purpose programming
+language designed and maintained by Thomas Mertes. It looks a little like
+Pascal or Ada, but its most unusual idea is that much of the language is not
+hard-coded into the compiler. Libraries can define new statements, operators,
+and syntax using Seed7 itself.
 
-## Start here
+Seed7 is a niche language rather than a mainstream application ecosystem. Its
+toolchain includes an interpreter and a compiler that translates Seed7 to C,
+then uses a C compiler to produce machine code. Its standard library covers
+areas such as networking, databases, graphics, files, and cryptography. This
+repository uses those facilities for a native HTTP and Live client
+demonstration, without delegating Convex behaviour to another client.
 
-[`examples/basics/main.sd7`](examples/basics/main.sd7) follows the shared
-counter from 0 to 1 using an HTTP query, a Live subscription started
-before the mutation, and an idempotent mutation.
+This client is an educational, unofficial demonstration. It is not a
+production Convex SDK.
 
-## What works
+## Getting Started
+
+See [`examples/basics/main.sd7`](examples/basics/main.sd7) for a complete
+working example. It reads a counter over HTTP, starts a live subscription,
+applies one safely repeatable mutation, and observes the resulting update.
+
+From the project root, run:
+
+```sh
+./run verify-example seed7
+```
+
+The command builds the example in Docker, starts the project's dedicated local
+Convex backend, and verifies the complete `0 -> 1` journey. You do not need to
+install Seed7 on your computer.
+
+## Interesting Parts
+
+### A query can read like a Seed7 statement
+
+TypeScript names a query through the generated `api` object. Seed7 libraries
+can define statically checked statement forms, so this call reads like a
+sentence.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+export function Seed7Comparison() {
+  const room = "seed7-readme-query";
+  const state = useQuery(api.demo.state, { room });
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // Generated types prove count is a number.
+}
+```
+
+**Seed7**
+
+```text
+const proc: showCount (inout convexClient: client, in string: room) is func
+  local
+    var jsonObject: queryArgs is jsonObject.value;
+    var convexOutcome: outcome is convexOutcome.value;
+  begin
+    # The caller creates client from a validated CONVEX_URL.
+    queryArgs @:= ["room"] jsonValue(room); # Build the { room } argument.
+    outcome := client query "demo:state" withArgs jsonValue(queryArgs);
+    if not outcome.ok then
+      writeln(STD_ERR, outcome.error.message);
+      exit(1);
+    else
+      # Only use the returned JSON after the call succeeds.
+      writeln(jsonEncode(outcome.value));
+    end if;
+  end func;
+```
+
+`query` and `withArgs` come from
+[`client/convex.s7i`](client/convex.s7i), not Seed7 itself. This small client
+uses a string path and checked JSON, while generated TypeScript knows the
+arguments and result type. `useQuery` also stays subscribed; Seed7's `query` is
+one HTTP snapshot. The full example below validates the returned count.
+
+### A Live subscription has an explicit lifecycle
+
+React manages a query subscription for a component. The Seed7 command-line
+client exposes that lifecycle directly.
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function LiveCounter() {
+  const room = "seed7-readme-live";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+  const addOne = () =>
+    increment({ room, language: "TypeScript", runId: crypto.randomUUID() });
+  return (
+    <button onClick={addOne}>
+      Count: {state?.count ?? "Loading..."}
+    </button>
+  );
+}
+```
+
+**Seed7**
+
+```text
+const proc: incrementAndObserve (inout convexClient: client,
+    in string: room) is func
+  local
+    var convexLive: live is convexLive.value;
+    var jsonObject: queryArgs is jsonObject.value;
+    var jsonObject: mutationArgs is jsonObject.value;
+    var convexOutcome: outcome is convexOutcome.value;
+  begin
+    # The caller creates client from a validated CONVEX_URL.
+    queryArgs @:= ["room"] jsonValue(room);
+    mutationArgs @:= ["room"] jsonValue(room);
+    mutationArgs @:= ["language"] jsonValue("Seed7");
+    mutationArgs @:= ["runId"] jsonValue(randomSessionId);
+
+    # Subscribe first, then explicitly wait for the initial value.
+    live := openConvexLive(client);
+    subscribeLive(live, "state", "demo:state", jsonValue(queryArgs));
+    outcome := waitForLiveValue(live, "state", 10 . SECONDS);
+    if outcome.ok then
+      # Mutate over HTTP only after Live is ready.
+      outcome := client mutate "demo:increment"
+          withArgs jsonValue(mutationArgs);
+    end if;
+
+    if outcome.ok then
+      # The same subscription receives the pushed update.
+      outcome := waitForLiveValue(live, "state", 10 . SECONDS);
+    end if;
+
+    # Always clean up, including after any failed operation above.
+    unsubscribeLive(live, "state");
+    closeLive(live);
+    if not outcome.ok then
+      exit(1);
+    end if;
+  end func;
+```
+
+React owns the lifecycle and rerenders when `state` changes. This client makes
+`waitForLiveValue` blocking so a command-line caller can consume events in
+sequence. That is an API choice, not a Seed7 limitation. The complete
+[`main.sd7` example](examples/basics/main.sd7) decodes and checks every result.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -20,6 +162,11 @@ before the mutation, and an idempotent mutation.
 | Bearer-token replacement and structured function errors | Verified by shared local and hosted conformance |
 | Live initial values and updates | Verified by shared local and hosted conformance |
 | Remove, reconnect, query-error recovery and bounded delivery | Verified by shared local and hosted conformance |
+
+HTTP and Live are both earned capabilities. The implementation was tested
+against the project's pinned local backend and its hosted compatibility target.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.sd7 -->
 ```text
@@ -146,71 +293,67 @@ const proc: main is func
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-`./run test seed7` formats-checks (Seed7 has no standalone formatter, so
-this is a warning-clean `s7c` compile of every checked-in source file
-instead), compiles, and runs the client's unit tests and the conformance
-adapter's basic protocol sanity checks. `./run verify-example seed7`
-exercises the exact example above against the dedicated backend. `./run
-verify seed7` and `./run verify-hosted seed7` run the shared HTTP and
-Live conformance suite against the local and hosted deployments.
+This is a native Seed7 implementation. Seed7's own standard library handles
+JSON, HTTP, network sockets, and encrypted connections. Unlike many clients in
+this experiment, it does not rely on OpenSSL, libcurl, or a WebSocket package.
+Seed7 has no WebSocket library, so `client/convex_live.s7i` implements the
+WebSocket message format itself and then implements Convex's live-query
+conversation on top. A WebSocket is simply a long-lived, two-way network
+connection that lets Convex push a new query result as soon as the underlying
+data changes.
 
-## Protocol notes and limits
+Seed7 also has no thread library. Instead of putting the live connection on a
+background thread, the client uses one event loop which alternates between
+commands from the test controller and updates from Convex. The controller is a
+small program used by this repository to ask every language client the same
+questions. During normal conformance testing it talks to the Seed7 program over
+a local TCP socket. When the program is controlled through ordinary standard
+input instead, live updates are delivered between commands rather than while
+the input is sitting idle, because Seed7 cannot check whether console input is
+ready without blocking.
 
-The adapter speaks NDJSON protocol v1 on stdin/stdout or one
-`ADAPTER_LISTEN` TCP connection. There is no delegated HTTP, TLS,
-WebSocket, or JSON library underneath this client the way `libcurl` and
-`json-c` sit underneath the C client: `client/convex.s7i` uses only
-Seed7's own standard library (`json.s7i`, `https_request.s7i`/
-`http_request.s7i`, `tls.s7i`) for HTTP, and `client/convex_live.s7i`
-implements RFC 6455 WebSocket framing and the Convex sync protocol
-(`Connect`, `ModifyQuerySet` Add/Remove, `Transition`) directly against
-raw `socket.s7i`/`tls.s7i` sockets, because no WebSocket library exists
-in Seed7's standard library to delegate to.
+One especially interesting detail is that Seed7's TLS 1.2 support is itself
+written in Seed7. TLS is the security layer used by HTTPS and secure
+WebSockets. Its implementation includes AES-GCM, which encrypts data and
+detects tampering; HMAC, which proves that handshake messages were not altered;
+elliptic-curve key exchange, which lets two computers agree on a secret without
+sending that secret over the network; and X.509 parsing, which reads website
+certificates. This makes the runtime impressively self-contained, but it also
+exposes the most important limitation listed below: the library verifies the
+mathematics of the certificate chain without confirming that the chain ends at
+a root certificate trusted by the operating system.
 
-Seed7 ships no thread library, so the whole Live state machine runs on
-one single-threaded event loop rather than a dedicated worker thread: the
-conformance adapter's `ADAPTER_LISTEN` control connection is a real
-`socket`, pollable exactly like the Live connection, so each loop
-iteration flushes any decoded subscription values, then services
-whichever of the two connections is ready. Plain stdin/stdout mode
-delivers Live updates only between adapter commands, because this
-toolchain's console file type has no readiness check to poll on (proved
-directly against the interpreter, not assumed); the shared conformance
-harness always drives a client's Live behaviour over `ADAPTER_LISTEN`, so
-this does not affect the earned capability.
+The client contains two less obvious correctness fixes. Convex may encode a
+whole JSON number as either `0` or `0.0`, so `wholeNumberOf` checks the preserved
+decimal text instead of converting through a floating-point number and risking
+rounding. Seed7 can also reuse the initializer of a local variable when that
+initializer calls an impure function. A network deadline based on the current
+time was therefore observed reusing an old timestamp. This client declares
+such variables with a neutral value and performs the real assignment inside
+the function body, where it is evaluated on every call.
 
-Seed7's own `tls.s7i` is a from-scratch TLS 1.2 implementation --
-handshake state machine, AES-GCM, HMAC, elliptic-curve key exchange, X.509
-parsing -- with no OpenSSL dependency at all, which is also why this
-client's runtime image carries no OpenSSL library, configuration, or
-provider modules. It cryptographically validates the certificate chain a
-server presents (each certificate's signature against its issuer's public
-key) but does not check the chain against a trusted root CA store, so a
-fully substituted chain from an attacker's own root would not be
-detected. This is recorded plainly here and in the manifest rather than
-worked around, since fixing it honestly would mean shipping a CA-store
-verifier as part of the client rather than quietly relying on the
-underlying library to already do it.
+For deeper verification, `./run test seed7` runs the Seed7-local tests, while
+`./run verify seed7` and `./run verify-hosted seed7` run the full shared test
+suite against local and hosted Convex deployments.
 
-Convex JSON numbers may render a whole count as `0` or `0.0`.
-`client/convex.s7i`'s `wholeNumberOf` decodes either form by reading
-`json.s7i`'s own preserved decimal text for a `jsonNumber` rather than
-round-tripping through `float`, so it accepts both forms exactly and
-rejects a genuinely fractional value, scientific notation, and a quoted
-number; see `client/tests/client_test.sd7` for the regression.
+## Known Issues
 
-## A sharp edge worth knowing about
-
-A Seed7 `local` variable declared as `var T: x is someImpureCall();`
-inside a function's `result`/`local`/`begin` block is *not* guaranteed to
-re-evaluate that initializer on every call on this toolchain: a deadline
-computed as `var time: deadline is time(NOW) + timeout;` was observed to
-silently reuse a stale clock reading across calls, and the same shape
-with a `/dev/urandom` read behaved identically. The fix used everywhere
-in this client is to declare the variable with a neutral default and
-assign the real value as the first statement in `begin` instead. This is
-recorded here because it is exactly the kind of defect a conformance
-suite exercising only one call per process would never catch, and it
-cost real debugging time to isolate down to that one line shape.
+1. **Certificate trust is incomplete.** Encrypted connections validate the
+   signatures in the certificate chain, but do not prove that the chain ends at
+   a root certificate trusted by the operating system. A determined attacker
+   able to substitute an entirely different valid chain would not be detected.
+2. **Standard-input mode cannot push while idle.** Live updates are delivered
+   between controller commands in this mode. The normal Docker verification
+   path uses a local TCP control connection and is not affected.
+3. **Some advanced Convex behaviour is outside this example's scope.** Live
+   authentication, optimistic updates, and mutations or actions sent over the
+   WebSocket are not implemented. Mutations and actions still work over HTTP.
+4. **Slow test controllers can apply backpressure.** Each subscription keeps
+   only its newest 16 updates, but once an update is handed to the operating
+   system, a controller that stops reading can temporarily stall output.
+5. **Replacing a subscription is not perfectly economical.** Reusing a
+   subscription ID immediately retires the old local state, but the reconnect
+   snapshot does not first send a separate removal for the old server-side
+   query ID.

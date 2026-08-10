@@ -1,37 +1,147 @@
-# Convex from Haxe
+<img src="logo.png" alt="Haxe logo" width="220">
+<!-- Logo source: https://haxe.org/img/branding/haxe-logo.png -->
 
-This is a small native Haxe client that calls Convex functions over HTTP and
-keeps a query current over Live WebSockets. It is compiled to Neko bytecode,
-and Neko supplies only ordinary runtime facilities: sockets, TLS, threads, and
-JSON. The Convex HTTP envelopes, the pinned sync protocol, RFC 6455 framing,
-reconnect behaviour, and the NDJSON conformance adapter are all written here in
-Haxe.
-One session UUID is retained across transport reconnects so connection counts
-and observed timestamps continue to describe the same server session.
+# Haxe
 
-It is educational and unofficial. It is not a production SDK and is not
-intended for package publication.
+[Haxe](https://haxe.org/) is an open-source, strictly typed language built
+around a cross-compiler. Its ECMAScript-influenced syntax is approachable if
+you know TypeScript, Java, C#, or ActionScript, but one Haxe codebase can target
+JavaScript, C++, JVM bytecode, Python, Lua, PHP, and several other runtimes. The
+project began in 2005 under Nicolas Cannasse as a successor to the ActionScript
+2 compiler MTASC and the experimental MTypes language.
 
-## Start here
+Haxe's current official site positions it as a cross-platform tool for games,
+web apps, mobile and desktop software, command-line tools, and shared APIs. This
+demonstration compiles Haxe to Neko bytecode, one of Haxe's own virtual-machine
+targets. It is educational and unofficial, not a production SDK or an
+officially supported Convex client.
 
-Read [`examples/basics/Main.hx`](examples/basics/Main.hx). It queries a fresh
-counter room, starts a Live subscription before anything changes, applies one
-idempotent mutation, and then waits for that same subscription to observe the
-new value. It prints its six lines only when HTTP, the mutation result, and
-Live all agree on the `0 -> 1` journey.
+## Getting Started
 
-## What works
+Start with [`examples/basics/Main.hx`](examples/basics/Main.hx). It queries an
+isolated counter, subscribes before changing it, applies one mutation with a
+fresh idempotency key, then waits for Live to report the resulting `0 -> 1`
+update.
+
+From the repository root, Docker builds the exact checked-in example into its
+minimal Neko runtime image and runs it against a unique room:
+
+```sh
+./run verify-example haxe
+```
+
+That command checks the example's six-line happy-path transcript. The complete
+HTTP and Live capability claims below come from the separate shared local and
+hosted conformance runs already recorded for this implementation.
+
+## Interesting Parts
+
+### Familiar object literals, dynamic results
+
+React's generated types connect a function, its arguments, and its result. The
+handwritten Haxe client accepts an anonymous object but returns `Dynamic` JSON.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+function StateCount({ room }: { room: string }) {
+  const state = useQuery(api.demo.state, { room });
+  return <span>{state?.count ?? "Loading"}</span>;
+}
+```
+
+**Haxe**
+
+```haxe
+class StateCount {
+  public static function openClient():ConvexClient {
+    var url = Sys.getEnv("CONVEX_URL");
+    if (url == null || url.length == 0)
+      throw new haxe.Exception("CONVEX_URL is required");
+    return new ConvexClient(url);
+  }
+  public static function read(client:ConvexClient, room:String):Int {
+    var state:Dynamic = client.query("demo:state", {room: room}).value;
+    return JsonTools.exactInteger(Reflect.field(state, "count"), "state.count");
+  }
+}
+```
+
+The helper rejects missing and empty URLs. Its caller owns the client and must
+close it. `read` is one HTTP request and validates its `Dynamic` count.
+
+### A blocking stream over a background WebSocket
+
+React manages subscription lifetime and rerenders on change. This Haxe client
+instead exposes a blocking stream backed by a bounded queue and an owner thread.
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+function Counter({ room }: { room: string }) {
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  const addOne = () => increment({ room, language: "TypeScript",
+    runId: crypto.randomUUID() });
+  return <button onClick={addOne}>Count: {state?.count ?? 0}</button>;
+}
+```
+
+**Haxe**
+
+```haxe
+class LiveCounter {
+  public static function increment(client:ConvexClient, room:String):Array<Int> {
+    var subscription = client.subscribe("counter", "demo:state", {room: room});
+    var failure:Dynamic = null;
+    var counts:Array<Int> = [];
+    try {
+      var initial = subscription.next(10.0);
+      if (initial.error != null) throw initial.error;
+      counts.push(JsonTools.exactInteger(Reflect.field(initial.value, "count"),
+        "initial Live count"));
+      client.mutation("demo:increment", {room: room, language: "Haxe",
+        runId: ConvexClient.randomId()});
+      var updated = subscription.next(10.0);
+      if (updated.error != null) throw updated.error;
+      counts.push(JsonTools.exactInteger(Reflect.field(updated.value, "count"),
+        "updated Live count"));
+    } catch (error:Dynamic) {
+      failure = error;
+    }
+    try subscription.close() catch (closeError:Dynamic) {
+      if (failure == null) failure = closeError;
+    }
+    if (failure != null) throw failure;
+    return counts;
+  }
+}
+```
+
+Blocking `next` is an API choice, not a Haxe limitation. The helper owns its
+subscription and preserves the first failure through cleanup; its caller owns
+the client. Closing or replacing a handle invalidates its old generation.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
 | HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
-| Bearer authentication transport and structured function errors | Verified by shared local and hosted conformance |
+| Bearer authentication and structured function errors over HTTP | Verified by shared local and hosted conformance |
 | Live initial values, external updates, and query-error recovery | Verified by shared local and hosted conformance |
-| Remove, five real reconnects, generation barriers, bounded delivery | Verified by shared local and hosted conformance |
+| Unsubscribe, replacement barriers, and five real reconnects | Verified by shared local and hosted conformance |
 | Live authentication, WebSocket mutations and actions, transition chunks | Not implemented |
 
-The shared result evaluator ran against the reviewed source and awarded HTTP
-and Live.
+The shared evaluator awarded both `http` and `live` to the reviewed Haxe
+source. These are existing evidence-backed results; this README update does not
+claim a fresh verification run.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.hx -->
 ```haxe
@@ -126,109 +236,48 @@ class Main {
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-Nothing is built on the host.
+This is a native Haxe implementation compiled with Haxe 4.2.5 to Neko 2.3.0
+bytecode. Neko provides the VM and ordinary sockets, TLS, threads, JSON, and
+filesystem access. The Convex HTTP envelopes, Live state machine, WebSocket
+framing, reconnect behavior, and test adapter are implemented in Haxe rather
+than delegated to another Convex SDK.
 
-```sh
-./run sync-examples
-./run validate
-./run test haxe
-./run verify-example haxe
-./run verify haxe
-./run verify-hosted haxe
-./run verify-all haxe
-```
+The choice of Neko shapes several details. JSON arrives as `Dynamic`, Neko
+strings need explicit strict UTF-8 validation for WebSocket text, and its
+target `Int` cannot represent every unsigned sync counter. Haxe also lacks
+`finally`, so the canonical example captures an error, performs both cleanup
+steps, then rethrows it.
 
-`test` pins Haxe 4.2.5 and Neko 2.3.0, compiles the client, the canonical
-example, the conformance adapter, and the test suite, then runs that suite
-against real sockets. It also proves the example refuses to start without a
-deployment instead of printing a partial transcript. `verify-example` runs the
-exact `examples/basics/Main.hx` program from its minimal image against a unique
-room and compares stdout with the shared expected transcript. `verify` adds
-shared black-box conformance against the approved local backend, and
-`verify-hosted` repeats it against the hosted drift target. Only the shared
-result evaluator awards capability badges, so this branch claims none.
+For Live queries, one owner thread has exclusive control of the WebSocket and
+query set. Public subscription handles send commands to that owner instead of
+reading or writing the socket themselves. This makes unsubscribe and same-ID
+replacement deterministic, and it lets reconnects restore active queries while
+suppressing an unchanged initial value.
 
-## Conformance and protocol notes
+Memory and time are deliberately bounded. The client retains at most 64 active
+subscriptions, queues at most 16 Live updates within a 24 MiB accounting
+budget, caps a server message at 4 MiB, and abandons a connection that stalls
+after a frame has begun. The adapter has a separate bounded output queue so a
+stopped controller cannot make the process grow indefinitely.
 
-HTTP requests are built and parsed here. The client sends `format: "json"` to
-the documented endpoints, bounds responses at 8 MiB, understands both
-`Content-Length` and chunked framing, and rejects ambiguous framing rather than
-guessing. Convex reports function failures inside the response envelope, so the
-envelope is decoded before the HTTP status is consulted; a status only ever
-describes a response that is not a Convex error envelope at all. A non-2xx body
-that claims `status: success` is rejected. A configured bearer token is
-transmitted byte for byte, and a token containing a line break is rejected
-rather than allowed to inject a header.
+The minimal `linux/amd64` images contain the Neko VM and its runtime library
+closure, CA certificates, `/bin/sh`, and only the POSIX tools required by the
+shared verifier. They run as `65532:65532` and do not contain Haxe, Haxelib, a
+compiler frontend, package manager, network utility, or delegated runtime.
 
-Live uses the pinned `convex-rs-0.10.4-unversioned-sync` profile recorded in
-`manifest.yaml`. One owner thread exclusively opens, reads, writes, retires,
-and rebuilds the socket. Subscription handles and the adapter send commands to
-that owner and wait for bounded acknowledgements. Transitions are validated in
-full, including versions, timestamps, and every modification, and only then
-committed
-and published, so a malformed member can never leave half a transition applied.
-Each subscription handle is bound to one generation; unsubscribe and same-ID
-replacement invalidate the old generation before the acknowledgement is
-published, so an update dequeued a moment earlier can never cross the barrier.
-After a reconnect the active `Add` operations are resent and an unchanged
-rehydration is suppressed, which keeps the observable sequence exactly initial
-value, disconnect acknowledgement, external mutation, new value.
+## Known Issues
 
-WebSocket framing is strict: masked server frames, set RSV bits, non-minimal
-lengths, fragmented control frames, unrequested extensions, and text that is
-not well-formed UTF-8 are all rejected. UTF-8 is validated with an explicit
-decoder that rejects overlong forms, surrogate halves, and scalars above
-U+10FFFF, because a byte-length check would accept all three. Validation
-happens on the reassembled message, so a character split across frames still
-decodes. Once any byte of a frame has been consumed the connection is
-committed: a deadline or a malformed field retires it instead of resuming at a
-byte that only looks like a frame boundary. Readiness is a short blocking read
-rather than a descriptor select, because under TLS a decoded record can already
-be buffered while the descriptor looks idle.
-
-Live delivery is bounded globally rather than per subscription: the newest 16
-updates within a 24 MiB budget that charges four times each encoded event plus
-a fixed record allowance, because a queued update is retained as a decoded Neko
-value. The adapter's output queue is separate and holds at most 16 encoded
-lines within 12 MiB, retaining only the bytes it will write. A relay that
-dequeued an update before losing ownership is rejected again immediately before
-the write. With a reader that has stopped, the adapter fails its own output
-instead of growing without bound.
-
-The owner also bounds retained query state to 64 active subscriptions and 8 MiB
-of encoded paths and arguments. Pending owner commands and query IDs awaiting a
-remote `QueryRemoved` are independently capped, so rapid replacement cannot
-move the unbounded state somewhere outside the delivery queue.
-
-The adapter speaks NDJSON protocol v1 over stdin/stdout, or over one
-`ADAPTER_LISTEN` TCP connection accepted within a bounded window. It validates
-every command strictly, counts identifier lengths in Unicode code points rather
-than bytes, and omits absent optional fields entirely rather than serializing
-them as null.
-
-Both runtime images contain the Neko VM, the modules it loads, their shared
-libraries, the certificate bundle, `/bin/sh`, and the individual POSIX tools
-the shared verifier requires. They contain no Haxe compiler, package manager,
-network tool, delegated runtime, or multicall binary, and the build proves that
-by probing for each. TLS is exercised from that exact rootfs during the build,
-so a missing certificate bundle or TLS module is found there rather than during
-hosted verification. Both run as `65532:65532`.
-
-## Limitations
-
-Live authentication, optimistic updates, mutations and actions over the
-WebSocket, journals, mutation replay, and `TransitionChunk` assembly are
-deferred; a `TransitionChunk` is treated as recoverable profile drift and
-retires the socket rather than publishing partial state. Values cover Convex's
-JSON-safe subset, so tagged encodings are not converted into richer Haxe types.
-The client has no server-inactivity watchdog; it relies on the peer closing or
-on a read failing. Inputs beyond the documented line, body, frame, delivery, or
-output bounds are rejected or coalesced rather than risking unbounded memory.
-Docker compilation and the shared local and hosted conformance runs passed,
-earning HTTP and Live. Neko's
-sync counters are supported through its exact non-negative signed integer range;
-the client refuses larger unsigned protocol values instead of wrapping them.
-The shared README renderer displays this canonical example directly from its
-formatted Haxe source.
+1. Live authentication, optimistic updates, WebSocket mutations and actions,
+   and `TransitionChunk` assembly are deferred.
+2. Function values use the JSON-safe subset exercised by this project and
+   remain `Dynamic`; there is no generated Haxe API layer that turns Convex
+   validators into compile-time result types.
+3. There is no server-inactivity watchdog. A completely silent peer is noticed
+   only when a later read or write fails.
+4. Under delivery pressure, the bounded Live queue drops the globally oldest
+   state so a slow consumer can catch up to newer values. An individual
+   oversized update becomes a structured failure instead of being retained.
+5. Sync counters are limited to Neko's exact non-negative signed integer range.
+   Larger unsigned protocol values are rejected rather than wrapped.
