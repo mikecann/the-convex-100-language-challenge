@@ -1,0 +1,33 @@
+schemaVersion: 1
+id: fennel
+displayName: "Fennel"
+rank: 100
+selectionTier: curated_backfill
+implementation:
+  status: attempting
+  provenance: transpiled
+  version: 0.1.0
+  notes: Fennel source is compiled ahead of time to Lua 5.1. Lua is the declared target runtime, while Convex HTTP and /api/sync behaviour is implemented in Fennel source.
+toolchain:
+  name: Fennel
+  version: 1.6.1
+targetRuntimeCommand: lua
+intendedCapabilities:
+  - http
+  - live
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - Language-local Docker tests are implemented; shared local and hosted conformance remain pending.
+  - The educational client supports the JSON-safe Convex value subset only.
+  - Live authentication, TransitionChunk assembly, optimistic updates, and mutation replay are deferred.
+capabilities: []
