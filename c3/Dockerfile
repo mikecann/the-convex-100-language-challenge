@@ -10,7 +10,7 @@ WORKDIR /src
 COPY client ./client
 COPY examples ./examples
 RUN gcc -std=c17 -Wall -Wextra -Werror -c client/platform.c -o /out-platform.o && \
-    C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -l curl -o /out-adapter client/adapter.c3 client/http.c3 client/values.c3 client/response.c3 /out-platform.o && \
+    C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -l curl -o /out-adapter client/adapter.c3 client/http.c3 client/values.c3 client/response.c3 /opt/c3/lib/std/core/string_escape.c3 /out-platform.o && \
     C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -o /out-example examples/basics/main.c3 && \
     readelf -h /out-adapter | grep 'Advanced Micro Devices X86-64'
 FROM build AS test

@@ -8,6 +8,8 @@ import std::os::env;
 import c3_http;
 import c3_response;
 
+extern fn CInt c3_adapter_listen(char* address);
+
 // Adapter output is deliberately written only here. C3 owns the command
 // routing and Convex response semantics; platform.c only exchanges HTTPS
 // bytes and never receives an operation name or Convex response type.
@@ -16,10 +18,7 @@ fn void emit(String event)
     io::printn(event);
 }
 
-// Adapter identifiers are schema-bounded ASCII test identifiers. The full
-// client will replace this temporary formatter with JSON string escaping
-// before it accepts arbitrary user-provided strings on this protocol surface.
-fn String quote(String value) => string::tformat(`"%s"`, value);
+fn String quote(String value) => value.tescape();
 
 fn void emit_error(String id, String name, String message, String data = "null")
 {
@@ -75,6 +74,12 @@ fn void call_http(String id, String op, String path, Object* args, String deploy
 
 fn void main()
 {
+    String listen_address = env::tget_var("ADAPTER_LISTEN") ?? "";
+    if (listen_address.len && c3_adapter_listen(listen_address.ptr) == 0)
+    {
+        io::eprintn("failed to bind ADAPTER_LISTEN");
+        return;
+    }
     String deployment = env::tget_var("CONVEX_URL") ?? "";
     String token = "";
     while (true)
