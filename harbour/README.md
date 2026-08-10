@@ -1,22 +1,168 @@
-# Convex from Harbour
+<img src="logo.png" alt="Harbour logo" width="180">
+<!-- Logo source: https://harbour.github.io/images/harbour.svg -->
 
-This demonstration uses Harbour, a free modern compiler for the xBase
-(Clipper/dBase) language family, to call Convex's documented JSON HTTP
-functions and to keep a reactive query current through a native Harbour
-WebSocket connection.
+# Harbour
 
-It is an educational, unofficial experiment. It is not a production SDK, an
-officially sanctioned Convex client, or a package intended for publication.
+[Harbour](https://harbour.github.io/about) is a free, cross-platform compiler
+for the xBase language family, compatible with the Clipper language that grew
+out of dBase-style database programming. The project
+[began in 1999](https://harbour.github.io/faq) as an open source Clipper
+compiler and now adds objects, threads, portable UI and database backends, and
+a large runtime library.
 
-## Start here
+Its present-day niche is practical: maintaining and extending xBase business
+software while targeting current operating systems. The
+[official project repository](https://github.com/harbour/core) describes it as
+multi-platform, multi-threaded, object-oriented, and scriptable.
 
-[`examples/basics/main.prg`](examples/basics/main.prg) is the canonical
-example. It reads a new counter room over HTTP, starts Live before changing
-it, applies an idempotent mutation, and proves the same `0 -> 1` journey
-arrived through the subscription. The block below is generated from that
-exact runnable file.
+This is an educational, unofficial Convex client. It is not a production SDK,
+an officially sanctioned Convex client, or a package intended for publication.
 
-## What works
+## Getting Started
+
+Start with [`examples/basics/main.prg`](examples/basics/main.prg). It reads a
+fresh counter over HTTP, subscribes before changing it, performs an idempotent
+mutation, and receives the resulting `0 -> 1` change through Live.
+
+From the repository root, run the exact example in its minimal Docker image
+against a unique room on the approved local backend:
+
+```sh
+./run verify-example harbour
+```
+
+## Interesting Parts
+
+### JSON objects are Harbour hashes
+
+A generated Convex TypeScript API gives React code typed arguments and return
+values. Harbour's `{ "key" => value }` syntax is a hash table, so it maps neatly
+to a JSON object, but this client decodes the result dynamically and must check
+its shape at runtime.
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { useMutation } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function IncrementButton() {
+  const increment = useMutation(api.demo.increment);
+  const [room] = useState(() => `harbour-readme-${crypto.randomUUID()}`);
+
+  async function handleClick() {
+    const result = await increment({
+      room,
+      language: "TypeScript",
+      runId: crypto.randomUUID(),
+    });
+    console.log(result.state.count); // result.state.count is a typed number.
+  }
+
+  return <button onClick={handleClick}>Increment</button>;
+}
+```
+
+**Harbour**
+
+```harbour
+PROCEDURE Main()
+   LOCAL cUrl, cRoom, oClient, hArgs, hResult, hValue
+
+   cUrl := GetEnv( "CONVEX_URL" )
+   IF Empty( cUrl )
+      OutErr( "CONVEX_URL is required" + hb_eol() )
+      RETURN
+   ENDIF
+   cRoom := "harbour-readme-" + ConvexUuid4()
+   oClient := TConvexClient():New( cUrl, NIL )
+
+   /* A Harbour hash becomes the JSON argument object sent to Convex. */
+   hArgs := { "room" => cRoom, ;
+      "language" => "Harbour", "runId" => ConvexUuid4() }
+   hResult := oClient:Call( "mutation", "demo:increment", hArgs, 10000 )
+
+   /* Unlike generated TypeScript, the decoded hash needs runtime checks. */
+   IF hResult[ "ok" ] .AND. ValType( hResult[ "value" ] ) == "H"
+      hValue := hResult[ "value" ]
+      IF hb_HHasKey( hValue, "state" ) .AND. ;
+         hb_HHasKey( hValue[ "state" ], "count" )
+         ? hValue[ "state" ][ "count" ]
+      ENDIF
+   ENDIF
+
+   oClient:Close()
+   RETURN
+```
+
+`Call()` is a one-off HTTP mutation. The hashes are pleasantly close to the
+wire-shaped data, but they do not provide the compile-time argument and result
+checks that `api.demo.increment` does.
+
+### A codeblock receives Live updates
+
+React owns a `useQuery` subscription for the component's lifetime. This
+Harbour client instead invokes a callback, called a codeblock, on its Live
+worker thread. The example uses a Harbour mutex as a channel so its main thread
+can wait for the value and then clean up explicitly.
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function Counter() {
+  const [room] = useState(() => `harbour-live-${crypto.randomUUID()}`);
+  const state = useQuery(api.demo.state, { room });
+
+  // React starts, updates, and disposes the subscription for this component.
+  if (state === undefined) return <p>Loading</p>;
+  return <p>{state.count}</p>; // state.count is a typed number.
+}
+```
+
+**Harbour**
+
+```harbour
+PROCEDURE Main()
+   LOCAL cUrl, cRoom, hArgs, cUpdates, bOnEvent, oClient, hUpdate
+
+   cUrl := GetEnv( "CONVEX_URL" )
+   IF Empty( cUrl )
+      OutErr( "CONVEX_URL is required" + hb_eol() )
+      RETURN
+   ENDIF
+   cRoom := "harbour-live-" + ConvexUuid4()
+   /* This hash is the complete query argument object. */
+   hArgs := { "room" => cRoom }
+   /* This mutex is used here as a one-value channel. */
+   cUpdates := hb_mutexCreate()
+
+   /* {| ... | ... } is a codeblock. The Live worker calls it per update. */
+   bOnEvent := {| cSubId, xValue, hError, xLogs | ;
+      hb_mutexNotify( cUpdates, { "value" => xValue, "error" => hError } ) }
+   oClient := TConvexClient():New( cUrl, bOnEvent )
+
+   oClient:Subscribe( "counter", "demo:state", hArgs )
+   /* Wait up to ten seconds for the initial state, then read its count. */
+   hb_mutexSubscribe( cUpdates, 10, @hUpdate )
+   /* The returned hash and its count are dynamically decoded. */
+   ? hUpdate[ "value" ][ "count" ]
+
+   /* This command-line API owns the lifecycle that React normally hides. */
+   oClient:Unsubscribe( "counter" )
+   oClient:Close()
+   RETURN
+```
+
+Codeblocks and threads are Harbour features. The direct callback and explicit
+`Subscribe()`/`Unsubscribe()` lifecycle are choices made by this small client,
+not limitations of the language.
+
+## Status
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
@@ -27,7 +173,7 @@ The shared evaluator awarded both badges from a clean exact-head build: 31 of
 31 checks against a local backend and 31 of 31 against the hosted deployment
 over real TLS.
 
-## The basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.prg -->
 ```harbour
@@ -154,7 +300,7 @@ PROCEDURE Main( cRoomArg )
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verify it in Docker
+## Implementation Notes
 
 ```sh
 ./run test harbour           # builds Harbour 3.2.0 from source, lints the
@@ -174,7 +320,7 @@ against a real local TLS server it starts, in trusted, untrusted, and
 wrong-hostname configurations, so certificate verification is exercised
 against actual peers rather than mocked.
 
-## Conformance and protocol notes
+### How it works
 
 - The client speaks the pinned `convex-rs@6f1df8a8` sync profile at
   `/api/sync`, matching every other client in this project.
@@ -222,34 +368,20 @@ against actual peers rather than mocked.
   `convex.cloud` but `subjectAltName` `convex.cloud` and `*.convex.cloud`,
   so a CN-only client cannot complete a hosted handshake at all.
 
-## Limitations
+## Known Issues
 
-- When a certificate carries no `subjectAltName` at all, hostname
-  verification falls back to pattern-matching the Subject CN (via
-  `X509_name_oneline()`), and a certificate with neither is a best-effort
-  skip of the name check specifically, rather than being rejected
-  outright. Chain verification itself (`SSL_get_verify_result()` against
-  the system trust store or `$SSL_CERT_FILE`) is always full strength and
-  rejects an untrusted or self-signed peer regardless of this narrowing.
-- A WebSocket control frame (close/ping/pong) arriving while a data message
-  is still being reassembled from continuation frames is treated as a
-  protocol failure that triggers a reconnect, rather than being returned to
-  the caller mid-reassembly and resumed afterward. Convex's own sync
-  protocol never fragments an application message, so this can only be
-  reached by a broken or hostile peer.
-- Live authentication, optimistic updates, WebSocket-issued mutations,
-  WebSocket actions, and `TransitionChunk` assembly are deferred; a
-  `TransitionChunk` is reported as protocol drift and the connection
-  reconnects.
-- Live values cover Convex's JSON-safe subset; tagged Convex value
-  conversions are deferred.
-- The client keeps no in-memory Live delivery queue: `convexlive.prg`'s
-  `DeliverValue()`/`DeliverError()` call the caller's event codeblock
-  directly from the Live worker thread, with no intermediate buffer. The
-  adapter's own codeblock writes straight to stdout (or the
-  `ADAPTER_LISTEN` TCP socket) under one mutex; a slow or stopped consumer
-  therefore blocks that single write against the OS pipe or socket buffer
-  rather than growing process memory.
-- JSON numbers are accepted only when mathematically integral and within a
-  signed 64-bit range; fractional and out-of-range values are rejected at
-  the point of use.
+1. When a certificate has no `subjectAltName`, hostname verification falls
+   back to its Subject CN. If it has neither, this client skips the hostname
+   check, although certificate-chain verification still rejects an untrusted
+   or self-signed peer.
+2. A WebSocket control frame received midway through a fragmented data message
+   triggers a reconnect instead of pausing and resuming message reassembly.
+3. Live authentication, optimistic updates, WebSocket mutations and actions,
+   and `TransitionChunk` assembly are deferred.
+4. Live values cover the JSON-safe Convex subset. Tagged Convex value
+   conversions are deferred.
+5. The client deliberately has no in-memory Live delivery queue. A slow event
+   codeblock blocks the worker on the OS pipe, socket buffer, or caller's
+   channel instead of allowing process memory to grow.
+6. Code that expects an integer accepts mathematically integral JSON numbers
+   within signed 64-bit range and rejects fractional or overflowing values.
