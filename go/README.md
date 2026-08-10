@@ -1,26 +1,192 @@
-# Convex from Go
+<img src="logo.png" alt="Go logo" width="180">
+<!-- Logo source: https://go.dev/blog/go-brand/Go-Logo/PNG/Go-Logo_Blue.png -->
 
-This folder shows a small Go program talking directly to Convex. It can call
-queries, mutations, and actions over HTTP, then keep a query updated in real
-time over a WebSocket.
+# Go
 
-This is an educational demonstration for the 100-language project. It is not
-an official Convex SDK or a package intended for production use.
+[Go](https://go.dev/) is a compiled, statically typed language created at
+[Google](https://go.dev/solutions/google/) by Robert Griesemer, Rob Pike, and
+Ken Thompson. Work began in 2007 and the project became public in 2009. It takes
+ideas familiar from C, including small syntax and compiled binaries, then adds
+garbage collection, structural
+interfaces, and lightweight concurrency. Go is especially common in API and
+RPC services, command-line tools, cloud infrastructure, and networking software.
+The [2025 Go Developer Survey](https://go.dev/blog/survey2025) found that 82% of
+respondents used it for their primary job, so its present-day niche is firmly
+professional backend and infrastructure work rather than language curiosity.
 
-## Start here
+This client is an educational, unofficial demonstration. It is not an official
+Convex SDK and it is not intended for production use.
 
-The [basic example](examples/basics/main.go) is the best place to begin. It:
+## Getting Started
 
-1. Connects to a Convex deployment.
-2. Queries the current state of a counter room.
-3. Starts a Live subscription to that same query.
-4. Runs a mutation which changes the counter.
-5. Receives the new value through Live without polling again.
+Start with the [canonical basic example](examples/basics/main.go). It queries a
+counter, opens a Live subscription, increments the counter, and checks that the
+HTTP and Live results agree. From the repository root, run:
 
-The implementation behind it lives in [client](client/). Everything is built
-and tested inside Docker, so no Go toolchain is installed on the host.
+```sh
+./run verify-example go
+```
 
-## What works
+That command builds and runs the example in Docker, so you do not need to
+install Go on the host.
+
+## Interesting Parts
+
+### Generated TypeScript types meet explicit Go decoding
+
+**TypeScript with React**
+
+```tsx
+import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
+
+export function App() {
+  return (
+    <ConvexProvider client={convex}>
+      <RoomCount />
+    </ConvexProvider>
+  );
+}
+
+function RoomCount() {
+  const room = "go-readme";
+  const state = useQuery(api.demo.state, { room });
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // The generated API makes count a number here.
+}
+```
+
+**Go**
+
+```go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+
+	convex "github.com/mikecann/100-convex-clients/go/client"
+)
+
+// roomState names the result fields this program wants to use.
+type roomState struct {
+	Count float64 `json:"count"` // Convex v.number maps to a Go JSON number.
+}
+
+func main() {
+	ctx := context.Background()
+	client, err := convex.New(os.Getenv("CONVEX_URL"))
+	if err != nil {
+		panic(err)
+	}
+	defer client.Close(ctx)
+
+	room := "go-readme"
+	result, err := client.Query(ctx, "demo:state", map[string]any{"room": room})
+	if err != nil {
+		panic(err)
+	}
+
+	var state roomState
+	if err := json.Unmarshal(result.Value, &state); err != nil {
+		panic(err)
+	}
+	fmt.Println(state.Count) // count is typed only after this explicit decode.
+}
+```
+
+The React hook gets argument and result types from Convex's generated API. This
+handwritten Go client instead accepts a function path and a JSON-shaped argument
+map, then returns `json.RawMessage`. A Go application chooses its own result
+struct and performs the decoding. Also, `Query` is a one-off HTTP request;
+unlike `useQuery`, it does not stay subscribed.
+
+### A Live query is an owned channel
+
+**TypeScript with React**
+
+```tsx
+import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
+
+export function App() {
+  return (
+    <ConvexProvider client={convex}>
+      <LiveCount room="go-readme" />
+    </ConvexProvider>
+  );
+}
+
+function LiveCount({ room }: { room: string }) {
+  const state = useQuery(api.demo.state, { room });
+  if (state === undefined) return <p>Connecting...</p>;
+  return <p>{state.count}</p>; // React rerenders when the query changes.
+}
+```
+
+**Go**
+
+```go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+
+	convex "github.com/mikecann/100-convex-clients/go/client"
+)
+
+type roomState struct {
+	Count float64 `json:"count"` // Convex v.number maps to a Go JSON number.
+}
+
+func main() {
+	ctx := context.Background()
+	client, err := convex.New(os.Getenv("CONVEX_URL"))
+	if err != nil {
+		panic(err)
+	}
+	defer client.Close(ctx) // Shut down the shared WebSocket when the app exits.
+
+	room := "go-readme"
+	subscription, err := client.Subscribe(
+		ctx,
+		"demo:state",
+		map[string]any{"room": room},
+	)
+	if err != nil {
+		panic(err)
+	}
+	defer subscription.Close() // Tell Convex when this query is no longer needed.
+
+	for update := range subscription.Updates() {
+		if update.Err != nil {
+			panic(update.Err)
+		}
+		var state roomState
+		if err := json.Unmarshal(update.Value, &state); err != nil {
+			panic(err)
+		}
+		fmt.Println(state.Count) // The initial value and later changes use one channel.
+	}
+}
+```
+
+React owns the subscription lifecycle and turns each value into a render. The Go
+client deliberately exposes a receive-only channel instead. Channels are a
+normal Go concurrency tool, but the blocking `range` API is this client's design
+choice, not a limitation of Go. The application explicitly closes both the
+subscription and client.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -32,7 +198,10 @@ and tested inside Docker, so no Go toolchain is installed on the host.
 | Authentication for Live subscriptions | Not yet |
 | Full tagged Convex value types | Not yet |
 
-## Basic example
+The implementation provenance is **native**. HTTP and Live are the two earned
+capabilities recorded in the manifest.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.go -->
 ```go
@@ -232,93 +401,46 @@ func randomID() string {
 ```
 <!-- END GENERATED EXAMPLE -->
 
-This block is generated from `examples/basics/main.go`, which is also the source
-shown on the evidence website. Edit and run the source file, then use
-`./run sync-examples` to refresh this README projection.
+This block is generated from `examples/basics/main.go`. The README, evidence
+site, and Docker image all use that exact source.
 
-## Conformance tests
+## Implementation Notes
 
-The test-only source under `client/tests/conformance/` builds a thin Go executable
-which accepts NDJSON protocol v1 on stdin and reserves stdout for NDJSON
-events. It lets the shared harness exercise the real client and is not part of
-the educational client API. It supports:
+- The public client is ordinary Go. It uses the standard `net/http` and
+  `encoding/json` packages for Convex's documented HTTP endpoints, plus the
+  pinned `github.com/coder/websocket` dependency for Live transport. All
+  Convex-specific request, subscription, and reconnect behaviour is implemented
+  in Go rather than delegated to another Convex client or runtime.
+- HTTP calls take a `context.Context`, validate that arguments encode as a named
+  JSON object, and return raw JSON alongside function log lines. Function,
+  protocol, and transport failures have distinct Go error types, so callers can
+  inspect them with `errors.As`.
+- One goroutine owns Live connections, subscriptions, query-set changes, and
+  reconnects. Each subscription exposes a receive-only channel buffered to 16
+  updates. If its reader falls behind, the client drops the oldest buffered
+  state and retains the newest rather than blocking the WebSocket owner.
+- Live targets the pinned internal `convex-rs` 0.10.4 profile at commit
+  `6f1df8a8ba1665084ec001e307ca841ca17074d7` through the unversioned `/api/sync`
+  endpoint. That is a tested compatibility target, not a stable third-party
+  protocol promise. The [protocol notes](../docs/protocol-profiles.md) define
+  the boundary.
+- The test-only conformance adapter is compiled with the `convexadapter` build
+  tag. Its `debugDisconnect` hook proves reconnect behaviour without appearing
+  in the educational client API. Adapter output has separate 16-record and
+  8 MiB limits so a stopped controller cannot create unbounded memory growth.
+- `./run test go` performs formatting checks, race-enabled unit tests, and
+  compilation inside the pinned Go 1.25.6 Docker image. `./run verify go` and
+  `./run verify-hosted go` are the separate shared conformance layers that
+  produced the capability evidence recorded above.
 
-- `hello`
-- `query`
-- `mutation`
-- `action`
-- `subscribe`
-- `unsubscribe`
-- `close`
+## Known Issues
 
-The adapter build also exposes `debugDisconnect`. This command is adapter-only
-and test-only. It force-closes the current WebSocket while leaving the client
-alive so the shared controller can test reconnect without Docker socket or host
-network access. The hook is hidden from normal Go builds by the
-`convexadapter` build tag.
-
-Each Live subscription buffers at most 16 updates. If a subscriber falls
-behind, the client discards the oldest buffered state and keeps the newest one.
-The adapter's separate output owner accepts at most 16 encoded records and 8
-MiB including conservative per-record overhead. It fails closed when either
-budget is exhausted, and adapter shutdown does not wait indefinitely for a
-controller that has stopped reading.
-
-Example handshake:
-
-```json
-{"protocolVersion":1,"id":"hello-1","op":"hello"}
-```
-
-Runtime variables:
-
-- `CONVEX_URL`, required before the first network command.
-- `CONVEX_AUTH_TOKEN`, optional bearer token for HTTP calls.
-
-## Docker-only verification
-
-No Go tooling should run on the host.
-
-```sh
-./run test go
-./run verify-example go
-./run verify go
-./run verify-hosted go
-```
-
-`test` runs race-enabled unit tests against mock HTTP and WebSocket peers.
-`verify-example` builds this exact basic example into a minimal container, runs
-it against a unique room, and requires the query, mutation, and Live subscription
-to agree on a `0 -> 1` change. `verify` runs that check plus the complete
-JavaScript-oracle and Go black-box suites against the pinned local backend.
-`verify-hosted` repeats them over current HTTPS and WSS. Only those shared
-controller results can calculate HTTP or Live. Trusted-main CI alone publishes
-the badges shown by the official evidence site.
-
-## How it talks to Convex
-
-HTTP calls use Convex's documented `/api/query`, `/api/mutation`, and
-`/api/action` endpoints. The client keeps successful values, function logs,
-structured application errors, and transport failures distinct.
-
-Live uses an ordinary Go WebSocket library, but the Convex-specific subscription
-and reconnect behaviour is implemented in Go. It does not wrap `convex-js`,
-`convex-rs`, the Convex CLI, `curl`, or another runtime.
-
-The Live implementation is deliberately experimental. It targets the internal
-`convex-rs` 0.10.4 protocol profile at commit
-`6f1df8a8ba1665084ec001e307ca841ca17074d7` and the unversioned `/api/sync`
-endpoint. That is a tested compatibility target, not a claim that Convex offers
-a stable third-party sync protocol. See the
-[protocol notes](../docs/protocol-profiles.md) for the exact boundary.
-
-## Outside the current HTTP and Live scope
-
-- Full tagged Convex value encoding and Go-native Int64/bytes/special-float mappings.
-- Live auth, auth rotation, and token refresh.
-- WebSocket mutations and actions.
-- Ordered mutation queue, mutation replay, and commit-timestamp resolution.
-- Action non-replay guarantees.
-- Query journals, reactive pagination, optimistic updates, and query deduplication.
-- The npm-versioned sync profile and `TransitionChunk` assembly.
-- Repeated fault, large-payload, and atomic multi-query-view testing.
+1. Live subscriptions do not support authentication, token rotation, or token
+   refresh. Bearer tokens apply only to HTTP calls.
+2. Values use JSON's safe subset as `json.RawMessage`. Tagged Convex values such
+   as Int64, bytes, and special floating-point values have no Go-native mapping.
+3. Mutations and actions use HTTP only. Live mutation ordering, replay,
+   journals, optimistic updates, and action non-replay guarantees are deferred.
+4. `TransitionChunk` assembly and the npm-versioned sync profile are not
+   implemented. Receiving a chunk is treated as protocol drift and causes a
+   reconnect.
