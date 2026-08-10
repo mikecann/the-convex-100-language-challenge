@@ -1,30 +1,189 @@
-# Convex from V
+<img src="logo.png" alt="V logo" width="120">
+<!-- Logo source: https://github.com/vlang/v-logo/blob/eec050c901ed3afefce8cbe56092d55ed6770706/dist/v-logo.svg -->
 
-This demonstration reads a shared counter from Convex over HTTP, subscribes to
-that same query through Convex's live sync protocol, increments the counter
-once, and then checks that both paths agree the value moved from 0 to 1.
+# V
 
-It is educational and unofficial. It is not a production SDK, not a sanctioned
-Convex client, and not something to depend on.
+V is a young, statically typed compiled language whose [public
+repository](https://github.com/vlang/v) began in 2019. It was designed around
+Go-like simplicity and C-like reach. Its main backend emits human-readable C,
+while the official project also targets JavaScript and highlights command-line
+tools, web applications, graphics, games, and low-level systems work. V is
+still a pre-1.0 beta with a much smaller ecosystem than Go, C#, or TypeScript,
+but it has an active project and a distinctive niche for people who want one
+compact language across application and systems code. See the [official V
+website](https://vlang.io/) and [documentation](https://docs.vlang.io/).
 
-## Start here
+This repository's Convex client is an educational, unofficial demonstration.
+It is not a production SDK and is not sanctioned by Convex or the V project.
 
-[examples/basics/main.v](examples/basics/main.v) is the one runnable teaching
-source. It reads the counter, starts listening *before* it writes, applies one
-idempotent increment, receives the new value over the live connection, and
-prints the six-line transcript every language in this repository shares.
+## Getting Started
 
-## What works
+Start with [the canonical V example](examples/basics/main.v). From the
+repository root, run:
+
+```sh
+./run verify-example v
+```
+
+Docker builds the pinned V toolchain and minimal `linux/amd64` example image,
+then runs the real program against an approved local Convex test deployment.
+The example reads a room's counter, subscribes before changing it, performs one
+idempotent increment, and confirms that Live delivers the new value.
+
+## Interesting Parts
+
+### A familiar query, with an explicit JSON boundary
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const state = useQuery(api.demo.state, { room: "docs-v" });
+  if (state === undefined) return <p>Loading...</p>;
+
+  return <p>{state.count}</p>; // Generated types make state.count a number.
+}
+```
+
+**V**
+
+```v
+import os
+import x.json2
+import convex
+
+fn run() ! {
+	url := os.getenv('CONVEX_URL')
+	if url.len == 0 {
+		return error('CONVEX_URL is required')
+	}
+	mut client := convex.new_client(url)!
+	defer {
+		client.close() // The command-line program owns the client's lifetime.
+	}
+
+	// V maps construct the same { room: "docs-v" } argument object.
+	result := client.query('demo:state', {
+		'room': json2.Any('docs-v')
+	})! // A trailing ! returns any client error from run().
+
+	// This demonstration has no generated schema types, so it checks JSON at runtime.
+	state := result.value as map[string]json2.Any
+	count := convex.integral_number(state['count'] or { json2.Any(json2.null) }) or {
+		return error('demo:state did not return an integral count')
+	}
+	println(count)
+}
+```
+
+The function name and arguments match, but the behavior does not: React's
+`useQuery` stays subscribed and rerenders the component, while `client.query`
+is one HTTP read. The V client deliberately returns `json2.Any` because this
+repository does not generate V types from the Convex schema, so narrowing and
+number validation happen at the boundary. The [complete
+example](examples/basics/main.v) checks the object shape before casting too.
+
+### Live data is an owned resource
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function CounterButton() {
+  const room = "docs-v";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  return (
+    <button
+      disabled={state === undefined}
+      onClick={() =>
+        increment({ room, language: "TypeScript", runId: crypto.randomUUID() })
+      }
+    >
+      {state?.count ?? "Loading..."}
+    </button>
+  ); // React owns subscription setup and cleanup; a new value rerenders this.
+}
+```
+
+**V**
+
+```v
+import os
+import time
+import x.json2
+import convex
+
+fn run() ! {
+	url := os.getenv('CONVEX_URL')
+	if url.len == 0 {
+		return error('CONVEX_URL is required')
+	}
+	mut client := convex.new_client(url)!
+	defer {
+		client.close() // Also retires the Live worker and socket.
+	}
+
+	// The subscription key lets this program replace or unsubscribe this query.
+	mut updates := client.subscribe('counter', 'demo:state', {
+		'room': json2.Any('docs-v')
+	})!
+	defer {
+		client.unsubscribe('counter') or {}
+	}
+
+	// The first delivery is the query's current value.
+	initial := updates.next(20 * time.second)!
+	if initial.is_error() {
+		return error(initial.error_message)
+	}
+	println(initial.value)
+
+	// Mutate only after subscribing, using the same arguments as the React call.
+	mutation := client.mutation('demo:increment', {
+		'room':     json2.Any('docs-v')
+		'language': json2.Any('V')
+		'runId':    json2.Any('v-${time.sys_mono_now()}')
+	})!
+	println(mutation.value) // The returned JSON contains { applied, state }.
+
+	// The relay blocks until Convex pushes the recomputed query value.
+	updated := updates.next(20 * time.second)!
+	if updated.is_error() {
+		return error(updated.error_message)
+	}
+	println(updated.value)
+}
+```
+
+V supports threads and channels, but this client intentionally exposes a
+blocking, deadline-bounded `next` operation. That keeps ownership obvious for a
+small command-line client: one internal worker owns the WebSocket, and the
+caller owns the subscription relay. Unlike a React hook, nothing automatically
+unsubscribes when a component disappears.
+
+## Status
 
 | Area | Current state |
 | --- | --- |
-| HTTP client source | Written in V, with unit fixtures for framing, envelopes, and bounds. Verified by shared conformance on both profiles. |
-| Live client source | Written against the pinned sync profile with a V-owned bounded RFC 6455 transport and real raw-peer fixtures. Verified by shared conformance on both profiles. |
-| Conformance adapter | Written for both stdin/stdout and `ADAPTER_LISTEN` TCP, with fixtures for command strictness, ordering, and invalidation. Built and verified. |
-| Docker images | Built with V 0.4.9 pinned to an exact commit, verified on both profiles. |
-| Capability badges | http, live. Both earned. |
+| HTTP client | Native V implementation. Shared conformance passed on the local and hosted profiles. |
+| Live client | Native V implementation with a bounded, client-owned WebSocket transport. Shared conformance passed on the local and hosted profiles. |
+| Conformance adapter | Supports stdin/stdout and `ADAPTER_LISTEN` TCP modes. Its language-local fixtures cover strict command and event shapes, ordering, and subscription invalidation. |
+| Docker images | V 0.4.9 and its bootstrap compiler are pinned to exact commits. The final images target `linux/amd64`. |
+| Earned capabilities | `http`, `live`. Both are evidence-backed. |
 
-## The basic example
+The coordinator's clean exact-head evidence recorded 31 of 31 checks passing
+against the approved local backend and another 31 of 31 against the dedicated
+hosted deployment over TLS. These are separate from compilation and from the
+canonical example check.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.v -->
 ```v
@@ -166,90 +325,51 @@ fn main() {
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verify it in Docker
+## Implementation Notes
 
-    ./run test v
-    ./run verify-example v
-    ./run verify v
-    ./run verify-hosted v
+This is a native V client. The Convex-specific request envelopes, response
+decoding, Live state machine, reconnect behavior, and WebSocket framing all
+live under [client/](client/). It uses V's standard sockets, JSON, SHA-1, and
+base64 support, plus OpenSSL for TLS. It does not call another Convex SDK,
+`curl`, Node.js, Python, or the Convex CLI.
 
-`./run test v` builds a `linux/amd64` image that checks formatting, lints,
-runs the V unit fixtures, and compiles both the canonical example and the
-conformance executable. `./run verify-example v` runs that exact example
-binary, from its minimal read-only runtime image, against a unique room on the
-approved local deployment and compares stdout byte for byte with the shared
-transcript. `./run verify v` adds the shared black-box conformance run, and
-`./run verify-hosted v` repeats both against the dedicated hosted target so
-protocol drift shows up somewhere other than production.
+The HTTP path opens one connection per call and limits the request, status
+line, headers, and response body independently. Function failures keep their
+structured data rather than being mistaken for generic HTTP failures. Once V
+returns a socket, one absolute deadline covers the TLS handshake and all reads
+and writes. The small C helpers in
+[client/socket_deadline.c.v](client/socket_deadline.c.v) set kernel socket
+deadlines because the pinned V OpenSSL wrapper bypasses `TcpConn`'s own timeout
+fields.
 
-The shared coordinator has run all of these against a clean exact-head build:
-31 of 31 conformance checks passed against a local backend, and 31 of 31
-passed again against the hosted deployment over real TLS.
+Live uses one worker as the sole owner of connection, read, write, reconnect,
+and active-query state. Public calls send commands to that worker. Each
+subscription relay is bounded by both update count and estimated bytes, with a
+second process-wide budget, so a slow consumer fails instead of growing memory
+without limit. The tests cover initial and changed values, query failure and
+recovery, five reconnects, stale-delivery invalidation, fragmented UTF-8,
+oversized frames, slow peers, and stopped readers.
 
-## Conformance and protocol notes
+The Docker build pins V 0.4.9 at commit
+`39534459885e916e2765b5b0c0ed66ce15f0ab86` and pins the separate bootstrap
+compiler source too. The final example and adapter images contain the compiled
+V binaries, their runtime library closure, OpenSSL configuration and CA
+certificates, and the small POSIX tool surface required by the shared verifier.
+They run as user `65532:65532` with no compiler or package manager.
 
-**HTTP.** Requests are framed in V over `net` and `net.ssl`. Once V returns a
-socket, one absolute deadline covers the TLS handshake, every partial write,
-and every read. The status line, header block, header count, `Content-Length`
-body, and chunked body each have their own ceiling, and the running total is
-capped at 2 MiB regardless of what the peer claims. A non-2xx status is decoded
-before it is judged, because a real Convex function rejection arrives with one
-- but a success-shaped envelope on a non-2xx status is refused. `TcpConn`'s own
-read/write timeouts only bound V's own socket wrapper, not OpenSSL's `SSL_read`
-and `SSL_write`, which read and write the file descriptor directly; this client
-also sets `SO_RCVTIMEO`/`SO_SNDTIMEO` on the descriptor itself (see
-[client/socket_deadline.c.v](client/socket_deadline.c.v)), which is what
-actually bounds a TLS peer that stops answering mid-exchange.
+## Known Issues
 
-**Live.** The pinned profile in `manifest.yaml` is implemented in V:
-`Connect`, `ModifyQuerySet` with monotonic base/new versions, and `Transition`
-with a start version that must match local state, a timestamp that may not move
-backwards, and per-query coalescing before anything is published. One worker
-owns the socket outright - connecting, reading, writing, changing the query set,
-and retiring connections. Callers reach it through a command channel, so no
-second thread can interleave a write with a partially written frame.
-
-**Delivery bounds.** Each subscription reserves both a count slot and a
-conservative charge covering twice the encoded size plus every decoded JSON
-node, and the client reserves a process-wide count and byte budget on top. A
-stopped consumer fails its own subscription instead of growing memory. The
-adapter's terminal writer applies the same idea to output, holding an event's
-charge while its write is in flight.
-
-**Reconnects.** `debugDisconnect` is adapter-only and is declared in
-`manifest.yaml`; it is not part of the client API this README teaches. Its
-acknowledgement is published only after the old connection is retired, a new
-delivery generation is in effect, and reconnect work is scheduled, so an update
-a relay is still holding from the retired connection is dropped rather than
-published across the boundary. Every connection resends the full active query
-set, and an unchanged rehydration is suppressed.
-
-**Frames.** Exact V 0.4.9 source review found that `net.websocket` allocates a
-peer-declared payload before callers can apply a ceiling and retries timed-out
-writes internally, so this client does not use it. The V-owned transport checks
-the declared length before allocation, applies one cumulative deadline across
-headers, fragments, controls and payload bytes, masks client frames, validates
-the upgrade challenge and token headers, and bounds cumulative writes. The
-loopback fixtures are real raw RFC 6455 peers, including a 1 GiB declared
-length with no body, continuous byte dribble, and a peer that stops reading.
-The frame budget is five seconds, intentionally below the eight-second command
-budget, so a close or unsubscribe cannot sit behind a longer in-progress frame
-read once a socket exists.
-
-## Limitations
-
-Deferred protocol behaviour: Live authentication, WebSocket mutations and
-actions, optimistic updates, journals, and `TransitionChunk` assembly. Convex
-values are handled as their JSON-safe subset; tagged value conversions are not
-implemented. HTTP uses one connection per call.
-
-V's current `net.dial_tcp` surface does not expose a caller-owned DNS/TCP-connect
-deadline: it is one call that blocks internally until it has either connected
-or failed, with no timeout parameter and no socket to attach one to until it
-returns. Everything from the moment `dial_tcp` returns onward - the TLS
-handshake, every write, every read - is bounded by this client's own absolute
-deadline, enforced at the kernel level via `SO_RCVTIMEO`/`SO_SNDTIMEO` (see
-[client/socket_deadline.c.v](client/socket_deadline.c.v)) because `TcpConn`'s
-own timeout fields never reach OpenSSL's direct `SSL_read`/`SSL_write` calls.
-The pre-connect phase itself remains unbounded by this client; it is a
-standing constraint of the V standard library, not a build-status caveat.
+1. Live authentication, WebSocket mutations and actions, optimistic updates,
+   journals, and `TransitionChunk` assembly are not implemented.
+2. Values cover Convex's JSON-safe subset only. Tagged Convex value conversions
+   are deferred, and JSON input is capped at 2 MiB, 128 nesting levels, and
+   8,192 structural nodes.
+3. HTTP opens a new connection for every call. Persistent connections and
+   request compression are deferred.
+4. V 0.4.9's synchronous `net.dial_tcp` does not expose a caller-owned
+   DNS/TCP-connect deadline. This client bounds the TLS handshake and all I/O
+   after a socket exists, but the pre-socket connect phase remains outside its
+   deadline.
+5. The client API's Live relay is deliberately blocking and manually managed.
+   A caller must unsubscribe or close the client, and a slow consumer is failed
+   when the relay's count or byte budget is exhausted.
