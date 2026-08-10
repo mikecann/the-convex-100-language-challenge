@@ -1,39 +1,208 @@
-# Convex from Gleam
+<img src="logo.png" alt="Lucy, the Gleam language mascot" width="150">
+<!-- Logo source: https://github.com/gleam-lang/gleam/blob/main/images/lucy.png -->
 
-This is a Convex client written in Gleam. It talks to a Convex deployment two
-ways: the documented HTTP API, which is one POST per function call, and the
-reactive `/api/sync` WebSocket, which pushes a new value whenever a subscribed
-query's result changes.
+# Gleam
 
-Almost all of it is Gleam. JSON encoding and decoding, HTTP/1.1, the WebSocket
-handshake, WebSocket frame codec, and every Convex-specific decision live in
-`client/`. Erlang/OTP supplies only what Gleam cannot reach directly: sockets,
-TLS, cryptography, and a few bounded binary and stream primitives. Those
-generic helpers live in `client/convex_ffi.erl`, which contains no Convex logic
-at all.
+[Gleam](https://gleam.run/) is a small, statically typed functional language
+that normally runs on the Erlang virtual machine, also known as the BEAM. Its
+first public release arrived in 2019 and version 1.0 followed in 2024. It takes
+inspiration from languages including Elm, OCaml, Erlang, and Elixir, and its
+modern niche is type-safe web services and concurrent systems. Gleam can also
+compile to JavaScript, though this client deliberately targets Erlang.
 
-It is educational and unofficial. It is not a Convex SDK, it is not supported
-by Convex, and it should not be used in production. It exists to answer one
-question honestly: can this language talk to Convex, and how much of the
-protocol can it carry?
+The BEAM gives Gleam lightweight processes and message passing, while Gleam
+adds exhaustive pattern matching and a sound type system. Its ecosystem is
+smaller than TypeScript's, but it can call Erlang and Elixir libraries on the
+same runtime. This client is an educational, unofficial demonstration, not a
+production SDK and not supported by Convex.
 
-## Start here
+## Getting Started
 
-[`examples/basics/main.gleam`](examples/basics/main.gleam) is the canonical
-example, and the block below is generated from that exact file. It walks one
-room's shared counter from `0` to `1`:
+Start with [`examples/basics/main.gleam`](examples/basics/main.gleam). It reads
+a counter over HTTP, subscribes before mutating it, and then observes the Live
+update from `0` to `1`.
 
-1. read the counter over HTTP,
-2. subscribe to the same query over Live and receive its current value,
-3. increment the counter with an idempotency key,
-4. receive the new value over Live,
-5. print a single verification line once HTTP and Live agree.
+From the repository root, run:
 
-The repaired source passed a fresh Docker build, language-local tests,
-final-image checks, independent review, and local and hosted black-box
-conformance, earning HTTP and Live.
+```sh
+./run verify-example gleam
+```
 
-## What works
+That command builds the pinned Gleam and Erlang environment in Docker, gives
+the example a fresh room, and runs the exact source printed later in this
+README. Nothing needs to be installed on the host.
+
+## Interesting Parts
+
+### A typed `Result`, but an explicitly decoded value
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const [room] = useState(() => `gleam-readme-${crypto.randomUUID()}`);
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // `state` and `count` are generated, typed values.
+}
+```
+
+**Gleam**
+
+```gleam
+import convex
+import convex_error.{type ConvexError}
+import convex_json.{JsonObject, JsonString} as json
+import convex_sys
+import gleam/result
+
+pub fn read_count() -> Result(Int, ConvexError) {
+  // Require real deployment configuration instead of silently using localhost.
+  use deployment_url <- result.try(
+    convex_sys.getenv("CONVEX_URL")
+    |> result.map_error(fn(_) {
+      convex_error.protocol_error("CONVEX_URL must be set")
+    }),
+  )
+  let unique_room_id =
+    "gleam-readme-" <> convex_sys.base64_encode(convex_sys.random_bytes(12))
+  use client <- result.try(convex.new(deployment_url))
+
+  let outcome = {
+    // Object keys are JSON strings here, not generated Convex argument types.
+    let arguments = JsonObject([#("room", JsonString(unique_room_id))])
+    use response <- result.try(convex.call(
+      client,
+      convex.Query,
+      "demo:state",
+      arguments,
+    ))
+    use raw_count <- result.try(
+      json.field(response.value, "count")
+      |> result.map_error(fn(_) {
+        convex_error.protocol_error("Convex value has no count field")
+      }),
+    )
+    // Only after this checked decode is the count a type-safe Gleam Int.
+    json.integral_int(raw_count)
+    |> result.map_error(fn(_) {
+      convex_error.protocol_error("count is not a whole number in range")
+    })
+  }
+
+  let _ = convex.close(client)
+  outcome
+}
+```
+
+React's generated API makes the argument and returned object type-safe, and
+`useQuery` stays subscribed while the component is mounted. This Gleam call is
+a one-off HTTP read. Its success or failure is visible in the return type as
+`Result(Int, ConvexError)`, but the Convex payload is the client's own `Json`
+type and must be checked at runtime before it becomes an `Int`.
+
+### Live updates arrive as typed process messages
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function LiveCounter() {
+  const [room] = useState(() => `gleam-live-${crypto.randomUUID()}`);
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  if (state === undefined) return <p>Loading...</p>;
+  return (
+    <button
+      onClick={() =>
+        void increment({
+          room,
+          language: "TypeScript",
+          runId: crypto.randomUUID(),
+        })
+      }
+    >
+      {state.count} {/* Convex owns the subscription; React rerenders on change. */}
+    </button>
+  );
+}
+```
+
+**Gleam**
+
+```gleam
+import convex
+import convex_error.{type ConvexError}
+import convex_json.{JsonObject, JsonString}
+import convex_live.{LiveFailure, LiveValue, SubscriptionEvent}
+import convex_sys
+import gleam/erlang/process
+import gleam/result
+
+pub fn live_journey() -> Result(Nil, ConvexError) {
+  // A missing deployment URL is a typed error, not an accidental local call.
+  use deployment_url <- result.try(
+    convex_sys.getenv("CONVEX_URL")
+    |> result.map_error(fn(_) {
+      convex_error.protocol_error("CONVEX_URL must be set")
+    }),
+  )
+  let room =
+    "gleam-live-" <> convex_sys.base64_encode(convex_sys.random_bytes(12))
+  let arguments = JsonObject([#("room", JsonString(room))])
+  let assert Ok(client) = convex.new(deployment_url)
+
+  // This BEAM subject is the typed mailbox for this subscription's events.
+  let updates = process.new_subject()
+  let assert Ok(subscription) =
+    convex.subscribe(client, "demo:state", arguments, updates)
+  let assert Ok(SubscriptionEvent(_, LiveValue(_initial, _), first_ack)) =
+    process.receive(updates, 10_000)
+  // Release the client's bounded event relay before waiting for another value.
+  process.send(first_ack, Nil)
+
+  let mutation_arguments =
+    JsonObject([
+      #("room", JsonString(room)),
+      #("language", JsonString("Gleam")),
+      #("runId", JsonString(room <> "-once")),
+    ])
+  let assert Ok(_) =
+    convex.call(client, convex.Mutation, "demo:increment", mutation_arguments)
+
+  // The next message is the reactive value, not another HTTP query.
+  let assert Ok(SubscriptionEvent(_, event, second_ack)) =
+    process.receive(updates, 10_000)
+  process.send(second_ack, Nil)
+  case event {
+    LiveValue(_updated, _) -> Nil
+    LiveFailure(_error) -> panic as "Live query failed"
+  }
+
+  let assert Ok(_) = convex.unsubscribe(client, subscription)
+  let assert Ok(_) = convex.close(client)
+  Ok(Nil)
+}
+```
+
+React hides subscription setup and cleanup behind the component lifecycle. The
+Gleam command-line client owns both, and a caller explicitly receives and
+acknowledges each value. `LiveValue` and `LiveFailure` are variants the compiler
+can distinguish, although this focused happy-path snippet asserts the value
+case. Waiting with `process.receive` is this client's deliberately simple API,
+not a limitation of Gleam. Callbacks or higher-level actor APIs could be built
+on the same BEAM processes.
+
+## Status
 
 | Capability | State | Notes |
 | --- | --- | --- |
@@ -43,7 +212,10 @@ conformance, earning HTTP and Live.
 | Live reconnect and resend | verified | The session identifier stays stable and active queries are rebuilt after reconnect. |
 | Earned capability badges | http, live | Awarded by the shared result evaluator from local and hosted runs at this exact head. |
 
-## The canonical example
+The implementation is native: Convex-specific HTTP and sync behavior is
+written in Gleam rather than delegated to another Convex client.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.gleam -->
 ```gleam
@@ -207,113 +379,48 @@ fn report(message: String) -> Nil {
 }
 ```
 <!-- END GENERATED EXAMPLE -->
+## Implementation Notes
 
-## Docker verification
+This is an Erlang-target Gleam 1.9.1 program running as BEAM bytecode. The
+public API in [`client/convex.gleam`](client/convex.gleam) returns immutable
+client values and typed `Result` values. Gleam generally uses `Result` rather
+than exceptions for recoverable failure. The canonical example uses
+`let assert` intentionally because any unexpected value should stop that
+verification program immediately.
 
-Everything is built and run inside Docker; nothing is installed on the host.
+JSON encoding and decoding, HTTP/1.1, the WebSocket handshake and framing, and
+all Convex behavior are implemented in Gleam. The small
+[`client/convex_ffi.erl`](client/convex_ffi.erl) module exposes generic
+Erlang/OTP sockets, TLS, cryptography, clocks, and bounded binary operations.
+That foreign code is outside Gleam's type checker, which is why the boundary is
+kept narrow and covered by language-local tests.
 
-```sh
-./run test gleam           # format check, compilation, language-local tests
-./run verify-example gleam # the example above, against a unique room
-./run verify gleam         # example plus shared conformance, local backend
-./run verify-hosted gleam  # the same, against the hosted drift target
-./run verify-all gleam     # both deployment profiles from one built image
+Live uses three kinds of lightweight BEAM process: one owner serializes all
+subscription state, one process owns the current socket, and one relay per
+subscription delivers bounded events. A caller acknowledges each event before
+the relay advances. This keeps a slow consumer from quietly growing an
+unbounded mailbox and makes `unsubscribe` a real delivery barrier.
 
-# On an approved Linux Docker host, isolate the real final adapter under its
-# 128 MiB cgroup and stop its TCP output reader near the 8/9 MiB boundaries.
-REPO_ROOT=$PWD gleam/client/tests/conformance/final_adapter_pressure_probe.sh
-```
+The Docker build pins the compiler, package versions, builder image, and
+minimal runtime image. It also creates separate test and production projections
+because Gleam has no conditional compilation. The final runtime contains BEAM
+bytecode and the required Erlang runtime pieces, but no Gleam compiler or
+package manager.
 
-`test` proves the source compiles and that the codec, fixture-server, and
-example-decoding tests pass inside the container. `verify-example` proves the
-exact program printed above runs against a real deployment and produces the
-shared transcript. `verify` adds the shared black-box conformance suite, and
-`verify-hosted` repeats it against the drift target so protocol changes are
-caught. Compilation is not example evidence, and example success is not
-conformance.
+## Known Issues
 
-The dedicated pressure probe builds the exact final `runtime` image plus two
-test-only sibling images. It keeps the fixture and controller out of the
-adapter's cgroup, runs `/usr/local/bin/convex-adapter` through its unchanged
-default entrypoint, and measures only that process tree. A first process proves
-a legal NDJSON string command above 8 MiB but below the 9 MiB limit is rejected
-as an unknown operation, a near-limit numeric token is rejected without a giant
-integer allocation, and the same parser recovers. Two fresh processes receive a
-declared WebSocket frame above the conservative 7 MiB client limit but below 8
-MiB, report that bounded protocol error, and reconnect for legal large values.
-One resumes a physically stalled reader; the other remains stopped until the
-one-second send deadline closes it. Those measurements must be refreshed for
-this repaired source. Accepted adapter-controller sockets use the adapter's
-normal fixed 64 KiB send-buffer request, so the proof needs no test-only hook in
-the final beam; public client connections never use the accepting-socket path.
-
-## How it fits together
-
-| Module | Responsibility |
-| --- | --- |
-| `client/convex.gleam` | Public API: HTTP calls, auth, subscribe, close. |
-| `client/convex_live.gleam` | The single sync owner: query set, transitions, reconnects, delivery. |
-| `client/convex_ws.gleam` | RFC 6455 handshake and frame codec. |
-| `client/convex_http.gleam` | HTTP/1.1 request and response, including chunked bodies. |
-| `client/convex_json.gleam` | JSON parser and encoder, including Convex's integer spellings. |
-| `client/convex_error.gleam` | The three failures a caller must tell apart. |
-| `client/convex_sys.gleam` | Typed view of the OTP primitives in `convex_ffi.erl`. |
-
-Three kinds of process cooperate for Live:
-
-* **The owner** holds every piece of sync state. Query-set versions, each
-  subscription's last value, and the reconnect schedule are only ever changed
-  here, so a version cannot be written twice or skipped.
-* **A connection process** owns one socket. It connects, upgrades, forwards raw
-  bytes to the owner, and writes the frames the owner hands it. Frame decoding
-  stays in the owner, which is why a read timeout part-way through a frame is
-  harmless: the parser state is not in the process that timed out.
-* **A relay per subscription** carries one event at a time, asks the owner for
-  permission immediately before delivery, and waits for the consumer to
-  acknowledge it before advancing. That makes unsubscribe and same-identifier
-  replacement real barriers and prevents a stopped consumer from growing an
-  unbounded BEAM mailbox.
-
-## Conformance and protocol notes
-
-The test-only executable under `client/tests/conformance/` implements NDJSON
-adapter protocol v1. It reserves stdout for protocol events, sends diagnostics
-to stderr, supports both stdin/stdout and the `ADAPTER_LISTEN` TCP mode, and
-calls the real client for every operation. It also implements the adapter-only
-`debugDisconnect` command so the shared controller can prove five real
-reconnects; that command is declared in `manifest.yaml` and is not part of the
-educational client API.
-
-The sync profile is pinned in `manifest.yaml`. `/api/sync` is not a documented
-or supported Convex interface, and nothing here should be read as implying it
-is stable.
-
-HTTP reads stream into an 8 MiB response bound. Convex error envelopes remain
-structured function errors even when an HTTP intermediary changes the status;
-a non-success status carrying a success-shaped envelope is protocol drift.
-Live permits at most eight active subscriptions and 8 MiB of retained encoded
-paths and arguments. The connection keeps one session identifier across
-reconnects, limits each WebSocket message to 7 MiB, and abandons a partial
-message if it cannot finish within three seconds.
-
-## Limitations
-
-* The shared local and hosted black-box conformance runs passed from clean
-  exact-head builds of this source (31/31 checks on both profiles), and the
-  manifest capability list records the evaluator's award.
-* `client/manifest.toml` records the exact Hex package versions and content
-  hashes used by the Docker build. Both the Gleam builder and Alpine runtime
-  bases are digest-pinned.
-* Gleam has no conditional compilation, so Docker creates distinct test and
-  production source projections. The relay pause point exists only in the test
-  build, and the production stage rejects it before creating final beams.
-* Live authentication, WebSocket mutations and actions, and tagged Convex
-  values are deferred.
-* `TransitionChunk` assembly is deferred; receiving one is treated as protocol
-  drift and reconnects.
-* Delivery is bounded: at most eight active subscriptions; 16 newest
-  undelivered events and 8 MiB of conservatively charged storage per
-  subscription; one global 16-event and 12 MiB encoded output budget in the
-  adapter; a 9 MiB NDJSON command limit; and a 7 MiB WebSocket message limit.
-  A value which cannot fit the relay budget produces an observable protocol
-  failure without changing the last delivered value.
+1. Live uses Convex's undocumented `/api/sync` interface pinned to the profile
+   in `manifest.yaml`. It is verified here, but it is not a supported public
+   protocol and may drift.
+2. Live authentication, mutations and actions over WebSocket, and tagged Convex
+   values are not implemented. Mutations and actions do work through the
+   documented HTTP API.
+3. `TransitionChunk` assembly is deferred. Receiving one is treated as a
+   protocol error and causes a reconnect.
+4. The client allows at most eight active subscriptions. Queues, controller
+   output, HTTP bodies, command lines, and WebSocket messages also have explicit
+   byte and event limits so a stalled reader cannot consume memory without
+   bound.
+5. The checked-in final-adapter pressure probe is marked for a fresh rerun in
+   the manifest. The existing HTTP and Live capability awards remain the
+   evidence-backed status recorded by the shared evaluator.
