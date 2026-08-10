@@ -1,30 +1,163 @@
-# Convex from Racket
+<img src="logo.png" alt="Racket logo" width="160">
+<!-- Logo source: https://racket-lang.org/img/racket-logo.svg -->
 
-This demonstration uses ordinary Racket to query and mutate a Convex deployment
-over its documented HTTP API, then listens to the same query over a native
-Racket RFC 6455 WebSocket implementation.
+# Racket
 
-It is an educational, unofficial experiment. It is not a production SDK, an
-officially sanctioned Convex client, or a package intended for publication.
+[Racket](https://racket-lang.org/) is a Lisp dialect descended from Scheme and
+a toolkit for building new languages. It grew out of PLT Scheme before the
+project adopted the Racket name, and it is now best known for language-oriented
+programming, programming-language research, education, and practical work from
+web applications to desktop tools. The [official guide](https://docs.racket-lang.org/guide/intro.html)
+describes Racket as a language, a family of languages, and a set of tools. The
+[rename history](https://racket-lang.org/new-name.html) explains how that wider
+scope outgrew the old PLT Scheme name.
 
-## Start here
+This repository's client is an educational, unofficial experiment. It is not a
+production SDK, an officially sanctioned Convex client, or a package intended
+for publication.
 
-[`examples/basics/main.rkt`](examples/basics/main.rkt) is the canonical example.
-It reads a fresh counter room over HTTP, subscribes before changing the room,
-applies one idempotent mutation, and proves Live observed the same `0 -> 1`
-journey. The source below is generated directly from that runnable file.
+## Getting Started
 
-## What works
+Start with [`examples/basics/main.rkt`](examples/basics/main.rkt). It queries a
+fresh counter room, starts a Live subscription before changing the room, applies
+one idempotent mutation, and checks that HTTP and Live both observed `0 -> 1`.
+
+From the repository root, run the exact example in its minimal Docker image:
+
+```sh
+./run verify-example racket
+```
+
+Docker supplies the pinned Racket toolchain and an approved test deployment, so
+you do not need to install Racket or configure Convex on the host.
+
+## Interesting Parts
+
+### Convex objects become immutable symbol-keyed hashes
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function RoomCount() {
+  const state = useQuery(api.demo.state, { room: "comparison-room" });
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // Generated types know the result shape.
+}
+```
+
+**Racket**
+
+```racket
+#lang racket/base
+
+(require "client/client.rkt")
+
+(define deployment-url
+  (or (getenv "CONVEX_URL") (error 'readme "CONVEX_URL is required")))
+(define client (make-convex-client deployment-url))
+
+;; `hasheq` creates an immutable object whose keys are symbols such as 'room.
+(define arguments (hasheq 'room "comparison-room"))
+
+;; This is one HTTP request, not a reactive subscription like useQuery.
+(define result (convex-client-query client "demo:state" arguments))
+(define state (convex-result-value result))
+(displayln (hash-ref state 'count)) ; The returned hash is dynamically typed.
+
+(convex-client-close! client)
+```
+
+Racket's quote in `'room` creates a symbol, which its JSON library maps to the
+object key `room`. Unlike the generated TypeScript API, this demonstration uses
+the string path `"demo:state"` and checks returned shapes at runtime. See the
+[HTTP client](client/http.rkt) for the JSON request and result handling.
+
+### A command-line program owns its Live subscription
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function LiveCounter() {
+  const room = "live-comparison-room";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  return (
+    <button
+      onClick={() =>
+        increment({ room, language: "typescript", runId: crypto.randomUUID() })
+      }
+    >
+      Count: {state?.count ?? "loading"} {/* React rerenders on each update. */}
+    </button>
+  );
+}
+```
+
+**Racket**
+
+```racket
+#lang racket/base
+
+(require "client/client.rkt")
+
+(define deployment-url
+  (or (getenv "CONVEX_URL") (error 'readme "CONVEX_URL is required")))
+(define client (make-convex-client deployment-url))
+(define room "live-comparison-room")
+(define run-id (format "readme-~a" (current-inexact-milliseconds)))
+(define subscription
+  (convex-client-subscribe client "demo:state" (hasheq 'room room)))
+
+(dynamic-wind
+  void
+  (lambda ()
+    ;; The client publishes the initial query value through the subscription.
+    (define initial (subscription-next-update subscription #:timeout 10))
+    (when (convex-update-error initial) (raise (convex-update-error initial)))
+
+    ;; Starting Live first means this mutation cannot slip between query setup
+    ;; and the subscription becoming active.
+    (convex-client-mutation
+     client
+     "demo:increment"
+     ;; runId makes retrying this logical write idempotent.
+     (hasheq 'room room 'language "racket" 'runId run-id))
+
+    ;; `next-update` blocks until Live supplies the changed value.
+    (define changed (subscription-next-update subscription #:timeout 10))
+    (when (convex-update-error changed) (raise (convex-update-error changed)))
+    (displayln (hash-ref (convex-update-value changed) 'count)))
+  (lambda ()
+    ;; `dynamic-wind` runs cleanup even when the body raises an exception.
+    (subscription-close! subscription)
+    (convex-client-close! client)))
+```
+
+React owns the `useQuery` subscription and component rerenders. This client
+instead exposes a blocking `subscription-next-update`, so a script owns the
+subscription, reads each value, and closes it. That is a deliberate API choice,
+not a limitation of Racket's threads, events, or callbacks. The complete
+[canonical example](examples/basics/main.rkt) also validates every returned
+counter value.
+
+## Status
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
 | HTTP | Verified by shared local and hosted conformance | Native Racket query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented. |
 | Live | Verified by shared local and hosted conformance | One native Racket Live owner handles subscriptions, replacement barriers, reconnects, reactive errors, and clean close against the pinned profile. |
 
-The shared local and hosted black-box tests passed, earning HTTP and Live. A
-successful Docker build or language-local socket test alone would not count.
+The shared local and hosted black-box tests earned both HTTP and Live. A Docker
+build or language-local socket test alone would not earn either capability.
 
-## The basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.rkt -->
 ```racket
@@ -159,106 +292,57 @@ successful Docker build or language-local socket test alone would not count.
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verify it in Docker
+## Implementation Notes
 
-From the repository root:
+The public client is native Racket. HTTP calls use Racket's `net/http-client`
+and `json` libraries, while [`client/websocket.rkt`](client/websocket.rkt)
+implements RFC 6455 framing directly. No JavaScript Convex client, Convex CLI,
+`curl`, or other language runtime performs the Convex work.
+
+HTTP uses Convex's documented JSON query, mutation, and action endpoints. A
+successful call returns a `convex-result` containing both the decoded value and
+Convex log lines. Function, protocol, transport, and closed-client failures have
+separate Racket exception structures, so an application can distinguish a
+function error from a broken connection.
+
+Live is managed by one owner thread. Public operations send it commands rather
+than changing the WebSocket concurrently. Each subscription keeps the newest 16
+updates, and all subscriptions share a 3 MiB encoded publication budget. A slow
+consumer therefore loses older state snapshots instead of growing memory without
+a bound. Live pins the internal profile `convex-rs-0.10.4-unversioned-sync` at
+commit `6f1df8a8ba1665084ec001e307ca841ca17074d7`, so hosted verification remains
+important because that protocol can drift.
+
+The Docker build pins official Racket 8.10 source commit
+`b10ecfb8311fca2d42636eea2ca12aff0b76b208`. On the required translated
+`linux/amd64` build path, packaged CS and precise-GC runtimes aborted before the
+client source ran. The working target is Racket BC with conservative GC, JIT,
+futures, and GUI support disabled. It produces standalone x86-64 executables;
+the final images contain the embedded runtime and TLS libraries, but no Racket
+command, compiler, package manager, or source tree. This is a Docker host
+compatibility choice, not a general limitation of Racket on x86-64 Linux.
+
+For the separate evidence layers, run these commands from the repository root:
 
 ```sh
 ./run test racket
-./run verify-example racket
 ./run verify racket
 ./run verify-hosted racket
 ./run verify-all racket
 ```
 
-`test` builds the pinned source toolchain and runs language-local tests in
-Docker. `verify-example` executes the exact source shown above. The remaining
-commands are root-owned gates that test the adapter against approved local and
-hosted deployments. Language work does not run or claim those shared gates.
+`test` covers formatting, compilation, and language-local behavior. The shared
+verification commands exercise the canonical example and client adapter against
+approved local and hosted deployments.
 
-## Conformance and protocol notes
+## Known Issues
 
-The test adapter under `client/tests/conformance/` speaks strict NDJSON adapter
-protocol v1 over stdin/stdout or one TCP connection. It calls the Racket client
-for every operation. Its serialized output gate owns subscription generations,
-so a stale relay cannot cross a replacement, unsubscribe, or close
-acknowledgement. `debugDisconnect` is adapter-only and proves genuine reconnects.
-Each subscription keeps at most the newest sixteen updates. All subscriptions
-also share a 3 MiB encoded publication budget, and the adapter holds an update's
-reservation until its NDJSON write finishes. The real final-image stress fixture
-stops its controller while near-limit updates arrive to check the 128 MiB gate.
-
-HTTP uses Convex's documented `format: "json"` endpoints. Live pins
-`convex-rs-0.10.4-unversioned-sync` at upstream commit
-`6f1df8a8ba1665084ec001e307ca841ca17074d7` and `/api/sync`. Realtime is an
-internal protocol, so hosted compatibility can drift and must be tested.
-
-The Docker toolchain builds official Racket 8.10 source commit
-`b10ecfb8311fca2d42636eea2ca12aff0b76b208` as x86_64 BC conservative GC with
-JIT, futures, and GUI support disabled. Packaged CS and precise-GC runtimes abort
-under this host's amd64 translation, while the conservative-GC runtime and its
-compiled ELF executables pass native architecture and execution checks.
-
-## Toolchain investigation
-
-This is a host-specific Docker translation result, not a claim that Racket is
-generally broken on x86-64 Linux. The investigation ran on macOS 26.5.2 arm64
-with Docker Desktop 29.6.2. The Docker server reported `aarch64` and LinuxKit
-6.12.76. Every probe below used `--platform linux/amd64`.
-
-Debian Bookworm's Racket 8.7 package works in an arm64 container:
-
-```sh
-docker run --rm --platform linux/arm64 debian:bookworm-slim \
-  sh -lc 'apt-get update && apt-get install -y racket && racket -v && racket -e "(displayln 42)"'
-# Welcome to Racket v8.7 [cs].
-# 42
-```
-
-The same package under amd64 translation reports
-`Error: error reading from ~a ("petite")` and exits 134 before version output.
-Pinned official images fail before they can evaluate client source too:
-
-```text
-racket/racket:8.18-full@sha256:c9104a6ce9df82947c5753718606cca305aeaf80c0b79038546625656277f56d
-  racket -v -> petite read error, exit 134
-
-racket/racket:8.17-bc@sha256:f50290e1c1f6e431c5077fe59265ba88283a42bcb5ee9187ee97413baa3cb023
-  racket -v -> abort, exit 134
-```
-
-Official BC tags 8.14, 8.10, and 7.9 also abort on this translation path.
-Alpine's amd64 Racket 8.17 package fails with the same `petite` error. The
-working source target is:
-
-```sh
-../../bc/configure \
-  --disable-jit --disable-futures --disable-gracket \
-  --enable-bcdefault --disable-useprefix --enable-origtree
-make cgc
-make install-cgc
-/build/racket/racket/bin/racketcgc -v
-# Welcome to Racket v8.10 [cgc].
-/build/racket/racket/bin/racketcgc -e '(displayln (+ 40 2))'
-# 42
-```
-
-Parallel `make -j4 cgc` reached nested libffi and then lost GNU make's jobserver
-descriptor under translation. The serial build is the deterministic pinned
-path. `racocgc exe --cgc --orig-exe` produces genuine ELF 64-bit x86-64
-executables. The final adapter and example embed Racket and their module
-closure, depend directly on glibc, and contain no interpreter, compiler,
-package manager, source tree, or delegated runtime.
-
-## Limitations
-
-- Bearer-token replacement and clearing apply to HTTP. Live authentication is
-  deferred.
-- Live values cover this experiment's JSON-safe subset, not lossless Convex
-  Int64, bytes, special floats, or negative zero.
-- Mutations and actions use HTTP. WebSocket mutation replay, journals,
-  optimistic updates, and read-your-own-write timestamps are outside this demo.
-- `TransitionChunk` is not implemented. Receiving one is treated as protocol
-  drift, published as a structured error, and followed by a reconnect.
-- The source toolchain intentionally uses conservative GC and no JIT to remain
-  runnable under the required Docker Desktop linux/amd64 translation path.
+1. Bearer-token replacement and clearing apply to HTTP only. Live
+   authentication is deferred.
+2. Live supports the JSON-safe values used by this experiment, not lossless
+   Convex Int64 values, bytes, special floating-point values, or negative zero.
+3. Mutations and actions use HTTP. WebSocket mutation replay and
+   read-your-own-write timestamps are not implemented.
+4. `TransitionChunk` assembly is not implemented. Receiving one is treated as
+   protocol drift, reported as a structured error, and followed by a reconnect.
+5. Mutation journals and optimistic updates are outside this demonstration.
