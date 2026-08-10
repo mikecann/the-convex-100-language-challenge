@@ -2,6 +2,7 @@ module c3_adapter;
 
 import std::io;
 import c3_http;
+import c3_values;
 
 // This is deliberately the smallest C3-owned adapter seed. Subsequent
 // milestones add the strict NDJSON command dispatcher and client calls here;
