@@ -1,21 +1,129 @@
-# Convex from Rexx
+# Rexx
 
-This demonstration uses Regina Rexx to call Convex's documented JSON HTTP
-endpoints and to keep a reactive query current through a native Rexx
-WebSocket connection.
+[Rexx](https://www.rexxla.org/) is a readable language usually run through an
+interpreter. [Mike Cowlishaw created it at IBM in
+1979](https://www.rexxla.org/rexxlang/history/mfc/rexxhist.html), and it grew
+from command and string processing into a general-purpose language used for
+[scripts, macros, application front ends, and automation](https://www.ibm.com/docs/en/cics-ts/6.x?topic=reference-rexx-general-concepts)
+across IBM systems and personal computers. Its modern niche is still scripting
+and systems integration, with portable implementations such as
+[Regina Rexx](https://sourceforge.net/p/regina-rexx/).
 
-It is an educational, unofficial experiment. It is not a production SDK, an
-officially sanctioned Convex client, or a package intended for publication.
+This project uses Regina to make ordinary HTTP calls and keep a Convex query
+current over WebSockets. It is an educational, unofficial experiment, not a
+production SDK, an officially sanctioned Convex client, or a package intended
+for publication.
 
-## Start here
+## Getting Started
 
-[`examples/basics/main.rexx`](examples/basics/main.rexx) is the canonical
-example. It reads a new counter room over HTTP, starts Live before changing
-it, applies an idempotent mutation, and proves the same `0 -> 1` journey
-arrived through the subscription. The block below is generated from that
-exact runnable file.
+The canonical [`examples/basics/main.rexx`](examples/basics/main.rexx) walks a
+fresh counter from `0` to `1` with an HTTP query, a Live subscription, and an
+idempotent mutation. From the repository root, run it entirely in Docker:
 
-## What works
+```sh
+./run verify-example rexx
+```
+
+That command builds the minimal example image, gives it a unique room, and
+runs the exact source reproduced under [Example](#example) against the approved
+local backend.
+
+## Interesting Parts
+
+### A query can be reactive and typed, or one-shot and textual
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const room = "readme-rexx-query";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // state.count is a type-safe number here.
+}
+```
+
+**Rexx**
+
+```rexx
+convexUrl = value('CONVEX_URL',, 'ENVIRONMENT')
+if convexUrl == '' then do
+  call lineout 'stderr', 'CONVEX_URL is required'
+  exit 1
+end
+roomArgs = '{"room":"readme-rexx-query"}'
+
+/* One CALL opens the HTTP connection, sends demo:state, and closes it. */
+call '/opt/convex/client/convex.rexx' 'http_call', 'query', 'demo:state', ,
+  roomArgs, convexUrl, ''
+stateEnvelope = result
+
+say stateEnvelope /* Plain character data, not a statically typed object. */
+```
+
+The function and arguments match, but the lifecycle does not. React keeps
+`useQuery` subscribed and rerenders when the value changes. Rexx's `http_call`
+is deliberately a single request, and this small client returns a JSON envelope
+as text for the caller to validate and decode.
+
+### Live makes ownership visible
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function LiveCounter() {
+  const room = "readme-rexx-live";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Connecting...</p>;
+  return <p>{state.count}</p>; // React owns subscribe, update, and cleanup.
+}
+```
+
+**Rexx**
+
+```rexx
+convexUrl = value('CONVEX_URL',, 'ENVIRONMENT')
+if convexUrl == '' then do
+  call lineout 'stderr', 'CONVEX_URL is required'
+  exit 1
+end
+roomArgs = '{"room":"readme-rexx-live"}'
+subscriptionId = 'readme-rexx-subscription'
+
+scheme = 'ws'
+if translate(left(convexUrl, 8)) == 'HTTPS://' then scheme = 'wss'
+parse var convexUrl '//' hostAndMore
+liveUrl = scheme || '://' || hostAndMore || '/api/sync'
+
+liveState = ''
+call '/opt/convex/client/convex.rexx' 'live_add', liveState, liveUrl, ,
+  subscriptionId, 'demo:state', roomArgs
+parse var result liveState '0b'x events
+
+/* Poll again later for the initial value or a reactive update. */
+call '/opt/convex/client/convex.rexx' 'live_poll', liveState, 500
+parse var result liveState '0b'x events
+say events /* Form-feed-separated JSON event text, not a typed value. */
+
+/* A command-line caller must explicitly unsubscribe and close. */
+call '/opt/convex/client/convex.rexx' 'live_remove', liveState, subscriptionId
+parse var result liveState '0b'x .
+call '/opt/convex/client/convex.rexx' 'live_close', liveState
+```
+
+This explicit polling API is a choice made by this client, not a limitation of
+Rexx. Each operation returns a new serialized `liveState`, so the caller owns
+the subscription and connection lifetime that React normally hides.
+
+## Status
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
@@ -24,9 +132,10 @@ exact runnable file.
 
 The shared evaluator awarded both badges from a clean exact-head build: 31 of
 31 checks against a local backend and 31 of 31 against the hosted deployment
-over real TLS.
+over real TLS. This documentation rewrite does not claim a fresh verification
+run.
 
-## The basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.rexx -->
 ```text
@@ -309,54 +418,35 @@ json_estr: procedure
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verify it in Docker
+## Implementation Notes
 
-```sh
-./run test rexx           # format/lint-equivalent checks, unit tests, and the
-                           # real loopback HTTP/Live fixtures, entirely offline
-./run verify-example rexx # runs the exact block above against a unique room
-                           # on the local self-hosted backend
-./run verify rexx         # verify-example plus shared black-box conformance
-```
+- [`client/convex.rexx`](client/convex.rexx) implements Convex HTTP, JSON,
+  WebSocket framing, the handshake helpers, and the Live state machine in
+  Rexx. The implementation is native, not a bridge to another Convex client.
+- Classic Rexx has no module system that leaves an imported client object alive
+  between calls. The file therefore dispatches fixed `CALL` operations. HTTP is
+  stateless, while Live threads a JSON state string through `live_add`,
+  `live_poll`, `live_remove`, and `live_close`.
+- Regina does not provide sockets or TLS itself. The narrow
+  [`client/shim.c`](client/shim.c) extension moves raw bytes and performs the
+  OpenSSL handshake. It contains no Convex, HTTP, JSON, or WebSocket behavior.
+- The pinned Docker toolchain is Regina Rexx `3.6-2.4` on Debian bookworm-slim
+  for `linux/amd64`. Language-local tests cover pure helpers plus real loopback
+  HTTP and Live sockets, and the minimal runtime includes Regina, its library
+  closure, CA certificates, and the OpenSSL runtime files it loads.
+- The Live API uses a single caller-owned polling loop. That keeps reads,
+  writes, reconnects, and subscription changes serialized without pretending
+  that a command-line Rexx process has React's component lifecycle.
 
-`./run test rexx` builds the `test` Docker stage: it compiles the small C
-transport shim with `-Wall -Wextra -Werror`, runs `client/tests/
-selftest_test.rexx` (the JSON codec, base64/SHA-1, WebSocket framing, HTTP
-response classification, and Live state-surgery helpers, exercised directly
-through `convex.rexx`'s own `selftest` operation), `client/tests/
-http_test.rexx` and `client/tests/live_test.rexx` (real loopback fixtures
-under `client/tests/fixtures/`, not mocks, proving the actual sockets and
-protocol state machine work), and a smoke check of the conformance adapter
-and the canonical example.
+## Known Issues
 
-## Conformance and protocol notes
-
-- The client speaks the pinned `convex-rs@6f1df8a8` sync profile at
-  `/api/sync`, matching every other client in this project.
-- `client/convex.rexx` is a single file because classic Rexx's `CALL`
-  statement has no library/import system: an external file loaded with
-  `CALL` runs from its first line every time, with no memory of previous
-  invocations. HTTP calls are one CALL each; Live is a small reducer where
-  the caller (the adapter, the example, or a test) holds a JSON "state"
-  string across many separate CALLs and gets an updated state plus any new
-  events back each time.
-- The C shim (`client/shim.c`) supplies only raw byte transport: TCP
-  connect/listen/accept/send/recv/close and the OpenSSL TLS handshake. It
-  carries no Convex, HTTP, JSON, or WebSocket logic; everything a reader
-  would recognise as "the protocol" is in `convex.rexx` itself.
-- `client/tests/conformance/adapter.rexx` implements NDJSON adapter
-  protocol v1 over both stdin/stdout and the `ADAPTER_LISTEN` TCP mode,
-  and declares `debugDisconnect` as its one adapter-only command.
-
-## Limitations
-
-- Live authentication, WebSocket-issued mutations/actions, journals, and
-  `TransitionChunk` assembly are deferred; a `TransitionChunk` is reported
-  as protocol drift and the connection reconnects.
-- A WebSocket message is assumed to arrive as one unfragmented frame. A
-  genuinely fragmented message is treated as an unsupported opcode.
-- Reconnect backoff and the partial-frame abandonment deadline are timed
-  with wall-clock milliseconds since midnight, because Rexx's `TIME('E')`
-  resets on every separate external `CALL` and so cannot time anything
-  spanning more than one call into `convex.rexx`. A run that straddles
-  local midnight could see one incorrect backoff interval.
+1. Live authentication, WebSocket mutations and actions, journals, and
+   `TransitionChunk` assembly are deferred. Receiving a `TransitionChunk`
+   reports protocol drift and triggers a reconnect.
+2. Multi-frame WebSocket message fragmentation is not reassembled. A fragmented
+   message is treated as unsupported and forces a reconnect.
+3. Reconnect and partial-frame deadlines use milliseconds since local midnight.
+   A run that crosses midnight could observe one incorrect backoff interval.
+4. Every caller uses the fixed installed path
+   `/opt/convex/client/convex.rexx`, because classic Rexx `CALL` cannot invoke a
+   client filename held in a variable.
