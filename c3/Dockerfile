@@ -19,5 +19,5 @@ RUN gcc -std=c17 -Wall -Wextra -Werror -c client/tests/http-platform-fixture.c -
       client/tests/http-response-fixtures.c3 client/http.c3 client/response.c3 client/values.c3 /out-http-platform-fixture.o \
     && /out-http-fixtures \
     && test "$(uname -m)" = x86_64 \
-    && test "$(/out-adapter)" = 'c3 adapter seed' \
+    && printf '%s\\n' '{"protocolVersion":1,"id":"hello-1","op":"hello"}' | /out-adapter | grep -Fx '{"protocolVersion":1,"id":"hello-1","type":"ready","language":"c3","implementation":"native","runtime":"C3 0.8.2"}' \
     && test "$(/out-example)" = 'c3 example seed'
