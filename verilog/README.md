@@ -1,103 +1,190 @@
-# Convex from Verilog
+# Verilog
 
-This directory is a Convex client written as a simulated hardware circuit in
-Verilog, run under Icarus Verilog (`iverilog`).
+Verilog is a hardware description language for describing, simulating, and
+synthesising digital circuits. It became IEEE 1364 in 1995, and the Verilog
+language is now part of the active
+[IEEE 1800 SystemVerilog standard](https://standards.ieee.org/ieee/1800/7743/).
+It remains a familiar tool in chip and FPGA work, which makes using it as a
+networked Convex client delightfully odd. This implementation runs the design
+with [Icarus Verilog](https://steveicarus.github.io/iverilog/) rather than
+turning it into physical hardware.
 
-This is educational and unofficial. It is not a production Convex SDK, and
-it is not published as a package.
+This project is educational and unofficial. It is not a production Convex SDK
+and is not published as a package.
+
+## Getting Started
+
+Start with the [canonical basic example](examples/basics/main.v). From the
+repository root, run:
+
+```sh
+./run verify-example verilog
+```
+
+That command builds and runs the exact example in Docker against a unique demo
+room. It checks the initial HTTP query, the initial Live value, the mutation,
+and the resulting Live update. It does not run the full conformance suite.
+
+## Interesting Parts
+
+### A query is a simulated circuit transaction
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function Counter() {
+  const state = useQuery(api.demo.state, { room: "readme-query" });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // state and count are type-safe here.
+}
+```
+
+**Verilog**
+
+```verilog
+module query_demo;
+  convex conv ();                 // A reusable client is a module instance.
+  convex_buffer args ();          // This buffer also knows how to encode JSON.
+  convex_buffer result ();        // Returned JSON is parsed in another buffer.
+
+  string room = "readme-query";
+  string args_json;
+  bit configured_ok, call_ok, function_error, found, number_ok;
+  integer i, root_token, count_token, count;
+  byte current_byte;
+
+  // The canonical main module passes the validated CONVEX_URL into this task.
+  task automatic run_query(input string deployment_url);
+  begin
+    conv.configure(deployment_url, configured_ok);
+    if (!configured_ok) $fatal(1, "CONVEX_URL is not a valid deployment URL");
+
+    // Build {"room":"readme-query"} without a JavaScript object or heap.
+    args.reset;
+    args.put_byte("{");
+    args.json_put_string("room");
+    args.put_byte(":");
+    args.json_put_string(room);
+    args.put_byte("}");
+
+    // Icarus cannot pass the buffer array into call(), so copy its bytes.
+    args_json = "";
+    for (i = 0; i < args.length(); i = i + 1) begin
+      current_byte = args.get_byte(i);
+      args_json = {args_json, current_byte};
+    end
+
+    // value_json contains the returned demo state as raw JSON.
+    conv.call("query", "demo:state", args_json, call_ok, function_error);
+
+    // Decode the returned value and read the same count React used above.
+    result.reset;
+    result.put_str(conv.value_json);
+    result.parse_json;
+    root_token = result.json_root();
+    result.json_object_get(root_token, "count", count_token, found);
+    result.tok_as_int(count_token, count, number_ok);
+    $display("%0d", count);
+  end
+  endtask
+endmodule
+```
+
+React's `useQuery` creates and maintains a reactive subscription. Verilog's
+`call()` is deliberately a one-off HTTP request, so it is closer to calling a
+Convex HTTP client than mounting a hook. The surprising bit is that the client
+is a hierarchy of module instances and the network call crosses a real clocked
+request/acknowledge bus before reaching the host. The
+[canonical example](examples/basics/main.v) supplies `deployment_url` by calling
+its byte-by-byte `getenv` helper for `CONVEX_URL`, rejects a missing or empty
+value, and then rejects any URL that `conv.configure()` cannot parse.
+
+### Reactivity is an explicit lifecycle
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function LiveCounter() {
+  const state = useQuery(api.demo.state, { room: "readme-live" });
+
+  // React rerenders this component whenever the subscribed value changes.
+  return <output>{state?.count ?? "Loading..."}</output>;
+}
+```
+
+**Verilog**
+
+```verilog
+convex conv ();
+convex_buffer args ();
+string room = "readme-live";
+string args_json;
+bit configured_ok, subscribe_ok, got_message;
+integer i, subscription_index, previous_version;
+byte current_byte;
+
+// The canonical main module passes the validated CONVEX_URL into this task.
+task automatic watch_counter(input string deployment_url);
+begin
+  conv.configure(deployment_url, configured_ok);
+  if (!configured_ok) $fatal(1, "CONVEX_URL is not a valid deployment URL");
+
+  // Build the subscription arguments as {"room":"readme-live"}.
+  args.reset;
+  args.put_byte("{");
+  args.json_put_string("room");
+  args.put_byte(":");
+  args.json_put_string(room);
+  args.put_byte("}");
+  args_json = "";
+  for (i = 0; i < args.length(); i = i + 1) begin
+    current_byte = args.get_byte(i);
+    args_json = {args_json, current_byte};
+  end
+
+  // The tag is this program's local handle for the subscription.
+  conv.sync.add_subscription("counter", "demo:state", args_json, subscribe_ok);
+  subscription_index = conv.sync.find_sub_by_tag("counter");
+  previous_version = conv.sync.sub_version[subscription_index];
+
+  // This API chooses an explicit blocking pump instead of a callback.
+  while (conv.sync.sub_version[subscription_index] == previous_version) begin
+    conv.sync.pump(100, got_message);
+  end
+
+  // The latest returned state is raw JSON in sub_value_json[index].
+  // The canonical example parses it and reads its count field here.
+  conv.sync.remove_subscription("counter", subscribe_ok);
+end
+endtask
+```
+
+The language can express event-driven processes, but this client intentionally
+exposes a blocking `pump()` operation so one process owns all WebSocket work.
+Unlike React, it also makes cleanup explicit. Each subscription stores only its
+newest value, so a slow consumer catches up rather than receiving every
+intermediate state.
 
 ## Status
 
-The toolchain gate, a JSON codec, HTTP/1.1 framing, RFC 6455 WebSocket
-framing, the `/api/sync` Live state machine, the public call facade
-(`client/convex.v`), the NDJSON conformance adapter, and the canonical
-example are all implemented and proven in Docker. The gate proves, inside
-Docker on the pinned toolchain, that a Verilog program can drive a real TCP
-connection and a real certificate- and hostname-verified TLS handshake
-through a small VPI (Verilog Procedural Interface) C module.
-`client/convex_buffer.v` adds a hand-written JSON encoder and decoder,
-covering AGENTS.md's integral-decimal-number rule (`0.0`/`1.0` decode as
-integers; fractional, quoted, non-finite and overflowing values are
-rejected), proven with a language-local unit suite. `client/convex_http.v`
-adds HTTP/1.1 request/response framing, proven with a real `POST
-/api/query` round trip to the shared demo deployment. `client/convex_sha1.v`
-and `client/convex_base64.v` add a pure-Verilog SHA-1 and base64 encoder (no
-crypto library binding exists for this toolchain), proven against RFC
-6455's own worked handshake example. `client/convex_websocket.v` builds RFC
-6455 WebSocket framing on top of all of the above: masking, fragmentation
-reassembly, interleaved control frames, one-shot (post-reassembly) UTF-8
-validation, and Sec-WebSocket-Accept verification, proven against a
-fixture peer that independently checks the client's own masked PONG and
-CLOSE frames. `client/convex_sync.v` adds the `/api/sync` Live state
-machine (the pinned `convex-rs-0.10.4-unversioned-sync` profile) on top of
-that: a subscription table, the initial value and later external updates,
-five real reconnects through an adapter-facing `debugDisconnect` hook with
-an unchanged rehydration correctly suppressed and a genuine mutation still
-delivered every time, `QueryFailed` followed by recovery on the same
-subscription, `connectionCount`/`lastCloseReason`/`maxObservedTimestamp`
-carried correctly, and exponential backoff that doubles on repeated
-failure and resets after every successful handshake. `client/convex.v` is
-the public `call()` facade (query/mutation/action, plus an embedded
-`convex_sync` instance for Live), proven against the real deployment: a
-successful query, a successful mutation, and a function-level failure
-carrying structured `errorData`. `client/tests/conformance/adapter.v` is
-the NDJSON adapter protocol v1 executable, proven over both stdin/stdout
-and `ADAPTER_LISTEN` TCP mode, including a real Live subscription, a real
-`debugDisconnect`-triggered reconnect, and a bounded per-subscription
-mailbox proven under a genuinely stopped reader.
-`examples/basics/main.v` is the canonical example, proven both to fail
-loudly with no configuration and to produce the exact transcript
-`_shared/examples/basics.expected.txt` records, against a fixture and
-against the real hosted deployment.
-
-The design follows the same shape as this repository's `vhdl/` client
-(also in progress): standard HDL has no sockets, no TLS and no clock
-outside the simulator, so a small foreign-boundary module
-(`client/native.c`) supplies exactly those primitives, and everything
-else - the request framing, the JSON, the WebSocket handshake, the
-`/api/sync` state machine - lives in Verilog itself, driven through a
-clocked request/acknowledge circuit (`client/convex_transport.v`) rather
-than through `iverilog` used as a scripting language with `#delay`
-statements standing in for real synchronization.
-
-Where VHDL reaches its foreign boundary through GHDL's VHPIDIRECT (a
-direct binding from a VHDL function declaration to a C symbol), this
-client reaches it through Icarus's VPI: `client/native.c` registers two
-Verilog system functions, `$cx_dispatch` and `$cx_now_ms`, and Icarus
-calls back into this module's C code whenever simulated Verilog evaluates
-either one. The effect at the call site is the same kind of "ordinary
-looking call secretly leaves the simulator" boundary; the wiring
-underneath is a callback table Icarus consults rather than a linked
-symbol. `runtime` and `example-runtime` are a second kind of boundary
-crossing worth spelling out: Icarus is compile-then-interpret, so
-`iverilog` (the front end) produces a `.vvp` bytecode file and `vvp` (a
-wholly separate binary) is the runtime executor that interprets it - there
-is no linked native ELF the way GHDL's LLVM backend produces for `vhdl/`.
-Both runtime images therefore ship `vvp` plus this client's own
-`native.vpi` plus the small subset of Icarus's own default VPI plugins
-`vvp` needs at startup, and never `iverilog`/`ivl`/`ivlpp` (the compiler
-front end and code generator), which live in the exact same Debian
-package and the exact same directory.
-
-## What works
-
-| Behaviour | Status |
+| Capability | Evidence-backed status |
 | --- | --- |
-| Real TCP connection driven from Verilog through the VPI boundary | Proven in Docker (`tcp_smoke`) |
-| Real TLS handshake with certificate and hostname verification | Proven in Docker (`tls_smoke`), against `usable-reindeer-44.convex.cloud:443` |
-| JSON codec (encode, parse, integral-decimal rule) | Proven in Docker (`json_test`), language-local unit suite |
-| HTTP/1.1 request/response framing | Proven in Docker (`http_smoke`), real `POST /api/query` round trip |
-| SHA-1 + base64 (Sec-WebSocket-Accept) | Proven in Docker (`sha1_test`), RFC 6455's own worked example |
-| RFC 6455 WebSocket framing (mask, fragmentation, control frames, UTF-8) | Proven in Docker (`ws_smoke`), against a fixture peer |
-| `/api/sync` Live protocol (subscribe, reconnect, rehydration, backoff) | Proven in Docker (`sync_smoke`), against a fixture peer |
-| `client/convex.v` call facade (query/mutation/action, structured errorData) | Proven in Docker (`convex_test`), against the real deployment |
-| NDJSON conformance adapter (stdin/stdout, `ADAPTER_LISTEN`, Live, bounded mailbox) | Proven in Docker (Scenarios A-D) |
-| Canonical `examples/basics` | Proven in Docker, exact transcript match |
-| `example-runtime` / `runtime` Docker stages | Built, policy-checked (uid 65532, read-only, no compiler), and run against the real deployment |
-| HTTP capability | Verified (`./run verify-all verilog` awarded it on both profiles) |
-| Live capability | Verified (`./run verify-all verilog` awarded it on both profiles) |
+| HTTP query, mutation, and action | Verified on local and hosted profiles |
+| Live queries | Verified on local and hosted profiles |
 
-## The canonical example
+The manifest classifies this as a native client. The small C VPI module supplies
+ordinary transport primitives such as sockets, TLS, randomness, time, and
+process I/O. JSON, HTTP framing, the WebSocket handshake and frames, and Convex
+Live behaviour are implemented in Verilog itself.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.v -->
 ```verilog
@@ -384,128 +471,41 @@ endmodule
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-```sh
-docker build --target test -t verilog-test .
-```
+The design runs under pinned Icarus Verilog 11.0. `iverilog` compiles the
+sources to VVP bytecode, while the final images contain only the separate
+`vvp` runtime and the required VPI plugins. The Icarus documentation explains
+both the [VVP runtime](https://steveicarus.github.io/iverilog/targets/tgt-vvp.html)
+and how a simulator loads
+[VPI modules](https://steveicarus.github.io/iverilog/usage/vpi.html).
 
-This installs the pinned Icarus Verilog toolchain, builds `client/native.c`
-as a VPI module against `vpi_user.h`, and proves:
+`client/convex_transport.v` is the boundary between the simulated design and
+`client/native.c`. It presents a clocked request/acknowledge interface. The C
+side registers just two Verilog system functions and performs the operations
+that HDL cannot perform alone, including TCP, verified TLS, randomness, and
+wall-clock reads.
 
-- **`tcp_smoke`**: a real TCP round trip, driven entirely from Verilog
-  through `client/convex_transport.v`'s clocked request/acknowledge bus and
-  `$cx_dispatch`, against a one-shot fixture TCP server built in the same
-  Docker stage.
-- **`tls_smoke`**: a real TLS 1.x handshake to
-  `usable-reindeer-44.convex.cloud:443`, with both certificate and hostname
-  verification (`SSL_set1_host` plus `SSL_get_verify_result`), through the
-  same VPI boundary, followed by a real HTTP/1.1 request sent over that
-  handshake and a real status line read back - proof that application bytes
-  travel through the verified channel, not only that a verification flag was
-  set.
-- **`http_smoke`**: a real `POST /api/query` round trip to the shared
-  demo deployment over that same verified channel, driven through
-  `client/convex_http.v`'s request/response framing and
-  `client/convex_buffer.v`'s JSON codec, checking the real
-  status/value/errorMessage/logLines envelope Convex's HTTP API returns.
-- **`sha1_test`**: `client/convex_sha1.v` and `client/convex_base64.v`
-  against two known-answer vectors, including RFC 6455's own worked
-  handshake example (`Sec-WebSocket-Key` `dGhlIHNhbXBsZSBub25jZQ==` must
-  produce `Sec-WebSocket-Accept` `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`) - no
-  network involved.
-- **`ws_smoke`**: a real RFC 6455 WebSocket handshake and message round
-  trip against a fixture peer, proving masking (client-to-server frames),
-  fragmentation reassembly across an interleaved PING control frame, and
-  one-shot UTF-8 validation over the fully reassembled message rather
-  than per fragment - the fixture independently checks the client's PONG
-  and CLOSE frames arrived masked with the right content.
-- **`sync_smoke`**: a real `/api/sync` session against a fixture peer
-  through six sequential connections (one initial connect plus five
-  `debugDisconnect`-triggered reconnects), proving the initial value, an
-  external mutation, `QueryFailed` followed by recovery on the same
-  subscription, and - on every one of the five reconnects - that an
-  unchanged rehydration is suppressed while a genuine mutation is still
-  delivered. The fixture independently checks each connection's own
-  `connectionCount` and `lastCloseReason`, and a separate deterministic
-  check proves exponential backoff actually doubles on repeated failure.
-- **`convex_test`**: `client/convex.v`'s `call()` facade against the real
-  approved deployment - a successful query, a successful mutation, and a
-  function-level failure carrying structured `errorData`.
-- **the adapter, Scenarios A-D**: the NDJSON adapter over plain
-  stdin/stdout (a real query call), over a FIFO-fed stdin with a real Live
-  subscription and a real `debugDisconnect`-triggered second TCP
-  connection, over `ADAPTER_LISTEN`'s TCP mode, and under a genuinely
-  stopped reader (4000 unpaced `Transition`s, ~350 KB over a 64 KB pipe
-  buffer, peak VmRSS sampled at 1.4 MB against the shared 128 MiB adapter
-  memory limit).
-- **the canonical example**: fails loudly (empty stdout, `CONVEX_URL is
-  required` on stderr, exit 1) with no deployment configured, then produces
-  the exact six lines `_shared/examples/basics.expected.txt` records
-  against a fixture that times the post-mutation Live `Transition` to
-  arrive after the mutation's own HTTP response has already completed.
+Above that boundary, the implementation is intentionally Verilog all the way
+up: bounded byte buffers and JSON tokens, HTTP/1.1 framing, pure-Verilog SHA-1
+and base64 for the WebSocket handshake, WebSocket framing, and the Convex Live
+state machine. One sync process owns reads, writes, reconnects, and query-set
+changes, which avoids concurrent access to the socket.
 
-```sh
-docker build --target runtime -t verilog-runtime .
-docker build --target example-runtime -t verilog-example-runtime .
-```
+The Docker-local tests cover the JSON codec, TCP and TLS transport, HTTP,
+WebSockets, reconnects, structured errors, adapter modes, and bounded memory.
+The recorded capability award comes from the repository's separate local and
+hosted conformance runs, not merely from compilation or fixtures.
 
-Both stages ship only `vvp` and this client's own `native.vpi` - never
-`iverilog`/`ivl`/`ivlpp` - run as `65532:65532`, and are proven with real
-`docker run --read-only --cap-drop=ALL` invocations against the real
-hosted deployment, not only the build-time `RUN` probes.
+## Known Issues
 
-## Limitations and deferred work
-
-- `client/convex_sync.v` does not validate Convex's `startVersion`/
-  `endVersion` state-version continuity (a peer client,
-  `mumps/client/convex.m`, does) - only `endVersion.ts` itself, for
-  `maxObservedTimestamp`. See that file's own header comment for the
-  reasoning; AGENTS.md's Live-acceptance section requires carrying
-  `maxObservedTimestamp` correctly, not rejecting a state-version
-  discontinuity, and the fixture peer never sends an invalid one.
-- Live delivery is a bounded mailbox, not a growing queue:
-  `convex_sync.v` keeps only the latest value per subscription (a single
-  slot with a version counter), and the adapter's own "have I emitted the
-  current version yet" tracking over it is the same fixed, `MAX_SUBS`-sized
-  shape - a slow consumer sees the newest value next, not a backlog of
-  every intermediate one. Proven under a real stopped reader; see the
-  adapter Scenario D entry above.
-- The gate's TCP, WebSocket and sync proofs, and every adapter scenario,
-  all use a hermetic Docker-local fixture server; only the TLS, HTTP,
-  `convex_test`, and canonical-example proofs reach the real Convex
-  deployment, matching this project's policy against pointing arbitrary
-  build-time network access at a real backend for anything but those
-  proofs.
-- The pinned `iverilog` does not support passing an unpacked array, a
-  `ref` port, or even a dynamic `byte queue[$]`, into a task or function -
-  confirmed directly against the toolchain rather than assumed. Every
-  buffer in this client is therefore module state reached only through a
-  hierarchical name, and `client/convex_buffer.v` combines byte storage
-  with JSON parsing of its own content in one module rather than two
-  separate packages the way `vhdl/` splits them.
-- The same toolchain also expands a `\"` or a lone `\\` inside a
-  SystemVerilog `string` literal into that escape's own four-character
-  spelling instead of the single byte it should produce (`"a\"b".len()`
-  reports 6, not 3) - documented in `client/convex_chars.vh`. Every
-  string literal in this client that needs a literal quote or backslash
-  spells it as an explicit byte constant instead.
-- A third, previously-hidden Icarus 11.0 bug was found while wiring the
-  adapter: `disable main;` inside a recursively self-nested
-  `parse_object` or `parse_array` call (an object whose value is itself
-  an object, or an array whose element is itself an array) does not only
-  exit the inner frame the way IEEE 1800 automatic-task reentrancy
-  requires - it also silently abandons the OUTER frame's own remaining
-  statements. An ordinary `"args":{}` envelope (the empty-args case most
-  adapter commands fall back to) was rejected as malformed even though
-  the bytes were well-formed JSON. Fixed in `client/convex_buffer.v` by
-  rewriting both tasks to thread a `failed` flag through nested
-  `if`/`else` instead of ever calling `disable` from a frame that may be
-  recursing; `{"a":[]}` (a DIFFERENT task recursing into the object one)
-  never triggered it, which is what made it easy to miss.
-- JSON string decoding does not combine a `\uD800`-`\uDBFF` /
-  `\uDC00`-`\uDFFF` surrogate pair into one astral codepoint; it rejects
-  the lone surrogate half instead. A Basic Multilingual Plane character
-  (the overwhelming majority of real text, and everything Convex's own
-  protocol control fields ever contain) decodes correctly; an emoji or
-  rare CJK extension character in user data would not.
+1. Live tracks `endVersion.ts` but does not validate full
+   `startVersion`/`endVersion` continuity.
+2. JSON decoding rejects UTF-16 surrogate pairs, so emoji and other astral
+   characters in user data do not decode.
+3. Live delivery is a bounded latest-value mailbox. A slow consumer can skip
+   intermediate values, although it still receives the newest state.
+4. Pinned Icarus 11.0 cannot pass the buffer shapes this client needs into
+   tasks, and mishandles quote and backslash escapes in string literals. The
+   implementation therefore keeps buffers as module state and writes those
+   characters as explicit byte constants.
