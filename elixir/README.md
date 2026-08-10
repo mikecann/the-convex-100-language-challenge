@@ -1,29 +1,159 @@
-# Convex from Elixir
+<img src="logo.png" alt="Elixir logo" width="240">
+<!-- Logo source: https://elixir-lang.org/downloads/logos/elixir-dark.svg -->
 
-This demonstration uses Elixir and OTP to query a Convex room, subscribe to it
-over Live, mutate it, and prove the reactive value changes from `0` to `1`.
+# Elixir
 
-It is educational and unofficial. It is not a production SDK, an officially
-sanctioned Convex client, or a package intended for Hex.
+[Elixir](https://elixir-lang.org/) is a functional language created by José
+Valim in 2012. It runs on the Erlang virtual machine, usually called the BEAM,
+and shares Erlang's OTP tools for processes, supervision, and fault-tolerant
+systems. Today its best-known niche is networked software, including web and
+realtime applications, though the official ecosystem also covers embedded
+systems, data pipelines, machine learning, and distributed systems.
 
-## Start here
+This is an educational, unofficial demonstration. It is not a production SDK,
+an officially sanctioned Convex client, or a package intended for Hex.
 
-Read [`examples/basics/main.ex`](examples/basics/main.ex). It is the exact
-program Docker runs and the website displays. The comments walk through client
-creation, the initial HTTP query, subscribing before the write, idempotent
-mutation, and the resulting Live update.
+## Getting Started
 
-## What works
+Start with [`examples/basics/main.ex`](examples/basics/main.ex). It queries a
+room, opens a Live subscription, performs an idempotent mutation, and observes
+the count change from `0` to `1`.
+
+From the repository root, run the exact example in its Docker runtime:
+
+```sh
+./run verify-example elixir
+```
+
+Docker supplies a unique room and the approved test deployment. The command
+compiles and executes the same source shown in the Example section below.
+
+## Interesting Parts
+
+### Success and failure are values you can match
+
+TypeScript normally reports a mutation failure by rejecting its promise. This
+Elixir client returns a tagged tuple such as `{:ok, result}` or
+`{:error, exception}`, so pattern matching makes the branch visible at the call
+site.
+
+**TypeScript with React**
+
+```tsx
+import { useMutation } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function IncrementButton() {
+  const increment = useMutation(api.demo.increment);
+
+  async function onClick() {
+    const result = await increment({
+      room: "readme-elixir",
+      language: "typescript",
+      runId: crypto.randomUUID(),
+    });
+    console.log(result.state.count); // The generated API makes this a number.
+  }
+
+  return <button onClick={onClick}>Increment</button>;
+}
+```
+
+**Elixir**
+
+```elixir
+alias Convex.Client
+
+deployment_url = System.fetch_env!("CONVEX_URL")
+{:ok, client} = Client.start_link(deployment_url)
+
+try do
+  args = %{
+    "room" => "readme-elixir",
+    "language" => "elixir",
+    "runId" => :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
+  }
+
+  case Client.mutation(client, "demo:increment", args) do
+    {:ok, result} ->
+      %{"state" => %{"count" => count}} = result.value
+      IO.inspect(count) # This shape is checked by the match at runtime, not statically typed.
+
+    {:error, error} ->
+      raise error
+  end
+after
+  Client.close(client)
+end
+```
+
+Elixir supports optional typespecs and static analysis, but it is dynamically
+typed. This demonstration accepts JSON maps, so its nested match is a runtime
+shape check. The TypeScript snippet instead gets generated argument and result
+types from `api.demo.increment`.
+
+### A Live query belongs to an Elixir process
+
+React owns the subscription behind `useQuery`, rerenders when its value changes,
+and cleans it up with the component. This command-line client gives the calling
+Elixir process an explicit subscription instead.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function RoomCount() {
+  const state = useQuery(api.demo.state, { room: "readme-elixir" });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // state.count is type-safe and triggers rerenders.
+}
+```
+
+**Elixir**
+
+```elixir
+alias Convex.{Client, Subscription}
+
+deployment_url = System.fetch_env!("CONVEX_URL")
+{:ok, client} = Client.start_link(deployment_url)
+
+try do
+  args = %{"room" => "readme-elixir"}
+  {:ok, subscription} = Client.subscribe(client, "demo:state", args)
+
+  try do
+    # The first message is the current reactive value for this room.
+    {:ok, update} = Subscription.next(subscription, 10_000)
+    %{"count" => count} = update.value
+    IO.inspect(count) # `count` is dynamically checked by the map match above.
+  after
+    # The CLI owns the lifecycle, so it must unsubscribe explicitly.
+    Subscription.close(subscription)
+  end
+after
+  Client.close(client)
+end
+```
+
+The BEAM provides lightweight processes and asynchronous message passing. The
+blocking `Subscription.next/2` wrapper is this client's deliberately small CLI
+API, not a limitation of Elixir. A long-running program would call it again, or
+receive the underlying messages in its own process, to handle later updates.
+
+## Status
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
 | HTTP | Verified by shared local and hosted conformance | Native query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented. |
 | Live | Verified by shared local and hosted conformance | Native WebSocket subscriptions, unsubscribe, typed query failures, and reconnect restoration are implemented against the pinned profile. |
 
-The shared local and hosted black-box controller passed both rows, and the
-manifest records the earned HTTP and Live capabilities.
+The manifest records both earned capabilities. These are results for the pinned
+test profile, not a claim that Convex supports this client.
 
-## Basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.ex -->
 ```elixir
@@ -163,47 +293,39 @@ end
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verify it in Docker
+## Implementation Notes
 
-```sh
-./run test elixir
-./run verify-example elixir
-./run verify elixir
-./run verify-hosted elixir
-./run verify-all elixir
-```
+- `Convex.Client` is a `GenServer`, an OTP process with private state and a
+  standard request/reply interface. It serializes HTTP calls, owns the bearer
+  token, and starts the Live process when the first subscription needs it.
+- Documented HTTP queries, mutations, and actions use Erlang's `:httpc`. Jason
+  handles JSON, CAStore supplies the certificate bundle, and HTTPS enables peer
+  verification, SNI, and hostname checks.
+- `Convex.Live` is a second `GenServer` with exclusive ownership of the Gun
+  WebSocket. It tracks active subscriptions, restores them after reconnecting,
+  and routes updates to each subscribing process's mailbox.
+- The Live implementation targets the internal
+  `convex-rs-0.10.4-unversioned-sync` profile at upstream commit
+  `6f1df8a8ba1665084ec001e307ca841ca17074d7`, using `/api/sync`. Passing the
+  shared tests against that pin does not turn it into a supported public
+  protocol.
+- The test-only adapter under `client/tests/conformance/` speaks adapter
+  protocol v1 over standard input/output or TCP. Its `debugDisconnect` command
+  exists only so conformance can prove reconnection and is not public client
+  API.
+- The Docker build pins Elixir 1.17.3 with Erlang/OTP 26.2.5.15. The final
+  runtime keeps the Erlang runtime and required OTP applications but excludes
+  Mix, Hex, Rebar, the Elixir compiler commands, and general-purpose network
+  utilities.
 
-`test` checks formatting, compiles all source and both executables, and runs
-language-local unit tests. `verify-example` runs the exact example above against
-a unique room. The two conformance commands separately test the approved local
-backend and dedicated hosted drift target. `verify-all` runs both from the same
-built source.
+## Known Issues
 
-## Conformance and protocol notes
-
-The public client calls `/api/query`, `/api/mutation`, and `/api/action` using
-the documented `format: "json"` HTTP contract. Its OTP Live process implements
-the `convex-rs-0.10.4-unversioned-sync` profile pinned at upstream commit
-`6f1df8a8ba1665084ec001e307ca841ca17074d7` and endpoint `/api/sync`.
-
-The test-only executable under `client/tests/conformance/` exposes NDJSON
-adapter protocol v1 over stdin/stdout or TCP. It includes `debugDisconnect`
-only so the shared controller can exercise real reconnection. That hook is not
-part of the educational client API.
-
-## Limitations
-
-Live authentication, WebSocket mutations and actions, transition chunks,
-mutation replay, optimistic updates, journals, and the non-JSON-safe Convex
-value extensions are deliberately outside this demonstration. Realtime is an
-internal protocol, so passing evidence for this pinned revision would not make
-it a supported third-party SDK contract.
-
-The pinned Gun 2.5.0 dependency currently resolves Cowlib 2.19.0. Hex flags
-both packages for the same request/response-splitting advisory
-(`GHSA-w4f7-4cxr-rv3c`) and separately flags Cowlib's cookie encoder for header
-injection (`GHSA-g2wm-735q-3f56`). This outbound client does not construct HTTP
-responses or call Cowlib's cookie encoder, but the vulnerable code remains in
-its dependency graph and no patched Hex release currently exists. Those
-unresolved advisories are another concrete reason not to treat this experiment
-as production-ready software.
+1. Live authentication, WebSocket mutations and actions, transition chunks,
+   mutation replay, journals, and optimistic updates are not implemented.
+2. Live values cover only the JSON-safe subset exercised by the shared suite.
+   Convex's additional value encodings are outside this demonstration.
+3. Gun 2.5.0 and Cowlib 2.19.0 remain flagged for request/response splitting
+   (`GHSA-w4f7-4cxr-rv3c`), and Cowlib's cookie encoder is flagged for header
+   injection (`GHSA-g2wm-735q-3f56`). This outbound client does not construct
+   responses or call that encoder, but the affected dependency code is still
+   present and no patched Hex release is currently available.
