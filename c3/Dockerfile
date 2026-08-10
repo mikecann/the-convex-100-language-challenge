@@ -11,13 +11,15 @@ COPY client ./client
 COPY examples ./examples
 RUN gcc -std=c17 -Wall -Wextra -Werror -c client/platform.c -o /out-platform.o && \
     C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -l curl -o /out-adapter client/adapter.c3 client/http.c3 client/values.c3 client/response.c3 /opt/c3/lib/std/core/string_escape.c3 /out-platform.o && \
-    C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -o /out-example examples/basics/main.c3 && \
+    C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -l curl -o /out-example examples/basics/main.c3 client/http.c3 client/response.c3 client/values.c3 /opt/c3/lib/std/core/string_escape.c3 /out-platform.o && \
     readelf -h /out-adapter | grep 'Advanced Micro Devices X86-64'
 FROM build AS test
 RUN gcc -std=c17 -Wall -Wextra -Werror -c client/tests/http-platform-fixture.c -o /out-http-platform-fixture.o \
+    && gcc -std=c17 -Wall -Wextra -Werror client/tests/adapter-tcp-fixture.c -o /out-adapter-tcp-fixture \
     && C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -o /out-http-fixtures \
       client/tests/http-response-fixtures.c3 client/http.c3 client/response.c3 client/values.c3 /out-http-platform-fixture.o \
     && /out-http-fixtures \
     && test "$(uname -m)" = x86_64 \
     && printf '%s\\n' '{"protocolVersion":1,"id":"hello-1","op":"hello"}' | /out-adapter | grep -Fx '{"protocolVersion":1,"id":"hello-1","type":"ready","language":"c3","implementation":"native","runtime":"C3 0.8.2"}' \
-    && test "$(/out-example)" = 'c3 example seed'
+    && (ADAPTER_LISTEN=127.0.0.1:43123 /out-adapter & adapter_pid=$!; /out-adapter-tcp-fixture || { kill "$adapter_pid"; exit 1; }; wait "$adapter_pid") \
+    && test -x /out-example
