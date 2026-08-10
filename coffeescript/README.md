@@ -22,7 +22,7 @@ checks the whole `0 -> 1` journey. The CoffeeScript implementation is under
 | HTTP bearer-token replacement | Verified by shared local and hosted conformance |
 | Initial and updated Live query values | Verified by shared local and hosted conformance |
 | Adapter-only Live reconnect hook | Verified by shared local and hosted conformance |
-| Capability badges | Not claimed until root-owned evidence |
+| Capability badges | HTTP and Live earned from root-owned local and hosted evidence |
 | Live authentication and WebSocket writes | Deferred |
 
 ## Basic example
@@ -123,5 +123,4 @@ Live authentication, optimistic updates, WebSocket mutations/actions, journal
 replay, tagged Convex values, and `TransitionChunk` assembly are deferred. A
 subscription keeps only its newest 16 updates and 8 MiB of queued encoded data,
 discarding old intermediate query states for a slow consumer. Capability badges
-remain empty until the exact source is exercised by shared local and hosted
-conformance.
+were earned when the exact source passed shared local and hosted conformance.

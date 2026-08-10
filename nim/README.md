@@ -14,7 +14,7 @@ Read the [canonical basic example](examples/basics/main.nim). It accepts a uniqu
 | --- | --- | --- |
 | HTTP query, mutation, action | Implemented in the client | Native bounded `std/httpclient` streaming, strict Convex response decoding, and structured errors |
 | HTTP bearer authentication | Implemented in the client | `setAuth` and `CONVEX_AUTH_TOKEN` set or replace the Authorization header |
-| Live subscriptions | Implemented; the canonical example completes its journey against a real deployment | One socket owner, Add replay across five real reconnects, transactional transitions, strict timestamp ordering, and a bounded delivery mailbox whose overflow is tested; shared conformance evidence is not claimed |
+| Live subscriptions | Verified by shared local and hosted conformance | One socket owner, Add replay across five real reconnects, transactional transitions, strict timestamp ordering, and a bounded delivery mailbox whose overflow is tested |
 
 The root-owned shared verifier earned HTTP and Live for the reviewed source commit.
 

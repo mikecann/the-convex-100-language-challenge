@@ -12,10 +12,10 @@ It is an educational, unofficial experiment, not a production SDK or a package i
 
 | Capability | Status |
 | --- | --- |
-| JSON HTTP queries, mutations, and actions | Written, never compiled or run |
-| Pinned Live query protocol | Written, never compiled or run |
-| Docker build and language-local tests | Not yet executed |
-| Shared conformance | Not attempted |
+| JSON HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
+| Pinned Live query protocol | Verified by shared local and hosted conformance |
+| Docker build and language-local tests | Passed |
+| Shared conformance | Passed locally and hosted; HTTP and Live earned |
 | Production SDK compatibility | Not claimed |
 
 Docker compilation and the shared local and hosted evaluator passed, earning HTTP and Live.

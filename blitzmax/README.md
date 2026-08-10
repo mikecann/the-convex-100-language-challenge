@@ -14,7 +14,7 @@ Read [`examples/basics/main.bmx`](examples/basics/main.bmx). It queries a fresh 
 | --- | --- |
 | HTTP queries, mutations, actions, and structured function errors | Verified by shared local and hosted conformance |
 | Live initial values, external updates, failure recovery, and reconnection | Verified by shared local and hosted conformance |
-| Full HTTP and Live conformance against the shared harness | Not yet earned |
+| Full HTTP and Live conformance against the shared harness | Passed locally and hosted; HTTP and Live earned |
 | Live authentication, optimistic updates, WebSocket mutations and actions | Deferred |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.bmx -->
@@ -230,7 +230,7 @@ convex_example_exit(status)
 ./run verify-example blitzmax
 ```
 
-`test` builds every BlitzMax executable inside Docker and runs the language-local suites: unit checks, a hostile HTTP peer, a hostile WebSocket peer, and adapter serialisation. It then exercises the real adapter over both stdin/stdout and TCP, and asserts that the minimal runtime images contain no compiler, package manager, or delegated runtime. `verify-example` runs the exact canonical example from its minimal image against a unique room and compares its stdout with the shared transcript. Neither earns a capability: only the root-owned shared conformance run can do that.
+`test` builds every BlitzMax executable inside Docker and runs the language-local suites: unit checks, a hostile HTTP peer, a hostile WebSocket peer, and adapter serialisation. It then exercises the real adapter over both stdin/stdout and TCP, and asserts that the minimal runtime images contain no compiler, package manager, or delegated runtime. `verify-example` runs the exact canonical example from its minimal image against a unique room and compares its stdout with the shared transcript. The later root-owned local and hosted conformance runs passed and earned HTTP and Live.
 
 ## Conformance and protocol notes
 

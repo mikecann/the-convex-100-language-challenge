@@ -231,6 +231,32 @@ reading transcripts, diffing branches, reconciling forks after each
 mass-kill, root-causing the two forgotten-badge near-misses — rather than
 purely routing.
 
+## Across all model providers
+
+The two Codex sessions above account for **46,142,173,262 tokens**. A separate
+provider check on 7 August 2026 pulled Claude usage from the saved local session
+records and Grok usage from the live OpenRouter dashboard:
+
+| Provider and model | Tokens | Source and caveat |
+| --- | ---: | --- |
+| Codex | 46,142,173,262 | The two transcript-derived tables above |
+| Claude Opus 5 | 3,148,726,203 | Saved Claude sessions; includes 3.052B cache reads, 69.2M cache writes and 26.75M output |
+| Claude Fable 5 | 193,765,957 | Saved Claude sessions; includes 188.1M cache reads, 4.67M cache writes and 1.01M output |
+| Claude Sonnet 5 | 1,123,725,974 | Saved Claude sessions |
+| Claude Haiku 4.5 | 16,021,031 | Saved Claude sessions |
+| OpenRouter Grok 4.5 | ~45,300,000 | Live dashboard; 305 requests and approximately $21.80 |
+| **All providers** | **~50,669,712,427** | Approximate because OpenRouter rounds its displayed totals |
+
+OpenRouter showed the project API key rounded to **45M tokens**, while its
+model breakdown showed **45.3M**. The table preserves 45.3M as the best
+available figure rather than presenting it as exact. The Claude figures are
+exactly what the saved sessions reported at the time of that provider check.
+
+This **50.67 billion** total supersedes the earlier 18.07 billion preliminary
+snapshot, which was taken before the transcript accounting for both completed
+Codex pushes was available. As with the session tables, the overwhelming
+majority was cached context processing, not full-price fresh input.
+
 ## Documentation produced
 
 | File | Purpose | Size |

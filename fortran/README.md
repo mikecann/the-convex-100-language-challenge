@@ -15,7 +15,7 @@ It is unofficial educational material, not a production SDK.
 | HTTP query, mutation, action, auth, logs, and structured errors | Works in language-local and hosted smoke tests |
 | Live query Add/Remove, updates, failure recovery, and reconnect | Works in deterministic state tests and hosted smoke tests |
 | NDJSON adapter over stdin or one TCP controller | Works with partial input, isolated malformed commands, bounded output, and EOF cleanup |
-| Capability badges | Not claimed until the root integration owner records shared local and hosted conformance evidence |
+| Capability badges | HTTP and Live earned from root-owned local and hosted conformance evidence |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.f90 -->
 ```fortran

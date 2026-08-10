@@ -21,7 +21,7 @@ same `0 -> 1` change. The native implementation is in [client](client/).
 | HTTP bearer token | Verified by shared local and hosted conformance |
 | Initial and updated Live values | Verified by shared local and hosted conformance |
 | Live reconnection test hook | Verified by shared local and hosted conformance |
-| Capability badges | Not claimed until root evidence |
+| Capability badges | HTTP and Live earned from root-owned local and hosted evidence |
 | Live authentication and WebSocket writes | Deferred |
 
 ## Basic example

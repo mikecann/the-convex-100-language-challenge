@@ -22,8 +22,8 @@ the mutation, and the resulting Live update.
 | HTTP | Verified by shared local and hosted conformance | Native queries, mutations, actions, bearer-token replacement, logs, TLS verification, and structured errors are implemented. |
 | Live | Verified by shared local and hosted conformance | One native WebSocket owner implements Add/Remove, typed query failures, bounded delivery, reconnect restoration, and stale-relay barriers against the pinned profile. |
 
-The manifest intentionally awards no badges yet. Only the shared local and
-hosted black-box controller may turn either row into a passing capability.
+The shared local and hosted black-box controller passed both rows, and the
+manifest records the earned HTTP and Live capabilities.
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.erl -->
 ```erlang
@@ -179,4 +179,5 @@ Cowlib's cookie encoder for header injection (`GHSA-g2wm-735q-3f56`). This
 outbound client neither constructs responses nor calls that cookie encoder,
 but the vulnerable code remains and no patched Hex release currently exists.
 That unresolved dependency risk is another reason not to use this experiment
-as production software. No HTTP or Live badge has been earned yet.
+as production software. The shared evaluator still awarded HTTP and Live for
+the pinned profile exercised by this project.

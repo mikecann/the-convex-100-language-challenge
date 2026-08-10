@@ -32,9 +32,8 @@ adapter:
     - debugDisconnect
 limitations:
   - >-
-    Docker build, language-local tests, and runtime images are unverified. No
-    Docker command has been executed for this checkpoint, so compilation,
-    deployment, and every runtime claim remain unproven.
+    Docker build, language-local tests, runtime-image checks, and shared local
+    and hosted conformance passed for the reviewed source.
   - >-
     Live authentication, optimistic updates, WebSocket mutations, WebSocket
     actions, journals, and TransitionChunk assembly are deferred. A chunk is

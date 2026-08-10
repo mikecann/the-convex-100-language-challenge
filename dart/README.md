@@ -187,5 +187,5 @@ It is an experimental compatibility target, not a stable public protocol.
 - Live authentication and token rotation are deferred.
 - Full tagged Convex values, WebSocket mutations/actions, journals, optimistic
   updates, and `TransitionChunk` assembly are deferred.
-- No HTTP or Live capability is claimed until shared local and hosted evidence
-  passes on the reviewed commit.
+- Shared local and hosted conformance passed on the reviewed commit, earning
+  HTTP and Live.

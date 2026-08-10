@@ -12,9 +12,9 @@ Read [`examples/basics/main.vala`](examples/basics/main.vala). It queries a fres
 
 | Capability | Status |
 | --- | --- |
-| HTTP queries, mutations, actions, and structured errors | Implemented, no earned badge |
-| Live initial values and updates used by the canonical example | Implemented, no earned badge |
-| Full HTTP and Live conformance | Not yet earned |
+| HTTP queries, mutations, actions, and structured errors | Verified by shared local and hosted conformance |
+| Live initial values and updates used by the canonical example | Verified by shared local and hosted conformance |
+| Full HTTP and Live conformance | Passed; both capabilities earned |
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.vala -->
 ```vala
@@ -158,7 +158,7 @@ int main (string[] args) {
 ./run verify-example vala
 ```
 
-`test` compiles and runs Vala's language-local adapter checks inside Docker. The final-image probes exercise the exact canonical example and adapter under the runtime policy. Root-owned shared conformance is still required before either capability can be earned.
+`test` compiles and runs Vala's language-local adapter checks inside Docker. The final-image probes exercise the exact canonical example and adapter under the runtime policy. The later root-owned local and hosted conformance runs passed, earning HTTP and Live.
 
 ## Conformance and protocol notes
 
@@ -174,4 +174,4 @@ The test-only adapter accepts strict NDJSON v1 over stdin/stdout or one `ADAPTER
 
 The language-local raw peers cover strict HTTP status and bounded streaming, function-error envelopes on non-2xx statuses, truncated `Content-Length` and unterminated chunked bodies, inactivity and continuous-drip deadlines, malformed-envelope recovery, strict RFC6455 upgrade validation, fragmented UTF-8 with control traffic, absolute partial-frame timeout and recovery, tree-shaped frame rejection and recovery, five reconnects with `Add` replay, stale relay barriers, and bounded close. They also exercise queued and in-flight count/byte reservations against both string-shaped and tree-shaped near-maximum values, but they do not replace fresh independent review or root-owned shared conformance.
 
-The retained-JSON bound is a real refusal, not a soft cap. A Convex value whose parsed tree would exceed eight MiB retained is reported as a `ProtocolError` rather than delivered, and a Live frame carrying one retires that connection and reconnects instead of being parsed. That is a deliberate trade: a wire-legal but node-dense payload is refused rather than allowed to exhaust the shared container limit. Live authentication lifecycle, optimistic updates, mutation and action messages over WebSocket, journals, and TransitionChunk assembly are deferred. The manifest deliberately declares no earned badges.
+The retained-JSON bound is a real refusal, not a soft cap. A Convex value whose parsed tree would exceed eight MiB retained is reported as a `ProtocolError` rather than delivered, and a Live frame carrying one retires that connection and reconnects instead of being parsed. That is a deliberate trade: a wire-legal but node-dense payload is refused rather than allowed to exhaust the shared container limit. Live authentication lifecycle, optimistic updates, mutation and action messages over WebSocket, journals, and TransitionChunk assembly are deferred. The manifest records the HTTP and Live capabilities earned for this pinned profile.

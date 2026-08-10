@@ -11,8 +11,8 @@ implementation:
     Native Pharo 12 Smalltalk client. HTTPS uses Zinc and Zodiac from the Pharo
     image; RFC 6455 framing, the Convex sync protocol, strict JSON and all
     Convex behaviour are implemented in Smalltalk. Pharo 12 ships no WebSocket
-    package, so none is delegated to. This source has not been built or
-    exercised in Docker yet, so it deliberately earns no badges.
+    package, so none is delegated to. Root-owned shared local and hosted
+    conformance passed, earning HTTP and Live.
 toolchain:
   name: Pharo
   version: "12.0-64bit-build-1258-sha-1645336"
@@ -32,8 +32,8 @@ adapter:
     - debugDisconnect
 limitations:
   - >-
-    Not yet built or run in Docker. Every claim below is a property of the
-    checked-in source and its deterministic tests, not of a verified image.
+    Docker build, language-local tests, runtime-image checks, and shared local
+    and hosted conformance passed for the reviewed source.
   - >-
     Live authentication, optimistic updates, WebSocket mutations and actions,
     journals, extended Convex value tags, and TransitionChunk assembly are

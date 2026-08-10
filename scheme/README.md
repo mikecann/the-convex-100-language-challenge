@@ -175,7 +175,7 @@ Read [`examples/basics/main.scm`](examples/basics/main.scm). It queries a fresh 
 ./run verify-all scheme
 ```
 
-`test` builds the pinned CHICKEN dependency graph from source, then runs strict JSON, real HTTP, real-socket Live, stdin/TCP adapter, and canonical example tests. It saves the exact adapter and example as native `linux/amd64` executables. `verify-example` runs the example from its minimal image against a unique room. The remaining shared commands add local and hosted black-box conformance. Only the root result evaluator can award HTTP or Live badges, so this language branch does not claim them itself.
+`test` builds the pinned CHICKEN dependency graph from source, then runs strict JSON, real HTTP, real-socket Live, stdin/TCP adapter, and canonical example tests. It saves the exact adapter and example as native `linux/amd64` executables. `verify-example` runs the example from its minimal image against a unique room. The remaining shared commands add local and hosted black-box conformance. Those runs passed, and the root result evaluator awarded HTTP and Live.
 
 ## Conformance and protocol notes
 
