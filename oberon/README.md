@@ -1,23 +1,175 @@
-# Convex from Oberon-07
+# Oberon-07
 
-This is a small native Oberon-07 client for Convex HTTP functions and reactive Live queries, built with OBNC, the Oberon-to-C compiler.
+[Oberon](https://people.inf.ethz.ch/wirth/Oberon/) is a compact, general-purpose language created by Niklaus Wirth at ETH Zurich as part of the Oberon operating-system project. It evolved from Modula-2, keeps the Pascal family’s structured style, and adds type extension while deliberately trimming the language down. The original language and system were developed in 1986 to 1990; this repository uses the [2007 revision, last revised in 2016](https://people.inf.ethz.ch/wirth/Oberon/Oberon07.Report.pdf). Today Oberon is a niche language, seen mainly in teaching, compiler work, and small systems projects such as [Project Oberon](https://people.inf.ethz.ch/wirth/ProjectOberon/index.html), rather than mainstream application development.
 
-It is an educational, unofficial experiment. It is not a production SDK and is not intended for package publication.
+This is an educational, unofficial Convex client. It is not a production SDK and is not intended for package publication.
 
-## Start here
+## Getting Started
 
-Read [`examples/basics/main.obn`](examples/basics/main.obn). It queries a fresh counter over HTTP, opens a Live subscription before mutating anything, applies one idempotent mutation, and checks that the HTTP query, the mutation result, and the Live subscription all agree on the same `0 -> 1` journey.
+Start with [`examples/basics/main.obn`](examples/basics/main.obn). It queries a fresh counter, opens a Live subscription, applies one idempotent mutation, and confirms the same `0 -> 1` result through both HTTP and Live.
 
-## What works
+From the repository root, Docker builds the Oberon program and runs that exact example against the approved test deployment:
 
-| Capability | Status |
+```sh
+./run verify-example oberon
+```
+
+## Interesting Parts
+
+### JSON is text in a fixed array
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function CurrentCount() {
+  const state = useQuery(api.demo.state, { room: "oberon-readme" });
+
+  // state and count are type-safe here.
+  return <span>{state?.count ?? "Loading..."}</span>;
+}
+```
+
+**Oberon-07**
+
+```oberon
+MODULE HttpQuery;
+
+	IMPORT J := ConvexJSON, S := ConvexSync, Shim := ConvexShim, extEnv, Out;
+
+	VAR
+		url: ARRAY 512 OF CHAR;
+		args, value, logs, errorMessage, errorData: ARRAY 8192 OF CHAR;
+		errorName, transportError: ARRAY 256 OF CHAR;
+		countText: ARRAY 64 OF CHAR;
+		haveUrlRes: INTEGER;
+		found, hasErrorData, ok: BOOLEAN;
+
+	PROCEDURE Fail(message: ARRAY OF CHAR);
+	BEGIN
+		Out.String(message); Out.Ln;
+		Shim.Exit(1)
+	END Fail;
+
+	PROCEDURE SetJSON(text: ARRAY OF CHAR; VAR destination: ARRAY OF CHAR);
+	VAR i: INTEGER;
+	BEGIN
+		i := 0;
+		WHILE text[i] # 0X DO
+			(* Backticks stand in for quote marks that OBNC cannot escape. *)
+			IF text[i] = "`" THEN destination[i] := CHR(34)
+			ELSE destination[i] := text[i]
+			END;
+			INC(i)
+		END;
+		destination[i] := 0X
+	END SetJSON;
+
+BEGIN
+	url[0] := 0X;
+	extEnv.Get("CONVEX_URL", url, haveUrlRes);
+	IF haveUrlRes < 0 THEN Fail("CONVEX_URL is required") END;
+	S.Init(url, "");
+
+	SetJSON("{`room`:`oberon-readme`}", args);
+	S.Call("query", "demo:state", args, value, logs, errorName,
+		errorMessage, errorData, hasErrorData, ok, transportError);
+	IF ~ok THEN Fail(transportError) END;
+	IF errorName[0] # 0X THEN Fail(errorMessage) END;
+
+	(* The result is raw JSON, so the caller selects and validates count. *)
+	IF ~(J.Member(value, "count", countText, found) & found) THEN
+		Fail("demo:state omitted count")
+	END
+END HttpQuery.
+```
+
+React's generated API types give the TypeScript call a structured argument and result. This client instead represents JSON in bounded, zero-terminated `ARRAY OF CHAR` buffers. `S.Call` is a one-off HTTP query, so unlike `useQuery` it does not subscribe or trigger another render. The full decoding and error checks are in the [canonical example](examples/basics/main.obn).
+
+### React rerenders; this client pumps
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const state = useQuery(api.demo.state, { room: "oberon-live" });
+
+  // React owns the subscription and rerenders when count changes.
+  return <span>{state?.count ?? "Loading..."}</span>;
+}
+```
+
+**Oberon-07**
+
+```oberon
+MODULE LiveQuery;
+
+	IMPORT S := ConvexSync, Shim := ConvexShim, extEnv, Out;
+
+	VAR
+		url: ARRAY 512 OF CHAR;
+		args, value, logs, errorMessage, errorData: ARRAY 8192 OF CHAR;
+		errorName, errorText: ARRAY 256 OF CHAR;
+		haveUrlRes, handle, eventKind, eventHandle: INTEGER;
+		hasErrorData, ok: BOOLEAN;
+
+	PROCEDURE Fail(message: ARRAY OF CHAR);
+	BEGIN
+		Out.String(message); Out.Ln;
+		Shim.Exit(1)
+	END Fail;
+
+	PROCEDURE SetJSON(text: ARRAY OF CHAR; VAR destination: ARRAY OF CHAR);
+	VAR i: INTEGER;
+	BEGIN
+		i := 0;
+		WHILE text[i] # 0X DO
+			IF text[i] = "`" THEN destination[i] := CHR(34)
+			ELSE destination[i] := text[i]
+			END;
+			INC(i)
+		END;
+		destination[i] := 0X
+	END SetJSON;
+
+BEGIN
+	url[0] := 0X;
+	extEnv.Get("CONVEX_URL", url, haveUrlRes);
+	IF haveUrlRes < 0 THEN Fail("CONVEX_URL is required") END;
+	S.Init(url, "");
+
+	SetJSON("{`room`:`oberon-live`}", args);
+	S.Subscribe("demo:state", args, handle, ok, errorText);
+	IF ~ok THEN Fail(errorText) END;
+
+	REPEAT
+		(* Pump owns the socket and returns one pending Live event. *)
+		S.Pump(200, eventKind, eventHandle, value, logs, errorName,
+			errorMessage, errorData, hasErrorData)
+	UNTIL (eventKind # 0) & (eventHandle = handle);
+	IF eventKind = 2 THEN Fail(errorMessage) END;
+
+	S.Unsubscribe(handle) (* The command-line program owns cleanup too. *)
+END LiveQuery.
+```
+
+Oberon can have procedure values, but this client deliberately exposes a blocking `Pump` operation instead of callbacks or a stream. That keeps one caller in sole control of WebSocket reads, reconnects, and queued updates. React hides that lifecycle inside `useQuery`; a command-line client has to choose when to wait and when to unsubscribe.
+
+## Status
+
+| Capability | Evidence-backed status |
 | --- | --- |
-| HTTP queries, mutations, actions, bearer auth, log lines, and structured errors | Implemented; language-local Docker tests pass, and shared conformance passes on both profiles |
-| Live initial values, external updates, and `QueryFailed` followed by recovery | Implemented; proved against a loopback fixture in `client/tests/TestLive.obn`, and shared conformance passes on both profiles |
-| A forced reconnect with Add resend, rehydration suppression, and `connectionCount` bookkeeping | Implemented; proved against `client/tests/FixtureServer.obn`, and shared conformance passes on both profiles |
-| WebSocket mutations, actions, Live authentication, optimistic updates | Not implemented |
-| `TransitionChunk` assembly | Not implemented; treated as protocol drift and reconnects |
-| Production SDK compatibility | Not claimed |
+| HTTP queries, mutations, actions, bearer auth, log lines, and structured errors | Earned. The recorded local and hosted shared-conformance runs pass. |
+| Live initial values, external updates, error recovery, and reconnects | Earned. Language-local fixture tests and the recorded local and hosted shared-conformance runs pass. |
+| WebSocket mutations and actions, Live authentication, optimistic updates, and journals | Not implemented. |
+| Production SDK compatibility | Not claimed. This remains an educational client. |
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.obn -->
 ```oberon
@@ -213,39 +365,23 @@ END main.
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-```sh
-./run sync-examples
-./run validate
-./run test oberon
-./run build oberon
-```
+The implementation is native by this repository's rules. [`ConvexSync.obn`](client/ConvexSync.obn) implements Convex calls, subscription state, reconnects, and event delivery in Oberon-07. The HTTP, JSON, base64, URL, and WebSocket layers are also Oberon modules. [`ConvexShim.c`](client/ConvexShim.c) is the one foreign module, limited to generic POSIX sockets, OpenSSL, polling, clocks, random bytes, and SHA-1. It does not delegate any Convex behavior to another SDK.
 
-The `test` target builds OBNC 0.17.2 from source, compiles every module and program for real `linux/amd64`, runs the language-local unit and Live acceptance tests, and exercises the NDJSON adapter's hello/close lifecycle. The `build` target produces the non-root `runtime` (adapter) image; `example-runtime` is built the same way with a different Dockerfile target. Root owns `verify-example`, `verify`, and `verify-hosted` because those commands serialize the shared backend and evidence store.
+The pinned [OBNC 0.17.2 compiler](https://miasap.se/obnc/) translates the Oberon modules to C inside Docker. The final images contain the compiled programs and their runtime libraries, not OBNC, a C compiler, a package manager, Node.js, Python, or the Convex CLI.
 
-## Protocol and runtime notes
+`ConvexSync` is a process-wide singleton. The caller of `Pump()` alone touches the WebSocket, reconnect state, and subscription changes. Pending Live events sit in a fixed ring of 32 entries, and each subscription has bounded storage for its path, arguments, and last value. This makes memory use predictable, but it also means a caller must keep pumping and must accept explicit limits.
 
-The client implements Convex's HTTP envelopes and this repository's pinned `/api/sync` profile directly in Oberon-07. The only foreign code is `client/ConvexShim.c`, a small C shim declared to OBNC through `client/ConvexShim.obn`'s `(*implemented in C*)` module (the same mechanism the standard library uses for its own C-backed modules, such as file and pipe I/O) that supplies raw POSIX sockets, OpenSSL for TLS, `poll()`, a monotonic clock, CSPRNG bytes, and SHA-1 for the WebSocket handshake key. It contains no Convex, HTTP, JSON, or WebSocket framing logic; all of that is `client/ConvexBase64.obn`, `client/ConvexJSON.obn`, `client/ConvexURL.obn`, `client/ConvexHTTP.obn`, `client/ConvexWS.obn`, and `client/ConvexSync.obn`.
+The compact language changes how ordinary plumbing reads. Oberon-07 has no `LOOP`/`EXIT`, and a function's `RETURN` must be its final statement, so the client threads `ok` and `done` flags through multi-step work. OBNC also does not zero-initialise local arrays, so append destinations are cleared explicitly. Its accepted string syntax cannot escape a quote inside a quoted literal, which is why the client's JSON builders translate backticks to `CHR(34)`.
 
-`ConvexSync` is a process-wide singleton with one worker: the process calling `Pump()` is the sole owner of the WebSocket socket, reconnect state, and query-set version, matching this repository's requirement that controller and subscription work never touch the socket concurrently. `Add`/`Remove` are queued and flushed the next time `Pump()` runs; a `debugDisconnect`-triggered reconnect resends every still-active `Add` in one `ModifyQuerySet` message and suppresses a rehydrated value that is byte-identical to what the subscription already had, so the observable sequence is initial value, disconnect, external mutation, updated value, never a spurious repeat of the old value. `QueryFailed` is delivered as a structured `FunctionError` without ending the subscription, and a later valid `Transition` recovers it normally. Timestamps are decoded from Convex's base64 little-endian 8-byte counters and compared by magnitude so `maxObservedTimestamp` only advances.
+The language-local tests cover JSON decoding, an initial Live value, an external update, `QueryFailed` recovery, and a forced reconnect that resends subscriptions without repeating an unchanged value. The test-only adapter supports the repository's stdin/stdout and TCP controller modes, but it is not part of the educational API.
 
-The deterministic Live acceptance test in `client/tests/TestLive.obn`, run against the loopback fixture in `client/tests/FixtureServer.obn`, exercises the initial value, `QueryFailed` and recovery, an external update, and a forced reconnect with resend and rehydration suppression - the same script this project's other compiled clients use, adapted to OBNC's control-flow constraints.
+## Known Issues
 
-The conformance adapter under `client/tests/conformance/ConvexAdapter.obn` implements NDJSON adapter protocol v1 over both stdin/stdout and TCP (`ADAPTER_LISTEN`), reserves stdout for protocol events, sends diagnostics to stderr, and omits optional fields (`id`, `subscriptionId`, `logs`, `errorData`) rather than serializing them as `null` when absent. `debugDisconnect` is exposed only there, not in the educational client API, exactly as this project requires for proving real reconnects.
-
-OBNC 0.17.2 implements a genuinely smaller language than some Oberon dialects, and this client works within those bounds throughout rather than around them in a few places:
-
-- **No `LOOP`/`EXIT`, and `RETURN` (if present) must be a procedure's last statement.** Standard Modula-2-style early returns from inside a loop or partway through a procedure do not exist in Oberon-07. Every guard clause in this client is instead written as an explicit boolean flag (`ok`, `done`) threaded through a flat sequence of `IF ok THEN ... END` steps, and every scanning loop uses that flag in its own condition (`WHILE ok & ~done DO ... END`) rather than breaking out of it.
-- **Nested procedures see only the module's top level declarations, not an enclosing procedure's own locals.** Oberon-07 has no closures over local state. Helpers that would naturally be nested inside their one caller (message builders, request writers) are ordinary module level procedures operating on module level buffers instead, documented at each one.
-- **The lexer accepts only double quoted string literals** - neither an escaped quote inside one nor the language report's alternative single quote delimiter compiles. Any text that needs a literal double quote character uses `CHR(34)` directly, and the JSON template fragments built by this client's shared `AppendBuf`/`AppendLit` helpers use a backtick as a stand-in for a quote mark instead, translated as each helper copies its text.
-- **Local array variables are not zero-initialised.** This matters concretely: `ConvexBase64.Encode` and `ConvexJSON.AppendQuoted` both append after whatever they find as a destination's existing 0X terminator, so a freshly declared local array passed to either without first being cleared can silently append after garbage bytes rather than at position zero. Every call site in this client clears its destination explicitly immediately beforehand; this was found and fixed via the loopback Live acceptance test during development, not by inspection.
-- **A module's file must be named exactly after the module itself.** `examples/basics/main.obn` therefore declares `MODULE main`, matching this project's canonical example filename, rather than a more descriptive module name.
-
-## Limitations
-
-Live authentication, WebSocket mutations, WebSocket actions, optimistic updates, and journals are deferred; every query, mutation, and action goes over the HTTP API, and Live is read-only subscription delivery. `TransitionChunk` assembly is deferred: receiving one, or any other unrecognised server message type, is reported as a `ProtocolError` and reconnects every active subscription.
-
-At most 16 Live subscriptions may be active at once (`client/ConvexSync.obn`'s fixed subscription table), with a 256-byte path and an 8192-byte argument and last-value cap per subscription. `Pump()` delivers from a bounded ring buffer of the newest 32 pending events; a slow or absent consumer causes the oldest queued event to be dropped rather than unbounded growth, but that overflow path is implemented without a dedicated language-local test yet. HTTP bodies are capped at 2 MiB and WebSocket messages at 4 MiB; chunked HTTP transfer-encoding is rejected as a transport error rather than decoded.
-
-Values are exposed as raw JSON text rather than a richer Oberon value tree; the example and tests decode only the specific fields they need. The shared local and hosted evaluators both pass against this commit, 31 of 31 checks each, so `manifest.yaml` claims the `http` and `live` badges.
+1. Live is read-only. Authentication, mutations, actions, optimistic updates, and journals over the WebSocket are deferred; function calls use HTTP.
+2. `TransitionChunk` is not assembled. An unknown server message becomes a `ProtocolError` and causes active subscriptions to reconnect.
+3. Values remain raw JSON text. Callers use `ConvexJSON` to extract and validate the fields they need rather than receiving an idiomatic value tree.
+4. The client allows at most 16 active Live subscriptions. Paths are capped at 256 bytes, arguments and remembered values at 8192 bytes, HTTP bodies at 2 MiB, and WebSocket messages at 4 MiB.
+5. If more than 32 Live events wait for `Pump()`, the oldest event is dropped. That overflow behavior exists but has no dedicated saturation test, and the adapter has not been pressure-tested with a stopped reader at the shared 128 MiB process limit.
+6. Chunked HTTP transfer encoding is rejected instead of decoded.
