@@ -1,33 +1,184 @@
-# Convex from Mercury
+<img src="logo.png" alt="Mercury" width="327">
+<!-- Logo source: https://mercurylang.org/images/mercurylogo.png -->
 
-This demonstration queries a Convex room with Mercury, observes it over Live,
-increments it, and checks the reactive value changes from `0` to `1`. Mercury
-is a logic/functional language with strong static types, mode declarations
-(which arguments a predicate reads versus produces), and a determinism system
-that states, for every predicate, exactly how many solutions it can have.
-Those declarations are not decoration here: `parse_json` is `semidet` because
-malformed input is an expected outcome rather than an exception, and
-`validate_transition` is `semidet` for the same reason a Live sync protocol
-violation should fail the connection rather than raise a surprise.
+# Mercury
 
-It is educational and unofficial. It is not a production SDK, an officially
-sanctioned Convex client, or a package intended for publication.
+[Mercury](https://mercurylang.org/) is a general-purpose logic/functional
+language created at the University of Melbourne in the 1990s. Its syntax has
+Prolog roots, while its strong static types feel closer to ML or Haskell.
+Mercury is still a specialist language rather than a mainstream application
+platform, used where declarative logic, compiler-checked data flow, and
+predictable results are more important than a huge package ecosystem. The
+[official overview](https://mercurylang.org/about.html) explains how types,
+modes, and determinism make it quite different from Prolog despite the family
+resemblance.
 
-## Start here
+This repository uses Mercury to query a Convex counter, subscribe to it, and
+increment it. It is an educational, unofficial demonstration, not a production
+SDK, an officially sanctioned Convex client, or a package intended for
+publication.
 
-[`examples/basics/main.m`](examples/basics/main.m) is the exact program the
-Docker image runs and the website displays. Its comments explain client
-setup, the initial HTTP query, starting Live before the mutation, the
-idempotency key, and the final reactive assertion.
+## Getting Started
 
-## What works
+The canonical [`examples/basics/main.m`](examples/basics/main.m) walks through
+the complete `0` to `1` counter journey. From the repository root, run:
+
+```sh
+./run verify-example mercury
+```
+
+That command builds and runs the exact example in Docker against a unique room.
+You do not need to install the Mercury compiler on your machine.
+
+## Interesting Parts
+
+### The compiler checks both data flow and possible outcomes
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const state = useQuery(api.demo.state, { room: "mercury-readme" });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // The generated API makes count a number.
+}
+```
+
+**Mercury**
+
+```mercury
+% `in` values are already known; `out` values are produced by the call.
+% `det` promises this predicate handles every outcome exactly once.
+:- pred read_count(io::di, io::uo) is det.
+
+read_count(!IO) :-
+    io.get_environment_var("CONVEX_URL", MaybeUrl, !IO),
+    (
+        MaybeUrl = yes(Url),
+        ( new_client(Url, _, Client) ->
+            Args = j_object(["room" - j_string("mercury-readme")]),
+            query(Client, "demo:state", Args, Result, !IO),
+            (
+                Result = call_ok(call_result(Value, _Logs)),
+                io.write_line(Value, !IO)
+            ;
+                Result = call_error(Error),
+                io.write_line(Error, !IO)
+            )
+        ;
+            io.stderr_stream(Stderr, !IO),
+            io.write_string(Stderr,
+                "CONVEX_URL is not a valid deployment URL\n", !IO),
+            io.set_exit_status(1, !IO)
+        )
+    ;
+        MaybeUrl = no,
+        io.stderr_stream(Stderr, !IO),
+        io.write_string(Stderr, "CONVEX_URL is required\n", !IO),
+        io.set_exit_status(1, !IO)
+    ).
+```
+
+React's `useQuery` is reactive and rerenders when the value changes. Mercury's
+`query` above is a one-off HTTP request. The unusual part is the declaration:
+the compiler checks which arguments flow in and out, and that both success and
+failure are covered. Mercury calls these [modes](https://mercurylang.org/information/doc-latest/mercury_reference_manual/Modes.html)
+and [determinism](https://mercurylang.org/information/doc-latest/mercury_reference_manual/Determinism.html).
+
+### React owns reactivity; this client makes it visible
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function CounterButton() {
+  const room = "mercury-readme";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  async function addOne() {
+    const result = await increment({
+      room,
+      language: "typescript",
+      runId: crypto.randomUUID(),
+    });
+    console.log(result.state.count); // The mutation returns updated state.
+  }
+
+  // React subscribes and unsubscribes with the component lifecycle.
+  return <button onClick={addOne}>Count: {state?.count ?? "..."}</button>;
+}
+```
+
+**Mercury**
+
+```mercury
+io.get_environment_var("CONVEX_URL", MaybeUrl, !IO),
+(
+    MaybeUrl = yes(Url),
+    ( new_client(Url, _, Client) ->
+        Room = "mercury-readme",
+        Args = j_object(["room" - j_string(Room)]),
+
+        % The command-line program owns the socket and threads state explicitly.
+        live_connect(Client, live_ok(Conn, LiveState0), !IO),
+        live_add(Conn, LiveState0, "demo:state", Args, QueryId,
+            LiveState1, ok, !IO),
+
+        % A fresh key makes this one logical write, even if the call is retried.
+        random_hex(16, RunId, !IO),
+        MutationArgs = j_object([
+            "room" - j_string(Room),
+            "language" - j_string("mercury"),
+            "runId" - j_string(RunId)
+        ]),
+        mutation(Client, "demo:increment", MutationArgs, MutationResult, !IO),
+
+        % Polling advances the state and returns the reactive query update.
+        live_poll(Conn, LiveState1,
+            live_transition(LiveState2, Changes), !IO),
+        io.write_line(MutationResult, !IO), % Contains applied and state.
+        io.write_line(Changes, !IO),        % Contains the reactive value.
+        live_remove(Conn, LiveState2, QueryId, _, _, !IO),
+        live_close(Conn, !IO)
+    ;
+        io.stderr_stream(Stderr, !IO),
+        io.write_string(Stderr,
+            "CONVEX_URL is not a valid deployment URL\n", !IO),
+        io.set_exit_status(1, !IO)
+    )
+;
+    MaybeUrl = no,
+    io.stderr_stream(Stderr, !IO),
+    io.write_string(Stderr, "CONVEX_URL is required\n", !IO),
+    io.set_exit_status(1, !IO)
+).
+```
+
+Mercury supports higher-order code, but this small client deliberately exposes
+a polling API. Passing `LiveState0`, `LiveState1`, and `LiveState2` makes the
+subscription's state transitions explicit and keeps one owner responsible for
+the WebSocket. The [full example](examples/basics/main.m) adds timeout handling
+and validates that the HTTP, mutation, and Live counts agree.
+
+## Status
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Verified by shared local and hosted conformance | Native query, mutation, and action over the documented JSON API, including bearer token auth, logs, and typed `FunctionError`/`ProtocolError`/`TransportError` failures. |
-| Live | Verified by shared local and hosted conformance | Native WebSocket subscriptions against the pinned `/api/sync` profile: initial value, external updates, unsubscribe, query-error recovery, and five real `debugDisconnect` reconnects with rehydration correctly suppressed. |
+| HTTP | Verified by shared local and hosted conformance | Native query, mutation, and action over the documented JSON API, including bearer token auth, logs, and structured `FunctionError`, `ProtocolError`, and `TransportError` failures. |
+| Live | Verified by shared local and hosted conformance | Native WebSocket subscriptions against the pinned `/api/sync` profile, including initial values, external updates, unsubscribe, query-error recovery, and reconnect coverage. |
 
-## Basic example
+Implementation provenance is **native**. These are the capabilities already
+recorded by the repository's shared evidence, not a claim that this README edit
+reran conformance.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.m -->
 ```objective-c
@@ -303,60 +454,35 @@ report_and_fail(Message, !IO) :-
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verify it in Docker
+## Implementation Notes
 
-```sh
-./run test mercury
-./run verify-example mercury
-./run verify mercury
-./run verify-hosted mercury
-./run verify-all mercury
-```
+The public client is split into three readable layers. [`client/convex.m`](client/convex.m)
+implements Convex calls and Live state in Mercury. [`client/convex_json.m`](client/convex_json.m)
+defines a small algebraic JSON type and parser, so malformed JSON is a normal
+`semidet` failure and integral values such as `1.0` can be accepted without
+silently accepting fractions or overflow. [`client/convex_transport.m`](client/convex_transport.m)
+uses Mercury's official C foreign-language interface for byte-level POSIX
+sockets, OpenSSL TLS, HTTP framing, WebSocket framing, and `poll(2)`. It does
+not delegate Convex behavior to another SDK.
 
-`test` builds every checked-in `.m` source with `mmc`, which performs
-Mercury's full type, mode, and determinism check for every predicate before
-running the language-local unit tests. `verify-example` exercises the exact
-example above against a unique room. The conformance commands are root-owned
-checks for the separate self-hosted and dedicated hosted deployments.
+Live is intentionally a caller-driven state machine rather than a background
+thread. The client validates transition versions and timestamps, coalesces
+repeated changes, and remembers the last delivered value so reconnecting does
+not emit an unchanged value again. The conformance adapter then uses one reactor
+loop for its control connection and Live socket.
 
-## Conformance and protocol notes
+The Docker build pins Mercury `22.01.8-1~noble`, compiles to native
+`linux/amd64` binaries through Mercury's C backend, and copies their runtime
+library closure into a reduced Debian image. The final image includes the CA
+bundle and OpenSSL provider files required for TLS, but not `mmc`, a package
+manager, Node.js, Python, or another client runtime.
 
-HTTP calls use the documented `/api/query`, `/api/mutation`, and
-`/api/action` JSON endpoints. Live uses the unversioned `/api/sync` profile
-pinned to `convex-rs` 0.10.4 at commit
-`6f1df8a8ba1665084ec001e307ca841ca17074d7`.
+## Known Issues
 
-Mercury has no HTTP, TLS, or WebSocket library in its standard distribution.
-`client/convex_transport.m` reaches OpenSSL and POSIX sockets through
-Mercury's C foreign-language interface for exactly the mechanical parts: TCP
-connect, the TLS 1.2+ handshake with real certificate and hostname
-verification against the system CA bundle, HTTP/1.1 response framing
-(Content-Length and chunked), the RFC 6455 WebSocket opening handshake and
-frame masking, base64, and `poll(2)`. Everything Convex-specific --
-`/api/query`/`/api/mutation`/`/api/action` envelope decoding, the sync
-protocol's `Connect`/`ModifyQuerySet`/`Transition` messages, version and
-timestamp validation, and modification coalescing -- is written in Mercury
-in `client/convex.m`, with a real `semidet`/`det` determinism declaration on
-every predicate that touches protocol state.
-
-The test-only adapter (`client/tests/conformance/adapter.m`) accepts NDJSON
-over stdin/stdout or one `ADAPTER_LISTEN` TCP connection. It is a single
-reactor loop: one `poll(2)` call over the control channel and the Live
-socket together, so exactly one piece of code ever reads, writes, or
-reconnects the WebSocket. Pure command parsing and event-JSON shaping live
-in `client/tests/conformance/adapter_logic.m` so they can be unit tested
-directly (`client/tests/conformance/adapter_test.m`) without a live process.
-
-## Limitations
-
-Live reconnect retries immediately rather than backing off exponentially
-under sustained failure, and the inbound message queue is bounded only by
-the shared 8 MiB per-frame limit, not by a dedicated slow-consumer count and
-byte budget the way the Haskell and Prolog clients implement one. WebSocket
-mutations/actions, `TransitionChunk` assembly, optimistic updates, journals,
-replay, and Convex's non-JSON-safe value types are out of scope. The runtime
-images contain Mercury's own `asm_fast.gc` grade runtime libraries, libgc,
-and the OpenSSL 3 configuration and provider modules TLS needs at connect
-time, but no `mmc` compiler, package manager, or delegated runtime. Realtime
-remains an internal protocol, so even passing evidence would not make this
-an officially supported SDK.
+1. Live reconnect retries immediately. A production client would need bounded
+   exponential backoff for sustained failures.
+2. A WebSocket frame is limited to 8 MiB, but Live delivery has no separate
+   slow-consumer count or total byte budget.
+3. The educational value layer supports JSON-safe Convex values only, and Live
+   does not assemble `TransitionChunk` messages. The pinned realtime protocol
+   is internal and is not an officially supported SDK surface.
