@@ -1,35 +1,207 @@
-# Convex from VHDL
+# VHDL
 
-This is a Convex client written in VHDL, expressed as a *simulated
-circuit* -- processes, signals and a clock -- rather than VHDL used
-procedurally with `wait` statements sprinkled through it. GHDL compiles
-the design to a standalone native executable that simulates the circuit;
-there is no real hardware involved.
+VHDL is an IEEE-standard language for describing, simulating, verifying, and
+synthesizing electronic systems. It grew out of the US Department of Defense's
+[VHSIC programme](https://microelectronics.esa.int/vhdl/doc/VHDLReport.pdf) and
+became IEEE Standard 1076 in 1987. Its strong typing and package syntax will
+look a little like Ada, but its everyday niche is digital hardware design and
+verification rather than application development. The
+[IEEE P1076 page](https://standards.ieee.org/ieee/1076/12535/) describes the
+current standard, while [GHDL](https://ghdl.github.io/ghdl/) is the open-source
+analyser, compiler, and simulator used here.
 
-This is an educational, unofficial demonstration. It is not a production
-Convex SDK and not a package intended for publication.
+This repository takes VHDL somewhere deliberately odd: a simulator-hosted
+Convex teaching client. The design models a clocked transport circuit, while a
+small C boundary supplies operating-system facilities that standard VHDL does
+not have. It is an educational, unofficial demonstration, not a production SDK
+or a claim that web clients belong in hardware.
 
-## Start here
+## Getting Started
 
-[`examples/basics/main.vhdl`](examples/basics/main.vhdl) is the canonical
-example. It reads a counter room over HTTP, starts a Live subscription
-before mutating it so the initial snapshot cannot be missed, applies an
-idempotent mutation, and proves the same `0 -> 1` journey arrived a second
-time through the subscription. The block below is generated from that
-exact runnable file.
+The canonical [`examples/basics/main.vhdl`](examples/basics/main.vhdl) queries a
+counter, subscribes before mutating it, applies an idempotent increment, and
+checks that Live delivers the same `0 -> 1` change. From the repository root,
+run the exact example in its Docker image against a unique room:
 
-## What works
+```sh
+./run verify-example vhdl
+```
 
-| Capability | Current state | What that means |
+You only need Docker. The command builds the pinned GHDL environment and runs
+the source reproduced in the Example section below.
+
+## Interesting Parts
+
+### Typed objects become bounded JSON buffers
+
+With the generated TypeScript API, Convex checks the argument shape and knows
+the query's return type. This client has no generated Convex types or general
+JSON value tree, so its caller writes the object into a fixed-capacity byte
+array, then explicitly parses and validates the returned `count`.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+function Counter({ room }: { room: string }) {
+  const state = useQuery(api.demo.state, { room });
+  if (state === undefined) return <p>Loading...</p>;
+
+  return <p>{state.count}</p>; // state and count are type-safe here.
+}
+```
+
+**VHDL**
+
+```vhdl
+procedure query_count(
+  signal rq : inout xport_req_t;
+  ep        : in http_endpoint_t;
+  room      : in string;
+  count     : out integer
+) is
+  variable args_buf : byte_array(0 to 255);
+  variable args_len : natural := 0;
+  variable no_token : byte_array(0 to 0);
+  variable is_function_error : boolean;
+  variable value_json, logs_json : byte_array(0 to 4095);
+  variable value_len, logs_len : natural;
+  variable error_message : byte_array(0 to 511);
+  variable error_message_len : natural;
+  variable error_data : byte_array(0 to 1023);
+  variable error_data_len : natural;
+  variable call_ok, parse_ok, found, count_ok : boolean;
+  variable toks : json_tok_array(0 to 63);
+  variable ntoks : natural;
+  variable count_tok : integer;
+begin
+  -- Build the same { room } argument object byte by byte.
+  buf_put_byte(args_buf, args_len, character'pos('{'));
+  json_put_string(args_buf, args_len, "room");
+  buf_put_byte(args_buf, args_len, character'pos(':'));
+  json_put_string(args_buf, args_len, room);
+  buf_put_byte(args_buf, args_len, character'pos('}'));
+
+  -- Call the real demo:state query through this client's HTTP facade.
+  client_call(rq, ep, no_token, 0, "query", "demo:state",
+              args_buf, args_len, is_function_error, value_json,
+              value_len, logs_json, logs_len, error_message,
+              error_message_len, error_data, error_data_len, call_ok);
+  assert call_ok and not is_function_error
+    report "query failed" severity failure;
+
+  -- VHDL types the buffer, not its JSON shape, so decode and check count.
+  json_parse(value_json, value_len, toks, ntoks, parse_ok);
+  assert parse_ok report "query returned invalid JSON" severity failure;
+  json_object_get(value_json, toks, ntoks, toks'low,
+                  "count", count_tok, found);
+  assert found report "demo state was missing count" severity failure;
+  json_tok_as_int(value_json, toks, count_tok, count, count_ok);
+  assert count_ok
+    report "demo count was not an integral number in range"
+    severity failure;
+end procedure query_count;
+```
+
+The full example accepts Convex's integral `0.0` representation while rejecting
+fractional, quoted, non-finite, and overflowing values. That is runtime client
+checking, not compile-time knowledge of the Convex schema.
+
+### React owns reactivity; this process advances it
+
+React's `useQuery` subscribes during rendering and cleans up with the component.
+The command-line VHDL client instead owns a `sync_manager_t`: it subscribes,
+calls `sync_step` until an event arrives, and unsubscribes explicitly.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+function LiveCounter({ room }: { room: string }) {
+  const state = useQuery(api.demo.state, { room });
+  if (state === undefined) return <p>Loading...</p>;
+
+  // The generated API makes state.count a number, and React owns the update.
+  return <p>{state.count}</p>;
+}
+```
+
+**VHDL**
+
+```vhdl
+procedure observe_once(
+  signal rq : inout xport_req_t;
+  ep        : in http_endpoint_t;
+  room      : in string
+) is
+  variable args_buf : byte_array(0 to 255);
+  variable args_len : natural := 0;
+  variable sm : sync_manager_t;
+  variable sub_ok, has_event, step_ok : boolean;
+  variable event_kind : sync_event_kind_t;
+  variable sub_id : byte_array(0 to 15);
+  variable sub_id_len : natural;
+  variable value_json, logs_json : byte_array(0 to 4095);
+  variable value_len, logs_len : natural;
+  variable error_name : byte_array(0 to 15);
+  variable error_name_len : natural;
+  variable error_message : byte_array(0 to 255);
+  variable error_message_len : natural;
+  variable error_data : byte_array(0 to 511);
+  variable error_data_len : natural;
+  variable attempts : natural := 0;
+begin
+  -- The caller passes the endpoint parsed from CONVEX_URL and a real room.
+  buf_put_byte(args_buf, args_len, character'pos('{'));
+  json_put_string(args_buf, args_len, "room");
+  buf_put_byte(args_buf, args_len, character'pos(':'));
+  json_put_string(args_buf, args_len, room);
+  buf_put_byte(args_buf, args_len, character'pos('}'));
+  sync_init(sm, ep);
+  sync_subscribe(rq, sm, "counter", "demo:state",
+                 args_buf, args_len, sub_ok);
+  assert sub_ok report "subscribe failed" severity failure;
+
+  -- Unlike useQuery, this client must be stepped until an update arrives.
+  loop
+    sync_step(rq, sm, 100, has_event, event_kind, sub_id,
+              sub_id_len, value_json, value_len, logs_json, logs_len,
+              error_name, error_name_len, error_message,
+              error_message_len, error_data, error_data_len, step_ok);
+    assert step_ok report "Live step failed" severity failure;
+    exit when has_event;
+    attempts := attempts + 1;
+    assert attempts < 100 report "Live query timed out" severity failure;
+  end loop;
+  assert event_kind = SYNC_UPDATED
+    report "Live query failed" severity failure;
+
+  -- value_json now contains the reactive state; the full example decodes it.
+  sync_unsubscribe(rq, sm, "counter", sub_ok);
+  assert sub_ok report "unsubscribe failed" severity failure;
+end procedure observe_once;
+```
+
+`sync_step` is this client's blocking, demand-driven API, so no background
+callback or React lifecycle hides ownership. The [canonical example](examples/basics/main.vhdl) shows
+`CONVEX_URL` parsing, full event decoding, mutation, and cleanup.
+
+## Status
+
+| Capability | Current state | Evidence-backed scope |
 | --- | --- | --- |
-| HTTP | Badge earned | `client/convex.vhdl`'s `client_call` implements query, mutation, action, bearer-token auth, logs, and structured function errors, and passes shared local and hosted black-box conformance. |
-| Live | Badge earned | `client/convex_sync.vhdl`'s subscription manager implements subscribe/unsubscribe, five-reconnect-capable backoff, and reactive error recovery (including a QueryFailed's structured `errorData`), and passes shared local and hosted black-box conformance, including a `debugDisconnect`-triggered reconnect cycle. |
+| HTTP | Badge earned | `client_call` supports query, mutation, action, bearer-token auth, logs, and structured function errors. |
+| Live | Badge earned | The subscription manager supports subscribe/unsubscribe, five reconnects with backoff, and recovery after reactive errors, including structured `errorData`. |
 
 The shared evaluator awarded both badges from a clean exact-head build: 31 of
 31 checks against a local backend and 31 of 31 against the hosted deployment
-over real TLS.
+over real TLS. This README rewrite does not claim a new verification run.
 
-## The basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.vhdl -->
 ```vhdl
@@ -358,92 +530,40 @@ end architecture behav;
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verify it in Docker
+## Implementation Notes
 
-```sh
-./run test vhdl           # builds native.c, analyzes and elaborates every
-                           # VHDL unit with GHDL 2.0.0's LLVM code generator,
-                           # checks the source style gate, and runs every
-                           # language-local suite plus three adapter
-                           # scenarios and the example against a fixture
-./run verify-example vhdl # runs the exact block above against a unique
-                           # room on the local self-hosted backend
-./run verify vhdl         # verify-example plus shared black-box conformance
-./run verify-hosted vhdl  # example and conformance against the hosted
-                           # drift target
-./run verify-all vhdl     # both deployment profiles from the same build
-```
+This is native VHDL in the repository's provenance taxonomy because all
+Convex-specific HTTP, JSON, WebSocket, and Live behaviour is implemented in
+VHDL. `client/native.c` is a narrow VHPIDIRECT boundary for sockets, OpenSSL,
+time, entropy, environment access, output, and process exit. It does not
+delegate to another Convex client.
 
-## The GHDL driver-rule finding
+The program is still simulator-hosted. VHDL describes concurrent hardware
+behaviour, and GHDL analyses, elaborates, and runs that design as a native ELF.
+Every executable instantiates `convex_transport`, whose clocked process alone
+calls the C boundary. A caller toggles `xport_req` and waits for `xport_ack`, so
+network I/O looks like a peripheral transaction on a simulated bus. Nothing in
+this repository turns that design into an FPGA or ASIC.
 
-GHDL requires an unresolved signal's complete set of drivers to come from
-one process, or one procedure-call chain rooted in one process. Two
-different processes may each drive a *different* field of the same record
-signal, including fields of an unresolved type such as `integer` -- that
-elaborates and runs fine. What GHDL forbids is two different processes
-driving the *same* unresolved scalar; GHDL does not reject that at
-analysis or elaboration-bind time, but the resulting executable fails at
-simulation elaboration with `error: several sources for unresolved signal
-... error during elaboration` (exit 1). `client/convex_native.vhdl` splits
-the request and acknowledge halves of the bus into two separate records
-for exactly this reason: `xport_req` is driven only by the driver-side
-`xport_call` procedure chain, and `xport_ack` is driven only by
-`convex_transport`'s own process. `client/tests/transport_smoke.vhdl` is
-the empirical proof that this split satisfies the rule end to end,
-including a real TLS handshake.
+The request and acknowledgement records are separate because GHDL requires an
+unresolved signal's drivers to come from one process or one procedure-call
+chain. `xport_req` belongs to the caller side and `xport_ack` to the transport
+process. The split is a practical VHDL constraint, not part of Convex.
 
-## Conformance and protocol notes
+Storage is deliberately bounded: byte buffers, JSON tokens, subscriptions, and
+pending Live events all have fixed capacities. The Live manager supports eight
+subscriptions and queues eight decoded events, dropping the oldest pending
+event on overflow. HTTP mutation and action calls remain separate from the Live
+WebSocket, and one process advances both sides rather than using OS threads.
 
-- The client speaks the pinned `convex-rs@6f1df8a8` sync profile at
-  `/api/sync`, matching every other client in this project.
-- `client/native.c` is the entire foreign side. Standard VHDL has no
-  sockets, no TLS, no monotonic clock, no entropy source, no environment
-  access and no process exit status; this file supplies exactly those, as
-  VHPIDIRECT-callable C functions and nothing else. Every byte of HTTP,
-  WebSocket and JSON protocol text, and every deadline and retry, stays in
-  VHDL.
-- `client/convex_native.vhdl`'s clocked request/acknowledge bus connects
-  VHDL to `native.c`; `client/convex_transport.vhdl`'s process is the sole
-  owner of the foreign boundary.
-- `client/convex_buffer.vhdl` supplies fixed-capacity byte buffers,
-  decimal, base64 and hex helpers, since VHDL has no heap and no
-  dynamically growing array. `client/convex_json.vhdl` is a bounded
-  token-array JSON codec built on it.
-- `client/convex_http.vhdl` is a hand-written HTTP/1.1 client (plain
-  `Content-Length` and chunked `Transfer-Encoding` responses).
-  `client/convex_ws.vhdl` is a hand-written RFC 6455 WebSocket layer:
-  handshake, masked frame encode, unmasked decode with fragmentation
-  reassembly, and transparent Ping/Pong.
-- `client/convex_sync.vhdl` drives Convex's pinned `/api/sync` protocol:
-  `Connect`/`ModifyQuerySet`/`Transition` handling, a bounded pending-event
-  queue, exponential reconnect backoff, and `connectionCount`/
-  `lastCloseReason`/`maxObservedTimestamp` bookkeeping.
-- `client/tests/conformance/adapter.vhdl` implements NDJSON adapter
-  protocol v1 over both stdin/stdout and the `ADAPTER_LISTEN` TCP mode
-  (`CMD_LISTEN`/`CMD_ACCEPT` in `native.c`), and declares `debugDisconnect`
-  as its one adapter-only command.
-- Real OpenSSL certificate- and hostname-verified TLS runs through
-  `native.c`'s boundary; `client/tests/transport_smoke.vhdl` proves it
-  against a local `openssl s_server` behind a private CA.
+## Known Issues
 
-## Limitations
-
-- The WebSocket handshake does not verify the server's
-  `Sec-WebSocket-Accept` response header against SHA-1 of the client's
-  key. A valid HTTP 101 upgrade response is still required, and every
-  frame exchanged afterward is real RFC 6455 framing; only that one
-  header's cryptographic check is skipped.
-- Live authentication, optimistic updates, WebSocket-issued mutations,
-  WebSocket actions, and `TransitionChunk` assembly are deferred.
-- `convex_sync.vhdl`'s own delivery queue holds at most `SYNC_MAX_PENDING`
-  (8) already-decoded events between caller steps and drops the oldest
-  undelivered event on overflow rather than growing without bound; it is a
-  deliberately bounded queue, not a demand-driven stream, and its overflow
-  behaviour is exercised by client-local tests.
-- JSON numbers are accepted only when mathematically integral and
-  representable exactly within a safe range; fractional, quoted,
-  non-finite, and out-of-range values are rejected at the point of use.
-- The client is single threaded by construction: `convex_transport`'s one
-  process owns the foreign boundary end to end, so Live progress and any
-  concurrent HTTP call are interleaved by that process's own request queue
-  rather than by OS-level concurrency.
+1. The WebSocket upgrade requires HTTP status 101 but does not verify
+   `Sec-WebSocket-Accept` against the client's key.
+2. Live authentication, optimistic updates, WebSocket mutations and actions,
+   and `TransitionChunk` assembly are not implemented.
+3. Fixed-capacity buffers reject oversized data. Integral JSON numbers are
+   accepted only within the client's safe range; fractional, quoted,
+   non-finite, and overflowing values are rejected where integers are expected.
+4. The eight-event Live queue drops its oldest undelivered item on overflow,
+   and callers must keep invoking `sync_step` to make progress.
