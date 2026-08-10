@@ -1,18 +1,186 @@
-# Convex from Zig
+# Zig
 
-This educational client calls Convex functions over HTTP and follows one
-reactive query through the pinned `/api/sync` WebSocket profile. The canonical
-example checks the counter's `0 -> 1` journey.
+[Zig](https://ziglang.org/) is a general-purpose language and toolchain created
+by Andrew Kelley for robust, low-level software. It sits near C in the systems
+programming world, with direct C interoperability, first-class cross-compiling,
+explicit memory allocation, and no hidden control flow or allocation. Its
+present-day niche includes command-line tools, servers, embedded software,
+operating-system work, and WebAssembly. Zig is still pre-1.0, so language and
+standard-library APIs can change between releases.
 
-This is unofficial teaching material, not a production SDK.
+This repository uses Zig 0.14.1 to build a native Convex client with Zig's
+standard HTTP, TLS, JSON, networking, and threading facilities. It is
+educational and unofficial, not a production SDK or an officially supported
+Convex package.
 
-## Start here
+## Getting Started
 
-Read [`examples/basics/main.zig`](examples/basics/main.zig). It configures the
-deployment, performs an HTTP query, starts Live before the mutation, applies an
-idempotent mutation, and checks the resulting Live value.
+Start with the runnable [`examples/basics/main.zig`](examples/basics/main.zig).
+From the repository root, Docker builds its pinned `linux/amd64` environment and
+runs the exact example against a fresh counter room:
 
-## What works
+```sh
+./run verify-example zig
+```
+
+The program queries `api.demo.state`, starts a Live subscription, calls
+`api.demo.increment`, and checks that both the mutation result and reactive
+update move the count from `0` to `1`.
+
+## Interesting Parts
+
+### Generated TypeScript types versus runtime JSON
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function CounterValue() {
+  const room = "zig-readme";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // Generated API types make state.count a number.
+}
+```
+
+**Zig**
+
+```zig
+const std = @import("std");
+const convex = @import("convex");
+
+fn printCount(allocator: std.mem.Allocator, client: *convex.Client) !void {
+    const room = "zig-readme";
+    var args_object = std.json.ObjectMap.init(allocator);
+    defer args_object.deinit();
+    try args_object.put("room", .{ .string = room }); // Build { room } explicitly.
+    const args = convex.JsonValue{ .object = args_object };
+
+    const result = try client.call(allocator, "query", "demo:state", args);
+    const value = result.value orelse return error.InvalidResponse;
+    const state = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidResponse,
+    };
+    const count = switch (state.get("count") orelse return error.InvalidResponse) {
+        .integer => |integer| integer,
+        .float => |float| if (@trunc(float) == float)
+            @as(i64, @intFromFloat(float))
+        else
+            return error.InvalidResponse,
+        else => return error.InvalidResponse,
+    };
+    // count is type-safe only after the runtime decoder accepts the JSON shape.
+    std.debug.print("count: {d}\n", .{count});
+}
+```
+
+Convex generates the TypeScript type for `api.demo.state`, including its
+arguments and return value. This client has no Zig code-generation step. It
+accepts `std.json.Value`, so the compiler checks the Zig decoder but cannot
+prove that the server returned a `count` field. The full example's
+[`countOf`](examples/basics/main.zig) helper adds stricter finite, integral, and
+range checks than the shortened comparison above.
+
+The React hook is also reactive, while `client.call` is deliberately a one-off
+HTTP request. Zig can run long-lived threaded code; choosing a synchronous HTTP
+method here is this client's small API design, not a Zig language limitation.
+
+### React-managed reactivity versus explicit ownership
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+function Counter() {
+  const room = "zig-readme";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  if (state === undefined) return <button disabled>Loading...</button>;
+  return (
+    <button
+      onClick={() =>
+        increment({ room, language: "TypeScript", runId: crypto.randomUUID() })
+      }
+    >
+      Count: {state.count} {/* React rerenders when the subscription updates. */}
+    </button>
+  );
+}
+```
+
+**Zig**
+
+```zig
+const std = @import("std");
+const convex = @import("convex");
+
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const deployment_url = try std.process.getEnvVarOwned(allocator, "CONVEX_URL");
+    defer allocator.free(deployment_url); // Real deployment configuration.
+    var client = try convex.Client.init(allocator, deployment_url);
+    var capture = convex.Capture.init(allocator); // Bounded mailbox for Live values.
+    var output = convex.Output.init(
+        allocator,
+        std.io.getStdErr().writer().any(),
+        std.io.getStdErr().handle,
+        .none,
+    );
+    output.capture = &capture;
+    defer {
+        client.deinit(); // Stop Live before freeing its delivery targets.
+        output.deinit();
+        capture.deinit();
+    }
+
+    var query_object = std.json.ObjectMap.init(allocator);
+    try query_object.put("room", .{ .string = "zig-readme" });
+    const query_args = convex.JsonValue{ .object = query_object };
+    try client.subscribe("counter", "demo:state", query_args, &output);
+    const initial = try capture.next(allocator, 10 * std.time.ns_per_s);
+    _ = initial; // The real example decodes and checks the initial count here.
+
+    var mutation_object = std.json.ObjectMap.init(allocator);
+    try mutation_object.put("room", .{ .string = "zig-readme" });
+    try mutation_object.put("language", .{ .string = "Zig" });
+    var run_id_bytes: [16]u8 = undefined;
+    std.crypto.random.bytes(&run_id_bytes);
+    var run_id_buffer: [24]u8 = undefined;
+    const run_id = std.base64.standard.Encoder.encode(&run_id_buffer, &run_id_bytes);
+    // A fresh idempotency key lets this fixed-room snippet apply on every run.
+    try mutation_object.put("runId", .{ .string = run_id });
+    const mutation = try client.call(
+        allocator,
+        "mutation",
+        "demo:increment",
+        .{ .object = mutation_object },
+    );
+    _ = mutation; // The real example checks applied and the returned state.
+
+    const updated = try capture.next(allocator, 10 * std.time.ns_per_s);
+    _ = updated; // This is the reactive value after the mutation.
+    try client.unsubscribe("counter");
+}
+```
+
+React owns subscription setup, rerenders, and cleanup for `useQuery`. This
+command-line client exposes that lifecycle directly: subscribe before the
+mutation, read the initial and updated values with blocking `Capture.next`,
+then unsubscribe and tear resources down in dependency order. Blocking `next`
+is a deliberate fit for this teaching program, not the only concurrency model
+Zig can express. Zig's `try` returns an error to the caller immediately, while
+`defer` still runs on that early return.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -21,6 +189,8 @@ idempotent mutation, and checks the resulting Live value.
 | Bearer-token lifecycle | Verified by shared local and hosted conformance |
 | Live initial values, updates, recovery, and reconnect hook | Verified by shared local and hosted conformance |
 | Convex tagged values | Deferred, JSON-safe values only |
+
+## Example
 
 The full teaching example below is generated directly from the runnable source.
 
@@ -156,72 +326,47 @@ live updated count: 1
 verified count: 0 -> 1
 ```
 
-## Docker verification
+## Implementation Notes
 
-```sh
-./run test zig
-./run build zig
-```
+- This is a native Zig implementation. `std.http.Client` handles HTTP and TLS,
+  `std.json` handles JSON, and the client implements its own small WebSocket
+  framing and Live owner layer. It does not delegate Convex behavior to Node,
+  Python, `curl`, the Convex CLI, or another Convex client.
+- The public API is intentionally small: `Client.call` handles query, mutation,
+  and action requests; `subscribe` and `unsubscribe` manage Live queries; and
+  `setAuth` replaces or clears a copied bearer token. The adapter-only
+  `debugDisconnect` hook exists for reconnect testing, not application code.
+- Allocation is visible. The caller supplies allocators, the example uses short
+  lived arenas for decoded responses, and `defer` releases values in a safe
+  order. Transport and malformed-response failures use Zig's error union.
+  Valid Convex function failures remain data in `CallResult.function_error`, so
+  callers can distinguish an application error from a broken connection or
+  response.
+- One owner thread serializes WebSocket reads, writes, reconnects, and active
+  subscriptions. Live delivery is bounded to sixteen queued or in-flight
+  events and eight MiB, dropping the oldest queued state under pressure. This
+  avoids an unbounded queue if the consumer stops reading.
+- Docker pins Zig 0.14.1 and builds `ReleaseSafe` static musl executables for
+  `linux/amd64`. The final non-root images contain the executable, CA
+  certificates, and only the small POSIX command surface required by the
+  shared verifier.
 
-The first command formats, unit-tests, and compiles the adapter and canonical
-example inside a pinned `linux/amd64` Zig 0.14.1 image. The second produces the
-minimal non-root example and adapter images. The root integration owner must
-run `verify-example`, local conformance, and hosted conformance before any
-capability badge is earned.
+For language details, Zig's official [overview](https://ziglang.org/learn/overview/)
+explains allocators, error handling, C interoperability, and cross-compiling.
+The [0.14.1 download page](https://ziglang.org/download/#release-0.14.1) records
+the toolchain release used here.
 
-## Protocol notes
+## Known Issues
 
-The adapter speaks NDJSON protocol v1 over stdin/stdout or one
-`ADAPTER_LISTEN` TCP connection. A single Live owner handles WebSocket
-connection state, query-set versions, reconnects, and writes. WebSocket frames
-are masked on client writes, control frames are answered, timestamps are
-compared as little-endian `uint64` values, and rehydration suppresses an
-unchanged value.
-
-Live output uses a two-phase delivery token. Dequeue keeps the event charged
-to the sixteen-event and eight MiB budgets, unsubscribe or replacement revokes
-the old generation, and the output worker checks that generation immediately
-before writing. A stopped reader therefore retains bounded recent state without
-letting an old relay cross its acknowledgement.
-
-Each adapter event is one NDJSON record: its JSON text and the newline that
-ends it are reserved and written together under a single deadline. A record
-abandoned after its first byte makes the stream terminal, so a truncated line
-is never followed by another event. One record may carry a whole two MiB sync
-message plus a 64 KiB envelope allowance, which is how a near-maximum Convex
-value reaches the controller while the count and byte budgets still keep the
-process far below the shared 128 MiB limit.
-
-Every network wait is an absolute deadline rather than a per-syscall timer, so
-a peer that trickles bytes cannot extend it. One deadline covers a whole Live
-bring-up — name lookup, connect, TLS, the 101 upgrade, and the first Connect
-frame — and `close` cancels it instead of waiting it out, which is why control
-commands stay bounded against a silent peer. Name lookups cannot be
-interrupted, so they run on their own thread; the caller leaves with its own
-copy of the addresses, and a lookup it has stopped waiting for owns and frees
-everything it produced from process-lifetime memory rather than from the
-caller's allocator, which it may outlive.
-
-Once connected, every complete incoming WebSocket message has one absolute
-five-second deadline. Progress cannot restart that clock, but a healthy hosted
-deployment still has enough time to publish the initial transition.
-
-The Live profile is the unversioned `convex-rs` 0.10.4 sync shape at commit
-`6f1df8a8ba1665084ec001e307ca841ca17074d7`. It is a protocol experiment, not
-an official compatibility promise.
-
-## Limitations
-
-Live authentication, optimistic updates, WebSocket mutations/actions, and
-`TransitionChunk` assembly remain deferred. The language-local fixtures cover
-fragmented UTF-8 data, interleaved control frames, non-minimal frame lengths,
-malformed Close frames, partial-frame deadlines, a stalled name lookup, a
-silent upgrade peer, a peer that drains part of a frame and then stops,
-structured recovery, five reconnects, stale-generation barriers, bounded close,
-an abandoned partial record, near-maximum values, and stopped-reader memory.
-Rejected HTTP replies — oversized chunked bodies, success-shaped bodies behind
-a failing status, malformed JSON, and failures without an `errorMessage` — are
-protocol failures the client recovers from, never invented function errors.
-Only the JSON-safe subset is decoded. The shared
-evaluator recorded clean local and hosted evidence (31/31 on both profiles)
-from this reviewed head, and the manifest records the http and live award.
+1. Live follows an unversioned sync shape pinned to `convex-rs` 0.10.4 at
+   commit `6f1df8a8ba1665084ec001e307ca841ca17074d7`. It is an experiment, not an
+   official Convex compatibility promise.
+2. Only JSON-safe Convex values are decoded. Tagged Convex values are deferred.
+3. Live authentication, optimistic updates, WebSocket mutations and actions,
+   and `TransitionChunk` assembly are not implemented.
+4. The Live API exposes a blocking bounded mailbox rather than a React-like
+   callback or hook abstraction. Slow consumers may lose older queued states,
+   while the newest state is retained within the count and byte budgets.
+5. Each HTTP operation has a ten-second absolute deadline. Live connection
+   setup also has a ten-second absolute deadline, and each complete incoming
+   WebSocket message has a five-second deadline.
