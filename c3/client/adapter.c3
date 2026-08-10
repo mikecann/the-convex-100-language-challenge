@@ -61,8 +61,12 @@ fn void call_http(String id, String op, String path, Object* args, String deploy
     c3_response::DecodedResponse result = decoded;
     if (result.kind == SUCCESS)
     {
+        // C3 represents an empty parsed array as an empty Object. In this
+        // field the wire contract tells us that the empty value is logLines,
+        // so preserve it as [] rather than serializing C3's internal {}.
+        String logs_json = !result.logs || result.logs.is_empty() ? "[]" : object_json(result.logs);
         emit(string::tformat(`{"id":%s,"type":"result","value":%s,"logs":%s}`,
-            quote(id), object_json(result.value), result.logs ? object_json(result.logs) : "[]"));
+            quote(id), object_json(result.value), logs_json));
         return;
     }
     emit_error(id, "FunctionError", result.error_message,
