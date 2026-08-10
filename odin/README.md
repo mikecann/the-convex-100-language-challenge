@@ -1,12 +1,181 @@
-# Convex from Odin
+<img src="logo.png" alt="Odin programming language logo" width="240">
+<!-- Logo source: https://github.com/odin-lang/odin-lang.org/blob/master/static/images/logo-slim.png -->
 
-This folder is a native Odin client for Convex's documented JSON HTTP endpoints and the repository's pinned Live WebSocket profile. It is an educational implementation, not an official SDK or a package I would ship to production unchanged.
+# Odin
 
-## Start here
+[Odin](https://odin-lang.org/) is a general-purpose systems programming language built around explicitness, high performance, and data-oriented programming. Ginger Bill started it in July 2016 after trying to improve C with a preprocessor; an early Pascal-like design soon became a new language influenced by Pascal, C, Go, Oberon-2, Newsqueak, and GLSL. Today it remains a specialist choice rather than a mainstream web language, with active use across games and graphics as well as applications, servers, kernels, and command-line tools. The project's [official FAQ](https://odin-lang.org/docs/faq/) has the fuller history and design rationale.
 
-Read [`examples/basics/main.odin`](examples/basics/main.odin). It queries a fresh room, subscribes before writing, applies one idempotent mutation, and proves the HTTP and Live paths agree on `0 -> 1`.
+This repository's Convex client is an educational, unofficial demonstration. It is not a production SDK or an officially supported Convex package.
 
-## What works
+## Getting Started
+
+Start with [`examples/basics/main.odin`](examples/basics/main.odin). It queries a fresh room, opens a Live subscription before writing, applies one idempotent mutation, and checks that both paths observe the same `0 -> 1` journey.
+
+From the repository root, run the canonical example in its pinned Docker environment:
+
+```console
+./run verify-example odin
+```
+
+That command builds and runs the exact example shown below against a unique room. You do not need to install Odin on your host.
+
+## Interesting Parts
+
+### A query returns owned JSON, not a generated application type
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Count() {
+  const state = useQuery(api.demo.state, { room: "readme-odin" });
+  if (state === undefined) return <p>Loading...</p>;
+
+  return <p>{state.count}</p>; // state and count are type-safe here.
+}
+```
+
+**Odin**
+
+```odin
+package main
+
+import convex "convex:."
+import "core:encoding/json"
+import "core:fmt"
+import "core:os"
+
+main :: proc() {
+	// Read the real deployment at runtime, just like the canonical example.
+	deployment_url := os.get_env_alloc("CONVEX_URL", context.allocator)
+	defer delete(deployment_url)
+	if deployment_url == "" { fmt.eprintln("CONVEX_URL is required"); return }
+
+	client, create_err := convex.create(deployment_url)
+	if create_err.kind != .None { fmt.eprintln(create_err.message); return }
+	defer convex.destroy(client) // The caller owns and releases the client.
+
+	args := `{"room":"readme-odin"}` // This client accepts named arguments as JSON text.
+	result, query_err := convex.query(client, "demo:state", args)
+	if query_err.kind != .None { fmt.eprintln(query_err.message); return }
+	defer convex.destroy_result(&result) // The returned JSON and logs are owned too.
+
+	root, parse_err := convex.parse_json(result.value_json, "demo state")
+	if parse_err.kind != .None { fmt.eprintln(parse_err.message); return }
+	defer json.destroy_value(root)
+
+	object, ok := convex.as_object(root)
+	if !ok { return }
+	count_value, exists := convex.member(object, "count")
+	if !exists { return }
+
+	// Odin's tagged union makes the runtime JSON case explicit.
+	#partial switch count in count_value {
+	case json.Integer: fmt.println(count)
+	case json.Float:   fmt.println(count) // Convex may encode a whole number as 0.0.
+	case:              return
+	}
+}
+```
+
+React's `useQuery` is reactive and manages its subscription lifecycle. `convex.query` is deliberately a one-off HTTP snapshot. The Odin language can model richer application types, but this small client intentionally returns bounded JSON text so each application chooses its own decoding layer.
+
+### Live updates are a resource the program owns
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const room = "readme-odin-live";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  return (
+    <button
+      onClick={() => {
+        const runId = crypto.randomUUID(); // Every click is a fresh increment.
+        void increment({ room, language: "TypeScript", runId });
+      }}
+    >
+      Count: {state?.count ?? "loading"} {/* React rerenders after the mutation. */}
+    </button>
+  );
+}
+```
+
+**Odin**
+
+```odin
+package main
+
+import convex "convex:."
+import "core:encoding/json"
+import "core:fmt"
+import "core:os"
+import "core:time"
+
+quote :: proc(text: string) -> string {
+	encoded, err := json.marshal(text, {spec = .JSON})
+	if err != nil { fmt.eprintln("could not encode arguments"); os.exit(1) }
+	return string(encoded)
+}
+
+main :: proc() {
+	deployment_url := os.get_env_alloc("CONVEX_URL", context.allocator)
+	defer delete(deployment_url)
+	if deployment_url == "" { fmt.eprintln("CONVEX_URL is required"); return }
+
+	client, create_err := convex.create(deployment_url)
+	if create_err.kind != .None { fmt.eprintln(create_err.message); return }
+	defer convex.destroy(client) // Also closes Live networking.
+
+	// The verifier supplies a unique room as the first argument.
+	room := "odin-readme"
+	if len(os.args) > 1 { room = os.args[1] }
+	room_json := quote(room)
+	defer delete(room_json)
+	room_args := fmt.aprintf(`{{"room":%s}}`, room_json)
+	defer delete(room_args)
+
+	subscription, subscribe_err := convex.subscribe(client, "demo:state", room_args)
+	if subscribe_err.kind != .None { fmt.eprintln(subscribe_err.message); return }
+	defer convex.subscription_destroy(subscription) // Unsubscribe and release its queue.
+
+	// The client exposes a blocking receive operation for the initial Live value.
+	initial, received := convex.subscription_recv(subscription, 20 * time.Second)
+	defer convex.destroy_update(&initial)
+	if !received || initial.error.kind != .None { return }
+
+	// This key is stable for a retry, while the verifier-unique room makes the run fresh.
+	run_id := fmt.aprintf("%s-odin-once", room)
+	defer delete(run_id)
+	run_id_json := quote(run_id)
+	defer delete(run_id_json)
+	mutation_args := fmt.aprintf(
+		`{{"room":%s,"language":"Odin","runId":%s}}`,
+		room_json,
+		run_id_json,
+	)
+	defer delete(mutation_args)
+	mutation_result, mutation_err := convex.mutation(client, "demo:increment", mutation_args)
+	if mutation_err.kind != .None { fmt.eprintln(mutation_err.message); return }
+	defer convex.destroy_result(&mutation_result)
+
+	// The next receive yields the reactive value published after the mutation.
+	updated, received_update := convex.subscription_recv(subscription, 20 * time.Second)
+	defer convex.destroy_update(&updated)
+	if !received_update || updated.error.kind != .None { return }
+}
+```
+
+The ordering is the same idea as `useQuery` plus `useMutation`: subscribe first, mutate, then observe the committed result. A blocking `subscription_recv` is this client's compact command-line API design, not a limitation of Odin. It makes ownership and timeouts visible where React normally handles them for a component.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -14,7 +183,9 @@ Read [`examples/basics/main.odin`](examples/basics/main.odin). It queries a fres
 | Live initial values, updates, reconnect, unsubscribe, and clean close | Verified by shared local and hosted conformance |
 | Shared HTTP and Live conformance | Passed; both capabilities earned |
 
-## Basic example
+The implementation is native Odin. It uses Odin's checked-in libcurl binding for ordinary HTTP, TLS, and WebSocket transport, while all Convex-specific request, response, and Live behavior is implemented in [`client/convex.odin`](client/convex.odin).
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.odin -->
 ```odin
@@ -160,32 +331,19 @@ main :: proc() {
 
 This generated block is also the source shown on the evidence site. Edit the source file, then run `./run sync-examples` to refresh this projection.
 
-## How it is built
+## Implementation Notes
 
-The pinned Docker build fetches Odin `dev-2026-08` at commit `ea5175d865c2034b033ebf5653d83638f10bba54` and WebSocket-enabled libcurl `8.21.0` through checked SHA-256 archives. It compiles and tests on `linux/amd64`, proves the linked libcurl exposes both `ws` and `wss` through `curl_version_info`, and replaces a pinned Debian runtime filesystem with only the two executables, their dynamic-library closure, CA certificates, TLS provider files, `dash` as `/bin/sh`, and individual `id` and `grep` binaries required by the shared verifier. The final process runs as numeric UID/GID `65532:65532`. There is no multicall binary, compiler, package manager, downloader, Convex CLI, or Docker client in that image. The Docker build allowlists every executable in the runtime `PATH`, directly rejects forbidden commands, and exercises the exact assembled root filesystem through `chroot`, including an HTTPS connection probe that proves its copied TLS closure reaches the adapter rather than relying on the build image's library paths.
+The Docker build pins Odin `dev-2026-08` at commit `ea5175d865c2034b033ebf5653d83638f10bba54` and a WebSocket-enabled libcurl `8.21.0`, then produces `linux/amd64` executables. The minimal runtime contains those executables, their required dynamic libraries, CA and TLS files, and only the small shell and text-tool surface required by the repository verifier. It runs as UID/GID `65532:65532` and contains no Odin compiler or package manager.
 
-The language-local libcurl build carries one narrow source patch. In connect-only WebSocket mode, stock libcurl can consume the prefix of a second frame into its private decoder and then return `CURLE_AGAIN`, which otherwise looks identical to a genuinely idle socket. The patch extends the already-linked `curl_ws_meta` function only inside this private image so the client can distinguish those states without adding or exporting an ABI symbol. The build asserts the exact upstream source context before applying it, asserts the replacement context afterwards, and runs a C regression covering both partial-successor and true-idle `CURLE_AGAIN` behavior. The final runtime copies this patched library, not the Debian libcurl.
+Queries, mutations, and actions share one HTTP call path. Responses must be strict UTF-8 JSON and fit within a two MiB wire limit. `Error_Kind` keeps Convex function failures distinct from malformed protocol data, network failures, expired timeouts, and calls on a closed client. Since the public result is JSON text, the example explicitly decodes and validates the `count` field instead of pretending it already has a generated Odin type.
 
-The root-owned shared verification passed locally and hosted, so the manifest records `http` and `live`.
+Live uses one owner thread for the WebSocket, reconnection state, and subscription changes. Callers send commands to that owner and receive updates through a one-record channel per subscription. Keeping only the newest update is a deliberate fit for reactive state: a slow consumer sees the latest value without growing an unbounded queue. Unsubscribe and replacement use generation barriers so an old relay cannot publish after acknowledgement.
 
-## Client design
+This image carries a narrow, regression-tested patch to libcurl's connect-only WebSocket handling. It lets the owner distinguish a genuinely idle socket from a partially consumed successor frame, which matters because restarting from a false frame boundary would corrupt the Live stream. The client still uses Odin's checked-in libcurl binding; the patch does not delegate Convex behavior to another SDK.
 
-Ordinary queries, mutations, and actions use Odin's checked-in libcurl binding for HTTP or HTTPS. Responses are streamed into a two MiB limit under one absolute cURL deadline, then parsed as strict UTF-8 JSON. Convex function failures retain `errorMessage`, optional structured `errorData`, and bounded `logLines`; malformed envelopes, transport failures, closed-client calls, and deadlines remain distinct error classes.
+## Known Issues
 
-Live uses a real `ws://` or `wss://` connection to `/api/sync`. One owner thread alone opens, reads, writes, retires, and reconnects that socket. It owns the query-set version, validates each Transition atomically before publication, orders eight-byte timestamps as little-endian numbers, carries `connectionCount`, `lastCloseReason`, and `maxObservedTimestamp` across reconnects, replays sorted Adds, and suppresses an unchanged rehydration value once. A failed query is a delivered `FunctionError`, so a later `QueryUpdated` can recover the same subscription.
-
-Every untrusted wire document is capped at two MiB, depth 64, and 65,536 JSON nodes before Odin allocates the parsed tree. There are at most 16 active subscriptions and 64 queued owner commands. Each subscription keeps only its newest update in a one-record channel. Partial WebSocket messages have an absolute five-second frame deadline, inactivity has a 30-second deadline, all writes have absolute deadlines, and reconnect backoff is capped at 15 seconds.
-
-## Conformance adapter
-
-`client/tests/conformance/` builds a strict NDJSON protocol v1 adapter. It reserves stdout for protocol events and accepts either stdin/stdout or one TCP `ADAPTER_LISTEN` controller (the shared harness binds it to `0.0.0.0:8080` so sibling containers on the pilot's Docker network can reach it). It supports `hello`, `query`, `mutation`, `action`, `subscribe`, `unsubscribe`, `setAuth`, `debugDisconnect`, and `close`.
-
-Subscription IDs have generation barriers. Replacing or removing an ID invalidates the old generation before its relay is joined, so no stale event can cross the acknowledgement boundary. The output owner caps its queue at 16 records or eight MiB and uses a bounded close. `debugDisconnect` is adapter-only and retires the current socket before acknowledging, which lets the shared harness test genuine reconnection without host network tricks.
-
-The language-local hostile peers cover dense and deeply nested JSON, malformed and oversized HTTP responses, non-2xx success-shaped bodies with later recovery, a stalled HTTP body, a valid WebSocket upgrade followed by a permanently partial frame, atomic transition rejection, failed-query recovery, little-endian timestamp order across `255 -> 256`, newest-only delivery, abandoned Add rollback, Unicode-scalar ID limits, strict command shapes, optional-field omission, and stale generation rejection. A separate checked-in process fixture drives the built adapter over its real TCP controller through malformed input, a structured HTTP error and recovery, same-ID replacement, unsubscribe, and genuine reconnect.
-
-The `memory-probe` Docker target is deliberately not an ordinary build check. Run it with `--memory=128m --memory-swap=128m --pids-limit=64`; its entrypoint refuses an uncapped cgroup, drives near-limit HTTP values into a stopped TCP controller, and checks `memory.peak` or `memory.current` stayed below the cgroup ceiling. Passing a build without running that capped container is not memory evidence.
-
-## Limitations
-
-Live authentication lifecycle, optimistic updates, mutations and actions over WebSocket, mutation replay, journals, and `TransitionChunk` assembly are deferred. A server `TransitionChunk` is treated as protocol drift and retires the connection. Public values remain bounded JSON text so an application can choose its own Odin types. HTTP and Live are earned only for the pinned profile and limits described here.
+1. Live authentication changes, optimistic updates, mutations and actions over WebSocket, mutation replay, and journals are not implemented.
+2. `TransitionChunk` assembly is deferred. Receiving one is treated as protocol drift and causes the Live connection to retire and reconnect.
+3. Public query and update values are bounded JSON text rather than generated Odin application types, so callers must decode their own records.
+4. The client allows at most 16 active subscriptions. Each subscription retains only its newest update, and the adapter output queue is capped at 16 records or eight MiB.
