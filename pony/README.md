@@ -1,32 +1,144 @@
-# Convex from Pony
+<img src="logo.png" alt="Pony logo" width="160">
+<!-- Logo source: https://raw.githubusercontent.com/ponylang/ponylang-website/main/docs/assets/logo.png -->
 
-A native Convex client written in Pony. It reads a shared counter over the
-documented HTTP API, subscribes to the same query over a WebSocket, increments
-the counter once, and proves that all three views agree on the change.
+# Pony
 
-Pony is the interesting part. One actor owns the Live socket, the query set,
-reconnect state, and every delivery decision, and no other actor can reach any
-of it. That is not a convention this code follows carefully; it is the only
-arrangement the type system permits, which removes an entire category of
-reactive-client bug before the first test runs.
+[Pony](https://www.ponylang.io/) is a native, object-oriented language built
+around actors and reference capabilities. Sylvan Clebsch began the project in
+2014 after working on low-latency actor systems in C and C++; Pony compiled its
+first program that September and became open source in 2015. It remains a
+smaller, pre-1.0 language, but its compiler supports the major desktop
+platforms and Pony applications run in production. Its clearest niche is
+concurrent systems where data-race freedom and predictable native performance
+matter.
 
-This is educational and unofficial. It is not a production SDK, not a
-sanctioned Convex client, and not published to any package registry.
+This repository's Pony client is educational and unofficial. It is not a
+production SDK, not sanctioned by Convex, and not published to a package
+registry.
 
-## Start here
+## Getting Started
 
-[examples/basics/main.pony](examples/basics/main.pony) is the canonical source
-and is projected verbatim below. It walks the whole journey: parse the
-deployment URL, create a client, query `demo:state` over HTTP, start listening
-before writing, apply `demo:increment` with an idempotency key, and then watch
-the same change arrive through the live subscription. It prints six lines and
-nothing else, and it fails rather than printing an unexpected value.
+The [canonical counter example](examples/basics/main.pony) queries a room,
+subscribes before changing it, runs one mutation, and observes the reactive
+update. From the repository root, Docker builds the pinned Pony toolchain and
+runs that exact example against an isolated room:
 
-Pony has no blocking calls, so the example is a small state machine: each
-Convex operation carries a caller-chosen step name and the answer arrives later
-under that name. Reading the steps in order is reading the program in order.
+```sh
+./run verify-example pony
+```
 
-## What works
+No Pony installation is needed on the host. This command proves the example's
+`0 -> 1` journey, but the separate shared conformance runs are what earned the
+client capabilities shown below.
+
+## Interesting Parts
+
+### A Convex response arrives as an actor message
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function Counter({ room }: { room: string }) {
+  // useQuery owns a reactive subscription for this component.
+  const state = useQuery(api.demo.state, { room });
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // The generated API makes count type-safe.
+}
+```
+
+**Pony**
+
+```pony
+actor CounterReader is ConvexCallback
+  let _env: Env
+  let _client: ConvexClient
+
+  new create(env: Env, deployment_url: String, room: String) ? =>
+    _env = env
+    let config = ConvexConfig(ConvexEndpoint(deployment_url)?)
+    _client = ConvexClient(config, TlsStreamOpener(env.root), RealTicker)
+
+    // The step label lets one actor match this later reply to this request.
+    _client.query(
+      "load-counter", "demo:state", JsonOf.obj1("room", room), this)
+
+  be convex_ok(step: String, result: ConvexResult) =>
+    if step == "load-counter" then
+      match result.value
+      | let fields: JsonObject =>
+        match try fields("count")? else None end
+        | let number: JsonNumber =>
+          try _env.out.print(number.integral()?.string()) end
+        end
+      end
+    end
+
+  be convex_failed(step: String, error': ConvexError) =>
+    _env.err.print(step + " failed: " + error'.describe())
+```
+
+The React hook is reactive and its lifecycle follows the component. Pony has
+asynchronous actor behaviours instead of a returned promise here, so this
+client sends a one-off HTTP query and later calls `convex_ok` or
+`convex_failed`. The explicit step label is this client's API choice, not a
+limitation of Pony's actor model. The full example also closes the client after
+its state machine finishes.
+
+### Live updates use explicit demand
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function LiveCount({ room }: { room: string }) {
+  // React subscribes while this component is mounted and cleans up for us.
+  const state = useQuery(api.demo.state, { room });
+  return <p>{state?.count ?? "Loading..."}</p>;
+}
+```
+
+**Pony**
+
+```pony
+actor LiveCount is (ConvexCallback & LiveWatcher)
+  let _client: ConvexClient
+
+  new create(client: ConvexClient, room: String) =>
+    _client = client
+    // This actor owns the watcher lifecycle that React normally hides.
+    _client.subscribe(
+      "counter", "demo:state", JsonOf.obj1("room", room), this,
+      "subscribe", this)
+
+  be live_value(handle: LiveHandle, result: ConvexResult) =>
+    // Read result.value here, then grant credit for exactly one more update.
+    handle.request_next()
+
+  be live_failed(handle: LiveHandle, error': ConvexError) =>
+    // A later valid value can recover this same subscription.
+    handle.request_next()
+
+  be stop() =>
+    // This actor, rather than React, explicitly ends the subscription.
+    _client.unsubscribe("counter", "unsubscribe", this)
+
+  be convex_ok(step: String, result: ConvexResult) => None
+  be convex_failed(step: String, error': ConvexError) => None
+```
+
+`request_next()` is a deliberate client API decision, not a Pony language
+restriction. It keeps at most one update in flight and lets the client cap each
+subscription at 32 queued updates or a conservatively charged 2 MiB. When a
+watcher falls behind, older states are discarded so the newest reactive state
+survives. Unlike `useQuery`, the command-line actor must explicitly unsubscribe
+or close its client.
+
+## Status
 
 | Area | Current state |
 | --- | --- |
@@ -47,7 +159,7 @@ The shared black-box controller awarded both badges from a clean build: 31 of
 over real TLS, with the canonical example byte-compared against the shared
 transcript on both profiles.
 
-## The basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.pony -->
 ```pony
@@ -345,97 +457,45 @@ primitive ExampleRunId
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verify it in Docker
+## Implementation Notes
 
-    ./run test pony
-    ./run verify-example pony
-    ./run verify pony
-    ./run verify-hosted pony
+This is a native client. Pony itself implements the Convex HTTP envelopes,
+JSON codec, WebSocket framing, and the pinned Live state machine. The only
+third-party Pony package is `net_ssl` 1.3.2 for ordinary TLS, while OpenSSL also
+provides operating-system entropy for WebSocket masks, upgrade keys, and
+session IDs.
 
-`./run test pony` builds a `linux/amd64` image that checks source style,
-compiles the client, the adapter, and the example, runs both deterministic test
-suites, and then probes the real adapter binary over both stdio and TCP with
-malformed input. `./run verify-example pony` runs the exact
-`/usr/local/bin/convex-example` entrypoint from the minimal image against a
-unique room and compares its six stdout lines to the shared transcript.
-`./run verify pony` adds the shared black-box conformance suite against the
-approved local backend, and `./run verify-hosted pony` repeats both against the
-hosted drift target.
+One `LiveOwner` actor exclusively owns the socket, active queries, reconnect
+state, and delivery decisions. Other actors can only send behaviours to it.
+Pony's reference capabilities make unsafe sharing a compile error, which is a
+particularly good fit for keeping a reactive connection's mutable state in one
+place. The cost is unfamiliar type annotations and callback-shaped control
+flow for developers arriving from TypeScript or Java.
 
-## Conformance and protocol notes
+The JSON codec preserves a number's original text. That lets the example accept
+mathematically integral forms such as `0.0` while rejecting fractions and
+overflow instead of silently routing them through a floating-point value. HTTP
+calls also preserve Convex function errors separately from transport and
+protocol failures.
 
-The Live transport implements the `convex-rs 0.10.4` unversioned `/api/sync`
-profile pinned in `manifest.yaml`. That endpoint is not a documented, versioned
-public API, so an unrecognised envelope, including `TransitionChunk`, fails the
-connection rather than being skipped.
+The Docker build pins Pony 0.58.0, Alpine 3.22, BusyBox 1.37.0, `net_ssl`
+1.3.2, and the dependency commit recorded in the manifest and Dockerfile. Pony
+links its runtime into static `linux/amd64` binaries. The final images run as
+`65532:65532` and contain a deliberately restricted shell surface for the
+shared verifier, not the Pony compiler or a package manager.
 
-Design decisions worth knowing before reading the code:
+For deeper checks, `./run test pony` runs the deterministic client tests inside
+Docker. `./run verify pony` and `./run verify-hosted pony` add local and hosted
+black-box conformance respectively.
 
-- **One owner.** `LiveOwner` is the only actor that touches the socket, the
-  query set version, reconnect state, and replay. Subscribers and the
-  conformance adapter send it behaviours.
-- **Demand-driven, bounded delivery.** The owner holds a bounded queue per
-  subscription (32 updates or a conservatively charged 2 MiB memory budget,
-  whichever binds first) and keeps exactly
-  one update in flight. A watcher asks for the next one through
-  `LiveHandle.request_next()`. A watcher that stops asking cannot grow an
-  unbounded Pony mailbox: the oldest updates are dropped and the newest state
-  survives, which is the right trade for a reactive query. The
-  `live/bounded-slow-watcher` test asserts exactly that boundary.
-- **Exact numbers.** JSON numbers keep their source lexeme rather than becoming
-  floats, so `0.0`, `1e2`, and `9007199254740993` all decode exactly, and a
-  fractional, quoted, or out-of-range count is a decoding failure rather than a
-  number that quietly changed. Echoed values also round-trip byte for byte.
-- **Real handshakes.** `Sec-WebSocket-Accept` is computed and compared, client
-  frames are masked, server frames must not be, and a text message is validated
-  as UTF-8 only after its fragments are joined.
-- **Nothing resumes mid-frame.** The frame reader never discards a partially
-  received frame, so a timeout can only abandon the connection; it can never
-  resynchronise at a byte that is not a frame boundary.
-- **Injected time and sockets.** Deadlines and connections are interfaces, so
-  every Live test runs in process against a scripted peer and a hand-fired
-  clock. Nothing sleeps, and no test binds a port. Those tests prove five
-  owner-level connection generations, not five real TCP/WSS reconnects. The
-  latter remains a mandatory shared-verifier gate.
-- **Adapter ordering.** Every emitted line passes through one output actor that
-  tracks the active relay generation, so an event from a retired subscription
-  can never appear after the acknowledgement that retired it. The adapter
-  writes to standard output through a non-blocking descriptor rather than
-  Pony's output actor. A full stdio pipe fails the adapter, and TCP pressure
-  hard-closes the controller connection, so a stopped reader cannot pin an
-  actor inside libc or grow the runtime's socket queue without limit.
-- **`debugDisconnect` is adapter-only.** It is behind the `convex_adapter`
-  build flag and is declared in `manifest.yaml`. An ordinary client build
-  refuses it.
+## Known Issues
 
-## Limitations
-
-Honest status, in the order it matters:
-
-- **Nothing has been compiled or run.** There is no Pony toolchain and no
-  Docker build behind this source. Expect a first Docker pass to fix real
-  compile errors.
-- **The most likely places to break** are the ones with the least local
-  evidence: the `net_ssl` API used in `client/tls`, the `ponyc` flags in the
-  Dockerfile (`--static`, `--define`, `--path`), the `ifdef "convex_adapter"`
-  gate, the OpenSSL `RAND_bytes` FFI used for WebSocket entropy, and the
-  `@fcntl`/`@write` FFI used by the adapter's standard output writer.
-  Core protocol code otherwise uses Pony's standard library, while Live links
-  libcrypto only for operating-system-backed entropy.
-- **Base images and `net_ssl` are pinned.** The Dockerfile records immutable
-  Docker Hub digests and verifies that the `net_ssl` 1.3.2 tag resolves to the
-  reviewed commit. A first Docker build still has to prove those exact pins.
-- **The runtime version is stamped by the image.** Pony does not expose its
-  runtime version to a program, so the Dockerfile sets
-  `PONY_RUNTIME_VERSION` from the pinned toolchain and the adapter reports
-  exactly that.
-- **Pony has no official formatter.** The Docker test stage enforces the
-  project's own rules instead: no tabs, no trailing whitespace, no line wider
-  than eighty columns.
-- **Deferred protocol behaviour.** Live authentication, mutations and actions
-  over the WebSocket, optimistic updates, and `TransitionChunk` reassembly are
-  not implemented. Each fails closed rather than being approximated.
-- **Unsubscribe does not wait for the server.** It removes local state and
-  writes `Remove` on a best-effort basis, then acknowledges. Close does wait,
-  but only for a bounded 250 ms.
-- **HTTP and Live are earned.** `capabilities` in `manifest.yaml` records the earned HTTP and Live capabilities.
+1. Live authentication, WebSocket mutations and actions, optimistic updates,
+   and `TransitionChunk` reassembly are not implemented. Unsupported messages
+   fail closed.
+2. Live uses the unversioned `/api/sync` profile pinned in `manifest.yaml`, so
+   backend protocol drift can require client changes.
+3. Unsubscribe removes local state and acknowledges without waiting for the
+   server. Client close waits for at most 250 ms.
+4. Pony does not expose its runtime version to the program. The runtime image
+   reports the version stamped from its pinned toolchain.
