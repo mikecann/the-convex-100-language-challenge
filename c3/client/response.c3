@@ -27,14 +27,20 @@ struct DecodedResponse
 // round-tripping through a lossy scalar representation.
 fn DecodedResponse? decode(String body)
 {
-    Object* root = json::tparse(body, JSON)!;
+    // `tparse` is only safe when the caller consumes the JSON tree in the
+    // same temporary-allocation scope. This function returns fields from the
+    // tree, so allocate them in the normal allocator instead of returning
+    // dangling temporary objects after `decode` returns.
+    Object* root = json::parse(mem, body, JSON)!;
     if (!root.is_map()) return PROTOCOL_ERROR~;
     Object* status = root.get("status") ?? PROTOCOL_ERROR~!;
     if (!status.is_string()) return PROTOCOL_ERROR~;
     Object* logs = root.has_key("logLines")
         ? root.get("logLines")!
         : null;
-    if (logs && !logs.is_array()) return PROTOCOL_ERROR~;
+    // C3 0.8.2 leaves an empty JSON array as an empty Object until its first
+    // element is pushed. logLines: [] is a valid Convex success envelope.
+    if (logs && !logs.is_array() && !logs.is_empty()) return PROTOCOL_ERROR~;
     if (status.s == "success")
     {
         Object* value = root.get("value") ?? PROTOCOL_ERROR~!;

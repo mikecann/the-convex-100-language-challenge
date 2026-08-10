@@ -23,7 +23,7 @@ static size_t receive(void *contents, size_t size, size_t count, void *opaque) {
 }
 
 int c3_http_request(const char *method, const char *url, const char *body, const char *bearer,
-                    char *response, size_t capacity, long *status) {
+                    char *response, size_t capacity, size_t *response_length, long *status) {
   CURL *curl = curl_easy_init();
   if (!curl || capacity < 2)
     return 0;
@@ -49,6 +49,7 @@ int c3_http_request(const char *method, const char *url, const char *body, const
   CURLcode result = curl_easy_perform(curl);
   if (result == CURLE_OK)
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, status);
+  *response_length = buffer.length;
   curl_easy_cleanup(curl);
   curl_slist_free_all(headers);
   return result == CURLE_OK;

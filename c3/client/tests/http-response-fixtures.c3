@@ -43,5 +43,41 @@ fn void main()
     bool fractional_rejected = false;
     if (catch ignored = fractional) fractional_rejected = true;
     require(fractional_rejected, "fractional counter rejected");
+
+    char[4096] transport_buffer;
+    usz response_length = 0;
+    CLong query_status = c3_http::post("https://fixture.invalid", "/api/query",
+        query, "token", transport_buffer[..], &response_length)!!;
+    require(query_status == 200, "query uses C3-selected HTTPS endpoint");
+    String transport_response = (String)transport_buffer[:response_length];
+    c3_response::DecodedResponse queried = c3_response::decode(transport_response)!!;
+    require(queried.kind == c3_response::ResponseKind.SUCCESS, "query fixture success");
+
+    // The fixture verifies that the C3 auth value reaches the ordinary
+    // transport boundary as a Bearer credential, without teaching C about
+    // Convex operation semantics.
+    CLong? rejected_auth_status = c3_http::post("https://fixture.invalid", "/api/query",
+        query, "wrong-token", transport_buffer[..], &response_length);
+    bool rejected_auth = false;
+    if (catch ignored = rejected_auth_status) rejected_auth = true;
+    require(rejected_auth, "invalid bearer credential is a transport failure");
+
+    CLong mutation_status = c3_http::post("https://fixture.invalid", "/api/mutation",
+        mutation, "token", transport_buffer[..], &response_length)!!;
+    require(mutation_status == 200, "mutation carries idempotency key");
+
+    CLong action_status = c3_http::post("https://fixture.invalid", "/api/action",
+        query, "", transport_buffer[..], &response_length)!!;
+    require(action_status == 200, "action endpoint transport success");
+    transport_response = (String)transport_buffer[:response_length];
+    c3_response::DecodedResponse action = c3_response::decode(transport_response)!!;
+    require(action.kind == c3_response::ResponseKind.FUNCTION_FAILURE, "action function failure classification");
+    require(action.error_data.is_map(), "action errorData preserved");
+
+    CLong? transport_status = c3_http::post("https://fixture.invalid", "/api/transport",
+        query, "", transport_buffer[..], &response_length);
+    bool transport_rejected = false;
+    if (catch ignored = transport_status) transport_rejected = true;
+    require(transport_rejected, "non-2xx response is transport failure");
     io::eprintfn("http-response-fixtures: PASS")!!;
 }
