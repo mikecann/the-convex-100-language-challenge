@@ -1,39 +1,165 @@
-# Convex from ReScript
+<img src="logo.png" alt="ReScript brandmark" width="120">
+<!-- Logo source: https://www.rescript-lang.org/brand/rescript-brandmark.svg -->
 
-A small Convex client written in ReScript. It reads a shared counter over
-Convex's documented HTTP API, watches the same counter over a realtime
-WebSocket subscription, increments it once, and proves the subscription
-reported the new value without asking again.
+# ReScript
 
-This is an educational demonstration for a video and website about how many
-languages can talk to Convex. It is not an official Convex SDK, it is not
-published to any registry, and it is not intended for production use.
+[ReScript](https://rescript-lang.org/) is a statically typed language that
+compiles to JavaScript for browser and Node.js applications. Its roots are in
+OCaml: BuckleScript adapted OCaml for JavaScript developers, Reason supplied an
+alternative syntax, and [the projects unified under the ReScript name in
+2020](https://rescript-lang.org/blog/bucklescript-is-rebranding/). Today it
+occupies a focused niche for developers who want JavaScript output and interop
+with a type system descended from OCaml, including type inference, variants,
+and exhaustive pattern matching.
 
-## Start here
+This repository's client is an educational, unofficial demonstration. It is
+not a production SDK, is not published to a package registry, and is not
+supported by Convex or the ReScript project.
 
-The canonical program is [`examples/basics/Main.res`](examples/basics/Main.res).
-It walks one journey end to end: configure a client, read `0` over HTTP, start a
-Live subscription and receive `0`, apply one idempotent increment, and receive
-`1` on the subscription that was already open. Every step asserts the value it
-expects, so an unexpected answer ends the run instead of printing a plausible
-transcript.
+## Getting Started
 
-## What works
+Start with [`examples/basics/Main.res`](examples/basics/Main.res). It reads a
+shared counter over HTTP, opens a Live subscription before mutating the counter,
+and confirms that the already-open subscription receives the new value.
 
-| Capability | State |
+From the repository root, run the canonical program in its Docker image:
+
+```sh
+./run verify-example rescript
+```
+
+Docker supplies the pinned ReScript and Node.js toolchain, so you do not need
+either installed on your machine. The command uses a unique room on the
+approved test deployment and checks the program's exact six-line transcript.
+
+## Interesting Parts
+
+### A generated TypeScript client versus checked JSON
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function RoomCount() {
+  const state = useQuery(api.demo.state, { room: "rescript-tour" });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // The generated API makes state.count a number.
+}
+```
+
+**ReScript**
+
+```rescript
+let deploymentUrl = switch Js.Dict.get(ConvexNode.environment, "CONVEX_URL") {
+| Some(value) if value != "" => value
+| _ => ConvexError.raiseError(ConvexError.usage("CONVEX_URL is required"))
+}
+
+let readCount = async () => {
+  let client = Convex.make(deploymentUrl)
+  // This small client names the function as a string and builds JSON arguments.
+  let args = ConvexJson.object_([("room", Js.Json.string("rescript-tour"))])
+  let result = await Convex.query(client, "demo:state", args)
+
+  // Server JSON is checked at the boundary before it becomes a ReScript int.
+  let count = switch ConvexJson.intField(result.value, "count") {
+  | Some(count) => count
+  | None => ConvexError.raiseError(ConvexError.protocol("state had no integral count"))
+  }
+  Js.log(count)
+  await Convex.close(client)
+}
+```
+
+The React hook is reactive and uses Convex's generated TypeScript API. This
+ReScript call is a one-off HTTP request, and this educational client deliberately
+returns `Js.Json.t`, so the application must decode the result. ReScript's
+`option` and exhaustive `switch` make the success and failure paths visible.
+
+### React owns reactivity; this client hands you the subscription
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function LiveCounter() {
+  const room = "rescript-live-demo";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  return (
+    <button
+      onClick={() =>
+        increment({ room, language: "typescript", runId: crypto.randomUUID() })
+      }
+    >
+      Count: {state?.count ?? "loading"}
+    </button>
+  ); // React keeps the query subscribed and rerenders after the mutation.
+}
+```
+
+**ReScript**
+
+```rescript
+let deploymentUrl = switch Js.Dict.get(ConvexNode.environment, "CONVEX_URL") {
+| Some(value) if value != "" => value
+| _ => ConvexError.raiseError(ConvexError.usage("CONVEX_URL is required"))
+}
+
+let watchOneIncrement = async () => {
+  let client = Convex.make(deploymentUrl)
+  let room = "rescript-live-demo"
+  let args = ConvexJson.object_([("room", Js.Json.string(room))])
+
+  // This command-line API exposes subscription ownership directly.
+  let subscription = await Convex.subscribe(client, "demo:state", args)
+  let initial = await ConvexLive.next(subscription) // Wait for the initial state.
+
+  let mutationResult = await Convex.mutation(
+    client,
+    "demo:increment",
+    ConvexJson.object_([
+      ("room", Js.Json.string(room)),
+      ("language", Js.Json.string("rescript")),
+      ("runId", Js.Json.string(ConvexNode.randomUUID())),
+    ]),
+  )
+  let updated = await ConvexLive.next(subscription) // The server pushes the new state.
+
+  await ConvexLive.closeSubscription(subscription)
+  await Convex.close(client)
+  (initial, mutationResult.value, updated)
+}
+```
+
+ReScript supports promises and `async`/`await`. The blocking-looking `next`
+operation is this client's API choice, not a language limitation. Unlike a
+React hook, the command-line program must explicitly consume updates,
+unsubscribe, and close the client. The complete example also validates the
+initial value, the mutation's `{applied, state}` result, and the pushed update.
+
+## Status
+
+The checked-in manifest records both HTTP and Live as earned capabilities from
+the existing shared local and hosted conformance evidence. This README rewrite
+does not claim a new verification run.
+
+| Capability | Evidence-backed state |
 | --- | --- |
-| HTTP query, mutation, action | Implemented, verified by shared conformance |
-| Bearer token set, replace, clear | Implemented, verified by shared conformance |
-| Structured `ConvexError` data and log lines | Implemented, verified by shared conformance |
-| Live subscribe, unsubscribe, reconnect, replay | Implemented, verified by shared conformance |
-| Reactive query failure and recovery | Implemented, verified by shared conformance |
+| HTTP query, mutation, and action | Implemented and verified |
+| Bearer token set, replace, and clear | Implemented and verified |
+| Structured `ConvexError` data and log lines | Implemented and verified |
+| Live subscribe, unsubscribe, reconnect, and replay | Implemented and verified |
+| Reactive query failure and recovery | Implemented and verified |
 | Earned capability badges | HTTP and Live |
 
-The Docker `test` target formats, compiles, and runs the language-local unit and
-conformance suites on native `linux/amd64`. The shared local and hosted result
-evaluator also passed, earning HTTP and Live.
-
-## The canonical example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.res -->
 ```rescript
@@ -205,160 +331,53 @@ ConvexNode.catchError(main(), error => {
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-Every command runs from the repository root and builds inside Docker. The
-language-local and shared verification commands passed for the reviewed source.
-
-```sh
-./run build rescript          # build the linux/amd64 image
-./run test rescript           # format check, compile, unit tests, example test
-./run verify-example rescript # run the canonical example against local Convex
-./run verify rescript         # example plus shared black-box conformance
-./run verify-hosted rescript  # the same suites against the hosted drift target
-```
-
-`test` proves the source is formatted, compiles, and passes the language-local
-suites. `verify-example` proves the exact program printed above produces the
-shared happy-path transcript against a real deployment. `verify` adds the
-shared controller's black-box HTTP and Live suites. `verify-hosted` repeats them
-against the dedicated hosted deployment, which is where protocol drift shows up.
-
-## How it is put together
+This is a transpiled implementation. ReScript 11.1.4 compiles the client to
+JavaScript, and Node.js 22.16.0 executes that output. Node's `fetch` handles
+HTTP, while the `ws` package handles WebSocket framing and TLS. The Convex
+request shapes, response decoding, error classification, subscription state,
+reconnects, and delivery limits are implemented in ReScript. The client does
+not delegate those decisions to an existing JavaScript Convex client.
 
 | Module | Responsibility |
 | --- | --- |
 | `client/Convex.res` | The public client: configuration, HTTP calls, subscriptions, shutdown |
 | `client/ConvexHttp.res` | `/api/query`, `/api/mutation`, `/api/action` with `format: "json"` |
-| `client/ConvexLive.res` | The single-owner sync socket: reconnect, replay, delivery |
-| `client/ConvexProtocol.res` | URLs, state versions, timestamps, and every wire message |
+| `client/ConvexLive.res` | One owner for the Live socket, reconnects, replay, and delivery |
+| `client/ConvexProtocol.res` | URL construction and the pinned realtime message profile |
 | `client/ConvexJson.res` | Decoding rules, including Convex's integral JSON numbers |
 | `client/ConvexError.res` | Function, protocol, transport, closed, and usage failures |
-| `client/ConvexNode.res` | Every borrowed JavaScript value, in one auditable place |
-| `client/tests/conformance/` | The NDJSON adapter the shared controller drives |
+| `client/ConvexNode.res` | The small boundary to Node.js and the `ws` package |
 
-### Provenance
+The HTTP side uses Convex's documented JSON endpoints. Responses are limited to
+2 MiB and must finish within 10 seconds. JSON numbers are checked before they
+become ReScript `int` values, so `1.0` is accepted while fractional, quoted,
+non-finite, and overflowing values are rejected.
 
-The client is native ReScript. ReScript's only compilation target is
-JavaScript, so the runtime is Node.js: `fetch` performs HTTP, and the `ws`
-package performs WebSocket framing and TLS. Every Convex-specific decision —
-request shape, error classification, query-set versioning, transition
-application, reconnect and replay, delivery bounds — is written in ReScript.
-Nothing shells out to another Convex client or to the Convex CLI.
+Live uses the pinned `convex-rs-0.10.4-unversioned-sync` profile at `/api/sync`,
+based on source commit `6f1df8a8ba1665084ec001e307ca841ca17074d7`.
+One owner serialises every socket operation so a reconnect cannot race a new
+subscription. Each subscription keeps at most 16 pending updates and 1 MiB,
+preferring newer state when a consumer is slow. Reconnects replay active
+queries but suppress an unchanged value the caller already received.
 
-### Pinned realtime profile
+The Docker images are pinned for `linux/amd64`, run as user `65532:65532`, and
+retain Node only because it is ReScript's execution target here. Build tools and
+package managers are removed from the runtime images. The test-only conformance
+adapter is separate from the public client and owns the `debugDisconnect` hook.
 
-Realtime is an internal Convex wire protocol, not a documented third-party API.
-This client implements one inspected profile and nothing else:
+## Known Issues
 
-| Property | Value |
-| --- | --- |
-| Profile | `convex-rs-0.10.4-unversioned-sync` |
-| Source commit | `6f1df8a8ba1665084ec001e307ca841ca17074d7` |
-| Endpoint | `/api/sync` |
-| Timestamps | Opaque little-endian base64, compared by value |
-| `TransitionChunk` | Reported as profile drift, not assembled |
-
-Convex JavaScript 1.43.0 uses `/api/<version>/sync` and keeps different session
-state. This client does not mix the two.
-
-### The single-owner socket
-
-One owner holds the WebSocket. Subscribes, unsubscribes, reads, reconnect
-timers, socket callbacks, and shutdown all become commands on one queue, and the
-owner drains that queue one command at a time. Nothing else may write to the
-socket or move the query-set version, so a reconnect can never race a subscribe
-and a retired connection's message can never be applied to a fresh session. Each
-connection is tagged with a generation, and events from an older generation are
-dropped.
-
-A reconnect rebuilds the entire query set from scratch. Where a subscriber has
-already been given a value, that query is marked as awaiting rehydration, so an
-identical replayed value is not published a second time: after
-`debugDisconnect`, the subscriber sees the initial value, then the next real
-write, and nothing in between.
-
-### Delivery bounds
-
-Live delivery is a bounded newest-value queue per subscription: at most 16
-updates and at most 1 MiB. An individual value that cannot fit is replaced by a
-small structured transport failure rather than retained outside the byte
-budget. A reactive query describes current state, so a slow reader is given the
-newest values rather than an unbounded backlog. There are at most 16 active
-subscriptions, with at most 16 KiB of encoded arguments each. Even a full
-replay therefore remains below the 2 MiB outgoing-message guard.
-
-Reconnect suppression stores a SHA-256 fingerprint of the last delivered
-value, not another copy of the value itself.
-
-HTTP reads stream through a 2 MiB decoded-body byte bound under one 10 second absolute
-deadline. WebSocket handshakes have a 5 second deadline and `ws` rejects any
-incoming message above 2 MiB before handing it to ReScript. A referenced
-five-second ping/pong heartbeat retires a socket within two heartbeat periods
-when an incomplete frame prevents control frames from being processed.
-
-The conformance adapter bounds both directions. One command line may not exceed
-1 MiB before the connection is abandoned, and output the runtime has not yet
-flushed may not exceed 16 records or 8 MiB. Those bounds exist because a
-controller that stops reading is the only realistic way for this process to
-approach the 128 MiB the verifier allows it.
-
-### The conformance adapter
-
-`client/tests/conformance/` implements NDJSON adapter protocol v1 over stdio, or
-over one accepted TCP connection when `ADAPTER_LISTEN` is set. Stdout carries
-protocol events only; diagnostics go to stderr. It is test infrastructure, not
-public client code, and it owns the only test hook in this repository:
-`debugDisconnect`, which drops the socket without closing the client so the
-shared controller can prove five real reconnects. `debugDisconnect` is not part
-of the educational client API.
-
-## Limitations and what is not proven
-
-- **The Docker `test` target passes on native `linux/amd64`.** Format check,
-  compilation, the language-local unit and conformance suites, the canonical
-  example, and the adapter protocol smoke test all run green inside Docker.
-  `verify` and `verify-hosted` also passed against local and hosted
-  deployments, so the manifest records the earned HTTP and Live capabilities.
-- **First-build fixes.** This checkpoint had never been compiled before its
-  first Docker build, and several genuine defects surfaced: a recursive
-  `sources` scan trying to compile the `rescript` package's own `.resi`-only
-  stdlib interface as a project source (fixed with an `ignored-dirs` entry for
-  `node_modules`); a `bytes` type name colliding with the compiler's built-in
-  type; a punned single-field record `{queryId}` parsing as a block expression
-  instead of a record in constructor position, in three places; a missing
-  `rec` on a mutually recursive type group; a missing pair of braces that let a
-  `switch` parse as a separate top-level statement, losing its enclosing
-  function's parameter; two field-name ambiguities across record types with
-  overlapping field names, needing explicit annotations; a test fixture that
-  exercised the wrong HTTP status for an "unknown status field" case; a
-  polling helper's `setTimeout` being unref'd, which let Node's test runner
-  conclude the event loop was idle mid-poll and cancel every later test in the
-  file; a test missing a drain of an expected failure event before reading the
-  next value; and a double-escaped `"\\n"` inside a `%raw` JS template literal
-  that never actually split on the real newlines `writeEvent` writes, so any
-  test reading back more than one record saw one unparseable blob instead of
-  two. `ws` exposing `WebSocket` as a named ESM export, the runtime stage's
-  `{"type":"module"}` marker, `node --test`'s explicit globs, and the projected
-  npm v3 lockfile all worked as assumed; only formatting and the defects above
-  needed correcting.
-- **The runtime image cannot pass image policy yet.** ReScript compiles to
-  JavaScript, so the minimal images need `node` as their declared target runtime
-  command. The shared policy in
-  `_shared/harness/scripts/target-runtime-policy.mjs` approves that command for
-  `javascript` and `typescript` only. Extending it to `rescript` is a shared
-  infrastructure decision, so `manifest.yaml` deliberately leaves
-  `targetRuntimeCommand` undeclared and this branch changes nothing under
-  `_shared/`.
-- **Frame progress uses a heartbeat guard.** `ws` owns frame parsing and the
-  2 MiB message bound. The client adds a five-second ping/pong deadline, so an
-  incomplete frame that prevents a pong from being parsed retires within ten
-  seconds. The first hostile-peer Docker fixture still has to prove this exact
-  delegated-runtime behaviour under continuous dribble and bounded shutdown.
-- **Syntax highlighting.** `.res` is not in the shared README fence map, so the
-  generated block above renders as plain text. Adding it is a shared change.
-- Live authentication, WebSocket mutations and actions, mutation replay,
-  optimistic updates, journals, read-your-own-write commit timestamps, and full
-  Convex value encodings are outside this client's scope.
-- Yellow uses the documented `format: "json"`, so Int64, bytes, special floats,
-  and negative zero are not claimed to round-trip losslessly.
+1. Live authentication, WebSocket mutations and actions, optimistic updates,
+   journals, and mutation replay are deferred. Mutations and actions currently
+   use the HTTP API.
+2. Live depends on an inspected internal protocol profile. `TransitionChunk`
+   and unknown realtime messages are reported as protocol drift, and
+   `TransitionChunk` assembly is not implemented.
+3. The delegated `ws` heartbeat and size limits still need a hostile-peer
+   Docker proof for a connection that continuously dribbles an incomplete
+   frame.
+4. HTTP uses Convex's documented `format: "json"`. Int64 values, bytes, special
+   floats, negative zero, and other non-JSON Convex encodings are not claimed
+   to round-trip losslessly.
