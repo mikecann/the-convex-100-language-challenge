@@ -1,54 +1,153 @@
-# Convex from J
+<p align="center"><img src="logo.png" alt="J programming language logo" width="128"></p>
+<!-- Logo source: https://www.jsoftware.com/images/jblue.png -->
 
-This is a Convex client written in J (Jsoftware), the array-oriented APL
-descendant. It reads a counter over Convex's documented JSON HTTP API,
-subscribes to the same query over a WebSocket, and watches its own increment
-arrive on that subscription.
+# J
 
-J has no bundled HTTP, TLS, WebSocket, or JSON library, so this client goes
-straight to the operating system: J's own `15!:0` foreign conjunction (`cd`,
-"call dll") declares direct bindings to `libc.so.6` for raw TCP sockets, to
-`libssl.so.3` for the TLS 1.3 handshake, and to `libcrypto.so.3` for SHA-1 and
-randomness. There is no compiled C helper anywhere in this client -- every
-foreign call is declared in `client/transport.ijs` itself, the same
-in-process approach proven end to end against this project's own hosted
-deployment before any client source was written. Everything that makes it a
-*Convex* client -- the JSON reader and writer, the documented HTTP envelope,
-RFC 6455 WebSocket framing and masking, the pinned sync profile, and the
-single-owner Live state machine with its reconnect and replay -- is J. Nothing
-shells out to curl, websocat, Node, or Python; that would make this a bridge
-rather than a native client.
+[J](https://www.jsoftware.com/) is a general-purpose array programming
+language created by Ken Iverson and Roger Hui. It grew from the APL tradition,
+but uses ASCII punctuation rather than APL's special glyphs. J remains a
+focused tool for mathematical, statistical, and logical data analysis, where
+applying one operation to a whole array can express a lot of work compactly.
 
-It is an educational demonstration, not an official Convex SDK, and not a
-package to depend on. Convex's realtime sync protocol is not a documented,
-stable third-party API, so the profile it implements is pinned to one
-inspected revision and recorded in `manifest.yaml`.
+This native client is an educational, unofficial demonstration. It is not a
+production SDK or a package you should depend on.
 
-## Start here
+## Getting Started
 
-[`examples/basics/main.ijs`](examples/basics/main.ijs) is the canonical
-example. It queries `demo:state` over HTTP, subscribes before mutating so no
-update can be missed, increments the counter once with a random idempotency
-key, and then proves the same `0 -> 1` change arrived over Live. Every value
-is checked, so the example fails rather than printing a transcript it did not
-earn.
+Start with [`examples/basics/main.ijs`](examples/basics/main.ijs). It reads a
+counter, opens a Live subscription, sends one increment with a fresh
+idempotency key, and observes the reactive update. From the repository root,
+run the exact example in its Docker image with:
 
-## What works
+```sh
+./run verify-example j
+```
 
-Capability badges are awarded only by the shared black-box controller, and
-this client has been through it: 31 of 31 checks passed against the local
-self-hosted backend, and 31 of 31 against the hosted deployment over real
-TLS, from the same clean exact-head build.
+## Interesting Parts
 
-| Capability | State | Notes |
+### Objects become boxed arrays
+
+TypeScript gets generated types for Convex arguments and return values. J has
+no native record type, so this client sends JSON text and decodes every value
+into a tagged, boxed array. Field access is therefore checked at runtime.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const room = "j-readme-query";
+  const state = useQuery(api.demo.state, { room });
+  if (state === undefined) return <p>Loading...</p>;
+
+  return <p>{state.count}</p>; // state and count are type-safe here.
+}
+```
+
+**J**
+
+```text
+load '/project/client/convex.ijs'
+
+read_count=: 3 : 0
+  url=. tx_getenv 'CONVEX_URL'        NB. Real deployment configuration.
+  if. -. convex_open url;'j-0.1.0' do. convex_error_message '' return. end.
+
+  room=. 'j-readme-query'
+  args=. '{"room":',(jw_quote room),'}' NB. J builds the argument object as JSON.
+  'ok value logs'=. convex_query 'demo:state';args
+  if. -. ok do. convex_error_message '' return. end.
+
+  'parsed state'=. cx_unpack2 cx_json_parse value
+  if. -. parsed do. 'invalid state JSON' return. end.
+  countNode=. state jfind 'count'      NB. Lookup in the boxed key/value rows.
+  count=. ". jpay > countNode          NB. This conversion is runtime-checked.
+  count
+)
+```
+
+The complete example adds the range and integral-number checks omitted from
+this focused comparison. The boxed representation is a client design choice
+that gives strings, numbers, arrays, and objects one uniform shape.
+
+### React hides a lifecycle that J drives explicitly
+
+`useQuery` subscribes when the component renders and cleans up when it
+unmounts. This command-line J client instead exposes a blocking pump and queue,
+so its single owner decides when socket work happens and when to close it.
+That is an API choice, not a limitation of reactive Convex queries.
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function LiveCounter() {
+  const room = "j-readme-live";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  return (
+    <button
+      onClick={() =>
+        increment({ room, language: "j", runId: crypto.randomUUID() })
+      }
+    >
+      Count: {state?.count ?? "loading"} {/* This value stays type-safe. */}
+    </button>
+  );
+}
+```
+
+**J**
+
+```text
+load '/project/client/live.ijs'
+
+watch_once=: 3 : 0
+  url=. tx_getenv 'CONVEX_URL'
+  if. -. convex_open url;'j-0.1.0' do. convex_error_message '' return. end.
+  cx_live_reset ''
+
+  room=. 'j-readme-live'
+  args=. '{"room":',(jw_quote room),'}'
+  cx_live_subscribe (<'counter'),(<'demo:state'),(<args) NB. Own the subscription.
+
+  cx_live_pump 200
+  'hasInitial tag initial logs errName errMsg errData'=. cx_live_next_update ''
+
+  runId=. tx_uuid ''                 NB. Fresh idempotency key for this mutation.
+  mutationArgs=. '{"room":',(jw_quote room),',"language":"j","runId":',(jw_quote runId),'}'
+  'mutationOk result mutationLogs'=. convex_mutation 'demo:increment';mutationArgs
+
+  cx_live_pump 200                   NB. Let the socket owner receive the update.
+  'hasUpdate tag updated logs errName errMsg errData'=. cx_live_next_update ''
+  cx_live_close 2000                 NB. Explicitly release socket and subscription state.
+  initial;result;updated
+)
+```
+
+The canonical example loops with deadlines until each expected value arrives
+and validates every result. The short version above keeps the ownership model
+visible without duplicating that full journey.
+
+## Status
+
+Capability badges come only from shared black-box verification. This client
+earned both `http` and `live`: 31 of 31 checks passed against the local backend
+and 31 of 31 against the hosted deployment over real TLS, using the same clean
+exact-head build.
+
+| Capability | Status | Evidence |
 | --- | --- | --- |
-| Builds in Docker | `./run test j` passes | jsource 9.8.0-beta6 builds from source inside Docker; the runtime and example images build and pass their in-image policy probes. |
-| HTTP query, mutation, action | Implemented, 31/31 shared conformance on both profiles | Bearer token lifecycle and structured `ConvexError` data included |
-| Live subscriptions | Implemented, 31/31 shared conformance on both profiles, including five real `debugDisconnect` reconnects | Verified by shared local and hosted conformance |
-| Language-local tests | Passing | `json_test.ijs`, `transport_test.ijs`, `convex_test.ijs`, `websocket_test.ijs`, and `adapter_test.ijs` exercise the JSON codec, byte/crypto primitives, HTTP framing, RFC 6455 frame assembly, and the adapter's own id-validation and error-serialisation shapes. |
-| Earned capability badges | `http`, `live` | Awarded by `./run verify j` and `./run verify-hosted j` from the same built source. |
+| Docker build and local tests | Passing | `./run test j` builds pinned jsource 9.8.0-beta6 and runs all five language-local suites. |
+| HTTP query, mutation, and action | `http` earned | Both verification profiles cover bearer-token lifecycle and structured `ConvexError` data. |
+| Live subscriptions | `live` earned | Both profiles cover updates, failure recovery, and five real forced reconnects. |
 
-## The canonical example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.ijs -->
 ```text
@@ -232,7 +331,7 @@ exit example_main ''
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
 ```sh
 ./run test j              # builds jsource from source, runs every local suite
@@ -241,18 +340,18 @@ exit example_main ''
 ./run verify-hosted j      # repeats both against the hosted drift target
 ```
 
-`./run test j` proves that jsource 9.8.0-beta6 builds from source, that every
-J source file parses and its local suites pass, and that the runtime and
-example images satisfy the shared filesystem policy. It proves nothing about
-a real deployment. `./run verify-example j` runs the canonical example itself
-against Convex and compares its stdout with the shared transcript.
-`./run verify j` adds the shared controller, which is the only thing that can
-award HTTP or Live; `./run verify-hosted j` repeats both against the hosted
-drift target. `./run verify-all j` builds once and runs both profiles from
-the same image, which is how the `http` and `live` badges above were earned:
-31 of 31 checks on each profile, from a clean exact-head build.
+The implementation is native J. It uses J's `15!:0` foreign conjunction to
+call libc for sockets, OpenSSL for TLS, and libcrypto for SHA-1 and random
+bytes. HTTP envelopes, JSON parsing, WebSocket framing, and Convex-specific
+Live behavior remain J code. Nothing delegates those jobs to another Convex
+client, `curl`, Node.js, or Python.
 
-## How it is put together
+`./run test j` builds the pinned interpreter and runs local suites. The other
+commands exercise the exact canonical example and then add local or hosted
+black-box conformance. They are listed here as the evidence workflow, not as a
+claim that they were rerun for this documentation edit.
+
+### Client layout
 
 | File | Role |
 | --- | --- |
@@ -264,38 +363,14 @@ the same image, which is how the `http` and `live` badges above were earned:
 | `client/tests/conformance/adapter.ijs` | Test-only NDJSON adapter v1 for the shared controller. |
 | `examples/basics/main.ijs` | The canonical example, projected into this README verbatim. |
 
-### Live
+### Live ownership
 
-One pump owns the WebSocket, matching J's own single-threaded execution
-model: the adapter loop alternates between pumping the socket
-(`cx_live_pump`) and taking one controller command, and every step is bounded
-by a monotonic deadline. Subscriptions never touch the socket themselves;
-they are rows in a small boxed table (`CX_SUBS`) that the pump owner reads.
-
-- Each connection sends `Connect` with the session id, connection count, last
-  close reason, and `maxObservedTimestamp`, then replays the whole active
-  query set as `Add` modifications. That is what restores subscriptions after
-  a drop, and it was proven against the hosted deployment with five real
-  `debugDisconnect` reconnects, each followed by a mutation and a correctly
-  received Live update.
-- A `Transition` is validated in full -- state versions, timestamp ordering,
-  and every modification -- before any part of it is published.
-- A repeated identical value is suppressed via a per-subscription signature,
-  so a reconnect's rehydration does not masquerade as a new update.
-- `QueryFailed` becomes a typed `FunctionError` event that leaves the
-  subscription active; transport and protocol faults become `TransportError`
-  and `ProtocolError` events, and the same subscription still delivers later
-  values after the reconnect.
-- Unsubscribe invalidates the local subscription state and purges its queued
-  deliveries before the acknowledgement is sent.
-- Convex's 64-bit sync timestamps are base64-encoded little-endian integers,
-  compared byte by byte from the most significant end rather than converted
-  to one J number, so a value nowhere near J's exact-double-precision safe
-  range never loses a bit.
-- Fragment reassembly and a control frame arriving mid-message are handled by
-  the pump loop; UTF-8 is validated exactly once, on the fully reassembled
-  message, using J's own `u:` Unicode conversion plus an explicit check for
-  an encoded UTF-16 surrogate half (valid input to `u:`, but not valid UTF-8).
+One pump owns the WebSocket, which fits J's single-threaded execution model.
+Subscriptions are rows in a boxed table, and callers alternate
+`cx_live_pump` with draining the bounded delivery queue. On reconnect the pump
+replays active subscriptions, suppresses unchanged rehydration values, and
+keeps function failures recoverable. The sync profile is pinned because it is
+not a documented, stable third-party API.
 
 ### Buffering
 
@@ -306,24 +381,13 @@ dropped oldest first. The adapter's own output queue is bounded separately
 droppable, and if only responses remain when the budget is crossed the
 adapter fails loudly instead of growing.
 
-### The adapter
+### Conformance adapter
 
-`client/tests/conformance/adapter.ijs` implements NDJSON adapter protocol v1.
-It is test infrastructure, not public client code: it reserves stdout for
-protocol events, sends diagnostics to stderr, works over stdin/stdout by
-default or the `ADAPTER_LISTEN` TCP socket the shared harness uses, and calls
-the real client for every operation. It implements the adapter-only
-`debugDisconnect` command, declared in `manifest.yaml` and deliberately
-absent from the educational client API. Because stdin/stdout are not
-sockets, the adapter's stdio transport enforces its own deadlines with
-`poll()` rather than the `SO_RCVTIMEO`/`SO_SNDTIMEO` socket options the rest
-of the client uses.
+`client/tests/conformance/adapter.ijs` is test infrastructure, not public
+client code. It calls the real client for every operation and owns the
+test-only `debugDisconnect` hook used to prove reconnect behavior.
 
-Optional members are omitted rather than serialized as null, because the
-shared controller validates every line against
-`_shared/schemas/adapter.schema.json`.
-
-## Tests
+### Tests
 
 Every suite runs inside the `test` image, entirely against hand-built input
 -- none of them open a socket, so they run the same whether or not a
@@ -337,27 +401,16 @@ deployment is reachable.
 | `websocket_test.ijs` | The RFC 6455 worked handshake example from the spec text, frame masking, and a 4-byte UTF-8 character deliberately split across a fragment boundary with a PING interleaved between the fragments -- the same fixture idea `icon/` uses for its own frame-boundary test. |
 | `tests/conformance/adapter_test.ijs` | Direct coverage of `adapter_id_valid` and the `adapter_error`/`adapter_result` JSON shapes: plain-ASCII and multi-byte UTF-8 ids, empty/invalid-UTF-8/over-128-codepoint rejection, structured error data carried verbatim, and an empty id omitted rather than serialised as a bogus field. Loads `adapter.ijs` as a library via `ADAPTER_AUTOEXEC=: 0` instead of running its real stdin/TCP loop. |
 
-## Known limitations and honest risks
+## Known Issues
 
-`./run verify-all j` passed both profiles from a clean exact-head build: 31
-of 31 checks against the local self-hosted backend, and 31 of 31 against the
-hosted deployment over real TLS, including HTTP query/mutation/action,
-bearer-token lifecycle, structured `ConvexError` data, and Live
-subscribe/update/failure/recovery with five real `debugDisconnect`
-reconnects. The `http` and `live` capability badges above come from that run,
-not from development-time testing against the hosted deployment.
-
-- WebSocket mutations, WebSocket actions, Live authentication, optimistic
-  updates, journals, and `TransitionChunk` assembly are not implemented.
-- Values are limited to Convex's JSON-safe subset. Int64, bytes, special
-  floats, and negative zero are not claimed, and strings containing U+0000
-  are refused because the JSON reader's own end-of-input sentinel would
-  otherwise collide with a genuine embedded NUL byte.
-- DNS resolution is the one unbounded step in a connection; every later step
-  honours a monotonic deadline.
-- Bracketed IPv6 deployment URLs are refused rather than mis-parsed.
-- The client is single threaded by construction. A long HTTP call delays
-  Live reads until that call's own deadline expires.
-- Syntax highlighting for the example block falls back to plain text (the
-  fenced code block below is tagged `text`), because the shared README
-  projector has no `.ijs` fence mapping.
+1. WebSocket mutations and actions, Live authentication, optimistic updates,
+   journals, and `TransitionChunk` assembly are not implemented.
+2. Values cover Convex's JSON-safe subset. Int64, bytes, special floats, and
+   negative zero are out of scope. Strings containing U+0000 are rejected.
+3. DNS resolution is the one unbounded connection step. Later TCP, TLS, read,
+   and write work uses monotonic deadlines.
+4. Bracketed IPv6 deployment URLs are rejected.
+5. The client is single threaded, so an HTTP call can delay Live reads until
+   that call reaches its own deadline.
+6. The canonical `.ijs` example uses a plain-text fence because the shared
+   README projector has no J syntax-highlighting mapping.
