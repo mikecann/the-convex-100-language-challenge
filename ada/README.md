@@ -1,14 +1,170 @@
-# Convex from Ada
+<img src="logo.png" alt="Ada Horizon logo" width="160">
+<!-- Logo source: https://raw.githubusercontent.com/AdaCore/learn/main/content/images/ada_horizon_logo/ada_horizon.svg -->
 
-This is a small native Ada client for Convex HTTP functions and reactive Live queries.
+# Ada
 
-It is an educational, unofficial experiment. It is not a production SDK and is not intended for package publication.
+Ada is a compiled, strongly typed language designed in the late 1970s for the United States Department of Defense's common-language programme. It descends from Pascal, favours readable words and explicit declarations over terse punctuation, and is standardized rather than owned by one company. Today its clearest niche is long-lived, high-integrity software in areas such as aerospace, rail, defence, medical devices, and industrial control. The [Ada language site](https://ada-lang.io/) is a friendly place to learn more.
 
-## Start here
+This repository contains an educational, unofficial Convex client. It is a demonstration, not a production SDK or a package intended for publication.
 
-Read [`examples/basics/convex_example.adb`](examples/basics/convex_example.adb). It queries a fresh counter, starts Live before changing it, applies one idempotent mutation, and checks that HTTP, the mutation result, and Live all agree on `0 -> 1`.
+## Getting Started
 
-## What works
+Start with [`examples/basics/convex_example.adb`](examples/basics/convex_example.adb). It queries a fresh counter, starts Live before changing it, applies one idempotent mutation, and checks that HTTP, the mutation result, and Live all agree on `0 -> 1`.
+
+From the repository root, Docker builds the pinned Ada toolchain and runs that exact example against a unique test room:
+
+```sh
+./run verify-example ada
+```
+
+This proves the canonical example compiles and completes its demonstrated journey. The broader `./run test ada`, `./run verify ada`, and `./run verify-hosted ada` gates cover language-local tests and shared conformance separately.
+
+## Interesting Parts
+
+### A mutation returns an explicit success variant
+
+In React, the generated API gives the mutation arguments and result their TypeScript types. This Ada client constructs the JSON object directly, then makes success or failure an explicit branch of `Call_Result`.
+
+**TypeScript with React**
+
+```tsx
+import { ConvexReactClient, useMutation } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+const deploymentUrl = import.meta.env.VITE_CONVEX_URL;
+if (!deploymentUrl) throw new Error("VITE_CONVEX_URL is required");
+export const convex = new ConvexReactClient(deploymentUrl); // Used by ConvexProvider.
+function IncrementButton() {
+  const increment = useMutation(api.demo.increment);
+
+  async function incrementAdaRoom() {
+    const runId = crypto.randomUUID(); // A fresh idempotency key per click.
+    const result = await increment({ room: "ada-readme", language: "ada", runId });
+    console.log(result.state.count); // Generated types know this is a number.
+  }
+  return <button onClick={incrementAdaRoom}>Increment</button>;
+}
+```
+
+**Ada**
+
+```ada
+with Ada.Environment_Variables;
+with Ada.Strings;
+with Ada.Strings.Fixed;
+with Ada.Text_IO;
+with Convex;
+with GNATCOLL.JSON;
+with GNATCOLL.Random;
+with Interfaces;
+
+procedure Increment_Once is
+   package JSON renames GNATCOLL.JSON;
+   Client : Convex.Client;
+   Args   : constant JSON.JSON_Value := JSON.Create_Object;
+   Raw_Id : constant String :=
+     Interfaces.Unsigned_32'Image (GNATCOLL.Random.Random_Unsigned_32);
+   Run_Id : constant String :=
+     "ada-" & Ada.Strings.Fixed.Trim (Raw_Id, Ada.Strings.Both);
+begin
+   if not Ada.Environment_Variables.Exists ("CONVEX_URL") then
+      raise Constraint_Error with "CONVEX_URL is required";
+   end if;
+
+   -- Ada has no generated demo API here, so construct the JSON arguments.
+   Args.Set_Field ("room", "ada-readme");
+   Args.Set_Field ("language", "ada");
+   Args.Set_Field ("runId", Run_Id);
+   Convex.Open
+     (Client, Ada.Environment_Variables.Value ("CONVEX_URL"));
+
+   declare
+      Result : constant Convex.Call_Result :=
+        Convex.Mutation (Client, "demo:increment", Args);
+   begin
+      -- Call_Result is discriminated: Value exists on the success arm.
+      if not Result.Success then
+         raise Constraint_Error with
+           Convex.US.To_String (Result.Error.Message);
+      end if;
+      Ada.Text_IO.Put_Line
+        (JSON.Write (Result.Value.Get ("state").Get ("count")));
+   end;
+   Convex.Close (Client);
+end Increment_Once;
+```
+
+The Ada compiler checks which arm of the result is available, but the fields inside `JSON_Value` are still dynamically decoded. The complete example adds range checks for Convex numbers such as `1.0` before treating them as integers.
+
+### A Live query is an owned resource
+
+React owns the subscription behind `useQuery`, rerenders when the value changes, and removes the subscription when the component unmounts. This command-line Ada API makes that lifecycle visible: open a manager, subscribe, take an update, release it, then unsubscribe and close.
+
+**TypeScript with React**
+
+```tsx
+import { ConvexReactClient, useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+const deploymentUrl = import.meta.env.VITE_CONVEX_URL;
+if (!deploymentUrl) throw new Error("VITE_CONVEX_URL is required");
+export const convex = new ConvexReactClient(deploymentUrl); // Used by ConvexProvider.
+function Counter() {
+  const state = useQuery(api.demo.state, { room: "ada-readme" });
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // React rerenders for later Live values.
+}
+```
+
+**Ada**
+
+```ada
+with Ada.Environment_Variables;
+with Ada.Strings.Unbounded;
+with Convex.Live;
+with GNATCOLL.JSON;
+
+procedure Read_One_Live_Update is
+   package JSON renames GNATCOLL.JSON;
+   package US renames Ada.Strings.Unbounded;
+   Live    : Convex.Live.Manager;
+   Stream  : Convex.Live.Subscription;
+   Args    : constant JSON.JSON_Value := JSON.Create_Object;
+   Success : Boolean;
+   Message : US.Unbounded_String;
+   Found   : Boolean;
+   Item    : Convex.Live.Update;
+begin
+   if not Ada.Environment_Variables.Exists ("CONVEX_URL") then
+      raise Constraint_Error with "CONVEX_URL is required";
+   end if;
+
+   Args.Set_Field ("room", "ada-readme");
+   Convex.Live.Open
+     (Live, Ada.Environment_Variables.Value ("CONVEX_URL"));
+   Convex.Live.Subscribe
+     (Live, "demo:state", Args, Stream, Success, Message);
+   if not Success then
+      raise Constraint_Error with US.To_String (Message);
+   end if;
+
+   -- Try_Next is non-blocking, so this CLI decides how often to poll.
+   loop
+      Convex.Live.Try_Next (Live, Stream, Found, Item);
+      exit when Found;
+      delay 0.01;
+   end loop;
+   -- Release returns this delivery's byte budget to the manager.
+   Convex.Live.Release (Live, Item);
+
+   Convex.Live.Unsubscribe (Live, Stream);
+   Convex.Live.Close (Live);
+end Read_One_Live_Update;
+```
+
+Ada supports built-in concurrency through tasks. The non-blocking `Try_Next` operation is this client's API choice: one internal Ada task owns socket reads, writes, reconnects, and query-set changes so callers cannot race the connection.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -16,6 +172,8 @@ Read [`examples/basics/convex_example.adb`](examples/basics/convex_example.adb).
 | Live initial values, updates, and `QueryFailed` recovery | Verified by shared local and hosted conformance |
 | Remove, five reconnects, generation barriers, and bounded global delivery | Verified by shared local and hosted conformance |
 | Production SDK compatibility | Not claimed |
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/convex_example.adb -->
 ```ada
@@ -267,39 +425,19 @@ end Convex_Example;
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-```sh
-./run sync-examples
-./run validate
-./run test ada
-./run build ada
-```
+This is a native Ada implementation. AWS 25.2.0 provides ordinary HTTP, TLS, sockets, and JSON support, while the Convex request envelopes, WebSocket framing, reconnect state, query changes, and transition handling live in the Ada sources under [`client/`](client/). It does not delegate Convex behaviour to another SDK, the Convex CLI, `curl`, Node.js, or Python.
 
-The `test` target checks GNATformat, builds every source with GNAT 14.2.1 for real `linux/amd64`, runs focused unit tests and deterministic loopback HTTP/WebSocket tests, and exercises the real NDJSON adapter lifecycle. The build target creates the non-root adapter image. Root owns `verify-example`, `verify`, and `verify-hosted` because those commands serialize the shared backend and evidence store.
+The public HTTP API uses a discriminated `Call_Result`: success carries a JSON value and failure carries a structured `FunctionError`, `ProtocolError`, `TransportError`, or `ClosedError`. The parser deliberately refuses ambiguous HTTP framing instead of guessing. It also distinguishes an omitted Convex `logLines` field from an explicitly empty array.
 
-## Protocol and runtime notes
+Live is coordinated by one Ada owner task. Synchronous add, remove, replacement, reconnect, and close barriers keep other tasks away from the socket. The manager retains at most 64 subscriptions and the newest 16 queued deliveries, with byte budgets as well as count limits. `QueryFailed` reaches the subscriber as a structured error without killing that subscription, so a later valid value can recover it.
 
-The client implements Convex's HTTP envelopes and the repository's pinned `/api/sync` profile directly in Ada. AWS 25.2.0 supplies ordinary HTTP, TLS, sockets, and JSON support. The WebSocket handshake, RFC 6455 framing, reconnect state, query-set changes, transition validation, and publication rules are Ada code in `client/`; the implementation does not invoke another Convex client, the Convex CLI, `curl`, Node.js, or Python.
+Docker pins Alire 2.1.0, GNAT 14.2.1, GPRbuild 25.0.1, AWS 25.2.0, GNATCOLL 25.0.0, libgpr 25.0.0, and XMLAda 25.0.0. The final digest-pinned Debian images contain the native executable closure, CA and OpenSSL data, `/bin/sh`, and the POSIX text tools required by the shared verifier. They run as user `65532:65532` without compilers, package managers, delegated runtimes, or network helper commands.
 
-A Convex deployment reports some function failures with a non-2xx status such as `560` and an otherwise ordinary error envelope, so the status line alone does not decide the error kind. Every response is framed, bounded, read, and parsed the same way whatever its status: a valid `status: "error"` envelope becomes a `FunctionError`, a success-shaped envelope under a failure status becomes a `ProtocolError`, and a body that is not a Convex envelope at all becomes a `ProtocolError` too. Connection failures, timeouts, and responses that exceed the size bounds stay `TransportError`, and none of these leave the client unable to make the next call.
+## Known Issues
 
-Response framing is deliberately strict, because a client that guesses which of two contradictory `Content-Length` headers to believe is more dangerous than one that refuses the message. Repeated or list-valued `Content-Length`, repeated `Transfer-Encoding`, `Content-Length` together with `Transfer-Encoding`, a transfer coding other than `chunked`, header lines with no field name, malformed field names, obsolete line folding, and control characters in header values are all rejected. Declared chunked, fixed-length, and connection-close bodies are all checked against the 2 MiB cap before a buffer that size is reserved. Deployment URLs and bearer tokens are rejected outright if they carry CR, LF, NUL, or any other control or non-ASCII byte, since both are interpolated into request headers.
-
-One Ada task exclusively owns the Live socket, reconnect metadata, and query-set version. Add, replacement, remove, forced reconnect, and close are synchronous owner barriers. Name resolution, the TCP connect, the TLS handshake, the upgrade request write, the `101` response, and the first Convex `Connect` frame share one absolute two-second deadline rather than one timeout each, so a peer that makes a little progress at every step still cannot hold that owner past it. Each later frame has one absolute 500 ms transmission deadline, so a slow-reading peer cannot keep the owner away from remove or close commands by accepting one chunk at a time. A complete transition is validated before any state or timestamp is committed, and only its final modification for each query is published. `QueryFailed` is delivered as a structured function error without ending the subscription, so a later value recovers normally. Timestamps are decoded as canonical little-endian unsigned 64-bit values and their numeric maximum is retained across reconnects. Backoff starts at 100 ms, caps at 15 seconds, and resets after a validated handshake or valid traffic, so a healthy connection between two failures does not hand the next failure an old maximum delay.
-
-Convex omits `logLines` entirely when a call or query produced no logs, and that absence is carried through the client's result and update types. The conformance adapter therefore omits the optional `logs` field instead of serializing an empty array the shared schema never asked for, and it validates every command identifier against the schema's 1-to-128 Unicode character bound before retaining or echoing it, so an identifier the controller would reject never appears inside an otherwise well-formed event.
-
-The adapter bounds what it reads and what it writes separately, because the two are bounded by different things. A command is small by definition, so NDJSON input is capped at 2 MiB. An emitted event is as large as the deployment's data: one Live delivery may carry a value close to the client's 4 MiB message ceiling, so the output ceiling is derived from the 20 MiB byte budget instead and is the longest line that budget can charge, roughly 5 MiB. The adapter asserts at compile time that this covers the message ceiling. When a finished event still does not fit, the adapter emits a structured `ProtocolError` for that subscription, or for that command, and keeps running: one value nobody can represent costs that delivery rather than the process, and the next delivery on the same subscription is published normally.
-
-At most 64 subscriptions and 8 MiB of conservatively charged paths and arguments are active. One manager-wide queue keeps the newest 16 deliveries and drops the globally oldest intermediate state first within a 20 MiB encoded and runtime-overhead budget. The adapter has a separate single output owner with limits of 16 events and 20 MiB, including its in-flight encoded line, copies, and conservative runtime overhead. Output uses one absolute three-second write deadline, and unsubscribe, same-ID replacement, and close wait on bounded old-generation retirement barriers before acknowledging. `debugDisconnect` is exposed only for conformance.
-
-Alire 2.1.0 pins GNAT 14.2.1, GPRbuild 25.0.1, AWS 25.2.0, GNATCOLL 25.0.0, libgpr 25.0.0, and XMLAda 25.0.0 inside Docker. AWS is explicitly built with its OpenSSL socket backend, while the client uses its native AWS.Net socket API and a small checked-in URL parser. The final digest-pinned Debian images contain only the native executable closure, CA/OpenSSL data, `/bin/sh`, and individual POSIX text tools. They run as `65532:65532` with a read-only filesystem, dropped capabilities, no new privileges, and the shared 128 MiB limit. Compilers, Alire, apt/dpkg, network helpers, delegated runtimes, service residue, and multicall binaries are absent.
-
-## Limitations
-
-Live authentication, optimistic updates, mutations and actions over the WebSocket, journals, and `TransitionChunk` assembly are deferred. Receiving an unsupported or malformed Live shape produces a structured protocol event, retires that socket, and reconnects active subscriptions. Values cover Convex's JSON-safe subset; tagged Convex value conversions are not implemented. The root-owned local and hosted evaluators passed from a clean reviewed commit (31/31 on both profiles), and the manifest capability list records the http and live award.
-
-TLS coverage is honest about what it proves. Deterministic loopback fixtures show that a handshake against a peer that resets the connection, answers with plaintext, or never speaks becomes a bounded `TransportError` and that the client still completes an ordinary call afterwards. Hostname verification is proved separately from chain verification: the Docker test stage mints one ephemeral certificate authority and two leaves for it, one named `localhost` and one named `wrong.invalid`, installs that authority as the only trusted anchor for the duration of the test, and then restores the trust store byte-for-byte. Because both leaves share an issuer, the accepted call and the refused call differ only in the certificate's name. No key material is committed; every key exists for seconds inside one build step.
-
-HTTP connect plus complete request transmission has one absolute five-second deadline, and the complete response has a separate absolute five-second deadline. HTTP responses are capped at 2 MiB and WebSocket messages at 4 MiB. A Live write temporarily builds one complete masked frame, up to that 4 MiB cap, so AWS can apply one TLS-aware deadline to the whole transmission rather than renew it per chunk. Response trees are capped at 128 levels and 65,536 structural nodes; adapter commands use the same depth limit, a stricter 8,192-node limit, a 2 MiB line cap, and an eight-command input queue. These are deliberate memory bounds for the 128 MiB runtime, not claims of official SDK compatibility.
+1. Live authentication, optimistic updates, mutations and actions over WebSocket, and `TransitionChunk` assembly are deferred. HTTP mutations and actions do work.
+2. Values cover Convex's JSON-safe subset. Tagged Convex value conversions are not implemented.
+3. HTTP responses are capped at 2 MiB and WebSocket messages at 4 MiB. Parsed response trees, active subscription state, delivery queues, and adapter input all have additional fixed bounds for the 128 MiB runtime.
+4. This follows the repository's pinned, undocumented sync profile. Passing local and hosted conformance does not make it an officially supported or production-compatible SDK.
