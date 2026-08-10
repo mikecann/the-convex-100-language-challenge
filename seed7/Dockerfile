@@ -30,7 +30,13 @@ WORKDIR /src/seed7/src
 # Build the bytecode interpreter (s7), then the Seed7-to-C compiler (s7c).
 # s7c is itself a Seed7 program: the freshly built s7 interpreter compiles
 # it, which is why the interpreter has to exist first.
-RUN cp mk_linux.mak makefile && make depend && make -j"$(nproc)" \
+# GCC's -flto=auto starts an internal make during the final link. Running the
+# outer build in parallel can leave that helper with unusable GNU Make
+# jobserver descriptors (observed as "write jobserver: Bad file descriptor"
+# under Docker Desktop's linux/amd64 Rosetta path). Build the pinned toolchain
+# serially so a cold build is deterministic; client compilation remains a
+# separate stage and is unaffected.
+RUN cp mk_linux.mak makefile && make depend && make -j1 \
     && test "$(uname -m)" = x86_64 \
     && file ../bin/s7 | grep -Eq 'ELF 64-bit.*x86-64'
 RUN make s7c \

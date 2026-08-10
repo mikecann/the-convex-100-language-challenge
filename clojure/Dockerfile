@@ -18,10 +18,14 @@ RUN set -eu; \
     done; \
     make oldconfig </dev/null >/dev/null; \
     make -j2 busybox >/dev/null; \
+    test "$(./busybox --list | sort | tr '\n' ' ')" = "ash awk basename cat cmp cut find grep head id ls sed sh sort tail tr uname uniq wc "; \
     mkdir -p /out/bin; \
-    cp busybox /out/bin/busybox; \
+    # Do not expose the multicall binary under the `busybox` name in the
+    # final image. Hard links still select only the explicitly compiled
+    # applets, while avoiding a generic command surface the policy rejects.
+    cp busybox /out/bin/sh; \
     for tool in sh awk basename cat cmp cut find grep head id ls sed sort tail tr uniq uname wc; do \
-        ln /out/bin/busybox "/out/bin/$tool"; \
+        test "$tool" = sh || ln /out/bin/sh "/out/bin/$tool"; \
     done
 
 FROM --platform=linux/amd64 ${JAVA_IMAGE} AS test
@@ -107,19 +111,16 @@ COPY --from=test /work/deps/ /opt/convex/lib/
 ENV PATH=/opt/clojure-jre/bin:/usr/local/bin:/usr/bin:/bin
 RUN test -x /bin/sh \
     && test "$(java -XX:+PerfDisableSharedMem -XshowSettings:properties -version 2>&1 | awk '/os.arch =/ { print $3 }')" = amd64 \
-    && test -x /bin/busybox \
-    && test "$(/bin/busybox --list | sort | tr '\n' ' ')" = "ash awk basename cat cmp cut find grep head id ls sed sh sort tail tr uname uniq wc " \
+    && ! test -e /bin/busybox \
     && test "$(find /opt/clojure-jre/bin -type f | wc -l)" = 1 \
     && test "$(find /opt/clojure-jre/bin -type f)" = /opt/clojure-jre/bin/java \
-    && ! /bin/busybox wget 2>/dev/null \
-    && ! /bin/busybox nc 2>/dev/null \
-    && ! /bin/sh -c 'exec -a wget /bin/busybox' 2>/dev/null \
-    && ! /bin/sh -c 'exec -a nc /bin/busybox' 2>/dev/null \
-    && ! /bin/sh -c 'exec -a curl /bin/busybox' 2>/dev/null \
-    && ! /bin/sh -c 'exec -a apt /bin/busybox' 2>/dev/null \
-    && ! /bin/sh -c 'exec -a javac /bin/busybox' 2>/dev/null \
-    && ! /bin/sh -c 'exec -a node /bin/busybox' 2>/dev/null \
-    && ! /bin/sh -c 'exec -a python /bin/busybox' 2>/dev/null \
+    && ! /bin/sh -c 'exec -a wget /bin/sh' 2>/dev/null \
+    && ! /bin/sh -c 'exec -a nc /bin/sh' 2>/dev/null \
+    && ! /bin/sh -c 'exec -a curl /bin/sh' 2>/dev/null \
+    && ! /bin/sh -c 'exec -a apt /bin/sh' 2>/dev/null \
+    && ! /bin/sh -c 'exec -a javac /bin/sh' 2>/dev/null \
+    && ! /bin/sh -c 'exec -a node /bin/sh' 2>/dev/null \
+    && ! /bin/sh -c 'exec -a python /bin/sh' 2>/dev/null \
     && ! command -v javac \
     && ! command -v jar \
     && ! command -v clojure \

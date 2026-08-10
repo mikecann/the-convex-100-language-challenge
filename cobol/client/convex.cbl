@@ -78,6 +78,8 @@ COPY "cvx-http.cpy".
 01 WS-SESSION-RAW           PIC X(16).
 01 WS-SESSION-HEX           PIC X(32).
 01 WS-SESSION-HEX-LEN       BINARY-LONG.
+01 WS-SESSION-ID            PIC X(36).
+01 WS-SESSION-ID-LEN        BINARY-LONG VALUE 36.
 
 *> ---- subscriptions ------------------------------------------------
 01 WS-SUBS.
@@ -127,6 +129,9 @@ COPY "cvx-http.cpy".
 *> the moment the value needed more than one digit. The Z's suppress
 *> leading zeros to spaces, which TRIM does strip.
 01 WS-NUMTEXT               PIC Z(23)9.
+*> Keep queryId distinct while a ModifyQuerySet STRING also needs its
+*> newVersion. Reusing WS-NUMTEXT would silently make both fields equal.
+01 WS-QUERY-ID-TEXT          PIC Z(23)9.
 01 WS-TSTEXT                PIC X(12).
 01 WS-TSVAL                 PIC 9(20).
 01 WS-TSVAL2                PIC 9(20).
@@ -631,19 +636,20 @@ ENTRY "cvx-live-unsubscribe" USING LK-SUBIX CVX-ERROR LK-STATUS.
 *> retired connection are discarded so the caller has a real barrier.
 ENTRY "cvx-live-debug-disconnect" USING LK-GEN CVX-ERROR LK-STATUS.
     MOVE CVX-OK TO LK-STATUS
-    IF WS-LIVE-UP = 0
-        MOVE CVX-ERR TO LK-STATUS
-        MOVE "TransportError" TO CVX-E-NAME
-        MOVE 14 TO CVX-E-NAME-LEN
-        MOVE "Live WebSocket is not connected" TO CVX-E-MSG
-        MOVE 31 TO CVX-E-MSG-LEN
-        MOVE 0 TO CVX-E-DATA-LEN
-        MOVE 0 TO LK-GEN
-        GOBACK
-    END-IF
     MOVE "DebugDisconnect" TO WS-CLOSE-REASON
     MOVE 15 TO WS-CLOSE-REASON-LEN
-    PERFORM RETIRE-SOCKET
+
+    *> A peer can close between the controller receiving the last Live
+    *> value and it issuing debugDisconnect.  RETIRE-AND-REPORT has
+    *> already retired that handle, but treating this as an adapter error
+    *> makes the controller race the owner instead of giving it a barrier.
+    *> In either state, discard pre-barrier deliveries, advance the
+    *> generation, and leave exactly one prompt reconnect scheduled.
+    IF WS-LIVE-UP = 1
+        PERFORM RETIRE-SOCKET
+    ELSE
+        ADD 1 TO WS-GENERATION
+    END-IF
     MOVE 0 TO WS-DLV-COUNT
     MOVE 0 TO WS-DLV-BYTES
     *> Schedule the reconnect immediately; the pump performs it.
@@ -798,14 +804,37 @@ SEND-CONNECT-MESSAGE.
         BY REFERENCE WS-SESSION-RAW
         BY VALUE WS-SIXTEEN
         RETURNING WS-RC
+    *> Convex's sync profile uses an RFC 4122 version-4 session ID.
+    *> A bare 32-digit hex nonce is random, but it is not a UUID and
+    *> hosted deployments may reject it after they validate a reconnect.
+    *> FUNCTION ORD/CHAR use a one-based character ordinal here.
+    COMPUTE WS-N = FUNCTION ORD(WS-SESSION-RAW(7:1)) - 1
+    COMPUTE WS-N = FUNCTION MOD(WS-N, 16) + 64
+    MOVE FUNCTION CHAR(WS-N + 1) TO WS-SESSION-RAW(7:1)
+    COMPUTE WS-N = FUNCTION ORD(WS-SESSION-RAW(9:1)) - 1
+    COMPUTE WS-N = FUNCTION MOD(WS-N, 64) + 128
+    MOVE FUNCTION CHAR(WS-N + 1) TO WS-SESSION-RAW(9:1)
     CALL "cvx-hex-encode" USING WS-SESSION-RAW WS-SIXTEEN
         WS-SESSION-HEX WS-SESSION-HEX-LEN
+    MOVE SPACES TO WS-SESSION-ID
+    STRING
+        WS-SESSION-HEX(1:8) DELIMITED SIZE
+        "-" DELIMITED SIZE
+        WS-SESSION-HEX(9:4) DELIMITED SIZE
+        "-" DELIMITED SIZE
+        WS-SESSION-HEX(13:4) DELIMITED SIZE
+        "-" DELIMITED SIZE
+        WS-SESSION-HEX(17:4) DELIMITED SIZE
+        "-" DELIMITED SIZE
+        WS-SESSION-HEX(21:12) DELIMITED SIZE
+        INTO WS-SESSION-ID
+    END-STRING
     MOVE SPACES TO WS-MSGBUF
     MOVE 1 TO WS-MSGLEN
     MOVE WS-CONN-COUNT TO WS-NUMTEXT
     STRING
         '{"type":"Connect","sessionId":"' DELIMITED SIZE
-        WS-SESSION-HEX(1:WS-SESSION-HEX-LEN) DELIMITED SIZE
+        WS-SESSION-ID(1:WS-SESSION-ID-LEN) DELIMITED SIZE
         '","connectionCount":' DELIMITED SIZE
         FUNCTION TRIM(WS-NUMTEXT) DELIMITED SIZE
         ',"lastCloseReason":"' DELIMITED SIZE
@@ -929,12 +958,16 @@ SEND-REMOVE-ONE.
     END-STRING
     COMPUTE WS-N = WS-QS-VERSION + 1
     MOVE WS-N TO WS-NUMTEXT
-    MOVE WS-S-QUERY-ID(WS-SUBIX) TO WS-TEXT
+    *> WS-TEXT is a large binary-safe buffer. Moving a numeric query ID
+    *> there produces NUL-padded digits, which turns this otherwise-valid
+    *> JSON into a hosted FatalError. WS-QUERY-ID-TEXT is numeric-edited and
+    *> FUNCTION TRIM therefore produces the one JSON number we intend.
+    MOVE WS-S-QUERY-ID(WS-SUBIX) TO WS-QUERY-ID-TEXT
     STRING
         ',"newVersion":' DELIMITED SIZE
         FUNCTION TRIM(WS-NUMTEXT) DELIMITED SIZE
         ',"modifications":[{"type":"Remove","queryId":' DELIMITED SIZE
-        FUNCTION TRIM(WS-TEXT) DELIMITED SIZE
+        FUNCTION TRIM(WS-QUERY-ID-TEXT) DELIMITED SIZE
         '}]}' DELIMITED SIZE
         INTO WS-MSGBUF
         WITH POINTER WS-MSGLEN
@@ -983,6 +1016,16 @@ HANDLE-LIVE-MESSAGE.
     END-IF
     CALL "cvx-json-string" USING WS-SLOT-LIVE WS-CHILD WS-SPAN
         WS-SPAN-LEN WS-ST
+    IF WS-ST NOT = CVX-OK
+        *> Keep the peer's malformed type out of the adapter protocol, but
+        *> leave a bounded operational clue on stderr for hosted drift.
+        DISPLAY "cobol live message has a non-string type; frame bytes "
+            WS-INLEN UPON SYSERR
+        MOVE "UnsupportedMessage" TO WS-CLOSE-REASON
+        MOVE 18 TO WS-CLOSE-REASON-LEN
+        PERFORM RETIRE-AND-REPORT
+        EXIT PARAGRAPH
+    END-IF
     EVALUATE TRUE
         WHEN WS-SPAN(1:WS-SPAN-LEN) = "Transition"
             PERFORM APPLY-TRANSITION
@@ -995,6 +1038,13 @@ HANDLE-LIVE-MESSAGE.
         WHEN OTHER
             *> Anything else, including a TransitionChunk, is profile
             *> drift for this client and retires the connection.
+            IF WS-SPAN-LEN > 64
+                MOVE 64 TO WS-N
+            ELSE
+                MOVE WS-SPAN-LEN TO WS-N
+            END-IF
+            DISPLAY "cobol live unsupported message type "
+                WS-SPAN(1:WS-N) " (frame bytes " WS-INLEN ")" UPON SYSERR
             MOVE "UnsupportedMessage" TO WS-CLOSE-REASON
             MOVE 18 TO WS-CLOSE-REASON-LEN
             PERFORM RETIRE-AND-REPORT

@@ -257,13 +257,14 @@ function runLiveOwner(string host, int port, boolean useTls, string caCertPath, 
                     }
                     next.reply.succeed();
                 } else if next.kind == CMD_DEBUG_DISCONNECT {
-                    RawSocket? current = socket;
-                    if current is () {
-                        next.reply.reject(error TransportError("Live WebSocket is not connected", logs = []));
-                    } else {
-                        disconnect("adapter debug disconnect");
-                        next.reply.succeed();
-                    }
+                    // The peer may have closed, or a read may have failed,
+                    // immediately before this command reached the owner. In
+                    // that case `disconnect` has already retired the old
+                    // socket and scheduled the reconnect. The adapter's
+                    // barrier is still satisfied, so acknowledge it instead
+                    // of turning that benign race into a TransportError.
+                    disconnect("adapter debug disconnect");
+                    next.reply.succeed();
                 } else {
                     // CMD_CLOSE
                     RawSocket? current = socket;

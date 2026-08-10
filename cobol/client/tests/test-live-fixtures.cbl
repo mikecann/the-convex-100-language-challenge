@@ -75,6 +75,7 @@ MAIN-PARAGRAPH.
 
     PERFORM TEST-FIVE-RECONNECT-CYCLES
     PERFORM TEST-QUERY-FAILED-RECOVERY
+    PERFORM TEST-REMOVE-MESSAGE
     PERFORM TEST-STALE-RELAY-REJECTED
 
     DISPLAY "test-live-fixtures: " WS-CHECKS " checks, "
@@ -289,6 +290,31 @@ TEST-QUERY-FAILED-RECOVERY.
         END-IF
     END-IF
     PERFORM TEARDOWN.
+
+*> ------------------------------------------------------------------
+*> The hosted server parses every websocket message strictly. Prove the
+*> Remove frame preserves its base/new query-set versions and query ID
+*> as independent JSON numbers after an initial Add transition.
+*> ------------------------------------------------------------------
+TEST-REMOVE-MESSAGE.
+    MOVE 1 TO WS-SESSIONS
+    MOVE 2 TO WS-MODE
+    PERFORM SPAWN-LIVE-PEER
+
+    CALL "cvx-live-subscribe" USING WS-PATH WS-PATH-LEN
+        WS-ARGS WS-ARGS-LEN WS-SUBIX CVX-ERROR WS-ST
+    PERFORM WAIT-DELIVERY
+    CALL "cvx-live-unsubscribe" USING WS-SUBIX CVX-ERROR WS-ST
+    CALL "cvx-live-close" USING WS-ST
+    CALL "cvx_fixture_reap" USING BY REFERENCE WS-EXIT RETURNING WS-RC
+
+    MOVE "Remove uses exact JSON query-set versions and query ID" TO WS-NAME
+    PERFORM CHECK-TRUE
+    *> The fixture awards one point for the Add and another only for the
+    *> exact Remove frame above.
+    IF WS-RC NOT = CVX-OK OR WS-EXIT NOT = 2
+        PERFORM FAIL-CASE
+    END-IF.
 
 *> ------------------------------------------------------------------
 *> Anything still queued from a retired connection belongs to the old

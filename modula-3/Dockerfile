@@ -44,7 +44,12 @@ RUN curl -fsSL -o /tmp/cm3-boot.tar.xz "${CM3_BOOT_URL}" \
 # package whose 2016-era `qsort` C declaration conflicts with GCC 13's
 # <stdlib.h> -- a broken build surface this headless network client never
 # needs in the first place.
-RUN python3 scripts/concierge.py install --prefix /opt/cm3 core tcp
+# Concierge uses the current directory for its temporary bootstrap CMake tree
+# when it is outside the CM3 source tree.  Do not run it from /work/cm3:
+# otherwise its package-index walk scans the entire generated bootstrap tree
+# after installing the config files, which looks like a hung Rosetta build.
+WORKDIR /work
+RUN python3 /work/cm3/scripts/concierge.py install --prefix /opt/cm3 --target AMD64_LINUX core tcp
 ENV PATH=/opt/cm3/bin:$PATH
 
 # ---------------------------------------------------------------------------

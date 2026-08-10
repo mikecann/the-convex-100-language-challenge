@@ -35,9 +35,19 @@ async function checkDirtyExit() {
   await adapter.stop();
 }
 
+async function checkExitHang() {
+  const adapter = new AdapterProcess(process.execPath, [broken, "exit-hang"]).start();
+  await adapter.request(hello);
+  const closed = await adapter.request({ id: "close", op: "close" });
+  assert.equal(closed.type, "closed");
+  await assert.rejects(adapter.waitForExit(100), /adapter exit timed out/);
+  await adapter.stop();
+}
+
 await checkWrongValue();
 await checkHang();
 await checkDirtyExit();
+await checkExitHang();
 
 // These are the ambiguous or easily mistyped additions. Keep the unit check
 // pure so `./run validate` can retain its read-only filesystem contract.

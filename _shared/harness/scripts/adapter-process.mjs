@@ -211,6 +211,22 @@ export class AdapterProcess {
     throw new Error(`unexpected subscription event: ${subscriptionId}`);
   }
 
+  async waitForExit(timeoutMs = 10_000) {
+    let timer;
+    try {
+      return await Promise.race([
+        this.exitPromise,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`adapter exit timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async stop() {
     if (!this.exited && this.socket) {
       this.socket.destroy();

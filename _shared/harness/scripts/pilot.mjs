@@ -371,14 +371,16 @@ if (wantsLive) {
 await test("client/adapter/clean-close", async () => {
   const response = await client.request({ id: nextId("client-close"), op: "close" });
   assert.equal(response.type, "closed", JSON.stringify(response));
-  assert.equal((await client.exitPromise).code, 0);
+  assert.equal((await client.waitForExit()).code, 0);
 });
+await client.stop();
 
 await test("oracle/adapter/clean-close", async () => {
   const response = await oracle.request({ id: nextId("oracle-close"), op: "close" });
   assert.equal(response.type, "closed", JSON.stringify(response));
-  assert.equal((await oracle.exitPromise).code, 0);
+  assert.equal((await oracle.waitForExit()).code, 0);
 });
+await oracle.stop();
 
 const earnedCapabilities = earnedCapabilitiesFor(testResults);
 

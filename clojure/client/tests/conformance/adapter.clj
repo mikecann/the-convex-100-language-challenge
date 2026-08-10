@@ -5,7 +5,7 @@
             [clojure.string :as string]
             [convex.client :as convex])
   (:import [java.io BufferedInputStream ByteArrayOutputStream InputStream OutputStream]
-           [java.net InetAddress InetSocketAddress ServerSocket]
+           [java.net InetAddress InetSocketAddress ServerSocket Socket SocketTimeoutException]
            [java.nio ByteBuffer]
            [java.nio.charset CodingErrorAction StandardCharsets]
            [java.util ArrayDeque]
@@ -421,10 +421,33 @@
     (.bind server (InetSocketAddress. (InetAddress/getByName host) port))
     server))
 
+(defn- finish-controller-socket! [^Socket socket]
+  ;; FIN is the controller's exit signal in TCP mode. Wait briefly for its
+  ;; automatic reciprocal FIN so constrained emulation cannot tear down the
+  ;; process before Docker's bridge has observed our half-close.
+  (.shutdownOutput socket)
+  (.setSoTimeout socket max-close-output-ms)
+  (try
+    (.read (.getInputStream socket))
+    (catch SocketTimeoutException _ nil)))
+
 (defn -main [& _]
   (if-let [address (System/getenv "ADAPTER_LISTEN")]
-    (with-open [server (bind address)
-                socket (.accept server)]
-      (run-adapter! (.getInputStream socket) (.getOutputStream socket)
-                    (System/getenv "CONVEX_URL")))
+    (do
+      (with-open [server (bind address)
+                  socket (.accept server)]
+        (run-adapter! (.getInputStream socket) (.getOutputStream socket)
+                      (System/getenv "CONVEX_URL"))
+        ;; The controller waits for TCP EOF before it removes the container.
+        ;; Send that FIN explicitly after the terminal event is flushed. Under
+        ;; constrained amd64 emulation, relying on JVM teardown to close the
+        ;; socket can leave the Docker bridge connection readable for seconds
+        ;; even though the Java process has already exited.
+        (finish-controller-socket! socket))
+      ;; HttpClient owns implementation threads that can outlive close() after
+      ;; a WebSocket-heavy session. The adapter is a one-controller executable:
+      ;; once its socket is closed and the terminal event has been flushed,
+      ;; terminate the JVM instead of leaving the container alive on one of
+      ;; those implementation threads.
+      (System/exit 0))
     (run-adapter! System/in System/out (System/getenv "CONVEX_URL"))))

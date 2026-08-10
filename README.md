@@ -61,6 +61,7 @@ Live includes HTTP. Implementation provenance is a separate label:
   client/                  client, build metadata, unit tests, and conformance entrypoint
   examples/basics/         the shared counter-room example and its own tests
   README.md                usage, evidence, and limitations
+  logo.png                 optional language logo displayed by the README
 _shared/                   trusted backend, harness, schemas, site, and results
 run                         Docker-only orchestration entrypoint
 roster/                    sourced language selection and feasibility audit

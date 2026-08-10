@@ -18,6 +18,8 @@ lines.on("line", (line) => {
     );
   } else if (mode === "dirty-exit") {
     process.exit(17);
+  } else if (mode === "exit-hang" && command.op === "close") {
+    process.stdout.write(`${JSON.stringify({ id: command.id, type: "closed" })}\n`);
   }
-  // The hang mode deliberately emits nothing.
+  // The hang modes deliberately remain alive after their relevant response.
 });

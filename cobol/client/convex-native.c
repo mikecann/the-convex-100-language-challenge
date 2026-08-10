@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -41,6 +42,30 @@ struct cvx_handle {
 };
 
 static struct cvx_handle g_handles[CVX_MAX_HANDLES];
+
+/*
+ * A Live peer is allowed to disappear at any point, including after the
+ * controller has decided to send the next query-set update.  Linux otherwise
+ * delivers SIGPIPE before write(2) can return EPIPE, which terminates the
+ * COBOL process and prevents the Live owner from retiring and reconnecting
+ * the socket.  TLS writes go through OpenSSL's BIO and cannot use
+ * MSG_NOSIGNAL, so ignore the signal once and let both TLS and plain writes
+ * report their normal, inspectable error status instead.
+ */
+static void ignore_sigpipe(void)
+{
+    static int configured;
+    struct sigaction action;
+
+    if (configured) {
+        return;
+    }
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = SIG_IGN;
+    sigemptyset(&action.sa_mask);
+    (void)sigaction(SIGPIPE, &action, NULL);
+    configured = 1;
+}
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                       */
@@ -545,6 +570,8 @@ int cvx_net_write(int handle, const unsigned char *in, int len,
         return CVX_HANDLE;
     }
 
+    ignore_sigpipe();
+
     while (done < len) {
         int ready;
         int n;
@@ -569,7 +596,10 @@ int cvx_net_write(int handle, const unsigned char *in, int len,
                 return CVX_TLS;
             }
         } else {
-            n = (int)write(h->fd, in + done, (size_t)(len - done));
+            /* MSG_NOSIGNAL narrows the plain-socket case as well.  The
+             * process-level guard above is still required for OpenSSL. */
+            n = (int)send(h->fd, in + done, (size_t)(len - done),
+                          MSG_NOSIGNAL);
             if (n > 0) {
                 done += n;
                 *sent = done;
@@ -770,6 +800,10 @@ int cvx_std_write(int fd, const unsigned char *in, int len)
     if (in == NULL || len < 0) {
         return CVX_ERR;
     }
+    /* A controller may close its NDJSON stream while the adapter is
+     * reporting a failure. Return CVX_ERR to the adapter instead of letting
+     * that peer-close take down the whole process. */
+    ignore_sigpipe();
     while (done < len) {
         int n = (int)write(fd, in + done, (size_t)(len - done));
 

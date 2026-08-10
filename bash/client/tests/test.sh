@@ -28,6 +28,7 @@ wait_for_listener() {
 state=/tmp/bash-convex-fixture
 mkdir -p "$state"
 rm -f "$state/partial-sent"
+rm -f "$state/partial-control-sent"
 : >"$state/ws.log"
 : >"$state/frames.log"
 : >"$state/server-frames.log"
@@ -63,6 +64,37 @@ export CONVEX_URL=http://127.0.0.1:18080
 
 source "$root/client/convex.sh"
 source "$root/client/live.sh"
+
+# A deadline can race with child reaping after dd has already produced every
+# requested byte. The parser must keep complete output despite status 124, or
+# the next read begins in the middle of a real RFC6455 frame.
+(
+	timeout() {
+		printf '\201'
+		return 124
+	}
+	LIVE_IN=0
+	_read_byte_deadline 0.1 </dev/null
+	test "$LIVE_BYTE" = 129
+)
+(
+	timeout() {
+		printf abcd
+		return 124
+	}
+	LIVE_IN=0
+	_read_payload_deadline 4 0.1 </dev/null
+	test "$LIVE_PAYLOAD" = abcd
+)
+(
+	timeout() {
+		printf '\001\002'
+		return 124
+	}
+	LIVE_IN=0
+	_read_payload_hex_deadline 2 0.1 </dev/null
+	test "$LIVE_PAYLOAD_HEX" = 0102
+)
 reset_live() {
 	live_disconnect
 	LIVE_QUERY_SET=0
@@ -578,6 +610,36 @@ test "$(jq -r .type <<<"$event")" = closed
 wait "$adapter_pid"
 unset adapter_pid
 jq -se 'any(.[]; .type=="Connect" and .lastCloseReason=="TransportError")' "$state/ws.log" >/dev/null
+
+# A control-frame reader can consume part of a payload before its child dd
+# reaches the deadline. The adapter must retire that connection, reconnect,
+# and never parse the remaining payload bytes as a fresh RFC6455 header.
+ADAPTER_LISTEN=127.0.0.1:19098 CONVEX_URL=$CONVEX_URL /usr/local/bin/convex-adapter &
+adapter_pid=$!
+wait_for_listener 127.0.0.1:19098
+exec {partial_control_fd}<>/dev/tcp/127.0.0.1/19098
+printf '%s\n' '{"id":"partial-control-sub","op":"subscribe","subscriptionId":"partial-control","path":"fixture:partialControl","args":{"room":"partial-control-room"}}' >&"$partial_control_fd"
+IFS= read -r -t 5 event <&"$partial_control_fd"
+test "$(jq -r .type <<<"$event")" = ack
+recovered=0
+for _ in $(seq 1 20); do
+	event=
+	IFS= read -r -t 1 event <&"$partial_control_fd" || true
+	[[ -n $event ]] && jq -e '.type=="subscription" and .subscriptionId=="partial-control" and .value.count==0' <<<"$event" >/dev/null && {
+		recovered=1
+		break
+	}
+	if [[ -n $event ]] && jq -e '.type=="subscription" and .error.name=="ProtocolError"' <<<"$event" >/dev/null; then exit 1; fi
+done
+test "$recovered" = 1
+printf '%s\n' '{"id":"partial-control-close","op":"close"}' >&"$partial_control_fd"
+for _ in $(seq 1 20); do
+	IFS= read -r -t 1 event <&"$partial_control_fd"
+	[[ $(jq -r '.id // ""' <<<"$event") = partial-control-close ]] && break
+done
+test "$(jq -r .type <<<"$event")" = closed
+wait "$adapter_pid"
+unset adapter_pid
 
 # The TCP adapter must bind the requested address, not every interface sharing
 # the requested port.

@@ -168,7 +168,11 @@ RUN printf '%s\n' \
       '}' | \
     gcc -x c - -I/opt/curl/include -L/opt/curl/lib -Wl,-rpath,/opt/curl/lib -lcurl -o /tmp/curl-websocket-check && \
     /tmp/curl-websocket-check
-RUN odin check client -no-entry-point -strict-style -vet
+# Odin’s parallel checker has intermittently asserted in Queue($T=Task) under
+# Docker Desktop’s linux/amd64 emulation on Apple Silicon. Keep this static
+# check deterministic; runtime builds and the test runner retain their normal
+# parallelism.
+RUN odin check client -no-entry-point -strict-style -vet -thread-count:1
 RUN timeout 90 odin test client \
       -define:ODIN_TEST_THREADS=1 \
       -strict-style -vet

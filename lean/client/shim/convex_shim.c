@@ -710,8 +710,15 @@ LEAN_EXPORT lean_object *convex_shim_conn_write(b_lean_obj_arg handle, b_lean_ob
 LEAN_EXPORT lean_object *convex_shim_conn_close(b_lean_obj_arg handle, lean_object *world) {
   (void)world;
   convex_conn *conn = convex_conn_of(handle);
-  if (conn->ssl != NULL) {
-    SSL_shutdown(conn->ssl);
+  /*
+   * WebSocket.close has already made its best-effort close-frame write under
+   * the caller's deadline. SSL_shutdown may in turn wait for a TLS close-notify
+   * from a peer, but this low-level finalizer has no deadline to enforce. Make
+   * the OS socket terminal instead: it wakes the TCP controller immediately
+   * and makes teardown bounded even after a Live peer stalls during shutdown.
+   */
+  if (conn->fd >= 0) {
+    shutdown(conn->fd, SHUT_RDWR);
   }
   convex_conn_release(conn);
   return lean_io_result_mk_ok(lean_box(0));

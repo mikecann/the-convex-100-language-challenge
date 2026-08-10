@@ -198,26 +198,42 @@ live_send() { live_send_frame 1 "$1"; }
 _read_byte_deadline() {
 	local deadline=$1 value read_status=0
 	value=$(timeout "$deadline" dd bs=1 count=1 status=none <&"$LIVE_IN" | od -An -tu1 | tr -d ' \n') || read_status=$?
+	# The deadline can fire after dd wrote its complete result but just before
+	# the timeout parent reaped it. Complete output wins over that late status;
+	# discarding it would move the stream past a real frame boundary.
+	if [[ -n $value ]]; then
+		LIVE_BYTE=$value
+		return 0
+	fi
 	((read_status == 124 || read_status == 143)) && return 4
 	# These descriptors are blocking. A successful zero-byte read is peer EOF,
 	# while the timeout helper reports an idle connection as status 124/143.
-	[[ -n $value ]] || return 3
-	LIVE_BYTE=$value
+	return 3
 }
 _read_payload_deadline() {
-	local count=$1 deadline=$2 read_status=0 value
+	local count=$1 deadline=$2 read_status=0 value actual
 	value=$(timeout "$deadline" dd bs="$count" count=1 iflag=fullblock status=none <&"$LIVE_IN") || read_status=$?
+	actual=$(printf %s "$value" | wc -c | tr -d ' ')
+	if ((actual == count)); then
+		LIVE_PAYLOAD=$value
+		return 0
+	fi
 	((read_status == 124 || read_status == 143)) && return 4
-	[[ $(printf %s "$value" | wc -c | tr -d ' ') -eq $count ]] || return 3
-	LIVE_PAYLOAD=$value
+	return 3
 }
 _read_payload_hex_deadline() {
 	local count=$1 deadline=$2 read_status=0 value
 	value=$(timeout "$deadline" dd bs="$count" count=1 iflag=fullblock status=none <&"$LIVE_IN" | od -An -v -tx1 | tr -d ' \n') || read_status=$?
-	((read_status == 124 || read_status == 143)) && return 4
-	((read_status == 0)) || return 3
-	((${#value} == count * 2)) || return 3
-	LIVE_PAYLOAD_HEX=$value
+	if ((${#value} == count * 2)); then
+		LIVE_PAYLOAD_HEX=$value
+		return 0
+	fi
+	# The frame header has already been consumed before this helper runs. A
+	# timeout may also mean dd consumed only part of the payload before it was
+	# killed, so the next byte is not a safe frame boundary. Retire this
+	# connection instead of treating the timeout like an idle socket.
+	((read_status == 124 || read_status == 143)) && return 3
+	return 3
 }
 _read_required_byte() {
 	local status=0

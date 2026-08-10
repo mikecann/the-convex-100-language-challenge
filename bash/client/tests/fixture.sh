@@ -194,6 +194,18 @@ if [[ $request = "GET $ws_path HTTP/1.1" ]]; then
 				printf x
 				exit 0
 			fi
+			if [[ $path = fixture:partialControl && ! -f $state_dir/partial-control-sent ]]; then
+				: >"$state_dir/partial-control-sent"
+				# Send a complete Ping header and only one payload byte before the
+				# reader deadline. Those consumed bytes make this connection unsafe
+				# to resume, even though the remaining payload arrives later.
+				write_byte 137
+				write_byte 4
+				printf p
+				sleep 0.4
+				printf ing
+				exit 0
+			fi
 			if [[ $path = fixture:stall ]]; then
 				write_byte 129
 				sleep 5

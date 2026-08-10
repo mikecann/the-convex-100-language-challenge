@@ -148,13 +148,15 @@ An implemented language root must contain only this public shape:
 ```text
 <language-id>/
   README.md
+  logo.png (optional)
   Dockerfile
   manifest.yaml
   client/
   examples/
 ```
 
-The validator rejects extra top-level build files or generic source and test
+The validator permits one optional `logo.png` when the README displays it. It
+rejects other extra top-level build files or generic source and test
 directories. Put necessary dependency metadata under `client/` and let Docker
 copy or rename it into the toolchain's expected location.
 
@@ -254,20 +256,27 @@ failure modes that ordinary happy-path tests miss:
 Write each language README for a curious viewer, not as an audit log. Use this
 order:
 
-1. `# Convex from <Language>` and a short explanation of what the demonstration
-   does.
-2. A clear statement that it is educational, unofficial, and not a production
-   SDK.
-3. `Start here`, linking to the canonical basic example and explaining its
-   journey.
-4. A plain-language `What works` table that does not round up partial support.
-5. The generated canonical example block.
-6. Docker verification commands and a short explanation of what each proves.
-7. Lower-level conformance and protocol notes.
-8. Honest limitations and deferred behaviour.
+1. The language's main official or project-owned logo when one is available,
+   followed by `# <Language>`.
+2. A friendly introduction covering what the language is, where it came from,
+   what people use it for, and a link to its main website.
+3. `## Getting Started`, linking to the canonical basic example and giving the
+   root Docker command that runs it.
+4. `## Interesting Parts`, with up to three concise comparisons for a casual
+   Convex React developer. Use valid, equivalent TypeScript examples alongside
+   focused target-language code, and explain client API choices without
+   presenting them as language limitations.
+5. `## Status`, preserving the evidence-backed capability table without
+   rounding up partial support.
+6. `## Example`, containing the generated canonical example block verbatim.
+7. `## Implementation Notes`, explaining transport, JSON, Live ownership,
+   runtime choices, and language-specific tradeoffs in accessible terms.
+8. `## Known Issues`, as a short numbered list of honest limitations and
+   deferred behaviour.
 
-Keep protocol pins and evidence detail, but do not make a new reader traverse
-them before discovering what the example does.
+Keep protocol pins and evidence detail, but explain jargon where it first
+appears. The canonical example is teaching material: keep its comments intact
+and never hand-edit the generated README block.
 
 ## Convex safety
 

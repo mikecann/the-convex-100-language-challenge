@@ -145,7 +145,12 @@ count(value,operation)
  ; exact shared transcript.
 bail(message)
  do closeLive^convex(2000)
- if message'="" use "/dev/stderr" write "MUMPS example failed: ",message,! use $principal
+ ; `/dev/stderr` is a Unix path, not automatically an M device. The final
+ ; image deliberately has no `/tmp`; a hosted transport failure used to reach
+ ; this branch and then fatal with IONOTOPEN before it could print its real
+ ; diagnostic. Open the already-mounted stderr stream first, just as the
+ ; adapter does, so error handling remains safe in that stripped image.
+ if message'="" open "/dev/stderr":append:5 use "/dev/stderr" write "MUMPS example failed: ",message,! use $principal
  quit -1
 ```
 <!-- END GENERATED EXAMPLE -->

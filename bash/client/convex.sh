@@ -36,7 +36,9 @@ _convex_call() {
 	response_envelope=
 	LC_ALL=C IFS= read -r -N "$((CONVEX_MAX_RESPONSE_BYTES + 5))" response_envelope < <(
 		set +e
-		printf %s "$body" | wget -qO- --timeout=15 --header='Content-Type: application/json' --header="Convex-Client: $CONVEX_CLIENT_VERSION" "${auth[@]}" --post-file=/dev/stdin "${CONVEX_URL%/}/api/$operation"
+		# BusyBox treats a lone dash as its already-open stdin; reopening
+		# /dev/stdin fails in the read-only final image.
+		printf %s "$body" | wget -qO- --timeout=15 --header='Content-Type: application/json' --header="Convex-Client: $CONVEX_CLIENT_VERSION" "${auth[@]}" --post-file=- "${CONVEX_URL%/}/api/$operation"
 		printf '\036%s' "$?"
 	) || true
 	[[ $response_envelope == *$'\036'* ]] || {

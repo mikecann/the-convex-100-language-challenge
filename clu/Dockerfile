@@ -5,13 +5,15 @@ ARG BUILD_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa04
 
 # Portable CLU (pclu), Valery Ushakov's 2021+ fix-up of Liskov's original
 # MIT CLU compiler, pinned by commit. Not packaged for Debian, so it is
-# built from source. Boehm GC 7.2f is the exact version pclu's own
-# README.md calls for; also built from source, statically, so no libgc.so
-# needs to ship in the runtime image.
+# built from source. pclu's README names Boehm GC 7.2f, but that 2014 release
+# faults during GC_init under Docker Desktop's amd64 Rosetta emulation before
+# pclu reads any source. GC 8.2.8 is a source-compatible conservative-GC
+# replacement that fixes that bootstrap failure; it is still built statically,
+# so no libgc.so needs to ship in the runtime image.
 ARG PCLU_REPO=https://github.com/nbuwe/pclu.git
 ARG PCLU_COMMIT=1a8ad7603ea20b9744942182a52810441182f6a6
-ARG GC_URL=https://www.hboehm.info/gc/gc_source/gc-7.2f.tar.gz
-ARG GC_SHA256=265ce3167273cff1d77081ad7dd86ca1269a0ec2ae0324f9ad8070ccc23d3d85
+ARG GC_URL=https://github.com/ivmai/bdwgc/releases/download/v8.2.8/gc-8.2.8.tar.gz
+ARG GC_SHA256=7649020621cb26325e1fb5c8742590d92fb48ce5c259b502faf7d9fb5dabb160
 
 # ---------------------------------------------------------------------------
 # test: build pclu from source, apply this client's runtime fix and new
@@ -37,28 +39,25 @@ RUN apt-get update \
        binutils \
        patch \
        m4 \
+       libatomic-ops-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eu; test "$(uname -m)" = x86_64
 
 # Fetch and verify Boehm GC by URL and checksum, matching the project's own
 # pin-by-digest policy for anything not packaged by the distribution.
-ADD --checksum=sha256:${GC_SHA256} ${GC_URL} /tmp/gc-7.2f.tar.gz
+ADD --checksum=sha256:${GC_SHA256} ${GC_URL} /tmp/gc-8.2.8.tar.gz
 RUN set -eu; \
-    mkdir -p /opt/gc-7.2f; \
-    tar xzf /tmp/gc-7.2f.tar.gz -C /opt/gc-7.2f --strip-components=1; \
-    rm -f /tmp/gc-7.2f.tar.gz
+    mkdir -p /opt/gc-8.2.8; \
+    tar xzf /tmp/gc-8.2.8.tar.gz -C /opt/gc-8.2.8 --strip-components=1; \
+    rm -f /tmp/gc-8.2.8.tar.gz
 
-# gc-7.2 (released 2014) relies on tentative definitions (a jmp_buf global
-# repeated, unqualified, in a header every gc .c file includes) that GCC's
-# -fno-common default (the default since GCC 10) rejects at final-link
-# time with "multiple definition of GC_jmp_buf". -fcommon restores the
-# old, and here required, behaviour. Static-only: the runtime image ships
-# no libgc.so, only the CLU binaries it is linked into.
+# Static-only: the runtime image ships no libgc.so, only the CLU binaries it
+# is linked into. -fcommon remains set for pclu's own older C sources.
 RUN set -eu; \
-    cd /opt/gc-7.2f; \
+    cd /opt/gc-8.2.8; \
     ./configure --enable-static=yes --enable-shared=no --enable-threads=no \
-        --with-libatomic-ops=no --prefix=/opt/gc-install CFLAGS="-fcommon -O2"; \
+        --prefix=/opt/gc-install CFLAGS="-fcommon -O2"; \
     make -j"$(nproc)"; \
     make install; \
     mkdir -p /opt/gc-install/include/gc/private; \

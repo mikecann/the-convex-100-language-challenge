@@ -50,6 +50,7 @@ MAIN-PARAGRAPH.
     CALL "cvx-util-init"
 
     PERFORM TEST-SINGLE-TEXT-FRAME
+    PERFORM TEST-PEER-CLOSE-DURING-WRITE
     PERFORM TEST-FRAGMENTED-MESSAGE
     PERFORM TEST-PING-IS-PONGED
     PERFORM TEST-PONG-IS-IGNORED
@@ -149,6 +150,29 @@ TEST-SINGLE-TEXT-FRAME.
         END-IF
     END-IF
     PERFORM END-CASE.
+
+*> A remote peer can vanish between deciding to write and the kernel
+*> accepting the WebSocket frame. This must be a normal transport error
+*> that the Live owner can retire, never a process-killing SIGPIPE.
+TEST-PEER-CLOSE-DURING-WRITE.
+    MOVE "closed peer returns a bounded write error" TO WS-NAME
+    PERFORM CHECK-TRUE
+    PERFORM START-CASE
+    CALL "cvx_fixture_close_peer" USING BY VALUE WS-PEER
+        RETURNING WS-RC
+    *> Observe the peer's FIN first. A later write is now guaranteed to
+    *> exercise the EPIPE path rather than racing the local socket state.
+    PERFORM POLL-ONCE
+    CALL "cvx_now_ms" USING BY REFERENCE WS-NOW RETURNING WS-RC
+    COMPUTE WS-DEADLINE = WS-NOW + WS-POLL-MS
+    MOVE "x" TO WS-PAYLOAD
+    MOVE 1 TO WS-PAYLOAD-LEN
+    CALL "cvx-ws-send-text" USING WS-HANDLE WS-PAYLOAD WS-PAYLOAD-LEN
+        WS-DEADLINE WS-ST
+    IF WS-ST NOT = CVX-ERR
+        PERFORM FAIL-CASE
+    END-IF
+    CALL "cvx_net_close" USING BY VALUE WS-HANDLE RETURNING WS-RC.
 
 *> Three fragments must reassemble into one message, and the message
 *> must not surface until the final frame arrives.

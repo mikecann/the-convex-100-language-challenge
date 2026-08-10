@@ -272,7 +272,8 @@ start_up = proc ()
 ```
 
 Builds pclu 1a8ad7603ea20b9744942182a52810441182f6a6 from source (Boehm GC
-7.2f static, the `-fcommon` fix GCC 10+ needs, and
+8.2.8 static, replacing the 2014 GC 7.2f release that faults during `GC_init`
+under Docker Desktop's amd64 Rosetta emulation, and
 `client/wordvec-64bit-word-size.patch`, a real 64-bit addressing bug fixed
 during development), adds the `_tls` builtin cluster, boots a hello-world
 smoke test, checks source style, compiles and runs the full language-local

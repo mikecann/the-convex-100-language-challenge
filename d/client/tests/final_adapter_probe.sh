@@ -43,7 +43,7 @@ wait_for_file() {
 
 expect_exact_line() {
     expected_line=$1
-    if ! IFS= read -r actual_line <&4; then
+    if ! IFS= read -r actual_line <&5; then
         printf 'adapter output closed before expected wire line: %s\n' "$expected_line" >&2
         if ! kill -0 "$adapter_pid" 2>/dev/null; then
             wait "$adapter_pid" || printf 'adapter exited with status %s\n' "$?" >&2
@@ -79,10 +79,17 @@ server_pid=$!
 sleep 0.1
 mkfifo "$live_input" "$live_output"
 exec 3<>"$live_input"
+# The adapter makes stdout nonblocking so its physical write deadline is
+# enforceable. A dup of this read-write FIFO descriptor would share that flag,
+# and dash then reports EAGAIN from `read` as a failed read. Keep fd 4 only as
+# the adapter's write-side open file description and open fd 5 independently
+# for this controller's blocking reads.
 exec 4<>"$live_output"
 ADAPTER_TEST_OUTPUT_DEADLINE_MS=20000 CONVEX_URL=http://127.0.0.1:18155 \
-    /out-adapter <&3 >&4 2>"$adapter_log" &
+    /out-adapter <&3 >&4 4>&- 2>"$adapter_log" &
 adapter_pid=$!
+exec 5<"$live_output"
+exec 4>&-
 sleep 30 >"$live_input" &
 input_keeper_pid=$!
 test "$(cat "/proc/$adapter_pid/cgroup")" = "$(cat /proc/self/cgroup)"
@@ -96,7 +103,7 @@ wait_for_file /tmp/d-live-count-first-sent
 sleep 0.05
 touch /tmp/d-live-count-burst
 wait_for_file /tmp/d-live-count-done
-exec 4>&-
+exec 5>&-
 /out-final-adapter-controller count <"$live_output"
 
 # Pause again, then send five valid 1.75 MiB Live frames. Sequence 102 is
@@ -108,12 +115,12 @@ touch /tmp/d-live-byte-burst
 wait_for_file /tmp/d-live-byte-done 1500
 /out-final-adapter-controller bytes <"$live_output"
 
-exec 4<"$live_output"
+exec 5<"$live_output"
 printf '%s\n' '{"id":"close","op":"close"}' >&3
 touch /tmp/d-live-finish
 expect_exact_line '{"id":"close","type":"closed"}'
 exec 3>&-
-exec 4>&-
+exec 5>&-
 kill "$input_keeper_pid"
 wait "$input_keeper_pid" || true
 input_keeper_pid=

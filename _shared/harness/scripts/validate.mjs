@@ -17,6 +17,7 @@ const ajv = new Ajv2020({ allErrors: true });
 addFormats(ajv);
 const validateManifest = ajv.compile(manifestSchema);
 const errors = [];
+const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 for (const schemaName of ["adapter.schema.json", "result.schema.json"]) {
   const schema = JSON.parse(
@@ -57,6 +58,7 @@ for (const language of roster.languages) {
   const directory = path.join(root, language.id);
   const manifestPath = path.join(directory, "manifest.yaml");
   const readmePath = path.join(directory, "README.md");
+  const logoPath = path.join(directory, "logo.png");
 
   if (!fs.existsSync(directory)) {
     errors.push(`${language.id}: missing top-level directory`);
@@ -75,6 +77,18 @@ for (const language of roster.languages) {
     }
     if (projection.original !== projection.projected) {
       errors.push(`${language.id}: README example is stale; run ./run sync-examples`);
+    }
+  }
+
+  if (fs.existsSync(logoPath)) {
+    const logoIsFile = fs.statSync(logoPath).isFile();
+    const logo = logoIsFile ? fs.readFileSync(logoPath) : Buffer.alloc(0);
+    if (!logoIsFile || !logo.subarray(0, 8).equals(pngSignature)) {
+      errors.push(`${language.id}: logo.png must be a PNG image file`);
+    }
+    const readme = fs.existsSync(readmePath) ? fs.readFileSync(readmePath, "utf8") : "";
+    if (!readme.includes('src="logo.png"') && !readme.includes("(logo.png)")) {
+      errors.push(`${language.id}: logo.png must be displayed by its README`);
     }
   }
 
@@ -112,6 +126,7 @@ for (const language of roster.languages) {
       "README.md",
       "client",
       "examples",
+      "logo.png",
       "manifest.yaml",
     ]);
     for (const entry of fs.readdirSync(directory)) {

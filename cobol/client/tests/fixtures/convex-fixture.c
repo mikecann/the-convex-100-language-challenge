@@ -30,6 +30,7 @@
 #include "../../convex-native.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <poll.h>
 #include <errno.h>
 #include <signal.h>
@@ -449,6 +450,35 @@ static int read_client_frame(int fd, char *out, int cap)
     return len;
 }
 
+/* The hosted sync service treats sessionId as an RFC 4122 UUID, not merely a
+ * random hex string. Keep the fixture strict so a locally permissive peer
+ * cannot hide a client that hosted verification will later reject. */
+static int has_uuid4_session_id(const char *message)
+{
+    const char *key = "\"sessionId\":\"";
+    const char *id;
+    int i;
+
+    id = strstr(message, key);
+    if (id == NULL) {
+        return 0;
+    }
+    id += strlen(key);
+    for (i = 0; i < 36; i++) {
+        unsigned char c = (unsigned char)id[i];
+
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (c != '-') {
+                return 0;
+            }
+        } else if (!isxdigit(c)) {
+            return 0;
+        }
+    }
+    return id[36] == '"' && id[14] == '4' &&
+        (id[19] == '8' || id[19] == '9' || id[19] == 'a' || id[19] == 'b');
+}
+
 /* A Live peer that serves `connections` sequential sessions.
  *
  * Session N replies with a Transition whose count is N-1, so a test
@@ -500,6 +530,10 @@ int cvx_fixture_spawn_live(int connections, int mode, int *port)
             n = read_client_frame(c, msg, sizeof(msg) - 1);
             if (n > 0) {
                 msg[n] = '\0';
+                if (!has_uuid4_session_id(msg)) {
+                    close(c);
+                    break;
+                }
             }
             n = read_client_frame(c, msg, sizeof(msg) - 1);
             if (n > 0) {
@@ -547,6 +581,23 @@ int cvx_fixture_spawn_live(int connections, int mode, int *port)
                         session);
                     n = server_frame(frame, body, n);
                     write_all(c, frame, n);
+                }
+                if (mode == 2 && session == 0) {
+                    /* A Remove must keep the independent query-set version
+                     * and query ID as bare JSON numbers. This catches a
+                     * numeric-to-alphanumeric COBOL MOVE that used to emit
+                     * NUL-padded bytes only a strict hosted server rejected. */
+                    n = read_client_frame(c, msg, sizeof(msg) - 1);
+                    if (n > 0) {
+                        msg[n] = '\0';
+                        if (strcmp(msg,
+                            "{\"type\":\"ModifyQuerySet\","
+                            "\"baseVersion\":1,\"newVersion\":2,"
+                            "\"modifications\":[{\"type\":\"Remove\","
+                            "\"queryId\":1}]}") == 0) {
+                            rebuilt++;
+                        }
+                    }
                 }
             }
             /* Hold the session open until the client drops it. The

@@ -284,7 +284,10 @@
           (is (= "ready" (get (json/read-str (.readLine reader)) "type")))
           (.write output (.getBytes (str (json/write-str (command "c" "close")) "\n") StandardCharsets/UTF_8))
           (.flush output)
-          (is (= "closed" (get (json/read-str (.readLine reader)) "type")))))
+          (is (= "closed" (get (json/read-str (.readLine reader)) "type")))
+          ;; The adapter owns connection shutdown. Keep this side open and
+          ;; prove the server sends EOF after its terminal event.
+          (is (nil? (.readLine reader)))))
       (is (not= ::timeout (deref running 2000 ::timeout))))))
 
 (deftest live-function-error-data-is-preserved-and-recovers

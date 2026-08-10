@@ -297,6 +297,7 @@ ENV OPENSSL_CONF=/etc/ssl/openssl.cnf \
     LC_ALL=C \
     ydb_dist=/opt/yottadb \
     ydb_chset=M \
+    ydb_tmp=/dev/shm \
     ydb_gbldir=/opt/convex/db/mumps.gld \
     ydb_routines=/opt/convex/o(/opt/convex/o) \
     gtmcrypt_config=/opt/convex/tls.conf \

@@ -59,6 +59,14 @@ COPY "cvx-limits.cpy".
 01 WS-BIG-LEN               BINARY-LONG.
 01 WS-ROUND                 BINARY-LONG.
 01 WS-ROUNDS                BINARY-LONG VALUE 12.
+01 WS-SMALL                 PIC X(64).
+01 WS-SMALL-LEN             BINARY-LONG.
+01 WS-BACKPRESSURE-ROUND    BINARY-LONG.
+*> Docker may grow an anonymous pipe to 1 MiB. These replies are about
+*> 100 bytes, so this comfortably reaches a blocked write on either
+*> the small default pipe or the grown one without changing the input
+*> workload being measured above.
+01 WS-BACKPRESSURE-ROUNDS   BINARY-LONG VALUE 16384.
 01 WS-I                     BINARY-LONG.
 01 WS-BLOCKED               BINARY-LONG VALUE 0.
 01 WS-REPORT                PIC -(18)9.
@@ -100,32 +108,56 @@ MAIN-PARAGRAPH.
         BY REFERENCE WS-SENT
         RETURNING WS-RC
 
-    PERFORM SAMPLE-RSS
-    MOVE WS-RSS TO WS-BASELINE
-
     *> Build one command line just under the 2 MiB adapter limit. It is
     *> deliberately a syntactically valid object with an enormous
     *> unknown field, so the adapter must scan the whole line.
     PERFORM BUILD-NEAR-MAX-LINE
 
+    *> Linux only charges BSS pages when GnuCOBOL first touches them.
+    *> The adapter has fixed 2 MiB slots spread over its client modules,
+    *> so its startup RSS is not its steady-state fixed footprint. Feed
+    *> two full lines before taking the baseline: the first makes the
+    *> adapter parse and emit, and the second cannot be accepted until
+    *> the first has completed. This accounts for fixed storage once,
+    *> then measures whether repeated input adds any more.
+    PERFORM FEED-BIG-LINE
+    PERFORM FEED-BIG-LINE
+    PERFORM SAMPLE-RSS
+    MOVE WS-RSS TO WS-BASELINE
+    MOVE WS-RSS TO WS-PEAK
+
     PERFORM VARYING WS-ROUND FROM 1 BY 1 UNTIL WS-ROUND > WS-ROUNDS
-        CALL "cvx_fixture_feed_adapter" USING
-            BY VALUE WS-IN-FD
-            BY REFERENCE WS-BIG
-            BY VALUE WS-BIG-LEN
-            BY VALUE WS-TIMEOUT-MS
-            BY REFERENCE WS-SENT
-            RETURNING WS-RC
-        IF WS-RC = CVX-TIMEOUT
-            *> Expected once the adapter is wedged on its blocked
-            *> stdout. That is correct backpressure, not a failure.
-            MOVE 1 TO WS-BLOCKED
-        END-IF
+        PERFORM FEED-BIG-LINE
         PERFORM SAMPLE-RSS
         IF WS-RSS > WS-PEAK
             MOVE WS-RSS TO WS-PEAK
         END-IF
     END-PERFORM
+
+    *> Near-maximum lines prove the input path is bounded, but their
+    *> error replies are deliberately small. Fill the stopped stdout
+    *> pipe with compact invalid commands as a separate, cheap proof
+    *> that the real adapter eventually blocks rather than queueing
+    *> output in its own address space.
+    PERFORM BUILD-SMALL-LINE
+    PERFORM VARYING WS-BACKPRESSURE-ROUND FROM 1 BY 1
+            UNTIL WS-BACKPRESSURE-ROUND > WS-BACKPRESSURE-ROUNDS
+            OR WS-BLOCKED = 1
+        CALL "cvx_fixture_feed_adapter" USING
+            BY VALUE WS-IN-FD
+            BY REFERENCE WS-SMALL
+            BY VALUE WS-SMALL-LEN
+            BY VALUE WS-TIMEOUT-MS
+            BY REFERENCE WS-SENT
+            RETURNING WS-RC
+        IF WS-RC = CVX-TIMEOUT
+            MOVE 1 TO WS-BLOCKED
+        END-IF
+    END-PERFORM
+    PERFORM SAMPLE-RSS
+    IF WS-RSS > WS-PEAK
+        MOVE WS-RSS TO WS-PEAK
+    END-IF
 
     MOVE "peak resident memory stays under the shared 128 MiB limit"
         TO WS-NAME
@@ -141,12 +173,12 @@ MAIN-PARAGRAPH.
         PERFORM FAIL-CASE
     END-IF
 
-    *> Exact accounting: every buffer is WORKING-STORAGE, so feeding
-    *> twelve near-maximum lines must not grow the process beyond the
-    *> one 2 MiB input line it is allowed to hold, plus slack for the
-    *> pages the runtime touches while scanning.
+    *> The primed baseline includes every fixed WORKING-STORAGE page the
+    *> near-maximum parse touches. Repeating those lines, then filling a
+    *> stopped-reader pipe, may use a little runtime bookkeeping but must
+    *> not add a growing input or output queue.
     COMPUTE WS-GROWTH = WS-PEAK - WS-BASELINE
-    MOVE "growth under repeated near-maximum input is bounded"
+    MOVE "growth after repeated near-maximum input is bounded"
         TO WS-NAME
     PERFORM CHECK-TRUE
     IF WS-GROWTH > 8388608
@@ -156,7 +188,7 @@ MAIN-PARAGRAPH.
     MOVE "a stopped reader applies backpressure rather than buffering"
         TO WS-NAME
     PERFORM CHECK-TRUE
-    IF WS-BLOCKED = 0 AND WS-GROWTH > 8388608
+    IF WS-BLOCKED NOT = 1
         PERFORM FAIL-CASE
     END-IF
 
@@ -192,6 +224,25 @@ BUILD-NEAR-MAX-LINE.
     ADD 2 TO WS-BIG-LEN
     MOVE X"0A" TO WS-BIG(WS-BIG-LEN + 1:1)
     ADD 1 TO WS-BIG-LEN.
+
+FEED-BIG-LINE.
+    CALL "cvx_fixture_feed_adapter" USING
+        BY VALUE WS-IN-FD
+        BY REFERENCE WS-BIG
+        BY VALUE WS-BIG-LEN
+        BY VALUE WS-TIMEOUT-MS
+        BY REFERENCE WS-SENT
+        RETURNING WS-RC.
+
+BUILD-SMALL-LINE.
+    MOVE SPACES TO WS-SMALL
+    MOVE 1 TO WS-SMALL-LEN
+    STRING
+        '{"id":"b","op":"not-an-operation"}' DELIMITED SIZE
+        X"0A" DELIMITED SIZE
+        INTO WS-SMALL WITH POINTER WS-SMALL-LEN
+    END-STRING
+    SUBTRACT 1 FROM WS-SMALL-LEN.
 
 SAMPLE-RSS.
     CALL "cvx_fixture_adapter_rss" USING
