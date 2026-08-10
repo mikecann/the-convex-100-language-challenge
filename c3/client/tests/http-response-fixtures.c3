@@ -3,6 +3,7 @@ module c3_http_response_fixtures;
 import std::io;
 import c3_http;
 import c3_response;
+import c3_values;
 
 fn void require(bool condition, String message)
 {
@@ -35,5 +36,12 @@ fn void main()
     String mutation = c3_http::mutation_envelope("demo:increment", `{"room":"r"}`, "run-1");
     require(query.contains(`"format":"json"`), "query envelope");
     require(mutation.contains(`"idempotencyKey":"run-1"`), "mutation idempotency key");
+
+    int counter = c3_values::parse_counter("1.0")!!;
+    require(counter == 1, "integral decimal counter accepted");
+    int? fractional = c3_values::parse_counter("1.5");
+    bool fractional_rejected = false;
+    if (catch ignored = fractional) fractional_rejected = true;
+    require(fractional_rejected, "fractional counter rejected");
     io::eprintfn("http-response-fixtures: PASS")!!;
 }
