@@ -1,28 +1,170 @@
-# Convex from GDScript
+<img src="logo.png" alt="Godot Engine logo used for GDScript" width="120">
+<!-- Logo source: https://godotengine.org/assets/press/icon_color.png (Godot Engine icon; GDScript has no separate official logo.) -->
 
-This folder demonstrates a small native Convex client written in GDScript and
-running on headless Godot 4. It calls Convex queries, mutations, and actions
-over the documented JSON HTTP API, and subscribes to a reactive query over a
-Live WebSocket, using only Godot's own networking.
+# GDScript
 
-This is educational, unofficial, and not a production SDK. Both the HTTP and
-Live capability badges are earned: the shared coordinator ran the local and
-hosted conformance suites against a clean exact-head build, and both passed
-31 of 31 on each profile.
+[GDScript](https://docs.godotengine.org/en/4.4/tutorials/scripting/gdscript/gdscript_basics.html)
+is Godot Engine's high-level, object-oriented scripting language. It is
+gradually typed, uses indentation-based syntax that will look familiar to a
+Python developer, and is entirely independent from Python. Godot created it
+after earlier work with languages including Lua and Python showed that a
+tightly integrated language made the engine easier to use and maintain.
 
-## Start here
+Its main home is gameplay and application logic inside Godot. The engine's
+[official FAQ](https://docs.godotengine.org/en/4.4/about/faq.html) recommends
+it to people starting with Godot because it is the engine's native language.
+This repository takes it somewhere less usual: a headless Godot 4 process
+talking to Convex. This client is educational, unofficial, and not a
+production SDK.
 
-The [basic example](examples/basics/main.gd) tells the whole story in one
-file. It reads a counter room over HTTP, subscribes to that room before
-changing anything, applies one idempotent increment, waits for the same change
-to arrive over the subscription, and prints its verification line only after
-HTTP and Live agree on the journey from `0` to `1`.
+## Getting Started
 
-The client itself is in [client](client/): `convex.gd` holds the HTTP
-envelopes and the public API, `http.gd` the bounded transport, `live.gd` the
-single owner of the WebSocket, and `subscription.gd` one reactive query.
+Start with the runnable [basic example](examples/basics/main.gd). It reads a
+counter, subscribes before changing it, makes one idempotent mutation, then
+waits for Convex to push the new value back over Live.
 
-## What works
+From the repository root, Docker builds the example image and runs that exact
+file against a unique room:
+
+```sh
+./run verify-example gdscript
+```
+
+## Interesting Parts
+
+### Success and failure are ordinary values
+
+A TypeScript Convex mutation returns a typed promise and rejects on failure.
+This GDScript client instead returns a `Dictionary` containing either `value`
+or `error`, so each network step has an explicit branch.
+
+**TypeScript with React**
+
+```tsx
+import { useMutation } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+function IncrementButton() {
+  const increment = useMutation(api.demo.increment);
+
+  async function incrementOnce() {
+    const result = await increment({
+      room: "gdscript-readme-mutation",
+      language: "typescript",
+      runId: crypto.randomUUID(), // A fresh ID makes this logical write idempotent.
+    });
+    console.log(result.state.count); // The generated API types state and count.
+  }
+
+  return <button onClick={incrementOnce}>Increment</button>;
+}
+```
+
+**GDScript**
+
+```gdscript
+func increment_once() -> void:
+	# Configuration stays outside the script, just like a web app's deployment URL.
+	var deployment_url := OS.get_environment("CONVEX_URL")
+	if deployment_url.is_empty():
+		printerr("CONVEX_URL is required")
+		return
+	var created := ConvexClient.create(deployment_url)
+	if ConvexResult.is_failure(created):
+		printerr(created["error"]["message"])
+		return
+	var client: ConvexClient = created["value"]
+
+	var room := "gdscript-readme-mutation"
+	var arguments := {
+		"room": room,
+		"language": "gdscript",
+		# A fresh ID makes this logical write idempotent.
+		"runId": "gdscript:%s:%d:%d" % [room, Time.get_ticks_usec(), randi()],
+	}
+	var mutated := client.mutation("demo:increment", arguments)
+	if ConvexResult.is_failure(mutated):
+		printerr(mutated["error"]["message"])
+		client.close()
+		return
+
+	# The outer variable is typed, but fields decoded from JSON are Variants.
+	var mutation_value: Dictionary = mutated["value"]
+	var state: Dictionary = mutation_value["state"]
+	var counted := ConvexValues.count_from_json(state.get("count"), "mutation count")
+	if not ConvexResult.is_failure(counted):
+		var count: int = counted["value"] # Explicitly an int after validation.
+		print(count)
+	client.close()
+```
+
+GDScript supports optional type annotations, but a `Dictionary` cannot declare
+the type of each field. That matters at the JSON boundary, where Godot parses
+numbers as floats. The client validates whole, finite, exactly representable
+counts before converting them to `int`.
+
+### React owns the hook; this program owns the subscription
+
+`useQuery` subscribes when a component renders and cleans up when it unmounts.
+The command-line GDScript client has no component lifecycle, so it creates the
+client, waits for one delivery, then closes both handles itself.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function RoomCount() {
+  const state = useQuery(api.demo.state, {
+    room: "gdscript-readme-live",
+  });
+  if (state === undefined) return <span>Loading...</span>;
+  // Generated types make state.count a number; React rerenders for later values.
+  return <span>{state.count}</span>;
+}
+```
+
+**GDScript**
+
+```gdscript
+func read_first_live_value() -> void:
+	var deployment_url := OS.get_environment("CONVEX_URL")
+	if deployment_url.is_empty():
+		printerr("CONVEX_URL is required")
+		return
+	var created := ConvexClient.create(deployment_url)
+	if ConvexResult.is_failure(created):
+		return
+	var client: ConvexClient = created["value"]
+
+	# subscribe returns a handle for this one reactive query.
+	var subscribed := client.subscribe(
+		"demo:state",
+		{"room": "gdscript-readme-live"},
+	)
+	if ConvexResult.is_failure(subscribed):
+		client.close()
+		return
+	var subscription: ConvexSubscription = subscribed["value"]
+
+	# This client API blocks here and drives Godot's WebSocket polling itself.
+	var update := subscription.next_update(15.0)
+	if not ConvexResult.is_failure(update):
+		var state: Dictionary = update["value"]
+		print(state.get("count"))
+
+	# There is no React unmount, so cleanup is our responsibility.
+	subscription.close()
+	client.close()
+```
+
+Godot has signals and `await`, but this client does not expose Live that way.
+Its blocking `next_update` is an API choice for a compact headless example,
+not a limitation of GDScript. A game loop can instead call `client.poll()` and
+use the non-blocking `try_next_update()` method.
+
+## Status
 
 | Surface | Repository state |
 | --- | --- |
@@ -32,7 +174,7 @@ single owner of the WebSocket, and `subscription.gd` one reactive query.
 | Docker images and the hardened runtime | Built and verified on both profiles |
 | Earned capabilities | http, live |
 
-## Basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.gd -->
 ```gdscript
@@ -207,112 +349,44 @@ func _report(result: Dictionary, step: String) -> int:
 ```
 <!-- END GENERATED EXAMPLE -->
 
-The block above is projected from the runnable source. Run `./run
-sync-examples` after changing it so the README and the website show the same
-code. The shared projector has no GDScript entry in its fence map yet, so the
-block is fenced as plain text; adding one is a shared-infrastructure change.
+The block above is projected byte-for-byte from the runnable source. If that
+source changes, `./run sync-examples` updates both this README and the website.
 
-## Docker checks
+## Implementation Notes
 
-`./run test gdscript` formats, lints, parses, and executes every language-local
-test inside Docker, then exports the two release packs. `./run build gdscript`
-produces the minimal adapter runtime image, and the shared example verifier
-builds the separate `example-runtime` image. Only the coordinator runs
-`./run verify-example gdscript`, `./run verify gdscript`, and
-`./run verify-hosted gdscript` against the approved deployments.
+This is a native GDScript client. Godot's
+[`HTTPClient`](https://docs.godotengine.org/en/4.4/classes/class_httpclient.html)
+provides HTTP and TLS, while
+[`WebSocketPeer`](https://docs.godotengine.org/en/4.4/classes/class_websocketpeer.html)
+handles WebSocket framing. The Convex request envelopes, bearer token header,
+Live query set, reconnects, deadlines, and structured errors are implemented
+in GDScript under [client](client/).
 
-Both runtime images pair Godot's Linux release export template, which contains
-no editor and no exporter, with one exported pack. The build proves inside each
-final image that the pack boots, that the example fails closed without
-configuration while writing nothing at all to standard output, and that the
-adapter answers `hello` and `close` with exactly two NDJSON lines.
+One `ConvexLive` object exclusively owns the socket. A subscription queues at
+most 16 updates and charges them against a 16 MiB budget, dropping the oldest
+state for a slow consumer. That is a useful fit for reactive state: the newest
+value matters more than replaying every intermediate value.
 
-## Conformance and protocol notes
-
-The conformance executable under
-[client/tests/conformance](client/tests/conformance/) speaks NDJSON adapter
-protocol v1 over standard input and output, or over the TCP address in
-`ADAPTER_LISTEN`, which is what the isolated harness uses. Failures are
-serialized as `FunctionError`, `ProtocolError`, `TransportError`, or
-`ClosedError`, and absent optional fields are omitted rather than sent as null.
-
-One owner object holds the only `WebSocketPeer`. Subscriptions, the example,
-and the adapter send it commands; nothing else reads, writes, closes, or
-reconnects a socket, and the owner refuses any command that arrives from a
-different thread. Each subscription keeps at most 16 updates and a
-conservatively charged 16 MiB memory budget, and
-drops and counts the oldest beyond that. The adapter's output queue holds at
-most 64 events and 8 MiB, including the line currently being written, so a
-TCP controller that stops reading produces a structured, bounded transport
-failure rather than unbounded growth. With one 2 MiB inbound Live frame, one
-2 MiB HTTP response, and one subscription queue added, retained application
-buffers remain well below the shared 128 MiB limit.
-
-Godot supplies the parts a native client should not reimplement: HTTPClient
-does HTTP/1.1 and TLS, and WebSocketPeer does the HTTP 101 handshake, frame
-masking, continuation-frame reassembly, UTF-8 validation, and ping and close
-control frames. Convex-specific behaviour is all GDScript: the request and
-response envelopes, `format: "json"`, bearer transport, the query set and its
-versions, atomic transition application, unchanged-rehydration suppression,
-timestamp tracking, backoff, and every deadline.
-
-Godot only loads its own certificate trust store from a code path this
-client's headless `--script` launch never takes (see
-[client/certs.gd](client/certs.gd) for the mechanism), so `TLSOptions.client()`
-with no explicit chain cannot verify a TLS connection in this runtime.
-`ConvexClient` supplies its own trust store instead: a certificate bundle
-generated at build time from the pinned `ca-certificates` Debian package,
-loaded once and passed to every HTTP and Live connection unless a caller
-supplies its own `tls_options`.
-
-The image pins Godot 4.4.1-stable by the published SHA-512 of its Linux
-editor archive and export templates, Debian bookworm-slim and BusyBox
-1.37.0-musl by digest, and gdtoolkit 4.3.4 for `gdformat` and `gdlint`. The
-runtime shell is built from checksum-pinned BusyBox source with only the
-required applets compiled in. The Live wire profile is pinned to
-`convex-rs-0.10.4-unversioned-sync` at source commit
+The headless `--script` path used here does not load Godot's normal certificate
+trust store, so the Docker build bundles the pinned Debian CA bundle and passes
+it explicitly to HTTP and Live connections. The runtime uses Godot
+4.4.1-stable, and the Live implementation is pinned to the
+`convex-rs-0.10.4-unversioned-sync` profile at commit
 `6f1df8a8ba1665084ec001e307ca841ca17074d7`.
 
-## Limitations
+`./run test gdscript` runs formatting, linting, parsing, and language-local
+tests in Docker. `./run build gdscript` builds the minimal adapter runtime.
+Those checks are different from the shared deployment verification recorded
+in the status table above.
 
-Values cover Convex's JSON-safe subset. Godot's JSON parser decodes every
-number as a float and is lax about numeric literals, so integers are validated
-and converted rather than cast. Values outside JavaScript's safe integer range
-are refused instead of rounded, including a literal that Godot already rounded
-while parsing.
+## Known Issues
 
-Standard input is the transport with a genuine Godot limitation behind it.
-`OS.read_buffer_from_stdin` blocks until the requested number of bytes has
-arrived or the pipe closes, there is no readiness query, no non-blocking mode,
-and no way to cancel a read in progress. The adapter therefore reads standard
-input one byte at a time on a helper thread, which is correct but slow for
-large values, and a controller that keeps the pipe open after `close` leaves
-that thread parked, which the adapter reports on standard error before it
-exits. The TCP transport has none of these problems and is what the shared
-harness uses.
-
-Standard output purity is a property of the runtime image rather than of a
-flag. Godot's `--quiet` cannot be used here: it disables the engine's standard
-output entirely, including the client's own `print`, so it would silence the
-example's six lines along with any engine chatter. The images use the release
-export template instead, which prints no engine banner, and both runtime
-stages prove that at build time by asserting the example writes nothing at all
-to standard output on its failure path and the adapter writes exactly two
-NDJSON lines for a hello and a close.
-
-Godot's standard-output API does not expose partial writes or a non-blocking
-mode. The bounded stopped-reader guarantee therefore applies to the TCP
-adapter transport used by the shared harness. Stdio remains suitable for an
-ordinary reading controller, but it cannot provide the same memory proof.
-
-A partially read WebSocket frame is not something this client can resume, and
-not because of an oversight: Godot's WebSocketPeer owns frame parsing and
-never exposes a half-read frame to GDScript. The owner places one absolute
-deadline between complete messages and abandons the whole connection when it
-expires. That bounds a continuously dribbled partial frame, but it also means
-GDScript cannot distinguish that attack from a completely idle server. The
-retry opens a new peer, so no read can resume at a false frame boundary.
-
-Live authentication, `TransitionChunk` assembly, optimistic updates, and
-WebSocket mutation replay are deliberately deferred. This demonstration is tied
-to a pinned, undocumented Live profile and treats protocol drift as an error.
+1. Values are limited to Convex's JSON-safe subset and JavaScript's exact
+   integer range because Godot parses JSON numbers as floats.
+2. Standard-input adapter mode reads a byte at a time on a helper thread. The
+   shared harness uses the better-behaved TCP mode.
+3. Godot hides partial WebSocket frames from GDScript. The client bounds the
+   time between complete messages, which also means a completely idle server
+   triggers a reconnect.
+4. Live authentication, `TransitionChunk` assembly, optimistic updates, and
+   WebSocket mutation replay are not implemented.
