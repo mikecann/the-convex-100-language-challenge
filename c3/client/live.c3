@@ -22,6 +22,43 @@ struct Subscription
     bool closed;
 }
 
+struct Manager
+{
+    usz query_set_version;
+    usz connection_count;
+    usz reconnect_generation;
+    bool connected;
+}
+
+fn void manager_init(Manager* manager)
+{
+    manager.reconnect_generation = 1;
+}
+
+// The owner calls this only after a successful RFC6455 handshake. Every
+// active Add is replayed against a fresh query-set version by the caller.
+fn void manager_connected(Manager* manager)
+{
+    manager.connected = true;
+    manager.query_set_version = 0;
+}
+
+fn usz manager_next_query_set_version(Manager* manager)
+{
+    manager.query_set_version++;
+    return manager.query_set_version;
+}
+
+// debugDisconnect retires the old generation before its acknowledgement.
+// Any relay holding an older generation must discard rather than emit it.
+fn void manager_debug_disconnect(Manager* manager)
+{
+    manager.connected = false;
+    manager.connection_count++;
+    manager.reconnect_generation++;
+    manager.query_set_version = 0;
+}
+
 fn void subscription_init(Subscription* subscription, usz query_id)
 {
     subscription.query_id = query_id;
