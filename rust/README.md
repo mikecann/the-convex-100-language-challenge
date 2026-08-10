@@ -1,23 +1,188 @@
-# Convex from Rust
+<img src="logo.png" alt="Rust logo" width="96">
+<!-- Logo source: https://www.rust-lang.org/static/images/rust-logo-blk.svg -->
 
-This educational Rust demonstration calls Convex over its documented JSON HTTP
-endpoints and keeps one query updated through the pinned `/api/sync` WebSocket
-profile. It is unofficial and is not a production SDK.
+# Rust
 
-## Start here
+[Rust](https://www.rust-lang.org/) is a compiled systems language built for
+reliable, efficient software. Its ownership model provides memory and thread
+safety without a garbage collector, giving it C- and C++-like control with more
+checks at compile time. [Rust 1.0 arrived in
+2015](https://blog.rust-lang.org/2015/05/15/Rust-1.0/), and the language is now
+used for command-line tools, network services, embedded software, WebAssembly,
+and performance-sensitive parts of larger applications.
 
-The [canonical basic example](examples/basics/main.rs) creates a client, reads
-a counter, starts Live, mutates the counter, and proves the Live update agrees.
+This repository uses Rust to implement a small native Convex client. It is an
+educational, unofficial demonstration, not a production SDK or a project
+endorsed by Convex or the Rust project.
 
-## What works
+## Getting Started
+
+Start with the [canonical basic example](examples/basics/main.rs). It reads a
+counter, opens a Live subscription, applies a mutation, and checks that the
+reactive update agrees with the mutation result.
+
+From the repository root, Docker builds and runs that exact program against a
+dedicated verification deployment:
+
+```sh
+./run verify-example rust
+```
+
+You do not need a Rust toolchain installed on the host.
+
+## Interesting Parts
+
+### The type system stops at the JSON boundary
+
+Convex's generated TypeScript API carries the result type into a React
+component. This Rust client deliberately returns `serde_json::Value`, so Rust
+can check a decoded struct but cannot infer its shape from the Convex function.
+
+**TypeScript with React**
+
+```tsx
+import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
+
+function RoomCount() {
+  const state = useQuery(api.demo.state, { room: "readme-rust" });
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // `state` and `count` are type-safe here.
+}
+
+export function App() {
+  return (
+    <ConvexProvider client={convex}>
+      <RoomCount />
+    </ConvexProvider>
+  );
+}
+```
+
+**Rust**
+
+```rust
+use convex_rust_demo::Client;
+use serde::Deserialize;
+use serde_json::json;
+
+#[derive(Deserialize)]
+struct State {
+    count: f64, // Decoding is where this JSON field becomes type-checked.
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let deployment = std::env::var("CONVEX_URL")?;
+    let client = Client::new(&deployment)?;
+    let result = client.query("demo:state", json!({ "room": "readme-rust" }))?;
+    let state: State = serde_json::from_value(result.value)?;
+    println!("{}", state.count);
+    client.close()?;
+    Ok(())
+}
+```
+
+The Rust call is a one-off HTTP query, not the equivalent of React's reactive
+`useQuery` hook. The [full example](examples/basics/main.rs) also handles the
+fact that a whole Convex number may be encoded as either `1` or `1.0`.
+
+### A Live subscription is a resource you own
+
+React starts and stops a query subscription with the component lifecycle. The
+Rust API instead exposes a subscription and a blocking `recv_timeout` mailbox.
+That blocking shape is a choice made by this small client, not a limitation of
+Rust, which also supports callbacks, channels, and async streams.
+
+**TypeScript with React**
+
+```tsx
+import {
+  ConvexProvider,
+  ConvexReactClient,
+  useMutation,
+  useQuery,
+} from "convex/react";
+import { api } from "../convex/_generated/api";
+
+const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
+
+function Counter() {
+  const room = "readme-live-rust";
+  const state = useQuery(api.demo.state, { room }); // React owns the subscription.
+  const increment = useMutation(api.demo.increment);
+  const addOne = () =>
+    increment({ room, language: "typescript", runId: crypto.randomUUID() });
+
+  return <button onClick={() => void addOne()}>{state?.count ?? "Loading..."}</button>;
+}
+
+export function App() {
+  return (
+    <ConvexProvider client={convex}>
+      <Counter />
+    </ConvexProvider>
+  );
+}
+```
+
+**Rust**
+
+```rust
+use convex_rust_demo::Client;
+use serde_json::json;
+use std::time::Duration;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let deployment = std::env::var("CONVEX_URL")?;
+    let room = "readme-live-rust";
+    let client = Client::new(&deployment)?;
+    let live = client.subscribe("demo:state", json!({ "room": room }))?;
+
+    // This client exposes the next reactive value through a blocking mailbox.
+    let initial = live.updates().recv_timeout(Duration::from_secs(10))?;
+    if let Some(error) = initial.error {
+        return Err(Box::new(error));
+    }
+    println!("initial: {}", initial.value.expect("initial value")["count"]);
+
+    let mutation = client.mutation(
+        "demo:increment",
+        json!({
+            "room": room,
+            "language": "rust",
+            "runId": uuid::Uuid::new_v4().to_string()
+        }),
+    )?;
+    println!("mutation: {}", mutation.value["state"]["count"]);
+
+    // The next mailbox item is the reactive result of that mutation.
+    let updated = live.updates().recv_timeout(Duration::from_secs(10))?;
+    if let Some(error) = updated.error {
+        return Err(Box::new(error));
+    }
+    println!("updated: {}", updated.value.expect("updated value")["count"]);
+
+    live.close()?; // Explicitly remove the query before stopping its owner loop.
+    client.close()?;
+    Ok(())
+}
+```
+
+The owned subscription makes cleanup and timeout policy visible. Its mailbox
+keeps the newest 16 updates, so a slow command-line consumer stays bounded but
+may not observe every intermediate value.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
 | HTTP queries, mutations, actions, and bearer-token replacement | Verified by shared local and hosted conformance |
-| Live query snapshots, updates, unsubscribe, reconnect | Verified by shared local and hosted conformance |
+| Live query snapshots, updates, unsubscribe, and reconnect | Verified by shared local and hosted conformance |
 | Live authentication and optimistic writes | Deferred |
 
-## Basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.rs -->
 ```rust
@@ -122,27 +287,37 @@ fn main() {
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-`./run test rust` formats, tests, and compiles the binaries inside Docker.
-`./run verify-example rust` executes the exact example. `./run verify rust`
-runs the shared black-box adapter conformance profile.
+This is a native Rust implementation. It uses blocking `reqwest` calls with
+Rustls for Convex's documented HTTP endpoints, `serde_json` for values, and
+`tungstenite` for Live WebSocket transport. Convex-specific request, response,
+subscription, and reconnect behaviour is implemented in
+[`client/lib.rs`](client/lib.rs), not delegated to another Convex client.
 
-## Protocol notes
+One owner thread is solely responsible for the Live socket and active query
+set. Other threads send it commands, which avoids concurrent reads and writes
+on the same connection. Each subscription receives updates through a bounded
+mailbox. Dropping a subscription also requests cleanup, while the example calls
+`close` explicitly so the lifecycle is obvious to a reader.
 
-The adapter speaks NDJSON v1 over stdin/stdout or the exact `ADAPTER_LISTEN`
-TCP address. `debugDisconnect` is adapter-only and deliberately forces the
-ordinary reconnect path. One owner thread serializes every Live query-set
-change and acknowledges removal, disconnect, and close only after the state
-transition completes. The adapter serializes subscription generations with its
-NDJSON writer so stale relays cannot cross an acknowledgement.
+The Docker build pins Rust 1.89.0 and produces static `linux/amd64` binaries.
+The final images contain the example or adapter, certificates, and only the
+small shell surface required by the shared verifier. They run as user
+`65532:65532`; Cargo, `rustc`, package managers, Node.js, and Python are absent.
 
-Live delivery has a per-subscription newest-16 mailbox, dropping the oldest
-intermediate value for a slow consumer. Reconnect backoff resets only after a
-valid server message, and the client carries the newest observed timestamp into
-the next `Connect` message.
+For the repository's test layers, `./run test rust` checks formatting, unit
+tests, compilation, and target architecture inside Docker. The Getting Started
+command executes the canonical example. `./run verify rust` and
+`./run verify-hosted rust` are the separate shared conformance profiles used by
+the recorded capability evidence.
 
-## Limitations
+## Known Issues
 
-This only implements the JSON-safe value subset. `TransitionChunk`, Live auth,
-optimistic updates, and WebSocket mutations/actions are explicitly deferred.
+1. Live follows a pinned, unversioned sync profile. `TransitionChunk` assembly,
+   Live authentication, optimistic updates, and WebSocket mutations or actions
+   are not implemented.
+2. The public value surface is JSON-only. Convex-specific values outside the
+   JSON-safe subset do not receive dedicated Rust types or codecs.
+3. Each Live subscription keeps only its newest 16 updates. If a consumer falls
+   behind, older intermediate states are dropped while the newest state is kept.
