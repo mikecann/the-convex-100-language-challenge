@@ -1,20 +1,157 @@
-# Convex from Perl
+<img src="logo.png" alt="Perl camel logo" width="160">
+<!-- Logo source: https://raw.githubusercontent.com/metacpan/perl-assets/main/blessed/exports/perl-010-300.png -->
 
-This is a small, native Perl demonstration of Convex HTTP calls and a pinned experimental Live protocol profile.
+# Perl
 
-It is educational and unofficial, not a production SDK or a package to install from CPAN.
+Perl is a high-level, dynamically typed language created by Larry Wall and
+first released in 1987. It draws on C, `sed`, `awk`, and the Unix shell, and is
+especially at home in text processing, system administration, web applications,
+and quick automation. Perl is still actively maintained, while its enormous
+CPAN module archive gives established codebases a long practical life. You can
+learn more at [perl.org](https://www.perl.org/).
 
-## Start here
+This repository contains an educational, unofficial Convex client
+demonstration. It is not a production SDK and is not a package to install from
+CPAN.
 
-[`examples/basics/main.pl`](examples/basics/main.pl) queries a fresh counter room, begins Live, applies an idempotent mutation, then verifies the Live update.
+## Getting Started
 
-## What works
+Start with [`examples/basics/main.pl`](examples/basics/main.pl). It queries a
+fresh counter room, starts a Live subscription, applies an idempotent mutation,
+and receives the resulting update.
+
+From the repository root, run the exact canonical example in its minimal Docker image:
+
+```sh
+./run verify-example perl
+```
+
+Docker supplies the pinned Perl runtime and dependencies, so you do not need to
+install Perl or CPAN packages on your host.
+
+## Interesting Parts
+
+### JSON objects become hash references
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function RoomCount() {
+  const room = "perl-readme-query";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>Count: {state.count}</p>; // The generated API types state.count.
+}
+```
+
+**Perl**
+
+```perl
+use strict;
+use warnings;
+use Convex;
+
+my $deployment_url = $ENV{CONVEX_URL} // die "CONVEX_URL is required";
+my $room           = 'perl-readme-query';
+
+# Create the client for the deployment selected by the verifier.
+my $client = Convex->new($deployment_url);
+
+# A hash reference is Perl's counterpart to the JavaScript argument object.
+my $response = $client->query( 'demo:state', { room => $room } );
+
+# The client returns a { value, logs } envelope. Arrow access follows nested
+# hash references, but Perl does not statically check the shape or count type.
+my $count = $response->{value}{count};
+print "Count: $count\n";
+$client->close;    # Release client resources explicitly.
+```
+
+The React hook keeps a reactive query alive and rerenders the component. Perl's
+`query` here is a one-off HTTP call, so the comparable part is constructing the
+argument object and reading the result, not the subscription lifecycle.
+
+### Live updates are pulled explicitly
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function CounterButton() {
+  const room = "perl-readme-live";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  async function addOne() {
+    const runId = crypto.randomUUID();
+    const result = await increment({ room, language: "typescript", runId });
+    console.log(result.state.count); // The mutation returns the new state.
+  }
+
+  return (
+    <button onClick={addOne} disabled={state === undefined}>
+      {state === undefined ? "Loading..." : `Count: ${state.count}`}
+    </button>
+  );
+}
+```
+
+**Perl**
+
+```perl
+use strict;
+use warnings;
+use Convex;
+
+my $deployment_url = $ENV{CONVEX_URL} // die "CONVEX_URL is required";
+my $room = 'perl-readme-live';
+my $run_id = join '-', 'perl-readme', time, int( rand(1_000_000) );
+
+# One client owns the HTTP calls and the shared Live worker.
+my $client = Convex->new($deployment_url);
+
+# Subscribe before mutating, then wait for the initial server value.
+my $subscription = $client->subscribe( 'demo:state', { room => $room } );
+my $initial      = $subscription->next_update(10);
+die $initial->{error} if $initial->{error};
+print "Initial count: ", $initial->{value}{count}, "\n";
+
+# Send an idempotency key and read the updated state from the HTTP result.
+my $mutation = $client->mutation(
+    'demo:increment',
+    { room => $room, language => 'perl', runId => $run_id }
+);
+print "Mutation count: ", $mutation->{value}{state}{count}, "\n";
+
+# next_update blocks for this subscription's next value or the timeout.
+my $updated = $subscription->next_update(10);
+die $updated->{error} if $updated->{error};
+print "Updated count: ", $updated->{value}{count}, "\n";
+
+$subscription->close;    # Remove this query from the Live connection.
+$client->close;          # Stop the shared worker and release its socket.
+```
+
+React owns the `useQuery` subscription and rerender lifecycle. This command-line
+API instead makes ownership visible through `subscribe`, blocking
+`next_update`, and `close`. Blocking is a deliberate client API choice, not a
+limitation of the Perl language.
+
+## Status
 
 | Behaviour | Status |
 | --- | --- |
 | Documented JSON HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
 | Pinned `/api/sync` Live query profile | Verified by shared local and hosted conformance |
 | Capability badges | HTTP and Live earned |
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.pl -->
 ```perl
@@ -101,49 +238,42 @@ $client->close;
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
 ```sh
 ./run test perl
 ./run build perl
 ```
 
-The first checks every source against Perl::Tidy 20260705, runs Perl::Critic
-1.156 at severity 5, performs syntax checks, and executes the language-local
-fixture matrix. All 37 build-only formatter and linter distributions are pinned
-by version, CPAN author path, and SHA-256 in
-[`client/tooling-cpan.lock`](client/tooling-cpan.lock); installation uses an
-empty local mirror so undeclared transitive downloads fail. The second builds
-the minimal linux/amd64 adapter runtime.
-Coordinator-owned `verify-example`, `verify`, and `verify-hosted` are required
-before either capability can be awarded.
+`./run test perl` checks formatting with Perl::Tidy 20260705, runs Perl::Critic
+1.156, performs syntax checks, and executes the language-local fixture suite.
+`./run build perl` builds the minimal `linux/amd64` adapter runtime. The
+formatter and linter dependencies are build-only and locked in
+[`client/tooling-cpan.lock`](client/tooling-cpan.lock).
 
-## Conformance notes
+The client is native Perl. [`client/Convex.pm`](client/Convex.pm) implements the
+documented JSON HTTP calls with `HTTP::Tiny` and `JSON::PP`; it does not delegate
+Convex behavior to another language's SDK. HTTP calls return a small envelope
+containing the decoded `value` and any server `logs`, which is why the examples
+read `$response->{value}` rather than the value directly.
 
-The adapter speaks NDJSON protocol v1 over stdin/stdout or `ADAPTER_LISTEN` TCP.
-Live is implemented with one worker that owns WebSocket reads, writes,
-reconnects, and query-set versions; each subscriber gets a newest-16 mailbox.
-Partial handshake and frame reads or writes abandon the connection after a
-two-second deadline. A partial write force-retires the uncertain stream before
-active Add operations are rehydrated on a new connection. Adapter EOF performs
-the same subscription, relay, client, and socket cleanup as an explicit close,
-without writing to the disconnected controller. Adapter NDJSON writes have a
-one-second complete-write deadline and force-retire a partial controller stream
-so EOF cleanup cannot wait forever behind output backpressure. Deterministic
-fixtures cover Add/Remove, QueryFailed recovery, five reconnects and metadata,
-unchanged hydration suppression, stale relay races, fragmented UTF-8 and
-control frames, structured recovery, partial and blocked writes, EOF, and
-hostile shutdown.
-`debugDisconnect` is adapter-only.
+For Live queries, one worker owns WebSocket I/O, reconnects, and the active
+query set. Each subscription has a bounded mailbox that keeps the newest 16
+updates, so a slow consumer cannot grow memory without limit. The explicit
+`next_update` method fits a terminal example and makes timeout handling clear,
+even though Perl also supports event-loop and callback-based designs.
 
-Runtime transport modules are supplied by the digest-pinned Perl 5.42.0 image:
-HTTP::Tiny 0.090, JSON::PP 4.16, IO::Socket::SSL 2.091, MIME::Base64 3.16_01,
-and Net::SSLeay 1.94. Final images use the pinned amd64 distroless Debian 12
-nonroot base, then add only the traced Perl and TLS runtime closure, the shell
-and text tools required by shared policy, and the client sources. CPAN and
-ExtUtils::MakeMaker modules are absent, as are compiler, linker, package
-manager, formatter, and linter commands.
+The final images use a digest-pinned Perl 5.42.0 build and an amd64 distroless
+Debian 12 nonroot base. They retain only the traced Perl and TLS runtime closure,
+the client, and the small shell surface required by the shared verifier. CPAN,
+compilers, linkers, formatters, and linters are not present in the runtime.
 
-## Limitations
+## Known Issues
 
-Live authentication, WebSocket mutations/actions, transition-chunk assembly, journals, optimistic updates, and full Convex value support are deliberately deferred. The sync endpoint is pinned experimental compatibility work, not a stable public protocol.
+1. Live authentication, WebSocket mutations and actions, transition-chunk
+   assembly, and full Convex value support are deferred. Mutations and actions
+   currently use the documented HTTP API.
+2. Live compatibility targets a pinned, undocumented `/api/sync` profile. It
+   is experimental compatibility work, not a stable public SDK contract.
+3. The Live mailbox retains only the newest 16 updates per subscription. A slow
+   consumer can miss older intermediate values.
