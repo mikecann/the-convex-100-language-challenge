@@ -1,27 +1,177 @@
-# Convex from COBOL
+# COBOL
 
-A small Convex client written in GnuCOBOL. It reads a shared counter over
-Convex's HTTP API, subscribes to the same query over a WebSocket, increments
-the counter once, and watches the new value arrive on the subscription.
+COBOL is an English-like compiled language designed for business data
+processing. CODASYL created it in 1959, drawing partly on Grace Hopper's
+FLOW-MATIC. It became a standard language and is still maintained as
+[ISO/IEC 1989:2023](https://www.iso.org/standard/74527.html). Its present-day
+niche is the long-lived transaction and administrative software used by banks,
+insurers, governments, and other large organisations. This implementation uses
+[GnuCOBOL](https://gnucobol.sourceforge.io/), which compiles COBOL through C to
+a native executable. [IBM's COBOL overview](https://www.ibm.com/think/topics/cobol)
+has a concise history and a current view of where the language is used.
 
 This is an educational demonstration, not an official Convex SDK and not a
-package intended for use in production. It exists to answer one question:
-can a language from 1959 hold up its end of a modern reactive protocol?
+package intended for production use.
 
-Mostly, yes. JSON, HTTP/1.1, the RFC 6455 framing, and every piece of Convex
-behaviour are written in COBOL. A small reviewed C file supplies only the four
-things the COBOL runtime genuinely cannot: a monotonic clock, a cryptographic
-random source, a SHA-1 digest, and byte movement over TCP and TLS.
+## Getting Started
 
-## Start here
+Start with [`examples/basics/main.cbl`](examples/basics/main.cbl). It reads a
+room's counter, starts a Live subscription before changing the value, performs
+one idempotent increment, and waits for Live to deliver the result.
 
-[`examples/basics/main.cbl`](examples/basics/main.cbl) is the whole journey in
-one program. It queries the counter, subscribes *before* mutating so the
-increment cannot slip past unobserved, applies the mutation with an
-idempotency key, and prints its verification line only once HTTP and Live
-agree on the same `0 -> 1` story.
+From the repository root, run the canonical program in its Docker image against
+a unique room on the approved test deployment:
 
-## What works
+```sh
+./run verify-example cobol
+```
+
+## Interesting Parts
+
+### Objects become fixed records and explicit JSON text
+
+In React, generated bindings give the argument and result their TypeScript
+shapes. This COBOL client instead accepts JSON in a fixed buffer and returns a
+raw JSON span. The program tracks every meaningful length, then asks its own
+JSON reader for the `count` member.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const state = useQuery(api.demo.state, { room: "interesting-parts" });
+  // api.demo.state is generated, so state.count is type-safe here.
+  return <p>{state?.count ?? "Loading..."}</p>;
+}
+```
+
+**COBOL**
+
+```cobol
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+COPY "cvx-limits.cpy".
+COPY "cvx-client.cpy".
+01 URL-BUFFER       PIC X(1024).
+01 URL-LENGTH       BINARY-LONG.
+01 CLIENT-VERSION   PIC X(64) VALUE "cobol-readme".
+01 CLIENT-V-LENGTH  BINARY-LONG VALUE 12.
+01 FUNCTION-PATH    PIC X(256) VALUE "demo:state".
+01 PATH-LENGTH      BINARY-LONG VALUE 10.
+*> The Convex argument object is JSON text plus its used length.
+01 ARGUMENTS-JSON   PIC X(8192) VALUE '{"room":"interesting-parts"}'.
+01 ARGUMENTS-LENGTH BINARY-LONG VALUE 28.
+01 OPERATION        BINARY-LONG VALUE 1. *> 1 means HTTP query.
+01 STATUS-CODE      BINARY-LONG.
+01 JSON-SLOT        BINARY-LONG VALUE 1.
+01 ROOT-NODE        BINARY-LONG.
+01 COUNT-NODE       BINARY-LONG.
+01 MEMBER-NAME      PIC X(64) VALUE "count".
+01 MEMBER-LENGTH    BINARY-LONG VALUE 5.
+01 COUNT-VALUE      BINARY-DOUBLE.
+
+PROCEDURE DIVISION.
+    ACCEPT URL-BUFFER FROM ENVIRONMENT "CONVEX_URL"
+    COMPUTE URL-LENGTH = FUNCTION LENGTH(FUNCTION TRIM(URL-BUFFER))
+
+    *> Configure the HTTP endpoint and Live socket owned by this client.
+    CALL "cvx-client-init" USING URL-BUFFER URL-LENGTH CLIENT-VERSION
+        CLIENT-V-LENGTH CVX-ERROR STATUS-CODE
+
+    *> The result comes back as a raw JSON span in CVX-RESULT.
+    CALL "cvx-client-call" USING OPERATION FUNCTION-PATH PATH-LENGTH
+        ARGUMENTS-JSON ARGUMENTS-LENGTH CVX-RESULT CVX-ERROR STATUS-CODE
+
+    *> Decode the same state.count value that TypeScript exposes directly.
+    CALL "cvx-json-parse" USING JSON-SLOT CVX-R-VALUE CVX-R-VALUE-LEN
+        STATUS-CODE
+    CALL "cvx-json-root" USING JSON-SLOT ROOT-NODE
+    CALL "cvx-json-member" USING JSON-SLOT ROOT-NODE MEMBER-NAME
+        MEMBER-LENGTH COUNT-NODE
+    CALL "cvx-json-int" USING JSON-SLOT COUNT-NODE COUNT-VALUE STATUS-CODE
+    DISPLAY "count: " COUNT-VALUE
+```
+
+The two snippets read the same `api.demo.state` result, but they do not have
+the same lifecycle. `useQuery` remains subscribed and rerenders the component.
+`cvx-client-call` is deliberately a one-off HTTP request.
+
+### React owns reactivity; the COBOL caller pumps it
+
+React subscribes and unsubscribes as the component mounts, changes arguments,
+or unmounts. This command-line API makes that ownership visible. The caller
+registers a query, checks the bounded delivery queue, and drives the one socket
+owner with `cvx-live-pump` until a value arrives.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function LiveCounter() {
+  // React keeps this query subscribed and rerenders after any increment.
+  const state = useQuery(api.demo.state, { room: "live-room" });
+  return <output>{state?.count ?? "Connecting..."}</output>;
+}
+```
+
+**COBOL**
+
+```cobol
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+COPY "cvx-limits.cpy".
+COPY "cvx-client.cpy".
+01 URL-BUFFER       PIC X(1024).
+01 URL-LENGTH       BINARY-LONG.
+01 CLIENT-VERSION   PIC X(64) VALUE "cobol-readme".
+01 CLIENT-V-LENGTH  BINARY-LONG VALUE 12.
+01 FUNCTION-PATH    PIC X(256) VALUE "demo:state".
+01 PATH-LENGTH      BINARY-LONG VALUE 10.
+01 ARGUMENTS-JSON   PIC X(8192) VALUE '{"room":"live-room"}'.
+01 ARGUMENTS-LENGTH BINARY-LONG VALUE 20.
+01 SUBSCRIPTION-ID  BINARY-LONG.
+01 STATUS-CODE      BINARY-LONG.
+01 PUMP-TIMEOUT-MS  BINARY-LONG VALUE 200.
+01 DELIVERY-READY   BINARY-LONG VALUE 0.
+PROCEDURE DIVISION.
+    ACCEPT URL-BUFFER FROM ENVIRONMENT "CONVEX_URL"
+    COMPUTE URL-LENGTH = FUNCTION LENGTH(FUNCTION TRIM(URL-BUFFER))
+    CALL "cvx-client-init" USING URL-BUFFER URL-LENGTH CLIENT-VERSION
+        CLIENT-V-LENGTH CVX-ERROR STATUS-CODE
+
+    *> Register demo:state. The returned number identifies this subscription.
+    CALL "cvx-live-subscribe" USING FUNCTION-PATH PATH-LENGTH
+        ARGUMENTS-JSON ARGUMENTS-LENGTH SUBSCRIPTION-ID CVX-ERROR STATUS-CODE
+
+    PERFORM UNTIL DELIVERY-READY = 1
+        *> First take any value already waiting in the bounded queue.
+        CALL "cvx-live-next" USING SUBSCRIPTION-ID CVX-RESULT CVX-ERROR
+            STATUS-CODE
+        IF STATUS-CODE = CVX-OK
+            MOVE 1 TO DELIVERY-READY
+        ELSE
+            *> No delivery yet, so let the sole socket owner do one step.
+            CALL "cvx-live-pump" USING PUMP-TIMEOUT-MS STATUS-CODE
+        END-IF
+    END-PERFORM
+
+    *> CVX-R-VALUE now contains the latest demo:state object as JSON.
+    DISPLAY CVX-R-VALUE(1:CVX-R-VALUE-LEN)
+    CALL "cvx-live-unsubscribe" USING SUBSCRIPTION-ID CVX-ERROR STATUS-CODE
+    CALL "cvx-live-close" USING STATUS-CODE
+```
+
+The blocking `next` plus explicit `pump` loop is this client's API choice, not
+a general restriction on every COBOL program. It keeps this small client
+single-owner and makes cleanup explicit. The complete example also subscribes
+before its mutation so it cannot miss the resulting update.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -39,7 +189,7 @@ exact-head run of `./run verify-all cobol`: 31/31 conformance checks passed
 against both the local self-hosted backend and the dedicated hosted drift
 target, from the same built image.
 
-## The canonical example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.cbl -->
 ```cobol
@@ -367,22 +517,50 @@ END PROGRAM CONVEX-EXAMPLE.
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verifying
+## Implementation Notes
+
+This is a native GnuCOBOL client. `convex.cbl` owns the public calls and the
+cooperative Live state machine. Separate COBOL modules implement bounded JSON,
+HTTP/1.1 framing, WebSocket framing, base64, UTF-8 validation, and Convex
+timestamp conversion. Convex-specific behaviour remains in COBOL.
+
+A small reviewed C extension supplies only facilities unavailable from the
+GnuCOBOL runtime: monotonic time, cryptographic random bytes, SHA-1, and
+deadline-aware TCP and TLS byte movement. GnuCOBOL itself translates the source
+through C and links a native executable. The pinned build uses GnuCOBOL
+`4.0~early~20200606-6+b1` for `linux/amd64`.
+
+Every substantial buffer is fixed in `WORKING-STORAGE`. The client shares
+scratch regions whose lifetimes do not overlap, bounds-checks declared network
+lengths before copying data, and holds at most 16 Live deliveries under a byte
+budget. When the queue fills, it drops the oldest delivery. A stopped adapter
+reader instead applies backpressure through the kernel pipe because the adapter
+writes events synchronously and owns no output queue.
+
+COBOL code has no hidden background task here. `cvx-live-pump` alone opens,
+reads, writes, reconnects, and changes the query set. Tests exercise fragmented
+frames, stalled peers, five reconnects, error recovery, and stale-delivery
+barriers. The adapter's `debugDisconnect` hook exists only for those shared
+tests and is not part of the educational client API.
+
+You can inspect the language-local Docker checks without running shared
+conformance:
 
 ```sh
-./run test cobol             # lint, unit tests, both executables, amd64
-./run verify-example cobol   # the example above, against a unique room
-./run verify cobol           # example plus shared black-box conformance
-./run verify-hosted cobol    # the same, against the hosted drift target
-./run verify-all cobol       # both deployment profiles, one built image
+./run test cobol
 ```
 
-`test` proves the source compiles and that the parser-level tests pass inside
-a genuine `linux/amd64` image. `verify-example` proves the example actually
-talks to Convex and produces the expected values. `verify` adds the shared
-conformance suite. Only the shared result evaluator awards badges.
+The historical capability evidence came from these separate shared gates:
 
-## How it fits together
+```sh
+./run verify cobol
+./run verify-hosted cobol
+./run verify-all cobol
+```
+
+Only the shared result evaluator awards capabilities.
+
+### Source map
 
 | File | Responsibility |
 | --- | --- |
@@ -395,121 +573,21 @@ conformance suite. Only the shared result evaluator awards badges.
 | `client/tests/conformance/adapter.cbl` | Test-only NDJSON adapter |
 | `client/tests/fixtures/convex-fixture.c` | Test-only hostile peers |
 
-### One owner, no threads
-
-COBOL has no threads, so this client is a cooperative single owner rather than
-a worker with mutexes. Exactly one routine, `cvx-live-pump`, ever touches the
-socket: it drains queued work, reads at most one message, and returns. Callers
-reach the transport only by pumping. The "one worker owns the socket" rule the
-Live design needs therefore holds by construction rather than by discipline.
-
-The cost is that the caller must pump. The example and the adapter both do
-this in their main loops, and it is why the adapter can interleave controller
-input, the Live owner, and delivery forwarding without any locking.
-
-### Memory is decided at link time
-
-Every buffer lives in `WORKING-STORAGE`. The client never allocates, so its
-memory ceiling is a property of the binary rather than of what a peer sends.
-The Docker test stage reads `.bss` out of the linked adapter and fails if it
-approaches the shared 128 MiB limit. Declared lengths — `Content-Length`, a
-chunk size, a WebSocket payload length — are all range-checked while they are
-still just numbers, before any byte they describe is accepted.
-
-A second, tighter budget applies specifically to the adapter: repeated
-near-maximum input must not grow its resident memory by more than 8 MiB, since
-every buffer is statically sized and nothing frees. Giving every module its
-own private 2 MiB "just in case" buffer blew through that budget; the fix was
-to have buffers whose lifetimes provably never overlap `REDEFINES` one
-another, and — across the module boundary between the adapter and
-`convex-json.cbl`, where `REDEFINES` cannot reach — to declare one `PIC X`
-item `IS EXTERNAL` in `client/cvx-scratch.cpy` so both programs' redefinitions
-resolve to the same physical storage. The one hazard that approach has: a
-buffer that is simultaneously a `cvx-json-parse` call's source and another
-redefinition's destination becomes a same-address self-copy, which GnuCOBOL
-does not treat as the no-op the COBOL standard implies. `cvx-scratch.cpy`
-documents which redefinition is safe to extend and why.
-
-The other lever was recognizing that some buffers were oversized for what
-they actually ever hold: the adapter's escape/field-extraction scratch is
-declared at 8192 bytes, not 2 MiB, because every real use of it is a short,
-individually-capped protocol field. Since `cvx-json-string` and
-`cvx-json-copy-span` write exactly as many bytes as a field's raw JSON span
-calls for regardless of the destination's real size, a `cvx-json-span-len`
-accessor lets the adapter check a field's raw length before ever copying it,
-rejecting an oversized field instead of overflowing the buffer.
-
-### Live delivery buffering
-
-The client owns a bounded queue, deliberately, rather than relying on a
-runtime mailbox. It is capped by both entry count (16) and a byte budget, and
-the oldest delivery is dropped when a slow consumer lets it fill. An
-unchanged rehydration after a reconnect is suppressed by a per-subscription
-content signature, so a reconnect that re-delivers the same value stays
-invisible to the consumer.
-
-### Testing against a hostile peer
-
-Framing bugs do not show up on a well-behaved connection, so the tests
-drive the real client through real sockets with a peer that misbehaves
-on purpose.
-
-Two fixture shapes, chosen deliberately:
-
-- A **socketpair preloaded with exact bytes**. The client reads through
-  its normal code path while the test controls precisely how much is
-  available at each moment. No timing is involved, so these cases are
-  perfectly reproducible. This covers chunked and oversized bodies,
-  conflicting framing headers, truncated responses, header floods, and
-  every malformed WebSocket frame.
-- A **forked loopback peer** replaying a byte script, used only where
-  timing is the subject: dribbling one byte at a time, and stalling
-  mid-message past the client's deadline.
-
-The resumability case deserves a mention because it is the one that
-catches the bug this parser design exists to prevent. A partial frame
-is made readable, the poll is allowed to time out, the remainder is
-pushed, and the next poll must return the complete message. A parser
-that restarted at a guessed frame boundary would fail it.
-
-For Live, a scripted peer completes a real RFC 6455 handshake, reads
-the client's `Connect` and `ModifyQuerySet` frames, and answers session
-N with count N. Five forced reconnects therefore produce five distinct
-values, so a genuine rehydration is distinguishable from a suppressed
-unchanged one. The peer counts how many sessions saw the client resend
-its `Add` and reports that as its exit status, which is how the
-query-set rebuild is proven rather than assumed.
-
-The fixture translation unit is linked only into test binaries. The
-build asserts that no `cvx_fixture_` symbol survives into the shipped
-`convex-example` or `convex-adapter`.
-
-## Protocol notes
-
 Live targets the pinned `convex-rs-0.10.4-unversioned-sync` profile at
-`/api/sync`, described in [`docs/protocol-profiles.md`](../docs/protocol-profiles.md).
-Convex's realtime protocol is internal and undocumented; this client tracks
-one inspected revision and treats anything else as drift.
+`/api/sync`. That realtime protocol is internal and undocumented, so this
+client treats unexpected transition shapes as protocol drift rather than
+claiming general compatibility.
 
-The WebSocket parser is resumable by construction. Raw bytes accumulate in a
-buffer and a frame is decoded only once it is entirely present, so a read that
-times out halfway through a frame simply leaves the bytes where they are.
-Parser state is never rewound to a guessed frame boundary.
+## Known Issues
 
-`debugDisconnect` is an adapter-only command used by the shared controller to
-force real reconnects. It is not part of the client API.
-
-## Limitations
-
-- A stopped controller stalls the adapter. Events are written
-  synchronously with no output queue, so backpressure lands in the
-  kernel pipe rather than in the process.
-- Live authentication, WebSocket mutations and actions, optimistic updates,
-  and mutation replay are out of scope.
-- `TransitionChunk` assembly is deferred; receiving one retires the
-  connection as profile drift.
-- Live values cover the JSON-safe subset. Tagged Convex value types are
-  deferred.
-- JSON numbers in exponent form round-trip verbatim but are not reduced to
-  integers, so they cannot be read as counts.
-- IPv6 literal hosts in the deployment URL are not parsed.
+1. Live authentication, WebSocket mutations and actions, optimistic updates,
+   and mutation replay are deferred. HTTP authentication and HTTP query,
+   mutation, and action calls are separate supported paths.
+2. `TransitionChunk` assembly is deferred. Receiving one retires the
+   connection as profile drift and starts recovery.
+3. Live values support the JSON-safe subset, not tagged Convex value types.
+4. JSON numbers written with an exponent round-trip as text but are not reduced
+   to integers, so the example cannot accept them as counter values.
+5. A slow Live consumer retains only the newest 16 queued deliveries within the
+   byte budget. Older deliveries are dropped deliberately.
+6. IPv6 literal deployment hosts are not parsed.

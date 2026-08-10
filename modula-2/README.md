@@ -1,23 +1,155 @@
-# Convex from Modula-2
+# Modula-2
 
-This is a small native Modula-2 client for Convex HTTP functions and reactive Live queries, built with GNU Modula-2 (gm2), the GCC front end for the language.
+[Modula-2](https://people.inf.ethz.ch/wirth/projects.html) is Niklaus Wirth's late-1970s revision of Pascal, created to build the Lilith personal workstation's system software. It added separately compiled modules, explicit interfaces, coroutines, and low-level facilities suited to operating systems, tools, teaching, and industrial control software. Wirth later simplified its ideas into Oberon.
 
-It is an educational, unofficial experiment. It is not a production SDK and is not intended for package publication.
+Today Modula-2 is a niche language rather than a mainstream application stack, but its [ISO standard](https://www.iso.org/standard/18583.html) remains current and [GNU Modula-2](https://gcc.gnu.org/onlinedocs/gm2/) is a documented GCC front end. This repository uses GNU Modula-2 14.2.0 to explore what a small, native Convex client looks like without a modern package ecosystem.
 
-## Start here
+This is an educational, unofficial demonstration. It is not a production SDK and is not intended for package publication.
 
-Read [`examples/basics/main.mod`](examples/basics/main.mod). It queries a fresh counter over HTTP, opens a Live subscription before mutating anything, applies one idempotent mutation, and checks that the HTTP query, the mutation result, and the Live subscription all agree on the same `0 -> 1` journey.
+## Getting Started
 
-## What works
+Start with [`examples/basics/main.mod`](examples/basics/main.mod). It queries a fresh counter, opens a Live subscription before changing the counter, sends one idempotent mutation, and confirms the same `0 -> 1` result through both HTTP and Live.
+
+From the repository root, Docker builds the exact canonical example and runs it against the project's approved test deployment:
+
+```sh
+./run verify-example modula-2
+```
+
+## Interesting Parts
+
+### A Convex result arrives as JSON in a fixed buffer
+
+In React, Convex generates TypeScript types from the backend function. This Modula-2 client instead accepts JSON text in caller-owned character arrays, then lets the program decode only the fields it needs.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function StateCount() {
+  const state = useQuery(api.demo.state, { room: "readme-modula-2" });
+
+  if (state === undefined) return <p>Loading</p>;
+  return <p>{state.count}</p>; // state and count are type-safe here.
+}
+```
+
+**Modula-2**
+
+```modula2
+MODULE QueryExample;
+
+FROM ConvexJSON IMPORT Member, IsIntegralNumber;
+FROM Environment IMPORT GetEnvironment;
+FROM STextIO IMPORT WriteString, WriteLn;
+FROM CShim IMPORT ShimExit;
+IMPORT ConvexSync;
+
+VAR
+  url: ARRAY [0..511] OF CHAR;
+  args, value, logs: ARRAY [0..65535] OF CHAR;
+  countText: ARRAY [0..63] OF CHAR;
+  errorName, errorMessage, errorData: ARRAY [0..65535] OF CHAR;
+  transportError: ARRAY [0..255] OF CHAR;
+  found, hasErrorData, ok: BOOLEAN;
+
+BEGIN
+  IF NOT GetEnvironment("CONVEX_URL", url) THEN
+    WriteString("CONVEX_URL is required"); WriteLn;
+    ShimExit(1);
+  END;
+  ConvexSync.Init(url, "");
+  args := '{"room":"readme-modula-2"}'; (* Build the argument object as JSON text. *)
+
+  ConvexSync.Call("query", "demo:state", args, value, logs,
+                  errorName, errorMessage, errorData, hasErrorData,
+                  ok, transportError);
+
+  IF ok AND (errorName[0] = 0C)
+     AND Member(value, "count", countText, found) AND found
+     AND IsIntegralNumber(countText) THEN
+    (* countText is still JSON text, for example "0" or "0.0". *)
+  END;
+END QueryExample.
+```
+
+The React hook is reactive, while `Call` is one HTTP request. The fixed arrays and explicit decoding are choices made by this compact client, not requirements of the Modula-2 language. See [`ConvexJSON.def`](client/ConvexJSON.def) for the small scanning API.
+
+### Live updates happen when the program pumps the connection
+
+React starts and stops a `useQuery` subscription with the component. The command-line client returns a numeric handle immediately, then the program calls `Pump` to advance network work and receive one queued event at a time.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+function Counter() {
+  const room = "readme-modula-2";
+  const state = useQuery(api.demo.state, { room });
+
+  // React and Convex own the subscription lifecycle and rerender on updates.
+  return <p>{state === undefined ? "Loading" : state.count}</p>;
+}
+```
+
+**Modula-2**
+
+```modula2
+MODULE LiveExample;
+
+FROM Environment IMPORT GetEnvironment;
+FROM STextIO IMPORT WriteString, WriteLn;
+FROM CShim IMPORT ShimExit;
+IMPORT ConvexSync;
+
+VAR
+  url: ARRAY [0..511] OF CHAR;
+  args: ARRAY [0..255] OF CHAR;
+  value, logs, errorMessage, errorData: ARRAY [0..8191] OF CHAR;
+  errorName, transportError: ARRAY [0..255] OF CHAR;
+  handle, eventKind, eventHandle: INTEGER;
+  hasErrorData, ok: BOOLEAN;
+
+BEGIN
+  IF NOT GetEnvironment("CONVEX_URL", url) THEN
+    WriteString("CONVEX_URL is required"); WriteLn;
+    ShimExit(1);
+  END;
+  ConvexSync.Init(url, "");
+  args := '{"room":"readme-modula-2"}'; (* Same demo:state argument object. *)
+  ConvexSync.Subscribe("demo:state", args, handle, ok, transportError);
+
+  IF ok THEN
+    REPEAT
+      (* Pump owns the socket and returns at most one Live event per call. *)
+      ConvexSync.Pump(200, eventKind, eventHandle, value, logs,
+                      errorName, errorMessage, errorData, hasErrorData);
+    UNTIL (eventKind <> 0) AND (eventHandle = handle);
+
+    (* value now contains the initial or updated demo:state JSON object. *)
+    ConvexSync.Unsubscribe(handle); (* The CLI owns cleanup explicitly. *)
+  END;
+END LiveExample.
+```
+
+Modula-2 supports coroutines and procedure values. The blocking, bounded `Pump` API is this client's deliberate single-owner design, not a language limitation. It keeps all WebSocket reads, writes, reconnects, and subscription changes in one place.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
 | HTTP queries, mutations, actions, bearer auth, log lines, and structured errors | Implemented; verified by shared conformance on both profiles |
-| Live initial values, external updates, and `QueryFailed` followed by recovery | Implemented; proved against a loopback fixture in `client/tests/TestLive.mod`, and verified by shared conformance on both profiles |
-| Five forced reconnects with Add resend, rehydration suppression, and `connectionCount`/backoff bookkeeping | Implemented; proved against `client/tests/FixtureServer.mod`, and verified by shared conformance on both profiles |
-| WebSocket mutations, actions, Live authentication, optimistic updates | Not implemented |
-| `TransitionChunk` assembly | Not implemented; treated as protocol drift and reconnects |
+| Live initial values, external updates, and `QueryFailed` followed by recovery | Implemented; proved against a loopback fixture in [`client/tests/TestLive.mod`](client/tests/TestLive.mod), and verified by shared conformance on both profiles |
+| Five forced reconnects with subscription resend, unchanged-value suppression, and connection/backoff bookkeeping | Implemented; proved against [`client/tests/FixtureServer.mod`](client/tests/FixtureServer.mod), and verified by shared conformance on both profiles |
+| WebSocket mutations, actions, Live authentication, optimistic updates, and journals | Not implemented |
+| `TransitionChunk` assembly | Not implemented; treated as a protocol error, followed by reconnecting active subscriptions |
 | Production SDK compatibility | Not claimed |
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.mod -->
 ```modula2
@@ -214,33 +346,21 @@ END Basics.
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-```sh
-./run sync-examples
-./run validate
-./run test modula-2
-./run build modula-2
-```
+The public client is split along boundaries that suit Modula-2's module system. Each `.def` file is the small public interface, while its `.mod` partner hides the implementation. `ConvexJSON` scans fixed character arrays without building a dynamic value tree. `ConvexHTTP` implements HTTP/1.1 framing, `ConvexWS` implements WebSocket framing, and `ConvexSync` adds the Convex request shapes and Live subscription behaviour.
 
-The `test` target installs gm2 14.2.0 from Debian trixie, compiles every module and program for real `linux/amd64`, runs the language-local unit and Live acceptance tests, and exercises the NDJSON adapter's hello/close lifecycle. The `build` target produces the non-root `runtime` (adapter) image; `example-runtime` is built the same way with a different Dockerfile target. Root owns `verify-example`, `verify`, and `verify-hosted` because those commands serialize the shared backend and evidence store.
+This is classified as a native client because the Convex-specific work is written in Modula-2. The small [`client/cshim.c`](client/cshim.c) layer provides only general operating-system facilities that GNU Modula-2 does not conveniently expose here: raw sockets, OpenSSL TLS, polling, a monotonic clock, secure random bytes, and SHA-1 for the WebSocket handshake. It does not understand Convex, HTTP, JSON, or WebSocket frames.
 
-## Protocol and runtime notes
+Live uses one process-wide connection. `Subscribe` records work, and the next `Pump` sends it or reads an available server message. A fixed table allows 16 active subscriptions. Pending delivery is a 32-event ring buffer; if a caller stops pumping and fills it, the oldest event is discarded instead of allowing memory to grow without a bound. Reconnects resend active subscriptions and suppress a repeated initial value when its JSON bytes match the last value already delivered.
 
-The client implements Convex's HTTP envelopes and this repository's pinned `/api/sync` profile directly in Modula-2. The only foreign code is `client/cshim.c`, a small C shim (declared to gm2 through `client/CShim.def`'s `DEFINITION MODULE FOR "C"`) that supplies raw POSIX sockets, OpenSSL for TLS, `poll()`, a monotonic clock, CSPRNG bytes, and SHA-1 for the WebSocket handshake key. It contains no Convex, HTTP, JSON, or WebSocket framing logic; all of that is `client/ConvexBase64.mod`, `client/ConvexJSON.mod`, `client/ConvexURL.mod`, `client/ConvexHTTP.mod`, `client/ConvexWS.mod`, and `client/ConvexSync.mod`.
+GNU Modula-2 14.2.0 also shaped some otherwise odd-looking code. The implementation keeps lookup tables in initialized variables because indexing a constant string can crash this compiler, uses top-level helpers instead of certain combinations of nested procedures, and replaces the standard `Strings.Length` for multi-megabyte arrays with bounded scans. These are compiler workarounds documented beside the affected code, not general Modula-2 rules.
 
-`ConvexSync` is a process-wide singleton with one worker: the process calling `Pump()` is the sole owner of the WebSocket socket, reconnect state, and query-set version, matching this repository's requirement that controller and subscription work never touch the socket concurrently. `Add`/`Remove` are queued and flushed the next time `Pump()` runs; a `debugDisconnect`-triggered reconnect resends every still-active `Add` in one `ModifyQuerySet` message and suppresses a rehydrated value that is byte-identical to what the subscription already had, so the observable sequence is initial value, disconnect, external mutation, updated value, never a spurious repeat of the old value. `QueryFailed` is delivered as a structured `FunctionError` without ending the subscription, and a later valid `Transition` recovers it normally. Timestamps are decoded from Convex's base64 little-endian 8-byte counters and compared by magnitude so `maxObservedTimestamp` only advances.
+## Known Issues
 
-Three genuine correctness bugs were found and fixed using the loopback fixture in `client/tests/FixtureServer.mod` together with `client/tests/TestLive.mod`, rather than by inspection: a transport-level disconnect was clearing every subscription's cached "last value", which defeated rehydration suppression on every single reconnect; the reconnect snapshot never cleared its own `addPending` flag, causing a redundant duplicate `Add` for the same query on the very next `Pump()`; and every failure event was hardcoded to report `FunctionError` regardless of its real cause, so a `TransportError` or `ProtocolError` was always misreported. All three are fixed in `client/ConvexSync.mod` and are covered by the deterministic two-process Live acceptance test.
-
-The conformance adapter under `client/tests/conformance/ConvexAdapter.mod` implements NDJSON adapter protocol v1 over both stdin/stdout and TCP (`ADAPTER_LISTEN`), reserves stdout for protocol events, sends diagnostics to stderr, and omits optional fields (`id`, `subscriptionId`, `logs`, `errorData`) rather than serializing them as `null` when absent. `debugDisconnect` is exposed only there, not in the educational client API, exactly as this project requires for proving real reconnects.
-
-GNU Modula-2 14.2.0 (the version Debian trixie packages) has a few undocumented compiler limitations this client works around: indexing a `CONST` string literal can crash the front end with an internal error, so lookup tables such as the base64 alphabet and hex digits are module-level `VAR` arrays assigned once when the module starts; two procedures that each declare their own nested procedure can crash the front end when one calls the other, so `ConvexSync`'s four message builders share flat, top-level `AppendBuf`/`AppendIntBuf` helpers instead of nested ones; and the standard library's `Strings.Length` segfaults on arrays of roughly 2 MiB or larger (this client's buffers routinely are), so every module uses a small hand-written bounded scan for string length instead. Each workaround is commented at its call site in the source.
-
-## Limitations
-
-Live authentication, WebSocket mutations, WebSocket actions, optimistic updates, and journals are deferred; every query, mutation, and action goes over the HTTP API, and Live is read-only subscription delivery. `TransitionChunk` assembly is deferred: receiving one, or any other unrecognised server message type, is reported as a `ProtocolError` and reconnects every active subscription.
-
-At most 16 Live subscriptions may be active at once (`client/ConvexSync.mod`'s fixed subscription table), with a 256-byte path and an 8192-byte argument and last-value cap per subscription. `Pump()` delivers from a bounded ring buffer of the newest 32 pending events; a slow or absent consumer causes the oldest queued event to be dropped rather than unbounded growth, but that overflow path is implemented without a dedicated language-local test yet. HTTP bodies are capped at 2 MiB and WebSocket messages at 4 MiB; chunked HTTP transfer-encoding is rejected as a transport error rather than decoded.
-
-Values are exposed as raw JSON text rather than a richer Modula-2 value tree; the example and tests decode only the specific fields they need. The language-local Docker `test` gate, loopback HTTP/TLS/WebSocket smoke tests, two-process Live acceptance test, and root-owned local and hosted evaluators all passed, earning HTTP and Live.
+1. Live is read-only. Queries, mutations, and actions use HTTP; Live authentication, WebSocket mutations and actions, optimistic updates, and journals are deferred.
+2. Values remain raw JSON text. Callers use `ConvexJSON` to extract the fields they need rather than receiving a richer Modula-2 value tree.
+3. `TransitionChunk` is not assembled. An unrecognised server message becomes a protocol error and causes active subscriptions to reconnect.
+4. The client caps HTTP bodies at 2 MiB and WebSocket messages at 4 MiB, and it rejects chunked HTTP transfer encoding.
+5. Live allows 16 subscriptions, with 8 KiB argument and last-value buffers per subscription. The 32-event overflow behaviour is implemented but does not yet have a dedicated language-local saturation test.
+6. The test adapter has not been pressure-tested with a stopped reader against the shared 128 MiB process limit.

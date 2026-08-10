@@ -1,41 +1,170 @@
-# Convex from Pike
+<img src="logo.png" alt="Pike logo" width="204">
+<!-- Logo source: https://pike.lysator.liu.se/assets/img/pike-logo.svg -->
 
-This folder is a small, deliberately readable Convex client written in Pike. It
-reads a shared counter over Convex's JSON HTTP API, watches the same query over
-a live WebSocket subscription, increments it once, and proves the resulting
-`0 -> 1` journey.
+# Pike
 
-It is educational and unofficial. It is not a Convex SDK, it is not supported,
-and it is not published anywhere. The shared conformance suites have since run
-against this commit and passed, 31 of 31 checks on both the local and the
-hosted profile, so it carries the `http` and `live` badges.
+[Pike](https://pike.lysator.liu.se/) is a dynamic, general-purpose language
+with C- and Java-like syntax, automatic memory management, and strong built-in
+collection types. Fredrik Hübinette began its predecessor, µLPC, in 1994; it
+was renamed Pike in 1996 and later moved to Linköping University. Its roots are
+in multiplayer games and the Roxen web server, while its broader uses include
+network services, multimedia, text processing, and systems administration.
+Pike remains actively developed in 2026, but it is a niche choice compared with
+JavaScript, Java, or C#. The official site has the fuller
+[history](https://pike.lysator.liu.se/about/history/) and current releases.
 
-## Start here
+This repository contains an educational, unofficial Convex client. It is not a
+production SDK, is not supported by Convex, and is not published as a package.
 
-[examples/basics/main.pike](examples/basics/main.pike) is the canonical runnable
-source, and it is the only example projected into this README and the website.
-It walks the whole journey in order: read the room over HTTP, subscribe before
-writing anything, check that Convex's first live value agrees with the HTTP
-read, apply one idempotent increment, and then wait for the reactive update to
-arrive on the subscription that was already open. Nothing is printed as verified
-until HTTP and Live agree.
+## Getting Started
 
-The client itself is in [client/](client/). It is one program assembled from
-seven readable pieces: structured errors, the JSON boundary, byte transport,
-HTTP, RFC 6455, the Live sync state machine, and the client facade.
+Start with the canonical
+[counter example](examples/basics/main.pike). It reads a fresh room, opens a
+Live subscription, increments the counter, and checks the reactive `0 -> 1`
+update. From the repository root, run it in its pinned Docker environment:
 
-## What works
+```sh
+./run verify-example pike
+```
+
+That command builds the minimal example image, gives it a unique room, and
+compares its output with the shared expected transcript. It does not install
+Pike or any build dependency on your host.
+
+## Interesting Parts
+
+### Named arguments are mappings, but returned data needs runtime checks
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function RoomCount() {
+  const room = "readme-pike-room";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // The generated API makes state.count type-safe.
+}
+```
+
+**Pike**
+
+```pike
+string deployment_url = getenv("CONVEX_URL");
+if (!deployment_url || !sizeof(deployment_url))
+  error("CONVEX_URL is required\n");
+
+// Compile this educational client, then connect to the checked deployment.
+object convex = compile_file("client/convex.pike")();
+object client = convex->Client(deployment_url);
+string room = "readme-pike-room";
+
+// ([ ... ]) is Pike's mapping literal, much like a JavaScript object.
+object result = client->query("demo:state", ([ "room": room ]));
+mapping state = convex->require_object(result->value, "demo:state result");
+
+// Mapping lookup returns 0 for both a missing key and a real zero value.
+if (zero_type(state->count))
+  error("demo:state omitted count\n");
+int count = convex->require_whole_number(state->count, "state count");
+write("%d\n", count);
+client->close(); // This command-line program owns its client lifecycle.
+```
+
+Both calls send `{ room: "readme-pike-room" }` to `api.demo.state`, but the
+semantics differ. React's `useQuery` owns a reactive subscription and rerenders
+the component. Pike's `query` is one HTTP snapshot, and the native client
+returns dynamically decoded JSON, so the example checks the object shape and
+number explicitly. Pike's `->` member syntax works for both objects and mapping
+keys, which is convenient until zero is a valid answer.
+
+### A command-line program owns the Live subscription itself
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function IncrementButton() {
+  const room = "readme-pike-live";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  async function onIncrement() {
+    const result = await increment({
+      room,
+      language: "TypeScript",
+      runId: crypto.randomUUID(),
+    });
+    console.log(result.state.count); // The mutation returns the updated state.
+  }
+
+  return <button onClick={onIncrement}>Count: {state?.count ?? 0}</button>;
+}
+```
+
+**Pike**
+
+```pike
+string deployment_url = getenv("CONVEX_URL");
+if (!deployment_url || !sizeof(deployment_url))
+  error("CONVEX_URL is required\n");
+
+// Compile this educational client, then connect to the checked deployment.
+object convex = compile_file("client/convex.pike")();
+object client = convex->Client(deployment_url);
+string room = "readme-pike-live";
+
+// Subscribe before mutating so this handle can observe the pushed update.
+object updates = client->subscribe("demo:state", ([ "room": room ]));
+object initial = updates->next_update(20000); // Wait for initial hydration.
+if (initial->failure)
+  error("initial Live query failed: %s\n", initial->failure->describe());
+write("initial count: %d\n",
+      convex->require_whole_number(initial->value->count, "initial count"));
+
+// Reuse this stable id for retries of this one logical mutation call.
+string run_id = sprintf("pike-%s-%d-%d", room, time(), random(1000000000));
+object result = client->mutation("demo:increment", ([
+  "room": room,
+  "language": "Pike",
+  "runId": run_id,
+]));
+mapping outcome = convex->require_object(result->value, "mutation result");
+write("mutation count: %d\n",
+      convex->require_whole_number(outcome->state->count, "mutation count"));
+
+object changed = updates->next_update(20000); // The existing Live query moved.
+write("live count: %d\n",
+      convex->require_whole_number(changed->value->count, "live count"));
+updates->close();
+client->close(); // Explicit cleanup replaces React's automatic unmount cleanup.
+```
+
+React owns setup, cleanup, and rerendering around `useQuery`. This Pike program
+owns an explicit subscription and closes it itself. The blocking `next_update`
+call is a deliberate API choice for a linear command-line example, not a Pike
+limitation. The same client also supports callbacks, which the conformance
+adapter uses when it needs pushed events instead of a blocking read.
+
+## Status
+
+The reviewed implementation earned both repository capability badges after
+passing 31 of 31 shared checks on both the local and hosted profiles.
 
 | Area | Repository state |
 | --- | --- |
-| HTTP queries, mutations, actions, bearer tokens | Verified locally and hosted |
-| Live subscriptions, reconnect, replay, recovery | Verified locally and hosted |
-| RFC 6455 client framing, masking, bounded close | Implemented in Pike, asserted byte for byte in tests |
-| NDJSON adapter over stdin/stdout and `ADAPTER_LISTEN` | Implemented, with a local TCP round trip in the Docker test stage |
-| Docker images, final runtime, shared verification | Passed for the reviewed source |
+| HTTP queries, mutations, actions, and bearer tokens | Verified locally and hosted |
+| Live subscriptions, reconnect, replay, and recovery | Verified locally and hosted |
+| Implementation provenance | Native Pike |
+| Supported platform | `linux/amd64` |
 | Earned capabilities | HTTP and Live |
 
-## The basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.pike -->
 ```pike
@@ -182,111 +311,49 @@ int main(int argc, array(string) argv)
 ```
 <!-- END GENERATED EXAMPLE -->
 
-Run `./run sync-examples` after changing the source so this block and the
-website stay identical to the file above.
+## Implementation Notes
 
-## Verify it in Docker
+The public client is assembled from seven Pike files under
+[`client/`](client/). `compile_file("client/convex.pike")()` compiles the facade
+and its textual includes into one program at runtime. Pike's standard modules
+provide JSON, sockets, TLS, SHA-1, and base64, but the Convex request envelopes,
+HTTP exchange, WebSocket framing, and Live state machine are implemented here.
+That is why the manifest describes this as native rather than a bridge to an
+existing SDK.
 
-    ./run test pike
-    ./run verify-example pike
-    ./run verify pike
-    ./run verify-hosted pike
+The HTTP API is synchronous and returns a `CallResult` containing a dynamically
+decoded value, log lines, and any classified failure. Live has one owner object
+for socket reads, writes, query changes, and reconnects. Subscriptions can use a
+callback or a bounded relay; the canonical example uses `next_update` because
+the sequence is easier to teach linearly. A relay holds at most 16 updates and
+2 MiB, then fails closed instead of dropping events or growing without limit.
 
-`./run test pike` builds the `test` image on `linux/amd64` and, inside it,
-asserts the container architecture, the exact Pike module surface, and the
-formatting gate; compiles the client, the example, and the adapter; runs every
-language-local test, including the loopback socket tests; and then drives the
-adapter through its stdin lifecycle, a structured `TransportError` from a real
-unconfigured call, its end-of-input lifecycle, and one real `ADAPTER_LISTEN`
-TCP connection. Both minimal images then run their own installed entrypoint
-before they are exported, so a broken shebang, a missing include, or a client
-the stripped runtime cannot compile fails the build rather than a later
-verification run.
+The client pins the `convex-rs-0.10.4-unversioned-sync` profile at source commit
+`6f1df8a8ba1665084ec001e307ca841ca17074d7`. It validates an entire Live
+transition before applying any part of it, replays active subscriptions after a
+reconnect, suppresses unchanged rehydration, and gives stalled frames and close
+handshakes deadlines. Pike has no canonical source formatter, so a local style
+test checks line endings, tabs, trailing whitespace, line width, and source
+characters instead.
 
-`./run verify-example pike` builds the minimal `example-runtime` image and runs
-the exact canonical example above against a unique room, comparing its stdout to
-the shared transcript line for line. `./run verify` adds the shared black-box
-conformance suite against the approved local backend, and `./run verify-hosted`
-repeats both against the hosted drift target. Only the shared result evaluator
-awards capability badges.
+For the wider evidence layers, `./run test pike` covers formatting,
+language-local behavior, compilation, runtime entrypoints, and the adapter TCP
+path inside Docker. `./run verify pike` adds local black-box conformance, while
+`./run verify-hosted pike` repeats it against the hosted drift target. These are
+different claims, and only the shared evaluator awards capabilities.
 
-## Conformance and protocol notes
+## Known Issues
 
-The conformance executable in
-[client/tests/conformance/](client/tests/conformance/) speaks strict NDJSON
-adapter protocol v1 over stdin and stdout, or over one accepted controller
-connection when `ADAPTER_LISTEN` is set. stdout carries protocol events only and
-diagnostics go to stderr. Every operation calls the real client; nothing is
-simulated. Failures are published as `FunctionError`, `ProtocolError`,
-`TransportError`, or `ClosedError`, and optional fields are omitted rather than
-serialized as null, because the shared schema has no room for an invented one.
-
-Live uses the pinned `convex-rs-0.10.4-unversioned-sync` profile at source
-commit `6f1df8a8ba1665084ec001e307ca841ca17074d7`, over `/api/sync`. One owner
-object is the only thing that reads the socket, writes the socket, changes the
-query-set version, or schedules a reconnect; subscribers and the adapter send it
-commands. A `Transition` is fully validated before any of it is applied, so a
-rejected modification cannot advance the version, move the observed timestamp,
-or leave half a transaction visible. Connections carry `connectionCount`,
-`lastCloseReason`, and `maxObservedTimestamp`, replay their active `Add`
-operations, and reset exponential backoff after a completed handshake or a valid
-transition. An unchanged rehydration after a reconnect is suppressed, so the
-observed sequence over five real reconnects stays exactly initial value,
-acknowledgement, external mutation, new value. A connection the server has gone
-quiet on for 30 seconds is retired as `InactiveServer` and replaced, because a
-blackholed socket is indistinguishable from an idle one and would otherwise
-strand every subscription it was carrying.
-
-Underneath all of that, one byte channel owns the socket. It reports itself
-ready only once the stream has proved it can accept application bytes, which
-for TLS means the handshake finished rather than merely started, and it keeps
-the write callback armed only while bytes are actually queued so an idle
-connection cannot spin the backend on a CPU-limited container. A connection
-that fails before its owner has attached handlers still announces that failure
-exactly once, so a refused connect is diagnosed rather than lost. Those are the
-parts an in-process fake cannot prove, so they are tested over loopback with a
-real descriptor.
-
-The RFC 6455 layer is written in Pike over one byte channel. It validates the
-101 accept value against the key it sent, masks every client frame, reassembles
-fragmented messages byte for byte including UTF-8 sequences split across
-fragments, answers pings, and refuses reserved bits, masked server frames,
-oversized frames, malformed control frames, and interleaved data frames. A frame
-that has started arriving keeps its exact parser state; if it stalls past the
-deadline the connection is abandoned rather than resynchronised at a guessed
-boundary. Close is bounded by a deadline, not by the peer: an idle peer, a
-flooding peer, and a peer stalled halfway through a frame all retire on time.
-
-Buffering is deliberate and bounded in both directions. A subscription relay
-holds at most 16 updates and 2 MiB of accounted payload and fails closed with a
-structured transport error rather than growing or silently dropping the oldest
-update. The adapter's output FIFO holds at most 64 events and 8 MiB, counts a
-conservative per-entry allowance alongside the encoded line, and keeps a
-partially written line queued and accounted for while a stopped reader blocks
-the write. Both bounds are asserted by tests that stop the reader, not by
-inspection.
-
-## Limitations
-
-Docker images, language-local tests, the canonical example, and shared local
-and hosted conformance passed, earning HTTP and Live.
-The base image is pinned by digest and every apt package is pinned to its exact
-bookworm revision taken from the published Debian index, so a revision that has
-since left the archive will fail that build line loudly rather than resolve to a
-newer one. Two TLS assumptions are still source-level claims. Pike spells the
-`SSL.Context` trust store API differently across releases, so the setup probes
-the context's identifiers and refuses to open an unverified connection when it
-finds none; the runtime image asserts that the trust store loads and holds a
-plausible number of authorities, which is where that probe gets settled. The
-socket channel likewise assumes `SSL.File` reports itself writable once its
-handshake completes, and the loopback tests can only prove that half of the
-contract without TLS.
-
-Values cover Convex's JSON-safe subset. Tagged Convex values such as `Int64` and
-bytes, Live authentication, WebSocket mutations and actions, optimistic updates,
-journals, and `TransitionChunk` assembly are deliberately deferred, and a
-`TransitionChunk` is refused rather than half-applied. Pike ships no canonical
-source formatter, so formatting is enforced by a language-local style gate over
-tabs, trailing whitespace, line width, line endings, and non-ASCII source
-characters instead of by a tool. This demonstration is tied to an undocumented
-Live profile and treats any drift from it as an error.
+1. Values are limited to Convex's JSON-safe subset. Tagged values such as
+   `Int64` and bytes are not implemented.
+2. Live authentication, WebSocket mutations and actions, optimistic updates,
+   journals, and `TransitionChunk` assembly are deferred. The client rejects a
+   `TransitionChunk` rather than applying a partial result.
+3. Live relies on a pinned, undocumented sync profile, so future protocol drift
+   is treated as an error. The pinned Debian package revisions can also leave
+   the archive, in which case the Docker build fails instead of silently taking
+   newer dependencies.
+4. TLS compatibility depends on Pike 8.0's `SSL.Context` trust-store naming and
+   `SSL.File` writable-callback behavior. The runtime checks the available API
+   and loaded authorities, but the loopback socket tests do not provide a real
+   TLS handshake by themselves.

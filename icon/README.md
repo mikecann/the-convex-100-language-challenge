@@ -1,32 +1,167 @@
-# Convex from Icon
+# Icon
 
-This demonstration uses Unicon (a modern superset of Icon) to call Convex's
-documented JSON HTTP endpoints and to keep a reactive query current through
-a native Unicon WebSocket connection.
+[Icon](https://www2.cs.arizona.edu/icon/) is a high-level, general-purpose
+language first released in 1979 as a successor to SNOBOL4. It is best known
+for string scanning and goal-directed evaluation, where an expression can
+succeed, fail, or produce several results. Development of the original Icon
+implementation is frozen.
 
-It is an educational, unofficial experiment. It is not a production SDK, an
-officially sanctioned Convex client, or a package intended for publication.
+This demonstration uses [Unicon](https://github.com/uniconproject/unicon), an
+actively maintained Icon descendant with object-oriented, networking,
+database, and concurrency features. Its project describes present-day use in
+teaching, research, and applications. This client is an educational,
+unofficial experiment, not a production SDK, an officially sanctioned Convex
+client, or a package intended for publication.
 
-## Start here
+## Getting Started
 
-[`examples/basics/main.icn`](examples/basics/main.icn) is the canonical
-example. It reads a new counter room over HTTP, starts Live before changing
-it, applies an idempotent mutation, and proves the same `0 -> 1` journey
-arrived through the subscription. The block below is generated from that
-exact runnable file.
+The canonical [`examples/basics/main.icn`](examples/basics/main.icn) example
+queries a fresh counter, subscribes before mutating it, and checks that HTTP
+and Live both observe `0 -> 1`. From the repository root, run it against the
+approved local test deployment entirely through Docker:
 
-## What works
+```sh
+./run verify-example icon
+```
+
+## Interesting Parts
+
+### Generated types become runtime table lookups
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function RoomCount() {
+  const room = "icon-readme";
+  const state = useQuery(api.demo.state, { room });
+  if (state === undefined) return <span>Loading...</span>;
+  return <span>{state.count}</span>; // state and count are type-safe here.
+}
+```
+
+**Icon**
+
+```text
+link "convex"
+
+procedure main()
+   local convexUrl, room, result, state
+   convexUrl := getenv("CONVEX_URL")
+   if /convexUrl | *convexUrl = 0 then stop("CONVEX_URL is required")
+   room := "icon-readme"
+
+   # This is one HTTP query. It does not stay subscribed like useQuery does.
+   result := convex_http_call("query", "demo:state",
+      table_of(["room", room]), convexUrl, "")
+   if result.kind ~== "result" then stop(result.errMessage)
+
+   state := result.value
+   write(state["count"]) # JSON objects and fields are checked at runtime.
+end
+```
+
+The generated TypeScript API knows the argument and return types. This Unicon
+client instead accepts an operation name and a table, then decodes the result
+to another table. That keeps the demonstration small, but misspelled paths or
+fields are runtime errors rather than editor feedback.
+
+### The program owns Live, and iteration is goal-directed
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const room = "icon-readme";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  if (state === undefined) return <button disabled>Loading...</button>;
+  return (
+    <button
+      onClick={() =>
+        void increment({
+          room,
+          language: "Icon",
+          runId: crypto.randomUUID(), // A fresh id makes this logical write idempotent.
+        })
+      }
+    >
+      Count: {state.count}
+    </button>
+  );
+}
+```
+
+**Icon**
+
+```text
+link "convex"
+
+procedure main()
+   local convexUrl, room, scheme, hostAndMore, liveUrl, liveState
+   local initial, mutation, updated, runId
+   convexUrl := getenv("CONVEX_URL")
+   if /convexUrl | *convexUrl = 0 then stop("CONVEX_URL is required")
+   room := "icon-readme"
+
+   scheme := if map(convexUrl[1:6]) == "https" then "wss" else "ws"
+   hostAndMore := convexUrl[find("://", convexUrl) + 3 : 0]
+   liveUrl := scheme || "://" || hostAndMore || "/api/sync"
+
+   # A CLI program explicitly creates, subscribes, polls, and closes Live.
+   liveState := convex_live_new(liveUrl)
+   convex_live_add(liveState, "counter", "demo:state",
+      table_of(["room", room]))
+   initial := next_value(liveState)
+   write("initial: ", initial["count"])
+
+   runId := "icon-readme-" || &now # Fresh for this invocation.
+   mutation := convex_http_call("mutation", "demo:increment",
+      table_of(["room", room, "language", "Icon", "runId", runId]),
+      convexUrl, "")
+   if mutation.kind ~== "result" then stop(mutation.errMessage)
+
+   updated := next_value(liveState)
+   write("updated: ", updated["count"])
+   convex_live_remove(liveState, "counter")
+   convex_live_close(liveState)
+end
+
+procedure next_value(liveState)
+   local event
+   repeat {
+      # ! generates each event; every asks for all generated results.
+      every event := !convex_live_poll(liveState, 500) do
+         if member(event, "value") then return event["value"]
+   }
+end
+```
+
+React owns the `useQuery` subscription lifecycle and rerenders on updates.
+The Unicon API deliberately exposes a blocking `convex_live_poll` operation,
+so a command-line program owns setup, polling, and cleanup itself. That is a
+choice made by this client, not a limitation of the language. The `!` and
+`every` pair show Icon's goal-directed evaluation in practical use by
+producing and consuming each event in a poll batch.
+
+## Status
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Badge earned | Query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented and pass shared local and hosted black-box conformance. |
-| Live | Badge earned | Subscribe/unsubscribe, five-reconnect-capable backoff, reactive error recovery, and clean close are implemented and pass shared local and hosted black-box conformance, including a debugDisconnect-triggered reconnect and a QueryFailed-then-recovery cycle. |
+| HTTP | Badge earned | Query, mutation, action, bearer-token lifecycle, logs, and structured errors pass shared local and hosted black-box conformance. |
+| Live | Badge earned | Subscribe/unsubscribe, reconnect backoff, reactive error recovery, and clean close pass shared local and hosted black-box conformance. |
 
 The shared evaluator awarded both badges from a clean exact-head build: 31 of
 31 checks against a local backend and 31 of 31 against the hosted deployment
 over real TLS.
 
-## The basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.icn -->
 ```text
@@ -197,73 +332,34 @@ end
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verify it in Docker
+## Implementation Notes
 
-```sh
-./run test icon            # builds Unicon from source, then runs the real
-                            # loopback HTTP/Live fixtures and unit tests,
-                            # entirely offline
-./run verify-example icon  # runs the exact block above against a unique
-                            # room on the local self-hosted backend
-./run verify icon          # verify-example plus shared black-box conformance
-```
+The reusable client is written in Unicon and linked directly into both the
+example and conformance adapter. It implements Convex's JSON HTTP behavior,
+JSON codec, WebSocket framing, and pinned Live state machine itself. Decoded
+JSON uses ordinary Icon tables, lists, strings, numbers, `&null`, and a small
+`JBool` record because Icon has no separate boolean type.
 
-`./run test icon` builds the Unicon toolchain from source (Debian does not
-package it, so this is pinned to a specific upstream commit), compiles the
-small C transport shim with `-Wall -Wextra -Werror`, runs `client/tests/
-selftest_test.icn` (the JSON codec, base64/SHA-1, WebSocket framing, and
-HTTP response classification, exercised directly since Unicon's `link`
-gives real, ordinary access to `convex.icn`'s procedures), `client/tests/
-http_test.icn` and `client/tests/live_test.icn` (real loopback fixtures
-under `client/tests/fixtures/`, not mocks, proving the actual sockets and
-protocol state machine work), and a smoke check of the conformance adapter
-and the canonical example.
+Unicon provides sockets but this build delegates raw TCP/TLS byte transport
+and wall-clock milliseconds to a narrow C/OpenSSL shim loaded through
+`loadfunc()`. The shim contains no Convex, HTTP, JSON, or WebSocket behavior.
+Wall-clock time is needed because Icon's `&time` measures execution time and
+barely advances while network reads are blocked.
 
-## Conformance and protocol notes
+The Docker build pins Unicon `13.2-16bebbfd` and Debian Bookworm by digest. It
+compiles the Unicon toolchain from source, runs pure codec/framing tests and
+real loopback HTTP and WebSocket fixtures, then packages `iconx`, the compiled
+programs, CA certificates, OpenSSL, and their runtime library closure. The
+exported images contain no compiler or package manager and run as user
+`65532:65532`.
 
-- The client speaks the pinned `convex-rs@6f1df8a8` sync profile at
-  `/api/sync`, matching every other client in this project.
-- Unicon compiles multiple source files together at build time via `link`,
-  so `client/convex.icn` is an ordinary reusable library: the adapter and
-  the example each link it directly and call its procedures with real
-  Icon values (tables, lists, records) -- no serialize-across-a-call
-  trick is needed for Live's state, which is just a record the caller
-  holds and mutates in place across calls.
-- The C shim (`client/shim.c`) supplies raw byte transport -- TCP
-  connect/listen/accept/send/recv/close and the OpenSSL TLS handshake --
-  plus one non-transport primitive, wall-clock milliseconds (Icon's own
-  `&time` is *execution* time and barely advances while blocked in
-  `recv()`, which would leave Live's reconnect backoff effectively
-  unbounded), loaded with Unicon's own `loadfunc()` foreign-function
-  interface. It carries no Convex, HTTP, JSON, or WebSocket logic;
-  everything a reader would recognise as "the protocol" is in
-  `convex.icn` itself.
-- `unicon -o out file.icn` does not produce a native ELF binary: it emits
-  a small shell wrapper that execs `iconx` (the actual interpreter)
-  against the compiled bytecode appended to the same file. The runtime
-  images carry `iconx` and pin `$ICONX` so that wrapper always finds it.
-- `client/tests/conformance/adapter.icn` implements NDJSON adapter
-  protocol v1 over both stdin/stdout and the `ADAPTER_LISTEN` TCP mode,
-  and declares `debugDisconnect` as its one adapter-only command.
-- Fragmented WebSocket messages are reassembled correctly: continuation
-  frames are concatenated as raw bytes into the message in progress,
-  control frames (ping/pong/close) are handled immediately without
-  disturbing that assembly since RFC 6455 permits them between the
-  fragments of a data message, and UTF-8 is validated once on the
-  complete reassembled message rather than per fragment, since a
-  multi-byte character split across a frame boundary is invalid UTF-8 in
-  either fragment's raw bytes alone. Fragment-assembly state lives on the
-  Live connection's own state record, so it survives correctly across a
-  `convex_live_poll` call that returns between fragments.
+## Known Issues
 
-## Limitations
-
-- Live authentication, WebSocket-issued mutations/actions, journals, and
-  `TransitionChunk` assembly are deferred; a `TransitionChunk` is reported
-  as protocol drift and the connection reconnects.
-- The Unicon toolchain is built from source in the `test` stage (Debian
-  does not package it), pinned to a specific upstream commit, with
-  graphics, 3D graphics, audio, VOIP, concurrency, pattern types, and the
-  built-in database disabled: none of them are needed for a headless
-  network client, and disabling them removes a large, otherwise-unused
-  build surface.
+1. Live authentication, mutations and actions over WebSocket, journals, and
+   `TransitionChunk` assembly are deferred. A `TransitionChunk` is treated as
+   protocol drift and triggers reconnect behavior.
+2. HTTP results are dynamically typed Icon values. There is no generated API
+   layer comparable to Convex's TypeScript types.
+3. The headless Docker build disables Unicon graphics, audio, VOIP,
+   concurrency, pattern types, and database features because this client does
+   not use them.

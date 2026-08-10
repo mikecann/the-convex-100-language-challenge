@@ -1,14 +1,126 @@
-# Convex from BlitzMax
+<img src="logo.png" alt="BlitzMax" width="248">
+<!-- Logo source: https://blitzmax.org/img/blitzmax.svg -->
 
-This client calls Convex from BlitzMax NG. It reads a shared counter over Convex's documented JSON HTTP endpoints and then keeps that counter current over a WebSocket, so a change made anywhere shows up without asking again.
+# BlitzMax
 
-It is educational and unofficial. It is not a production SDK, and it is not intended for package publication.
+[BlitzMax NG](https://blitzmax.org/) is a strongly typed, garbage-collected, open-source language in the Blitz BASIC family. It keeps BASIC's readable, statement-oriented feel while adding objects, modules, native compilation, and cross-platform libraries. It is best known for apps and games, with built-in graphics, sound, UI, and community modules.
 
-## Start here
+BlitzMax is a niche language today, but its compiler, documentation, and module ecosystem are still maintained. This Convex client is an educational, unofficial demonstration, not a production SDK or a package intended for publication.
 
-Read [`examples/basics/main.bmx`](examples/basics/main.bmx). It queries a fresh room's counter, starts a Live subscription **before** anything changes, applies one idempotent mutation from inside the subscription, and then proves that HTTP and Live agree on the journey `0 -> 1`.
+## Getting Started
 
-## What works
+Start with [`examples/basics/main.bmx`](examples/basics/main.bmx). It queries a fresh room, subscribes before changing it, increments the counter once, and checks that HTTP and Live both see `0 -> 1`.
+
+From the repository root, run the canonical example in its Docker image:
+
+```sh
+./run verify-example blitzmax
+```
+
+## Interesting Parts
+
+### `SuperStrict` types stop where JSON begins
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function QueryCount() {
+  const room = "readme-blitzmax-query";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <span>Loading...</span>;
+  return <span>{state.count}</span>; // The generated Convex API makes state.count type-safe.
+}
+```
+
+**BlitzMax**
+
+```blitzmax
+SuperStrict
+
+Import "../../client/transport.bmx"
+Import "../../client/jsonvalue.bmx"
+Import "../../client/convex.bmx"
+
+Local room:String = "readme-blitzmax-query"
+' ~q is BlitzMax's escape for a quote inside a string literal.
+Local args:TJSONObject = ConvexParseJsonObject("{~qroom~q:" + ConvexQuote(room) + "}", "arguments")
+Local client:TConvexClient = TConvexClient.Create(ConvexEnv("CONVEX_URL"))
+
+' Query is an HTTP call here, not a reactive hook.
+Local value:TJSON = client.Query("demo:state", args).value
+Local state:TJSONObject = TJSONObject(value)
+If Not state Then Throw TConvexError.Protocol("demo:state did not return an object")
+Local count:Long = ConvexIntegralValue(state.Get("count"), "state count")
+Print count ' count is a checked 64-bit integer here.
+
+client.Close()
+```
+
+`SuperStrict` requires every variable and return type to be declared, so `room`, `state`, and `count` cannot silently change type. Unlike the generated TypeScript API, BlitzMax does not know the Convex function's return shape at compile time. This client therefore casts `TJSON` nodes and validates each important field at runtime.
+
+### A Live query is an object you drive and retire
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function RoomCount() {
+  const room = "readme-blitzmax-live";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // React rerenders when the subscribed value changes.
+}
+```
+
+**BlitzMax**
+
+```blitzmax
+SuperStrict
+
+Import "../../client/transport.bmx"
+Import "../../client/jsonvalue.bmx"
+Import "../../client/convex.bmx"
+
+' Type declares an object; Extends supplies the callback BlitzMax must override.
+Type TCountObserver Extends TConvexObserver
+    Field received:Int ' Each observer instance remembers whether a value arrived.
+
+    Method OnUpdate(subscription:TConvexSubscription, value:TJSON, problem:TConvexFunctionError) Override
+        If problem Then Throw TConvexError.Protocol(problem.message)
+
+        Local state:TJSONObject = TJSONObject(value)
+        If Not state Then Throw TConvexError.Protocol("demo:state did not return an object")
+        Local count:Long = ConvexIntegralValue(state.Get("count"), "Live count")
+        Print count ' The callback receives each initial or changed value.
+        received = True
+    End Method
+End Type
+
+Local room:String = "readme-blitzmax-live"
+Local args:TJSONObject = ConvexParseJsonObject("{~qroom~q:" + ConvexQuote(room) + "}", "arguments")
+Local client:TConvexClient = TConvexClient.Create(ConvexEnv("CONVEX_URL"))
+Local observer:TCountObserver = New TCountObserver
+Local subscription:TConvexSubscription = client.Subscribe("demo:state", args, observer)
+
+Local deadline:TConvexDeadline = TConvexDeadline.Create(5000)
+While Not observer.received And Not deadline.Expired()
+    client.Pump(50) ' The command-line app explicitly drives Live progress.
+Wend
+If Not observer.received Then Throw TConvexError.Transport("timed out waiting for Live")
+client.Unsubscribe(subscription) ' Explicitly retire this query.
+client.Close() ' Explicitly close its transport too.
+```
+
+React owns the `useQuery` subscription while the component is mounted. This command-line client instead exposes an observer plus `Pump`, `Unsubscribe`, and `Close`. That explicit lifecycle is a client API choice suited to the single-owner event loop in this implementation, not a limitation of BlitzMax objects or callbacks.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -16,6 +128,8 @@ Read [`examples/basics/main.bmx`](examples/basics/main.bmx). It queries a fresh 
 | Live initial values, external updates, failure recovery, and reconnection | Verified by shared local and hosted conformance |
 | Full HTTP and Live conformance against the shared harness | Passed locally and hosted; HTTP and Live earned |
 | Live authentication, optimistic updates, WebSocket mutations and actions | Deferred |
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.bmx -->
 ```blitzmax
@@ -221,35 +335,19 @@ convex_example_exit(status)
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-```sh
-./run sync-examples
-./run validate
-./run test blitzmax
-./run verify-example blitzmax
-```
+This is a native BlitzMax NG client built with the pinned `0.165.3.61.202608020404` toolchain. Stock `Net.mbedtls` handles TCP and TLS, and stock `Text.Json` supplies jansson JSON nodes. The Convex HTTP envelopes, HTTP response framing, WebSocket handshake and frames, and pinned Live query protocol are implemented in BlitzMax rather than delegated to another Convex client.
 
-`test` builds every BlitzMax executable inside Docker and runs the language-local suites: unit checks, a hostile HTTP peer, a hostile WebSocket peer, and adapter serialisation. It then exercises the real adapter over both stdin/stdout and TCP, and asserts that the minimal runtime images contain no compiler, package manager, or delegated runtime. `verify-example` runs the exact canonical example from its minimal image against a unique room and compares its stdout with the shared transcript. The later root-owned local and hosted conformance runs passed and earned HTTP and Live.
+HTTP queries, mutations, and actions are separate request-response calls. Live uses one socket owner driven by `Pump`, and subscriptions receive values through `TConvexObserver` objects. Delivery is non-reentrant and bounded, unsubscribe is a barrier against stale queued values, and reconnects replay active subscriptions while suppressing the one unchanged rehydration snapshot.
 
-## Conformance and protocol notes
+The client validates complete HTTP body framing before treating bytes as a result, preserves structured Convex function errors, and applies one absolute deadline after the initial DNS and TCP connect. It scans untrusted JSON before jansson allocates a tree, rejecting values above an estimated 8 MiB retained-memory budget or 64 nesting levels. Language-local Docker tests cover these bounds, malformed peers, reconnects, and both adapter transports.
 
-BlitzMax NG supplies the byte transport and the JSON codec. `Net.mbedtls` provides the TCP socket and a verified TLS session — the client sets the server name itself, because the module's wrapper exposes no binding for SNI and a certificate that is never checked against the name you asked for is not a check. `Text.Json` (jansson) parses and serialises values. Everything Convex-specific is BlitzMax: the `/api/query`, `/api/mutation`, and `/api/action` envelopes; HTTP/1.1 response framing; the RFC 6455 upgrade, masking, and incremental frame parser; and the pinned `/api/sync` query-set protocol with its `Connect`, `ModifyQuerySet`, and `Transition` handling.
+The final runtime images contain the compiled BlitzMax executables, their native library closure, CA certificates, and the small POSIX shell surface required by the shared verifier. They run as user `65532:65532` without a compiler, package manager, Convex CLI, Node.js, or Python.
 
-One owner holds the Live socket. Subscribing, unsubscribing, reading, writing, retiring a connection, and changing the query-set version all happen there, driven from a single `Pump`. A `Transition` is fully validated — start version, query-set bounds, and a numerically monotonic little-endian timestamp — and every piece of connection state is committed before a subscriber can observe the update that produced it. Retiring a connection bumps a generation and restarts the query-set version, so a late frame from a retired socket cannot be mistaken for a valid continuation on its replacement. A reconnection replays the active `Add` operations and suppresses exactly one unchanged rehydration snapshot, so the sequence a viewer sees is the real journey rather than a repeat.
+## Known Issues
 
-HTTP responses are parsed before they are classified. A complete Convex function-error envelope keeps its `errorMessage`, `errorData`, and `logLines` on any status, while a non-2xx reply that is not a Convex envelope stays a transport failure rather than being promoted into an application error. A body that never satisfied its `Content-Length`, or a chunked body missing its terminal zero chunk, is a transport failure — not the value that its truncated bytes happen to spell.
-
-Memory bounds measure what is retained, not what was serialised. A parsed jansson tree costs roughly a hundred bytes per value, so a dense array can retain far more than it weighs on the wire while staying inside every byte-count limit. Untrusted JSON is therefore scanned before it is parsed and refused if its tree would exceed eight MiB retained or nest deeper than sixty-four levels. Each Live relay is generation-tagged and bounded to sixteen reserved queued or in-flight events and to that same eight-MiB retained bound plus a fixed allowance, so one value accepted at the maximum can be held exactly once, with the event currently in a subscriber's hands still charged. Adapter output has a two-MiB event cap and a one-second default absolute write deadline, so a stopped controller cannot pin the process.
-
-Deadlines are absolute, not inactivity timeouts. Each operation creates one monotonic expiry and every wait inside it shrinks against that same expiry, so a peer that drips one byte at a time cannot hold a call open. Closing is bounded by construction: the close frame is attempted once and the peer's echo is never awaited.
-
-The test-only adapter under `client/tests/conformance/` speaks strict NDJSON v1 on stdin/stdout, or over one `ADAPTER_LISTEN` TCP controller connection. It reserves stdout for protocol events, sends diagnostics to stderr, rejects unknown fields rather than ignoring them, and never serialises an absent `id`, value, or error as `null`. `debugDisconnect` is adapter-only and exists so the shared harness can prove real reconnections; it is not part of the educational client API.
-
-## Limitations
-
-The language-local peers are cooperative rather than threaded: the peer is serviced from the client's own idle hook, so each hostile sequence replays byte for byte on every run. They cover truncated `Content-Length` and unterminated chunked bodies, function-error envelopes on non-2xx statuses, malformed-body recovery, continuously dripping and silent peers against an absolute deadline, a forged `Sec-WebSocket-Accept`, an unoffered extension, a masked server frame, invalid UTF-8, an over-declared frame length, a rewound sync timestamp, a mismatched start version, a fragmented message with an interleaved ping, a frame that stalls halfway and resumes, five real reconnects with `Add` replay and suppressed rehydration, a bounded close against a stalled peer, and relay count, byte, and invalidation barriers. They do not replace fresh independent review or the root-owned shared conformance runs.
-
-Name resolution and the TCP connect are the one step outside the absolute deadline. mbed TLS performs both inside a single blocking call, so those two phases are bounded by the operating system's resolver and connect timeouts. Everything after them — the TLS handshake, every request, every frame, and every close — is bounded by the client.
-
-A Convex value whose parsed tree would exceed the retained bound is reported as a `ProtocolError` rather than delivered, and a Live frame carrying one retires that connection instead of being parsed. That is a deliberate trade: a wire-legal but node-dense payload is refused rather than allowed to exhaust the container's memory limit. Live authentication lifecycle, optimistic updates, mutations and actions over the WebSocket, journals, and `TransitionChunk` assembly are all deferred. The shared README and site generator has no BlitzMax fence mapping yet, so the example below renders as plain text rather than highlighted source; that mapping lives in shared infrastructure. The manifest records the http and live badges the shared evaluator awarded from clean exact-head local and hosted runs.
+1. Live authentication lifecycle, optimistic updates, WebSocket mutations and actions, journals, and `TransitionChunk` assembly are deferred.
+2. DNS resolution and TCP connect use mbed TLS's blocking call, so the operating system controls those timeouts. The client's absolute deadline covers every later handshake, request, frame, and close step.
+3. Values use Convex's JSON-safe subset. A wire-valid JSON value is rejected with `ProtocolError` if its estimated retained tree exceeds 8 MiB or nests more than 64 levels.
+4. The shared site generator has no BlitzMax syntax mapping yet, so the canonical `blitzmax` code fence renders without syntax highlighting.

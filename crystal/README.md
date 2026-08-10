@@ -1,18 +1,134 @@
-# Convex from Crystal
+<img src="logo.png" alt="Crystal logo" width="260">
+<!-- Logo source: https://crystal-lang.org/media/crystal-media-kit-6e57ec7.zip -->
 
-This educational, unofficial demonstration uses Crystal to query and mutate a Convex room over HTTP, then follow the same room through Convex Live. It is not a production SDK.
+# Crystal
 
-## Start here
+[Crystal](https://crystal-lang.org/) is a general-purpose, object-oriented language with Ruby-inspired syntax, static type checking, type inference, and native compilation. The project [reached 1.0 in 2021](https://crystal-lang.org/2021/03/22/crystal-1.0-what-to-expect/). Today it has a specialist niche, with the official project documenting [production use](https://crystal-lang.org/used_in_prod/) across web services, messaging, security, bioinformatics, and other systems.
 
-Read the [canonical basic example](examples/basics/main.cr). It performs an HTTP query, starts Live before the mutation, applies an idempotent increment, and checks the resulting `0 -> 1` update.
+This repository uses Crystal to query and mutate a Convex room over HTTP, then watch that room through Convex Live. It is an educational, unofficial demonstration, not a production SDK or an officially supported Convex client.
 
-## What works
+## Getting Started
+
+Start with the [canonical basic example](examples/basics/main.cr). It reads a room, subscribes before changing it, sends an idempotent increment, and confirms the Live value moves from `0` to `1`.
+
+From the repository root, run the example in its pinned Docker environment:
+
+```sh
+./run verify-example crystal
+```
+
+That command builds the minimal example image and runs this exact source against the approved test deployment. You do not need Crystal installed on your machine.
+
+## Interesting Parts
+
+### Familiar syntax, explicit JSON at the network boundary
+
+With Convex React, generated API bindings carry the argument and return types into TypeScript. This Crystal client deliberately stays small and accepts function names as strings, so values crossing the network are `JSON::Any` and the caller narrows them explicitly.
+
+**TypeScript with React**
+
+```tsx
+import { useMutation } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+function IncrementButton() {
+  const increment = useMutation(api.demo.increment);
+
+  async function handleClick() {
+    const result = await increment({
+      room: "readme-mutation",
+      language: "typescript",
+      runId: crypto.randomUUID(), // Retrying this ID will not increment twice.
+    });
+    console.log(result.applied); // The generated API makes this a boolean.
+  }
+
+  return <button onClick={handleClick}>Increment</button>;
+}
+```
+
+**Crystal**
+
+```crystal
+require "json"
+require "./client/client"
+
+client = Convex::Client.new(ENV.fetch("CONVEX_URL"))
+begin
+  # Crystal infers the hash type, while JSON::Any marks values crossing the wire.
+  args = {
+    "room"     => JSON::Any.new("readme-mutation"),
+    "language" => JSON::Any.new("crystal"),
+    "runId"    => JSON::Any.new(Random::Secure.hex(8)),
+  }
+  result = client.mutation("demo:increment", args)
+  puts result.value["applied"].as_bool # Check the dynamic JSON value as a Bool.
+ensure
+  client.close
+end
+```
+
+Both snippets call the same mutation with the same three arguments. The React call is asynchronous and generated types describe its result. This Crystal API blocks until the HTTP response arrives and checks the returned JSON shape at runtime.
+
+### React owns subscriptions; this command-line client owns one directly
+
+`useQuery` subscribes when a component renders, rerenders it when the value changes, and cleans up when the component unmounts. The Crystal client exposes a `Subscription` with a blocking `next` method instead. That is a deliberate API choice for a small command-line demonstration, not a limitation of Crystal. Underneath, the client uses Crystal fibers and channels to keep Live work concurrent.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+function RoomCount() {
+  const state = useQuery(api.demo.state, { room: "readme-live" });
+
+  if (state === undefined) return <span>Loading...</span>;
+  return <span>{state.count}</span>; // React rerenders when this count changes.
+}
+```
+
+**Crystal**
+
+```crystal
+require "json"
+require "./client/client"
+
+client = Convex::Client.new(ENV.fetch("CONVEX_URL"))
+begin
+  args = {"room" => JSON::Any.new("readme-live")}
+  subscription = client.subscribe("demo:state", args)
+  begin
+    # next waits for the first Live value or raises after the timeout.
+    initial = subscription.next(10.seconds)
+    raise initial.error.not_nil! if initial.error
+    puts initial.value.not_nil!["count"].to_json
+
+    # After another client increments the room, next waits for that new value.
+    changed = subscription.next(10.seconds)
+    raise changed.error.not_nil! if changed.error
+    puts changed.value.not_nil!["count"].to_json
+  ensure
+    subscription.close # Explicit cleanup replaces React's unmount lifecycle.
+  end
+ensure
+  client.close
+end
+```
+
+The focused Crystal fragment only shows delivery and cleanup. The complete example below starts Live before its mutation and validates the returned numbers carefully, including Convex numbers encoded as `0.0` or `1.0`.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
-| Native HTTP query, mutation, action | Verified by shared local and hosted conformance at this exact head |
+| Native HTTP query, mutation, and action | Verified by shared local and hosted conformance at this exact head |
 | Native Live query and reconnect | Verified by shared local and hosted conformance at this exact head |
-| Authentication | HTTP bearer token; Live auth deferred |
+| Authentication | HTTP bearer token works; Live authentication is deferred |
+
+The manifest records both `http` and `live` as earned capabilities. This README update does not rerun or change that evidence.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.cr -->
 ```crystal
@@ -83,21 +199,19 @@ end
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-```sh
-./run test crystal
-./run verify-example crystal
-./run verify crystal
-./run verify-hosted crystal
-```
+- This is a native Crystal implementation. It uses Crystal's standard HTTP, JSON, WebSocket, TLS, channel, and fiber support, and does not delegate Convex work to another SDK or runtime.
+- The repository pins Crystal 1.14.1 and builds static `linux/amd64` executables. The minimal runtime keeps the TLS certificate and OpenSSL configuration that hosted connections need, but contains no Crystal compiler or package manager.
+- HTTP calls stream at most 2 MiB before decoding the Convex response. Non-successful HTTP status codes, malformed protocol responses, and Convex function errors remain distinct failures.
+- One owner fiber controls the Live socket, including reconnects and active query replay. Each public subscription receives updates through a bounded channel. A slow consumer keeps the newest useful state without allowing queued data to grow forever.
+- The Live parser handles fragmented UTF-8 and control frames. Fixed connect, frame, and write deadlines keep `close` and `unsubscribe` bounded when a peer stalls.
+- The test-only conformance adapter translates the shared command stream into calls on this real client. It is not part of the educational client API.
 
-The first command formats, compiles, and runs deterministic HTTP/Live, reconnect, frame, relay, and envelope fixtures inside Docker. The remaining commands execute the exact minimal example and adapter against the approved deployments.
+For a deeper look, read the [client implementation](client/client.cr) and the deterministic [Live tests](client/tests/live_test.cr). Crystal's official documentation also explains its [fiber and channel concurrency model](https://crystal-lang.org/reference/latest/guides/concurrency.html) and the runtime checks provided by [`JSON::Any`](https://crystal-lang.org/api/latest/JSON/Any.html).
 
-## Protocol notes
+## Known Issues
 
-The adapter speaks NDJSON protocol v1 over stdin/stdout or `ADAPTER_LISTEN`. One Crystal owner fiber creates, reads, writes, retires, reconnects, and replays the Live socket. Every reconnect entry retires the transport, resets remote versions, and marks surviving queries for unchanged rehydration suppression before Add replay. Its incremental frame parser preserves raw TCP and OpenSSL-buffered bytes across short idle polls, while a five-second absolute frame deadline abandons a genuinely stalled partial frame and lets close commands stay responsive. HTTP rejects non-2xx status before decoding Convex JSON, retains at most 2 MiB while streaming response chunks, and reports malformed successful-response envelopes as protocol failures rather than transport failures. Subscription delivery is bounded by 16 events and 3 MiB each, with a 128-event and 16 MiB aggregate owner budget that includes structured errors, logs, and conservative envelope overhead. The adapter writes directly under one mutex instead of filling another mailbox. It validates every command before narrowing JSON values, caps the adapter at 16 active subscriptions, and allows one 3 MiB line per relay plus one controller response, a conservative 17-event/51 MiB output ceiling. The final probe runs a stopped-reader case in a separate process and cgroup, with both process RSS and cgroup memory required to stay below a 96 MiB safety gate inside the shared 128 MiB limit.
-
-## Limitations
-
-TransitionChunk assembly, Live authentication, WebSocket mutations, optimistic updates, and the complete Convex value surface remain deferred. Shared local and hosted conformance passed 31/31 from clean exact-head builds, and the manifest capability list records the evaluator award of http and live.
+1. Live authentication and `TransitionChunk` assembly are not implemented.
+2. Convex values are limited to Crystal's JSON types, so the complete Convex value model is not available.
+3. Mutations use HTTP. WebSocket mutations, optimistic updates, and mutation replay are deferred.

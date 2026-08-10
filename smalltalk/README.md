@@ -1,34 +1,148 @@
-# Convex from Smalltalk
+<img src="logo.png" alt="Pharo logo" width="240">
+<!-- Logo source: https://pharo.org/files/pharo.png -->
 
-This is a small Convex client written in Pharo 12 Smalltalk. It talks to a Convex
-deployment two ways: ordinary HTTP function calls, and a live subscription over a
-WebSocket that pushes new query results as soon as the data changes.
+# Smalltalk
 
-Everything Convex-specific is written in Smalltalk, including the RFC 6455
-WebSocket framing, because Pharo 12 ships no WebSocket package at all. Zinc and
-Zodiac, which come with the Pharo image, provide HTTP and TLS the way any Pharo
-program would use them.
+Smalltalk is the family of languages that made objects and message sending the
+centre of the programming model. This client uses [Pharo](https://pharo.org/),
+a modern open-source Smalltalk environment that began in 2008 as a fork of
+Squeak. Pharo combines a dynamic language, an object image and its development
+tools, so it feels more like a live system than a compiler pointed at loose
+source files.
 
-It is educational, unofficial, and not a production SDK. Nobody at Convex
-supports it, the sync protocol it speaks is not a published stable interface, and
-it exists to answer one question: can Smalltalk hold up its end of a modern
-reactive backend?
+Pharo remains a specialist language rather than a mainstream application stack,
+but it has an active community and is used for web applications, teaching,
+research and commercial systems. This repository's client is educational,
+unofficial and not a production SDK. It is not supported by Convex, and its Live
+implementation relies on an unpublished sync protocol that may change.
 
-## Start here
+## Getting Started
 
-The canonical example is [`examples/basics/main.st`](examples/basics/main.st).
+The canonical [`examples/basics/main.st`](examples/basics/main.st) program reads
+a shared counter, subscribes before changing it, applies one mutation and waits
+for Live to deliver the new value. From the repository root, run it entirely in
+Docker with:
 
-It follows one shared counter through a complete journey. It reads the current
-count over HTTP, subscribes to the same query before changing anything, applies a
-mutation carrying an idempotency key, and then waits for the new value to arrive
-over the live subscription rather than polling again. Only when all three agree
-does it print its final `verified count: 0 -> 1` line.
+```sh
+./run verify-example smalltalk
+```
 
-Starting the subscription *before* the mutation is the interesting part. That
-ordering is what makes the update impossible to miss, and it is what a polling
-client cannot promise.
+The verifier supplies a fresh room, runs the exact source shown below in its
+minimal runtime image and checks the expected `0 -> 1` journey. It proves the
+example, not the wider conformance suite.
 
-## What works
+## Interesting Parts
+
+### Keyword messages make calls read differently
+
+React's generated API gives the query result a static TypeScript type. This
+Smalltalk client instead builds an ordered JSON object and returns the decoded
+result as a dictionary. The colons in `query:args:` mark the two parts of one
+keyword message, not named arguments to a conventional function.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function Counter() {
+  const state = useQuery(api.demo.state, { room: "readme-room" });
+  if (state === undefined) return <p>Loading...</p>;
+
+  return <p>{state.count}</p>; // state and count are type-safe here.
+}
+```
+
+**Smalltalk**
+
+```smalltalk
+| deployment client arguments state |
+"Read the deployment URL supplied to this process by the verifier or operator."
+deployment := OSEnvironment current at: 'CONVEX_URL' ifAbsent: [ nil ].
+(deployment isNil or: [ deployment isEmpty ]) ifTrue: [
+	(ConvexTransportError message: 'CONVEX_URL is required') signal ].
+
+"Create an ordered dictionary that will become the query's JSON args object."
+arguments := ConvexJson objectWith: { 'room' -> 'readme-room' }.
+client := ConvexClient deployment: deployment.
+
+[
+	"Send the keyword message query:args: and decode the one-off HTTP result."
+	state := client query: 'demo:state' args: arguments.
+	Transcript show: (state at: 'count') printString
+] ensure: [ client close ]. "Release any client-owned resources even on error."
+```
+
+`useQuery` keeps a React component subscribed and rerenders it. The Smalltalk
+call above is deliberately a one-off HTTP read, so another call is needed to see
+later data. That is a client API difference, not a limitation of Smalltalk.
+
+### A Live subscription is an object you own
+
+React owns the query subscription for as long as the component needs it. The
+command-line Smalltalk API exposes that lifecycle directly: subscribe, pull the
+next delivery with a deadline, inspect either its error or value, then close it.
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function LiveCounter() {
+  const room = "readme-live-room";
+  const state = useQuery(api.demo.state, { room }); // React owns the subscription.
+  const increment = useMutation(api.demo.increment);
+
+  const addOne = () =>
+    increment({ room, language: "typescript", runId: crypto.randomUUID() });
+
+  return <button onClick={addOne}>Count: {state?.count ?? "loading"}</button>;
+  // A Live update rerenders this component with the mutation's new count.
+}
+```
+
+**Smalltalk**
+
+```smalltalk
+| deployment client room arguments subscription initial mutation update |
+"Use the same required deployment setting as the canonical example."
+deployment := OSEnvironment current at: 'CONVEX_URL' ifAbsent: [ nil ].
+(deployment isNil or: [ deployment isEmpty ]) ifTrue: [
+	(ConvexTransportError message: 'CONVEX_URL is required') signal ].
+
+room := 'readme-live-room'.
+arguments := ConvexJson objectWith: { 'room' -> room }.
+client := ConvexClient deployment: deployment.
+
+[
+	"Subscribe before mutating so the resulting update cannot be missed."
+	subscription := client subscribe: 'demo:state' args: arguments.
+	initial := subscription nextWithinMilliseconds: 10000.
+	initial error ifNotNil: [ :error | error signal ].
+
+	"The runId makes this increment idempotent if the operation is retried."
+	mutation := client mutation: 'demo:increment' args: (ConvexJson objectWith: {
+		'room' -> room.
+		'language' -> 'smalltalk'.
+		'runId' -> ConvexRandom hexIdentifier }).
+	Transcript show: ((mutation at: 'state') at: 'count') printString.
+
+	"Pull the reactive delivery and decode its dictionary value."
+	update := subscription nextWithinMilliseconds: 10000.
+	update error ifNotNil: [ :error | error signal ].
+	Transcript show: (update value at: 'count') printString
+] ensure: [
+	subscription ifNotNil: [ subscription close ].
+	client close ].
+```
+
+Pharo supports blocks, callbacks and concurrent processes. Returning a
+`ConvexUpdate` from blocking `nextWithinMilliseconds:` is this client's API
+choice for a small command-line example, not the language's only reactive style.
+
+## Status
 
 | Capability | State |
 | --- | --- |
@@ -41,11 +155,12 @@ client cannot promise.
 | Optimistic updates, WebSocket mutations and actions | Not implemented |
 | Extended Convex value tags, journals, transition chunks | Not implemented |
 
-The shared evaluator awarded the `http` and `live` badges from a clean
-exact-head build: 31 of 31 conformance checks against a local backend and 31 of
-31 against the hosted deployment over real TLS.
+The evidence recorded for the current implementation earned the `http` and
+`live` capabilities: 31 of 31 shared checks passed against the local backend and
+31 of 31 against the hosted deployment over real TLS. This README-only change
+does not claim a fresh verification run.
 
-## The example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.st -->
 ```smalltalk
@@ -207,110 +322,44 @@ activate
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-```sh
-./run test smalltalk
-./run verify-example smalltalk
-./run verify smalltalk
-./run verify-hosted smalltalk
-./run verify-all smalltalk
-```
+This is a native Pharo 12 implementation. The pinned image is build 1258 at
+commit `1645336`, and the headless VM is `v12.0.3-beta+33.23e5a5a`. The
+[Dockerfile](Dockerfile) downloads both from immutable URLs and verifies their
+SHA-256 hashes. Zinc and Zodiac, which ship in the image, provide HTTP and TLS.
+All Convex-specific behaviour lives in
+[`client/Convex.st`](client/Convex.st).
 
-`./run test smalltalk` builds the image, loads every checked-in source file into
-a scratch Pharo image, runs the whole SUnit suite, then builds the two saved
-runtime images and probes their real entry points. It fails if a file does not
-compile, if any test fails, if fewer tests run than expected, or if a saved image
-still evaluates arbitrary Smalltalk.
+Pharo 12 has no bundled WebSocket package, so `ConvexWebSocket` implements the
+RFC 6455 client framing used by Live. One owner process alone reads and writes
+the socket, manages subscriptions and reconnects, and replays active
+subscriptions after reconnecting. The newest 16 deliveries are retained within
+a 20 MiB byte budget, which keeps a stalled consumer from growing memory without
+bound.
 
-`./run verify-example smalltalk` runs the exact program printed above, in the
-minimal example image, against its own room on the approved deployment. It fails
-on any unexpected value, not merely on a crash.
+The client also avoids using Pharo's general STON reader for network JSON.
+STON accepts more than JSON and can instantiate a named class, so `ConvexJson`
+parses only the expected JSON grammar and caps input at 2 MiB, 128 nesting
+levels and 8192 structural nodes. HTTP response bodies and Live frames use the
+same 2 MiB ceiling.
 
-`./run verify smalltalk` adds the shared black-box conformance suite against the
-approved local backend, and `./run verify-hosted smalltalk` repeats it against
-the hosted drift target. `./run verify-all smalltalk` runs both profiles from one
-build.
+Docker produces separate saved images for the example and conformance adapter.
+The build removes interactive command handlers and proves the runtime images
+cannot evaluate arbitrary Smalltalk. The VM remains outside `PATH`; Pharo's
+compiler stays inside the saved object image because the runtime needs that
+image to boot.
 
-## Under the hood
+## Known Issues
 
-**Pins.** The Pharo image is build 1258, commit `1645336`, and the headless
-virtual machine is `v12.0.3-beta+33.23e5a5a`. Both are downloaded by immutable
-URL and checked by SHA-256 in the Dockerfile. The Convex sync profile is pinned
-in [`manifest.yaml`](manifest.yaml).
-
-**Transports.** HTTPS goes through `ZnClient`, with redirects and retries turned
-off, a bounded maximum entity size, and one addition: Zodiac completes a TLS
-handshake without judging the certificate chain, so `ConvexHttpsClient` asserts a
-zero verification state before any request body is written. The Live client does
-the same after its own handshake.
-
-**Framing.** `ConvexWebSocket` implements the client half of RFC 6455: masked
-client frames, fragmentation with a byte budget, ping and pong, a bounded close
-handshake, and rejection of masked server frames, reserved bits, unassigned
-opcodes and non-minimal length encodings. Its reader is an explicit state machine
-that consumes one byte at a time, so a deadline that expires halfway through a
-frame leaves the parser exactly where it was instead of resynchronising at a
-false boundary. There is a deterministic test for precisely that.
-One absolute five-second deadline starts with the first byte and survives across
-short owner polls, so a peer cannot keep a partial frame alive by dribbling one
-byte before each poll expires.
-
-**JSON.** Pharo ships STON, whose reader also accepts STON syntax and will
-instantiate a class named in the document. Convex values arrive from the network,
-so this client parses JSON with its own strict reader instead: RFC 8259 only,
-bounded to 2 MiB, 128 levels of nesting and 8192 structural nodes, with surrogate
-pairs joined and lone surrogates refused.
-
-**Live ownership.** One process owns the socket, the query set version, every
-reconnection and every publication. Subscribing, unsubscribing, the adapter-only
-disconnect and closing are all commands sent to that owner and acknowledged by
-it, so no other process ever touches the stream. Unsubscribe invalidates the
-subscription before it acknowledges, which is what lets the conformance adapter
-prove that a relay paused mid-publish cannot emit a stale value afterwards.
-
-A whole `Transition` is validated before any part of it is published: the start
-version must match local state, the timestamp must not move backwards, and every
-modification must parse. Reconnection replays the full active `Add` set from
-query set version zero and suppresses the unchanged rehydration the server sends,
-so the observable sequence stays initial value, disconnect acknowledgement,
-external mutation, new value.
-
-**Buffering.** The Live owner keeps the newest 16 deliveries within a 20 MiB
-budget charged from the encoded value, logs and structured error data plus a
-per-entry overhead; consumers poll that queue rather than owning mailboxes of
-their own, so a slow consumer cannot grow memory. The conformance adapter keeps
-its own newest-16 output bound within 6 MiB including the line being written.
-Subscription values there are newest-wins, while command responses are never
-dropped, because a controller waiting for an acknowledgement would hang.
-
-**Conformance executable.** [`client/tests/conformance/ConvexAdapter.st`](client/tests/conformance/ConvexAdapter.st)
-speaks NDJSON adapter protocol v1 over stdin and stdout, or over TCP when
-`ADAPTER_LISTEN` is set. It is test infrastructure, not client API: the
-`debugDisconnect` hook it needs is compiled as an extension in that file alone,
-so it never exists in the image the example runs in, and the example build fails
-if it leaks.
-
-**Runtime shape.** Each entry point is a separate saved Pharo image. Before the
-snapshot, the build removes every interactive command handler: evaluate, file-in,
-save, test, package loading and the rest. The Docker build then proves the saved
-images refuse to evaluate `1 + 1`. The virtual machine is installed outside
-`PATH`, so the only commands the runtime images offer are
-`/usr/local/bin/convex-adapter` and `/usr/local/bin/convex-example`. Pharo's
-compiler remains inside the image because a Smalltalk image needs it to boot;
-that is documented rather than hidden.
-
-## Limitations
-
-- Live authentication, optimistic updates, WebSocket mutations and actions,
-  journals, extended Convex value tags, and `TransitionChunk` assembly are all
-  deferred. Only the JSON-safe Convex value subset is carried.
-- Byte-at-a-time frame reading is what makes mid-frame timeouts safe, but it
-  makes very large Live frames slower than a bulk reader would be.
-- The certificate verification assertions are written but have not yet met a
-  real bad certificate inside Docker.
-- The saved images ship without a changes file. Docker entrypoint probes passed
-  on a read-only filesystem without one.
-- The shared site and README projection has no syntax-highlighting entry for
-  `.st`, so the example above renders as plain text. Changing that belongs to
-  shared infrastructure, not to this language directory.
+1. Live authentication, optimistic updates, WebSocket mutations and actions,
+   journals, extended Convex value tags and `TransitionChunk` assembly are not
+   implemented. Only JSON-safe Convex values are carried.
+2. The WebSocket parser reads one byte at a time because Zodiac loses bytes from
+   a bulk read that times out. This preserves parser state but slows very large
+   Live frames.
+3. Both TLS paths assert Zodiac's certificate verification state after the
+   handshake, but that check has not yet been exercised against a real invalid
+   certificate in Docker.
+4. The saved images intentionally omit a changes file. Their entry points passed
+   the recorded read-only-filesystem probes without one.

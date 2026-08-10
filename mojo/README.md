@@ -1,20 +1,181 @@
-# Convex from Mojo
+<img src="logo.png" alt="Mojo" width="234">
+<!-- Logo source: https://mojolang.org/img/mojo-wordmark.svg -->
 
-A native Mojo client that calls Convex functions over HTTP and keeps queries
-current over the pinned Live WebSocket profile — with every protocol layer
-written in Mojo, because Mojo's standard library has none of them.
+# Mojo
 
-This is educational and unofficial, not a production Convex SDK.
+Mojo is a young systems programming language from Modular, first shown publicly
+in 2023. It borrows Python's approachable syntax, then adds static types,
+ownership-aware semantics, and native compilation influenced by languages such
+as Rust, C++, and Swift. Modular is building it primarily for high-performance
+AI infrastructure and code that spans CPUs, GPUs, and other accelerators.
 
-## Start here
+That makes Mojo an interesting but still evolving choice in 2026, with a much
+smaller application ecosystem than mainstream languages. The language's
+present-day home is kernels, numerical work, and AI systems rather than ordinary
+web clients like this one. Start with the [official Mojo site](https://mojolang.org/)
+or the [Mojo Manual](https://docs.modular.com/mojo/manual/). This Convex client
+is an educational, unofficial demonstration, not a production SDK.
 
-[`examples/basics/main.mojo`](examples/basics/main.mojo) follows one shared
-counter from 0 to 1: it reads the count over HTTP, starts a Live subscription
-*before* the write so no reactive update can slip through the gap, applies an
-idempotent mutation, and then watches the same subscription deliver the new
-value.
+## Getting Started
 
-## What works
+The canonical [`examples/basics/main.mojo`](examples/basics/main.mojo) program
+reads a fresh counter, subscribes before changing it, applies one idempotent
+mutation, and observes the reactive update from `0` to `1`.
+
+From the repository root, run:
+
+```sh
+./run verify-example mojo
+```
+
+The command builds and runs that exact example inside Docker against the
+approved test backend. It does not require a Mojo toolchain on your host.
+
+## Interesting Parts
+
+### A familiar query shape, with explicit JSON at the boundary
+
+In a React app, generated Convex types carry the query arguments and result into
+the component. This Mojo client deliberately exposes the HTTP result as JSON
+text, so the application has to construct and decode that boundary itself.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function CounterState() {
+  const room = "mojo-readme-query";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // `state` and `count` are type-safe here.
+}
+```
+
+**Mojo**
+
+```mojo
+from std.os import getenv
+
+from convex import Client, default_ca_file
+from json import parse, quote
+
+
+fn main() raises:
+    var deployment_url = getenv("CONVEX_URL")
+    if not deployment_url:
+        raise Error("CONVEX_URL is required")
+
+    var client = Client(deployment_url, default_ca_file())
+    var room = String("mojo-readme-query")
+    # This client accepts serialized JSON rather than a generated argument type.
+    var args_json = String('{"room":') + quote(room) + "}"
+    var response = client.call(String("query"), String("demo:state"), args_json)
+    if not response.ok:
+        raise Error(response.error_name + ": " + response.error_message)
+
+    var document = parse(response.value_json)
+    # The field name is checked at runtime; `count` is an Int after `as_int`.
+    var count = document.as_int(document.member(document.root, "count"))
+    print(count)
+    client.close(2000)
+```
+
+The Mojo syntax looks Python-like, but `String`, `Client`, and `Int` are static
+types. Unlike the generated TypeScript API, this small client cannot catch a
+misspelled function name or JSON field at compile time.
+
+### React owns reactivity; this command-line client owns it directly
+
+`useQuery` subscribes during rendering and React cleans it up when the component
+unmounts. The Mojo program starts the subscription itself, blocks until each
+value arrives, and must unsubscribe and close the client.
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function CounterButton() {
+  const room = "mojo-readme-live";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  async function incrementOnce() {
+    const result = await increment({
+      room,
+      language: "TypeScript",
+      runId: crypto.randomUUID(), // Fresh on every click, so each write can apply.
+    });
+    console.log(result.state.count); // The mutation result is generated and typed.
+  }
+
+  return (
+    <button onClick={() => void incrementOnce()}>
+      {state === undefined ? "Loading..." : `Count: ${state.count}`}
+    </button>
+  ); // A successful mutation causes `useQuery` to render the new count.
+}
+```
+
+**Mojo**
+
+```mojo
+from std.base64 import b64encode
+from std.os import getenv
+
+from convex import Client, default_ca_file
+from json import parse, quote
+from net import random_bytes
+
+
+fn main() raises:
+    var deployment_url = getenv("CONVEX_URL")
+    if not deployment_url:
+        raise Error("CONVEX_URL is required")
+
+    var client = Client(deployment_url, default_ca_file())
+    var room = String("mojo-readme-live")
+    var query_args = String('{"room":') + quote(room) + "}"
+
+    # This program owns the subscription and asks for each delivery explicitly.
+    client.subscribe(String("counter"), String("demo:state"), query_args)
+    var initial = client.wait_update(String("counter"), 20000)
+    var initial_json = parse(initial.value_json)
+    print(initial_json.as_int(initial_json.member(initial_json.root, "count")))
+
+    # Kernel randomness gives this write a new idempotency key on every run.
+    var run_id = String("mojo-readme-") + b64encode(Span(random_bytes(16)))
+    var mutation_args = String('{"room":') + quote(room)
+    mutation_args += ',"language":"Mojo"'
+    mutation_args += ',"runId":' + quote(run_id) + "}"
+    var result = client.call(
+        String("mutation"), String("demo:increment"), mutation_args
+    )
+    if not result.ok:
+        raise Error(result.error_name + ": " + result.error_message)
+    var result_json = parse(result.value_json)
+    var state = result_json.member(result_json.root, "state")
+    print(result_json.as_int(result_json.member(state, "count")))
+
+    # The same subscription now yields the reactive consequence of the write.
+    var updated = client.wait_update(String("counter"), 20000)
+    var updated_json = parse(updated.value_json)
+    print(updated_json.as_int(updated_json.member(updated_json.root, "count")))
+
+    client.unsubscribe(String("counter"))
+    client.close(2000)  # Cleanup is the caller's responsibility here.
+```
+
+The blocking `wait_update` interface is a choice made by this compact client
+for a command-line demonstration, not a limitation of the Mojo language. It
+also makes ownership obvious: one `Client` owns the connection and its queued
+updates, while React normally hides that lifecycle behind hooks.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -23,6 +184,11 @@ value.
 | Live initial values and updates | Verified by shared local and hosted conformance |
 | Remove, reconnect, query-error recovery and bounded delivery | Verified by shared local and hosted conformance |
 | Live authentication, optimistic updates, WebSocket mutations | Not implemented |
+
+Both HTTP and Live are earned capabilities. The missing Live features above
+remain missing rather than being inferred from the passing subset.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.mojo -->
 ```mojo
@@ -126,95 +292,47 @@ fn main() raises:
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-`./run test mojo` compiles the client, the example and the adapter inside
-Docker and runs the language-local suites: the JSON reader and writer, SHA-1
-and the WebSocket accept token, the deterministic Live suite, the adapter
-event shapes, and both adapter transports.
+The demonstration pins Mojo `0.26.2.0` and compiles ahead of time to native
+`linux/amd64` executables. Mojo is installed from its Python wheel only in the
+Docker build stage. The final images contain the executable, its Mojo shared
+library closure, OpenSSL, a CA bundle, and the small shell toolset required by
+the repository. They contain no Python interpreter, Mojo compiler, package
+manager, or delegated Convex client.
 
-`./run verify-example mojo` executes the exact example above from its minimal
-image against the approved backend and compares its stdout to the shared
-transcript.
+At this pinned version, the standard library does not provide the networking
+and serialization stack this client needs. [`client/net.mojo`](client/net.mojo)
+calls libc sockets and OpenSSL through Mojo's C FFI, while
+[`client/json.mojo`](client/json.mojo), [`client/http.mojo`](client/http.mojo),
+and [`client/websocket.mojo`](client/websocket.mojo) implement JSON, HTTP/1.1,
+and WebSocket framing in Mojo. Convex-specific request and Live behavior stays
+in [`client/convex.mojo`](client/convex.mojo). That is why the manifest records
+`native` provenance rather than `binding`: ordinary transport uses system
+libraries, but no other language's Convex client performs the work.
 
-`./run verify mojo` adds the shared black-box conformance run, and
-`./run verify-all mojo` repeats it against the hosted drift target from the
-same built image.
+The Live API is single-threaded by design. One bounded `pump` operation owns
+all reads, writes, reconnects, and subscription changes. `wait_update` repeatedly
+advances that operation until a value or error is ready. Each subscription
+keeps at most 16 deliveries within a 256 KiB encoded-text budget, dropping the
+oldest when a slow caller exceeds either limit. Function, protocol, and
+transport failures remain distinct so callers do not mistake a broken
+connection for a successful Convex value.
 
-## How it is built
+For repository evidence, `./run test mojo` checks formatting, compilation, and
+the language-local JSON, WebSocket, Live, event-shape, and adapter-transport
+suites. `./run verify mojo` adds local black-box conformance, while
+`./run verify-all mojo` repeats conformance against both approved deployment
+profiles. Those are separate gates from the example command in Getting Started.
 
-Mojo compiles ahead of time to a native ELF executable. It is distributed as a
-PyPI wheel, so the build stage has Python and pip in it; nothing from that
-stage reaches the runtime image, which is `FROM scratch` and contains only the
-compiled binary, the shared libraries it actually loads, a CA bundle, and the
-shell plus POSIX text tools the shared image policy requires.
+## Known Issues
 
-Everything Convex-specific, and every protocol layer beneath it, is Mojo:
-
-- **Sockets and TLS** — `client/net.mojo` declares `getaddrinfo`, `socket`,
-  `connect`, `poll`, `read`, `write` and the OpenSSL handshake and record-layer
-  entry points through `sys.ffi.external_call`. Those are the same C functions a
-  C client links against; only the spelling is Mojo. `getaddrinfo` results are
-  tried in turn, so an AAAA answer on an IPv4-only Docker bridge falls through
-  to the A record instead of stalling. TLS verification pins the expected
-  hostname with `SSL_set1_host` and checks `SSL_get_verify_result`.
-- **JSON** — `client/json.mojo` is a reader and writer over a flat node arena
-  with a hard depth bound. Number tokens are kept verbatim, so a Convex value
-  that arrives as `0.0` is echoed back as `0.0` rather than normalised.
-- **HTTP/1.1** — `client/http.mojo` builds the request and parses the status
-  line, headers, and a body delimited by `Content-Length`, chunked encoding, or
-  end of stream.
-- **WebSocket** — `client/websocket.mojo` implements RFC 6455 from the
-  specification: the opening handshake, SHA-1 for the `Sec-WebSocket-Accept`
-  check, client masking with kernel entropy, continuation assembly, and control
-  frames handled mid-message.
-- **Convex** — `client/convex.mojo` owns the documented HTTP function calls and
-  the pinned sync state machine.
-
-This is `native` rather than `binding` provenance: no pre-built Mojo package
-wraps sockets, HTTP or WebSockets here, and no Convex protocol work is
-delegated to another language's client.
-
-## Protocol notes and limits
-
-The adapter speaks NDJSON protocol v1 on stdin/stdout, or over the one
-`ADAPTER_LISTEN` TCP connection the shared controller dials.
-
-The client is single-threaded on purpose. A `pump` call is the only code that
-reads the WebSocket, writes it, reconnects it, or advances the query-set
-version, so exclusive ownership is structural rather than enforced by a lock.
-`subscribe`, `unsubscribe` and the adapter-only `debugDisconnect` record intent
-and `pump` performs it. Reconnects back off from 100 ms to 15 s and reset to
-the floor after a successful handshake. Each new connection resends `Add` for
-every active query, and an unchanged rehydration is suppressed so a reconnect
-does not deliver the same value twice.
-
-Delivery is bounded twice over: each subscription keeps the newest 16 updates
-and at most 256 KiB of encoded value text, dropping the oldest when a consumer
-is slow. A count limit alone would not be a memory limit when one value can
-approach the maximum frame size.
-
-Retiring a subscription — by `unsubscribe` or by re-registering the same ID —
-clears its queue before the acknowledgement is published, so no value queued
-for the old registration can be delivered under the new one.
-
-A frame is consumed from the read buffer only once all of its bytes have
-arrived, so a read that hits its deadline mid-frame leaves the buffer untouched
-and resumes at the same boundary rather than misreading a payload byte as an
-opcode. UTF-8 is validated once, on the reassembled message, because a
-codepoint may legitimately straddle a fragment boundary.
-
-## Limitations
-
-- Live authentication, optimistic updates, WebSocket mutations and WebSocket
-  actions are deferred. `setAuth` applies to HTTP calls only.
-- Live values cover the JSON-safe subset; tagged Convex value types are
-  deferred.
-- `TransitionChunk` assembly is deferred and treated as protocol drift that
-  reconnects.
-- One HTTP connection is opened per call rather than pooled, so keep-alive
-  reuse is deferred.
-- `libNVPTX.so` is part of the shared-library closure of every compiled Mojo
-  program in this release and is therefore staged in the runtime image. It is a
-  runtime library, not a command: the final image contains no `mojo`, no
-  compiler frontend, no interpreter and no package manager.
+1. Live authentication, optimistic updates, WebSocket mutations, and WebSocket
+   actions are not implemented. `set_auth` changes later HTTP calls only.
+2. Live values support the JSON-safe subset of Convex values. Tagged Convex
+   value types are deferred.
+3. `TransitionChunk` assembly is not implemented. The client treats one as
+   protocol drift and reconnects.
+4. A slow Live consumer loses the oldest queued updates after 16 deliveries or
+   256 KiB. The newest update is retained.
+5. HTTP calls open a fresh connection each time. There is no keep-alive pool.

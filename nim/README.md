@@ -1,14 +1,128 @@
-# Convex from Nim
+<img src="logo.png" alt="Nim crown logo" width="160">
+<!-- Logo source: https://raw.githubusercontent.com/nim-lang/assets/master/Art/logo-crown.png -->
 
-This educational demonstration uses a native Nim client to query a counter over HTTP, subscribe to the same query over Convex Live, apply an idempotent mutation, and verify the resulting update.
+# Nim
 
-It is unofficial teaching material, not a production SDK or a published Nim package.
+[Nim](https://nim-lang.org/) is a statically typed, compiled systems language with indentation-based syntax that will feel familiar to a Python developer. It can generate small native executables without a virtual machine, supports C, C++, and JavaScript backends, and deliberately mixes ideas from Python, Ada, and Modula. The project began under the name Nimrod, [became Nim in 2014](https://nim-lang.org/blog/2014/12/29/version-0102-released.html), and reached [version 1.0 in 2019](https://nim-lang.org/blog/2019/09/23/version-100-released.html).
 
-## Start here
+Today Nim is a niche alternative for command-line tools, games, embedded work, and other systems software where developers want compact source and native executables. This repository uses it to build a native Convex client. The client is educational and unofficial, not a production SDK or a published Nim package.
 
-Read the [canonical basic example](examples/basics/main.nim). It accepts a unique room as its first argument and prints the shared `0 -> 1` transcript only after HTTP and Live agree.
+## Getting Started
 
-## What works
+Read the [canonical basic example](examples/basics/main.nim) to see an HTTP query, a Live subscription, an idempotent mutation, and the resulting reactive update. From the repository root, run the exact example in its pinned Docker environment:
+
+```sh
+./run verify-example nim
+```
+
+The command supplies a fresh room, runs `/usr/local/bin/convex-example` from the minimal `linux/amd64` image, and checks the shared `0 -> 1` output. It is an example check, not the full conformance suite.
+
+## Interesting Parts
+
+### JSON looks like an object literal, but the result stays dynamic
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function RoomCount() {
+  const state = useQuery(api.demo.state, { room: "readme-json-room" });
+  if (state === undefined) return <p>Loading...</p>;
+
+  return <p>{state.count}</p>; // state and count are type-safe here.
+}
+```
+
+**Nim**
+
+```nim
+import std/[json, os]
+import ../../client/convex
+
+proc main() =
+  let deployment = getEnv("CONVEX_URL")
+  if deployment.len == 0:
+    quit("CONVEX_URL is required", 2)
+  let client = newClient(deployment)
+  defer: client.close() # `defer` closes the client when this scope exits.
+
+  # `%*` is Nim's macro for turning this object-like syntax into a JsonNode.
+  let state = client.query("demo:state", %*{"room": "readme-json-room"})
+
+  # The response is dynamic JSON, so this client validates the numeric value.
+  let count = integralCount(state.value["count"])
+  echo count
+
+main()
+```
+
+The shapes look pleasantly similar, but the semantics differ. Convex's generated TypeScript API checks the function name, arguments, and returned fields at compile time. This Nim client accepts a function path string and returns `JsonNode`, so decoding and field validation happen at runtime. The Nim call is also a one-off HTTP snapshot, not a reactive subscription like `useQuery`.
+
+### A Live subscription is a resource you own
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const room = "readme-live-room";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  async function addOne() {
+    const result = await increment({
+      room,
+      language: "typescript",
+      runId: crypto.randomUUID(),
+    });
+    console.log(result.state.count); // The mutation returns the updated state.
+  }
+
+  // React starts and stops the query subscription with the component.
+  return <button onClick={addOne}>{state?.count ?? "Loading..."}</button>;
+}
+```
+
+**Nim**
+
+```nim
+import std/[json, os, strformat, times]
+import ../../client/convex
+
+proc main() =
+  let room = "readme-live-room"
+  let deployment = getEnv("CONVEX_URL")
+  if deployment.len == 0:
+    quit("CONVEX_URL is required", 2)
+  let client = newClient(deployment)
+  defer: client.close() # Closing the client also stops its socket owner.
+
+  let subscription = client.subscribe("demo:state", %*{"room": room})
+  defer: subscription.close() # The command-line program owns this lifecycle.
+
+  let initial = subscription.nextUpdate()
+  echo parseJson(initial.value)["count"] # First delivery is the current value.
+
+  let result = client.mutation("demo:increment", %*{
+    "room": room,
+    "language": "nim",
+    "runId": fmt"nim-{getTime().toUnix}-{epochTime()}"
+  })
+  echo result.value["state"]["count"] # The mutation returns updated state.
+
+  let updated = subscription.nextUpdate()
+  echo parseJson(updated.value)["count"] # This blocks for the Live update.
+
+main()
+```
+
+React manages the subscription and rerenders the component. Nim itself supports several concurrency styles, but this client deliberately exposes blocking `nextUpdate()` calls because they make ownership and sequencing clear in a small command-line example. The real example also checks `isError` before decoding an update and uses a unique idempotency key.
+
+## Status
 
 | Capability | Status | Evidence |
 | --- | --- | --- |
@@ -16,9 +130,9 @@ Read the [canonical basic example](examples/basics/main.nim). It accepts a uniqu
 | HTTP bearer authentication | Implemented in the client | `setAuth` and `CONVEX_AUTH_TOKEN` set or replace the Authorization header |
 | Live subscriptions | Verified by shared local and hosted conformance | One socket owner, Add replay across five real reconnects, transactional transitions, strict timestamp ordering, and a bounded delivery mailbox whose overflow is tested |
 
-The root-owned shared verifier earned HTTP and Live for the reviewed source commit.
+The root-owned shared verifier earned both HTTP and Live for the reviewed source commit. These are the capabilities recorded in `manifest.yaml`; this README edit does not claim a new verification run.
 
-## Canonical example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.nim -->
 ```nim
@@ -91,31 +205,25 @@ main()
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-Run these on a genuine x86_64 Docker lane, not on a development Mac:
+This is a native Nim implementation. Convex-specific HTTP envelopes, response errors, Live query bookkeeping, reconnection, and transition validation live in [the client](client/convex.nim). Ordinary HTTP, TLS, and JSON use Nim's standard library. WebSocket transport comes from `treeform/ws` 0.6.0, pinned by archive checksum in the Dockerfile. It does not delegate Convex behaviour to a JavaScript client, the Convex CLI, `curl`, or another language runtime.
+
+The Docker build uses Nim 2.2.4 with threads and the [ORC memory manager](https://nim-lang.org/1.6.20/mm.html). One worker owns the Live socket while the caller consumes updates from a deliberately small mailbox. Crossing that thread boundary turned out to be the particularly Nim-specific problem: the implementation stores delivery strings in C-allocated memory so they are not accidentally freed through the wrong thread's allocator. Each subscription has four slots, and all subscriptions together are limited to 16 records and 8 MiB. If a slow consumer fills the mailbox, the newest update is dropped and a `TransportError` is delivered after the already-buffered values.
+
+The build patches both Nim's HTTP parser and the pinned WebSocket source before compiling. Those patches reject oversized data before it is fully materialised, make failed socket writes observable, bound handshakes and frames, and correctly accept control frames between message fragments. The Live state machine validates a whole server transition before committing any part of it, replays active subscriptions after reconnect, and suppresses an unchanged value during rehydration.
+
+For local source, compilation, and language-specific tests, use:
 
 ```sh
 ./run test nim
-./run verify-example nim
 ```
 
-The `test` target executes strict adapter-schema serialization, exact stdin and TCP adapter modes, atomic Live transition recovery, fragmented Unicode/control/oversize frames, a failed Add against a stalled peer, idle/flood/half-frame close deadlines, bounded HTTP streams, stale relay generations, count-plus-byte output limits, the bounded Live delivery mailbox and its overflow ordering, and the real stopped-reader process fixture. It also compiles the exact example, adapter, and hosted five-reconnect test. Run the reconnect executable with `CONVEX_URL` to prove the hosted five-barrier sequence. `verify-example` runs the exact canonical source from its pinned amd64 runtime image against a unique room. Root-owned `verify`, `verify-hosted`, and `verify-all` add shared black-box evidence later.
+That Docker target compiles the canonical example and test-only conformance adapter, then runs focused tests for decoding, HTTP bounds, Live state, fragmented frames, reconnect behaviour, shutdown deadlines, and bounded output. Full local and hosted conformance are separate root-owned evidence runs.
 
-Each binary compiles in its own Docker layer. The commands and assertions are the same as one combined step; the split simply lets an emulated amd64 lane whose `gcc` crashes at random resume from the last good binary.
+## Known Issues
 
-The build pins Nim 2.2.4, treeform/ws 0.6.0, the dependency archive checksum, and the non-scratch Debian runtime image digest. Checked-in build scripts patch Nim's native HTTP parser and treeform/ws before compilation, enforcing response/frame limits before unbounded materialisation, exposing failed writes, and handling control frames between fragments. Nim's asynchronous sockets default to `SafeDisconn`, which completes a write to a reset peer without raising; the patch drops that flag so a Live `Add` that never reached the server fails activation instead of being acknowledged. The final image remains based on that pinned Debian digest while pruning its filesystem to the exact native binary, approved POSIX commands, TLS libraries, OpenSSL configuration/provider modules, CA bundle, and name-resolution closure. It explicitly removes the `openssl` and `perl` commands and checks the complete final command surface in both runtime targets.
-
-## Adapter and protocol notes
-
-The test-only adapter speaks NDJSON protocol v1 over stdin/stdout or one TCP controller connection. It validates every command before field access, rejects additional properties and wrong types, omits absent optional fields, reports structured `FunctionError`, `ProtocolError`, and `TransportError` values, and reserves `debugDisconnect` for the adapter build.
-
-A Transition from a real deployment also carries `clientClockSkew` and `serverTs` beside the four fields this client acts on. Both are accepted by name and ignored, so the field allow-list still rejects genuinely unknown fields.
-
-The Live implementation validates a complete Transition into temporary state before commit, replays active Add operations after reconnect, suppresses unchanged rehydration, and abandons the entire connection after a frame deadline so consumed partial bytes are never reused. A global 16-record, 8 MiB Live-delivery budget complements each four-slot mailbox. One adapter output owner reserves at most 16 records and 10 MiB, invalidates stale relay generations in queue order, and applies a bounded write deadline.
-
-## Limitations
-
-Root shared conformance ran from a clean exact-head build: local and hosted profiles both passed 31/31 and the shared evaluator awarded the http and live badges recorded in the manifest. Live authentication, WebSocket mutations/actions, and `TransitionChunk` assembly are deferred. The pinned third-party WebSocket transport is patched during the Docker build.
-
-The evidence for this head was produced on Apple Silicon through Docker Desktop's Rosetta `linux/amd64` emulation. The images are genuine `linux/amd64` — the build fails unless `uname -m` reports `x86_64` — but no native x86_64 host has executed this exact source commit, and Rosetta's `gcc` segfaults at random during compilation. Read every timing-sensitive result here as emulated rather than native.
+1. Live authentication is not implemented. Bearer authentication applies only to HTTP calls.
+2. Mutations and actions use HTTP. The Live socket supports subscriptions, not WebSocket mutations or actions.
+3. `TransitionChunk` assembly is deferred, so the client handles complete `Transition` messages only.
+4. The exact awarded build ran as genuine `linux/amd64` under Docker Desktop's Rosetta emulation on Apple Silicon, not on a native x86_64 host. Heavy Nim compilation can hit unrelated `gcc` crashes in that emulated lane.

@@ -1,60 +1,195 @@
-# Convex from PureScript
+<img src="logo.png" alt="PureScript logo" width="220">
+<!-- Logo source: https://github.com/purescript/logo/blob/master/PS_Logo_Final.svg -->
 
-This is a PureScript client for [Convex](https://convex.dev). It reads a shared
-counter over Convex's documented HTTP API, watches the same query over the
-reactive `/api/sync` WebSocket, increments it once, and shows both surfaces
-agreeing on the journey from `0` to `1`.
+# PureScript
 
-Everything Convex-specific is written in PureScript: the JSON codec, HTTP/1.1,
-the WebSocket handshake and framing, the sync protocol, and the single Live
-owner that holds all of it together. PureScript has no runtime of its own, so
-the compiled program runs on the BEAM through the
-[purerl](https://github.com/purerl/purerl) Erlang backend, and Erlang/OTP
-supplies sockets, TLS, cryptography, timers, and processes through three small
-FFI modules that contain no Convex logic.
+[PureScript](https://www.purescript.org/) is a small, strongly typed functional
+language created by Phil Freeman and heavily inspired by Haskell. Its usual
+home is the JavaScript ecosystem, where people use its expressive types and
+JavaScript interop for web applications, servers, and libraries. It remains a
+specialist choice today, but it has an active package and learning ecosystem.
 
-## This is educational, not an SDK
+PureScript can target other backends too. This demonstration uses
+[purerl](https://github.com/purerl/purerl), which turns the compiler's CoreFn
+output into Erlang source, so the client ultimately runs on the BEAM instead of
+Node.js. This is an educational, unofficial Convex client for a video and
+website, not a production SDK and not supported by Convex.
 
-This client is a demonstration written for a video and a website about how many
-languages can talk to Convex. It is unofficial, it is not supported by Convex,
-and it is not a production SDK. Do not depend on it.
+## Getting Started
 
-## Start here
+The best place to begin is the
+[canonical counter example](examples/basics/Main.purs). It reads `demo:state`,
+starts a Live subscription, calls `demo:increment`, and checks the same `0` to
+`1` journey through both interfaces.
 
-The canonical example is
-[`examples/basics/Main.purs`](examples/basics/Main.purs). It is the whole
-journey in one file:
+From the repository root, run:
 
-1. Create a client for a deployment URL.
-2. Read `demo:state` over HTTP and decode the counter, which starts at `0`.
-3. Subscribe to the same query *before* changing anything, so no update can
-   fall into a gap, and take the initial Live value.
-4. Run the `demo:increment` mutation with an idempotency key.
-5. Take the Live update the mutation causes, and confirm it agrees with the
-   mutation's own return value.
-6. Unsubscribe, close the client, and print the final verification line.
+```sh
+./run verify-example purescript
+```
 
-Every step checks the value it received. Compiling is not evidence, so the
-example fails loudly rather than printing a line it did not earn.
+The command builds the minimal example image and runs that exact source file in
+Docker against a unique room. Nothing from the PureScript toolchain needs to be
+installed on your host.
 
-## What works
+## Interesting Parts
 
-Shared local and hosted black-box conformance passed 31/31 from clean
-exact-head builds, and the shared evaluator awarded the http and live badges
-recorded in the manifest.
+### JSON is a real data type, not an untyped object
 
-| Capability | Status | Evidence |
+**TypeScript with React**
+
+```tsx
+import { useMutation } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function IncrementButton() {
+  const room = "readme-purescript";
+  const increment = useMutation(api.demo.increment);
+
+  return (
+    <button
+      onClick={async () => {
+        const result = await increment({
+          room,
+          language: "TypeScript",
+          runId: crypto.randomUUID(), // A fresh click gets a fresh idempotency key.
+        });
+        console.log(result.state.count); // Generated types know this is a number.
+      }}
+    >
+      Increment
+    </button>
+  );
+}
+```
+
+**PureScript**
+
+```purescript
+-- The verifier supplies a unique room as the first command-line argument.
+arguments <- Sys.plainArguments
+room <- case listHead arguments of
+  Nothing -> Sys.fatal "pass a unique room as the first argument"
+  Just value -> pure value
+
+deployment <- Sys.env "CONVEX_URL" ""
+if deployment == "" then Sys.fatal "set CONVEX_URL to a Convex deployment"
+else do
+  clientResult <- Convex.new deployment
+  case clientResult of
+    Left problem -> Sys.fatal problem.message
+    Right client -> do
+      -- The room is verifier-unique, so this is one unique logical action.
+      let runId = room <> "-once"
+      -- `JsonObject` and `Tuple` make the wire shape explicit.
+      let mutationArgs = JsonObject
+            ( Cons (Tuple "room" (JsonString room))
+                ( Cons (Tuple "language" (JsonString "PureScript"))
+                    (listSingleton (Tuple "runId" (JsonString runId)))
+                )
+            )
+      outcome <- Convex.call client Convex.Mutation "demo:increment" mutationArgs
+      case outcome of
+        Left problem -> Sys.fatal problem.message
+        Right result -> case Json.field result.value "state" of
+          Nothing -> Sys.fatal "the mutation returned no state"
+          Just state -> case Json.field state "count" of
+            Nothing -> Sys.fatal "the state returned no count"
+            Just raw -> case Json.integralInt raw of
+              Nothing -> Sys.fatal "count was not a whole number"
+              Just count ->
+                Sys.println ("mutation count: " <> intToString count)
+      -- This command-line program owns the client, so it releases it itself.
+      _ <- Convex.close client
+      pure unit
+```
+
+The React call gets argument and result types from Convex's generated API. This
+PureScript client instead accepts a function path and its own `Json` algebraic
+data type, so the backend schema is checked at runtime. Pattern matching makes
+every missing field and failed call visible, but it is not generated end-to-end
+type safety.
+
+### Reactive updates arrive through a process mailbox
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function Counter() {
+  const room = "readme-purescript";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <span>Loading...</span>;
+  return <span>{state.count}</span>; // React rerenders after each Live update.
+}
+```
+
+**PureScript**
+
+```purescript
+let room = "readme-purescript"
+let args = JsonObject (listSingleton (Tuple "room" (JsonString room)))
+
+deployment <- Sys.env "CONVEX_URL" ""
+if deployment == "" then Sys.fatal "set CONVEX_URL to a Convex deployment"
+else do
+  clientResult <- Convex.new deployment
+  case clientResult of
+    Left problem -> Sys.fatal problem.message
+    Right client -> do
+      -- The BEAM process running this code receives subscription events.
+      self <- Sys.selfPid
+      subscribed <- Convex.subscribe client "demo:state" args self
+      case subscribed of
+        Left problem -> Sys.fatal problem.message
+        Right subscriptionId -> do
+          delivery <- Sys.receiveEvent 10000
+          case delivery of
+            Nothing -> Sys.fatal "Live timed out"
+            Just received -> do
+              -- Acknowledge before the bounded relay sends another value.
+              Live.acknowledge received
+              case received.event of
+                LiveFailure problem -> Sys.fatal problem.message
+                LiveValue value _logs -> case Json.field value "count" of
+                  Nothing -> Sys.fatal "the Live value returned no count"
+                  Just raw -> case Json.integralInt raw of
+                    Nothing -> Sys.fatal "count was not a whole number"
+                    Just count ->
+                      Sys.println ("live count: " <> intToString count)
+          -- Unsubscribe is an explicit lifecycle boundary in this API.
+          _ <- Convex.unsubscribe client subscriptionId
+          _ <- Convex.close client
+          pure unit
+```
+
+`useQuery` owns the subscription lifecycle and rerenders the component when the
+value changes. PureScript supports many asynchronous abstractions, but this
+client deliberately exposes a mailbox plus a blocking receive because it maps
+cleanly onto BEAM processes. The full example starts Live before its mutation,
+then receives both the initial value and the resulting update.
+
+## Status
+
+The checked-in evidence awarded both `http` and `live`. This README rewrite did
+not rerun shared verification or change those claims.
+
+| Capability | Status | Existing evidence |
 | --- | --- | --- |
-| Compiles | verified | `./run test purescript` passes: full compile, purerl translation, erlc -Werror, all four language-local suites |
-| Canonical example | verified | exact six-line transcript matched against self-hosted and hosted deployments |
-| HTTP (`query`, `mutation`, `action`, structured errors, auth) | verified | shared local and hosted conformance passed at this exact head |
-| Live (`/api/sync` subscribe, update, unsubscribe, five reconnects, query-error recovery) | verified | shared local and hosted conformance passed at this exact head |
-| Live authentication, WebSocket mutations and actions | not implemented | deferred, see limitations |
+| Compiles | verified | `./run test purescript` completed the PureScript, purerl, and Erlang build plus four language-local suites |
+| Canonical example | verified | the exact six-line transcript matched on local and hosted deployments |
+| HTTP | verified | query, mutation, action, structured errors, and authentication passed local and hosted conformance |
+| Live | verified | subscribe, update, unsubscribe, five reconnects, and query-error recovery passed local and hosted conformance |
+| Live authentication, WebSocket mutations, WebSocket actions | not implemented | deliberately deferred |
 
-## The canonical example
+## Example
 
-This block is generated from the runnable file, so the source here, in the
-repository, and on the website are always the same bytes.
+This generated block is the runnable
+[`examples/basics/Main.purs`](examples/basics/Main.purs) file. The repository
+and website use the same bytes.
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.purs -->
 ```purescript
@@ -214,149 +349,59 @@ expect condition message =
   if condition then pure unit else Sys.fatal message
 ```
 <!-- END GENERATED EXAMPLE -->
-## Verifying it in Docker
 
-Every build, test, and verification step runs inside Docker. Nothing is
-installed on the host.
+## Implementation Notes
+
+This implementation is declared `transpiled`. The pinned build path is
+`purs` 0.15.14 to CoreFn, `purerl` 0.0.24 to Erlang source, then Erlang/OTP 26
+to BEAM bytecode for `linux/amd64`. OTP provides sockets, TLS, cryptography,
+timers, and processes through three small Erlang FFI modules. All JSON, HTTP,
+WebSocket, and Convex-specific decisions remain in PureScript.
+
+There is no package set. [`Convex.Prelude`](client/Convex/Prelude.purs) and
+[`Convex.Bytes`](client/Convex/Bytes.purs) contain the small vocabulary the
+client needs, keeping the build to two pinned compiler binaries. In this code,
+`do` notation is specifically wired to `Effect`, while equality and ordering
+use Erlang term operations. That is safe for the concrete values this client
+compares, but it is a deliberate local design rather than normal unrestricted
+PureScript.
+
+Live has one owner process for connection and query state, one socket process,
+and one relay per subscription. Each subscription retains at most 16
+undelivered events within an 8 MiB budget, and every delivered event must be
+acknowledged. That explicit backpressure is why the mailbox example calls
+`Live.acknowledge`.
+
+The Live implementation targets the pinned
+`convex-rs-0.10.4-unversioned-sync` profile at source commit
+`6f1df8a8ba1665084ec001e307ca841ca17074d7`. `/api/sync` is not a documented,
+stable public protocol, so unfamiliar transitions become `ProtocolError`
+values rather than being guessed at.
+
+The useful Docker checks remain separate:
 
 ```sh
 ./run test purescript
-```
-
-Builds the `test` target. That stage downloads the two pinned compiler
-binaries, checks the style gate, type-checks and compiles the PureScript to
-Erlang, compiles the Erlang with `erlc -Werror`, and runs the four
-language-local test programs plus the adapter's stdin smoke tests against the
-resulting bytecode.
-
-```sh
 ./run verify-example purescript
-```
-
-Builds the minimal `example-runtime` image and runs the exact
-`examples/basics/Main.purs` program against a unique room on the approved local
-backend. Its stdout must match `_shared/examples/basics.expected.txt` exactly.
-
-```sh
 ./run verify purescript
-```
-
-Adds the shared black-box conformance suite: the JavaScript oracle and this
-client are driven through the same NDJSON adapter protocol against the same
-deployment, and only the shared evaluator may award a capability badge.
-
-```sh
 ./run verify-hosted purescript
 ./run verify-all purescript
 ```
 
-Repeat the example and conformance checks against the dedicated hosted drift
-target, and run both deployment profiles from one built image.
+`test` covers the language-local build and tests. `verify-example` runs the
+teaching example. `verify` and `verify-hosted` add shared conformance against
+local and hosted deployments, while `verify-all` runs both profiles from the
+same built source.
 
-## How it is put together
+## Known Issues
 
-| Module | What it owns |
-| --- | --- |
-| `client/Convex.purs` | The public client: HTTP calls, auth, and the one Live owner |
-| `client/Convex/Json.purs` | A JSON codec with Convex's integer rules and its own budgets |
-| `client/Convex/Http.purs` | HTTP/1.1 over a socket, with head, body, and deadline bounds |
-| `client/Convex/Ws.purs` | RFC 6455 framing as a value, so a read timeout keeps parser state |
-| `client/Convex/Live.purs` | The sync protocol: one owner, one socket, one relay per subscription |
-| `client/Convex/Error.purs` | The three failures Convex asks callers to tell apart |
-| `client/Convex/Prelude.purs` | The small prelude this client is written against |
-| `client/Convex/Bytes.purs` | Byte strings and the scans that would be slow one byte at a time |
-| `client/Convex/Sys.purs` | The OTP surface: sockets, TLS, crypto, clock, streams, processes |
-
-### No package set
-
-The client depends on no PureScript packages. PureScript ships no built-in
-prelude, and the purerl ecosystem's preludes move independently of the
-compiler, so depending on one would make a reproducible build depend on a
-package set resolving the same way twice. Instead `Convex.Prelude` and
-`Convex.Bytes` define the handful of types, operators, and primitives the
-client actually uses, and the whole toolchain is two binaries pinned by
-SHA-256.
-
-Two consequences are worth knowing while reading the code. `do` notation always
-means `Effect`, because `bind` and `discard` are defined for `Effect` only.
-And `==`, `<`, and friends are Erlang term operations rather than type classes,
-which is sound for the integers, strings, byte strings, and decoded JSON this
-client compares.
-
-### Live behaviour
-
-One owner process holds the query-set version, the server's last transition
-version, every subscription's last value, and the reconnect schedule. A
-connection process owns the socket and is a byte pipe; frame decoding stays in
-the owner, so a read timeout part-way through a frame is harmless. A relay
-process per subscription carries one event at a time and must ask the owner for
-permission immediately before delivery, which makes unsubscribe and
-same-identifier replacement real barriers rather than timing assumptions.
-
-Delivery is bounded twice over. Each subscription keeps at most the newest 16
-undelivered events within an 8 MiB byte budget, counting the event its relay is
-currently holding, and the subscriber must acknowledge each delivery before the
-relay carries another. A subscriber that stops reading therefore cannot grow a
-BEAM mailbox behind the client's own limits.
-
-### Conformance adapter
-
-`client/tests/conformance/Adapter.purs` is test infrastructure, not public
-client code. It speaks NDJSON adapter protocol v1 over stdin/stdout, or over a
-TCP connection when `ADAPTER_LISTEN` is set, reserves stdout for protocol
-events, and calls the real client for every operation. It implements the
-adapter-only `debugDisconnect` command so the shared controller can prove five
-real reconnects; that command is declared in `manifest.yaml` and is not part of
-the client API.
-
-Input and output are both bounded. One NDJSON command may not exceed 9 MiB, and
-a longer line is discarded up to its newline and answered with a protocol
-error. Queued output has one global 16-event and 12 MiB budget that includes
-the payload the sender is physically writing, and saturation closes the stalled
-controller rather than retaining more events. The `runtime` image build proves
-both bounds against the real final adapter with a reader that never reads.
-
-### Protocol pins
-
-| Pin | Value |
-| --- | --- |
-| Sync profile | `convex-rs-0.10.4-unversioned-sync` |
-| Sync source commit | `6f1df8a8ba1665084ec001e307ca841ca17074d7` |
-| Sync endpoint | `/api/sync` |
-| Adapter protocol | v1 |
-| PureScript compiler | `purs` 0.15.14 |
-| Erlang backend | `purerl` 0.0.24 |
-| Runtime | Erlang/OTP 26 |
-| Platform | `linux/amd64` |
-
-The sync protocol is not a documented, stable Convex API. It is pinned to the
-revision above and treated as drift-sensitive: anything the client cannot
-reconcile with that profile is reported as a `ProtocolError` rather than
-absorbed.
-
-## Honest limitations
-
-- Docker compilation, tests, final image policy, canonical example, and shared
-  local and hosted conformance passed, earning HTTP and Live.
-- **The BEAM is a delegated runtime.** PureScript compiles to a host language,
-  and this client targets purerl, so the final images contain the BEAM emulator
-  plus the `kernel`, `stdlib`, `crypto`, `ssl`, `public_key`, and `asn1`
-  applications. No compiler, package manager, or other delegated runtime is
-  present, and the image build proves that.
-- **`purs-tidy` is not run.** The standard PureScript formatter is distributed
-  as a Node package, and adding a JavaScript runtime to this build only to
-  reformat source would undercut the point of a two-binary toolchain. The test
-  stage enforces a deterministic style gate over the checked-in source instead.
-- **Live authentication is deferred.** `Convex.setAuth` affects HTTP calls only;
-  the sync connection does not send an `Authenticate` message.
-- **WebSocket mutations and actions are deferred.** Mutations and actions go
-  over HTTP; only queries are subscribed over the socket.
-- **Tagged Convex values are deferred.** The client speaks the `json` format
-  and does not decode Convex's tagged representations of `Int64`, `Bytes`, or
-  `Set`.
-- **`TransitionChunk` assembly is deferred.** Receiving one is reported as
-  protocol drift rather than reassembled.
-- **JSON has hard bounds.** An object may carry at most 256 entries, nesting is
-  limited to 64 levels, and a document to 65536 structural values.
-- **Equality is Erlang term equality.** That is sound for everything this
-  client compares, but it would not be for values containing functions.
+1. Live authentication is not implemented. `Convex.setAuth` affects HTTP calls
+   only.
+2. Mutations and actions use HTTP. The WebSocket side subscribes to queries
+   only.
+3. Tagged Convex `Int64`, `Bytes`, and `Set` values are not decoded, and a
+   `TransitionChunk` is reported as protocol drift instead of being assembled.
+4. JSON is intentionally bounded to 256 entries per object, 64 nesting levels,
+   and 65,536 structural values.
+5. `purs-tidy` is not part of the pinned toolchain. Docker applies the
+   repository's deterministic style checks instead.

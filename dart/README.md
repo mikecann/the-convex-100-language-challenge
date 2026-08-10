@@ -1,18 +1,167 @@
-# Convex from Dart
+<img src="logo.png" alt="Dart logo" width="160">
+<!-- Logo source: https://services.google.com/fh/files/misc/dart_brand_guidelines_assets.zip -->
 
-This folder shows a small native Dart program that calls Convex queries,
-mutations, and actions over HTTP, then keeps a query updated over WebSocket.
+# Dart
 
-This is educational and unofficial. It is not a production SDK or a package
-intended for publication.
+[Dart](https://dart.dev/) is a type-safe, garbage-collected language with
+familiar C-style syntax. It was first released in 2011 as an embeddable,
+multi-platform language, then [Dart 2 refocused it on client development](https://dart.dev/blog/announcing-dart-2-optimized-for-client-side-development).
+Today its best-known niche is powering Flutter apps, though the SDK can also
+compile command-line and server programs to native machine code or target the
+web through JavaScript and WebAssembly.
 
-## Start here
+This repository's client is educational, unofficial, and not a production SDK
+or publishable package. Dart and the related logo are trademarks of Google LLC.
+We are not endorsed by or affiliated with Google LLC.
 
-Read the [basic example](examples/basics/main.dart). It queries a fresh counter,
-starts Live before a mutation, verifies the initial and updated values, then
-cleans up its subscription and client.
+## Getting Started
 
-## What works
+Start with the [canonical basic example](examples/basics/main.dart). It queries
+a fresh counter, opens a Live subscription before mutating that counter, checks
+the reactive update, and cleans up both resources. From the repository root,
+Docker builds and runs that exact program against a unique test room:
+
+```sh
+./run verify-example dart
+```
+
+The command needs Docker, but it does not require a Dart SDK on your host.
+
+## Interesting Parts
+
+### A typed hook meets a JSON boundary
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function CounterReadout() {
+  const state = useQuery(api.demo.state, { room: "readme-dart-query" });
+  if (state === undefined) return <p>Loading...</p>;
+
+  const count = state.count; // Generated types know this is a number.
+  return <p>Count: {count}</p>;
+}
+```
+
+**Dart**
+
+```dart
+import 'dart:io';
+
+import 'client/convex_client.dart';
+
+Future<void> main() async {
+  final deploymentUrl = Platform.environment['CONVEX_URL'];
+  if (deploymentUrl == null || deploymentUrl.isEmpty) {
+    throw StateError('CONVEX_URL is required');
+  }
+
+  final client = ConvexClient(deploymentUrl);
+  try {
+    final result = await client.query('demo:state', {
+      'room': 'readme-dart-query', // Dart maps become Convex argument objects.
+    });
+    final state = result.value;
+    if (state is! Map || state['count'] is! num) {
+      throw FormatException('demo:state returned an unexpected value');
+    }
+    // Convex numbers decode as num; validate before choosing an int.
+    final count = (state['count'] as num).toInt();
+    stdout.writeln('Count: $count');
+  } finally {
+    await client.close();
+  }
+}
+```
+
+The generated React API carries the function's result type into the component.
+This small Dart client deliberately returns decoded JSON as `Object?`, so the
+application validates and maps the shape it needs. The Dart call is also a
+one-off HTTP query, unlike `useQuery`, which stays subscribed while the React
+component is mounted.
+
+### A Live query is an ordinary Dart stream
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function LiveCounter() {
+  const room = "readme-dart-live";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  return (
+    <button
+      disabled={state === undefined}
+      onClick={() =>
+        increment({
+          room,
+          language: "typescript",
+          runId: crypto.randomUUID(),
+        })
+      }
+    >
+      Count: {state?.count ?? "loading"}
+    </button>
+  ); // React owns the subscription and refreshes this render automatically.
+}
+```
+
+**Dart**
+
+```dart
+import 'dart:async';
+import 'dart:io';
+
+import 'client/convex_client.dart';
+import 'client/live_client.dart';
+
+Future<void> main() async {
+  final deploymentUrl = Platform.environment['CONVEX_URL'];
+  if (deploymentUrl == null || deploymentUrl.isEmpty) {
+    throw StateError('CONVEX_URL is required');
+  }
+
+  final client = ConvexClient(deploymentUrl);
+  final subscription = await client.subscribe('demo:state', {
+    'room': 'readme-dart-live',
+  });
+  // One iterator stays attached, so no update is lost between reads.
+  final updates = StreamIterator<LiveUpdate>(subscription.updates);
+  try {
+    if (!await updates.moveNext()) throw StateError('Live stream closed');
+    if (updates.current.error != null) throw updates.current.error!;
+    stdout.writeln('Initial: ${updates.current.value}');
+
+    await client.mutation('demo:increment', {
+      'room': 'readme-dart-live',
+      'language': 'dart',
+      'runId': 'dart-readme-${DateTime.now().microsecondsSinceEpoch}',
+    });
+
+    if (!await updates.moveNext()) throw StateError('Live stream closed');
+    if (updates.current.error != null) throw updates.current.error!;
+    stdout.writeln('Updated: ${updates.current.value}'); // Reactive value.
+  } finally {
+    await updates.cancel();
+    await subscription.close(); // The command-line program owns this lifecycle.
+    await client.close();
+  }
+}
+```
+
+Dart supports asynchronous streams directly. This client chooses to expose
+Live results as a single-listener `Stream<LiveUpdate>` and makes callers close
+the subscription explicitly. React hides those details behind component mount,
+rerender, and unmount behavior.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -21,7 +170,7 @@ cleans up its subscription and client.
 | Experimental Live query and reconnect support | Verified by shared local and hosted conformance |
 | Earned capability badges | HTTP and Live |
 
-## Basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.dart -->
 ```dart
@@ -150,42 +299,35 @@ String _runId() =>
 ```
 <!-- END GENERATED EXAMPLE -->
 
-The block is generated from the canonical runnable source. Run `./run
-sync-examples` after changing it so the website and README stay identical.
+The block above is generated from the canonical runnable source. If that source
+changes, `./run sync-examples` updates both the README and website copy.
 
-## Docker-only verification
+## Implementation Notes
 
-```sh
-./run test dart
-./run build dart
-./run verify-example dart
-./run verify dart
-./run verify-hosted dart
-```
+The public client has no third-party package dependencies. It uses Dart's
+standard `dart:io` HTTP, TLS, and WebSocket support plus `dart:convert` for JSON,
+then implements the Convex-specific request and Live behavior in Dart. HTTP
+calls return `Future<ConvexResult>` values and distinguish function, protocol,
+transport, and closed-client failures with a sealed error hierarchy.
 
-`test` formats, analyses, unit-tests, and compiles the canonical example and
-conformance adapter inside Docker. `build` creates the final linux/amd64
-runtime image; the coordinator's serial verification also applies the shared
-runtime policy and awards any HTTP or Live badges.
+One `LiveClient` serializes socket ownership, reconnects, and subscription
+changes. Each subscription feeds a single-listener stream through a bounded
+newest-16 relay, dropping the oldest queued update if a consumer falls behind.
+That protects socket processing from an unbounded Dart `StreamController`
+queue. The implementation also suppresses an unchanged value after reconnect.
 
-## Conformance and protocol notes
+Docker pins Dart SDK 3.7.2 and compiles the example and test adapter into
+`linux/amd64` AOT executables. The final images include their runtime library
+closure and CA certificates, but no Dart command, compiler, package manager,
+Node.js, Python, or Convex CLI. The experimental Live implementation targets
+the unversioned `/api/sync` behavior pinned to convex-rs 0.10.4 source commit
+`6f1df8a8ba1665084ec001e307ca841ca17074d7`.
 
-The test-only adapter under `client/tests/conformance/` accepts NDJSON protocol
-v1 on stdin/stdout or a single `ADAPTER_LISTEN` TCP connection. Its
-`debugDisconnect` command is adapter-only and forces a reconnect after retiring
-the old socket. It is not part of the educational Dart API.
+## Known Issues
 
-The client uses Dart's ordinary `dart:io` HTTP/TLS and WebSocket facilities.
-Convex-specific request bodies, query-set Add/Remove messages, transitions,
-error classes, reconnect metadata, and bounded newest-16 delivery are written
-in Dart. The Live profile is the unversioned `/api/sync` profile pinned to
-convex-rs 0.10.4 source commit `6f1df8a8ba1665084ec001e307ca841ca17074d7`.
-It is an experimental compatibility target, not a stable public protocol.
-
-## Limitations
-
-- Live authentication and token rotation are deferred.
-- Full tagged Convex values, WebSocket mutations/actions, journals, optimistic
-  updates, and `TransitionChunk` assembly are deferred.
-- Shared local and hosted conformance passed on the reviewed commit, earning
-  HTTP and Live.
+1. Live authentication and token rotation are not implemented.
+2. Values are limited to JSON-safe data. Full tagged Convex value types are not
+   decoded by this demonstration.
+3. WebSocket mutations and actions, query journals, optimistic updates, and
+   `TransitionChunk` assembly are deferred. The HTTP and Live capabilities in
+   the status table are still backed by shared local and hosted conformance.

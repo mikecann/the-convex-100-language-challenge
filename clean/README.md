@@ -1,31 +1,169 @@
-# Convex from Clean
+# Clean
 
-This folder is a native [Clean](https://clean.cs.ru.nl) client for Convex's
-documented JSON HTTP endpoints and the project's pinned `/api/sync` Live
-WebSocket profile. Clean is a pure, lazy functional language whose
-*uniqueness types* let the compiler prove a value has exactly one live
-reference and therefore mutate it in place without breaking referential
-transparency — the ownership reasoning Rust made famous, arriving roughly
-twenty-five years earlier. Clean's distribution has no JSON, HTTP, or
-WebSocket support to reach for, so all three are written here in Clean
-itself, over a hand-rolled TCP socket layer reached through Clean's own
-`ccall` C FFI. OpenSSL's `libssl`/`libcrypto` are reached the same way, for
-the TLS record layer, SHA-1, Base64, and randomness — the same kind of
-foreign-function boundary every other native client in this project uses for
-its language's TLS story. Everything Convex-specific stays in Clean.
+[Clean](https://clean-lang.org/) is a general-purpose, pure, lazy functional
+language created by researchers at Radboud University Nijmegen. It is close to
+Haskell in feel, but uses uniqueness types to safely thread state and I/O
+through otherwise pure code. Clean is a small modern niche, with current work
+centred on its package ecosystem and projects such as the iTask web workflow
+system.
 
-This is unofficial, educational teaching material, not an official Convex SDK
-and not a package meant for publication.
+This client is unofficial educational material. It demonstrates Convex from
+Clean, but it is not an official Convex SDK or a package intended for
+production use.
 
-## Start here
+## Getting Started
 
-Read [`examples/basics/main.icl`](examples/basics/main.icl). It configures
-the deployment from `CONVEX_URL`, performs an HTTP query, starts a Live
-subscription before the mutation so the initial snapshot cannot be missed,
-applies an idempotent mutation, and checks that both the HTTP and Live paths
-agree on the resulting `0 -> 1` count.
+The canonical [`examples/basics/main.icl`](examples/basics/main.icl) queries a
+counter, subscribes before mutating it, and checks the reactive `0 -> 1`
+update. From the repository root, Docker builds the exact example below and
+runs it against a fresh room:
 
-## What works
+```sh
+./run verify-example clean
+```
+
+## Interesting Parts
+
+### Effects are values in Clean
+
+In React, `useQuery` hides the network effect and gives you a generated,
+type-safe result. This Clean client makes the effect visible by consuming and
+returning `*World`. The star is a uniqueness annotation: Clean proves there is
+only one usable world value, which keeps I/O ordered without making the whole
+language impure.
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
+
+function Counter() {
+  const [room] = useState(() => `clean-readme-${crypto.randomUUID()}`);
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // state and count are type-safe here.
+}
+
+export function App() {
+  return <ConvexProvider client={convex}><Counter /></ConvexProvider>;
+}
+```
+
+**Clean**
+
+```text
+import StdEnv
+import StdMaybe
+import Convex.Result
+import Convex.Wire
+import Convex.HTTP
+import Convex.Client
+
+readCount :: !String !String !*World -> (!Int, !*World)
+readCount deploymentUrl room world
+	// The caller supplies a fresh room name, just like the shared verifier.
+	# (created, world) = clientInit deploymentUrl world
+	= case created of
+		RErr message = abort message
+		ROk client = query client world
+where
+	query client world
+		# args = JObject [("room", JString room)]
+		# (result, world) = clientCall "query" "demo:state" args client world
+		= case result of
+			RErr message = abort message
+			ROk response = case response.crFailure of
+				Just (message, _) = abort message
+				Nothing = case jsonLookup "count" response.crValue of
+					Just value = case jsonAsWholeInt value of
+						Just count
+							# world = clientClose client world
+							= (count, world) // count is checked at runtime.
+						Nothing = abort "count was not a whole number"
+					Nothing = abort "state was missing count"
+```
+
+The Clean call is a one-off HTTP query, not the equivalent of React's ongoing
+subscription. Its path, arguments, and decoded JSON fields are runtime-checked
+because this demonstration does not generate Clean types from the Convex API.
+
+### React owns the subscription; Clean asks for each step
+
+React subscribes on render and cleans up on unmount. This command-line client
+owns that lifecycle directly: it registers a subscription ID, repeatedly asks
+the connection for the next event, and later unsubscribes and closes. Returning
+the updated `Client` from each operation is this API's explicit state-passing
+design. Unlike `*World`, `Client` itself is abstract but not uniqueness-typed.
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function LiveCounter() {
+  // This component runs inside the configured ConvexProvider shown above.
+  const [room] = useState(() => `clean-live-${crypto.randomUUID()}`);
+  const state = useQuery(api.demo.state, { room });
+
+  return <p>{state?.count ?? "Loading..."}</p>; // React owns subscribe/unsubscribe.
+}
+```
+
+**Clean**
+
+```text
+import StdEnv
+import StdMaybe
+import Convex.Result
+import Convex.Wire
+import Convex.Live
+import Convex.Client
+
+nextState :: !String !String !*World -> (!SyncEvent, !*World)
+nextState deploymentUrl room world
+	// The caller supplies a fresh room; the URL normally comes from CONVEX_URL.
+	# (created, world) = clientInit deploymentUrl world
+	= case created of
+		RErr message = abort message
+		ROk client = subscribe client world
+where
+	subscribe client world
+		# args = JObject [("room", JString room)]
+		// "readme-live" identifies this local subscription, not a Convex document.
+		# (subscribed, world) = clientSubscribe "readme-live" "demo:state" args client world
+		= case subscribed of
+			RErr message = abort message
+			ROk client1 = wait client1 world
+
+	wait client world
+		// Blocking for one step is a client API choice, not a Clean limitation.
+		# (event, client1, world) = clientStep 100 client world
+		= case event of
+			Nothing = wait client1 world
+			Just update = finish update client1 world
+
+	finish update client world
+		# (unsubscribed, world) = clientUnsubscribe "readme-live" client world
+		= case unsubscribed of
+			RErr message = abort message
+			ROk client1
+				# world = clientClose client1 world
+				= (update, world)
+```
+
+The complete example handles failed events, verifies values, unsubscribes, and
+closes the client. The Live implementation is demand-driven rather than a
+background callback or stream, so the caller decides when another network step
+may happen.
+
+## Status
 
 | Capability | State | Notes |
 | --- | --- | --- |
@@ -37,8 +175,10 @@ agree on the resulting `0 -> 1` count.
 | Convex tagged values | deferred | JSON-safe values only |
 | Live authentication, optimistic writes, WebSocket mutations/actions | deferred | |
 
-The full teaching example below is generated directly from the runnable
-source.
+These claims come from the repository's recorded shared evaluator results. No
+fresh conformance run was performed for this documentation-only change.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.icl -->
 ```text
@@ -234,90 +374,36 @@ where
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-```sh
-./run test clean           # compiles the client, the example, and the adapter; runs offline unit tests
-./run verify-example clean # runs the canonical example against a unique room
-./run verify clean         # adds shared local black-box conformance
-./run verify-hosted clean  # repeats example and conformance against the real hosted deployment, over real TLS
-./run verify-all clean     # builds once, then runs both deployment profiles
-```
+- This is a native Clean implementation. Convex-specific HTTP, JSON,
+  WebSocket, and Live behaviour is written under [`client/Convex/`](client/Convex/).
+  Raw TCP and OpenSSL are reached through Clean's C FFI; no JavaScript client,
+  Convex CLI, `curl`, or other delegated client performs the calls.
+- The bundled Clean 3.1 distribution has no ready-made JSON, HTTP, or
+  WebSocket stack for this setup, so the client includes those layers. HTTP
+  calls open one connection per query, mutation, or action. Live keeps one
+  connection and one call stack in charge of reads, writes, subscription
+  state, and reconnects.
+- Clean's uniqueness typing matters most at the actual effect boundary here.
+  Memory helpers thread both their pointer and `*World` through FFI reads and
+  writes, preventing reordering or accidental loss of a write. `Client` and
+  its internal `LiveManager` are explicitly returned as updated values, but
+  they are not declared unique types.
+- Clean 3.1 miscompiled void-returning OpenSSL `ccall` declarations in this
+  workload and corrupted the Clean heap. `Convex.TLS` works around that
+  measured toolchain bug by declaring those functions as returning a discarded
+  `Int`. TLS still verifies the certificate and hostname.
 
-`./run test clean` proves the client compiles, its offline unit tests pass
-(`FoundationTest`, `WireTest`, `HTTPTest`, `WebSocketTest`, `ClientTest`), and
-both `convex-adapter` and `convex-example` build as `linux/amd64` binaries.
-Two of the test binaries (`ConvexCallTest`, `ConvexLiveTest`) exercise a real
-backend end-to-end — an HTTP query/mutation round trip, and the full Live
-subscribe/update/five-reconnect sequence — but only when `CONVEX_URL` is set,
-so `./run test` itself stays entirely offline while the same binaries are
-real, runnable regressions against a live deployment.
+## Known Issues
 
-## Conformance and protocol notes
-
-- `client/tests/conformance/main.icl` is the NDJSON adapter protocol v1
-  executable. It is test infrastructure, not part of the educational API: it
-  decodes one command per input line, calls the real client in `client/`, and
-  encodes one event per output line, in both stdin/stdout mode and the
-  `ADAPTER_LISTEN` TCP mode the shared harness uses (a raw POSIX
-  socket/bind/listen/accept, since this is the one place in this client that
-  needs a server-side socket).
-- The Live layer (`client/Convex/Live.icl`) is a single call stack owning the
-  connection at all times, threaded explicitly as a `LiveManager` record
-  through every function (Clean's natural analogue of a mutable owning
-  pointer) rather than handed to a background worker. `liveStep` advances the
-  connection by at most one step — reconnecting if there are active
-  subscriptions but no socket, or waiting up to a caller-chosen timeout for
-  the next frame — so a caller loop that alternates between reading its own
-  command source and calling this function stays responsive to `close`,
-  `unsubscribe`, and `debugDisconnect` instead of blocking for seconds inside
-  one deep read. Delivery buffering is a direct consequence of this: at most
-  one already-decoded event is held between calls, so the step function
-  itself is the backpressure.
-- Every connection-level failure inside `liveStep` (a stalled peer, a
-  protocol violation) closes the socket and is published as a
-  `FunctionError`-shaped event per active subscription rather than returned
-  as a hard error, so a caller never needs a second failure channel.
-- `Convex.TLS`'s handshake and encrypted read/write retry against
-  non-blocking `SSL_get_error` results, polled through the same `Deadline`
-  the rest of this client threads everywhere — verified end-to-end against
-  the real hosted deployment, including full certificate and hostname
-  verification. See the honest-limitations section below for the real `clm`
-  3.1 code-generation defect this required working around.
-
-## Honest limitations
-
-- **A real `clm` 3.1 code-generation defect, worked around in `Convex.TLS`.**
-  Every real TLS handshake against the hosted deployment used to crash the
-  Clean runtime with `Run Time Warning: cycle in spine detected` and exit
-  255, 100% reproducibly. Root-caused by bisection: a ccall whose type
-  string declares a `void` return (`"...:V:A"` — `SSL_free`, `SSL_CTX_free`,
-  `SSL_CTX_set_verify`) reliably corrupts Clean's own heap the moment *any*
-  other ccall in that connection's lifetime runs afterward, regardless of
-  which call it is, its argument types, or Clean-level function boundaries.
-  A minimal probe that completes a real handshake against the hosted
-  deployment and then forces GC pressure after each individual cleanup step
-  isolated it precisely: `SSL_shutdown` then `SSL_free`, with nothing
-  after, ran clean every time; adding a single further ccall after
-  `SSL_free` — `SSL_CTX_free`, `closeRaw`, even an unrelated diagnostic
-  `fcntl` probe — crashed every time. The fix, applied throughout
-  `client/Convex/TLS.icl`: every genuinely void-returning OpenSSL binding
-  is declared as returning a discarded `Int` instead (`"...:I:A"`), which
-  alone eliminates the corruption with no change in behavior. See
-  `SSL_CTX_free`'s own comment in that file for the full writeup; this is
-  likely worth reporting to the Clean toolchain maintainers.
-- Convex.WebSocket's UTF-8 validator is a pragmatic well-formedness check
-  (every leading byte's declared sequence length is followed by exactly that
-  many continuation bytes), not a full RFC 3629 validator: it does not
-  additionally reject overlong encodings, surrogate code points, or
-  codepoints above U+10FFFF.
-- Live authentication, optimistic writes, WebSocket mutations/actions, and
-  `TransitionChunk` assembly are all deferred; only the JSON-safe
-  query/mutation/action profile is implemented.
-- Reconnection has no exponential backoff yet: a Live bring-up that keeps
-  failing is retried on the very next `liveStep` call rather than after a
-  growing delay.
-- The adapter's own combined wait on both the command input and the Live
-  socket is a single 100ms poll on input followed unconditionally by one
-  non-blocking `liveStep 0`, rather than a true combined poll on both file
-  descriptors: `Client` is an abstract type with no exposed file descriptor.
+1. WebSocket UTF-8 checking validates byte sequence shape but does not reject
+   every overlong encoding, surrogate, or code point above U+10FFFF.
+2. Live authentication, optimistic writes, WebSocket mutations and actions,
+   and `TransitionChunk` assembly are deferred. HTTP bearer authentication and
+   JSON-safe query, mutation, and action calls are supported.
+3. Failed Live reconnects have no exponential backoff. The next `clientStep`
+   retries immediately.
+4. The conformance adapter polls command input for up to 100 ms before a
+   non-blocking Live step, so either kind of input may take roughly 100 ms to
+   be noticed.

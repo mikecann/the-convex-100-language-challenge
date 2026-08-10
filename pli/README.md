@@ -1,14 +1,193 @@
-# Convex from PL/I
+# PL/I
 
-A native Convex client written in PL/I and compiled by Iron Spring PL/I 1.4.1. It calls Convex functions over HTTP and keeps a query current over the pinned Live WebSocket profile — JSON, HTTP/1.1, RFC 6455 framing and the Convex sync state machine are all written in PL/I.
+PL/I, pronounced "P-L one", is IBM's general-purpose language for both
+commercial and scientific work. It first appeared in 1964 and sits in the same
+compiled, procedural family a modern developer might associate with COBOL and
+Fortran, while also supporting calls into C. Today its clearest home is
+maintaining and modernising applications on IBM Z and AIX. IBM's
+[PL/I overview](https://www.ibm.com/docs/en/zos-basic-skills?topic=zos-pli),
+[compiler family](https://www.ibm.com/products/pli-compiler-family), and
+[language timeline](https://www.ibm.com/ibm/files/S608123Y18657C60/us__en_us__ibm100__fortran__computer_language_evolution.pdf)
+give useful official context.
 
-This is educational and unofficial, not a production Convex SDK.
+This repository takes it somewhere much less expected: a native Convex client
+compiled with [Iron Spring PL/I 1.4.1](https://www.iron-spring.com/readme_linux.html).
+It is an educational, unofficial demonstration, not a production Convex SDK.
 
-## Start here
+## Getting Started
 
-[`examples/basics/main.pli`](examples/basics/main.pli) follows one shared counter from 0 to 1. It reads the room with an ordinary HTTP query, opens a Live subscription to the same query *before* changing anything, applies one idempotent mutation, and then shows the Live subscription reporting the new value on its own. The final line is printed only after every step agrees.
+Start with [`examples/basics/main.pli`](examples/basics/main.pli). It queries a
+new room, subscribes to that same room, increments the counter once, and waits
+for Convex to push the updated value.
 
-## What works
+From the repository root, run:
+
+```sh
+./run verify-example pli
+```
+
+The command builds and runs the canonical example in Docker against a unique
+test room. You do not need a PL/I compiler installed on your machine.
+
+## Interesting Parts
+
+### Arguments are objects in React and bytes here
+
+In React, generated Convex types make the mutation arguments and return value
+ordinary TypeScript objects:
+
+**TypeScript with React**
+
+```tsx
+import { useMutation } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+function IncrementOnce() {
+  const increment = useMutation(api.demo.increment);
+
+  return (
+    <button
+      onClick={async () => {
+        const result = await increment({
+          room: "readme-pli",
+          language: "TypeScript",
+          // One fresh key per click, reused if that call is retried.
+          runId: crypto.randomUUID(),
+        });
+        console.log(result.state.count); // The result is type-safe here.
+      }}
+    >
+      Increment
+    </button>
+  );
+}
+```
+
+Iron Spring's fixed `CHAR` values are blank padded and limited to roughly
+32,000 characters. This client therefore assembles the same argument object in
+a growable byte buffer before making the HTTP mutation:
+
+**PL/I**
+
+```pli
+%include convex; /* The client API, buffers, and result fields. */
+
+dcl mutationpath char(14) init('demo:increment');
+dcl mutationcount fixed bin(31);
+dcl statenode fixed bin(31);
+dcl countnode fixed bin(31);
+
+/* Build the exact JSON object Convex expects, without CHAR padding. */
+call bclear( B_TMP );
+call bputt( B_TMP, '{"room":"readme-pli",' );
+call bputt( B_TMP, '"language":"PL/I",' );
+/* This focused program makes one logical call, so its key stays fixed. */
+call bputt( B_TMP, '"runId":"readme-pli-once"}' );
+
+/* The real client posts this mutation and parses the JSON response. */
+call cvxcall( 'mutation', addr(mutationpath), 14,
+              bdata(B_TMP), blen(B_TMP) );
+if callok = 0 then call c_exit( 1 );
+
+/* A returned value is a JSON node index, so fields are explicit. */
+statenode = jmember( D_HTTP, callvalue, 'state' );
+countnode = jmember( D_HTTP, statenode, 'count' );
+mutationcount = jinteger( D_HTTP, countnode );
+```
+
+This is not how every PL/I API must look. It is a client design shaped by this
+compiler's string model and by the need to preserve arbitrary Convex JSON.
+The React handler creates a fresh idempotency key for each click. This PL/I
+fragment represents one process invocation, so its fixed key safely identifies
+that one logical call and any retry of it. The canonical example derives its
+stable `runId` from the verifier's unique room. Its exact builder is in
+[`main.pli`](examples/basics/main.pli).
+
+### React hides the subscription loop
+
+`useQuery` owns a subscription for the lifetime of the component. When the
+mutation changes the room, React renders again with the pushed value:
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+function Counter() {
+  const room = "readme-pli-live";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  if (state === undefined) return <p>Loading...</p>;
+
+  return (
+    <button
+      onClick={() =>
+        increment({
+          room,
+          language: "TypeScript",
+          // Each click is a new logical increment with its own retry key.
+          runId: crypto.randomUUID(),
+        })
+      }
+    >
+      {state.count} {/* A pushed update causes this component to render again. */}
+    </button>
+  );
+}
+```
+
+A command-line PL/I program has no component lifecycle, so this client exposes
+the subscription and its event loop directly:
+
+**PL/I**
+
+```pli
+%include convex; /* The client API, buffers, and subscription state. */
+
+dcl statepath char(10) init('demo:state');
+dcl subname char(5) init('basic');
+dcl slot fixed bin(31);
+dcl envname char(32);
+dcl deployment ptr;
+
+call cvxinit();                 /* Initialise all client-owned state. */
+envname = 'CONVEX_URL' || '00'x;
+deployment = c_getenv( addr(envname) );
+/* Configure the deployment selected by the Docker verifier. */
+if deployment = sysnull() then call c_exit( 1 );
+if cvxseturl( deployment, c_strlen(deployment) ) = 0 then
+  call c_exit( 1 );
+
+call bclear( B_TMP );
+call bputt( B_TMP, '{"room":"readme-pli-live"}' );
+
+/* Subscribe before the mutation so the later value is a pushed update. */
+slot = livesub( addr(subname), 5, addr(statepath), 10,
+                bdata(B_TMP), blen(B_TMP) );
+
+/* livepump advances the socket; livetake removes one queued delivery. */
+do while( livetake( slot ) = 0 );
+  if livepump( -1, 50 ) = 0 then;
+  end;
+/* B_MSG now contains the initial demo:state value as JSON text. */
+
+/* The full example performs demo:increment here, then waits again. */
+do while( livetake( slot ) = 0 );
+  if livepump( -1, 50 ) = 0 then;
+  end;
+/* B_MSG now contains the pushed state after the mutation. */
+
+call liveshutdown();            /* Dispose of subscriptions and the socket. */
+```
+
+PL/I has broader event and multitasking facilities. The explicit `livepump`
+and blocking `livetake` pairing is this client's small, deterministic API, not
+a language restriction. The complete example adds deadlines, decoding, and
+value checks around this focused lifecycle.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -17,6 +196,8 @@ This is educational and unofficial, not a production Convex SDK.
 | Live initial values and external updates | Verified by shared local and hosted conformance |
 | Remove, reconnect, query-error recovery and bounded delivery | Verified by shared local and hosted conformance |
 | Live authentication, WebSocket mutations and actions, optimistic updates | Deferred |
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.pli -->
 ```pli
@@ -267,23 +448,52 @@ This is educational and unofficial, not a production Convex SDK.
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-`./run test pli` builds the compiler from its pinned tarball, runs the style gate, the client unit tests and the deterministic Live tests, and exercises the adapter's real stdin/stdout behaviour. `./run verify-example pli` runs the exact example above against the approved local backend in its minimal image. `./run verify-all pli` is the shared HTTP and Live conformance gate on both the local and hosted deployments.
+This is a native implementation. PL/I owns the Convex JSON handling, HTTP/1.1
+framing, WebSocket framing, and Live state. It calls libc for sockets and DNS,
+and OpenSSL for TLS plus the cryptographic pieces of the WebSocket handshake.
+It does not delegate Convex behaviour to another SDK or runtime.
 
-## How it is put together
+Iron Spring PL/I 1.4.1 emits 32-bit i386 programs. Docker still provides a real
+`linux/amd64` image, and the final example and adapter run through the kernel's
+i386 compatibility support with Debian's 32-bit C and OpenSSL libraries. The
+compiler alone runs through QEMU during the build because its stock startup
+code uses a legacy signal syscall blocked by Docker. The shipped programs link
+[`client/plisig.pli`](client/plisig.pli), a small replacement that uses the
+allowed signal interface.
 
-Iron Spring PL/I produces 32-bit ELF objects and its runtime library is 32-bit, so the client binaries are i386 executables running on an amd64 image through the kernel's ia32 compatibility layer. They are linked against Debian's i386 multiarch C library and OpenSSL. Sockets, DNS, TLS, and the SHA-1, base64 and random bytes the RFC 6455 handshake needs are reached through PL/I's `OPTIONS( BYVALUE LINKAGE(SYSTEM) )` foreign-call convention; no Convex behaviour is delegated.
+Large values live in libc-allocated buffers because of the compiler's fixed
+string limit. The parser records offsets into the original JSON rather than
+building a PL/I object tree, so values can pass through without changing large
+numbers or object order. Callers explicitly decode the fields they need.
 
-Two details of this compiler shaped the design more than anything else:
+One poll loop owns all Live reads, writes, reconnects, and subscription
+changes. Each subscription keeps the newest 16 deliveries, the whole client
+allows at most 8 MiB of queued deliveries, and any one HTTP response or Live
+message is capped at 2 MiB. On reconnect, active subscriptions are sent again
+and an unchanged replay is suppressed.
 
-- **A CHAR string is capped at about 32000 characters.** An HTTP body or a Live message cannot live in one, so every payload larger than a short field is held in libc-allocated storage addressed by a pointer and a length, and PL/I reads it a byte at a time through a `BASED` overlay. A Convex value is carried as the exact JSON text it arrived as, which is also why values survive byte for byte with no PL/I value tree in the middle.
-- **The runtime's start-up routine installs signal handlers with the legacy i386 `sigaction` syscall**, which Docker's default seccomp profile refuses. Every stock PL/I binary therefore dies with `SIGACTION 1 returned -1` before reaching `main` inside a container. [`client/plisig.pli`](client/plisig.pli) replaces that one routine with an `rt_sigaction` version that the profile does allow, and it is linked ahead of the vendor archive so the original is never pulled in. The compiler itself cannot be relinked, so it — and only it — runs under `qemu-i386-static` during the build.
+The evidence-backed Docker gates are deliberately separate:
 
-## Protocol notes and limits
+- `./run test pli` checks style, unit behaviour, deterministic Live behaviour,
+  compilation, and the adapter inside Docker.
+- `./run verify-example pli` runs the exact example above against a unique room.
+- `./run verify pli` adds shared local HTTP and Live conformance.
+- `./run verify-hosted pli` repeats the shared checks against the hosted target.
+- `./run verify-all pli` runs both deployment profiles from the same source.
 
-The adapter speaks NDJSON protocol v1 on stdin and stdout, or over one `ADAPTER_LISTEN` TCP connection. A single thread owns everything: the same poll loop that reads controller commands also reads the WebSocket, so reads, writes, reconnects and query-set version changes cannot interleave. Reconnection backs off from 100 ms to 15 s and resets after a successful handshake. Each reconnection resends the active `Add` operations, and an unchanged value replayed by the new connection is suppressed so a caller waiting for the next change does not see the old one.
+## Known Issues
 
-Delivery is bounded twice: each subscription retains the newest 16 updates and drops the oldest, and the client refuses any single HTTP body or Live message above 2 MiB and holds at most 8 MiB of undelivered updates in total.
-
-Deferred: Live authentication, WebSocket mutations and actions, optimistic updates, tagged Convex value types, and `TransitionChunk` assembly — which is treated as protocol drift that reconnects. Rehydration suppression compares values as JSON text rather than semantically, so a value the backend re-serialised differently would be republished rather than suppressed.
+1. Live authentication, WebSocket mutations and actions, and optimistic updates
+   are deferred. HTTP authentication replacement is verified.
+2. Live values support the JSON-safe subset. Tagged Convex value types are not
+   decoded yet.
+3. `TransitionChunk` assembly is not implemented. Receiving one is treated as
+   protocol drift and causes a reconnect.
+4. Reconnect replay suppression compares JSON text, not semantic values. If the
+   backend serialises an unchanged object differently, the client republishes
+   it.
+5. Payload and queue limits are intentional. An individual HTTP response or
+   Live message over 2 MiB is rejected, and a slow reader loses older updates
+   once its 16-entry subscription queue fills.

@@ -1,19 +1,142 @@
-# Convex from XPL
+# XPL
 
-A native XPL client that calls Convex functions over HTTP and drives a real
-Live WebSocket subscription, built entirely on hand-declared POSIX socket
-and OpenSSL calls -- there is no HTTP, JSON, or WebSocket library for XPL to
-delegate to.
+XPL is a compact language derived from PL/I for writing compilers. It was
+announced at the 1968 Fall Joint Computer Conference, and the name covers both
+the language and its original translator-writing system. XPL influenced the
+PL/M family and HAL/S. Today it is a historical, specialist language with
+modern ports rather than a mainstream application ecosystem. The
+[XPL site hosted by co-creator David Wortman](https://www.cs.toronto.edu/XPL/)
+collects its history, language description, and ports, while the
+[compiler used here](https://github.com/sergev/xpl-compiler) translates XPL to
+C.
 
-This is educational and unofficial, not a production Convex SDK.
+This repository's client is an educational, unofficial demonstration. It is
+not a production Convex SDK.
 
-## Start here
+## Getting Started
 
-[`examples/basics/main.xpl`](examples/basics/main.xpl) follows the shared
-counter from 0 to 1 using an HTTP query, a Live subscription started before
-the mutation, and an idempotent mutation.
+Start with [`examples/basics/main.xpl`](examples/basics/main.xpl). It queries a
+counter, starts a Live subscription, applies an idempotent mutation, and checks
+that the reactive value moves from 0 to 1.
 
-## What works
+From the repository root, run the exact example in its Docker image against the
+dedicated test backend:
+
+```sh
+./run verify-example xpl
+```
+
+The command builds and runs the XPL program inside Docker, so you do not need an
+XPL compiler installed on your machine.
+
+## Interesting Parts
+
+### Function arguments and results are JSON text
+
+**TypeScript with React**
+
+```tsx
+import { useMutation } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function IncrementButton() {
+  const increment = useMutation(api.demo.increment);
+
+  return (
+    <button
+      onClick={async () => {
+        const result = await increment({
+          room: "readme-xpl",
+          language: "XPL",
+          runId: crypto.randomUUID(), // One idempotency key for this click.
+        });
+        console.log(result.state.count); // The generated API types describe this result.
+      }}
+    >
+      Increment
+    </button>
+  );
+}
+```
+
+**XPL**
+
+```text
+declare room character, run_id character, args character, count fixed;
+
+/* Read CONVEX_URL and optional authentication before making a client call. */
+if convex_init = 0 then call die(g_error_message);
+if argc > 1 then room = argv(1);
+else room = 'xpl-basic-example';
+
+/* The verifier supplies a unique room, so room-plus-once is stable for this run. */
+run_id = room || '-once';
+/* Build the same argument object as JSON because XPL has no record type. */
+args = '{"room":' || json_encode_string('', room) ||
+    ',"language":' || json_encode_string('', 'XPL') ||
+    ',"runId":' || json_encode_string('', run_id) || '}';
+
+if convex_call('mutation', 'demo:increment', args) = 0 then
+    call die(g_error_message); /* The client puts structured failure details in globals. */
+
+/* Locate the returned state object, then decode its count as a whole number. */
+if json_find_member(g_value_json, 1, 'state') = 0 then
+    call die('mutation result has no state');
+count = count_of(substr(g_value_json, g_span_start, g_span_end - g_span_start));
+/* convex_call closes its one-off HTTP connection before returning. */
+```
+
+React's generated API gives the mutation typed arguments and a typed return
+value. This XPL client instead accepts an encoded JSON object and exposes the
+returned JSON through `g_value_json`. That is a client design shaped by XPL's
+small type system, not a different Convex function. The full executable gets a
+verifier-unique room, so `room || '-once'` remains stable for one process and
+one logical mutation. It is not a globally safe fixed idempotency key. React
+can create a fresh key for each click with `crypto.randomUUID()`.
+
+### A reactive query has an explicit lifetime
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const state = useQuery(api.demo.state, { room: "readme-xpl" });
+  if (state === undefined) return <span>Loading...</span>;
+  return <span>{state.count}</span>; // React rerenders when Convex sends an update.
+}
+```
+
+**XPL**
+
+```text
+declare room character, args character, count fixed;
+
+/* Configure the client before opening the Live connection. */
+if convex_init = 0 then call die(g_error_message);
+if argc > 1 then room = argv(1);
+else room = 'xpl-basic-example';
+args = '{"room":' || json_encode_string('', room) || '}';
+
+/* The command-line program owns the subscription that React normally owns. */
+if convex_subscribe('demo:state', args) = 0 then call die(g_error_message);
+if convex_subscription_next = 0 then call die(g_error_message);
+
+/* Each call waits for the next value; the complete example calls it again after mutation. */
+count = count_of(g_sub_pending_value);
+output = 'live initial count: ' || count;
+call convex_unsubscribe; /* Cleanup is explicit rather than tied to component unmounting. */
+```
+
+`useQuery` subscribes and unsubscribes with the React component lifecycle. The
+XPL example owns the connection directly, and this client deliberately exposes
+a blocking `convex_subscription_next` operation because that keeps a small
+command-line program straightforward. A one-off `convex_call('query', ...)`
+would fetch the same shape once, but it would not be reactive.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -22,19 +145,11 @@ the mutation, and an idempotent mutation.
 | Live subscribe, unsubscribe, external updates, and query error recovery | Verified by shared local and hosted conformance |
 | Concurrent multi-subscription delivery and five real `debugDisconnect` reconnects | Verified by shared local and hosted conformance |
 
-The adapter's Live surface needs to answer `subscribe`, `unsubscribe`, and
-`debugDisconnect` for arbitrarily many concurrently active subscriptions
-while still reading new NDJSON commands -- normally a job for a background
-worker per connection. XPL has no way to call a function through a
-runtime-computed pointer, so there is no start routine to hand to
-`pthread_create`, and this client does not use threads at all: instead, one
-`poll(2)` call multiplexes the controller connection and the Convex
-WebSocket, subscriptions live in a plain table keyed by `subscriptionId`
-(whose table slot doubles as the Convex `queryId`), and dispatch is an
-`if`/`case` chain over that table rather than an indirect call. See
-`client/tests/conformance/adapter.xpl`'s entry point for the reactor and
-`client/convex.xpl`'s `ws_transition_begin` / `ws_transition_next` for how a
-`Transition` message's modifications get walked without recursion.
+The manifest records both `http` and `live` as earned capabilities. The table
+above reports the existing evidence; this documentation change does not claim a
+new verification run.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.xpl -->
 ```text
@@ -153,40 +268,41 @@ eof
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-`./run test xpl` compiles the client, the conformance adapter, and the
-canonical example in Docker, and runs the language-local unit tests.
-`./run verify-example xpl` exercises the exact example above against the
-dedicated backend -- including the Live subscription. `./run verify xpl` is
-the shared HTTP and Live conformance gate.
+The pinned XPL 1.0 translator emits C, and GCC turns that into the final ELF
+executables. The compiler and GCC stay in the Docker build stage; the runtime
+images contain only the binaries, CA certificates, and OpenSSL runtime needed
+to connect to Convex.
 
-## Protocol notes and limits
+There is no XPL package ecosystem to supply an HTTP, JSON, or WebSocket client.
+[`client/convex.xpl`](client/convex.xpl) declares POSIX socket and OpenSSL
+functions with `EXTERNAL`, then implements the Convex-specific request and Live
+behavior itself. It also constructs `sockaddr_in`, `addrinfo`, and WebSocket
+frame memory with `corebyte()`, `coreword()`, and `corelongword()` because this
+code cannot pass C-style structures around naturally.
 
-XPL has no package ecosystem for HTTP, TLS, JSON, or WebSockets, so
-`client/convex.xpl` calls libc sockets and OpenSSL directly through
-`EXTERNAL` procedure declarations and implements the HTTP request/response
-cycle, the WebSocket handshake and frame codec, and the Convex sync
-profile's `Connect` / `ModifyQuerySet` / `Transition` messages itself.
-`inline()` is never used, not even for a header include: `sockaddr_in`,
-`addrinfo`, and the WebSocket frame header are all built and read with
-`corebyte()` / `coreword()` / `corelongword()` memory pokes at their
-documented glibc x86-64 offsets instead. XPL has no recursion (a nested
-procedure compiles to a C function with static locals, which cannot safely
-call itself) and no structs usable as formal parameters, so the JSON
-scanner walks text with an explicit integer depth counter rather than a
-parse tree, and a fragment this client only needs to relay -- call
-arguments, a result value, log lines -- is copied as its exact source span
-instead of being decoded and re-encoded.
+XPL procedures return one scalar and the client cannot use structs as ordinary
+out-parameters, so operations publish result spans and error details through
+globals. The hand-written JSON scanner is iterative because recursive nested
+procedures are unsafe in this translator. Large JSON-safe values are kept as
+exact source spans instead of decoded into a general XPL value and encoded
+again.
 
-Live authentication, optimistic updates, WebSocket mutations and actions,
-tagged (non-JSON-safe) Convex values, and `TransitionChunk` assembly are
-deferred. A rehydration that reconnecting after `debugDisconnect` triggers is
-suppressed when it repeats the last value already delivered for that
-subscription, so a caller sees initial value, disconnect acknowledgement,
-external change, updated value -- never a duplicate in between. XPL has no
-`#include` or module system, so the Docker build concatenates
-`client/convex.xpl` ahead of each entry point (the adapter, the example,
-and the language-local test program) before invoking the compiler, the same
-role a C header plus a second translation unit would play, done with `cat`
-instead of `#include`.
+XPL also has no module or `#include` system. The Docker build concatenates the
+client core in front of the example, adapter, or unit-test entry point before
+translation. For conformance, the adapter uses one `poll(2)` loop to own both
+the controller socket and Live WebSocket. Its fixed table supports up to 32
+simultaneous subscriptions without threads or runtime-computed function calls.
+
+## Known Issues
+
+1. The public client handles the JSON-safe Convex value subset only. Tagged
+   values such as Convex integers and bytes do not have a general XPL decoding
+   layer.
+2. Live authentication, optimistic updates, WebSocket mutations and actions,
+   and `TransitionChunk` assembly are deferred. HTTP bearer-token replacement
+   is supported.
+3. The direct educational Live API owns one active subscription, while the
+   conformance adapter multiplexes at most 32. The implementation is pinned to
+   `linux/amd64` and relies on glibc x86-64 structure offsets.

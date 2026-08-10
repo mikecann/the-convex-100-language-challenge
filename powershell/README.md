@@ -1,20 +1,137 @@
-# Convex from PowerShell
+<img src="logo.png" alt="PowerShell logo" width="128">
+<!-- Logo source: https://github.com/PowerShell/PowerShell/blob/master/assets/Powershell_256.png -->
 
-This small PowerShell client calls a Convex function over HTTP, then follows the same counter through the experimental Live sync profile.
+# PowerShell
 
-It is educational and unofficial, not a production SDK or a supported Convex package.
+[PowerShell](https://learn.microsoft.com/powershell/) is a cross-platform command shell, scripting language, and automation framework built on .NET. [Windows PowerShell 1.0 arrived in 2006](https://learn.microsoft.com/powershell/scripting/install/powershell-support-lifecycle), and [Microsoft open-sourced the cross-platform edition in 2016](https://devblogs.microsoft.com/powershell/windows-powershell-is-now-powershell-an-open-source-project-with-linux-support-how-did-we-do-it/). Its distinctive trick is an object pipeline: commands pass structured .NET objects instead of making every program parse text. It remains especially useful for Windows administration, Microsoft cloud tooling, deployment scripts, and CI automation, while also running on Linux and macOS.
 
-## Start here
+This client is an educational, unofficial demonstration. It is not a production SDK or a supported Convex package.
 
-The [canonical basic example](examples/basics/main.ps1) makes the counter's `0 -> 1` journey: HTTP query, initial Live value, idempotent mutation, and the Live update caused by that mutation.
+## Getting Started
 
-## What works
+The [canonical basic example](examples/basics/main.ps1) takes a counter from `0` to `1` with an HTTP query, a Live subscription, and an idempotent mutation. From the repository root, Docker builds the pinned PowerShell environment and runs that exact example against an isolated test room:
+
+```sh
+./run verify-example powershell
+```
+
+You do not need PowerShell installed on the host.
+
+## Interesting Parts
+
+### Convex arguments look like ordinary PowerShell hashtables
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function CounterSnapshot() {
+  const room = "powershell-readme";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>Count: {state.count}</p>; // The hook keeps this value reactive.
+}
+```
+
+**PowerShell**
+
+```powershell
+. (Join-Path $PWD 'powershell/client/Convex.ps1') # Dot-source the client functions.
+
+$deploymentUrl = $env:CONVEX_URL
+if (-not $deploymentUrl) { throw 'CONVEX_URL is required' }
+$room = 'powershell-readme'
+$client = New-ConvexClient $deploymentUrl
+try {
+    # A hashtable becomes the Convex function's { room } argument object.
+    $state = (Get-ConvexQuery $client 'demo:state' @{ room = $room }).Value
+    Write-Output "Count: $($state.count)"
+}
+finally {
+    Close-ConvexClient $client
+}
+```
+
+PowerShell's `@{ room = $room }` is a key/value object much like the TypeScript argument object. The important semantic difference is lifecycle: React's `useQuery` stays subscribed and rerenders the component, while `Get-ConvexQuery` makes one HTTP request and returns one snapshot.
+
+### A command-line subscription has an explicit lifetime
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function ReactiveCounter() {
+  const room = "powershell-live-readme";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  async function incrementOnce() {
+    await increment({
+      room,
+      language: "typescript",
+      runId: crypto.randomUUID(), // One logical mutation gets one retry-safe key.
+    });
+  }
+
+  return (
+    <button onClick={incrementOnce} disabled={state === undefined}>
+      Count: {state?.count ?? "loading"}
+    </button>
+  ); // React owns subscription setup and cleanup for useQuery.
+}
+```
+
+**PowerShell**
+
+```powershell
+. (Join-Path $PWD 'powershell/client/Convex.ps1')
+
+$deploymentUrl = $env:CONVEX_URL
+if (-not $deploymentUrl) { throw 'CONVEX_URL is required' }
+$room = 'powershell-live-readme'
+$client = New-ConvexClient $deploymentUrl
+$live = New-ConvexLiveState $deploymentUrl
+$subscription = $null
+try {
+    # Subscribe first, then block until the initial reactive value arrives.
+    $subscription = Add-ConvexSubscription $live 'counter' 'demo:state' @{ room = $room }
+    $initial = Receive-ConvexSubscription $live $subscription 10000
+    Write-Output "Initial: $($initial.value.count)"
+
+    $result = (Invoke-ConvexMutation $client 'demo:increment' @{
+            room     = $room
+            language = 'powershell'
+            runId    = [guid]::NewGuid().ToString('N')
+        }).Value
+    Write-Output "Mutation returned: $($result.state.count)"
+
+    # Receive the next value emitted for the same subscription.
+    $updated = Receive-ConvexSubscription $live $subscription 10000
+    Write-Output "Live update: $($updated.value.count)"
+}
+finally {
+    if ($subscription) { Remove-ConvexSubscription $live 'counter' }
+    Close-ConvexLive $live
+    Close-ConvexClient $client
+}
+```
+
+PowerShell supports callbacks and asynchronous .NET APIs, but this client deliberately exposes a blocking `Receive-ConvexSubscription` operation. That choice makes ownership visible in a script: subscribe, receive values, unsubscribe, and close. React hides those mechanics behind the component lifecycle.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
 | JSON HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
 | Pinned `/api/sync` Live reads | Verified by shared local and hosted conformance |
-| Capability badges | http, live — awarded by the shared evaluator from clean exact-head local and hosted runs |
+| Capability badges | `http`, `live`, awarded by the shared evaluator from clean exact-head local and hosted runs |
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.ps1 -->
 ```powershell
@@ -73,23 +190,28 @@ finally { if ($live) { Close-ConvexLive $live }; Close-ConvexClient $client }
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
+
+The client is native PowerShell. The public functions in [`client/Convex.ps1`](client/Convex.ps1) implement Convex-specific HTTP and Live behaviour themselves, using .NET's `System.Net.Http`, `System.Net.WebSockets`, and JSON classes only for ordinary transport and decoding. HTTP queries, mutations, and actions share one request path, return both the decoded `Value` and Convex log lines, and preserve structured function errors instead of flattening them into strings.
+
+Live is the harder half. One background PowerShell runspace exclusively owns the WebSocket, reconnects, and subscription changes, so callers never race each other on the socket. The public API gives each subscription a small queue and a blocking receive function. It retains the newest 16 events per subscription, with global limits of 64 events and 8 MiB, which keeps a slow script from growing memory without bound.
+
+The final images pin PowerShell 7.5.0 and run as an unprivileged user. They include the PowerShell runtime and the small POSIX command surface required by the shared verifier, but remove package managers, compiler assemblies, and unrelated shells and runtimes.
+
+### Verification layers
 
 ```sh
 ./run test powershell
 ./run build powershell
+./run verify-example powershell
+./run verify-all powershell
 ```
 
-The first command formats/parses and runs deterministic client and adapter checks in an amd64 PowerShell container. The second builds the final non-root runtime image. Root-owned verification separately runs the canonical example and shared local and hosted conformance.
+`test` checks formatting, parsing, client behaviour, adapter behaviour, and memory bounds inside Docker. `build` creates the minimal runtime images. `verify-example` runs the exact source shown above. Root-owned `verify-all` is the broader local and hosted conformance gate used for the capability awards in the status table.
 
-## Conformance and protocol notes
+## Known Issues
 
-`/usr/local/bin/convex-adapter` implements NDJSON protocol v1 through stdin/stdout or `ADAPTER_LISTEN`. Its one owner runspace alone reads, writes, reconnects, and advances `/api/sync` versions. Subscription relays check the active generation under a lock. Live delivery keeps the newest 16 events per subscription inside a global 64-event and 8 MiB queue budget.
-
-Both adapter modes share one ordered writer. It admits a single encoded event at a time within an 18 MiB reservation that charges the UTF-8 bytes, retained event graph, and runtime overhead, and it holds that reservation for the whole record so events can never interleave. Serializing, every chunked write, the newline, and the flush share one cumulative one-second deadline. A timeout releases the reservation exactly once and then terminates the stream — disposing the controller socket, or standard output in stdin mode — so nothing can follow a partial record.
-
-Every Live socket operation is bounded the same way. One cumulative cancellable budget covers DNS, connect, TLS, the 101 upgrade, the initial `Connect` frame, and the replayed `ModifyQuerySet`; a public call that stops waiting cancels that budget so the abandoned work retires instead of delaying the next control command. Assembling one WebSocket message has an absolute deadline armed by its first byte and never extended by later fragments, so a peer that trickles bytes forever fails exactly like one that stops mid-frame: a structured `TransportError`, a reconnect, replayed `Add` operations, and a later valid value on the same subscription.
-
-## Limitations
-
-Live authentication, optimistic updates, WebSocket mutations/actions, tagged Convex values, query journals, and transition chunks are deliberately out of scope. The client supports the full transitions used by the pinned profile but rejects unsupported transition chunk variants transactionally. `/api/sync` is pinned experimental protocol behaviour, not a stability promise.
+1. Live authentication, optimistic updates, WebSocket mutations and actions, query journals, and transition chunks are not implemented.
+2. Live values are limited to the JSON-safe subset exercised by this demonstration. Convex tagged values are outside the current client.
+3. Live follows a pinned, experimental `/api/sync` profile. Passing the recorded local and hosted checks does not make that undocumented protocol a stability promise.
+4. `Receive-ConvexSubscription` blocks the calling script until a value or timeout arrives. That is this educational client's API choice, not a limitation of PowerShell itself.

@@ -1,32 +1,148 @@
-# Convex from MUMPS
+# MUMPS
 
-This demonstration uses YottaDB's implementation of M (MUMPS) to call
-Convex's documented JSON HTTP endpoints and to keep a reactive query current
-through a native M WebSocket connection.
+[MUMPS](https://yottadb.com/heritage-legacy-m-mumps-future-yottadb/), usually
+called M today, began in the late 1960s as a compact language for data-intensive
+medical systems. Its defining model is a hierarchical associative array that
+can live either in process-local memory or in the database. That combination
+still has a practical niche in electronic health records. This demonstration
+uses [YottaDB](https://yottadb.com/product/), a current implementation of M
+that largely conforms to ISO/IEC 11756:1999.
 
-It is an educational, unofficial experiment. It is not a production SDK, an
+This is an educational, unofficial experiment. It is not a production SDK, an
 officially sanctioned Convex client, or a package intended for publication.
 
-## Start here
+## Getting Started
 
-[`examples/basics/main.m`](examples/basics/main.m) is the canonical example.
-It reads a new counter room over HTTP, starts Live before changing it,
-applies an idempotent mutation, and proves the same `0 -> 1` journey arrived
-through the subscription. The block below is generated from that exact
-runnable file.
+Start with [`examples/basics/main.m`](examples/basics/main.m). It reads a
+counter over HTTP, subscribes before changing it, applies one idempotent
+mutation, then waits for the same change to arrive over Live.
 
-## What works
+From the repository root, run the canonical program in its Docker image against
+a unique room on the approved local test deployment:
+
+```sh
+./run verify-example mumps
+```
+
+You do not need YottaDB installed on the host. The repository's Docker build
+provides the pinned compiler and runtime.
+
+## Interesting Parts
+
+### A typed object in React becomes an inspected local tree in M
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const room = "readme-mumps";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // state and count are type-safe here.
+}
+```
+
+**MUMPS**
+
+```mumps
+ do setup^convex
+ new url set url=$ztrnlnm("CONVEX_URL") ; Read configuration from the environment.
+ if '$$open^convex(url,"mumps-readme") zhalt 1 ; ' means logical NOT.
+ new q set q=$char(34) ; A quote character, used to construct valid JSON.
+ new room set room="readme-mumps"
+ new args set args="{"_q_"room"_q_":"_q_room_q_"}" ; _ concatenates strings.
+
+ new response
+ if '$$query^convex("demo:state",args,.response) zhalt 1 ; . passes the result by reference.
+ new mark set mark=$$jMark^convex()
+ new root set root=$$jParse^convex(response("value")) ; Parse JSON into local array nodes.
+ if root<0 zhalt 1
+ new countNode set countNode=$$jFind^convex(root,"count")
+ if countNode<0!($$jType^convex(countNode)'="number") zhalt 1
+ write $$jText^convex(countNode),! ; Checked at runtime, not type-safe at compile time.
+ do jRelease^convex(mark) ; Release this parse tree's bounded node allocation.
+```
+
+The React hook owns a reactive subscription and rerenders the component. The M
+call above is deliberately a one-off HTTP query. M has no static object type to
+match Convex's generated TypeScript type, so this client parses the response
+into a subscripted local array and checks each node before using it. YottaDB's
+[language guide](https://docs.yottadb.com/ProgrammersGuide/langfeat.html#variables)
+explains these sparse, expression-subscripted arrays.
+
+### React manages Live; this command-line client waits explicitly
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function IncrementButton() {
+  const room = "readme-mumps";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  async function addOne() {
+    const result = await increment({
+      room,
+      language: "typescript",
+      runId: crypto.randomUUID(),
+    });
+    console.log(result.state.count); // The mutation result is type-safe here.
+  }
+
+  return <button onClick={addOne}>Count: {state?.count ?? 0}</button>;
+}
+```
+
+**MUMPS**
+
+```mumps
+ do setup^convex ; Initialize the client's bounded tables.
+ new url set url=$ztrnlnm("CONVEX_URL") ; Read the deployment URL from the environment.
+ if '$$open^convex(url,"mumps-readme") zhalt 1 ; Create this program's client session.
+ new q set q=$char(34)
+ new room set room="readme-mumps"
+ new args set args="{"_q_"room"_q_":"_q_room_q_"}"
+ if '$$subscribe^convex("counter","demo:state",args) zhalt 1 ; Register Live before mutation.
+
+ new hasError,errName,errMsg,value
+ if '$$waitUpdate^convex("counter",15000,.hasError,.errName,.errMsg,.value) zhalt 1
+ if hasError zhalt 1 ; The first blocking wait receives the initial Live value.
+
+ new mutation,response
+ set mutation="{"_q_"room"_q_":"_q_room_q_","_q_"language"_q_":"_q_"mumps"_q_","_q_"runId"_q_":"_q_$$randomHex^convex(16)_q_"}"
+ if '$$mutation^convex("demo:increment",mutation,.response) zhalt 1
+ ; response("value") is JSON text, so callers must validate it at runtime.
+
+ if '$$waitUpdate^convex("counter",15000,.hasError,.errName,.errMsg,.value) zhalt 1
+ if hasError zhalt 1 ; This blocking wait receives the reactive update.
+ do closeLive^convex(2000) ; The command-line program owns subscription cleanup.
+```
+
+M supports ordinary subroutines and returned values, but this client's blocking
+`waitUpdate` is an API choice suited to its single-threaded command-line loop.
+React instead manages subscription setup and cleanup around the component
+lifecycle. The complete example performs the runtime JSON checks omitted here.
+
+## Status
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
 | HTTP | Badge earned | Query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented and pass shared local and hosted black-box conformance. |
 | Live | Badge earned | Subscribe/unsubscribe, reconnect-on-drop with exponential backoff, unchanged-rehydration suppression, reactive error recovery, and clean close are implemented and pass shared local and hosted black-box conformance, including a debugDisconnect-triggered five-reconnect proof and a QueryFailed-then-recovery cycle. |
 
-The shared evaluator awarded both badges from a clean exact-head build: 31 of
-31 checks against a local backend and 31 of 31 against the hosted deployment
-over real TLS.
+The existing shared evaluator evidence awarded both badges from a clean
+exact-head build: 31 of 31 checks against a local backend and 31 of 31 against
+the hosted deployment over real TLS. This README edit does not claim a fresh
+verification run.
 
-## The basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.m -->
 ```mumps
@@ -155,124 +271,60 @@ bail(message)
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verify it in Docker
+## Implementation Notes
+
+The implementation is native M. It uses YottaDB's own
+`OPEN`/`USE`/`READ`/`WRITE` device commands for TCP sockets, and `WRITE /TLS`
+for encryption. Those commands are documented in YottaDB's official
+[I/O guide](https://docs.yottadb.com/ProgrammersGuide/ioproc.html). JSON,
+HTTP/1.1, WebSocket framing, SHA-1, base64, and the Convex-specific behavior are
+implemented in [`client/convex.m`](client/convex.m), not delegated to another
+Convex client.
+
+YottaDB r2.06 is installed and compiled entirely inside Docker. The language
+test target compiles every checked-in M routine, runs JSON and cryptographic
+unit tests offline, then exercises HTTP and Live through real loopback sockets:
 
 ```sh
-./run test mumps            # installs YottaDB r2.06 (with its OpenSSL TLS
-                             # plugin) from the pinned installer, compiles
-                             # the client, and runs the real loopback
-                             # HTTP/Live fixtures and unit tests, entirely
-                             # offline
-./run verify-example mumps  # runs the exact block above against a unique
-                             # room on the local self-hosted backend
-./run verify mumps          # verify-example plus shared black-box conformance
-./run verify-hosted mumps   # verify-example plus conformance against the
-                             # dedicated hosted drift target, over real TLS
-./run verify-all mumps      # builds once, then runs both profiles above
+./run test mumps
+./run verify-example mumps
+./run verify mumps
+./run verify-hosted mumps
+./run verify-all mumps
 ```
 
-`./run test mumps` installs YottaDB r2.06 from its pinned installer script
-(Debian does not package it), building the OpenSSL-backed TLS plugin from
-source as part of the same install, compiles every checked-in `.m` source to
-a native object with `mumps -object`, runs `client/tests/jsontest.m` and
-`client/tests/cryptotest.m` (the JSON codec and the SHA-1/base64 digest
-primitives the WebSocket handshake depends on) with no network at all, and
-runs `client/tests/httptest.m` and `client/tests/livetest.m` against real
-`127.0.0.1` sockets served by `client/tests/fixture.m` -- not mocks -- so a
-bug in the client's own request framing or WebSocket codec cannot pass by
-construction. The local fixtures speak plain HTTP, so they never exercise
-TLS; `verify-hosted`/`verify-all` are what first proved the real TLS path
-against a real deployment.
+These commands prove different layers. `test` covers compilation and
+language-local behavior. `verify-example` runs the exact example above.
+`verify` adds local black-box conformance, `verify-hosted` checks the hosted
+drift target over TLS, and `verify-all` runs both deployment profiles from one
+build. The existing badge evidence described in Status comes from the shared
+evaluator, not from this README edit.
 
-## Conformance and protocol notes
+The client speaks the repository's pinned `convex-rs@6f1df8a8` sync profile at
+`/api/sync`. Its Live loop is single-threaded and keeps only the newest value
+for each subscription. The conformance adapter adds a bounded queue of eight
+entries and 4 MiB, dropping old subscription updates before control responses.
+Reconnect delay starts at 250 ms, doubles up to 30 seconds, and resets after a
+successful handshake. Active subscriptions are resent after reconnect, while
+an unchanged first value is suppressed.
 
-- The client speaks the pinned `convex-rs@6f1df8a8` sync profile at
-  `/api/sync`, matching every other client in this project.
-- Every socket is opened with M's own `OPEN`/`USE`/`READ`/`WRITE` device
-  syntax (device type `"SOCKET"`); TLS is a `WRITE /TLS(...)` on that same
-  device, backed by YottaDB's OpenSSL plugin (`libgtmtls.so`, built from
-  source with the installer's `--encplugin` option). No foreign process or
-  shim is involved for the Convex protocol itself, for either plain or
-  encrypted transport -- but YottaDB's TLS plugin never sends TLS Server
-  Name Indication (confirmed by reading its source: `gtm_tls_connect()`
-  calls `SSL_connect()` directly, with no `SSL_set_tlsext_host_name` call
-  anywhere, and by cross-checking every documented `WRITE /TLS` config
-  option, none of which touch SNI), which a real hosted deployment's
-  TLS-terminating front requires to select a certificate at all --
-  reproduced directly with `openssl s_client -noservername` against the
-  same host, which fails with the identical handshake alert. `client/
-  sni_shim.c` is a small `LD_PRELOAD` interposer that sets the SNI hostname
-  from `CONVEX_URL` before delegating to the real `SSL_connect`; it carries
-  no Convex, HTTP, JSON, or WebSocket logic, the same narrow pattern this
-  project already uses for a language runtime missing exactly one native
-  primitive (see `icon/client/shim.c`).
-- `sockOpen` deliberately opens an empty `SOCKET` device first and `USE`s it
-  with `CONNECT`, then reads `$KEY` while it is the current device, rather
-  than trusting `$DEVICE` on a single combined `OPEN`/`CONNECT`: `$DEVICE`
-  was observed reporting success for both a live connection and a genuinely
-  refused one, which YottaDB's own documentation attributes to `$DEVICE`/
-  `$KEY` only being meaningful for the device actually `USE`d. `$KEY`
-  reliably reports `"ESTABLISHED|handle|address"` on success and `""` on
-  failure.
-- `sockRead` uses the uncounted form of `READ`, not `READ var#count:timeout`:
-  direct experiment against a peer that writes a few bytes and then holds
-  the connection open confirmed the counted form blocks for the whole
-  timeout (or EOF) instead of returning as soon as any data is ready, which
-  would make every read on a live connection cost its entire budget.
-- Live delivery buffering is deliberate and bounded in two layers. The
-  client itself keeps only the latest value per subscription (a Transition
-  overwrites the prior one in place -- no unbounded queue). The test-only
-  conformance adapter (`client/tests/conformance/adapter.m`) adds a bounded
-  output queue on top of that for backpressure toward the controller: 8
-  slots, a 4 MiB byte budget, subscription events droppable oldest-first,
-  and `hello`/`result`/`error`/`ack`/`closed` responses never dropped.
-- Reconnect-on-drop uses exponential backoff (250ms base, doubling, capped
-  at 30s), reset to the base the moment a handshake next succeeds so a
-  healthy connection never inherits a stale, grown delay from an earlier,
-  unrelated run of failures. `liveMaybeReconnect` is polled once per
-  adapter main-loop pass rather than run on its own thread -- M here is
-  single-threaded, so the Live socket, the controller connection, and
-  reconnect scheduling are all driven from that one loop, never touched
-  concurrently.
-- A reconnect resends every active subscription's `Add` and arms a
-  one-shot rehydration guard per subscription. If the very next
-  `QueryUpdated` for that subscription is byte-identical to the value it
-  had before the drop, it is suppressed rather than delivered a second
-  time; a changed value, or a `QueryFailed`, clears the guard and is
-  delivered normally. This keeps a debugDisconnect-triggered reconnect's
-  observable sequence exactly initial value, disconnect acknowledgement,
-  external change, updated value -- not an extra unchanged rehydration in
-  between.
-- `subscribe` sends its query's `Add` two different ways depending on
-  whether a Live connection is already up: a cold start's `Add` rides
-  along in the same `ModifyQuerySet` that `liveConnect` uses to replay
-  every active subscription, while a second (or later) subscription on an
-  already-open connection sends its own incremental `ModifyQuerySet`.
-  Getting the branch between those two cases backwards silently drops the
-  second path entirely -- shared conformance (`client/live/external-update`
-  onward) is what caught this, since the language-local fixture only ever
-  exercises a single subscription per connection.
-- `client/tests/conformance/adapter.m` implements NDJSON adapter protocol
-  v1 over both stdin/stdout and the `ADAPTER_LISTEN` TCP mode, and declares
-  `debugDisconnect` as its one adapter-only command.
-- Fragmented WebSocket messages are reassembled correctly: continuation
-  frames are concatenated as raw payload bytes into the message in
-  progress, control frames (ping/pong/close) are handled between the
-  fragments of a data message per RFC 6455 without disturbing that
-  assembly, and UTF-8 is never separately validated by this client (Convex
-  JSON payloads are decoded byte-for-byte in M mode; the JSON parser itself
-  rejects malformed encoding while parsing string literals).
-- YottaDB always attaches a database region at process startup, even though
-  this client never references a `^global`; a region is created once at
-  build time (`mupip create`) and shipped read-only inside the runtime
-  images, never written again.
+One small C transport shim remains: [`client/sni_shim.c`](client/sni_shim.c)
+adds TLS Server Name Indication before YottaDB's OpenSSL plugin connects. It
+contains no Convex, HTTP, JSON, or WebSocket behavior. YottaDB still attaches a
+database region when each process starts, although this client uses only local
+variables and never references a persistent `^global`; the image therefore
+contains an unused region created at build time.
 
-## Limitations
+## Known Issues
 
-- Live authentication, WebSocket-issued mutations/actions, journals, and
-  `TransitionChunk` assembly are deferred; a `TransitionChunk` is reported
-  as protocol drift and the connection reconnects.
-- A YottaDB process always runs in byte-oriented M mode here (`ydb_chset=M`
-  for every stage), not UTF-8 mode. `--utf8` is deliberately never passed to
-  the installer: it would only add a second, ICU-linked engine variant this
-  client never selects, at the cost of an extra dependency.
+1. Live authentication, mutations and actions sent over WebSocket, journals,
+   and `TransitionChunk` assembly are deferred. Receiving a `TransitionChunk`
+   is treated as protocol drift and triggers a reconnect.
+2. The client retains only the latest unread Live value per subscription. A
+   slow consumer sees the newest state rather than every intermediate update.
+3. The runtime deliberately uses byte-oriented M mode (`ydb_chset=M`) rather
+   than YottaDB's UTF-8 engine. JSON bytes pass through unchanged, and the
+   client parser validates string escapes, but the runtime does not provide
+   general Unicode-aware M string operations.
+4. Hosted TLS depends on the narrow SNI shim described above because YottaDB's
+   TLS plugin does not set the hostname itself.

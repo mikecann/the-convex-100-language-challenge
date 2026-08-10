@@ -1,20 +1,190 @@
-# Convex from Vala
+<img src="logo.png" alt="Vala logo" width="160">
+<!-- Logo source: https://raw.githubusercontent.com/vala-lang/vala-www/main/public/android-icon-192x192.png -->
 
-This native Vala client calls Convex over documented JSON HTTP endpoints and keeps a query current through the repository's pinned Live WebSocket profile.
+# Vala
 
-It is educational and unofficial. It is not a production SDK and is not intended for package publication.
+[Vala](https://vala.dev/) is a statically typed language from the GNOME ecosystem. It began as a way to write GObject software with modern, C#-influenced syntax instead of hand-writing all the supporting C. The self-hosting `valac` compiler translates Vala into C and then a native binary, so programs use the existing GLib and GObject world rather than a Vala virtual machine.
 
-## Start here
+That makes Vala a specialist language today: it is most at home in GNOME and Linux desktop applications, command-line tools, and libraries that need a normal C-compatible interface. This repository uses that same niche for a native Convex client built on GLib, JSON-GLib, GIO, and libsoup. It is an educational, unofficial demonstration, not a production SDK or a package intended for publication.
 
-Read [`examples/basics/main.vala`](examples/basics/main.vala). It queries a fresh counter, starts Live before changing it, applies one idempotent mutation, and proves that HTTP and Live agree on `0 -> 1`.
+## Getting Started
 
-## What works
+Start with [`examples/basics/main.vala`](examples/basics/main.vala). It queries a fresh counter, subscribes before changing it, applies one idempotent mutation, and checks that the one-off HTTP result and later Live values agree on `0 -> 1`.
+
+From the repository root, Docker builds the exact canonical example and runs it against an approved test deployment:
+
+```sh
+./run verify-example vala
+```
+
+## Interesting Parts
+
+### JSON values stay explicit
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function StateCount() {
+  const room = "vala-readme";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  console.log(state.count); // state and count are type-safe here.
+  return <p>Count: {state.count}</p>;
+}
+```
+
+**Vala**
+
+```vala
+var builder = new Json.Builder ();
+builder.begin_object ();
+builder.set_member_name ("room");
+builder.add_string_value ("vala-readme"); // Build the Convex args object explicitly.
+builder.end_object ();
+
+var url = Environment.get_variable ("CONVEX_URL");
+if (url == null || url.length == 0) {
+  throw new Convex.ClientError.PROTOCOL ("CONVEX_URL is required");
+}
+var client = new Convex.Client (url);
+var value = client.query ("demo:state", builder.get_root ()).value;
+
+// JSON-GLib gives us a runtime JSON tree, so validate before decoding.
+if (value.get_node_type () != Json.NodeType.OBJECT ||
+    !value.get_object ().has_member ("count")) {
+  throw new Convex.ClientError.PROTOCOL ("demo:state omitted count");
+}
+var count_node = value.get_object ().get_member ("count");
+if (count_node.get_node_type () != Json.NodeType.VALUE ||
+    (count_node.get_value_type () != typeof (int64) &&
+     count_node.get_value_type () != typeof (double))) {
+  throw new Convex.ClientError.PROTOCOL ("demo:state returned a non-number");
+}
+double numeric_count = count_node.get_double ();
+int64 count = (int64) numeric_count;
+if ((double) count != numeric_count) {
+  throw new Convex.ClientError.PROTOCOL ("demo:state returned a fractional count");
+}
+stdout.printf ("%" + int64.FORMAT + "\n", count);
+client.close ();
+```
+
+React and generated Convex types make the component result type-safe and keep it current. This Vala method is a blocking, one-off HTTP query, and its result is a `Json.Node` that the program must inspect. That is a choice in this demonstration client, not a limit of Vala, which also supports asynchronous methods.
+
+### Live updates arrive as GLib signals
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function LiveCounter() {
+  const room = "vala-live-readme";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  return (
+    <button
+      onClick={() =>
+        increment({ room, language: "TypeScript", runId: crypto.randomUUID() })
+      }
+    >
+      Count: {state?.count ?? "loading"} {/* React owns the subscription lifecycle. */}
+    </button>
+  );
+}
+```
+
+**Vala**
+
+```vala
+Json.Node args_for (string room, string? language = null, string? run_id = null) {
+  var builder = new Json.Builder ();
+  builder.begin_object ();
+  builder.set_member_name ("room");
+  builder.add_string_value (room);
+  if (language != null) {
+    builder.set_member_name ("language");
+    builder.add_string_value (language);
+  }
+  if (run_id != null) {
+    builder.set_member_name ("runId");
+    builder.add_string_value (run_id);
+  }
+  builder.end_object ();
+  return builder.get_root ().copy ();
+}
+
+var url = Environment.get_variable ("CONVEX_URL");
+if (url == null || url.length == 0) {
+  throw new Convex.ClientError.PROTOCOL ("CONVEX_URL is required");
+}
+var client = new Convex.Client (url);
+var subscription = client.subscribe ("demo:state", args_for ("vala-live-readme"));
+var loop = new MainLoop (); // A command-line app must keep GLib dispatching events.
+bool mutated = false;
+
+subscription.updated.connect ((value, failure) => {
+  try {
+    if (failure != null) throw new Convex.ClientError.PROTOCOL (failure.message);
+    if (value == null) throw new Convex.ClientError.PROTOCOL ("Live omitted its value");
+
+    if (value.get_node_type () != Json.NodeType.OBJECT ||
+        !value.get_object ().has_member ("count")) {
+      throw new Convex.ClientError.PROTOCOL ("Live omitted count");
+    }
+    var count_node = value.get_object ().get_member ("count");
+    if (count_node.get_node_type () != Json.NodeType.VALUE ||
+        (count_node.get_value_type () != typeof (int64) &&
+         count_node.get_value_type () != typeof (double))) {
+      throw new Convex.ClientError.PROTOCOL ("Live returned a non-number");
+    }
+    double numeric_count = count_node.get_double ();
+    if (numeric_count != numeric_count || numeric_count < 0 ||
+        numeric_count >= 9223372036854775808.0) {
+      throw new Convex.ClientError.PROTOCOL ("Live returned an out-of-range count");
+    }
+    int64 count = (int64) numeric_count; // Convex may encode this as 1 or 1.0.
+    if ((double) count != numeric_count) {
+      throw new Convex.ClientError.PROTOCOL ("Live returned a fractional count");
+    }
+    stdout.printf ("count: %" + int64.FORMAT + "\n", count); // A reactive value arrived.
+    if (!mutated) {
+      mutated = true;
+      client.mutation (
+        "demo:increment",
+        args_for ("vala-live-readme", "Vala", Uuid.string_random ())
+      ); // The runId makes a retry idempotent.
+    } else {
+      client.unsubscribe (subscription); // This client owns cleanup explicitly.
+      client.close ();
+      loop.quit ();
+    }
+  } catch (Error error) {
+    stderr.printf ("Live failed: %s\n", error.message);
+    client.close ();
+    loop.quit ();
+  }
+});
+loop.run ();
+```
+
+Vala signals are close to C# events: `.connect` registers a callback that runs when the object emits. The client deliberately exposes Live through that native mechanism. Unlike a React component, this command-line program must keep a GLib main loop running and explicitly unsubscribe and close the client.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
 | HTTP queries, mutations, actions, and structured errors | Verified by shared local and hosted conformance |
 | Live initial values and updates used by the canonical example | Verified by shared local and hosted conformance |
 | Full HTTP and Live conformance | Passed; both capabilities earned |
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.vala -->
 ```vala
@@ -149,29 +319,17 @@ int main (string[] args) {
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-```sh
-./run sync-examples
-./run validate
-./run test vala
-./run verify-example vala
-```
+This is a native implementation. Vala owns the Convex request envelopes and Live behaviour; it does not hand protocol work to an existing Convex SDK. The pinned Vala 0.56.3 compiler translates the source to C, and the Docker build produces a native `linux/amd64` executable. libsoup 3 handles HTTP and TLS, JSON-GLib represents values, and GLib/GIO sockets carry the client-owned WebSocket implementation.
 
-`test` compiles and runs Vala's language-local adapter checks inside Docker. The final-image probes exercise the exact canonical example and adapter under the runtime policy. The later root-owned local and hosted conformance runs passed, earning HTTP and Live.
+The public HTTP calls are synchronous and return a `Result` containing a JSON-GLib node plus Convex log lines. Responses are streamed under a 2 MiB cap and one absolute deadline. The client parses a valid Convex error envelope before classifying the HTTP status so function error messages, data, and logs are not lost.
 
-## Conformance and protocol notes
+Live has one owner on the GLib main context. It manages socket reads, writes, query changes, reconnects, and active subscriptions, then publishes complete updates through each subscription's `updated` signal. Delivery is deliberately bounded by both event count and retained memory, and unsubscribe invalidates an old relay before returning. The adapter-only `debugDisconnect` hook exists for conformance tests and is not part of the educational API.
 
-The client implements Convex-specific HTTP envelopes and the pinned `/api/sync` query-set profile in Vala. libsoup supplies streaming HTTP with a two MiB body limit and one absolute operation deadline, while a GLib/GIO `SocketClient` and TLS connection carry the client-owned RFC6455 handshake, masking, incremental frame parser, control frames, and close deadlines. One GLib-main-context Live owner opens, reads, writes, retires, and reconnects the socket. It commits a complete Transition before publishing updates, validates query-set versions and uint32 bounds, tracks the little-endian timestamp numerically, reports structured failures, and suppresses unchanged rehydration.
+## Known Issues
 
-HTTP responses are parsed before they are classified, so a Convex function-error envelope keeps its `errorMessage`, `errorData`, and `logLines` on any status, while a malformed or non-envelope non-2xx body stays a transport failure. A body that never satisfied its declared `Content-Length` or chunked framing is a transport failure too, rather than the value its truncated bytes happen to spell. Complete keep-alive chunked responses are supported; chunked responses which also declare `Connection: close` are conservatively refused because libsoup 3.2 does not expose the terminal zero chunk to its decoded stream.
-
-Memory bounds measure what is retained rather than what was serialized. A parsed JSON-GLib tree costs about a hundred bytes per node, so a dense array can retain roughly fifty times its wire size while staying inside every byte-count limit. Untrusted JSON is therefore scanned before it is parsed and refused if its tree would exceed eight MiB retained or nest deeper than sixty-four levels, and delivery relays are generation-tagged and bounded to sixteen reserved queued or in-flight events and eight MiB of retained value, error, log, and runtime representation. Adapter output has a two MiB event cap, conservative in-flight byte accounting, and a one-second default absolute write deadline so a stopped controller cannot pin the process indefinitely.
-
-The test-only adapter accepts strict NDJSON v1 over stdin/stdout or one `ADAPTER_LISTEN` TCP controller. `debugDisconnect` is adapter-only and lets the shared harness prove real reconnections.
-
-## Limitations
-
-The language-local raw peers cover strict HTTP status and bounded streaming, function-error envelopes on non-2xx statuses, truncated `Content-Length` and unterminated chunked bodies, inactivity and continuous-drip deadlines, malformed-envelope recovery, strict RFC6455 upgrade validation, fragmented UTF-8 with control traffic, absolute partial-frame timeout and recovery, tree-shaped frame rejection and recovery, five reconnects with `Add` replay, stale relay barriers, and bounded close. They also exercise queued and in-flight count/byte reservations against both string-shaped and tree-shaped near-maximum values, but they do not replace fresh independent review or root-owned shared conformance.
-
-The retained-JSON bound is a real refusal, not a soft cap. A Convex value whose parsed tree would exceed eight MiB retained is reported as a `ProtocolError` rather than delivered, and a Live frame carrying one retires that connection and reconnects instead of being parsed. That is a deliberate trade: a wire-legal but node-dense payload is refused rather than allowed to exhaust the shared container limit. Live authentication lifecycle, optimistic updates, mutation and action messages over WebSocket, journals, and TransitionChunk assembly are deferred. The manifest records the HTTP and Live capabilities earned for this pinned profile.
+1. Live authentication refresh, optimistic updates, and mutation or action calls over the WebSocket are deferred. HTTP mutation and action calls still work.
+2. `TransitionChunk` assembly is not implemented. Receiving one is treated as protocol drift, reported as a protocol error, and followed by reconnecting the Live owner.
+3. Untrusted JSON is refused above an estimated 8 MiB retained tree or 64 nesting levels, and HTTP bodies are capped at 2 MiB. A wire-valid but very node-dense Convex value can therefore be rejected.
+4. With libsoup 3.2, a chunked response that also says `Connection: close` is conservatively rejected because the decoded stream cannot prove that the terminating chunk arrived.

@@ -1,14 +1,133 @@
-# Convex from Common Lisp
+<img src="logo.png" alt="Common Lisp logo" width="128">
+<!-- Logo source: https://common-lisp.net/static/imgs/lisplogo_flag2_128.png -->
 
-This is a small native Common Lisp client that calls Convex functions over HTTP and keeps a query current over Live WebSockets.
+# Common Lisp
 
-It is educational and unofficial. It is not a production SDK and is not intended for package publication.
+Common Lisp is the standardized, multi-paradigm member of the Lisp family. Work on the language began in 1981 by bringing several Lisp dialects together, and it became ANSI standard X3.226-1994. Its parenthesized forms are both code and ordinary list-shaped data, while the language also includes an object system, conditions, macros, native compilation, and interactive development. The [Common Lisp HyperSpec history](https://www.lispworks.com/documentation/HyperSpec/Front/Help.htm) explains that path from the wider Lisp family to the portable standard.
 
-## Start here
+Today Common Lisp is a specialist language with an active ecosystem rather than a mainstream default. It is still used where interactive development, long-running processes, native performance, or building a language tailored to the problem are useful. This client runs on [SBCL](https://www.sbcl.org/), a native Common Lisp compiler with a debugger and profiler. [Common-Lisp.net](https://common-lisp.net/) is a community-maintained starting point for implementations, libraries, tools, and current events.
 
-Read [`examples/basics/main.lisp`](examples/basics/main.lisp). It queries a fresh counter, starts Live before changing it, applies one idempotent mutation, and checks that HTTP, the mutation result, and Live all agree on `0 -> 1`.
+This repository's client is educational and unofficial. It is not a production SDK and is not intended for package publication.
 
-## What works
+## Getting Started
+
+Start with [`examples/basics/main.lisp`](examples/basics/main.lisp). It queries a new counter, subscribes before changing it, applies one idempotent mutation, and checks that HTTP, the mutation result, and Live all agree on `0 -> 1`.
+
+From the repository root, run the exact example in its Docker image against a unique test room:
+
+```sh
+./run verify-example common-lisp
+```
+
+No Common Lisp toolchain is installed on the host.
+
+## Interesting Parts
+
+### JSON needs one more false value than Lisp has
+
+TypeScript receives a generated result type, so `applied` is a normal `boolean` and `state.count` is known to be a number. This Common Lisp client deliberately returns generic JSON values instead. Objects are string-keyed hash tables, and `+json-false+` and `+json-null+` are distinct sentinels because Common Lisp's `nil` already means both false and the empty list.
+
+**TypeScript with React**
+
+```tsx
+import { useMutation } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function IncrementButton() {
+  const increment = useMutation(api.demo.increment);
+
+  async function handleClick() {
+    const result = await increment({
+      room: "common-lisp-readme",
+      language: "typescript",
+      runId: crypto.randomUUID(),
+    });
+
+    console.log(result.applied); // Generated types make this boolean.
+    console.log(result.state.count); // Generated types make this number.
+  }
+
+  return <button onClick={handleClick}>Increment</button>;
+}
+```
+
+**Common Lisp**
+
+```common-lisp
+(load "/project/client/load.lisp")
+(in-package #:convex)
+
+(let* ((deployment (or (sb-ext:posix-getenv "CONVEX_URL")
+                       (error "CONVEX_URL is required")))
+       (client (make-client deployment)))
+  (unwind-protect
+       (let* (;; JSON-OBJECT builds the named Convex argument object.
+              (arguments (json-object "room" "common-lisp-readme"
+                                      "language" "common-lisp"
+                                      "runId" (random-hex-id)))
+              (result (client-mutation client "demo:increment" arguments))
+              ;; RESULT-VALUE is generic JSON, so read object fields by name.
+              (value (result-value result))
+              (applied (json-get value "applied" +json-false+))
+              (state (json-get value "state")))
+         (format t "applied: ~:[false~;true~]~%" (eq applied t))
+         (format t "count: ~D~%" (json-get state "count")))
+    ;; UNWIND-PROTECT is Lisp's equivalent of finally for cleanup.
+    (client-close client)))
+```
+
+The explicit decoding is a choice in this small client, not a Common Lisp restriction. A larger SDK could generate structs and accessors from Convex function types.
+
+### React owns reactivity; this program owns a subscription
+
+`useQuery` subscribes while the component is mounted and rerenders it when the value changes. The Common Lisp API exposes that lifecycle directly: create a subscription, block for its next delivery, inspect either its value or structured error, and close it. The blocking `subscription-next` call is this client's command-line-friendly API design, not a limitation of Common Lisp's concurrency model.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const state = useQuery(api.demo.state, { room: "common-lisp-live" });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>Count: {state.count}</p>; // React rerenders on each Live value.
+}
+```
+
+**Common Lisp**
+
+```common-lisp
+(load "/project/client/load.lisp")
+(in-package #:convex)
+
+(let* ((deployment (or (sb-ext:posix-getenv "CONVEX_URL")
+                       (error "CONVEX_URL is required")))
+       (client (make-client deployment))
+       (subscription nil))
+  (unwind-protect
+       (progn
+         ;; Starting the subscription opens Live and sends demo:state's args.
+         (setf subscription
+               (client-subscribe client "demo:state"
+                                 (json-object "room" "common-lisp-live")))
+         ;; A command-line program decides when to wait for each reactive value.
+         (loop repeat 2
+               for update = (subscription-next subscription :timeout 10.0)
+               do (unless update (error "Timed out waiting for Live"))
+                  (if (update-error update)
+                      (error (update-error update))
+                      (format t "Count: ~D~%"
+                              (json-get (update-value update) "count")))))
+    ;; The caller, rather than a React component, owns both lifetimes.
+    (when subscription (subscription-close subscription))
+    (client-close client)))
+```
+
+The first delivery hydrates the current query. A later delivery arrives after the data changes, without polling the HTTP endpoint. See the complete sequencing and validation in the [canonical example](examples/basics/main.lisp).
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -16,6 +135,8 @@ Read [`examples/basics/main.lisp`](examples/basics/main.lisp). It queries a fres
 | Bearer authentication and structured function errors | Verified by shared local and hosted conformance |
 | Live initial values, updates, and query-error recovery | Verified by shared local and hosted conformance |
 | Remove, five reconnects, generation barriers, and bounded delivery | Verified by shared local and hosted conformance |
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.lisp -->
 ```common-lisp
@@ -122,30 +243,19 @@ Read [`examples/basics/main.lisp`](examples/basics/main.lisp). It queries a fres
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-```sh
-./run sync-examples
-./run validate
-./run test common-lisp
-./run verify-example common-lisp
-./run verify common-lisp
-./run verify-hosted common-lisp
-./run verify-all common-lisp
-```
+The client is native Common Lisp running on SBCL 2.2.9. It implements Convex's documented JSON HTTP calls and the repository's pinned `/api/sync` Live profile itself. SBCL sockets provide TCP, while direct OpenSSL 3 calls provide TLS, certificate and hostname checks, hashing, and the WebSocket transport. It does not delegate Convex behavior to another SDK, the Convex CLI, `curl`, Node.js, or Python.
 
-`test` runs strict JSON, HTTP, real-socket Live, and adapter tests before saving the exact example and adapter as native `linux/amd64` executables. `verify-example` runs the generated example from its minimal image against a unique room. The remaining shared commands add local and hosted black-box conformance; only their result evaluator can award HTTP or Live capability badges.
+HTTP calls return a `result` containing a generic JSON value and log lines. Function failures, malformed protocol data, and transport failures are separate Common Lisp condition types, so callers can handle them differently. The JSON layer rejects excessive depth and structure, and it preserves JSON false and null with dedicated sentinels.
 
-## Conformance and protocol notes
+One owner thread has exclusive control of the Live socket. Other threads queue subscribe, unsubscribe, reconnect, and close requests to it. The client validates each complete transition before publishing any part of it, suppresses unchanged reconnect hydration with a fixed-size hash, and keeps delivery memory bounded. The public queue holds at most 16 newest updates within a conservative 20 MiB budget; active subscriptions have separate 64-item and 8 MiB bounds.
 
-The public client implements Convex's documented JSON HTTP endpoints and the repository's pinned `/api/sync` profile directly in Common Lisp. It uses SBCL's ordinary socket support plus direct OpenSSL 3 calls for TLS, certificate-chain validation, hostname validation, and WebSocket transport. It does not invoke another Convex client, the Convex CLI, `curl`, Node.js, or Python.
+Docker saves the example and adapter as native `linux/amd64` SBCL executables. The minimal runtime keeps only their library closure, TLS material, and the shell tools required by the shared verifier. It runs as `65532:65532` and contains no `sbcl` command or package manager.
 
-One owner thread exclusively opens, reads, writes, retires, and reconnects the Live socket. Controllers queue Add, Remove, reconnect, and close commands to that owner. Complete transitions are validated, coalesced per query, and committed atomically; unchanged hydration is suppressed with a fixed-size incremental SHA-256 signature rather than a retained JSON copy. One manager-wide queue retains at most the newest 16 updates within a conservative 20 MiB budget. It charges four times the exact encoded event length, recursive SBCL container overhead, and a fixed envelope allowance. Active subscriptions have a separate 64-count and 8 MiB decoded path/argument budget. JSON decoding stops at 128 levels or 8,192 structural nodes before deeply nested or container-dense input can exhaust the runtime. Backoff starts at 100 ms, caps at 15 seconds, and resets after a valid connection or transition.
+## Known Issues
 
-The test-only adapter speaks bounded UTF-8 NDJSON protocol v1 over stdin/stdout or one `ADAPTER_LISTEN` TCP connection. Its output has a separate newest-16, 6 MiB global bound that includes a kernel-blocked in-flight write. One global dispatcher owns dequeue through publication for every subscription, and its allocation-light UTF-8 encoder never creates a second full Common Lisp output string. `debugDisconnect` exists only in this adapter so the shared harness can prove real reconnects.
-
-The final images contain saved SBCL executables, their runtime library closure, OpenSSL providers and roots, `/bin/sh`, and individual POSIX text tools required by the verifier. They do not contain the `sbcl` compiler command, package managers, network utilities, delegated runtimes, or a multicall binary. Both run as `65532:65532` with a read-only filesystem and all capabilities dropped.
-
-## Limitations
-
-Live authentication, optimistic updates, mutation and action messages over the WebSocket, journals, and `TransitionChunk` assembly are deferred. Receiving `TransitionChunk` is treated as protocol drift, emits a structured protocol error, and reconnects without permanently stranding the subscription. Values cover Convex's JSON-safe subset; tagged Convex value encodings are not yet converted into richer Common Lisp types. JSON values beyond the documented depth, node, active-subscription, or delivery budgets are rejected instead of risking unbounded runtime memory. Shared local and hosted conformance earned HTTP and Live from a clean reviewed commit.
+1. Live authentication, optimistic updates, mutations and actions over Live, and journals are not implemented.
+2. `TransitionChunk` assembly is not implemented. Receiving one produces a recoverable protocol error and reconnect.
+3. Values cover Convex's JSON-safe subset. Tagged Convex encodings are not converted into richer Common Lisp types.
+4. Very deep, highly structured, or oversized Live data is rejected at the documented bounds rather than allowed to grow memory without limit.

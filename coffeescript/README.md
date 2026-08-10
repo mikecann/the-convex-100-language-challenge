@@ -1,20 +1,154 @@
-# Convex from CoffeeScript
+<img src="logo.png" alt="CoffeeScript logo" width="420">
+<!-- Logo source: https://raw.githubusercontent.com/jashkenas/coffeescript/main/documentation/site/logo.svg -->
 
-This folder shows a compact CoffeeScript program talking directly to Convex. It
-uses HTTP for functions, then follows a query over the pinned WebSocket sync
-profile.
+# CoffeeScript
+
+[CoffeeScript](https://coffeescript.org/) is a small language that compiles to
+JavaScript. First released in 2009, it brought Ruby-flavoured concise syntax,
+significant whitespace, classes, and comprehensions to browser and Node.js
+development. Projects including Atom, Hubot, and Trix helped make it familiar
+in the 2010s. It is a niche choice today, but CoffeeScript 2 still targets the
+modern JavaScript ecosystem and supports features such as `async`/`await`.
 
 This is an educational, unofficial demonstration for the 100-language project.
 It is not a production SDK or a package intended for publication.
 
-## Start here
+## Getting Started
 
-Read the [basic example](examples/basics/main.coffee). It queries a unique
-counter room, starts Live before writing, applies one idempotent mutation, and
-checks the whole `0 -> 1` journey. The CoffeeScript implementation is under
-[client](client/); Docker compiles it to JavaScript only while building.
+Read the [canonical basic example](examples/basics/main.coffee), then run it
+from the repository root:
 
-## What works
+```sh
+./run verify-example coffeescript
+```
+
+Docker compiles the exact CoffeeScript example and runs its final minimal image
+against a fresh counter room. It checks a one-off query, an initial Live value,
+one idempotent mutation, and the resulting Live update from `0` to `1`.
+
+## Interesting Parts
+
+### Indentation builds the same argument object
+
+React's `useQuery` is reactive and stays subscribed while the component needs
+the result. This CoffeeScript client's `query` method is a one-off HTTP read.
+The interesting language difference here is smaller: indentation replaces the
+braces and commas around the argument object, and parentheses around the call
+are optional.
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const [room] = useState(() => `readme-react-query-${crypto.randomUUID()}`);
+  const state = useQuery(api.demo.state, {
+    room,
+  });
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // state and count are type-safe here.
+}
+```
+
+**CoffeeScript**
+
+```coffeescript
+{ randomUUID } = require 'node:crypto'
+{ Client } = require './client/convex'
+
+# The deployment URL selects the same Convex backend that React is configured for.
+deploymentUrl = process.env.CONVEX_URL
+throw new Error 'CONVEX_URL is required' unless deploymentUrl
+client = new Client deploymentUrl
+try
+  args =
+    room: "readme-coffeescript-query-#{randomUUID()}"
+
+  # No braces, commas, or call parentheses are needed here.
+  result = await client.query 'demo:state', args
+  console.log result.value.count # Decoded at runtime, not type-checked like api.demo.state.
+finally
+  await client.close()
+```
+
+The function name is a string and the returned value is decoded at runtime in
+this client. CoffeeScript does not gain the generated argument and result types
+that the TypeScript import provides.
+
+### The command-line client owns the Live lifecycle
+
+React starts and stops the `useQuery` subscription as the component mounts,
+changes arguments, and unmounts. This client deliberately exposes a pull-style
+`next` operation instead. That is this educational API's design, not
+a limit of CoffeeScript, which supports callbacks, promises, and
+`async`/`await`.
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function LiveCounter() {
+  const [room] = useState(() => `readme-react-live-${crypto.randomUUID()}`);
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  if (state === undefined) return <p>Loading...</p>;
+  return (
+    <button
+      onClick={async () => {
+        const result = await increment({
+          room,
+          language: "TypeScript",
+          runId: crypto.randomUUID(),
+        });
+        console.log(result.state.count); // The mutation result is type-safe here.
+      }}
+    >
+      Count: {state.count}
+    </button>
+  );
+}
+```
+
+**CoffeeScript**
+
+```coffeescript
+{ randomUUID } = require 'node:crypto'
+{ Client } = require './client/convex'
+
+deploymentUrl = process.env.CONVEX_URL
+throw new Error 'CONVEX_URL is required' unless deploymentUrl
+client = new Client deploymentUrl
+room = "readme-coffeescript-live-#{randomUUID()}" # Fresh state for this run.
+subscription = await client.subscribe 'demo:state', { room }
+try
+  initial = await subscription.next 10_000 # Wait explicitly for the initial value.
+  console.log initial.value.value.count # A dynamic runtime value, not a generated type.
+
+  result = await client.mutation 'demo:increment',
+    room: room
+    language: 'CoffeeScript'
+    runId: randomUUID() # Makes this mutation attempt idempotent.
+  console.log result.value.state.count # The mutation's returned state.
+
+  updated = await subscription.next 10_000 # Wait for the reactive update.
+  console.log updated.value.value.count
+finally
+  await subscription.close() # The CLI owns cleanup that React normally manages.
+  await client.close()
+```
+
+CoffeeScript infers that surrounding code is asynchronous as soon as it uses
+`await`, so there is no separate `async` keyword. The complete example adds
+deadline, error, and value checks around each focused step.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -25,7 +159,7 @@ checks the whole `0 -> 1` journey. The CoffeeScript implementation is under
 | Capability badges | HTTP and Live earned from root-owned local and hosted evidence |
 | Live authentication and WebSocket writes | Deferred |
 
-## Basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.coffee -->
 ```coffeescript
@@ -89,38 +223,32 @@ finally
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker-only verification
+## Implementation Notes
 
-```sh
-./run test coffeescript
-./run build coffeescript
-```
+CoffeeScript 2.7.0 compiles these `.coffee` files to modern JavaScript during
+the Docker build. The compiler stays in the build stage. The final images run
+the generated JavaScript on Node 22.16.0, which is why the manifest honestly
+labels this implementation `transpiled` rather than native.
 
-`test` compiles and checks the CoffeeScript client, adapter, deterministic
-transport fixtures, and the exact canonical example inside a pinned
-`linux/amd64` image. `build` produces non-root `runtime` and `example-runtime`
-images. Root-owned `verify-example`, `verify`, and `verify-hosted` are the only
-commands that can award HTTP or Live badges.
+Node supplies HTTP, TLS, JSON, promises, and cryptographic UUIDs. The `ws`
+package supplies WebSocket framing only. The CoffeeScript in
+[`client/convex.coffee`](client/convex.coffee) still owns the Convex request
+shapes, Live query bookkeeping, reconnect policy, duplicate rehydration
+suppression, and bounded update delivery.
 
-## Conformance and protocol notes
+The public client returns promises for HTTP operations and subscriptions. Its
+Live API uses `subscription.next()` to make sequencing obvious in a terminal
+example. One promise chain owns all WebSocket lifecycle changes so callbacks
+cannot race a reconnect or query-set update. The test-only adapter adds strict
+serialization and bounded input and output for the shared conformance harness;
+it is not another public client API.
 
-The test-only adapter accepts strict NDJSON v1 over stdin/stdout or the
-single-controller `ADAPTER_LISTEN` TCP endpoint. It serializes commands and
-all output, caps input at 32 lines or 4 MiB, caps output at 3 MiB, and closes a
-stalled controller after a 500 ms write deadline. It uses an adapter-only
-`debugDisconnect` command to retire a connection before acknowledging it.
+## Known Issues
 
-CoffeeScript compiles to JavaScript in the build stage, so this implementation
-is accurately marked `transpiled`. Node is the declared target runtime in the
-minimal images. `ws` is used solely for TLS WebSocket framing, while this
-CoffeeScript source owns the Convex HTTP envelopes, query-set versions,
-rehydration suppression, reconnect backoff, timestamp tracking, and delivery
-queues.
-
-## Limitations
-
-Live authentication, optimistic updates, WebSocket mutations/actions, journal
-replay, tagged Convex values, and `TransitionChunk` assembly are deferred. A
-subscription keeps only its newest 16 updates and 8 MiB of queued encoded data,
-discarding old intermediate query states for a slow consumer. Capability badges
-were earned when the exact source passed shared local and hosted conformance.
+1. Live authentication, optimistic updates, WebSocket mutations and actions,
+   journal replay, tagged Convex values, and `TransitionChunk` assembly are not
+   implemented.
+2. Live values are limited to the JSON-safe subset used by the pinned sync
+   profile.
+3. A slow consumer keeps only the newest 16 subscription updates within an
+   8 MiB encoded-data budget, so older intermediate states can be discarded.

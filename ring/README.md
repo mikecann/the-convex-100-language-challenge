@@ -1,32 +1,165 @@
-# Convex from Ring
+<img src="logo.png" alt="Ring logo" width="220">
+<!-- Logo source: https://ring-lang.github.io/images/theringlogo.jpg -->
 
-This demonstration uses Ring to call Convex's documented JSON HTTP endpoints and
-to keep a reactive query current over a real WebSocket connection to Convex's
-sync socket.
+# Ring
 
-It is an educational, unofficial experiment. It is not a production SDK, an
-officially sanctioned Convex client, or a package intended for publication.
+[Ring](https://ring-lang.github.io/) is a dynamic, multi-paradigm language for
+building applications, tools, and domain-specific languages. [Mahmoud Fayed's
+earlier Supernova GUI language inspired the design, and work on Ring began in
+2011](https://ring-lang.github.io/doc1.27/introduction.html). The project
+released Ring 1.0 in 2016. Ring compiles to bytecode for its own
+virtual machine, whose implementation is written in ANSI C, and its influences
+include C, C++, C#, Lua, Python, Ruby, BASIC, and Supernova.
 
-## Start here
+The project targets console programs, desktop and mobile GUIs, web apps, games,
+embedded systems, and languages tailored to a particular problem. Ring remains
+a niche choice beside mainstream application languages, but it is actively
+maintained: [Ring 1.27 was released in May
+2026](https://ring-lang.github.io/news.html), alongside an active collection of
+libraries and applications.
 
-[`examples/basics/main.ring`](examples/basics/main.ring) is the canonical
-example. It reads a fresh counter room over HTTP, starts Live before changing
-anything, applies an idempotent mutation, and proves the same `0 -> 1` journey
-arrived through the subscription. The block below is generated from that exact
-runnable file.
+This repository's client is an educational, unofficial experiment. It is not a
+production SDK, an officially sanctioned Convex client, or a package intended
+for publication.
 
-## What works
+## Getting Started
+
+Start with [`examples/basics/main.ring`](examples/basics/main.ring). It queries
+a fresh counter, subscribes before changing it, applies an idempotent mutation,
+and observes the reactive update from `0` to `1`.
+
+From the repository root, run the canonical program in its Docker image:
+
+```sh
+./run verify-example ring
+```
+
+That command builds the example runtime, gives the program a unique counter
+room, and checks its output against the repository's shared expected transcript.
+You do not need Ring installed on your host.
+
+## Interesting Parts
+
+### Convex values stay as exact JSON until Ring asks for a field
+
+**TypeScript with React**
+
+```tsx
+import { useMutation } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+function IncrementButton() {
+  const increment = useMutation(api.demo.increment);
+
+  return (
+    <button
+      onClick={async () => {
+        const result = await increment({
+          room: "readme-ring",
+          language: "TypeScript",
+          runId: crypto.randomUUID(), // Fresh idempotency key for this button action.
+        });
+        console.log(result.state.count); // The generated API makes count a number.
+      }}
+    >
+      Increment
+    </button>
+  );
+}
+```
+
+**Ring**
+
+```text
+load "convex.ring"
+
+cDeployment = cvxEnv("CONVEX_URL")
+oConvex = new ConvexClient(cDeployment) # Reuses one TLS-verified HTTP handle.
+
+# Ring builds the argument object as JSON text, including a unique idempotency key.
+cArgs = cvxJsonObject([
+	["room", cvxJsonQuote("readme-ring")],
+	["language", cvxJsonQuote("Ring")],
+	["runId", cvxJsonQuote(lower(hex(floor(uv_hrtime() / 1000))))]])
+
+aResult = oConvex.mutation("demo:increment", cArgs) # A blocking HTTP call.
+cState = cvxJsonField(aResult[:value], "state", true)
+nCount = cvxWholeNumber(cvxJsonField(cState, "count", true), "mutation count")
+? nCount # The helper rejects fractions, strings, and overflowing values.
+
+oConvex.close() # Releases the reusable HTTP handle.
+```
+
+The React client returns a generated, type-safe object. This Ring client instead
+retains Convex values as byte-exact JSON text, then validates only the fields the
+program uses. That is a client design suited to Ring's dynamic type system, not
+a requirement of the language.
+
+### A Live subscription is an event loop you can see
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+function Counter() {
+  const room = "readme-ring";
+  const state = useQuery(api.demo.state, { room });
+
+  // Convex owns the subscription and React rerenders when state changes.
+  return <output>{state === undefined ? "Loading" : state.count}</output>;
+}
+```
+
+**Ring**
+
+```text
+load "convex.ring"
+
+cDeployment = cvxEnv("CONVEX_URL")
+oConvex = new ConvexClient(cDeployment)
+cArgs = cvxJsonObject([["room", cvxJsonQuote("readme-ring")]])
+nSubscription = oConvex.subscribe("demo:state", cArgs) # Opens Live on demand.
+
+nDeadline = cvxNowMs() + 20000
+while cvxNowMs() < nDeadline
+	oConvex.pump(200)        # Give the client time to receive or reconnect.
+	aEvent = oConvex.nextEvent() # Take the oldest buffered delivery.
+	if len(aEvent) = 0 or aEvent[1] != nSubscription
+		loop
+	ok
+	if aEvent[2] = "error"
+		raise(aEvent[6]) # A reactive function or transport failure is explicit.
+	ok
+	nCount = cvxWholeNumber(cvxJsonField(aEvent[3], "count", true), "live count")
+	? nCount
+	exit
+end
+
+oConvex.unsubscribe(nSubscription) # Stop this reactive query first.
+oConvex.close()                     # Then release HTTP and WebSocket handles.
+```
+
+`useQuery` hides subscription setup, cleanup, and rerender scheduling inside
+React. The Ring client deliberately exposes `pump()` and an explicit
+`nextEvent()` queue so a command-line program decides when network work runs.
+Ring supports other programming styles; this explicit lifecycle is this
+client's API choice.
+
+## Status
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Verified by shared local and hosted conformance | Ring builds the Convex request envelopes and classifies every response, over libcurl's TLS-verified HTTP. Query, mutation, action, bearer-token lifecycle, log lines and structured function errors are implemented. |
-| Live | Verified by shared local and hosted conformance | Ring owns the Convex sync protocol: query-set versions, transitions, reconnect ownership, hydration suppression and publication. libcurl carries the RFC 6455 frames underneath. |
+| HTTP | Verified by shared local and hosted conformance | Query, mutation, action, bearer-token lifecycle, log lines, and structured function errors work over TLS-verified HTTP. |
+| Live | Verified by shared local and hosted conformance | Subscriptions, external updates, structured failures, bounded buffering, unsubscribe barriers, and reconnect recovery work over a real WebSocket. |
 
-Root-owned local and hosted black-box conformance passed 31/31 from clean
-exact-head builds, and the manifest capability list records the evaluator's
-http and live award.
+Root-owned local and hosted black-box conformance passed 31/31 from clean,
+exact-head builds. The evaluator awarded both `http` and `live`, and the
+manifest records those capabilities. This README-only change did not rerun
+Docker or shared conformance.
 
-## The basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.ring -->
 ```text
@@ -149,70 +282,52 @@ func exampleCleanup oConvex, nSubscription
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verify it in Docker
+## Implementation Notes
 
-```sh
-./run test ring
-./run verify-example ring
-./run verify ring
-./run verify-hosted ring
-./run verify-all ring
-```
+This is a native Ring implementation. RingLibCurl provides TLS, HTTP, and RFC
+6455 WebSocket framing, while RingLibuv provides the monotonic clock and the
+test adapter's controller stream. Request envelopes, response classification,
+JSON scanning, Live query state, reconnects, and publication decisions are all
+implemented in [`client/convex.ring`](client/convex.ring), without delegating to
+another Convex client.
 
-`test` builds Ring 1.27 from source with the RingLibCurl, RingLibuv and
-RingOpenSSL extensions, then runs the deterministic unit suite, a real loopback
-HTTP and WebSocket suite, a genuine stopped-reader socket test, and the
-adapter's stdin/stdout smoke check. `verify-example` runs the canonical source
-above in its minimal image and compares stdout with the universal transcript.
-The remaining commands are root-owned shared gates against the approved local
-and hosted deployments.
+Ring has numbers, strings, lists, and objects rather than a TypeScript-style
+generated model for each Convex function. The client therefore keeps returned
+Convex values as exact JSON subtrees. Helper functions quote strings, select
+object fields, and accept integral JSON numbers such as `1.0` while rejecting a
+fractional or quoted count. Result records are Ring lists with string keys, so
+`aResult[:value]` selects the raw successful value.
 
-## Conformance and protocol notes
+Live delivery uses a client-owned FIFO capped at 64 events and 2 MiB. A slow
+consumer loses the oldest delivery and can inspect the drop count. One owner
+handles every WebSocket read, write, reconnect, and query-set change, while
+`pump()` gives the calling program a bounded turn on that owner.
 
-The test-only executable under `client/tests/conformance/` speaks NDJSON adapter
-protocol v1 on stdin/stdout and over the TCP mode the shared harness uses. It
-calls the real Ring client for every operation and reserves stdout for protocol
-events. Its adapter-only `debugDisconnect` command lets the shared controller
-prove five real reconnects; it is not part of the educational client API.
+The Docker build pins Ring 1.27 at commit
+`f88d95236319460327b05efcfdab7c342caa7d22`. The Live implementation pins the
+`convex-rs-0.10.4-unversioned-sync` profile at commit
+`6f1df8a8ba1665084ec001e307ca841ca17074d7` and endpoint `/api/sync`. The final
+images run as user `65532:65532` with a read-only filesystem and no compiler,
+package manager, Convex CLI, or delegated language runtime.
 
-HTTP uses Convex's documented `format: "json"` endpoints. Live pins
-`convex-rs-0.10.4-unversioned-sync` at
-`6f1df8a8ba1665084ec001e307ca841ca17074d7` and `/api/sync`. That realtime
-protocol is not documented as stable, so hosted verification remains required.
+The language-local Docker test suite covers the JSON and whole-number helpers,
+real loopback HTTP and WebSocket traffic, fragmented UTF-8, five forced
+reconnects, recovery after structured failures, stale-delivery barriers, and a
+real stopped reader. The adapter under `client/tests/conformance/` is test
+infrastructure, not part of the public teaching API.
 
-Ring itself is pinned to `ring-lang/ring` tag `v1.27`, commit
-`f88d95236319460327b05efcfdab7c342caa7d22`, built inside Docker with the
-upstream build scripts. Both runtime images run as `65532:65532` on a read-only
-filesystem with all Linux capabilities dropped, and they contain no compiler,
-package manager, Convex CLI or delegated language runtime.
+## Known Issues
 
-## Limitations
-
-- RFC 6455 framing, masking and the upgrade handshake are libcurl's. Ring owns
-  everything above that: message reassembly and its byte budget, the query-set
-  state machine, reconnect ownership, and every publication decision. libcurl
-  must be built with WebSocket support, which is the default from curl 8.11.
-- Live authentication, `TransitionChunk` assembly, optimistic updates, mutation
-  replay and WebSocket writes are deferred. A chunk is treated as recoverable
-  protocol drift rather than being silently ignored.
-- Values are limited to this experiment's JSON-safe subset. Tagged Convex
-  `Int64`, bytes, special floats and negative zero are outside scope.
-- The Live handshake is a blocking libcurl call, so a reconnect can stall the
-  adapter's controller stream for up to its fifteen second handshake budget.
-- Ring has no portable process exit code, so an adapter that misses its two
-  second close deadline reports the failure on stderr and by withholding the
-  terminal event instead of exiting non-zero.
-- Delivery buffering is deliberate and owned by the client: a bounded 64-event,
-  2 MiB FIFO that drops the oldest delivery for a slow consumer and reports the
-  drop count. The conformance adapter adds its own newest-16 output queue with a
-  6 MiB byte budget that reserves four slots and 64 KiB for control events, and
-  it rechecks subscription ownership immediately before handing bytes to libuv
-  so an unsubscribe or same-ID replacement can never be crossed by a stale
-  value.
-- A hostile TLS peer fixture is deferred because Ring has no TLS server
-  primitive. TLS is covered instead by pinned verification settings, a real
-  handshake probe executed inside the final runtime image, and a negative test
-  that requires an `https` request to a plaintext listener to fail as a
-  transport error.
-- Root-owned local and hosted conformance awarded the http and live badges
-  recorded in the manifest (31/31 on both profiles at this exact head).
+1. The Live protocol is not documented as stable. This client is pinned to one
+   observed sync profile, so hosted conformance remains important drift
+   evidence.
+2. Live authentication, `TransitionChunk` assembly, optimistic updates,
+   mutation replay, and mutations or actions over the WebSocket are deferred.
+3. Values cover this experiment's JSON-safe subset. Tagged Convex `Int64`,
+   bytes, special floats, and negative zero are outside scope.
+4. A Live handshake is a blocking libcurl call and can occupy the caller for up
+   to the 15-second handshake budget. Under sustained backpressure, the client
+   drops the oldest queued delivery rather than growing without bound.
+5. Ring has no portable process exit-code API. If the test adapter cannot drain
+   its close response within two seconds, it reports the failure on stderr and
+   withholds the terminal event instead of exiting nonzero.

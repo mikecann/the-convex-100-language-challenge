@@ -1,60 +1,149 @@
-# Convex from BCPL
+# BCPL
 
-BCPL was designed in 1966, a decade before TCP/IP and thirty years before
-Convex. It has one data type — the word — no strings, no structures, no
-libraries beyond a small standard set, and no notion of a network. This
-demonstration talks to a Convex deployment from it anyway: it reads a counter
-over HTTPS, subscribes to the same query over a WebSocket, increments the
-counter, and watches the reactive update arrive.
+[BCPL](https://www.cl.cam.ac.uk/~mr10/BCPL.html) is a small, typeless systems
+programming language designed by Martin Richards in 1966 and first implemented
+at MIT in 1967. It grew out of CPL, influenced B and then C, and was built to
+make compilers and systems software portable. Today it is a historical niche,
+but Richards still publishes the [Cintcode manual](https://www.cl.cam.ac.uk/~mr10/bcplman.pdf)
+and example programs. Cambridge's [history of the language](https://www.cl.cam.ac.uk/newlabphotos/MR/)
+summarises its influence on B and C.
 
-Everything Convex-specific is written in BCPL. HTTP/1.1, RFC 6455 WebSocket
-framing, SHA-1, base64, UTF-8 validation, JSON, and the Convex sync protocol
-are all in the `.b` files under `client/`. The one thing BCPL genuinely cannot
-do is move bytes: no BCPL implementation has sockets, and none has TLS. For
-that the client uses the Cintcode system's own documented extension hook —
-`sys(Sys_ext, ...)`, which Martin Richards' distribution provides so that users
-can add facilities — and implements it in a single C file that knows nothing
-about Convex. That boundary is described in detail below.
+This project uses BCPL to query a Convex counter over HTTPS and watch it update
+over a WebSocket. It is educational, unofficial, unsupported by Convex, and not
+a production SDK.
 
-This client runs on the distribution's 64-bit Cintcode system, `cintsys64`,
-rather than the 32-bit one. The 32-bit interpreter keeps a raw C pointer —
-such as the `FILE*` a file primitive gets back from `fopen()` — inside a
-32-bit BCPL word; on a 64-bit host a heap address routinely lands above
-2**32, so the low bits alone are not a valid pointer and using them corrupts
-memory. That is not a hypothetical: the plain, unmodified 32-bit `bcpl`
-compiler compiling a five-line "hello world" program on this project's build
-host segfaults inside libc `ftell()`, called with a sign-extended garbage
-`FILE*`, before any client source is ever reached. The 64-bit interpreter's
-BCPLWORD is 64 bits, wide enough for a real pointer, so this class of
-corruption cannot occur. See [Limitations](#limitations) for the exact `gdb`
-evidence and the one vendor gap the switch to `cintsys64` uncovered.
+## Getting Started
 
-## This is a demonstration, not an SDK
+Start with [`examples/basics/main.b`](examples/basics/main.b). It reads a fresh
+room, subscribes before writing, increments the counter once, and checks the
+Live update from `0` to `1`.
 
-This is educational material for a video and a website. It is not an official
-Convex SDK, it is not supported by Convex, and it is not published anywhere.
-Do not use it in production.
+From the repository root, Docker builds and runs the exact canonical example:
 
-## Start here
+```sh
+./run verify-example bcpl
+```
 
-[`examples/basics/main.b`](examples/basics/main.b) is the canonical example and
-the same source shown below. Its journey is:
+## Interesting Parts
 
-1. Read the current counter for a room over HTTP and check that it is `0`.
-2. Subscribe to the same query **before** mutating, so the update caused by the
-   mutation cannot slip past between the two calls.
-3. Receive the initial Live value, also `0`.
-4. Increment the counter with a run identifier that makes the mutation safe to
-   retry.
-5. Receive the resulting Live value, `1`.
-6. Print a verification line only once every step agrees.
+### One word can represent anything, but it proves nothing
 
-The first section of that file is the client library, pulled in with
-`GET "convex.b"`. Building a large BCPL program by textual inclusion is the
-ordinary way to do it on this system, and it is why the example begins with
-three `GET` lines rather than an import list.
+**TypeScript with React**
 
-## What works
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function Count() {
+  const room = "bcpl-readme-types";
+  const state = useQuery(api.demo.state, { room });
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // state and count are type-safe here.
+}
+```
+
+**BCPL**
+
+```text
+LET start() = VALOF
+{ LET url = 0
+  LET room = 0
+  LET client = 0
+  LET arguments = 0
+  LET path = 0
+  LET result = 0
+  LET count = 0
+
+  UNLESS convexInit() DO stop(1)
+  url := cxGetenv("CONVEX_URL")
+  IF url = 0 DO stop(1)
+  IF url!Bb_len = 0 DO stop(1)
+  room := bbFromStr("bcpl-readme-types") // Matches the React teaching room.
+  client := convexNew(url) // This word now points at the client record.
+  arguments := jsObject()
+  jsObjectPutStr(arguments, "room", jsStringFromBuffer(bbCopy(room)))
+  path := bbFromStr("demo:state")
+  result := convexCall(client, "/api/query", path,
+                       arguments, cxDeadline(Httptimeoutms))
+  // The returned word has no static shape. Check it before using it as a count.
+  UNLESS jsWholeNumber(jsObjectGet(result!Rs_value, "count"), @count) DO stop(1)
+  writef("count: %n*n", count)
+
+  convexResultFree(result)
+  jsFree(arguments)
+  convexClose(client)
+  convexFree(client)
+  bbFree(path)
+  bbFree(room)
+  bbFree(url)
+  RESULTIS 0
+}
+```
+
+BCPL is typeless: a word may hold an integer, address, or encoded handle. This
+client therefore represents JSON with tagged records of its own and checks the
+`count` node explicitly. The React hook is reactive; this BCPL call is one HTTP
+read. The [complete example](examples/basics/main.b) also handles every failure.
+
+### React owns the subscription; this program owns it
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function LiveCount() {
+  const room = "bcpl-readme-live";
+  const state = useQuery(api.demo.state, { room });
+  // React subscribes on mount, rerenders on change, and cleans up on unmount.
+  return <p>{state?.count ?? "Loading..."}</p>;
+}
+```
+
+**BCPL**
+
+```text
+LET watchOnce() BE
+{ LET url = 0
+  LET room = 0
+  LET client = 0
+  LET arguments = 0
+  LET subscription = 0
+  LET initial = 0
+  LET count = 0
+
+  UNLESS convexInit() DO stop(1)
+  url := cxGetenv("CONVEX_URL")
+  IF url = 0 DO stop(1)
+  IF url!Bb_len = 0 DO stop(1)
+  room := bbFromStr("bcpl-readme-live") // Matches the React teaching room.
+  client := convexNew(url)
+  arguments := jsObject()
+  jsObjectPutStr(arguments, "room", jsStringFromBuffer(bbCopy(room)))
+  subscription := convexSubscribe(client, bbFromStr("readme-watch"),
+                                  bbFromStr("demo:state"), arguments)
+  // This client API deliberately offers a blocking next-update operation.
+  initial := convexNextUpdate(client, subscription, cxDeadline(15000))
+  UNLESS jsWholeNumber(jsObjectGet(initial!Up_value, "count"), @count) DO stop(1)
+  writef("initial count: %n*n", count)
+  upFree(initial)
+
+  // A command-line program must end the subscription and release the client.
+  convexUnsubscribe(client, subscription)
+  convexClose(client)
+  convexFree(client)
+  bbFree(room)
+  bbFree(url)
+}
+```
+
+The blocking `convexNextUpdate` call is this client's API choice, not a BCPL
+language restriction. The implementation has one single-threaded Live manager
+that owns reads, reconnects, and subscription changes. React hides that
+lifecycle behind `useQuery`; this command-line client makes it explicit.
+
+## Status
 
 | Capability | State | Notes |
 | --- | --- | --- |
@@ -65,17 +154,16 @@ three `GET` lines rather than an import list.
 | Live reconnect | Implemented | Exponential backoff, query-set replay, unchanged-rehydration suppression |
 | Convex log lines | Implemented | Returned with HTTP results and Live updates |
 | Live authentication | Deferred | Subscriptions are unauthenticated |
-| Optimistic updates | Deferred | — |
+| Optimistic updates | Deferred | Not implemented |
 | WebSocket mutations and actions | Deferred | Mutations and actions go over HTTP |
 | Chunked transitions | Deferred | `TransitionChunk` is treated as protocol drift and reconnects |
 | Tagged Convex value types | Deferred | Live values cover the JSON-safe subset |
 | Earned capability badges | **http, live** | 31/31 shared conformance tests pass against both the self-hosted and hosted backends |
 
-The badge row is the one that matters: nothing is claimed until the shared
-black-box conformance suite has been run from a clean commit by the root
-integration agent. It has: both `http` and `live` are earned.
+The earned capabilities remain `http` and `live`, backed by 31/31 shared tests
+against both the self-hosted and hosted backends.
 
-## The canonical example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.b -->
 ```text
@@ -295,7 +383,9 @@ LET start() = VALOF
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verifying it with Docker
+## Implementation Notes
+
+### Docker gates
 
 Everything is built and run inside Docker; nothing is installed on the host.
 
@@ -320,7 +410,7 @@ What each proves, and what it does not:
 - `verify-hosted` repeats it against the hosted deployment, which is where
   protocol drift shows up. Local conformance does not replace it.
 
-## How it is put together
+### How it is put together
 
 ```text
 client/
@@ -398,7 +488,7 @@ on both descriptors at once and giving the owner a slice each time round.
 ### Memory
 
 The Cintcode memory is allocated once, at startup, at a fixed three million
-64-bit words — 24 MiB, the same byte ceiling a 32-bit build would get from six
+64-bit words, or 24 MiB, the same byte ceiling a 32-bit build would get from six
 million 32-bit words. Every BCPL allocation in this client comes out of it, so
 the client's memory ceiling is a property of the process rather than a promise.
 Inside it, each buffer is capped at 4 MiB, a WebSocket frame at 1 MiB, a
@@ -411,15 +501,15 @@ The request bound is separate from the buffer bound on purpose: the request
 line, headers and body are assembled in one buffer before anything is written,
 so a body that would not leave room for the rest of the message is refused
 rather than sent truncated behind a `Content-Length` that no longer describes
-it. A chunked response is decoded the same way — each consumed chunk is
+it. A chunked response is decoded the same way: each consumed chunk is
 trimmed off the front of the raw stream, so the encoding never has to fit in
 memory beside the body it decodes to.
 
 ### Numbers
 
 JSON numbers are kept as their literal text rather than converted. Even this
-system's 64-bit words cannot hold every number a JSON document can carry — a
-value near IEEE double precision's range, for instance — so holding the
+system's 64-bit words cannot hold every number a JSON document can carry. A
+value near IEEE double precision's range is one example, so holding the
 lexeme is what lets every value survive a round trip exactly as Convex sent
 it. A caller that wants an integer asks `jsWholeNumber`, which accepts
 Convex's `0` and `0.0` forms and the exponent notations that stay integral,
@@ -430,9 +520,9 @@ this system's `maxint` (9223372036854775807) can hold.
 
 BCPL predates the idea of a code formatter and no BCPL implementation ships
 one, so `./run test bcpl` holds the checked-in sources to an explicit hygiene
-contract instead — no tabs, no carriage returns, no trailing whitespace, no
-line past 100 columns, a final newline, and nothing outside printable ASCII —
-and holds the C boundary to a warning-free `-Wall -Wextra -Werror` build. Short
+contract instead: no tabs, no carriage returns, no trailing whitespace, no
+line past 100 columns, a final newline, and nothing outside printable ASCII.
+It also holds the C boundary to a warning-free `-Wall -Wextra -Werror` build. Short
 single-line error arms such as `UNLESS buffer DO { bbFree(other); RESULTIS 0 }`
 are kept because they are the idiom the BCPL distribution itself uses
 throughout, not to save lines.
@@ -443,7 +533,7 @@ literal means, so the UTF-8 the tests need is pushed byte by byte instead of
 written as a literal. The client itself handles UTF-8 perfectly well; it just
 never has to read any from its own source.
 
-## Conformance and protocol notes
+### Conformance and protocol notes
 
 - The adapter at `client/tests/conformance/adapter.b` is test infrastructure,
   not public client code. It speaks NDJSON adapter protocol v1 over stdin and
@@ -459,8 +549,8 @@ never has to read any from its own source.
   rehydration so an unchanged replay is suppressed.
 - The sync protocol is pinned by `syncProfile` in `manifest.yaml`. It is not a
   documented or supported Convex API, and this client treats any departure from
-  the pinned shape — an unknown message, a `Transition` that does not continue
-  from the version the client holds, a `TransitionChunk` — as drift that
+  the pinned shape, such as an unknown message, a discontinuous `Transition`,
+  or a `TransitionChunk`, as drift that
   reconnects rather than as data.
 - The WebSocket reader is resumable, not blocking. Bytes accumulate and the
   parse cursor only ever advances over a frame that has arrived in full, so a
@@ -482,39 +572,36 @@ never has to read any from its own source.
   6455 closing handshake instead of dropping TCP, bounded by the same two
   second deadline. Exactly one close frame leaves each connection.
 
-## Limitations
+## Known Issues
 
-- **The transport is not BCPL.** Sockets, TLS, name resolution, the monotonic
-  clock and random bytes come from C. That is unavoidable — no BCPL
-  implementation has ever had them — but it is the honest boundary of what this
-  demonstration proves about the language.
-- Live subscriptions are unauthenticated. `setAuth` affects HTTP calls only.
-- Optimistic updates, WebSocket mutations and WebSocket actions are not
-  implemented; mutations and actions go over HTTP.
-- `TransitionChunk` assembly is not implemented.
-- Live values cover the JSON-safe subset. Tagged Convex value types such as
-  `Int64` and `Bytes` are not decoded.
-- HTTP opens one connection per request. Keep-alive is not implemented.
-- Numbers outside the 64-bit Cintcode word (wider than 19 decimal digits, or
-  past 9223372036854775807) round trip exactly but cannot be decoded to an
-  integer.
-- The toolchain is pinned to a 2015 mirror of Martin Richards' distribution
-  and is patched at build time for one gap in it: the pinned commit's
-  `cintsys64.c` `dosys()` switch never received the 2014 addition of
-  `sys(Sys_ext, ...)` that the 32-bit `cintsys.c` has, so there was no way for
-  a 64-bit-Cintcode BCPL program to reach a user C extension at all. The
-  Dockerfile patches in the same one-line `case 68` (`Sys_ext`'s value, from
-  `g/libhdr.h`) that the 32-bit interpreter already has, anchored so a future
-  upstream sync that already carries the fix fails the anchor assertion
-  instead of silently duplicating it.
-- This client targets `cintsys64`, the distribution's 64-bit Cintcode system,
-  because the 32-bit one segfaults on this architecture independently of any
-  Convex code. Confirmed directly on the build host: `gdb --batch -ex run -ex
-  bt` on the plain, unmodified 32-bit `bcpl` compiler compiling a five-line
-  "hello world" program shows `SIGSEGV` inside libc `ftell()`, called with a
-  sign-extended garbage `FILE*` — a 32-bit BCPL word holding a raw C pointer
-  that a 64-bit host handed back above `2**32` — deep inside the
-  distribution's own `cintsys.c` `dosys()`, before any client source is ever
-  reached. It reproduces with no Convex extension linked in at all.
-- `http` and `live` are earned: 31/31 shared conformance tests pass against
-  both the self-hosted and hosted backends, from a clean commit.
+1. **The transport is not BCPL.** Sockets, TLS, name resolution, the monotonic
+    clock, and random bytes come from the C extension because this Cintcode
+    distribution does not provide them.
+1. Live subscriptions are unauthenticated. `setAuth` affects HTTP calls only.
+1. Optimistic updates, WebSocket mutations and WebSocket actions are not
+   implemented; mutations and actions go over HTTP.
+1. `TransitionChunk` assembly is not implemented.
+1. Live values cover the JSON-safe subset. Tagged Convex value types such as
+   `Int64` and `Bytes` are not decoded.
+1. HTTP opens one connection per request. Keep-alive is not implemented.
+1. Numbers outside the 64-bit Cintcode word (wider than 19 decimal digits, or
+   past 9223372036854775807) round trip exactly but cannot be decoded to an
+   integer.
+1. The toolchain is pinned to a 2015 mirror of Martin Richards' distribution
+   and is patched at build time for one gap in it: the pinned commit's
+   `cintsys64.c` `dosys()` switch never received the 2014 addition of
+   `sys(Sys_ext, ...)` that the 32-bit `cintsys.c` has, so there was no way for
+   a 64-bit-Cintcode BCPL program to reach a user C extension at all. The
+   Dockerfile patches in the same one-line `case 68` (`Sys_ext`'s value, from
+   `g/libhdr.h`) that the 32-bit interpreter already has, anchored so a future
+   upstream sync that already carries the fix fails the anchor assertion
+   instead of silently duplicating it.
+1. This client targets `cintsys64`, the distribution's 64-bit Cintcode system,
+   because the 32-bit one segfaults on this architecture independently of any
+   Convex code. Confirmed directly on the build host: `gdb --batch -ex run -ex
+   bt` on the plain, unmodified 32-bit `bcpl` compiler compiling a five-line
+   "hello world" program shows `SIGSEGV` inside libc `ftell()`, called with a
+   sign-extended garbage `FILE*`. A 32-bit BCPL word was holding a raw C pointer
+   that a 64-bit host handed back above `2**32`, deep inside the
+   distribution's own `cintsys.c` `dosys()`, before any client source is ever
+   reached. It reproduces with no Convex extension linked in at all.

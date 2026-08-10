@@ -1,28 +1,143 @@
-# Convex from APL
+<img src="logo.png" alt="APL logo" width="120">
+<!-- Logo source: https://www.dyalog.com/uploads/images/apl_logo.png -->
 
-This demonstration uses GNU APL -- an implementation of the array language
-itself, not a descendant -- to call Convex's documented JSON HTTP API and its
-WebSocket `/api/sync` Live subscription protocol.
+# APL
 
-It is an educational, unofficial experiment. It is not a production SDK, an
-officially sanctioned Convex client, or a package intended for publication.
+APL is an array-oriented language whose compact symbols apply operations to
+whole collections of values. It grew from Kenneth Iverson's mathematical
+notation, named by his 1962 book
+[*A Programming Language*](https://computerhistory.org/blog/the-apl-programming-language-source-code/),
+and became an interactive programming system at IBM. Modern implementations
+include Dyalog APL and GNU APL, while Iverson's later J continued the same broad
+array-language family. APL is now a specialist language with an active niche in
+[data-heavy work](https://www.dyalog.com/application-development-partners/index.htm)
+such as finance, insurance, research, and modelling. This client uses
+[GNU APL](https://www.gnu.org/software/apl/), a free implementation of the
+extended ISO APL standard.
 
-## Start here
+This is an educational, unofficial demonstration. It is not a production SDK,
+an officially sanctioned Convex client, or a package intended for publication.
 
-[`examples/basics/main.apl`](examples/basics/main.apl) is the canonical
-example. It queries a fresh counter room over HTTP, opens a Live subscription
-on that same room, applies an idempotent mutation, and observes the `0 -> 1`
-journey land reactively over the WebSocket subscription rather than by
-re-querying. The block below is generated from that exact runnable file.
+## Getting Started
 
-## What works
+The canonical [`examples/basics/main.apl`](examples/basics/main.apl) queries a
+fresh counter, subscribes before mutating it, and observes the count change from
+`0` to `1` through Live rather than issuing a second query.
+
+From the repository root, run:
+
+```sh
+./run verify-example apl
+```
+
+That command builds the example and its minimal GNU APL runtime in Docker, gives
+it a unique room on the approved local test deployment, and checks its exact
+output. It does not install GNU APL on your host.
+
+## Interesting Parts
+
+### Convex objects cross the APL boundary as explicit JSON
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const room = "apl-readme";
+  const state = useQuery(api.demo.state, { room }); // Arguments and results are typed.
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>Count: {state.count}</p>; // state.count stays reactive and type-safe.
+}
+```
+
+**APL**
+
+```apl
+ROOM←'apl-readme'
+CONVEXURL←EnvGet 'CONVEX_URL'
+
+⍝ StateArgs builds {"room":"apl-readme"}; HttpCall sends one HTTP query.
+CURRENT←HttpCall ('query' 'demo:state' (StateArgs ROOM) CONVEXURL '')
+
+⍝ The parser represents each JSON value as a tagged pair such as ('n' 0).
+VALUE←ResultValue CURRENT
+COUNT←RequireWholeCount VALUE 'current query' ⍝ Pull out count and reject fractions.
+```
+
+React's `useQuery` manages a subscription and rerenders when the value changes.
+This APL `HttpCall` is deliberately a one-off snapshot. The explicit JSON text
+and tagged parsed values are choices made by this small client because GNU APL
+does not supply the TypeScript-style generated object types a React app gets.
+The full encoding and decoding helpers live in
+[`client/convex.apl`](client/convex.apl).
+
+### A command-line subscription has an explicit service loop
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function CounterButton() {
+  const room = "apl-readme";
+  const state = useQuery(api.demo.state, { room }); // React owns subscription cleanup.
+  const increment = useMutation(api.demo.increment);
+
+  async function addOne() {
+    // Create one key for this action. Reuse it only if this same call is retried.
+    const runId = crypto.randomUUID();
+    const result = await increment({ room, language: "TypeScript", runId });
+    console.log(result.state.count); // The mutation returns the new state.
+  }
+
+  return <button onClick={addOne}>Count: {state?.count ?? "..."}</button>;
+}
+```
+
+**APL**
+
+```apl
+CONVEXURL←EnvGet 'CONVEX_URL'
+ROOM←'apl-readme'
+SUBID←'readme-state'
+
+ConvexInit '/opt/convex/client/shim.so' ⍝ Load the narrow TLS and crypto helper.
+OK←LiveInit CONVEXURL              ⍝ Configure Live; the first service tick connects.
+LiveSubscribe (SUBID 'demo:state' (StateArgs ROOM))
+INITIAL←WaitForLiveValue (SUBID 0 'live initial value') ⍝ Drive ticks until count is 0.
+
+RUNID←'apl-',(⍕NowMs)
+MUTATION←HttpCall ('mutation' 'demo:increment' (IncrementArgs (ROOM RUNID)) CONVEXURL '')
+MUTATIONCOUNT←RequireWholeCount ('state' JGet ResultValue MUTATION) 'mutation'
+UPDATED←WaitForLiveValue (SUBID 1 'live updated value') ⍝ Keep ticking until Live sends 1.
+
+LiveUnsubscribe SUBID              ⍝ Remove the tracked query explicitly.
+LiveClose                          ⍝ Close the WebSocket before the process exits.
+```
+
+GNU APL has no worker thread behind this client. `LiveServiceTick` performs one
+non-blocking read, and the example's `WaitForLiveValue` helper calls it until the
+expected update arrives. That blocking helper is an API decision for a linear
+command-line example, not a claim that APL cannot express callbacks or other
+application structures. In React, the framework and Convex hooks own this
+lifecycle for the component.
+
+## Status
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Verified (`./run verify-all apl` awarded it on both profiles) | Query, mutation, and action calls, the `format:"json"` envelope, structured `FunctionError`/`TransportError`/`ProtocolError` classification, response `logs`, and structured `error.data` are implemented in `client/convex.apl` and pass both language-local tests and the shared black-box conformance pilot against the approved local self-hosted backend and the dedicated hosted protocol-drift target. |
-| Live | Verified (`./run verify-all apl` awarded it on both profiles) | The WebSocket `/api/sync` state machine -- RFC 6455 handshake/framing/masking/fragmentation, Connect, ModifyQuerySet (Add/Remove), Transition application, `QueryFailed`-then-recovery, and reconnect with exponential backoff reset -- is implemented in `client/convexlive.apl` and passes the shared conformance pilot's `client/live/*` cases, including five real reconnects via `debugDisconnect`, against both deployment profiles. |
+| HTTP | Verified on local and hosted profiles | Query, mutation, and action calls pass the shared conformance suite, including nested JSON, logs, structured function errors, UTF-8, document IDs, idempotency, and bearer-token lifecycle. |
+| Live | Verified on local and hosted profiles | Subscribing, reactive updates, unsubscribe, error recovery, and five real reconnects pass shared conformance. The implementation also handles WebSocket masking, fragmentation, control frames, and reconnect backoff. |
 
-## The basic example
+Both capabilities are recorded in [`manifest.yaml`](manifest.yaml). The existing
+evidence reports all 31 shared cases passing on each deployment profile and
+`Earned capabilities: http, live`; this README edit does not claim a fresh run.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.apl -->
 ```text
@@ -250,203 +365,59 @@ Main
 ```
 <!-- END GENERATED EXAMPLE -->
 
-(The block above is the file's header; the full runnable source, including
-`Main` and its helpers, is in
-[`examples/basics/main.apl`](examples/basics/main.apl) itself -- the website
-build renders the complete file verbatim from that same source.)
+## Implementation Notes
 
-## Verify it in Docker
+This is a native GNU APL client. [`client/convex.apl`](client/convex.apl)
+implements JSON, HTTP framing, result classification, authentication, and
+transport helpers. [`client/convexlive.apl`](client/convexlive.apl) implements
+WebSocket framing and the Live state machine. No JavaScript, Python, Convex
+CLI, or existing Convex SDK performs those jobs.
+
+Plain HTTP and WebSocket connections use GNU APL's built-in `⎕FIO` socket
+operations. HTTPS and secure WebSockets use
+[`client/shim.cc`](client/shim.cc), a deliberately narrow native function for
+TLS, DNS resolution, SHA-1, and secure random bytes. The C++ layer does not
+know about JSON, HTTP messages, subscriptions, or Convex functions.
+
+Live has single-process ownership rather than a background reader. Each
+`LiveServiceTick` makes one non-blocking socket read and immediately returns
+any subscription events it decoded. There is no separate application-level
+delivery queue. The kernel socket buffer is bounded, and an individual
+reassembled WebSocket message is capped at 4 MiB.
+
+The Docker build pins GNU APL 2.0 and builds it from the official source
+release. The exported images contain only the interpreter, the APL client, the
+small native helper and its runtime libraries, certificate data, and the
+minimal shell tools required by the shared verifier. Both runtime entrypoints
+run as user `65532:65532`.
+
+For the other test layers:
 
 ```sh
-./run test apl            # builds GNU APL from source, then runs the
-                           # language-local self-tests and adapter/example
-                           # smoke checks, entirely offline
-./run verify-example apl  # runs the example above against a unique room
-                           # on the local self-hosted backend
-./run verify apl          # verify-example plus shared black-box conformance
+./run test apl            # offline source and language-local checks
+./run verify apl          # example plus local shared conformance
+./run verify-hosted apl   # example plus hosted drift conformance
+./run verify-all apl      # both deployment profiles from one source
 ```
 
-`./run test apl` builds GNU APL 2.0 from its official source tarball
-(Debian only packages GNU APL in `sid`, and only with `--with-gtk3`, which
-this build does not need or want -- see "Toolchain" below), compiles the
-native transport function with `-Wall -Wextra -Werror`, runs
-`client/tests/selftest.apl` (JSON round-trip/escaping, object field lookup,
-whole-number acceptance, URL parsing, HTTP status-line/header helpers,
-chunked hex sizes, environment-variable handling, and the four
-`HttpClassify` envelope shapes -- all with no network dependency), and a
-smoke check of the conformance adapter and the canonical example's
-`CONVEX_URL is required` error path.
+`test` covers JSON, whole-number decoding, URL and HTTP helpers, result
+envelopes, and adapter startup. The `verify*` commands add real deployment
+behaviour, so a compiling image or a passing offline test is not by itself
+evidence for HTTP or Live.
 
-`./run verify-example apl` runs the example above -- both transports, the
-whole `0 -> 1` journey -- against a unique room on the local self-hosted
-backend and diffs its stdout byte-for-byte against
-`_shared/examples/basics.expected.txt`. `./run verify apl` additionally runs
-the shared black-box conformance pilot: for both the reference JS oracle and
-this client it reports `client/adapter/hello`, all `client/http/*` cases
-(query, nested JSON round-trip with `logs`, mutation, idempotent mutation,
-document-ID strings, actions, structured errors with `error.data`, UTF-8,
-and bearer-token lifecycle), all `client/live/*` cases (initial result,
-external update, unsubscribe, five real reconnects via `debugDisconnect`,
-and query-error-recovery), and `client/adapter/clean-close` -- and prints
-`Earned capabilities: http, live`. `./run verify-hosted apl` repeats example
-and conformance verification against the dedicated hosted protocol-drift
-target instead, and `./run verify-all apl` runs both deployment profiles
-from the same built source; all 31 pilot cases pass on both.
+## Known Issues
 
-## Toolchain
-
-GNU APL is built from the official upstream source release
-(`ftp.gnu.org/gnu/apl`), pinned by URL and sha256, rather than installed
-from Debian's `.deb`. Debian packages GNU APL only in `sid` (not yet in
-`trixie`/`bookworm`), and its package build enables `--with-gtk3`, which
-pulls in the entire GTK/cairo/pango stack for `⎕GTK`/`⎕PLOT`/`⎕PNG` -- none
-of which a headless network client uses. The plain upstream tarball's
-default configuration has `--with-gtk3` off, producing the same GPL,
-Debian-adjacent GNU APL 2.0 with a runtime library closure of just
-`libstdc++`/`libm`/`libc`/`libgcc_s` (confirmed with `ldd`).
-
-## Conformance and protocol notes
-
-- The client speaks the pinned `convex-rs@6f1df8a8` sync profile at
-  `/api/sync` for both HTTP (query/mutation/action) and Live (the
-  WebSocket subscription protocol).
-- `client/convex.apl` (HTTP) and `client/convexlive.apl` (RFC 6455
-  WebSocket framing and the sync-protocol state machine) are GNU APL
-  library workspace files, loaded by the adapter and the example with
-  `)COPY '/opt/convex/client/convex.apl'` then
-  `)COPY '/opt/convex/client/convexlive.apl'` -- the same mechanism GNU
-  APL's own shipped `wslib5` standard-library files use, and, like them,
-  both files start with the `⍝!` marker GNU APL's file-format check
-  requires to recognise a plain-text file as a library rather than a
-  `)DUMP`/XML workspace.
-- GNU APL's own `⎕FIO` (`Quad-FIO[32..42]`) supplies raw TCP sockets
-  natively -- `socket`/`connect`/`send`/`recv`/`read`/`write`/`fcntl` --
-  for the plain (`ws://`, `http://`) transport; no native function is
-  needed for that path at all. TLS (`wss://`, `https://`) uses a small
-  native function, `client/shim.cc`, compiled against GNU APL's own
-  internal headers (`Native_interface.hh` and friends) and loaded at
-  runtime with dyadic `⎕FX` -- the documented mechanism GNU APL's own
-  shipped `lib_file_io.so` uses for exactly this. The same native
-  function also supplies SHA-1 and CSPRNG bytes (both needed only for the
-  RFC 6455 WebSocket handshake and per-frame masking) and DNS resolution
-  (`⎕FIO`'s own `connect()` takes an address that is already resolved to
-  a 32-bit integer; GNU APL has no `getaddrinfo` of its own). No HTTP,
-  JSON, WebSocket framing, or Convex sync-protocol logic lives in the
-  native function.
-- GNU APL has no threads (there is no way to call a function through a
-  runtime-computed pointer, which a thread's entry point would need), so
-  Live's WebSocket reader is not a background worker. The whole adapter
-  process is the one worker: `client/tests/conformance/adapter.apl`'s
-  command loop does one non-blocking read of the next NDJSON command and
-  one non-blocking poll of the Live connection per pass, so a subscribed
-  query's update is written out promptly without a second thread ever
-  touching the connection concurrently.
-- `client/tests/conformance/adapter.apl` implements NDJSON adapter
-  protocol v1 over both stdin/stdout and the `ADAPTER_LISTEN` TCP mode
-  (`⎕FIO[41]`/`[42]`, read/write, work identically on a plain fd or an
-  accepted socket fd), with real `subscribe`/`unsubscribe`/
-  `debugDisconnect` handlers backed by `client/convexlive.apl` --
-  `debugDisconnect` is its one adapter-only command, acknowledged only
-  after the old connection is retired and the next reconnect is
-  scheduled.
-- GNU APL's CLI has no way to run a script from a bare positional
-  filename argument, only via `-f file`; `/usr/local/bin/convex-example`
-  and `/usr/local/bin/convex-adapter` are therefore tiny `#!/bin/sh`
-  launchers that run `apl -s -f <script> -- "$@"`, the same shape
-  `unicon -o`'s own generated launcher uses for this project's Icon
-  client.
-
-## Limitations
-
-- `client/tests/selftest.apl` (the offline, no-network Docker `test` stage)
-  covers HTTP-side behaviour only. It does not include a local mock
-  WebSocket fixture server exercising Live's edge cases deterministically
-  and offline -- fragmentation/control-frame interleaving under an
-  adversarial peer, five reconnects with an explicit backoff-reset
-  assertion, a stopped-reader queue bound, and so on -- the way some other
-  languages in this project do for their own `test` target. Every one of
-  those scenarios this client actually implements is instead exercised
-  against a real backend by the shared conformance pilot's `client/live/*`
-  cases (`reconnect-five-times` genuinely reconnects five times over real
-  TLS; `query-error-recovery` genuinely recovers from a real
-  `FunctionError`) and, for the bugs a real run alone surfaced, by hand --
-  real evidence, but not the fully offline, adversarial local coverage
-  AGENTS.md's Live acceptance section asks for.
-- Bearer-token authentication (`setAuth`) is accepted by the adapter,
-  threaded into the HTTP `Authorization` header, and exercised by the
-  shared conformance pilot's `client/http/bearer-token-lifecycle` case
-  against the approved local backend.
-- The native function is deliberately narrow: TCP connect/send/recv/close
-  for TLS, SHA-1, CSPRNG bytes, and DNS resolution only. No HTTP, JSON,
-  WebSocket framing, or Convex sync-protocol behaviour lives in C++.
-- `⎕FIO[40]` (`select`) reliably raised `DOMAIN ERROR` in this build even
-  when its argument's shape and nesting exactly matched `Quad_FIO.cc`'s
-  own documented expectations (checked directly with `⍴`/`≡`/`⊃` before
-  it ever reached `select()`). Both the HTTP transport and the Live
-  WebSocket reader work around this with a non-blocking `fcntl` +
-  `⎕FIO[37]`/`[41]` `recv()`/`read()` poll loop instead, which does not
-  have the same problem.
-- A GNU APL function header cannot destructure a parenthesized left
-  argument into two formal names, e.g. `Z←(A B) Fn C` -- it silently
-  produces a `DEFN ERROR` at definition time and the whole body then
-  falls through to top-level immediate execution the moment the function
-  is called, rather than ever running as a function, with no compile-time
-  warning that anything is wrong. Found only once Live was driven against
-  a real backend end to end (`WsBuildFrame`'s original header); the fix
-  is a single left-argument name, destructured inside the body instead.
-- The sync protocol's very first `Transition` on a fresh connection must
-  be matched against `startVersion.ts` `"AAAAAAAAAAA="` (timestamp zero),
-  not an empty string -- confirmed against a real backend after an empty
-  initial `LVREMOTETS` made every first `Transition` fail validation
-  silently (no error surfaced to the operator; the subscription just
-  never delivered).
-- The most serious landmine here: `client/shim.cc`'s `handle_of()` parsed
-  a TLS handle argument with `atoi()` over its raw bytes, assuming ASCII
-  decimal text -- correct for what `CONVEXTLS[1]` (connect) *returns*
-  ("K:1"), wrong for what it later *receives*, since `client/convex.apl`'s
-  `ConnConnect` immediately `⍎`-evaluates that text into a genuine APL
-  numeric scalar before storing it. A real integer cell's raw codepoint
-  *is* its numeric value (handle 1 arrives as the SOH control character,
-  codepoint 1, not the ASCII digit `'1'`, codepoint 49), so `atoi()` over
-  that byte silently parsed every non-zero handle as 0. This was
-  completely invisible through every check so far, local and hosted,
-  hand-run and shared-conformance, because only one TLS connection was
-  ever open at a time (Live and HTTP never ran concurrently until this
-  work) -- handle 0 was always correct by coincidence. It surfaced only
-  once Live's own persistent connection held slot 0 open while a
-  concurrent HTTP call's connection (correctly assigned slot 1 by
-  `client/shim.cc`'s own bookkeeping) got silently misrouted onto slot 0
-  instead: the HTTP request bytes went out on Live's socket, and the
-  reply never came, reported as `TransportError: connection closed
-  before headers completed`. Reproduced deterministically against the
-  dedicated hosted target (not against the local backend, since that
-  target is plain HTTP and never touches this native function at all) --
-  a targeted native-level trace pinned it to the exact `SSL_write` call
-  before the fix went in. Fixed by reading the argument cell's numeric
-  value directly, the same way `maxBytes`/`timeoutMs` already are, rather
-  than assuming text.
-- A second landmine, found chasing a real OOM kill on the same dedicated
-  hosted target once the handle bug above was fixed: the conformance
-  adapter's own command loop looped straight back to the top of its
-  read/tick cycle without ever reaching its idle branch's sleep, the
-  moment any Live command had been issued -- an unthrottled busy-spin,
-  tens of thousands of `LiveServiceTick` passes per second, each a
-  handful of small APL allocations that add up under that much churn. A
-  cgroup memory trace against the real target showed it plainly: flat
-  around 22 MiB through every HTTP test and the first Live test, then
-  climbing continuously (not one spike) past the shared 128 MiB budget
-  within about two seconds of Live going active, killing the adapter
-  mid-conformance-run with no application-level error at all (the
-  harness only ever saw "adapter TCP connection closed"). Fixed by
-  falling through to the loop's existing one-tick-per-pass sleep
-  regardless of whether Live was active.
-- GNU APL's own script-exit path (`)OFF`, required to leave the
-  interpreter cleanly -- omitting it drops the process into an
-  interactive `^D`/end-of-input prompt loop instead) appends one
-  unsuppressible bare blank line to stdout after a script's last real
-  line of output, on top of the already-present per-`)COPY` `DUMPED
-  <mtime>` banner. Both `examples/basics/entrypoint.sh` and
-  `client/tests/conformance/entrypoint.sh` filter it at the shell
-  boundary (holding the most recently read line back by one step so a
-  genuine trailing empty line is dropped instead of printed), since
-  neither is suppressible from inside the language.
+1. The offline self-test has no adversarial mock WebSocket server. Live
+   fragmentation, control-frame interleaving, reconnects, and error recovery
+   are covered by shared real-backend evidence, but not by deterministic
+   language-local fixtures.
+2. GNU APL has no threads in this implementation, so an application must keep
+   calling `LiveServiceTick` while it wants updates. A stalled caller also
+   stalls subscription delivery.
+3. GNU APL's `⎕FIO[40]` `select` operation raised `DOMAIN ERROR` for the
+   expected argument shape in this build. The client works around it with
+   non-blocking `fcntl`, `recv`, and `read` polling.
+4. GNU APL prints `)COPY` banners and a final blank line that cannot be
+   suppressed from the scripts. The two shell entrypoints filter those lines
+   so example output and adapter output remain machine-readable; that pipeline
+   does not preserve the interpreter's own exit status.

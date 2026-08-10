@@ -1,19 +1,143 @@
-# Convex from JavaScript
+# JavaScript
 
-This folder shows a small JavaScript program talking directly to Convex. It
-calls queries, mutations, and actions over HTTP, then follows a query over a
-WebSocket.
+JavaScript is the dynamic, prototype-based language created by Brendan Eich at
+Netscape in 1995 and later standardised as ECMAScript. It began in web browsers,
+where it remains the language built into the platform, and now also runs
+server-side, on desktops, and in embedded systems. It borrows familiar syntax
+from C and Java but has a very different object and type system. [MDN's
+JavaScript reference](https://developer.mozilla.org/en-US/docs/Web/JavaScript)
+is the practical language home, while [ECMA-262](https://tc39.es/ecma262/)
+defines the standard.
 
-This is an educational, unofficial demonstration for the 100-language project.
-It is not a production SDK or a package intended for publication.
+This folder uses Node.js to show JavaScript talking directly to Convex. It is an
+educational, unofficial demonstration, not a production SDK or a package meant
+for publication.
 
-## Start here
+## Getting Started
 
-Read the [basic example](examples/basics/main.js). It queries a counter room,
-starts Live, applies one idempotent mutation, and checks that Live observes the
-same `0 -> 1` change. The native implementation is in [client](client/).
+Start with the [canonical basic example](examples/basics/main.js). It reads a
+counter, subscribes before writing, applies one idempotent increment, and sees
+the reactive value move from `0` to `1`.
 
-## What works
+From the repository root, run the exact example in its Docker image against the
+approved test deployment:
+
+```sh
+./run verify-example javascript
+```
+
+## Interesting Parts
+
+### Generated references versus a JSON boundary
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+function Counter() {
+  const state = useQuery(api.demo.state, { room: "readme-javascript" });
+  if (state === undefined) return <p>Loading...</p>;
+
+  console.log(state.count); // The generated API makes state and count type-safe.
+  return <p>{state.count}</p>;
+}
+```
+
+**JavaScript**
+
+```javascript
+import { Client } from "./client/convex.js";
+
+const deploymentUrl = process.env.CONVEX_URL;
+if (!deploymentUrl) throw new Error("CONVEX_URL is required");
+
+const client = new Client(deploymentUrl);
+const response = await client.query("demo:state", {
+  room: "readme-javascript", // Arguments are an ordinary named JSON object.
+});
+
+const count = response.value.count;
+if (!Number.isSafeInteger(count)) {
+  throw new TypeError("demo:state returned a non-integer count");
+}
+console.log(count); // This check, not JavaScript's type system, protects the boundary.
+await client.close();
+```
+
+Convex's generated TypeScript API checks the function reference, arguments, and
+returned shape during development. This small client deliberately uses the
+string path `"demo:state"` and plain JSON, so application code must validate any
+shape it depends on at runtime. The client wraps the returned value with its
+Convex log lines as `{ value, logs }`.
+
+### Owning a reactive subscription
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+function Counter() {
+  const room = "readme-javascript-live";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+  if (state === undefined) return <p>Loading...</p>;
+
+  return (
+    <button
+      onClick={() =>
+        increment({ room, language: "typescript", runId: crypto.randomUUID() })
+      }
+    >
+      {state.count} {/* React rerenders after the mutation changes this query. */}
+    </button>
+  );
+}
+```
+
+**JavaScript**
+
+```javascript
+import { Client } from "./client/convex.js";
+
+const deploymentUrl = process.env.CONVEX_URL;
+if (!deploymentUrl) throw new Error("CONVEX_URL is required");
+
+const client = new Client(deploymentUrl);
+const room = "readme-javascript-live";
+const subscription = client.subscribe("demo:state", { room }); // Start Live first.
+
+try {
+  const first = await subscription.next(); // Wait for the initial reactive value.
+  if (first.done) throw new Error("subscription closed before its first value");
+  if (first.value.error) throw first.value.error;
+  console.log(first.value.value.count);
+
+  await client.mutation("demo:increment", {
+    room,
+    language: "javascript",
+    runId: crypto.randomUUID(), // Make a retry of this write idempotent.
+  });
+
+  const changed = await subscription.next(); // The mutation reruns the Live query.
+  if (changed.done) throw new Error("subscription closed before its update");
+  if (changed.value.error) throw changed.value.error;
+  console.log(changed.value.value.count);
+} finally {
+  await subscription.close(); // This sends Remove for the Live query.
+  await client.close(); // This closes the underlying WebSocket.
+}
+```
+
+`useQuery` ties the subscription to a component and React owns its cleanup. A
+command-line program has no component lifecycle, so this client exposes an
+async iterator whose `next()` method makes each value and the cleanup visible.
+That is this client's API choice, not a limitation of JavaScript.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -24,7 +148,7 @@ same `0 -> 1` change. The native implementation is in [client](client/).
 | Capability badges | HTTP and Live earned from root-owned local and hosted evidence |
 | Live authentication and WebSocket writes | Deferred |
 
-## Basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.js -->
 ```javascript
@@ -108,35 +232,31 @@ async function nextUpdate(subscription, name) {
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker-only verification
+## Implementation Notes
 
-```sh
-./run test javascript
-./run build javascript
-```
+This is a native JavaScript implementation running on Node.js 22.16.0. Built-in
+`fetch` handles HTTP and the `ws` package provides WebSocket transport, but no
+existing Convex JavaScript client is delegated the work. The code in
+[`client/convex.js`](client/convex.js) constructs HTTP requests, interprets
+Convex success and error envelopes, and implements the Live query-set and
+reconnect behaviour itself.
 
-`test` parses the client, adapter, and exact canonical example, then runs its
-local tests inside a pinned linux/amd64 Node image. `build` produces the
-non-root conformance image and the matching example-runtime target. Root-owned
-`verify-example`, `verify`, and `verify-hosted` are the only commands that can
-award HTTP or Live capability badges.
+HTTP queries, mutations, and actions are one-shot promises. Live subscriptions
+are async iterators backed by a newest-value queue capped at 16 pending updates.
+If a consumer falls behind, the oldest queued state is discarded because a
+reactive query represents current state rather than a durable event log.
 
-## Conformance and protocol notes
+The test-only [conformance adapter](client/tests/conformance/adapter.js) exposes
+the shared controller protocol over stdin/stdout or TCP. Its `debugDisconnect`
+operation exists only so conformance tests can force a real reconnect. It is not
+part of the educational client API.
 
-The test-only adapter at `client/tests/conformance/adapter.js` accepts NDJSON
-protocol v1 over stdin/stdout or `ADAPTER_LISTEN` TCP. Its `debugDisconnect`
-command is deliberately adapter-only, so the shared controller can exercise
-real reconnects without any Docker or host-network privilege.
+## Known Issues
 
-HTTP uses the documented JSON `/api/query`, `/api/mutation`, and `/api/action`
-endpoints. Live uses `ws` solely for WebSocket transport; JavaScript implements
-the Convex query-set, transition, and reconnect behaviour itself against the
-experimental `convex-rs-0.10.4-unversioned-sync` `/api/sync` profile.
-
-## Limitations
-
-Live authentication, WebSocket mutations/actions, optimistic updates, journal
-replay, TransitionChunk assembly, and tagged Convex value encodings are
-deferred. Each subscription keeps at most 16 pending updates and discards the
-oldest value for a slow consumer, because reactive queries represent current
-state rather than an event log.
+1. Live authentication is not implemented, even though bearer tokens work for
+   HTTP calls.
+2. Mutations and actions use HTTP only. WebSocket writes, optimistic updates,
+   and journal replay are deferred.
+3. Live follows the experimental
+   `convex-rs-0.10.4-unversioned-sync` profile. Transition chunks and tagged
+   non-JSON Convex values are treated as protocol drift rather than decoded.

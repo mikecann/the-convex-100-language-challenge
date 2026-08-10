@@ -1,51 +1,176 @@
-# Convex from REBOL
+<img src="logo.png" alt="Rebol 3 project artwork" width="640">
+<!-- Logo source: https://github.com/user-attachments/assets/8b71fff1-b421-4254-a1c0-eea4f4791cc5 -->
 
-A from-scratch Convex client written in REBOL, using Rebol/Bulk 3.22.1 (the
-[Oldes/Rebol3](https://github.com/Oldes/Rebol3) fork)'s own native
-`tcp://`/`tls://` port schemes -- no OpenSSL, no FFI, no delegated runtime.
+# REBOL
 
-This is an educational demonstration for the 100 Convex Clients project, not
-an official Convex SDK and not a package meant for publication.
+REBOL, short for Relative Expression Based Object Language, is an interpreted language created by Carl Sassenrath and introduced by REBOL Technologies in 1998. Its signature idea is that the same compact, typed values and blocks can represent code, data, and small domain-specific languages called dialects. It was built for lightweight networked programs and data exchange, and it later inspired related languages including Red. The original [REBOL site](https://www.rebol.com/what-rebol.html) explains the language's history and dialect model.
 
-- Selection tier: `coverage`
-- Implementation status: `working`
-- Earned capabilities: `http`, `live` -- see `_shared/results/` for the
-  evidence and "Docker verification" below for the exact commands.
+Today REBOL is a niche community language rather than a mainstream application stack. This project uses the actively maintained [Oldes/Rebol3](https://github.com/Oldes/Rebol3) fork and its feature-rich Bulk build. Its current downloads and language reference live at [rebol.tech](https://rebol.tech/). This client is an educational, unofficial demonstration, not a production Convex SDK or a package intended for publication.
 
-## Start here
+## Getting Started
 
-`examples/basics/main.r3` is the canonical example: it reads a room's
-counter over Convex's documented HTTP API, opens a Live subscription over
-`/api/sync` before mutating anything so the "before" and "after" values can
-never be confused with each other, applies an idempotent mutation, and
-proves the Live subscription reported the same change without a second poll.
-It produces exactly the shared project's universal happy-path transcript,
-byte for byte:
+The [canonical example](examples/basics/main.r3) queries a fresh counter, starts a Live subscription before changing it, applies an idempotent mutation, and receives the reactive update. From the repository root, run:
 
-```
-current count: 0
-live initial count: 0
-mutation applied: true
-mutation count: 1
-live updated count: 1
-verified count: 0 -> 1
+```sh
+./run verify-example rebol
 ```
 
-## What works
+That command builds the pinned `linux/amd64` example image in Docker and runs the exact source shown later in this README against an approved test deployment.
 
-| Piece | Status |
+## Interesting Parts
+
+### Maps are explicit, and returned JSON is checked at runtime
+
+In TypeScript, generated Convex types check the mutation arguments and result while you write the component.
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { useMutation } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function IncrementButton() {
+  const increment = useMutation(api.demo.increment);
+  const [room] = useState(() => `react-readme-${crypto.randomUUID()}`);
+
+  async function handleClick() {
+    const result = await increment({
+      room,
+      language: "typescript",
+      runId: crypto.randomUUID(), // A retry can reuse this ID safely.
+    });
+    console.log(result.state.count); // The result and count are type-safe here.
+  }
+
+  return <button onClick={handleClick}>Increment</button>;
+}
+```
+
+**REBOL**
+
+```rebol
+do %../../client/convex.r3
+
+convex-url: get-env "CONVEX_URL"
+unless convex-open convex-url "rebol-readme-0.1.0" [
+    print convex-error-message
+    quit/return 1
+]
+
+room: rejoin ["rebol-readme-" enbase random-bytes 8 16]
+mutation-args: make map! []
+put mutation-args "room" room
+put mutation-args "language" "rebol"
+put mutation-args "runId" enbase random-bytes 8 16
+
+result: convex-mutation "demo:increment" mutation-args
+unless result/ok [
+    print convex-error-message
+    quit/return 1
+]
+count: convex-field-integer (select result/value "state") "count"
+unless count [
+    print "count was not a safe whole number"
+    quit/return 1
+]
+print count
+```
+
+`map!` is the REBOL counterpart to the TypeScript argument object. Square-bracket blocks hold ordered REBOL values, so `make map! []` starts from an empty block and the `unless [...]` blocks contain executable code. These are ordinary REBOL blocks, not a custom dialect. Function specifications enforce top-level types at runtime, but decoded JSON fields are dynamic, so this client deliberately validates `count` instead of pretending it has TypeScript-style static field inference.
+
+### React hides the subscription lifecycle; this client exposes it
+
+`useQuery` subscribes when the component mounts, updates it when arguments change, and cleans it up when the component unmounts.
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const [room] = useState(() => `react-live-${crypto.randomUUID()}`);
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  if (state === undefined) return <p>Loading...</p>;
+
+  return (
+    <button
+      onClick={() =>
+        increment({ room, language: "typescript", runId: crypto.randomUUID() })
+      }
+    >
+      Count: {state.count} {/* This rerenders when the query result changes. */}
+    </button>
+  );
+}
+```
+
+**REBOL**
+
+```rebol
+do %../../client/convex.r3
+
+convex-url: get-env "CONVEX_URL"
+unless convex-open convex-url "rebol-live-readme-0.1.0" [
+    print convex-error-message
+    quit/return 1
+]
+
+room: rejoin ["rebol-live-" enbase random-bytes 8 16]
+query-args: make map! []
+put query-args "room" room
+
+;; This command-line client owns setup and teardown itself.
+unless convex-subscribe "counter" "demo:state" query-args [
+    print convex-error-message
+    quit/return 1
+]
+initial: convex-wait-update "counter" 15000
+unless initial/ok [
+    print convex-error-message
+    quit/return 1
+]
+print convex-field-integer initial/value "count"
+
+mutation-args: make map! []
+put mutation-args "room" room
+put mutation-args "language" "rebol"
+put mutation-args "runId" enbase random-bytes 8 16
+mutation: convex-mutation "demo:increment" mutation-args
+unless mutation/ok [
+    print convex-error-message
+    quit/return 1
+]
+
+updated: convex-wait-update "counter" 15000
+unless updated/ok [
+    print convex-error-message
+    quit/return 1
+]
+print convex-field-integer updated/value "count"  ;; The reactive result.
+
+convex-unsubscribe "counter"
+convex-close-live 2000
+```
+
+The blocking `convex-wait-update` call is a design choice in this small command-line client, not a limitation of REBOL's event system. It keeps the ownership and ordering visible: subscribe, consume the initial value, mutate, consume the update, then clean up. The complete example below adds all value and error checks.
+
+## Status
+
+| Capability | Evidence-backed status |
 | --- | --- |
-| Rebol/Bulk toolchain (fetched, sha256-verified, architecture-asserted) | Proven in Docker |
-| `client/json.r3` (hand-rolled JSON codec) | Tested, 62+ checks, including Convex's integral-decimal number rule |
-| `client/x509.r3` (TLS chain-of-trust and hostname verification) | Proven against four live hosts: accepts the real Convex chain, rejects self-signed, expired, and wrong-hostname certificates |
-| `client/convex.r3` (HTTP query/mutation/action, RFC 6455 WebSocket, `/api/sync` Live state machine) | Full HTTP and Live conformance verified end to end |
-| `examples/basics/main.r3` | Verified against both deployment profiles via `./run verify-example`/`verify-all` |
-| NDJSON conformance adapter (`client/tests/conformance/main.r3`), stdin/stdout and `ADAPTER_LISTEN` TCP | Full shared conformance verified, both deployment profiles |
-| Five real reconnects, backoff reset, and unchanged-rehydration suppression | Dedicated regression (`client/tests/live-reconnect-test.r3`), not just the shared conformance run |
-| Adapter's bounded output queue under a stopped reader | Dedicated regression (`client/tests/conformance/queue-test.r3`) |
-| `example-runtime` / `runtime` Docker stages | Built, pruned, policy-checked, and verified |
+| HTTP query, mutation, and action | Earned |
+| Live queries | Earned |
+| Local and hosted shared conformance | All 31 required checks passed on both profiles |
+| Implementation provenance | Native REBOL, with no delegated Convex client or runtime |
 
-## The canonical example
+The implementation is `working` in the `coverage` selection tier. The recorded evidence under `_shared/results/` was produced from the same clean source image for the local and hosted deployment profiles. This README does not claim that those historical checks were rerun for this documentation edit.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.r3 -->
 ```rebol
@@ -224,7 +349,9 @@ print "verified count: 0 -> 1"
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
+
+### Docker verification
 
 ```
 ./run test rebol
@@ -262,7 +389,7 @@ this README was updated alongside. Only the shared result evaluator computes
 the `http`/`live` capability badges from that evidence; this README does not
 round up ahead of it.
 
-## The TLS chain-of-trust and hostname verification (`client/x509.r3`)
+### The TLS chain-of-trust and hostname verification (`client/x509.r3`)
 
 The hardest and highest-risk part of a REBOL Convex client was built and
 proven ahead of the rest: **`client/x509.r3`**, a from-scratch certificate
@@ -320,7 +447,7 @@ correctness traps while building this:
   capture the exact bytes as they pass through, with no re-encoding
   involved.
 
-## The conformance adapter
+### The conformance adapter
 
 `client/tests/conformance/main.r3` is test infrastructure, not public client
 code: it wraps `client/convex.r3`'s public `convex-*` functions with the
@@ -388,7 +515,7 @@ store is staged at all: `client/x509.r3`'s trust bundle
 (`client/ca-bundle/*.pem`) is entirely separate from the system trust
 store.
 
-## REBOL lessons learned along the way
+### REBOL lessons learned along the way
 
 - This Rebol/Bulk build always tries to create `~/.rebol/` once at process
   start, and prints one uncontrollable warning line to stdout -- even
@@ -419,30 +546,30 @@ store.
   `wait` integration, and the FUNCTION-vs-FUNC trap for a listening
   `tcp://` port's nested `awake` closure.
 
-## Known limitations
-
-- `system/ports/input`'s `wait` integration does not work in this build
-  (see above); the conformance adapter's stdin/stdout transport mode
-  cannot interleave pumping Live with waiting for the next controller
-  command the way its `ADAPTER_LISTEN` TCP mode does. The shared harness
-  uses `ADAPTER_LISTEN`, where this does not apply.
-- The trust bundle (`client/ca-bundle/`) is a small curated set (GTS Root
-  R1, GTS Root R4, ISRG Root X1, GlobalSign Root CA), sha256-verified
-  against each publisher's own listing at the time it was bundled -- not
-  the full system trust store.
-- Live authentication (`setAuth` while a Live connection is open, rather
-  than before one starts), WebSocket-issued mutations and actions, and
-  `TransitionChunk` assembly are not implemented; an unrecognized
-  Transition modification is reported as a `ProtocolError` and the
-  connection reconnects.
-- The client keeps only the latest delivered value per subscription (no
-  unbounded queue); the conformance adapter's own bounded output queue
-  (8 slots, 4 MiB) is what bounds memory toward a slow or stopped
-  consumer, proven directly by `client/tests/conformance/queue-test.r3`.
-
-## Toolchain
+### Toolchain
 
 Rebol/Bulk 3.22.1, tag `3.22.1` from
 [github.com/Oldes/Rebol3](https://github.com/Oldes/Rebol3/releases/tag/3.22.1),
 asset `rebol3-bulk-linux-x64.gz`, sha256
 `1932a7048b09cad5fc7bd9c6e4649f9fcfb45245d55876871d6a89e1d5dbad32`.
+
+## Known Issues
+
+1. `system/ports/input`'s `wait` integration does not work in this build
+  (see above); the conformance adapter's stdin/stdout transport mode
+  cannot interleave pumping Live with waiting for the next controller
+  command the way its `ADAPTER_LISTEN` TCP mode does. The shared harness
+  uses `ADAPTER_LISTEN`, where this does not apply.
+2. The trust bundle (`client/ca-bundle/`) is a small curated set (GTS Root
+  R1, GTS Root R4, ISRG Root X1, GlobalSign Root CA), sha256-verified
+  against each publisher's own listing at the time it was bundled -- not
+  the full system trust store.
+3. Live authentication (`setAuth` while a Live connection is open, rather
+  than before one starts), WebSocket-issued mutations and actions, and
+  `TransitionChunk` assembly are not implemented; an unrecognized
+  Transition modification is reported as a `ProtocolError` and the
+  connection reconnects.
+4. The client keeps only the latest delivered value per subscription (no
+  unbounded queue); the conformance adapter's own bounded output queue
+  (8 slots, 4 MiB) is what bounds memory toward a slow or stopped
+  consumer, proven directly by `client/tests/conformance/queue-test.r3`.

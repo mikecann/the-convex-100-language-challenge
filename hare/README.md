@@ -1,27 +1,177 @@
-# Convex from Hare
+<img src="logo.png" alt="Harriet, the Hare programming language mascot" width="160">
+<!-- Logo source: https://harelang.org/mascot.png -->
 
-This folder is a native [Hare](https://harelang.org) client for Convex's
-documented JSON HTTP endpoints and the project's pinned `/api/sync` Live
-WebSocket profile. Hare is a small, self-hosted systems language with no
-runtime and, deliberately, almost no standard library beyond the operating
-system and a small core: there is no JSON, HTTP, TLS, or WebSocket support to
-reach for, so all four are written here in Hare itself. The one place this
-client leaves Hare is OpenSSL's `libssl`, reached through Hare's own C ABI for
-the TLS record layer — the same kind of foreign-function boundary every other
-native client in this project uses for its language's TLS story.
+# Hare
 
-This is unofficial, educational teaching material, not an official Convex SDK
-and not a package meant for publication.
+[Hare](https://harelang.org) is a statically typed systems language with manual
+memory management and a minimal runtime. It was publicly announced in 2022
+after roughly two and a half years of private development. Hare is closest to
+C, shares `defer` and some standard-library ideas with Go, and targets operating
+systems, command-line tools, compilers, networking software, and other low-level
+work.
 
-## Start here
+It remains a young, specialist language rather than a mainstream application
+platform. That makes a Convex client an interesting stretch: Hare's standard
+library has networking primitives, but this client implements JSON, HTTP, and
+WebSockets itself, using OpenSSL through Hare's C ABI only for TLS. This is
+unofficial educational material, not an official Convex SDK or a package meant
+for production use.
 
-Read [`examples/basics/main.ha`](examples/basics/main.ha). It configures the
-deployment from `CONVEX_URL`, performs an HTTP query, starts a Live
-subscription before the mutation so the initial snapshot cannot be missed,
-applies an idempotent mutation, and checks that both the HTTP and Live paths
-agree on the resulting `0 -> 1` count.
+## Getting Started
 
-## What works
+The canonical [`examples/basics/main.ha`](examples/basics/main.ha) queries a
+counter, subscribes before mutating it, and checks the resulting `0 -> 1`
+update. From the repository root, Docker builds the exact program shown later
+and runs it against a unique room:
+
+```sh
+./run verify-example hare
+```
+
+## Interesting Parts
+
+### JSON values have to prove their shape
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Count() {
+  const [room] = useState(() => `hare-readme-types-${crypto.randomUUID()}`);
+  const state = useQuery(api.demo.state, { room });
+  if (state === undefined) return <p>Loading...</p>;
+
+  return <p>{state.count}</p>; // Generated types know this is a number.
+}
+```
+
+**Hare**
+
+```hare
+use convex;
+use fmt;
+use os;
+use strings;
+use time;
+
+const url = os::getenv("CONVEX_URL") as str;
+const client = convex::client_init(url) as *convex::client;
+defer convex::client_close(client); // Hare has no garbage collector.
+
+const now = time::now(time::clock::REALTIME);
+const room = fmt::asprintf("hare-readme-types-{}-{}", now.sec, now.nsec);
+defer free(room); // Keep this read separate from any previous run.
+let fields: []convex::entry = alloc([
+	convex::entry {
+		key = strings::dup("room"),
+		value = strings::dup(room),
+	},
+]);
+defer {
+	free(fields[0].key);
+	convex::finish(&fields[0].value);
+	free(fields);
+};
+const args: convex::value = fields; // This is the { room: ... } object.
+let result = convex::client_call(client, "query", "demo:state", args)
+	as convex::call_result;
+defer convex::call_result_finish(&result);
+
+const count_value = convex::lookup(result.value, "count") as *convex::value;
+const count = match (*count_value) {
+case let integer: i64 =>
+	yield integer;
+case let decimal: f64 =>
+	yield decimal: i64;
+case =>
+	abort("count was not numeric");
+};
+// count is type-safe as i64 only after the match checks the JSON variants.
+```
+
+Convex's generated TypeScript API carries the validator's result type into the
+component. This small Hare client instead returns its own tagged union,
+`convex::value`, so application code must inspect the JSON shape. Hare's
+`match` then narrows the selected arm to a concrete type.
+
+### Live updates are pulled by the caller
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const [room] = useState(() => `hare-readme-live-${crypto.randomUUID()}`);
+  const state = useQuery(api.demo.state, { room });
+
+  // React owns the subscription and rerenders after any later mutation.
+  return <p>{state?.count ?? "Loading..."}</p>;
+}
+```
+
+**Hare**
+
+```hare
+use convex;
+use fmt;
+use os;
+use strings;
+use time;
+
+const url = os::getenv("CONVEX_URL") as str;
+const client = convex::client_init(url) as *convex::client;
+defer convex::client_close(client);
+
+const now = time::now(time::clock::REALTIME);
+const room = fmt::asprintf("hare-readme-live-{}-{}", now.sec, now.nsec);
+defer free(room); // Each run gets its own counter room.
+let fields: []convex::entry = alloc([
+	convex::entry {
+		key = strings::dup("room"),
+		value = strings::dup(room),
+	},
+]);
+defer {
+	free(fields[0].key);
+	convex::finish(&fields[0].value);
+	free(fields);
+};
+const args: convex::value = fields;
+
+// Register the query explicitly. The client keeps it active across reconnects.
+convex::client_subscribe(client, "counter", "demo:state", args)!;
+defer convex::client_unsubscribe(client, "counter")!;
+
+for (true) {
+	match (convex::client_live_step(client, 100)) {
+	case let event: convex::sync_event =>
+		let event = event;
+		defer convex::sync_event_finish(&event);
+		if (event.subscription_id == "counter") {
+			// event.value is the initial state, then each reactive update.
+			break;
+		};
+	case void =>
+		continue; // Nothing arrived during this 100 ms step.
+	case let err: convex::client_error =>
+		abort(err: str);
+	};
+};
+```
+
+Hare can use callbacks through function pointers, but this client deliberately
+offers a blocking, poll-driven `client_live_step` API. One call stack owns the
+socket, each call yields at most one event, and the command-line caller owns
+unsubscribe and cleanup. That is an API and lifecycle choice, not a claim that
+Hare cannot express callbacks.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -32,6 +182,8 @@ agree on the resulting `0 -> 1` count.
 | Live reconnect | Verified by shared local and hosted conformance, including five real `debugDisconnect`-driven reconnects that each resend the active subscription and correctly suppress a duplicate event for an unchanged rehydrated value |
 | Convex tagged values | Deferred, JSON-safe values only |
 | Live authentication, optimistic writes, WebSocket mutations/actions | Deferred |
+
+## Example
 
 The full teaching example below is generated directly from the runnable
 source.
@@ -235,80 +387,46 @@ fn wait_for_update(client: *convex::client, subscription_id: str) convex::value 
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
+
+The client is native Hare. [`client/json.ha`](client/json.ha),
+[`client/http.ha`](client/http.ha), and [`client/ws.ha`](client/ws.ha)
+implement the JSON, HTTP/1.1, and WebSocket layers rather than delegating to
+another Convex client. [`client/tls.ha`](client/tls.ha) is the sole C-ABI
+boundary and uses OpenSSL's `libssl` for encrypted transport and certificate
+verification. All Convex-specific behaviour remains in Hare.
+
+Live is a single-threaded state machine. The caller advances it with
+`client_live_step`, which either reconnects, consumes one frame, returns one
+decoded event, or reports that its short polling window was quiet. With no
+background reader, the step function provides backpressure and the client
+holds at most one decoded event between calls.
+
+Hare's build driver has no option to request static linking, so the Docker
+build wraps the linker and adds `-static`. It produces `linux/amd64` binaries
+with a minimal runtime filesystem and a CA bundle. The test-only conformance
+adapter supports both standard input/output and TCP modes, but it is not part
+of the educational client API.
+
+For the complete Docker layers, run these from the repository root:
 
 ```sh
-./run test hare           # hare test (offline), and compiles both static binaries
-./run verify-example hare # runs the canonical example against a unique room
-./run verify hare         # adds shared local black-box conformance
-./run verify-hosted hare  # repeats example and conformance against the hosted target
-./run verify-all hare     # builds once, then runs both deployment profiles
+./run test hare           # offline language-local tests and compilation
+./run verify-example hare # the canonical example against a unique room
+./run verify hare         # example plus local black-box conformance
+./run verify-hosted hare  # the same checks against the hosted target
+./run verify-all hare     # both deployment profiles from one build
 ```
 
-`./run test hare` proves the client compiles, its offline unit tests pass
-(JSON encode/decode, and every regression that does not need a live
-deployment), and both `convex-adapter` and `convex-example` build as
-statically linked `linux/amd64` binaries. The three regressions in this
-suite that do need a live deployment — a real TLS handshake, an HTTP
-query/mutation round trip, and a full Live subscribe/reconnect sequence —
-each check for an opt-in environment variable (`HARE_TEST_NETWORK` or
-`CONVEX_URL`) and are a silent no-op without it, so `./run test` stays
-entirely offline while still being real code a developer can run against a
-live deployment locally.
+## Known Issues
 
-## Conformance and protocol notes
-
-- `client/tests/conformance/main.ha` is the NDJSON adapter protocol v1
-  executable. It is test infrastructure, not part of the educational API: it
-  decodes one command per input line, calls the real client in `client/`, and
-  encodes one event per output line, in both stdin/stdout mode and the
-  `ADAPTER_LISTEN` TCP mode the shared harness uses.
-- The Live layer (`client/live.ha`) is single-threaded and poll-driven by
-  design: Hare has no threads or async runtime in its standard library, so
-  one call stack owns the WebSocket at all times rather than handing it to a
-  background worker. `client_live_step` advances the connection by at most
-  one step — reconnecting if there are active subscriptions but no socket, or
-  waiting up to a caller-chosen timeout for the next frame — so a caller loop
-  that alternates between reading its own command source and calling this
-  function stays responsive to `close`, `unsubscribe`, and `debugDisconnect`
-  instead of blocking for seconds inside one deep read. Delivery buffering
-  is a direct consequence of this: at most one already-decoded event is held
-  between calls, so the step function itself is the backpressure.
-- TLS (`client/tls.ha`) is the one C-ABI boundary in this client. It
-  verifies the peer certificate against the system CA bundle, drives the
-  handshake and encrypted read/write through non-blocking `SSL_get_error`
-  retries polled with Hare's own `unix::poll`, and is exercised against a
-  real TLS server as part of the test suite (see above).
-- Static linking is a Dockerfile-level workaround, not a Hare feature: Hare's
-  build driver always shells out to the platform toolchain's `cc` to link,
-  but exposes no flag of its own to request `-static`. The Docker image
-  installs a thin `cc` wrapper earlier on `PATH` that adds it, so both
-  shipped binaries are fully static musl executables whose only runtime
-  dependency is the CA certificate bundle a TLS deployment needs.
-- This client does not use `net::dial::dial` for hostname resolution
-  (`http.ha`'s `resolve_host` instead). Hare 0.24.2's `net::ip::parse`
-  rejects a bare trailing `::` — valid IPv6 shorthand for an all-zero
-  remainder, as in `fe00::` or `ff00::` — and `unix::hosts::next` propagates
-  that as a hard error instead of skipping the unparseable line. Docker's
-  container networking generates an `/etc/hosts` containing exactly those
-  lines (`ip6-localnet`, `ip6-mcastprefix`), so `net::dial::dial` failed to
-  resolve any hostname at all inside this project's own backend network,
-  including a host with a perfectly valid entry earlier in the same file.
-  `resolve_host` re-implements a tolerant `/etc/hosts` scan that skips a
-  line it cannot parse, then falls back to a real DNS query.
-
-## Honest limitations
-
-- Hare 0.24 (current when this client was written) has no `hare fmt` or
-  other blessed formatter in its toolchain. Source here is hand-formatted
-  against the tabs-for-indentation style Hare's own standard library uses,
-  not machine-checked.
-- Reconnection has no exponential backoff yet: a Live bring-up that keeps
-  failing is retried on the very next step call rather than after a growing
-  delay.
-- Convex tagged values, Live authentication, optimistic writes, WebSocket
-  mutations and actions, and `TransitionChunk` assembly are all deferred.
-- Fragmented incoming WebSocket messages and interleaved control frames are
-  implemented in `client/ws.ha`, but exercised only against the real Convex
-  backend so far, not yet against an adversarial local fixture peer the way
-  this project's other native clients test hostile-peer behavior.
+1. Convex tagged values are deferred, so this client currently accepts only
+   JSON-safe values.
+2. Live authentication, optimistic writes, WebSocket mutations and actions,
+   and `TransitionChunk` assembly are not implemented.
+3. Reconnect attempts have no exponential backoff. A persistently unavailable
+   deployment is retried on the next `client_live_step` call.
+4. Hare 0.24 has no blessed formatter, so the checked-in source is
+   hand-formatted. Fragmented incoming WebSocket messages and interleaved
+   control frames are implemented, but have not been exercised against an
+   adversarial local fixture peer.

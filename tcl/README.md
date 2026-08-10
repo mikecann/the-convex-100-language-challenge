@@ -1,30 +1,188 @@
-# Convex from Tcl
+<p align="center"><img src="logo.png" alt="Tcl/Tk core logo" width="120"></p>
+<!-- Logo source: https://www.tcl-lang.org/images/tcllogo.gif -->
 
-This demonstration uses Tcl to call Convex's documented JSON HTTP endpoints and
-to keep a reactive query current through a native Tcl WebSocket connection.
+# Tcl
 
-It is an educational, unofficial experiment. It is not a production SDK, an
-officially sanctioned Convex client, or a package intended for publication.
+Tcl, short for Tool Command Language, began with John Ousterhout's work on an
+embeddable command language at Berkeley in the late 1980s, as told in
+[Tcl's official history](https://www.tcl-lang.org/about/history.html). It later
+gained the Tk GUI toolkit and found a durable niche in test automation,
+embedded control, electronic design tools, networking, and cross-platform
+desktop software. The [official Tcl/Tk site](https://www.tcl-lang.org/) covers
+the language, current releases, and community.
 
-## Start here
+This repository uses Tcl's small command-oriented language and event loop to
+talk to Convex over HTTP and a Tcl-owned WebSocket connection. It is an
+educational, unofficial experiment, not a production SDK, an officially
+sanctioned Convex client, or a package intended for publication.
 
-[`examples/basics/main.tcl`](examples/basics/main.tcl) is the canonical example.
-It reads a new counter room over HTTP, starts Live before changing it, applies
-an idempotent mutation, and proves the same `0 -> 1` journey arrived through
-the subscription. The block below is generated from that exact runnable file.
+## Getting Started
 
-## What works
+Start with [`examples/basics/main.tcl`](examples/basics/main.tcl). It queries a
+fresh counter, opens a Live subscription before mutating it, and proves the
+same `0 -> 1` journey through both paths.
+
+From the repository root, Docker builds the pinned Tcl environment and runs
+that exact example against an approved test deployment:
+
+```sh
+./run verify-example tcl
+```
+
+## Interesting Parts
+
+### Convex objects become Tcl dictionaries
+
+In a normal Convex React app, generated TypeScript types connect the function
+reference, its arguments, and its return value. This Tcl client instead builds
+JSON explicitly, then decodes the returned object to a Tcl `dict`.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+const room = `tcl-dict-${crypto.randomUUID()}`;
+
+export function Count() {
+  const state = useQuery(api.demo.state, { room });
+  if (state === undefined) return <p>Loading...</p>;
+
+  return <p>{state.count}</p>; // state and count are type-safe here.
+}
+```
+
+**Tcl**
+
+```tcl
+source tcl/client/convex.tcl
+
+if {![info exists ::env(CONVEX_URL)] || $::env(CONVEX_URL) eq ""} {
+    error "CONVEX_URL is required"
+}
+set deployment $::env(CONVEX_URL) ;# The real Convex deployment URL.
+set room "tcl-dict-[clock microseconds]" ;# A fresh room for this run.
+set client [::convex::new $deployment]
+
+# This client wants raw JSON arguments, so strings must be quoted explicitly.
+set args [::convex::object [list room [::convex::quote $room]]]
+set response [::convex::query $client demo:state $args]
+set state [::convex::decode [dict get $response value]]
+
+puts [dict get $state count] ;# Checked by key at runtime, not by a type checker.
+::convex::close $client
+```
+
+[Tcl dictionaries](https://www.tcl-lang.org/man/tcl8.6/TclCmd/dict.htm) are
+efficient key-value mappings, but Tcl does not statically tie `demo:state` to a
+result shape. The client's `object`, `quote`, and `decode` helpers keep the JSON
+boundary explicit. Also, the Tcl call above is a one-off HTTP query. Unlike
+`useQuery`, it does not subscribe or update a UI.
+
+### Live is an explicit event-loop relationship
+
+React owns the `useQuery` subscription lifecycle and rerenders the component
+when the value changes. Tcl has callbacks and an event loop, but this client
+deliberately exposes subscription ownership directly. The command-line caller
+waits for callback state, then unsubscribes and closes the client itself.
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const [room] = useState(() => `tcl-live-${crypto.randomUUID()}`);
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  return (
+    <button
+      disabled={state === undefined}
+      onClick={() =>
+        increment({ room, language: "typescript", runId: crypto.randomUUID() })
+      }
+    >
+      {state?.count ?? "Loading..."} {/* React rerenders on each Live value. */}
+    </button>
+  );
+}
+```
+
+**Tcl**
+
+```tcl
+source tcl/client/convex.tcl
+
+proc receive_state {kind payload logs} {
+    if {$kind eq "error"} {
+        set ::liveError [::convex::decode [::convex::field $payload message]]
+        set ::liveReady 1 ;# Wake vwait, then report the error outside callback.
+        return
+    }
+    set ::liveState [::convex::decode $payload] ;# Decode the callback's value.
+    set ::liveReady 1 ;# Writing this variable releases vwait below.
+}
+
+if {![info exists ::env(CONVEX_URL)] || $::env(CONVEX_URL) eq ""} {
+    error "CONVEX_URL is required"
+}
+set deployment $::env(CONVEX_URL)
+set room "tcl-live-[clock microseconds]"
+set client [::convex::new $deployment]
+set stateArgs [::convex::object [list room [::convex::quote $room]]]
+
+try {
+    set ::liveError ""
+    set ::liveReady 0
+    set subscription [::convex::subscribe \
+        $client demo:state $stateArgs [list receive_state]]
+    vwait ::liveReady ;# Tcl processes socket events until the callback writes it.
+    if {$::liveError ne ""} { error "Live query failed: $::liveError" }
+    puts "initial: [dict get $::liveState count]"
+
+    # Arm the wait before mutating so a fast update cannot arrive in a gap.
+    set ::liveReady 0
+    set runId "tcl-run-[clock microseconds]"
+    set mutationArgs [::convex::object [list \
+        room [::convex::quote $room] \
+        language [::convex::quote tcl] \
+        runId [::convex::quote $runId]]]
+    set result [::convex::mutation $client demo:increment $mutationArgs]
+    set returned [::convex::decode [dict get $result value]]
+    puts "mutation applied: [dict get $returned applied]" ;# Runtime lookup.
+
+    vwait ::liveReady
+    if {$::liveError ne ""} { error "Live query failed: $::liveError" }
+    puts "updated: [dict get $::liveState count]" ;# The reactive value is now 1.
+} finally {
+    if {[info exists subscription]} {
+        ::convex::unsubscribe $client $subscription
+    }
+    ::convex::close $client
+}
+```
+
+[`vwait`](https://www.tcl-lang.org/man/tcl8.6/TclCmd/vwait.htm) processes Tcl
+events until a variable is written. The blocking-looking flow is this client's
+API choice for a readable CLI example, not a limitation of Tcl's callback or
+coroutine support.
+
+## Status
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Verified | Shared local and hosted conformance passed from a clean exact-head build; query, mutation, action, bearer-token lifecycle, logs, and structured errors are covered. |
-| Live | Verified | Shared local and hosted conformance passed from a clean exact-head build; subscriptions, unsubscribe, five real reconnects, reactive errors, and clean close are covered. |
+| HTTP | Verified | Shared local and hosted conformance passed from a clean exact-head build. Query, mutation, action, bearer-token lifecycle, logs, and structured errors are covered. |
+| Live | Verified | Shared local and hosted conformance passed from a clean exact-head build. Subscriptions, unsubscribe, five real reconnects, reactive errors, and clean close are covered. |
 
-The shared evaluator awarded the http and live badges from root-owned local
-and hosted black-box conformance runs at this exact head (31/31 on both
-profiles), and the manifest capability list records the award.
+The shared evaluator awarded both badges with 31/31 checks passing on the local
+and hosted profiles. This README-only update does not claim a fresh conformance
+run.
 
-## The basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.tcl -->
 ```tcl
@@ -125,88 +283,43 @@ try {
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verify it in Docker
+## Implementation Notes
 
-```sh
-./run test tcl
-./run verify-example tcl
-./run verify tcl
-./run verify-hosted tcl
-./run verify-all tcl
-```
+The public client is native Tcl 8.6.13. Tcllib supplies HTTP and JSON support,
+TclTLS 1.7.22 supplies TLS, and the client implements Convex envelopes, error
+classification, hostname checks, transport deadlines, WebSocket framing, and
+Live state in Tcl. HTTP query, mutation, and action calls are synchronous. Live
+uses nonblocking channels and Tcl's event loop to deliver `value` or `error`
+callbacks.
 
-`test` runs Tcl parsing, real loopback HTTP, TLS, and WebSocket fixtures, five
-forced reconnects, absolute transport deadlines, and real stopped-reader memory,
-backpressure, ordering, and shutdown checks inside Docker. The TLS fixture
-certificates are generated during that build, so no key material is stored in
-this repository.
-`verify-example` executes the canonical source above and compares its stdout
-with the universal transcript. The remaining commands are root-owned shared
-gates for the approved local and hosted deployments.
+Tcl values do not retain every distinction present in JSON. The client keeps
+Convex values as raw JSON at important boundaries and validates exact tokens
+before decoding them to Tcl values. That is why callers use helpers such as
+`::convex::quote`, `::convex::object`, `::convex::field`, and
+`::convex::decode` rather than handing arbitrary Tcl lists to the transport.
 
-## Conformance and protocol notes
+The Live implementation pins `convex-rs-0.10.4-unversioned-sync` at commit
+`6f1df8a8ba1665084ec001e307ca841ca17074d7`. It owns RFC 6455 parsing instead
+of delegating to another Convex client, preserves partial frames across reads,
+and reconnects active subscriptions. The final runtime contains Tcl, Tcllib,
+TclTLS, CA certificates, OpenSSL's required runtime modules, and basic POSIX
+tools, but no compiler or package manager.
 
-The test-only adapter under `client/tests/conformance/` speaks NDJSON protocol
-v1 on stdin/stdout and TCP. It calls the real Tcl client for every operation.
-Its adapter-only `debugDisconnect` command lets the shared harness prove five
-real reconnects. Command schemas are strict: a missing or wrongly typed `id`,
-`op`, `path`, `args`, `subscriptionId`, or `token` is a structured
-`ProtocolError` and never reaches a deployment.
+Language-local Docker tests cover real loopback HTTP, TLS, and WebSocket peers,
+strict errors, five reconnects, fragmented UTF-8, deadlines, response and frame
+limits, stale-callback barriers, and stopped-reader memory bounds. The
+test-only adapter speaks the repository's protocol and calls this same client;
+it is not part of the educational API.
 
-HTTP uses Convex's documented `format: "json"` endpoints. Live pins
-`convex-rs-0.10.4-unversioned-sync` at
-`6f1df8a8ba1665084ec001e307ca841ca17074d7` and `/api/sync`. That realtime
-protocol is not documented as stable, so hosted verification remains required.
+## Known Issues
 
-Responses are classified by what the deployment actually said, not only by the
-status line:
-
-| Response | Result | Why |
-| --- | --- | --- |
-| `200` with `status: "success"` | value and logs | the documented success envelope |
-| `200` with `status: "error"`, or `560` | `FunctionError` | the function ran and failed, so the caller can act on it |
-| `408`, `429`, `5xx` | `TransportError` | this attempt was not answered and may be retried |
-| any other non-`200` | `ProtocolError` | the deployment refused the request and would refuse it again |
-
-Transport limits are enforced while data is arriving rather than afterwards. A
-response is abandoned once its declared or accumulated size passes 2 MiB, a
-WebSocket frame is refused from its header alone, and connect, partial-frame,
-and write deadlines are absolute, so a peer that trickles bytes forever cannot
-extend them. HTTPS and WSS share one TLS policy: the pinned CA bundle, TLS 1.2
-or newer, SNI for a named host, and a peer identity that has to match the host
-being connected to.
-
-## Limitations
-
-- Live authentication and `TransitionChunk` assembly are intentionally not yet
-  implemented. A chunk is treated as recoverable protocol drift.
-- Values are limited to this experiment's JSON-safe subset. Tagged Convex
-  Int64, bytes, special floats, and negative zero are outside scope.
-- Mutations and actions use HTTP. Optimistic updates, journals, mutation replay,
-  and WebSocket writes are deferred.
-- TclTLS 1.7.22 verifies the certificate chain but does not check the host name,
-  so this client checks the peer identity itself inside the TLS verify callback
-  and refuses a certificate that names nothing it can compare. Hosted
-  verification is where real Convex certificates are first exercised.
-- A chunked HTTP response is bounded by its current chunk, because Tcl's `http`
-  package reads a complete chunk before it reports progress. Identity-encoded
-  and connection-close responses are bounded to one 64 KiB block of overshoot.
-- Language-local tests cover exact adapter envelopes, strict command schemas,
-  structured `560`, `500`, and `400` responses, streaming response bounds, TLS
-  chain and hostname refusals against real handshakes, five real socket
-  reconnects, structured error recovery, fragmented UTF-8 and control frames,
-  absolute connect, partial-frame, and write deadlines, frame limits enforced
-  from the header, strict uint32 Live counters and query IDs, QueryFailed shape
-  and rollback, generation barriers, and a real stopped reader with
-  near-maximum values.
-  Adapter output uses generation ownership at dequeue and immediately before
-  channel acceptance, so an unsubscribe or same-ID replacement cannot let an
-  old queued relay cross its acknowledgement. Accepted bytes remain ordered,
-  nonduplicated, and budgeted until Tcl drains them. A bounded timer observes
-  real pending channel output without starving controller or Live reads, and a
-  real nonblocking-pipe fixture exercises that accepted-byte boundary. The
-  newest-16 queue reserves four event slots and 64 KiB for control events, and
-  charges each NDJSON newline plus conservative Tcl and channel overhead. Close
-  waits up to two seconds for the terminal response to drain, then fails
-  boundedly. Root-owned local and hosted conformance remain the final capability
-  gates.
+1. Live authentication and `TransitionChunk` assembly are not implemented. A
+   chunk is treated as recoverable protocol drift.
+2. Values are limited to the JSON-safe subset. Tagged Convex Int64, bytes,
+   special floats, and negative zero are deferred.
+3. Mutations and actions use HTTP. Optimistic updates, journals, mutation
+   replay, and WebSocket writes are not part of this client.
+4. TclTLS verifies the certificate chain but not the host name, so this client
+   performs its own peer-name check in the TLS callback.
+5. Tcllib reports chunked HTTP progress one complete chunk at a time, so the
+   2 MiB response limit can overshoot by the size of the current chunk.

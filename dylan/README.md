@@ -1,55 +1,179 @@
-# Convex from Dylan
+<img src="logo.png" alt="Open Dylan logo" width="220">
+<!-- Logo source: https://opendylan.org/_static/images/opendylan-light.png -->
 
-This is a Convex client written in Dylan, the ALGOL-syntax Lisp Apple built
-for the Newton and then killed. It reads a shared counter over Convex's
-documented JSON HTTP endpoint, subscribes to the same query over Convex Live,
-applies a mutation, and shows the change arriving reactively — multimethod
-dispatch, real macros, and a genuine module system, all driven by a
-foreign-function boundary declared in Dylan itself rather than in a separate
-C file.
+# Dylan
 
-It is educational, unofficial, and not a production SDK. It exists to answer
-one question honestly: does a language most people have never run still hold
-up as a place to write a real network client? Nothing here is supported by
-Convex. Shared local and hosted black-box conformance earned HTTP and Live.
+Dylan is a general-purpose, object-oriented language created at Apple in the
+early 1990s, initially with the Newton in mind. Scheme and Common Lisp shaped
+its object model, but the modern language uses readable infix syntax rather
+than Lisp parentheses. It combines dynamic-language features such as multiple
+dispatch and macros with optional type constraints that help a compiler produce
+efficient native code. The [official history](https://package.opendylan.org/opendylan/history/)
+and [Open Dylan tour](https://opendylan.org/about/) are good introductions.
 
-## Start here
+Today Dylan is a small but active open source niche centred on the
+[Open Dylan compiler and libraries](https://opendylan.org/). This repository
+uses it for a native network client, which is a practical way to see how its
+types, multiple return values, modules, and C foreign-function interface feel
+in real code. This is an educational, unofficial demonstration, not a
+production SDK and not supported by Convex.
 
-The whole demonstration is one file:
-[`examples/basics/main.dylan`](examples/basics/main.dylan).
+## Getting Started
 
-It walks a single journey and refuses to print its final line unless every
-step agrees:
+Start with the canonical
+[`examples/basics/main.dylan`](examples/basics/main.dylan). It queries a fresh
+counter, subscribes to that same counter before changing it, applies one
+idempotent mutation, and waits for the reactive `0 -> 1` update.
 
-1. Query `demo:state` over HTTP and read the current count.
-2. Subscribe to the same query over Live, **before** mutating, so no update
-   can fall into the gap.
-3. Check that the first Live value hydrates the same count the HTTP query
-   returned.
-4. Apply `demo:increment` with a fresh idempotency key.
-5. Receive the new count over Live, with no second HTTP request.
+From the repository root, run:
 
-Against a fresh room, that is the `0 -> 1` journey printed below.
+```sh
+./run verify-example dylan
+```
 
-## What works
+That command builds and runs the exact example in Docker against a unique test
+room, then checks its concise stdout transcript. It does not install Open Dylan
+on your host.
+
+## Interesting Parts
+
+### One call can return a value, an error, and logs
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function CounterRead() {
+  const room = "readme-dylan";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>Count: {state.count}</p>; // state.count is type-safe here.
+}
+```
+
+**Dylan**
+
+```dylan
+let url-text = cx-getenv("CONVEX_URL");
+if (~url-text) error("CONVEX_URL is required") end if;
+let base-url = parse-convex-url(url-text);
+if (~base-url) error("CONVEX_URL is not a valid http(s) URL") end if;
+// The Docker entrypoint maps the verifier's unique room to EXAMPLE_ROOM.
+let room = cx-getenv("EXAMPLE_ROOM");
+if (~room) error("EXAMPLE_ROOM is required") end if;
+// Dylan uses #f for false and, here, for "no authentication token".
+let query-args = make-json-object();
+json-object-set!(query-args, "room", room); // Build { room } explicitly.
+
+let (state, query-error, _logs) =
+  convex-http-call(base-url, "query", "demo:state", query-args, #f,
+                   cx-now-ms() + 15000);
+if (query-error)
+  error(query-error.err-message); // The error is separate from the value.
+end if;
+let count = count-of(state); // Validate the decoded JSON before using it.
+```
+
+Dylan functions can return several values directly, so the client returns the
+result, a structured error, and Convex log lines without wrapping them in a
+result object. This Dylan call is a one-off HTTP request. Unlike `useQuery`, it
+does not stay subscribed or trigger a render when the data changes.
+
+### The command-line client owns the reactive lifetime
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function CounterButton() {
+  const room = "readme-dylan-live";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  if (state === undefined) return <p>Loading...</p>;
+
+  async function addOne() {
+    const result = await increment({
+      room,
+      language: "TypeScript",
+      runId: crypto.randomUUID(),
+    });
+    console.log(result.state.count); // The mutation also returns the new state.
+  }
+
+  // useQuery keeps this label reactive after the mutation.
+  return <button onClick={addOne}>Count: {state.count}</button>;
+}
+```
+
+**Dylan**
+
+```dylan
+let url-text = cx-getenv("CONVEX_URL");
+if (~url-text) error("CONVEX_URL is required") end if;
+let base-url = parse-convex-url(url-text);
+if (~base-url) error("CONVEX_URL is not a valid http(s) URL") end if;
+// The verifier supplies a fresh room through the Docker entrypoint.
+let room = cx-getenv("EXAMPLE_ROOM");
+if (~room) error("EXAMPLE_ROOM is required") end if;
+let query-args = make-json-object();
+json-object-set!(query-args, "room", room);
+
+let manager = sync-manager-new(base-url); // This program owns the connection.
+let query-id =
+  sync-subscribe(manager, "demo:state", query-args, cx-now-ms() + 8000);
+let initial = await-update(manager, query-id, cx-now-ms() + 10000);
+let initial-count = count-of(initial.upd-value); // The first Live value.
+
+let mutation-args = make-json-object();
+json-object-set!(mutation-args, "room", room);
+json-object-set!(mutation-args, "language", "Dylan");
+json-object-set!(mutation-args, "runId", concatenate(room, "-once"));
+let (result, mutation-error, _logs) =
+  convex-http-call(base-url, "mutation", "demo:increment", mutation-args,
+                   #f, cx-now-ms() + 15000); // #f means no auth token.
+if (mutation-error)
+  error(mutation-error.err-message);
+end if;
+let mutation-count = count-of(json-object-ref(result, "state"));
+// The subscription was started first, so the 0 -> 1 update cannot be missed.
+let updated = await-update(manager, query-id, cx-now-ms() + 10000);
+let updated-count = count-of(updated.upd-value); // The reactive value is now 1.
+sync-unsubscribe(manager, query-id, cx-now-ms() + 5000); // Explicit cleanup.
+```
+
+React mounts and cleans up the `useQuery` subscription for the component. The
+Dylan API instead exposes a manager, a subscription ID, a blocking
+`await-update` helper, and explicit unsubscribe. Blocking here is this client's
+small command-line API design, not a limitation of the Dylan language. The
+`concatenate(room, "-once")` run ID is safe in this example because the
+verifier creates a new room for every run. A reusable application should
+generate an operation ID and reuse it only when retrying that same logical
+mutation.
+
+## Status
 
 | Capability | State | Notes |
 | --- | --- | --- |
-| HTTP query, mutation, action | Verified | Hand-rolled HTTP/1.1 over the native transport layer |
-| Structured Convex errors | Verified | `FunctionError`, `ProtocolError` and `TransportError` keep name, message, data and log lines |
-| TLS with certificate and hostname verification | Verified | Checked against a private CA in the Docker test stage, and against the real hosted deployment |
-| Live subscribe, update, unsubscribe | Verified | RFC 6455 framing written in Dylan |
-| WebSocket handshake `Sec-WebSocket-Accept` verification | Verified | Real SHA-1 via libcrypto, checked against a public echo server |
-| Live reconnect and rehydration | Verified | Adapter-only `debugDisconnect`, five real reconnects, unchanged rehydration suppressed |
-| Live authentication, optimistic updates, WebSocket mutations | Not implemented | Deferred; see limitations |
-| Earned badges | **HTTP, Live** | 31/31 shared conformance checks, both self-hosted and hosted profiles |
+| HTTP query, mutation, action | Verified | Hand-written HTTP/1.1 over the native transport layer |
+| Structured Convex errors | Verified | `FunctionError`, `ProtocolError`, and `TransportError` preserve names, messages, data, and log lines |
+| TLS certificate and hostname verification | Verified | Covered by local private-CA tests and hosted evidence |
+| Live subscribe, update, unsubscribe | Verified | RFC 6455 framing and the sync state machine are written in Dylan |
+| WebSocket handshake verification | Verified | Checks `Sec-WebSocket-Accept` using SHA-1 from libcrypto |
+| Live reconnect and rehydration | Verified | Five real reconnects were covered, with unchanged rehydration suppressed |
+| Live authentication, optimistic updates, WebSocket mutations | Not implemented | Deferred in the current client |
+| Earned badges | **HTTP, Live** | Existing evidence records 31/31 shared checks on local and hosted profiles |
 
-Every capability above passed the shared black-box conformance suite
-(`./run verify-all dylan`) on both the self-hosted and the hosted deployment
-profiles, from the same built image, at the commit this README was generated
-from — not merely a green Docker build.
+These are evidence-backed repository results, not a claim that this README
+reran conformance. The manifest records native provenance, Open Dylan 2026.2,
+`linux/amd64`, and the pinned sync profile used for those results.
 
-## The canonical example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.dylan -->
 ```text
@@ -189,153 +313,57 @@ main();
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-Everything builds and runs inside Docker; nothing is installed on the host.
+The client is native Dylan. It does not call another Convex SDK, Node.js,
+Python, `curl`, or the Convex CLI. Dylan code implements JSON, HTTP/1.1,
+WebSocket framing, and the pinned Live sync behaviour. Its only foreign calls
+are POSIX socket and polling functions plus OpenSSL, declared directly with
+Dylan's `define C-function`. There is no separate C support file.
 
-```sh
-./run test dylan
-```
-
-Installs Open Dylan 2026.2 from its official release tarball, runs the style
-gate, compiles every target (the client-local suites, the TLS suite, the
-conformance adapter, and the example), and runs the language-local suites:
-strict JSON and the number rules, HTTP framing and the Convex envelope, the
-WebSocket codec and the sync state machine, and TLS verification against a
-private CA. It also proves the example fails cleanly with no deployment
-configured and prints nothing on stdout when it does.
-
-```sh
-./run verify-example dylan
-```
-
-Builds the minimal example image and runs the exact canonical example against
-a unique room, comparing stdout byte for byte with the shared transcript.
-
-```sh
-./run verify dylan
-./run verify-hosted dylan
-./run verify-all dylan
-```
-
-Add shared black-box conformance against the approved local backend, then the
-hosted drift target, then both from the same built source. Only the shared
-result evaluator may award a badge.
-
-## How it is put together
-
-Open Dylan resolves a library's own module files by plain relative filename
-within the directory a `.lid` file lives in, not through the registry
-mechanism the release's own bundled libraries use — and this project's public
-layout has nowhere honest to put a registry entry for a client's own code.
-So, exactly like `algol60/Dockerfile`'s `assemble_flat`/`assemble_live` shell
-functions, the Dockerfile copies the same shared module files into a fresh
-directory alongside each target's own entry point before compiling it:
+Open Dylan resolves the source records listed by each `.lid` project beside
+that project file. The repository keeps one clear educational copy of each
+client source, so the Docker build assembles a temporary directory for each
+executable before compiling it:
 
 | File | Responsibility |
 | --- | --- |
-| `client/convex-library.dylan` | The `define library`/`define module` declarations every other file compiles into |
-| `client/convex-native.dylan` | `define C-function` declarations for POSIX sockets/poll and OpenSSL — the only foreign code in this client |
-| `client/convex-json.dylan` | A JSON reader and writer over Dylan's own strings, tables and vectors |
-| `client/convex-http.dylan` | HTTP/1.1 framing (including chunked transfer-encoding) and Convex's documented JSON HTTP functions |
-| `client/convex-ws.dylan` | RFC 6455 WebSocket framing: masking, fragmentation, control frames, and UTF-8 validation |
-| `client/convex-sync.dylan` | The `/api/sync` state machine, its single reactor owner, and its per-subscription delivery queues |
+| [`client/convex-native.dylan`](client/convex-native.dylan) | POSIX and OpenSSL foreign-function declarations |
+| [`client/convex-json.dylan`](client/convex-json.dylan) | JSON values represented by Dylan strings, tables, vectors, numbers, and booleans |
+| [`client/convex-http.dylan`](client/convex-http.dylan) | HTTP framing and Convex query, mutation, and action calls |
+| [`client/convex-ws.dylan`](client/convex-ws.dylan) | WebSocket masking, fragmentation, control frames, and UTF-8 validation |
+| [`client/convex-sync.dylan`](client/convex-sync.dylan) | One-owner Live reactor and bounded per-subscription queues |
 
-### No separate C file
+One call path, `sync-pump`, owns WebSocket reads, writes, reconnects, and query
+set changes. The example and conformance adapter call that reactor explicitly,
+so Live only progresses while it is being pumped. On reconnect, the client
+resends active subscriptions and suppresses an unchanged first value so callers
+do not see a duplicate update.
 
-Unlike this project's other compile-to-C native clients, there is no reviewed
-`.c` support file at all. `client/convex-native.dylan` declares POSIX and
-OpenSSL entry points directly with Dylan's `define C-function`, and Open
-Dylan's C-FFI marshals Dylan strings, integers and structs to and from the C
-calling convention itself. The boundary is proven, not assumed: `cx-getenv`'s
-result is explicitly converted from Open Dylan's `<C-string>` wrapper class to
-a genuine `<byte-string>` before anything else touches it, because the two
-merely *look* alike at the REPL.
+TLS setup explicitly enables certificate and hostname checks. The WebSocket
+handshake also recomputes `Sec-WebSocket-Accept` with libcrypto's SHA-1 rather
+than trusting any HTTP 101 response. Language-local tests cover trusted,
+untrusted, and wrong-host certificate cases, framing details, JSON behaviour,
+and the sync state machine.
 
-TLS verification is switched on next to the connection, not left to a
-default: `SSL_CTX_set_default_verify_paths`, `SSL_CTX_set_verify` with
-`SSL_VERIFY_PEER`, and `SSL_set1_host` for hostname checking are all set on
-every handshake. The Docker test stage proves it by connecting three ways to
-a local TLS server — trusted, untrusted issuer, and wrong hostname — and only
-the first may succeed.
+The conformance adapter is test infrastructure rather than part of the public
+client API. It adds `debugDisconnect` so shared tests can force reconnects.
+The underlying `/api/sync` profile is pinned but undocumented, so this project
+does not claim it is a stable public Convex protocol.
 
-### A real `Sec-WebSocket-Accept` check
+## Known Issues
 
-The WebSocket handshake recomputes the server's expected
-`Sec-WebSocket-Accept` value with a real SHA-1 (borrowed from libcrypto,
-`cx-sha1` in `client/convex-native.dylan`) and rejects the handshake if it
-does not match, rather than accepting any HTTP 101 response the way a
-from-scratch implementation without easy access to a hash function might.
-
-### One owner, and no threads to enforce it with
-
-Exactly one call path may touch the WebSocket, change the query-set version,
-or decide to reconnect: `convex-sync.dylan`'s `sync-pump`, called from
-whichever caller — the example, the adapter's own event loop — invokes it.
-This client's C-FFI boundary exposes no threading primitive, so unlike the
-reference C client's dedicated worker thread, single ownership here is not
-enforced by a lock; it is simply the only code path that exists. Live
-progress happens only while `sync-pump` is running, which the adapter does
-continuously between reading commands.
-
-After a reconnect the server resends the current value of every active query.
-Publishing that unchanged value would turn one logical update into two, so
-each subscription remembers the exact JSON value it last published and
-suppresses an identical rehydration. Publishing an error clears that memory,
-which is what lets a `QueryFailed` be followed by the same value again and
-still read as a recovery.
-
-## Conformance and protocol notes
-
-`client/tests/conformance/adapter.dylan` is test infrastructure, not public
-client code. It speaks NDJSON adapter protocol v1 over stdin and stdout, or
-over one accepted TCP connection when `ADAPTER_LISTEN` is set, and calls the
-real client for every operation. Stdout carries protocol events only; every
-diagnostic goes to stderr.
-
-It implements the adapter-only `debugDisconnect` command, declared in
-`manifest.yaml` under `adapter.adapterOnlyCommands`, so the shared controller
-can prove real reconnects. That command is not part of the educational client
-API.
-
-Optional fields are omitted rather than serialized as null: an absent command
-id, an absent error `data`, and an absent `logs` array never appear as
-`null`. `client/convex-json.dylan`'s ordered-object builder is what makes the
-adapter's emitted field order match the shapes documented here.
-
-The pinned sync profile is recorded in `manifest.yaml`. It is an undocumented
-protocol, and nothing here implies it is stable or officially supported. In
-particular, the session id sent in the `Connect` message is generated once
-per client lifetime and resent on every reconnect — a deliberate choice made
-where this project's own C and ALGOL 60 reference clients disagree with each
-other (see `convex-sync.dylan`'s header comment).
-
-## Limitations and deferred behaviour
-
-- `convex-sync.dylan`'s reactor has no real concurrency primitive backing it
-  (see "One owner, and no threads to enforce it with" above), so
-  `client/tests/live-test.dylan` tests the sync state machine's own logic
-  directly by constructing manager and subscription fixtures and feeding
-  them hand-built Transition messages, rather than by running a fixture
-  WebSocket server concurrently with the client under test in one process —
-  the same tradeoff, for the same reason, documented in the ALGOL 60
-  client's `live-test.alg`. The framing and handshake layer itself (masking,
-  continuation-frame assembly, control frames, UTF-8 validation, and the
-  real `Sec-WebSocket-Accept` check) is instead proven against a real public
-  echo server, not a loopback fixture.
-- Live authentication, optimistic updates, WebSocket mutations, WebSocket
-  actions, and `TransitionChunk` assembly are deferred.
-- Live values cover Convex's JSON-safe subset; tagged Convex value
-  conversions (the undocumented `convex_encoded_json` format) are deferred.
-- JSON numbers are accepted whether the server renders a whole count as an
-  integer or as an integral float; a genuinely fractional value decodes as a
-  Dylan `<float>` rather than being silently truncated.
-- Active Live subscriptions are bounded: each subscription's delivery queue
-  holds at most 64 pending updates and drops the oldest undelivered event on
-  overflow rather than growing without bound. A single Live text message is
-  capped at 2 MiB, matching the HTTP response cap.
-- Open Dylan has no standard source formatter, so source style (no tabs, no
-  trailing whitespace, a final newline, and a column limit) is checked
-  explicitly in the Docker test stage rather than against a canonical
-  formatter's output — the same position this project's ALGOL 60 and Forth
-  clients are in.
+1. Live authentication, optimistic updates, WebSocket mutations and actions,
+   and `TransitionChunk` assembly are not implemented.
+2. Live values support Convex's JSON-safe subset. Tagged
+   `convex_encoded_json` values are deferred.
+3. Live is single-threaded and advances only while `sync-pump` runs. Local
+   state-machine tests use hand-built transitions instead of an in-process
+   fixture WebSocket server.
+4. Each subscription holds at most 64 pending updates and drops the oldest on
+   overflow. Live text messages and HTTP responses are capped at 2 MiB.
+5. The client keeps one session ID for its lifetime and reuses it after a
+   reconnect. That is a deliberate implementation choice recorded in the
+   source, not a documented Convex guarantee.
+6. Open Dylan has no standard source formatter. Docker enforces spaces, final
+   newlines, no trailing whitespace, and repository line-length limits instead.

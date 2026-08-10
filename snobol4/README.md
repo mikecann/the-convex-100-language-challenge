@@ -1,22 +1,156 @@
-# Convex from SNOBOL4
+# SNOBOL4
 
-This demonstration uses SNOBOL4 - specifically CSNOBOL4, Phil Budne's free
-port of the original 1962 Bell Labs implementation - to call Convex's
-documented JSON HTTP endpoints and to keep a reactive query current through a
-native SNOBOL4 WebSocket connection.
+SNOBOL began at Bell Labs in 1962 as a language for string and symbolic
+processing. SNOBOL4 followed from a major redesign begun in 1966, adding the
+pattern language, tables, arrays, structures, and numeric types that define it
+today. Its statement-level success and failure branches will look unusual to a
+TypeScript, C#, Java, or C developer. The [official history](https://www.regressive.org/snobol4/history.html)
+and [SNOBOL4 tutorial](https://www.regressive.org/snobol4/docs/burks/tutorial/contents.htm)
+are good introductions.
 
-It is an educational, unofficial experiment. It is not a production SDK, an
-officially sanctioned Convex client, or a package intended for publication.
+This demonstration uses [CSNOBOL4](https://www.regressive.org/snobol4/csnobol4/),
+Phil Budne's open source C port of the original Bell Labs Macro SNOBOL4. The
+project remains a small, specialist ecosystem centred on text processing and
+pattern matching, but CSNOBOL4 2.3.4 makes the full language practical on a
+modern Unix-like system. This client is an educational, unofficial experiment,
+not a production SDK, an officially sanctioned Convex client, or a package
+intended for publication.
 
-## Start here
+## Getting Started
 
-[`examples/basics/main.sno`](examples/basics/main.sno) is the canonical
-example. It reads a new counter room over HTTP, starts Live before changing
-it, applies an idempotent mutation, and proves the same `0 -> 1` journey
-arrived through the subscription. The block below is generated from that
-exact runnable file.
+Start with [`examples/basics/main.sno`](examples/basics/main.sno). It queries a
+fresh counter room, subscribes before changing it, applies an idempotent
+mutation, and observes the resulting Live update.
 
-## What works
+From the repository root, run the exact canonical example in its Docker image:
+
+```sh
+./run verify-example snobol4
+```
+
+Docker supplies the pinned CSNOBOL4 toolchain and an approved test deployment,
+so nothing needs to be installed on the host.
+
+## Interesting Parts
+
+### Generated types versus runtime JSON checks
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function RoomCount() {
+  const state = useQuery(api.demo.state, {
+    room: "snobol4-readme-query",
+  });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // state and count are type-safe here.
+}
+```
+
+**SNOBOL4**
+
+```snobol4
+-include 'convex.sno'
+
+*   Configuration is explicit. :F(label) branches when the call fails.
+    deployment = io.getenv("CONVEX_URL")
+    cvx.configure(deployment, "")                              :f(configure.failed)
+
+*   Build the real demo:state argument object, then make one HTTP query.
+    room = "snobol4-readme-query"
+    args = json.object1("room", json.qs(room))
+    rawstate = cvx.query("demo:state", args)                    :f(query.failed)
+
+*   The response is raw JSON. These checks provide runtime safety, not
+*   compile-time type safety.
+    rawcount = json.field(rawstate, "count")                    :f(query.badshape)
+    count = json.uint32(rawcount)                               :f(query.badshape)
+    output = count                                               :(done)
+
+configure.failed
+    output = "invalid deployment configuration"                 :(done)
+query.failed
+    output = cvx.err.name ": " cvx.err.message                  :(done)
+query.badshape
+    output = "demo:state returned an invalid count"
+done
+end
+```
+
+The React hook is reactive and its result type comes from Convex's generated
+API. `cvx.query` is a one-off HTTP call. SNOBOL4 values are dynamically typed,
+so this client returns raw JSON and makes callers validate the fields they use.
+Inside [`client/convex-json.sno`](client/convex-json.sno), SNOBOL4 patterns such
+as `SPAN` and `RPOS` do the token validation.
+
+### React owns reactivity, this client exposes it
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function LiveRoomCount() {
+  const state = useQuery(api.demo.state, {
+    room: "snobol4-readme-live",
+  });
+
+  if (state === undefined) return <p>Connecting...</p>;
+  return <p>{state.count}</p>; // React rerenders when the query changes.
+}
+```
+
+**SNOBOL4**
+
+```snobol4
+-include 'convex.sno'
+
+    deployment = io.getenv("CONVEX_URL")
+    cvx.configure(deployment, "")                              :f(configure.failed)
+    cvx.live.init()
+
+*   This command-line program owns the subscription and its cleanup.
+    room = "snobol4-readme-live"
+    args = json.object1("room", json.qs(room))
+    queryid = cvx.live.subscribe("demo:state", args)
+
+*   Pump the connection until the initial Live value enters the queue.
+live.wait
+    gt(cvx.live.event_count, 0)                                :s(live.ready)
+    cvx.live.pump(io.now() + 250)                              :s(live.wait)
+                                                               :(live.failed)
+live.ready
+    kind = cvx.live.next_event()                               :f(live.failed)
+    ident(kind, "value")                                      :f(live.failed)
+    rawcount = json.field(cvx.live.event.payload, "count")     :f(live.failed)
+    count = json.uint32(rawcount)                              :f(live.failed)
+    output = count                                               :(live.cleanup)
+
+live.failed
+    output = "Live query failed"
+live.cleanup
+    cvx.live.unsubscribe(queryid)
+    cvx.live.close()
+                                                               :(done)
+
+configure.failed
+    output = "invalid deployment configuration"
+done
+end
+```
+
+React manages the subscription lifecycle behind `useQuery`. This small
+command-line client instead exposes `pump` and `next_event`, letting its caller
+decide when network progress happens and when queued values are consumed. That
+is a deliberate API design for this experiment, not a claim that one-off HTTP
+queries and reactive hooks are equivalent.
+
+## Status
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
@@ -28,7 +162,7 @@ The shared evaluator has run local and hosted black-box conformance for this
 client and awarded both capabilities; `capabilities` in `manifest.yaml`
 reflects that award.
 
-## The basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.sno -->
 ```snobol4
@@ -184,7 +318,30 @@ end
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verify it in Docker
+## Implementation Notes
+
+The implementation is native SNOBOL4 for all Convex-specific behaviour. It
+builds JSON, HTTP/1.1, RFC 6455 WebSocket frames, SHA-1, base64, and the pinned
+Convex Live messages in the `.sno` files under [`client/`](client/). Standard
+SNOBOL4 does not provide sockets, verified TLS, a monotonic clock, or operating
+system entropy, so [`client/convexrt.c`](client/convexrt.c) supplies only those
+low-level primitives through CSNOBOL4's documented `LOAD()` mechanism. It does
+not implement HTTP, WebSockets, JSON, or Convex behaviour.
+
+HTTP query, mutation, and action calls use Convex's documented JSON endpoints.
+They return the raw JSON value and classify failures as `FunctionError`,
+`ProtocolError`, or `TransportError`. Live uses `/api/sync` with the pinned
+`convex-rs-0.10.4-unversioned-sync` profile at commit
+`6f1df8a8ba1665084ec001e307ca841ca17074d7`. That realtime protocol is not
+documented as stable, which is why hosted conformance is part of the evidence.
+
+The Live client has a bounded queue of 64 events and 8 MiB, dropping the oldest
+event first when either limit is reached. It also invalidates queued events
+before acknowledging an unsubscribe or replacement. Reconnect behaviour is
+covered by five consecutive disconnect, reconnect, resubscribe, and delivery
+cycles against a separate fixture process.
+
+The repository provides these Docker-only gates:
 
 ```sh
 ./run test snobol4
@@ -195,93 +352,24 @@ end
 ```
 
 `test` builds CSNOBOL4 2.3.4 from source (pinned by URL and checksum, since it
-is not packaged for Debian), builds the small native transport shim, lints
-every source file, and runs real loopback JSON, HTTP, WebSocket, and Live
-protocol fixtures, the conformance adapter's stdio and TCP modes, and the
-example's fast-fail path, all inside Docker. The remaining commands are
-root-owned shared gates for the approved local and hosted deployments; both
-have passed for this client from a clean exact-head build, earning the http
-and live capability badges above.
+is not packaged for Debian), builds the native transport shim, checks source
+style, and runs language-local JSON, HTTP, WebSocket, Live, adapter, and example
+tests. The remaining commands are the repository's local, hosted, and combined
+shared gates. They have passed for this exact client revision and earned the
+HTTP and Live capabilities shown above.
 
-## Conformance and protocol notes
+## Known Issues
 
-The test-only adapter under `client/tests/conformance/` speaks NDJSON
-protocol v1 on stdin/stdout and TCP. It calls the real SNOBOL4 client for
-every operation. Its adapter-only `debugDisconnect` command lets the shared
-harness prove reconnects. Command schemas are strict: a missing or wrongly
-typed `id`, `op`, `path`, `args`, `subscriptionId`, or `token` is a
-structured `ProtocolError` and never reaches a deployment.
-
-HTTP uses Convex's documented `format: "json"` endpoints. Live pins
-`convex-rs-0.10.4-unversioned-sync` at
-`6f1df8a8ba1665084ec001e307ca841ca17074d7` and `/api/sync`. That realtime
-protocol is not documented as stable, so hosted verification remains
-required before any Live claim.
-
-Responses are classified by what the deployment actually said, not only by
-the status line:
-
-| Response | Result | Why |
-| --- | --- | --- |
-| `200` with `status: "success"` | value and logs | the documented success envelope |
-| `200` with `status: "error"`, or `560` | `FunctionError` | the function ran and failed, so the caller can act on it |
-| `408`, `429`, `5xx` | `TransportError` | this attempt was not answered and may be retried |
-| any other non-`200` | `ProtocolError` | the deployment refused the request and would refuse it again |
-
-Transport limits are enforced while data is arriving rather than afterwards.
-A response is abandoned once its declared or accumulated size passes 2 MiB, a
-WebSocket frame is refused from its header alone, and connect and
-partial-frame deadlines are absolute and independent of the caller's own
-short polling interval, so a peer that trickles bytes forever cannot extend
-them. HTTPS and WSS share one TLS policy: the pinned CA bundle, TLS 1.2 or
-newer, SNI for a named host, and a peer identity that has to match the host
-being connected to (`SSL_set1_host`, so a certificate valid for another host
-is rejected).
-
-Standard SNOBOL4 has no sockets, TLS, monotonic clock, or entropy source.
-`client/convexrt.c` is the only native code in this client: a small,
-reviewed C library loaded through CSNOBOL4's own documented external-function
-mechanism (`LOAD()`, backed by `dlopen()`), supplying exactly those
-primitives and nothing else. Every HTTP, WebSocket, JSON, and Convex protocol
-decision - and every deadline - is SNOBOL4 source, reviewable in
-`client/convex-*.sno`.
-
-## Limitations
-
-- Live authentication, optimistic updates, WebSocket mutations and actions,
-  journals, and `TransitionChunk` assembly are intentionally not yet
-  implemented. Mutations and actions use HTTP.
-- Values are limited to this experiment's JSON-safe subset: objects, arrays,
-  strings, whole numbers within a `uint32` range, booleans, and null. Tagged
-  Convex `Int64`, bytes, and special floats are outside scope.
-- CSNOBOL4's own `-O3` default reproducibly crashes GCC's `cc1` on this
-  project's QEMU-emulated `linux/amd64` build host; the Dockerfile pins
-  `-O0` explicitly rather than relying on CSNOBOL4's own configure default.
-  Two independent from-clean `-O3` builds each crashed compiling a
-  different, unrelated file, and `-O0` has built cleanly every time - the
-  pattern AGENTS.md documents for other heavy toolchains on QEMU hosts, not
-  a defect in CSNOBOL4 or this client.
-- `client/tests/live_test.sno` asserts five real, consecutive WebSocket
-  reconnects against a real second OS process
-  (`client/tests/live_test_fixture.sno`): the handshake, masking, the
-  `debugDisconnect` acknowledgement barrier (old connection retired and a
-  reconnect genuinely scheduled before the command is acknowledged), and a
-  genuine resubscribed value on every one of the five reconnects are all
-  required to pass, and this is deterministic on this build host across
-  repeated runs.
-- Live delivery is a bounded queue: at most 64 pending events and 8 MiB of
-  conservatively charged encoded bytes per client, oldest dropped first.
-  Unsubscribe and a same-subscriptionId replacement bump a per-query
-  generation counter that invalidates any already-queued event for that
-  query before its acknowledgement is published; this has a deterministic,
-  non-timing-dependent regression test.
-- Language-local tests cover 32-bit bitwise arithmetic against known SHA-1
-  and RFC 6455 test vectors, JSON field/array extraction and escaping
-  (including surrogate pairs and UTF-8 pass-through), `uint32` validation
-  (accepting Convex's integral-decimal form such as `1.0`, rejecting
-  fractions, overflow, and leading zeros), a real loopback HTTP fixture
-  covering bearer auth, structured errors, and logs, a real loopback
-  WebSocket fixture covering the handshake and masking, and a real second
-  process acting as a Live peer covering Add, an initial value, an external
-  update, `QueryFailed`, and the unsubscribe generation barrier. Root-owned
-  local and hosted conformance remain the final capability gates.
+1. Live authentication, optimistic updates, WebSocket mutations and actions,
+   journals, and `TransitionChunk` assembly are not implemented. Mutations and
+   actions use HTTP.
+2. Values are limited to JSON-safe objects, arrays, strings, `uint32` whole
+   numbers, booleans, and null. Tagged Convex `Int64`, bytes, and special floats
+   are outside this experiment.
+3. CSNOBOL4's default `-O3` build reproducibly crashes GCC's `cc1` on this
+   project's QEMU-emulated `linux/amd64` host. The Dockerfile pins `-O0`; the
+   observed failures happened in unrelated CSNOBOL4 files before this client's
+   source was involved.
+4. HTTP responses and individual WebSocket frames are capped at 2 MiB. The
+   client also uses absolute connection and partial-frame deadlines, so slow or
+   oversized peers fail instead of growing memory use indefinitely.

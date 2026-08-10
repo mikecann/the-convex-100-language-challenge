@@ -1,14 +1,122 @@
-# Convex from Agda
+# Agda
 
-This is a small native Agda client that calls Convex functions over HTTP and keeps a query current over Live WebSockets. Agda is a dependently typed language with no sockets of its own, so the interesting question is how much of Convex can be expressed in Agda itself. The answer here is: all of it except the octets on the wire.
+[Agda](https://agda.readthedocs.io/en/latest/getting-started/what-is-agda.html) is a dependently typed functional programming language and interactive theorem prover. It grew out of the programming-logic work at Chalmers, following languages including Alf, Alfa, Agda 1, and Cayenne. Its type system can express facts about values, so the same source can be both an executable program and a constructive proof. That makes Agda a specialist tool today, mostly seen in formal methods, programming-language research, and teaching, with close conceptual neighbours such as Lean, Idris, and Rocq.
 
-It is educational and unofficial. It is not a production SDK and is not intended for package publication.
+This repository uses that unusual tool to build a real Convex client. It is an educational, unofficial demonstration, not a production SDK and not a package intended for publication.
 
-## Start here
+## Getting Started
 
-Read [`examples/basics/Main.agda`](examples/basics/Main.agda). It queries a fresh counter, starts Live before changing it, applies one idempotent mutation, and checks that HTTP, the mutation result, and Live all agree on `0 -> 1`.
+Start with [`examples/basics/Main.agda`](examples/basics/Main.agda). It reads a fresh counter over HTTP, subscribes to the same state, applies an idempotent mutation, then checks that the mutation result and the next Live value both show `0 -> 1`.
 
-## What works
+From the repository root, Docker builds the pinned toolchain and runs that exact example against an approved test deployment:
+
+```sh
+./run verify-example agda
+```
+
+You do not need Agda, GHC, or Cabal installed on your machine.
+
+## Interesting Parts
+
+### JSON stays explicit
+
+In a Convex React app, generated TypeScript types make the arguments and returned object feel ordinary:
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function CounterSnapshot() {
+  const room = "agda-readme";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>Count: {state.count}</p>; // state.count is a type-safe number.
+}
+```
+
+This Agda client represents JSON with constructors such as `jobj`, `jstr`, and `jnum`. The call itself can fail, and reading `count` can fail separately, so both cases are visible in the types:
+
+**Agda**
+
+```agda
+room : String
+room = "agda-readme"
+
+roomArgs : JSON
+roomArgs = jobj (("room" , jstr room) ∷ []) -- Build the named argument object.
+
+countOf : JSON → Maybe Nat
+countOf value = fromField (objGet value "count")
+  where
+    fromField : Maybe JSON → Maybe Nat
+    fromField nothing = nothing             -- The field was missing.
+    fromField (just count) = asNat count     -- Reject a fractional or oversized value.
+
+showState : Client → IO ⊤
+showState client = clientQuery client "demo:state" roomArgs >>= onResult
+  where
+    onResult : Either ConvexError CallResult → IO ⊤
+    onResult (left error) = errLine (message error) -- The Convex call failed.
+    onResult (right result) = onCount (countOf (resultValue result))
+
+    onCount : Maybe Nat → IO ⊤
+    onCount nothing = errLine "demo:state returned no integral count"
+    onCount (just count) = putLine (showNat count)
+```
+
+The Agda call above is a one-off HTTP query. Unlike `useQuery`, it will not subscribe or rerun when the database changes. This explicit value model is a choice in this small client, not a requirement imposed by dependent types.
+
+### Live updates have an owner
+
+React starts and stops the subscription with the component. The component only describes which reactive value it wants:
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const room = "agda-readme";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>Count: {state.count}</p>; // React rerenders when Convex sends an update.
+}
+```
+
+A command-line Agda program owns that lifecycle directly. `clientSubscribe` starts Live lazily, `clientNext` waits for one update, and cleanup is acknowledged before the function returns:
+
+**Agda**
+
+```agda
+watchOnce : Client → IO ⊤
+watchOnce client =
+  clientSubscribe client "demo:state"
+    (jobj (("room" , jstr "agda-readme") ∷ [])) -- Register the reactive query.
+    >>= onSubscribed
+  where
+    onSubscribed : Either ConvexError Nat → IO ⊤
+    onSubscribed (left error) = errLine (message error)
+    onSubscribed (right subscriptionId) =
+      clientNext client subscriptionId 10000 -- Block for the initial Live value.
+        >>= finish subscriptionId
+
+    finish : Nat → Maybe Update → IO ⊤
+    finish subscriptionId nothing =
+      errLine "Live timed out" >> clientUnsubscribe client subscriptionId >> return tt
+    finish subscriptionId (just update) =
+      putLine (encode (updValue update))       -- Inspect the delivered Convex value.
+        >> clientUnsubscribe client subscriptionId
+        >> return tt                          -- No update may cross this acknowledgement.
+```
+
+Agda supports higher-order functions and concurrency. The blocking `clientNext` API is a deliberate fit for this teaching example, while one internal worker owns the WebSocket and reconnects. The complete example subscribes before mutating so it cannot miss the counter change.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -18,6 +126,8 @@ Read [`examples/basics/Main.agda`](examples/basics/Main.agda). It queries a fres
 | Unsubscribe barriers, five reconnects, and bounded delivery | Verified locally and hosted |
 
 The Docker `test` target builds the toolchain, type-checks and compiles the client, and runs its unit, conformance, and TLS tests on native `linux/amd64`. Shared local and hosted conformance also passed, earning HTTP and Live.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.agda -->
 ```agda
@@ -194,39 +304,22 @@ main =
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-```sh
-./run sync-examples
-./run validate
-./run test agda
-./run verify-example agda
-./run verify agda
-./run verify-hosted agda
-./run verify-all agda
-```
+This is a native Agda implementation of Convex's documented JSON HTTP endpoints and the repository's pinned `/api/sync` profile. JSON, UTF-8, HTTP framing, the WebSocket handshake and frames, and the Live state machine are written in Agda. It does not delegate Convex behaviour to another SDK, the Convex CLI, `curl`, Node.js, or Python.
 
-`test` builds the pinned Agda compiler from Hackage, type-checks the client, then compiles and runs the protocol, adapter, TLS, and Live fixture tests before saving the adapter and the canonical example as native `linux/amd64` executables. `verify-example` runs the example from its minimal image against a unique room. The remaining shared commands add local and hosted black-box conformance. Those root-owned runs passed, and the shared result evaluator awarded HTTP and Live.
+The pinned toolchain is Agda 2.7.0.1 with GHC 9.10.1. Agda's [GHC backend](https://agda.readthedocs.io/en/v2.7.0.1/tools/compilers.html) turns the checked source into native executables. This project deliberately uses only Agda's builtin modules, not `agda-stdlib`, so [`client/Convex/Prelude.agda`](client/Convex/Prelude.agda) supplies its small collection of list, string, and arithmetic helpers.
 
-## Conformance and protocol notes
+Agda itself does not provide the socket and operating-system primitives this client needs. The reviewed boundary in [`client/Convex/Prim.agda`](client/Convex/Prim.agda) maps a small set of opaque Agda types and operations to Haskell, using the language's documented [GHC foreign-function interface](https://agda.readthedocs.io/en/v2.7.0.1/language/foreign-function-interface.html). It moves bytes over TCP and TLS, manages threads and an `MVar`, reads time and entropy, and handles process I/O. It does not understand Convex, HTTP, JSON, or WebSockets.
 
-The public client implements Convex's documented JSON HTTP endpoints and this repository's pinned `/api/sync` profile directly in Agda. The JSON codec, UTF-8, base64, SHA-1, FNV-1a, HTTP request construction and response framing, RFC6455 framing and handshake verification, the Live envelope and state machine, and the NDJSON adapter are all Agda code. No request invokes another Convex client, the Convex CLI, `curl`, Node.js, or Python.
+One worker owns the Live socket and receives commands from the public client. This avoids concurrent reads or writes during reconnects. Deliveries are bounded by both count and estimated memory: the client retains at most 16 updates within 20 MiB, while active subscriptions have their own 64-entry and 8 MiB limits. Unsubscribe waits for a barrier acknowledgement, so an update from the retired subscription cannot appear afterwards.
 
-The reviewed foreign boundary is one file, [`client/Convex/Prim.agda`](client/Convex/Prim.agda). It supplies only what Agda's runtime does not have: a packed byte buffer with constant-time length and indexing, TCP and TLS byte transport, a listener for the adapter's TCP mode, threads and one `MVar`, a monotonic clock, entropy from `/dev/urandom`, and process I/O. None of those primitives understands Convex, HTTP, or WebSockets. TLS is the pure-Haskell `tls` package with the system certificate store, and the client asks it to verify the hostname it was told to connect to; `client/tests/TlsTest.agda` proves the same certificate is accepted for `localhost` and refused for `127.0.0.1`.
+`./run test agda` builds and runs the language-local protocol, adapter, TLS, and Live fixture tests in Docker. `./run verify-example agda` exercises the exact example above. The root-owned local and hosted conformance runs are separate evidence layers, and those recorded runs earned the HTTP and Live capabilities shown in the status table.
 
-One worker owns the Live socket. It alone connects, reads, writes, retires, reconnects, and changes the query-set version; the public API queues acknowledged commands and waits for the worker's reply. A monotonically increasing transport generation is stamped on every published update, and unsubscribe, same-identifier replacement, and the adapter-only debug disconnect each advance it before their acknowledgement is published, so a consumer that already dequeued an update from a retired connection can still recognise and drop it. A valid value received just before a transport failure is restamped rather than discarded, so it stays ahead of the structured failure event. Unchanged rehydration after a reconnect is suppressed with a 64-bit FNV-1a signature instead of a retained copy of the value.
+## Known Issues
 
-Bounds are byte budgets, not event counts. JSON decoding refuses input past 1 MiB, 64 levels, or 4096 structural nodes, and a lexical pre-pass enforces the two structural limits before a value is built. A WebSocket frame header declaring more than 1 MiB is rejected before any payload octet is buffered. Every read carries an absolute monotonic deadline computed once, so a peer that dribbles a frame one octet at a time is abandoned rather than granted an extension, and a partially filled buffer is never rewound to a false frame boundary. The Live manager retains the newest 16 deliveries within a conservative 20 MiB budget charged at four times the exact encoded length plus a fixed record allowance; active subscriptions have a separate 64-entry, 8 MiB budget. Reconnect backoff starts at 100 ms, caps at 15 seconds, and resets after a successful handshake or a valid server transition.
-
-The adapter speaks bounded UTF-8 NDJSON protocol v1 over stdin/stdout or one `ADAPTER_LISTEN` connection. Its own output queue retains at most the newest 16 encoded events within 6 MiB, including a write currently in flight. Subscription values are droppable under pressure; acknowledgements and errors wait for room until a deadline and then fail rather than being lost. `client/tests/AdapterTest.agda` drives that queue with a reader that never drains and checks the serialised shape of every event kind, including that an absent `id` or `logs` field is omitted rather than sent as null.
-
-Waiting is implemented as bounded polling against absolute deadlines rather than condition variables. That is a deliberate trade: it costs a few milliseconds of latency and keeps the shared state to a single `MVar` per component, which is the whole synchronisation surface a reviewer has to audit.
-
-The final images contain the compiled executable, glibc, `libgmp`, `libffi`, the DNS resolver modules, certificate roots, `/bin/sh`, and the individual POSIX tools the shared verifier requires. They contain no Agda, GHC, Cabal, C compiler, package or network tool, delegated runtime, or multicall binary. Both run as `65532:65532` under the repository's read-only, capability-drop, no-new-privileges, 128 MiB policy.
-
-## Limitations
-
-Docker build, image policy, canonical example, and shared local and hosted
-conformance passed, earning HTTP and Live.
-
-Live authentication, optimistic updates, mutations and actions over the WebSocket, journals, and `TransitionChunk` assembly are deferred; a `TransitionChunk` is treated as recoverable protocol drift and retires the socket rather than publishing partial state. Values cover Convex's JSON-safe subset; tagged Convex value encodings are not converted into richer Agda types. The client depends on Agda's builtin modules only, so `agda-stdlib` is not fetched and the Docker build has a single Agda dependency to pin; the trade is that `client/Convex/Prelude.agda` re-implements a small set of list, string, and arithmetic helpers. Naturals compile to `Integer`, so the byte-at-a-time parsers are correct but not fast, and the documented 1 MiB ceilings are set with that cost in mind. Input beyond the documented line, JSON, subscription, delivery, or output bounds is rejected or coalesced instead of risking unbounded memory.
+1. Live authentication, optimistic updates, WebSocket mutations and actions, journals, and `TransitionChunk` assembly are not implemented. A `TransitionChunk` causes a recoverable reconnect instead of exposing partial state.
+2. Values cover Convex's JSON-safe subset. Tagged Convex values are not decoded into richer Agda types.
+3. JSON, HTTP responses, and Live messages are limited to 1 MiB. JSON also stops at 64 nesting levels and 4096 structural nodes.
+4. Waiting uses bounded polling rather than condition variables. It adds a few milliseconds of latency, but keeps each component's shared state behind one `MVar`.
+5. The byte-at-a-time parsers favour auditability over speed. Agda naturals compile to arbitrary-precision `Integer`, so these paths are not designed for high-throughput workloads.

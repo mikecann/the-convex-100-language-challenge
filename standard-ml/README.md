@@ -1,32 +1,176 @@
-# Convex from Standard ML
+# Standard ML
 
-This is a small native Poly/ML client that calls Convex functions over HTTP and keeps a query current over Live WebSockets.
+[Standard ML](https://www.smlnj.org/sml.html) is a strict functional language
+with type inference, pattern matching, algebraic data types, and a powerful
+module system. It was proposed in 1983, designed from 1984 to 1988, and revised
+as [Standard ML '97](https://www.smlnj.org/sml97.html). The language is formally
+defined rather than owned by one implementation.
 
-It is educational and unofficial. It is not a production SDK and is not intended for package publication.
+This client uses [Poly/ML](https://www.polyml.org/), an implementation whose
+modern niche includes large theorem-proving systems such as Isabelle and HOL4.
+It is an educational, unofficial Convex client, not a production SDK or a
+package intended for publication.
 
-## Start here
+## Getting Started
 
-Read [`examples/basics/main.sml`](examples/basics/main.sml). It queries a fresh counter, subscribes to Live before changing anything, applies one idempotent mutation, and checks that the HTTP query, the mutation result, and the Live update all agree on `0 -> 1`.
+The canonical [`examples/basics/main.sml`](examples/basics/main.sml) program
+queries a fresh counter, starts a Live subscription, applies one idempotent
+mutation, and checks that every view agrees on `0 -> 1`.
 
-## What works
+From the repository root, Docker builds the pinned Poly/ML environment and runs
+that exact example against a unique room:
 
-The language-local Docker tests and shared local and hosted conformance all
-passed. The table describes the evidence that earned HTTP and Live.
+```sh
+./run verify-example standard-ml
+```
 
-| Capability | What proves it |
-| --- | --- |
-| HTTP queries, mutations, and actions | Local fixtures over real kernel sockets |
-| Bearer authentication and structured function errors | Local fixtures over real kernel sockets |
-| Strict response framing, and recovery after a refused response | A fixture that serves thirteen malformed framings in turn |
-| Live initial values, updates, and query-error recovery | Raw WebSocket fixtures |
-| Remove, five reconnects, generation barriers, and bounded delivery | Raw WebSocket fixtures |
-| A first connection retried inside one caller budget | A fixture that refuses twice and then answers |
-| No subscription left behind by an abandoned acknowledgement | A fixture that watches for the withdrawing Remove |
-| Real TLS, including host and address name checking | A local OpenSSL server with a private authority |
-| Bounded name resolution, independent of the resolver | Literal, uncached, and cached lookups against an expired deadline |
-| Deterministic style and lint rules | Every checked-in Standard ML source in this directory |
-| Minimal `linux/amd64` runtime and example images | Policy assertions plus both exact entrypoints executed in their own final image |
-| Shared local and hosted conformance | Not attempted |
+## Interesting Parts
+
+### JSON becomes a value you must narrow
+
+Generated Convex bindings make the query result statically known in React. This
+Standard ML client deliberately exposes the wire-neutral `Json.value` algebraic
+data type instead, so pattern matching makes every accepted shape explicit.
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const [room] = useState(() => `readme-${crypto.randomUUID()}`);
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // state and count are type-safe here.
+}
+```
+
+**Standard ML**
+
+```sml
+val deployment =
+  case OS.Process.getEnv "CONVEX_URL" of
+      SOME url => if url = "" then raise Fail "CONVEX_URL is required" else url
+    | NONE => raise Fail "CONVEX_URL is required"
+val room = "readme-" ^ Rand.hex 16
+val client = Convex.client deployment
+
+(* The HTTP call returns generic JSON, so the program checks the object field
+   and accepts only a mathematically integral Convex number. *)
+val {value = state, ...} =
+  Convex.query
+    (client, "demo:state", Json.Object [("room", Json.String room)])
+val count =
+  case Json.asInt (Json.getOr (state, "count", Json.Null)) of
+      SOME value => value
+    | NONE => raise Fail "demo:state returned a non-integral count"
+val _ = Convex.close client
+```
+
+The React hook is reactive and owns a subscription. `Convex.query` above is a
+one-off HTTP request, so the comparison is about result typing, not lifecycle.
+Standard ML knows that `count` is an `IntInf.int` after the match, but the JSON
+field name and shape are checked at runtime because this demo has no generated
+bindings.
+
+### Live has an explicit lifetime
+
+React ties a query subscription to a component. This command-line API makes the
+same resource visible: subscribe before mutating, wait for updates, then always
+unsubscribe and close the client.
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function IncrementButton() {
+  const [room] = useState(() => `readme-${crypto.randomUUID()}`);
+  const state = useQuery(api.demo.state, { room }); // React owns Live cleanup.
+  const increment = useMutation(api.demo.increment);
+
+  async function addOne() {
+    const result = await increment({
+      room,
+      language: "typescript",
+      runId: crypto.randomUUID(), // A fresh id makes this attempt idempotent.
+    });
+    console.log(result.state.count); // The mutation result is type-safe.
+  }
+
+  return <button onClick={addOne}>Count: {state?.count ?? 0}</button>;
+}
+```
+
+**Standard ML**
+
+```sml
+val deployment =
+  case OS.Process.getEnv "CONVEX_URL" of
+      SOME url => if url = "" then raise Fail "CONVEX_URL is required" else url
+    | NONE => raise Fail "CONVEX_URL is required"
+val room = "readme-" ^ Rand.hex 16
+val client = Convex.client deployment
+val live =
+  Convex.subscribe
+    (client, "demo:state", Json.Object [("room", Json.String room)])
+
+fun nextValue () =
+  case Convex.next (live, 10.0) of
+      NONE => raise Fail "Live update timed out"
+    | SOME update =>
+        (case Convex.updateError update of
+             SOME failure => raise ConvexError.Error failure
+           | NONE => Convex.updateValue update)
+
+fun run () =
+  let
+    val initial = nextValue () (* The subscription hydrates before mutation. *)
+    val {value = result, ...} =
+      Convex.mutation
+        (client, "demo:increment",
+         Json.Object
+           [("room", Json.String room),
+            ("language", Json.String "standard-ml"),
+            ("runId", Json.String (Rand.hex 16))])
+    val updated = nextValue () (* This is the reactive result, not a new query. *)
+  in
+    (initial, result, updated)
+  end
+
+(* Both resources are explicit, so every exit path releases both. *)
+fun cleanup () =
+  ((Convex.unsubscribe live handle _ => ());
+   Convex.close client handle _ => ())
+val result =
+  run ()
+  handle error => (cleanup (); raise error)
+val _ = cleanup ()
+```
+
+Blocking `Convex.next` is this client's small command-line API choice, not a
+limitation of Standard ML. Poly/ML provides threads, and the implementation has
+one owner thread handling WebSocket I/O and reconnects while callers consume a
+bounded update queue.
+
+## Status
+
+Both intended capabilities are awarded from the repository's existing clean,
+exact-head evidence. Local and hosted shared conformance each passed 31 of 31
+checks.
+
+| Capability | Status | Evidence |
+| --- | --- | --- |
+| HTTP | Awarded | Queries, mutations, actions, auth, structured errors, strict framing, TLS, and deadlines passed |
+| Live | Awarded | Initial values, updates, errors, unsubscribe barriers, bounded delivery, and five reconnects passed |
+| Implementation | Native | Convex HTTP and Live behaviour is implemented in Standard ML; OpenSSL supplies TLS only |
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.sml -->
 ```sml
@@ -164,52 +308,43 @@ end
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-```sh
-./run sync-examples
-./run validate
-./run test standard-ml
-./run verify-example standard-ml
-./run verify standard-ml
-./run verify-hosted standard-ml
-./run verify-all standard-ml
-```
+This is a native client. JSON parsing and printing, HTTP/1.1, SHA-1, base64,
+WebSocket framing, and Convex-specific HTTP and Live behaviour are Standard ML
+code built on the Basis Library's sockets and Poly/ML's thread extension. It
+does not call another Convex SDK, the Convex CLI, `curl`, Node.js, or Python.
 
-`test` builds the pinned Poly/ML toolchain, then runs the style and lint gate, encoding, real-TLS, real-HTTP, raw-WebSocket Live, adapter-protocol, adapter-driven-Live, canonical-example, and bounded-writer tests, and saves the adapter and example as native `linux/amd64` executables. `verify-example` runs the example from its minimal image against a unique room. The remaining shared commands add local and hosted black-box conformance. The root result evaluator awarded the HTTP and Live badges from clean exact-head local and hosted runs of this source (31/31 on both profiles).
+The Basis Library does not provide TLS, so Poly/ML's documented
+[`Foreign`](https://www.polyml.org/Doc.html) interface binds OpenSSL 3. OpenSSL
+handles cryptography and certificate checks through memory BIOs, while Standard
+ML retains ownership of socket I/O and deadlines. The client checks both DNS
+names and literal IP addresses against certificates.
 
-Poly/ML ships no formatter, and Standard ML has no de facto equivalent of `gofmt`, so the first `test` layer is a style and lint gate written in Standard ML instead: it reads every checked-in source in this directory and enforces printable-ASCII encoding, a 100-column width, no trailing whitespace, exactly one terminating newline, balanced comment nesting, a documentation comment at the top of each file, and a short list of forbidden constructs. It is a mechanical gate a reviewer can read in full, not a claim to have run a formatter.
+Live uses one owner thread for opening, reading, writing, and reconnecting the
+WebSocket. Public calls send commands to that owner. Updates are coalesced and
+bounded by both count and encoded-size budgets, and each carries a connection
+generation so an old update cannot leak across unsubscribe, replacement, or
+reconnect. The adapter-only `debugDisconnect` hook exists solely for shared
+conformance and is not part of the API shown to learners.
 
-`./run test standard-ml`, `verify-example`, `verify`, `verify-hosted`, and `verify-all` all ran green from this tip: the full language-local suites plus shared local and hosted black-box conformance (31/31 on both profiles) from clean exact-head builds.
+Poly/ML compiles the example and adapter into native `linux/amd64` executables.
+Their minimal images keep the Poly/ML runtime, OpenSSL, certificate roots, and
+the small POSIX surface required by verification, but no compiler, package
+manager, or delegated language runtime. Poly/ML has no standard formatter, so
+the Docker test image runs a repository-local deterministic style and lint gate
+over every Standard ML source file.
 
-## Conformance and protocol notes
+## Known Issues
 
-The client implements Convex's documented JSON HTTP endpoints and the repository's pinned unversioned `/api/sync` profile directly in Standard ML. JSON parsing and printing, SHA-1, base64, HTTP/1.1 request and response handling, and RFC 6455 framing are all Standard ML code over the Basis Library's `Socket` and Poly/ML's `Thread`. No request invokes another Convex client, the Convex CLI, `curl`, Node.js, or Python.
-
-HTTP response framing is read strictly rather than generously. The status line must carry a version this client speaks and a three-digit status inside the assigned range; header names must be real tokens, and obsolete line folding is refused. A repeated `Content-Length` or `Transfer-Encoding`, a response carrying both, and a `Content-Length` that is not a plain decimal are all rejected, because each of those is a length two parsers can disagree about. A refused response closes only its own connection: the next call opens a fresh one and succeeds.
-
-TLS is the one borrowed facility, because the Basis Library has none. OpenSSL is bound through Poly/ML's `Foreign` structure in a single file and is driven through a pair of memory BIOs: OpenSSL only ever transforms buffers, and Standard ML decides when to wait and for how long. That keeps every deadline enforceable and means no foreign call performs I/O or stalls the garbage collector. Certificates are verified against the trusted roots *and* against the name the caller asked for, using `SSL_set1_host` for names and `X509_VERIFY_PARAM_set1_ip_asc` for literal addresses. Those objects live in the C heap where the collector cannot reach them, so every failure path frees exactly what it created, and the library handles themselves are loaded once under a lock.
-
-Name resolution is the one call the Basis Library gives no deadline: `NetHostDB.getByName` blocks inside the C resolver. A literal address is converted without a lookup at all, and a real name is looked up on its own thread, so a caller waits only until its own absolute deadline and the answer is cached for every later connection. That is what keeps Live close and unsubscribe bounded while a connection is being opened.
-
-One owner thread exclusively opens, reads, writes, retires, and reconnects the Live socket. Callers queue Add, Remove, reconnect, and close commands to that owner and wait for acknowledgements. Complete transitions are validated, coalesced per query, and committed atomically, so a transition whose second member is malformed publishes nothing at all. Unchanged reconnect hydration is suppressed with a fixed-size fingerprint rather than a retained copy of the value. Every delivered update carries its socket generation, which lets the adapter reject an update dequeued before a replacement, unsubscribe, or reconnect barrier.
-
-Every command carries one absolute budget, fixed when its caller queued it, so a retrying owner can never restart the caller's clock. A subscribe that arrives before the socket is up is registered and then resolved in the owner's ordinary loop: the connection is retried inside that single budget, and close and unsubscribe are still answered while it retries. If the caller stops waiting first, the acknowledgement is cancelled under the same lock the owner would settle under, and the owner withdraws the query with a real `Remove` rather than leaving a subscription nobody holds.
-
-Once any byte of a frame has been consumed, the frame deadline applies and a timeout abandons that connection rather than resuming the parser at a byte that is not a frame header. Reconnect backoff starts at 100 ms, caps at 15 seconds, and resets after a valid connection or transition. `connectionCount`, `lastCloseReason`, and `maxObservedTimestamp` are carried across reconnects. A connection is counted exactly once, when a socket that genuinely existed is retired, so retried handshakes that never produced one do not inflate the count the server sees.
-
-The manager retains the newest 16 updates within a conservative 20 MiB budget that charges four times the exact encoded length plus a fixed record allowance. Active subscriptions have a separate 64-entry and 8 MiB budget. JSON decoding stops at 2 MiB, 128 levels, or 8,192 structural nodes before malformed or dense input can exhaust the runtime.
-
-The adapter speaks bounded UTF-8 NDJSON protocol v1 over stdin and stdout or one `ADAPTER_LISTEN` TCP connection. Its independent output queue retains at most the newest 16 encoded events within 6 MiB, including a write already in flight. Subscription values may be coalesced under pressure, while acknowledgements and errors wait for bounded room or fail the connection. On the TCP transport the whole connection shares one cumulative 30-second write budget, spent by a write that fails as well as one that succeeds, so a controller that stops reading cannot hold the process open one deadline at a time. A controller that keeps reading spends milliseconds of that budget across a whole session; one that stops exhausts it inside a single stalled write. `debugDisconnect` is adapter-only: it lives in `Convex.Internal`, not in the client surface the example teaches.
-
-The bounded-writer audit needs a caller that never reads stdout, which no in-process test can arrange, so it is a separate test-only executable built from `client/tests/flood-adapter.sml`. Nothing selects it at run time, and the build asserts that the shipped adapter carries neither that behaviour nor any string belonging to it.
-
-The final images contain the native executable, the Poly/ML runtime library, OpenSSL 3, certificate roots, `/bin/sh`, and the individual POSIX tools the shared verifier requires. They contain no Poly/ML compiler or frontend, no C compiler, no package or network tools, no delegated runtimes, and no multicall binary, and run as `65532:65532` under the repository's read-only, capability-drop, no-new-privileges, 128 MiB policy. Each runtime image executes its own exact entrypoint during the build: the adapter answers a hello and close exchange, and the example is run unconfigured and must exit 1 with an empty stdout, from that image, as that user, over that filesystem. Docker and shared local and hosted conformance all passed for the reviewed source.
-
-## Limitations
-
-Shared local and hosted conformance passed, earning HTTP and Live in addition to the language-local fixture evidence below.
-
-Building `linux/amd64` under emulation on an arm64 host intermittently faults inside the C toolchain. `polyc` links the exported heap with `g++`, and `collect2` has died once with an internal segmentation fault; the build retries only that exact signature, up to four attempts, and a genuine Standard ML error still fails on the first. The `busybox` prune in `runtime-base` has also segfaulted once under emulation, which simply needs the image build repeating. Neither fault has reproduced on a native `linux/amd64` builder.
-
-Live authentication, optimistic updates, mutation and action messages over the WebSocket, journals, and `TransitionChunk` assembly are deferred; a `TransitionChunk` is treated as recoverable protocol drift and retires the socket rather than publishing partial state. HTTP uses a bounded single-request connection-close exchange, and chunked framing is rejected explicitly rather than mis-parsed. Only IPv4 deployment addresses resolve. Values cover Convex's JSON-safe subset; tagged Convex value encodings are not converted into richer Standard ML types. Input beyond the documented line, JSON, subscription, delivery, or output bounds is rejected or coalesced instead of risking unbounded memory. The manifest capability list records the evaluator award from those runs.
+1. Live authentication, optimistic updates, WebSocket mutations and actions,
+   journals, and `TransitionChunk` assembly are not implemented.
+2. HTTP deliberately uses one bounded connection-close request and rejects
+   transfer coding, conflicting framing headers, and non-decimal lengths.
+3. Networking resolves IPv4 only. Convex tagged values remain generic JSON
+   rather than becoming richer Standard ML values.
+4. `linux/amd64` builds under arm64 emulation can occasionally fault inside
+   `polyc`'s C toolchain or the BusyBox prune step. The targeted compiler retry
+   does not hide genuine Standard ML errors.
+5. Resource limits are intentional: JSON, active subscriptions, Live delivery,
+   and adapter output all have fixed count or byte budgets.

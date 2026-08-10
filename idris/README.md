@@ -1,14 +1,148 @@
-# Convex from Idris
+<img src="logo.png" alt="Idris logo" width="128">
+<!-- Logo source: https://github.com/idris-lang/Idris2/blob/main/icons/idris-256x256.png -->
 
-This small client calls Convex functions over HTTPS and follows a reactive query through the pinned `/api/sync` WebSocket profile, written in Idris 2 and compiled to a native executable.
+# Idris
 
-It is an educational, unofficial experiment, not a production SDK or a package intended for publication.
+[Idris](https://www.idris-lang.org/) is a purely functional, general-purpose language built around type-driven development. Its signature feature is dependent types, where types can refer to values and express facts such as "these two lists have the same length." Idris 2 continues that research with a new core based on quantitative type theory. Its syntax will feel most familiar to Haskell or OCaml developers, but it occupies a smaller present-day niche in programming-language research, education, and software where proving invariants in the type system is the point.
 
-## Start here
+This repository uses Idris 2 to call Convex over HTTPS and follow a reactive query over WebSocket. It is an educational, unofficial experiment, not a production SDK or a package intended for publication.
 
-[`examples/basics/Main.idr`](examples/basics/Main.idr) is the canonical example. It reads a counter over HTTP, starts Live before the write, applies one idempotent mutation, and prints the resulting reactive value only when every step agrees.
+## Getting Started
 
-## What works
+The canonical [`examples/basics/Main.idr`](examples/basics/Main.idr) reads a counter, subscribes before changing it, applies one idempotent mutation, and checks the resulting reactive update. From the repository root, Docker builds the exact example and runs it against a fresh room:
+
+```sh
+./run verify-example idris
+```
+
+## Interesting Parts
+
+### JSON shapes stay visible
+
+In a typical Convex React app, generated bindings give the query arguments and result their TypeScript types. This small Idris client deliberately exposes a general JSON API, so the argument object and the result decoding are both visible at the call site.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function Counter() {
+  const room = "idris-readme";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // `state` and `count` are type-safe here.
+}
+```
+
+**Idris**
+
+```idris
+import Convex
+import Data.Maybe
+import System
+import System.File
+
+abort : String -> IO a
+abort reason =
+  do ignore $ fPutStrLn stderr ("convex example: " ++ reason)
+     exitFailure
+
+main : IO ()
+main =
+  do let room = "idris-readme"
+     deployment <- getEnv "CONVEX_URL"
+     url <- maybe (abort "CONVEX_URL is required") pure deployment
+     created <- newClient url
+     case created of
+          Left problem => abort problem -- Client creation can fail explicitly.
+          Right client =>
+            do response <- query client "demo:state"
+                             (JObject [("room", JString room)]) -- Build the JSON argument.
+               case response of
+                    Left problem => putStrLn (message problem) -- `Either` needs both cases.
+                    Right result =>
+                      case field "count" (resultValue result) >>= wholeNumber of
+                           Just count => printLn count -- Dynamic JSON is now an Idris `Int`.
+                           Nothing => putStrLn "state had no whole count"
+               closeClient client
+```
+
+That manual decoding is a choice made by this demonstration client, not a limitation of Idris. The tradeoff is less generated convenience, but the code makes the wire-level JSON boundary hard to miss. See the [`Json` type and accessors](client/Convex/Json.idr).
+
+### React owns reactivity; this program owns the subscription
+
+`useQuery` subscribes when the component renders, updates the component when data changes, and cleans up with the component lifecycle. This command-line client instead returns a subscription handle and exposes a blocking `nextUpdate`. Idris supports richer concurrency patterns, but this client intentionally uses a single caller-driven socket owner.
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function Counter() {
+  const room = "idris-live-readme";
+  const state = useQuery(api.demo.state, { room }); // React owns this subscription.
+  const increment = useMutation(api.demo.increment);
+
+  async function addOne() {
+    await increment({
+      room,
+      language: "typescript",
+      runId: crypto.randomUUID(),
+    });
+    // `useQuery` rerenders the component with the resulting state.
+  }
+
+  return <button onClick={addOne}>Count: {state?.count ?? 0}</button>;
+}
+```
+
+**Idris**
+
+```idris
+import Convex
+import Data.Maybe
+import System
+import System.File
+
+abort : String -> IO a
+abort reason =
+  do ignore $ fPutStrLn stderr ("convex example: " ++ reason)
+     exitFailure
+
+main : IO ()
+main =
+  do let room = "idris-live-readme"
+     deployment <- getEnv "CONVEX_URL"
+     url <- maybe (abort "CONVEX_URL is required") pure deployment
+     created <- newClient url
+     case created of
+          Left problem => abort problem
+          Right client =>
+            do started <- subscribe client "demo:state" (JObject [("room", JString room)])
+               case started of
+                    Left problem => abort (message problem)
+                    Right watch =>
+                      do initial <- nextUpdate client watch 10000
+                         -- `nextUpdate` drives Live until the initial value arrives.
+                         runId <- newRunId
+                         changed <- mutation client "demo:increment"
+                                      (JObject [ ("room", JString room)
+                                               , ("language", JString "idris")
+                                               , ("runId", JString runId)
+                                               ])
+                         -- This is the reactive result, not a new HTTP query.
+                         updated <- nextUpdate client watch 10000
+                         -- Cleanup is explicit outside a component lifecycle.
+                         ignore $ unsubscribe client watch
+                         closeClient client
+```
+
+The complete example checks the `Either` and `Maybe` values omitted from this focused sequence. The important semantic difference is lifecycle ownership: React rerenders automatically, while this program decides when to wait, unsubscribe, and close.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -19,6 +153,8 @@ It is an educational, unofficial experiment, not a production SDK or a package i
 | Production SDK compatibility | Not claimed |
 
 Docker compilation and the shared local and hosted evaluator passed, earning HTTP and Live.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.idr -->
 ```idris
@@ -127,27 +263,19 @@ main =
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-```sh
-./run sync-examples
-./run validate
-./run test idris
-./run build idris
-```
+The public [`Convex` module](client/Convex.idr) gives one client both transports. `query`, `mutation`, and `action` use Convex's documented JSON HTTP endpoint, while `subscribe` and `nextUpdate` use the pinned sync profile. HTTP failures remain distinct as function, protocol, or transport errors, and log lines stay separate from returned values.
 
-`./run test idris` bootstraps Idris 2 from source with Chez Scheme, compiles the client with the RefC backend for `linux/amd64`, and runs four language-local suites against real loopback fixtures: wire formats, HTTP, Live, TLS, and the conformance adapter. `./run build idris` produces the non-root adapter image. Root runs `verify-example`, `verify`, and `verify-hosted` serially, because they share the backend and the evidence store.
+Idris 2's RefC backend compiles the program through C to a native `linux/amd64` executable. The Convex-specific HTTP envelopes, strict JSON, WebSocket framing, and Live state machine are written in Idris. A small [`client/support`](client/support) shim supplies ordinary sockets, polling, monotonic time, randomness, and OpenSSL byte transport. It does not delegate to another Convex client.
 
-## Protocol and conformance notes
+The JSON implementation reads and writes byte buffers directly because RefC character handling is not a safe place to round-trip arbitrary UTF-8. Parsed numbers retain their original token, while `wholeNumber` accepts values such as `1.0` only when they are mathematically integral and in range. The Live client also owns a bounded queue, validates a complete transition before publishing it, and suppresses an unchanged value when reconnecting.
 
-The client owns every Convex-specific behaviour in Idris: the documented `format: "json"` HTTP envelopes, the separation of `logLines` from returned values, HTTP 560 as a structured function error distinct from a 400 request failure or a 500 deployment failure, strict JSON, RFC 6455 framing, and the pinned unversioned sync messages. A C shim under [`client/support/`](client/support) supplies only ordinary transport: sockets, `poll`, monotonic time, randomness, and OpenSSL bytes. Its whole surface uses `int64_t` and `char*` so the RefC foreign declarations cannot disagree with it.
+The Docker build pins Idris 2 0.7.0 and bootstraps it with Chez Scheme, then ships only the native executables and their runtime library closure. The conformance adapter in [`client/tests/conformance`](client/tests/conformance) is test infrastructure, not part of the educational client API.
 
-There is one owner of the sync socket. Subscribe, unsubscribe, close, and the adapter-only disconnect hook all run inside the same caller-driven pump, so no second path can touch the socket. A whole `Transition` is validated before anything is published, timestamps are canonical little-endian Base64 that must not move backwards, and an unchanged rehydration after a reconnect is suppressed so a reconnect delivers only what actually changed. Unsubscribe and same-identifier replacement bump a generation before their acknowledgement, which discards anything already queued for the old subscription.
+## Known Issues
 
-Every read and write carries an absolute deadline computed once, so a peer that dribbles bytes is bounded rather than merely slow. Once any byte of a WebSocket frame has been consumed, a timeout abandons the connection instead of resynchronising on a false boundary.
-
-The adapter under [`client/tests/conformance/`](client/tests/conformance) is test infrastructure, not client API. It validates every controller command against the shared schema, omits absent optional fields rather than serialising them as null, reserves stdout for protocol events, and carries the same NDJSON stream over stdin/stdout or over `ADAPTER_LISTEN`. `debugDisconnect` exists only there; the educational `Convex` module does not export it.
-
-## Limitations
-
-Docker build, language-local tests, canonical example, and shared local and hosted conformance passed, earning HTTP and Live. The client is single-threaded and caller-driven rather than backed by a background thread. Values are limited to the documented JSON format, so Int64, bytes, and special floats are not claimed. Live authentication, optimistic updates, WebSocket mutations and actions, and `TransitionChunk` assembly are deferred, and a `TransitionChunk` is treated as profile drift that retires the connection.
+1. The API accepts and returns the client's general `Json` type. It has no generated function bindings, so argument and result shapes are checked manually.
+2. Live is single-threaded and caller-driven. `nextUpdate` runs the socket owner loop, and a slow consumer may lose the oldest intermediate update after the shared 64-event or 4 MiB delivery limit is reached.
+3. Live targets the pinned `convex-rs-0.10.4-unversioned-sync` profile, not a documented stable third-party protocol. `TransitionChunk` is treated as protocol drift and closes that connection.
+4. Live authentication, optimistic updates, WebSocket mutations and actions, and non-JSON Convex values such as Int64, bytes, and special floats are not implemented.

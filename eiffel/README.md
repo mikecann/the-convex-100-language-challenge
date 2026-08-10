@@ -1,23 +1,142 @@
-# Convex from Eiffel
+<img src="logo.png" alt="Eiffel" width="226">
+<!-- Logo source: https://www.eiffel.org/theme/responsive-eiffel-org/images/logo.png -->
 
-This Eiffel demonstration queries a Convex counter over HTTP, follows it over
-a Live WebSocket subscription, applies one idempotent mutation, and checks
-that every view agrees on the move from 0 to 1. Eiffel's design-by-contract
-is used where it genuinely expresses this protocol's own invariants — the
-`module:function` shape of every call path, the JSON value's own shape
-constraints, and the sync engine's subscription bookkeeping — rather than
-decorating routines with contracts for their own sake.
+# Eiffel
 
-It is unofficial educational material, not a production SDK.
+Eiffel is a statically typed, object-oriented language built around classes and
+Design by Contract: routines can state preconditions and postconditions, while
+classes can state invariants. Bertrand Meyer designed it at ISE in 1985 and
+introduced it publicly at OOPSLA in 1986. It has been used for industrial
+software and teaching, and today occupies a specialist niche around software
+correctness, long-lived systems, and EiffelStudio. The [official Eiffel
+site](https://www.eiffel.org/) has the language reference and current tools.
 
-## Start here
+This repository uses Eiffel to make a native Convex client with HTTP calls and
+Live WebSocket subscriptions. It is unofficial educational material, not a
+production SDK.
 
-[`examples/basics/convex_example_app.e`](examples/basics/convex_example_app.e)
-follows a counter from 0 to 1: an HTTP query, a Live subscription started
-before the mutation so it cannot race past it, the idempotent mutation, and
-the resulting Live update arriving without polling again.
+## Getting Started
 
-## What works
+The canonical [`examples/basics/convex_example_app.e`](examples/basics/convex_example_app.e)
+walkthrough queries a new counter room, subscribes before changing it, applies
+one idempotent increment, and receives the new value through the open Live
+connection.
+
+From the repository root, run:
+
+```sh
+./run verify-example eiffel
+```
+
+That command builds the Eiffel example in Docker and runs the exact source shown
+later in this README against the project's approved test deployment. You do not
+need EiffelStudio installed on your machine.
+
+## Interesting Parts
+
+### Contracts guard the call boundary
+
+**TypeScript with React**
+
+```tsx
+import { api } from "../convex/_generated/api";
+import { useQuery } from "convex/react";
+
+export function RoomCount() {
+  const state = useQuery(api.demo.state, { room: "readme-contract-room" });
+  if (state === undefined) return <p>Loading...</p>;
+
+  return <p>{state.count}</p>; // The generated API types both args and result.
+}
+```
+
+**Eiffel**
+
+```eiffel
+local
+	args: CONVEX_JSON_VALUE
+	state: detachable CONVEX_RESULT
+	client: CONVEX_CLIENT
+	environment: EXECUTION_ENVIRONMENT
+	configured_url: detachable STRING_32
+	deployment_url: STRING
+do
+	create environment
+	configured_url := environment.item ("CONVEX_URL")
+	-- Reject missing or empty configuration before creating the client.
+	check attached configured_url as url_32 and then not url_32.is_empty then
+		deployment_url := url_32.to_string_8
+		create client.make (deployment_url)
+		create args.make_object
+		args.put_field ("room", create {CONVEX_JSON_VALUE}.make_string ("readme-contract-room"))
+
+		-- query's contract requires a module:function path and an object of arguments.
+		state := client.query ("demo:state", args)
+		check attached state as result and then result.is_success then
+			print (result.value.field ("count").number_item) -- Decode the JSON result explicitly.
+		end
+	end
+end
+```
+
+React's generated `api.demo.state` reference gives TypeScript the function's
+argument and return types. This small Eiffel client instead validates the common
+call shape with `require` clauses, then represents the result as an explicit JSON
+value. Also, `useQuery` stays reactive; `client.query` is one HTTP request.
+
+### A Live subscription has an explicit owner
+
+**TypeScript with React**
+
+```tsx
+import { api } from "../convex/_generated/api";
+import { useQuery } from "convex/react";
+
+export function LiveRoomCount() {
+  const state = useQuery(api.demo.state, { room: "readme-live-room" });
+  return <p>{state?.count ?? "Loading..."}</p>;
+}
+```
+
+**Eiffel**
+
+```eiffel
+local
+	args: CONVEX_JSON_VALUE
+	client: CONVEX_CLIENT
+	poll: CONVEX_POLL
+	environment: EXECUTION_ENVIRONMENT
+	configured_url: detachable STRING_32
+	deployment_url: STRING
+do
+	create environment
+	configured_url := environment.item ("CONVEX_URL")
+	-- Reject missing or empty configuration before creating the client.
+	check attached configured_url as url_32 and then not url_32.is_empty then
+		deployment_url := url_32.to_string_8
+		create client.make (deployment_url)
+		create args.make_object
+		args.put_field ("room", create {CONVEX_JSON_VALUE}.make_string ("readme-live-room"))
+
+		-- Name the subscription, then open the client's one Live connection.
+		client.live.add_subscription ("room-count", "demo:state", args)
+		client.live.ensure_connected
+
+		create poll
+		if poll.wait_readable (client.live.descriptor, 200) then
+			client.live.poll (200) -- Decode the next pushed update into pending_events.
+		end
+		client.live.remove_subscription ("room-count") -- The owner tears it down explicitly.
+	end
+end
+```
+
+React starts, updates, and disposes the subscription with the component. The
+command-line client deliberately exposes a small polling API, so its application
+owns connection progress and cleanup. That is this client's API choice, not a
+limitation of the Eiffel language.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -25,6 +144,8 @@ the resulting Live update arriving without polling again.
 | Live subscribe/unsubscribe, initial value, external updates, reconnect after `debugDisconnect` with correct resubscribe and no stale/duplicate events | Implemented; validated end to end against the project's local Convex backend, including a real forced-reconnect scenario |
 | NDJSON adapter over stdin or one TCP controller (`ADAPTER_LISTEN`) | Implemented for `hello`, `query`, `mutation`, `action`, `subscribe`, `unsubscribe`, `setAuth`, `debugDisconnect`, `close` |
 | Capability badges | `http` and `live`, awarded from a 31/31 pass of the shared conformance suite against both the local and hosted deployments |
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/convex_example_app.e -->
 ```eiffel
@@ -265,109 +386,46 @@ end
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-```sh
-./run sync-examples eiffel
-./run validate
-./run test eiffel
-./run build eiffel
-```
+This is a native implementation. Eiffel code owns the Convex request envelopes,
+JSON parser and encoder, HTTP/1.1 calls, sync state, and WebSocket frames. It does
+not call another Convex SDK. A small C support file supplies raw socket I/O,
+OpenSSL TLS with certificate and hostname verification, and `select(2)` through
+Eiffel's documented external-call mechanism.
 
-`sync-examples` proves this displayed source is the runnable source. `validate`
-checks the public layout and manifest. `test` builds the toolchain stage,
-runs the network-free JSON regression suite, compiles the exact example and
-adapter for `linux/amd64`, and smoke-tests the adapter's clean-close path.
-`build` produces the final adapter image. The root integration owner
-separately runs `verify-example`, local conformance, and hosted conformance
-after review.
+The C support file is also a practical EiffelStudio workaround. Version
+25.02.9.8732 miscompiled this project's larger inline-C arrangement when it
+combined generated classes into a `big_file`, so the native functions are built
+as one ordinary translation unit instead. Runnable targets use EiffelStudio's
+ahead-of-time `-finalize` mode because the incremental workbench runtime treated
+an interrupted blocking call as a fatal signal in this workload.
 
-During development (outside the committed test suite, since it needs a live
-deployment) the client, sync engine, WebSocket, and TLS/HTTP transport were
-each additionally proven against the project's real local Convex backend and
-a real public TLS host: a full HTTP query → Live subscribe → mutation → Live
-update round trip, and a genuine forced-reconnect scenario (`debugDisconnect`
-followed by an external mutation) that confirms the resubscribed connection
-delivers exactly the new value with no stale rehydration event in between.
+One owner advances the Live connection. On reconnect it resends every active
+subscription and suppresses an unchanged first value, so callers do not mistake
+rehydration for a new update. Mutations and actions still use HTTP while that
+WebSocket is open. JSON numbers are stored as `REAL_64`; callers that expect a
+counter use `is_integral_in_range` before converting values such as `1.0` to an
+integer.
 
-## Protocol notes and limits
+The build pins EiffelStudio 25.02.9.8732 and produces `linux/amd64` example and
+adapter images. The final images run as user `65532:65532` and retain only the
+compiled program, its runtime library closure, CA and OpenSSL data, `/bin/sh`,
+and the small POSIX tool set required by the shared verifier.
 
-Eiffel owns Convex request encoding and JSON decoding (`convex_json_value.e`,
-`convex_json_parser.e`), HTTP/1.1 framing (`convex_http_client.e`), the
-`Connect`/`ModifyQuerySet`/`Transition` sync protocol
-(`convex_sync.e`), and RFC 6455 WebSocket framing (`convex_websocket.e`).
-Mutations and actions always run over HTTP, even while a Live connection is
-open, matching this project's other Live-capable native clients: the pinned
-`convex-rs-0.10.4-unversioned-sync` profile's `Mutation`/`Action` client
-messages are not implemented.
+## Known Issues
 
-`convex_native.c`/`convex_native.h` are a small ordinary C translation unit
-for TCP sockets, TLS (OpenSSL, with certificate and hostname verification),
-and `select(2)`, called through Eiffel's plain (non-inline) `"C signature"`
-external declarations. This is not the usual way EiffelStudio programs reach
-C: its own `"C inline"` feature bodies are the normal, documented mechanism.
-This project's toolchain (EiffelStudio 25.02.9.8732) reliably miscompiles a
-project once enough classes' inline C bodies get bundled into one
-translation unit ("`big_file`"): gcc reports the last bundled class's
-functions redeclared with conflicting linkage, because the generated
-`big_file_C*_c.c` is one `#include` short of what its own per-class header
-promised. Moving TLS, raw sockets, and `select` into an ordinary, separately
-compiled `.c` file and declaring plain externals for it sidesteps that
-bundling path entirely; `Dockerfile` documents the same finding next to the
-build steps it changed. A second, unrelated toolchain finding: EiffelStudio's
-incremental `-freeze` ("workbench") runtime reports an ordinary EINTR from a
-GC or scheduling signal interrupting `select(2)` as a fatal "operating
-system signal" exception and kills the process, instead of the syscall
-simply returning to its caller; every target that actually runs is therefore
-built with `-finalize` instead (see `convex_native.c`'s `EINTR` retry loops
-for the C-side half of the same fix).
-
-The adapter (`client/tests/conformance/`) is a single-threaded event loop:
-one `select(2)` call per iteration watches the control stream and, once a
-subscription exists, the Live WebSocket's descriptor, so exactly one owner
-ever touches either transport (see `convex_sync.e`'s header comment). A
-reconnected sync connection resends every active subscription in one
-`ModifyQuerySet`, and suppresses delivering that rehydration as a
-"subscription" event unless the decoded value or error actually differs from
-what was last reported, so a forced reconnect's observable sequence is
-exactly initial value, disconnect acknowledgement, external mutation, then
-the new value — never a stale duplicate in between.
-
-The build is pinned to EiffelStudio 25.02.9.8732 (the free GPL edition; no
-license key, no account) on the digest-pinned Ubuntu 22.04 build image.
-Production uses digest-pinned Debian 12 slim with OpenSSL 3.0.20-1~deb12u2
-and CA certificates 20230311+deb12u1.
-
-## Limitations
-
-Live authentication, WebSocket mutations, WebSocket actions, optimistic
-updates, journals, and `TransitionChunk` assembly are deferred, matching this
-project's other Live-capable native clients. The client decodes Convex's
-documented JSON-safe value subset only, not the richer tagged
-`convex_encoded_json` encoding. The HTTP client requires a `Content-Length`
-response header (chunked transfer encoding is not implemented); Convex's own
-JSON API always sends one, so this has not been a practical limit in
-testing, but it means this client cannot talk to an arbitrary HTTP server.
-`Sec-WebSocket-Accept` is not verified against the sent key during the
-handshake; only the HTTP `101` status is checked, since this client never
-reuses a connection across origins.
-
-No explicit byte or event-count bound is yet enforced on adapter output or
-Live delivery queues beyond ordinary process memory; a conservative budget
-and a stopped-reader regression (see the Ada and Fortran clients for the
-shape of that test) are follow-up work. The
-language-local test suite currently covers the JSON value and parser only;
-CONVEX_SOCKET, CONVEX_WEBSOCKET, CONVEX_SYNC, and CONVEX_CLIENT were
-validated by hand against a live deployment during development (see "Docker
-verification" above) but do not yet have an automated, network-free
-regression suite of their own.
-
-The runtime images retain Debian's `/bin/sh` and the small POSIX text-tool
-set the shared verifier requires. They contain the compiled Eiffel
-executable, its dynamic-library closure (`libc`, `libm`, `libssl`,
-`libcrypto`; EiffelStudio's own runtime is statically linked in `-finalize`
-mode), CA certificates, and OpenSSL configuration — no compiler, package
-manager, Convex CLI, Node.js, Python, or `curl`. `http` and `live` were
-awarded from a shared local and hosted conformance run (31/31 both
-profiles) at this README's reviewed commit; any later change to the
-Dockerfile, client, or examples forfeits that evidence until it is rerun.
+1. Live authentication, WebSocket mutations and actions, optimistic updates,
+   journals, and `TransitionChunk` assembly are deferred. Mutations and actions
+   use HTTP even when Live is connected.
+2. Values are limited to Convex's documented JSON-safe subset. The tagged
+   `convex_encoded_json` format is not implemented.
+3. WebSocket support covers the text-frame subset used by the pinned sync
+   profile. Binary frames and extensions are out of scope, and the upgrade
+   checks HTTP status `101` without verifying `Sec-WebSocket-Accept`.
+4. Live delivery and adapter output have no explicit event-count or byte budget
+   beyond process memory. The language-local tests cover JSON behavior, but the
+   socket, HTTP, WebSocket, and sync classes do not yet have network-free unit
+   fixtures.
+5. The HTTP reader requires a `Content-Length` response and does not implement
+   chunked transfer encoding.

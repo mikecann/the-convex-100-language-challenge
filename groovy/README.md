@@ -1,20 +1,67 @@
-# Convex from Groovy
+<img src="logo.png" alt="Apache Groovy logo" width="240">
+<!-- Logo source: https://apache.org/logos/res/groovy/groovy.png -->
 
-This small Groovy client makes a normal Convex HTTP query and mutation, then keeps the same query live over `/api/sync` to show the counter changing from `0` to `1`.
+# Groovy
 
-It is an educational, unofficial protocol demonstration, not a production SDK or a package intended for publication.
+[Apache Groovy](https://groovy-lang.org/) is a Java-like language for the JVM. The project began in 2003 and reached 1.0 in January 2007. Groovy can be dynamically or statically typed, interoperates directly with Java, and is now most at home in JVM scripting, build and test automation, web applications, and readable domain-specific languages.
 
-## Start here
+This client uses Groovy 4 to make Convex HTTP calls and maintain a live query. It is an educational, unofficial demonstration, not a production SDK or a package intended for publication.
 
-[`examples/basics/Main.groovy`](examples/basics/Main.groovy) is the canonical example. It creates one unique room, reads it through HTTP, starts Live before the mutation, applies an idempotent mutation, and proves the resulting Live update agrees.
+## Getting Started
 
-## What works
+Read [`examples/basics/Main.groovy`](examples/basics/Main.groovy) for the complete `0 -> 1` counter journey. From the repository root, Docker builds the exact example and runs it against a unique room:
+
+```sh
+./run verify-example groovy
+```
+
+## Interesting Parts
+
+### A live query has an explicit owner
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function Counter() {
+  const room = "groovy-readme";
+  const state = useQuery(api.demo.state, { room });
+  // state.count is type-safe here because api.demo.state is generated.
+  return <p>{state?.count ?? "Loading..."}</p>;
+}
+```
+
+**Groovy**
+
+```groovy
+import convex.LiveClient
+import java.time.Duration
+import java.util.Objects
+
+String url = Objects.requireNonNull(System.getenv('CONVEX_URL'), 'CONVEX_URL is required')
+Map args = [room: 'groovy-readme'] // A map becomes the Convex argument object.
+
+try (LiveClient live = new LiveClient(url)) {
+  LiveClient.Subscription subscription = live.subscribe('demo:state', args)
+  Map state = (Map) subscription.next(Duration.ofSeconds(10))
+  println state.count // Groovy reads the decoded map entry like a property.
+  subscription.close()
+}
+```
+
+React starts, updates, and disposes the `useQuery` subscription with the component. This command-line client makes ownership visible. Its blocking `next` method is an API choice for a linear teaching example, not a limitation of Groovy, which also supports callbacks and asynchronous Java APIs.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
 | JSON HTTP query, mutation, action, bearer auth, logs, and structured errors | Verified by shared local and hosted conformance at this exact head |
 | `/api/sync` live queries with reconnect and error recovery | Verified by shared local and hosted conformance at this exact head |
 | Live auth, optimistic mutations, and `TransitionChunk` | Deliberately deferred |
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.groovy -->
 ```groovy
@@ -94,21 +141,12 @@ final class Main {
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker checks
+## Implementation Notes
 
-```sh
-./run test groovy       # Lints, compiles, and runs Groovy-local deterministic tests in Docker.
-./run build groovy      # Builds the linux/amd64 non-root conformance runtime image.
-./run verify-example groovy  # Root-owned: runs this exact example against the approved local deployment.
-./run verify-all groovy      # Root-owned: runs local and hosted black-box conformance serially.
-```
+Groovy map literals feed its JSON encoder directly, and decoded JSON maps support property-style reads such as `state.count`. Transport comes from the JDK's HTTP and WebSocket clients. One owner thread handles Live connection state, while bounded queues protect the 128 MiB runtime. The final images contain compiled Groovy bytecode and a stripped Groovy runtime on Temurin JRE 21, but no Groovy compiler or build tooling.
 
-The final images run compiled bytecode on the Temurin JRE. They contain no Groovy compiler, build tool, package manager, Node, Python, curl, or Convex CLI. The adapter and example also use separate compiled classpaths, so neither image contains the other's program or the test suite.
+## Known Issues
 
-## Protocol notes
-
-The client uses the pinned `convex-rs-0.10.4-unversioned-sync` `/api/sync` profile. JDK WebSocket callbacks copy fragments and control messages into a bounded inbox; one single-threaded owner performs protocol parsing, writes, reconnects, and query-set mutations. Each subscription keeps the newest 16 events within a 2 MiB encoded-value budget. The callback inbox is separately bounded to 32 events and 4 MiB. The test-only adapter supports strict, byte-bounded NDJSON on stdin/stdout or one `ADAPTER_LISTEN` TCP connection. Its output queue is bounded to 16 events and 4 MiB, and it exposes `debugDisconnect` only for the shared controller.
-
-## Limitations
-
-This is intentionally narrow: it has no persistence, offline replay, optimistic state, package metadata, or claim of protocol stability. A `QueryFailed` is delivered as a structured subscription error; a later valid `QueryUpdated` on the same subscription recovers it.
+1. Live authentication, optimistic updates, WebSocket mutations, and `TransitionChunk` assembly are not implemented.
+2. The Live client follows the pinned, undocumented `convex-rs-0.10.4-unversioned-sync` profile, so it must not be treated as a stable public protocol.
+3. There is no persistence or offline replay. A subscription reports a structured failure and can recover when a later valid update arrives.

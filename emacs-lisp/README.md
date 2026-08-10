@@ -1,33 +1,171 @@
-# Convex from Emacs Lisp
+<img src="logo.png" alt="GNU Emacs logo" width="128">
+<!-- Logo source: https://git.savannah.gnu.org/cgit/emacs.git/plain/etc/images/icons/hicolor/128x128/apps/emacs.png -->
 
-This demonstration uses batch-mode GNU Emacs - the same Emacs Lisp a text
-editor's own configuration is written in - to call Convex's documented JSON
-HTTP endpoints and to keep a reactive query current through a native Emacs
-Lisp WebSocket connection.
+# Emacs Lisp
 
-It is an educational, unofficial experiment. It is not a production SDK, an
-officially sanctioned Convex client, or a package intended for publication.
+[Emacs Lisp](https://www.gnu.org/software/emacs/) is the Lisp dialect built
+into GNU Emacs. It powers most Emacs commands and extensions, so its everyday
+niche is editor configuration and packages rather than standalone services.
+[GNU Emacs work began in 1984](https://www.gnu.org/gnu/the-gnu-project.html)
+and had its [initial public release in
+1985](https://www.gnu.org/software/emacs/history.html); today the same
+interpreter can also run scripts in batch mode, which is how this client talks
+to Convex.
 
-## Start here
+This is an educational, unofficial demonstration. It is not a production SDK,
+an officially sanctioned Convex client, or a package intended for publication.
 
-[`examples/basics/main.el`](examples/basics/main.el) is the canonical
-example. It reads a new counter room over HTTP, starts Live before changing
-it, applies an idempotent mutation, and proves the same `0 -> 1` journey
-arrived through the subscription. The block below is generated from that
-exact runnable file.
+## Getting Started
 
-## What works
+[`examples/basics/main.el`](examples/basics/main.el) is the canonical example.
+It queries a fresh counter room, subscribes before changing it, applies an
+idempotent mutation, and observes the reactive `0 -> 1` update.
 
-| Capability | Current state | What that means |
+From the repository root, run the exact example in its Docker runtime:
+
+```sh
+./run verify-example emacs-lisp
+```
+
+Docker supplies the pinned GNU Emacs 28.2 runtime and the verifier supplies a
+unique room on an approved test deployment.
+
+## Interesting Parts
+
+### JSON objects become Lisp hash tables
+
+In a normal Convex React app, the generated `api` object carries the function's
+argument and return types into `useQuery`. This small client accepts path
+strings and decodes JSON objects into Emacs Lisp hash tables instead.
+
+**TypeScript with React**
+
+```tsx
+import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
+
+function Counter() {
+  const state = useQuery(api.demo.state, { room: "readme-room" });
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // Generated types know state.count is a number.
+}
+
+export function App() {
+  return <ConvexProvider client={convex}><Counter /></ConvexProvider>;
+}
+```
+
+**Emacs Lisp**
+
+```emacs-lisp
+(let ((deployment (getenv "CONVEX_URL"))
+      (args (make-hash-table :test 'equal)))
+  (when (or (null deployment) (string-empty-p deployment))
+    (error "CONVEX_URL is required"))
+  ;; JSON object keys are strings in this client.
+  (puthash "room" "readme-room" args)
+  (convex-configure deployment)
+  (let ((state (convex-query "demo:state" args)))
+    (unless state
+      (error "query failed: %s" (plist-get convex--last-error :message)))
+    (message "%s" (gethash "count" state)))) ; Checked at runtime, not generated typing.
+```
+
+`convex-query` is a one-off, blocking HTTP call. It is useful in a script, but
+it is not equivalent to React's reactive `useQuery` hook.
+
+### React owns the subscription; this client asks you to pump it
+
+React rerenders after the mutation because `useQuery` owns its subscription
+lifecycle. The Emacs Lisp API exposes that lifecycle directly: subscribe,
+pump the connection until an event is queued, decode it, then unsubscribe and
+close.
+
+**TypeScript with React**
+
+```tsx
+import { ConvexProvider, ConvexReactClient, useMutation, useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
+
+function Counter() {
+  const room = "readme-room";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  async function addOne() {
+    const result = await increment({
+      room,
+      language: "typescript",
+      runId: crypto.randomUUID(),
+    });
+    console.log(result.applied, result.state.count); // Both fields are generated types.
+  }
+
+  return <button onClick={() => void addOne()}>{state?.count ?? "Loading..."}</button>;
+}
+
+export function App() {
+  return <ConvexProvider client={convex}><Counter /></ConvexProvider>;
+}
+```
+
+**Emacs Lisp**
+
+```emacs-lisp
+(let ((deployment (getenv "CONVEX_URL"))
+      (query-args (make-hash-table :test 'equal))
+      (mutation-args (make-hash-table :test 'equal))
+      subscription)
+  (when (or (null deployment) (string-empty-p deployment))
+    (error "CONVEX_URL is required"))
+  (puthash "room" "readme-room" query-args)
+  (puthash "room" "readme-room" mutation-args)
+  (puthash "language" "emacs-lisp" mutation-args)
+  ;; A fresh key makes retries idempotent without colliding with an earlier evaluation.
+  (puthash "runId"
+           (format "readme-%x-%x" (emacs-pid) (truncate (* (float-time) 1000000)))
+           mutation-args)
+  (convex-configure deployment)
+  (unwind-protect
+      (progn
+        (setq subscription (convex-live-subscribe "demo:state" query-args))
+        ;; This client deliberately exposes a blocking pull API for Live events.
+        (while (not (convex-live-next-event))
+          (convex-live-pump (+ (float-time) 0.2)))
+        (let ((result (convex-mutation "demo:increment" mutation-args)))
+          (message "%s %s"
+                   (gethash "applied" result)
+                   (gethash "count" (gethash "state" result))))
+        ;; Pump again to receive the value changed by the mutation.
+        (while (not (convex-live-next-event))
+          (convex-live-pump (+ (float-time) 0.2)))
+        (message "%s" (gethash "count"
+                               (json-parse-string convex-live--event-payload
+                                                  :object-type 'hash-table))))
+    (when subscription (convex-live-unsubscribe subscription))
+    (convex-live-close)))
+```
+
+Emacs itself supports asynchronous network processes, callbacks, timers, and
+an event loop. The explicit `pump` and `next-event` shape is this client's API
+choice for deterministic batch programs, not a limitation of Emacs Lisp.
+
+## Status
+
+| Capability | Current state | Evidence-backed scope |
 | --- | --- | --- |
-| HTTP | Badge earned | Query, mutation, action, bearer-token lifecycle, structured `FunctionError`/`ProtocolError`/`TransportError` classification, and logs pass a real loopback test suite in Docker and shared local and hosted black-box conformance (31/31 both profiles). The example-runtime and runtime Docker images were also run end to end against a real loopback deployment, not merely built. |
-| Live | Badge earned | Subscribe, an initial value, an external update, `QueryFailed`, and the unsubscribe-before-acknowledgement barrier pass a real loopback test suite against the client directly, plus shared local and hosted black-box conformance (31/31 both profiles). `debugDisconnect`'s acknowledgement barrier and five consecutive real reconnect-and-resubscribe cycles, each required to deliver a genuine resubscribed value, are proven deterministically against a real second OS process. The shared harness drives the adapter over TCP; the TCP transport was independently confirmed end to end (subscribe, deliver a value) in the real runtime image, but the stdio transport has an unresolved intermittent crash under Live load that this run did not exercise - see Limitations. |
+| HTTP | Badge earned | Query, mutation, action, bearer-token lifecycle, logs, and structured function, protocol, and transport errors passed 31/31 shared checks on both local and hosted deployments. |
+| Live | Badge earned | Subscription delivery, external updates, query failure and recovery, unsubscribe barriers, and five real reconnect-and-resubscribe cycles passed the same 31/31 local and 31/31 hosted checks. The shared harness uses the adapter's TCP transport; the separate stdio Live path still has the intermittent crash noted below. |
 
-The shared evaluator awarded both badges from a clean exact-head build
-(`e5e2b85`): 31 of 31 conformance checks against a local backend and 31 of
-31 against the hosted deployment over real TLS.
+Both badges were awarded from the clean exact-head build at `e5e2b85`, with
+hosted checks running over real TLS. This documentation update does not claim a
+new verification run.
 
-## The basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.el -->
 ```emacs-lisp
@@ -158,133 +296,61 @@ the event kind (\"value\"/\"error\"), or nil on timeout."
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verify it in Docker
+## Implementation Notes
+
+This is a native Emacs Lisp implementation. HTTP uses Emacs's bundled
+`url-retrieve-synchronously`, JSON uses `json-serialize` and
+`json-parse-string`, and TLS uses `open-network-stream` with GnuTLS. The
+[Emacs Lisp manual](https://www.gnu.org/software/emacs/manual/html_node/elisp/Processes.html)
+describes those network connections as process objects, which is why Live can
+wait for socket input through `accept-process-output` without another runtime.
+
+Emacs does not bundle a WebSocket client in the pinned 28.2 image, so
+[`client/convex.el`](client/convex.el) implements the RFC 6455 handshake,
+masking, fragmentation, ping/pong, and framing over Emacs network processes.
+It limits a frame to 2 MiB and gives a partially received frame eight seconds
+to finish. Live events sit in a bounded client-owned queue of 64 events and
+8 MiB, with the oldest event dropped first if either limit is exceeded.
+
+The public API deliberately keeps one global client and returns decoded values
+synchronously. Failed HTTP calls return `nil` and leave a structured error in
+`convex--last-error`. Live uses explicit `convex-live-pump` and
+`convex-live-next-event` calls even though Emacs supports asynchronous process
+filters and callbacks. That choice keeps the batch example and conformance
+adapter deterministic, but an editor package would probably wrap this core in
+callbacks or promises of its own.
+
+The test-only adapter supports both TCP and NDJSON over standard input. Its
+small `stdin-poll.c` helper only checks whether inherited stdin is ready; it
+does not implement any Convex behavior and is not part of the educational
+client. HTTP pins the documented JSON endpoints. Live pins
+`convex-rs-0.10.4-unversioned-sync` at
+`6f1df8a8ba1665084ec001e307ca841ca17074d7` and `/api/sync`, so hosted
+verification is important because that realtime protocol is not documented as
+stable.
+
+For the language-local Docker gate, run:
 
 ```sh
 ./run test emacs-lisp
-./run verify-example emacs-lisp
-./run verify emacs-lisp
-./run verify-hosted emacs-lisp
-./run verify-all emacs-lisp
 ```
 
-`test` installs `emacs-nox` 28.2, byte-compiles the client and the adapter
-with warnings treated as errors, lints every source file, and runs real
-loopback JSON, HTTP, WebSocket, and Live protocol fixtures, the conformance
-adapter's stdio and TCP modes, and the example's fast-fail path, all inside
-Docker. The remaining commands are root-owned shared gates for the approved
-local and hosted deployments; `./run verify-all emacs-lisp` has passed both,
-earning the http and live badges above.
+That byte-compiles with warnings treated as errors, checks source style, and
+runs the loopback HTTP, WebSocket, Live, queue, and adapter tests. The stronger
+root-owned gates are `./run verify emacs-lisp`, `./run verify-hosted
+emacs-lisp`, and `./run verify-all emacs-lisp`.
 
-## Conformance and protocol notes
+## Known Issues
 
-The test-only adapter under `client/tests/conformance/` speaks NDJSON
-protocol v1 on stdin/stdout and TCP. It calls the real Emacs Lisp client
-(`client/convex.el`) for every operation. Its adapter-only `debugDisconnect`
-command lets the shared harness prove reconnects. Command schemas are
-strict: a missing or wrongly typed `id`, `op`, `path`, `args`,
-`subscriptionId`, or `token` is a structured `ProtocolError` and never
-reaches a deployment.
-
-HTTP uses Convex's documented `format: "json"` endpoints. Live pins
-`convex-rs-0.10.4-unversioned-sync` at
-`6f1df8a8ba1665084ec001e307ca841ca17074d7` and `/api/sync`. That realtime
-protocol is not documented as stable, so hosted verification remains
-required before any Live claim.
-
-Responses are classified by what the deployment actually said, not only by
-the status line:
-
-| Response | Result | Why |
-| --- | --- | --- |
-| `200` with `status: "success"` | value and logs | the documented success envelope |
-| `200` with `status: "error"`, or `560` | `FunctionError` | the function ran and failed, so the caller can act on it |
-| `408`, `429`, `5xx` | `TransportError` | this attempt was not answered and may be retried |
-| any other non-`200` | `ProtocolError` | the deployment refused the request and would refuse it again |
-
-A single WebSocket frame is bounded to 2 MiB, and once any byte of a frame
-has been consumed, an 8-second partial-frame deadline governs completing it,
-tracked independently of the caller's own polling deadline so a slow peer
-cannot hold the connection open with repeated short polls.
-
-Emacs has genuine network primitives, so `client/convex.el` is native end to
-end and has no C in it at all: HTTP goes through `url.el`
-(`url-retrieve-synchronously`), JSON through the built-in
-`json-parse-string`/`json-serialize`, SHA-1 through `secure-hash`, base64
-through `base64-encode-string`/`base64-decode-string`, and TLS through
-`open-network-stream`'s own `:type 'tls` (GnuTLS - confirmed with a real
-HTTPS connection, not merely `gnutls-available-p`). Emacs has no WebSocket
-library, so the RFC 6455 handshake and frame format for Live are
-hand-written Emacs Lisp over `make-network-process`/`open-network-stream`,
-the same way several other clients in this project implement WebSockets by
-hand over a raw socket. The one piece of native code anywhere in this
-client, `client/tests/conformance/stdin-poll.c`, exists solely for the
-test-only adapter's stdio transport - see Limitations for exactly why.
-
-## Limitations
-
-- Live authentication, optimistic updates, WebSocket mutations and actions,
-  journals, and `TransitionChunk` assembly are intentionally not yet
-  implemented. Mutations and actions use HTTP.
-- Values are limited to this experiment's JSON-safe subset: objects, arrays,
-  strings, whole numbers within a `uint32` range, booleans, and null. Tagged
-  Convex `Int64`, bytes, and special floats are outside scope.
-- `client/tests/conformance/stdin-poll.c` is the only native code anywhere
-  in this client, and it exists solely for the test-only NDJSON adapter,
-  never for `client/convex.el`. The adapter's own loop must multiplex two
-  independent readiness conditions - the next NDJSON command arriving on
-  stdin, and the next Live delivery becoming available from the WebSocket
-  the client already owns - without either one blocking the other
-  indefinitely. Emacs's own network processes support exactly this via
-  `accept-process-output` with a timeout (used natively for the TCP
-  transport, with no helper at all), but batch-mode Emacs Lisp has no
-  equivalent for its own inherited stdin: `read-from-minibuffer` (the only
-  primitive that reads piped, non-tty stdin at all in `--batch` mode) is an
-  uninterruptible blocking read with no timeout,
-  `read-event`/`read-char`/`sit-for` never observe piped stdin data even
-  when it is already available, Lisp threads do not run concurrently with a
-  blocking read (confirmed empirically in both directions), and a spawned
-  subprocess does not inherit this process's own external stdin (Emacs
-  redirects a child's stdin to a pipe it controls). Several other
-  single-threaded languages in this project hit the identical wall for the
-  identical reason and solve it the identical way: a `poll(2)` readiness
-  check on stdin, callable with a timeout. `stdin-poll.c` never reads or
-  forwards a byte of stdin itself - only `convex.el`'s own
-  `read-from-minibuffer` call ever consumes adapter input.
-- The stdio transport's multiplexing loop was observed during testing to
-  crash the whole Emacs process, without a Lisp-level error or backtrace,
-  on some runs where a Live subscription became active while the adapter
-  was simultaneously polling stdin at a high cadence on this QEMU-emulated
-  build host; other runs of the identical scenario completed without
-  incident, and it was not root-caused in the time available. The TCP
-  transport is unaffected - proven reliably and repeatedly, including a
-  full subscribe-and-deliver-a-value exchange against a real loopback
-  fixture in the actual runtime image - because it never uses `stdin-poll`
-  or a subprocess at all. `client/tests/live_test.el` proves the complete
-  Live acceptance list against `client/convex.el` directly, not through the
-  adapter, so that suite is unaffected; the specific, unresolved risk is
-  stdio-transported Live delivery through the adapter.
-- Live delivery is a bounded queue owned entirely by `convex.el`: at most 64
-  pending events and 8 MiB of conservatively charged encoded bytes per
-  client, oldest dropped first. The adapter adds no second queue on top of
-  it - it drains whatever is available and writes it out immediately, so a
-  stalled reader applies ordinary OS pipe or socket backpressure to the
-  adapter's own loop rather than an adapter-private buffer growing without
-  bound. Unsubscribe and a same-subscriptionId replacement bump a per-query
-  generation counter that invalidates any already-queued event for that
-  query before its acknowledgement is published; this has a deterministic,
-  non-timing-dependent regression test.
-- Language-local tests cover WebSocket frame encode/round-trip (short and
-  extended-length payloads), the Convex timestamp/version comparison Live's
-  reconnect and out-of-order guard depend on, HTTP envelope message
-  classification, the delivery queue's 64-event bound and oldest-dropped
-  ordering, generation-based stale-event invalidation, a real loopback HTTP
-  fixture covering bearer auth, structured errors, and logs, a real loopback
-  WebSocket fixture covering the handshake and masking, and a real second
-  process acting as a Live peer covering Add, an initial value, an external
-  update, five real reconnects, `QueryFailed` with structured `errorData`,
-  and the unsubscribe generation barrier. Root-owned local and hosted
-  conformance have since passed 31/31 on both profiles, earning the http
-  and live badges above; the stdio-transport Live risk noted earlier in
-  this list is unaffected by that result, since the shared harness drives
-  the adapter over TCP and never exercises the stdio transport.
+1. Live authentication, optimistic updates, WebSocket mutations and actions,
+   journals, and `TransitionChunk` assembly are not implemented. Mutations and
+   actions go over HTTP.
+2. Values are limited to JSON-safe objects, arrays, strings, booleans, null,
+   and whole numbers in the supported range. Tagged Convex `Int64`, bytes, and
+   special floats are outside this experiment.
+3. The adapter's stdio transport has intermittently crashed under concurrent
+   Live delivery and high-cadence stdin polling on a QEMU-emulated build host.
+   The TCP adapter path used by shared conformance and the direct client Live
+   tests are unaffected, but stdio Live remains unresolved.
+4. A slow consumer can overflow the bounded Live queue. The client drops the
+   oldest pending events rather than allowing memory use to grow without bound.

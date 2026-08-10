@@ -1,19 +1,183 @@
-# Convex from Kotlin
+<img src="logo.png" alt="Kotlin logo" width="240">
+<!-- Logo source: https://resources.jetbrains.com/storage/products/kotlin/docs/kotlin_logos.zip -->
 
-This folder shows a small Kotlin program talking directly to Convex. It uses
-the documented JSON HTTP endpoints and a native, experimental Live WebSocket
-implementation to follow a counter as it changes.
+# Kotlin
 
-This is educational and unofficial, not a production SDK or a package intended
-for publication.
+[Kotlin](https://kotlinlang.org/) is an open-source, statically typed language
+developed by JetBrains. The project began in 2010 and reached 1.0 in 2016. It
+mixes object-oriented and functional features, compiles to Java-compatible JVM
+bytecode, and can also target Android, JavaScript, WebAssembly, and native code.
 
-## Start here
+Its clearest present-day niche is Android, where
+[Google's tooling and guidance are Kotlin-first](https://developer.android.com/kotlin/first),
+but its Java interoperability also makes it practical for
+[JVM backend work](https://kotlinlang.org/docs/server-overview.html) with
+frameworks such as Spring and Ktor. This repository's client uses that JVM
+path. It is an educational, unofficial demonstration, not a production SDK or
+a package intended for publication.
 
-The [basic example](examples/basics/Main.kt) follows one useful journey: it
-reads a counter with HTTP, starts Live before changing anything, applies an
-idempotent mutation, and confirms the Live update agrees with the response.
+## Getting Started
 
-## What works
+The [canonical example](examples/basics/Main.kt) reads a counter once over
+HTTP, subscribes to the same counter over Live, applies an idempotent mutation,
+and checks that the reactive update agrees with the mutation result.
+
+From the repository root, run:
+
+```sh
+./run verify-example kotlin
+```
+
+The command builds and runs the exact example in Docker against a verifier-owned
+room. It proves the example's `0 -> 1` journey, not the client's full conformance
+suite.
+
+## Interesting Parts
+
+### Generated types versus explicit JSON
+
+**TypeScript with React**
+
+```tsx
+import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
+
+function Counter() {
+  const state = useQuery(api.demo.state, { room: "readme-kotlin" });
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // Function, arguments, and result are generated types.
+}
+
+export function App() {
+  return (
+    <ConvexProvider client={convex}>
+      <Counter />
+    </ConvexProvider>
+  );
+}
+```
+
+**Kotlin**
+
+```kotlin
+import convex.kotlin.ConvexClient
+import convex.kotlin.integralIntOrNull
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.put
+
+fun main() {
+    val deploymentUrl = System.getenv("CONVEX_URL") ?: error("CONVEX_URL is required")
+    val arguments = buildJsonObject { put("room", "readme-kotlin") }
+
+    ConvexClient(deploymentUrl).use { client ->
+        // This client accepts a function path and JSON, rather than generated types.
+        val state = client.query("demo:state", arguments).value.jsonObject
+        val count = state["count"]?.integralIntOrNull() ?: error("count was not an Int")
+        println(count)
+    } // use closes the client's HTTP and Live resources.
+}
+```
+
+Kotlin itself is statically typed, but this small client deliberately exposes
+`JsonElement` values instead of generating a Kotlin model for each Convex
+function. The React hook remains subscribed and rerenders its component. The
+Kotlin `query` above is a one-off HTTP read. See
+[`ConvexClient.kt`](client/src/main/kotlin/convex/kotlin/ConvexClient.kt) for the
+actual API.
+
+### React-owned reactivity versus an owned subscription
+
+**TypeScript with React**
+
+```tsx
+import {
+  ConvexProvider,
+  ConvexReactClient,
+  useMutation,
+  useQuery,
+} from "convex/react";
+import { api } from "./convex/_generated/api";
+
+const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
+
+function Counter() {
+  const state = useQuery(api.demo.state, { room: "readme-live" });
+  const increment = useMutation(api.demo.increment);
+  if (state === undefined) return <p>Loading...</p>;
+
+  async function addOne() {
+    const result = await increment({
+      room: "readme-live",
+      language: "typescript",
+      runId: crypto.randomUUID(),
+    });
+    console.log(result.state.count); // The mutation result is type-safe too.
+  }
+
+  // React keeps the query subscribed and rerenders after the mutation.
+  return <button onClick={() => void addOne()}>Count: {state.count}</button>;
+}
+
+export function App() {
+  return (
+    <ConvexProvider client={convex}>
+      <Counter />
+    </ConvexProvider>
+  );
+}
+```
+
+**Kotlin**
+
+```kotlin
+import convex.kotlin.ConvexClient
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.put
+import java.util.UUID
+
+fun main() {
+    val deploymentUrl = System.getenv("CONVEX_URL") ?: error("CONVEX_URL is required")
+    val roomArguments = buildJsonObject { put("room", "readme-live") }
+
+    ConvexClient(deploymentUrl).use { client ->
+        // Start Live first so no update can be missed between the read and mutation.
+        client.subscribe("demo:state", roomArguments).use { subscription ->
+            val initialUpdate = subscription.next() ?: error("initial Live value timed out")
+            initialUpdate.error?.let { throw it }
+            val initial = initialUpdate.value ?: error("initial Live value was missing")
+            println(initial.jsonObject["count"]) // The first snapshot is delivered explicitly.
+
+            val result =
+                client.mutation(
+                    "demo:increment",
+                    buildJsonObject {
+                        put("room", "readme-live")
+                        put("language", "kotlin")
+                        put("runId", UUID.randomUUID().toString())
+                    },
+                ).value.jsonObject
+            println(result["state"]) // The caller decodes the returned JSON shape.
+
+            val updatedEvent = subscription.next() ?: error("Live update timed out")
+            updatedEvent.error?.let { throw it }
+            val updated = updatedEvent.value ?: error("Live update value was missing")
+            println(updated.jsonObject["count"]) // next blocks until a snapshot arrives.
+        } // Closing the subscription removes it from Live.
+    }
+}
+```
+
+Kotlin supports coroutines, callbacks, and streams. This client's blocking
+`Subscription.next()` is an API choice for a small command-line demonstration,
+not a language limitation. It makes lifecycle and ordering visible, while React
+owns those details for `useQuery`. The complete sequence is in the
+[canonical example](examples/basics/Main.kt).
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -23,7 +187,7 @@ idempotent mutation, and confirms the Live update agrees with the response.
 | Earned capability badges | HTTP and Live |
 | Live authentication, WebSocket mutations/actions, optimistic updates, replay | Deferred |
 
-## Basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/Main.kt -->
 ```kotlin
@@ -108,40 +272,37 @@ private fun count(
 The block above is generated from the exact runnable source used by the Docker
 image. Run `./run sync-examples` after editing it.
 
-## Docker-only verification
+## Implementation Notes
 
-```sh
-./run test kotlin
-./run build kotlin
-```
+This is a native Kotlin/JVM implementation. The public client uses JDK 21's
+`HttpClient` and `WebSocket` for transport and `kotlinx.serialization` for JSON.
+It does not delegate Convex behavior to the JavaScript client, the Convex CLI,
+or another language runtime. HTTP query, mutation, and action calls are
+synchronous, retain Convex log lines, and keep function errors distinct from
+transport and protocol errors.
 
-`test` compiles the Kotlin sources, runs local HTTP tests, and assembles the
-canonical example plus conformance adapter inside Docker. `build` creates the
-minimal Linux amd64 adapter image. The coordinator runs the shared example and
-hosted conformance gates serially because they share a backend and evidence.
+Resource ownership follows familiar JVM patterns: `ConvexClient` and
+`Subscription` implement `AutoCloseable`, so callers can scope them with
+Kotlin's `use` function. Live socket state, reconnects, and query-set changes
+run through one owner thread. Each subscription has a bounded queue containing
+at most the newest 16 updates, which prevents a slow consumer from creating an
+unbounded backlog.
 
-## Conformance and protocol notes
+The Live implementation targets the experimental, unversioned `/api/sync`
+profile documented by `convex-rs` 0.10.4 at commit
+`6f1df8a8ba1665084ec001e307ca841ca17074d7`. The test-only
+[`AdapterMain.kt`](client/tests/conformance/AdapterMain.kt) translates the
+shared conformance protocol into calls on the real client. Docker builds with
+Kotlin 2.2.21 and JDK 21, then uses `jlink` to create a smaller JVM runtime for
+the final Linux amd64 images.
 
-The test-only executable at `client/tests/conformance/AdapterMain.kt` accepts
-NDJSON protocol v1 through stdin/stdout or `ADAPTER_LISTEN` TCP. It calls the
-real Kotlin client for query, mutation, action, subscription, authentication,
-unsubscribe, clean close, and its adapter-only `debugDisconnect` hook.
+## Known Issues
 
-Live has one owner thread for socket reads, writes, reconnects, and query-set
-versions. Each subscription keeps the newest 16 updates, dropping old
-intermediate state for a slow consumer. A relay rechecks subscription identity
-after dequeue so a stale event cannot escape after unsubscribe or same-ID
-replacement.
-
-The implementation targets the experimental unversioned `/api/sync` profile
-documented by `convex-rs` 0.10.4 at commit
-`6f1df8a8ba1665084ec001e307ca841ca17074d7`. It uses JDK HTTP/WebSocket and
-Kotlin JSON only, never the Convex CLI, Node, Python, curl, or another Convex
-client.
-
-## Limitations
-
-Live authentication, WebSocket mutations/actions, optimistic updates, journals,
-replay, tagged Convex values beyond JSON-safe values, and TransitionChunk
-assembly are deferred. A TransitionChunk is treated as protocol drift and
-reconnects, rather than silently producing a partial state.
+1. Live authentication, WebSocket mutations and actions, optimistic updates,
+   journals, and replay are deferred. HTTP authentication is supported.
+2. A `TransitionChunk` is treated as protocol drift and triggers a reconnect;
+   the client does not assemble chunked transitions.
+3. A slow Live consumer receives the newest snapshots, but older intermediate
+   values are deliberately dropped after its 16-update queue fills.
+4. The demonstration covers JSON-safe values. Tagged Convex values outside
+   ordinary JSON are deferred.

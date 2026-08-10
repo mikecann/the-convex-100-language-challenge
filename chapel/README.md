@@ -1,30 +1,157 @@
-# Convex from Chapel
+<img src="logo.png" alt="Chapel logo" width="220">
+<!-- Logo source: https://chapel-lang.org/images/chapel-logo.png -->
 
-This folder shows Chapel calling Convex queries, mutations, and actions over
-HTTPS, then following a query over a Live WebSocket connection.
+# Chapel
 
-This is an educational, unofficial demonstration. It is not a production SDK
-or a package intended for publication.
+[Chapel](https://chapel-lang.org/) is a compiled language for productive
+parallel computing, from a multicore laptop to clusters, GPUs, and
+supercomputers. It grew out of Cray's work in DARPA's High Productivity
+Computing Systems program and is now an open-source project led by Hewlett
+Packard Enterprise with community collaborators. Its C-like surface is meant
+to feel approachable to developers coming from C, C++, Fortran, Java, Python,
+or MATLAB, while ideas from ZPL, High-Performance Fortran, and Cray's
+parallel-C extensions shaped its parallel model. Chapel remains a specialist
+language, used mainly in high-performance computing and large-scale data work.
 
-## Start here
+This client is an educational, unofficial demonstration. It is not a
+production SDK and is not a package intended for publication.
 
-[`examples/basics/main.chpl`](examples/basics/main.chpl) follows one isolated
-counter room from 0 to 1. It queries the current state, starts Live before the
-write, applies an idempotent mutation, and receives the resulting Live value.
+## Getting Started
 
-## What works
+The canonical [`examples/basics/main.chpl`](examples/basics/main.chpl) example
+queries a fresh counter, subscribes before changing it, runs an idempotent
+mutation, and observes the reactive update from `0` to `1`.
+
+From the repository root, run:
+
+```sh
+./run verify-example chapel
+```
+
+That command builds and runs the exact example in Docker against an isolated
+room. You do not need Chapel installed on your machine.
+
+## Interesting Parts
+
+### Mutation data crosses an explicit JSON boundary
+
+**TypeScript with React**
+
+```tsx
+import { useMutation } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function IncrementButton() {
+  const increment = useMutation(api.demo.increment);
+
+  async function handleClick() {
+    const result = await increment({
+      room: "chapel-readme",
+      language: "typescript",
+      runId: crypto.randomUUID(),
+    });
+    console.log(result.state.count); // Generated types know this is a number.
+  }
+
+  return <button onClick={handleClick}>Increment</button>;
+}
+```
+
+**Chapel**
+
+```chapel
+use Convex;
+use ConvexTransport;
+
+const deploymentUrl = environment("CONVEX_URL");
+if deploymentUrl.numBytes == 0 then halt("CONVEX_URL is required");
+var client = new owned Client(deploymentUrl);
+defer client.close(); // The owned client also cleans itself up at scope exit.
+
+const room = "chapel-readme";
+const mutationArgs = "{\"room\":" + jsonQuote(room) +
+  ",\"language\":\"chapel\",\"runId\":" +
+  jsonQuote(randomUUID()) + "}";
+
+const result = client.mutation("demo:increment", mutationArgs);
+if !result.ok then halt("mutation failed: ", result.failure.message);
+
+// This client returns raw JSON, so decode and validate the application value.
+const (hasState, stateJson) = jsonRaw(result.valueJson, "state");
+const (validCount, count) = jsonIntegralField(stateJson, "count");
+if !hasState || !validCount then halt("mutation returned an invalid state");
+writeln(count);
+```
+
+React's generated Convex API carries argument and return types into the
+component. This Chapel demonstration deliberately exposes JSON strings and a
+`callResult` record, so the caller handles failures and decoding explicitly.
+The numeric helper accepts Convex values such as `1.0` only when they are
+mathematically integral and fit in a Chapel `int(64)`.
+
+### A Live query has an explicit owner and inbox
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function Counter() {
+  const room = "chapel-readme";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>Count: {state.count}</p>; // React rerenders when the query changes.
+}
+```
+
+**Chapel**
+
+```chapel
+use Convex;
+use ConvexTransport;
+
+const deploymentUrl = environment("CONVEX_URL");
+if deploymentUrl.numBytes == 0 then halt("CONVEX_URL is required");
+var client = new owned Client(deploymentUrl);
+defer client.close(); // Retires the background Live connection.
+
+const room = "chapel-readme";
+const roomArgs = "{\"room\":" + jsonQuote(room) + "}";
+const (subscription, failure) = client.subscribe("demo:state", roomArgs);
+if failure.isPresent || subscription == nil then
+  halt("subscribe failed: ", failure.message);
+defer subscription!.close(); // Unsubscribes when this scope ends.
+
+// next() waits for one complete snapshot or update from the bounded inbox.
+const update = subscription!.next(10.0);
+if !update.available || update.failure.isPresent || !update.hasValue then
+  halt("Live did not return a value");
+const (validCount, count) = jsonIntegralField(update.valueJson, "count");
+if !validCount then halt("Live returned an invalid count");
+writeln(count);
+```
+
+`useQuery` lets React own subscription setup, teardown, and rerendering. The
+command-line Chapel API instead returns a `shared Subscription` and lets the
+caller pull updates with blocking `next(timeout)`. Blocking delivery is this
+client's API choice, not a Chapel limitation: Chapel has its own task-parallel
+constructs, and this client uses a background task to own the WebSocket.
+
+## Status
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
 | HTTP | Badge earned | Query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented and pass shared local and hosted black-box conformance. |
-| Live | Badge earned | Initial and updated query values, unsubscribe, reconnect-on-drop with exponential backoff, unchanged-rehydration suppression, reactive error recovery, and clean shutdown are implemented and pass shared local and hosted black-box conformance, including a debugDisconnect-triggered five-reconnect proof and a QueryFailed-then-recovery cycle. |
-| Live authentication and tagged Convex values | Deferred | Not implemented; see Limitations. |
+| Live | Badge earned | Initial and updated query values, unsubscribe, reconnect-on-drop with exponential backoff, unchanged-rehydration suppression, reactive error recovery, and clean shutdown are implemented and pass shared local and hosted black-box conformance, including a `debugDisconnect`-triggered five-reconnect proof and a `QueryFailed`-then-recovery cycle. |
 
 The shared evaluator awarded both badges from a clean exact-head build: 31 of
 31 checks against a local backend and 31 of 31 against the hosted deployment
-over real TLS.
+over real TLS. The manifest still defers Live authentication and tagged Convex
+values, so neither is implied by those badges.
 
-## Basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.chpl -->
 ```chapel
@@ -138,121 +265,55 @@ module ChapelConvexBasics {
 The block above is projected from the exact source compiled into
 `/usr/local/bin/convex-example` and shown on the evidence site.
 
-## Docker verification
+## Implementation Notes
 
-No Chapel tooling runs on the host.
+This is a native Chapel client, not a wrapper around another Convex SDK.
+Chapel implements the Convex request envelopes, result handling, Live state
+machine, reconnect behavior, and subscription lifecycle. A small C boundary
+uses libcurl for HTTP, TLS, and WebSockets and json-c for dynamic JSON parsing,
+which is a practical fit because Chapel has direct
+[C interoperability](https://chapel-lang.org/docs/technotes/extern.html).
+
+The ownership words in the example are meaningful. `owned Client` gives one
+scope responsibility for the client, while `shared Subscription` allows the
+background Live task and the consuming task to keep the same subscription
+alive safely. Chapel's compiler manages both lifetimes. See the official
+[class lifetime documentation](https://chapel-lang.org/docs/language/spec/classes.html)
+for the distinction between `owned`, `shared`, `borrowed`, and `unmanaged`.
+
+One background Chapel task owns all WebSocket reads, writes, reconnects, and
+query changes. Each subscription keeps the newest 16 complete updates within a
+4 MiB limit, with at most 64 subscriptions and a 32 MiB aggregate Live budget.
+If a subscription inbox overflows, it drops the oldest update. The API exposes
+function, protocol, transport, and closed failures as data so callers can
+decide how to handle them.
+
+All development commands run through Docker:
 
 ```sh
 ./run test chapel
-./run verify-example chapel
 ./run verify chapel
 ./run verify-hosted chapel
 ./run verify-all chapel
 ```
 
-`test` is the language-local formatting, unit, architecture, adapter, and
-compilation gate. It includes raw HTTP, TLS, and RFC 6455 peers which exercise
-body and frame limits, absolute deadlines, strict upgrades, fragmented UTF-8,
-control frames, malformed-101 rejection before any Convex message, continuous
-ping and slow-write deadlines, exact RFC 6455 decoding after forced short
-writes, non-2xx HTTP rejection, repeated reconnects without pre-establishment
-transport events, one-byte frame-header retirement after Add, complete/complete
-and complete/partial buffered decoder states, repeated idle timeouts followed
-by healthy traffic, hydration suppression, query failures, generation barriers,
-and a real stopped-reader adapter below 128 MiB. The other
-commands execute the canonical example and shared black-box contracts; only
-their recorded results may award HTTP or Live badges.
+`test` covers formatting, compilation, unit tests, architecture, hostile HTTP
+and WebSocket peers, and bounded shutdown. `verify` and `verify-hosted` run the
+canonical example plus shared black-box conformance against local and hosted
+deployments. `verify-all` runs both profiles from the same built source.
 
-## Conformance and protocol notes
+The toolchain is Chapel 2.8.0, and the final `linux/amd64` images contain the
+compiled client programs and their runtime libraries without the Chapel
+compiler or a package manager.
 
-The test-only adapter under `client/tests/conformance/` speaks strict NDJSON
-protocol v1 on stdin/stdout or one `ADAPTER_LISTEN` TCP connection. It reserves
-stdout for events and calls the real Chapel client for every operation. Its
-`debugDisconnect` command is adapter-only and waits until the old socket is
-retired before acknowledging the controller. Commands reject unknown fields,
-wrong JSON types, blank or overlong identifiers, paths outside 3 to 1024 Unicode
-scalars, and non-object arguments before dispatch.
+## Known Issues
 
-libcurl supplies HTTP, TLS, and WebSocket transport, while json-c supplies
-dynamic JSON parsing. Chapel owns Convex envelopes, the pinned `/api/sync`
-state machine, query-set versions, little-endian timestamp ordering, reconnect
-backoff, hydration suppression, generation barriers, and structured failures.
-The WebSocket boundary independently validates status 101, case-insensitive
-Upgrade and Connection tokens, and the SHA-1/Base64 accept proof using a
-constant-time comparison. JSON string extraction is length-aware and rejects
-embedded NUL wherever Chapel exposes a scalar string.
-Receive calls caused by socket activity or plausible libcurl-buffered data run
-under a per-call watchdog tied to the current `CURLINFO_ACTIVESOCKET`. A stalled
-header decoder is shut down at the message's absolute one-second deadline, and
-the watchdog is always joined before cleanup can reuse the descriptor. True
-idle waits stay in `poll` and do not create a watchdog.
-HTTP bodies, WebSocket messages, and NDJSON lines cross the Chapel/C boundary
-with explicit byte lengths. C rejects invalid UTF-8, embedded NUL, or bytes past
-the declared text before Chapel constructs a string; decoding uses recoverable
-`try` blocks rather than process-aborting `try!`. A fully consumed bad NDJSON
-line emits a structured error and the next command is still accepted.
-Authorization fixtures record the exact outgoing header and prove opaque token
-bytes are preserved, replacement takes effect, and an empty token omits the
-header entirely.
-
-Each subscription transfers complete updates through Chapel synchronization
-slots and retains the newest 16 within a 4 MiB byte budget. Relay tasks retain a
-shared subscription handle until they observe close. At most 64 subscriptions
-are active at once and retired slots are reusable. One 32 MiB aggregate budget
-covers every retained path, argument object, last value, queued value, logs, and
-error payload across all subscriptions, including conservative runtime overhead.
-The adapter has a separate
-sole output writer bounded to 16 encoded records and 8 MiB including
-conservative overhead. Subscription overflow drops the oldest value, while
-adapter overflow fails closed; neither can grow without limit.
-One Client lifecycle lock serializes closed-state changes with Live owner
-creation, snapshots, and removal, while shared task intents keep each selected
-owner alive after that short critical section.
-Subscriptions hold a shared accounting/lifecycle handle rather than a borrowed
-manager pointer. `Subscription.close()` snapshots that handle once under its own
-lock, so concurrent Client and subscription closure cannot dereference a retired
-Live owner or create an ownership cycle. Accounting underflow is detected and
-the pressure regression returns the shared counter to exactly zero.
-Counter release uses a compare/exchange loop, so an underflow attempt is
-reported without ever publishing a transient negative value. Adapter teardown
-shares one three-second absolute budget across all 64 subscriptions, the Client,
-and the sole output writer. Live dial attempts are capped at one second so a
-closing Client can join its owner inside that budget. The adapter writes
-`closed` only after every owner and the output writer report successful stop;
-otherwise it retains the first failure, attempts a terminal error, and exits
-nonzero.
-
-The final image contains the compiled adapter and example plus a real POSIX
-shell and the verifier's `id`, `grep`, `sed`, and `awk`. BusyBox and its
-multicall links, package managers, compilers, scripting runtimes, and CLI network
-clients are removed. The image gate executes the exact example binary and
-expects its controlled connection failure against an unreachable local URL.
-The runtime build also removes `/sbin/apk` explicitly and audits every executable
-regular file across the filesystem, allowing only the documented binaries and
-their runtime libraries.
-The Chapel base and Alpine runtime are digest-pinned. Apt is additionally fixed
-to the `20260806T000000Z` Debian snapshot, and the build records the exact
-libcurl, json-c, OpenSSL, and Python package versions in
-`/out/material-versions`. A test-only child of the stripped runtime runs the raw
-peer suite with a locally trusted, hostname-validated TLS certificate; the final
-adapter and example stages depend on its success marker.
-Transport injection symbols and their Chapel wrappers compile only in the two
-test binaries under `CHAPEL_TRANSPORT_TEST`; an `nm` gate rejects those symbols
-from every production and runtime-bound binary.
-
-The language-local stopped-reader fixture proves the writer deadline is what
-interrupts blocked input using exactly one near-2 MiB valid response, so adapter
-queue overflow cannot be the cause. A second real-adapter regression drives 64
-subscriptions through the command loop, stops the Client owner, and joins an
-unread output socket under one three-second absolute budget. It requires the
-writer failure to propagate as a structured terminal failure and a nonzero
-exit, with both owner and writer stopped. The independent
-final-image cgroup memory proof remains a remote Docker gate and is not claimed
-by source inspection.
-
-## Limitations
-
-The Live implementation is pinned to the unversioned profile identified in
-`manifest.yaml`; it is not a compatibility promise. Live authentication,
-optimistic updates, tagged Convex values, WebSocket mutations/actions, and
-`TransitionChunk` assembly are deferred.
+1. Live is pinned to the unversioned sync profile recorded in
+   [`manifest.yaml`](manifest.yaml), so it is evidence for that profile rather
+   than a promise of compatibility with future protocol changes.
+2. Live authentication, optimistic updates, WebSocket mutations, and WebSocket
+   actions are deferred. Queries, mutations, and actions do work over HTTP.
+3. Live values expose the JSON-safe subset as raw JSON. Tagged Convex values
+   and `TransitionChunk` assembly are not implemented.
+4. The bounded Live inbox can discard older updates when a consumer falls
+   behind. This protects memory but means it is not an event-history API.

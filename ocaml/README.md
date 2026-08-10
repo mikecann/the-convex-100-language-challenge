@@ -1,20 +1,144 @@
-# Convex from OCaml
+<a href="https://ocaml.org/"><img src="logo.png" alt="OCaml" width="360"></a>
+<!-- Logo source: https://github.com/ocaml/ocaml-logo/blob/master/Colour/PNG/colour-logo.png -->
 
-This educational client shows an OCaml program querying a Convex deployment over HTTP, listening for a Live value, and applying a mutation that the Live subscription observes.
+# OCaml
 
-It is unofficial teaching material, not a production SDK or a supported Convex package.
+[OCaml](https://ocaml.org/) is a statically typed functional programming language in the ML family. It was created at INRIA in 1996, building on Caml and earlier ML research, and combines type inference, pattern matching, first-class functions, garbage collection, and native-code compilation. Today it has a focused but active niche in areas such as financial systems, developer tools, static analysis, and verification-heavy software.
 
-## Start here
+This repository's client is educational and unofficial. It demonstrates what a native OCaml Convex client can look like, but it is not a production SDK or a package intended for publication.
 
-Read the [canonical basic example](examples/basics/main.ml). It performs a query, starts Live before the write, checks the initial value, applies an idempotent mutation, and checks the resulting Live update.
+## Getting Started
 
-## What works
+Start with the [canonical counter example](examples/basics/main.ml). From the repository root, run:
 
-| Capability | Status | Evidence boundary |
-| --- | --- | --- |
-| Native HTTP query, mutation, and action | In verification | Docker test plus the shared black-box HTTP suite |
-| Structured HTTP errors and bearer-token lifecycle | In verification | Adapter protocol and shared error/auth tests |
-| Native Live query updates and reconnects | In verification | One socket-owner worker and the shared five-reconnect suite |
+```sh
+./run verify-example ocaml
+```
+
+The command builds and runs the exact example shown below in Docker against a unique room. It queries the current count, subscribes before mutating, increments once, and checks that HTTP, the mutation result, and Live agree.
+
+## Interesting Parts
+
+### Pattern matching makes success and failure explicit
+
+Convex's generated TypeScript API gives React code the query's return type. This OCaml client instead returns `('a, Convex.error) result`, so callers must handle `Ok` and `Error` explicitly. The outer result is type-safe, but this client deliberately represents function values as `Yojson.Safe.t`; a field such as `count` becomes trustworthy only after the program validates and converts it.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function RoomCount() {
+  const state = useQuery(api.demo.state, { room: "readme-room" });
+  if (state === undefined) return <p>Loading...</p>;
+
+  return <p>{state.count}</p>; // state and count are type-safe here.
+}
+```
+
+**OCaml**
+
+```ocaml
+let room = "readme-room"
+
+let deployment =
+  match Sys.getenv_opt "CONVEX_URL" with
+  | Some url -> url
+  | None -> failwith "CONVEX_URL is required"
+
+let client =
+  match Convex.create deployment with
+  | Ok client -> client (* The result proves this is a usable client. *)
+  | Error error -> failwith (Convex.error_message error)
+
+let () =
+  Fun.protect
+    ~finally:(fun () -> Convex.close client)
+    (fun () ->
+      let response =
+        match Convex.query client "demo:state" (`Assoc [ ("room", `String room) ]) with
+        | Ok response -> response (* The HTTP call succeeded, type-safely. *)
+        | Error error -> failwith (Convex.error_message error)
+      in
+      match
+        Convex.parse_integral_int64
+          (Yojson.Safe.Util.member "count" response.value)
+      with
+      | Ok count -> Printf.printf "%Ld\n" count (* count is an int64 here. *)
+      | Error message -> failwith message)
+```
+
+The TypeScript hook is reactive and its generated types describe `demo:state`. The OCaml call above is a one-off HTTP query, not an equivalent subscription, and its JSON boundary is a design choice in this client rather than an OCaml limitation.
+
+### Live is an explicit resource in this command-line API
+
+React owns a `useQuery` subscription while the component is mounted and rerenders when its value changes. The OCaml API used here exposes the subscription directly: the caller pulls the next update with a timeout and must unsubscribe. OCaml supports callbacks, streams, and lightweight concurrency; the blocking `subscription_next` shape is this small client's API choice.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function LiveRoomCount() {
+  const state = useQuery(api.demo.state, { room: "readme-live-room" });
+  if (state === undefined) return <p>Connecting...</p>;
+
+  return <p>{state.count}</p>; // React rerenders with a type-safe count.
+}
+```
+
+**OCaml**
+
+```ocaml
+let deployment =
+  match Sys.getenv_opt "CONVEX_URL" with
+  | Some url -> url
+  | None -> failwith "CONVEX_URL is required"
+
+let client =
+  match Convex.create deployment with
+  | Ok client -> client
+  | Error error -> failwith (Convex.error_message error)
+
+let subscription =
+  match
+    Convex.subscribe client "demo:state"
+      (`Assoc [ ("room", `String "readme-live-room") ])
+  with
+  | Ok subscription -> subscription (* An abstract, type-safe handle. *)
+  | Error error -> failwith (Convex.error_message error)
+
+let () =
+  Fun.protect
+    ~finally:(fun () ->
+      ignore (Convex.unsubscribe subscription);
+      Convex.close client)
+    (fun () ->
+      match Convex.subscription_next subscription 10.0 with
+      | Ok (Some { value = Some json; error = None; _ }) ->
+          print_endline (Yojson.Safe.to_string json) (* JSON still needs decoding. *)
+      | Ok (Some { error = Some error; _ }) ->
+          failwith (Convex.error_message error)
+      | Ok (Some { value = None; _ }) -> failwith "Live update omitted value"
+      | Ok None -> failwith "Live subscription closed or timed out"
+      | Error error -> failwith (Convex.error_message error))
+```
+
+The full example starts Live before the mutation so it cannot miss the change, then disposes both resources even when validation fails.
+
+## Status
+
+| Capability | Status |
+| --- | --- |
+| Native HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
+| Structured HTTP errors and bearer authentication | Verified by shared local and hosted conformance |
+| Native Live initial values, updates, removal, and reconnects | Verified by shared local and hosted conformance |
+
+The manifest records both `http` and `live` as earned capabilities. These badges describe what this implementation passed in the repository's black-box suite, not general guarantees about every possible OCaml client.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.ml -->
 ```ocaml
@@ -135,30 +259,22 @@ let () =
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-All OCaml builds run in the pinned `linux/amd64` Docker image. From the repository root:
+The public client implements Convex's documented JSON HTTP function endpoints directly in OCaml. It uses OCaml's Unix sockets for transport, `ocaml-ssl` for TLS, and Yojson for JSON representation. It does not delegate Convex behavior to another SDK, the Convex CLI, `curl`, Node.js, or Python. The Docker build pins OCaml 5.2.1, Dune 3.17.2, Yojson 2.2.2, `ssl` 0.7.0, and ocamlformat 0.27.0.
 
-```sh
-./run test ocaml
-./run verify-example ocaml
-./run verify ocaml
-```
+HTTP operations return OCaml's polymorphic `result` type and keep function, HTTP, protocol, transport, and closed-client failures distinct. TLS verifies both the certificate chain and hostname. The example's `parse_integral_int64` helper also handles a wire-level wrinkle: a Convex integer may arrive as `0.0`, so decoding accepts mathematically integral JSON numbers while rejecting fractions, quoted values, non-finite values, and overflow.
 
-The first command checks formatting, unit fixtures, and compilation. The example command executes the exact source projected above in its minimal runtime image. The shared verify command is the evidence gate for HTTP and Live capabilities.
+Live uses the repository's pinned `/api/sync` profile and a hand-written RFC 6455 WebSocket implementation. One worker thread exclusively owns reads, writes, reconnects, and query-set versions. That avoids concurrent socket access while controller threads submit commands. The implementation validates the opening handshake, fragmented UTF-8 messages, control frames, close data, and frame lengths, then resets reconnect backoff after a valid connection or transition.
 
-## Protocol notes
+Delivery is bounded process-wide at 256 retained updates and 16 MiB of accounted memory, with at most 16 updates per subscription. If those limits are crossed, the oldest update in the process is dropped. The test-only adapter has its own bounded ordered output writer and exposes `debugDisconnect` only so conformance can exercise five real reconnects. Those adapter details are evidence machinery, not part of the educational client API.
 
-The client implements the documented JSON Functions API directly with OCaml Unix sockets, and implements the pinned `/api/sync` profile directly with an OCaml WebSocket frame reader and writer. TLS uses `ocaml-ssl`; JSON uses `yojson`. The Live worker exclusively owns socket reads, writes, reconnects, and query-set versions.
+For local checks, `./run test ocaml` formats, compiles, and exercises language-local fixtures inside Docker. `./run verify ocaml`, `./run verify-hosted ocaml`, and `./run verify-all ocaml` are separate shared evidence gates; this README update does not claim to have rerun them.
 
-The WebSocket handshake is validated rather than assumed: a `101` is accepted only when the peer names the websocket protocol, carries the `Upgrade` token in its `Connection` list, and echoes the exact `Sec-WebSocket-Accept` derived from the key this client just generated. Frames are checked against the structural rules RFC 6455 gives a client before any payload is used, including reserved bits, masked server frames, control frame size and fragmentation, minimally encoded lengths, close codes, and UTF-8 in text frames and close reasons. Reconnect backoff returns to its floor after a validated handshake, so a healthy connection never leaves the next attempt waiting out an older maximum.
+## Known Issues
 
-Live delivery is bounded across the whole process rather than per subscription, because a container memory limit is shared by every subscription at once. The budget is derived from the 128 MiB conformance gate after reserving for the OCaml runtime, one inbound frame being parsed, the adapter's whole output path, and explicit headroom; an update is charged for its value, logs, structured error data, and the encoded output it becomes. When the budget is exceeded the oldest update anywhere in the process is dropped.
-
-The adapter speaks NDJSON v1 over stdin/stdout or a single loopback TCP connection. Command lines are bounded while they are read, and every event leaves through one bounded ordered writer, so a controller that stops reading cannot block an unsubscribe or grow the process. `debugDisconnect` is compiled into the adapter surface only and is used to prove that active `Add` operations are replayed after five real reconnects.
-
-## Limitations
-
-Authentication is implemented for HTTP calls and can be replaced or cleared through the adapter. The Live handshake carries whatever token `setAuth` last stored, but Live authentication is still deferred: there is no token refresh, no sync-protocol `Authenticate` message, and no `AuthError` recovery, and none of it has evidence. WebSocket mutations and actions, optimistic updates, tagged Convex values, and `TransitionChunk` assembly are likewise deferred.
-
-TLS pins TLS 1.2, verifies the certificate chain against the system CA bundle, and binds the expected hostname so a valid certificate issued for some other host is rejected. Deployments reached by IP address over `https` are therefore not supported.
+1. Live authentication is incomplete. The WebSocket handshake carries the last bearer token, but token refresh, the sync-protocol `Authenticate` message, and `AuthError` recovery are deferred and unverified.
+2. Live values cover the JSON-safe subset. Tagged Convex values and `TransitionChunk` assembly are rejected as protocol errors rather than decoded.
+3. Mutations and actions use HTTP. WebSocket mutations, WebSocket actions, and optimistic updates are not implemented.
+4. Delivery limits are deliberate. A slow consumer can cause the oldest queued update to be dropped once the process-wide or per-subscription budget is reached.
+5. HTTPS deployment URLs using an IP address are unsupported because TLS hostname validation expects a DNS hostname.

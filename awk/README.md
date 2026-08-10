@@ -1,47 +1,180 @@
-# Convex from Awk
+# Awk
 
-This is a Convex client written in GNU Awk. It reads a counter over Convex's
-documented JSON HTTP API, subscribes to the same query over a WebSocket, and
-watches its own increment arrive on that subscription.
+Awk is a small pattern-scanning and text-processing language [created at Bell
+Labs in the 1970s](https://www.gnu.org/software/gawk/manual/html_node/History.html)
+by Alfred Aho, Peter Weinberger, and Brian Kernighan. Its name comes from their
+surnames. It is still a handy fit for record-oriented jobs such as logs,
+reports, and shell pipelines, and it is [standardized by
+POSIX](https://pubs.opengroup.org/onlinepubs/9799919799/utilities/awk.html). This
+client uses [GNU Awk](https://www.gnu.org/software/gawk/), the GNU implementation
+that adds [loadable extensions](https://www.gnu.org/software/gawk/manual/html_node/Dynamic-Extensions.html)
+to the core language.
 
-Awk has no sockets, no TLS, and no binary framing, so the demonstration adds one
-small compiled gawk extension, `client/convexext.c`, loaded in process with
-`@load`. It provides exactly what an ordinary language runtime would already
-offer: deadline-bounded TCP and TLS sockets, a monotonic clock, SHA-1, base64,
-randomness, unsigned 64-bit timestamp comparison, and RFC6455 frame encode and
-decode. Everything that makes it a *Convex* client — the HTTP envelope, the JSON
-reader and writer, the pinned sync profile, the single-owner Live state machine
-with its reconnect and replay, the NDJSON test adapter, and the example — is
-Awk. Nothing shells out to curl, websocat, Node, or Python; that would make this
-a bridge rather than a native client.
+This is an educational, unofficial Convex client, not a production SDK or a
+package you should depend on. It demonstrates both HTTP functions and reactive
+Live queries while keeping the Convex-specific behaviour in Awk.
 
-It is an educational demonstration, not an official Convex SDK, and not a
-package to depend on. Convex's realtime sync protocol is not a documented,
-stable third-party API, so the profile it implements is pinned to one inspected
-revision and recorded in `manifest.yaml`.
+## Getting Started
 
-## Start here
+Start with [`examples/basics/main.awk`](examples/basics/main.awk). It reads a
+counter, starts a Live query before mutating it, increments with a fresh
+idempotency key, and observes the resulting `0 -> 1` update.
 
-[`examples/basics/main.awk`](examples/basics/main.awk) is the canonical example.
-It queries `demo:state` over HTTP, subscribes before mutating so no update can
-be missed, increments the counter once with a random idempotency key, and then
-proves the same `0 -> 1` change arrived over Live. Every value is checked, so
-the example fails rather than printing a transcript it did not earn.
+From the repository root, run the exact example in its Docker runtime image:
 
-## What works
+```sh
+./run verify-example awk
+```
+
+Docker supplies the pinned GNU Awk runtime and compiled transport extension, so
+nothing needs to be installed on your host.
+
+## Interesting Parts
+
+### JSON objects become strings and associative arrays
+
+With generated Convex types, React gives you a typed argument object and typed
+result. This Awk client accepts JSON text and writes its response into an
+associative array, Awk's map-like collection.
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const state = useQuery(api.demo.state, {
+    room: "readme-awk-query-room",
+  });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // `state` and `count` are type-safe here.
+}
+```
+
+**Awk**
+
+```awk
+@include "convex.awk"
+
+BEGIN {
+    room = "readme-awk-query-room"
+    arguments = "{\"room\":" convex_quote(room) "}"
+
+    # Configuration is explicit, and CONVEX_URL names the deployment.
+    url = ENVIRON["CONVEX_URL"]
+    if (url == "") {
+        exit 1
+    }
+    if (!convex_open(url, "awk-readme")) {
+        exit 1
+    }
+    if (!convex_query("demo:state", arguments, response)) {
+        exit 1
+    }
+
+    # Awk is dynamic: response["value"] is JSON text and must be checked at runtime.
+    mark = cx_json_mark()
+    root = cx_json_parse(response["value"], 0)
+    if (root < 0 || cx_json_type(root) != "object") {
+        cx_json_release(mark)
+        exit 1
+    }
+    count_node = cx_json_find(root, "count")
+    if (count_node < 0 || cx_json_type(count_node) != "number") {
+        cx_json_release(mark)
+        exit 1
+    }
+    print cx_json_text(count_node)
+    cx_json_release(mark)
+}
+```
+
+The TypeScript hook stays subscribed and rerenders the component. The Awk call
+above is deliberately a one-off HTTP query, so it has no reactive lifecycle.
+The full example also rejects fractional, quoted, non-finite, and overflowing
+counts instead of trusting dynamic input.
+
+### The command-line client owns the Live lifecycle
+
+React manages subscription setup, updates, and cleanup behind `useQuery`. The
+Awk API exposes those steps because a command-line program has no component
+lifecycle to attach them to.
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function LiveCounter() {
+  const room = "readme-awk-live-room";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  async function addOne() {
+    const result = await increment({
+      room,
+      language: "typescript",
+      runId: crypto.randomUUID(), // A fresh id makes this mutation attempt unique.
+    });
+    console.log(result.state.count); // The mutation result is type-safe.
+  }
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <button onClick={addOne}>Count: {state.count}</button>;
+}
+```
+
+**Awk**
+
+```awk
+@include "convex.awk"
+
+BEGIN {
+    room = "readme-awk-live-room"
+    arguments = "{\"room\":" convex_quote(room) "}"
+    url = ENVIRON["CONVEX_URL"]
+    if (url == "") exit 1
+    if (!convex_open(url, "awk-readme")) exit 1
+
+    # Subscribe first, then receive the initial reactive value.
+    if (!convex_subscribe("counter", "demo:state", arguments)) exit 1
+    if (!convex_wait_update("counter", 15000, initial)) exit 1
+
+    mutation_args = "{\"room\":" convex_quote(room) \
+        ",\"language\":\"awk\",\"runId\":" \
+        convex_quote(convex_random_hex(16)) "}"
+    if (!convex_mutation("demo:increment", mutation_args, mutation)) exit 1
+    # mutation["value"] contains the returned { applied, state } JSON.
+
+    # This blocking `wait` is this client's API choice, not an Awk limitation.
+    if (!convex_wait_update("counter", 15000, updated)) exit 1
+    # updated["value"] is the later reactive state and needs runtime decoding.
+
+    convex_unsubscribe("counter") # Stop this query before closing the socket.
+    convex_close_live(2000) # Connection cleanup has a bounded deadline.
+}
+```
+
+The Awk process owns one WebSocket and pumps it while
+`convex_wait_update` blocks. The client reconnects and replays active
+subscriptions, while its delivery queue stays bounded.
+
+## Status
 
 The shared black-box controller passed against local and hosted deployments,
 earning HTTP and Live.
 
-| Capability | State | Notes |
+| Capability | Status | Evidence |
 | --- | --- | --- |
-| Builds in Docker | `./run test awk` passes | gawk 5.3.2 and the extension build from source inside Docker; the runtime and example images build and pass their in-image policy probes. |
-| HTTP query, mutation, action | Implemented, local tests pass | Verified by shared local and hosted conformance |
-| Live subscriptions | Implemented, local tests pass | Verified by shared local and hosted conformance |
-| Language-local tests | Passing | Seven suites drive the real socket path against an Awk fixture peer inside the `test` image. |
-| Earned capability badges | HTTP and Live | Shared local and hosted conformance passed. |
+| Docker build and local tests | Passing | `./run test awk` builds GNU Awk 5.3.2 and the extension, then runs seven language-local suites. |
+| HTTP query, mutation, and action | Earned | Shared local and hosted conformance passed. |
+| Live subscriptions | Earned | Shared local and hosted conformance passed. |
+| Implementation provenance | Native | Convex behaviour is implemented in Awk; the C extension supplies transport and framing primitives. |
 
-## The canonical example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.awk -->
 ```awk
@@ -212,7 +345,7 @@ function example_shutdown(status) {
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
 ```sh
 ./run test awk             # builds gawk and the extension from source, runs every local suite
@@ -228,7 +361,7 @@ the canonical example itself against Convex and compares its stdout with the
 shared transcript. `./run verify awk` adds the shared controller, which is the
 only thing that can award HTTP or Live.
 
-## How it is put together
+### Files
 
 | File | Role |
 | --- | --- |
@@ -241,122 +374,49 @@ only thing that can award HTTP or Live.
 
 ### Live
 
-One worker owns the WebSocket. Awk runs a single thread, so the adapter loop
-*is* that owner: it alternates between pumping the socket and taking one
-controller command, and every step is bounded by a monotonic deadline from the
-extension. Subscriptions never touch the socket themselves; they queue
-commands for the owner and read from a bounded delivery queue.
+Awk runs a single thread, so the adapter loop owns the WebSocket and alternates
+between pumping it and accepting commands. Every step has a monotonic deadline.
+After a disconnect, the client reconnects and replays active subscriptions. It
+also suppresses an unchanged rehydration value, so reconnecting does not look
+like a new application update.
 
-- Each connection sends `Connect` with the session id, connection count, last
-  close reason, and `maxObservedTimestamp`, then replays the whole active query
-  set as `Add` modifications. That is what restores subscriptions after a drop.
-- A `Transition` is validated in full — state versions, timestamp ordering, and
-  every modification — before any part of it is published.
-- A repeated identical value is suppressed, so a reconnect's rehydration does
-  not masquerade as a new update.
-- `QueryFailed` becomes a typed `FunctionError` event that leaves the
-  subscription active; transport and protocol faults become `TransportError` and
-  `ProtocolError` events, and the same subscription still delivers later values
-  after the reconnect.
-- Unsubscribe and same-id replacement invalidate the old relay and purge its
-  queued deliveries *before* returning, so no stale value can cross either
-  acknowledgement.
-- Sixty-four bit sync timestamps are compared in the extension, because an Awk
-  double cannot hold a nanosecond timestamp without losing its low bits.
-- Partial WebSocket frames retain their parser state across short owner time
-  slices, but an absolute 5 second frame deadline prevents endless dribbling.
+Subscription replacement and unsubscribe clear stale queued values before they
+return. Partial WebSocket frames retain their parser state across short reads,
+and 64-bit sync timestamps are compared in the extension because an Awk number
+cannot represent their low bits exactly.
 
 ### Buffering
 
-The client owns its update queue, so both bounds are explicit: the newest 8
-deliveries within 4 MiB, and the newest 8 encoded adapter events within 4 MiB
-including one in-flight write. Subscription events are droppable and are dropped
-oldest first; responses are not, and if only responses remain when the budget is
-crossed the adapter fails loudly instead of growing. A single delivery larger
-than the whole budget is refused rather than emptying the queue for it. These
-bounds are far below the shared 128 MiB adapter limit because Awk holds whole
-values in memory.
-
-Active subscription definitions are separately capped at 64 entries and 768
-KiB of charged state. That leaves headroom when every Add is serialized into
-the single replay frame sent after a reconnect.
+The client retains the newest eight deliveries within 4 MiB. Older subscription
+events may be dropped, but command responses are not. Active subscriptions are
+separately capped at 64 entries and 768 KiB so reconnect replay stays below the
+WebSocket frame limit. These are client design choices, not Awk language limits.
 
 ### The adapter
 
-`client/tests/conformance/adapter.awk` implements NDJSON adapter protocol v1. It
-is test infrastructure, not public client code: it reserves stdout for protocol
-events, sends diagnostics to stderr, works over stdin/stdout or the
-`ADAPTER_LISTEN` TCP socket, and calls the real client for every operation. It
-implements the adapter-only `debugDisconnect` command, which is declared in
-`manifest.yaml` and deliberately absent from the educational client API.
+`client/tests/conformance/adapter.awk` is test infrastructure, not public client
+code. It calls the real client for each operation and includes a test-only
+disconnect command used to prove reconnect behaviour.
 
-Optional members are omitted rather than serialized as null, because the shared
-controller validates every line against `_shared/schemas/adapter.schema.json`.
-`client/tests/adapter_test.awk` asserts the exact bytes of every event shape and
-then drives the real adapter end to end over its NDJSON stream.
+### Tests
 
-## Tests
+Seven suites run inside the Docker test image. They cover JSON, HTTP and TLS,
+Live setup and recovery, WebSocket fragmentation, bounded queues, adapter event
+shapes, and the canonical example's full counter journey against a deterministic
+fixture.
 
-Every suite runs inside the `test` image. They use the same extension the
-runtime images ship, except the TLS suite, which needs the test build's TLS
-server hook.
+## Known Issues
 
-| Suite | What it covers |
-| --- | --- |
-| `ext_test.awk` | Clock, digests, randomness, UTF-8 validation, uint64 timestamps, and RFC6455 framing over a real loopback pair, including 64-bit lengths, control frames, masking rules in both directions, and a partly delivered message that survives two read timeouts. |
-| `json_test.awk` | Round trips, verbatim number literals, escapes and surrogate pairs, every rejection, and URL parsing. |
-| `http_test.awk` | The Convex envelope, `logLines`, structured errors, chunked and close-framed bodies, the exact `Authorization: Bearer` header, and a stalled peer that only the client's own deadline can end. |
-| `live_test.awk` | Add and Remove, initial and external values, suppression, `QueryFailed` then recovery, fragmentation, the unsubscribe barrier, same-id replacement, five real `debugDisconnect` reconnects with Add replay, stale-generation retirement, transport and protocol recovery, connection bookkeeping, and bounded close. |
-| `adapter_test.awk` | Exact event shapes, both queue bounds, and a full NDJSON session against the fixture. |
-| `tls_test.awk` | A real TLS handshake against a certificate authority created in the build, plus the rejection of a certificate issued for another name. |
-| `examples/basics/main_test.awk` | The example's own integral-count rules, its behaviour without `CONVEX_URL`, and a full `0 -> 1` journey against a fixture deployment. |
-
-The fixture in `client/tests/fixture.awk` is an independent Awk implementation of
-the other half of each exchange: HTTP responder, scripted sync server, TLS
-peer, and a miniature counter deployment. Its server-side RFC6455 framing is
-also written in Awk over raw extension sockets, rather than calling the client's
-C frame parser. Tests start it as a co-process and drive it command by command,
-so the cases are deterministic rather than timed.
-
-## Known limitations and honest risks
-
-`./run test awk` passes: the gawk source build, the extension, every
-language-local suite, and the runtime/example image policy probes all run
-green inside Docker. The canonical example plus shared local and hosted
-conformance also passed, earning HTTP and Live.
-
-- The gawk tarball is pinned to 5.3.2, not the newer 5.4.x series. A
-  from-source 5.4.1 build was tried first and miscompiled a common `if`
-  pattern that combines two array-subscript comparisons with `&&` (verified in
-  isolation against Debian's packaged 5.2.1 and Alpine's packaged 5.3.2, which
-  both evaluate the same program correctly, and against a from-source 5.3.2
-  build, which also does not reproduce it, at multiple optimization levels).
-  That looks like an upstream regression in the very new 5.4 series rather
-  than anything in this build, so the toolchain stays on the last version
-  confirmed correct. The pinned `xz-utils` version is deliberately absent
-  while every other apt package is pinned; and the runtime closure is staged
-  from `ldd` output rather than a hand-checked list, which is safer but still
-  worth another look.
-- The test stage performs a verified TLS exchange and hostname-mismatch check.
-  The final pruned image currently proves that its exact trust store loads, but
-  its first real TLS handshake still needs the final-image runtime probe.
-- The sync profile assumes a reconnecting client restarts from the zero state
-  version, which is what the pinned `convex-rs` revision does. Only a run
-  against a real deployment can confirm that the server agrees.
-- The example's `0 -> 1` journey is currently proved against a fixture
-  deployment written in Awk, not against Convex. `./run verify-example awk` is
-  the run that turns that into evidence.
-- RFC6455 framing and masking are in the extension, not in Awk. The Live
-  protocol, its state machine, and its recovery are Awk.
-- The client is single threaded. A long HTTP call delays Live reads until that
-  call's deadline expires.
-- WebSocket mutations and actions, Live authentication, optimistic updates,
-  journals, and `TransitionChunk` assembly are not implemented.
-- Yellow proves bearer-token transport, not identity-provider integration. No
-  signed JWT is exercised.
-- Values are limited to Convex's JSON-safe subset. Int64, bytes, special floats,
-  and negative zero are not claimed, and strings containing U+0000 are refused
-  because Awk cannot carry them safely.
-- Bracketed IPv6 deployment URLs are refused rather than mis-parsed.
-- Syntax highlighting for the example block falls back to plain text, because
-  the shared README projector has no `.awk` fence mapping.
+1. The client is pinned to GNU Awk 5.3.2. A source build of 5.4.1 miscompiled
+   an array-subscript condition used by this implementation, so the newer
+   toolchain is deliberately not claimed.
+2. Awk has no built-in TLS sockets or WebSocket framing. The in-process
+   `convexext.c` extension supplies those primitives, while the HTTP envelope,
+   JSON handling, Live state machine, reconnect, and replay remain in Awk.
+3. The client is single threaded. An HTTP call delays Live reads until that
+   call completes or reaches its deadline.
+4. WebSocket mutations and actions, Live authentication, optimistic updates,
+   journals, and `TransitionChunk` assembly are not implemented.
+5. Values cover Convex's JSON-safe subset only. Tagged values such as int64 and
+   bytes are out of scope, U+0000 strings are refused, and bracketed IPv6
+   deployment URLs are unsupported.

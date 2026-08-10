@@ -1,60 +1,180 @@
-# Convex from Simula 67
+<img src="logo.png" alt="Simula logo" width="240">
+<!-- Logo source: https://commons.wikimedia.org/wiki/File:Simula_-_logo.svg -->
 
-This is a Convex client written in Simula 67, the language that introduced
-classes, objects, inheritance, virtual methods and coroutines to programming
-— ideas nearly every language written since has inherited. It reads a shared
-counter over Convex's documented JSON HTTP endpoint, subscribes to the same
-query over Convex Live, applies a mutation, and shows the change arriving
-reactively, all translated to C by GNU Cim and linked against one small,
-reviewed native shim for sockets and TLS.
+# Simula 67
 
-It is educational, unofficial, and not a production SDK. It exists to answer
-one question honestly: can a fifty-eight-year-old language that predates
-TCP/IP by over a decade, compiled by a small GNU project compiler, support a
-useful Convex client? Nothing here is supported by Convex. Shared local and
-hosted black-box conformance earned HTTP and Live.
+Simula began at the Norwegian Computing Center in the 1960s, where Ole-Johan
+Dahl and Kristen Nygaard were building a language for discrete-event
+simulation. Simula 67 grew into a general-purpose, ALGOL 60-based language and
+introduced the class and object model that helped shape Smalltalk, C++, Java,
+C#, and much of modern object-oriented programming. The
+[SIMULA Standard](https://portablesimula.github.io/github.io/doc/SimulaStandard86/chap_0.htm)
+remains the clearest language reference.
 
-## Start here
+You are unlikely to choose Simula for a new web app in 2026. Its present-day
+niche is language history, teaching, and maintaining or exploring simulation
+software. This demonstration uses [GNU Cim](https://www.gnu.org/software/cim/),
+a Simula compiler that translates the program to C. This client is educational,
+unofficial, and not a production Convex SDK.
 
-The whole demonstration is one file:
-[`examples/basics/main.sim`](examples/basics/main.sim).
+## Getting Started
 
-It walks a single journey and refuses to print its final line unless every
-step agrees:
+Start with the [canonical counter example](examples/basics/main.sim). It queries
+`demo:state`, subscribes before changing anything, calls `demo:increment`, and
+then waits for the resulting Live update.
 
-1. Query `demo:state` over HTTP and read the current count.
-2. Subscribe to the same query over Live, **before** mutating, so no update
-   can fall into the gap.
-3. Check that the first Live value hydrates the same count the HTTP query
-   returned.
-4. Apply `demo:increment` with a fresh idempotency key.
-5. Receive the new count over Live, with no second HTTP request.
+From the repository root, run the exact example inside Docker:
 
-Against a fresh room, that is the `0 -> 1` journey printed below. The
-failure path behind every `givingup` call is a real Simula class,
-`ExampleFailure`, built with `new` and dispatched with `.report` — the same
-class mechanism Simula gave to nearly every language that followed it.
+```sh
+./run verify-example simula
+```
 
-## What works
+The verifier supplies an isolated room and checks the program's `0 -> 1`
+transcript. It does not install GNU Cim or any build dependency on your host.
 
-| Capability | State | Notes |
+## Interesting Parts
+
+### React hides the subscription; this client makes it visible
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+function Counter() {
+  const room = "readme-comparison";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  if (state === undefined) return <p>Loading...</p>;
+
+  return (
+    <button
+      onClick={() =>
+        increment({
+          room,
+          language: "typescript",
+          runId: crypto.randomUUID(),
+        })
+      }
+    >
+      Count: {state.count} {/* React rerenders when the query changes. */}
+    </button>
+  );
+}
+```
+
+**Simula 67**
+
+```simula
+procedure watchstate(host, hostlen, port, portlen, tls);
+   integer array host, port;
+   integer hostlen, portlen, tls;
+begin
+   integer array pathbuf(0:31), argsbuf(0:127), errbuf(0:255);
+   integer pathlen, argslen, errbuflen, errkind, sub, initialkind, discard;
+
+   pathlen := 0;
+   discard := bufputstr(pathbuf, 32, pathlen, "demo:state");
+   argslen := 0;
+   discard := bufputstr(argsbuf, 128, argslen,
+      "{""room"":""readme-comparison""}");
+
+   errbuflen := 0; errkind := 0;
+   livesubscribe(host, hostlen, port, portlen, tls,
+      pathbuf, pathlen, argsbuf, 0, argslen,
+      cxnowms + 10000, sub, errbuf, errbuflen, errkind);
+   if errkind <> 0 then cxexit(1);
+
+   comment This blocking next call pumps the socket and returns the first
+      query value. The caller, rather than a UI framework, owns progress;
+   initialkind := livenext(sub, 10000);
+   if initialkind = 0 then cxexit(1);
+   livereleasetaken;
+
+   comment Cleanup is explicit too. The full example mutates between the
+      initial delivery and the updated delivery;
+   liveunsubscribe(sub, cxnowms + 5000);
+   liveclose(cxnowms + 5000)
+end watchstate;
+```
+
+`useQuery` owns the subscription lifecycle and causes React to rerender. The
+Simula language has coroutines, but this particular client deliberately offers
+a blocking `livenext` API with explicit unsubscribe and close operations. That
+is a client design choice, not a limitation of the language. See the
+[complete sequence](examples/basics/main.sim).
+
+### An object-oriented failure path from 1967
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+class ExampleFailure extends Error {}
+
+function CheckedCounter() {
+  const state = useQuery(api.demo.state, { room: "readme-comparison" });
+
+  if (state === undefined) return <p>Loading...</p>;
+  if (!Number.isSafeInteger(state.count)) {
+    throw new ExampleFailure("demo:state did not return a safe whole count");
+  }
+
+  return <p>Count: {state.count}</p>;
+}
+```
+
+**Simula 67**
+
+```simula
+class ConvexOutcome(reasontext); text reasontext;
+begin
+   comment Common state inherited by every example outcome;
+end ConvexOutcome;
+
+ConvexOutcome class ExampleFailure;
+begin
+   procedure report;
+   begin
+      comment The real example writes reasontext to stderr, then exits;
+      cxexit(1)
+   end report;
+end ExampleFailure;
+
+begin
+   ref(ExampleFailure) outcome;
+   outcome :- new ExampleFailure("demo:state did not return a count");
+   outcome.report
+end;
+```
+
+The syntax looks old, but the ideas are familiar: subclassing, object
+construction, a typed reference, and an instance method. GNU Cim 5.1 cannot
+compile the parameterless virtual declaration this example would need for
+polymorphic dispatch through `ConvexOutcome`, so the checked-in code calls
+`report` through the concrete `ExampleFailure` reference.
+
+## Status
+
+| Capability | Status | What the evidence says |
 | --- | --- | --- |
-| HTTP query, mutation, action | Implemented, conformance green | Written in Simula over the native transport layer |
-| Structured Convex errors | Implemented, conformance green | `FunctionError`, `ProtocolError` and `TransportError` keep name, message, data and log lines |
-| TLS with certificate and hostname verification | Implemented, exercised by hosted conformance | Same reviewed design as this project's ALGOL 60 client, and the hosted profile's 31/31 ran over real TLS against the deployment. The dedicated trust/untrusted/wrong-host unit proof is still not run; see limitations |
-| Live subscribe, update, unsubscribe | Implemented, conformance green | RFC 6455 framing written in Simula |
-| Live reconnect and rehydration | Implemented, conformance green | Adapter-only `debugDisconnect`, unchanged rehydration suppressed |
-| WebSocket handshake response verification | Partial | HTTP 101 upgrade is required; `Sec-WebSocket-Accept` is not checked against SHA-1, see limitations |
-| Live authentication, optimistic updates, WebSocket mutations | Not implemented | Deferred; see limitations |
-| Earned badges | **`http` and `live`** | 31/31 on both the local and hosted profiles, from clean exact head `9bd9b4d` |
+| HTTP query, mutation, and action | Earned | Native Simula implementation passed shared local and hosted conformance |
+| Structured errors | Earned with HTTP and Live | Function, protocol, and transport errors remain distinguishable |
+| Live subscribe, update, unsubscribe, and reconnect | Earned | Shared local and hosted profiles each passed 31/31 at clean exact head `9bd9b4d` |
+| TLS certificate and hostname verification | Exercised by hosted conformance | The separate private-CA trust test has not been run for this client |
+| WebSocket handshake verification | Partial | An HTTP 101 is required, but `Sec-WebSocket-Accept` is not checked against the client's key |
+| Authentication and optimistic updates | Not implemented | Deferred rather than counted as partial support |
+| Manifest capabilities | **`http`, `live`** | These are the only awarded badges |
 
-Every row above says "Docker gate green" deliberately, not "verified": the
-The language-local suite has 60 unmocked assertions. The Docker test stage,
-native shim build, canonical example, adapter probe, and shared local and
-hosted black-box conformance all passed. The manifest records the earned HTTP
-and Live result.
+This documentation-only edit does not claim a fresh verification run. The
+table preserves the results already recorded by the manifest and prior shared
+evidence.
 
-## The canonical example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.sim -->
 ```simula
@@ -445,47 +565,19 @@ cxexit(0);
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-Everything builds and runs inside Docker; nothing is installed on the host.
+GNU Cim 5.1 translates Simula to C, then a C compiler produces the native
+executable. The Docker build assembles the educational source files into one
+lexically shared Simula block, compiles the canonical example and conformance
+adapter, and places each executable in its own minimal runtime image.
 
-```sh
-./run test simula
-```
+### Source layout
 
-Builds GNU Cim 5.1 from source, runs the style gate, compiles the native
-support library on its own, and executes the language-local suite: strict
-JSON and the number rules, HTTP framing and the Convex envelope, RFC 6455
-frame build/read round trips, and deployment URL parsing. It also proves the
-example fails cleanly with no deployment configured and prints nothing on
-stdout when it does, and that the conformance adapter answers `hello` and
-`close` correctly.
-
-```sh
-./run verify-example simula
-```
-
-Builds the minimal example image and runs the exact canonical example against
-a unique room, comparing stdout byte for byte with the shared transcript.
-
-```sh
-./run verify simula
-./run verify-hosted simula
-./run verify-all simula
-```
-
-Add shared black-box conformance against the approved local backend, then the
-hosted drift target, then both from the same built source. Only the shared
-result evaluator may award a badge.
-
-## How it is put together
-
-GNU Cim has no linker for separately compiled Simula units the way a
-production Simula system would, and, like this project's ALGOL 60 client, no
-shared global state across files declared outside one shared block — only
-lexical nesting inside a `begin ... end` block shares variables between
-separately written source files here. The client is assembled from layered
-source files at build time, innermost first:
+This implementation does not use GNU Cim's separate-compilation support.
+Instead, lexical nesting inside one `begin ... end` block lets the client
+layers share the state needed by HTTP and Live. The Dockerfile assembles the
+separately written files at build time, innermost first:
 
 | File | Responsibility |
 | --- | --- |
@@ -510,7 +602,7 @@ HTTP, no WebSocket framing, no JSON, no retry policy and no Convex
 knowledge. Every loop, deadline and bound is driven from Simula.
 
 The boundary between the two languages is GNU Cim's own calling
-convention — confirmed by compiling a throwaway probe program with `cim -S`
+convention, confirmed by compiling a throwaway probe program with `cim -S`
 and reading the C it generated, rather than assumed from the manual. A
 by-value `integer` parameter, and an `integer procedure`'s return value, are
 both a plain 64-bit C `long`, matching every `integer array` element, which
@@ -539,12 +631,12 @@ object rather than a flat error code: `ConvexOutcome` is the base class, and
 `ExampleFailure` is a subclass with its own constructor parameter and its
 own `report` instance method, constructed with `new` and invoked through a
 typed reference. GNU Cim 5.1 turned out not to support a bare, parameterless
-`virtual: procedure P;` specification — confirmed by reading the compiler's
+`virtual: procedure P;` specification, confirmed by reading the compiler's
 own grammar, `src/parser.y`, whose `ONE_SPEC` rule has a dedicated error
 production for exactly that shape, matching the compiler's own manual's
-up-front warning about limited virtual procedure parameter support — so
-dispatch here is through a concrete class rather than a virtual call through
-the common supertype. Construction, inheritance and instance methods are
+up-front warning about limited virtual procedure parameter support. As a
+result, dispatch here is through a concrete class rather than a virtual call
+through the common supertype. Construction, inheritance and instance methods are
 still genuine and exercised, including by a real language-local test that
 constructs both classes and calls their instance methods.
 
@@ -555,15 +647,15 @@ apply only to boolean operands. RFC 6455 masking, which the specification
 defines as a byte-by-byte exclusive or, is written in `client/convex-ws.sim`
 as an explicit eight-bit arithmetic loop (`bytexor`) instead, the same
 approach this project's ALGOL 60 client uses for the same reason. Every
-payload length form — the 7-bit, 16-bit and 64-bit extended forms — is built
-and parsed through plain division and multiplication by 256.
+payload length form, including the 7-bit, 16-bit and 64-bit extended forms, is
+built and parsed through plain division and multiplication by 256.
 
 ### One owner, and the barriers around it
 
 Exactly one call path may touch the WebSocket, change the query-set version
 or decide to reconnect: `client/convex-live.sim`'s procedures, driven by
-whichever caller — the example, a test, or the conformance adapter's poll
-loop — is currently inside one of them. Simula's `SIMULATION` class does
+whichever caller, whether the example, a test, or the conformance adapter's
+poll loop, is currently inside one of them. Simula's `SIMULATION` class does
 provide real coroutines, but this client, like this project's ALGOL 60
 client, does not use them for socket ownership; single-owner discipline is
 enforced by convention rather than by the language.
@@ -585,7 +677,7 @@ header. A frame's declared payload length is checked against the configured
 ceiling before any payload byte is requested, so an inflated length header
 cannot make the client reserve memory on a peer's behalf.
 
-## Conformance and protocol notes
+### Conformance and protocol notes
 
 `client/tests/conformance/adapter.sim` is test infrastructure, not public
 client code. It speaks NDJSON adapter protocol v1 over stdin and stdout, or
@@ -606,37 +698,19 @@ The pinned sync profile is recorded in `manifest.yaml`. It is an
 undocumented protocol, and nothing here implies it is stable or officially
 supported.
 
-## Limitations and deferred behaviour
+## Known Issues
 
-- Shared local and hosted conformance passed, earning HTTP and Live. The
-  limitations below remain deliberately outside those capabilities.
-- TLS has not been separately unit-tested against a private CA the way this
-  project's ALGOL 60 client does. `client/convexrt.c`'s TLS code is the same
-  reviewed design (peer verification, the default CA bundle, and
-  `SSL_set1_host` hostname checking, all switched on together), but that
-  specific trust/untrusted/wrong-host proof has not been run for this
-  checkpoint.
-- The WebSocket handshake does not verify the server's
-  `Sec-WebSocket-Accept` response header against SHA-1 of the client's key,
-  matching this project's ALGOL 60 client. A valid HTTP 101 upgrade response
-  is still required, and every frame exchanged afterward is real RFC 6455
-  framing; only that one header's cryptographic check is skipped.
-- `convexcall` and `livesubscribe` open their own connection internally, and
-  the language-local test suite has no fixture server to connect to, so it
-  exercises HTTP framing, the Convex envelope decoder, and RFC 6455 frame
-  build/read round trips directly rather than through a live connection.
-- Live is driven by the caller. Reactive updates arrive only while a caller
-  is inside `livenext`, the adapter's event loop, or another client
-  procedure.
-- Live authentication, optimistic updates, WebSocket mutations, WebSocket
-  actions, journals and `TransitionChunk` assembly are deferred.
-- Live values cover Convex's JSON-safe subset; tagged Convex value
-  conversions are deferred.
-- JSON numbers are accepted only when mathematically integral and
-  representable exactly within a safe 64-bit range; fractional and
-  out-of-range values are rejected at the point of use.
-- Active Live subscriptions and the delivery queue are bounded; a value too
-  large for the configured byte budget becomes an observable
-  `ProtocolError` without changing the subscription's last delivered value,
-  and queue overflow drops the oldest undelivered event rather than growing
-  without bound.
+1. The WebSocket upgrade requires HTTP 101 but does not verify
+   `Sec-WebSocket-Accept` against SHA-1 of the client's key.
+2. Live authentication, optimistic updates, WebSocket mutations and actions,
+   journals, `TransitionChunk` assembly, and tagged Convex value conversions
+   are deferred.
+3. Live is caller-driven. Updates progress while code is inside `livenext`,
+   the adapter loop, or another client procedure. The queue is bounded and
+   drops the oldest undelivered event on overflow.
+4. TLS ran against the hosted deployment with certificate and hostname checks,
+   but this client has not had the separate private-CA trust, untrusted-CA, and
+   wrong-host unit proof used by the ALGOL 60 client.
+5. The language-local suite tests HTTP and WebSocket framing directly because
+   `convexcall` and `livesubscribe` open their own connections and the suite has
+   no concurrent fixture server.

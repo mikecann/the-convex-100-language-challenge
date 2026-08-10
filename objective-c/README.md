@@ -1,20 +1,150 @@
-# Convex from Objective-C
+# Objective-C
 
-A native Objective-C client that calls Convex functions over HTTP and follows a query through the pinned `/api/sync` WebSocket profile.
+Objective-C is C with an object system inspired by Smalltalk: method calls are messages in square brackets, and objects use a dynamic runtime. Brad Cox and Tom Love created it in the early 1980s. It later became the main language for NeXT, macOS, and iOS software, so its present-day niche is largely established Apple-platform code and frameworks. Apple's archived [Programming with Objective-C](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/ProgrammingWithObjectiveC/Introduction/Introduction.html) is the clearest official introduction.
 
-This is educational and unofficial, not a production Convex SDK.
+This implementation runs on Linux using [GNUstep](https://www.gnustep.org/), an open source implementation of the Cocoa-style Foundation APIs. It is an educational, unofficial demonstration, not a production Convex SDK.
 
-## Start here
+## Getting Started
 
-[`examples/basics/main.m`](examples/basics/main.m) follows the shared counter from 0 to 1. It performs an HTTP query, begins Live before the mutation, uses an idempotency key, and verifies the reactive update.
+The canonical [`examples/basics/main.m`](examples/basics/main.m) follows one counter from `0` to `1`: it queries the initial state, subscribes before mutating, increments once, and reads the resulting Live update.
 
-## What works
+From the repository root, run:
+
+```sh
+./run verify-example objective-c
+```
+
+That command builds and runs the exact example below in Docker against a unique test room. It proves the example journey, while the broader shared conformance commands are what support the capability claims in the Status section.
+
+## Interesting Parts
+
+### A familiar query becomes a message to an object
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function Counter() {
+  const state = useQuery(api.demo.state, { room: "readme-objective-c" });
+  return <p>{state === undefined ? "Loading..." : state.count}</p>;
+}
+```
+
+**Objective-C**
+
+```objective-c
+#import "ConvexClient.h"
+#import <Foundation/Foundation.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  const char *deployment = getenv("CONVEX_URL");
+  if (!deployment) {
+    fprintf(stderr, "CONVEX_URL is required\n");
+    [pool drain];
+    return 1;
+  }
+  // Convert the deployment setting into a Foundation URL, then create a client.
+  NSURL *url = [NSURL URLWithString:[NSString stringWithUTF8String:deployment]];
+  NSError *error = nil;
+  CVXClient *client = [[CVXClient alloc] initWithDeploymentURL:url
+                                                clientVersion:@"readme-example"
+                                                        error:&error];
+
+  // NSDictionary is the Objective-C argument object for { room: ... }.
+  NSDictionary *arguments = @{ @"room" : @"readme-objective-c" };
+  CVXResult *result = [client query:@"demo:state" args:arguments error:&error];
+  NSNumber *count = [result.value objectForKey:@"count"];
+  printf("%lld\n", [count longLongValue]); // The value is decoded at runtime.
+
+  [client release]; // This build uses manual reference counting.
+  [pool drain];
+  return 0;
+}
+```
+
+The brackets send the `query:args:error:` message to `client`; named pieces such as `args:` are part of the method selector. Unlike `useQuery`, this call is a one-off HTTP query. It returns ordinary Foundation objects rather than a generated TypeScript type, so the complete example validates the dictionary and number before trusting them.
+
+### The caller owns the Live subscription
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function LiveCounter() {
+  const room = "readme-objective-c-live";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  return (
+    <button
+      onClick={() =>
+        increment({ room, language: "TypeScript", runId: crypto.randomUUID() })
+      }
+    >
+      Count: {state?.count ?? "Loading..."}
+    </button>
+  );
+}
+```
+
+**Objective-C**
+
+```objective-c
+#import "ConvexClient.h"
+#import <Foundation/Foundation.h>
+
+static void incrementAndReadUpdate(CVXClient *client) {
+  NSString *room = @"readme-objective-c-live";
+  NSError *error = nil;
+  NSDictionary *queryArguments = @{ @"room" : room };
+
+  // Subscribe first so the mutation's reactive update cannot be missed.
+  CVXSubscription *subscription = [client subscribe:@"demo:state"
+                                                args:queryArguments
+                                               error:&error];
+  CVXLiveUpdate *initial =
+      [subscription nextUpdateWithTimeoutMilliseconds:10000 error:&error];
+
+  NSDictionary *mutationArguments = @{
+    @"room" : room,
+    @"language" : @"Objective-C",
+    @"runId" : [[NSUUID UUID] UUIDString],
+  };
+  // A fresh UUID gives this call its own mutation identity.
+  CVXResult *mutation = [client mutation:@"demo:increment"
+                                    args:mutationArguments
+                                   error:&error];
+  // Block until Live delivers the state produced by that mutation.
+  CVXLiveUpdate *updated =
+      [subscription nextUpdateWithTimeoutMilliseconds:10000 error:&error];
+  // Decode initial.value, mutation.value, and updated.value as Foundation objects.
+  (void)initial;
+  (void)mutation;
+  (void)updated;
+  [subscription unsubscribe:&error]; // The command-line caller cleans up.
+}
+```
+
+React starts, updates, and disposes the `useQuery` subscription with the component lifecycle. Here the caller creates and removes `CVXSubscription` explicitly. Objective-C can use callbacks and asynchronous APIs, but this client deliberately offers blocking `nextUpdateWithTimeoutMilliseconds:error:` so command-line sequencing stays easy to see. The full example checks every returned value and error.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
 | HTTP queries, mutations, actions, token changes, and structured errors | Verified by shared local and hosted conformance |
 | Live initial values and updates through `/api/sync` | Verified by shared local and hosted conformance |
 | Remove, reconnect, query-error recovery, and bounded delivery | Verified by shared local and hosted conformance |
+
+The implementation is native: Convex-specific HTTP and Live behavior is written here in Objective-C and C, rather than delegated to another Convex client.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.m -->
 ```objective-c
@@ -132,18 +262,21 @@ int main(int argc, char **argv) {
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-`./run test objective-c` formats, compiles, and runs deterministic Objective-C client and Live fixtures inside Docker. `./run build objective-c` produces the non-root amd64 adapter runtime. Root-owned `verify-example` and conformance commands remain the capability-evidence gates.
+The public surface consists of Objective-C classes and Foundation values: `CVXClient`, `CVXResult`, `CVXSubscription`, `CVXLiveUpdate`, `NSDictionary`, `NSArray`, and `NSError`. The build uses Clang 14.0.6, GNUstep Base 1.28.0, and libobjc 12 on `linux/amd64`. It uses manual reference counting, which is why the example explicitly releases the client and drains its autorelease pool. [Clang's user manual](https://clang.llvm.org/docs/UsersManual.html) documents its Objective-C language support.
 
-## Protocol notes
+Checksum-pinned libcurl 8.21.0 handles HTTP, TLS, and WebSocket transport, while json-c 0.16 parses and writes JSON behind a private C boundary. Application code sees Foundation objects, not json-c handles. Convex-specific request, subscription, reconnect, and ownership logic remains in this client, so its `native` provenance does not mean every low-level transport primitive was rewritten from scratch.
 
-The public API is made of real Objective-C classes and Foundation values: `CVXClient`, `CVXSubscription`, `NSDictionary`, `NSArray`, and `NSError`. It runs on GNUstep Base and libobjc on Linux. The canonical example and a deterministic local fixture both exercise that API. A private C boundary exists only so the black-box adapter can inspect exact protocol events without exposing json-c types to application code.
+Live uses one worker to own the WebSocket and connection state. Each subscription keeps the newest 16 updates, and all subscriptions share an 8 MiB encoded-byte budget. The blocking `nextUpdateWithTimeoutMilliseconds:error:` method pulls from that bounded queue. Reconnects restore active subscriptions and suppress an unchanged rehydration value.
 
-The adapter speaks NDJSON protocol v1 on stdin/stdout or a single `ADAPTER_LISTEN` TCP connection. Checksum-pinned libcurl 8.21.0 supplies HTTP, TLS, and WebSocket transport, while json-c 0.16 supplies the internal JSON parser. Convex-specific protocol and ownership logic remains here. One worker alone owns the socket, query-set changes, and reconnects. It resubscribes active queries after reconnect, suppresses unchanged hydration, resets backoff after a healthy connection, and reports structured function, protocol, and transport errors without stranding valid subscriptions.
+For local checks, `./run test objective-c` formats and compiles the source, then runs deterministic HTTP, Live, queue, deadline, and adapter fixtures in Docker. `./run build objective-c` creates the stripped non-root runtime images. The shared `verify`, `verify-hosted`, and `verify-all` commands are separate evidence gates and should be run by the repository coordinator.
 
-The final images keep the root filesystem read-only. Their `/tmp` points at Docker's bounded `/dev/shm` runtime tmpfs because GNUstep startup under amd64 emulation needs temporary lock storage; neither client writes persistent application state there.
+The final images use a read-only root filesystem and run as user `65532:65532`. GNUstep needs temporary lock storage during startup, so `/tmp` maps to Docker's bounded `/dev/shm` tmpfs rather than persistent application storage.
 
-Live delivery keeps the newest 16 updates per subscription and also enforces a conservative shared 8 MiB encoded-byte budget. The adapter caps active subscriptions at 16. Controller output has one owner and a 500 ms write deadline, so a stopped stdin or TCP reader cannot leave generation invalidation, unsubscribe, replacement, EOF cleanup, or close blocked behind output.
+## Known Issues
 
-Live authentication, optimistic updates, tagged Convex values, WebSocket mutations/actions, and `TransitionChunk` assembly are intentionally deferred. The sync endpoint is an undocumented pinned profile and may drift. Shared local and hosted conformance earned HTTP and Live.
+1. Live authentication, optimistic updates, WebSocket mutations, and WebSocket actions are not implemented. Queries, mutations, actions, and token changes are available over HTTP.
+2. Live follows an undocumented `/api/sync` profile pinned to a tested backend revision. That profile can drift independently of Convex's documented HTTP API.
+3. A subscription retains only its newest 16 updates. One encoded Live message above 2 MiB is rejected, and all subscriptions share an 8 MiB queue budget.
+4. The conformance adapter accepts at most 16 active subscriptions and abandons its controller output stream if a write remains blocked for 500 ms.
