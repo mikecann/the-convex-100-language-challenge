@@ -1,0 +1,26 @@
+schemaVersion: 1
+id: c3
+displayName: "C3"
+rank: 101
+selectionTier: exploratory
+implementation:
+  status: in-progress
+  provenance: native
+  version: 0.1.0
+  notes: C3 implementation in progress. A narrow C shim will provide only TLS, socket, clock, and random primitives.
+toolchain:
+  name: C3
+  version: 0.8.2
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities: []
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+limitations:
+  - Implementation is in progress and has not earned HTTP or Live capability evidence.
+capabilities: []
