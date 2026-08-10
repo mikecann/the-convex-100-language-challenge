@@ -1,22 +1,153 @@
-# Convex from R
+<img src="logo.png" alt="R logo" width="180">
+<!-- Logo source: https://www.r-project.org/logo/Rlogo.svg -->
 
-This is a small R client that queries a Convex counter over HTTP, listens for
-the same value over Live, and proves the counter moved from `0` to `1`.
+# R
 
-It is educational and unofficial. It is not a production SDK or a package for
+[R](https://www.r-project.org/) is a language and environment for statistical
+computing and graphics. Ross Ihaka and Robert Gentleman began it in the early
+1990s as a free implementation inspired by Bell Labs' S language. R remains a
+specialist mainstay for statistics, data science, research, and
+publication-quality graphics, with a large ecosystem of extension packages.
+
+This repository uses R for an educational Convex client demonstration. It is
+unofficial, is not a production SDK, and is not a package intended for
 publication.
 
-## Start here
+## Getting Started
 
-[The canonical basics example](examples/basics/main.R) creates the client,
-starts Live before the mutation, and checks every observed value.
+[The canonical basics example](examples/basics/main.R) queries a counter,
+subscribes to it before changing it, and checks the complete `0` to `1`
+journey. From the repository root, run:
 
-## What works
+```sh
+./run verify-example r
+```
+
+That command builds and runs the exact example in Docker against an isolated
+room. You do not need R installed on your computer.
+
+## Interesting Parts
+
+### Named lists become Convex argument objects
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function CounterValue() {
+  const state = useQuery(api.demo.state, { room: "readme-r-query" });
+  if (state === undefined) return <span>Loading...</span>;
+  return <span>{state.count}</span>; // state and count are type-safe here.
+}
+```
+
+**R**
+
+```r
+source("client/convex.R")
+
+read_counter <- function() {
+  # CONVEX_URL selects the deployment; the named list becomes { room: ... }.
+  client <- convex_client(Sys.getenv("CONVEX_URL"))
+  on.exit(client$close()) # Dispose of HTTP and Live resources on every exit.
+
+  args <- list(room = "readme-r-query")
+  state <- client$query("demo:state", args)$value
+  print(state$count) # JSON objects decode to named lists, accessed with `$`.
+}
+
+read_counter()
+```
+
+R's named lists are a natural fit for JSON objects, so the call stays compact.
+Unlike the generated TypeScript API, field names and result shapes are checked
+at runtime. This R call is also a one-off HTTP query, not a reactive hook.
+
+### This client makes the Live lifecycle explicit
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function LiveCounter() {
+  const room = "readme-r-live";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  async function addOne() {
+    const result = await increment({
+      room,
+      language: "typescript",
+      runId: crypto.randomUUID(), // Retries with this key apply only once.
+    });
+    console.log(result.applied);
+    // useQuery owns the subscription and rerenders when the count changes.
+  }
+
+  return (
+    <button disabled={state === undefined} onClick={addOne}>
+      Count: {state?.count ?? "loading"}
+    </button>
+  );
+}
+```
+
+**R**
+
+```r
+source("client/convex.R")
+source("client/live.R")
+
+watch_one_change <- function() {
+  client <- convex_client(Sys.getenv("CONVEX_URL"))
+  on.exit(client$close(), add = TRUE) # Always dispose of the client.
+  room <- "readme-r-live"
+
+  # Subscribe before mutating, then read the initial server value explicitly.
+  subscription <- client$subscribe("demo:state", list(room = room))
+  on.exit(subscription$close(), add = TRUE) # Stop Live when this function ends.
+  initial <- subscription$next_update()$value
+  print(initial$count)
+
+  # Convex treats runId as an idempotency key. Time and PID distinguish this run.
+  run_id <- paste0("readme-r-", as.integer(Sys.time()), "-", Sys.getpid())
+  result <- client$mutation(
+    "demo:increment",
+    list(
+      room = room,
+      language = "r",
+      runId = run_id
+    )
+  )$value
+  print(result$applied) # The mutation result is another decoded named list.
+
+  updated <- subscription$next_update()$value
+  print(updated$count) # This value arrived through Live, not another query.
+}
+
+watch_one_change()
+```
+
+React creates, updates, and disposes the subscription with the component. This
+command-line client instead returns a subscription that the caller reads and
+closes directly. The blocking `next_update()` API is a deliberate client design
+for a small executable, not a limitation of R itself.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
 | HTTP queries, mutations, and actions | Verified by shared local and hosted conformance |
 | Live subscriptions and reconnects | Verified by shared local and hosted conformance |
+
+The manifest records this as a native R implementation with both `http` and
+`live` capabilities earned.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.R -->
 ```r
@@ -108,23 +239,30 @@ if (sys.nframe() == 0L) run_example()
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-`./run test r` runs R formatting, unit tests, and adapter lifecycle checks in
-Docker. `./run build r` builds the minimal linux/amd64 runtime images. The
-coordinator runs `verify-example`, `verify`, and `verify-hosted` serially.
+The client builds Convex's HTTP request envelopes and Live query state in R.
+The `curl`, `jsonlite`, `later`, and `websocket` packages provide ordinary
+HTTP/TLS, JSON, event-loop, and WebSocket machinery; they do not delegate to
+another Convex client. The image pins R 4.5.1, curl 7.1.0, jsonlite 2.0.0, later
+1.4.8, and websocket 1.4.4.
 
-## Protocol notes
+Live socket callbacks run through one `later` event loop, which keeps socket
+ownership and reconnect state in one place. Every subscription exposes
+`next_update()` for a bounded wait and `take_update()` for a non-blocking read.
+Its queue retains only the newest 16 deliveries.
 
-The client owns Convex HTTP envelopes and the `/api/sync` query-set protocol in
-R. `curl`, `jsonlite`, `later`, and `websocket` supply only low-level transport,
-JSON, and event-loop primitives. The image pins R 4.5.1, curl 7.1.0, jsonlite
-2.0.0, later 1.4.8, and websocket 1.4.4. Each subscription keeps only its newest
-16 deliveries. R's base `compiler` namespace remains because the interpreter
-loads it for bytecode, but the runtime image removes the `R` command, `R CMD`
-tooling, compilers, linkers, package managers, and build frontends.
+All build and verification work happens in Docker. `./run test r` checks R
+formatting and language-local tests, while `./run build r` creates the minimal
+`linux/amd64` runtime images. The final image keeps R's base `compiler`
+namespace because `Rscript` needs bytecode support, but removes the interactive
+`R` command, `R CMD` tools, compilers, linkers, and package managers.
 
-## Limitations
+## Known Issues
 
-The implementation intentionally supports the JSON-safe values exercised by
-this experiment. Live auth and TransitionChunk assembly are deferred.
+1. The client supports the JSON-safe Convex values exercised here, not the full
+   set of Convex-specific value types.
+2. Live authentication, optimistic updates, and `TransitionChunk` assembly are
+   deferred.
+3. A slow Live consumer can lose intermediate deliveries because each
+   subscription intentionally keeps only its newest 16 events.
