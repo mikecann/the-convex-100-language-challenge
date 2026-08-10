@@ -1,29 +1,144 @@
-# Convex from Erlang
+# Erlang
 
-This native Erlang client queries a Convex counter, subscribes to it over Live,
-mutates it, and proves the reactive value changes from `0` to `1`. OTP, Gun,
-and JSX provide ordinary transport and JSON building blocks while Erlang owns
-the Convex-specific behavior.
+[Erlang](https://www.erlang.org/) is a functional language and runtime created
+at Ericsson in the late 1980s for telecom systems. Its lightweight processes,
+message passing, and fault-tolerance tools now also suit highly available
+servers in areas such as banking, ecommerce, and messaging. OTP is the standard
+set of Erlang libraries and middleware used to build those systems.
 
-It is educational and unofficial. It is not a production SDK, an officially
+This repository uses those ideas to make a native Convex client. It is an
+educational, unofficial demonstration, not a production SDK, an officially
 sanctioned Convex client, or a package intended for Hex.
 
-## Start here
+## Getting Started
 
-[`examples/basics/main.erl`](examples/basics/main.erl) is the exact program
-Docker runs and the website displays. Its comments follow the shared counter
-from 0 to 1 with an HTTP query, a real `/api/sync` subscription started before
-the mutation, and the resulting Live update.
+The canonical [`examples/basics/main.erl`](examples/basics/main.erl) queries a
+counter, starts a Live subscription, increments it, and receives the reactive
+update from `0` to `1`. From the repository root, run it in Docker with:
 
-## What works
+```sh
+./run verify-example erlang
+```
+
+## Interesting Parts
+
+### Maps and pattern matching replace generated app types
+
+**TypeScript with React**
+
+```tsx
+import { useMutation } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function IncrementButton() {
+  const increment = useMutation(api.demo.increment);
+
+  async function handleClick() {
+    const result = await increment({
+      room: "docs-erlang",
+      language: "TypeScript",
+      runId: crypto.randomUUID(), // Fresh idempotency key for this click.
+    });
+    console.log(result.state.count); // Generated Convex types know this is a number.
+  }
+
+  return <button onClick={handleClick}>Increment</button>;
+}
+```
+
+**Erlang**
+
+```erlang
+increment_once() ->
+    Deployment =
+        case os:getenv("CONVEX_URL") of
+            false -> erlang:error(missing_convex_url);
+            Url -> Url
+        end,
+    {ok, Client} = convex:new(Deployment),
+    %% A new random idempotency key lets each invocation increment once.
+    RunId = base64:encode(crypto:strong_rand_bytes(16)),
+    Args = #{<<"room">> => <<"docs-erlang">>,
+             <<"language">> => <<"Erlang">>,
+             <<"runId">> => RunId},
+    try
+        %% convex:call/4 blocks, then returns decoded Erlang maps.
+        {ok, #{<<"state">> := #{<<"count">> := Count}}, _Logs} =
+            convex:call(Client, mutation, <<"demo:increment">>, Args),
+        io:format("~p~n", [Count]) % Count is checked at runtime, not generated typing.
+    after
+        convex:close(Client)
+    end.
+```
+
+Convex code generation gives the React call app-specific argument and return
+types. This Erlang client has no equivalent generated type layer. It decodes
+JSON to maps, and the pattern either binds `Count` from the expected shape or
+fails immediately. The synchronous `convex:call/4` API is this client's design,
+not a limitation of Erlang's process model.
+
+### A Live value arrives as a process message
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  const state = useQuery(api.demo.state, { room: "docs-erlang-live" });
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // React rerenders when the query changes.
+}
+```
+
+**Erlang**
+
+```erlang
+print_next_count() ->
+    Deployment =
+        case os:getenv("CONVEX_URL") of
+            false -> erlang:error(missing_convex_url);
+            Url -> Url
+        end,
+    {ok, Client} = convex:new(Deployment),
+    Args = #{<<"room">> => <<"docs-erlang-live">>},
+    %% self() makes this process the destination for Live messages.
+    {ok, Live, Subscription} =
+        convex:subscribe(Client, <<"demo:state">>, Args, self()),
+    try
+        receive
+            %% This can be the initial value or a later reactive update.
+            {convex_live, Subscription,
+             #{value := #{<<"count">> := Count}}} ->
+                io:format("~p~n", [Count])
+        after 10000 ->
+            erlang:error(live_timeout)
+        end
+    after
+        %% A CLI program owns teardown that React handles on unmount.
+        convex:unsubscribe(Live, Subscription),
+        convex:close(Client)
+    end.
+```
+
+React's `useQuery` owns the subscription lifecycle and rerenders the component.
+Here one Erlang `gen_server` owns the WebSocket, then sends `{convex_live, ...}`
+messages to the subscriber's mailbox. Erlang supports many ways to structure
+that message handling. Blocking in `receive` is the small command-line API and
+example's choice.
+
+## Status
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
 | HTTP | Verified by shared local and hosted conformance | Native queries, mutations, actions, bearer-token replacement, logs, TLS verification, and structured errors are implemented. |
-| Live | Verified by shared local and hosted conformance | One native WebSocket owner implements Add/Remove, typed query failures, bounded delivery, reconnect restoration, and stale-relay barriers against the pinned profile. |
+| Live | Verified by shared local and hosted conformance | One native WebSocket owner implements subscription add/remove, query failures, bounded delivery, reconnect restoration, and stale-message barriers against the pinned profile. |
 
-The shared local and hosted black-box controller passed both rows, and the
-manifest records the earned HTTP and Live capabilities.
+The manifest records both HTTP and Live as earned capabilities. These results
+apply to the repository's pinned backend and sync profile.
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.erl -->
 ```erlang
@@ -124,60 +239,46 @@ env(Name, Default) ->
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-```sh
-./run test erlang
-./run build erlang
-sh erlang/client/tests/conformance/adversarial.sh
-```
+This is a native Erlang implementation. OTP 26.2.5.15 supplies `httpc`, TLS,
+processes, and the `gen_server` behaviour. Gun 2.5.0 handles ordinary WebSocket
+transport, Cowlib 2.19.0 supports Gun, and JSX 3.1.0 handles JSON. Erlang code in
+[`client/convex.erl`](client/convex.erl) builds Convex HTTP requests and decodes
+results, while [`client/live.erl`](client/live.erl) owns the Convex-specific
+Live state.
 
-`test` checks the target architecture, treats Erlang compiler lint warnings as
-errors, compiles the client, example, and adapter, and runs deterministic
-codec, real-socket Live, and partial-NDJSON fixtures. `build` creates the
-minimal non-root conformance image. The adversarial fixture stops reading the
-real final adapter's TCP output while 240 KiB Live updates arrive and proves
-the 128 MiB container closes cleanly instead of being OOM-killed. The root
-integration task separately owns the serialized `verify-example`, `verify`,
-`verify-hosted`, and `verify-all` evidence runs.
+One `gen_server` has exclusive ownership of the socket, reconnect state, and
+query set. Per-subscription relay processes keep slow consumers away from that
+owner. Each subscription retains at most the newest 16 undelivered events and
+256 KiB, including an event already being delivered. The conformance adapter
+has the same count and byte limits for output to a stalled controller.
 
-## Protocol notes and limits
+The Docker image contains the BEAM runtime and the required OTP bytecode, but
+not Erlang compiler commands or package tooling. HTTP, TLS, WebSocket, and JSON
+startup are probed in that final non-root image. `debugDisconnect` is compiled
+into the adapter for reconnect testing and is not part of the educational
+client API.
 
-OTP `httpc` and `ssl` provide ordinary HTTP/TLS transport. Gun 2.5.0 provides
-ordinary WebSocket framing, fragmentation, and control handling, and JSX 3.1.0
-provides JSON. The Erlang `live` owner alone opens `/api/sync`, sends
-Connect/Add/Remove messages, maintains query-set and timestamp state, and
-publishes atomically deduplicated updates.
+For more background, Erlang's official documentation explains
+[processes and message passing](https://www.erlang.org/doc/system/ref_man_processes.html),
+[map patterns](https://www.erlang.org/doc/system/expressions.html#maps-in-patterns),
+and [the language's history](https://www.erlang.org/course/history.html).
+Convex documents how its React client
+[manages reactive queries](https://docs.convex.dev/client/react/overview) and
+how [generated API types](https://docs.convex.dev/generated-api/) provide
+TypeScript type safety.
 
-Each subscription keeps the newest 16 undelivered events within a 256 KiB
-bound. Both limits include the event currently held by its relay, and an
-overflowed relay is confirmed dead before its physical payload leaves the byte
-budget. The adapter also owns one global 16-event, 256 KiB encoded-output
-budget, including the binary held by a blocked socket send; it closes a stalled
-controller when that budget fills. Stdin and `ADAPTER_LISTEN` TCP share the
-same 1 MiB newline parser and discard incomplete EOF fragments.
+## Known Issues
 
-The final image uses Dash plus individual POSIX text packages. It removes the
-BusyBox multicall binary and all of its links, so `wget` and `nc` cannot be
-recovered through command lookup, a different `argv[0]`, or a BusyBox applet.
-It also removes Alpine package-manager libraries, certificate update helpers,
-standalone network and ELF-inspection tools, and OTP's unused compile frontend
-modules. The remaining OTP bytecode is the runtime closure exercised by the
-HTTP, TLS, WebSocket, and JSON startup probe.
-The adapter exposes `debugDisconnect` only for conformance.
-
-## Limitations
-
-Live authentication, WebSocket mutations and actions, tagged Convex values,
-mutation replay, optimistic updates, and `TransitionChunk` assembly are
-deferred. Realtime is an internal protocol, so passing evidence for this pinned
-revision would not make it a supported third-party SDK contract.
-
-The pinned Gun dependency resolves Cowlib 2.19.0. Hex flags both packages for
-request/response splitting (`GHSA-w4f7-4cxr-rv3c`) and separately flags
-Cowlib's cookie encoder for header injection (`GHSA-g2wm-735q-3f56`). This
-outbound client neither constructs responses nor calls that cookie encoder,
-but the vulnerable code remains and no patched Hex release currently exists.
-That unresolved dependency risk is another reason not to use this experiment
-as production software. The shared evaluator still awarded HTTP and Live for
-the pinned profile exercised by this project.
+1. Live authentication, WebSocket mutations and actions, tagged Convex values,
+   and `TransitionChunk` assembly are not implemented.
+2. Live relies on an internal, pinned Convex sync profile. Passing conformance
+   does not make that profile a supported third-party SDK contract.
+3. Gun 2.5.0 and Cowlib 2.19.0 contain code flagged by Hex for
+   request/response splitting (`GHSA-w4f7-4cxr-rv3c`), and Cowlib's cookie
+   encoder is flagged for header injection (`GHSA-g2wm-735q-3f56`). This
+   outbound client does not construct responses or call the cookie encoder,
+   but the dependency code remains and no patched Hex release is available.
+4. Live delivery is intentionally bounded. A slow subscriber keeps only the
+   newest 16 events within 256 KiB rather than an unlimited history.
