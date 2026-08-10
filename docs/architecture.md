@@ -188,12 +188,15 @@ Trusted CI records:
 
 Policy checks inspect source, manifests, image history, SBOMs, child processes, and outbound destinations. This detects obvious delegation to `curl`, Node, Python, the Convex CLI, or an undeclared shared core. Native provenance still requires review because automated checks are evidence, not proof.
 
-JavaScript and Python are the narrow exception to the generic delegated-runtime
-probe: an implemented manifest must declare its approved
-`targetRuntimeCommand`, and the final image must contain that command. The probe
-continues to reject the other common delegated runtimes, package managers,
-`curl`, and the Convex CLI. Adding another exception is a shared policy change,
-not something a language implementation may do for itself.
+Target-language interpreters are narrow exceptions to the generic
+delegated-runtime probe. An implemented manifest must declare its approved
+`targetRuntimeCommand`, and the final image must contain that command. This
+includes JavaScript-target languages on Node, Python and Hy on Python, and Lua
+and Fennel on Lua. The interpreter genuinely executes that language's own
+client code; it does not delegate Convex behaviour to another client. The probe
+continues to reject every undeclared runtime, package manager, `curl`, and the
+Convex CLI. Adding another exception is a shared policy change, not something a
+language implementation may do for itself.
 
 The Go pilot implements source and tree revisions, image and base digests,
 per-test and transcript hashes, final-image inspection, SBOM, and build

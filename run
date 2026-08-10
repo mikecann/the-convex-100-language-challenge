@@ -99,7 +99,7 @@ image_policy() {
   )
 
   case "$target_runtime" in
-    "" | node | php | python | python3) ;;
+    "" | lua | node | php | python | python3) ;;
     *)
       printf '%s\n' "Unsupported target runtime command: $target_runtime" >&2
       exit 1
@@ -131,7 +131,7 @@ image_policy() {
           exit 1
         fi
       fi
-      for command_name in node php python python3; do
+      for command_name in lua node php python python3; do
         if test "$command_name" = "$TARGET_RUNTIME_COMMAND"; then
           continue
         fi
@@ -211,7 +211,7 @@ $listing
     # forbidden in images with no claim to it. Delegated runtimes (node, php,
     # python) are already covered by image_policy above.
     case "$language:$command_name" in
-      perl:perl | lua:lua) continue ;;
+      fennel:lua | lua:lua | perl:perl) continue ;;
     esac
     skip=""
     for declared_tool in $declared; do

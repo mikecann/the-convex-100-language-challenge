@@ -55,8 +55,11 @@ assert.equal(fenceLanguageFor("assembly-x86-64", "main.asm"), "nasm");
 assert.equal(fenceLanguageFor("ballerina", "main.bal"), "ballerina");
 assert.equal(fenceLanguageFor("freebasic", "main.bas"), "freebasic");
 assert.equal(fenceLanguageFor("c", "main.c"), "c");
+assert.equal(fenceLanguageFor("c3", "main.c3"), "c3");
+assert.equal(fenceLanguageFor("fennel", "main.fnl"), "fennel");
 assert.equal(fenceLanguageFor("groovy", "main.groovy"), "groovy");
 assert.equal(fenceLanguageFor("julia", "main.jl"), "julia");
+assert.equal(fenceLanguageFor("hy", "main.hy"), "hy");
 assert.equal(fenceLanguageFor("objective-c", "main.m"), "objective-c");
 assert.equal(fenceLanguageFor("matlab", "main.m"), "matlab");
 assert.equal(fenceLanguageFor("wolfram-language", "main.m"), "mathematica");
@@ -77,6 +80,27 @@ assert.ok(
   [...requiredHTTPTests, ...requiredLiveTests].every((name) => !name.includes("go/")),
 );
 
+assert.equal(
+  targetRuntimeError("fennel", {
+    implementation: { status: "attempting" },
+    targetRuntimeCommand: "lua",
+  }),
+  null,
+);
+assert.equal(
+  targetRuntimeError("hy", {
+    implementation: { status: "attempting" },
+    targetRuntimeCommand: "python3",
+  }),
+  null,
+);
+assert.equal(
+  targetRuntimeError("lua", {
+    implementation: { status: "attempting" },
+    targetRuntimeCommand: "lua",
+  }),
+  null,
+);
 assert.equal(
   targetRuntimeError("python", {
     implementation: { status: "attempting" },

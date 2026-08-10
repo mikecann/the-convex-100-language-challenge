@@ -72,8 +72,11 @@ function readOptionalResult(directory, languageId) {
 
 const syntaxAliases = {
   "assembly-x86-64": "asm",
+  c3: "c",
   "delphi-object-pascal": "pascal",
+  fennel: "lisp",
   fortran: "fortran-free-form",
+  hy: "lisp",
   "visual-basic-dotnet": "vb",
   "wolfram-language": "wolfram",
 };
@@ -144,6 +147,7 @@ async function firstExample(languageId) {
 }
 
 const languages = await Promise.all(roster.languages.map(async (entry) => {
+  const logoSource = path.join(root, entry.id, "logo.png");
   const manifest = parse(
     fs.readFileSync(path.join(root, entry.id, "manifest.yaml"), "utf8"),
   );
@@ -163,12 +167,26 @@ const languages = await Promise.all(roster.languages.map(async (entry) => {
     evidenceTrust: trustedResult ? "trusted-main" : localResult ? evidenceChannel : null,
     hostedResult,
     example: await firstExample(entry.id),
+    logo: fs.existsSync(logoSource) ? `/logos/${entry.id}.png` : null,
   };
 }));
 
 fs.mkdirSync(output, { recursive: true });
 for (const filename of ["index.html", "app.js", "styles.css"]) {
   fs.copyFileSync(path.join(source, filename), path.join(output, filename));
+}
+
+// Logos live with their language implementations, which keeps ownership and
+// attribution obvious. Project them into the static site just like examples.
+const logoOutput = path.join(output, "logos");
+fs.rmSync(logoOutput, { recursive: true, force: true });
+fs.mkdirSync(logoOutput, { recursive: true });
+for (const language of languages) {
+  if (!language.logo) continue;
+  fs.copyFileSync(
+    path.join(root, language.id, "logo.png"),
+    path.join(logoOutput, `${language.id}.png`),
+  );
 }
 fs.writeFileSync(
   path.join(output, "data.json"),

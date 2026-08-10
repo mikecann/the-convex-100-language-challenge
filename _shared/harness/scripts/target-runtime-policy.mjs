@@ -5,7 +5,10 @@
 // protocol behaviour still has to be written in the target language.
 export const approvedTargetRuntimeCommands = new Map([
   ["coffeescript", new Set(["node"])],
+  ["fennel", new Set(["lua"])],
+  ["hy", new Set(["python3"])],
   ["javascript", new Set(["node"])],
+  ["lua", new Set(["lua"])],
   ["php", new Set(["php"])],
   ["python", new Set(["python", "python3"])],
   ["rescript", new Set(["node"])],
