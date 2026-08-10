@@ -1,21 +1,173 @@
-# Convex from Assembly (x86-64 NASM)
+<img src="logo.png" alt="NASM logo" width="240">
+<!-- Logo source: https://www.nasm.us/images/nasmlogw.png -->
 
-A Convex client written by hand in x86-64 assembly (NASM, System V AMD64
-calling convention). It talks to Convex over plain HTTP or HTTPS and over
-the WebSocket-based Live sync protocol, building and parsing the
-request/response JSON itself, framing WebSocket messages itself, and
-reasoning about the C ABI to call OpenSSL directly for the TLS handshake.
+# Assembly (x86-64 NASM)
 
-This is educational and unofficial, not a production Convex SDK.
+Assembly languages expose a processor's instructions, registers, and memory
+operations directly instead of supplying objects, exceptions, or a runtime
+that manages them. This client targets 64-bit x86 Linux and uses
+[NASM](https://www.nasm.us/), the Netwide Assembler. NASM began with Simon
+Tatham and Julian Hall in the 1990s and remains a portable assembler for x86
+object formats. Hand-written assembly is now a specialist tool for work such
+as operating-system code, embedded startup, reverse engineering, and small
+performance-critical routines, not a normal choice for an application SDK.
 
-## Start here
+This demonstration is educational and unofficial. It is not a production
+Convex SDK.
 
-[`examples/basics/main.s`](examples/basics/main.s) queries the shared
-counter over HTTP, starts a Live subscription, applies an idempotent
-mutation, and confirms the resulting reactive update -- the full `0 -> 1`
-journey other language examples on this site show.
+## Getting Started
 
-## What works
+The canonical [`examples/basics/main.s`](examples/basics/main.s) performs the
+same shared-counter journey as the other clients: query `demo:state`, subscribe
+to it, call `demo:increment`, then observe the reactive value change from 0 to
+1. From the repository root, Docker builds the pinned `linux/amd64` image and
+runs that exact example against a unique room:
+
+```sh
+./run verify-example assembly-x86-64
+```
+
+## Interesting Parts
+
+### A query becomes a register-level call
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+function QueryCount() {
+  const room = "readme-room";
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // state and count are type-safe here.
+}
+```
+
+**Assembly (x86-64 NASM)**
+
+```nasm
+default rel
+%include "convex.inc"                    ; operation constants and layouts
+extern convex_call
+
+section .rodata
+    path_state: db "demo:state"
+    path_state_len equ $ - path_state
+
+section .text
+; int query_state(client, args, out, err)
+; System V inputs: rdi = convex_client*, rsi = owned { room: "readme-room" },
+; rdx = convex_result*, rcx = convex_error*. The return value is in eax.
+query_state:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    mov [rbp-8], rdi                     ; client
+    mov [rbp-16], rsi                    ; args, consumed by convex_call
+    mov [rbp-24], rdx                    ; output result
+    mov [rbp-32], rcx                    ; output error
+
+    mov rdi, [rbp-8]
+    mov esi, CONVEX_OP_QUERY
+    lea rdx, [rel path_state]
+    mov ecx, path_state_len
+    mov r8, [rbp-16]
+    mov r9, [rbp-24]
+    sub rsp, 16                          ; seventh ABI argument uses the stack
+    mov rax, [rbp-32]
+    mov [rsp], rax
+    call convex_call
+    add rsp, 16
+    mov rsp, rbp
+    pop rbp
+    ret
+```
+
+React's `useQuery` is reactive and manages a subscription. The assembly call
+above is deliberately only a one-off HTTP read. Its caller has already built
+the `{ room }` JSON object, and `convex_call` takes ownership of it. The
+canonical example below shows construction, result decoding, checks, and
+cleanup.
+
+### Reactivity is an explicit resource
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+function Counter() {
+  const room = "readme-room";
+  const state = useQuery(api.demo.state, { room });
+
+  // React subscribes on mount, rerenders on updates, and unsubscribes on unmount.
+  return <span>{state?.count ?? "Loading..."}</span>;
+}
+```
+
+**Assembly (x86-64 NASM)**
+
+```nasm
+default rel
+%include "convex.inc"                    ; structure layouts
+extern convex_live_subscribe
+extern convex_live_next
+extern convex_live_unsubscribe
+
+section .rodata
+    path_state: db "demo:state"
+    path_state_len equ $ - path_state
+
+section .text
+; int observe_state_once(live, args, out)
+; System V: rdi = initialized convex_live*, rsi = fresh { room: "readme-room" }
+; args (ownership moves on success), rdx = caller-owned convex_update* output.
+observe_state_once:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    mov [rbp-8], rdi                     ; Live state remains caller-owned
+    mov [rbp-16], rsi                    ; args move to a successful subscription
+    mov [rbp-24], rdx                    ; delivered update remains caller-owned
+
+    mov rdi, [rbp-8]
+    lea rsi, [rel path_state]
+    mov edx, path_state_len
+    mov rcx, [rbp-16]
+    call convex_live_subscribe
+    test rax, rax
+    jz .failed                           ; caller still owns args on failure
+    mov [rbp-32], rax                    ; opaque subscription handle
+
+    mov rdi, rax
+    mov rsi, [rbp-24]
+    mov edx, 10000
+    call convex_live_next                ; blocking API choice, 10 second limit
+    mov [rbp-16], rax                    ; 1 = update delivered, 0 = timeout
+
+    mov rdi, [rbp-32]
+    call convex_live_unsubscribe         ; frees the subscription and its args
+    mov rax, [rbp-16]
+    jmp .done
+.failed:
+    xor eax, eax
+.done:
+    mov rsp, rbp
+    pop rbp
+    ret
+```
+
+The command-line client explicitly subscribes, waits, and unsubscribes where
+React does that around component lifetime. This blocking `next` API is a
+client design choice, not a NASM limitation. A delivered update's contents
+belong to the caller; the canonical example shows their cleanup. The internal
+eight-entry queue drops its oldest update when a reader falls behind.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -23,6 +175,8 @@ journey other language examples on this site show.
 | Structured function errors and bearer-token auth | Verified by shared local and hosted conformance (`FunctionError` decoding, `Authorization: Bearer` header) |
 | Nested JSON, UTF-8, and console log lines | Verified by shared local and hosted conformance |
 | Live subscriptions: initial value, external updates, unsubscribe, five real reconnects, query-error recovery | Verified by shared local and hosted conformance |
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.s -->
 ```text
@@ -551,54 +705,61 @@ section .rodata
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
+
+The provenance is `native`, with an important boundary. NASM 2.16.01
+assembles all Convex-specific behavior: request and response envelopes, the
+HTTP/1.1 parser, JSON value model, RFC 6455 WebSocket framing, UTF-8 checks,
+and the Live sync state machine. It does not delegate those jobs to another
+Convex client, `curl`, Node.js, Python, or the Convex CLI.
+
+This is not a freestanding executable made solely from assembly. NASM emits
+ELF object files, then GCC links them with the C runtime, glibc, `libssl`, and
+`libcrypto`. The assembly follows the
+[System V AMD64 ABI](https://gitlab.com/x86-psABIs/x86-64-ABI) to call C
+functions. glibc supplies ordinary facilities such as `getenv`, allocation,
+DNS lookup, sockets, `poll`, and process I/O. OpenSSL supplies TLS and SHA-1
+for the WebSocket handshake. The surrounding connection policy is still
+assembly: it loads system trust roots, requests peer verification, sets SNI,
+configures the expected hostname with
+[`SSL_set1_host`](https://docs.openssl.org/3.6/man3/SSL_set1_host/), and checks
+the handshake result.
+
+The JSON parser preserves integer literals as exact 64-bit values, which
+matters for nanosecond Live timestamps beyond JavaScript's exact integer
+range. Decimal or exponent forms become IEEE-754 doubles. Serialization uses
+a deliberately limited fixed-point formatter with at most six fractional
+digits, not a general shortest-round-trip conversion.
+
+The Docker `test` target assembles each translation unit, links the example
+and conformance adapter, checks that both are genuine x86-64 ELF executables,
+and exercises the adapter over standard I/O and TCP. The final runtime keeps
+the dynamic loader, glibc, OpenSSL, CA certificates, `/bin/sh`, and `id`
+because the binaries and shared verifier need them. It does not include NASM,
+GCC, a package manager, or another language runtime.
 
 ```sh
-./run sync-examples
 ./run test assembly-x86-64
 ./run verify-example assembly-x86-64
 ./run verify-all assembly-x86-64
 ```
 
-`test` assembles every client translation unit individually, links the
-conformance adapter and the canonical example, and runs protocol-level
-smoke tests against the adapter over both stdin/stdout and the
-`ADAPTER_LISTEN` TCP path. `verify-example` builds the minimal runtime
-image and runs the exact canonical example against a unique room on the
-local backend and the hosted deployment. `verify-all` runs the shared
-black-box conformance pilot against both deployment profiles. Root owns
-`verify-example`, `verify`, `verify-hosted`, and `verify-all` because those
-commands serialize the shared backend and evidence store.
+The checked-in evidence records 31/31 shared local and hosted conformance
+checks from clean commit `90dbc94968f10f25b0fa379be9d1dcb2e619d865`. That
+evidence, not this README edit, earns the `http` and `live` capabilities.
 
-Shared local and hosted conformance passed 31/31 from a clean exact-head
-build (commit `90dbc94968f10f25b0fa379be9d1dcb2e619d865`), earning both the
-`http` and `live` capabilities recorded in `manifest.yaml`.
+## Known Issues
 
-## Protocol notes and limits
-
-The adapter speaks NDJSON protocol v1 on stdin/stdout or one
-`ADAPTER_LISTEN` TCP connection. Every HTTP call opens a fresh TCP
-connection (TLS-wrapped for `https://` deployments, calling libssl's C ABI
-directly with full certificate verification), sends the request, and
-parses the response body per its framing (`Content-Length`, chunked
-transfer-encoding, or read-until-close). `query`, `mutation`, and `action`
-all route through the same `POST /api/<op>` envelope Convex's HTTP API
-documents. `setAuth` sets the bearer token used on subsequent calls.
-`subscribe`, `unsubscribe`, and the adapter-only `debugDisconnect` drive
-the Live sync state machine over a hand-framed RFC 6455 WebSocket
-connection: the Convex `Connect`/`ModifyQuerySet`/`Transition` protocol,
-client-side masking, fragmented-message reassembly with interleaved
-control frames, exponential reconnect backoff with full `Add` resend, and
-suppression of an unchanged rehydration after a healthy reconnect. See
-`manifest.yaml` for the full list of documented limitations (Live
-authentication and Live mutations/actions are deferred; only query
-subscriptions use Live).
-
-JSON parsing preserves full 64-bit precision for integer literals (no
-decimal point or exponent) rather than routing them through a double --
-important for Convex's nanosecond sync timestamps, which routinely exceed
-2^53 and would silently lose precision as floating point. A literal that
-does contain a decimal point or exponent is decoded as a double and, on
-the way back out, printed with a bounded 6-fractional-digit formatter
-(trailing zeros trimmed) rather than a general shortest-round-trip
-algorithm.
+1. Live supports query subscriptions only. Authentication and mutations or
+   actions over the WebSocket are deferred, although HTTP bearer auth,
+   mutations, and actions are verified.
+2. A subscription buffers eight updates and drops the oldest when its reader
+   falls behind. Reconnects resend active queries and suppress an unchanged
+   rehydration value.
+3. JSON supports this project's JSON-safe subset, not Convex's richer tagged
+   values. Double formatting is also intentionally limited as described
+   above.
+4. Each HTTP operation opens a fresh TCP or TLS connection. There is no
+   keep-alive pool, and IPv6-literal deployment URLs are rejected.
+5. Parser safety limits include 128 levels of JSON nesting, 200,000 allocated
+   JSON nodes, and 64 KiB of HTTP response headers.
