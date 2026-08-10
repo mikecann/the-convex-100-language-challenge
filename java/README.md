@@ -108,7 +108,7 @@ public final class Main {
 
 `test` compiles and runs Java-local checks inside Docker. `build` produces the
 minimal runtime images. The latter two commands are root-owned shared evidence
-runs and have not yet awarded any capability badges.
+runs; local and hosted conformance passed and awarded HTTP and Live.
 
 ## Protocol notes
 

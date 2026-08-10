@@ -220,8 +220,8 @@ sending.
 
 ## Limitations
 
-- Nothing here has been compiled or run. The Docker build, the language-local
-  tests, and both runtime images are unverified.
+- The Docker build, language-local tests, both runtime images, and shared local
+  and hosted conformance passed for the reviewed source.
 - Live authentication and `TransitionChunk` assembly are not implemented. A
   chunk is treated as recoverable protocol drift.
 - Values are limited to this experiment's JSON-safe subset. Tagged Convex

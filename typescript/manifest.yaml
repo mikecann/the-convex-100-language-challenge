@@ -7,7 +7,7 @@ implementation:
   status: working
   provenance: native
   version: 0.1.0
-  notes: Native TypeScript implementation of Convex HTTP and sync behaviour. ws supplies WebSocket transport only; badges await root-owned conformance evidence.
+  notes: Native TypeScript implementation of Convex HTTP and sync behaviour. ws supplies WebSocket transport only; root-owned local and hosted conformance earned HTTP and Live.
 toolchain:
   name: Node.js and TypeScript
   version: Node.js 22.16.0, TypeScript 5.8.3

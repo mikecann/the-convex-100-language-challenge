@@ -12,8 +12,8 @@ It is unofficial teaching code, not a production SDK.
 
 | Capability | Status |
 | --- | --- |
-| HTTP query, mutation, and action calls | Implemented locally; capability badge awaits root-owned shared conformance |
-| Live query updates and reconnects | Implemented locally; capability badge awaits root-owned shared conformance |
+| HTTP query, mutation, and action calls | Verified by root-owned local and hosted conformance |
+| Live query updates and reconnects | Verified by root-owned local and hosted conformance |
 | HTTP bearer authentication | Implemented locally |
 | Live authentication and optimistic updates | Not implemented |
 
@@ -95,7 +95,7 @@ let main argv =
 
 Run `./run test fsharp` to compile the client, adapter, and exact example in the pinned .NET SDK image and execute the deterministic language-local fixtures. Run `./run build fsharp` to produce the non-root minimal adapter runtime.
 
-The repository coordinator owns `verify-example`, `verify`, and `verify-hosted`. Those shared gates are still required before this client earns HTTP or Live capability badges.
+The repository coordinator owns `verify-example`, `verify`, and `verify-hosted`. Those shared gates passed, earning HTTP and Live capability badges.
 
 ## Protocol notes
 
@@ -109,4 +109,4 @@ The adapter implements NDJSON protocol v1 over stdin/stdout or one TCP controlle
 
 This is pinned to an undocumented protocol profile, so it is evidence for this experiment rather than a stable SDK contract. Live authentication, optimistic updates, transition chunks, journals, and WebSocket mutation or action calls are not implemented. HTTP supports bearer authentication and remains the path for mutations and actions.
 
-The language-local fixtures also cover atomic transition rejection, repeated-query coalescing, strict state versions, 255 to 256 little-endian timestamp ordering, semantic object and null hydration, same-value recovery after errors, cross-subscription memory pressure, command and subscription ceilings, bounded HTTP bodies, oversized partial NDJSON, controller backpressure, and sole-owner socket instrumentation. Shared local and hosted conformance evidence is deliberately left to the repository coordinator.
+The language-local fixtures also cover atomic transition rejection, repeated-query coalescing, strict state versions, 255 to 256 little-endian timestamp ordering, semantic object and null hydration, same-value recovery after errors, cross-subscription memory pressure, command and subscription ceilings, bounded HTTP bodies, oversized partial NDJSON, controller backpressure, and sole-owner socket instrumentation. The repository coordinator's shared local and hosted conformance runs passed.

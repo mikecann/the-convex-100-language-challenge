@@ -123,5 +123,4 @@ Live authentication, optimistic updates, WebSocket mutations/actions, journal
 replay, tagged Convex values, and `TransitionChunk` assembly are deferred. A
 subscription keeps only its newest 16 updates and 8 MiB of queued encoded data,
 discarding old intermediate query states for a slow consumer. Capability badges
-remain empty until the exact source is exercised by shared local and hosted
-conformance.
+were earned when the exact source passed shared local and hosted conformance.
