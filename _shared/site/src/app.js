@@ -43,6 +43,9 @@ document.querySelector("#language-count").textContent = data.languages.length;
 document.querySelector("#working-count").textContent = data.languages.filter(
   (language) => language.result?.earnedCapabilities?.length > 0,
 ).length;
+document.querySelector("#live-count").textContent = data.languages.filter(
+  (language) => language.result?.earnedCapabilities?.includes("live"),
+).length;
 
 if (data.evidenceChannel !== "trusted-main") {
   const notice = document.querySelector("#evidence-notice");
@@ -59,6 +62,20 @@ function status(language) {
   if (capabilities(language).length > 0) return "working";
   if (["failed", "blocked"].includes(language.implementation.status)) return "failed";
   return language.implementation.status;
+}
+
+function logoElement(language) {
+  if (language.logo) {
+    const image = document.createElement("img");
+    image.src = language.logo;
+    image.alt = "";
+    image.loading = "lazy";
+    return image;
+  }
+  const monogram = document.createElement("span");
+  monogram.className = "monogram";
+  monogram.textContent = language.displayName.replace(/[^A-Za-z0-9+#]/g, "").slice(0, 2);
+  return monogram;
 }
 
 function badge(name) {
@@ -119,6 +136,7 @@ function render() {
 
     const card = template.content.firstElementChild.cloneNode(true);
     card.dataset.status = languageStatus;
+    card.querySelector(".logo").append(logoElement(language));
     card.querySelector(".rank").textContent = `#${language.rank}`;
     card.querySelector(".name").textContent = language.displayName;
     card.querySelector(".state").textContent = languageStatus;
@@ -185,11 +203,18 @@ function addDetailList(parent, entries) {
 
 function showLanguage(language) {
   dialogContent.replaceChildren();
+  const titleRow = document.createElement("div");
+  titleRow.className = "dialog-title";
+  const titleLogo = document.createElement("span");
+  titleLogo.className = "logo";
+  titleLogo.setAttribute("aria-hidden", "true");
+  titleLogo.append(logoElement(language));
   const title = document.createElement("h2");
   title.textContent = language.displayName;
+  titleRow.append(titleLogo, title);
   const intro = document.createElement("p");
   intro.textContent = `Roster rank ${language.rank}. Implementation status: ${status(language)}.`;
-  dialogContent.append(title, intro);
+  dialogContent.append(titleRow, intro);
 
   const badgeRow = document.createElement("div");
   badgeRow.className = "dialog-badges";
