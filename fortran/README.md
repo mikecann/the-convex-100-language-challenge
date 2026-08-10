@@ -1,14 +1,81 @@
-# Convex from Fortran
+<img src="logo.png" alt="Fortran logo" width="128">
+<!-- Logo source: https://github.com/fortran-lang/webpage/blob/main/source/_static/images/fortran-logo-256x256.png -->
 
-This Fortran 2018 demonstration queries a Convex counter over HTTP, follows it over Live, applies an idempotent mutation, and checks that every view agrees on the move from 0 to 1.
+# Fortran
 
-It is unofficial educational material, not a production SDK.
+Fortran began at IBM in 1954 under John Backus and reached users in 1957. Its name comes from "formula translation", which still fits a language built for numeric work. Modern Fortran is statically and strongly typed, supports several programming styles, and remains active in science, engineering, weather modelling, and high-performance computing. The [Fortran community site](https://fortran-lang.org/) is the best starting point for the language today, while [IBM's history](https://www.ibm.com/history/fortran) tells the origin story.
 
-## Start here
+This repository is an educational experiment. The client is unofficial and is not a production Convex SDK.
 
-[`examples/basics/main.f90`](examples/basics/main.f90) follows a counter from 0 to 1: an HTTP query, a Live query started before the mutation, the idempotent mutation, and the resulting Live update.
+## Getting Started
 
-## What works
+The canonical [`examples/basics/main.f90`](examples/basics/main.f90) program queries a counter, starts a Live subscription, performs an idempotent mutation, and observes the reactive update from 0 to 1.
+
+From the repository root, Docker builds and runs that exact program against the approved test deployment:
+
+```sh
+./run verify-example fortran
+```
+
+## Interesting Parts
+
+### React owns the subscription; this client makes it visible
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "../convex/_generated/api";
+
+export function Counter() {
+  // React subscribes on mount and unsubscribes on unmount.
+  const state = useQuery(api.demo.state, { room: "fortran-readme" });
+  return <p>{state?.count ?? "Loading..."}</p>; // state.count is type-safe here.
+}
+```
+
+**Fortran**
+
+```fortran
+program live_counter
+  use convex_fortran
+  implicit none
+
+  type(convex_client) :: client
+  type(convex_live) :: live
+  character(:), allocatable :: url, value, error
+  logical :: ok
+  integer :: count, url_length
+
+  ! Read the deployment selected by the caller, then create the client.
+  call get_environment_variable('CONVEX_URL', length=url_length)
+  if (url_length == 0) error stop 'CONVEX_URL is required'
+  allocate(character(url_length) :: url)
+  call get_environment_variable('CONVEX_URL', url)
+  call convex_new(url, client, ok, error)
+  if (.not. ok) error stop error
+
+  ! The arguments are JSON text because this small client has no value tree.
+  call convex_live_start(client, 'demo:state', &
+    '{"room":"fortran-readme"}', live, ok, error)
+  if (.not. ok) error stop error
+
+  ! next blocks until the subscription produces its initial value.
+  call convex_live_next(live, value, ok, error)
+  if (.not. ok) error stop error
+  count = convex_count(value, ok) ! Decode the returned state object's count.
+  if (.not. ok) error stop 'invalid counter state'
+  write (*, '(I0)') count
+
+  ! There is no component unmount, so cleanup is explicit.
+  call convex_live_close(live)
+  call convex_live_close()
+end program live_counter
+```
+
+Both snippets subscribe to `api.demo.state` with the same room argument. React rerenders whenever `useQuery` changes. This client instead exposes a blocking `convex_live_next` call so a command-line program can decide when to consume each value. That blocking API is a choice made by this client, not a limitation of Fortran.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -16,6 +83,8 @@ It is unofficial educational material, not a production SDK.
 | Live query Add/Remove, updates, failure recovery, and reconnect | Works in deterministic state tests and hosted smoke tests |
 | NDJSON adapter over stdin or one TCP controller | Works with partial input, isolated malformed commands, bounded output, and EOF cleanup |
 | Capability badges | HTTP and Live earned from root-owned local and hosted conformance evidence |
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.f90 -->
 ```fortran
@@ -123,29 +192,19 @@ end program basics
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-```sh
-./run sync-examples fortran
-./run validate
-./run test fortran
-./run build fortran
-```
+The Fortran module implements Convex request encoding, JSON decoding, HTTP operations, Live subscription state, reconnects, and bounded delivery. A single worker owns WebSocket activity. The public Live API then lets application code start a subscription, wait for values, unsubscribe, and close it explicitly.
 
-`sync-examples` proves this displayed source is the runnable source. `validate` checks the public layout and manifest. `test` compiles the exact example and adapter for `linux/amd64`, then runs transactional Live-state, real RFC6455 socket, and adapter-process fixtures. `build` produces the final adapter image. The root integration owner must separately run `verify-example`, local conformance, and hosted conformance after review.
+Fortran's standard C interoperability is used only at the transport boundary. [`client/curl_transport.c`](client/curl_transport.c) supplies HTTPS through libcurl, cancellable DNS through c-ares, and TLS plus RFC6455 WebSockets through OpenSSL and sockets. Convex paths, messages, and state decisions remain in Fortran, so the implementation is classified as native rather than a bridge.
 
-## Protocol notes and limits
+The build uses GNU Fortran 14.2.0 and a digest-pinned Debian Bookworm toolchain. The runtime keeps the compiled program, its dynamic-library closure, certificates, OpenSSL providers, `/bin/sh`, and basic text tools required by the shared verifier. It does not contain a compiler, package manager, Convex CLI, Node.js, Python, or the curl command.
 
-The Fortran module owns Convex request encoding, JSON decoding, `Connect`, versioned `ModifyQuerySet` Add/Remove operations, transactional `Transition` application, reconnect metadata, backoff, generation barriers, hydration suppression, and the global newest-16 Live queue. One worker exclusively owns WebSocket reads, writes, reconnects, and query-set versions.
+Language-local Docker tests cover compilation, JSON edge cases, Live recovery, WebSocket framing, bounded shutdown, and the adapter process. The capability table above comes from the separate root-owned local and hosted conformance evidence, not from compilation alone.
 
-`client/curl_transport.c` is a small ordinary transport ABI. It uses libcurl 7.88.1 for HTTPS, c-ares 1.18.1 for cancellable bounded DNS, and OpenSSL plus sockets for TLS and RFC6455. It validates the upgrade response, masks client frames, assembles fragmented UTF-8, services control frames, abandons partial frames on timeout, and bounds DNS, handshakes, writes, and close without leaving resolver work behind. It contains no Convex paths, messages, or state decisions.
+## Known Issues
 
-The build is pinned to GCC/GNU Fortran 14.2.0 on the digest-pinned Bookworm toolchain image. Production uses digest-pinned Debian 12.11 slim with c-ares 1.18.1-3, libcurl 7.88.1-10+deb12u15, OpenSSL 3.0.20-1~deb12u2, CA certificates 20230311+deb12u1, and libgfortran5 12.2.0-14+deb12u1.
-
-The adapter reserves stdout for protocol events. Its single writer keeps at most 16 encoded events and 32 MiB including conservative overhead, coalescing queued updates for the same subscription. The client uses the same count and byte limits for Live delivery, and supports at most 64 active subscriptions. Test-only transition hooks are included only in the separately compiled test object.
-
-## Limitations
-
-Live authentication is deferred. Values remain JSON text rather than a richer Fortran value tree. WebSocket mutations/actions, optimistic updates, journals, replay, and `TransitionChunk` assembly are also deferred; an unknown server transition is reported as `ProtocolError` and reconnects instead of being guessed at.
-
-The runtime images intentionally retain Debian's `/bin/sh` and basic text tools because the shared verifier requires them. They contain the compiled Fortran executable, its dynamic-library closure, CA certificates, OpenSSL configuration/providers, and no compiler, package manager, Convex CLI, Node.js, Python, curl command, or unsafe multicall binary. The root-owned shared evidence run passed from a clean reviewed commit, earning HTTP and Live.
+1. Live authentication is not implemented.
+2. Values are JSON text instead of an idiomatic Fortran value tree.
+3. WebSocket mutations and actions, optimistic updates, journals, replay, and `TransitionChunk` assembly are deferred.
+4. Live delivery is capped at 64 subscriptions and the newest 16 encoded events or 32 MiB. An unknown server transition reports `ProtocolError` and reconnects.
