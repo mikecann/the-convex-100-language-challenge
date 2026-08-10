@@ -1,34 +1,162 @@
-# Convex from ATS2
+<img src="logo.png" alt="ATS logo" width="140">
+<!-- Logo source: https://www.cs.bu.edu/~hwxi/atslangweb/MYDATA/theLogo.png -->
 
-This demonstration queries a Convex room with ATS2, observes it over Live,
-increments it, and checks the reactive value changes from `0` to `1`. ATS2
-proves memory safety with dependent and linear types over a language that
-compiles straight through C. That proof burden is spent deliberately here:
-`convex_json.dats` walks a cJSON-parsed tree exactly once into a genuine ATS
-algebraic datatype, and every predicate that actually interprets a Convex
-value -- looking up a field, coalescing a sync-protocol Transition's
-modifications, deciding whether a number is a whole count -- operates on
-that ATS type through exhaustiveness-checked pattern matching, not on the C
-tree.
+# ATS2
 
-It is educational and unofficial. It is not a production SDK, an officially
-sanctioned Convex client, or a package intended for publication.
+ATS2 is a statically typed language created by Hongwei Xi to bring formal
+specification and implementation into the same program. Its functional core is
+influenced by ML, its low-level side is comfortable around C, and its best-known
+features are dependent and linear types. Postiats compiles ATS2 to C99, which is
+why ATS still has a niche in systems work, refinement-based development, and
+teaching type theory rather than mainstream application development. The
+[official ATS site](https://www.ats-lang.org/) is the best starting point.
 
-## Start here
+This repository uses those ideas to query, mutate, and observe a Convex counter.
+It is an educational, unofficial demonstration, not a production SDK, an
+officially sanctioned Convex client, or a package intended for publication.
 
-[`examples/basics/main.dats`](examples/basics/main.dats) is the exact
-program the Docker image runs and the website displays. Its comments
-explain client setup, the initial HTTP query, starting Live before the
-mutation, the idempotency key, and the final reactive assertion.
+## Getting Started
 
-## What works
+The [canonical example](examples/basics/main.dats) follows one room from `0` to
+`1` through an HTTP query, a Live subscription, and an idempotent mutation. From
+the repository root, Docker builds and runs that exact program against a unique
+test room:
+
+```sh
+./run verify-example ats
+```
+
+## Interesting Parts
+
+### A JSON value has to earn its shape
+
+**TypeScript with React**
+
+```tsx
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function CounterRead() {
+  const state = useQuery(api.demo.state, { room: "ats-json-read" });
+  if (state === undefined) return <span>Loading...</span>;
+
+  return <span>{state.count}</span>; // state.count is type-safe here.
+}
+```
+
+**ATS2**
+
+```ats
+#include "share/atspre_staload.hats"
+staload "./convex_json.sats"
+staload "./convex_transport.sats"
+staload "./convex.sats"
+
+(* The caller passes its validated CONVEX_URL rather than baking in a deployment. *)
+fun read_count(deploymentUrl: string): int =
+  case+ new_client(deploymentUrl) of
+  | CONone() => (exit(1); 0)
+  | COSome(client) => (
+      case+ http_query(client, "demo:state", jobj1("room", JStr("ats-json-read"))) of
+      | CallErr(_) => (exit(1); 0)
+      | CallOk(value, _) => (
+          case+ json_lookup("count", value) of
+          | JONone() => (exit(1); 0)
+          | JOSome(countJson) => (
+              case+ json_integral_int(countJson) of
+              | IONone() => (exit(1); 0)
+              | IOSome(count) => count
+              (* count is an ATS int only after every shape check succeeds. *)
+            )
+        )
+    )
+```
+
+React gets the return type from Convex's generated API. This ATS client instead
+receives its one-off HTTP result as the local `json` datatype, then uses
+exhaustive pattern matching and a checked whole-number conversion. ATS does not
+know the `demo:state` schema ahead of time in this implementation.
+
+### React owns Live for you; this program owns it directly
+
+**TypeScript with React**
+
+```tsx
+import { useMutation, useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+export function LiveCounter() {
+  const room = "ats-live-room";
+  const state = useQuery(api.demo.state, { room });
+  const increment = useMutation(api.demo.increment);
+
+  const bump = () =>
+    increment({ room, language: "typescript", runId: crypto.randomUUID() });
+
+  // React starts, updates, and disposes the subscription with the component.
+  return <button onClick={bump}>{state?.count ?? "Loading..."}</button>;
+}
+```
+
+**ATS2**
+
+```ats
+#include "share/atspre_staload.hats"
+staload "./convex_json.sats"
+staload "./convex_transport.sats"
+staload "./convex.sats"
+
+(* This is the signature of await_live from examples/basics/main.dats. *)
+extern fun await_live(conn: live_conn, state: live_state, queryId: int,
+  label: string): (json, live_state)
+
+(* The caller passes its validated CONVEX_URL rather than baking in a deployment. *)
+fun increment_with_live(deploymentUrl: string): void =
+  case+ new_client(deploymentUrl) of
+  | CONone() => exit(1)
+  | COSome(client) => (
+      case+ live_connect(client) of
+      | LiveErr(_) => exit(1)
+      | LiveOkConn(conn, state0) => (
+          case+ live_add(conn, state0, "demo:state",
+              jobj1("room", JStr("ats-live-room"))) of
+          | AddErr(_) => (live_close(conn); exit(1))
+          | AddOk(queryId, state1) => let
+              (* The canonical await_live helper polls until this queryId changes. *)
+              val (_, state2) = await_live(conn, state1, queryId, "initial value")
+              val runId = random_hex(16) (* A fresh id makes this increment idempotent. *)
+              val mutationArgs = JObj(JFLCons("room", JStr("ats-live-room"),
+                JFLCons("language", JStr("ats"), JFLCons("runId", JStr(runId), JFLNil()))))
+            in
+              case+ http_mutation(client, "demo:increment", mutationArgs) of
+              | CallErr(_) => (live_close(conn); exit(1))
+              | CallOk(_, _) => let
+                  (* Live was started first, so this observes the mutation. *)
+                  val (_, state3) = await_live(conn, state2, queryId, "updated value")
+                  val state4 = live_remove(conn, state3, queryId)
+                  val () = live_close(conn) (* This program owns cleanup explicitly. *)
+                in
+                  ()
+                end
+            end
+        )
+    )
+```
+
+The ATS language can support other concurrency styles. The blocking
+`await_live` helper and explicit state threading are choices made by this small
+client. Unlike `useQuery`, it has no component lifecycle to perform cleanup.
+The [full example](examples/basics/main.dats) includes every result check omitted
+from this focused comparison.
+
+## Status
 
 | Capability | Current state | What that means |
 | --- | --- | --- |
-| HTTP | Verified by shared local and hosted conformance | Native query, mutation, and action over the documented JSON API, including bearer token auth, logs, and typed `FunctionError`/`ProtocolError`/`TransportError` failures. |
-| Live | Verified by shared local and hosted conformance | Native WebSocket subscriptions against the pinned `/api/sync` profile: initial value, external updates, unsubscribe, query-error recovery, and five real `debugDisconnect` reconnects with rehydration correctly suppressed. |
+| HTTP | Verified by shared local and hosted conformance | Native query, mutation, and action over the documented JSON API, including bearer-token auth, logs, and structured function, protocol, and transport failures. |
+| Live | Verified by shared local and hosted conformance | Native WebSocket subscriptions against the pinned `/api/sync` profile, including initial and external updates, unsubscribe, query-error recovery, and five real reconnects. |
 
-## Basic example
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.dats -->
 ```text
@@ -217,74 +345,36 @@ end
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Verify it in Docker
+## Implementation Notes
 
-```sh
-./run test ats
-./run verify-example ats
-./run verify ats
-./run verify-hosted ats
-./run verify-all ats
-```
+This is a native ATS2 implementation. cJSON parses incoming text, then
+[`client/convex_json.dats`](client/convex_json.dats) walks that C tree once into
+an ATS algebraic datatype. Convex-specific request envelopes, result decoding,
+Live state, and update coalescing stay in
+[`client/convex.dats`](client/convex.dats). OpenSSL and POSIX sockets provide
+TLS, HTTP, WebSocket, and polling through ATS's C foreign-function interface.
 
-`test` builds every checked-in `.sats`/`.dats` source with `patscc`, which
-performs ATS2's full dependent-type, linear-resource, and pattern-match
-exhaustiveness check before running the language-local unit tests.
-`verify-example` exercises the exact example above against a unique room.
-The conformance commands are root-owned checks for the separate self-hosted
-and dedicated hosted deployments.
+That boundary matters. ATS2 supports dependent and linear types, but this client
+does not claim that every network byte is tracked by such a proof. Its growable
+HTTP and WebSocket buffers live in the C transport shim. The ATS side gains
+ordinary algebraic types and exhaustive `case+` matching for JSON and client
+results, while the test adapter uses one reactor loop as the sole owner of Live
+socket reads, writes, and reconnects.
 
-## Conformance and protocol notes
-
-HTTP calls use the documented `/api/query`, `/api/mutation`, and
-`/api/action` JSON endpoints. Live uses the unversioned `/api/sync` profile
-pinned to `convex-rs` 0.10.4 at commit
+The Docker build uses ATS2/Postiats `0.4.2-1.1` on `linux/amd64`. It temporarily
+flattens the source tree because `patsopt --dynamics` resolves `staload` paths
+from its working directory. The final images contain the compiled program,
+OpenSSL, cJSON, libc, CA data, and basic verifier tools, but no ATS compiler or
+package manager. Live targets the unversioned `/api/sync` behavior pinned to
+`convex-rs` 0.10.4 at commit
 `6f1df8a8ba1665084ec001e307ca841ca17074d7`.
 
-ATS2 ships no HTTP, TLS, WebSocket, or JSON library. JSON parsing is
-delegated to cJSON (Ubuntu's own `libcjson-dev`); `client/convex_json.dats`
-walks its tree exactly once into a genuine ATS algebraic datatype at the FFI
-boundary, and every accessor and the renderer both operate on that ATS type
-afterward. `client/convex_transport.dats` reaches OpenSSL and POSIX sockets
-through ATS's C foreign-language interface for the mechanical parts: TCP
-connect, the TLS 1.2+ handshake with real certificate and hostname
-verification against the system CA bundle, HTTP/1.1 response framing
-(Content-Length and chunked), the RFC 6455 WebSocket opening handshake and
-frame masking, base64, and `poll(2)`. Everything Convex-specific --
-`/api/query`/`/api/mutation`/`/api/action` envelope decoding, the sync
-protocol's `Connect`/`ModifyQuerySet`/`Transition` messages, version and
-timestamp validation, and modification coalescing -- is written in ATS in
-`client/convex.dats`.
+## Known Issues
 
-The test-only adapter (`client/tests/conformance/adapter.dats`) accepts
-NDJSON over stdin/stdout or one `ADAPTER_LISTEN` TCP connection. It is a
-single reactor loop: one `poll(2)` call over the control channel and the
-Live socket together, so exactly one piece of code ever reads, writes, or
-reconnects the WebSocket. Pure command parsing and event-JSON shaping live
-in `client/tests/conformance/adapter_logic.dats` so they can be unit tested
-directly (`client/tests/conformance/adapter_test.dats`) without a live
-process.
-
-## Limitations
-
-`patscc`/`patsopt` resolve `staload` paths relative to the invoking working
-directory rather than the source file's own directory, and a `--dynamics`
-build target cannot itself contain a directory component, so the Docker
-build flattens the checked-in `client/` tree into one directory before
-compiling; the checked-in source layout itself still follows AGENTS.md.
-
-Live reconnect retries immediately rather than backing off exponentially
-under sustained failure, and the inbound message queue is bounded only by
-the shared 8 MiB per-frame limit, not by a dedicated slow-consumer count and
-byte budget the way the Haskell and Prolog clients implement one. Growable
-transport buffers (HTTP bodies, WebSocket frame payloads) are managed on
-the C side of the FFI boundary rather than under a dependent size proof --
-this client's dependent/linear-typing claim is in the JSON value tree and
-the protocol-state handling, not in the raw byte transport. WebSocket
-mutations/actions, `TransitionChunk` assembly, optimistic updates,
-journals, replay, and Convex's non-JSON-safe value types are out of scope.
-The runtime images contain the libraries the two final binaries link
-against (libssl, libcrypto, libcjson, libc) plus OpenSSL's configuration
-and provider modules, but no `patscc` compiler, package manager, or
-delegated runtime. Realtime remains an internal protocol, so even passing
-evidence would not make this an officially supported SDK.
+1. Reconnect retries immediately during sustained failure instead of using
+   exponential backoff.
+2. Incoming Live data has an 8 MiB per-frame limit, but no separate aggregate
+   count and byte budget for a slow consumer.
+3. Growable transport buffers are managed in C rather than covered by an ATS
+   dependent-size proof.
+4. The educational client supports JSON-safe Convex values only.
