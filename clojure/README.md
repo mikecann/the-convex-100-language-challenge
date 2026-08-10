@@ -1,20 +1,125 @@
-# Convex from Clojure
+<img src="logo.png" alt="Clojure logo" width="128">
+<!-- Logo source: https://clojure.org/images/clojure-logo-icon-256.png -->
 
-This Clojure client calls Convex functions over HTTP, then keeps a query current over the experimental pinned Live sync profile.
+# Clojure
 
-It is educational, unofficial, and not a production Convex SDK.
+[Clojure](https://clojure.org/) is a functional Lisp created by Rich Hickey and [first presented publicly in 2007](https://clojure.org/about/documentary). It [compiles to JVM bytecode](https://clojure.org/about/jvm_hosted), works directly with Java libraries, and favours immutable data over mutable objects. It remains a focused modern language rather than a mainstream one, with the [2025 community survey](https://clojure.org/news/2026/02/18/state-of-clojure-2025) showing especially visible use in financial services, enterprise software, and healthcare.
 
-## Start here
+This repository's client is an educational demonstration. It is unofficial and is not a production Convex SDK.
 
-The [canonical basic example](examples/basics/main.clj) performs a unique room's `0 -> 1` counter journey: HTTP query, initial Live value, idempotent mutation, then its Live update.
+## Getting Started
 
-## What works
+Start with the [canonical basic example](examples/basics/main.clj). It creates a client from `CONVEX_URL`, gives the run its own room, reads the counter over HTTP, opens a Live subscription, performs an idempotent mutation, and observes the reactive `0 -> 1` update.
+
+From the repository root, Docker builds the example and runs that exact source against an approved test deployment:
+
+```sh
+./run verify-example clojure
+```
+
+## Interesting Parts
+
+### Immutable maps make mutation arguments explicit
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { useMutation } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+function IncrementButton() {
+  const increment = useMutation(api.demo.increment);
+  const [room] = useState(() => `clojure-${crypto.randomUUID()}`);
+
+  async function addOne() {
+    const args = {
+      room,
+      language: "typescript",
+      runId: crypto.randomUUID(),
+    };
+    const result = await increment(args);
+    console.log(result.state.count); // The generated API makes this number type-safe.
+  }
+
+  return <button onClick={addOne}>Increment</button>;
+}
+```
+
+**Clojure**
+
+```clojure
+(require '[convex.client :as convex])
+(import '[java.util UUID])
+
+(let [url (or (System/getenv "CONVEX_URL")
+              (throw (ex-info "CONVEX_URL is required" {})))
+      room-args {"room" (str "clojure-" (UUID/randomUUID))}
+      ;; assoc returns a new map. room-args still contains only the room.
+      mutation-args (assoc room-args
+                           "language" "clojure"
+                           "runId" (str (UUID/randomUUID)))]
+  (with-open [client (convex/client url)]
+    (let [result (:value (convex/mutation client "demo:increment" mutation-args))]
+      ;; JSON map keys and count are checked at runtime, not by generated types.
+      (println (get-in result ["state" "count"])))))
+```
+
+Clojure's maps are [immutable and persistent](https://clojure.org/reference/data_structures), so adding the mutation fields does not alter the reusable query arguments. The trade-off here is type safety: the React client gets generated function and result types, while this small Clojure client accepts dynamic string-keyed JSON maps and relies on runtime validation.
+
+### A command-line subscription has a lifecycle you can see
+
+**TypeScript with React**
+
+```tsx
+import { useState } from "react";
+import { useQuery } from "convex/react";
+import { api } from "./convex/_generated/api";
+
+function Counter() {
+  const [room] = useState(() => `clojure-${crypto.randomUUID()}`);
+  const state = useQuery(api.demo.state, { room });
+
+  if (state === undefined) return <p>Loading...</p>;
+  return <p>{state.count}</p>; // state.count is type-safe and rerenders reactively.
+}
+```
+
+**Clojure**
+
+```clojure
+(require '[convex.client :as convex])
+(import '[java.util UUID])
+
+(let [url (or (System/getenv "CONVEX_URL")
+              (throw (ex-info "CONVEX_URL is required" {})))
+      room-args {"room" (str "clojure-" (UUID/randomUUID))}]
+  ;; This CLI owns the HTTP client, Live client, and subscription explicitly.
+  (with-open [http (convex/client url)
+              live (convex/live-client url)
+              subscription (convex/subscribe live "demo:state" room-args)]
+    (let [initial (:value (convex/next-update subscription 10000))]
+      (println (get initial "count")) ; Initial Live value.
+      (convex/mutation http "demo:increment"
+                       (assoc room-args
+                              "language" "clojure"
+                              "runId" (str (UUID/randomUUID))))
+      (let [updated (:value (convex/next-update subscription 10000))]
+        ;; This is the reactive update from the same subscription.
+        (println (get updated "count"))))))
+```
+
+React starts, updates, and disposes the `useQuery` subscription with the component. This command-line client instead returns a subscription that the caller consumes and closes. Its blocking `next-update` operation is a deliberate client API choice for a readable example, not a limitation of Clojure's concurrency tools.
+
+## Status
 
 | Capability | Status |
 | --- | --- |
 | HTTP query, mutation, action, auth, logs, and structured errors | Verified by shared local and hosted conformance |
 | Live initial values, changes, query-error recovery, and reconnects | Verified by shared local and hosted conformance |
 | Bounded delivery and lifecycle barriers | Implemented and covered by deterministic fixtures |
+
+## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.clj -->
 ```clojure
@@ -72,16 +177,19 @@ The [canonical basic example](examples/basics/main.clj) performs a unique room's
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
-`./run test clojure` checks standard formatting, runs the language-local HTTP, raw WebSocket, lifecycle, and adapter tests, then AOT-compiles the exact example and adapter. `./run build clojure` creates the minimal non-root runtime. Its BusyBox is built from source with only the shell and inspection applets the verifier needs, so network and package-management applets are absent even when callers forge `argv[0]`. Root owns the serial shared example and conformance evidence.
+This is a native Clojure implementation. Convex-specific HTTP and Live behavior lives in Clojure, while JDK 21 supplies HTTP, TLS, and WebSocket transport and `clojure.data.json` 2.5.1 handles JSON. The demonstration is pinned to Clojure 1.12.0 and the experimental `convex-rs-0.10.4-unversioned-sync` profile at backend commit `6f1df8a8ba1665084ec001e307ca841ca17074d7`.
 
-## Protocol notes
+HTTP calls are synchronous and return `{:value ... :logs ...}` maps. Function failures become `ExceptionInfo` values with structured data instead of being mistaken for successful results. For Live queries, one dedicated owner thread controls the WebSocket, query versions, reconnects, and writes. The JDK WebSocket admits one callback at a time, and the owner queue is capped at 64 events. That is an implementation design, not a Clojure Agent.
 
-The client uses the documented JSON HTTP endpoints and the pinned `convex-rs-0.10.4-unversioned-sync` profile. One Clojure actor owns every WebSocket, query-set version, reconnect, and serialized write. The JDK WebSocket is demand-driven: at most one callback is admitted at a time, and the owner's executor has a fixed 64-event queue as a second safety boundary. Convex timestamps must be canonical eight-byte base64 values; the client decodes their little-endian unsigned value so reconnects retain the true numeric maximum even across `255 -> 256` and a later lower rehydration. Backoff resets after a successful WebSocket handshake, and unchanged hydration is suppressed.
+`./run test clojure` checks formatting, exercises the HTTP, raw WebSocket, lifecycle, pressure, example, and adapter tests, then ahead-of-time compiles the canonical example and conformance adapter. `./run build clojure` creates the minimal non-root runtime. The runtime retains the Clojure compiler classes needed while core namespaces load, but exposes no Clojure or Java compiler command, package manager, source tree, or build metadata.
 
-The adapter supports partial NDJSON over stdin/stdout and `ADAPTER_LISTEN` TCP, validates every command shape before dispatch, flushes each correlated event, and continues after request errors. Malformed commands receive a structured `ProtocolError`; an invalid or absent command ID is omitted instead of becoming schema-invalid JSON null. It rejects an encoded command line above 1 MiB before allocating the whole line. Its asynchronous writer has one newest-16, 4 MiB encoded budget across queued and in-flight output, so a stopped reader cannot block Live relays or grow memory without limit. Replacement, unsubscribe, and the test-only `debugDisconnect` acknowledge only after their generation/relay barriers; replacement and unsubscribe also await the corresponding WebSocket send completion.
+The test-only adapter speaks protocol v1 over standard input/output or `ADAPTER_LISTEN` TCP. It validates command shapes, keeps protocol output separate from diagnostics, preserves structured errors, and uses lifecycle barriers so an old subscription cannot publish after replacement or unsubscribe has been acknowledged.
 
-## Limitations
+## Known Issues
 
-The Live profile is experimental, but the shared controller passed locally and against the hosted drift target, earning HTTP and Live. Authentication, optimistic updates, transition chunks, journals, and replay are deferred. All subscriptions share one newest-16, 4 MiB encoded delivery budget, and each inbound WebSocket message is limited to 2 MiB. The AOT runtime still includes Clojure's `clojure.lang.Compiler` classes because core namespace loading references them, but it exposes no Clojure or Java compiler command and contains no source or build metadata.
+1. Live uses an experimental pinned sync profile. Live authentication, optimistic updates, transition chunks, journals, and replay are deferred.
+2. The client has no generated Clojure API types. Function paths and decoded JSON values are checked at runtime, so application code should validate the fields it depends on as the canonical example does for `count`.
+3. All subscriptions share a newest-16, 4 MiB encoded delivery budget. Under pressure, stale snapshots can be dropped to retain newer ones. Incoming Live messages are capped at 2 MiB.
+4. The minimal AOT runtime still contains `clojure.lang.Compiler` classes because Clojure core namespace loading references them, although no compiler command is available.
