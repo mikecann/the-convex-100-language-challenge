@@ -152,8 +152,9 @@ generated bindings connect `api.demo.increment` to its argument and return types
 
 ## Status
 
-The recorded clean local and hosted conformance runs earned both HTTP and Live. This README edit
-does not claim a new verification run.
+Clean parent commit `305e9a4` passed all 31 local and all 31 hosted checks from
+the same built image, earning both HTTP and Live. This prose-only reconciliation
+does not change those verified build inputs.
 
 | Capability | Status |
 | --- | --- |

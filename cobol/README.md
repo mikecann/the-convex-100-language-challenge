@@ -187,7 +187,7 @@ before its mutation so it cannot miss the resulting update.
 `http` and `live` were awarded by the shared result evaluator from a clean,
 exact-head run of `./run verify-all cobol`: 31/31 conformance checks passed
 against both the local self-hosted backend and the dedicated hosted drift
-target, from the same built image.
+target from the same built image at parent commit `305e9a4`.
 
 ## Example
 

@@ -88,7 +88,9 @@ React's `useQuery` starts, updates, and disposes the subscription with the compo
 | HTTP queries, mutations, actions, auth replacement, errors, and logs | Verified by shared local and hosted conformance |
 | Live subscriptions, unsubscribe, failures, recovery, and reconnect | Verified by shared local and hosted conformance |
 
-These are existing evidence-backed awards. This README change did not rerun shared verification.
+Clean parent commit `305e9a4` passed all 31 local and all 31 hosted checks from
+the same built image. This prose-only reconciliation does not change those
+verified build inputs.
 
 ## Example
 

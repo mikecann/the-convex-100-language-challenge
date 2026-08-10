@@ -137,10 +137,12 @@ lifecycle. The complete example performs the runtime JSON checks omitted here.
 | HTTP | Badge earned | Query, mutation, action, bearer-token lifecycle, logs, and structured errors are implemented and pass shared local and hosted black-box conformance. |
 | Live | Badge earned | Subscribe/unsubscribe, reconnect-on-drop with exponential backoff, unchanged-rehydration suppression, reactive error recovery, and clean close are implemented and pass shared local and hosted black-box conformance, including a debugDisconnect-triggered five-reconnect proof and a QueryFailed-then-recovery cycle. |
 
-The existing shared evaluator evidence awarded both badges from a clean
-exact-head build: 31 of 31 checks against a local backend and 31 of 31 against
-the hosted deployment over real TLS. This README edit does not claim a fresh
-verification run.
+Historical shared evaluator evidence awarded both badges with 31 of 31 checks
+against a local backend and 31 of 31 against the hosted deployment over real
+TLS. A clean run from parent commit `305e9a4` passed the canonical local
+example, then failed while connecting the hosted mutation under YottaDB on
+Docker Desktop's amd64 Rosetta path. This version therefore still needs a
+native x86_64 hosted rerun before it has fresh exact-head evidence.
 
 ## Example
 
@@ -328,3 +330,9 @@ contains an unused region created at build time.
    general Unicode-aware M string operations.
 4. Hosted TLS depends on the narrow SNI shim described above because YottaDB's
    TLS plugin does not set the hostname itself.
+5. On Docker Desktop's amd64 Rosetta path, YottaDB intermittently fails
+   hostname connections even though direct connections to either resolved IP
+   work and hosted Live has passed separately. The clean parent-commit run
+   described in Status reproduced this during the hosted mutation, so the
+   remaining verification belongs on a native x86_64 host rather than in a
+   weakened client or harness workaround.

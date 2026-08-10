@@ -131,9 +131,9 @@ separate worker owns socket reads, reconnects, and query-set changes.
 
 ## Status
 
-The repository's recorded shared local and hosted conformance evidence passed
-31 of 31 checks on both profiles. This README update does not rerun that
-evidence or award any new capability.
+Clean parent commit `305e9a4` passed `./run verify-all bash`: 31 of 31 checks
+passed against both the local and hosted profiles from the same built image.
+This prose-only reconciliation does not change the verified build inputs.
 
 | Capability | Status |
 | --- | --- |

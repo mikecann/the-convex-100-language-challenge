@@ -391,8 +391,9 @@ style, runs the language-local tests, and compiles the example and adapter. GC
 8.2.8 replaces pclu's documented 7.2f because that older release faults during
 `GC_init` under Docker Desktop's amd64 Rosetta emulation. The remaining commands
 run the canonical example and shared conformance against the local deployment,
-hosted drift target, or both. The passing capability evidence reported above
-predates this prose-only README edit.
+hosted drift target, or both. Clean parent commit `305e9a4` passed all 31 local
+and all 31 hosted checks from the same built image. This prose-only
+reconciliation does not change those build inputs.
 
 ## Known Issues
 
