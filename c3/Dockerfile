@@ -14,4 +14,9 @@ RUN gcc -std=c17 -Wall -Wextra -Werror -c client/platform.c -o /out-platform.o &
     C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -o /out-example examples/basics/main.c3 && \
     readelf -h /out-adapter | grep 'Advanced Micro Devices X86-64'
 FROM build AS test
-RUN test "$(uname -m)" = x86_64 && test "$(/out-adapter)" = 'c3 adapter seed' && test "$(/out-example)" = 'c3 example seed'
+RUN C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -o /out-http-fixtures \
+      client/tests/http-response-fixtures.c3 client/http.c3 client/response.c3 \
+    && /out-http-fixtures \
+    && test "$(uname -m)" = x86_64 \
+    && test "$(/out-adapter)" = 'c3 adapter seed' \
+    && test "$(/out-example)" = 'c3 example seed'
