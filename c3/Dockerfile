@@ -18,7 +18,10 @@ RUN gcc -std=c17 -Wall -Wextra -Werror -c client/tests/http-platform-fixture.c -
     && gcc -std=c17 -Wall -Wextra -Werror client/tests/adapter-tcp-fixture.c -o /out-adapter-tcp-fixture \
     && C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -o /out-http-fixtures \
       client/tests/http-response-fixtures.c3 client/http.c3 client/response.c3 client/values.c3 /out-http-platform-fixture.o \
+    && C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -o /out-live-buffer-fixture \
+      client/tests/live-buffer-fixture.c3 client/live.c3 \
     && /out-http-fixtures \
+    && /out-live-buffer-fixture \
     && test "$(uname -m)" = x86_64 \
     && printf '%s\\n' '{"protocolVersion":1,"id":"hello-1","op":"hello"}' | /out-adapter | grep -Fx '{"protocolVersion":1,"id":"hello-1","type":"ready","language":"c3","implementation":"native","runtime":"C3 0.8.2"}' \
     && (ADAPTER_LISTEN=127.0.0.1:43123 /out-adapter & adapter_pid=$!; /out-adapter-tcp-fixture || { kill "$adapter_pid"; exit 1; }; wait "$adapter_pid") \
