@@ -99,5 +99,8 @@
   "factor": "Factor_(programming_language)",
   "rescript": "ReScript",
   "eiffel": "Eiffel_(programming_language)",
-  "moonbit": null
+  "moonbit": null,
+  "lolcode": "LOLCODE",
+  "fennel": null,
+  "c3": null
 }
