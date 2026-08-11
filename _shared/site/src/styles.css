@@ -76,6 +76,7 @@ body.home:not(.nav-solid) .top-nav .verified-pill {
   text-decoration: none;
   white-space: nowrap;
 }
+.brand-icon { display: block; width: 26px; height: 26px; object-fit: contain; }
 .verified-pill {
   padding: 0.28rem 0.7rem;
   border: 1px solid rgb(74 222 128 / 35%);

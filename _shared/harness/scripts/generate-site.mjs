@@ -262,7 +262,7 @@ for (const entry of roster.languages) {
 }
 
 fs.mkdirSync(output, { recursive: true });
-for (const filename of ["index.html", "app.js", "styles.css", "hero-mark.png"]) {
+for (const filename of ["index.html", "app.js", "styles.css", "hero-mark.png", "mark-icon.png"]) {
   fs.copyFileSync(path.join(source, filename), path.join(output, filename));
 }
 
