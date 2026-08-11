@@ -12,8 +12,8 @@ used for command-line tools, network services, embedded software, WebAssembly,
 and performance-sensitive parts of larger applications.
 
 This repository uses Rust to implement a small native Convex client. It is an
-educational, unofficial demonstration, not a production SDK or a project
-endorsed by Convex or the Rust project.
+educational, unofficial demonstration, not a production SDK and not an official
+Convex or Rust project.
 
 ## Getting Started
 

@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="The measured numbers behind The Convex 100 Language Challenge: conformance checks, infeasible languages, source lines, and tokens." />
+    <link rel="icon" type="image/png" href="/mark-icon.png" />
+    <title>The numbers · The Convex 100 Language Challenge</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <nav class="top-nav" aria-label="Site">
+      <a class="brand" href="/">
+        <img class="brand-icon" src="/mark-icon.png" alt="" width="26" height="26" />
+        <span class="brand-label">The Convex 100 Language Challenge</span>
+      </a>
+      <div class="nav-links">
+        <a href="/">Languages</a>
+        <a href="/graveyard/">Graveyard</a>
+        <a href="/faq/">FAQ</a>
+        <a href="/numbers/" aria-current="page">Numbers</a>
+        <a href="https://github.com/mikecann/100-convex-clients">GitHub</a>
+      </div>
+    </nav>
+
+    <main class="page">
+      <h1>The numbers</h1>
+      <p class="page-lead">
+        Measured, not estimated. The full ledger, including how each figure was
+        taken and every caveat, is in
+        <a href="https://github.com/mikecann/100-convex-clients/blob/main/STATS.md">STATS.md</a>.
+      </p>
+      <div class="numbers-grid">
+        <div class="number">
+          <strong>62</strong>
+          <span>conformance checks per badge: 31 against a local backend, 31 against a real hosted deployment over TLS</span>
+        </div>
+        <div class="number">
+          <strong>22</strong>
+          <span>languages recorded infeasible, with evidence, and replaced. Nothing was quietly dropped</span>
+        </div>
+        <div class="number">
+          <strong>355,755</strong>
+          <span>lines of client and example source, as measured at the 83-language snapshot</span>
+        </div>
+        <div class="number">
+          <strong>50.67B</strong>
+          <span>tokens moved across the project, over 99% of them cheap cache reads</span>
+        </div>
+        <div class="number">
+          <strong>26</strong>
+          <span>languages verified in a single 24-hour session: 57 to 83, with 489 commits and 80 pull requests merged</span>
+        </div>
+        <div class="number">
+          <strong>102</strong>
+          <span>agents and workflows that reported in during that session</span>
+        </div>
+      </div>
+      <p class="page-lead">
+        The companion records:
+        <a href="https://github.com/mikecann/100-convex-clients/blob/main/LESSONS.md">LESSONS.md</a>
+        for what was learned,
+        <a href="https://github.com/mikecann/100-convex-clients/blob/main/INFEASIBLE.md">INFEASIBLE.md</a>
+        for what could not be done, and
+        <a href="https://github.com/mikecann/100-convex-clients/blob/main/BUILD-FLEET.md">BUILD-FLEET.md</a>
+        for the rented build fleet.
+      </p>
+    </main>
+
+    <footer class="page-footer">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <img class="footer-mark" src="/mark-icon.png" alt="" width="40" height="40" />
+          <p class="footer-blurb">
+            Convex clients in one hundred programming languages, from Fortran
+            to Mojo. Every badge here is earned by the same conformance suite,
+            and anything without published evidence is shown as unverified.
+          </p>
+        </div>
+        <nav class="footer-column" aria-label="Site sections">
+          <h2>Explore</h2>
+          <a href="/">Languages</a>
+          <a href="/graveyard/">Graveyard</a>
+          <a href="/faq/">FAQ</a>
+          <a href="/numbers/">Numbers</a>
+        </nav>
+        <nav class="footer-column" aria-label="Project records">
+          <h2>The record</h2>
+          <a href="https://github.com/mikecann/100-convex-clients/blob/main/STATS.md">Statistics</a>
+          <a href="https://github.com/mikecann/100-convex-clients/blob/main/INFEASIBLE.md">Infeasible languages</a>
+          <a href="https://github.com/mikecann/100-convex-clients/blob/main/LESSONS.md">Lessons learned</a>
+          <a href="https://github.com/mikecann/100-convex-clients/blob/main/BUILD-FLEET.md">The build fleet</a>
+        </nav>
+        <nav class="footer-column" aria-label="Elsewhere">
+          <h2>Elsewhere</h2>
+          <a href="https://github.com/mikecann/100-convex-clients">Repository</a>
+          <a href="https://www.convex.dev/">Convex</a>
+          <a href="https://docs.convex.dev/http-api/">Convex HTTP API</a>
+        </nav>
+      </div>
+      <div class="footer-base">
+        <p>An educational experiment by <a href="https://github.com/mikecann">Mike Cann</a>.</p>
+        <p>Built with Convex.</p>
+      </div>
+    </footer>
+  </body>
+</html>

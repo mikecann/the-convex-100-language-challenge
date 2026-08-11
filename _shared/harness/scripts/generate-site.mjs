@@ -3,6 +3,7 @@ import path from "node:path";
 import process from "node:process";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
+import { Marked } from "marked";
 import { bundledLanguages, codeToHtml } from "shiki";
 import { parse } from "yaml";
 import { projectReadmeExamples } from "./example-readme.mjs";
@@ -15,7 +16,14 @@ import {
 const root = process.env.REPO_ROOT ?? "/repo";
 const output = path.join(root, "_shared/site/dist");
 const source = path.join(root, "_shared/site/src");
+const repoWebUrl = "https://github.com/mikecann/100-convex-clients";
 const roster = parse(fs.readFileSync(path.join(root, "roster/languages.yaml"), "utf8"));
+const languageYears = JSON.parse(
+  fs.readFileSync(path.join(root, "_shared/site/language-years.json"), "utf8"),
+);
+const languageWikipedia = JSON.parse(
+  fs.readFileSync(path.join(root, "_shared/site/language-wikipedia.json"), "utf8"),
+);
 const resultIndexPath = path.join(root, "_shared/results/index.json");
 const resultIndex = fs.existsSync(resultIndexPath)
   ? JSON.parse(fs.readFileSync(resultIndexPath, "utf8"))
@@ -146,6 +154,68 @@ async function firstExample(languageId) {
   };
 }
 
+function fenceSyntax(lang) {
+  const candidates = [lang, extensionAliases[lang], syntaxAliases[lang]];
+  return candidates.find((candidate) => candidate && candidate in bundledLanguages) ?? "text";
+}
+
+// Renders repository-owned markdown (language READMEs, INFEASIBLE.md) to HTML
+// for the site. Relative links are rewritten to the GitHub repository at the
+// given ref so the site can quote a file without copying it, and fenced code
+// is highlighted with the same Shiki theme as the canonical examples.
+async function renderMarkdown(markdown, { baseDirectory, ref }) {
+  const rewrite = (href, { raw = false } = {}) => {
+    if (!href || /^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("#") || href.startsWith("/")) {
+      return href;
+    }
+    const resolved = new URL(href, `https://resolve.invalid/${baseDirectory}/README.md`)
+      .pathname.replace(/^\//, "");
+    return raw
+      ? `${repoWebUrl}/raw/${ref}/${resolved}`
+      : `${repoWebUrl}/blob/${ref}/${resolved}`;
+  };
+
+  const marked = new Marked({ async: true, gfm: true });
+  marked.use({
+    walkTokens: async (token) => {
+      if (token.type === "code") {
+        token.highlightedHtml = await codeToHtml(token.text, {
+          lang: fenceSyntax(token.lang?.split(/\s+/)[0]?.toLowerCase()),
+          theme: "github-dark-default",
+        });
+      }
+      if (token.type === "link") token.href = rewrite(token.href);
+      if (token.type === "image") token.href = rewrite(token.href, { raw: true });
+    },
+    renderer: {
+      code(token) {
+        return token.highlightedHtml ?? false;
+      },
+    },
+  });
+  return marked.parse(markdown);
+}
+
+async function renderLanguageReadme(languageId, ref) {
+  const readmePath = path.join(root, languageId, "README.md");
+  if (!fs.existsSync(readmePath)) return null;
+  const markdown = fs
+    .readFileSync(readmePath, "utf8")
+    // The site's dialog already shows the logo and language name, so drop the
+    // README's own logo image, its source-attribution comment, and its title.
+    .replace(/^<img [^>]*>\s*\n/, "")
+    .replace(/^<!--[\s\S]*?-->\s*\n/, "")
+    .replace(/^# .+\n/m, "");
+  return renderMarkdown(markdown, { baseDirectory: languageId, ref });
+}
+
+async function renderGraveyard() {
+  const markdown = fs
+    .readFileSync(path.join(root, "INFEASIBLE.md"), "utf8")
+    .replace(/^# .+\n/m, "");
+  return renderMarkdown(markdown, { baseDirectory: ".", ref: "main" });
+}
+
 const languages = await Promise.all(roster.languages.map(async (entry) => {
   const logoSource = path.join(root, entry.id, "logo.png");
   const manifest = parse(
@@ -157,23 +227,56 @@ const languages = await Promise.all(roster.languages.map(async (entry) => {
     : null;
   const localResult = includeLocal ? readOptionalResult("local", entry.id) : null;
   const hostedResult = includeLocal ? readOptionalResult("hosted", entry.id) : null;
+  const result = trustedResult ?? localResult;
+  // Source links pin to the exact verified commit when there is one, so what
+  // the site shows is what the badge was earned against.
+  const sourceRef = result?.sourceCommit ?? "main";
+  const example = await firstExample(entry.id);
+  const readmeHtml = await renderLanguageReadme(entry.id, sourceRef);
   return {
     ...entry,
+    firstAppeared: languageYears[entry.id] ?? null,
+    wikipediaUrl: languageWikipedia[entry.id]
+      ? `https://en.wikipedia.org/wiki/${languageWikipedia[entry.id]}`
+      : null,
     implementation: manifest.implementation,
     toolchain: manifest.toolchain ?? null,
     syncProfile: manifest.syncProfile ?? null,
     declaredCapabilities: manifest.capabilities,
-    result: trustedResult ?? localResult,
+    result,
     evidenceTrust: trustedResult ? "trusted-main" : localResult ? evidenceChannel : null,
     hostedResult,
-    example: await firstExample(entry.id),
+    example,
+    sourceUrl: `${repoWebUrl}/tree/${sourceRef}/${entry.id}`,
+    exampleUrl: example ? `${repoWebUrl}/blob/${sourceRef}/${entry.id}/${example.path}` : null,
+    readme: readmeHtml ? `/readmes/${entry.id}.html` : null,
     logo: fs.existsSync(logoSource) ? `/logos/${entry.id}.png` : null,
+    readmeHtml,
   };
 }));
 
+for (const entry of roster.languages) {
+  if (!(entry.id in languageYears)) {
+    throw new Error(`${entry.id}: missing first-appeared year in _shared/site/language-years.json`);
+  }
+}
+
 fs.mkdirSync(output, { recursive: true });
-for (const filename of ["index.html", "app.js", "styles.css"]) {
+for (const filename of ["index.html", "app.js", "styles.css", "hero-mark.png", "mark-icon.png"]) {
   fs.copyFileSync(path.join(source, filename), path.join(output, filename));
+}
+
+// Content pages are static shells in src; build-time tokens let a page carry
+// repository-owned markdown (the graveyard) without shipping it in data.json.
+const graveyardHtml = await renderGraveyard();
+for (const page of ["graveyard", "faq", "numbers"]) {
+  const pageSource = fs.readFileSync(path.join(source, `${page}.html`), "utf8");
+  const pageOutput = path.join(output, page);
+  fs.mkdirSync(pageOutput, { recursive: true });
+  fs.writeFileSync(
+    path.join(pageOutput, "index.html"),
+    pageSource.replace("<!-- BUILD:GRAVEYARD -->", () => graveyardHtml),
+  );
 }
 
 // Logos live with their language implementations, which keeps ownership and
@@ -188,9 +291,31 @@ for (const language of languages) {
     path.join(logoOutput, `${language.id}.png`),
   );
 }
+// README fragments are fetched lazily by the dialog; shipping them inside
+// data.json would multiply the initial payload by the size of 100 READMEs.
+const readmeOutput = path.join(output, "readmes");
+fs.rmSync(readmeOutput, { recursive: true, force: true });
+fs.mkdirSync(readmeOutput, { recursive: true });
+for (const language of languages) {
+  if (language.readmeHtml) {
+    fs.writeFileSync(path.join(readmeOutput, `${language.id}.html`), language.readmeHtml);
+  }
+  delete language.readmeHtml;
+}
+
 fs.writeFileSync(
   path.join(output, "data.json"),
-  `${JSON.stringify({ schemaVersion: 1, generatedAt: new Date().toISOString(), evidenceChannel, languages }, null, 2)}\n`,
+  `${JSON.stringify(
+    {
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      evidenceChannel,
+      repoUrl: repoWebUrl,
+      languages,
+    },
+    null,
+    2,
+  )}\n`,
 );
 
 console.log(`PASS generated static evidence site for ${languages.length} languages`);

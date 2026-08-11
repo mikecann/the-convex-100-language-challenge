@@ -3,28 +3,48 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="Verified Convex clients across 100 programming languages." />
-    <title>100 Convex clients</title>
+    <meta name="description" content="Convex working in 100 programming languages, from Fortran to Mojo. Every badge earned by the same conformance suite. No unearned badges." />
+    <meta property="og:title" content="The Convex 100 Language Challenge" />
+    <meta property="og:description" content="From Fortran to Mojo. Seventy years of languages, one realtime database. Convex clients in 100 languages, every badge verified against a local and a hosted deployment." />
+    <meta property="og:type" content="website" />
+    <link rel="icon" type="image/png" href="/mark-icon.png" />
+    <title>The Convex 100 Language Challenge</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
-  <body>
-    <header class="page-header">
-      <div>
-        <h1>100 Convex clients</h1>
-        <p>One backend. One conformance test. No unearned badges.</p>
+  <body class="home">
+    <nav class="top-nav" aria-label="Site">
+      <a class="brand" href="/">
+        <img class="brand-icon" src="/mark-icon.png" alt="" width="26" height="26" />
+        <span class="brand-label">The Convex 100 Language Challenge</span>
+      </a>
+      <span id="verified-pill" class="verified-pill" hidden></span>
+      <div class="nav-links">
+        <a href="/" aria-current="page">Languages</a>
+        <a href="/graveyard/">Graveyard</a>
+        <a href="/faq/">FAQ</a>
+        <a href="/numbers/">Numbers</a>
+        <a href="https://github.com/mikecann/100-convex-clients">GitHub</a>
       </div>
-      <div class="summary" aria-label="Project summary">
-        <strong id="working-count">0</strong>
-        <span>passing clients</span>
-        <strong id="language-count">100</strong>
-        <span>languages attempted</span>
+    </nav>
+
+    <header class="page-header">
+      <div class="masthead">
+        <img class="hero-mark" src="/hero-mark.png" alt="" />
+        <h1>The <a class="title-link" href="https://www.convex.dev/">Convex</a> 100 Language Challenge<button id="disclaimer-open" class="title-asterisk" type="button" aria-label="Disclaimer: not official SDKs">*</button></h1>
+        <p class="tagline">From <a class="tagline-language" href="/languages/fortran" data-language-id="fortran">Fortran</a> to <a class="tagline-language" href="/languages/mojo" data-language-id="mojo">Mojo</a>. Seventy years of languages, one realtime database.</p>
+        <div class="try-strip">
+          <code id="try-command">git clone https://github.com/mikecann/100-convex-clients && cd 100-convex-clients && ./run verify-example fortran</code>
+          <button class="copy-button" type="button" data-copy-target="try-command">Copy</button>
+          <span class="try-note">Docker is the only prerequisite. Swap <code>fortran</code> for any language below.</span>
+        </div>
       </div>
     </header>
 
-    <p id="evidence-notice" class="evidence-notice" hidden></p>
-
     <main>
-      <section class="controls" aria-label="Language filters">
+      <section id="languages" class="controls" aria-label="Language filters">
         <label>
           Search
           <input id="search" type="search" placeholder="Go, Python, COBOL..." />
@@ -38,6 +58,14 @@
             <option value="failed">Failed or blocked</option>
           </select>
         </label>
+        <label>
+          Sort
+          <select id="sort-order">
+            <option value="rank">Roster rank</option>
+            <option value="oldest">Oldest first</option>
+            <option value="newest">Newest first</option>
+          </select>
+        </label>
         <div class="legend" aria-label="Capability legend">
           <button class="badge http" type="button" data-capability="http">HTTP</button>
           <button class="badge live" type="button" data-capability="live">Live</button>
@@ -47,9 +75,63 @@
       <section id="language-grid" class="language-grid" aria-live="polite"></section>
     </main>
 
-    <dialog id="language-dialog">
-      <button id="dialog-close" class="dialog-close" aria-label="Close">×</button>
-      <div id="dialog-content"></div>
+    <footer class="page-footer">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <img class="footer-mark" src="/mark-icon.png" alt="" width="40" height="40" />
+          <p class="footer-blurb">
+            Convex clients in one hundred programming languages, from Fortran
+            to Mojo. Every badge here is earned by the same conformance suite,
+            and anything without published evidence is shown as unverified.
+          </p>
+        </div>
+        <nav class="footer-column" aria-label="Site sections">
+          <h2>Explore</h2>
+          <a href="/">Languages</a>
+          <a href="/graveyard/">Graveyard</a>
+          <a href="/faq/">FAQ</a>
+          <a href="/numbers/">Numbers</a>
+        </nav>
+        <nav class="footer-column" aria-label="Project records">
+          <h2>The record</h2>
+          <a href="https://github.com/mikecann/100-convex-clients/blob/main/STATS.md">Statistics</a>
+          <a href="https://github.com/mikecann/100-convex-clients/blob/main/INFEASIBLE.md">Infeasible languages</a>
+          <a href="https://github.com/mikecann/100-convex-clients/blob/main/LESSONS.md">Lessons learned</a>
+          <a href="https://github.com/mikecann/100-convex-clients/blob/main/BUILD-FLEET.md">The build fleet</a>
+        </nav>
+        <nav class="footer-column" aria-label="Elsewhere">
+          <h2>Elsewhere</h2>
+          <a href="https://github.com/mikecann/100-convex-clients">Repository</a>
+          <a href="https://www.convex.dev/">Convex</a>
+          <a href="https://docs.convex.dev/http-api/">Convex HTTP API</a>
+        </nav>
+      </div>
+      <div class="footer-base">
+        <p>An educational experiment by <a href="https://github.com/mikecann">Mike Cann</a>.</p>
+        <p>Built with Convex.</p>
+      </div>
+    </footer>
+
+    <aside id="language-panel" class="language-panel" aria-label="Language details">
+      <div class="panel-bar">
+        <button id="panel-close" class="dialog-close" aria-label="Close language details">×</button>
+      </div>
+      <div id="panel-content"></div>
+    </aside>
+
+    <dialog id="disclaimer-dialog" class="capability-dialog" aria-labelledby="disclaimer-title">
+      <button id="disclaimer-close" class="dialog-close" aria-label="Close disclaimer">×</button>
+      <h2 id="disclaimer-title">An educational experiment</h2>
+      <p class="capability-summary">
+        These clients are educational experiments built for this project, the
+        website and the accompanying video. They are not official Convex SDKs,
+        not published packages, and not intended for production use.
+      </p>
+      <p class="capability-summary">
+        What is real: every badge on this site is earned by the same
+        conformance suite, run against a local backend and a real hosted
+        deployment, with the evidence published per language.
+      </p>
     </dialog>
 
     <dialog id="capability-dialog" class="capability-dialog" aria-labelledby="capability-title">
@@ -60,12 +142,12 @@
     <template id="language-card-template">
       <article class="language-card">
         <button class="language-card-open" type="button">
-          <span class="card-meta">
+          <span class="card-top">
+            <span class="logo" aria-hidden="true"></span>
             <span class="rank"></span>
-            <span class="state"></span>
           </span>
-          <span class="language-logo-slot"></span>
           <strong class="name"></strong>
+          <span class="state"></span>
         </button>
         <span class="badges"></span>
       </article>

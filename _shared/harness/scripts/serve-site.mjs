@@ -9,6 +9,8 @@ const contentTypes = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  ".png": "image/png",
+  ".svg": "image/svg+xml",
 };
 
 const server = http.createServer((request, response) => {
@@ -26,6 +28,12 @@ const server = http.createServer((request, response) => {
   // here makes a direct visit or browser refresh behave like normal navigation.
   if (!fs.existsSync(filePath) && /^\/languages\/[^/]+\/?$/.test(requestPath)) {
     filePath = path.join(root, "index.html");
+  }
+
+  // Content pages are directories with an index document, like static hosts
+  // serve them.
+  if (fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) {
+    filePath = path.join(filePath, "index.html");
   }
 
   if (!fs.existsSync(filePath)) {

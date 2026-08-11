@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Frequently asked questions about The Convex 100 Language Challenge: what the badges prove, what the clients cover, and how it was built." />
+    <link rel="icon" type="image/png" href="/mark-icon.png" />
+    <title>FAQ · The Convex 100 Language Challenge</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <nav class="top-nav" aria-label="Site">
+      <a class="brand" href="/">
+        <img class="brand-icon" src="/mark-icon.png" alt="" width="26" height="26" />
+        <span class="brand-label">The Convex 100 Language Challenge</span>
+      </a>
+      <div class="nav-links">
+        <a href="/">Languages</a>
+        <a href="/graveyard/">Graveyard</a>
+        <a href="/faq/" aria-current="page">FAQ</a>
+        <a href="/numbers/">Numbers</a>
+        <a href="https://github.com/mikecann/100-convex-clients">GitHub</a>
+      </div>
+    </nav>
+
+    <main class="page faq">
+      <h1>Questions you are probably asking</h1>
+      <details open>
+        <summary>Are these official Convex clients?</summary>
+        <p>
+          No. They are educational experiments built for this project, the
+          website and the accompanying video. They are not official Convex
+          SDKs, not published packages, and they will not be maintained or
+          supported going forward. For real work, use the official
+          <a href="https://docs.convex.dev/">Convex client libraries</a>.
+        </p>
+      </details>
+      <details>
+        <summary>How much of the Convex API do they cover?</summary>
+        <p>
+          The core client surface: queries, mutations, actions, JSON-safe
+          values, auth-token forwarding and error handling, plus realtime
+          query subscriptions over WebSockets for the Live badge. They do not
+          cover the full official SDK surface.
+        </p>
+      </details>
+      <details>
+        <summary>Is this server-side Convex?</summary>
+        <p>
+          No, client-side only. The backend the clients talk to is a normal
+          Convex backend with its queries, mutations and actions written in
+          TypeScript as usual. This project is about calling into a Convex
+          backend from each language, the way a frontend or another service
+          would. So no, sadly there is no COBOL running on Convex's servers.
+        </p>
+      </details>
+      <details>
+        <summary>Did AI really write all of it?</summary>
+        <p>
+          Yes, all of it. The human job was direction: picking the goals,
+          setting the rules, reviewing the evidence and deciding what happened
+          next. The agents did the typing, and the test suite kept everyone
+          honest.
+        </p>
+      </details>
+      <details>
+        <summary>How do I know the badges are real?</summary>
+        <p>
+          Every badge comes from <code>./run verify-all</code> at an exact
+          clean commit: 31 of 31 conformance checks against a local backend
+          and 31 of 31 against a real hosted deployment over TLS. The evidence
+          behind every badge, including the commit, container digest,
+          toolchain and timestamp, is on this site for every language.
+        </p>
+      </details>
+      <details>
+        <summary>How do I try one myself?</summary>
+        <p>
+          Install Docker, clone the
+          <a href="https://github.com/mikecann/100-convex-clients">repository</a>,
+          and run <code>./run verify-example &lt;language&gt;</code> from the
+          repository root. That builds the language's pinned toolchain in
+          Docker and runs its canonical example against a real backend, so
+          nothing needs to be installed on your machine except Docker itself.
+        </p>
+      </details>
+      <details>
+        <summary>Why only 100 when 22 failed?</summary>
+        <p>
+          Infeasible languages were recorded with evidence in
+          <a href="/graveyard/">the graveyard</a> and replaced from the roster
+          reserve list, so the roster still reaches 100. Nothing was quietly
+          dropped.
+        </p>
+      </details>
+      <details>
+        <summary>Can I get a proper idiomatic client for language X?</summary>
+        <p>
+          Maybe! If enough people want a fuller implementation of a particular
+          language, it could happen. Say so in the video comments.
+        </p>
+      </details>
+    </main>
+
+    <footer class="page-footer">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <img class="footer-mark" src="/mark-icon.png" alt="" width="40" height="40" />
+          <p class="footer-blurb">
+            Convex clients in one hundred programming languages, from Fortran
+            to Mojo. Every badge here is earned by the same conformance suite,
+            and anything without published evidence is shown as unverified.
+          </p>
+        </div>
+        <nav class="footer-column" aria-label="Site sections">
+          <h2>Explore</h2>
+          <a href="/">Languages</a>
+          <a href="/graveyard/">Graveyard</a>
+          <a href="/faq/">FAQ</a>
+          <a href="/numbers/">Numbers</a>
+        </nav>
+        <nav class="footer-column" aria-label="Project records">
+          <h2>The record</h2>
+          <a href="https://github.com/mikecann/100-convex-clients/blob/main/STATS.md">Statistics</a>
+          <a href="https://github.com/mikecann/100-convex-clients/blob/main/INFEASIBLE.md">Infeasible languages</a>
+          <a href="https://github.com/mikecann/100-convex-clients/blob/main/LESSONS.md">Lessons learned</a>
+          <a href="https://github.com/mikecann/100-convex-clients/blob/main/BUILD-FLEET.md">The build fleet</a>
+        </nav>
+        <nav class="footer-column" aria-label="Elsewhere">
+          <h2>Elsewhere</h2>
+          <a href="https://github.com/mikecann/100-convex-clients">Repository</a>
+          <a href="https://www.convex.dev/">Convex</a>
+          <a href="https://docs.convex.dev/http-api/">Convex HTTP API</a>
+        </nav>
+      </div>
+      <div class="footer-base">
+        <p>An educational experiment by <a href="https://github.com/mikecann">Mike Cann</a>.</p>
+        <p>Built with Convex.</p>
+      </div>
+    </footer>
+  </body>
+</html>
