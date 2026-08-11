@@ -1,0 +1,36 @@
+schemaVersion: 1
+id: lolcode
+displayName: "LOLCODE"
+rank: 52
+selectionTier: ranked
+implementation:
+  status: working
+  provenance: native
+  version: 0.1.0
+  notes: >-
+    Convex-specific HTTP, JSON response handling, Live query-set ownership,
+    reconnect behavior, and adapter protocol are authored in LOLCODE. A small
+    statically compiled lci extension provides only ordinary verified transport,
+    raw JSON token, clock, randomness, and controller-stream primitives.
+toolchain:
+  name: lci
+  version: 0.11.2
+syncProfile:
+  id: convex-rs-0.10.4-unversioned-sync
+  sourceCommit: 6f1df8a8ba1665084ec001e307ca841ca17074d7
+  endpoint: /api/sync
+intendedCapabilities:
+  - http
+  - live
+platforms:
+  - linux/amd64
+adapter:
+  protocolVersion: 1
+  entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
+limitations:
+  - The client targets the repository's pinned, undocumented Convex sync profile.
+capabilities:
+  - http
+  - live

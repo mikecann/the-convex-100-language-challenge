@@ -1,0 +1,161 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 99ccb02..8627632 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,5 +1,5 @@
+ cmake_minimum_required(VERSION 2.8)
+-project(lci)
++project(lci C)
+ 
+ ENABLE_TESTING()
+ SET(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake )
+@@ -41,10 +41,12 @@ SET(SRCS
+   error.c
+   binding.c
+   inet.c
++  platform.c
++  transport.c
+ )
+ 
+ add_executable(lci ${SRCS} ${HDRS})
+-target_link_libraries(lci m ncurses readline)
++target_link_libraries(lci m ncurses readline curl jansson crypto)
+ add_subdirectory(test)
+ install(
+   TARGETS lci
+diff --git a/binding.c b/binding.c
+index e74f211..f498011 100644
+--- a/binding.c
++++ b/binding.c
+@@ -1,6 +1,8 @@
+ #include "binding.h"
+ #include "inet.h"  /* for sockets */
+ 
++extern int loadTransportLibrary(ScopeObject *scope);
++
+ ValueObject *getArg(struct scopeobject *scope, char *name)
+ {
+ 	IdentifierNode *id = createIdentifierNode(IT_DIRECT, (void *)copyString(name), NULL, NULL, 0);
+@@ -357,6 +359,8 @@ void loadLibrary(ScopeObject *scope, IdentifierNode *target)
+ 
+ 		if (!updateScopeValue(scope, scope, id, val)) goto loadLibraryAbort;
+ 		deleteIdentifierNode(id);
++	} else if (!strcmp(name, "TRANSPORT")) {
++		if (!loadTransportLibrary(scope)) goto loadLibraryAbort;
+ 	}
+ 
+ 	if (name) free(name);
+diff --git a/main.c b/main.c
+index 40fc059..e02f663 100644
+--- a/main.c
++++ b/main.c
+@@ -160,7 +160,16 @@ int pipeline(char *buffer, unsigned int length, const char *fname, ScopeObject *
+ 		return 1;
+ 	}
+ 	deleteTokens(tokens);
+-	if (interpretMainNodeScope(node, NULL)) {
++	if (scope) {
++		ReturnObject *ret = interpretStmtNodeList(node->block->stmts, scope);
++		if (!ret) {
++			deleteMainNode(node);
++			return 1;
++		}
++		deleteReturnObject(ret);
++		return 0;
++	}
++	if (interpretMainNodeScope(node, NULL)) {
+ 		deleteMainNode(node);
+ 		return 1;
+ 	}
+@@ -177,6 +186,7 @@ int main(int argc, char **argv)
+ 	char *fname = NULL;
+ 	FILE *file = NULL;
+ 	int ch;
++	ScopeObject *shared_scope = NULL;
+ 
+ 	char *revision = "v0.11.2";
+ 	program_name = argv[0];
+@@ -222,6 +232,9 @@ int main(int argc, char **argv)
+ 		}
+ 	}
+ 
++	shared_scope = createScopeObject(NULL);
++	if (!shared_scope) return 1;
++
+ 	for (; optind < argc; optind++) {
+ 		size = length = 0;
+ 		buffer = fname = NULL;
+@@ -277,1 +290,4 @@ int main(int argc, char **argv)
+-		return pipeline(buffer, length, fname, NULL);
++		if (pipeline(buffer, length, fname, shared_scope)) {
++			deleteScopeObject(shared_scope);
++			return 1;
++		}
+@@ -282,2 +298,3 @@ int main(int argc, char **argv)
+-	return 0;
++	deleteScopeObject(shared_scope);
++	return 0;
+ }
+diff --git a/interpreter.h b/interpreter.h
+index 780f230..f914b1a 100644
+--- a/interpreter.h
++++ b/interpreter.h
+@@ -97,4 +97,5 @@ typedef struct {
+ 	ValueType type;           /**< The type of value stored. */
+ 	ValueData data;           /**< The value data. */
+ 	unsigned short semaphore; /**< A semaphore for value usage. */
++	unsigned char runtimeString; /**< String bytes already decoded from LOLCODE escapes. */
+ } ValueObject;
+@@ -150,6 +151,7 @@ ValueObject *createBooleanValueObject(int);
+ ValueObject *createIntegerValueObject(long long);
+ ValueObject *createFloatValueObject(float);
+ ValueObject *createStringValueObject(char *);
++ValueObject *createRuntimeStringValueObject(char *);
+ ValueObject *createFunctionValueObject(FuncDefStmtNode *);
+ ValueObject *createArrayValueObject(ScopeObject *);
+ ValueObject *createBlobValueObject(void *);
+diff --git a/interpreter.c b/interpreter.c
+index f9c9ded..8fb8aef 100644
+--- a/interpreter.c
++++ b/interpreter.c
+@@ -251,9 +251,17 @@ ValueObject *createStringValueObject(char *data)
+ 	}
+ 	p->type = VT_STRING;
+ 	p->data.s = data;
+ 	p->semaphore = 1;
++	p->runtimeString = 0;
+ 	return p;
+ }
+ 
++ValueObject *createRuntimeStringValueObject(char *data)
++{
++	ValueObject *value = createStringValueObject(data);
++	if (value) value->runtimeString = 1;
++	return value;
++}
++
+ /**
+  * Creates a function-type value.
+@@ -1514,6 +1523,11 @@ ValueObject *castStringExplicit(ValueObject *node,
+ 			char *str = getString(node);
+ 			unsigned int a, b;
+ 			size_t size;
++			if (node->runtimeString) {
++				char *copy = copyString(str);
++				if (!copy) return NULL;
++				return createRuntimeStringValueObject(copy);
++			}
+ 			/* Perform interpolation */
+ 			size = strlen(getString(node)) + 1;
+ 			temp = malloc(sizeof(char) * size);
+@@ -1691,6 +1706,6 @@ ValueObject *castStringExplicit(ValueObject *node,
+ 			data = malloc(sizeof(char) * (strlen(temp) + 1));
+ 			strcpy(data, temp);
+ 			free(temp);
+-			return createStringValueObject(data);
++			return createRuntimeStringValueObject(data);
+ 		}
+ 		case VT_FUNC: {
+@@ -3063,1 +3078,1 @@ ValueObject *interpretConcatExprNode(ExprNode *node,
+-	return createStringValueObject(acc);
++	return createRuntimeStringValueObject(acc);

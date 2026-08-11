@@ -52,7 +52,7 @@ Weights:
 
 TIOBE's unordered 51 to 100 group is assigned a tied rank of 75.5. An unlisted language contributes zero from that source.
 
-The current roster records three broad selection tiers:
+The frozen research ranking records three broad selection tiers:
 
 - `ranked`: positions 1 to 56, supported by multiple sources or a strong position in a broad ranking.
 - `coverage`: positions 57 to 79, primarily broadening TIOBE and RedMonk coverage.
@@ -70,7 +70,21 @@ Popularity never changes because a language is difficult to containerize. Each r
 
 These letters are research hypotheses, not earned capabilities. Only a pinned container build and the shared conformance suite can replace them with evidence.
 
-The initial audit identifies likely genuine blockers including ABAP, SAS, LabVIEW, Solidity networking, Apex, X++, ActionScript on Linux, Visual FoxPro, XBase++, and `bc`. The project will preserve those failures. If the eventual objective requires 100 working implementations, a separate feasible implementation roster can transparently backfill them without rewriting the popularity research.
+The initial audit identifies likely genuine blockers including ABAP, SAS, LabVIEW, Solidity networking, Apex, X++, ActionScript on Linux, Visual FoxPro, XBase++, and `bc`. The project preserves failed attempts and their evidence rather than deleting them.
+
+## Feasible implementation backfills
+
+The active 100-language implementation roster follows the frozen ranking until a language cannot pass on the project's only verification host. A backfill keeps the original rank as an implementation slot, not as a new popularity claim. The replaced directory and its failure evidence remain in the repository.
+
+On 11 August 2026, the project made these explicit host-compatibility backfills:
+
+| Implementation slot | Preserved attempt | Active replacement | Reason |
+| ---: | --- | --- | --- |
+| 35 | MUMPS | Fennel | The YottaDB hostname transport failed intermittently under the current amd64-on-Apple-Silicon environment. |
+| 45 | SETL | C3 | The GNU SETL VM exceeded the shared 128 MiB runtime limit even for a trivial pretranslated program. |
+| 52 | Modula-3 | LOLCODE | The CM3 toolchain could not complete reliably on the current verification host. |
+
+Fennel, C3, and LOLCODE therefore inherit those implementation slots and selection tiers solely to keep a stable 100-entry roster. Their inclusion does not revise the frozen source rankings above.
 
 ## Source limitations
 
