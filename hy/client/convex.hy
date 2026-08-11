@@ -22,6 +22,21 @@
   (defn __init__ [self [value None] [error None] [logs None]]
     (setv self.value value self.error error self.logs (or logs []))))
 
+(defclass DeliveryBudget []
+  ;; This budget is shared by every subscription owned by one Live manager.
+  ;; A per-subscription cap alone multiplies with subscription count and can
+  ;; break the adapter's 128 MiB cgroup limit.
+  (defn __init__ [self maximum]
+    (setv self.maximum maximum self.buffered-bytes 0 self.lock (threading.Lock)))
+  (defn reserve [self amount]
+    (with [self.lock]
+      (if (> (+ self.buffered-bytes amount) self.maximum)
+        False
+        (do (setv self.buffered-bytes (+ self.buffered-bytes amount)) True))))
+  (defn release [self amount]
+    (with [self.lock]
+      (setv self.buffered-bytes (max 0 (- self.buffered-bytes amount))))))
+
 (defn _error-message [value]
   (if (isinstance value Exception) (str value) (str value)))
 
@@ -30,10 +45,11 @@
   ;; A bounded item count and byte budget make a stopped adapter reader unable
   ;; to turn a noisy subscription into an unbounded Python queue.
   (setv MAX-BYTES (* 8 1024 1024))
-  (defn __init__ [self manager query-id]
+  (defn __init__ [self manager query-id [delivery-budget None]]
     (setv self.manager manager self.query-id query-id self.closed False
           self.updates (queue.Queue self.MAX-UPDATES) self.buffered-bytes 0
-          self.lock (threading.Lock)))
+          self.lock (threading.Lock)
+          self.delivery-budget (or delivery-budget (DeliveryBudget self.MAX-BYTES))))
   (defn _update-bytes [self update]
     ;; Count everything the adapter will retain and later encode, plus a small
     ;; allowance for Python object and queue overhead.
@@ -46,7 +62,9 @@
       (setv update (.get self.updates :timeout timeout))
       (except [queue.Empty] (raise (TransportError "timed out waiting for Live update"))))
     (with [self.lock]
-      (setv self.buffered-bytes (max 0 (- self.buffered-bytes (self._update-bytes update)))))
+      (setv released (self._update-bytes update)
+            self.buffered-bytes (max 0 (- self.buffered-bytes released)))
+      (.release self.delivery-budget released))
     (if (isinstance update.error ClosedError) (raise update.error) update))
   (defn deliver [self update]
     (if self.closed None
@@ -58,14 +76,16 @@
                           (> (+ self.buffered-bytes encoded) self.MAX-BYTES)))
             (try
               (setv dropped (.get-nowait self.updates))
-              (setv self.buffered-bytes (max 0 (- self.buffered-bytes (self._update-bytes dropped))))
+              (setv dropped-bytes (self._update-bytes dropped)
+                    self.buffered-bytes (max 0 (- self.buffered-bytes dropped-bytes)))
+              (.release self.delivery-budget dropped-bytes)
               (except [queue.Empty] (break))))
           ;; One event larger than the entire budget is deliberately dropped.
-          (when (<= encoded self.MAX-BYTES)
+          (when (and (<= encoded self.MAX-BYTES) (.reserve self.delivery-budget encoded))
             (try
               (.put-nowait self.updates update)
               (setv self.buffered-bytes (+ self.buffered-bytes encoded))
-              (except [queue.Full] None)))))))
+              (except [queue.Full] (.release self.delivery-budget encoded))))))))
   (defn close [self]
     (if (not self.closed)
       (do (setv self.closed True) (.unsubscribe self.manager self.query-id))
@@ -73,6 +93,7 @@
 
 (defclass LiveManager []
   (setv INITIAL-VERSION {"querySet" 0 "identity" 0 "ts" "AAAAAAAAAAA="})
+  (setv MAX-LIVE-MESSAGE (* 1024 1024))
   (defn __init__ [self deployment-url version [websocket-factory connect]]
     (setv parsed (urllib.parse.urlparse deployment-url)
           scheme (if (= parsed.scheme "https") "wss" "ws")
@@ -83,6 +104,7 @@
           self.last-close-reason "InitialConnect" self.query-version 0
           self.backoff 0.05
           self.remote-version (dict self.INITIAL-VERSION)
+          self.delivery-budget (DeliveryBudget (* 16 1024 1024))
           self.max-observed-timestamp None
           self.last-updates {} self.rehydrating (set)
           self.websocket-factory websocket-factory
@@ -99,7 +121,7 @@
   (defn _connect [self]
     ;; This worker is the only owner of websocket reads, writes and version state.
     (setv self.handshaken False
-          self.socket (self.websocket-factory self.url :additional_headers {"Convex-Client" self.version} :open_timeout 10 :close_timeout 1)
+          self.socket (self.websocket-factory self.url :additional_headers {"Convex-Client" self.version} :open_timeout 10 :close_timeout 1 :max_size self.MAX-LIVE-MESSAGE)
           self.query-version 0 self.remote-version (dict self.INITIAL-VERSION))
     (setv connect-message {"type" "Connect" "sessionId" (secrets.token_hex 16) "connectionCount" self.connection-count "lastCloseReason" self.last-close-reason "clientTs" 0})
     (when self.max-observed-timestamp
@@ -135,7 +157,7 @@
       (if (= kind "add")
       (do
        (setv query-id (if self.subs (+ 1 (max (.keys self.subs))) 0))
-       (setv subscription (Subscription self query-id))
+       (setv subscription (Subscription self query-id self.delivery-budget))
        (setv (get self.subs query-id) [(get command 1) (get command 2) subscription])
        (if self.socket (self._send-modify [(self._add query-id (get command 1) (get command 2))]) None)
        (.put (get command 3) subscription))

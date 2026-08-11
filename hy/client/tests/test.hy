@@ -3,7 +3,7 @@
 (import http.server io json os queue subprocess sys threading time)
 (setv client-path (os.environ.get "CONVEX_CLIENT_PATH" "/work/client"))
 (sys.path.insert 0 client-path)
-(import convex [Client ClosedError FunctionError LiveManager ProtocolError Subscription TransportError Update])
+(import convex [Client ClosedError DeliveryBudget FunctionError LiveManager ProtocolError Subscription TransportError Update])
 (import websockets.sync.server [serve])
 (sys.path.insert 0 (os.path.join client-path "tests/conformance"))
 (import adapter [forward-updates])
@@ -255,7 +255,18 @@
   ;; A single value cannot bypass the byte cap after older entries are evicted.
   (.deliver subscription (Update :value {"payload" (* "x" (* 9 1024 1024))}))
   (assert (= subscription.buffered-bytes 0))
-  (assert (.empty subscription.updates)))
+  (assert (.empty subscription.updates))
+
+  ;; Many subscriptions share one manager-wide budget. Their individual caps
+  ;; cannot multiply beyond the amount the 128 MiB final adapter can retain.
+  (setv shared-budget (DeliveryBudget (* 16 1024 1024))
+        subscriptions (lfor index (range 20) (Subscription None index shared-budget)))
+  (for [index (range 20)]
+    (.deliver (get subscriptions index)
+              (Update :value {"payload" (+ (str index) (* "z" 1024 1024))})))
+  (assert (<= shared-budget.buffered-bytes (* 16 1024 1024)))
+  (assert (= shared-budget.buffered-bytes
+             (sum (gfor subscription subscriptions subscription.buffered-bytes)))))
 
 (defn test-stale-relay-invalidation []
   (defclass OneUpdate []

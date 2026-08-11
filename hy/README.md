@@ -117,8 +117,12 @@ HTTP and Live capabilities shown above.
 HTTP, JSON handling, Live query-set ownership, reconnects, and adapter protocol
 events are all in Hy. Python's standard library supplies HTTPS and JSON;
 `websockets` supplies only RFC 6455 transport. Each subscription uses a bounded
-16-message, 8 MiB queue, dropping the oldest pending value when necessary. One
-Live worker exclusively owns WebSocket I/O, reconnects, and query-set versions.
+16-message, 8 MiB queue, and all subscriptions share a 16 MiB manager budget,
+dropping pending values when necessary. One Live worker exclusively owns
+WebSocket I/O, reconnects, and query-set versions, with a 1 MiB Live message
+limit. The adapter's test-only stopped-reader mode lets Docker measure that
+aggregate policy in the exact final image; ordinary adapter commands cannot
+activate it.
 
 The Docker build transpiles Hy 1.3.1 to Python ahead of time. The final pinned
 non-scratch image contains Python 3.13.5, CA certificates, the `websockets`

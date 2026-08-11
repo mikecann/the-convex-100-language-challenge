@@ -1,6 +1,6 @@
-(import json os socket sys threading)
+(import json os socket sys threading time)
 (sys.path.insert 0 (os.environ.get "CONVEX_CLIENT_PATH" "/opt/convex/client"))
-(import convex [Client FunctionError])
+(import convex [Client DeliveryBudget FunctionError Subscription Update])
 
 (defn error-value [exc]
   (setv result {"name" exc.__class__.__name__ "message" (str exc)})
@@ -82,8 +82,35 @@
     (if (is-not ident None) (setv (get event "id") ident) None)
     (emit event)))
 
+(defn stopped-reader-memory-probe [writer]
+  ;; This mode is only for the language-local Docker stress. It runs inside the
+  ;; exact final adapter image, while a controller keeps the TCP connection open
+  ;; without reading. Multiple relay writes become in-flight and every remaining
+  ;; update is charged to one aggregate 16 MiB manager budget.
+  (setv budget (DeliveryBudget (* 16 1024 1024))
+        subscriptions {}
+        lock (threading.Lock))
+  (for [index (range 12)]
+    (setv subscription (Subscription None index budget)
+          (get subscriptions (str index)) subscription)
+    (.deliver subscription (Update :value {"payload" (+ (str index) ":" (* "x" (- (* 1024 1024) 32)))}))
+    (.start (threading.Thread :target forward-updates
+                             :args [subscriptions lock writer (str index) subscription]
+                             :daemon True)))
+  (for [round (range 4)]
+    (for [index (range 12)]
+      (.deliver (get subscriptions (str index))
+                (Update :value {"payload" (+ (str round) ":" (str index) ":" (* "y" (- (* 1024 1024) 40)))}))))
+  ;; The external probe samples cgroup RSS while this exact process is held at
+  ;; steady state. Exiting early would make a false low-memory result possible.
+  (time.sleep 30))
+
 (when (= __name__ "__main__")
   (if (os.environ.get "ADAPTER_LISTEN")
     (do (setv [host port] (.rsplit (os.environ.get "ADAPTER_LISTEN") ":" 1) server (socket.create_server #(host (int port))) [connection _] (.accept server) reader (.makefile connection "r") writer (.makefile connection "w"))
-        (try (run reader writer) (finally (.close reader) (.close writer) (.close connection) (.close server))))
+        (try
+          (if (os.environ.get "HY_ADAPTER_STOPPED_READER_PROBE")
+            (stopped-reader-memory-probe writer)
+            (run reader writer))
+          (finally (.close reader) (.close writer) (.close connection) (.close server))))
     (run sys.stdin sys.stdout)))
