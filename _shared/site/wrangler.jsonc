@@ -1,0 +1,17 @@
+{
+  "name": "the-convex-100-language-challenge",
+  "compatibility_date": "2026-08-11",
+  "workers_dev": false,
+  "preview_urls": false,
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "single-page-application",
+    "html_handling": "auto-trailing-slash"
+  },
+  "routes": [
+    {
+      "pattern": "the-convex-100-language-challenge.mikecann.app",
+      "custom_domain": true
+    }
+  ]
+}
