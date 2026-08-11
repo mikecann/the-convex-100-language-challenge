@@ -152,9 +152,6 @@ function render() {
 
     const card = template.content.firstElementChild.cloneNode(true);
     card.dataset.status = languageStatus;
-    // A verified card earned at least one capability from published evidence;
-    // a merely claimed status never gets the verified treatment.
-    card.dataset.verified = String(capabilities(language).length > 0);
     card.querySelector(".logo").append(logoElement(language));
     card.querySelector(".rank").textContent = language.firstAppeared
       ? `#${language.rank} · ${language.firstAppeared}`

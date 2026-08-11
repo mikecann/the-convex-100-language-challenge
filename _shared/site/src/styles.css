@@ -233,24 +233,6 @@ main { padding: 0 clamp(1rem, 5vw, 5rem) 5rem; }
 .language-card[data-status="failed"] { border-color: rgb(255 107 120 / 45%); }
 .language-card[data-status="failed"]:hover { box-shadow: 0 12px 32px -14px rgb(255 107 120 / 45%); }
 
-/* The verified treatment is reserved for cards whose capabilities come from
-   published evidence, never for a manifest's own claim. */
-.language-card[data-verified="true"]::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 3px;
-  border-radius: 1rem 1rem 0 0;
-  background: linear-gradient(90deg, var(--live), rgb(74 222 128 / 35%));
-  box-shadow: 0 0 14px rgb(74 222 128 / 45%);
-}
-.language-card[data-verified="true"]:hover, .language-card[data-verified="true"]:focus-within {
-  border-color: rgb(74 222 128 / 55%);
-  box-shadow: 0 12px 32px -14px rgb(74 222 128 / 40%), 0 2px 10px rgb(0 0 0 / 35%);
-}
-
 .language-card-open {
   display: flex;
   flex-direction: column;
