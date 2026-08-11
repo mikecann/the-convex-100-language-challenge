@@ -9,6 +9,7 @@
     "oracle-smoke": "node scripts/oracle-smoke.mjs",
     "pilot": "node scripts/pilot.mjs",
     "site": "node scripts/generate-site.mjs",
+    "site-snapshot": "node scripts/snapshot-site-evidence.mjs",
     "site-serve": "node scripts/serve-site.mjs",
     "sync-examples": "node scripts/sync-examples.mjs"
   },

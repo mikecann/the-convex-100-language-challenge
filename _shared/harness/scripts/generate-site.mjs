@@ -30,6 +30,16 @@ const resultIndex = fs.existsSync(resultIndexPath)
   : { results: {} };
 const includeLocal = process.env.INCLUDE_LOCAL_RESULTS === "true";
 const evidenceChannel = process.env.EVIDENCE_CHANNEL ?? "trusted-main";
+const previewSnapshotPath = path.join(
+  root,
+  "_shared/site/evidence/local-preview.json",
+);
+const previewSnapshot = includeLocal && fs.existsSync(previewSnapshotPath)
+  ? JSON.parse(fs.readFileSync(previewSnapshotPath, "utf8"))
+  : null;
+if (previewSnapshot && previewSnapshot.schemaVersion !== 1) {
+  throw new Error(`${previewSnapshotPath}: unsupported schema version`);
+}
 const resultSchema = JSON.parse(
   fs.readFileSync(path.join(root, "_shared/schemas/result.schema.json"), "utf8"),
 );
@@ -70,12 +80,25 @@ function readOptionalResult(directory, languageId) {
     directory,
     `${languageId}-pilot-result.json`,
   );
-  if (!fs.existsSync(resultPath)) return null;
-  return checkedResult(
-    JSON.parse(fs.readFileSync(resultPath, "utf8")),
-    resultPath,
-    false,
-  );
+  if (fs.existsSync(resultPath)) {
+    return checkedResult(
+      JSON.parse(fs.readFileSync(resultPath, "utf8")),
+      resultPath,
+      false,
+    );
+  }
+
+  // GitHub runners do not have the ignored local verification directory. The
+  // publishing snapshot contains only the result JSON already exposed by the
+  // generated site's data.json, without transcripts, logs, or OCI archives.
+  const snapshotResult = previewSnapshot?.results?.[directory]?.[languageId];
+  return snapshotResult
+    ? checkedResult(
+        snapshotResult,
+        `${previewSnapshotPath}#${directory}.${languageId}`,
+        false,
+      )
+    : null;
 }
 
 const syntaxAliases = {

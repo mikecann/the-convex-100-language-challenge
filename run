@@ -27,6 +27,7 @@ usage() {
     "  sync-examples       project canonical example sources into READMEs" \
     "  site                generate the trusted static evidence site" \
     "  site-preview        generate a clearly labelled local-evidence preview" \
+    "  site-snapshot       refresh the checked-in local-preview evidence snapshot" \
     "  site-serve          serve the generated site at http://127.0.0.1:4173"
 }
 
@@ -623,6 +624,17 @@ case "$command_name" in
       "$client_digest" \
       "$source_commit" \
       "$source_dirty"
+    ;;
+  site-snapshot)
+    require_docker
+    build_harness
+    docker run --rm \
+      --user "$(id -u):$(id -g)" \
+      --env npm_config_cache=/tmp/npm-cache \
+      --tmpfs /tmp \
+      --volume "$repo_root:/repo" \
+      --env REPO_ROOT=/repo \
+      100-convex-clients-harness:local npm run site-snapshot
     ;;
   site|site-preview)
     require_docker
