@@ -57,8 +57,11 @@ body.home:not(.nav-solid) .top-nav {
   background: transparent;
   backdrop-filter: none;
 }
-.top-nav .brand, .top-nav .verified-pill { transition: opacity 300ms ease; }
-body.home:not(.nav-solid) .top-nav .brand,
+/* The small ring mark stays visible in the nav at all times, on every page —
+   only the wordmark and the verified pill wait for the hero title to scroll
+   out of view before they fade in alongside the bar itself. */
+.brand-label, .top-nav .verified-pill { transition: opacity 300ms ease; }
+body.home:not(.nav-solid) .top-nav .brand-label,
 body.home:not(.nav-solid) .top-nav .verified-pill {
   opacity: 0;
   pointer-events: none;
@@ -106,10 +109,12 @@ main > section, .graveyard { scroll-margin-top: 4.5rem; }
 
 h1 {
   margin: 0;
-  font-size: clamp(2.6rem, 6.5vw, 5.5rem);
+  max-width: 100%;
+  font-size: clamp(2.4rem, 6vw, 5rem);
   font-weight: 800;
   letter-spacing: -0.045em;
-  line-height: 1;
+  line-height: 1.05;
+  overflow-wrap: break-word;
   background: linear-gradient(100deg, #fff 30%, #d9c7f2 70%, #b78ae0);
   -webkit-background-clip: text;
   background-clip: text;
@@ -126,10 +131,10 @@ h1 {
 .tagline-language:hover { border-bottom-color: var(--brand-yellow); }
 
 .hero-mark {
-  height: 1.05em;
+  display: block;
+  height: clamp(4.5rem, 9vw, 7.5rem);
   width: auto;
-  margin-right: 0.15em;
-  vertical-align: -0.18em;
+  margin: 0 0 1.25rem;
 }
 
 .title-asterisk {
