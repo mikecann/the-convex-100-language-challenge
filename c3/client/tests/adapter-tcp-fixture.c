@@ -20,10 +20,22 @@ int main(void) {
   }
   if (fd < 0) return 1;
   freeaddrinfo(result);
-  const char *hello = "{\"protocolVersion\":1,\"id\":\"tcp-1\",\"op\":\"hello\"}\n";
-  if (write(fd, hello, strlen(hello)) != (ssize_t)strlen(hello)) return 1;
-  char reply[512] = {0};
-  ssize_t n = read(fd, reply, sizeof reply - 1);
+  /* Send both commands in one write. The adapter must not strand `close` in
+   * stdio read-ahead while its C3 owner polls the underlying descriptor. */
+  const char *commands =
+      "{\"protocolVersion\":1,\"id\":\"tcp-1\",\"op\":\"hello\"}\n"
+      "{\"id\":\"tcp-close\",\"op\":\"close\"}\n";
+  if (write(fd, commands, strlen(commands)) != (ssize_t)strlen(commands)) return 1;
+  char reply[1024] = {0};
+  size_t used = 0;
+  ssize_t n;
+  while ((n = read(fd, reply + used, sizeof reply - used - 1)) > 0) {
+    used += (size_t)n;
+    if (used == sizeof reply - 1) break;
+  }
   close(fd);
-  return n > 0 && strstr(reply, "\"id\":\"tcp-1\"") && strstr(reply, "\"type\":\"ready\"") ? 0 : 1;
+  return used > 0 && strstr(reply, "\"id\":\"tcp-1\"") &&
+         strstr(reply, "\"type\":\"ready\"") &&
+         strstr(reply, "\"id\":\"tcp-close\"") &&
+         strstr(reply, "\"type\":\"closed\"") ? 0 : 1;
 }

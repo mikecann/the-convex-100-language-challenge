@@ -20,7 +20,25 @@ fn void main()
     expect(c3_live::subscription_deliver(&subscription, "external"), "external update rejected");
     c3_live::LiveEvent event;
     expect(c3_live::subscription_take(&subscription, &event) && event.payload == "initial", "initial update missing");
+    c3_live::live_event_dispose(&event);
     expect(c3_live::subscription_take(&subscription, &event) && event.payload == "external", "external update missing");
+    c3_live::live_event_dispose(&event);
+
+    // Keep replacing a full queue with near-limit messages. This is the same
+    // ownership pattern as a stopped adapter reader. The queue must remain at
+    // its declared count and byte bounds instead of retaining every eviction.
+    char[16384] large_payload;
+    for (usz index = 0; index < large_payload.len; index++) large_payload[index] = 'x';
+    String large_event = (String)large_payload[..];
+    for (usz index = 0; index < 20000; index++)
+    {
+        expect(c3_live::subscription_deliver(&subscription, large_event),
+            "bounded churn event rejected");
+    }
+    expect(subscription.count == c3_live::MAX_BUFFERED_EVENTS,
+        "event count exceeded its bound");
+    expect(subscription.buffered_bytes <= c3_live::MAX_BUFFERED_BYTES,
+        "event bytes exceeded their bound");
     c3_live::subscription_invalidate(&subscription);
     expect(!c3_live::subscription_deliver(&subscription, "stale"), "stale relay crossed invalidation");
     expect(c3_live::manager_close(&manager), "manager did not close cleanly");

@@ -2,11 +2,16 @@
 ARG DEBIAN_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 FROM ${DEBIAN_IMAGE} AS build
 ARG C3_VERSION=0.8.2
+ARG CA_CERTIFICATES_VERSION=20250419~deb12u1
 ARG CURL_VERSION=7.88.1-10+deb12u15
+ARG GCC_VERSION=4:12.2.0-3
+ARG LIBC_DEV_VERSION=2.36-9+deb12u14
 ARG OPENSSL_VERSION=3.0.20-1~deb12u2
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl=${CURL_VERSION} libcurl4-openssl-dev=${CURL_VERSION} \
-      libssl-dev=${OPENSSL_VERSION} openssl=${OPENSSL_VERSION} gcc libc6-dev \
+      ca-certificates=${CA_CERTIFICATES_VERSION} curl=${CURL_VERSION} \
+      libcurl4-openssl-dev=${CURL_VERSION} gcc=${GCC_VERSION} \
+      libc6-dev=${LIBC_DEV_VERSION} libssl-dev=${OPENSSL_VERSION} \
+      openssl=${OPENSSL_VERSION} \
     && rm -rf /var/lib/apt/lists/*
 ADD --checksum=sha256:dda062e791359d01549c5d1aefbac5ac88dcd9c6f84e0b2d3309e92f8f6600aa \
   https://github.com/c3lang/c3c/releases/download/v${C3_VERSION}/c3-linux-static.tar.gz /tmp/c3.tar.gz

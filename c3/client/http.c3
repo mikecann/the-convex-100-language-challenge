@@ -31,13 +31,14 @@ fn String? endpoint_for(String deployment, String path)
 
 fn String query_envelope(String path, String args)
 {
-    return string::tformat(`{"path":"%s","args":%s,"format":"json"}`, path, args);
+    return string::tformat(`{"path":%s,"args":%s,"format":"json"}`,
+                           path.tescape(), args);
 }
 
 fn String mutation_envelope(String path, String args, String idempotency_key)
 {
-    return string::tformat(`{"path":"%s","args":%s,"format":"json","idempotencyKey":"%s"}`,
-                           path, args, idempotency_key);
+    return string::tformat(`{"path":%s,"args":%s,"format":"json","idempotencyKey":%s}`,
+                           path.tescape(), args, idempotency_key.tescape());
 }
 
 fn CLong? post(String deployment, String endpoint_path, String payload, String bearer,

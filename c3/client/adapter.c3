@@ -92,7 +92,11 @@ fn void main()
         // WebSocket, so commands can never race query-set transitions.
         c3_live::manager_tick(&live);
         c3_live::LiveEvent live_event;
-        while (c3_live::manager_take_event(&live, &live_event)) emit(live_event.payload);
+        while (c3_live::manager_take_event(&live, &live_event))
+        {
+            emit(live_event.payload);
+            c3_live::live_event_dispose(&live_event);
+        }
         if (c3_stdin_ready(20) == 0) continue;
         String? maybe_line = io::treadline(limit: 1048576);
         if (catch ignored = maybe_line) { c3_live::manager_close(&live); return; }

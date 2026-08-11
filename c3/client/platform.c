@@ -483,5 +483,11 @@ int c3_adapter_listen(const char *address) {
   if (peer < 0) return 0;
   int ok = dup2(peer, STDIN_FILENO) >= 0 && dup2(peer, STDOUT_FILENO) >= 0;
   close(peer);
+  /* The C3 owner polls fd 0 between NDJSON lines. Disable stdio read-ahead so
+   * a second command already buffered in FILE* cannot become invisible to
+   * that readiness check. Unbuffered stdout also makes every event available
+   * to the controller before it waits for the next command. */
+  if (ok) ok = setvbuf(stdin, NULL, _IONBF, 0) == 0 &&
+               setvbuf(stdout, NULL, _IONBF, 0) == 0;
   return ok;
 }

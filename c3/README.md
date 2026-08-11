@@ -97,8 +97,15 @@ fn int? next_live_count(c3_live::Manager* live)
         c3_live::LiveEvent event;
         if (!c3_live::manager_take_event(live, &event)) continue;
         Object* root = json::tparse(event.payload, JSON)!!;
-        if (!root.has_key("value")) return LIVE_FAILED~;
-        return count_of(root.get("value")!!);
+        if (!root.has_key("value"))
+        {
+            io::eprintfn("Live subscription failed: %s", event.payload)!!;
+            c3_live::live_event_dispose(&event);
+            return LIVE_FAILED~;
+        }
+        int? count = count_of(root.get("value")!!);
+        c3_live::live_event_dispose(&event);
+        return count;
     }
     return LIVE_TIMEOUT~;
 }

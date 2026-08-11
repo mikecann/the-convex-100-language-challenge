@@ -7,6 +7,7 @@ extern fn void fixture_reset();
 extern fn CInt fixture_push(char* message);
 extern fn CInt fixture_sent_contains(char* fragment);
 extern fn CInt fixture_connect_count();
+extern fn void fixture_fail_next_connect();
 extern fn void fixture_advance(CLongLong millis);
 
 fn void expect(bool value, String message)
@@ -37,12 +38,23 @@ fn void expect_event(c3_live::Manager* manager, String fragment)
     c3_live::LiveEvent event;
     expect(c3_live::manager_take_event(manager, &event), "expected Live event");
     expect(event.payload.contains(fragment), fragment);
+    c3_live::live_event_dispose(&event);
 }
 
 fn void main()
 {
     fixture_reset();
     c3_live::Manager manager;
+    c3_live::manager_init(&manager, "https://fixture.invalid");
+
+    // A subscribe that cannot establish its transport is rejected, not left
+    // behind to reconnect and emit events for an ID the adapter never acked.
+    fixture_fail_next_connect();
+    expect(!c3_live::manager_subscribe(&manager, "failed", "demo:state", `{"room":"failed"}`),
+        "failed transport unexpectedly acknowledged subscribe");
+    expect(!c3_live::has_active_subscriptions(&manager),
+        "failed subscribe remained active");
+    expect(c3_live::manager_close(&manager), "failed-subscribe manager did not close");
     c3_live::manager_init(&manager, "https://fixture.invalid");
 
     expect(c3_live::manager_subscribe(&manager, "sub", "demo:state", `{"room":"r"}`),

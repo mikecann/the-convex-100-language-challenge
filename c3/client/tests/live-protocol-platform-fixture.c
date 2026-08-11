@@ -11,6 +11,7 @@ static char sent[MAX_MESSAGES][MAX_MESSAGE_BYTES];
 static char incoming[MAX_MESSAGES][MAX_MESSAGE_BYTES];
 static size_t sent_count, incoming_head, incoming_count;
 static int connect_count;
+static int fail_next_connect;
 static long long now_millis;
 
 void fixture_reset(void) {
@@ -18,6 +19,7 @@ void fixture_reset(void) {
   memset(incoming, 0, sizeof incoming);
   sent_count = incoming_head = incoming_count = 0;
   connect_count = 0;
+  fail_next_connect = 0;
   now_millis = 0;
 }
 
@@ -34,11 +36,13 @@ int fixture_sent_contains(const char *fragment) {
 }
 
 int fixture_connect_count(void) { return connect_count; }
+void fixture_fail_next_connect(void) { fail_next_connect = 1; }
 void fixture_advance(long long millis) { now_millis += millis; }
 
 void *c3_ws_connect(const char *url, const char *ca_path, long timeout_millis) {
   (void)ca_path;
   if (!url || strncmp(url, "wss://", 6) || timeout_millis <= 0) return NULL;
+  if (fail_next_connect) { fail_next_connect = 0; return NULL; }
   struct fixture_socket *socket = calloc(1, sizeof *socket);
   if (!socket) return NULL;
   socket->active = 1;

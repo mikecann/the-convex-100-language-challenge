@@ -1,6 +1,8 @@
 module c3_http_response_fixtures;
 
 import std::io;
+import std::collections::object;
+import std::encoding::json;
 import c3_http;
 import c3_response;
 import c3_values;
@@ -36,6 +38,14 @@ fn void main()
     String mutation = c3_http::mutation_envelope("demo:increment", `{"room":"r"}`, "run-1");
     require(query.contains(`"format":"json"`), "query envelope");
     require(mutation.contains(`"idempotencyKey":"run-1"`), "mutation idempotency key");
+    Object* escaped_query = json::tparse(
+        c3_http::query_envelope("demo:\"quoted", `{}`), JSON)!!;
+    require(escaped_query.get("path")!!.s == "demo:\"quoted",
+        "query path is JSON escaped");
+    Object* escaped_mutation = json::tparse(
+        c3_http::mutation_envelope("demo:increment", `{}`, "run\"1"), JSON)!!;
+    require(escaped_mutation.get("idempotencyKey")!!.s == "run\"1",
+        "idempotency key is JSON escaped");
 
     int counter = c3_values::parse_counter("1.0")!!;
     require(counter == 1, "integral decimal counter accepted");

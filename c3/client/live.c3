@@ -81,6 +81,21 @@ struct Manager
 fn String quote(String value) => value.tescape();
 fn String object_json(Object* value) => string::tformat("%s", value);
 
+// Strings copied into the long-lived manager use the normal allocator. Keep
+// their ownership explicit so a busy subscription cannot leak one allocation
+// per update even though its queue has a byte and item cap.
+fn void free_owned(String* value)
+{
+    if (value.ptr) mem::free(value.ptr);
+    *value = {};
+}
+
+fn void live_event_dispose(LiveEvent* event)
+{
+    free_owned(&event.payload);
+    event.bytes = 0;
+}
+
 fn bool websocket_connect(WebSocket* websocket, String url, String ca_path, CLong timeout_millis)
 {
     websocket.transport = c3_ws_connect(url.ptr, ca_path.ptr, timeout_millis);
@@ -128,6 +143,22 @@ fn void subscription_init(Subscription* subscription, usz query_id,
     subscription.args_json = args_json.copy(mem);
 }
 
+fn void subscription_release_storage(Subscription* subscription)
+{
+    while (subscription.count)
+    {
+        live_event_dispose(&subscription.events[subscription.head]);
+        subscription.head = (subscription.head + 1) % MAX_BUFFERED_EVENTS;
+        subscription.count--;
+    }
+    free_owned(&subscription.subscription_id);
+    free_owned(&subscription.path);
+    free_owned(&subscription.args_json);
+    free_owned(&subscription.last_value);
+    subscription.head = 0;
+    subscription.buffered_bytes = 0;
+}
+
 // Count and byte caps are both required. Dropping the oldest value prevents a
 // stopped adapter reader from retaining unbounded Live data.
 fn bool subscription_deliver(Subscription* subscription, String payload)
@@ -140,6 +171,7 @@ fn bool subscription_deliver(Subscription* subscription, String payload)
     {
         if (!subscription.count) return false;
         subscription.buffered_bytes -= subscription.events[subscription.head].bytes;
+        live_event_dispose(&subscription.events[subscription.head]);
         subscription.head = (subscription.head + 1) % MAX_BUFFERED_EVENTS;
         subscription.count--;
     }
@@ -164,10 +196,10 @@ fn bool subscription_take(Subscription* subscription, LiveEvent* event)
 // publishes its acknowledgement.
 fn void subscription_invalidate(Subscription* subscription)
 {
-    subscription.generation++;
-    subscription.head = 0;
-    subscription.count = 0;
-    subscription.buffered_bytes = 0;
+    usz generation = subscription.generation + 1;
+    subscription_release_storage(subscription);
+    *subscription = {};
+    subscription.generation = generation;
     subscription.closed = true;
 }
 
@@ -199,7 +231,7 @@ fn Subscription* free_slot(Manager* manager)
 {
     foreach (&subscription : manager.subscriptions)
     {
-        if (!subscription.occupied || subscription.closed) return subscription;
+        if (!subscription.occupied) return subscription;
     }
     return null;
 }
@@ -250,7 +282,6 @@ fn String remove_message(Manager* manager, usz query_id)
 fn void manager_init(Manager* manager, String deployment)
 {
     *manager = {};
-    manager.remote_timestamp = INITIAL_TS;
     manager.last_close_reason = "InitialConnect";
     manager.reconnect_generation = 1;
     manager.backoff_millis = 100;
@@ -274,8 +305,10 @@ fn void manager_retire(Manager* manager, String reason, bool report_error)
     manager.query_set_version = 0;
     manager.remote_query_set = 0;
     manager.remote_identity = 0;
-    manager.remote_timestamp = INITIAL_TS;
-    manager.last_close_reason = reason.copy(mem);
+    free_owned(&manager.remote_timestamp);
+    // Retirement reasons are fixed protocol labels owned by this module, so
+    // retain the static string instead of allocating one per reconnect.
+    manager.last_close_reason = reason;
     foreach (&subscription : manager.subscriptions)
     {
         if (subscription.occupied && !subscription.closed) subscription.rehydrating = true;
@@ -304,7 +337,7 @@ fn bool manager_connect(Manager* manager)
     manager.query_set_version = 0;
     manager.remote_query_set = 0;
     manager.remote_identity = 0;
-    manager.remote_timestamp = INITIAL_TS;
+    free_owned(&manager.remote_timestamp);
     if (!send_connect(manager)) { manager_retire(manager, "ConnectWriteFailed", false); return false; }
     foreach (&subscription : manager.subscriptions)
     {
@@ -358,12 +391,19 @@ fn bool manager_subscribe(Manager* manager, String subscription_id,
     subscription_init(subscription, manager.next_query_id++, subscription_id, path, args_json);
     if (!manager.connected)
     {
-        if (!manager_connect(manager)) return false;
+        if (!manager_connect(manager))
+        {
+            // The adapter reports a failed subscribe command, so this query
+            // must not reconnect later and emit events for an unacknowledged ID.
+            subscription_invalidate(subscription);
+            return false;
+        }
         return true;
     }
     if (!websocket_send(&manager.websocket, add_message(manager, subscription), IO_TIMEOUT_MS))
     {
         schedule_reconnect(manager, "AddWriteFailed", "TransportError");
+        subscription_invalidate(subscription);
         return false;
     }
     manager.query_set_version++;
@@ -484,7 +524,7 @@ fn bool handle_transition(Manager* manager, Object* root)
     }
     if (start_query_set != manager.remote_query_set
         || start_identity != manager.remote_identity
-        || start_timestamp != manager.remote_timestamp)
+        || start_timestamp != (manager.remote_timestamp.len ? manager.remote_timestamp : INITIAL_TS))
     {
         io::eprintfn("C3 Live version mismatch %d/%d/%s != %d/%d/%s",
             start_query_set, start_identity, start_timestamp,
@@ -520,6 +560,7 @@ fn bool handle_transition(Manager* manager, Object* root)
             String value_json = object_json(value);
             bool unchanged = subscription.has_last_value && subscription.last_value == value_json;
             bool suppress = subscription.rehydrating && unchanged;
+            free_owned(&subscription.last_value);
             subscription.last_value = value_json.copy(mem);
             subscription.has_last_value = true;
             subscription.rehydrating = false;
@@ -540,7 +581,9 @@ fn bool handle_transition(Manager* manager, Object* root)
     }
     manager.remote_query_set = end_query_set;
     manager.remote_identity = end_identity;
+    free_owned(&manager.remote_timestamp);
     manager.remote_timestamp = end_timestamp.copy(mem);
+    free_owned(&manager.max_observed_timestamp);
     manager.max_observed_timestamp = end_timestamp.copy(mem);
     return true;
 }
@@ -573,7 +616,9 @@ fn CInt manager_tick(Manager* manager)
                            "TransportError");
         return -1;
     }
-    Object*? parsed = json::parse(mem, (String)manager.receive_buffer[:length], JSON);
+    // A Transition is fully consumed during this tick. Parsing it in the
+    // temporary allocator avoids retaining a JSON tree for every Live update.
+    Object*? parsed = json::tparse((String)manager.receive_buffer[:length], JSON);
     if (catch ignored = parsed)
     {
         schedule_reconnect(manager, "InvalidLiveJSON", "ProtocolError");
@@ -625,5 +670,8 @@ fn bool manager_close(Manager* manager)
     bool closed = websocket_close(&manager.websocket, IO_TIMEOUT_MS);
     if (manager.receive_buffer.ptr) mem::free(manager.receive_buffer.ptr);
     manager.receive_buffer = {};
+    free_owned(&manager.websocket_url);
+    free_owned(&manager.remote_timestamp);
+    free_owned(&manager.max_observed_timestamp);
     return closed;
 }
