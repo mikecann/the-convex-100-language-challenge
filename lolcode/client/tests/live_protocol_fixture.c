@@ -165,6 +165,7 @@ int main(void)
         "{\"type\":\"Transition\",\"startVersion\":{\"querySet\":1,\"identity\":0,\"ts\":\"BBBBBBBBBBB=\"},"
         "\"endVersion\":{\"querySet\":1,\"identity\":1,\"ts\":\"CCCCCCCCCCC=\"},"
         "\"modifications\":[{\"type\":\"QueryUpdated\",\"queryId\":0,\"value\":1,\"logLines\":[]}]}";
+    char logical_session[128] = {0};
 
     for (int connection = 0; connection < 6; connection++) {
         fprintf(stderr, "fixture waiting connection %d\n", connection);
@@ -174,9 +175,25 @@ int main(void)
         require_text(peer, message, sizeof message);
         char expected_count[64];
         snprintf(expected_count, sizeof expected_count, "\"connectionCount\":%d", connection);
+        const char *session = strstr(message, "\"sessionId\":\"");
+        if (!session) fail("Connect omitted sessionId");
+        session += strlen("\"sessionId\":\"");
+        const char *session_end = strchr(session, '"');
+        if (!session_end || session_end == session ||
+            (size_t)(session_end - session) >= sizeof logical_session)
+            fail("Connect sessionId shape mismatch");
+        if (connection == 0) {
+            memcpy(logical_session, session, (size_t)(session_end - session));
+            logical_session[session_end - session] = '\0';
+        } else if (strlen(logical_session) != (size_t)(session_end - session) ||
+                   memcmp(logical_session, session, (size_t)(session_end - session))) {
+            fail("sessionId changed across reconnect");
+        }
         if (!strstr(message, "\"type\":\"Connect\"") || !strstr(message, expected_count) ||
             (connection == 0 && !strstr(message, "\"lastCloseReason\":\"InitialConnect\"")) ||
-            (connection > 0 && !strstr(message, "\"lastCloseReason\":\"DebugDisconnect\""))) {
+            (connection > 0 &&
+             (!strstr(message, "\"lastCloseReason\":\"DebugDisconnect\"") ||
+              !strstr(message, "\"maxObservedTimestamp\":\"BBBBBBBBBBB=\"")))) {
             fprintf(stderr, "unexpected Connect %d: %s\n", connection, message);
             fail("Connect metadata mismatch");
         }

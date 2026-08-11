@@ -9,6 +9,8 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <math.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +57,7 @@ int lol_ws_close(void *opaque, long timeout_millis);
 void lol_ws_free(void *opaque);
 int lol_stdin_ready(long timeout_millis);
 int lol_adapter_listen(const char *address);
+int lol_random_session_id(char *output, size_t capacity);
 
 static int controller_status;
 
@@ -135,6 +138,17 @@ static ReturnObject *random_hex_wrapper(ScopeObject *scope)
     if (!hex) return string_result(NULL);
     for (long long i = 0; i < count; i++) sprintf(hex + i * 2, "%02x", bytes[i]);
     return string_result(hex);
+}
+
+static ReturnObject *random_uuid_wrapper(ScopeObject *scope)
+{
+    (void)scope;
+    char *uuid = malloc(37);
+    if (!uuid || !lol_random_session_id(uuid, 37)) {
+        free(uuid);
+        return string_result(NULL);
+    }
+    return string_result(uuid);
 }
 
 static ReturnObject *json_valid_wrapper(ScopeObject *scope)
@@ -222,8 +236,21 @@ static ReturnObject *json_array_at_wrapper(ScopeObject *scope)
 static int json_semantic_equal(json_t *left, json_t *right)
 {
     if (!left || !right) return 0;
-    if (json_is_number(left) && json_is_number(right))
-        return json_number_value(left) == json_number_value(right);
+    if (json_is_number(left) && json_is_number(right)) {
+        if (json_is_integer(left) && json_is_integer(right))
+            return json_integer_value(left) == json_integer_value(right);
+        if (json_is_real(left) && json_is_real(right))
+            return json_real_value(left) == json_real_value(right);
+        json_t *integer_value = json_is_integer(left) ? left : right;
+        double real = json_real_value(json_is_real(left) ? left : right);
+        // Compare mixed integer/real spellings without first rounding the
+        // integer through a double. This keeps 1 equal to 1.0 but distinguishes
+        // adjacent large integers that a double cannot represent separately.
+        if (!isfinite(real) || trunc(real) != real ||
+            real < -9223372036854775808.0 || real >= 9223372036854775808.0)
+            return 0;
+        return json_integer_value(integer_value) == (json_int_t)real;
+    }
     if (json_typeof(left) != json_typeof(right)) return 0;
     if (json_is_array(left)) {
         if (json_array_size(left) != json_array_size(right)) return 0;
@@ -284,12 +311,19 @@ static ReturnObject *json_integer_wrapper(ScopeObject *scope)
     json_t *value = parse_json_any(string_arg(scope, "json"));
     char buffer[64] = "";
     if (json_is_integer(value)) {
-        snprintf(buffer, sizeof buffer, "%lld", (long long)json_integer_value(value));
+        json_int_t integer = json_integer_value(value);
+        if (integer >= -INT64_C(9007199254740991) &&
+            integer <= INT64_C(9007199254740991))
+            snprintf(buffer, sizeof buffer, "%lld", (long long)integer);
     } else if (json_is_real(value)) {
         double number = json_real_value(value);
-        long long integer = (long long)number;
-        if ((double)integer == number)
+        // LOLCODE NUMBAR values are doubles, so accept only exactly
+        // representable Convex JSON integers before performing the cast.
+        if (isfinite(number) && number >= -9007199254740991.0 &&
+            number <= 9007199254740991.0 && trunc(number) == number) {
+            long long integer = (long long)number;
             snprintf(buffer, sizeof buffer, "%lld", integer);
+        }
     }
     json_decref(value);
     return string_result(strdup(buffer));
@@ -610,6 +644,7 @@ int loadTransportLibrary(ScopeObject *scope)
     loadBinding(library, "NOW", NULL, now_wrapper);
     loadBinding(library, "SLEEP", "millis", sleep_wrapper);
     loadBinding(library, "RANDOMHEX", "bytes", random_hex_wrapper);
+    loadBinding(library, "RANDOMUUID", NULL, random_uuid_wrapper);
     loadBinding(library, "JSONVALID", "json", json_valid_wrapper);
     loadBinding(library, "JSONESCAPE", "text", json_escape_wrapper);
     loadBinding(library, "JSONHAS", "json key", json_has_wrapper);

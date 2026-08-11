@@ -215,7 +215,7 @@ provider modules, and shared-library closure, but no compiler, package manager,
 transport CLI, Python, or Node.js command.
 
 One owner performs all WebSocket reads, writes, query-set version changes, and
-reconnects. Its output queue is globally bounded to 64 events and 4 MiB of
+reconnects. Its output queue is globally bounded to 16 events and 4 MiB of
 encoded payload. Overflow drops the oldest event, and subscription generations
 prevent stale values crossing replacement or unsubscribe acknowledgements.
 
