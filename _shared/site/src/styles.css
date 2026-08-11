@@ -82,7 +82,7 @@ main { padding: 0 clamp(1rem, 5vw, 5rem) 5rem; }
 
 .language-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(11.5rem, 1fr));
   gap: 0.75rem;
 }
 
@@ -90,7 +90,7 @@ main { padding: 0 clamp(1rem, 5vw, 5rem) 5rem; }
   position: relative;
   display: flex;
   flex-direction: column;
-  min-height: 9rem;
+  min-height: 11.75rem;
   border: 1px solid var(--border);
   border-radius: 0.4rem;
   background: linear-gradient(145deg, var(--surface-raised), var(--surface));
@@ -101,7 +101,9 @@ main { padding: 0 clamp(1rem, 5vw, 5rem) 5rem; }
 .language-card[data-status="working"] { box-shadow: inset 0 3px 0 var(--live); }
 .language-card[data-status="failed"] { box-shadow: inset 0 3px 0 var(--failed); }
 .language-card-open {
-  display: grid;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
   flex: 1;
   width: 100%;
   padding: 1rem 1rem 0.55rem;
@@ -113,10 +115,32 @@ main { padding: 0 clamp(1rem, 5vw, 5rem) 5rem; }
 }
 .language-card-open:focus-visible { outline: 2px solid #c1cee0; outline-offset: -4px; }
 .language-card > .badges { padding: 0 1rem 1rem; }
+.card-meta { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; width: 100%; }
 .rank { color: var(--muted); font-family: ui-monospace, monospace; font-size: 0.8rem; }
-.name { align-self: end; font-size: 1.15rem; }
+.name { align-self: flex-start; font-size: 1.15rem; }
 .state { color: var(--muted); font-size: 0.78rem; text-transform: capitalize; }
 .badges, .dialog-badges { display: flex; flex-wrap: wrap; gap: 0.35rem; min-height: 1.25rem; }
+
+.language-logo-slot { display: grid; place-items: center; width: 100%; }
+.language-logo {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border: 1px solid rgb(255 255 255 / 25%);
+  border-radius: 1rem;
+  background: #f8fafc;
+  box-shadow: 0 0.65rem 1.4rem rgb(0 0 0 / 24%);
+}
+.language-logo img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.language-logo-fallback {
+  color: #263247;
+  font: 800 1.1rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: -0.08em;
+}
+.card-language-logo { width: 4.5rem; height: 4.5rem; padding: 0.3rem; }
+.dialog-heading { display: flex; align-items: center; gap: 1rem; padding-right: 3rem; }
+.dialog-language-logo { width: 5rem; height: 5rem; padding: 0.35rem; }
 
 .badge {
   display: inline-flex;
@@ -202,5 +226,6 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   .page-header { align-items: stretch; flex-direction: column; padding-top: 2rem; }
   .summary { min-width: 0; }
   .legend { width: 100%; margin-left: 0; }
+  .dialog-heading { align-items: flex-start; flex-direction: column; }
   dialog dl { grid-template-columns: 1fr; }
 }

@@ -74,6 +74,36 @@ function badge(name) {
   return button;
 }
 
+function languageLogo(language, className, { lazy = true } = {}) {
+  const mark = document.createElement("span");
+  mark.className = `language-logo ${className}`;
+  mark.setAttribute("aria-hidden", "true");
+
+  // The name next to this mark is the accessible label. This short fallback
+  // keeps cards balanced for languages that do not have a project logo yet.
+  const fallback = document.createElement("span");
+  fallback.className = "language-logo-fallback";
+  fallback.textContent = language.displayName.slice(0, 2).toUpperCase();
+
+  if (!language.logo) {
+    mark.append(fallback);
+    return mark;
+  }
+
+  const image = document.createElement("img");
+  image.src = language.logo;
+  image.alt = "";
+  image.decoding = "async";
+  image.loading = lazy ? "lazy" : "eager";
+  fallback.hidden = true;
+  image.addEventListener("error", () => {
+    image.remove();
+    fallback.hidden = false;
+  });
+  mark.append(image, fallback);
+  return mark;
+}
+
 function showCapability(name) {
   const definition = capabilityDefinitions[name];
   if (!definition) return;
@@ -122,6 +152,9 @@ function render() {
     card.querySelector(".rank").textContent = `#${language.rank}`;
     card.querySelector(".name").textContent = language.displayName;
     card.querySelector(".state").textContent = languageStatus;
+    card
+      .querySelector(".language-logo-slot")
+      .replaceChildren(languageLogo(language, "card-language-logo"));
     const badges = card.querySelector(".badges");
     for (const capability of capabilities(language)) badges.append(badge(capability));
     const openButton = card.querySelector(".language-card-open");
@@ -185,11 +218,14 @@ function addDetailList(parent, entries) {
 
 function showLanguage(language) {
   dialogContent.replaceChildren();
+  const heading = document.createElement("div");
+  heading.className = "dialog-heading";
   const title = document.createElement("h2");
   title.textContent = language.displayName;
+  heading.append(languageLogo(language, "dialog-language-logo", { lazy: false }), title);
   const intro = document.createElement("p");
   intro.textContent = `Roster rank ${language.rank}. Implementation status: ${status(language)}.`;
-  dialogContent.append(title, intro);
+  dialogContent.append(heading, intro);
 
   const badgeRow = document.createElement("div");
   badgeRow.className = "dialog-badges";
