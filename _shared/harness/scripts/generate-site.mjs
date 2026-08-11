@@ -260,6 +260,19 @@ for (const filename of ["index.html", "app.js", "styles.css"]) {
   fs.copyFileSync(path.join(source, filename), path.join(output, filename));
 }
 
+// Content pages are static shells in src; build-time tokens let a page carry
+// repository-owned markdown (the graveyard) without shipping it in data.json.
+const graveyardHtml = await renderGraveyard();
+for (const page of ["graveyard", "faq", "numbers"]) {
+  const pageSource = fs.readFileSync(path.join(source, `${page}.html`), "utf8");
+  const pageOutput = path.join(output, page);
+  fs.mkdirSync(pageOutput, { recursive: true });
+  fs.writeFileSync(
+    path.join(pageOutput, "index.html"),
+    pageSource.replace("<!-- BUILD:GRAVEYARD -->", () => graveyardHtml),
+  );
+}
+
 // Logos live with their language implementations, which keeps ownership and
 // attribution obvious. Project them into the static site just like examples.
 const logoOutput = path.join(output, "logos");
@@ -292,7 +305,6 @@ fs.writeFileSync(
       generatedAt: new Date().toISOString(),
       evidenceChannel,
       repoUrl: repoWebUrl,
-      graveyardHtml: await renderGraveyard(),
       languages,
     },
     null,

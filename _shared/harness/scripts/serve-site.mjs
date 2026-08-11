@@ -30,6 +30,12 @@ const server = http.createServer((request, response) => {
     filePath = path.join(root, "index.html");
   }
 
+  // Content pages are directories with an index document, like static hosts
+  // serve them.
+  if (fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) {
+    filePath = path.join(filePath, "index.html");
+  }
+
   if (!fs.existsSync(filePath)) {
     response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
     response.end("Not found\n");

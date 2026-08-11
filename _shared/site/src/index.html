@@ -23,10 +23,10 @@
       </a>
       <span id="verified-pill" class="verified-pill" hidden></span>
       <div class="nav-links">
-        <a href="#languages">Languages</a>
-        <a href="#graveyard" data-open-details>Graveyard</a>
-        <a href="#faq">FAQ</a>
-        <a href="#numbers">Numbers</a>
+        <a href="/" aria-current="page">Languages</a>
+        <a href="/graveyard/">Graveyard</a>
+        <a href="/faq/">FAQ</a>
+        <a href="/numbers/">Numbers</a>
         <a href="https://github.com/mikecann/100-convex-clients">GitHub</a>
       </div>
     </nav>
@@ -36,6 +36,11 @@
         <p class="eyebrow">An educational experiment · not official SDKs</p>
         <h1>100 Convex clients</h1>
         <p class="tagline">One backend. One conformance test. No unearned badges.</p>
+        <div class="try-strip">
+          <code id="try-command">git clone https://github.com/mikecann/100-convex-clients && cd 100-convex-clients && ./run verify-example fortran</code>
+          <button class="copy-button" type="button" data-copy-target="try-command">Copy</button>
+          <span class="try-note">Docker is the only prerequisite. Swap <code>fortran</code> for any language below.</span>
+        </div>
       </div>
     </header>
 
@@ -71,113 +76,6 @@
       </section>
 
       <section id="language-grid" class="language-grid" aria-live="polite"></section>
-
-      <section id="numbers" class="numbers" aria-label="Project numbers">
-        <h2>The numbers</h2>
-        <p>
-          Measured, not estimated. The full ledger, including how each figure was
-          taken and every caveat, is in
-          <a href="https://github.com/mikecann/100-convex-clients/blob/main/STATS.md">STATS.md</a>.
-        </p>
-        <div class="numbers-grid">
-          <div class="number">
-            <strong>62</strong>
-            <span>conformance checks per badge: 31 against a local backend, 31 against a real hosted deployment over TLS</span>
-          </div>
-          <div class="number">
-            <strong>22</strong>
-            <span>languages recorded infeasible, with evidence, and replaced. Nothing was quietly dropped</span>
-          </div>
-          <div class="number">
-            <strong>355,755</strong>
-            <span>lines of client and example source, as measured at the 83-language snapshot</span>
-          </div>
-          <div class="number">
-            <strong>50.67B</strong>
-            <span>tokens moved across the project, over 99% of them cheap cache reads</span>
-          </div>
-        </div>
-      </section>
-
-      <section id="graveyard" class="graveyard" aria-label="Infeasible languages">
-        <h2>The graveyard</h2>
-        <p class="graveyard-intro">
-          Not every language on the original roster could be done honestly.
-          These are the ones that could not, each recorded with evidence in
-          <a href="https://github.com/mikecann/100-convex-clients/blob/main/INFEASIBLE.md">INFEASIBLE.md</a>,
-          whose first rule is that nothing on the page is ever deleted.
-        </p>
-        <details class="graveyard-details">
-          <summary>Read the full record</summary>
-          <div id="graveyard-content" class="rendered-markdown"></div>
-        </details>
-      </section>
-
-      <section id="faq" class="faq" aria-label="Frequently asked questions">
-        <h2>Questions you are probably asking</h2>
-        <details>
-          <summary>Are these official Convex clients?</summary>
-          <p>
-            No. They are educational experiments built for this project, the
-            website and the accompanying video. They are not published packages,
-            not production SDKs and not officially supported by
-            <a href="https://www.convex.dev/">Convex</a>.
-          </p>
-        </details>
-        <details>
-          <summary>How much of the Convex API do they cover?</summary>
-          <p>
-            The core client surface: queries, mutations, actions, JSON-safe
-            values, auth-token forwarding and error handling, plus realtime
-            query subscriptions over WebSockets for the Live badge. They do not
-            cover the full official SDK surface.
-          </p>
-        </details>
-        <details>
-          <summary>Is this server-side Convex?</summary>
-          <p>
-            No, client-side only. The backend the clients talk to is a normal
-            Convex backend with its queries, mutations and actions written in
-            TypeScript as usual. This project is about calling into a Convex
-            backend from each language, the way a frontend or another service
-            would. So no, sadly there is no COBOL running on Convex's servers.
-          </p>
-        </details>
-        <details>
-          <summary>Did AI really write all of it?</summary>
-          <p>
-            Yes, all of it. The human job was direction: picking the goals,
-            setting the rules, reviewing the evidence and deciding what happened
-            next. The agents did the typing, and the test suite kept everyone
-            honest.
-          </p>
-        </details>
-        <details>
-          <summary>How do I know the badges are real?</summary>
-          <p>
-            Every badge comes from <code>./run verify-all</code> at an exact
-            clean commit: 31 of 31 conformance checks against a local backend
-            and 31 of 31 against a real hosted deployment over TLS. The evidence
-            behind every badge, including the commit, container digest,
-            toolchain and timestamp, is on this site for every language.
-          </p>
-        </details>
-        <details>
-          <summary>Why only 100 when 22 failed?</summary>
-          <p>
-            Infeasible languages were recorded with evidence in the graveyard
-            above and replaced from the roster reserve list, so the roster still
-            reaches 100. Nothing was quietly dropped.
-          </p>
-        </details>
-        <details>
-          <summary>Can I get a proper idiomatic client for language X?</summary>
-          <p>
-            Maybe! If enough people want a fuller implementation of a particular
-            language, it could happen. Say so in the video comments.
-          </p>
-        </details>
-      </section>
     </main>
 
     <footer class="page-footer">
@@ -197,10 +95,12 @@
       </p>
     </footer>
 
-    <dialog id="language-dialog">
-      <button id="dialog-close" class="dialog-close" aria-label="Close">×</button>
-      <div id="dialog-content"></div>
-    </dialog>
+    <aside id="language-panel" class="language-panel" aria-label="Language details" hidden>
+      <div class="panel-bar">
+        <button id="panel-close" class="dialog-close" aria-label="Close language details">×</button>
+      </div>
+      <div id="panel-content"></div>
+    </aside>
 
     <dialog id="capability-dialog" class="capability-dialog" aria-labelledby="capability-title">
       <button id="capability-close" class="dialog-close" aria-label="Close capability explanation">×</button>

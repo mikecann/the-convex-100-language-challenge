@@ -6,8 +6,8 @@ const template = document.querySelector("#language-card-template");
 const search = document.querySelector("#search");
 const statusFilter = document.querySelector("#status-filter");
 const sortOrder = document.querySelector("#sort-order");
-const dialog = document.querySelector("#language-dialog");
-const dialogContent = document.querySelector("#dialog-content");
+const panel = document.querySelector("#language-panel");
+const panelContent = document.querySelector("#panel-content");
 const capabilityDialog = document.querySelector("#capability-dialog");
 const capabilityContent = document.querySelector("#capability-content");
 
@@ -47,22 +47,14 @@ const liveCount = data.languages.filter(
   (language) => language.result?.earnedCapabilities?.includes("live"),
 ).length;
 const verifiedPill = document.querySelector("#verified-pill");
-verifiedPill.hidden = false;
-verifiedPill.dataset.complete = String(workingCount === data.languages.length);
-verifiedPill.textContent =
-  `${workingCount}/${data.languages.length} verified` +
-  (workingCount > 0 && liveCount === workingCount
-    ? " · all Live"
-    : liveCount > 0
-      ? ` · ${liveCount} Live`
-      : "");
-verifiedPill.title =
-  "Verified means the client passed the full conformance suite against both a local backend and a real hosted deployment.";
-
-const graveyardContent = document.querySelector("#graveyard-content");
-if (graveyardContent && data.graveyardHtml) {
-  // Repository-owned markdown rendered by the site generator, not user input.
-  graveyardContent.innerHTML = data.graveyardHtml;
+if (workingCount > 0) {
+  verifiedPill.hidden = false;
+  verifiedPill.dataset.complete = String(workingCount === data.languages.length);
+  verifiedPill.textContent =
+    `${workingCount}/${data.languages.length} verified` +
+    (liveCount === workingCount ? " · all Live" : liveCount > 0 ? ` · ${liveCount} Live` : "");
+  verifiedPill.title =
+    "Verified means the client passed the full conformance suite against both a local backend and a real hosted deployment.";
 }
 
 if (data.evidenceChannel !== "trusted-main") {
@@ -166,23 +158,22 @@ function render() {
     if (filter === "failed" && languageStatus !== "failed") continue;
 
     const card = template.content.firstElementChild.cloneNode(true);
-    const verified = capabilities(language).length > 0;
     card.dataset.status = languageStatus;
     // A verified card earned at least one capability from published evidence;
     // a merely claimed status never gets the verified treatment.
-    card.dataset.verified = String(verified);
+    card.dataset.verified = String(capabilities(language).length > 0);
     card.querySelector(".logo").append(logoElement(language));
     card.querySelector(".rank").textContent = language.firstAppeared
       ? `#${language.rank} · ${language.firstAppeared}`
       : `#${language.rank}`;
     card.querySelector(".name").textContent = language.displayName;
-    // The badges already say a verified card works; text status is reserved
-    // for the states worth calling out.
-    card.querySelector(".state").textContent = verified
-      ? ""
-      : languageStatus === "working"
-        ? "unverified"
-        : languageStatus;
+    // Text status is reserved for the noteworthy states; working is the norm
+    // and the badges carry the proof.
+    card.querySelector(".state").textContent = ["failed", "planned", "blocked"].includes(
+      languageStatus,
+    )
+      ? languageStatus
+      : "";
     const badges = card.querySelector(".badges");
     for (const capability of capabilities(language)) badges.append(badge(capability));
     const openButton = card.querySelector(".language-card-open");
@@ -216,7 +207,9 @@ function openLanguage(language, { updateHistory = true } = {}) {
 }
 
 function closeLanguage({ updateHistory = true } = {}) {
-  if (dialog.open) dialog.close();
+  panel.hidden = true;
+  document.body.classList.remove("panel-open");
+  openedLanguageId = null;
   if (updateHistory && routedLanguage()) {
     window.history.pushState({}, "", "/");
   }
@@ -277,6 +270,50 @@ function evidenceColumn(title, result) {
   return column;
 }
 
+function copyButton(text) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "copy-button";
+  button.textContent = "Copy";
+  button.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      button.textContent = "Copied";
+      setTimeout(() => {
+        button.textContent = "Copy";
+      }, 1500);
+    } catch {
+      button.textContent = "Copy failed";
+    }
+  });
+  return button;
+}
+
+function tryItBlock(language) {
+  const block = document.createElement("div");
+  block.className = "try-it";
+  const heading = document.createElement("h3");
+  heading.textContent = "Try it yourself";
+  const explanation = document.createElement("p");
+  explanation.textContent =
+    "Docker is the only prerequisite. This builds the pinned toolchain and runs the canonical example against a real backend:";
+  const commands = [
+    "git clone https://github.com/mikecann/100-convex-clients",
+    "cd 100-convex-clients",
+    `./run verify-example ${language.id}`,
+  ].join("\n");
+  const pre = document.createElement("pre");
+  pre.className = "try-commands";
+  const code = document.createElement("code");
+  code.textContent = commands;
+  pre.append(code);
+  const actions = document.createElement("p");
+  actions.className = "try-actions";
+  actions.append(copyButton(commands));
+  block.append(heading, explanation, pre, actions);
+  return block;
+}
+
 const readmeCache = new Map();
 let openedLanguageId = null;
 
@@ -310,7 +347,7 @@ async function loadReadme(language, container) {
 
 function showLanguage(language) {
   openedLanguageId = language.id;
-  dialogContent.replaceChildren();
+  panelContent.replaceChildren();
 
   const titleRow = document.createElement("div");
   titleRow.className = "dialog-title";
@@ -325,14 +362,13 @@ function showLanguage(language) {
   const intro = document.createElement("p");
   const introParts = [`Roster rank ${language.rank}`];
   if (language.firstAppeared) introParts.push(`first appeared ${language.firstAppeared}`);
-  introParts.push(`implementation status: ${status(language)}`);
   intro.textContent = `${introParts.join(" · ")}.`;
-  dialogContent.append(titleRow, intro);
+  panelContent.append(titleRow, intro);
 
   const badgeRow = document.createElement("div");
   badgeRow.className = "dialog-badges";
   for (const capability of capabilities(language)) badgeRow.append(badge(capability));
-  dialogContent.append(badgeRow);
+  panelContent.append(badgeRow);
 
   const links = document.createElement("p");
   links.className = "dialog-links";
@@ -348,7 +384,9 @@ function showLanguage(language) {
     exampleLink.textContent = "Canonical example";
     links.append(exampleLink);
   }
-  dialogContent.append(links);
+  panelContent.append(links);
+
+  panelContent.append(tryItBlock(language));
 
   if (language.readme) {
     const aboutHeading = document.createElement("h3");
@@ -359,7 +397,7 @@ function showLanguage(language) {
     loading.className = "readme-loading";
     loading.textContent = "Loading README…";
     readmeContainer.append(loading);
-    dialogContent.append(aboutHeading, readmeContainer);
+    panelContent.append(aboutHeading, readmeContainer);
     loadReadme(language, readmeContainer);
   }
 
@@ -380,14 +418,14 @@ function showLanguage(language) {
       pre.append(code);
       highlighted.append(pre);
     }
-    dialogContent.append(heading, highlighted);
+    panelContent.append(heading, highlighted);
   }
 
   const evidenceHeading = document.createElement("h3");
   evidenceHeading.textContent = "The evidence";
-  dialogContent.append(evidenceHeading);
+  panelContent.append(evidenceHeading);
 
-  addDetailList(dialogContent, [
+  addDetailList(panelContent, [
     ["Evidence channel", language.evidenceTrust],
     ["Source commit", language.result?.sourceCommit],
     ["Source dirty", language.result ? String(language.result.dirty) : null],
@@ -405,23 +443,21 @@ function showLanguage(language) {
   columns.className = "evidence-columns";
   columns.append(evidenceColumn("Conformance run", language.result));
   columns.append(evidenceColumn("Hosted deployment", language.hostedResult));
-  dialogContent.append(columns);
+  panelContent.append(columns);
 
   document.title = `${language.displayName} · 100 Convex clients`;
-  if (!dialog.open) dialog.showModal();
-  dialog.scrollTop = 0;
+  panel.hidden = false;
+  document.body.classList.add("panel-open");
+  panel.scrollTop = 0;
 }
 
 search.addEventListener("input", render);
 statusFilter.addEventListener("change", render);
 sortOrder.addEventListener("change", render);
-// The graveyard is collapsed by default; someone who asked for it via the nav
-// should land on it open.
-document.querySelector("[data-open-details]")?.addEventListener("click", () => {
-  const details = document.querySelector(".graveyard-details");
-  if (details) details.open = true;
+document.querySelector("#panel-close").addEventListener("click", () => closeLanguage());
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !panel.hidden && !capabilityDialog.open) closeLanguage();
 });
-document.querySelector("#dialog-close").addEventListener("click", () => closeLanguage());
 document.querySelector("#capability-close").addEventListener("click", () => capabilityDialog.close());
 for (const legendBadge of document.querySelectorAll(".legend [data-capability]")) {
   const name = legendBadge.dataset.capability;
@@ -430,16 +466,23 @@ for (const legendBadge of document.querySelectorAll(".legend [data-capability]")
   legendBadge.title = `${definition.label}: ${definition.summary}`;
   legendBadge.addEventListener("click", () => showCapability(name));
 }
-dialog.addEventListener("click", (event) => {
-  if (event.target === dialog) closeLanguage();
-});
-dialog.addEventListener("cancel", (event) => {
-  event.preventDefault();
-  closeLanguage();
-});
 capabilityDialog.addEventListener("click", (event) => {
   if (event.target === capabilityDialog) capabilityDialog.close();
 });
+for (const button of document.querySelectorAll("[data-copy-target]")) {
+  button.addEventListener("click", async () => {
+    const source = document.getElementById(button.dataset.copyTarget);
+    try {
+      await navigator.clipboard.writeText(source.textContent);
+      button.textContent = "Copied";
+      setTimeout(() => {
+        button.textContent = "Copy";
+      }, 1500);
+    } catch {
+      button.textContent = "Copy failed";
+    }
+  });
+}
 
 render();
 window.addEventListener("popstate", syncLanguageRoute);

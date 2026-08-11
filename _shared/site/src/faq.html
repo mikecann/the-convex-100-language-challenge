@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Frequently asked questions about the 100 Convex clients project: what the badges prove, what the clients cover, and how it was built." />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f0c13'/%3E%3Cpath d='M18.08 4.18 A12 12 0 0 1 27.28 20.10' fill='none' stroke='%23f3b01c' stroke-width='5' stroke-linecap='round'/%3E%3Cpath d='M25.19 23.71 A12 12 0 0 1 6.81 23.71' fill='none' stroke='%23ee342f' stroke-width='5' stroke-linecap='round'/%3E%3Cpath d='M4.72 20.10 A12 12 0 0 1 13.92 4.18' fill='none' stroke='%238d2676' stroke-width='5' stroke-linecap='round'/%3E%3C/svg%3E" />
+    <title>FAQ · 100 Convex clients</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <nav class="top-nav" aria-label="Site">
+      <a class="brand" href="/">
+        <svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true">
+          <path d="M18.08 4.18 A12 12 0 0 1 27.28 20.10" fill="none" stroke="#f3b01c" stroke-width="5" stroke-linecap="round" />
+          <path d="M25.19 23.71 A12 12 0 0 1 6.81 23.71" fill="none" stroke="#ee342f" stroke-width="5" stroke-linecap="round" />
+          <path d="M4.72 20.10 A12 12 0 0 1 13.92 4.18" fill="none" stroke="#8d2676" stroke-width="5" stroke-linecap="round" />
+        </svg>
+        <span>100 Convex clients</span>
+      </a>
+      <div class="nav-links">
+        <a href="/">Languages</a>
+        <a href="/graveyard/">Graveyard</a>
+        <a href="/faq/" aria-current="page">FAQ</a>
+        <a href="/numbers/">Numbers</a>
+        <a href="https://github.com/mikecann/100-convex-clients">GitHub</a>
+      </div>
+    </nav>
+
+    <main class="page faq">
+      <h1>Questions you are probably asking</h1>
+      <details open>
+        <summary>Are these official Convex clients?</summary>
+        <p>
+          No. They are educational experiments built for this project, the
+          website and the accompanying video. They are not published packages,
+          not production SDKs and not officially supported by
+          <a href="https://www.convex.dev/">Convex</a>.
+        </p>
+      </details>
+      <details>
+        <summary>How much of the Convex API do they cover?</summary>
+        <p>
+          The core client surface: queries, mutations, actions, JSON-safe
+          values, auth-token forwarding and error handling, plus realtime
+          query subscriptions over WebSockets for the Live badge. They do not
+          cover the full official SDK surface.
+        </p>
+      </details>
+      <details>
+        <summary>Is this server-side Convex?</summary>
+        <p>
+          No, client-side only. The backend the clients talk to is a normal
+          Convex backend with its queries, mutations and actions written in
+          TypeScript as usual. This project is about calling into a Convex
+          backend from each language, the way a frontend or another service
+          would. So no, sadly there is no COBOL running on Convex's servers.
+        </p>
+      </details>
+      <details>
+        <summary>Did AI really write all of it?</summary>
+        <p>
+          Yes, all of it. The human job was direction: picking the goals,
+          setting the rules, reviewing the evidence and deciding what happened
+          next. The agents did the typing, and the test suite kept everyone
+          honest.
+        </p>
+      </details>
+      <details>
+        <summary>How do I know the badges are real?</summary>
+        <p>
+          Every badge comes from <code>./run verify-all</code> at an exact
+          clean commit: 31 of 31 conformance checks against a local backend
+          and 31 of 31 against a real hosted deployment over TLS. The evidence
+          behind every badge, including the commit, container digest,
+          toolchain and timestamp, is on this site for every language.
+        </p>
+      </details>
+      <details>
+        <summary>How do I try one myself?</summary>
+        <p>
+          Install Docker, clone the
+          <a href="https://github.com/mikecann/100-convex-clients">repository</a>,
+          and run <code>./run verify-example &lt;language&gt;</code> from the
+          repository root. That builds the language's pinned toolchain in
+          Docker and runs its canonical example against a real backend, so
+          nothing needs to be installed on your machine except Docker itself.
+        </p>
+      </details>
+      <details>
+        <summary>Why only 100 when 22 failed?</summary>
+        <p>
+          Infeasible languages were recorded with evidence in
+          <a href="/graveyard/">the graveyard</a> and replaced from the roster
+          reserve list, so the roster still reaches 100. Nothing was quietly
+          dropped.
+        </p>
+      </details>
+      <details>
+        <summary>Can I get a proper idiomatic client for language X?</summary>
+        <p>
+          Maybe! If enough people want a fuller implementation of a particular
+          language, it could happen. Say so in the video comments.
+        </p>
+      </details>
+    </main>
+
+    <footer class="page-footer">
+      <nav aria-label="Project links">
+        <a href="https://github.com/mikecann/100-convex-clients">Repository</a>
+        <a href="https://github.com/mikecann/100-convex-clients/blob/main/STATS.md">STATS.md</a>
+        <a href="https://github.com/mikecann/100-convex-clients/blob/main/INFEASIBLE.md">INFEASIBLE.md</a>
+        <a href="https://github.com/mikecann/100-convex-clients/blob/main/LESSONS.md">LESSONS.md</a>
+        <a href="https://github.com/mikecann/100-convex-clients/blob/main/BUILD-FLEET.md">BUILD-FLEET.md</a>
+        <a href="https://www.convex.dev/">Convex</a>
+        <a href="https://docs.convex.dev/http-api/">Convex HTTP API</a>
+      </nav>
+      <p>
+        An educational experiment by Mike Cann. Not affiliated with or endorsed
+        by Convex. Every badge is backed by published evidence; anything without
+        evidence is shown as unverified.
+      </p>
+    </footer>
+  </body>
+</html>

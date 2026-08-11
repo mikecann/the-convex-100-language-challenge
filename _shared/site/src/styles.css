@@ -280,12 +280,12 @@ dialog::backdrop { background: rgb(8 5 14 / 72%); backdrop-filter: blur(6px); }
 .dialog-title { display: flex; align-items: center; gap: 1rem; }
 .dialog-title .logo { width: 3.2rem; height: 3.2rem; flex: none; }
 .dialog-title .monogram { font-size: 1.2rem; border-radius: 0.8rem; }
-dialog h2 { margin: 0; font-size: clamp(1.9rem, 5vw, 2.6rem); letter-spacing: -0.03em; }
-dialog h3 { margin-top: 2rem; letter-spacing: -0.01em; }
-dialog p { color: var(--muted); }
-dialog dl { display: grid; grid-template-columns: 9.5rem 1fr; gap: 0.6rem 1rem; margin-top: 1.5rem; }
-dialog dt { color: var(--muted); }
-dialog dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+dialog h2, .language-panel h2 { margin: 0; font-size: clamp(1.9rem, 5vw, 2.6rem); letter-spacing: -0.03em; }
+dialog h3, .language-panel h3 { margin-top: 2rem; letter-spacing: -0.01em; }
+dialog p, .language-panel p { color: var(--muted); }
+dialog dl, .language-panel dl { display: grid; grid-template-columns: 9.5rem 1fr; gap: 0.6rem 1rem; margin-top: 1.5rem; }
+dialog dt, .language-panel dt { color: var(--muted); }
+dialog dd, .language-panel dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 pre { overflow: auto; padding: 1rem; border: 1px solid var(--border); border-radius: 0.75rem; background: #0a0812; }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .example-code .shiki {
@@ -326,17 +326,20 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .capability-dialog[data-capability="http"] .capability-cumulative { border-color: var(--http); }
 .capability-dialog[data-capability="live"] .capability-cumulative { border-color: var(--live); }
 
-/* ---- Below-grid sections ---- */
+/* ---- Content pages (graveyard, FAQ, numbers) ---- */
 
-main > section:not(.controls):not(.language-grid) { margin-top: 4rem; }
-main h2 {
-  margin: 0 0 0.75rem;
-  font-size: clamp(1.6rem, 3.5vw, 2.2rem);
-  font-weight: 800;
-  letter-spacing: -0.03em;
+main.page {
+  max-width: 64rem;
+  margin: 0 auto;
+  padding: 2.5rem clamp(1rem, 4vw, 3rem) 4rem;
 }
-main section > p { max-width: 70ch; color: var(--muted); line-height: 1.6; }
-main section > p a, .graveyard-intro a { color: var(--brand-yellow); }
+main.page h1 {
+  font-size: clamp(2rem, 5vw, 3.2rem);
+  margin-bottom: 1rem;
+}
+.page-lead { max-width: 70ch; color: var(--muted); font-size: 1.05rem; line-height: 1.65; }
+.page-lead a { color: var(--brand-yellow); }
+.nav-links a[aria-current="page"] { color: var(--text); }
 
 .numbers-grid {
   display: grid;
@@ -360,22 +363,6 @@ main section > p a, .graveyard-intro a { color: var(--brand-yellow); }
   font-variant-numeric: tabular-nums;
 }
 .number span { color: var(--muted); font-size: 0.88rem; line-height: 1.5; }
-
-.graveyard-details {
-  margin-top: 1.25rem;
-  border: 1px solid var(--border);
-  border-radius: 1rem;
-  background: var(--surface);
-}
-.graveyard-details > summary {
-  padding: 1rem 1.25rem;
-  color: var(--brand-yellow);
-  font-weight: 600;
-  cursor: pointer;
-  list-style-position: inside;
-}
-.graveyard-details[open] > summary { border-bottom: 1px solid var(--border); }
-.graveyard-details > .rendered-markdown { padding: 0.5rem 1.5rem 1.5rem; }
 
 .faq details {
   border: 1px solid var(--border);
@@ -403,6 +390,96 @@ main section > p a, .graveyard-intro a { color: var(--brand-yellow); }
 .page-footer a { color: var(--muted); text-decoration: none; }
 .page-footer a:hover { color: var(--brand-yellow); }
 .page-footer p { max-width: 70ch; margin: 1.25rem 0 0; color: rgb(255 255 255 / 35%); font-size: 0.85rem; line-height: 1.6; }
+
+/* ---- Try it yourself ---- */
+
+.try-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem 0.9rem;
+  margin-top: 1.5rem;
+}
+.try-strip > code {
+  padding: 0.55rem 0.85rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 0.6rem;
+  background: rgb(10 8 15 / 80%);
+  color: var(--live);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82rem;
+  overflow-x: auto;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.try-note { color: var(--muted); font-size: 0.85rem; }
+.try-note code { color: var(--text); font-size: 0.95em; }
+
+.copy-button {
+  padding: 0.45rem 0.9rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 0.6rem;
+  background: rgb(255 255 255 / 6%);
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+.copy-button:hover { border-color: var(--brand-yellow); background: rgb(243 176 28 / 10%); }
+
+.try-it {
+  margin: 1.5rem 0 0;
+  padding: 1.1rem 1.25rem;
+  border: 1px solid rgb(74 222 128 / 30%);
+  border-radius: 0.9rem;
+  background: rgb(74 222 128 / 5%);
+}
+.try-it h3 { margin: 0 0 0.5rem; }
+.try-it p { margin: 0 0 0.75rem; }
+.try-commands {
+  margin: 0;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.6rem;
+  background: #0a0812;
+  font-size: 0.84rem;
+  line-height: 1.7;
+  overflow-x: auto;
+}
+.try-actions { margin: 0.75rem 0 0; }
+
+/* ---- Language detail panel ---- */
+
+.language-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 15;
+  width: min(46rem, 100vw);
+  overflow-y: auto;
+  padding: 0 clamp(1.25rem, 3vw, 2.25rem) 3rem;
+  border-left: 1px solid var(--border-strong);
+  background: var(--surface);
+  box-shadow: -30px 0 60px -30px rgb(0 0 0 / 60%);
+}
+.panel-bar {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  justify-content: flex-end;
+  padding: 0.9rem 0 0.4rem;
+  background: linear-gradient(180deg, var(--surface) 70%, transparent);
+}
+.language-panel .dialog-close { position: static; float: none; }
+@media (min-width: 1200px) {
+  .language-panel { width: min(46rem, 42vw); }
+  body.panel-open main,
+  body.panel-open .page-header,
+  body.panel-open .page-footer { margin-right: min(46rem, 42vw); }
+}
 
 /* ---- Dialog additions ---- */
 
@@ -494,6 +571,6 @@ main section > p a, .graveyard-intro a { color: var(--brand-yellow); }
   .page-header { padding-top: 2rem; }
   .controls { position: static; }
   .legend { width: 100%; margin-left: 0; }
-  dialog dl { grid-template-columns: 1fr; }
+  dialog dl, .language-panel dl { grid-template-columns: 1fr; }
   .evidence-columns { grid-template-columns: 1fr; }
 }
