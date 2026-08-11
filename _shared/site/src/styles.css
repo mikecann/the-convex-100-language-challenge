@@ -101,17 +101,22 @@ h1 {
 
 .tagline { margin: 1rem 0 0; color: var(--muted); font-size: 1.12rem; }
 
-main { padding: 0 clamp(1rem, 5vw, 5rem) 5rem; }
-
-.evidence-notice {
-  margin: 0 clamp(1rem, 5vw, 5rem) 1.25rem;
-  padding: 0.8rem 1.1rem;
-  border: 1px solid rgb(243 176 28 / 45%);
-  border-radius: 0.8rem;
-  background: rgb(243 176 28 / 8%);
-  color: var(--http);
-  font-size: 0.92rem;
+.title-asterisk {
+  padding: 0;
+  margin-left: 0.05em;
+  border: 0;
+  background: transparent;
+  color: var(--brand-yellow);
+  font: inherit;
+  font-size: 0.55em;
+  vertical-align: super;
+  cursor: pointer;
+  transition: filter 120ms ease;
 }
+.title-asterisk:hover { filter: brightness(1.3); }
+.title-asterisk:focus-visible { outline: 2px solid var(--brand-yellow); outline-offset: 2px; border-radius: 0.2em; }
+
+main { padding: 0 clamp(1rem, 5vw, 5rem) 5rem; }
 
 .controls {
   position: sticky;

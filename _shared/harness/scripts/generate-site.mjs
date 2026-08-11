@@ -21,6 +21,9 @@ const roster = parse(fs.readFileSync(path.join(root, "roster/languages.yaml"), "
 const languageYears = JSON.parse(
   fs.readFileSync(path.join(root, "_shared/site/language-years.json"), "utf8"),
 );
+const languageWikipedia = JSON.parse(
+  fs.readFileSync(path.join(root, "_shared/site/language-wikipedia.json"), "utf8"),
+);
 const resultIndexPath = path.join(root, "_shared/results/index.json");
 const resultIndex = fs.existsSync(resultIndexPath)
   ? JSON.parse(fs.readFileSync(resultIndexPath, "utf8"))
@@ -233,6 +236,9 @@ const languages = await Promise.all(roster.languages.map(async (entry) => {
   return {
     ...entry,
     firstAppeared: languageYears[entry.id] ?? null,
+    wikipediaUrl: languageWikipedia[entry.id]
+      ? `https://en.wikipedia.org/wiki/${languageWikipedia[entry.id]}`
+      : null,
     implementation: manifest.implementation,
     toolchain: manifest.toolchain ?? null,
     syncProfile: manifest.syncProfile ?? null,

@@ -57,13 +57,6 @@ if (workingCount > 0) {
     "Verified means the client passed the full conformance suite against both a local backend and a real hosted deployment.";
 }
 
-if (data.evidenceChannel !== "trusted-main") {
-  const notice = document.querySelector("#evidence-notice");
-  notice.hidden = false;
-  notice.textContent =
-    "Local evidence preview. Passing badges shown here are candidates until trusted main CI publishes them.";
-}
-
 function capabilities(language) {
   return language.result?.earnedCapabilities ?? [];
 }
@@ -213,7 +206,7 @@ function closeLanguage({ updateHistory = true } = {}) {
   if (updateHistory && routedLanguage()) {
     window.history.pushState({}, "", "/");
   }
-  document.title = "100 Convex clients";
+  document.title = "100 Convex Clients";
 }
 
 function syncLanguageRoute() {
@@ -384,6 +377,12 @@ function showLanguage(language) {
     exampleLink.textContent = "Canonical example";
     links.append(exampleLink);
   }
+  if (language.wikipediaUrl) {
+    const wikipediaLink = document.createElement("a");
+    wikipediaLink.href = language.wikipediaUrl;
+    wikipediaLink.textContent = "Wikipedia";
+    links.append(wikipediaLink);
+  }
   panelContent.append(links);
 
   panelContent.append(tryItBlock(language));
@@ -445,7 +444,7 @@ function showLanguage(language) {
   columns.append(evidenceColumn("Hosted deployment", language.hostedResult));
   panelContent.append(columns);
 
-  document.title = `${language.displayName} · 100 Convex clients`;
+  document.title = `${language.displayName} · 100 Convex Clients`;
   panel.hidden = false;
   document.body.classList.add("panel-open");
   panel.scrollTop = 0;
@@ -459,6 +458,12 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !panel.hidden && !capabilityDialog.open) closeLanguage();
 });
 document.querySelector("#capability-close").addEventListener("click", () => capabilityDialog.close());
+const disclaimerDialog = document.querySelector("#disclaimer-dialog");
+document.querySelector("#disclaimer-open").addEventListener("click", () => disclaimerDialog.showModal());
+document.querySelector("#disclaimer-close").addEventListener("click", () => disclaimerDialog.close());
+disclaimerDialog.addEventListener("click", (event) => {
+  if (event.target === disclaimerDialog) disclaimerDialog.close();
+});
 for (const legendBadge of document.querySelectorAll(".legend [data-capability]")) {
   const name = legendBadge.dataset.capability;
   const definition = capabilityDefinitions[name];
