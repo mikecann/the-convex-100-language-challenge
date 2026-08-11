@@ -34,6 +34,18 @@ COPY examples /project/examples
 FROM build AS test
 RUN /src/build/lci /project/client/convex.lol /project/client/tests/smoke.lol \
     | grep -Fx 'lolcode runtime bindings: ok'
+RUN gcc -std=c17 -Wall -Wextra -Werror /project/client/tests/http_fixture.c \
+      -o /tmp/http-fixture; \
+    /tmp/http-fixture & fixture_pid=$!; \
+    trap 'kill "$fixture_pid" 2>/dev/null || true' EXIT; \
+    CONVEX_URL=http://127.0.0.1:43140 \
+      /src/build/lci /project/client/convex.lol /project/client/tests/http_test.lol \
+      | grep -Fx 'lolcode HTTP fixtures: ok'; \
+    test_status=$?; \
+    if test "$test_status" -ne 0; then exit "$test_status"; fi; \
+    wait "$fixture_pid"; fixture_status=$?; \
+    trap - EXIT; \
+    test "$fixture_status" -eq 0
 
 FROM test AS runtime
 ENTRYPOINT ["/src/build/lci"]
