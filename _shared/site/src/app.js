@@ -40,13 +40,24 @@ const capabilityDefinitions = {
   },
 };
 
-document.querySelector("#language-count").textContent = data.languages.length;
-document.querySelector("#working-count").textContent = data.languages.filter(
+const workingCount = data.languages.filter(
   (language) => language.result?.earnedCapabilities?.length > 0,
 ).length;
-document.querySelector("#live-count").textContent = data.languages.filter(
+const liveCount = data.languages.filter(
   (language) => language.result?.earnedCapabilities?.includes("live"),
 ).length;
+const verifiedPill = document.querySelector("#verified-pill");
+verifiedPill.hidden = false;
+verifiedPill.dataset.complete = String(workingCount === data.languages.length);
+verifiedPill.textContent =
+  `${workingCount}/${data.languages.length} verified` +
+  (workingCount > 0 && liveCount === workingCount
+    ? " · all Live"
+    : liveCount > 0
+      ? ` · ${liveCount} Live`
+      : "");
+verifiedPill.title =
+  "Verified means the client passed the full conformance suite against both a local backend and a real hosted deployment.";
 
 const graveyardContent = document.querySelector("#graveyard-content");
 if (graveyardContent && data.graveyardHtml) {
@@ -155,16 +166,23 @@ function render() {
     if (filter === "failed" && languageStatus !== "failed") continue;
 
     const card = template.content.firstElementChild.cloneNode(true);
+    const verified = capabilities(language).length > 0;
     card.dataset.status = languageStatus;
     // A verified card earned at least one capability from published evidence;
     // a merely claimed status never gets the verified treatment.
-    card.dataset.verified = String(capabilities(language).length > 0);
+    card.dataset.verified = String(verified);
     card.querySelector(".logo").append(logoElement(language));
     card.querySelector(".rank").textContent = language.firstAppeared
       ? `#${language.rank} · ${language.firstAppeared}`
       : `#${language.rank}`;
     card.querySelector(".name").textContent = language.displayName;
-    card.querySelector(".state").textContent = languageStatus;
+    // The badges already say a verified card works; text status is reserved
+    // for the states worth calling out.
+    card.querySelector(".state").textContent = verified
+      ? ""
+      : languageStatus === "working"
+        ? "unverified"
+        : languageStatus;
     const badges = card.querySelector(".badges");
     for (const capability of capabilities(language)) badges.append(badge(capability));
     const openButton = card.querySelector(".language-card-open");
@@ -397,6 +415,12 @@ function showLanguage(language) {
 search.addEventListener("input", render);
 statusFilter.addEventListener("change", render);
 sortOrder.addEventListener("change", render);
+// The graveyard is collapsed by default; someone who asked for it via the nav
+// should land on it open.
+document.querySelector("[data-open-details]")?.addEventListener("click", () => {
+  const details = document.querySelector(".graveyard-details");
+  if (details) details.open = true;
+});
 document.querySelector("#dialog-close").addEventListener("click", () => closeLanguage());
 document.querySelector("#capability-close").addEventListener("click", () => capabilityDialog.close());
 for (const legendBadge of document.querySelectorAll(".legend [data-capability]")) {

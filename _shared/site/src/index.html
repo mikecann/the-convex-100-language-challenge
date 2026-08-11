@@ -7,37 +7,42 @@
     <meta property="og:title" content="100 Convex clients" />
     <meta property="og:description" content="One backend. One conformance test. No unearned badges. Convex clients in 100 languages, every badge verified against a local and a hosted deployment." />
     <meta property="og:type" content="website" />
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230f0c13'/%3E%3Ctext x='32' y='42' font-family='system-ui,sans-serif' font-size='26' font-weight='800' text-anchor='middle' fill='%234ade80'%3E100%3C/text%3E%3C/svg%3E" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f0c13'/%3E%3Cpath d='M18.08 4.18 A12 12 0 0 1 27.28 20.10' fill='none' stroke='%23f3b01c' stroke-width='5' stroke-linecap='round'/%3E%3Cpath d='M25.19 23.71 A12 12 0 0 1 6.81 23.71' fill='none' stroke='%23ee342f' stroke-width='5' stroke-linecap='round'/%3E%3Cpath d='M4.72 20.10 A12 12 0 0 1 13.92 4.18' fill='none' stroke='%238d2676' stroke-width='5' stroke-linecap='round'/%3E%3C/svg%3E" />
     <title>100 Convex clients</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <nav class="top-nav" aria-label="Site">
+      <a class="brand" href="/">
+        <svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true">
+          <path d="M18.08 4.18 A12 12 0 0 1 27.28 20.10" fill="none" stroke="#f3b01c" stroke-width="5" stroke-linecap="round" />
+          <path d="M25.19 23.71 A12 12 0 0 1 6.81 23.71" fill="none" stroke="#ee342f" stroke-width="5" stroke-linecap="round" />
+          <path d="M4.72 20.10 A12 12 0 0 1 13.92 4.18" fill="none" stroke="#8d2676" stroke-width="5" stroke-linecap="round" />
+        </svg>
+        <span>100 Convex clients</span>
+      </a>
+      <span id="verified-pill" class="verified-pill" hidden></span>
+      <div class="nav-links">
+        <a href="#languages">Languages</a>
+        <a href="#graveyard" data-open-details>Graveyard</a>
+        <a href="#faq">FAQ</a>
+        <a href="#numbers">Numbers</a>
+        <a href="https://github.com/mikecann/100-convex-clients">GitHub</a>
+      </div>
+    </nav>
+
     <header class="page-header">
       <div class="masthead">
         <p class="eyebrow">An educational experiment · not official SDKs</p>
         <h1>100 Convex clients</h1>
         <p class="tagline">One backend. One conformance test. No unearned badges.</p>
       </div>
-      <div class="summary" aria-label="Project summary">
-        <div class="stat">
-          <strong id="working-count">0</strong>
-          <span>passing clients</span>
-        </div>
-        <div class="stat">
-          <strong id="live-count">0</strong>
-          <span>live capable</span>
-        </div>
-        <div class="stat">
-          <strong id="language-count">100</strong>
-          <span>languages attempted</span>
-        </div>
-      </div>
     </header>
 
     <p id="evidence-notice" class="evidence-notice" hidden></p>
 
     <main>
-      <section class="controls" aria-label="Language filters">
+      <section id="languages" class="controls" aria-label="Language filters">
         <label>
           Search
           <input id="search" type="search" placeholder="Go, Python, COBOL..." />
@@ -67,7 +72,7 @@
 
       <section id="language-grid" class="language-grid" aria-live="polite"></section>
 
-      <section class="numbers" aria-label="Project numbers">
+      <section id="numbers" class="numbers" aria-label="Project numbers">
         <h2>The numbers</h2>
         <p>
           Measured, not estimated. The full ledger, including how each figure was
@@ -108,7 +113,7 @@
         </details>
       </section>
 
-      <section class="faq" aria-label="Frequently asked questions">
+      <section id="faq" class="faq" aria-label="Frequently asked questions">
         <h2>Questions you are probably asking</h2>
         <details>
           <summary>Are these official Convex clients?</summary>
