@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN tar -xjf /tmp/busybox.tar.bz2 -C /tmp
 WORKDIR /tmp/busybox-1.37.0
 RUN make allnoconfig >/dev/null && \
-    for option in STATIC BUSYBOX ASH ASH_ECHO ASH_PRINTF ASH_TEST AWK BASENAME CAT CMP CUT DIRNAME ENV GREP HEAD ID SED TAIL TEST TR TRUE FALSE UNAME WC; do \
+    for option in STATIC BUSYBOX ASH ASH_CMDCMD ASH_ECHO ASH_PRINTF ASH_TEST AWK BASENAME CAT CMP CUT DIRNAME ENV GREP HEAD ID SED TAIL TEST TR TRUE FALSE UNAME WC; do \
       sed -i "s/# CONFIG_${option} is not set/CONFIG_${option}=y/" .config; \
     done && \
     CC=musl-gcc make -j2 busybox >/dev/null && \
