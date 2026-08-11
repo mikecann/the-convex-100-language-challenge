@@ -23,6 +23,8 @@ platforms:
 adapter:
   protocolVersion: 1
   entrypoint: /usr/local/bin/convex-adapter
+  adapterOnlyCommands:
+    - debugDisconnect
 limitations:
   - Implementation is in progress and has not earned HTTP or Live capability evidence.
 capabilities: []

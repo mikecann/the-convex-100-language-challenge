@@ -122,6 +122,21 @@ static int random_bytes(unsigned char *output, size_t length) {
   return 1;
 }
 
+int c3_random_session_id(char *output, size_t capacity) {
+  unsigned char raw[16];
+  if (!output || capacity < 37 || !random_bytes(raw, sizeof raw)) return 0;
+  raw[6] = (raw[6] & 0x0f) | 0x40;
+  raw[8] = (raw[8] & 0x3f) | 0x80;
+  return snprintf(output, capacity,
+      "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+      raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+      raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]) == 36;
+}
+
+long long c3_monotonic_millis(void) {
+  return monotonic_millis();
+}
+
 static int send_raw(struct c3_websocket *websocket, const void *data, size_t length,
                     int64_t deadline) {
   const unsigned char *bytes = data;
@@ -195,7 +210,9 @@ static int response_has_header(const char *response, const char *name, const cha
 
 static int perform_websocket_upgrade(struct c3_websocket *websocket, const char *url,
                                      long timeout_millis) {
-  const char *authority = url + 6;
+  const char *scheme_end = strstr(url, "://");
+  if (!scheme_end) return 0;
+  const char *authority = scheme_end + 3;
   const char *path = strchr(authority, '/');
   size_t authority_length = path ? (size_t)(path - authority) : strlen(authority);
   if (!authority_length || authority_length > 511 || strpbrk(authority, "\r\n#")) return 0;
@@ -232,21 +249,28 @@ static int perform_websocket_upgrade(struct c3_websocket *websocket, const char 
 }
 
 void *c3_ws_connect(const char *url, const char *ca_path, long timeout_millis) {
-  if (!url || strncmp(url, "wss://", 6) || timeout_millis <= 0) return NULL;
-  char https_url[2048];
-  if (snprintf(https_url, sizeof https_url, "https://%s", url + 6) >= (int)sizeof https_url)
+  if (!url || timeout_millis <= 0) return NULL;
+  int secure = !strncmp(url, "wss://", 6);
+  int plaintext = !strncmp(url, "ws://", 5);
+  if (!secure && !plaintext) return NULL;
+  const char *remainder = url + (secure ? 6 : 5);
+  char connection_url[2048];
+  if (snprintf(connection_url, sizeof connection_url, "%s://%s",
+               secure ? "https" : "http", remainder) >= (int)sizeof connection_url)
     return NULL;
   CURL *curl = curl_easy_init();
   if (!curl) return NULL;
-  curl_easy_setopt(curl, CURLOPT_URL, https_url);
+  curl_easy_setopt(curl, CURLOPT_URL, connection_url);
   curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1L);
   curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_millis);
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, timeout_millis);
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-  curl_easy_setopt(curl, CURLOPT_CAINFO,
-                   ca_path && *ca_path ? ca_path : "/etc/ssl/certs/ca-certificates.crt");
+  if (secure) {
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    curl_easy_setopt(curl, CURLOPT_CAINFO,
+                     ca_path && *ca_path ? ca_path : "/etc/ssl/certs/ca-certificates.crt");
+  }
   curl_easy_setopt(curl, CURLOPT_NOPROXY, "*");
   if (curl_easy_perform(curl) != CURLE_OK) {
     curl_easy_cleanup(curl);
@@ -418,6 +442,18 @@ void c3_ws_free(void *opaque) {
   if (!websocket) return;
   retire_websocket(websocket);
   free(websocket);
+}
+
+/* Adapter multiplexing remains C3-owned. This exposes only POSIX readiness so
+ * the owner can service WebSocket messages while waiting for NDJSON input. */
+int c3_stdin_ready(long timeout_millis) {
+  if (timeout_millis < 0 || timeout_millis > INT32_MAX) return 0;
+  struct pollfd descriptor = {STDIN_FILENO, POLLIN, 0};
+  int result;
+  do {
+    result = poll(&descriptor, 1, (int)timeout_millis);
+  } while (result < 0 && errno == EINTR);
+  return result > 0 && (descriptor.revents & (POLLIN | POLLHUP));
 }
 
 /* TCP mode is an adapter I/O transport only. Once connected, C3 reads and

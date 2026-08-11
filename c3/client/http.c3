@@ -22,7 +22,10 @@ fn bool request(char* method, char* url, char* body, char* bearer, char* respons
 fn String? endpoint_for(String deployment, String path)
 {
     Url parsed = url::tparse(deployment)!;
-    if (parsed.scheme != "https" || !parsed.host) return INVALID_ENDPOINT~;
+    if ((parsed.scheme != "https" && parsed.scheme != "http") || !parsed.host)
+    {
+        return INVALID_ENDPOINT~;
+    }
     return string::tformat("%s%s", deployment, path);
 }
 

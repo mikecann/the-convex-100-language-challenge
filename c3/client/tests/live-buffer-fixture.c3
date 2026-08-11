@@ -13,11 +13,9 @@ fn void main()
     expect(!c3_live::websocket_is_active(&disconnected), "zeroed WebSocket was active");
     expect(c3_live::websocket_close(&disconnected, 10), "zeroed WebSocket did not close cleanly");
     c3_live::Manager manager;
-    c3_live::manager_init(&manager);
-    c3_live::manager_connected(&manager);
-    expect(c3_live::manager_next_query_set_version(&manager) == 1, "Add did not advance query-set version");
+    c3_live::manager_init(&manager, "https://fixture.invalid");
     c3_live::Subscription subscription;
-    c3_live::subscription_init(&subscription, 7);
+    c3_live::subscription_init(&subscription, 7, "sub-7", "demo:state", `{"room":"r"}`);
     expect(c3_live::subscription_deliver(&subscription, "initial"), "initial update rejected");
     expect(c3_live::subscription_deliver(&subscription, "external"), "external update rejected");
     c3_live::LiveEvent event;
@@ -25,8 +23,6 @@ fn void main()
     expect(c3_live::subscription_take(&subscription, &event) && event.payload == "external", "external update missing");
     c3_live::subscription_invalidate(&subscription);
     expect(!c3_live::subscription_deliver(&subscription, "stale"), "stale relay crossed invalidation");
-    c3_live::manager_debug_disconnect(&manager);
-    expect(!manager.connected && manager.connection_count == 1 && manager.reconnect_generation == 2,
-        "debugDisconnect did not retire the connection generation");
+    expect(c3_live::manager_close(&manager), "manager did not close cleanly");
     io::printn("c3 live buffer fixture passed");
 }

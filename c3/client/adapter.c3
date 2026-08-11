@@ -6,9 +6,11 @@ import std::encoding::json;
 import std::io;
 import std::os::env;
 import c3_http;
+import c3_live;
 import c3_response;
 
 extern fn CInt c3_adapter_listen(char* address);
+extern fn CInt c3_stdin_ready(CLong timeout_millis);
 
 // Adapter output is deliberately written only here. C3 owns the command
 // routing and Convex response semantics; platform.c only exchanges HTTPS
@@ -82,10 +84,18 @@ fn void main()
     }
     String deployment = env::tget_var("CONVEX_URL") ?? "";
     String token = "";
+    c3_live::Manager live;
+    c3_live::manager_init(&live, deployment);
     while (true)
     {
+        // This loop is the single Live owner. It alone reads and writes the
+        // WebSocket, so commands can never race query-set transitions.
+        c3_live::manager_tick(&live);
+        c3_live::LiveEvent live_event;
+        while (c3_live::manager_take_event(&live, &live_event)) emit(live_event.payload);
+        if (c3_stdin_ready(20) == 0) continue;
         String? maybe_line = io::treadline(limit: 1048576);
-        if (catch ignored = maybe_line) return;
+        if (catch ignored = maybe_line) { c3_live::manager_close(&live); return; }
         String line = maybe_line;
         Object*? parsed = json::tparse(line, JSON);
         if (catch ignored = parsed)
@@ -122,6 +132,7 @@ fn void main()
         }
         if (op.s == "close")
         {
+            c3_live::manager_close(&live);
             emit(string::tformat(`{"id":%s,"type":"closed"}`, quote(id.s)));
             return;
         }
@@ -130,9 +141,60 @@ fn void main()
         {
             Object* path = command.get("path")!!;
             Object* args = command.get("args")!!;
-            if (!path.is_string() || !args.is_map()) { emit_error(id.s, "ProtocolError", "path and args are invalid"); continue; }
+            if (!path.is_string() || (!args.is_map() && !args.is_empty())) { emit_error(id.s, "ProtocolError", "path and args are invalid"); continue; }
             if (!deployment.len) { emit_error(id.s, "TransportError", "CONVEX_URL is required"); continue; }
             call_http(id.s, op.s, path.s, args, deployment, token);
+            continue;
+        }
+        if (op.s == "subscribe" && command.has_key("subscriptionId")
+            && command.has_key("path") && command.has_key("args"))
+        {
+            Object* subscription_id = command.get("subscriptionId")!!;
+            Object* path = command.get("path")!!;
+            Object* args = command.get("args")!!;
+            if (!subscription_id.is_string() || !path.is_string()
+                || (!args.is_map() && !args.is_empty()))
+            {
+                emit_error(id.s, "ProtocolError", "subscriptionId, path, and args are invalid");
+                continue;
+            }
+            if (!deployment.len)
+            {
+                emit_error(id.s, "TransportError", "CONVEX_URL is required");
+                continue;
+            }
+            if (!c3_live::manager_subscribe(&live, subscription_id.s, path.s, object_json(args)))
+            {
+                emit_error(id.s, "TransportError", "Live subscription could not connect");
+                continue;
+            }
+            emit(string::tformat(`{"id":%s,"type":"ack"}`, quote(id.s)));
+            continue;
+        }
+        if (op.s == "unsubscribe" && command.has_key("subscriptionId"))
+        {
+            Object* subscription_id = command.get("subscriptionId")!!;
+            if (!subscription_id.is_string())
+            {
+                emit_error(id.s, "ProtocolError", "subscriptionId must be a string");
+                continue;
+            }
+            if (!c3_live::manager_unsubscribe(&live, subscription_id.s))
+            {
+                emit_error(id.s, "TransportError", "Live unsubscribe failed");
+                continue;
+            }
+            emit(string::tformat(`{"id":%s,"type":"ack"}`, quote(id.s)));
+            continue;
+        }
+        if (op.s == "debugDisconnect")
+        {
+            if (!c3_live::manager_debug_disconnect(&live))
+            {
+                emit_error(id.s, "TransportError", "Live reconnect failed");
+                continue;
+            }
+            emit(string::tformat(`{"id":%s,"type":"ack"}`, quote(id.s)));
             continue;
         }
         emit_error(id.s, "ProtocolError", "unsupported adapter operation");

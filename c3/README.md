@@ -1,3 +1,68 @@
+# C3
+
+[C3](https://c3-lang.org/) is a modern systems language inspired by C, with
+modules, safer defaults, optional error returns, and familiar low-level control.
+It is used for native tools, games, and other software where a small compiled
+binary and predictable resource use matter. This repository's client is an
+unofficial educational demonstration, not a production SDK.
+
+## Getting Started
+
+Start with [`examples/basics/main.c3`](examples/basics/main.c3). From the
+repository root, Docker builds the pinned `linux/amd64` toolchain and runs that
+exact program against a fresh room:
+
+```sh
+./run verify-example c3
+```
+
+## Interesting Parts
+
+### Calls stay explicit
+
+React normally hides request construction behind generated hooks:
+
+```tsx
+const state = useQuery(api.demo.state, { room });
+```
+
+The small C3 API makes the same boundary visible:
+
+```c3
+String query = c3_http::query_envelope("demo:state", state_args);
+c3_http::post(deployment, "/api/query", query, "", response[..], &response_length)!!;
+```
+
+That is an API choice for a teaching client, not a C3 limitation. C3 still owns
+the Convex envelope and response semantics while libcurl supplies ordinary TLS.
+
+### Live has one owner
+
+React owns subscription lifetime for `useQuery`. Here a `Manager` explicitly
+owns the WebSocket, query-set versions, reconnects, and bounded delivery queues:
+
+```c3
+c3_live::Manager live;
+c3_live::manager_init(&live, deployment);
+if (!c3_live::manager_subscribe(&live, "example", "demo:state", state_args)) return;
+```
+
+This keeps reads, writes, replay, and cleanup serialized in one place.
+
+## Status
+
+| Capability | Status |
+| --- | --- |
+| HTTP | Pending shared verification |
+| Live | Pending shared verification |
+
+The language-local Docker suite passes, but capability badges remain empty
+until the shared local and hosted black-box runs approve the committed image.
+
+## Example
+
+<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.c3 -->
+```c3
 module c3_example;
 
 import std::collections::object;
@@ -107,3 +172,28 @@ fn int main(String[] args)
     io::printn("verified count: 0 -> 1");
     return 0;
 }
+```
+<!-- END GENERATED EXAMPLE -->
+
+Its expected stdout transcript is the repository-wide six-line basics
+transcript, proving the `0 -> 1` journey across HTTP and Live.
+
+## Implementation Notes
+
+- The implementation is native C3. C3 owns HTTP envelopes, Convex response
+  decoding, Live transitions, query-set versions, subscriptions, and recovery.
+  A narrow C shim uses pinned libcurl and OpenSSL for HTTPS, verified TLS,
+  secure randomness, clocks, and RFC6455 transport bytes.
+- One manager owns WebSocket I/O. Each subscription is bounded to 16 events and
+  256 KiB, while incoming WebSocket messages are capped at 2 MiB.
+- `debugDisconnect` is adapter-only test infrastructure. It retires the old
+  connection before acknowledging and is not part of the educational API.
+- Runtime images are Debian-derived, run as `65532:65532`, and contain only the
+  allowlisted shell/text tools, compiled binaries, CA data, and TLS/DNS closure.
+
+## Known Issues
+
+1. HTTP authentication is supported by the conformance adapter, but Live auth
+   transitions are not yet exposed by the small public C3 API.
+2. HTTP and Live remain unawarded until root-owned local and hosted conformance
+   runs record clean exact-head evidence.
