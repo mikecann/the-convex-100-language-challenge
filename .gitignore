@@ -6,6 +6,7 @@
 # Local orchestration state and generated reports
 .worktrees/
 .cache/
+.wrangler/
 artifacts/
 results/local/
 _shared/results/local/
