@@ -7,7 +7,7 @@ implementation:
   status: attempting
   provenance: native
   version: 0.1.0
-  notes: C3 implementation in progress. A narrow C shim will provide only TLS, socket, clock, and random primitives.
+  notes: C3 owns Convex protocol state. A narrow C shim provides libcurl/OpenSSL TLS, RFC6455 bytes, clocks, and secure randomness.
 toolchain:
   name: C3
   version: 0.8.2

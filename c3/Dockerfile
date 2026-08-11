@@ -2,7 +2,12 @@
 ARG DEBIAN_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 FROM ${DEBIAN_IMAGE} AS build
 ARG C3_VERSION=0.8.2
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libcurl4-openssl-dev gcc libc6-dev && rm -rf /var/lib/apt/lists/*
+ARG CURL_VERSION=7.88.1-10+deb12u15
+ARG OPENSSL_VERSION=3.0.20-1~deb12u2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl=${CURL_VERSION} libcurl4-openssl-dev=${CURL_VERSION} \
+      libssl-dev=${OPENSSL_VERSION} openssl=${OPENSSL_VERSION} gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
 ADD --checksum=sha256:dda062e791359d01549c5d1aefbac5ac88dcd9c6f84e0b2d3309e92f8f6600aa \
   https://github.com/c3lang/c3c/releases/download/v${C3_VERSION}/c3-linux-static.tar.gz /tmp/c3.tar.gz
 RUN tar -xzf /tmp/c3.tar.gz -C /opt && test "$(/opt/c3/c3c --version | awk '/C3 Compiler Version/ {print $4}')" = "$C3_VERSION"
@@ -10,17 +15,27 @@ WORKDIR /src
 COPY client ./client
 COPY examples ./examples
 RUN gcc -std=c17 -Wall -Wextra -Werror -c client/platform.c -o /out-platform.o && \
-    C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -l curl -o /out-adapter client/adapter.c3 client/http.c3 client/values.c3 client/response.c3 /opt/c3/lib/std/core/string_escape.c3 /out-platform.o && \
-    C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -l curl -o /out-example examples/basics/main.c3 client/http.c3 client/response.c3 client/values.c3 /opt/c3/lib/std/core/string_escape.c3 /out-platform.o && \
+    C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -l curl -l crypto -o /out-adapter client/adapter.c3 client/http.c3 client/values.c3 client/response.c3 /opt/c3/lib/std/core/string_escape.c3 /out-platform.o && \
+    C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -l curl -l crypto -o /out-example examples/basics/main.c3 client/http.c3 client/response.c3 client/values.c3 /opt/c3/lib/std/core/string_escape.c3 /out-platform.o && \
     readelf -h /out-adapter | grep 'Advanced Micro Devices X86-64'
 FROM build AS test
-RUN gcc -std=c17 -Wall -Wextra -Werror -c client/tests/http-platform-fixture.c -o /out-http-platform-fixture.o \
+RUN openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=C3-WebSocket-Test-CA \
+      -keyout /tmp/ws-ca-key.pem -out /tmp/ws-ca.pem >/dev/null 2>&1 \
+    && openssl req -newkey rsa:2048 -nodes -subj /CN=localhost \
+      -addext subjectAltName=DNS:localhost -keyout /tmp/ws-server-key.pem -out /tmp/ws-server.csr >/dev/null 2>&1 \
+    && printf 'subjectAltName=DNS:localhost\n' >/tmp/ws-server.ext \
+    && openssl x509 -req -days 1 -in /tmp/ws-server.csr -CA /tmp/ws-ca.pem -CAkey /tmp/ws-ca-key.pem \
+      -CAcreateserial -extfile /tmp/ws-server.ext -out /tmp/ws-server.pem >/dev/null 2>&1 \
+    && gcc -std=c17 -Wall -Wextra -Werror -c client/tests/http-platform-fixture.c -o /out-http-platform-fixture.o \
+    && gcc -std=c17 -Wall -Wextra -Werror client/tests/websocket-platform-fixture.c client/platform.c \
+      -lcurl -lssl -lcrypto -o /out-websocket-platform-fixture \
     && gcc -std=c17 -Wall -Wextra -Werror client/tests/adapter-tcp-fixture.c -o /out-adapter-tcp-fixture \
     && C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -o /out-http-fixtures \
       client/tests/http-response-fixtures.c3 client/http.c3 client/response.c3 client/values.c3 /out-http-platform-fixture.o \
-    && C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -o /out-live-buffer-fixture \
-      client/tests/live-buffer-fixture.c3 client/live.c3 \
+    && C3C_LIB=/opt/c3/lib /opt/c3/c3c compile -l curl -l crypto -o /out-live-buffer-fixture \
+      client/tests/live-buffer-fixture.c3 client/live.c3 /out-platform.o \
     && /out-http-fixtures \
+    && /out-websocket-platform-fixture \
     && /out-live-buffer-fixture \
     && test "$(uname -m)" = x86_64 \
     && printf '%s\\n' '{"protocolVersion":1,"id":"hello-1","op":"hello"}' | /out-adapter | grep -Fx '{"protocolVersion":1,"id":"hello-1","type":"ready","language":"c3","implementation":"native","runtime":"C3 0.8.2"}' \

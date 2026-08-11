@@ -9,6 +9,9 @@ fn void expect(bool value, String message)
 
 fn void main()
 {
+    c3_live::WebSocket disconnected;
+    expect(!c3_live::websocket_is_active(&disconnected), "zeroed WebSocket was active");
+    expect(c3_live::websocket_close(&disconnected, 10), "zeroed WebSocket did not close cleanly");
     c3_live::Manager manager;
     c3_live::manager_init(&manager);
     c3_live::manager_connected(&manager);
