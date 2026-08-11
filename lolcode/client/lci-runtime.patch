@@ -96,3 +96,66 @@ index 40fc059..e02f663 100644
 +	deleteScopeObject(shared_scope);
 +	return 0;
  }
+diff --git a/interpreter.h b/interpreter.h
+index 780f230..f914b1a 100644
+--- a/interpreter.h
++++ b/interpreter.h
+@@ -97,4 +97,5 @@ typedef struct {
+ 	ValueType type;           /**< The type of value stored. */
+ 	ValueData data;           /**< The value data. */
+ 	unsigned short semaphore; /**< A semaphore for value usage. */
++	unsigned char runtimeString; /**< String bytes already decoded from LOLCODE escapes. */
+ } ValueObject;
+@@ -150,6 +151,7 @@ ValueObject *createBooleanValueObject(int);
+ ValueObject *createIntegerValueObject(long long);
+ ValueObject *createFloatValueObject(float);
+ ValueObject *createStringValueObject(char *);
++ValueObject *createRuntimeStringValueObject(char *);
+ ValueObject *createFunctionValueObject(FuncDefStmtNode *);
+ ValueObject *createArrayValueObject(ScopeObject *);
+ ValueObject *createBlobValueObject(void *);
+diff --git a/interpreter.c b/interpreter.c
+index f9c9ded..8fb8aef 100644
+--- a/interpreter.c
++++ b/interpreter.c
+@@ -251,9 +251,17 @@ ValueObject *createStringValueObject(char *data)
+ 	}
+ 	p->type = VT_STRING;
+ 	p->data.s = data;
+ 	p->semaphore = 1;
++	p->runtimeString = 0;
+ 	return p;
+ }
+ 
++ValueObject *createRuntimeStringValueObject(char *data)
++{
++	ValueObject *value = createStringValueObject(data);
++	if (value) value->runtimeString = 1;
++	return value;
++}
++
+ /**
+  * Creates a function-type value.
+@@ -1514,6 +1523,11 @@ ValueObject *castStringExplicit(ValueObject *node,
+ 			char *str = getString(node);
+ 			unsigned int a, b;
+ 			size_t size;
++			if (node->runtimeString) {
++				char *copy = copyString(str);
++				if (!copy) return NULL;
++				return createRuntimeStringValueObject(copy);
++			}
+ 			/* Perform interpolation */
+ 			size = strlen(getString(node)) + 1;
+ 			temp = malloc(sizeof(char) * size);
+@@ -1691,6 +1706,6 @@ ValueObject *castStringExplicit(ValueObject *node,
+ 			data = malloc(sizeof(char) * (strlen(temp) + 1));
+ 			strcpy(data, temp);
+ 			free(temp);
+-			return createStringValueObject(data);
++			return createRuntimeStringValueObject(data);
+ 		}
+ 		case VT_FUNC: {
+@@ -3063,1 +3078,1 @@ ValueObject *interpretConcatExprNode(ExprNode *node,
+-	return createStringValueObject(acc);
++	return createRuntimeStringValueObject(acc);

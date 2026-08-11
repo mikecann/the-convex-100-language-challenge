@@ -65,29 +65,9 @@ static int controller_status;
 static ReturnObject *string_result(char *value)
 {
     if (!value) value = strdup("");
-
-    // lci treats ':' as its string escape prefix whenever a value crosses an
-    // expression boundary. External bytes are data, so double literal colons
-    // here and let lci decode them once. Without this, JSON object separators,
-    // URLs, and Convex function names silently lose their colons.
-    size_t length = strlen(value);
-    size_t colons = 0;
-    for (size_t i = 0; i < length; i++) {
-        if (value[i] == ':') colons++;
-    }
-    char *escaped = malloc(length + colons + 1);
-    if (!escaped) {
-        free(value);
-        return NULL;
-    }
-    size_t output = 0;
-    for (size_t i = 0; i < length; i++) {
-        escaped[output++] = value[i];
-        if (value[i] == ':') escaped[output++] = ':';
-    }
-    escaped[output] = '\0';
-    free(value);
-    return createReturnObject(RT_RETURN, createStringValueObject(escaped));
+    // External transport and JSON bytes are already data, not source literals.
+    // Mark them so lci never reinterprets ':' escape sequences on later calls.
+    return createReturnObject(RT_RETURN, createRuntimeStringValueObject(value));
 }
 
 static ReturnObject *integer_result(long long value)
@@ -239,11 +219,36 @@ static ReturnObject *json_array_at_wrapper(ScopeObject *scope)
     return string_result(result);
 }
 
+static int json_semantic_equal(json_t *left, json_t *right)
+{
+    if (!left || !right) return 0;
+    if (json_is_number(left) && json_is_number(right))
+        return json_number_value(left) == json_number_value(right);
+    if (json_typeof(left) != json_typeof(right)) return 0;
+    if (json_is_array(left)) {
+        if (json_array_size(left) != json_array_size(right)) return 0;
+        for (size_t index = 0; index < json_array_size(left); index++)
+            if (!json_semantic_equal(json_array_get(left, index), json_array_get(right, index)))
+                return 0;
+        return 1;
+    }
+    if (json_is_object(left)) {
+        if (json_object_size(left) != json_object_size(right)) return 0;
+        const char *key;
+        json_t *value;
+        json_object_foreach(left, key, value) {
+            if (!json_semantic_equal(value, json_object_get(right, key))) return 0;
+        }
+        return 1;
+    }
+    return json_equal(left, right);
+}
+
 static ReturnObject *json_equal_wrapper(ScopeObject *scope)
 {
     json_t *left = parse_json_any(string_arg(scope, "left"));
     json_t *right = parse_json_any(string_arg(scope, "right"));
-    int equal = left && right && json_equal(left, right);
+    int equal = json_semantic_equal(left, right);
     json_decref(left);
     json_decref(right);
     return boolean_result(equal);

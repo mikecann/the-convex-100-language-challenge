@@ -35,6 +35,9 @@ COPY examples /project/examples
 FROM build AS test
 RUN /src/build/lci /project/client/convex.lol /project/client/tests/smoke.lol \
     | grep -Fx 'lolcode runtime bindings: ok'
+RUN /src/build/lci /project/client/convex.lol /project/client/live.lol \
+      /project/client/tests/live_test.lol \
+    | grep -Fx 'lolcode Live state fixtures: ok'
 RUN openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=LOLCODE-WebSocket-Test-CA \
       -keyout /tmp/ws-ca-key.pem -out /tmp/ws-ca.pem >/dev/null 2>&1 \
     && openssl req -newkey rsa:2048 -nodes -subj /CN=localhost \
