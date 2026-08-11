@@ -59,6 +59,7 @@ const fenceLanguages = {
   ".kts": "kotlin",
   ".lean": "lean",
   ".lisp": "common-lisp",
+  ".lol": "lolcode",
   ".lua": "lua",
   ".m": "objective-c",
   ".ml": "ocaml",

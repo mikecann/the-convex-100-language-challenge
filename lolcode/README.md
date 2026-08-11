@@ -84,6 +84,7 @@ reviewed commit.
 
 ## Example
 
+<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.lol -->
 ```lolcode
 HAI 1.3
 
@@ -198,6 +199,7 @@ VISIBLE "verified count: 0 -> 1"
 
 KTHXBYE
 ```
+<!-- END GENERATED EXAMPLE -->
 
 ## Implementation Notes
 
