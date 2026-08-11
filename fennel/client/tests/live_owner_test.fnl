@@ -82,8 +82,11 @@
       (let [change (. message.modifications 1)]
         (if (and (= change.type :Add) (not self.suppress-add-update))
             (table.insert socket.incoming
-                          (transition 0 message.newVersion :AAAAAAAAAAA=
-                                      :AQAAAAAAAAA=
+                          (transition message.baseVersion message.newVersion
+                                      (if (= message.baseVersion 0)
+                                          :AAAAAAAAAAA= :AQAAAAAAAAA=)
+                                      (if (= message.newVersion 1)
+                                          :AQAAAAAAAAA= :AgAAAAAAAAA=)
                                       {:type :QueryUpdated
                                        :queryId change.queryId
                                        :value {:count 0}
@@ -153,10 +156,14 @@
             "unchanged reconnect hydration leaked"))
   (var connects 0)
   (var adds 0)
+  (var logical-session nil)
   (each [_ message (ipairs server.sent)]
     (if (= message.type :Connect)
         (do
           (expect-equal message.connectionCount connects :connectionCount)
+          (if logical-session
+              (expect-equal message.sessionId logical-session :sessionId)
+              (set logical-session message.sessionId))
           (set connects (+ connects 1)))
         (and (= message.type :ModifyQuerySet)
              (= (. (. message.modifications 1) :type) :Add))
@@ -164,6 +171,57 @@
   (expect-equal connects 6 "Connect count")
   (expect-equal adds 6 "Add replay count")
   (assert (: manager :close)))
+
+;; Only one ModifyQuerySet may be unacknowledged. A rapid second subscription
+;; waits in the owner until the first Transition confirms query-set version 1.
+(let [server (server-for-updates)
+      manager (Live.Manager.new "http://unit.test" :fennel-test
+                                {:websocket-factory (fn []
+                                                      (: server :new-socket))})
+      _ (set server.suppress-add-update true)
+      first (assert (: manager :subscribe "demo:state" {:room :first}))
+      second (assert (: manager :subscribe "demo:state" {:room :second}))]
+  (expect-equal (length server.sent) 2 "messages before first acknowledgement")
+  (set server.suppress-add-update false)
+  (table.insert (. (. server.connections 1) :incoming)
+                (transition 0 1 :AAAAAAAAAAA= :AQAAAAAAAAA=
+                            {:type :QueryUpdated
+                             :queryId first.query-id
+                             :value {:count 0}
+                             :logLines (json.array [])}))
+  (assert (: first :next-update 1))
+  (assert (: second :next-update 1))
+  (let [second-modify (. server.sent 3)]
+    (expect-equal second-modify.type :ModifyQuerySet "queued modification type")
+    (expect-equal second-modify.baseVersion 1 "queued base version")
+    (expect-equal second-modify.newVersion 2 "queued new version"))
+  (assert (: manager :close)))
+
+;; Failed handshakes count as connection attempts. The first successful Connect
+;; reports both failures rather than restarting at zero.
+(let [server (server-for-updates)]
+  (set server.connect-failures 2)
+  (let [manager (Live.Manager.new "http://unit.test" :fennel-test
+                                  {:websocket-factory (fn []
+                                                        (: server :new-socket))})
+        subscription (assert (: manager :subscribe "demo:state"
+                                {:room :handshake}))]
+    (var transport-errors 0)
+    (var hydrated false)
+    (while (not hydrated)
+      (let [update (assert (: subscription :next-update 2))]
+        (if update.error
+            (do
+              (expect-equal update.error.name :TransportError
+                            "failed handshake event")
+              (set transport-errors (+ transport-errors 1)))
+            (set hydrated true))))
+    (expect (>= transport-errors 1)
+            "failed handshakes emitted no structured transport failure")
+    (let [connect (. server.sent 1)]
+      (expect-equal connect.type :Connect "post-failure Connect")
+      (expect-equal connect.connectionCount 2 "failed connection count"))
+    (assert (: manager :close))))
 
 ;; Transport failure is structured, reconnects, and does not strand later data.
 (let [server (server-for-updates)
@@ -192,6 +250,40 @@
     (expect-equal update.value.count 3 "post-reconnect value"))
   (assert (: manager :close)))
 
+;; A malformed server Transition is also structured, retires that generation,
+;; and leaves the subscription able to receive a later valid value.
+(let [server (server-for-updates)
+      manager (Live.Manager.new "http://unit.test" :fennel-test
+                                {:websocket-factory (fn []
+                                                      (: server :new-socket))})
+      subscription (assert (: manager :subscribe "demo:state"
+                              {:room :protocol-recover}))]
+  (assert (: subscription :next-update 1))
+  (let [first-socket (. server.connections 1)]
+    (table.insert first-socket.incoming
+                  (transition 1 1 :AQAAAAAAAAA= :AgAAAAAAAAA=
+                              {:type :QueryUpdated
+                               :queryId subscription.query-id
+                               :value {:count 99}
+                               :logLines (json.object {})})))
+  (let [update (assert (: subscription :next-update 1))]
+    (expect-equal update.error.name :ProtocolError "protocol failure"))
+  (let [deadline (+ (cqueues.monotime) 2)]
+    (while (and (< (length server.connections) 2)
+                (< (cqueues.monotime) deadline))
+      (: manager.cq :step 0.2)))
+  (expect-equal (length server.connections) 2 "protocol reconnect")
+  (let [second-socket (. server.connections 2)]
+    (table.insert second-socket.incoming
+                  (transition 1 1 :AQAAAAAAAAA= :AgAAAAAAAAA=
+                              {:type :QueryUpdated
+                               :queryId subscription.query-id
+                               :value {:count 4}
+                               :logLines (json.array [])})))
+  (let [update (assert (: subscription :next-update 1))]
+    (expect-equal update.value.count 4 "post-protocol-reconnect value"))
+  (assert (: manager :close)))
+
 ;; The subscription queue has a deliberate newest-16 count bound.
 (let [manager {:unsubscribe (fn [] true)}
       subscription (Live.Subscription.new manager 0)]
@@ -200,5 +292,17 @@
   (expect-equal (length subscription.updates) 16 "subscription queue bound")
   (let [update (assert (: subscription :try-next-update))]
     (expect-equal update.value 5 "oldest retained update")))
+
+;; The byte budget is independent from the count bound. Large newest values
+;; evict older ones before retained storage can grow past three MiB.
+(let [manager {:unsubscribe (fn [] true)}
+      subscription (Live.Subscription.new manager 0)]
+  (for [value 1 3]
+    (: subscription :deliver
+       {:value (string.rep (tostring value) (* 2 1024 1024))
+        :logs (json.array [])}))
+  (expect-equal (length subscription.updates) 1 "subscription byte bound")
+  (expect (<= subscription.update-bytes (* 3 1024 1024))
+          "subscription byte budget was exceeded"))
 
 (print "live owner tests passed")

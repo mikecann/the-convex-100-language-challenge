@@ -89,6 +89,20 @@
             "QueryRemoved retained cached state")
     (expect (= (: subscription :try-next-update) nil)
             "QueryRemoved delivered stale data"))
+  ;; The uint64 comparison must stop at the first unequal high byte. A later
+  ;; low byte cannot make 200 newer than an already observed 256.
+  (set manager.max-observed-timestamp :AAEAAAAAAAA=)
+  (let [sixth {:querySet 0 :identity 0 :ts :yAAAAAAAAAA=}
+        (ok err) (: manager :transition (transition fifth sixth []))]
+    (expect ok (or (and err err.message) "lower maximum transition failed"))
+    (expect (= manager.max-observed-timestamp :AAEAAAAAAAA=)
+            "a lower timestamp replaced the observed maximum")
+    (let [backward {:querySet 0 :identity 0 :ts :xwAAAAAAAAA=}
+          (accepted protocol-error) (: manager :transition
+                                       (transition sixth backward []))]
+      (expect (= accepted nil) "a backward timestamp was accepted")
+      (expect (= protocol-error.name :ProtocolError)
+              "timestamp regression was not structured")))
   ;; Remove invalidates the subscription before an acknowledgement can be sent.
   (: subscription :finish)
   (expect (= (: subscription :try-next-update) nil)

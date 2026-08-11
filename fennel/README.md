@@ -1,9 +1,13 @@
 # Convex from Fennel
 
-This demonstration compiles a genuine Fennel client ahead of time, then uses it
-from Lua 5.1 to query, mutate, and subscribe to a shared Convex counter.
+[Fennel](https://fennel-lang.org/) is a Lisp created by Calvin Rose that
+compiles to Lua. It gives Lua programs macros and expression-oriented syntax
+while retaining Lua's small runtime and straightforward interoperation. People
+use it anywhere Lua fits, including embedded tools, games, and configuration.
 
-It is educational, unofficial, and not a production SDK.
+This educational, unofficial demonstration compiles a genuine Fennel Convex
+client ahead of time, then runs the generated program on Lua 5.1. It is not a
+production SDK.
 
 ## Getting Started
 
@@ -26,10 +30,34 @@ black-box conformance against local, hosted, or both deployment profiles.
 
 ## Interesting Parts
 
-The client implements Convex's HTTP API and `/api/sync` protocol in Fennel. One
-cqueues worker owns the WebSocket connection, so reconnects, query-set changes,
-and incoming transitions cannot race with controller commands. Subscription and
-adapter-output queues have separate count and byte limits.
+Fennel's keyword call syntax keeps the three HTTP operations close to the
+TypeScript shape:
+
+```ts
+const state = await client.query(api.demo.state, { room });
+```
+
+```fennel
+(local state (checked (: client :query "demo:state" {: room})))
+```
+
+Both versions start Live before the mutation. In TypeScript, a browser client
+returns an unsubscribe callback:
+
+```ts
+const unsubscribe = client.onUpdate(api.demo.state, { room }, handleState);
+```
+
+The Fennel client returns a subscription with a bounded update stream:
+
+```fennel
+(local subscription (checked (: client :subscribe "demo:state" {: room})))
+(local update (checked (: subscription :next-update 10)))
+```
+
+One cqueues worker owns the WebSocket, query-set versions, and reconnects. That
+is the same single-owner idea as an event loop, expressed with Fennel tables and
+coroutines rather than JavaScript promises.
 
 ## Status
 
@@ -46,16 +74,12 @@ adapter-output queues have separate count and byte limits.
 #!/usr/local/bin/fennel
 ;; This canonical example demonstrates one complete Convex HTTP and Live journey.
 (local Convex (require :convex))
+(local Integer (require :integer))
 
 (fn checked [result err]
   (if result result
       (error (.. (or (and err err.name) :Error) ": "
                  (or (and err err.message) "unknown failure")))))
-
-(fn checked-count [value operation]
-  (if (not (and (= (type value) :number) (= (% value 1) 0)))
-      (error (.. operation " count must be a whole number")))
-  value)
 
 (fn main []
   (let [deployment-url (assert (os.getenv :CONVEX_URL) "CONVEX_URL is required")
@@ -65,13 +89,13 @@ adapter-output queues have separate count and byte limits.
         room (or (. arg 1) :fennel-example)
         ;; Read the starting state through Convex's HTTP query API.
         current (checked (: client :query "demo:state" {: room}))
-        initial (checked-count current.value.count "current query")]
+        initial (Integer.checked current.value.count "current query")]
     (print (.. "current count: " initial))
     ;; Subscribe before mutating so no reactive update can be missed.
     (let [subscription (checked (: client :subscribe "demo:state" {: room}))
           live-initial (checked (: subscription :next-update 10))
-          live-initial-count (checked-count live-initial.value.count
-                                            "initial Live value")]
+          live-initial-count (Integer.checked live-initial.value.count
+                                             "initial Live value")]
       (assert (= live-initial-count initial)
               "initial Live value disagreed with HTTP")
       (print (.. "live initial count: " live-initial-count))
@@ -83,7 +107,7 @@ adapter-output queues have separate count and byte limits.
                                  ":")
             mutation (checked (: client :mutation "demo:increment"
                                  {: room :language :fennel :runId run-id}))
-            changed (checked-count mutation.value.state.count :mutation)]
+            changed (Integer.checked mutation.value.state.count :mutation)]
         (assert (= mutation.value.applied true) "mutation was not applied")
         (assert (= changed (+ initial 1))
                 "mutation count did not advance by one")
@@ -91,8 +115,8 @@ adapter-output queues have separate count and byte limits.
         (print (.. "mutation count: " changed))
         ;; Receive the resulting value from Live, without HTTP polling.
         (let [live-changed (checked (: subscription :next-update 10))
-              live-changed-count (checked-count live-changed.value.count
-                                                "updated Live value")]
+              live-changed-count (Integer.checked live-changed.value.count
+                                                 "updated Live value")]
           (assert (= live-changed-count changed)
                   "updated Live value disagreed with mutation")
           (print (.. "live updated count: " live-changed-count))
@@ -108,9 +132,11 @@ adapter-output queues have separate count and byte limits.
 
 The test-only adapter implements NDJSON protocol v1 over stdin/stdout and TCP.
 One cqueues worker exclusively owns WebSocket reads, writes, reconnects, and
-query-set versions. Subscription delivery keeps the newest 16 updates. Adapter
-output is separately bounded to 64 pending events and 8 MiB including a
-conservative per-entry overhead.
+query-set versions. It keeps one logical session ID across reconnects and never
+sends a second `ModifyQuerySet` before the preceding Transition acknowledges
+the first. Subscription delivery keeps the newest 16 updates within a 3 MiB
+budget. Adapter output is separately bounded to 64 pending events and 8 MiB,
+including a conservative per-entry overhead.
 
 The implementation pins Fennel 1.6.1, Lua 5.1.5, lua-http 0.4, cqueues, dkjson,
 and the repository's `convex-rs-0.10.4-unversioned-sync` profile. Fennel owns all
@@ -119,7 +145,8 @@ TLS, HTTP, WebSocket, scheduling, randomness, and JSON primitives.
 
 ## Known Issues
 
-Shared local and hosted conformance remain pending, so this branch does not award
-itself HTTP or Live capabilities. The educational client supports the JSON-safe
-Convex value subset. Live authentication, TransitionChunk assembly, optimistic
-updates, and mutation replay are deferred.
+1. Shared local and hosted conformance remain pending, so this branch does not
+   award itself HTTP or Live capabilities.
+2. The educational client supports the JSON-safe Convex value subset.
+3. Live authentication, `TransitionChunk` assembly, optimistic updates, and
+   mutation replay are deferred.

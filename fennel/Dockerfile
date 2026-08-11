@@ -36,12 +36,15 @@ COPY examples ./examples
 RUN set -eu; \
     mkdir -p /generated/client/tests/conformance /generated/examples/basics; \
     fennel --compile client/json.fnl > /generated/client/json.lua; \
+    fennel --compile client/integer.fnl > /generated/client/integer.lua; \
     fennel --compile client/live.fnl > /generated/client/live.lua; \
     fennel --compile client/convex.fnl > /generated/client/convex.lua; \
     fennel --compile client/tests/conformance/adapter_events.fnl > /generated/client/adapter_events.lua; \
     fennel --compile client/tests/conformance/adapter_output.fnl > /generated/client/adapter_output.lua; \
     fennel --compile client/tests/conformance/adapter.fnl > /generated/client/tests/conformance/adapter.lua; \
     fennel --compile client/tests/http_fixture_test.fnl > /generated/client/tests/http_fixture_test.lua; \
+    fennel --compile client/tests/integer_test.fnl > /generated/client/tests/integer_test.lua; \
+    fennel --compile client/tests/adapter_events_test.fnl > /generated/client/tests/adapter_events_test.lua; \
     fennel --compile client/tests/adapter_output_test.fnl > /generated/client/tests/adapter_output_test.lua; \
     fennel --compile client/tests/live_owner_test.fnl > /generated/client/tests/live_owner_test.lua; \
     fennel --compile client/tests/live_fixture_test.fnl > /generated/client/tests/live_fixture_test.lua; \
@@ -49,6 +52,8 @@ RUN set -eu; \
     find /generated -type f -name '*.lua' -exec luac5.1 -p '{}' ';'
 RUN LUA_PATH='/generated/client/?.lua;;' lua5.1 /generated/client/tests/live_fixture_test.lua
 RUN LUA_PATH='/generated/client/?.lua;;' lua5.1 /generated/client/tests/http_fixture_test.lua
+RUN LUA_PATH='/generated/client/?.lua;;' lua5.1 /generated/client/tests/integer_test.lua
+RUN LUA_PATH='/generated/client/?.lua;;' lua5.1 /generated/client/tests/adapter_events_test.lua
 RUN LUA_PATH='/generated/client/?.lua;;' lua5.1 /generated/client/tests/adapter_output_test.lua
 RUN LUA_PATH='/generated/client/?.lua;;' lua5.1 /generated/client/tests/live_owner_test.lua
 RUN printf '%s\n' '{"protocolVersion":1,"id":"hello","op":"hello"}' '{"id":"close","op":"close"}' | \
@@ -105,7 +110,7 @@ RUN set -eu; root=/runtime-root; \
       while IFS= read -r library; do cp --parents "$library" "$root"; done; \
     for library in /lib/x86_64-linux-gnu/libnss_dns.so.2 /lib/x86_64-linux-gnu/libnss_files.so.2 /lib/x86_64-linux-gnu/libresolv.so.2; do test ! -e "$library" || cp --parents "$library" "$root"; done; \
     for config in /etc/nsswitch.conf /etc/host.conf /etc/gai.conf; do test ! -e "$config" || cp --parents "$config" "$root"; done; \
-    cp /generated/client/json.lua /generated/client/live.lua /generated/client/convex.lua \
+    cp /generated/client/json.lua /generated/client/integer.lua /generated/client/live.lua /generated/client/convex.lua \
       /generated/client/adapter_events.lua /generated/client/adapter_output.lua "$root/opt/convex/client/"; \
     cp /generated/client/tests/conformance/adapter.lua "$root/opt/convex/adapter.lua"; \
     cp /generated/examples/basics/main.lua "$root/opt/convex/example.lua"; \
