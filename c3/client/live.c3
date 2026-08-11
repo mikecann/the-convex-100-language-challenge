@@ -25,7 +25,7 @@ const CLong IO_TIMEOUT_MS = 250;
 // A tick may wait this long for the first byte. Once a frame starts, the same
 // bounded window gives normal packet fragmentation time to complete before the
 // transport retires the connection rather than losing parser alignment.
-const CLong IDLE_POLL_MS = 250;
+const CLong IDLE_POLL_MS = 1000;
 const String INITIAL_TS = "AAAAAAAAAAA=";
 
 struct LiveEvent
