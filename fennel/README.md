@@ -63,8 +63,8 @@ coroutines rather than JavaScript promises.
 
 | Capability | Status |
 | --- | --- |
-| HTTP query, mutation, and action | Implemented; shared verification pending |
-| Live query subscriptions | Implemented; shared verification pending |
+| HTTP query, mutation, and action | Passing locally and hosted |
+| Live query subscriptions | Passing locally and hosted |
 | Authentication for HTTP calls | Implemented |
 | Live authentication | Deferred |
 
@@ -147,8 +147,6 @@ TLS, HTTP, WebSocket, scheduling, randomness, and JSON primitives.
 
 ## Known Issues
 
-1. Shared local and hosted conformance remain pending, so this branch does not
-   award itself HTTP or Live capabilities.
-2. The educational client supports the JSON-safe Convex value subset.
-3. Live authentication, `TransitionChunk` assembly, optimistic updates, and
+1. The educational client supports the JSON-safe Convex value subset.
+2. Live authentication, `TransitionChunk` assembly, optimistic updates, and
    mutation replay are deferred.

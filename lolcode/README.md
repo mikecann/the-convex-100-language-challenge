@@ -75,12 +75,11 @@ FOUND YR I IZ TRANSPORT'Z JSONINTEGER YR I IZ TRANSPORT'Z JSONGET YR VALUE AN YR
 
 | Capability | Status |
 | --- | --- |
-| HTTP | Pending shared verification |
-| Live | Pending shared verification |
+| HTTP | Passing locally and hosted |
+| Live | Passing locally and hosted |
 
-The implementation and language-local fixtures are complete, but capabilities
-stay unawarded until the shared local and hosted black-box suites pass from the
-reviewed commit.
+The shared black-box suite passes against both the self-hosted and hosted test
+deployments, including five real Live reconnects and query-error recovery.
 
 ## Example
 
@@ -223,9 +222,7 @@ prevent stale values crossing replacement or unsubscribe acknowledgements.
 
 ## Known Issues
 
-1. HTTP and Live remain pending until the shared local and hosted conformance
-   runs award them from a clean reviewed commit.
-2. The demonstration targets the repository’s pinned, undocumented Convex sync
+1. The demonstration targets the repository’s pinned, undocumented Convex sync
    profile and is educational code, not an officially supported SDK.
-3. lci has no conventional package ecosystem for HTTP or WebSockets, so the
+2. lci has no conventional package ecosystem for HTTP or WebSockets, so the
    ordinary TLS, JSON-token, and RFC6455 primitives live in a small C extension.

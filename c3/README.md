@@ -53,11 +53,11 @@ This keeps reads, writes, replay, and cleanup serialized in one place.
 
 | Capability | Status |
 | --- | --- |
-| HTTP | Pending shared verification |
-| Live | Pending shared verification |
+| HTTP | Passing locally and hosted |
+| Live | Passing locally and hosted |
 
-The language-local Docker suite passes, but capability badges remain empty
-until the shared local and hosted black-box runs approve the committed image.
+The shared black-box suite passes against both the self-hosted and hosted test
+deployments, including five real Live reconnects and recovery after query errors.
 
 ## Example
 
@@ -202,5 +202,3 @@ transcript, proving the `0 -> 1` journey across HTTP and Live.
 
 1. HTTP authentication is supported by the conformance adapter, but Live auth
    transitions are not yet exposed by the small public C3 API.
-2. HTTP and Live remain unawarded until root-owned local and hosted conformance
-   runs record clean exact-head evidence.

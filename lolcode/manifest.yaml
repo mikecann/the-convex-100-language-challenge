@@ -4,7 +4,7 @@ displayName: "LOLCODE"
 rank: 52
 selectionTier: ranked
 implementation:
-  status: attempting
+  status: working
   provenance: native
   version: 0.1.0
   notes: >-
@@ -30,5 +30,7 @@ adapter:
   adapterOnlyCommands:
     - debugDisconnect
 limitations:
-  - Implementation is in progress and no capability has been awarded.
-capabilities: []
+  - The client targets the repository's pinned, undocumented Convex sync profile.
+capabilities:
+  - http
+  - live
