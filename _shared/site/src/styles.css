@@ -119,10 +119,10 @@ h1 {
 .tagline { margin: 1rem 0 0; color: var(--muted); font-size: 1.12rem; }
 
 .hero-mark {
-  height: 0.78em;
+  height: 1.05em;
   width: auto;
-  margin-right: 0.2em;
-  vertical-align: -0.06em;
+  margin-right: 0.15em;
+  vertical-align: -0.18em;
 }
 
 .title-asterisk {
