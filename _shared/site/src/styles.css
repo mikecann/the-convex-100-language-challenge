@@ -57,11 +57,12 @@ body.home:not(.nav-solid) .top-nav {
   background: transparent;
   backdrop-filter: none;
 }
-/* The small ring mark stays visible in the nav at all times, on every page —
-   only the wordmark and the verified pill wait for the hero title to scroll
-   out of view before they fade in alongside the bar itself. */
-.brand-label, .top-nav .verified-pill { transition: opacity 300ms ease; }
-body.home:not(.nav-solid) .top-nav .brand-label,
+/* On the home page the whole brand (icon + wordmark) and the verified pill
+   wait for the hero title to scroll out of view before fading in together
+   with the bar itself. Subpages have no hero, so their nav is solid from
+   the start and this never applies. */
+.top-nav .brand, .top-nav .verified-pill { transition: opacity 300ms ease; }
+body.home:not(.nav-solid) .top-nav .brand,
 body.home:not(.nav-solid) .top-nav .verified-pill {
   opacity: 0;
   pointer-events: none;
@@ -109,18 +110,36 @@ main > section, .graveyard { scroll-margin-top: 4.5rem; }
 }
 
 h1 {
-  margin: 0;
+  /* background-clip: text paints the gradient only inside this element's box,
+     so any glyph ink outside the box is simply not drawn. A line-height below
+     Inter's content area (~1.21em) pulls the last line's box up above the
+     descenders, which clips the tails off g, y and j. The padding extends the
+     paint area past them; the negative margin keeps the layout spacing. */
+  margin: 0 0 -0.12em;
+  padding-bottom: 0.12em;
   max-width: 100%;
   font-size: clamp(2.4rem, 6vw, 5rem);
   font-weight: 800;
   letter-spacing: -0.045em;
-  line-height: 1.05;
+  line-height: 1.1;
   overflow-wrap: break-word;
   background: linear-gradient(100deg, #fff 30%, #d9c7f2 70%, #b78ae0);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
 }
+/* Inherits the transparent colour so the h1 gradient paints through it; the
+   underline is drawn in brand yellow because currentColor is transparent. */
+.title-link {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: rgb(243 176 28 / 45%);
+  text-decoration-thickness: 0.045em;
+  text-underline-offset: 0.06em;
+  transition: text-decoration-color 120ms ease;
+}
+.title-link:hover { text-decoration-color: var(--brand-yellow); }
+.title-link:focus-visible { outline: 2px solid var(--brand-yellow); outline-offset: 0.05em; border-radius: 0.05em; }
 
 .tagline { margin: 1rem 0 0; color: var(--muted); font-size: 1.12rem; }
 .tagline-language {
