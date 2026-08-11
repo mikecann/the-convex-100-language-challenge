@@ -4,7 +4,7 @@ displayName: "LOLCODE"
 rank: 52
 selectionTier: ranked
 implementation:
-  status: in-progress
+  status: attempting
   provenance: native
   version: 0.1.0
   notes: >-

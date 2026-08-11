@@ -607,7 +607,7 @@ int loadTransportLibrary(ScopeObject *scope)
     loadBinding(library, "ENV", "name", env_wrapper);
     loadBinding(library, "DIAG", "message", stderr_wrapper);
     loadBinding(library, "ABORT", "message", abort_wrapper);
-    loadBinding(library, "NOW", "", now_wrapper);
+    loadBinding(library, "NOW", NULL, now_wrapper);
     loadBinding(library, "SLEEP", "millis", sleep_wrapper);
     loadBinding(library, "RANDOMHEX", "bytes", random_hex_wrapper);
     loadBinding(library, "JSONVALID", "json", json_valid_wrapper);
@@ -636,9 +636,9 @@ int loadTransportLibrary(ScopeObject *scope)
     loadBinding(library, "WSDISCONNECT", "websocket", ws_disconnect_wrapper);
     loadBinding(library, "WSCLOSE", "websocket timeout", ws_close_wrapper);
     loadBinding(library, "WSFREE", "websocket", ws_free_wrapper);
-    loadBinding(library, "IOOPEN", "", io_open_wrapper);
+    loadBinding(library, "IOOPEN", NULL, io_open_wrapper);
     loadBinding(library, "IOREAD", "timeout", io_read_wrapper);
-    loadBinding(library, "IOSTATUS", "", io_status_wrapper);
+    loadBinding(library, "IOSTATUS", NULL, io_status_wrapper);
     loadBinding(library, "IOWRITE", "line", io_write_wrapper);
     return install_library(scope, "TRANSPORT", library);
 }
