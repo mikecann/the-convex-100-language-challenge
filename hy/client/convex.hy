@@ -81,6 +81,7 @@
           self.closed False self.socket None self.connection-count 0
           self.handshaken False
           self.last-close-reason "InitialConnect" self.query-version 0
+          self.backoff 0.05
           self.remote-version (dict self.INITIAL-VERSION)
           self.max-observed-timestamp None
           self.last-updates {} self.rehydrating (set)
@@ -160,33 +161,60 @@
   (defn _transition [self message]
     (if (!= (.get message "startVersion") self.remote-version)
       (raise (ProtocolError "Transition start version does not match local version")) None)
-    (for [mod (.get message "modifications" [])]
-      (setv query-id (.get mod "queryId") entry (.get self.subs query-id))
-      (if entry
+    (setv modifications (.get message "modifications")
+          end-version (.get message "endVersion")
+          staged [])
+    (if (or (not (isinstance modifications list)) (not (isinstance end-version dict)))
+      (raise (ProtocolError "Transition versions and modifications were malformed")) None)
+    ;; Validate the complete transition before publishing any part of it. A
+    ;; malformed later modification must not leave subscribers on a half-
+    ;; applied version.
+    (for [mod modifications]
+      (if (not (isinstance mod dict)) (raise (ProtocolError "Transition modification was not an object")) None)
+      (setv query-id (.get mod "queryId")
+            kind (.get mod "type")
+            logs (.get mod "logLines" []))
+      (if (not (isinstance logs list)) (raise (ProtocolError "Transition logLines was not an array")) None)
+      (for [line logs]
+        (if (not (isinstance line str)) (raise (ProtocolError "Transition logLines contained a non-string")) None))
+      (setv update None signature None)
+      (if (= kind "QueryUpdated")
         (do
-          (setv kind (.get mod "type") update None signature None)
-          (if (= kind "QueryUpdated")
-            (setv update (Update :value (.get mod "value") :logs (.get mod "logLines" []))
-                  signature ["value" (.get mod "value")])
-            (if (= kind "QueryFailed")
-              (setv update (Update :error (FunctionError (.get mod "errorMessage" "query failed") :data (.get mod "errorData") :logs (.get mod "logLines" [])) :logs (.get mod "logLines" []))
-                    signature ["error" (.get mod "errorMessage" "query failed") (.get mod "errorData")])
-              None))
-          (when update
-            (setv replay (and (in query-id self.rehydrating)
-                              (= signature (.get self.last-updates query-id))))
-            (.discard self.rehydrating query-id)
-            (setv (get self.last-updates query-id) signature)
-            (if replay None (.deliver (get entry 2) update))))
-        None))
-    (setv self.remote-version (.get message "endVersion")
-          timestamp (.get self.remote-version "ts"))
-    (when timestamp
-      (setv candidate (int.from_bytes (base64.b64decode timestamp) "little")
-            current (if self.max-observed-timestamp
-                      (int.from_bytes (base64.b64decode self.max-observed-timestamp) "little")
-                      -1))
-      (when (> candidate current) (setv self.max-observed-timestamp timestamp))))
+          (if (not (in "value" mod)) (raise (ProtocolError "QueryUpdated omitted value")) None)
+          (setv update (Update :value (get mod "value") :logs logs)
+                signature ["value" (get mod "value")]))
+        (if (= kind "QueryFailed")
+          (do
+            (setv error-message (.get mod "errorMessage"))
+            (if (not (isinstance error-message str)) (raise (ProtocolError "QueryFailed omitted string errorMessage")) None)
+            (setv update (Update :error (FunctionError error-message :data (.get mod "errorData") :logs logs) :logs logs)
+                  signature ["error" error-message (.get mod "errorData")]))
+          (if (!= kind "QueryRemoved")
+            (raise (ProtocolError "unknown Transition modification"))
+            None)))
+      (setv entry (.get self.subs query-id))
+      (when (and entry update) (.append staged [query-id entry update signature])))
+    (setv timestamp (.get end-version "ts"))
+    (if (not (isinstance timestamp str)) (raise (ProtocolError "Transition end timestamp was malformed")) None)
+    (try
+      (setv timestamp-bytes (base64.b64decode timestamp :validate True))
+      (except [Exception] (raise (ProtocolError "Transition end timestamp was malformed"))))
+    (if (!= (len timestamp-bytes) 8) (raise (ProtocolError "Transition end timestamp was malformed")) None)
+    (for [[query-id entry update signature] staged]
+      (setv replay (and (in query-id self.rehydrating)
+                        (= signature (.get self.last-updates query-id))))
+      (.discard self.rehydrating query-id)
+      (setv (get self.last-updates query-id) signature)
+      (if replay None (.deliver (get entry 2) update)))
+    (setv self.remote-version end-version
+          candidate (int.from_bytes timestamp-bytes "little")
+          current (if self.max-observed-timestamp
+                    (int.from_bytes (base64.b64decode self.max-observed-timestamp) "little")
+                    -1))
+    (when (> candidate current) (setv self.max-observed-timestamp timestamp))
+    ;; A valid server transition proves the connection is healthy. Future
+    ;; transport failures must start again at the minimum retry delay.
+    (setv self.backoff 0.05))
   (defn _run [self]
     (while (not self.closed)
       (try
@@ -222,7 +250,9 @@
                                       (TransportError (_error-message err))))
                 (for [[_ entry] (.items self.subs)]
                   (.deliver (get entry 2) (Update :error visible-error))))
-              (time.sleep 0.05)))))))
+              (setv delay self.backoff
+                    self.backoff (min 2.0 (* self.backoff 2)))
+              (time.sleep delay)))))))
   (defn close [self]
     (when (not self.closed)
       (setv reply (queue.Queue 1))

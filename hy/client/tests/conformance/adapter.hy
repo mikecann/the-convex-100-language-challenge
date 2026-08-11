@@ -4,29 +4,35 @@
 
 (defn error-value [exc]
   (setv result {"name" exc.__class__.__name__ "message" (str exc)})
-  (if (isinstance exc FunctionError) (setv (get result "data") exc.data) None) result)
+  ;; `data` is optional in Convex failures. Omit it instead of turning absence
+  ;; into JSON null, because the adapter protocol preserves that distinction.
+  (if (and (isinstance exc FunctionError) (is-not exc.data None))
+    (setv (get result "data") exc.data)
+    None)
+  result)
+
+(defn forward-updates [subscriptions lock writer subscription-id subscription [after-dequeue None]]
+  (while True
+    (try
+      (setv update (.next-update subscription))
+      ;; Tests pause here to prove replacement and unsubscribe can invalidate a
+      ;; relay that has already dequeued a value but has not published it yet.
+      (when after-dequeue (after-dequeue))
+      (with [lock]
+        (if (is-not (.get subscriptions subscription-id) subscription)
+          (break)
+          (do
+            (.write writer (+ (json.dumps (if update.error
+                                             {"type" "subscription" "subscriptionId" subscription-id "error" (error-value update.error) "logs" update.logs}
+                                             {"type" "subscription" "subscriptionId" subscription-id "value" update.value "logs" update.logs})
+                                          :separators ["," ":"]) "\n"))
+            (.flush writer))))
+      (except [Exception] (break)))))
 
 (defn run [reader writer]
   (setv client None subscriptions {} lock (threading.Lock))
   (defn emit [event]
     (with [lock] (.write writer (+ (json.dumps event :separators ["," ":"]) "\n")) (.flush writer)))
-  (defn forward [subscription-id subscription]
-    (while True
-      (try
-        (setv update (.next-update subscription))
-        ;; Check ownership while holding the same lock used for ACK output.
-        ;; Replacement and unsubscribe invalidate the relay before their ACK,
-        ;; so a dequeued stale value cannot cross that acknowledgement.
-        (with [lock]
-          (if (is-not (.get subscriptions subscription-id) subscription)
-            (break)
-            (do
-              (.write writer (+ (json.dumps (if update.error
-                                               {"type" "subscription" "subscriptionId" subscription-id "error" (error-value update.error) "logs" update.logs}
-                                               {"type" "subscription" "subscriptionId" subscription-id "value" update.value "logs" update.logs})
-                                            :separators ["," ":"]) "\n"))
-              (.flush writer))))
-        (except [Exception] (break)))))
   (for [line reader]
     (setv ident None)
     (try
@@ -50,7 +56,7 @@
                 (if old-subscription (.close old-subscription) None)
                 (setv subscription (.subscribe client (get command "path") (.get command "args" {})))
                 (with [lock] (setv (get subscriptions subscription-id) subscription))
-                (.start (threading.Thread :target forward :args [subscription-id subscription] :daemon True))
+                (.start (threading.Thread :target forward-updates :args [subscriptions lock writer subscription-id subscription] :daemon True))
                 (setv event {"type" "ack"}))
               (if (= op "unsubscribe")
                 (do
@@ -76,7 +82,8 @@
     (if (is-not ident None) (setv (get event "id") ident) None)
     (emit event)))
 
-(if (os.environ.get "ADAPTER_LISTEN")
-  (do (setv [host port] (.rsplit (os.environ.get "ADAPTER_LISTEN") ":" 1) server (socket.create_server #(host (int port))) [connection _] (.accept server) reader (.makefile connection "r") writer (.makefile connection "w"))
-      (try (run reader writer) (finally (.close reader) (.close writer) (.close connection) (.close server))))
-  (run sys.stdin sys.stdout))
+(when (= __name__ "__main__")
+  (if (os.environ.get "ADAPTER_LISTEN")
+    (do (setv [host port] (.rsplit (os.environ.get "ADAPTER_LISTEN") ":" 1) server (socket.create_server #(host (int port))) [connection _] (.accept server) reader (.makefile connection "r") writer (.makefile connection "w"))
+        (try (run reader writer) (finally (.close reader) (.close writer) (.close connection) (.close server))))
+    (run sys.stdin sys.stdout)))

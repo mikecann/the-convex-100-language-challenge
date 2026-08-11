@@ -1,15 +1,42 @@
 # Convex from Hy
 
-Hy is a Lisp dialect embedded in Python. This educational, unofficial client
-uses Hy's Lisp syntax while Python 3 runs the transpiled program.
+[Hy](https://hylang.org/) is a Lisp dialect embedded in Python. This
+educational, unofficial client uses Hy's Lisp syntax while Python 3 runs the
+transpiled program.
 
-## Start here
+## Getting Started
 
 [`examples/basics/main.hy`](examples/basics/main.hy) queries a counter, starts
 Live, applies an idempotent increment, and checks the resulting update. Run it
 through the root Docker command: `./run verify-example hy`.
 
-## What works
+## Interesting Parts
+
+Hy keeps the Lisp call shape while using the same named Convex arguments a
+React client would pass:
+
+```typescript
+const value = await client.query("demo:state", { room });
+```
+
+```hy
+(setv value (.query client "demo:state" {"room" room}))
+```
+
+Starting Live before the mutation is explicit in both versions. The Hy
+subscription returns structured updates so query failures stay distinct from
+successful values:
+
+```typescript
+const unsubscribe = client.onUpdate("demo:state", { room }, handleUpdate);
+```
+
+```hy
+(setv subscription (.subscribe client "demo:state" {"room" room}))
+(setv update (.next-update subscription 10))
+```
+
+## Status
 
 | Capability | Status |
 | --- | --- |
@@ -19,7 +46,7 @@ through the root Docker command: `./run verify-example hy`.
 ## Example
 
 <!-- BEGIN GENERATED EXAMPLE: examples/basics/main.hy -->
-```clojure
+```hy
 (import math os secrets sys)
 (sys.path.insert 0 (os.environ.get "CONVEX_CLIENT_PATH" "/work/client"))
 (import convex [Client])
@@ -69,7 +96,7 @@ through the root Docker command: `./run verify-example hy`.
 ```
 <!-- END GENERATED EXAMPLE -->
 
-## Docker verification
+## Implementation Notes
 
 From the repository root:
 
@@ -87,8 +114,6 @@ The verification commands then exercise the exact minimal images against the
 approved local and hosted deployments. Only the shared evaluator may award the
 HTTP and Live capabilities shown above.
 
-## Conformance and protocol notes
-
 HTTP, JSON handling, Live query-set ownership, reconnects, and adapter protocol
 events are all in Hy. Python's standard library supplies HTTPS and JSON;
 `websockets` supplies only RFC 6455 transport. Each subscription uses a bounded
@@ -100,7 +125,7 @@ non-scratch image contains Python 3.13.5, CA certificates, the `websockets`
 transport dependency, `/bin/sh`, and basic policy tools. It does not contain Hy,
 `hy2py`, pip, a compiler, or another delegated runtime.
 
-## Known issues
+## Known Issues
 
 1. This client awaits shared local and hosted conformance before it earns a badge.
 2. Live authentication, TransitionChunk assembly, mutation replay, optimistic

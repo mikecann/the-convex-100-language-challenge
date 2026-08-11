@@ -7,7 +7,7 @@ WORKDIR /work
 COPY client ./client
 COPY examples ./examples
 # Hy is the language frontend and websockets supplies only RFC 6455 transport.
-RUN pip install --no-cache-dir hy==1.3.1 websockets==17.0.1
+RUN pip install --no-cache-dir hy==1.3.1 funcparserlib==1.0.1 websockets==17.0.1
 # hy2py emits an unused `import hy` even when generated code uses no Hy runtime
 # objects. Remove that import so the final Python image exposes no Hy compiler.
 RUN mkdir -p /transpiled/client /transpiled/examples && \
@@ -17,6 +17,8 @@ RUN mkdir -p /transpiled/client /transpiled/examples && \
     hy2py client/tests/conformance/adapter.hy --output /transpiled/adapter.py && \
     hy2py examples/basics/main.hy --output /transpiled/examples/main.py && \
     sed -i '/^import hy$/d' /transpiled/client/convex.py /transpiled/test.py /transpiled/example-test.py /transpiled/adapter.py /transpiled/examples/main.py && \
+    sed -i '1i#!/usr/local/bin/python3' /transpiled/adapter.py /transpiled/examples/main.py && \
+    cp /transpiled/adapter.py /transpiled/client/adapter.py && \
     python3 -m py_compile /transpiled/client/convex.py /transpiled/test.py /transpiled/example-test.py /transpiled/adapter.py /transpiled/examples/main.py
 RUN PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/work/client python3 -m hy client/tests/test.hy
 RUN PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/work/client python3 -m hy client/tests/example.hy
@@ -28,9 +30,10 @@ RUN test "$(python3 -c 'import platform; print(platform.machine())')" = x86_64
 
 FROM --platform=linux/amd64 ${PYTHON_IMAGE} AS runtime-rootfs
 RUN pip install --no-cache-dir websockets==17.0.1 && set -eu; root=/runtime-root; mkdir -p "$root/bin" "$root/usr/bin" "$root/usr/local/bin" "$root/usr/local/lib" "$root/usr/lib" "$root/etc"; \
-    cp /usr/local/bin/python3 "$root/usr/local/bin/python3"; cp /bin/dash "$root/bin/dash"; ln -s dash "$root/bin/sh"; cp /usr/bin/id "$root/usr/bin/id"; cp /usr/bin/grep "$root/usr/bin/grep"; \
+    cp /usr/local/bin/python3 "$root/usr/local/bin/python3"; cp /bin/dash "$root/bin/dash"; ln -s dash "$root/bin/sh"; \
+    for tool in id grep sed awk cat head tail tr wc; do cp "/usr/bin/$tool" "$root/usr/bin/$tool"; done; \
     cp -a /usr/local/lib/python3.13 "$root/usr/local/lib/python3.13"; rm -rf "$root/usr/local/lib/python3.13/ensurepip" "$root/usr/local/lib/python3.13/site-packages/pip" "$root/usr/local/lib/python3.13/site-packages/pip-"*; \
-    { ldd /usr/local/bin/python3 /bin/dash /usr/bin/id /usr/bin/grep; find /usr/local/lib/python3.13 -type f -name '*.so' -exec ldd '{}' ';'; } | awk '$3 ~ /^\// { print $3 } $1 ~ /^\// && $1 !~ /:$/ { print $1 }' | sort -u | while IFS= read -r library; do cp --parents "$library" "$root"; done; \
+    { ldd /usr/local/bin/python3 /bin/dash /usr/bin/id /usr/bin/grep /usr/bin/sed /usr/bin/awk /usr/bin/cat /usr/bin/head /usr/bin/tail /usr/bin/tr /usr/bin/wc; find /usr/local/lib/python3.13 -type f -name '*.so' -exec ldd '{}' ';'; } | awk '$3 ~ /^\// { print $3 } $1 ~ /^\// && $1 !~ /:$/ { print $1 }' | sort -u | while IFS= read -r library; do cp --parents "$library" "$root"; done; \
     for library in /lib/x86_64-linux-gnu/libnss_*.so.2; do test ! -e "$library" || cp --parents "$library" "$root"; done; \
     cp --parents /lib/x86_64-linux-gnu/libgcc_s.so.1 "$root"; \
     cp -a /etc/ssl "$root/etc/ssl"; mkdir -p "$root/usr/lib/ssl"; ln -s /etc/ssl/certs/ca-certificates.crt "$root/usr/lib/ssl/cert.pem"; ln -s /etc/ssl/certs "$root/usr/lib/ssl/certs"; ln -s /etc/ssl/openssl.cnf "$root/usr/lib/ssl/openssl.cnf"; for config in /etc/nsswitch.conf /etc/host.conf /etc/gai.conf; do test ! -e "$config" || cp --parents "$config" "$root"; done
@@ -45,8 +48,8 @@ USER 65532:65532
 
 FROM runtime-base AS example-runtime
 COPY --from=test --chmod=0555 /transpiled/examples/main.py /usr/local/bin/convex-example
-ENTRYPOINT ["/usr/local/bin/python3", "/usr/local/bin/convex-example"]
+ENTRYPOINT ["/usr/local/bin/convex-example"]
 
 FROM runtime-base AS runtime
 COPY --from=test --chmod=0555 /transpiled/adapter.py /usr/local/bin/convex-adapter
-ENTRYPOINT ["/usr/local/bin/python3", "/usr/local/bin/convex-adapter"]
+ENTRYPOINT ["/usr/local/bin/convex-adapter"]
