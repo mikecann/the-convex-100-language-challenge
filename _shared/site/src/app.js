@@ -5,6 +5,7 @@ const grid = document.querySelector("#language-grid");
 const template = document.querySelector("#language-card-template");
 const search = document.querySelector("#search");
 const statusFilter = document.querySelector("#status-filter");
+const sortOrder = document.querySelector("#sort-order");
 const dialog = document.querySelector("#language-dialog");
 const dialogContent = document.querySelector("#dialog-content");
 const capabilityDialog = document.querySelector("#capability-dialog");
@@ -46,6 +47,12 @@ document.querySelector("#working-count").textContent = data.languages.filter(
 document.querySelector("#live-count").textContent = data.languages.filter(
   (language) => language.result?.earnedCapabilities?.includes("live"),
 ).length;
+
+const graveyardContent = document.querySelector("#graveyard-content");
+if (graveyardContent && data.graveyardHtml) {
+  // Repository-owned markdown rendered by the site generator, not user input.
+  graveyardContent.innerHTML = data.graveyardHtml;
+}
 
 if (data.evidenceChannel !== "trusted-main") {
   const notice = document.querySelector("#evidence-notice");
@@ -120,12 +127,25 @@ function showCapability(name) {
   capabilityDialog.showModal();
 }
 
+function sortedLanguages() {
+  const languages = [...data.languages];
+  const byYear = (language) => language.firstAppeared ?? Number.MAX_SAFE_INTEGER;
+  if (sortOrder.value === "oldest") {
+    languages.sort((a, b) => byYear(a) - byYear(b) || a.rank - b.rank);
+  } else if (sortOrder.value === "newest") {
+    languages.sort(
+      (a, b) => (b.firstAppeared ?? 0) - (a.firstAppeared ?? 0) || a.rank - b.rank,
+    );
+  }
+  return languages;
+}
+
 function render() {
   const term = search.value.trim().toLowerCase();
   const filter = statusFilter.value;
   grid.replaceChildren();
 
-  for (const language of data.languages) {
+  for (const language of sortedLanguages()) {
     const languageStatus = status(language);
     if (term && !`${language.displayName} ${language.id}`.toLowerCase().includes(term)) {
       continue;
@@ -136,8 +156,13 @@ function render() {
 
     const card = template.content.firstElementChild.cloneNode(true);
     card.dataset.status = languageStatus;
+    // A verified card earned at least one capability from published evidence;
+    // a merely claimed status never gets the verified treatment.
+    card.dataset.verified = String(capabilities(language).length > 0);
     card.querySelector(".logo").append(logoElement(language));
-    card.querySelector(".rank").textContent = `#${language.rank}`;
+    card.querySelector(".rank").textContent = language.firstAppeared
+      ? `#${language.rank} · ${language.firstAppeared}`
+      : `#${language.rank}`;
     card.querySelector(".name").textContent = language.displayName;
     card.querySelector(".state").textContent = languageStatus;
     const badges = card.querySelector(".badges");
@@ -201,8 +226,74 @@ function addDetailList(parent, entries) {
   parent.append(list);
 }
 
+function testList(tests) {
+  const list = document.createElement("ul");
+  list.className = "test-list";
+  for (const test of tests) {
+    const item = document.createElement("li");
+    item.dataset.status = test.status;
+    item.textContent = `${test.status.toUpperCase()}  ${test.name}  ${test.durationMs} ms`;
+    list.append(item);
+  }
+  return list;
+}
+
+function evidenceColumn(title, result) {
+  const column = document.createElement("div");
+  column.className = "evidence-column";
+  const heading = document.createElement("h4");
+  heading.textContent = title;
+  const verdict = document.createElement("p");
+  verdict.className = "evidence-verdict";
+  if (result?.tests) {
+    const passed = result.tests.filter((test) => test.status === "pass").length;
+    verdict.textContent = `${passed} of ${result.tests.length} checks passed`;
+    column.append(heading, verdict, testList(result.tests));
+  } else if (result?.earnedCapabilities?.length > 0) {
+    verdict.textContent = `Earned: ${result.earnedCapabilities.join(", ")}`;
+    column.append(heading, verdict);
+  } else {
+    verdict.textContent = "No published evidence yet.";
+    column.append(heading, verdict);
+  }
+  return column;
+}
+
+const readmeCache = new Map();
+let openedLanguageId = null;
+
+async function loadReadme(language, container) {
+  if (!readmeCache.has(language.id)) {
+    readmeCache.set(
+      language.id,
+      fetch(language.readme).then((readmeResponse) => {
+        if (!readmeResponse.ok) throw new Error(`readme ${readmeResponse.status}`);
+        return readmeResponse.text();
+      }),
+    );
+  }
+  try {
+    const html = await readmeCache.get(language.id);
+    if (openedLanguageId !== language.id) return;
+    // Repository-owned markdown rendered by the site generator, not user input.
+    container.innerHTML = html;
+  } catch {
+    readmeCache.delete(language.id);
+    if (openedLanguageId !== language.id) return;
+    const fallback = document.createElement("p");
+    fallback.textContent = "The README could not be loaded.";
+    const link = document.createElement("a");
+    link.href = `${language.sourceUrl}#readme`;
+    link.textContent = "Read it on GitHub instead.";
+    fallback.append(" ", link);
+    container.replaceChildren(fallback);
+  }
+}
+
 function showLanguage(language) {
+  openedLanguageId = language.id;
   dialogContent.replaceChildren();
+
   const titleRow = document.createElement("div");
   titleRow.className = "dialog-title";
   const titleLogo = document.createElement("span");
@@ -212,8 +303,12 @@ function showLanguage(language) {
   const title = document.createElement("h2");
   title.textContent = language.displayName;
   titleRow.append(titleLogo, title);
+
   const intro = document.createElement("p");
-  intro.textContent = `Roster rank ${language.rank}. Implementation status: ${status(language)}.`;
+  const introParts = [`Roster rank ${language.rank}`];
+  if (language.firstAppeared) introParts.push(`first appeared ${language.firstAppeared}`);
+  introParts.push(`implementation status: ${status(language)}`);
+  intro.textContent = `${introParts.join(" · ")}.`;
   dialogContent.append(titleRow, intro);
 
   const badgeRow = document.createElement("div");
@@ -221,18 +316,34 @@ function showLanguage(language) {
   for (const capability of capabilities(language)) badgeRow.append(badge(capability));
   dialogContent.append(badgeRow);
 
-  addDetailList(dialogContent, [
-    ["Evidence channel", language.evidenceTrust],
-    ["Source commit", language.result?.sourceCommit],
-    ["Source dirty", language.result ? String(language.result.dirty) : null],
-    ["Provenance", language.implementation.provenance],
-    ["Toolchain", language.toolchain ? `${language.toolchain.name} ${language.toolchain.version}` : null],
-    ["Platform", language.result?.platform],
-    ["Image digest", language.result?.imageDigest],
-    ["Protocol", language.result?.protocol],
-    ["Verified", language.result?.finishedAt],
-    ["Hosted drift", language.hostedResult?.earnedCapabilities?.join(", ")],
-  ]);
+  const links = document.createElement("p");
+  links.className = "dialog-links";
+  const sourceLink = document.createElement("a");
+  sourceLink.href = language.sourceUrl;
+  sourceLink.textContent = language.result?.sourceCommit
+    ? `Source on GitHub @ ${language.result.sourceCommit.slice(0, 12)}`
+    : "Source on GitHub";
+  links.append(sourceLink);
+  if (language.exampleUrl) {
+    const exampleLink = document.createElement("a");
+    exampleLink.href = language.exampleUrl;
+    exampleLink.textContent = "Canonical example";
+    links.append(exampleLink);
+  }
+  dialogContent.append(links);
+
+  if (language.readme) {
+    const aboutHeading = document.createElement("h3");
+    aboutHeading.textContent = `About ${language.displayName}`;
+    const readmeContainer = document.createElement("div");
+    readmeContainer.className = "rendered-markdown";
+    const loading = document.createElement("p");
+    loading.className = "readme-loading";
+    loading.textContent = "Loading README…";
+    readmeContainer.append(loading);
+    dialogContent.append(aboutHeading, readmeContainer);
+    loadReadme(language, readmeContainer);
+  }
 
   if (language.example) {
     const heading = document.createElement("h3");
@@ -254,26 +365,38 @@ function showLanguage(language) {
     dialogContent.append(heading, highlighted);
   }
 
-  if (language.result?.tests) {
-    const heading = document.createElement("h3");
-    heading.textContent = "Conformance evidence";
-    const tests = document.createElement("ul");
-    tests.className = "test-list";
-    for (const test of language.result.tests) {
-      const item = document.createElement("li");
-      item.dataset.status = test.status;
-      item.textContent = `${test.status.toUpperCase()}  ${test.name}  ${test.durationMs} ms`;
-      tests.append(item);
-    }
-    dialogContent.append(heading, tests);
-  }
+  const evidenceHeading = document.createElement("h3");
+  evidenceHeading.textContent = "The evidence";
+  dialogContent.append(evidenceHeading);
+
+  addDetailList(dialogContent, [
+    ["Evidence channel", language.evidenceTrust],
+    ["Source commit", language.result?.sourceCommit],
+    ["Source dirty", language.result ? String(language.result.dirty) : null],
+    ["Provenance", language.implementation.provenance],
+    ["Toolchain", language.toolchain ? `${language.toolchain.name} ${language.toolchain.version}` : null],
+    ["Platform", language.result?.platform],
+    ["Image digest", language.result?.imageDigest],
+    ["Protocol", language.result?.protocol],
+    ["Verified", language.result?.finishedAt],
+  ]);
+
+  // Every badge is earned twice: once against a local backend and once against
+  // a real hosted deployment. Show both runs side by side.
+  const columns = document.createElement("div");
+  columns.className = "evidence-columns";
+  columns.append(evidenceColumn("Conformance run", language.result));
+  columns.append(evidenceColumn("Hosted deployment", language.hostedResult));
+  dialogContent.append(columns);
 
   document.title = `${language.displayName} · 100 Convex clients`;
   if (!dialog.open) dialog.showModal();
+  dialog.scrollTop = 0;
 }
 
 search.addEventListener("input", render);
 statusFilter.addEventListener("change", render);
+sortOrder.addEventListener("change", render);
 document.querySelector("#dialog-close").addEventListener("click", () => closeLanguage());
 document.querySelector("#capability-close").addEventListener("click", () => capabilityDialog.close());
 for (const legendBadge of document.querySelectorAll(".legend [data-capability]")) {
