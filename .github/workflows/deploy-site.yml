@@ -38,16 +38,23 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
+          mkdir -p _shared/site/.wrangler
+          docker build \
+            --file _shared/site/Dockerfile.deploy \
+            --tag 100-convex-clients-site-deployer \
+            _shared/site
           docker run --rm \
-            --user "$(id -u):$(id -g)" \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
             --env CLOUDFLARE_ACCOUNT_ID \
             --env CLOUDFLARE_API_TOKEN \
-            --env npm_config_cache=/tmp/npm-cache \
             --tmpfs /tmp \
-            --volume "$PWD:/repo" \
-            --workdir /repo/_shared/site \
-            node:22.18.0-bookworm-slim@sha256:752ea8a2f758c34002a0461bd9f1cee4f9a3c36d48494586f60ffce1fc708e0e \
-            sh -lc 'npx --yes wrangler@4.112.0 deploy --config wrangler.jsonc'
+            --tmpfs /root \
+            --tmpfs /site/.wrangler \
+            --volume "$PWD/_shared/site:/site:ro" \
+            100-convex-clients-site-deployer \
+            deploy --config wrangler.jsonc
 
       - name: Verify the custom domain
         run: curl --fail --silent --show-error --retry 5 --retry-all-errors https://the-convex-100-language-challenge.mikecann.app/data.json >/dev/null
