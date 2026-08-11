@@ -42,20 +42,40 @@
     </main>
 
     <footer class="page-footer">
-      <nav aria-label="Project links">
-        <a href="https://github.com/mikecann/100-convex-clients">Repository</a>
-        <a href="https://github.com/mikecann/100-convex-clients/blob/main/STATS.md">STATS.md</a>
-        <a href="https://github.com/mikecann/100-convex-clients/blob/main/INFEASIBLE.md">INFEASIBLE.md</a>
-        <a href="https://github.com/mikecann/100-convex-clients/blob/main/LESSONS.md">LESSONS.md</a>
-        <a href="https://github.com/mikecann/100-convex-clients/blob/main/BUILD-FLEET.md">BUILD-FLEET.md</a>
-        <a href="https://www.convex.dev/">Convex</a>
-        <a href="https://docs.convex.dev/http-api/">Convex HTTP API</a>
-      </nav>
-      <p>
-        An educational experiment by Mike Cann. Not affiliated with or endorsed
-        by Convex. Every badge is backed by published evidence; anything without
-        evidence is shown as unverified.
-      </p>
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <img class="footer-mark" src="/mark-icon.png" alt="" width="40" height="40" />
+          <p class="footer-blurb">
+            Convex clients in one hundred programming languages, from Fortran
+            to Mojo. Every badge here is earned by the same conformance suite,
+            and anything without published evidence is shown as unverified.
+          </p>
+        </div>
+        <nav class="footer-column" aria-label="Site sections">
+          <h2>Explore</h2>
+          <a href="/">Languages</a>
+          <a href="/graveyard/">Graveyard</a>
+          <a href="/faq/">FAQ</a>
+          <a href="/numbers/">Numbers</a>
+        </nav>
+        <nav class="footer-column" aria-label="Project records">
+          <h2>The record</h2>
+          <a href="https://github.com/mikecann/100-convex-clients/blob/main/STATS.md">Statistics</a>
+          <a href="https://github.com/mikecann/100-convex-clients/blob/main/INFEASIBLE.md">Infeasible languages</a>
+          <a href="https://github.com/mikecann/100-convex-clients/blob/main/LESSONS.md">Lessons learned</a>
+          <a href="https://github.com/mikecann/100-convex-clients/blob/main/BUILD-FLEET.md">The build fleet</a>
+        </nav>
+        <nav class="footer-column" aria-label="Elsewhere">
+          <h2>Elsewhere</h2>
+          <a href="https://github.com/mikecann/100-convex-clients">Repository</a>
+          <a href="https://www.convex.dev/">Convex</a>
+          <a href="https://docs.convex.dev/http-api/">Convex HTTP API</a>
+        </nav>
+      </div>
+      <div class="footer-base">
+        <p>An educational experiment by <a href="https://github.com/mikecann">Mike Cann</a>.</p>
+        <p>Built with Convex.</p>
+      </div>
     </footer>
   </body>
 </html>

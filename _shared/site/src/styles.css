@@ -443,14 +443,53 @@ main.page h1 {
 .faq code { background: rgb(255 255 255 / 8%); padding: 0.1rem 0.35rem; border-radius: 0.3rem; font-size: 0.9em; }
 
 .page-footer {
-  margin-top: 4rem;
-  padding: 2rem clamp(1rem, 5vw, 5rem) 3rem;
+  margin-top: 5rem;
+  padding: 3.5rem clamp(1rem, 5vw, 5rem) 2.5rem;
+  border-top: 1px solid var(--border);
+  background: linear-gradient(180deg, transparent, rgb(255 255 255 / 2%));
+}
+.footer-grid {
+  display: grid;
+  grid-template-columns: minmax(17rem, 1.5fr) repeat(3, minmax(9rem, 1fr));
+  gap: 2.5rem 3rem;
+}
+.footer-brand { display: grid; gap: 1rem; align-content: start; }
+.footer-mark { width: 2.5rem; height: 2.5rem; object-fit: contain; }
+.footer-blurb {
+  max-width: 44ch;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.65;
+}
+.footer-column { display: grid; gap: 0.6rem; align-content: start; }
+.footer-column h2 {
+  margin: 0 0 0.25rem;
+  color: rgb(255 255 255 / 42%);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.footer-column a {
+  color: var(--muted);
+  font-size: 0.92rem;
+  text-decoration: none;
+  transition: color 120ms ease;
+}
+.footer-column a:hover { color: var(--brand-yellow); }
+.footer-base {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.5rem 1.5rem;
+  margin-top: 3rem;
+  padding-top: 1.5rem;
   border-top: 1px solid var(--border);
 }
-.page-footer nav { display: flex; flex-wrap: wrap; gap: 0.4rem 1.5rem; }
-.page-footer a { color: var(--muted); text-decoration: none; }
-.page-footer a:hover { color: var(--brand-yellow); }
-.page-footer p { max-width: 70ch; margin: 1.25rem 0 0; color: rgb(255 255 255 / 35%); font-size: 0.85rem; line-height: 1.6; }
+.footer-base p { margin: 0; color: rgb(255 255 255 / 38%); font-size: 0.85rem; }
+.footer-base a { color: rgb(255 255 255 / 60%); text-decoration: none; }
+.footer-base a:hover { color: var(--brand-yellow); }
 
 /* ---- Try it yourself ---- */
 
@@ -643,4 +682,7 @@ body.panel-open .language-panel {
   .legend { width: 100%; margin-left: 0; }
   dialog dl, .language-panel dl { grid-template-columns: 1fr; }
   .evidence-columns { grid-template-columns: 1fr; }
+  .footer-grid { grid-template-columns: 1fr 1fr; gap: 2rem 1.5rem; }
+  .footer-brand { grid-column: 1 / -1; }
+  .footer-base { margin-top: 2rem; }
 }
