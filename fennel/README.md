@@ -70,6 +70,7 @@ coroutines rather than JavaScript promises.
 
 ## Example
 
+<!-- BEGIN GENERATED EXAMPLE: examples/basics/main.fnl -->
 ```fennel
 #!/usr/local/bin/fennel
 ;; This canonical example demonstrates one complete Convex HTTP and Live journey.
@@ -127,6 +128,7 @@ coroutines rather than JavaScript promises.
 
 (main)
 ```
+<!-- END GENERATED EXAMPLE -->
 
 ## Implementation Notes
 

@@ -1,8 +1,8 @@
 schemaVersion: 1
 id: c3
 displayName: "C3"
-rank: 100
-selectionTier: curated_backfill
+rank: 45
+selectionTier: ranked
 implementation:
   status: attempting
   provenance: native

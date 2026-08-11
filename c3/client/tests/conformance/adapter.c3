@@ -1,3 +1,4 @@
+// This executable is shared-conformance infrastructure, not part of the public client.
 module c3_adapter;
 
 import std::collections::object;

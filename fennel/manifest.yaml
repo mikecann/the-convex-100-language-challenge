@@ -1,8 +1,8 @@
 schemaVersion: 1
 id: fennel
 displayName: "Fennel"
-rank: 100
-selectionTier: curated_backfill
+rank: 35
+selectionTier: ranked
 implementation:
   status: attempting
   provenance: transpiled
