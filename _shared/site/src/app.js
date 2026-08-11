@@ -200,7 +200,6 @@ function openLanguage(language, { updateHistory = true } = {}) {
 }
 
 function closeLanguage({ updateHistory = true } = {}) {
-  panel.hidden = true;
   document.body.classList.remove("panel-open");
   openedLanguageId = null;
   if (updateHistory && routedLanguage()) {
@@ -445,7 +444,6 @@ function showLanguage(language) {
   panelContent.append(columns);
 
   document.title = `${language.displayName} · 100 Convex Clients`;
-  panel.hidden = false;
   document.body.classList.add("panel-open");
   panel.scrollTop = 0;
 }
@@ -455,8 +453,26 @@ statusFilter.addEventListener("change", render);
 sortOrder.addEventListener("change", render);
 document.querySelector("#panel-close").addEventListener("click", () => closeLanguage());
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !panel.hidden && !capabilityDialog.open) closeLanguage();
+  if (
+    event.key === "Escape" &&
+    document.body.classList.contains("panel-open") &&
+    !capabilityDialog.open
+  ) {
+    closeLanguage();
+  }
 });
+
+// The nav chrome stays invisible while the hero title is on screen; once the
+// title scrolls away, the bar fades in to carry the brand.
+const heroTitle = document.querySelector(".masthead h1");
+if (heroTitle) {
+  new IntersectionObserver(
+    ([entry]) => {
+      document.body.classList.toggle("nav-solid", !entry.isIntersecting);
+    },
+    { rootMargin: "-64px 0px 0px 0px" },
+  ).observe(heroTitle);
+}
 document.querySelector("#capability-close").addEventListener("click", () => capabilityDialog.close());
 const disclaimerDialog = document.querySelector("#disclaimer-dialog");
 document.querySelector("#disclaimer-open").addEventListener("click", () => disclaimerDialog.showModal());
