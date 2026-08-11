@@ -9,11 +9,12 @@ index 99ccb02..8627632 100644
  
  ENABLE_TESTING()
  SET(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake )
-@@ -41,10 +41,11 @@ SET(SRCS
+@@ -41,10 +41,12 @@ SET(SRCS
    error.c
    binding.c
    inet.c
 +  platform.c
++  transport.c
  )
  
  add_executable(lci ${SRCS} ${HDRS})

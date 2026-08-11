@@ -22,6 +22,7 @@ WORKDIR /src
 RUN tar -xzf /tmp/lci.tar.gz --strip-components=1 \
     && test "$(git --version 2>/dev/null || true)" = ""
 COPY client/platform.c ./platform.c
+COPY client/transport.c ./transport.c
 COPY client/lci-runtime.patch /tmp/lci-runtime.patch
 RUN patch -p1 < /tmp/lci-runtime.patch \
     && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -34,6 +35,19 @@ COPY examples /project/examples
 FROM build AS test
 RUN /src/build/lci /project/client/convex.lol /project/client/tests/smoke.lol \
     | grep -Fx 'lolcode runtime bindings: ok'
+RUN openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=LOLCODE-WebSocket-Test-CA \
+      -keyout /tmp/ws-ca-key.pem -out /tmp/ws-ca.pem >/dev/null 2>&1 \
+    && openssl req -newkey rsa:2048 -nodes -subj /CN=localhost \
+      -addext subjectAltName=DNS:localhost -keyout /tmp/ws-server-key.pem \
+      -out /tmp/ws-server.csr >/dev/null 2>&1 \
+    && printf 'subjectAltName=DNS:localhost\n' >/tmp/ws-server.ext \
+    && openssl x509 -req -days 1 -in /tmp/ws-server.csr -CA /tmp/ws-ca.pem \
+      -CAkey /tmp/ws-ca-key.pem -CAcreateserial -extfile /tmp/ws-server.ext \
+      -out /tmp/ws-server.pem >/dev/null 2>&1 \
+    && gcc -std=c17 -Wall -Wextra -Werror \
+      /project/client/tests/websocket_fixture.c /project/client/transport.c \
+      -lcurl -lssl -lcrypto -o /tmp/websocket-fixture \
+    && /tmp/websocket-fixture | grep -Fx 'lolcode websocket transport fixture: ok'
 RUN gcc -std=c17 -Wall -Wextra -Werror /project/client/tests/http_fixture.c \
       -o /tmp/http-fixture; \
     /tmp/http-fixture & fixture_pid=$!; \

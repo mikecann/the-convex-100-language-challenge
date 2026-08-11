@@ -40,6 +40,24 @@ typedef struct {
     char error[256];
 } Controller;
 
+typedef struct {
+    void *transport;
+    int last_status;
+    char error[128];
+} LolWebSocket;
+
+void *lol_ws_connect(const char *url, const char *ca_path, long timeout_millis);
+int lol_ws_is_active(void *opaque);
+int lol_ws_send_text(void *opaque, const char *data, size_t length, long timeout_millis);
+int lol_ws_receive_text(void *opaque, char *output, size_t capacity, size_t *length,
+                       long timeout_millis);
+int lol_ws_close(void *opaque, long timeout_millis);
+void lol_ws_free(void *opaque);
+int lol_stdin_ready(long timeout_millis);
+int lol_adapter_listen(const char *address);
+
+static int controller_status;
+
 // This extension deliberately exposes only ordinary runtime primitives.
 // Convex request envelopes, response rules, Live state, and adapter behavior
 // stay in the checked-in LOLCODE sources.
@@ -406,6 +424,167 @@ static ReturnObject *http_free_wrapper(ScopeObject *scope)
     return createReturnObject(RT_DEFAULT, NULL);
 }
 
+static LolWebSocket *ws_arg(ScopeObject *scope)
+{
+    return (LolWebSocket *)getBlob(getArg(scope, "websocket"));
+}
+
+static ReturnObject *ws_connect_wrapper(ScopeObject *scope)
+{
+    const char *url = string_arg(scope, "url");
+    long long timeout = getInteger(getArg(scope, "timeout"));
+    LolWebSocket *websocket = calloc(1, sizeof *websocket);
+    if (!websocket) return createReturnObject(RT_RETURN, createBlobValueObject(NULL));
+    websocket->transport = lol_ws_connect(
+        url, "/etc/ssl/certs/ca-certificates.crt", timeout > 0 ? (long)timeout : 10000);
+    websocket->last_status = websocket->transport ? 1 : -1;
+    if (!websocket->transport)
+        snprintf(websocket->error, sizeof websocket->error, "WebSocket connect failed");
+    return createReturnObject(RT_RETURN, createBlobValueObject(websocket));
+}
+
+static ReturnObject *ws_active_wrapper(ScopeObject *scope)
+{
+    LolWebSocket *websocket = ws_arg(scope);
+    return boolean_result(websocket && lol_ws_is_active(websocket->transport));
+}
+
+static ReturnObject *ws_send_wrapper(ScopeObject *scope)
+{
+    LolWebSocket *websocket = ws_arg(scope);
+    const char *payload = string_arg(scope, "payload");
+    long long timeout = getInteger(getArg(scope, "timeout"));
+    int ok = websocket && lol_ws_send_text(
+        websocket->transport, payload, strlen(payload), (long)timeout);
+    if (websocket) {
+        websocket->last_status = ok ? 1 : -1;
+        if (!ok) snprintf(websocket->error, sizeof websocket->error, "WebSocket write failed");
+    }
+    return boolean_result(ok);
+}
+
+static ReturnObject *ws_receive_wrapper(ScopeObject *scope)
+{
+    LolWebSocket *websocket = ws_arg(scope);
+    long long timeout = getInteger(getArg(scope, "timeout"));
+    char *message = malloc(MAX_MESSAGE_BYTES + 1);
+    size_t length = 0;
+    if (!websocket || !message) {
+        free(message);
+        return string_result(strdup(""));
+    }
+    int status = lol_ws_receive_text(
+        websocket->transport, message, MAX_MESSAGE_BYTES, &length, (long)timeout);
+    websocket->last_status = status;
+    if (status == 1) {
+        message[length] = '\0';
+        return string_result(message);
+    }
+    free(message);
+    if (status == 2)
+        snprintf(websocket->error, sizeof websocket->error, "WebSocket peer closed");
+    else if (status < 0)
+        snprintf(websocket->error, sizeof websocket->error,
+                 "invalid WebSocket frame or transport failure");
+    return string_result(strdup(""));
+}
+
+static ReturnObject *ws_status_wrapper(ScopeObject *scope)
+{
+    LolWebSocket *websocket = ws_arg(scope);
+    return integer_result(websocket ? websocket->last_status : -1);
+}
+
+static ReturnObject *ws_error_wrapper(ScopeObject *scope)
+{
+    LolWebSocket *websocket = ws_arg(scope);
+    return string_result(strdup(websocket ? websocket->error : "invalid WebSocket"));
+}
+
+static ReturnObject *ws_disconnect_wrapper(ScopeObject *scope)
+{
+    LolWebSocket *websocket = ws_arg(scope);
+    if (websocket && websocket->transport) {
+        lol_ws_free(websocket->transport);
+        websocket->transport = NULL;
+        websocket->last_status = -1;
+        snprintf(websocket->error, sizeof websocket->error, "debug disconnect");
+    }
+    return createReturnObject(RT_DEFAULT, NULL);
+}
+
+static ReturnObject *ws_close_wrapper(ScopeObject *scope)
+{
+    LolWebSocket *websocket = ws_arg(scope);
+    long long timeout = getInteger(getArg(scope, "timeout"));
+    int ok = 1;
+    if (websocket && websocket->transport) {
+        ok = lol_ws_close(websocket->transport, (long)timeout);
+        lol_ws_free(websocket->transport);
+        websocket->transport = NULL;
+    }
+    return boolean_result(ok);
+}
+
+static ReturnObject *ws_free_wrapper(ScopeObject *scope)
+{
+    LolWebSocket *websocket = ws_arg(scope);
+    if (websocket) {
+        if (websocket->transport) lol_ws_free(websocket->transport);
+        free(websocket);
+    }
+    return createReturnObject(RT_DEFAULT, NULL);
+}
+
+static ReturnObject *io_open_wrapper(ScopeObject *scope)
+{
+    (void)scope;
+    const char *listen = getenv("ADAPTER_LISTEN");
+    controller_status = 1;
+    if (listen && *listen && !lol_adapter_listen(listen)) controller_status = -1;
+    setvbuf(stdin, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    return boolean_result(controller_status == 1);
+}
+
+static ReturnObject *io_read_wrapper(ScopeObject *scope)
+{
+    long long timeout = getInteger(getArg(scope, "timeout"));
+    if (!lol_stdin_ready((long)timeout)) {
+        controller_status = 0;
+        return string_result(strdup(""));
+    }
+    char *line = malloc(MAX_MESSAGE_BYTES + 2);
+    if (!line || !fgets(line, MAX_MESSAGE_BYTES + 2, stdin)) {
+        free(line);
+        controller_status = -1;
+        return string_result(strdup(""));
+    }
+    size_t length = strlen(line);
+    if (!length || (line[length - 1] != '\n' && !feof(stdin))) {
+        free(line);
+        controller_status = -2;
+        return string_result(strdup(""));
+    }
+    while (length && (line[length - 1] == '\n' || line[length - 1] == '\r'))
+        line[--length] = '\0';
+    controller_status = 1;
+    return string_result(line);
+}
+
+static ReturnObject *io_status_wrapper(ScopeObject *scope)
+{
+    (void)scope;
+    return integer_result(controller_status);
+}
+
+static ReturnObject *io_write_wrapper(ScopeObject *scope)
+{
+    const char *line = string_arg(scope, "line");
+    int ok = fputs(line, stdout) >= 0 && fputc('\n', stdout) != EOF && fflush(stdout) == 0;
+    return boolean_result(ok);
+}
+
 static int install_library(ScopeObject *scope, const char *name, ScopeObject *library)
 {
     IdentifierNode *id = createIdentifierNode(IT_DIRECT, copyString((char *)name), NULL, NULL, 0);
@@ -443,5 +622,18 @@ int loadTransportLibrary(ScopeObject *scope)
     loadBinding(library, "HTTPBODY", "response", http_body_wrapper);
     loadBinding(library, "HTTPERROR", "response", http_error_wrapper);
     loadBinding(library, "HTTPFREE", "response", http_free_wrapper);
+    loadBinding(library, "WSCONNECT", "url timeout", ws_connect_wrapper);
+    loadBinding(library, "WSACTIVE", "websocket", ws_active_wrapper);
+    loadBinding(library, "WSSEND", "websocket payload timeout", ws_send_wrapper);
+    loadBinding(library, "WSRECEIVE", "websocket timeout", ws_receive_wrapper);
+    loadBinding(library, "WSSTATUS", "websocket", ws_status_wrapper);
+    loadBinding(library, "WSERROR", "websocket", ws_error_wrapper);
+    loadBinding(library, "WSDISCONNECT", "websocket", ws_disconnect_wrapper);
+    loadBinding(library, "WSCLOSE", "websocket timeout", ws_close_wrapper);
+    loadBinding(library, "WSFREE", "websocket", ws_free_wrapper);
+    loadBinding(library, "IOOPEN", "", io_open_wrapper);
+    loadBinding(library, "IOREAD", "timeout", io_read_wrapper);
+    loadBinding(library, "IOSTATUS", "", io_status_wrapper);
+    loadBinding(library, "IOWRITE", "line", io_write_wrapper);
     return install_library(scope, "TRANSPORT", library);
 }
