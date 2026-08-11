@@ -4,7 +4,6 @@ const data = await response.json();
 const grid = document.querySelector("#language-grid");
 const template = document.querySelector("#language-card-template");
 const search = document.querySelector("#search");
-const statusFilter = document.querySelector("#status-filter");
 const sortOrder = document.querySelector("#sort-order");
 const panel = document.querySelector("#language-panel");
 const panelContent = document.querySelector("#panel-content");
@@ -126,7 +125,9 @@ function showCapability(name) {
 function sortedLanguages() {
   const languages = [...data.languages];
   const byYear = (language) => language.firstAppeared ?? Number.MAX_SAFE_INTEGER;
-  if (sortOrder.value === "oldest") {
+  if (sortOrder.value === "popularity") {
+    languages.sort((a, b) => a.rank - b.rank);
+  } else if (sortOrder.value === "oldest") {
     languages.sort((a, b) => byYear(a) - byYear(b) || a.rank - b.rank);
   } else if (sortOrder.value === "newest") {
     languages.sort(
@@ -138,7 +139,6 @@ function sortedLanguages() {
 
 function render() {
   const term = search.value.trim().toLowerCase();
-  const filter = statusFilter.value;
   grid.replaceChildren();
 
   for (const language of sortedLanguages()) {
@@ -146,10 +146,6 @@ function render() {
     if (term && !`${language.displayName} ${language.id}`.toLowerCase().includes(term)) {
       continue;
     }
-    if (filter === "working" && languageStatus !== "working") continue;
-    if (filter === "planned" && languageStatus !== "planned") continue;
-    if (filter === "failed" && languageStatus !== "failed") continue;
-
     const card = template.content.firstElementChild.cloneNode(true);
     card.dataset.status = languageStatus;
     card.querySelector(".logo").append(logoElement(language));
@@ -349,7 +345,7 @@ function showLanguage(language) {
   titleRow.append(titleLogo, title);
 
   const intro = document.createElement("p");
-  const introParts = [`Roster rank ${language.rank}`];
+  const introParts = [`Popularity #${language.rank}`];
   if (language.firstAppeared) introParts.push(`first appeared ${language.firstAppeared}`);
   intro.textContent = `${introParts.join(" · ")}.`;
   panelContent.append(titleRow, intro);
@@ -446,7 +442,6 @@ function showLanguage(language) {
 }
 
 search.addEventListener("input", render);
-statusFilter.addEventListener("change", render);
 sortOrder.addEventListener("change", render);
 document.querySelector("#panel-close").addEventListener("click", () => closeLanguage());
 document.addEventListener("keydown", (event) => {
