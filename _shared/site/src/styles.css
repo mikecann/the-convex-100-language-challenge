@@ -117,6 +117,13 @@ h1 {
 }
 
 .tagline { margin: 1rem 0 0; color: var(--muted); font-size: 1.12rem; }
+.tagline-language {
+  color: var(--brand-yellow);
+  text-decoration: none;
+  border-bottom: 1px dashed rgb(243 176 28 / 45%);
+  transition: border-color 120ms ease;
+}
+.tagline-language:hover { border-bottom-color: var(--brand-yellow); }
 
 .hero-mark {
   height: 1.05em;

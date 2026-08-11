@@ -205,7 +205,7 @@ function closeLanguage({ updateHistory = true } = {}) {
   if (updateHistory && routedLanguage()) {
     window.history.pushState({}, "", "/");
   }
-  document.title = "100 Convex Clients";
+  document.title = "The Convex 100 Language Challenge";
 }
 
 function syncLanguageRoute() {
@@ -443,7 +443,7 @@ function showLanguage(language) {
   columns.append(evidenceColumn("Hosted deployment", language.hostedResult));
   panelContent.append(columns);
 
-  document.title = `${language.displayName} · 100 Convex Clients`;
+  document.title = `${language.displayName} · The Convex 100 Language Challenge`;
   document.body.classList.add("panel-open");
   panel.scrollTop = 0;
 }
@@ -490,6 +490,18 @@ for (const legendBadge of document.querySelectorAll(".legend [data-capability]")
 capabilityDialog.addEventListener("click", (event) => {
   if (event.target === capabilityDialog) capabilityDialog.close();
 });
+// Tagline language names open their panel in place; the href stays a real
+// deep link for new-tab clicks and no-JS visitors.
+for (const link of document.querySelectorAll("[data-language-id]")) {
+  link.addEventListener("click", (event) => {
+    const language = data.languages.find(
+      (candidate) => candidate.id === link.dataset.languageId,
+    );
+    if (!language) return;
+    event.preventDefault();
+    openLanguage(language);
+  });
+}
 for (const button of document.querySelectorAll("[data-copy-target]")) {
   button.addEventListener("click", async () => {
     const source = document.getElementById(button.dataset.copyTarget);
