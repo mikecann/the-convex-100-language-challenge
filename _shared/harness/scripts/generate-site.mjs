@@ -280,9 +280,7 @@ async function renderGraveyard() {
   const markdown = fs
     .readFileSync(path.join(root, "INFEASIBLE.md"), "utf8")
     .replace(/^# .+\n/m, "");
-  const graveyardEntries = [
-    ...markdown.split("## Chosen replacements", 1)[0].matchAll(/^\| ([a-z0-9-]+) \|/gm),
-  ]
+  const graveyardEntries = [...markdown.matchAll(/^\| ([a-z0-9-]+) \|/gm)]
     .map((match) => match[1])
     .filter((id) => id !== "---");
   const expectedIds = new Set(graveyardEntries);
@@ -306,16 +304,16 @@ async function renderGraveyard() {
   for (const logo of graveyardLogos) {
     const cell = `<td>${logo.id}</td>`;
     const brandedCell = `<td><span class="graveyard-language"><a href="${logo.sourceUrl}" aria-label="${logo.name} logo source"><img src="/graveyard-logos/${logo.asset}" alt="" width="38" height="38" loading="lazy"></a><span>${logo.name}</span></span></td>`;
-    // Later replacement tables mention many of these IDs again. Brand the
-    // actual graveyard row only so the record stays readable rather than
-    // repeating the same mark throughout the history below it.
+    // Brand the first-column language cell while leaving its plain-English
+    // final reason untouched.
     html = html.replace(cell, brandedCell);
   }
 
   const sourceLinks = graveyardLogos
     .map((logo) => `<li><a href="${logo.sourceUrl}">${logo.name}</a></li>`)
     .join("");
-  return `${html}<details class="graveyard-logo-sources"><summary>Logo sources</summary><p>Each mark links to the language's official project or vendor page and is used here only for identification.</p><ul>${sourceLinks}</ul></details>`;
+  const categoryCount = markdown.match(/^## /gm)?.length ?? 0;
+  return `<div class="graveyard-overview"><div><strong>${expectedIds.size}</strong><span>languages outside the final roster</span></div><div><strong>${categoryCount}</strong><span>plain-English reason groups</span></div><div><strong>${roster.languages.length}</strong><span>languages that made the final cut</span></div></div>${html}<details class="graveyard-logo-sources"><summary>Logo sources</summary><p>Each mark links to the language's official project or vendor page and is used here only for identification.</p><ul>${sourceLinks}</ul></details>`;
 }
 
 function escapeHtml(value) {
