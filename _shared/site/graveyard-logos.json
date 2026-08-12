@@ -25,5 +25,9 @@
   { "id": "gml", "name": "GameMaker Language", "asset": "gml.png", "sourceUrl": "https://gamemaker.io/en/gamemaker" },
   { "id": "oz", "name": "Oz", "asset": "oz.png", "sourceUrl": "https://mozart-oz.org/" },
   { "id": "actionscript", "name": "ActionScript", "asset": "actionscript.png", "sourceUrl": "https://airsdk.dev/reference/actionscript/3.0/" },
-  { "id": "logo", "name": "Logo", "asset": "logo.png", "sourceUrl": "https://el.media.mit.edu/logo-foundation/" }
+  { "id": "logo", "name": "Logo", "asset": "logo.png", "sourceUrl": "https://el.media.mit.edu/logo-foundation/" },
+  { "id": "mumps", "name": "MUMPS", "asset": "mumps.png", "sourceUrl": "https://docs.yottadb.com/AdminOpsGuide/man.html" },
+  { "id": "setl", "name": "SETL", "asset": "setl.png", "sourceUrl": "https://setl.org/setl/" },
+  { "id": "modula-3", "name": "Modula-3", "asset": "modula-3.png", "sourceUrl": "https://www.modula3.org/" },
+  { "id": "hy", "name": "Hy", "asset": "hy.png", "sourceUrl": "https://hylang.org/" }
 ]

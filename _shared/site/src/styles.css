@@ -791,6 +791,42 @@ body.panel-open .language-panel {
   align-items: center;
   gap: 0.65rem;
 }
+.graveyard-page { max-width: 72rem; }
+.graveyard-page > .rendered-markdown { max-width: none; }
+.graveyard-overview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.8rem;
+  margin: 1.5rem 0 2.25rem;
+}
+.graveyard-overview > div {
+  display: grid;
+  gap: 0.45rem;
+  min-height: 8rem;
+  align-content: space-between;
+  padding: 1.1rem;
+  border: 1px solid var(--border);
+  border-radius: 1rem;
+  background: linear-gradient(150deg, rgb(255 255 255 / 5%), rgb(255 255 255 / 1%));
+}
+.graveyard-overview strong {
+  color: var(--http);
+  font-size: 2.6rem;
+  font-weight: 800;
+  letter-spacing: -0.045em;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.graveyard-overview span { max-width: 24ch; color: var(--muted); font-size: 0.84rem; line-height: 1.45; }
+.graveyard-page .rendered-markdown > h2 {
+  margin-top: 2.75rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--border);
+}
+.graveyard-page .rendered-markdown > h2:first-of-type { margin-top: 0; padding-top: 0; border-top: 0; }
+.graveyard-page .rendered-markdown > h2 + p { max-width: 72ch; color: var(--muted); }
+.graveyard-page .rendered-markdown table { width: 100%; }
+.graveyard-page .rendered-markdown td:first-child { min-width: 12rem; }
 .graveyard-language a {
   display: grid;
   width: 2.5rem;
@@ -845,6 +881,8 @@ body.panel-open .language-panel {
   .roster-chart li { grid-template-rows: auto 8rem auto minmax(3.8rem, auto); }
   .roster-chart li > small { font-size: 0.6rem; }
   .integrity-callout { grid-template-columns: 1fr; }
+  .graveyard-overview { grid-template-columns: 1fr 1fr; }
+  .graveyard-overview > div:last-child { grid-column: 1 / -1; }
 }
 
 @media (max-width: 440px) {
@@ -854,4 +892,6 @@ body.panel-open .language-panel {
   .roster-chart li > small { display: none; }
   .roster-chart li { grid-template-rows: auto 7rem auto; }
   .chart-row-label { gap: 0.5rem; }
+  .graveyard-overview { grid-template-columns: 1fr; }
+  .graveyard-overview > div:last-child { grid-column: auto; }
 }
