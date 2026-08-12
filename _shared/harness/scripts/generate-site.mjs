@@ -4,9 +4,13 @@ import process from "node:process";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { Marked } from "marked";
-import { bundledLanguages, codeToHtml } from "shiki";
+import { bundledLanguages, codeToHtml, createHighlighter } from "shiki";
 import { parse } from "yaml";
 import { projectReadmeExamples } from "./example-readme.mjs";
+import {
+  customLanguageGrammars,
+  customLanguageIds,
+} from "./site-language-grammars.mjs";
 import {
   hasPassingTests,
   requiredHTTPTests,
@@ -28,6 +32,10 @@ const languageYears = JSON.parse(
 const languageWikipedia = JSON.parse(
   fs.readFileSync(path.join(root, "_shared/site/language-wikipedia.json"), "utf8"),
 );
+const customHighlighter = await createHighlighter({
+  themes: ["github-dark-default"],
+  langs: Object.values(customLanguageGrammars),
+});
 const resultIndexPath = path.join(root, "_shared/results/index.json");
 const resultIndex = fs.existsSync(resultIndexPath)
   ? JSON.parse(fs.readFileSync(resultIndexPath, "utf8"))
@@ -107,14 +115,43 @@ function readOptionalResult(directory, languageId) {
 
 const syntaxAliases = {
   "assembly-x86-64": "asm",
-  c3: "c",
   "delphi-object-pascal": "pascal",
-  fennel: "lisp",
   fortran: "fortran-free-form",
   hy: "lisp",
   "visual-basic-dotnet": "vb",
   "wolfram-language": "wolfram",
 };
+
+const hasSyntax = (language) =>
+  Boolean(language) && (language in bundledLanguages || customLanguageIds.has(language));
+
+async function highlightCode(code, language) {
+  let html;
+  if (customLanguageIds.has(language)) {
+    html = customHighlighter.codeToHtml(code, {
+      lang: language,
+      theme: "github-dark-default",
+    });
+  } else {
+    html = await codeToHtml(code, {
+      lang: language,
+      theme: "github-dark-default",
+    });
+  }
+
+  if (language === "text") return html;
+
+  // A registered grammar can still be accidentally empty or malformed. Make
+  // the publishing build prove that it produced real token colour variation,
+  // rather than accepting an all-white block under a non-"text" language id.
+  const tokenColors = new Set(
+    [...html.matchAll(/color:#[0-9a-f]{6}/gi)].map(([color]) => color.toLowerCase()),
+  );
+  if (tokenColors.size < 3) {
+    throw new Error(`${language}: syntax grammar produced no meaningful highlighting`);
+  }
+  return html;
+}
 
 const extensionAliases = {
   clj: "clojure",
@@ -146,7 +183,7 @@ for (const [alias, target] of [
   ...Object.entries(syntaxAliases),
   ...Object.entries(extensionAliases),
 ]) {
-  if (!(target in bundledLanguages)) {
+  if (!hasSyntax(target)) {
     throw new Error(`syntax alias ${alias} resolves to unavailable Shiki language ${target}`);
   }
 }
@@ -154,7 +191,7 @@ for (const [alias, target] of [
 function syntaxFor(languageId, file) {
   const extension = path.extname(file).slice(1).toLowerCase();
   const candidates = [syntaxAliases[languageId], languageId, extensionAliases[extension], extension];
-  return candidates.find((candidate) => candidate && candidate in bundledLanguages) ?? "text";
+  return candidates.find(hasSyntax) ?? "text";
 }
 
 async function firstExample(languageId) {
@@ -170,20 +207,20 @@ async function firstExample(languageId) {
   const file = path.resolve(languageDirectory, relativeSource);
   const code = fs.readFileSync(file, "utf8");
   const language = syntaxFor(languageId, file);
+  if (language === "text") {
+    throw new Error(`${languageId}: canonical example has no syntax grammar`);
+  }
   return {
     path: relativeSource,
     code,
     language,
-    highlightedHtml: await codeToHtml(code, {
-      lang: language,
-      theme: "github-dark-default",
-    }),
+    highlightedHtml: await highlightCode(code, language),
   };
 }
 
 function fenceSyntax(lang) {
   const candidates = [lang, extensionAliases[lang], syntaxAliases[lang]];
-  return candidates.find((candidate) => candidate && candidate in bundledLanguages) ?? "text";
+  return candidates.find(hasSyntax) ?? "text";
 }
 
 // Renders repository-owned markdown (language READMEs, INFEASIBLE.md) to HTML
@@ -206,10 +243,10 @@ async function renderMarkdown(markdown, { baseDirectory, ref }) {
   marked.use({
     walkTokens: async (token) => {
       if (token.type === "code") {
-        token.highlightedHtml = await codeToHtml(token.text, {
-          lang: fenceSyntax(token.lang?.split(/\s+/)[0]?.toLowerCase()),
-          theme: "github-dark-default",
-        });
+        token.highlightedHtml = await highlightCode(
+          token.text,
+          fenceSyntax(token.lang?.split(/\s+/)[0]?.toLowerCase()),
+        );
       }
       if (token.type === "link") token.href = rewrite(token.href);
       if (token.type === "image") token.href = rewrite(token.href, { raw: true });
