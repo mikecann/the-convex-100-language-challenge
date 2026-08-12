@@ -827,6 +827,11 @@ body.panel-open .language-panel {
 .graveyard-page .rendered-markdown > h2 + p { max-width: 72ch; color: var(--muted); }
 .graveyard-page .rendered-markdown table { width: 100%; }
 .graveyard-page .rendered-markdown td:first-child { min-width: 12rem; }
+.graveyard-page .rendered-markdown :is(th, td):nth-child(2) {
+  min-width: 8.5rem;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
 .graveyard-language a {
   display: grid;
   width: 2.5rem;
