@@ -1,0 +1,129 @@
+schemaVersion: 1
+snapshotDate: "2026-08-12"
+method: reciprocal-rank-fusion
+rrfConstant: 20
+missingGitHubRosterRank: 101
+sources:
+  pldb:
+    version: 12.0.0
+    publishedAt: "2024-12-03T04:32:24.518Z"
+    gitCommit: 7af506d747175b46d0b1ed9601537d66314eb34f
+    url: https://github.com/breck7/pldb
+  githubInnovationGraph:
+    period: 2026-Q1
+    releasedAt: "2026-07-07T15:25:55Z"
+    gitCommit: 054c7dbc527518fa2ecfd316efe2aa01f3986c39
+    url: https://github.com/github/innovationgraph/blob/054c7dbc527518fa2ecfd316efe2aa01f3986c39/data/languages.csv
+sourceAliases:
+  pldb:
+    algol60: algol-60
+    assembly-x86-64: x86-assembly
+    delphi-object-pascal: object-pascal
+    fsharp: f-sharp
+    pli: pl-i
+    visual-basic-dotnet: visual-basic.net
+  githubInnovationGraph:
+    assembly-x86-64: Assembly
+    delphi-object-pascal: Pascal
+    visual-basic-dotnet: Visual Basic .NET
+languages:
+  - { popularityRank: 1, id: javascript, pldbGlobalRank: 1, pldbRosterRank: 1, githubPushers: 5662372, githubRosterRank: 1, score: 0.095238095 }
+  - { popularityRank: 2, id: python, pldbGlobalRank: 3, pldbRosterRank: 3, githubPushers: 4109495, githubRosterRank: 2, score: 0.088932806 }
+  - { popularityRank: 3, id: c, pldbGlobalRank: 2, pldbRosterRank: 2, githubPushers: 907620, githubRosterRank: 7, score: 0.082491582 }
+  - { popularityRank: 4, id: java, pldbGlobalRank: 4, pldbRosterRank: 4, githubPushers: 1074838, githubRosterRank: 5, score: 0.081666667 }
+  - { popularityRank: 5, id: cpp, pldbGlobalRank: 5, pldbRosterRank: 5, githubPushers: 944644, githubRosterRank: 6, score: 0.078461538 }
+  - { popularityRank: 6, id: typescript, pldbGlobalRank: 14, pldbRosterRank: 10, githubPushers: 2787317, githubRosterRank: 3, score: 0.076811594 }
+  - { popularityRank: 7, id: bash, pldbGlobalRank: 19, pldbRosterRank: 14, githubPushers: 2319832, githubRosterRank: 4, score: 0.071078431 }
+  - { popularityRank: 8, id: php, pldbGlobalRank: 10, pldbRosterRank: 8, githubPushers: 559093, githubRosterRank: 9, score: 0.070197044 }
+  - { popularityRank: 9, id: ruby, pldbGlobalRank: 9, pldbRosterRank: 7, githubPushers: 421014, githubRosterRank: 12, score: 0.068287037 }
+  - { popularityRank: 10, id: csharp, pldbGlobalRank: 16, pldbRosterRank: 11, githubPushers: 564606, githubRosterRank: 8, score: 0.067972350 }
+  - { popularityRank: 11, id: go, pldbGlobalRank: 11, pldbRosterRank: 9, githubPushers: 393708, githubRosterRank: 13, score: 0.064785789 }
+  - { popularityRank: 12, id: powershell, pldbGlobalRank: 18, pldbRosterRank: 13, githubPushers: 515689, githubRosterRank: 10, score: 0.063636364 }
+  - { popularityRank: 13, id: perl, pldbGlobalRank: 8, pldbRosterRank: 6, githubPushers: 138488, githubRosterRank: 20, score: 0.063461538 }
+  - { popularityRank: 14, id: kotlin, pldbGlobalRank: 25, pldbRosterRank: 19, githubPushers: 433614, githubRosterRank: 11, score: 0.057899090 }
+  - { popularityRank: 15, id: swift, pldbGlobalRank: 21, pldbRosterRank: 16, githubPushers: 377812, githubRosterRank: 14, score: 0.057189542 }
+  - { popularityRank: 16, id: rust, pldbGlobalRank: 20, pldbRosterRank: 15, githubPushers: 317919, githubRosterRank: 15, score: 0.057142857 }
+  - { popularityRank: 17, id: r, pldbGlobalRank: 17, pldbRosterRank: 12, githubPushers: 123499, githubRosterRank: 21, score: 0.055640244 }
+  - { popularityRank: 18, id: lua, pldbGlobalRank: 24, pldbRosterRank: 18, githubPushers: 249825, githubRosterRank: 17, score: 0.053342817 }
+  - { popularityRank: 19, id: objective-c, pldbGlobalRank: 32, pldbRosterRank: 25, githubPushers: 276290, githubRosterRank: 16, score: 0.050000000 }
+  - { popularityRank: 20, id: dart, pldbGlobalRank: 37, pldbRosterRank: 28, githubPushers: 209669, githubRosterRank: 18, score: 0.047149123 }
+  - { popularityRank: 21, id: scala, pldbGlobalRank: 22, pldbRosterRank: 17, githubPushers: 28457, githubRosterRank: 30, score: 0.047027027 }
+  - { popularityRank: 22, id: haskell, pldbGlobalRank: 26, pldbRosterRank: 20, githubPushers: 23803, githubRosterRank: 32, score: 0.044230769 }
+  - { popularityRank: 23, id: clojure, pldbGlobalRank: 27, pldbRosterRank: 21, githubPushers: 16547, githubRosterRank: 35, score: 0.042572062 }
+  - { popularityRank: 24, id: fortran, pldbGlobalRank: 50, pldbRosterRank: 34, githubPushers: 54374, githubRosterRank: 22, score: 0.042328042 }
+  - { popularityRank: 25, id: elixir, pldbGlobalRank: 29, pldbRosterRank: 23, githubPushers: 20646, githubRosterRank: 33, score: 0.042123738 }
+  - { popularityRank: 26, id: julia, pldbGlobalRank: 35, pldbRosterRank: 27, githubPushers: 29225, githubRosterRank: 28, score: 0.042109929 }
+  - { popularityRank: 27, id: coffeescript, pldbGlobalRank: 28, pldbRosterRank: 22, githubPushers: 9823, githubRosterRank: 43, score: 0.039682540 }
+  - { popularityRank: 28, id: awk, pldbGlobalRank: 62, pldbRosterRank: 40, githubPushers: 46518, githubRosterRank: 24, score: 0.039393939 }
+  - { popularityRank: 29, id: prolog, pldbGlobalRank: 33, pldbRosterRank: 26, githubPushers: 13830, githubRosterRank: 37, score: 0.039282990 }
+  - { popularityRank: 30, id: erlang, pldbGlobalRank: 30, pldbRosterRank: 24, githubPushers: 9852, githubRosterRank: 42, score: 0.038856305 }
+  - { popularityRank: 31, id: groovy, pldbGlobalRank: 64, pldbRosterRank: 41, githubPushers: 42608, githubRosterRank: 25, score: 0.038615665 }
+  - { popularityRank: 32, id: zig, pldbGlobalRank: 45, pldbRosterRank: 31, githubPushers: 11348, githubRosterRank: 40, score: 0.036274510 }
+  - { popularityRank: 33, id: assembly-x86-64, pldbGlobalRank: 306, pldbRosterRank: 76, githubPushers: 162573, githubRosterRank: 19, score: 0.036057692 }
+  - { popularityRank: 34, id: tcl, pldbGlobalRank: 81, pldbRosterRank: 48, githubPushers: 39525, githubRosterRank: 27, score: 0.035982478 }
+  - { popularityRank: 35, id: scheme, pldbGlobalRank: 60, pldbRosterRank: 38, githubPushers: 18408, githubRosterRank: 34, score: 0.035759898 }
+  - { popularityRank: 36, id: cobol, pldbGlobalRank: 38, pldbRosterRank: 29, githubPushers: 4232, githubRosterRank: 52, score: 0.034297052 }
+  - { popularityRank: 37, id: racket, pldbGlobalRank: 42, pldbRosterRank: 30, githubPushers: 4844, githubRosterRank: 50, score: 0.034285714 }
+  - { popularityRank: 38, id: d, pldbGlobalRank: 56, pldbRosterRank: 36, githubPushers: 9879, githubRosterRank: 41, score: 0.034250585 }
+  - { popularityRank: 39, id: emacs-lisp, pldbGlobalRank: 270, pldbRosterRank: 72, githubPushers: 49148, githubRosterRank: 23, score: 0.034125379 }
+  - { popularityRank: 40, id: nim, pldbGlobalRank: 46, pldbRosterRank: 32, githubPushers: 6713, githubRosterRank: 48, score: 0.033936652 }
+  - { popularityRank: 41, id: ocaml, pldbGlobalRank: 69, pldbRosterRank: 43, githubPushers: 12869, githubRosterRank: 39, score: 0.032822168 }
+  - { popularityRank: 42, id: verilog, pldbGlobalRank: 143, pldbRosterRank: 61, githubPushers: 28539, githubRosterRank: 29, score: 0.032753842 }
+  - { popularityRank: 43, id: ada, pldbGlobalRank: 49, pldbRosterRank: 33, githubPushers: 3949, githubRosterRank: 53, score: 0.032566555 }
+  - { popularityRank: 44, id: vhdl, pldbGlobalRank: 80, pldbRosterRank: 47, githubPushers: 13298, githubRosterRank: 38, score: 0.032166752 }
+  - { popularityRank: 45, id: fsharp, pldbGlobalRank: 67, pldbRosterRank: 42, githubPushers: 7936, githubRosterRank: 47, score: 0.031054405 }
+  - { popularityRank: 46, id: smalltalk, pldbGlobalRank: 74, pldbRosterRank: 45, githubPushers: 8825, githubRosterRank: 44, score: 0.031009615 }
+  - { popularityRank: 47, id: gdscript, pldbGlobalRank: 607, pldbRosterRank: 93, githubPushers: 40237, githubRosterRank: 26, score: 0.030588688 }
+  - { popularityRank: 48, id: crystal, pldbGlobalRank: 53, pldbRosterRank: 35, githubPushers: 780, githubRosterRank: 61, score: 0.030527497 }
+  - { popularityRank: 49, id: haxe, pldbGlobalRank: 59, pldbRosterRank: 37, githubPushers: 1928, githubRosterRank: 58, score: 0.030364372 }
+  - { popularityRank: 50, id: common-lisp, pldbGlobalRank: 169, pldbRosterRank: 66, githubPushers: 14666, githubRosterRank: 36, score: 0.029485050 }
+  - { popularityRank: 51, id: visual-basic-dotnet, pldbGlobalRank: 88, pldbRosterRank: 51, githubPushers: 8133, githubRosterRank: 46, score: 0.029236022 }
+  - { popularityRank: 52, id: forth, pldbGlobalRank: 85, pldbRosterRank: 50, githubPushers: 6371, githubRosterRank: 49, score: 0.028778468 }
+  - { popularityRank: 53, id: delphi-object-pascal, pldbGlobalRank: 521, pldbRosterRank: 90, githubPushers: 24479, githubRosterRank: 31, score: 0.028698752 }
+  - { popularityRank: 54, id: purescript, pldbGlobalRank: 75, pldbRosterRank: 46, githubPushers: 3590, githubRosterRank: 54, score: 0.028665029 }
+  - { popularityRank: 55, id: standard-ml, pldbGlobalRank: 132, pldbRosterRank: 60, githubPushers: 8384, githubRosterRank: 45, score: 0.027884615 }
+  - { popularityRank: 56, id: gleam, pldbGlobalRank: 70, pldbRosterRank: 44, githubPushers: 618, githubRosterRank: 64, score: 0.027529762 }
+  - { popularityRank: 57, id: lean, pldbGlobalRank: 120, pldbRosterRank: 57, githubPushers: 4432, githubRosterRank: 51, score: 0.027071520 }
+  - { popularityRank: 58, id: rescript, pldbGlobalRank: 94, pldbRosterRank: 52, githubPushers: 2654, githubRosterRank: 56, score: 0.027046784 }
+  - { popularityRank: 59, id: odin, pldbGlobalRank: 99, pldbRosterRank: 54, githubPushers: 682, githubRosterRank: 63, score: 0.025561706 }
+  - { popularityRank: 60, id: chapel, pldbGlobalRank: 61, pldbRosterRank: 39, githubPushers: 0, githubRosterRank: null, score: 0.025213615 }
+  - { popularityRank: 61, id: idris, pldbGlobalRank: 84, pldbRosterRank: 49, githubPushers: 126, githubRosterRank: 76, score: 0.024909420 }
+  - { popularityRank: 62, id: v, pldbGlobalRank: 126, pldbRosterRank: 58, githubPushers: 325, githubRosterRank: 65, score: 0.024585219 }
+  - { popularityRank: 63, id: agda, pldbGlobalRank: 250, pldbRosterRank: 70, githubPushers: 2712, githubRosterRank: 55, score: 0.024444444 }
+  - { popularityRank: 64, id: j, pldbGlobalRank: 108, pldbRosterRank: 55, githubPushers: 189, githubRosterRank: 71, score: 0.024322344 }
+  - { popularityRank: 65, id: vala, pldbGlobalRank: 198, pldbRosterRank: 68, githubPushers: 776, githubRosterRank: 62, score: 0.023558758 }
+  - { popularityRank: 66, id: ballerina, pldbGlobalRank: 146, pldbRosterRank: 63, githubPushers: 306, githubRosterRank: 67, score: 0.023542446 }
+  - { popularityRank: 67, id: fennel, pldbGlobalRank: 131, pldbRosterRank: 59, githubPushers: 181, githubRosterRank: 72, score: 0.023527793 }
+  - { popularityRank: 68, id: eiffel, pldbGlobalRank: 177, pldbRosterRank: 67, githubPushers: 250, githubRosterRank: 68, score: 0.022857889 }
+  - { popularityRank: 69, id: mercury, pldbGlobalRank: 383, pldbRosterRank: 83, githubPushers: 2540, githubRosterRank: 57, score: 0.022695751 }
+  - { popularityRank: 70, id: janet, pldbGlobalRank: 209, pldbRosterRank: 69, githubPushers: 191, githubRosterRank: 70, score: 0.022347066 }
+  - { popularityRank: 71, id: rebol, pldbGlobalRank: 424, pldbRosterRank: 86, githubPushers: 1130, githubRosterRank: 59, score: 0.022092190 }
+  - { popularityRank: 72, id: apl, pldbGlobalRank: 97, pldbRosterRank: 53, githubPushers: 0, githubRosterRank: null, score: 0.021963093 }
+  - { popularityRank: 73, id: rexx, pldbGlobalRank: 304, pldbRosterRank: 75, githubPushers: 237, githubRosterRank: 69, score: 0.021762271 }
+  - { popularityRank: 74, id: io, pldbGlobalRank: 493, pldbRosterRank: 88, githubPushers: 948, githubRosterRank: 60, score: 0.021759259 }
+  - { popularityRank: 75, id: clean, pldbGlobalRank: 347, pldbRosterRank: 79, githubPushers: 325, githubRosterRank: 66, score: 0.021728917 }
+  - { popularityRank: 76, id: mojo, pldbGlobalRank: 116, pldbRosterRank: 56, githubPushers: 0, githubRosterRank: null, score: 0.021422358 }
+  - { popularityRank: 77, id: modula-2, pldbGlobalRank: 298, pldbRosterRank: 74, githubPushers: 168, githubRosterRank: 74, score: 0.021276596 }
+  - { popularityRank: 78, id: pony, pldbGlobalRank: 144, pldbRosterRank: 62, githubPushers: 0, githubRosterRank: null, score: 0.020459585 }
+  - { popularityRank: 79, id: factor, pldbGlobalRank: 150, pldbRosterRank: 64, githubPushers: 0, githubRosterRank: null, score: 0.020169225 }
+  - { popularityRank: 80, id: c3, pldbGlobalRank: 155, pldbRosterRank: 65, githubPushers: 0, githubRosterRank: null, score: 0.020029169 }
+  - { popularityRank: 81, id: pike, pldbGlobalRank: 505, pldbRosterRank: 89, githubPushers: 169, githubRosterRank: 73, score: 0.019927000 }
+  - { popularityRank: 82, id: harbour, pldbGlobalRank: 666, pldbRosterRank: 94, githubPushers: 130, githubRosterRank: 75, score: 0.019298246 }
+  - { popularityRank: 83, id: pli, pldbGlobalRank: 267, pldbRosterRank: 71, githubPushers: 0, githubRosterRank: null, score: 0.019253474 }
+  - { popularityRank: 84, id: moonbit, pldbGlobalRank: 271, pldbRosterRank: 73, githubPushers: 0, githubRosterRank: null, score: 0.019017151 }
+  - { popularityRank: 85, id: oberon, pldbGlobalRank: 315, pldbRosterRank: 77, githubPushers: 0, githubRosterRank: null, score: 0.018573741 }
+  - { popularityRank: 86, id: algol60, pldbGlobalRank: 318, pldbRosterRank: 78, githubPushers: 0, githubRosterRank: null, score: 0.018468544 }
+  - { popularityRank: 87, id: simula, pldbGlobalRank: 350, pldbRosterRank: 80, githubPushers: 0, githubRosterRank: null, score: 0.018264463 }
+  - { popularityRank: 88, id: lolcode, pldbGlobalRank: 364, pldbRosterRank: 81, githubPushers: 0, githubRosterRank: null, score: 0.018165453 }
+  - { popularityRank: 89, id: ring, pldbGlobalRank: 370, pldbRosterRank: 82, githubPushers: 0, githubRosterRank: null, score: 0.018068384 }
+  - { popularityRank: 90, id: bcpl, pldbGlobalRank: 397, pldbRosterRank: 84, githubPushers: 0, githubRosterRank: null, score: 0.017879847 }
+  - { popularityRank: 91, id: dylan, pldbGlobalRank: 412, pldbRosterRank: 85, githubPushers: 0, githubRosterRank: null, score: 0.017788272 }
+  - { popularityRank: 92, id: ats, pldbGlobalRank: 468, pldbRosterRank: 87, githubPushers: 0, githubRosterRank: null, score: 0.017610257 }
+  - { popularityRank: 93, id: blitzmax, pldbGlobalRank: 540, pldbRosterRank: 91, githubPushers: 0, githubRosterRank: null, score: 0.017273472 }
+  - { popularityRank: 94, id: icon, pldbGlobalRank: 542, pldbRosterRank: 92, githubPushers: 0, githubRosterRank: null, score: 0.017193034 }
+  - { popularityRank: 95, id: seed7, pldbGlobalRank: 756, pldbRosterRank: 95, githubPushers: 0, githubRosterRank: null, score: 0.016960115 }
+  - { popularityRank: 96, id: freebasic, pldbGlobalRank: 790, pldbRosterRank: 96, githubPushers: 0, githubRosterRank: null, score: 0.016885152 }
+  - { popularityRank: 97, id: clu, pldbGlobalRank: 821, pldbRosterRank: 97, githubPushers: 0, githubRosterRank: null, score: 0.016811471 }
+  - { popularityRank: 98, id: hare, pldbGlobalRank: 1061, pldbRosterRank: 98, githubPushers: 0, githubRosterRank: null, score: 0.016739039 }
+  - { popularityRank: 99, id: snobol4, pldbGlobalRank: 1794, pldbRosterRank: 99, githubPushers: 0, githubRosterRank: null, score: 0.016667824 }
+  - { popularityRank: 100, id: xpl, pldbGlobalRank: 2215, pldbRosterRank: 100, githubPushers: 0, githubRosterRank: null, score: 0.016597796 }

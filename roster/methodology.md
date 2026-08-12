@@ -60,6 +60,26 @@ The frozen research ranking records three broad selection tiers:
 
 Exact adjacent positions are weak after roughly 30. After 56, coverage is more meaningful than rank.
 
+## Current site popularity order
+
+The implementation-slot number above is intentionally frozen, so it cannot be shown as a popularity claim after a failed language is replaced. The website instead reads a separate, reproducible ranking from [`popularity.yaml`](popularity.yaml) for the 100 languages that are actually active.
+
+That order fuses two signals with equal weight:
+
+- [PLDB 12.0.0](https://github.com/breck7/pldb), published 3 December 2024, supplies complete coverage. Its ranking combines estimated users, jobs, downstream language foundations, influence, and measurement coverage.
+- [GitHub Innovation Graph 2026 Q1](https://github.com/github/innovationgraph/blob/054c7dbc527518fa2ecfd316efe2aa01f3986c39/data/languages.csv), released 7 July 2026, supplies the current-activity signal. For each language, the project sums unique pushers across economies, then ranks the active roster by that total.
+
+Each source is first ranked only within the active 100, then combined with reciprocal-rank fusion:
+
+```text
+popularityScore(language) = 1 / (20 + pldbRosterRank)
+                          + 1 / (20 + githubRosterRank)
+```
+
+GitHub reports 76 of the active languages in the 2026 Q1 dataset. A language with no reported GitHub activity is tied below the observed set at rank 101 rather than treated as having literally zero users. The final 1 to 100 order sorts by the fused score, with PLDB's global rank as the deterministic tie-breaker.
+
+This is a useful relative ordering, not a claim of precise market share. GitHub covers public activity and suppresses small economy-level observations; PLDB gives the obscure tail coverage that contemporary surveys lack, but its reproducible published snapshot is older. Exact neighbouring positions near the bottom should be read as roughly comparable niche languages.
+
 ## Feasibility is a separate axis
 
 Popularity never changes because a language is difficult to containerize. Each roster entry contains a preliminary desk audit for Docker, outbound HTTPS, JSON, and WebSockets:

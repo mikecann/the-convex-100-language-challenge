@@ -18,6 +18,10 @@ const output = path.join(root, "_shared/site/dist");
 const source = path.join(root, "_shared/site/src");
 const repoWebUrl = "https://github.com/mikecann/100-convex-clients";
 const roster = parse(fs.readFileSync(path.join(root, "roster/languages.yaml"), "utf8"));
+const popularity = parse(fs.readFileSync(path.join(root, "roster/popularity.yaml"), "utf8"));
+const popularityById = new Map(
+  popularity.languages.map((entry) => [entry.id, entry]),
+);
 const languageYears = JSON.parse(
   fs.readFileSync(path.join(root, "_shared/site/language-years.json"), "utf8"),
 );
@@ -256,8 +260,13 @@ const languages = await Promise.all(roster.languages.map(async (entry) => {
   const sourceRef = result?.sourceCommit ?? "main";
   const example = await firstExample(entry.id);
   const readmeHtml = await renderLanguageReadme(entry.id, sourceRef);
+  const popularityEntry = popularityById.get(entry.id);
+  if (!popularityEntry) {
+    throw new Error(`${entry.id}: missing popularity ranking`);
+  }
   return {
     ...entry,
+    popularityRank: popularityEntry.popularityRank,
     firstAppeared: languageYears[entry.id] ?? null,
     wikipediaUrl: languageWikipedia[entry.id]
       ? `https://en.wikipedia.org/wiki/${languageWikipedia[entry.id]}`
