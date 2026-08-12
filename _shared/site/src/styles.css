@@ -833,13 +833,12 @@ body.panel-open .language-panel {
   height: 2.5rem;
   flex: 0 0 2.5rem;
   place-items: center;
-  border: 1px solid var(--border);
-  border-radius: 0.65rem;
-  background: rgb(255 255 255 / 92%);
-  transition: border-color 120ms ease, transform 120ms ease;
+  background: transparent;
+  opacity: 0.86;
+  transition: opacity 120ms ease, transform 120ms ease;
 }
 .graveyard-language a:hover {
-  border-color: var(--brand-yellow);
+  opacity: 1;
   transform: translateY(-1px);
 }
 .rendered-markdown .graveyard-language img {
