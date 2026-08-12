@@ -640,6 +640,47 @@ body.panel-open .language-panel {
 .rendered-markdown th { background: rgb(255 255 255 / 5%); }
 .rendered-markdown td { color: #cfc8e2; }
 .rendered-markdown td:first-child { white-space: nowrap; font-weight: 600; color: var(--text); }
+.graveyard-language {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+.graveyard-language a {
+  display: grid;
+  width: 2.5rem;
+  height: 2.5rem;
+  flex: 0 0 2.5rem;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 0.65rem;
+  background: rgb(255 255 255 / 92%);
+  transition: border-color 120ms ease, transform 120ms ease;
+}
+.graveyard-language a:hover {
+  border-color: var(--brand-yellow);
+  transform: translateY(-1px);
+}
+.rendered-markdown .graveyard-language img {
+  width: 1.9rem;
+  height: 1.9rem;
+  object-fit: contain;
+  border-radius: 0.25rem;
+}
+.graveyard-logo-sources {
+  margin-top: 2.5rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.8rem;
+  background: rgb(255 255 255 / 3%);
+}
+.graveyard-logo-sources summary { cursor: pointer; font-weight: 700; }
+.graveyard-logo-sources p { margin-bottom: 0.75rem; font-size: 0.9rem; }
+.graveyard-logo-sources ul {
+  columns: 3 10rem;
+  margin: 0;
+  padding-left: 1.2rem;
+}
+.graveyard-logo-sources li { break-inside: avoid; font-size: 0.88rem; }
 
 @media (max-width: 700px) {
   .top-nav { flex-wrap: wrap; gap: 0.6rem 1rem; }

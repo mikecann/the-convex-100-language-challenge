@@ -32,6 +32,9 @@ const languageYears = JSON.parse(
 const languageWikipedia = JSON.parse(
   fs.readFileSync(path.join(root, "_shared/site/language-wikipedia.json"), "utf8"),
 );
+const graveyardLogos = JSON.parse(
+  fs.readFileSync(path.join(root, "_shared/site/graveyard-logos.json"), "utf8"),
+);
 const customHighlighter = await createHighlighter({
   themes: ["github-dark-default"],
   langs: Object.values(customLanguageGrammars),
@@ -277,7 +280,42 @@ async function renderGraveyard() {
   const markdown = fs
     .readFileSync(path.join(root, "INFEASIBLE.md"), "utf8")
     .replace(/^# .+\n/m, "");
-  return renderMarkdown(markdown, { baseDirectory: ".", ref: "main" });
+  const graveyardEntries = [
+    ...markdown.split("## Chosen replacements", 1)[0].matchAll(/^\| ([a-z0-9-]+) \|/gm),
+  ]
+    .map((match) => match[1])
+    .filter((id) => id !== "---");
+  const expectedIds = new Set(graveyardEntries);
+  const logoById = new Map(graveyardLogos.map((logo) => [logo.id, logo]));
+
+  if (logoById.size !== graveyardLogos.length) {
+    throw new Error("_shared/site/graveyard-logos.json contains duplicate language IDs");
+  }
+  for (const id of expectedIds) {
+    if (!logoById.has(id)) throw new Error(`${id}: missing graveyard logo`);
+  }
+  for (const logo of graveyardLogos) {
+    if (!expectedIds.has(logo.id)) {
+      throw new Error(`${logo.id}: graveyard logo does not match an infeasible or at-risk entry`);
+    }
+    const assetPath = path.join(source, "graveyard-logos", logo.asset);
+    if (!fs.existsSync(assetPath)) throw new Error(`${logo.id}: missing logo asset ${logo.asset}`);
+  }
+
+  let html = await renderMarkdown(markdown, { baseDirectory: ".", ref: "main" });
+  for (const logo of graveyardLogos) {
+    const cell = `<td>${logo.id}</td>`;
+    const brandedCell = `<td><span class="graveyard-language"><a href="${logo.sourceUrl}" aria-label="${logo.name} logo source"><img src="/graveyard-logos/${logo.asset}" alt="" width="38" height="38" loading="lazy"></a><span>${logo.name}</span></span></td>`;
+    // Later replacement tables mention many of these IDs again. Brand the
+    // actual graveyard row only so the record stays readable rather than
+    // repeating the same mark throughout the history below it.
+    html = html.replace(cell, brandedCell);
+  }
+
+  const sourceLinks = graveyardLogos
+    .map((logo) => `<li><a href="${logo.sourceUrl}">${logo.name}</a></li>`)
+    .join("");
+  return `${html}<details class="graveyard-logo-sources"><summary>Logo sources</summary><p>Each mark links to the language's official project or vendor page and is used here only for identification.</p><ul>${sourceLinks}</ul></details>`;
 }
 
 const languages = await Promise.all(roster.languages.map(async (entry) => {
@@ -333,6 +371,16 @@ for (const entry of roster.languages) {
 fs.mkdirSync(output, { recursive: true });
 for (const filename of ["index.html", "app.js", "styles.css", "hero-mark.png", "mark-icon.png"]) {
   fs.copyFileSync(path.join(source, filename), path.join(output, filename));
+}
+
+const graveyardLogoOutput = path.join(output, "graveyard-logos");
+fs.rmSync(graveyardLogoOutput, { recursive: true, force: true });
+fs.mkdirSync(graveyardLogoOutput, { recursive: true });
+for (const logo of graveyardLogos) {
+  fs.copyFileSync(
+    path.join(source, "graveyard-logos", logo.asset),
+    path.join(graveyardLogoOutput, logo.asset),
+  );
 }
 
 // Content pages are static shells in src; build-time tokens let a page carry
