@@ -111,14 +111,8 @@ function sortedLanguages() {
   const byPopularity = (language) => language.popularityRank ?? language.rank;
   if (sortOrder.value === "popularity") {
     languages.sort((a, b) => byPopularity(a) - byPopularity(b));
-  } else if (sortOrder.value === "oldest") {
+  } else if (sortOrder.value === "age") {
     languages.sort((a, b) => byYear(a) - byYear(b) || byPopularity(a) - byPopularity(b));
-  } else if (sortOrder.value === "newest") {
-    languages.sort(
-      (a, b) =>
-        (b.firstAppeared ?? 0) - (a.firstAppeared ?? 0) ||
-        byPopularity(a) - byPopularity(b),
-    );
   }
   return languages;
 }
