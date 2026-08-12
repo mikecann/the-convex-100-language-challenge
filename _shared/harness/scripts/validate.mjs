@@ -9,6 +9,7 @@ import { targetRuntimeError } from "./target-runtime-policy.mjs";
 
 const root = process.env.REPO_ROOT ?? "/repo";
 const roster = parse(fs.readFileSync(path.join(root, "roster/languages.yaml"), "utf8"));
+const popularity = parse(fs.readFileSync(path.join(root, "roster/popularity.yaml"), "utf8"));
 const manifestSchema = JSON.parse(
   fs.readFileSync(path.join(root, "_shared/schemas/manifest.schema.json"), "utf8"),
 );
@@ -46,6 +47,38 @@ if (roster.schemaVersion !== 1 || roster.languages.length !== 100) {
   errors.push("roster must contain exactly 100 schema-v1 languages");
 }
 
+if (popularity.schemaVersion !== 1 || popularity.languages?.length !== 100) {
+  errors.push("popularity ranking must contain exactly 100 schema-v1 languages");
+}
+
+const popularityIds = new Set();
+const popularityRanks = new Set();
+for (const language of popularity.languages ?? []) {
+  if (popularityIds.has(language.id)) errors.push(`duplicate popularity id: ${language.id}`);
+  if (popularityRanks.has(language.popularityRank)) {
+    errors.push(`duplicate popularity rank: ${language.popularityRank}`);
+  }
+  popularityIds.add(language.id);
+  popularityRanks.add(language.popularityRank);
+
+  const githubRank = language.githubRosterRank ?? popularity.missingGitHubRosterRank;
+  const expectedScore =
+    1 / (popularity.rrfConstant + language.pldbRosterRank) +
+    1 / (popularity.rrfConstant + githubRank);
+  if (Math.abs(expectedScore - language.score) > 1e-9) {
+    errors.push(`${language.id}: popularity score does not match source ranks`);
+  }
+}
+
+const expectedPopularityOrder = [...(popularity.languages ?? [])].sort(
+  (a, b) => b.score - a.score || a.pldbGlobalRank - b.pldbGlobalRank,
+);
+expectedPopularityOrder.forEach((language, index) => {
+  if (language.popularityRank !== index + 1) {
+    errors.push(`${language.id}: popularity rank does not match score order`);
+  }
+});
+
 const ids = new Set();
 const ranks = new Set();
 
@@ -54,6 +87,9 @@ for (const language of roster.languages) {
   if (ranks.has(language.rank)) errors.push(`duplicate rank: ${language.rank}`);
   ids.add(language.id);
   ranks.add(language.rank);
+  if (!popularityIds.has(language.id)) {
+    errors.push(`${language.id}: missing from popularity ranking`);
+  }
 
   const directory = path.join(root, language.id);
   const manifestPath = path.join(directory, "manifest.yaml");
@@ -163,6 +199,10 @@ for (const language of roster.languages) {
     const runtimeError = targetRuntimeError(language.id, manifest);
     if (runtimeError) errors.push(runtimeError);
   }
+}
+
+for (const id of popularityIds) {
+  if (!ids.has(id)) errors.push(`${id}: popularity ranking language is not in active roster`);
 }
 
 if (errors.length > 0) {

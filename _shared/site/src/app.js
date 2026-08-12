@@ -108,13 +108,16 @@ function showCapability(name) {
 function sortedLanguages() {
   const languages = [...data.languages];
   const byYear = (language) => language.firstAppeared ?? Number.MAX_SAFE_INTEGER;
+  const byPopularity = (language) => language.popularityRank ?? language.rank;
   if (sortOrder.value === "popularity") {
-    languages.sort((a, b) => a.rank - b.rank);
+    languages.sort((a, b) => byPopularity(a) - byPopularity(b));
   } else if (sortOrder.value === "oldest") {
-    languages.sort((a, b) => byYear(a) - byYear(b) || a.rank - b.rank);
+    languages.sort((a, b) => byYear(a) - byYear(b) || byPopularity(a) - byPopularity(b));
   } else if (sortOrder.value === "newest") {
     languages.sort(
-      (a, b) => (b.firstAppeared ?? 0) - (a.firstAppeared ?? 0) || a.rank - b.rank,
+      (a, b) =>
+        (b.firstAppeared ?? 0) - (a.firstAppeared ?? 0) ||
+        byPopularity(a) - byPopularity(b),
     );
   }
   return languages;
@@ -133,8 +136,8 @@ function render() {
     card.dataset.status = languageStatus;
     card.querySelector(".logo").append(logoElement(language));
     card.querySelector(".rank").textContent = language.firstAppeared
-      ? `#${language.rank} · ${language.firstAppeared}`
-      : `#${language.rank}`;
+      ? `#${language.popularityRank} · ${language.firstAppeared}`
+      : `#${language.popularityRank}`;
     card.querySelector(".name").textContent = language.displayName;
     // Text status is reserved for the noteworthy states; working is the norm
     // and the badges carry the proof.
@@ -328,7 +331,7 @@ function showLanguage(language) {
   titleRow.append(titleLogo, title);
 
   const intro = document.createElement("p");
-  const introParts = [`Popularity #${language.rank}`];
+  const introParts = [`Popularity #${language.popularityRank}`];
   if (language.firstAppeared) introParts.push(`first appeared ${language.firstAppeared}`);
   intro.textContent = `${introParts.join(" · ")}.`;
   panelContent.append(titleRow, intro);
