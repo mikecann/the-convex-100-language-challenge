@@ -57,13 +57,11 @@ body.home:not(.nav-solid) .top-nav {
   background: transparent;
   backdrop-filter: none;
 }
-/* On the home page the whole brand (icon + wordmark) and the verified pill
-   wait for the hero title to scroll out of view before fading in together
-   with the bar itself. Subpages have no hero, so their nav is solid from
-   the start and this never applies. */
-.top-nav .brand, .top-nav .verified-pill { transition: opacity 300ms ease; }
-body.home:not(.nav-solid) .top-nav .brand,
-body.home:not(.nav-solid) .top-nav .verified-pill {
+/* On the home page the brand waits for the hero title to scroll out of view
+   before fading in with the bar itself. Subpages have no hero, so their nav is
+   solid from the start and this never applies. */
+.top-nav .brand { transition: opacity 300ms ease; }
+body.home:not(.nav-solid) .top-nav .brand {
   opacity: 0;
   pointer-events: none;
 }
@@ -78,18 +76,6 @@ body.home:not(.nav-solid) .top-nav .verified-pill {
   white-space: nowrap;
 }
 .brand-icon { display: block; width: 26px; height: 26px; object-fit: contain; }
-.verified-pill {
-  padding: 0.28rem 0.7rem;
-  border: 1px solid rgb(74 222 128 / 35%);
-  border-radius: 999px;
-  background: rgb(74 222 128 / 8%);
-  color: var(--live);
-  font-size: 0.78rem;
-  font-weight: 700;
-  white-space: nowrap;
-  cursor: default;
-}
-.verified-pill[data-complete="false"] { border-color: var(--border-strong); background: rgb(255 255 255 / 5%); color: var(--muted); }
 .nav-links { display: flex; flex-wrap: wrap; gap: 0.4rem 1.4rem; margin-left: auto; }
 .nav-links a { color: var(--muted); font-size: 0.92rem; font-weight: 600; text-decoration: none; }
 .nav-links a:hover { color: var(--brand-yellow); }
@@ -657,7 +643,6 @@ body.panel-open .language-panel {
 
 @media (max-width: 700px) {
   .top-nav { flex-wrap: wrap; gap: 0.6rem 1rem; }
-  .verified-pill { order: 3; }
   .nav-links { width: 100%; margin-left: 0; }
   .page-header { padding-top: 2rem; }
   .controls { position: static; }

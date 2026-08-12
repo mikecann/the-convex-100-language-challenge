@@ -39,23 +39,6 @@ const capabilityDefinitions = {
   },
 };
 
-const workingCount = data.languages.filter(
-  (language) => language.result?.earnedCapabilities?.length > 0,
-).length;
-const liveCount = data.languages.filter(
-  (language) => language.result?.earnedCapabilities?.includes("live"),
-).length;
-const verifiedPill = document.querySelector("#verified-pill");
-if (workingCount > 0) {
-  verifiedPill.hidden = false;
-  verifiedPill.dataset.complete = String(workingCount === data.languages.length);
-  verifiedPill.textContent =
-    `${workingCount}/${data.languages.length} verified` +
-    (liveCount === workingCount ? " · all Live" : liveCount > 0 ? ` · ${liveCount} Live` : "");
-  verifiedPill.title =
-    "Verified means the client passed the full conformance suite against both a local backend and a real hosted deployment.";
-}
-
 function capabilities(language) {
   return language.result?.earnedCapabilities ?? [];
 }
