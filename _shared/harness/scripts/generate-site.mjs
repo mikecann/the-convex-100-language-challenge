@@ -318,6 +318,185 @@ async function renderGraveyard() {
   return `${html}<details class="graveyard-logo-sources"><summary>Logo sources</summary><p>Each mark links to the language's official project or vendor page and is used here only for identification.</p><ul>${sourceLinks}</ul></details>`;
 }
 
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function plainMarkdown(value) {
+  return value
+    .replaceAll("**", "")
+    .replaceAll("`", "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .trim();
+}
+
+function markdownTableAfter(markdown, marker) {
+  const markerOffset = markdown.indexOf(marker);
+  if (markerOffset === -1) throw new Error(`STATS.md: missing ${marker}`);
+  const tableOffset = markdown.indexOf("\n|", markerOffset);
+  if (tableOffset === -1) throw new Error(`STATS.md: missing table after ${marker}`);
+  const lines = markdown.slice(tableOffset + 1).split("\n");
+  const tableLines = [];
+  for (const line of lines) {
+    if (!line.startsWith("|")) break;
+    tableLines.push(line);
+  }
+  const rows = tableLines.map((line) =>
+    line.slice(1, -1).split("|").map((cell) => cell.trim()),
+  );
+  if (rows.length < 3) throw new Error(`STATS.md: incomplete table after ${marker}`);
+  return rows.slice(2);
+}
+
+function numberFrom(value) {
+  const parsed = Number.parseFloat(plainMarkdown(value).replace(/[^0-9.]/g, ""));
+  if (!Number.isFinite(parsed)) throw new Error(`STATS.md: cannot parse number from ${value}`);
+  return parsed;
+}
+
+function statByPrefix(rows, prefix) {
+  const row = rows.find(([label]) => plainMarkdown(label).startsWith(prefix));
+  if (!row) throw new Error(`STATS.md: missing statistic ${prefix}`);
+  return plainMarkdown(row[1]);
+}
+
+function horizontalRows(rows, maximum, valueIndex = 1) {
+  return rows.map((row) => {
+    const label = plainMarkdown(row[0]);
+    const value = numberFrom(row[valueIndex]);
+    const width = (value / maximum) * 100;
+    return `<li><div class="chart-row-label"><span>${escapeHtml(label)}</span><strong>${escapeHtml(plainMarkdown(row[valueIndex]))}</strong></div><div class="chart-track"><span style="--bar-width:${width.toFixed(3)}%"></span></div></li>`;
+  }).join("");
+}
+
+async function renderNumbers() {
+  const statsMarkdown = fs.readFileSync(path.join(root, "STATS.md"), "utf8");
+  const headline = markdownTableAfter(statsMarkdown, "## Headline numbers");
+  const rosterProgress = markdownTableAfter(statsMarkdown, "## The roster");
+  const replacementReasons = markdownTableAfter(statsMarkdown, "## Why 25 slots were replaced");
+  const providers = markdownTableAfter(statsMarkdown, "### By provider").filter(
+    ([provider]) => !plainMarkdown(provider).startsWith("All providers"),
+  );
+  const naiveCosts = markdownTableAfter(statsMarkdown, "### 1. If every token were billed as fresh input");
+  const cacheCosts = markdownTableAfter(statsMarkdown, "### 2. Cache-aware, at the same list prices");
+  const actualCosts = markdownTableAfter(statsMarkdown, "### 3. What was actually paid");
+  const integrity = markdownTableAfter(statsMarkdown, "## The integrity finding");
+  const defectClasses = markdownTableAfter(statsMarkdown, "## Recurring defect classes");
+  const recorded = statsMarkdown.match(/last recomputed on ([0-9-]+) at commit\n`([^`]+)`/);
+  if (!recorded) throw new Error("STATS.md: missing recomputation date and commit");
+
+  const verified = statByPrefix(headline, "Rostered languages verified");
+  const totalTokens = statByPrefix(headline, "Total tokens moved").replace(" billion", "B");
+  const cacheShare = statByPrefix(headline, "Share of those tokens");
+  const sourceLines = statByPrefix(headline, "Client and example source lines");
+  const replacements = statByPrefix(headline, "Slot replacements");
+  const paid = statByPrefix(headline, "Actually paid");
+  const latestVerified = numberFrom(rosterProgress.at(-1)[1]);
+  if (latestVerified !== numberFrom(verified)) {
+    throw new Error("STATS.md: latest roster count does not match the headline verified count");
+  }
+  const replacementTotal = replacementReasons.reduce(
+    (sum, row) => sum + numberFrom(row[1]),
+    0,
+  );
+  if (replacementTotal !== numberFrom(replacements)) {
+    throw new Error("STATS.md: replacement causes do not add up to the headline total");
+  }
+  const providerTokens = providers.map((row) => numberFrom(row[1]));
+  const providerTotal = providerTokens.reduce((sum, value) => sum + value, 0);
+  const providerNames = ["Claude", "Codex", "Grok"];
+  const providerSegments = providers.map((row, index) => {
+    const percentage = (providerTokens[index] / providerTotal) * 100;
+    return `<span class="token-segment token-segment-${index + 1}" style="--segment-width:${percentage.toFixed(3)}%" title="${providerNames[index]}: ${percentage.toFixed(1)}%"></span>`;
+  }).join("");
+  const providerLegend = providers.map((row, index) => {
+    const percentage = (providerTokens[index] / providerTotal) * 100;
+    return `<li><span class="chart-key token-segment-${index + 1}"></span><span>${providerNames[index]}</span><strong>${percentage.toFixed(1)}%</strong><small>${escapeHtml(plainMarkdown(row[1]))} tokens</small></li>`;
+  }).join("");
+
+  const progressBars = rosterProgress.map(([date, value, event]) => {
+    const verifiedCount = numberFrom(value);
+    return `<li><strong>${verifiedCount}</strong><div class="roster-bar"><span style="--bar-height:${verifiedCount}%"></span></div><span>${escapeHtml(plainMarkdown(date))}</span><small>${escapeHtml(plainMarkdown(event))}</small></li>`;
+  }).join("");
+
+  const replacementMaximum = Math.max(...replacementReasons.map((row) => numberFrom(row[1])));
+  const defectMaximum = Math.max(...defectClasses.map((row) => numberFrom(row[1])));
+  const naiveTotal = numberFrom(naiveCosts.at(-1)[1]);
+  const cacheTotal = numberFrom(cacheCosts.at(-1)[1]);
+  const actualTotal = numberFrom(actualCosts.at(-1)[1]);
+  if (actualTotal !== numberFrom(paid)) {
+    throw new Error("STATS.md: actual-cost table does not match the headline amount paid");
+  }
+  const costRows = [
+    ["Actually paid", actualTotal, paid],
+    ["Cache-aware list price", cacheTotal, "~$14,000"],
+    ["Without caching", naiveTotal, "~$110,400"],
+  ];
+  const costChart = costRows.map(([label, value, display]) => {
+    const width = (value / naiveTotal) * 100;
+    return `<li><div class="chart-row-label"><span>${label}</span><strong>${display}</strong></div><div class="chart-track cost-track"><span style="--bar-width:${width.toFixed(3)}%"></span></div></li>`;
+  }).join("");
+
+  const leakedImages = statByPrefix(integrity, "Images actually leaking");
+  const ledgerMarkdown = statsMarkdown.replace(/^# .+\n/m, "");
+  const ledgerHtml = await renderMarkdown(ledgerMarkdown, { baseDirectory: ".", ref: "main" });
+
+  return `
+    <p class="stats-freshness">Source recomputed ${escapeHtml(recorded[1])} at commit <code>${escapeHtml(recorded[2])}</code>.</p>
+    <section class="stats-headlines" aria-label="Headline project statistics">
+      <div class="stat-callout"><strong>${escapeHtml(verified)}</strong><span>languages with both HTTP and Live verified</span></div>
+      <div class="stat-callout"><strong>${escapeHtml(totalTokens)}</strong><span>deduplicated tokens moved across all providers</span></div>
+      <div class="stat-callout"><strong>${escapeHtml(cacheShare)}</strong><span>of all tokens were cache reads</span></div>
+      <div class="stat-callout"><strong>${escapeHtml(sourceLines)}</strong><span>lines of client, example and test source</span></div>
+      <div class="stat-callout"><strong>${escapeHtml(replacements)}</strong><span>roster slots replaced with the evidence preserved</span></div>
+      <div class="stat-callout"><strong>${escapeHtml(paid)}</strong><span>actually paid, versus roughly $14k at list API prices</span></div>
+    </section>
+
+    <div class="stats-chart-grid">
+      <section class="stats-panel stats-panel-wide" aria-labelledby="roster-progress-title">
+        <div class="stats-panel-heading"><h2 id="roster-progress-title">The final push</h2><p>Verified languages over five consecutive days in August 2026.</p></div>
+        <ol class="roster-chart" role="img" aria-label="Verified languages rose from 57 on August 7 to 83, then 100, dipped to 97 after revalidation, and returned to 100 on August 11.">${progressBars}</ol>
+      </section>
+
+      <section class="stats-panel" aria-labelledby="provider-title">
+        <div class="stats-panel-heading"><h2 id="provider-title">Tokens by provider</h2><p>Claude and Codex split almost the entire 32.13 billion-token workload.</p></div>
+        <div class="token-stack" role="img" aria-label="Claude 52.1 percent, Codex 47.7 percent, Grok 0.1 percent">${providerSegments}</div>
+        <ul class="token-legend">${providerLegend}</ul>
+      </section>
+
+      <section class="stats-panel" aria-labelledby="cost-title">
+        <div class="stats-panel-heading"><h2 id="cost-title">What caching changed</h2><p>The same workload viewed three different ways. Bars share a linear $110,400 scale.</p></div>
+        <ul class="horizontal-chart">${costChart}</ul>
+        <p class="chart-note">The $472 actually paid is just 0.4% of the uncached list-price estimate.</p>
+      </section>
+
+      <section class="stats-panel" aria-labelledby="replacement-title">
+        <div class="stats-panel-heading"><h2 id="replacement-title">Why slots were replaced</h2><p>Twenty-five replacements, grouped by the gate that failed.</p></div>
+        <ul class="horizontal-chart compact-chart">${horizontalRows(replacementReasons, replacementMaximum)}</ul>
+      </section>
+
+      <section class="stats-panel" aria-labelledby="defect-title">
+        <div class="stats-panel-heading"><h2 id="defect-title">Recurring defect classes</h2><p>The bugs that repeatedly consumed expensive verification cycles.</p></div>
+        <ul class="horizontal-chart compact-chart defect-chart">${horizontalRows(defectClasses, defectMaximum)}</ul>
+      </section>
+    </div>
+
+    <section class="integrity-callout" aria-labelledby="integrity-title">
+      <div><strong>${escapeHtml(leakedImages)}</strong><span>runtime images were leaking forbidden tooling</span></div>
+      <div><h2 id="integrity-title">The integrity finding</h2><p>Seventy-five merged images were audited. Eighteen were leaking because checks that looked strict could never fail. All eighteen were fixed, and the policy now inspects exported filesystems centrally.</p></div>
+    </section>
+
+    <details class="stats-ledger">
+      <summary>Read the complete measured ledger</summary>
+      <div class="rendered-markdown">${ledgerHtml}</div>
+    </details>
+  `;
+}
+
 const languages = await Promise.all(roster.languages.map(async (entry) => {
   const logoSource = path.join(root, entry.id, "logo.png");
   const manifest = parse(
@@ -386,13 +565,16 @@ for (const logo of graveyardLogos) {
 // Content pages are static shells in src; build-time tokens let a page carry
 // repository-owned markdown (the graveyard) without shipping it in data.json.
 const graveyardHtml = await renderGraveyard();
+const numbersHtml = await renderNumbers();
 for (const page of ["graveyard", "faq", "numbers"]) {
   const pageSource = fs.readFileSync(path.join(source, `${page}.html`), "utf8");
   const pageOutput = path.join(output, page);
   fs.mkdirSync(pageOutput, { recursive: true });
   fs.writeFileSync(
     path.join(pageOutput, "index.html"),
-    pageSource.replace("<!-- BUILD:GRAVEYARD -->", () => graveyardHtml),
+    pageSource
+      .replace("<!-- BUILD:GRAVEYARD -->", () => graveyardHtml)
+      .replace("<!-- BUILD:NUMBERS -->", () => numbersHtml),
   );
 }
 
