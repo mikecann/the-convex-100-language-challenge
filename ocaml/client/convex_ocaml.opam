@@ -4,8 +4,8 @@ description: "Build metadata used only inside the demonstration Docker image."
 version: "0.1.0"
 maintainer: "educational@example.invalid"
 authors: [ "100 Convex Clients contributors" ]
-homepage: "https://github.com/mikecann/100-convex-clients"
-bug-reports: "https://github.com/mikecann/100-convex-clients/issues"
+homepage: "https://github.com/mikecann/the-convex-100-language-challenge"
+bug-reports: "https://github.com/mikecann/the-convex-100-language-challenge/issues"
 depends: [
   "ocaml" { = "5.2.1" }
   "dune" { = "3.17.2" }

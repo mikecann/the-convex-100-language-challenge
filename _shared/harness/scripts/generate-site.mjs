@@ -20,7 +20,7 @@ import {
 const root = process.env.REPO_ROOT ?? "/repo";
 const output = path.join(root, "_shared/site/dist");
 const source = path.join(root, "_shared/site/src");
-const repoWebUrl = "https://github.com/mikecann/100-convex-clients";
+const repoWebUrl = "https://github.com/mikecann/the-convex-100-language-challenge";
 const roster = parse(fs.readFileSync(path.join(root, "roster/languages.yaml"), "utf8"));
 const popularity = parse(fs.readFileSync(path.join(root, "roster/popularity.yaml"), "utf8"));
 const popularityById = new Map(

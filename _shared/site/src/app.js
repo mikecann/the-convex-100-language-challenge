@@ -263,8 +263,8 @@ function tryItBlock(language) {
   explanation.textContent =
     "Docker is the only prerequisite. This builds the pinned toolchain and runs the canonical example against a real backend:";
   const commands = [
-    "git clone https://github.com/mikecann/100-convex-clients",
-    "cd 100-convex-clients",
+    "git clone https://github.com/mikecann/the-convex-100-language-challenge",
+    "cd the-convex-100-language-challenge",
     `./run verify-example ${language.id}`,
   ].join("\n");
   const pre = document.createElement("pre");

@@ -11,7 +11,7 @@ import (
 	"os"
 	"time"
 
-	convex "github.com/mikecann/100-convex-clients/go/client"
+	convex "github.com/mikecann/the-convex-100-language-challenge/go/client"
 )
 
 // roomState is the part of the Convex query result used by this example.

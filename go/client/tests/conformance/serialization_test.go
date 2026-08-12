@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	convex "github.com/mikecann/100-convex-clients/go/client"
+	convex "github.com/mikecann/the-convex-100-language-challenge/go/client"
 )
 
 func TestAdapterSerializationUsesExactNDJSONShapes(t *testing.T) {

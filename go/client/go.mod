@@ -1,4 +1,4 @@
-module github.com/mikecann/100-convex-clients/go/client
+module github.com/mikecann/the-convex-100-language-challenge/go/client
 
 go 1.25.0
 

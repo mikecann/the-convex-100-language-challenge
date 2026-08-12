@@ -15,7 +15,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
-	convex "github.com/mikecann/100-convex-clients/go/client"
+	convex "github.com/mikecann/the-convex-100-language-challenge/go/client"
 )
 
 func TestReconnectSuppressesOnlyFirstUnchangedRehydration(t *testing.T) {
