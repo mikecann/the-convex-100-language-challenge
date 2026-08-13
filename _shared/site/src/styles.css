@@ -508,6 +508,9 @@ main.page h1 {
 .compact-chart { gap: 0.7rem; }
 .compact-chart .chart-row-label { font-size: 0.74rem; }
 .compact-chart .chart-track { height: 0.48rem; }
+.dimension-chart { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.9rem 1.5rem; }
+.dimension-chart .chart-row-label { font-size: 0.76rem; }
+.stats-panel:not(.stats-panel-wide) .dimension-chart { grid-template-columns: 1fr; }
 .defect-chart .chart-track span { background: linear-gradient(90deg, var(--live), rgb(74 222 128 / 34%)); }
 .integrity-callout {
   display: grid;
@@ -882,6 +885,7 @@ body.panel-open .language-panel {
   .stats-headlines { grid-template-columns: 1fr 1fr; }
   .stats-chart-grid { grid-template-columns: 1fr; }
   .stats-panel-wide { grid-column: auto; }
+  .dimension-chart { grid-template-columns: 1fr; }
   .roster-chart li { grid-template-rows: auto 8rem auto minmax(3.8rem, auto); }
   .roster-chart li > small { font-size: 0.6rem; }
   .integrity-callout { grid-template-columns: 1fr; }
