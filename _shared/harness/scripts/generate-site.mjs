@@ -623,6 +623,16 @@ for (const entry of roster.languages) {
   }
 }
 
+const stylesheet = fs.readFileSync(path.join(source, "styles.css"), "utf8");
+const definedBrandVariables = new Set(
+  [...stylesheet.matchAll(/(--brand-[a-z-]+)\s*:/g)].map((match) => match[1]),
+);
+for (const match of stylesheet.matchAll(/var\((--brand-[a-z-]+)\)/g)) {
+  if (!definedBrandVariables.has(match[1])) {
+    throw new Error(`styles.css: ${match[1]} is used but never defined`);
+  }
+}
+
 fs.mkdirSync(output, { recursive: true });
 for (const filename of ["index.html", "app.js", "styles.css", "hero-mark.png", "mark-icon.png"]) {
   fs.copyFileSync(path.join(source, filename), path.join(output, filename));
