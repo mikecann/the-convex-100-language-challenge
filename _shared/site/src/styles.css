@@ -501,7 +501,7 @@ main.page h1 {
   min-width: 2px;
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, var(--brand-purple), var(--brand-pink));
+  background: linear-gradient(90deg, var(--brand-purple), var(--brand-red));
 }
 .cost-track span { background: linear-gradient(90deg, var(--http), var(--brand-yellow)); }
 .chart-note { margin: 1rem 0 0; color: var(--muted); font-size: 0.78rem; line-height: 1.45; }
