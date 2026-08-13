@@ -113,6 +113,12 @@ function sortedLanguages() {
     languages.sort((a, b) => byPopularity(a) - byPopularity(b));
   } else if (sortOrder.value === "age") {
     languages.sort((a, b) => byYear(a) - byYear(b) || byPopularity(a) - byPopularity(b));
+  } else if (sortOrder.value === "alphabetical") {
+    languages.sort(
+      (a, b) =>
+        a.displayName.localeCompare(b.displayName, "en", { sensitivity: "base" }) ||
+        byPopularity(a) - byPopularity(b),
+    );
   }
   return languages;
 }
