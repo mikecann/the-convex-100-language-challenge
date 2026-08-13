@@ -371,6 +371,25 @@ function horizontalRows(rows, maximum, valueIndex = 1) {
   }).join("");
 }
 
+function compactTokenCount(value) {
+  if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(2)}B`;
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+  return String(value);
+}
+
+function dimensionalRows(rows, total) {
+  const maximum = Math.max(...rows.map(([, value]) => value));
+  return rows.map(([label, value]) => {
+    const percentage = (value / total) * 100;
+    const displayPercentage = percentage > 0 && percentage < 0.1
+      ? "<0.1%"
+      : `${percentage.toFixed(1)}%`;
+    const width = (value / maximum) * 100;
+    return `<li><div class="chart-row-label"><span>${escapeHtml(label)}</span><strong>${escapeHtml(displayPercentage)} · ${compactTokenCount(value)}</strong></div><div class="chart-track"><span style="--bar-width:${width.toFixed(3)}%"></span></div></li>`;
+  }).join("");
+}
+
 async function renderNumbers() {
   const statsMarkdown = fs.readFileSync(path.join(root, "STATS.md"), "utf8");
   const headline = markdownTableAfter(statsMarkdown, "## Headline numbers");
@@ -379,6 +398,9 @@ async function renderNumbers() {
   const providers = markdownTableAfter(statsMarkdown, "### By provider").filter(
     ([provider]) => !plainMarkdown(provider).startsWith("All providers"),
   );
+  const models = markdownTableAfter(statsMarkdown, "### By model");
+  const reasoningEfforts = markdownTableAfter(statsMarkdown, "### By reasoning effort");
+  const workPhases = markdownTableAfter(statsMarkdown, "### The work, session by session");
   const naiveCosts = markdownTableAfter(statsMarkdown, "### 1. If every token were billed as fresh input");
   const cacheCosts = markdownTableAfter(statsMarkdown, "### 2. Cache-aware, at the same list prices");
   const actualCosts = markdownTableAfter(statsMarkdown, "### 3. What was actually paid");
@@ -415,6 +437,42 @@ async function renderNumbers() {
     const percentage = (providerTokens[index] / providerTotal) * 100;
     return `<li><span class="chart-key token-segment-${index + 1}"></span><span>${providerNames[index]}</span><strong>${percentage.toFixed(1)}%</strong><small>${escapeHtml(plainMarkdown(row[1]))} tokens</small></li>`;
   }).join("");
+
+  const modelRows = models.map((row) => [
+    `${plainMarkdown(row[0])} · ${plainMarkdown(row[1])}`,
+    numberFrom(row[6]),
+  ]);
+  const modelTotal = modelRows.reduce((sum, [, value]) => sum + value, 0);
+  if (modelTotal !== providerTokens[0] + providerTokens[1]) {
+    throw new Error("STATS.md: model totals do not match the Claude and Codex provider totals");
+  }
+  const effortRows = reasoningEfforts.map((row) => [
+    plainMarkdown(row[0]).split(" (")[0],
+    numberFrom(row[1]),
+  ]);
+  const effortTotal = effortRows.reduce((sum, [, value]) => sum + value, 0);
+  const autoReviewTokens = modelRows.find(([label]) => label.endsWith("auto-review"))?.[1] ?? 0;
+  if (effortTotal + autoReviewTokens !== providerTokens[1]) {
+    throw new Error("STATS.md: reasoning-effort totals do not reconcile to Codex usage");
+  }
+  const tokenTypeRows = [
+    ["Fresh input", models.reduce((sum, row) => sum + numberFrom(row[2]), 0)],
+    ["Cache writes", models.reduce((sum, row) => sum + numberFrom(row[3]), 0)],
+    ["Cache reads", models.reduce((sum, row) => sum + numberFrom(row[4]), 0)],
+    ["Output", models.reduce((sum, row) => sum + numberFrom(row[5]), 0)],
+  ];
+  const tokenTypeTotal = tokenTypeRows.reduce((sum, [, value]) => sum + value, 0);
+  if (tokenTypeTotal !== modelTotal) {
+    throw new Error("STATS.md: token-type totals do not reconcile to model usage");
+  }
+  const workPhaseRows = workPhases.map((row) => [plainMarkdown(row[0]), numberFrom(row[3])]);
+  const workPhaseTotal = workPhaseRows.reduce((sum, [, value]) => sum + value, 0);
+  // The ledger's named session groups are 70,256 tokens shy of the independently
+  // aggregated model total, a 0.0002% transcript-boundary remainder. Keep a tight
+  // tolerance so a material drift still breaks the site build.
+  if (Math.abs(workPhaseTotal - modelTotal) > modelTotal * 0.0001) {
+    throw new Error("STATS.md: work-phase totals have materially drifted from model usage");
+  }
 
   const progressBars = rosterProgress.map(([date, value, event]) => {
     const verifiedCount = numberFrom(value);
@@ -464,6 +522,26 @@ async function renderNumbers() {
         <div class="stats-panel-heading"><h2 id="provider-title">Tokens by provider</h2><p>Claude and Codex split almost the entire 32.13 billion-token workload.</p></div>
         <div class="token-stack" role="img" aria-label="Claude 52.1 percent, Codex 47.7 percent, Grok 0.1 percent">${providerSegments}</div>
         <ul class="token-legend">${providerLegend}</ul>
+      </section>
+
+      <section class="stats-panel stats-panel-wide" aria-labelledby="model-title">
+        <div class="stats-panel-heading"><h2 id="model-title">Tokens by model</h2><p>Share of the measured Claude and Codex workload. Bars are relative to the largest model, while labels show each model's share of the total.</p></div>
+        <ul class="horizontal-chart dimension-chart">${dimensionalRows(modelRows, modelTotal)}</ul>
+      </section>
+
+      <section class="stats-panel" aria-labelledby="reasoning-title">
+        <div class="stats-panel-heading"><h2 id="reasoning-title">Codex reasoning effort</h2><p>Reasoning effort was recorded for Codex turns only. Claude transcripts did not carry an equivalent field.</p></div>
+        <ul class="horizontal-chart dimension-chart">${dimensionalRows(effortRows, effortTotal)}</ul>
+      </section>
+
+      <section class="stats-panel" aria-labelledby="token-type-title">
+        <div class="stats-panel-heading"><h2 id="token-type-title">What kind of tokens moved</h2><p>Claude and Codex token traffic split into fresh input, cache writes, cache reads and output.</p></div>
+        <ul class="horizontal-chart dimension-chart">${dimensionalRows(tokenTypeRows, tokenTypeTotal)}</ul>
+      </section>
+
+      <section class="stats-panel stats-panel-wide" aria-labelledby="work-phase-title">
+        <div class="stats-panel-heading"><h2 id="work-phase-title">Tokens by work phase</h2><p>Named session groups from the ledger, covering implementation, review, revalidation, documentation, site design and video preparation.</p></div>
+        <ul class="horizontal-chart dimension-chart">${dimensionalRows(workPhaseRows, workPhaseTotal)}</ul>
       </section>
 
       <section class="stats-panel" aria-labelledby="cost-title">
