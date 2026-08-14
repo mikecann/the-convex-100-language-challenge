@@ -3,7 +3,7 @@ index 99ccb02..8627632 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -1,5 +1,5 @@
- cmake_minimum_required(VERSION 2.8)
+ cmake_minimum_required(VERSION 2.8) 
 -project(lci)
 +project(lci C)
  

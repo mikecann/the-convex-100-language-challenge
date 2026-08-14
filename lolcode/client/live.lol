@@ -9,7 +9,7 @@ I HAS A CONVEXNEXTQUERY ITZ 0
 I HAS A CONVEXQUERYSET ITZ 0
 I HAS A CONVEXREMOTEQUERYSET ITZ 0
 I HAS A CONVEXREMOTEIDENTITY ITZ 0
-I HAS A CONVEXREMOTETS ITZ "AAAAAAAAAAA="
+I HAS A CONVEXREMOTETS ITZ "AAAAAAAAAAA=" 
 I HAS A CONVEXMAXTS ITZ ""
 BTW A logical client session survives transport reconnects. Convex uses the
 BTW connection count, not a fresh session ID, to distinguish those attempts.

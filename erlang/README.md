@@ -22,111 +22,67 @@ update from `0` to `1`. From the repository root, run it in Docker with:
 
 ## Interesting Parts
 
-### Maps and pattern matching replace generated app types
+### One pattern match takes the reply apart
 
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-
-  async function handleClick() {
-    const result = await increment({
-      room: "docs-erlang",
-      language: "TypeScript",
-      runId: crypto.randomUUID(), // Fresh idempotency key for this click.
-    });
-    console.log(result.state.count); // Generated Convex types know this is a number.
-  }
-
-  return <button onClick={handleClick}>Increment</button>;
-}
-```
-
-**Erlang**
+Erlang has no generated type layer, and it barely misses one: pattern matching
+reaches into the decoded JSON map, binds the one number you care about, and
+refuses to continue if the shape is wrong. The `<<"...">>` marks are Erlang's
+bit syntax — invented at Ericsson for dissecting telecom packets, doing double
+duty here as JSON keys.
 
 ```erlang
-increment_once() ->
-    Deployment =
-        case os:getenv("CONVEX_URL") of
-            false -> erlang:error(missing_convex_url);
-            Url -> Url
-        end,
-    {ok, Client} = convex:new(Deployment),
-    %% A new random idempotency key lets each invocation increment once.
-    RunId = base64:encode(crypto:strong_rand_bytes(16)),
-    Args = #{<<"room">> => <<"docs-erlang">>,
-             <<"language">> => <<"Erlang">>,
-             <<"runId">> => RunId},
-    try
-        %% convex:call/4 blocks, then returns decoded Erlang maps.
-        {ok, #{<<"state">> := #{<<"count">> := Count}}, _Logs} =
-            convex:call(Client, mutation, <<"demo:increment">>, Args),
-        io:format("~p~n", [Count]) % Count is checked at runtime, not generated typing.
-    after
-        convex:close(Client)
-    end.
+Args = #{<<"room">> => <<"docs-erlang">>,
+         <<"language">> => <<"Erlang">>,
+         <<"runId">> => RunId},
+%% TypeScript: const result = await increment({ room, language, runId });
+{ok, #{<<"state">> := #{<<"count">> := Count}}, _Logs} =
+    convex:call(Client, mutation, <<"demo:increment">>, Args),
+io:format("count: ~p~n", [Count])
 ```
 
-Convex code generation gives the React call app-specific argument and return
-types. This Erlang client has no equivalent generated type layer. It decodes
-JSON to maps, and the pattern either binds `Count` from the expected shape or
-fails immediately. The synchronous `convex:call/4` API is this client's design,
-not a limitation of Erlang's process model.
+One `=` performed the success check, the destructuring, and the validation.
 
-### A Live value arrives as a process message
+### The reactive update is mail in your mailbox
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, { room: "docs-erlang-live" });
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // React rerenders when the query changes.
-}
-```
-
-**Erlang**
+Every Erlang process has a mailbox, and `receive` is language syntax, not a
+library. The client's `gen_server` owns the WebSocket; passing `self()` asks it
+to mail this process each value of the query, from the initial hydration to
+every later change.
 
 ```erlang
-print_next_count() ->
-    Deployment =
-        case os:getenv("CONVEX_URL") of
-            false -> erlang:error(missing_convex_url);
-            Url -> Url
-        end,
-    {ok, Client} = convex:new(Deployment),
-    Args = #{<<"room">> => <<"docs-erlang-live">>},
-    %% self() makes this process the destination for Live messages.
-    {ok, Live, Subscription} =
-        convex:subscribe(Client, <<"demo:state">>, Args, self()),
-    try
-        receive
-            %% This can be the initial value or a later reactive update.
-            {convex_live, Subscription,
-             #{value := #{<<"count">> := Count}}} ->
-                io:format("~p~n", [Count])
-        after 10000 ->
-            erlang:error(live_timeout)
-        end
-    after
-        %% A CLI program owns teardown that React handles on unmount.
-        convex:unsubscribe(Live, Subscription),
-        convex:close(Client)
-    end.
+{ok, Live, Subscription} =
+    convex:subscribe(Client, <<"demo:state">>, Args, self()),
+receive
+    %% TypeScript: const state = useQuery(api.demo.state, { room });
+    {convex_live, Subscription, #{value := #{<<"count">> := Count}}} ->
+        io:format("count is now ~p~n", [Count])
+after 10000 ->
+    erlang:error(live_timeout)
+end
 ```
 
-React's `useQuery` owns the subscription lifecycle and rerenders the component.
-Here one Erlang `gen_server` owns the WebSocket, then sends `{convex_live, ...}`
-messages to the subscriber's mailbox. Erlang supports many ways to structure
-that message handling. Blocking in `receive` is the small command-line API and
-example's choice.
+React rerenders a component; Erlang delivers a tuple. And the `after` clause is
+a built-in timeout — no `Promise.race` required.
+
+### Writing `1 =` is the whole assertion
+
+Erlang was built for phone switches that must not stop, so its culture is "let
+it crash": write the value you expect on the left of `=`, and any mismatch
+throws `badmatch` with the offending value attached, ready for a supervisor to
+handle. The canonical example verifies its whole `0 -> 1` journey this way
+(`count/1` is the example's small decoder helper) — no assertion library in
+sight.
+
+```erlang
+{ok, Initial, _} = convex:call(Client, query, <<"demo:state">>, Args),
+0 = count(Initial),
+{ok, Mutation, _} =
+    convex:call(Client, mutation, <<"demo:increment">>, MutationArgs),
+true = maps:get(<<"applied">>, Mutation),
+1 = count(maps:get(<<"state">>, Mutation))
+```
+
+If the counter ever came back as `2`, the crash report would say exactly that.
 
 ## Status
 

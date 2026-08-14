@@ -31,136 +31,94 @@ nothing needs to be installed on your host.
 
 ## Interesting Parts
 
-### JSON objects become strings and associative arrays
+### JSON is written by putting strings side by side
 
-With generated Convex types, React gives you a typed argument object and typed
-result. This Awk client accepts JSON text and writes its response into an
-associative array, Awk's map-like collection.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, {
-    room: "readme-awk-query-room",
-  });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // `state` and `count` are type-safe here.
-}
-```
-
-**Awk**
+Awk — Bell Labs, 1977 — has no string concatenation operator: writing two
+expressions next to each other joins them, and the client builds every Convex
+argument object exactly that way. A Convex call also has no input file to
+scan, so the whole program lives in `BEGIN`, awk's before-any-input hook
+moonlighting as `main`.
 
 ```awk
-@include "convex.awk"
-
 BEGIN {
     room = "readme-awk-query-room"
+    # Adjacent strings concatenate; there is no operator to forget.
     arguments = "{\"room\":" convex_quote(room) "}"
 
-    # Configuration is explicit, and CONVEX_URL names the deployment.
-    url = ENVIRON["CONVEX_URL"]
-    if (url == "") {
-        exit 1
-    }
-    if (!convex_open(url, "awk-readme")) {
-        exit 1
-    }
-    if (!convex_query("demo:state", arguments, response)) {
-        exit 1
-    }
-
-    # Awk is dynamic: response["value"] is JSON text and must be checked at runtime.
-    mark = cx_json_mark()
-    root = cx_json_parse(response["value"], 0)
-    if (root < 0 || cx_json_type(root) != "object") {
-        cx_json_release(mark)
-        exit 1
-    }
-    count_node = cx_json_find(root, "count")
-    if (count_node < 0 || cx_json_type(count_node) != "number") {
-        cx_json_release(mark)
-        exit 1
-    }
-    print cx_json_text(count_node)
-    cx_json_release(mark)
+    if (!convex_open(ENVIRON["CONVEX_URL"], "awk-readme")) exit 1
+    # TypeScript: const state = useQuery(api.demo.state, { room })
+    if (!convex_query("demo:state", arguments, response)) exit 1
 }
 ```
 
-The TypeScript hook stays subscribed and rerenders the component. The Awk call
-above is deliberately a one-off HTTP query, so it has no reactive lifecycle.
-The full example also rejects fractional, quoted, non-finite, and overflowing
-counts instead of trusting dynamic input.
+### The result comes back in the array you hand over
 
-### The command-line client owns the Live lifecycle
-
-React manages subscription setup, updates, and cleanup behind `useQuery`. The
-Awk API exposes those steps because a command-line program has no component
-lifecycle to attach them to.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "readme-awk-live-room";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  async function addOne() {
-    const result = await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(), // A fresh id makes this mutation attempt unique.
-    });
-    console.log(result.state.count); // The mutation result is type-safe.
-  }
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <button onClick={addOne}>Count: {state.count}</button>;
-}
-```
-
-**Awk**
+An Awk function can return only a single number or string — but arrays pass by
+reference. So every client call takes an array as its final argument and fills
+it in place: `response["value"]` holds the result JSON, and a Live update
+carries `update["errorName"]` beside its value. Parsed JSON follows the same
+spirit: nodes are integer handles you walk, then release with a mark.
 
 ```awk
-@include "convex.awk"
+# convex_query filled `response` through its third parameter.
+mark = cx_json_mark()
+root = cx_json_parse(response["value"], 0)
+node = cx_json_find(root, "count")
+if (node >= 0 && cx_json_type(node) == "number") {
+    print cx_json_text(node)    # TypeScript: state.count
+}
+cx_json_release(mark)
+```
 
-BEGIN {
-    room = "readme-awk-live-room"
-    arguments = "{\"room\":" convex_quote(room) "}"
-    url = ENVIRON["CONVEX_URL"]
-    if (url == "") exit 1
-    if (!convex_open(url, "awk-readme")) exit 1
+### Four spaces of whitespace are the variable declaration
 
-    # Subscribe first, then receive the initial reactive value.
-    if (!convex_subscribe("counter", "demo:state", arguments)) exit 1
-    if (!convex_wait_update("counter", 15000, initial)) exit 1
+Awk has no `local` keyword: touch a variable and it is global, unless it
+happens to be a function parameter. The time-honored idiom is to pad the
+parameter list — callers pass three arguments, and everything after the
+conspicuous gap is a fresh local. This is the client's Live wait, verbatim;
+the gap before `deadline` is its declaration.
 
-    mutation_args = "{\"room\":" convex_quote(room) \
-        ",\"language\":\"awk\",\"runId\":" \
-        convex_quote(convex_random_hex(16)) "}"
-    if (!convex_mutation("demo:increment", mutation_args, mutation)) exit 1
-    # mutation["value"] contains the returned { applied, state } JSON.
-
-    # This blocking `wait` is this client's API choice, not an Awk limitation.
-    if (!convex_wait_update("counter", 15000, updated)) exit 1
-    # updated["value"] is the later reactive state and needs runtime decoding.
-
-    convex_unsubscribe("counter") # Stop this query before closing the socket.
-    convex_close_live(2000) # Connection cleanup has a bounded deadline.
+```awk
+function convex_wait_update(tag, timeout_ms, update,    deadline) {
+    deadline = convex_now_ms() + timeout_ms
+    for (;;) {
+        while (convex_next_update(update)) {
+            if (update["tag"] == tag) {
+                return 1
+            }
+        }
+        if (cx_remaining(deadline) <= 0) {
+            return cx_fail("TransportError", "timed out waiting for a Live update")
+        }
+        convex_live_pump(cx_remaining(deadline) > 250 ? 250 : cx_remaining(deadline))
+    }
 }
 ```
 
-The Awk process owns one WebSocket and pumps it while
-`convex_wait_update` blocks. The client reconnects and replays active
-subscriptions, while its delivery queue stays bounded.
+These fifteen lines are also the reactive heart: one single-threaded process
+owns the WebSocket, draining delivered updates and pumping the socket in turn.
+
+### Subscribe first, and the socket proves the increment
+
+Live is verified for this client, and the canonical example leans on it:
+subscribe, read the initial value, mutate, then watch the same change arrive
+over the WebSocket without polling. Everything React's `useQuery` hides behind
+a hook becomes four explicit calls.
+
+```awk
+# Subscribe before mutating, so the update is an observation, not a race.
+if (!convex_subscribe("counter", "demo:state", arguments)) exit 1
+if (!convex_wait_update("counter", 15000, initial)) exit 1
+
+mutation_args = "{\"room\":" convex_quote(room) \
+    ",\"language\":\"awk\",\"runId\":" convex_quote(convex_random_hex(16)) "}"
+if (!convex_mutation("demo:increment", mutation_args, mutation)) exit 1
+
+# The same change arrives as a pushed update, not a second poll.
+if (!convex_wait_update("counter", 15000, updated)) exit 1
+convex_unsubscribe("counter")
+convex_close_live(2000)
+```
 
 ## Status
 

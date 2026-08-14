@@ -262,9 +262,13 @@ order:
    what people use it for, and a link to its main website.
 3. `## Getting Started`, linking to the canonical basic example and giving the
    root Docker command that runs it.
-4. `## Interesting Parts`, with up to three concise comparisons for a casual
-   Convex React developer. Use valid, equivalent TypeScript examples alongside
-   focused target-language code, and explain client API choices without
+4. `## Interesting Parts`, with two to four short subsections that showcase
+   the language's most distinctive syntax or semantics through focused
+   Convex-calling snippets adapted from the real client and example code.
+   Keep each snippet under roughly 20 lines, and relate it to TypeScript only
+   through a brief comment inside the snippet (for example
+   `-- TypeScript: await client.mutation("demo:increment", args)`), never a
+   separate TypeScript code block. Explain client API choices without
    presenting them as language limitations.
 5. `## Status`, preserving the evidence-backed capability table without
    rounding up partial support.

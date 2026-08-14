@@ -33,111 +33,91 @@ room. You do not need Chapel installed on your machine.
 
 ## Interesting Parts
 
-### Mutation data crosses an explicit JSON boundary
+### Ownership is spelled in the type
 
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-
-  async function handleClick() {
-    const result = await increment({
-      room: "chapel-readme",
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.state.count); // Generated types know this is a number.
-  }
-
-  return <button onClick={handleClick}>Increment</button>;
-}
-```
-
-**Chapel**
+Chapel classes carry their memory-management strategy right in the type.
+This client hands you a `new owned Client` — one scope owns it, and the
+compiler deletes it on exit — while `subscribe` returns a
+`shared Subscription`, because the background Live task and your code
+genuinely co-own it. `defer` schedules cleanup for every exit path.
 
 ```chapel
-use Convex;
-use ConvexTransport;
+var client = new owned Client(environment("CONVEX_URL"));
+defer client.close(); // Runs on every exit path from this scope.
 
-const deploymentUrl = environment("CONVEX_URL");
-if deploymentUrl.numBytes == 0 then halt("CONVEX_URL is required");
-var client = new owned Client(deploymentUrl);
-defer client.close(); // The owned client also cleans itself up at scope exit.
-
-const room = "chapel-readme";
-const mutationArgs = "{\"room\":" + jsonQuote(room) +
-  ",\"language\":\"chapel\",\"runId\":" +
-  jsonQuote(randomUUID()) + "}";
-
-const result = client.mutation("demo:increment", mutationArgs);
-if !result.ok then halt("mutation failed: ", result.failure.message);
-
-// This client returns raw JSON, so decode and validate the application value.
-const (hasState, stateJson) = jsonRaw(result.valueJson, "state");
-const (validCount, count) = jsonIntegralField(stateJson, "count");
-if !hasState || !validCount then halt("mutation returned an invalid state");
-writeln(count);
-```
-
-React's generated Convex API carries argument and return types into the
-component. This Chapel demonstration deliberately exposes JSON strings and a
-`callResult` record, so the caller handles failures and decoding explicitly.
-The numeric helper accepts Convex values such as `1.0` only when they are
-mathematically integral and fit in a Chapel `int(64)`.
-
-### A Live query has an explicit owner and inbox
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function Counter() {
-  const room = "chapel-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>Count: {state.count}</p>; // React rerenders when the query changes.
-}
-```
-
-**Chapel**
-
-```chapel
-use Convex;
-use ConvexTransport;
-
-const deploymentUrl = environment("CONVEX_URL");
-if deploymentUrl.numBytes == 0 then halt("CONVEX_URL is required");
-var client = new owned Client(deploymentUrl);
-defer client.close(); // Retires the background Live connection.
-
-const room = "chapel-readme";
-const roomArgs = "{\"room\":" + jsonQuote(room) + "}";
+// subscribe returns a `shared` class: the background Live task and
+// this scope co-own the subscription, so both keep it alive safely.
 const (subscription, failure) = client.subscribe("demo:state", roomArgs);
 if failure.isPresent || subscription == nil then
   halt("subscribe failed: ", failure.message);
 defer subscription!.close(); // Unsubscribes when this scope ends.
-
-// next() waits for one complete snapshot or update from the bounded inbox.
-const update = subscription!.next(10.0);
-if !update.available || update.failure.isPresent || !update.hasValue then
-  halt("Live did not return a value");
-const (validCount, count) = jsonIntegralField(update.valueJson, "count");
-if !validCount then halt("Live returned an invalid count");
-writeln(count);
 ```
 
-`useQuery` lets React own subscription setup, teardown, and rerendering. The
-command-line Chapel API instead returns a `shared Subscription` and lets the
-caller pull updates with blocking `next(timeout)`. Blocking delivery is this
-client's API choice, not a Chapel limitation: Chapel has its own task-parallel
-constructs, and this client uses a background task to own the WebSocket.
+Rust-flavored ownership intent, minus a borrow checker to argue with.
+
+### The mutation's answer is a tuple you must unpack
+
+Chapel procs can return tuples, and callers split them open in a single
+`const`. The JSON helpers here hand back `(success, value)` pairs, so there
+is no way to grab a count without also holding the flag that says whether it
+decoded.
+
+```chapel
+const result = client.mutation("demo:increment", mutationArgs);
+if !result.ok then halt("mutation failed: ", result.failure.message);
+
+// TypeScript: const { state } = await increment({ room, language, runId });
+const (hasState, stateJson) = jsonRaw(result.valueJson, "state");
+const (valid, count) = jsonIntegralField(stateJson, "count");
+if !hasState || !valid then halt("mutation returned an invalid state");
+writeln("count: ", count);
+```
+
+`jsonIntegralField` also validates the Convex number the way the backend
+means it: `1.0` decodes as an integer, `1.5` is refused.
+
+### One `begin` keyword owns the WebSocket
+
+Chapel was designed at Cray for supercomputers, so starting a task is a
+one-word language feature, not a threading library. Your first `subscribe`
+spawns a single background task with `begin`; it owns every WebSocket read,
+write, and reconnect while your code pulls finished updates with a blocking
+`next(timeout)`.
+
+```chapel
+// Inside the client: the entire Live protocol runs on one spawned task.
+begin with (in manager) manager.run();
+
+// In the example: block until Convex delivers the next complete value.
+const update = subscription!.next(10.0);
+// TypeScript: const state = useQuery(api.demo.state, { room });
+if update.hasValue then
+  writeln("live count: ", countFromState("live update", update.valueJson));
+```
+
+React gets pushed a rerender; here you pull the update when you are ready.
+
+### The Live inbox rides on Cray-style full/empty bits
+
+Chapel kept one of the Cray MTA's best ideas: `sync` variables, which pair a
+value with a full/empty bit. A write requires Empty and leaves Full; a read
+requires Full and leaves Empty — so each slot is a safe handoff between
+tasks with no condition variables in sight. Every subscription's bounded
+inbox is an array of them.
+
+```chapel
+// client/Convex.chpl -- each mailbox slot is a sync variable.
+var updates: [0..<subscriptionQueueCapacity] sync liveUpdate;
+
+// The Live task publishes an update: write-when-Empty, leave Full.
+updates[entryIndex].writeEF(accepted);
+
+// next() consumes it: read-when-Full, leave Empty.
+const result = updates[queueStart].readFE();
+```
+
+The handoff React delegates to its scheduler, Chapel expresses as a
+language-level bit.
 
 ## Status
 

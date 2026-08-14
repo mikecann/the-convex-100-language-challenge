@@ -18,103 +18,68 @@ You do not need Agda, GHC, or Cabal installed on your machine.
 
 ## Interesting Parts
 
-### JSON stays explicit
+### `∷` and `==ⁿ` are library code, not syntax
 
-In a Convex React app, generated TypeScript types make the arguments and returned object feel ordinary:
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function CounterSnapshot() {
-  const room = "agda-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>Count: {state.count}</p>; // state.count is a type-safe number.
-}
-```
-
-This Agda client represents JSON with constructors such as `jobj`, `jstr`, and `jnum`. The call itself can fail, and reading `count` can fail separately, so both cases are visible in the types:
-
-**Agda**
+Agda source is written in real Unicode — the editor input method turns `\::` into `∷` and `\to` into `→` — and almost every operator is an ordinary definition whose underscores mark argument slots, a scheme called mixfix. Even list cons, `_∷_`, comes from a library. Building the arguments for a Convex query is just pairs consed onto `[]`:
 
 ```agda
-room : String
-room = "agda-readme"
-
 roomArgs : JSON
-roomArgs = jobj (("room" , jstr room) ∷ []) -- Build the named argument object.
-
-countOf : JSON → Maybe Nat
-countOf value = fromField (objGet value "count")
-  where
-    fromField : Maybe JSON → Maybe Nat
-    fromField nothing = nothing             -- The field was missing.
-    fromField (just count) = asNat count     -- Reject a fractional or oversized value.
+roomArgs = jobj (("room" , jstr "agda-readme") ∷ [])
+-- TypeScript: const state = useQuery(api.demo.state, { room: "agda-readme" })
 
 showState : Client → IO ⊤
 showState client = clientQuery client "demo:state" roomArgs >>= onResult
-  where
-    onResult : Either ConvexError CallResult → IO ⊤
-    onResult (left error) = errLine (message error) -- The Convex call failed.
-    onResult (right result) = onCount (countOf (resultValue result))
-
-    onCount : Maybe Nat → IO ⊤
-    onCount nothing = errLine "demo:state returned no integral count"
-    onCount (just count) = putLine (showNat count)
 ```
 
-The Agda call above is a one-off HTTP query. Unlike `useQuery`, it will not subscribe or rerun when the database changes. This explicit value model is a choice in this small client, not a requirement imposed by dependent types.
+This client's `_==ⁿ_` for comparing counts is defined the same way — two lines in `client/Convex/Prelude.agda`, no compiler magic.
 
-### Live updates have an owner
+### The next count is literally `suc current`
 
-React starts and stops the subscription with the component. The component only describes which reactive value it wants:
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const room = "agda-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>Count: {state.count}</p>; // React rerenders when Convex sends an update.
-}
-```
-
-A command-line Agda program owns that lifecycle directly. `clientSubscribe` starts Live lazily, `clientNext` waits for one update, and cleanup is acknowledged before the function returns:
-
-**Agda**
+Agda's `Nat` is the Peano inductive type from a proofs course: a number is `zero` or `suc` of another number. So when the example predicts what `demo:increment` will return, it takes the successor by constructor:
 
 ```agda
-watchOnce : Client → IO ⊤
-watchOnce client =
-  clientSubscribe client "demo:state"
-    (jobj (("room" , jstr "agda-readme") ∷ [])) -- Register the reactive query.
-    >>= onSubscribed
-  where
-    onSubscribed : Either ConvexError Nat → IO ⊤
-    onSubscribed (left error) = errLine (message error)
-    onSubscribed (right subscriptionId) =
-      clientNext client subscriptionId 10000 -- Block for the initial Live value.
-        >>= finish subscriptionId
+expected : Nat
+expected = suc current
+-- TypeScript: const expected = current + 1
 
-    finish : Nat → Maybe Update → IO ⊤
-    finish subscriptionId nothing =
-      errLine "Live timed out" >> clientUnsubscribe client subscriptionId >> return tt
-    finish subscriptionId (just update) =
-      putLine (encode (updValue update))       -- Inspect the delivered Convex value.
-        >> clientUnsubscribe client subscriptionId
-        >> return tt                          -- No update may cross this acknowledgement.
+if not (counted ==ⁿ expected)
+  then stop client "mutation returned an unexpected count"
 ```
 
-Agda supports higher-order functions and concurrency. The blocking `clientNext` API is a deliberate fit for this teaching example, while one internal worker owns the WebSocket and reconnects. The complete example subscribes before mutating so it cannot miss the counter change.
+The GHC backend compiles `Nat` to arbitrary-precision `Integer`, so the proof-friendly definition costs nothing at runtime.
+
+### A Live update cannot be left half-handled
+
+Agda is a total language: every pattern match must cover every constructor, or the file does not compile. After `clientSubscribe` registers the reactive query, `clientNext` hands back a `Maybe Update`, and an `Update` carries either a Convex value or a structured error — so timeout, failure, and fresh data each get their own checked equation:
+
+```agda
+-- TypeScript: useQuery returns undefined while loading; here each case is an equation.
+liveValue : String → Maybe Update → Either String JSON
+liveValue label nothing = left (label <> " timed out")
+liveValue label (just u) = onError (updError u)
+  where
+    onError : Maybe ConvexError → Either String JSON
+    onError (just e) = left (label <> " failed: " <> message e)
+    onError nothing = right (updValue u)
+```
+
+Forget the `nothing` case and the coverage checker rejects the program — a missed Live edge case is a compile error, not a 2 a.m. crash.
+
+### Exactly one module touches the real world
+
+Agda's runtime has no sockets, threads, or clock. The client declares them as `postulate`s — names assumed rather than defined — and a `COMPILE GHC` pragma binds each one to Haskell, all inside the single reviewed module [`client/Convex/Prim.agda`](client/Convex/Prim.agda):
+
+```agda
+postulate
+  Socket : Set
+  socketSend : Socket → Bytes → Nat → IO (IOResult ⊤)
+  socketRecv : Socket → Nat → Nat → IO RecvResult
+
+{-# COMPILE GHC socketSend = convexSend #-}
+{-# COMPILE GHC socketRecv = convexRecv #-}
+```
+
+Everything above that boundary — HTTP framing, the JSON codec, WebSocket frames, the Live state machine — is plain type-checked Agda moving opaque octets.
 
 ## Status
 

@@ -28,125 +28,85 @@ one idempotent mutation, and the resulting Live update from `0` to `1`.
 
 ## Interesting Parts
 
-### Indentation builds the same argument object
+### Indentation is the argument object
 
-React's `useQuery` is reactive and stays subscribed while the component needs
-the result. This CoffeeScript client's `query` method is a one-off HTTP read.
-The interesting language difference here is smaller: indentation replaces the
-braces and commas around the argument object, and parentheses around the call
-are optional.
-
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const [room] = useState(() => `readme-react-query-${crypto.randomUUID()}`);
-  const state = useQuery(api.demo.state, {
-    room,
-  });
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**CoffeeScript**
+CoffeeScript's founding motto is "it's just JavaScript" — the same semantics
+with far less punctuation. Significant whitespace stands in for braces and
+commas, and call parentheses are optional, so a Convex mutation's argument
+object is simply an indented block under the function name.
 
 ```coffeescript
-{ randomUUID } = require 'node:crypto'
-{ Client } = require './client/convex'
-
-# The deployment URL selects the same Convex backend that React is configured for.
-deploymentUrl = process.env.CONVEX_URL
-throw new Error 'CONVEX_URL is required' unless deploymentUrl
-client = new Client deploymentUrl
-try
-  args =
-    room: "readme-coffeescript-query-#{randomUUID()}"
-
-  # No braces, commas, or call parentheses are needed here.
-  result = await client.query 'demo:state', args
-  console.log result.value.count # Decoded at runtime, not type-checked like api.demo.state.
-finally
-  await client.close()
+# TypeScript: await increment({ room, language: "TypeScript", runId: crypto.randomUUID() })
+result = await client.mutation 'demo:increment',
+  room: room
+  language: 'CoffeeScript'
+  runId: randomUUID()
+console.log result.value.state.count
 ```
 
-The function name is a string and the returned value is decoded at runtime in
-this client. CoffeeScript does not gain the generated argument and result types
-that the TypeScript import provides.
+The compiler folds those indented pairs into one plain JavaScript object before
+the request ever leaves for the server.
 
-### The command-line client owns the Live lifecycle
+### The reactive update is just another `await`
 
-React starts and stops the `useQuery` subscription as the component mounts,
-changes arguments, and unmounts. This client deliberately exposes a pull-style
-`next` operation instead. That is this educational API's design, not
-a limit of CoffeeScript, which supports callbacks, promises, and
-`async`/`await`.
-
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  const [room] = useState(() => `readme-react-live-${crypto.randomUUID()}`);
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  if (state === undefined) return <p>Loading...</p>;
-  return (
-    <button
-      onClick={async () => {
-        const result = await increment({
-          room,
-          language: "TypeScript",
-          runId: crypto.randomUUID(),
-        });
-        console.log(result.state.count); // The mutation result is type-safe here.
-      }}
-    >
-      Count: {state.count}
-    </button>
-  );
-}
-```
-
-**CoffeeScript**
+CoffeeScript never asks you to write `async`: any function containing `await`
+is compiled as asynchronous, and a top-level `await` quietly wraps the whole
+script. So Convex's signature move — the server pushing a fresh query value
+after a write — reads as a straight line. `next` hands back an iterator-style
+`{ value, done }` envelope, which is why the counter sits at
+`.value.value.count`.
 
 ```coffeescript
-{ randomUUID } = require 'node:crypto'
-{ Client } = require './client/convex'
-
-deploymentUrl = process.env.CONVEX_URL
-throw new Error 'CONVEX_URL is required' unless deploymentUrl
-client = new Client deploymentUrl
-room = "readme-coffeescript-live-#{randomUUID()}" # Fresh state for this run.
+# TypeScript: const state = useQuery(api.demo.state, { room })
 subscription = await client.subscribe 'demo:state', { room }
-try
-  initial = await subscription.next 10_000 # Wait explicitly for the initial value.
-  console.log initial.value.value.count # A dynamic runtime value, not a generated type.
-
-  result = await client.mutation 'demo:increment',
-    room: room
-    language: 'CoffeeScript'
-    runId: randomUUID() # Makes this mutation attempt idempotent.
-  console.log result.value.state.count # The mutation's returned state.
-
-  updated = await subscription.next 10_000 # Wait for the reactive update.
-  console.log updated.value.value.count
-finally
-  await subscription.close() # The CLI owns cleanup that React normally manages.
-  await client.close()
+initial = await subscription.next 10_000 # Bounded wait for the first value.
+# ...the demo:increment mutation from above lands here...
+updated = await subscription.next 10_000 # The server pushes; the promise resolves.
+console.log "count: #{initial.value.value.count} -> #{updated.value.value.count}"
+await subscription.close()
 ```
 
-CoffeeScript infers that surrounding code is asynchronous as soon as it uses
-`await`, so there is no separate `async` keyword. The complete example adds
-deadline, error, and value checks around each focused step.
+No callback was registered and no `async` keyword was typed.
+
+### Guards read like a sentence
+
+Postfix `if` and `unless` put the condition after the action, Ruby-style, and
+the existential operator `?` — CoffeeScript's "does this exist?" check, shipped
+a decade before JavaScript's `?.` — keeps null tests down to one character. The
+basics example combines all three to drain Live updates safely.
+
+```coffeescript
+nextUpdate = (subscription, name) ->
+  item = await subscription.next 10_000
+  throw new Error "#{name} subscription closed" if item.done
+  throw item.value.error if item.value.error?
+  item.value
+```
+
+Five lines buy a bounded wait, structured error propagation, and — thanks to
+inferred `async` — a promise-returning helper.
+
+### `@` writes the constructor for you
+
+`@` is shorthand for `this`, and a constructor parameter spelled `@path` both
+accepts the argument and assigns `this.path` in one stroke — more Ruby
+heritage. It is exactly how [`client/convex.coffee`](client/convex.coffee)
+models one Live subscription, while the existential assignment `?=` creates the
+WebSocket manager only when someone first subscribes.
+
+```coffeescript
+class Subscription
+  constructor: (@manager, @id, @path, @args) -> # Four fields, zero `this.x = x` lines.
+    @updates = new BoundedUpdates()
+    @active = true
+
+  next: (deadlineMs) -> @updates.next deadlineMs
+
+# Meanwhile in Client: no subscribers means no WebSocket at all.
+subscribe: (path, args = {}) ->
+  @live ?= new LiveManager @deploymentUrl, @clientVersion
+  @live.subscribe path, args
+```
 
 ## Status
 

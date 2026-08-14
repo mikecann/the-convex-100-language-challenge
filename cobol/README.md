@@ -28,148 +28,92 @@ a unique room on the approved test deployment:
 
 ## Interesting Parts
 
-### Objects become fixed records and explicit JSON text
+### The argument object is a picture, not an object
 
-In React, generated bindings give the argument and result their TypeScript
-shapes. This COBOL client instead accepts JSON in a fixed buffer and returns a
-raw JSON span. The program tracks every meaningful length, then asks its own
-JSON reader for the `count` member.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, { room: "interesting-parts" });
-  // api.demo.state is generated, so state.count is type-safe here.
-  return <p>{state?.count ?? "Loading..."}</p>;
-}
-```
-
-**COBOL**
+COBOL programs open with a DATA DIVISION, where every variable is declared with
+a PICTURE clause that literally draws its storage: `PIC X(8192)` is exactly
+8,192 characters, forever. A Convex argument object here is therefore JSON text
+living in a fixed buffer, chaperoned everywhere by its used length.
 
 ```cobol
-DATA DIVISION.
 WORKING-STORAGE SECTION.
-COPY "cvx-limits.cpy".
-COPY "cvx-client.cpy".
-01 URL-BUFFER       PIC X(1024).
-01 URL-LENGTH       BINARY-LONG.
-01 CLIENT-VERSION   PIC X(64) VALUE "cobol-readme".
-01 CLIENT-V-LENGTH  BINARY-LONG VALUE 12.
-01 FUNCTION-PATH    PIC X(256) VALUE "demo:state".
-01 PATH-LENGTH      BINARY-LONG VALUE 10.
-*> The Convex argument object is JSON text plus its used length.
-01 ARGUMENTS-JSON   PIC X(8192) VALUE '{"room":"interesting-parts"}'.
-01 ARGUMENTS-LENGTH BINARY-LONG VALUE 28.
-01 OPERATION        BINARY-LONG VALUE 1. *> 1 means HTTP query.
-01 STATUS-CODE      BINARY-LONG.
-01 JSON-SLOT        BINARY-LONG VALUE 1.
-01 ROOT-NODE        BINARY-LONG.
-01 COUNT-NODE       BINARY-LONG.
-01 MEMBER-NAME      PIC X(64) VALUE "count".
-01 MEMBER-LENGTH    BINARY-LONG VALUE 5.
-01 COUNT-VALUE      BINARY-DOUBLE.
-
-PROCEDURE DIVISION.
-    ACCEPT URL-BUFFER FROM ENVIRONMENT "CONVEX_URL"
-    COMPUTE URL-LENGTH = FUNCTION LENGTH(FUNCTION TRIM(URL-BUFFER))
-
-    *> Configure the HTTP endpoint and Live socket owned by this client.
-    CALL "cvx-client-init" USING URL-BUFFER URL-LENGTH CLIENT-VERSION
-        CLIENT-V-LENGTH CVX-ERROR STATUS-CODE
-
-    *> The result comes back as a raw JSON span in CVX-RESULT.
-    CALL "cvx-client-call" USING OPERATION FUNCTION-PATH PATH-LENGTH
-        ARGUMENTS-JSON ARGUMENTS-LENGTH CVX-RESULT CVX-ERROR STATUS-CODE
-
-    *> Decode the same state.count value that TypeScript exposes directly.
-    CALL "cvx-json-parse" USING JSON-SLOT CVX-R-VALUE CVX-R-VALUE-LEN
-        STATUS-CODE
-    CALL "cvx-json-root" USING JSON-SLOT ROOT-NODE
-    CALL "cvx-json-member" USING JSON-SLOT ROOT-NODE MEMBER-NAME
-        MEMBER-LENGTH COUNT-NODE
-    CALL "cvx-json-int" USING JSON-SLOT COUNT-NODE COUNT-VALUE STATUS-CODE
-    DISPLAY "count: " COUNT-VALUE
+COPY "cvx-limits.cpy".   *> compile-time constants such as CVX-OK
+COPY "cvx-client.cpy".   *> the shared CVX-RESULT and CVX-ERROR records
+01 WS-PATH      PIC X(256)  VALUE "demo:state".
+01 WS-PATH-LEN  BINARY-LONG VALUE 10.
+*> TypeScript: useQuery(api.demo.state, { room: "cobol-example" })
+01 WS-ARGS      PIC X(8192) VALUE '{"room":"cobol-example"}'.
+01 WS-ARGS-LEN  BINARY-LONG VALUE 24.
 ```
 
-The two snippets read the same `api.demo.state` result, but they do not have
-the same lifecycle. `useQuery` remains subscribed and rerenders the component.
-`cvx-client-call` is deliberately a one-off HTTP request.
+Nothing is allocated at runtime — the declaration *is* the memory layout,
+which is how this client promises bounded memory before it dials the network.
 
-### React owns reactivity; the COBOL caller pumps it
+### STRING assembles JSON with a moving pointer
 
-React subscribes and unsubscribes as the component mounts, changes arguments,
-or unmounts. This command-line API makes that ownership visible. The caller
-registers a query, checks the bounded delivery queue, and drives the one socket
-owner with `cvx-live-pump` until a value arrives.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  // React keeps this query subscribed and rerenders after any increment.
-  const state = useQuery(api.demo.state, { room: "live-room" });
-  return <output>{state?.count ?? "Connecting..."}</output>;
-}
-```
-
-**COBOL**
+Grace Hopper's camp believed programs should read aloud, so COBOL statements
+are verb-first sentences. The STRING verb concatenates fields into a buffer
+while `WITH POINTER` tracks the write position — here splicing an escaped room
+name into the mutation arguments.
 
 ```cobol
-DATA DIVISION.
-WORKING-STORAGE SECTION.
-COPY "cvx-limits.cpy".
-COPY "cvx-client.cpy".
-01 URL-BUFFER       PIC X(1024).
-01 URL-LENGTH       BINARY-LONG.
-01 CLIENT-VERSION   PIC X(64) VALUE "cobol-readme".
-01 CLIENT-V-LENGTH  BINARY-LONG VALUE 12.
-01 FUNCTION-PATH    PIC X(256) VALUE "demo:state".
-01 PATH-LENGTH      BINARY-LONG VALUE 10.
-01 ARGUMENTS-JSON   PIC X(8192) VALUE '{"room":"live-room"}'.
-01 ARGUMENTS-LENGTH BINARY-LONG VALUE 20.
-01 SUBSCRIPTION-ID  BINARY-LONG.
-01 STATUS-CODE      BINARY-LONG.
-01 PUMP-TIMEOUT-MS  BINARY-LONG VALUE 200.
-01 DELIVERY-READY   BINARY-LONG VALUE 0.
-PROCEDURE DIVISION.
-    ACCEPT URL-BUFFER FROM ENVIRONMENT "CONVEX_URL"
-    COMPUTE URL-LENGTH = FUNCTION LENGTH(FUNCTION TRIM(URL-BUFFER))
-    CALL "cvx-client-init" USING URL-BUFFER URL-LENGTH CLIENT-VERSION
-        CLIENT-V-LENGTH CVX-ERROR STATUS-CODE
-
-    *> Register demo:state. The returned number identifies this subscription.
-    CALL "cvx-live-subscribe" USING FUNCTION-PATH PATH-LENGTH
-        ARGUMENTS-JSON ARGUMENTS-LENGTH SUBSCRIPTION-ID CVX-ERROR STATUS-CODE
-
-    PERFORM UNTIL DELIVERY-READY = 1
-        *> First take any value already waiting in the bounded queue.
-        CALL "cvx-live-next" USING SUBSCRIPTION-ID CVX-RESULT CVX-ERROR
-            STATUS-CODE
-        IF STATUS-CODE = CVX-OK
-            MOVE 1 TO DELIVERY-READY
-        ELSE
-            *> No delivery yet, so let the sole socket owner do one step.
-            CALL "cvx-live-pump" USING PUMP-TIMEOUT-MS STATUS-CODE
-        END-IF
-    END-PERFORM
-
-    *> CVX-R-VALUE now contains the latest demo:state object as JSON.
-    DISPLAY CVX-R-VALUE(1:CVX-R-VALUE-LEN)
-    CALL "cvx-live-unsubscribe" USING SUBSCRIPTION-ID CVX-ERROR STATUS-CODE
-    CALL "cvx-live-close" USING STATUS-CODE
+CALL "cvx-json-esc-string" USING WS-ROOM WS-ROOM-LEN
+    WS-ROOM-JSON WS-ROOM-JSON-LEN
+MOVE 1 TO WS-ARGS-LEN
+STRING
+    '{"room":' DELIMITED SIZE
+    WS-ROOM-JSON(1:WS-ROOM-JSON-LEN) DELIMITED SIZE
+    ',"language":"COBOL"}' DELIMITED SIZE
+    INTO WS-ARGS
+    WITH POINTER WS-ARGS-LEN
+END-STRING
+SUBTRACT 1 FROM WS-ARGS-LEN
 ```
 
-The blocking `next` plus explicit `pump` loop is this client's API choice, not
-a general restriction on every COBOL program. It keeps this small client
-single-owner and makes cleanup explicit. The complete example also subscribes
-before its mutation so it cannot miss the resulting update.
+The pointer finishes one past the last byte written, so one SUBTRACT turns it
+into the JSON's length — and `WS-ARGS(1:WS-ARGS-LEN)` slices exactly that span.
+
+### PERFORM UNTIL 1 = 2 is the event loop
+
+COBOL has no threads, callbacks, or async, so where React's `useQuery` keeps a
+subscription alive invisibly, this client hands the WebSocket to the caller.
+You subscribe, then alternate "any delivery queued?" with "let the socket do
+one step" — and `1 = 2` is the classic COBOL spelling of `while (true)`.
+
+```cobol
+CALL "cvx-live-subscribe" USING WS-PATH WS-PATH-LEN
+    WS-ARGS WS-ARGS-LEN WS-SUBIX CVX-ERROR WS-STATUS
+*> TypeScript: React pumps the socket for you behind useQuery.
+PERFORM UNTIL 1 = 2
+    CALL "cvx-live-next" USING WS-SUBIX CVX-RESULT CVX-ERROR WS-STATUS
+    IF WS-STATUS = CVX-OK
+        EXIT PERFORM      *> CVX-R-VALUE now holds fresh demo:state JSON
+    END-IF
+    CALL "cvx-live-pump" USING WS-TIMEOUT WS-STATUS
+END-PERFORM
+```
+
+The example subscribes before calling `demo:increment`, so the update cannot
+slip past unobserved — the same guarantee Convex gives a mounted React
+component.
+
+### Numbers are printed by drawing a picture of them
+
+There is no printf. A numeric-edited PICTURE describes what the printed number
+should look like — `-(18)9` draws a minus sign that floats in ahead of the
+digits, with unused positions becoming spaces — and MOVE performs the
+conversion as a side effect of assignment.
+
+```cobol
+01 WS-NUMTEXT  PIC -(18)9.
+*> ...
+MOVE WS-UPDATED TO WS-NUMTEXT
+*> TypeScript: console.log(`live updated count: ${state.count}`)
+DISPLAY "live updated count: " FUNCTION TRIM(WS-NUMTEXT)
+```
+
+The declaration is the format string, fixed at compile time like everything
+else here.
 
 ## Status
 

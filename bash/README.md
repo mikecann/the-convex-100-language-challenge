@@ -25,109 +25,81 @@ Convex test deployment.
 
 ## Interesting Parts
 
-### JSON values cross a text boundary
+### Where TypeScript has types, Bash has `jq`
 
-In a React app, generated Convex types keep the argument and result as typed
-JavaScript objects.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function CounterSnapshot() {
-  const room = "bash-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-Bash has strings rather than typed object values, so this client uses `jq` at
-both sides of the call. `--arg` safely constructs the named argument object,
-and `convex_whole_number` rejects a fractional or non-number count.
-
-**Bash**
+Bash values are all strings, so this client hands JSON correctness to `jq`,
+the tiny JSON language that became the shell world's standard toolkit. `--arg`
+builds the argument object with proper escaping no matter what the variable
+holds, and `convex_whole_number` refuses any count that is not a whole JSON
+number.
 
 ```bash
-# Load the repository's HTTP client and require its CONVEX_URL configuration.
-source bash/client/convex.sh
-require_convex_url
-
 room=bash-readme
-args=$(jq -cn --arg room "$room" '{room:$room}') # Build { room } as JSON.
-state=$(convex_query demo:state "$args")          # Make one HTTP query.
-count=$(convex_whole_number "$(jq -c '.count' <<<"$state")")
-printf '%s\n' "$count"
+args=$(jq -cn --arg room "$room" '{room:$room}') # Correct JSON, whatever $room holds.
+# TypeScript: const state = useQuery(api.demo.state, { room })
+state=$(convex_query demo:state "$args")
+convex_whole_number "$(jq -c '.count' <<<"$state")"
 ```
 
-The Bash call is a one-off snapshot. Unlike `useQuery`, it does not stay
-subscribed or rerun code when the value changes.
+Every value crosses the wire as text, and `jq` is the checkpoint on both
+sides.
 
-### Reactivity is an explicit sequence
+### One unprintable byte smuggles the exit status
 
-React owns the subscription behind `useQuery`, rerenders when the value
-changes, and releases the subscription when the component unmounts.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function CounterButton() {
-  const room = "bash-reactive-readme";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  async function addOne() {
-    const result = await increment({
-      room,
-      language: "TypeScript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.state.count); // The mutation also returns the new state.
-  }
-
-  return <button onClick={addOne}>Count: {state?.count ?? "..."}</button>;
-}
-```
-
-The command-line client owns those steps directly. It starts Live before the
-mutation so it cannot miss the change, then blocks for each selected value.
-
-**Bash**
+Capturing a command's output normally discards the exit status of the process
+that produced it. `client/convex.sh` recovers it with a gift from the 1963
+ASCII table: byte `0x1E`, the record separator, can never occur inside valid
+JSON, so wget's status rides home behind one.
 
 ```bash
-# Load the HTTP and Live clients, and always release the subscription and socket.
-source bash/client/convex.sh
-source bash/client/live.sh
-require_convex_url
-trap 'live_remove 0 || true; live_close' EXIT
-
-room=bash-reactive-readme
-query_args=$(jq -cn --arg room "$room" '{room:$room}')
-live_connect
-live_add 0 readme-counter demo:state "$query_args" # Subscribe as query 0.
-
-initial=$(live_next_value 0) # Wait for the initial reactive value.
-printf 'initial: %s\n' "$(convex_whole_number "$(jq -c '.count' <<<"$initial")")"
-
-run_id="bash-readme-$$-$RANDOM" # Give this increment its own idempotency key.
-mutation_args=$(jq -cn --arg room "$room" --arg run_id "$run_id" \
-  '{room:$room,language:"Bash",runId:$run_id}')
-result=$(convex_mutation demo:increment "$mutation_args")
-printf 'mutation: %s\n' "$(convex_whole_number "$(jq -c '.state.count' <<<"$result")")"
-
-updated=$(live_next_value 0) # Wait for Live to deliver the changed state.
-printf 'updated: %s\n' "$(convex_whole_number "$(jq -c '.count' <<<"$updated")")"
+IFS= read -r -N "$((CONVEX_MAX_RESPONSE_BYTES + 5))" response_envelope < <(
+  printf %s "$body" | wget -qO- --post-file=- "${CONVEX_URL%/}/api/query"
+  printf '\036%s' "$?" # Append wget's exit code behind a record separator.
+)
+transport_status=${response_envelope##*$'\036'} # The digits after the last 0x1E.
+response=${response_envelope%$'\036'*}          # The JSON before it.
 ```
 
-The blocking `live_next_value` operation is a choice made by this small client,
-not a Bash language restriction. It keeps a terminal example linear while a
-separate worker owns socket reads, reconnects, and query-set changes.
+The same `read -N` bound enforces the 2 MiB response cap before the payload
+ever becomes a Bash variable.
+
+### The WebSocket begins as a redirect to `/dev/tcp`
+
+Bash has no networking library, but it inherited a piece of magic from the
+Korn shell: redirecting to the virtual path `/dev/tcp/host/port` makes the
+shell itself open a TCP socket. `client/live.sh` reaches Convex's sync
+endpoint that way, then performs the WebSocket upgrade with a `printf`.
+
+```bash
+exec {LIVE_FD}<>"/dev/tcp/$host/$port" # The shell opens the socket for ws://.
+# For wss://, a coprocess wraps the same byte stream in verified TLS instead.
+coproc LIVE_TLS (openssl s_client -quiet -connect "$host:$port" -servername "$host")
+
+printf 'GET /api/sync HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\n\r\n' \
+  "$hostport" >&"$LIVE_FD" # (Key and version headers elided.)
+```
+
+From there, `live.sh` masks and parses RFC 6455 frames byte by byte with
+`printf`, `dd`, and `od`.
+
+### `trap` is the unmount handler
+
+`trap` has been the shell's cleanup hook since the 1977 Bourne shell: run this
+string whenever the script exits, however it exits. Here it plays the part of
+React's effect cleanup, releasing the subscription and socket even when a
+`set -e` failure aborts the script halfway through.
+
+```bash
+trap 'live_remove 0 || true; live_close' EXIT # TypeScript: useQuery unsubscribes on unmount
+live_connect
+live_add 0 readme-counter demo:state "$args"  # Subscribe as query id 0.
+initial=$(live_next_value 0)                  # Block until the first pushed value.
+convex_mutation demo:increment "$mutation_args" >/dev/null
+updated=$(live_next_value 0)                  # The new count arrives; no polling.
+```
+
+Blocking on `live_next_value` keeps a terminal script linear while the server
+does the reactive work of deciding when there is something new to deliver.
 
 ## Status
 

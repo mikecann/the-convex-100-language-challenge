@@ -21,148 +21,63 @@ This proves the canonical example compiles and completes its demonstrated journe
 
 ## Interesting Parts
 
-### A mutation returns an explicit success variant
+### Success and failure are two arms of one record
 
-In React, the generated API gives the mutation arguments and result their TypeScript types. This Ada client constructs the JSON object directly, then makes success or failure an explicit branch of `Call_Result`.
-
-**TypeScript with React**
-
-```tsx
-import { ConvexReactClient, useMutation } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-const deploymentUrl = import.meta.env.VITE_CONVEX_URL;
-if (!deploymentUrl) throw new Error("VITE_CONVEX_URL is required");
-export const convex = new ConvexReactClient(deploymentUrl); // Used by ConvexProvider.
-function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-
-  async function incrementAdaRoom() {
-    const runId = crypto.randomUUID(); // A fresh idempotency key per click.
-    const result = await increment({ room: "ada-readme", language: "ada", runId });
-    console.log(result.state.count); // Generated types know this is a number.
-  }
-  return <button onClick={incrementAdaRoom}>Increment</button>;
-}
-```
-
-**Ada**
+Rust's `Result` and TypeScript's discriminated unions have a great-grandparent: the Ada variant record, in the language since 1983. A `Call_Result`'s physical shape depends on its `Success` discriminant — the `Value` field only exists on the `True` arm, and reading a field from the wrong arm raises `Constraint_Error` instead of handing back garbage.
 
 ```ada
-with Ada.Environment_Variables;
-with Ada.Strings;
-with Ada.Strings.Fixed;
-with Ada.Text_IO;
-with Convex;
-with GNATCOLL.JSON;
-with GNATCOLL.Random;
-with Interfaces;
+type Call_Result (Success : Boolean := False) is record
+   case Success is
+      when True =>
+         Value    : JSON.JSON_Value;
+         Has_Logs : Boolean := False;
+         Logs     : JSON.JSON_Array;
+      when False =>
+         Error : Error_Info;
+   end case;
+end record;
 
-procedure Increment_Once is
-   package JSON renames GNATCOLL.JSON;
-   Client : Convex.Client;
-   Args   : constant JSON.JSON_Value := JSON.Create_Object;
-   Raw_Id : constant String :=
-     Interfaces.Unsigned_32'Image (GNATCOLL.Random.Random_Unsigned_32);
-   Run_Id : constant String :=
-     "ada-" & Ada.Strings.Fixed.Trim (Raw_Id, Ada.Strings.Both);
-begin
-   if not Ada.Environment_Variables.Exists ("CONVEX_URL") then
-      raise Constraint_Error with "CONVEX_URL is required";
-   end if;
-
-   -- Ada has no generated demo API here, so construct the JSON arguments.
-   Args.Set_Field ("room", "ada-readme");
-   Args.Set_Field ("language", "ada");
-   Args.Set_Field ("runId", Run_Id);
-   Convex.Open
-     (Client, Ada.Environment_Variables.Value ("CONVEX_URL"));
-
-   declare
-      Result : constant Convex.Call_Result :=
-        Convex.Mutation (Client, "demo:increment", Args);
-   begin
-      -- Call_Result is discriminated: Value exists on the success arm.
-      if not Result.Success then
-         raise Constraint_Error with
-           Convex.US.To_String (Result.Error.Message);
-      end if;
-      Ada.Text_IO.Put_Line
-        (JSON.Write (Result.Value.Get ("state").Get ("count")));
-   end;
-   Convex.Close (Client);
-end Increment_Once;
+--  TypeScript: const result = await increment({ room, language, runId })
+Result : constant Convex.Call_Result :=
+  Convex.Mutation (Client, "demo:increment", Args);
 ```
 
-The Ada compiler checks which arm of the result is available, but the fields inside `JSON_Value` are still dynamically decoded. The complete example adds range checks for Convex numbers such as `1.0` before treating them as integers.
+Every query, mutation, and action comes back through this one type, so the failure path is impossible to forget.
 
-### A Live query is an owned resource
+### The socket has one owner, and `task` is a keyword
 
-React owns the subscription behind `useQuery`, rerenders when the value changes, and removes the subscription when the component unmounts. This command-line Ada API makes that lifecycle visible: open a manager, subscribe, take an update, release it, then unsubscribe and close.
-
-**TypeScript with React**
-
-```tsx
-import { ConvexReactClient, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-const deploymentUrl = import.meta.env.VITE_CONVEX_URL;
-if (!deploymentUrl) throw new Error("VITE_CONVEX_URL is required");
-export const convex = new ConvexReactClient(deploymentUrl); // Used by ConvexProvider.
-function Counter() {
-  const state = useQuery(api.demo.state, { room: "ada-readme" });
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // React rerenders for later Live values.
-}
-```
-
-**Ada**
+Ada shipped concurrency as part of the language in 1983 — no threads library, because avionics software could not wait for one. The Live client leans on that: a single `task` owns the WebSocket, and its `entry` declarations are rendezvous points where a caller and the owner briefly meet to exchange data. The `Storage_Size` aspect even sizes the task's stack for the client's four-megabyte message ceiling, declared right on the type.
 
 ```ada
-with Ada.Environment_Variables;
-with Ada.Strings.Unbounded;
-with Convex.Live;
-with GNATCOLL.JSON;
-
-procedure Read_One_Live_Update is
-   package JSON renames GNATCOLL.JSON;
-   package US renames Ada.Strings.Unbounded;
-   Live    : Convex.Live.Manager;
-   Stream  : Convex.Live.Subscription;
-   Args    : constant JSON.JSON_Value := JSON.Create_Object;
-   Success : Boolean;
-   Message : US.Unbounded_String;
-   Found   : Boolean;
-   Item    : Convex.Live.Update;
-begin
-   if not Ada.Environment_Variables.Exists ("CONVEX_URL") then
-      raise Constraint_Error with "CONVEX_URL is required";
-   end if;
-
-   Args.Set_Field ("room", "ada-readme");
-   Convex.Live.Open
-     (Live, Ada.Environment_Variables.Value ("CONVEX_URL"));
-   Convex.Live.Subscribe
-     (Live, "demo:state", Args, Stream, Success, Message);
-   if not Success then
-      raise Constraint_Error with US.To_String (Message);
-   end if;
-
-   -- Try_Next is non-blocking, so this CLI decides how often to poll.
-   loop
-      Convex.Live.Try_Next (Live, Stream, Found, Item);
-      exit when Found;
-      delay 0.01;
-   end loop;
-   -- Release returns this delivery's byte budget to the manager.
-   Convex.Live.Release (Live, Item);
-
-   Convex.Live.Unsubscribe (Live, Stream);
-   Convex.Live.Close (Live);
-end Read_One_Live_Update;
+--  From client/convex-live.ads: the only door to the socket.
+task type Owner_Task with Storage_Size => 16 * 1024 * 1024 is
+   entry Configure (Deployment_URL : String);
+   --  ... Add and Remove entries edit the subscribed query set
+   entry Next
+     (Id, Generation : Natural; Found : out Boolean; Item : out Update);
+   entry Release_Update (Token : Natural);
+   entry Stop;
+end Owner_Task;
 ```
 
-Ada supports built-in concurrency through tasks. The non-blocking `Try_Next` operation is this client's API choice: one internal Ada task owns socket reads, writes, reconnects, and query-set changes so callers cannot race the connection.
+Reads, writes, reconnects, and query-set changes all happen inside that one task, so a data race on the connection cannot be written.
+
+### Live updates arrive through `out` parameters
+
+An Ada function returns exactly one value, so procedures hand back multiple results through `out` parameters — the call site reads like a row of labeled return slots. Add `exit when` to leave a loop mid-body and `delay`, a sleep statement built into the language, and polling a subscription needs no imports at all.
+
+```ada
+Convex.Live.Subscribe (Live, "demo:state", Args, Stream, Success, Message);
+--  TypeScript: const state = useQuery(api.demo.state, { room: "ada-readme" })
+loop
+   Convex.Live.Try_Next (Live, Stream, Found, Item);
+   exit when Found;
+   delay 0.01;
+end loop;
+Convex.Live.Release (Live, Item);  --  return this delivery's byte budget
+```
+
+The first delivery hydrates the query with its current value; after a `demo:increment` mutation, the next one is pushed over the same socket — no HTTP re-poll.
 
 ## Status
 

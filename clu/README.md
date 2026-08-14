@@ -24,94 +24,91 @@ update. From the repository root, run it in its pinned Docker environment with:
 
 ## Interesting Parts
 
-### A cluster hides the representation
+### The `$` crosses a boundary CLU invented
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, { room: "clu-cluster-readme" });
-  return <p>{state?.count ?? "Loading..."}</p>; // state.count is type-safe here.
-}
-```
-
-**CLU**
+Every call in this client, from `json$field` to `chttp$call`, names a
+*cluster*: the construct with which Barbara Liskov's group introduced the
+abstract data type in the early 1970s. A cluster pairs a hidden representation
+(the `rep`) with the only operations allowed to touch it, and the Live client's
+header is its entire public surface:
 
 ```clu
-base_url: string := _environ("CONVEX_URL") % Real deployment configuration.
-    except when not_found: signal failed("CONVEX_URL is required") end
-if string$empty(base_url) then signal failed("CONVEX_URL is required") end
-room: string := "clu-cluster-readme"
-args_raw: string := json$object1("room", json$qs(room))
+sync = cluster is create, add, remove, debug_disconnect, poll, close
 
+rep = record[scheme: string, host: string, port: int,
+             sock: maybe[wsconn], subs: qarr,
+             next_backoff_ms: int, next_reconnect_at: int]
+             % ...plus session, timestamp, and reconnect bookkeeping.
+```
+
+The whole WebSocket connection, subscription table, and reconnect state machine
+live inside that `rep`, and no other file in the client can reach in.
+
+### One call returns eight values, and none of them is a tuple
+
+CLU procedures return multiple values natively, with no tuple wrapper and no
+output parameters, a design Go made famous four decades later. Convex's entire
+result-or-error envelope arrives as one row of named, typed locals:
+
+```clu
+% TypeScript: const state = await client.query(api.demo.state, { room });
 kind: string, value_raw: string, err_name: string, err_message: string,
-    err_data: string, has_err_data: bool, logs_raw: string, has_logs: bool :=
-    chttp$call("query", "demo:state", args_raw, base_url, "")
+    err_data: string, has_err_data: bool, logs_raw: string,
+    has_logs: bool :=
+    chttp$call("query", "demo:state", query_args, base_url, "")
 
-count_raw: string := json$field(value_raw, "count")
-count: int := json$uint32(count_raw) % count is type-safe after explicit decoding.
+count: int := json$uint32(json$field(value_raw, "count"))
 ```
 
-The generated TypeScript API carries the function's argument and return types.
-This small CLU client instead receives raw JSON and decodes the field it needs.
-The React hook remains subscribed and rerenders on changes, while this focused
-CLU call is only a one-off HTTP snapshot; the explicit Live lifecycle below is
-the real reactive equivalent.
-The interesting bit is the `$`: `json$uint32` and `chttp$call` invoke operations
-exported by clusters. A cluster owns its hidden representation and exposes only
-named operations, much like a class with private state, although a stateless
-cluster such as `json` also works well as a module namespace.
+`kind` says whether Convex answered with a result or an error, and everything
+is already unpacked before the next line runs.
 
-### Live is an explicit, iterator-driven lifecycle
+### A 1975 iterator drives the realtime loop
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  const state = useQuery(api.demo.state, { room: "clu-live-readme" });
-  return <p>{state?.count ?? "Loading..."}</p>; // React owns subscribe and cleanup.
-}
-```
-
-**CLU**
+CLU's other famous invention is the iterator, the coroutine-shaped ancestor of
+Python generators and JavaScript's `for...of`. Portable CLU has no threads, so
+the Live subscription (Convex's reactive WebSocket protocol) only advances when
+you call `sync$poll`, and the canonical example lets an iterator supply the
+"keep asking" loop:
 
 ```clu
-base_url: string := _environ("CONVEX_URL") % Real deployment configuration.
-    except when not_found: signal failed("CONVEX_URL is required") end
-if string$empty(base_url) then signal failed("CONVEX_URL is required") end
-room: string := "clu-live-readme"
-args_raw: string := json$object1("room", json$qs(room))
 s: sync := sync$create(base_url, "clu-0.1.0")
-    except when not_possible (msg: string): signal failed(msg) end
-query_id: int := sync$add(s, "demo:state", args_raw) % Start the subscription.
+query_id: int := sync$add(s, "demo:state", query_args) % Subscribe.
 
-for attempt: int in int$from_to(1, 20) do % The iterator supplies loop values.
-    found: bool, kind: string, ignored_id: int, value_raw: string,
-        err_name: string, err_message: string, err_data: string,
-        has_err_data: bool, has_logs: bool, logs_raw: string := sync$poll(s, 500)
-        except when not_possible (msg: string): signal failed(msg) end
+% TypeScript: const state = useQuery(api.demo.state, { room });
+for attempt: int in int$from_to(1, 20) do
+    found: bool, kind: string, id: int, value_raw: string, ename: string,
+        emsg: string, edata: string, hed: bool, hlogs: bool,
+        logs: string := sync$poll(s, 500)
     if found cand string$equal(kind, "update") then
         count: int := json$uint32(json$field(value_raw, "count"))
-        break % count is the latest reactive value, decoded as a CLU int.
+        break
         end
     end
-
-sync$remove(s, query_id) % This command-line client owns unsubscribe and cleanup.
-sync$close(s)
+sync$remove(s, query_id)
 ```
 
-React's hook owns the subscription and rerenders the component when its value
-changes. The CLU API deliberately exposes a blocking `poll` operation because
-this Portable CLU runtime has no threads or async runtime. CLU's iterator drives
-the bounded polling loop, while declared signals and nearby `except` clauses
-make transport failures part of the control flow rather than magic return
-values. The iterator does not make the subscription reactive by itself.
+(`cand` is CLU's short-circuit "conditional and".) React's `useQuery` hides
+exactly this lifecycle; here subscribe, poll, and unsubscribe are all yours.
+
+### Exceptions were born here, and they cling to statements
+
+CLU pioneered the exception model most languages later adopted: a procedure
+declares its signals in its signature, and the caller attaches an `except`
+clause to the exact statement that can raise them, with no try-block
+scaffolding wrapped around half a function.
+
+```clu
+wait_for_value = proc (s: sync, timeout_ms: int) returns (string)
+                                                 signals (failed(string))
+    % ...polls sync$poll until a Live update arrives, or signals failed.
+
+initial_value: string := wait_for_value(s, 10000)
+    except when failed (msg: string): fail("initial Live value", msg) end
+```
+
+The signature is honest about failure, and the handler sits exactly where the
+risk is.
 
 ## Status
 

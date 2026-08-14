@@ -23,119 +23,52 @@ The command builds and runs the exact example in Docker against a unique test ro
 
 ## Interesting Parts
 
-### Turning JSON into an ordinary typed value
+### Braces that read like a JSON literal
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-function RoomCount() {
-  const state = useQuery(api.demo.state, { room: "readme-cpp" });
-  if (state === undefined) return <p>Loading...</p>;
-
-  console.log(state.count); // The generated API makes count a number here.
-  return <p>{state.count}</p>;
-}
-```
-
-**C++**
+C++11 added uniform initialization, and it let libraries overload `{ ... }` lists — so `nlohmann::json` (aliased here as `convex::Json`) makes argument-building look like the JSON it produces. Reading a field back goes through a member function template: you name the C++ type you want, right at the call site.
 
 ```cpp
-#include "convex.hpp"
+// TypeScript: const state = useQuery(api.demo.state, { room: "readme-cpp" });
+const auto result = client.query("demo:state", {{"room", "readme-cpp"}});
 
-#include <cstdlib>
-#include <iostream>
-#include <stdexcept>
-
-int main() {
-  const char *url = std::getenv("CONVEX_URL");
-  if (!url) {
-    throw std::runtime_error("CONVEX_URL is required");
-  }
-  convex::Client client(url); // The destructor also closes transports.
-
-  // C++ builds the named Convex arguments as a JSON object.
-  const convex::Json args{{"room", "readme-cpp"}};
-  const auto result = client.query("demo:state", args);
-
-  // Check the JSON shape and convert count at the application boundary.
-  const int count = result.value.at("count").get<int>();
-  std::cout << count << '\n';
-}
+// .get<T>() is a template: you pick the static type here, and the
+// JSON-to-int conversion is checked at this exact boundary.
+const int count = result.value.at("count").get<int>();
 ```
 
-The React hook is reactive and generated TypeScript types describe its result. This C++ call is a one-off HTTP query. The client returns `nlohmann::json`, so application code chooses where to validate and convert fields into C++ types. See the small public surface in [`client/convex.hpp`](client/convex.hpp).
+No generated types, no schema file — the braces *are* the argument object, and `get<int>()` is the one line where dynamic JSON becomes an ordinary typed value.
 
-### Owning a Live subscription explicitly
+### The destructor is your unmount handler
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-function LiveRoomCount() {
-  // React starts, updates, and disposes this subscription with the component.
-  const state = useQuery(api.demo.state, { room: "readme-cpp-live" });
-  return <p>{state?.count ?? "Loading..."}</p>;
-}
-```
-
-**C++**
+RAII — "resource acquisition is initialization" — is C++'s signature idea, designed by Stroustrup in the 1980s: cleanup code lives in destructors, so leaving a scope is what releases a resource. Here that means the client and every Live subscription tear down their own transports the moment they go out of scope.
 
 ```cpp
-#include "convex.hpp"
+{
+  convex::Client client(url);  // opens transports
+  auto subscription = client.subscribe("demo:state", {{"room", "readme-cpp"}});
+  // ... query, mutate, read Live updates ...
+}   // scope ends: ~Subscription stops its worker, ~Client closes transports
+// TypeScript: React's useEffect cleanup does this for you on unmount.
+```
 
-#include <cstdlib>
-#include <iostream>
-#include <random>
-#include <stdexcept>
-#include <string>
+Explicit `close()` calls exist for when you want to control the timing — but you cannot forget the destructor version, because the compiler inserts it.
 
-// Create a fresh idempotency key for this logical mutation attempt.
-static std::string run_id() {
-  std::random_device random;
-  return std::to_string(random()) + std::to_string(random());
-}
+### A Live update is a `std::optional`, not a callback
 
-int main() {
-  const char *url = std::getenv("CONVEX_URL");
-  if (!url) {
-    throw std::runtime_error("CONVEX_URL is required");
-  }
-  convex::Client client(url);
-  const convex::Json query_args{{"room", "readme-cpp-live"}};
+A private worker thread owns the WebSocket and handles reconnects; your thread simply *pulls* the next value when it wants one. `next_update()` blocks up to a timeout, and its return type — `std::optional<Update>`, a C++17 vocabulary type — makes "nothing arrived in time" a distinct state you must inspect, not a null pointer or a sentinel.
 
-  // This command-line client owns the subscription and waits for each value.
-  auto subscription = client.subscribe("demo:state", query_args);
-  const auto initial = subscription->next_update();
-  if (!initial || !initial->error.empty()) {
-    throw std::runtime_error("initial Live value failed");
-  }
-  const int before = initial->value.at("count").get<int>();
+```cpp
+auto subscription = client.subscribe("demo:state", {{"room", "readme-cpp"}});
 
-  // A unique runId makes a retried increment refer to the same logical write.
-  const convex::Json mutation_args{{"room", "readme-cpp-live"},
-                                   {"language", "cpp"},
-                                   {"runId", run_id()}};
-  const auto mutation = client.mutation("demo:increment", mutation_args);
-  const bool applied = mutation.value.at("applied").get<bool>();
-
-  // next_update blocks until a value arrives or its timeout expires.
-  const auto changed = subscription->next_update();
-  if (!changed || !changed->error.empty()) {
-    throw std::runtime_error("updated Live value failed");
-  }
-  const int after = changed->value.at("count").get<int>();
-  std::cout << before << " -> " << after << ", applied: " << std::boolalpha
-            << applied << '\n';
-  subscription->close(); // React normally performs this lifecycle step.
+// Blocks until the worker delivers a value, or 10 seconds pass.
+const std::optional<convex::Update> update = subscription->next_update();
+if (update && update->error.empty()) {
+  // TypeScript: useQuery pushes re-renders; here you pull each value.
+  std::cout << update->value.at("count").get<int>() << '\n';
 }
 ```
 
-C++ supports callbacks, futures, coroutines, and other asynchronous styles. The blocking `next_update()` operation is a deliberate choice in this tiny client, not a limitation of C++. It keeps the teaching example linear while a private worker thread owns the WebSocket and reconnects.
+Same reactive Convex query underneath — the push-vs-pull difference is just who owns the event loop, and in a command-line program that's you.
 
 ## Status
 

@@ -28,126 +28,93 @@ test room:
 
 ## Interesting Parts
 
-### A JSON value has to earn its shape
+### Three matches stand between JSON and an int
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function CounterRead() {
-  const state = useQuery(api.demo.state, { room: "ats-json-read" });
-  if (state === undefined) return <span>Loading...</span>;
-
-  return <span>{state.count}</span>; // state.count is type-safe here.
-}
-```
-
-**ATS2**
+ATS descends from Hongwei Xi's Dependent ML, and it shows in everyday code:
+`case+` is pattern matching that treats a missing branch as a compile error,
+not a warning. Convex responses arrive as a local `json` datatype, so reaching
+the counter means winning three matches in a row.
 
 ```ats
-#include "share/atspre_staload.hats"
-staload "./convex_json.sats"
-staload "./convex_transport.sats"
-staload "./convex.sats"
-
-(* The caller passes its validated CONVEX_URL rather than baking in a deployment. *)
-fun read_count(deploymentUrl: string): int =
-  case+ new_client(deploymentUrl) of
-  | CONone() => (exit(1); 0)
-  | COSome(client) => (
-      case+ http_query(client, "demo:state", jobj1("room", JStr("ats-json-read"))) of
-      | CallErr(_) => (exit(1); 0)
-      | CallOk(value, _) => (
-          case+ json_lookup("count", value) of
-          | JONone() => (exit(1); 0)
-          | JOSome(countJson) => (
-              case+ json_integral_int(countJson) of
-              | IONone() => (exit(1); 0)
-              | IOSome(count) => count
-              (* count is an ATS int only after every shape check succeeds. *)
-            )
+(* TypeScript: state.count -- the generated api already guarantees the shape. *)
+fun whole_count(operation: string, j: json): int =
+  case+ j of
+  | JObj(_) => (
+      case+ json_lookup("count", j) of
+      | JOSome(cj) => (
+          case+ json_integral_int(cj) of
+          | IOSome(n) => n
+          | IONone() => (fail_with(sc2(operation, " did not contain a whole count")); 0)
         )
+      | JONone() => (fail_with(sc2(operation, " did not contain a whole count")); 0)
     )
+  | _ => (fail_with(sc2(operation, " was not an object")); 0)
 ```
 
-React gets the return type from Convex's generated API. This ATS client instead
-receives its one-off HTTP result as the local `json` datatype, then uses
-exhaustive pattern matching and a checked whole-number conversion. ATS does not
-know the `demo:state` schema ahead of time in this implementation.
+`json_integral_int` rejects fractional, non-finite, and out-of-range numbers
+outright, so by the time you hold an `int`, there is nothing left to doubt.
 
-### React owns Live for you; this program owns it directly
+### The C is pasted straight into the program
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "ats-live-room";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  const bump = () =>
-    increment({ room, language: "typescript", runId: crypto.randomUUID() });
-
-  // React starts, updates, and disposes the subscription with the component.
-  return <button onClick={bump}>{state?.count ?? "Loading..."}</button>;
-}
-```
-
-**ATS2**
+Postiats compiles ATS2 to C99, and the language leans into it: a `%{^ ... %}`
+block is verbatim C dropped into the source file, and `mac#` binds it to an ATS
+name. Look at `out_present` — the type `&int? >> int` says this by-reference
+argument arrives *possibly uninitialized* and leaves definitely initialized.
+The type system tracks that transition across the call.
 
 ```ats
-#include "share/atspre_staload.hats"
-staload "./convex_json.sats"
-staload "./convex_transport.sats"
-staload "./convex.sats"
-
-(* This is the signature of await_live from examples/basics/main.dats. *)
-extern fun await_live(conn: live_conn, state: live_state, queryId: int,
-  label: string): (json, live_state)
-
-(* The caller passes its validated CONVEX_URL rather than baking in a deployment. *)
-fun increment_with_live(deploymentUrl: string): void =
-  case+ new_client(deploymentUrl) of
-  | CONone() => exit(1)
-  | COSome(client) => (
-      case+ live_connect(client) of
-      | LiveErr(_) => exit(1)
-      | LiveOkConn(conn, state0) => (
-          case+ live_add(conn, state0, "demo:state",
-              jobj1("room", JStr("ats-live-room"))) of
-          | AddErr(_) => (live_close(conn); exit(1))
-          | AddOk(queryId, state1) => let
-              (* The canonical await_live helper polls until this queryId changes. *)
-              val (_, state2) = await_live(conn, state1, queryId, "initial value")
-              val runId = random_hex(16) (* A fresh id makes this increment idempotent. *)
-              val mutationArgs = JObj(JFLCons("room", JStr("ats-live-room"),
-                JFLCons("language", JStr("ats"), JFLCons("runId", JStr(runId), JFLNil()))))
-            in
-              case+ http_mutation(client, "demo:increment", mutationArgs) of
-              | CallErr(_) => (live_close(conn); exit(1))
-              | CallOk(_, _) => let
-                  (* Live was started first, so this observes the mutation. *)
-                  val (_, state3) = await_live(conn, state2, queryId, "updated value")
-                  val state4 = live_remove(conn, state3, queryId)
-                  val () = live_close(conn) (* This program owns cleanup explicitly. *)
-                in
-                  ()
-                end
-            end
-        )
-    )
+%{^
+#include <stdlib.h>
+static char *c_getenv_impl(const char *name, int *out_present) {
+    char *v = getenv(name);
+    *out_present = (v != NULL);
+    return v != NULL ? v : "";
+}
+%}
+(* TypeScript: const url = process.env.CONVEX_URL *)
+extern fun c_getenv(name: string, out_present: &int? >> int): string = "mac#c_getenv_impl"
 ```
 
-The ATS language can support other concurrency styles. The blocking
-`await_live` helper and explicit state threading are choices made by this small
-client. Unlike `useQuery`, it has no component lifecycle to perform cleanup.
-The [full example](examples/basics/main.dats) includes every result check omitted
-from this focused comparison.
+The entire TLS, HTTP, and WebSocket transport crosses this same boundary in
+[`convex_transport`](client/convex_transport.sats).
+
+### The subscription is a value you hand forward
+
+No hidden object mutates behind your back: `live_state` is an immutable value,
+and every Live operation returns the next one. Watching the counter go `0 -> 1`
+means handing `st0`, `st1`, `st2`... forward, one snapshot at a time.
+
+```ats
+case+ live_add(conn, st0, "demo:state", roomArgs) of
+| AddErr(msg) => (live_close(conn); fail_with(sc2("could not subscribe: ", msg)))
+| AddOk(queryId, st1) => let
+    (* TypeScript: useQuery(api.demo.state, { room }) -- React threads all this for you. *)
+    val (initialV, st2) = await_live(conn, st1, queryId, "initial Live value")
+    (* ... the demo:increment mutation lands here ... *)
+    val (updatedV, st3) = await_live(conn, st2, queryId, "updated Live value")
+    val st4 = live_remove(conn, st3, queryId)
+    val () = live_close(conn)
+  in () end
+```
+
+Because the subscription starts before the mutation is sent, the update cannot
+be missed — the same guarantee React gives you, spelled out in values.
+
+### Mutation arguments are cons cells all the way down
+
+ATS has no record-literal syntax for ad-hoc JSON, so this client builds objects
+the classic ML way: a hand-rolled linked list of key/value pairs, constructed
+inside-out with `JFLCons`.
+
+```ats
+(* TypeScript: increment({ room, language: "ats", runId: crypto.randomUUID() }) *)
+val runId = random_hex(16)
+val mutArgs = JObj(JFLCons("room", JStr(room),
+  JFLCons("language", JStr("ats"), JFLCons("runId", JStr(runId), JFLNil()))))
+```
+
+`http_mutation(c, "demo:increment", mutArgs)` posts it; the fresh `runId` makes
+the increment idempotent, and `jobj1` hides the cons cells for one-key objects.
 
 ## Status
 

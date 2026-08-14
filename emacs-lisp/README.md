@@ -32,127 +32,78 @@ unique room on an approved test deployment.
 
 ## Interesting Parts
 
-### JSON objects become Lisp hash tables
+### A quoted symbol picks how JSON keys compare
 
-In a normal Convex React app, the generated `api` object carries the function's
-argument and return types into `useQuery`. This small client accepts path
-strings and decodes JSON objects into Emacs Lisp hash tables instead.
-
-**TypeScript with React**
-
-```tsx
-import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
-
-function Counter() {
-  const state = useQuery(api.demo.state, { room: "readme-room" });
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // Generated types know state.count is a number.
-}
-
-export function App() {
-  return <ConvexProvider client={convex}><Counter /></ConvexProvider>;
-}
-```
-
-**Emacs Lisp**
+In Lisp, code and data share one syntax, and `'equal` is the tiny proof: a
+symbol, quoted so it is passed along as a value instead of being evaluated,
+telling the hash table to compare keys by string contents. Every JSON object
+Convex returns is decoded into exactly this kind of table.
 
 ```emacs-lisp
-(let ((deployment (getenv "CONVEX_URL"))
-      (args (make-hash-table :test 'equal)))
-  (when (or (null deployment) (string-empty-p deployment))
-    (error "CONVEX_URL is required"))
-  ;; JSON object keys are strings in this client.
+(let ((args (make-hash-table :test 'equal))) ; 'equal compares keys by contents
   (puthash "room" "readme-room" args)
-  (convex-configure deployment)
+  (convex-configure (getenv "CONVEX_URL"))
+  ;; TypeScript: await client.query("demo:state", { room })
   (let ((state (convex-query "demo:state" args)))
-    (unless state
-      (error "query failed: %s" (plist-get convex--last-error :message)))
-    (message "%s" (gethash "count" state)))) ; Checked at runtime, not generated typing.
+    (message "count: %s" (gethash "count" state))))
 ```
 
-`convex-query` is a one-off, blocking HTTP call. It is useful in a script, but
-it is not equivalent to React's reactive `useQuery` hook.
+That quote mark is shorthand for `(quote equal)`, notation straight out of
+McCarthy's 1960 Lisp paper, still on the job against a modern realtime
+database.
 
-### React owns the subscription; this client asks you to pump it
+### Failure is `nil`; the details are a plist
 
-React rerenders after the mutation because `useQuery` owns its subscription
-lifecycle. The Emacs Lisp API exposes that lifecycle directly: subscribe,
-pump the connection until an event is queued, decode it, then unsubscribe and
-close.
-
-**TypeScript with React**
-
-```tsx
-import { ConvexProvider, ConvexReactClient, useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
-
-function Counter() {
-  const room = "readme-room";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  async function addOne() {
-    const result = await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.applied, result.state.count); // Both fields are generated types.
-  }
-
-  return <button onClick={() => void addOne()}>{state?.count ?? "Loading..."}</button>;
-}
-
-export function App() {
-  return <ConvexProvider client={convex}><Counter /></ConvexProvider>;
-}
-```
-
-**Emacs Lisp**
+`convex-query` returns the decoded value, or `nil` on failure, and then the
+full story waits in `convex--last-error` as a property list: alternating keys
+and values, one of Lisp's oldest data structures. `plist-get` fishes out a
+field by its keyword.
 
 ```emacs-lisp
-(let ((deployment (getenv "CONVEX_URL"))
-      (query-args (make-hash-table :test 'equal))
-      (mutation-args (make-hash-table :test 'equal))
-      subscription)
-  (when (or (null deployment) (string-empty-p deployment))
-    (error "CONVEX_URL is required"))
-  (puthash "room" "readme-room" query-args)
-  (puthash "room" "readme-room" mutation-args)
-  (puthash "language" "emacs-lisp" mutation-args)
-  ;; A fresh key makes retries idempotent without colliding with an earlier evaluation.
-  (puthash "runId"
-           (format "readme-%x-%x" (emacs-pid) (truncate (* (float-time) 1000000)))
-           mutation-args)
-  (convex-configure deployment)
-  (unwind-protect
-      (progn
-        (setq subscription (convex-live-subscribe "demo:state" query-args))
-        ;; This client deliberately exposes a blocking pull API for Live events.
-        (while (not (convex-live-next-event))
-          (convex-live-pump (+ (float-time) 0.2)))
-        (let ((result (convex-mutation "demo:increment" mutation-args)))
-          (message "%s %s"
-                   (gethash "applied" result)
-                   (gethash "count" (gethash "state" result))))
-        ;; Pump again to receive the value changed by the mutation.
-        (while (not (convex-live-next-event))
-          (convex-live-pump (+ (float-time) 0.2)))
-        (message "%s" (gethash "count"
-                               (json-parse-string convex-live--event-payload
-                                                  :object-type 'hash-table))))
-    (when subscription (convex-live-unsubscribe subscription))
-    (convex-live-close)))
+(let ((state (convex-query "demo:state" args)))
+  (unless state
+    ;; convex--last-error looks like (:name ... :message ... :data ...)
+    (error "query failed: %s" (plist-get convex--last-error :message)))
+  (gethash "count" state))
 ```
 
-Emacs itself supports asynchronous network processes, callbacks, timers, and
-an event loop. The explicit `pump` and `next-event` shape is this client's API
-choice for deterministic batch programs, not a limitation of Emacs Lisp.
+### You hold the crank of the event loop
+
+React's `useQuery` re-renders your component when the server pushes a new
+value. Here the push arrives over a WebSocket this client implements itself
+(Emacs models a network connection as a process object), and you pull:
+`convex-live-pump` waits on the socket, `convex-live-next-event` dequeues the
+next update.
+
+```emacs-lisp
+(convex-live-subscribe "demo:state" args)
+;; TypeScript: useQuery(api.demo.state, { room }) re-renders for you
+(while (not (convex-live-next-event))
+  (convex-live-pump (+ (float-time) 0.2))) ; wait up to 200 ms for socket input
+(gethash "count"
+         (json-parse-string convex-live--event-payload :object-type 'hash-table))
+```
+
+When a mutation lands, the same loop wakes with the new count: Convex
+reactivity, hand-pumped from a text editor whose lineage predates the web.
+
+### `unwind-protect` was `finally` before `finally`
+
+Lisp had guaranteed cleanup decades before mainstream languages picked up
+`try/finally`. The canonical example wraps its whole Live session in
+`unwind-protect`, so the subscription is dropped and the WebSocket closed no
+matter how the body exits.
+
+```emacs-lisp
+(unwind-protect
+    (progn
+      (setq subscription (convex-live-subscribe "demo:state" args))
+      ;; ... pump Live events, apply the mutation, pump again ...
+      (message "verified count: 0 -> 1"))
+  ;; Cleanup runs on success, error, or C-g.
+  (when subscription (convex-live-unsubscribe subscription))
+  (convex-live-close))
+```
 
 ## Status
 

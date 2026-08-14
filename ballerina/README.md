@@ -34,45 +34,38 @@ You do not need Ballerina installed on your machine.
 
 ## Interesting Parts
 
-### Record literals fit Convex arguments, but results stay honest JSON
+### `check` makes a Convex call one honest line
 
-Ballerina's [records](https://ballerina.io/learn/by-example/records/) look at
-home beside JavaScript object literals. Its [union types and `is`
-narrowing](https://ballerina.io/learn/by-example/unions/) are especially useful
-when Convex JSON numbers may decode as `int`, `float`, or `decimal`.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-
-  async function handleClick() {
-    const result = await increment({
-      room: "readme-ballerina-records",
-      language: "typescript",
-      runId: crypto.randomUUID(), // A fresh key makes this attempt idempotent.
-    });
-    console.log(result.state.count); // Generated API types make count a number.
-  }
-
-  return <button onClick={handleClick}>Increment</button>;
-}
-```
-
-**Ballerina**
+Ballerina has no exceptions for ordinary failure: a function that can fail
+*returns* its error, and the `check` keyword either unwraps the success value
+or hands the error straight back to the caller. Add record literals — same
+braces, same field shorthand as JavaScript — and a mutation stays compact
+without hiding its failure path.
 
 ```ballerina
-import ballerina/io;
-import ballerina/os;
-import ballerina/uuid;
+Client convexClient = check new (url);
 
-function wholeCount(json value) returns int|error {
+// TypeScript: const result = await increment({ room, language, runId });
+CallResult result = check convexClient.mutation("demo:increment", {
+    room, // Field shorthand, straight out of a JS object literal.
+    language: "ballerina",
+    runId: uuid:createType1AsString()
+});
+```
+
+Every `check` marks a spot where the compiler knows the call can go wrong.
+
+### `json` is a language type, and `is` carves it up
+
+Ballerina grew up at WSO2 doing integration work, so JSON is not a library —
+`json` is a built-in union of nil, booleans, strings, numbers, arrays, and
+maps. Convex may spell a whole counter as `1`, `1.0`, or a decimal on the
+wire, and the canonical example narrows all three with `is` type tests:
+
+```ballerina
+function wholeCounter(json value, string operation) returns int {
     if value is int {
-        return value; // The `is` check narrows value to int in this branch.
+        return value; // Narrowed: a plain int from here on, no cast.
     }
     if value is float && value == value.floor() {
         return <int>value;
@@ -80,119 +73,54 @@ function wholeCount(json value) returns int|error {
     if value is decimal && value == value.floor() {
         return <int>value;
     }
-    return error("count was not a whole number");
-}
-
-public function main() returns error? {
-    string deploymentUrl = os:getEnv("CONVEX_URL");
-    if deploymentUrl.length() == 0 {
-        return error("CONVEX_URL is required");
-    }
-    Client client = check new (deploymentUrl);
-    string room = "readme-ballerina-records";
-    CallResult result = check client.mutation("demo:increment", {
-        room, // Record shorthand builds the same Convex argument object.
-        language: "ballerina",
-        runId: uuid:createType1AsString()
-    });
-    int count = check wholeCount(check result.value.state.count);
-    io:println(count); // count is type-safe only after explicit JSON narrowing.
-    ConvexError? closeError = client.close();
+    panic error(operation + " count is not a whole number");
 }
 ```
 
-The TypeScript client is generated from the Convex API, so it knows the
-function's argument and return types. This Ballerina client intentionally
-exposes `json`; the record literal is convenient, but the caller must validate
-returned fields. The full example also rejects fractional and overflowing
-counters.
+Type tests are control flow: inside the branch, `value` simply *is* an `int`.
 
-### Live updates have an explicit lifecycle
+### Four kinds of failure, four distinct error types
 
-React owns the `useQuery` subscription while the component is mounted. This
-command-line client instead returns a `Subscription`, and the caller receives
-updates from its mailbox and closes it directly.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "readme-ballerina-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  if (state === undefined) return <p>Loading...</p>;
-
-  async function handleIncrement() {
-    const result = await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.applied); // The mutation result is generated and typed.
-  }
-
-  return (
-    <button
-      onClick={() => void handleIncrement()}
-    >
-      Count: {state.count}
-    </button>
-  ); // React rerenders this component when the query result changes.
-}
-```
-
-**Ballerina**
+The client models Convex's failure shapes as separate `distinct error` types —
+the function itself failing, a protocol violation, a transport fault, and a
+call on an already-closed client — unioned into one `ConvexError`. Call sites
+narrow with `is`, and the compiler checks every branch is handled.
 
 ```ballerina
-import ballerina/os;
-import ballerina/uuid;
+public type ConvexError FunctionError|ProtocolError|TransportError|ClosedError;
 
-function nextUpdate(Subscription live) returns Update|ConvexError {
-    Update|ClosedError|TransportError delivery =
-        live.updates().recvTimeout(10.0); // This client chooses a blocking read.
-    if delivery is ClosedError|TransportError {
-        return delivery; // The union is narrowed before Update fields are used.
-    }
-    ConvexError? updateError = delivery.err;
-    if updateError is ConvexError {
-        return updateError;
-    }
-    return delivery;
-}
-
-public function main() returns error? {
-    string deploymentUrl = os:getEnv("CONVEX_URL");
-    if deploymentUrl.length() == 0 {
-        return error("CONVEX_URL is required");
-    }
-    Client client = check new (deploymentUrl);
-    string room = "readme-ballerina-live";
-    Subscription live = check client.subscribe("demo:state", {room});
-    Update initial = check nextUpdate(live); // First delivery is the current value.
-
-    CallResult result = check client.mutation("demo:increment", {
-        room,
-        language: "ballerina",
-        runId: uuid:createType1AsString()
-    });
-    if (check result.value.applied) != true {
-        return error("mutation was not applied"); // Validate the HTTP result.
-    }
-    Update changed = check nextUpdate(live); // Next delivery is the reactive update.
-
-    ConvexError? liveCloseError = live.close(); // Stop this query explicitly.
-    ConvexError? clientCloseError = client.close(); // Stop the shared Live owner.
+CallResult|ConvexError result = convexClient.query("demo:state", {room});
+if result is FunctionError {
+    // The Convex function reported failure: an expected outcome, with logs.
+    io:println(result.detail().logs);
 }
 ```
 
-Ballerina supports streams and asynchronous concurrency, but this client's
-blocking `recvTimeout` mailbox is an API decision, not a language limitation.
-It keeps the newest 16 deliveries for each subscription and drops older
-intermediate states when a consumer falls behind.
+A failed Convex function is data you branch on, not a stack trace you catch.
+
+### Live updates land in a mailbox, not a callback
+
+Where React's `useQuery` rerenders your component, this command-line client
+hands you a `Subscription` you read like a channel. One background strand —
+Ballerina's lightweight thread — owns the WebSocket, and each subscription
+gets an isolated, bounded mailbox holding the newest 16 deliveries.
+
+```ballerina
+// TypeScript: const state = useQuery(api.demo.state, { room });
+Subscription live = check convexClient.subscribe("demo:state", {room});
+Update|ClosedError|TransportError initial = live.updates().recvTimeout(10.0);
+
+// ...increment the counter...
+
+Update|ClosedError|TransportError updated = live.updates().recvTimeout(10.0);
+if updated is Update {
+    io:println(updated.value); // The reactive update, pushed by Convex.
+}
+ConvexError? liveCloseErr = live.close(); // Unsubscribing is explicit here.
+```
+
+The union return type means you cannot touch `updated.value` before deciding
+what a timeout or a closed client should mean.
 
 ## Status
 

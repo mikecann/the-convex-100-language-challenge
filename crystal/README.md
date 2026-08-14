@@ -21,102 +21,62 @@ That command builds the minimal example image and runs this exact source against
 
 ## Interesting Parts
 
-### Familiar syntax, explicit JSON at the network boundary
+### Ruby's `case`, TypeScript's narrowing
 
-With Convex React, generated API bindings carry the argument and return types into TypeScript. This Crystal client deliberately stays small and accepts function names as strings, so values crossing the network are `JSON::Any` and the caller narrows them explicitly.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-
-  async function handleClick() {
-    const result = await increment({
-      room: "readme-mutation",
-      language: "typescript",
-      runId: crypto.randomUUID(), // Retrying this ID will not increment twice.
-    });
-    console.log(result.applied); // The generated API makes this a boolean.
-  }
-
-  return <button onClick={handleClick}>Increment</button>;
-}
-```
-
-**Crystal**
+Crystal's founding pitch at Manas Tech fits on a sticker: Ruby's syntax, C's speed. The static half shows up the moment a Convex value crosses the wire — `JSON::Any#raw` returns a union type, and a plain Ruby-looking `case` narrows it branch by branch, much the way TypeScript narrows with `typeof`, except here it compiles to a native binary.
 
 ```crystal
-require "json"
-require "./client/client"
-
-client = Convex::Client.new(ENV.fetch("CONVEX_URL"))
-begin
-  # Crystal infers the hash type, while JSON::Any marks values crossing the wire.
-  args = {
-    "room"     => JSON::Any.new("readme-mutation"),
-    "language" => JSON::Any.new("crystal"),
-    "runId"    => JSON::Any.new(Random::Secure.hex(8)),
-  }
-  result = client.mutation("demo:increment", args)
-  puts result.value["applied"].as_bool # Check the dynamic JSON value as a Bool.
-ensure
-  client.close
-end
-```
-
-Both snippets call the same mutation with the same three arguments. The React call is asynchronous and generated types describe its result. This Crystal API blocks until the HTTP response arrives and checks the returned JSON shape at runtime.
-
-### React owns subscriptions; this command-line client owns one directly
-
-`useQuery` subscribes when a component renders, rerenders it when the value changes, and cleans up when the component unmounts. The Crystal client exposes a `Subscription` with a blocking `next` method instead. That is a deliberate API choice for a small command-line demonstration, not a limitation of Crystal. Underneath, the client uses Crystal fibers and channels to keep Live work concurrent.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-function RoomCount() {
-  const state = useQuery(api.demo.state, { room: "readme-live" });
-
-  if (state === undefined) return <span>Loading...</span>;
-  return <span>{state.count}</span>; // React rerenders when this count changes.
-}
-```
-
-**Crystal**
-
-```crystal
-require "json"
-require "./client/client"
-
-client = Convex::Client.new(ENV.fetch("CONVEX_URL"))
-begin
-  args = {"room" => JSON::Any.new("readme-live")}
-  subscription = client.subscribe("demo:state", args)
-  begin
-    # next waits for the first Live value or raises after the timeout.
-    initial = subscription.next(10.seconds)
-    raise initial.error.not_nil! if initial.error
-    puts initial.value.not_nil!["count"].to_json
-
-    # After another client increments the room, next waits for that new value.
-    changed = subscription.next(10.seconds)
-    raise changed.error.not_nil! if changed.error
-    puts changed.value.not_nil!["count"].to_json
-  ensure
-    subscription.close # Explicit cleanup replaces React's unmount lifecycle.
+# Convex numbers travel as JSON, so a counter may arrive as Int64 or Float64.
+def whole_count(value : JSON::Any, operation : String) : Int64
+  case number = value.raw
+  when Int64
+    number                     # the compiler knows number : Int64 here
+  when Float64                 # ...and number : Float64 here (range checks elided)
+    integer = number.to_i64
+    raise "#{operation} count was fractional" unless number == integer
+    integer
+  else
+    raise "#{operation} count was not numeric"
   end
-ensure
-  client.close
 end
 ```
 
-The focused Crystal fragment only shows delivery and cleanup. The complete example below starts Live before its mutation and validates the returned numbers carefully, including Convex numbers encoded as `0.0` or `1.0`.
+No casts and no annotations inside the branches — flow typing does it all.
+
+### `select` races the Live channel against the clock
+
+Crystal's concurrency is CSP, the model Go made famous: lightweight fibers talking over typed channels. This client spawns one owner fiber for the whole Live WebSocket, and each subscription is a bounded `Channel(Update)` that fiber feeds. Waiting for the next reactive value is a `select` — and even the timeout reads like Ruby, because `10.seconds` is a method call returning a typed `Time::Span`.
+
+```crystal
+subscription = client.subscribe("demo:state", {"room" => JSON::Any.new("readme-live")})
+# TypeScript: const state = useQuery(api.demo.state, { room: "readme-live" })
+update = subscription.next(10.seconds)
+
+# Inside next, delivery is a race between the channel and the clock:
+select
+when value = @queue.receive
+  value
+when timeout(10.seconds)
+  raise TransportError.new("timed out waiting for Live update", "live")
+end
+```
+
+Where React resubscribes on render and cleans up on unmount, here `subscription.close` is the unmount — explicit, but one line.
+
+### The whole demo sits inside a compile-time `if`
+
+Those `{% %}` fences in the example below are macros: Crystal code that runs while the compiler does, operating on the program itself. The basics example wraps its entire networked body in one, so building with `-Dexample_count_test` compiles the network program out and leaves only `whole_count` for the unit test. It is `#ifdef`, reborn inside a language that looks like Ruby.
+
+```crystal
+{% unless flag?(:example_count_test) %}
+  room = ARGV[0]? || "crystal-example"   # [0]? returns nil instead of raising
+  client = Convex::Client.new(ENV.fetch("CONVEX_URL"), ENV["CONVEX_AUTH_TOKEN"]?)
+  current = client.query("demo:state", {"room" => JSON::Any.new(room)})
+  # ... subscribe, mutate, verify — all inside the compile-time block ...
+{% end %}
+```
+
+One binary carries the demo; the test binary never even links it.
 
 ## Status
 

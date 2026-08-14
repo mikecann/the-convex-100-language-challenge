@@ -34,140 +34,88 @@ Pascal installed on the host.
 
 ## Interesting Parts
 
-### A query is a hook in React and an owned result in Pascal
+### One directive turns Free Pascal into Delphi
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-const room = "pascal-readme-room";
-
-export function Count() {
-  const state = useQuery(api.demo.state, { room });
-  if (state === undefined) return <span>Loading...</span>;
-
-  return <span>{state.count}</span>; // The generated API types state.count.
-}
-```
-
-**Delphi/Object Pascal**
+Pascal configures its own compiler with `{$...}` directives right in the
+source. This client is built with the open source Free Pascal compiler, and a
+single line per file switches it into Delphi compatibility mode.
 
 ```pascal
+program ConvexExampleApp;
+
+{$mode delphi}    { Free Pascal, speaking the Delphi dialect }
+{$apptype console}
+
 uses
   SysUtils, fpjson,
-  ConvexClient, ConvexResult;
-
-procedure PrintCount;
-var
-  Client: TConvexClient;
-  Args: TJSONObject;
-  QueryResult: TConvexResult;
-begin
-  Client := TConvexClient.Create(GetEnvironmentVariable('CONVEX_URL'));
-  Args := TJSONObject.Create;
-  try
-    Args.Add('room', 'pascal-readme-room'); // Build Convex's args object.
-    QueryResult := Client.Query('demo:state', Args); // One blocking HTTP query.
-    try
-      WriteLn(TJSONObject(QueryResult.Value).Find('count').AsInteger);
-    finally
-      QueryResult.Free; // The caller owns the returned result and JSON value.
-    end;
-  finally
-    Args.Free;
-    Client.Free;
-  end;
-end;
+  ConvexClient, ConvexResult, ConvexSyncEvent, ConvexJsonUtil;
 ```
 
-React's `useQuery` owns a reactive subscription and rerenders when the result
-changes. `Client.Query` is deliberately a one-off HTTP call, so this smaller
-Pascal example owns its JSON arguments, result object, and cleanup explicitly.
+### The query result is yours — and yours to Free
 
-### React manages Live for you; this client exposes the loop
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-const room = "pascal-live-room";
-
-export function LiveCounter() {
-  const state = useQuery(api.demo.state, { room }); // React owns the subscription.
-  const increment = useMutation(api.demo.increment);
-
-  if (state === undefined) return <button disabled>Loading...</button>;
-  return (
-    <button
-      onClick={() => void increment({
-        room,
-        language: "TypeScript with React",
-        runId: `${room}-${crypto.randomUUID()}`, // Fresh idempotency key.
-      })}
-    >
-      Count: {state.count}
-    </button>
-  ); // A pushed query result causes this component to rerender.
-}
-```
-
-**Delphi/Object Pascal**
+Object Pascal has no garbage collector; the Delphi idiom since 1995 is one
+`try..finally` per owned object. `Client.Query` returns a `TConvexResult`
+that the caller owns, so cleanup is part of the call's visible shape.
 
 ```pascal
-uses
-  SysUtils, fpjson,
-  ConvexClient, ConvexResult;
-
-function NextLiveCount(Client: TConvexClient): Int64;
-begin
-  repeat
-    Client.Live.Poll(200); // This command-line program drives Live itself.
-  until Client.Live.PendingEvents.Count > 0;
-  Result := TJSONObject(Client.Live.PendingEvents[0].Value)
-    .Find('count').AsInteger;
-  Client.Live.PendingEvents.Clear; // Clearing also frees the owned event.
-end;
-
-procedure IncrementWhileWatching(Client: TConvexClient);
-var
-  Room: string;
-  Args, MutationArgs: TJSONObject;
-  MutationResult: TConvexResult;
-  Guid: TGUID;
-begin
-  Room := 'pascal-live-room';
-  Args := TJSONObject.Create;
-  Args.Add('room', Room);
+Args := TJSONObject.Create;
+Args.Add('room', Room);
+try
+  // TypeScript: const state = useQuery(api.demo.state, { room })
+  StateResult := Client.Query('demo:state', Args);
   try
-    Client.Live.AddSubscription('counter', 'demo:state', Args);
-    Client.Live.EnsureConnected; // Open one WebSocket and send the subscription.
-    WriteLn('initial: ', NextLiveCount(Client));
-
-    MutationArgs := TJSONObject.Create;
-    MutationArgs.Add('room', Room);
-    MutationArgs.Add('language', 'Delphi/Object Pascal');
-    CreateGUID(Guid); // Match React's fresh idempotency key per invocation.
-    MutationArgs.Add('runId', Room + '-' + GUIDToString(Guid));
-    MutationResult := Client.Mutation('demo:increment', MutationArgs);
-    MutationResult.Free; // The update arrives separately through Live.
-    MutationArgs.Free;
-
-    WriteLn('updated: ', NextLiveCount(Client)); // Server-pushed result.
-    Client.Live.RemoveSubscription('counter');
+    if StateResult.IsSuccess then
+      WriteLn('count: ', TJSONObject(StateResult.Value).Find('count').AsInteger);
   finally
-    Args.Free;
+    StateResult.Free;  { frees the result and its decoded JSON tree }
   end;
+finally
+  Args.Free;
 end;
 ```
 
-The Pascal language supports callbacks and threads. The blocking `Poll` call
-and visible event list are choices made by this small command-line client so
-one owner controls the socket. These snippets show the successful path; the
-complete example adds deadlines, checks every result, and guarantees cleanup.
+### Properties: fields on the outside, getters underneath
+
+Delphi's `property` keyword — the 1995 feature that made drag-and-drop
+component design work, and that Anders Hejlsberg later carried into C# —
+publishes read-only views of private state. `TConvexResult` uses it to make
+the success/failure split feel like plain data access.
+
+```pascal
+{ From ConvexResult.pas: read-only windows onto private fields. }
+property IsSuccess: Boolean read FIsSuccess;
+property Value: TJSONData read FValue;
+property ErrorMessage: string read FErrorMessage;
+
+{ At the call site a property reads like a field: }
+if not MutationResult.IsSuccess then
+  WriteLn(StdErr, MutationResult.ErrorMessage);
+```
+
+### repeat..until the server pushes
+
+Pascal's post-condition loop reads almost like English, and this client keeps
+Convex's reactive side visible enough to use one: subscribe, pump the
+WebSocket, and every server push lands as a `TConvexSyncEvent` in
+`PendingEvents`. No hidden scheduler — your program is the event loop.
+
+```pascal
+Client.Live.AddSubscription('basics', 'demo:state', Args);
+Client.Live.EnsureConnected;  { one WebSocket, one owner }
+
+repeat
+  Client.Live.Poll(200);  { pump the socket for up to 200 ms }
+until Client.Live.PendingEvents.Count > 0;
+
+// TypeScript: useQuery(api.demo.state, { room }) rerenders on this same push
+Event := Client.Live.PendingEvents[0];
+if not Event.IsError then
+  WriteLn('live count: ', TJSONObject(Event.Value).Find('count').AsInteger);
+Client.Live.PendingEvents.Clear;  { the list owns and frees its events }
+```
+
+Mutate the room from anywhere — even another process — and the update arrives
+on this socket without querying again.
 
 ## Status
 

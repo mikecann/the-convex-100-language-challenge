@@ -19,106 +19,67 @@ From the repository root, run the canonical example in its Docker image:
 
 ## Interesting Parts
 
-### `SuperStrict` types stop where JSON begins
+### The return type is welded to the function's name
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function QueryCount() {
-  const room = "readme-blitzmax-query";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <span>Loading...</span>;
-  return <span>{state.count}</span>; // The generated Convex API makes state.count type-safe.
-}
-```
-
-**BlitzMax**
+BlitzMax descends from Mark Sibly's Blitz BASIC family — the 2004 successor to the game-focused Blitz3D, carried on today as the community-run BlitzMax NG — and it kept BASIC's habit of putting types after a colon. That applies to functions too: `Function CountFrom:Long(...)` declares the return type right on the name. With `SuperStrict` at the top of the file, every declaration is mandatory, so this helper that unpacks a Convex query result is typed end to end.
 
 ```blitzmax
 SuperStrict
 
-Import "../../client/transport.bmx"
-Import "../../client/jsonvalue.bmx"
-Import "../../client/convex.bmx"
+' The Long return type rides on the function name itself.
+Function CountFrom:Long(value:TJSON, operation:String)
+	Local state:TJSONObject = TJSONObject(value)
+	If Not state Then Throw TConvexError.Protocol(operation + " did not return an object")
+	Return ConvexIntegralValue(state.Get("count"), operation + " count")
+End Function
 
-Local room:String = "readme-blitzmax-query"
-' ~q is BlitzMax's escape for a quote inside a string literal.
-Local args:TJSONObject = ConvexParseJsonObject("{~qroom~q:" + ConvexQuote(room) + "}", "arguments")
-Local client:TConvexClient = TConvexClient.Create(ConvexEnv("CONVEX_URL"))
-
-' Query is an HTTP call here, not a reactive hook.
-Local value:TJSON = client.Query("demo:state", args).value
-Local state:TJSONObject = TJSONObject(value)
-If Not state Then Throw TConvexError.Protocol("demo:state did not return an object")
-Local count:Long = ConvexIntegralValue(state.Get("count"), "state count")
-Print count ' count is a checked 64-bit integer here.
-
-client.Close()
+' TypeScript: const state = useQuery(api.demo.state, { room }); state.count
+Local current:Long = CountFrom(client.Query("demo:state", args).value, "current query")
 ```
 
-`SuperStrict` requires every variable and return type to be declared, so `room`, `state`, and `count` cannot silently change type. Unlike the generated TypeScript API, BlitzMax does not know the Convex function's return shape at compile time. This client therefore casts `TJSON` nodes and validates each important field at runtime.
+The generated TypeScript API knows a query's shape at compile time; BlitzMax cannot, so the client casts `TJSON` nodes and checks each field loudly at runtime.
 
-### A Live query is an object you drive and retire
+### JSON where `~q` means quote
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function RoomCount() {
-  const room = "readme-blitzmax-live";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // React rerenders when the subscribed value changes.
-}
-```
-
-**BlitzMax**
+BlitzMax strings escape with `~`, not backslash: `~q` is a double quote, `~n` a newline, `~t` a tab. A JSON literal therefore looks like no other language's — and the trailing `..` is BlitzMax's way of continuing a statement onto the next line.
 
 ```blitzmax
-SuperStrict
+' ~q escapes a double quote inside a BlitzMax string literal.
+Function IncrementArguments:TJSONObject(room:String, idempotencyKey:String)
+	Return ConvexParseJsonObject("{~qroom~q:" + ConvexQuote(room) + ",~qlanguage~q:~qBlitzMax~q,~qrunId~q:" + ..
+		ConvexQuote(idempotencyKey) + "}", "arguments")
+End Function
 
-Import "../../client/transport.bmx"
-Import "../../client/jsonvalue.bmx"
-Import "../../client/convex.bmx"
+' TypeScript: await client.mutation("demo:increment", { room, language: "BlitzMax", runId })
+Local result:TConvexResult = client.Mutation("demo:increment", IncrementArguments(room, ConvexNewUuid()))
+```
 
-' Type declares an object; Extends supplies the callback BlitzMax must override.
+`ConvexQuote` escapes the values, so the only quotes written by hand are the JSON keys.
+
+### Live updates pump like a game loop
+
+BlitzMax grew up powering games, where the program owns its main loop and the world advances one frame at a time. This client keeps that shape for Convex's realtime side: a subscription delivers each new value to an object that `Extends TConvexObserver` (note the trailing `Override`, a BlitzMax NG addition), and nothing moves until you `Pump` the socket.
+
+```blitzmax
 Type TCountObserver Extends TConvexObserver
-    Field received:Int ' Each observer instance remembers whether a value arrived.
+	Field received:Int
 
-    Method OnUpdate(subscription:TConvexSubscription, value:TJSON, problem:TConvexFunctionError) Override
-        If problem Then Throw TConvexError.Protocol(problem.message)
-
-        Local state:TJSONObject = TJSONObject(value)
-        If Not state Then Throw TConvexError.Protocol("demo:state did not return an object")
-        Local count:Long = ConvexIntegralValue(state.Get("count"), "Live count")
-        Print count ' The callback receives each initial or changed value.
-        received = True
-    End Method
+	Method OnUpdate(subscription:TConvexSubscription, value:TJSON, problem:TConvexFunctionError) Override
+		Print ConvexIntegralValue(TJSONObject(value).Get("count"), "Live count")
+		received = True
+	End Method
 End Type
 
-Local room:String = "readme-blitzmax-live"
-Local args:TJSONObject = ConvexParseJsonObject("{~qroom~q:" + ConvexQuote(room) + "}", "arguments")
-Local client:TConvexClient = TConvexClient.Create(ConvexEnv("CONVEX_URL"))
+' TypeScript: const state = useQuery(api.demo.state, { room })
 Local observer:TCountObserver = New TCountObserver
 Local subscription:TConvexSubscription = client.Subscribe("demo:state", args, observer)
-
-Local deadline:TConvexDeadline = TConvexDeadline.Create(5000)
-While Not observer.received And Not deadline.Expired()
-    client.Pump(50) ' The command-line app explicitly drives Live progress.
+While Not observer.received
+	client.Pump(50) ' give the Live socket a 50 ms slice; new values land in OnUpdate
 Wend
-If Not observer.received Then Throw TConvexError.Transport("timed out waiting for Live")
-client.Unsubscribe(subscription) ' Explicitly retire this query.
-client.Close() ' Explicitly close its transport too.
+client.Unsubscribe(subscription)
 ```
 
-React owns the `useQuery` subscription while the component is mounted. This command-line client instead exposes an observer plus `Pump`, `Unsubscribe`, and `Close`. That explicit lifecycle is a client API choice suited to the single-owner event loop in this implementation, not a limitation of BlitzMax objects or callbacks.
+React re-renders whenever Convex pushes a new value; here the push arrives inside `OnUpdate` exactly as often as you pump — a frame loop, with a counter instead of sprites.
 
 ## Status
 

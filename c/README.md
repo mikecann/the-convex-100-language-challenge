@@ -19,137 +19,75 @@ From the repository root, run the exact example in its Docker image against the 
 
 ## Interesting Parts
 
-### A reactive query becomes an explicit subscription handle
+### The header hides the struct, and the linker keeps the secret
 
-**TypeScript with React**
+C predates objects entirely, so it has no `private` keyword — yet [`client/convex.h`](client/convex.h) encapsulates perfectly with the classic *opaque pointer* idiom: declare a struct's name in the header, define its body only inside `convex.c`. Callers can hold a `convex_client *` but can never reach inside it.
 
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
+```c
+/* The struct bodies live only in convex.c; here they are just names. */
+typedef struct convex_client convex_client;
+typedef struct convex_subscription convex_subscription;
 
-export function CurrentCount() {
-  const room = "readme-c";
-  const state = useQuery(api.demo.state, { room });
+convex_client *convex_new(const char *deployment_url,
+                          const char *client_version, convex_error *error);
+void convex_free(convex_client *client);
+```
 
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // React rerenders when this query changes.
+Fifty years on, this is still how libcurl and SQLite draw their API boundaries — and how this client draws its own.
+
+### Errors arrive through out-parameters, zeroed by `{0}`
+
+C has no exceptions and one return value per function, so every fallible call returns a success flag and writes its payload through pointers you hand in. The `= {0}` initializer — a universal aggregate zero that works on any struct — is what makes the pattern safe to set up.
+
+```c
+convex_error error = {0};  /* {0} zeroes every field of the struct. */
+convex_result result = {0};
+
+/* TypeScript: const state = await client.query("demo:state", { room }); */
+if (!convex_call(client, "query", "demo:state", args, &result, &error)) {
+  fprintf(stderr, "%s\n", error.message);
+  return 1;
 }
 ```
 
-**C**
+Success and failure both have a concrete address before the call is even made.
+
+### One `json_object_put` releases the whole argument tree
+
+With no object literals in the language, the arguments to `demo:increment` are assembled node by node from [json-c](https://json-c.github.io/json-c/json-c-current-release/doc/html/index.html)'s reference-counted values. Each `json_object_object_add` transfers ownership of a child into the parent, so a single `put` at the end drops the entire tree.
 
 ```c
-#include "convex.h"
-#include <curl/curl.h>
-#include <json-c/json.h>
-#include <stdio.h>
-#include <stdlib.h>
+json_object *args = json_object_new_object();
+json_object_object_add(args, "room", json_object_new_string(room));
+json_object_object_add(args, "language", json_object_new_string("C"));
+json_object_object_add(args, "runId", json_object_new_string(run_id));
 
-int main(void) {
-  curl_global_init(CURL_GLOBAL_DEFAULT);
-  convex_error error = {0};
-  const char *deployment_url = getenv("CONVEX_URL");
-  convex_client *client = convex_new(deployment_url, "c-readme", &error);
-  if (!client)
-    return 1;
+/* TypeScript: await increment({ room, language, runId }); */
+convex_call(client, "mutation", "demo:increment", args, &result, &error);
 
-  /* json-c builds the { room: "readme-c" } argument object explicitly. */
-  json_object *args = json_object_new_object();
-  json_object_object_add(args, "room", json_object_new_string("readme-c"));
+json_object_put(args); /* One put frees args and every child value. */
+```
 
-  convex_subscription *subscription =
-      convex_subscribe(client, "demo:state", args, &error);
-  convex_update update = {0};
-  if (!subscription ||
-      convex_subscription_next(subscription, &update, 10000) != 1)
-    return 1;
+### A Live update is a tri-state integer
 
+Convex reactivity without a UI framework: `convex_subscribe` returns a handle, a dedicated pthread worker owns the WebSocket, and you drain updates with a blocking wait whose return value follows the old Unix `poll(2)` convention — `1` update, `0` timeout, `-1` closed.
+
+```c
+/* TypeScript: const state = useQuery(api.demo.state, { room }); */
+convex_subscription *subscription =
+    convex_subscribe(client, "demo:state", args, &error);
+
+convex_update update = {0};
+if (convex_subscription_next(subscription, &update, 10000) == 1) {
   json_object *count = NULL;
   json_object_object_get_ex(update.value, "count", &count);
-  printf("%d\n", json_object_get_int(count)); /* The initial Live value. */
-
-  convex_update_free(&update); /* Release the value returned by next(). */
-  convex_unsubscribe(subscription, &error);
-  json_object_put(args); /* Release the argument tree owned by this scope. */
-  convex_free(client);   /* Stops the worker and releases the client. */
-  return 0;
+  printf("count: %d\n", json_object_get_int(count));
+  convex_update_free(&update);
 }
+convex_unsubscribe(subscription, &error);
 ```
 
-`useQuery` owns the subscription lifecycle and causes React to rerender. This C client instead returns a subscription handle and exposes a blocking `convex_subscription_next` operation. That blocking API is a deliberate client design for a small command-line demonstration, not a limitation of C or pthreads. See the complete [counter sequence](examples/basics/main.c).
-
-### Function arguments and results are reference-counted JSON trees
-
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function IncrementButton() {
-  const room = "readme-c";
-  const increment = useMutation(api.demo.increment);
-
-  return (
-    <button
-      onClick={async () => {
-        const result = await increment({
-          room,
-          language: "TypeScript",
-          runId: crypto.randomUUID(),
-        });
-        console.log(result.state.count); // The generated API types this result.
-      }}
-    >
-      Increment
-    </button>
-  );
-}
-```
-
-**C**
-
-```c
-#include "convex.h"
-#include <curl/curl.h>
-#include <json-c/json.h>
-#include <stdio.h>
-#include <stdlib.h>
-
-int main(void) {
-  curl_global_init(CURL_GLOBAL_DEFAULT);
-  convex_error error = {0};
-  convex_result result = {0};
-  const char *deployment_url = getenv("CONVEX_URL");
-  convex_client *client = convex_new(deployment_url, "c-readme", &error);
-  if (!client)
-    return 1;
-
-  /* Construct the three arguments accepted by the demo:increment mutation. */
-  json_object *args = json_object_new_object();
-  json_object_object_add(args, "room", json_object_new_string("readme-c"));
-  json_object_object_add(args, "language", json_object_new_string("C"));
-  json_object_object_add(args, "runId",
-                         json_object_new_string("readme-c-once"));
-
-  if (!convex_call(client, "mutation", "demo:increment", args, &result,
-                   &error))
-    return 1;
-
-  json_object *state = NULL;
-  json_object *count = NULL;
-  json_object_object_get_ex(result.value, "state", &state);
-  json_object_object_get_ex(state, "count", &count);
-  printf("%d\n", json_object_get_int(count)); /* Decode the returned state. */
-
-  convex_result_free(&result); /* Release the client's result references. */
-  json_object_put(args);       /* Release args and all of its child values. */
-  convex_free(client);
-  return 0;
-}
-```
-
-The React client gets generated argument and return types. C has no generated bindings here, so the function path is a string and json-c represents both inputs and outputs. The fixed `runId` makes this focused C mutation idempotent: retrying it does not increment twice.
+Each subscription owns a 16-slot queue that the worker fills and your thread drains — the whole reactive story in three function calls.
 
 ## Status
 

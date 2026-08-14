@@ -24,144 +24,86 @@ runs it against a fresh room:
 
 ## Interesting Parts
 
-### Effects are values in Clean
+### The compiler proves there is only one world
 
-In React, `useQuery` hides the network effect and gives you a generated,
-type-safe result. This Clean client makes the effect visible by consuming and
-returning `*World`. The star is a uniqueness annotation: Clean proves there is
-only one usable world value, which keeps I/O ordered without making the whole
-language impure.
-
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
-
-function Counter() {
-  const [room] = useState(() => `clean-readme-${crypto.randomUUID()}`);
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-
-export function App() {
-  return <ConvexProvider client={convex}><Counter /></ConvexProvider>;
-}
-```
-
-**Clean**
+Haskell answered "how does a pure language do I/O?" with monads. Clean — born
+at Radboud University Nijmegen — answered with uniqueness types: the `*` in
+`*World` promises there is never a second reference to the world, so each
+Convex call consumes it and hands back a fresh one. The `!` marks are
+strictness annotations, eagerness declared right in the type.
 
 ```text
-import StdEnv
-import StdMaybe
-import Convex.Result
-import Convex.Wire
-import Convex.HTTP
-import Convex.Client
+clientCall :: !String !String !JSON !Client !*World -> (!Result CallResult, !*World)
 
-readCount :: !String !String !*World -> (!Int, !*World)
-readCount deploymentUrl room world
-	// The caller supplies a fresh room name, just like the shared verifier.
-	# (created, world) = clientInit deploymentUrl world
-	= case created of
-		RErr message = abort message
-		ROk client = query client world
-where
-	query client world
-		# args = JObject [("room", JString room)]
-		# (result, world) = clientCall "query" "demo:state" args client world
-		= case result of
-			RErr message = abort message
-			ROk response = case response.crFailure of
-				Just (message, _) = abort message
-				Nothing = case jsonLookup "count" response.crValue of
-					Just value = case jsonAsWholeInt value of
-						Just count
-							# world = clientClose client world
-							= (count, world) // count is checked at runtime.
-						Nothing = abort "count was not a whole number"
-					Nothing = abort "state was missing count"
+// TypeScript: const state = await client.query("demo:state", { room })
+# (queryResult, w) = clientCall "query" "demo:state" (JObject [("room", JString room)]) client w
+= case queryResult of
+	RErr e = abort ("query failed: " +++ e)
+	ROk cr = afterQuery room client cr w
 ```
 
-The Clean call is a one-off HTTP query, not the equivalent of React's ongoing
-subscription. Its path, arguments, and decoded JSON fields are runtime-checked
-because this demonstration does not generate Clean types from the Convex API.
+Use `w` twice and the program simply does not compile: sequencing bugs are
+type errors here.
 
-### React owns the subscription; Clean asks for each step
+### `#` makes pure code read top to bottom
 
-React subscribes on render and cleans up on unmount. This command-line client
-owns that lifecycle directly: it registers a subscription ID, repeatedly asks
-the connection for the next event, and later unsubscribes and closes. Returning
-the updated `Client` from each operation is this API's explicit state-passing
-design. Unlike `*World`, `Client` itself is abstract but not uniqueness-typed.
-
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  // This component runs inside the configured ConvexProvider shown above.
-  const [room] = useState(() => `clean-live-${crypto.randomUUID()}`);
-  const state = useQuery(api.demo.state, { room });
-
-  return <p>{state?.count ?? "Loading..."}</p>; // React owns subscribe/unsubscribe.
-}
-```
-
-**Clean**
+Clean's `#` is a "let-before": each line rebinds a name for the rest of the
+function, so `w` can shadow its previous self one step at a time. The mutation
+below reads like an imperative script, yet it desugars to nested lets and
+stays a pure expression.
 
 ```text
-import StdEnv
-import StdMaybe
-import Convex.Result
-import Convex.Wire
-import Convex.Live
-import Convex.Client
-
-nextState :: !String !String !*World -> (!SyncEvent, !*World)
-nextState deploymentUrl room world
-	// The caller supplies a fresh room; the URL normally comes from CONVEX_URL.
-	# (created, world) = clientInit deploymentUrl world
-	= case created of
-		RErr message = abort message
-		ROk client = subscribe client world
-where
-	subscribe client world
-		# args = JObject [("room", JString room)]
-		// "readme-live" identifies this local subscription, not a Convex document.
-		# (subscribed, world) = clientSubscribe "readme-live" "demo:state" args client world
-		= case subscribed of
-			RErr message = abort message
-			ROk client1 = wait client1 world
-
-	wait client world
-		// Blocking for one step is a client API choice, not a Clean limitation.
-		# (event, client1, world) = clientStep 100 client world
-		= case event of
-			Nothing = wait client1 world
-			Just update = finish update client1 world
-
-	finish update client world
-		# (unsubscribed, world) = clientUnsubscribe "readme-live" client world
-		= case unsubscribed of
-			RErr message = abort message
-			ROk client1
-				# world = clientClose client1 world
-				= (update, world)
+runMutation :: !String !Client !Int !*World -> *World
+runMutation room client before w
+	// TypeScript: await client.mutation("demo:increment", { room, language, runId })
+	# args = JObject [("room", JString room), ("language", JString "Clean"), ("runId", JString (room +++ "-once"))]
+	# (mutResult, w) = clientCall "mutation" "demo:increment" args client w
+	= case mutResult of
+		RErr e = abort ("mutation failed: " +++ e)
+		ROk cr = afterMutation room client before cr w
 ```
 
-The complete example handles failed events, verifies values, unsubscribes, and
-closes the client. The Live implementation is demand-driven rather than a
-background callback or stream, so the caller decides when another network step
-may happen.
+That `runId` is an idempotency key: retrying against the same room is safe.
+
+### Arguments are constructors, not strings
+
+Clean 3.1 ships no JSON library, so `Convex.Wire` defines the wire format as a
+plain algebraic type. Arguments are assembled from constructors and taken
+apart with `jsonLookup` — and `jsonAsWholeInt` knowingly accepts the `0.0`
+Convex's JSON profile may use for a whole count.
+
+```text
+:: JSON = JNull | JBool Bool | JInt Int | JReal Real
+	| JString String | JArray [JSON] | JObject [(String, JSON)]
+
+// TypeScript: { room } — the object literal, spelled as constructor calls
+args = JObject [("room", JString room)]
+```
+
+### A Live update is something you step toward
+
+Convex's realtime side usually arrives as a callback; this client inverts the
+flow. `clientSubscribe` registers interest in `demo:state`, then each
+`clientStep 100` advances the WebSocket by at most one bounded step and maybe
+hands back a `SyncEvent`. The `|` line is a guard; the example subscribes
+before mutating, so the `0 -> 1` update cannot be missed.
+
+```text
+// TypeScript: useQuery re-renders for you; here the caller asks for each step
+loop client d w
+	# (expiredNow, w) = isExpired d w
+	| expiredNow = (RErr "timed out waiting for a Live update", client, w)
+	# (eventOpt, client1, w) = clientStep 100 client w
+	= case eventOpt of
+		Nothing = loop client1 d w
+		Just event = case event.seKind of
+			SeFailed = (RErr ("subscription failed: " +++ event.seErrorMessage), client1, w)
+			SeUpdated = (ROk event, client1, w)
+```
+
+Demand-driven Live keeps the caller in charge of when the network may act —
+and the same loop quietly drives the reconnects counted in the Status table
+below.
 
 ## Status
 

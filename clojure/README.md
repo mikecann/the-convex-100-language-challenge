@@ -19,97 +19,59 @@ From the repository root, Docker builds the example and runs that exact source a
 
 ## Interesting Parts
 
-### Immutable maps make mutation arguments explicit
+### The reply is just a map, and a keyword can read it
 
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { useMutation } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-  const [room] = useState(() => `clojure-${crypto.randomUUID()}`);
-
-  async function addOne() {
-    const args = {
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    };
-    const result = await increment(args);
-    console.log(result.state.count); // The generated API makes this number type-safe.
-  }
-
-  return <button onClick={addOne}>Increment</button>;
-}
-```
-
-**Clojure**
+Clojure keywords such as `:value` are not mere constants — each one is a function that looks itself up in a map. Add the thread-first macro `->`, which feeds each result into the next form, and drilling into a Convex response reads top-to-bottom instead of inside-out.
 
 ```clojure
-(require '[convex.client :as convex])
-(import '[java.util UUID])
+;; TypeScript: const { count } = await client.query("demo:state", { room });
+(-> (convex/query client "demo:state" {"room" room})
+    :value              ; the keyword extracts its own entry from the reply map
+    (get "count"))
+```
 
-(let [url (or (System/getenv "CONVEX_URL")
-              (throw (ex-info "CONVEX_URL is required" {})))
-      room-args {"room" (str "clojure-" (UUID/randomUUID))}
-      ;; assoc returns a new map. room-args still contains only the room.
+### `assoc` returns a new map, so argument-building cannot backfire
+
+Clojure's collections are [persistent data structures](https://clojure.org/reference/data_structures), built on the hash array mapped tries Rich Hickey adapted from Phil Bagwell's research. "Updating" a map returns a fresh map that shares structure with the old one, so the basics example grows its query arguments into mutation arguments with no defensive copying.
+
+```clojure
+(let [room-args {"room" room}
+      ;; A brand-new map; room-args itself is untouched, forever.
       mutation-args (assoc room-args
                            "language" "clojure"
                            "runId" (str (UUID/randomUUID)))]
-  (with-open [client (convex/client url)]
-    (let [result (:value (convex/mutation client "demo:increment" mutation-args))]
-      ;; JSON map keys and count are checked at runtime, not by generated types.
-      (println (get-in result ["state" "count"])))))
+  (convex/mutation client "demo:increment" mutation-args)
+  (convex/query client "demo:state" room-args))  ; still exactly {"room" room}
 ```
 
-Clojure's maps are [immutable and persistent](https://clojure.org/reference/data_structures), so adding the mutation fields does not alter the reusable query arguments. The trade-off here is type safety: the React client gets generated function and result types, while this small Clojure client accepts dynamic string-keyed JSON maps and relies on runtime validation.
+### `with-open` gives a Live subscription the lifetime of a block
 
-### A command-line subscription has a lifecycle you can see
-
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-function Counter() {
-  const [room] = useState(() => `clojure-${crypto.randomUUID()}`);
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // state.count is type-safe and rerenders reactively.
-}
-```
-
-**Clojure**
+The HTTP client, the Live client, and every subscription implement Java's `AutoCloseable`, so `with-open` — in Clojure years before Java 7 grew try-with-resources — plays the role the component lifecycle plays for `useQuery`: leaving the block unsubscribes and closes the WebSocket, even when an exception escapes.
 
 ```clojure
-(require '[convex.client :as convex])
-(import '[java.util UUID])
-
-(let [url (or (System/getenv "CONVEX_URL")
-              (throw (ex-info "CONVEX_URL is required" {})))
-      room-args {"room" (str "clojure-" (UUID/randomUUID))}]
-  ;; This CLI owns the HTTP client, Live client, and subscription explicitly.
-  (with-open [http (convex/client url)
-              live (convex/live-client url)
-              subscription (convex/subscribe live "demo:state" room-args)]
-    (let [initial (:value (convex/next-update subscription 10000))]
-      (println (get initial "count")) ; Initial Live value.
-      (convex/mutation http "demo:increment"
-                       (assoc room-args
-                              "language" "clojure"
-                              "runId" (str (UUID/randomUUID))))
-      (let [updated (:value (convex/next-update subscription 10000))]
-        ;; This is the reactive update from the same subscription.
-        (println (get updated "count"))))))
+;; TypeScript: const state = useQuery(api.demo.state, { room });
+(with-open [client (convex/client url)
+            live (convex/live-client url)
+            subscription (convex/subscribe live "demo:state" room-args)]
+  (println (get (:value (convex/next-update subscription 10000)) "count"))
+  (convex/mutation client "demo:increment" mutation-args)
+  ;; The same open subscription now delivers the reactive update: 0 -> 1.
+  (println (get (:value (convex/next-update subscription 10000)) "count")))
 ```
 
-React starts, updates, and disposes the `useQuery` subscription with the component. This command-line client instead returns a subscription that the caller consumes and closes. Its blocking `next-update` operation is a deliberate client API choice for a readable example, not a limitation of Clojure's concurrency tools.
+### A failed Convex function throws data, not just a string
+
+Since Clojure 1.4, `ex-info` has built exceptions that carry an arbitrary map, and `ex-data` gets the map back. This client wraps every Convex function failure that way, so the server's structured error payload arrives as ordinary data you can destructure — no exception-class hierarchy to learn.
+
+```clojure
+(try
+  (convex/query client "demo:state" {})  ; oops — forgot the room argument
+  (catch clojure.lang.ExceptionInfo error
+    ;; TypeScript: if (e instanceof ConvexError) console.log(e.data)
+    (let [{:keys [kind data]} (ex-data error)]
+      (println kind "-" (ex-message error))
+      data)))
+```
 
 ## Status
 

@@ -21,65 +21,63 @@ That command builds and runs the exact example below inside Docker against a uni
 
 ## Interesting Parts
 
-### React owns the subscription; D gives you the handle
+### `scope (exit)` is the unmount your program doesn't have
 
-**TypeScript with React**
-
-```tsx
-import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
-const room = `d-readme-${crypto.randomUUID()}`;
-
-function Counter() {
-  const state = useQuery(api.demo.state, { room });
-  if (state === undefined) return <span>Loading...</span>;
-  return <span>{state.count}</span>; // The generated API makes count a number.
-}
-
-export function App() {
-  return (
-    <ConvexProvider client={convex}>
-      <Counter />
-    </ConvexProvider>
-  );
-}
-```
-
-**D**
+In React, `useQuery` tears down its Convex subscription when the component unmounts. A command-line D program has no unmount, so this client hands you the handle, and D hands you the [scope guard statement](https://dlang.org/spec/statement.html#ScopeGuardStatement) — an idea Andrei Alexandrescu popularized in C++, built straight into D years before Go's `defer`. Cleanup sits beside acquisition and runs on every exit path, exceptions included.
 
 ```d
-import convex : ConvexClient;
-import std.json : JSONType, JSONValue;
-import std.process : environment;
-import std.uuid : randomUUID;
+auto client = new ConvexClient(url);
+scope (exit)
+    client.close(); // runs on normal return *and* when an exception unwinds
 
-void main()
-{
-    auto url = environment.get("CONVEX_URL", "");
-    if (url.length == 0)
-        throw new Exception("CONVEX_URL is required");
-    auto room = "d-readme-" ~ randomUUID().toString();
-    auto client = new ConvexClient(url);
-    scope (exit)
-        client.close(); // Always closes, including when an exception unwinds.
-
-    auto live = client.subscribe("demo:state", JSONValue([
-        "room": JSONValue(room) // D infers the associative-array type here.
-    ]));
-    scope (exit)
-        live.close(); // This command-line client owns its subscription lifetime.
-
-    auto initial = live.next(10_000); // Blocking next() is this client's API choice.
-    assert(initial !is null && initial.hasValue);
-    auto count = initial.value.object["count"];
-    assert(count.type == JSONType.integer || count.type == JSONType.float_);
-    // D knows this is JSONValue; this client checks its payload shape at runtime.
-}
+auto live = client.subscribe("demo:state", JSONValue(["room": JSONValue(room)]));
+scope (exit)
+    live.close(); // guards fire in reverse order: subscription, then client
 ```
 
-React's `useQuery` starts, updates, and disposes the subscription with the component. The D language supports callbacks and delegates, but this small client instead exposes `subscribe`, blocking `next`, and `close` so ownership is obvious in a command-line example. D's [`scope (exit)`](https://dlang.org/spec/statement.html#ScopeGuardStatement) makes both cleanup paths reliable. Unlike the generated TypeScript API, the D client accepts function paths as strings and returns Phobos [`JSONValue`](https://dlang.org/library/std/json/json_value.html), so response shape checks remain explicit.
+### Argument objects are built-in hash-map literals
+
+D put associative arrays in the language itself rather than a library, so a Convex argument object is just a `["key": value]` literal wrapped in Phobos's `JSONValue`. And strings concatenate with `~`, because Walter Bright kept `+` strictly arithmetic.
+
+```d
+// TypeScript: await client.mutation(api.demo.increment, { room, language, runId })
+auto result = client.mutation("demo:increment", JSONValue([
+    "room": JSONValue(room),
+    "language": JSONValue("d"),
+    "runId": JSONValue(room ~ "-once")
+]));
+assert(result.value.object["applied"].type == JSONType.true_);
+```
+
+The client does its own bookkeeping with the same feature — every Live subscription lives in a `SubscriptionState[uint]` keyed by query id.
+
+### The reactive update is a value you pull with `next`
+
+Live here is the real `/api/sync` WebSocket protocol, run by a worker thread that feeds each subscription's mailbox. Instead of a component re-rendering, you ask for the next update — blocking with a deadline that D lets you write as `10_000`, digit separators included.
+
+```d
+auto live = client.subscribe("demo:state", JSONValue(["room": JSONValue(room)]));
+auto initial = live.next(10_000); // blocks up to 10s; null on timeout or close
+
+// ...one idempotent demo:increment mutation over HTTP later...
+
+// TypeScript: useQuery would simply re-render <Counter /> with the new count
+auto updated = live.next(10_000);
+assert(updated !is null && updated.hasValue); // the push agrees with HTTP
+```
+
+### `unittest` is a keyword, and the example ships its own tests
+
+D has had `unittest` blocks since its earliest releases: drop one into any module, compile with `-unittest`, and the asserts run before `main`. The basics example uses one to prove its counter decoder, while a `version (ExampleUnitTest)` block — conditional compilation without a preprocessor — swaps in an empty `main` for the test build.
+
+```d
+unittest
+{
+    assert(wholeCounter(JSONValue(0.0), "zero") == 0);
+    assert(wholeCounter(JSONValue(1.0), "one") == 1);
+    // ...and it rejects 0.5, "1", NaN, infinity, and negatives.
+}
+```
 
 ## Status
 

@@ -36,95 +36,77 @@ output. It does not install GNU APL on your host.
 
 ## Interesting Parts
 
-### Convex objects cross the APL boundary as explicit JSON
+### A Convex reply is a nested vector of tagged pairs
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const room = "apl-readme";
-  const state = useQuery(api.demo.state, { room }); // Arguments and results are typed.
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>Count: {state.count}</p>; // state.count stays reactive and type-safe.
-}
-```
-
-**APL**
+APL's one data structure is the array, so this client parses every JSON value
+into a two-element vector: a one-character tag plus a payload — `('n' 0)` is
+the number zero, `('s' 'hi')` a string, and an object is a vector of
+(key value) pairs. APL also evaluates strictly right to left, so decoding a
+query response becomes one uninterrupted pipeline.
 
 ```apl
-ROOM←'apl-readme'
-CONVEXURL←EnvGet 'CONVEX_URL'
-
-⍝ StateArgs builds {"room":"apl-readme"}; HttpCall sends one HTTP query.
 CURRENT←HttpCall ('query' 'demo:state' (StateArgs ROOM) CONVEXURL '')
-
-⍝ The parser represents each JSON value as a tagged pair such as ('n' 0).
-VALUE←ResultValue CURRENT
-COUNT←RequireWholeCount VALUE 'current query' ⍝ Pull out count and reject fractions.
+⍝ TypeScript: const { count } = await client.query(api.demo.state, { room })
+VALUE←ResultValue CURRENT              ⍝ the "value" field of the envelope
+COUNT←JWholeNumber 'count' JGet VALUE  ⍝ read right to left: get, then narrow
 ```
 
-React's `useQuery` manages a subscription and rerenders when the value changes.
-This APL `HttpCall` is deliberately a one-off snapshot. The explicit JSON text
-and tagged parsed values are choices made by this small client because GNU APL
-does not supply the TypeScript-style generated object types a React app gets.
-The full encoding and decoding helpers live in
-[`client/convex.apl`](client/convex.apl).
+Dyadic `JGet` takes the key on its left and the object on its right, so
+`'count' JGet VALUE` reads almost like English.
 
-### A command-line subscription has an explicit service loop
+### Subscribe, then tick: a Live update is an event you shake loose
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function CounterButton() {
-  const room = "apl-readme";
-  const state = useQuery(api.demo.state, { room }); // React owns subscription cleanup.
-  const increment = useMutation(api.demo.increment);
-
-  async function addOne() {
-    // Create one key for this action. Reuse it only if this same call is retried.
-    const runId = crypto.randomUUID();
-    const result = await increment({ room, language: "TypeScript", runId });
-    console.log(result.state.count); // The mutation returns the new state.
-  }
-
-  return <button onClick={addOne}>Count: {state?.count ?? "..."}</button>;
-}
-```
-
-**APL**
+Convex's signature feature is the reactive query, and this client speaks the
+real `/api/sync` WebSocket protocol — in APL. GNU APL has no threads here, so
+instead of a hidden worker, `LiveServiceTick` does one non-blocking read and
+hands back whatever subscription events it decoded.
 
 ```apl
-CONVEXURL←EnvGet 'CONVEX_URL'
-ROOM←'apl-readme'
 SUBID←'readme-state'
-
-ConvexInit '/opt/convex/client/shim.so' ⍝ Load the narrow TLS and crypto helper.
-OK←LiveInit CONVEXURL              ⍝ Configure Live; the first service tick connects.
 LiveSubscribe (SUBID 'demo:state' (StateArgs ROOM))
-INITIAL←WaitForLiveValue (SUBID 0 'live initial value') ⍝ Drive ticks until count is 0.
-
-RUNID←'apl-',(⍕NowMs)
-MUTATION←HttpCall ('mutation' 'demo:increment' (IncrementArgs (ROOM RUNID)) CONVEXURL '')
-MUTATIONCOUNT←RequireWholeCount ('state' JGet ResultValue MUTATION) 'mutation'
-UPDATED←WaitForLiveValue (SUBID 1 'live updated value') ⍝ Keep ticking until Live sends 1.
-
-LiveUnsubscribe SUBID              ⍝ Remove the tracked query explicitly.
-LiveClose                          ⍝ Close the WebSocket before the process exits.
+⍝ TypeScript: const state = useQuery(api.demo.state, { room })
+EVENTS←LiveServiceTick        ⍝ one non-blocking read; zero or more events
+EV←1⊃EVENTS                   ⍝ each event is (subscriptionId kind payload)
+→('v'≡2⊃EV)⍴GOTVALUE          ⍝ 'v' means a fresh value arrived
 ```
 
-GNU APL has no worker thread behind this client. `LiveServiceTick` performs one
-non-blocking read, and the example's `WaitForLiveValue` helper calls it until the
-expected update arrives. That blocking helper is an API decision for a linear
-command-line example, not a claim that APL cannot express callbacks or other
-application structures. In React, the framework and Convex hooks own this
-lifecycle for the component.
+That last line is classic GNU APL control flow: `→` is a branch, and
+`(condition)⍴LABEL` reshapes the label away when the condition is 0 — an
+if-statement built from an array primitive.
+
+### WebSocket masking is one XOR across bit planes
+
+RFC 6455 requires every frame a client sends to be XOR-masked with a random
+4-byte key. Most languages write a byte loop; this client explodes the whole
+payload into a bit matrix and XORs it in a single expression — Iverson
+designed his notation for exactly this kind of whole-array arithmetic.
+
+```apl
+MASKREP←MASK[1+4|(⍳N)-1]      ⍝ tile the 4-byte mask across all N bytes
+BITSDATA←(8⍴2)⊤BYTES          ⍝ ⊤ explodes each byte into its 8 bits
+BITSMASK←(8⍴2)⊤MASKREP
+Z←2⊥BITSDATA≠BITSMASK         ⍝ ≠ on bits IS xor; ⊥ folds bits back to bytes
+⍝ TypeScript: the browser does this invisibly inside new WebSocket(url)
+```
+
+XOR is its own inverse, so the very same function unmasks incoming frames.
+
+### Base64 is mostly a reshape
+
+Opening a Live connection means the WebSocket handshake, which needs
+`base64(sha1(key + GUID))`. Rather than a lookup loop, the encoder ravels
+every byte into one long bit vector, regroups it into rows of six, and
+indexes the alphabet — base64 as pure array surgery.
+
+```apl
+BITS←,⍉(8⍴2)⊤PADDED           ⍝ all the bytes' bits, one long vector
+SEXT←(6⍴2)⊥⍉(M,6)⍴BITS        ⍝ regroup into M six-bit numbers, 0..63
+ALPHA←'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+Z←ALPHA[SEXT+1]               ⍝ the encoded text is an index expression
+```
+
+One handshake later, `WsAcceptValue` has checked the server's answer and
+Convex updates start flowing.
 
 ## Status
 

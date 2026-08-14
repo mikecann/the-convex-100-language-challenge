@@ -23,109 +23,68 @@ No Common Lisp toolchain is installed on the host.
 
 ## Interesting Parts
 
-### JSON needs one more false value than Lisp has
+### False gets its own symbol, because `nil` is already three things
 
-TypeScript receives a generated result type, so `applied` is a normal `boolean` and `state.count` is known to be a number. This Common Lisp client deliberately returns generic JSON values instead. Objects are string-keyed hash tables, and `+json-false+` and `+json-null+` are distinct sentinels because Common Lisp's `nil` already means both false and the empty list.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-
-  async function handleClick() {
-    const result = await increment({
-      room: "common-lisp-readme",
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-
-    console.log(result.applied); // Generated types make this boolean.
-    console.log(result.state.count); // Generated types make this number.
-  }
-
-  return <button onClick={handleClick}>Increment</button>;
-}
-```
-
-**Common Lisp**
+Since the very first Lisps of the late 1950s, `nil` has punned as false, the empty list, and "nothing here". JSON refuses to play along: `false`, `null`, and `[]` are three different values, and a Convex result cares which one came back. So this client decodes JSON's awkward pair into dedicated sentinel symbols, `+json-false+` and `+json-null+`, that can never collide with real data.
 
 ```common-lisp
-(load "/project/client/load.lisp")
-(in-package #:convex)
-
-(let* ((deployment (or (sb-ext:posix-getenv "CONVEX_URL")
-                       (error "CONVEX_URL is required")))
-       (client (make-client deployment)))
-  (unwind-protect
-       (let* (;; JSON-OBJECT builds the named Convex argument object.
-              (arguments (json-object "room" "common-lisp-readme"
-                                      "language" "common-lisp"
-                                      "runId" (random-hex-id)))
-              (result (client-mutation client "demo:increment" arguments))
-              ;; RESULT-VALUE is generic JSON, so read object fields by name.
-              (value (result-value result))
-              (applied (json-get value "applied" +json-false+))
-              (state (json-get value "state")))
-         (format t "applied: ~:[false~;true~]~%" (eq applied t))
-         (format t "count: ~D~%" (json-get state "count")))
-    ;; UNWIND-PROTECT is Lisp's equivalent of finally for cleanup.
-    (client-close client)))
+(let* ((result (client-mutation client "demo:increment"
+                                (json-object "room" "common-lisp-readme"
+                                             "language" "common-lisp"
+                                             "runId" (random-hex-id))))
+       ;; TypeScript: result.applied is just a boolean
+       (applied (json-get (result-value result) "applied" +json-false+)))
+  ;; ~:[false~;true~] is FORMAT's inline if/else -- a tiny language of its own.
+  (format t "applied: ~:[false~;true~]~%" (eq applied t)))
 ```
 
-The explicit decoding is a choice in this small client, not a Common Lisp restriction. A larger SDK could generate structs and accessors from Convex function types.
+One `eq` test settles what Convex meant by `false`, and `format` prints the verdict with a directive instead of an `if`.
 
-### React owns reactivity; this program owns a subscription
+### A Convex error is a condition you can interrogate
 
-`useQuery` subscribes while the component is mounted and rerenders it when the value changes. The Common Lisp API exposes that lifecycle directly: create a subscription, block for its next delivery, inspect either its value or structured error, and close it. The blocking `subscription-next` call is this client's command-line-friendly API design, not a limitation of Common Lisp's concurrency model.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, { room: "common-lisp-live" });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>Count: {state.count}</p>; // React rerenders on each Live value.
-}
-```
-
-**Common Lisp**
+Common Lisp's condition system, standardized in the 1980s, treats an error as a full object with named slots — it can even offer restarts that resume a computation instead of unwinding it. Here `function-error`, `protocol-error`, and `transport-error` are distinct condition types, each carrying Convex's error name, message, data, and log lines behind reader functions.
 
 ```common-lisp
-(load "/project/client/load.lisp")
-(in-package #:convex)
-
-(let* ((deployment (or (sb-ext:posix-getenv "CONVEX_URL")
-                       (error "CONVEX_URL is required")))
-       (client (make-client deployment))
-       (subscription nil))
-  (unwind-protect
-       (progn
-         ;; Starting the subscription opens Live and sends demo:state's args.
-         (setf subscription
-               (client-subscribe client "demo:state"
-                                 (json-object "room" "common-lisp-live")))
-         ;; A command-line program decides when to wait for each reactive value.
-         (loop repeat 2
-               for update = (subscription-next subscription :timeout 10.0)
-               do (unless update (error "Timed out waiting for Live"))
-                  (if (update-error update)
-                      (error (update-error update))
-                      (format t "Count: ~D~%"
-                              (json-get (update-value update) "count")))))
-    ;; The caller, rather than a React component, owns both lifetimes.
-    (when subscription (subscription-close subscription))
-    (client-close client)))
+(handler-case
+    (client-query client "demo:state" (json-object "room" room))
+  ;; TypeScript: catch (error) { if (error instanceof ConvexError) ... }
+  (function-error (condition)
+    (format t "Convex rejected the call ~A: ~A~%"
+            (error-name condition) (error-message condition)))
+  (transport-error ()
+    (format t "The network flaked; safe to retry.~%")))
 ```
 
-The first delivery hydrates the current query. A later delivery arrives after the data changes, without polling the HTTP endpoint. See the complete sequencing and validation in the [canonical example](examples/basics/main.lisp).
+The canonical example uses exactly this split to wait through a recoverable socket retirement while failing fast on real query errors.
+
+### LOOP reads the Live stream almost in English
+
+`loop` is Common Lisp's famously controversial iteration macro: a whole mini-language of English-ish keywords that compiles away at macroexpansion time. Paired with keyword arguments like `:timeout`, it makes consuming Convex's reactive Live protocol read almost like the sentence describing it.
+
+```common-lisp
+(let ((subscription (client-subscribe client "demo:state"
+                                      (json-object "room" room))))
+  ;; TypeScript: const state = useQuery(api.demo.state, { room })
+  (loop repeat 2
+        for update = (subscription-next subscription :timeout 10.0)
+        do (format t "count: ~D~%"
+                   (json-get (update-value update) "count")))
+  (subscription-close subscription))
+```
+
+The first delivery hydrates the current value; the second arrives when someone increments the counter, with no polling. Where React hides the subscription inside `useQuery`, this program holds it as a value it can wait on and close.
+
+### UNWIND-PROTECT is `finally`, decades early
+
+Lisp had guaranteed-cleanup control flow long before `try`/`finally` reached the mainstream: `unwind-protect` runs its cleanup forms however the protected body exits — normal return, error, or a non-local jump. It is how every program in this directory makes sure the client and its Live socket are retired.
+
+```common-lisp
+(let ((client (make-client (sb-ext:posix-getenv "CONVEX_URL"))))
+  (unwind-protect
+       (client-query client "demo:state" (json-object "room" room))
+    ;; TypeScript: the finally block after await client.query(...)
+    (client-close client)))
+```
 
 ## Status
 

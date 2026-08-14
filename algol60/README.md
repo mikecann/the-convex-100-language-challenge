@@ -31,96 +31,94 @@ output. Nothing needs to be installed on the host.
 
 ## Interesting Parts
 
-### A Convex argument object becomes a byte buffer
+### The whole foreign-function interface is the word `code`
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-function RoomCount() {
-  const state = useQuery(api.demo.state, { room: "readme-demo" });
-
-  // The result is a normal typed object, and count is type-safe here.
-  return <output>{state?.count ?? "Loading..."}</output>;
-}
-```
-
-**ALGOL 60**
+The 1960 Revised Report already reserved room for procedure bodies written
+outside the language. This client declares fourteen native primitives —
+sockets, TLS, clock, entropy — as ALGOL 60 headings whose entire body is
+`code;`, linked against C by MARST; everything above them is pure ALGOL 60,
+HTTP/1.1 and WebSocket framing included.
 
 ```algol
-integer array room[0:31];
-integer array argsbuf[0:63];
-integer roomlen, argslen, discard;
+integer procedure cxopen(host, hostlen, port, portlen, tls, deadlinems);
+   comment opens a TCP stream, optionally in verified TLS, by a deadline;
+   value hostlen, portlen, tls, deadlinems;
+   integer array host, port;
+   integer hostlen, portlen, tls, deadlinems;
+code;
+```
 
-comment ALGOL 60 cannot construct a string value, so the room is bytes;
-roomlen := 0;
-discard := bufputstr(room, 32, roomlen, "readme-demo");
+An FFI declaration style older than the word "FFI" itself.
 
-comment Build the same {"room":"readme-demo"} argument as JSON bytes;
+### The opening brace of the arguments is the integer 123
+
+ALGOL 60 strings are literal constants: a program can pass `"readme-demo"`
+along but never build, compare, or return a string value. So every buffer is
+an `integer array` of bytes with an explicit length, and the `demo:state`
+argument object is assembled numerically — 123 and 125 are `{` and `}`.
+
+```algol
+comment TypeScript: const state = useQuery(api.demo.state, { room });
 argslen := 0;
-discard := bufputbyte(argsbuf, 64, argslen, 123);
-discard := bufputstr(argsbuf, 64, argslen, "\"room\":");
-discard := jsonwritestring(argsbuf, 64, argslen, room, 0, roomlen);
-discard := bufputbyte(argsbuf, 64, argslen, 125)
+discard := bufputbyte(argsbuf, 512, argslen, 123);
+discard := bufputstr(argsbuf, 512, argslen, "\"room\":");
+discard := jsonwritestring(argsbuf, 512, argslen, exampleroombuf, 0,
+   exampleroomlen);
+discard := bufputbyte(argsbuf, 512, argslen, 125)
 ```
 
-The React hook accepts an ordinary object and returns a typed object. This
-client passes the `argsbuf` byte range to `convexcall`, then finds and decodes
-the returned `count` field explicitly. The complete HTTP call is in the
-[canonical example](examples/basics/main.alg).
+The finished bytes go straight to `convexcall("query", ...)`.
 
-### React manages reactivity, this API asks the caller to drive it
+### The reply travels back by name
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-function Counter() {
-  const room = "readme-demo";
-  const state = useQuery(api.demo.state, { room });
-
-  // React keeps the subscription alive and rerenders after any client updates it.
-  return <output>{state?.count ?? "Loading..."}</output>;
-}
-```
-
-**ALGOL 60**
+ALGOL 60's parameters default to call-by-name — the mechanism behind Jensen's
+device — and only names listed under `value` are copied in. With no record
+types in the language, a decoded JSON field returns through parallel scalars
+written directly into the caller, and the function result is delivered by
+assigning to the procedure's own name.
 
 ```algol
-procedure watchcounter(host, hostlen, port, portlen, tls,
-      pathbuf, pathlen, argsbuf, argslen);
-   value hostlen, portlen, tls, pathlen, argslen;
-   integer array host, port, pathbuf, argsbuf;
-   integer hostlen, portlen, tls, pathlen, argslen;
+integer procedure examplecount(buf, off, limit, ok);
+   value off, limit;
+   integer array buf;
+   integer off, limit, ok;
 begin
-   integer array errbuf[0:255];
-   integer sub, errbuflen, errkind, initialkind, updatedkind;
-
-   comment Subscribe to demo:state with {"room":"readme-demo"};
-   errbuflen := 0; errkind := 0;
-   livesubscribe(host, hostlen, port, portlen, tls,
-      pathbuf, pathlen, argsbuf, 0, argslen, cxnowms + 10000,
-      sub, errbuf, errbuflen, errkind);
-
-   comment Explicitly wait first for hydration, then for another update;
-   initialkind := livenext(sub, 10000);
-   updatedkind := livenext(sub, 10000);
-
-   comment Cleanup is also owned by this command-line program;
-   liveunsubscribe(sub, cxnowms + 5000)
-end watchcounter
+   integer voff, vlen, found;
+   integer array errbuf[0:255]; integer errbuflen, errkind;
+   comment ok is absent from the value list, so ok := 0 updates the caller;
+   jsonfindfield(buf, off, limit, "count", voff, vlen, found,
+      errbuf, errbuflen, errkind);
+   if errkind != 0 | found = 0 then
+      ok := 0
+   else
+      examplecount := jsonparseint(buf, voff, vlen, ok)
+end examplecount
 ```
 
-The caller passes deployment details, the `demo:state` path, and the JSON
-argument bytes into `watchcounter`. `livenext` being blocking is a choice made
-by this small client API, not a general limit on reactive systems. React owns
-subscription setup, cleanup, and rerendering for `useQuery`; the ALGOL 60
-command-line program owns those steps and only makes Live progress while it is
-inside the client or its polling loop.
+One call, and the caller holds the field's offset, length, and a found flag: a
+struct, exploded into names.
+
+### No threads, so you pull each Live update with `livenext`
+
+The Live badge is earned by real RFC 6455 WebSocket framing and Convex's sync
+protocol, all in ALGOL 60 — but with no threads or event loop, the
+subscription only progresses while the caller is inside a client procedure.
+The example subscribes before mutating, so no update can fall into a gap.
+
+```algol
+livesubscribe(examplehost, examplehostlen, exampleport, exampleportlen,
+   exampletls, pathbuf, pathlen, argsbuf, 0, argslen, cxnowms + 10000,
+   sub, errbuf, errbuflen, errkind);
+
+comment TypeScript: useQuery keeps the socket alive and rerenders for you;
+updatedkind := livenext(sub, 10000);
+livetakencopyvalue(updatedcopy, 2048, updatedlen);
+livereleasetaken;
+updated := examplecount(updatedcopy, 0, updatedlen, updatedok)
+```
+
+`livenext` blocks until the server pushes the next value; copy it out, release
+the delivery slot, decode. The pull loop is the render loop.
 
 ## Status
 

@@ -30,118 +30,81 @@ compiles and executes the same source shown in the Example section below.
 
 ## Interesting Parts
 
-### Success and failure are values you can match
+### The Convex client is itself a tiny server
 
-TypeScript normally reports a mutation failure by rejecting its promise. This
-Elixir client returns a tagged tuple such as `{:ok, result}` or
-`{:error, exception}`, so pattern matching makes the branch visible at the call
-site.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-
-  async function onClick() {
-    const result = await increment({
-      room: "readme-elixir",
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.state.count); // The generated API makes this a number.
-  }
-
-  return <button onClick={onClick}>Increment</button>;
-}
-```
-
-**Elixir**
+Elixir runs on the BEAM, the virtual machine Ericsson built for telephone
+switches in the 1980s, and inherits Erlang's OTP toolkit of battle-tested
+process patterns. This client is a `GenServer`: `Client.start_link` spawns a
+lightweight process that privately holds the bearer token and connections, and
+each public function is a one-liner that mails that process a request and
+awaits its reply.
 
 ```elixir
-alias Convex.Client
+defmodule Convex.Client do
+  use GenServer
 
-deployment_url = System.fetch_env!("CONVEX_URL")
-{:ok, client} = Client.start_link(deployment_url)
+  def query(client, path, args, timeout \\ 30_000),
+    do: GenServer.call(client, {:call, :query, path, args}, timeout)
 
-try do
-  args = %{
-    "room" => "readme-elixir",
-    "language" => "elixir",
-    "runId" => :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
-  }
-
-  case Client.mutation(client, "demo:increment", args) do
-    {:ok, result} ->
-      %{"state" => %{"count" => count}} = result.value
-      IO.inspect(count) # This shape is checked by the match at runtime, not statically typed.
-
-    {:error, error} ->
-      raise error
-  end
-after
-  Client.close(client)
+  def mutation(client, path, args, timeout \\ 30_000),
+    do: GenServer.call(client, {:call, :mutation, path, args}, timeout)
 end
 ```
 
-Elixir supports optional typespecs and static analysis, but it is dynamically
-typed. This demonstration accepts JSON maps, so its nested match is a runtime
-shape check. The TypeScript snippet instead gets generated argument and result
-types from `api.demo.increment`.
+Every request funnels through one process mailbox, so calls are serialized
+without a lock in sight.
 
-### A Live query belongs to an Elixir process
+### One pattern match takes the reply apart
 
-React owns the subscription behind `useQuery`, rerenders when its value changes,
-and cleans it up with the component. This command-line client gives the calling
-Elixir process an explicit subscription instead.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function RoomCount() {
-  const state = useQuery(api.demo.state, { room: "readme-elixir" });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // state.count is type-safe and triggers rerenders.
-}
-```
-
-**Elixir**
+Where TypeScript reports a failed mutation by rejecting a promise, Elixir
+functions return tagged tuples — `{:ok, value}` or `{:error, reason}` — and
+`case` pattern-matches on them, putting both branches in plain view at the
+call site. The same match can reach deep into the decoded JSON in one breath.
 
 ```elixir
-alias Convex.{Client, Subscription}
+# TypeScript: const result = await increment({ room, language, runId })
+case Client.mutation(client, "demo:increment", %{
+       "room" => room,
+       "language" => "elixir",
+       "runId" => random_id()
+     }) do
+  # The nested match doubles as a runtime assertion on the reply's shape.
+  {:ok, %{value: %{"applied" => true, "state" => %{"count" => count}}}} ->
+    IO.inspect(count)
 
-deployment_url = System.fetch_env!("CONVEX_URL")
-{:ok, client} = Client.start_link(deployment_url)
+  {:error, error} ->
+    raise error
+end
+```
 
-try do
-  args = %{"room" => "readme-elixir"}
-  {:ok, subscription} = Client.subscribe(client, "demo:state", args)
+If the deployment ever answered with `"applied" => false`, no clause would
+match and the code would fail loudly rather than carry a wrong count forward.
 
-  try do
-    # The first message is the current reactive value for this room.
-    {:ok, update} = Subscription.next(subscription, 10_000)
-    %{"count" => count} = update.value
-    IO.inspect(count) # `count` is dynamically checked by the map match above.
+### A reactive update is a letter in your mailbox
+
+Every BEAM process has a mailbox, and asynchronous events arrive there as
+plain messages. The `Convex.Live` process owns the WebSocket and forwards each
+new Live value to the subscribing process with `send`. Receiving one is the
+entire implementation of `Subscription.next/2`:
+
+```elixir
+def next(%__MODULE__{reference: reference}, timeout \\ 10_000) do
+  # TypeScript: const state = useQuery(api.demo.state, { room })
+  receive do
+    {:convex_update, ^reference, {:ok, value, logs}} -> {:ok, %{value: value, logs: logs}}
+    {:convex_update, ^reference, {:error, error}} -> {:error, error}
+    {:convex_closed, ^reference} -> {:error, %Convex.ClosedError{}}
   after
-    # The CLI owns the lifecycle, so it must unsubscribe explicitly.
-    Subscription.close(subscription)
+    timeout -> {:error, :timeout}
   end
-after
-  Client.close(client)
 end
 ```
 
-The BEAM provides lightweight processes and asynchronous message passing. The
-blocking `Subscription.next/2` wrapper is this client's deliberately small CLI
-API, not a limitation of Elixir. A long-running program would call it again, or
-receive the underlying messages in its own process, to handle later updates.
+The `^` pin operator selects only mail tagged with this subscription's unique
+reference, leaving everything else in the mailbox. After
+`Client.subscribe(client, "demo:state", %{"room" => room})`, each fresh count
+is one `receive` away — where React re-renders a component, the BEAM simply
+delivers a letter, and any process can be the recipient.
 
 ## Status
 

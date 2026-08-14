@@ -18,36 +18,97 @@ exact program against a fresh room:
 
 ## Interesting Parts
 
-### Calls stay explicit
+### A fault travels inside `int?`
 
-React normally hides request construction behind generated hooks:
-
-```tsx
-const state = useQuery(api.demo.state, { room });
-```
-
-The small C3 API makes the same boundary visible:
+C3 is Christoffer Lernö's careful evolution of C, and its signature move is the
+Optional: `int?` is an `int` that may instead carry a named fault, fusing
+`Option` and `Result` into one type. Faults are declared with `faultdef` and
+raised with a `~` suffix — so when Convex serialises a counter as the JSON
+double `1.0`, the decoder can insist it is mathematically integral:
 
 ```c3
-String query = c3_http::query_envelope("demo:state", state_args);
-c3_http::post(deployment, "/api/query", query, "", response[..], &response_length)!!;
+faultdef EXPECTED_INTEGRAL_NUMBER, OUT_OF_RANGE;
+
+fn int? parse_counter(String encoded)
+{
+    Object* value = json::tparse(encoded, JSON)!;
+    if (value.type != double) return EXPECTED_INTEGRAL_NUMBER~;
+    double number = value.f;
+    if (number != (double)(int)number) return EXPECTED_INTEGRAL_NUMBER~;
+    if (number > 2147483647.0 || number < -2147483648.0) return OUT_OF_RANGE~;
+    return (int)number;
+}
 ```
 
-That is an API choice for a teaching client, not a C3 limitation. C3 still owns
-the Convex envelope and response semantics while libcurl supplies ordinary TLS.
+At the call site one suffix picks the policy: `!` re-raises to the caller,
+`!!` asserts success.
 
-### Live has one owner
+### `??` turns a missing key into a raised fault
 
-React owns subscription lifetime for `useQuery`. Here a `Manager` explicitly
-owns the WebSocket, query-set versions, reconnects, and bounded delivery queues:
+Most languages give `??` a default value. In C3 the right-hand side can itself
+be a raised fault, and a trailing `!` re-raises it — so "fetch this key or fail
+the whole decode" is one line, repeated for each field of Convex's response
+envelope:
+
+```c3
+fn DecodedResponse? decode(String body)
+{
+    Object* root = json::parse(mem, body, JSON)!;
+    if (!root.is_map()) return PROTOCOL_ERROR~;
+    Object* status = root.get("status") ?? PROTOCOL_ERROR~!;
+    // ...
+    Object* value = root.get("value") ?? PROTOCOL_ERROR~!;
+    return { .kind = SUCCESS, .value = value, .logs = logs };
+}
+```
+
+No `if err != nil` staircase — malformed JSON, a missing key, and a wrong type
+all funnel into the same typed fault channel.
+
+### Backtick JSON on the temp allocator
+
+C3's backtick strings are raw, so a JSON template keeps its quotes unescaped.
+The stdlib's `t`-prefixed functions (`tformat`, `tescape`) allocate on the temp
+allocator — an arena wiped wholesale at scope end, so building an envelope per
+request never needs an individual `free`:
+
+```c3
+// TypeScript: await client.mutation(api.demo.increment, { room, ... })
+fn String mutation_envelope(String path, String args, String idempotency_key)
+{
+    return string::tformat(`{"path":%s,"args":%s,"format":"json","idempotencyKey":%s}`,
+                           path.tescape(), args, idempotency_key.tescape());
+}
+```
+
+The reply then lands in a stack buffer sliced as `response[..]` — a full Convex
+round trip with no heap allocation for the payload at all.
+
+### Live is a loop you tick
+
+No hidden background thread: one `Manager` owns the WebSocket, query-set
+versions, reconnect backoff, and bounded event queues, and it only makes
+progress when you call `manager_tick`. Updates come out as owned events you
+dispose yourself — allocation stays visible, C-style:
 
 ```c3
 c3_live::Manager live;
 c3_live::manager_init(&live, deployment);
 if (!c3_live::manager_subscribe(&live, "example", "demo:state", state_args)) return;
+
+while (c3_monotonic_millis() < deadline)
+{
+    c3_live::manager_tick(&live);
+    c3_live::LiveEvent event;
+    if (!c3_live::manager_take_event(&live, &event)) continue;
+    // TypeScript: const state = useQuery(api.demo.state, { room }) re-renders here
+    Object* root = json::tparse(event.payload, JSON)!!;
+    c3_live::live_event_dispose(&event);
+}
 ```
 
-This keeps reads, writes, replay, and cleanup serialized in one place.
+The same tick also drives the five real reconnects the conformance suite
+demands — one loop, one owner, no callbacks.
 
 ## Status
 

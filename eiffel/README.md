@@ -34,107 +34,92 @@ need EiffelStudio installed on your machine.
 
 ## Interesting Parts
 
-### Contracts guard the call boundary
+### The API's one rule is written once, as a contract
 
-**TypeScript with React**
-
-```tsx
-import { api } from "../convex/_generated/api";
-import { useQuery } from "convex/react";
-
-export function RoomCount() {
-  const state = useQuery(api.demo.state, { room: "readme-contract-room" });
-  if (state === undefined) return <p>Loading...</p>;
-
-  return <p>{state.count}</p>; // The generated API types both args and result.
-}
-```
-
-**Eiffel**
+Bertrand Meyer designed Eiffel around Design by Contract: a routine states what
+it `require`s of its caller, and a violation stops the program at the guilty
+call site, naming the broken clause. Convex has exactly one shape rule that
+every call shares -- the path must look like `module:function` -- so this
+client writes it once as a precondition instead of re-checking it in three
+routine bodies.
 
 ```eiffel
-local
-	args: CONVEX_JSON_VALUE
-	state: detachable CONVEX_RESULT
-	client: CONVEX_CLIENT
-	environment: EXECUTION_ENVIRONMENT
-	configured_url: detachable STRING_32
-	deployment_url: STRING
-do
-	create environment
-	configured_url := environment.item ("CONVEX_URL")
-	-- Reject missing or empty configuration before creating the client.
-	check attached configured_url as url_32 and then not url_32.is_empty then
-		deployment_url := url_32.to_string_8
-		create client.make (deployment_url)
-		create args.make_object
-		args.put_field ("room", create {CONVEX_JSON_VALUE}.make_string ("readme-contract-room"))
-
-		-- query's contract requires a module:function path and an object of arguments.
-		state := client.query ("demo:state", args)
-		check attached state as result and then result.is_success then
-			print (result.value.field ("count").number_item) -- Decode the JSON result explicitly.
-		end
+query (a_path: STRING; a_args: CONVEX_JSON_VALUE): detachable CONVEX_RESULT
+		-- TypeScript: the generated `api.demo.state' reference checks this shape at compile time.
+	require
+		a_path_is_module_colon_function: is_module_colon_function (a_path)
+		a_args_attached: a_args /= Void
+		a_args_is_object: a_args.is_object
+	do
+		Result := call_http ("query", a_path, a_args)
 	end
+```
+
+Pass `"demo/state"` by mistake and the run halts citing
+`a_path_is_module_colon_function` -- not a puzzling HTTP error three layers later.
+
+### `detachable` makes the failure branch unskippable
+
+Eiffel is void-safe: a `detachable` type admits `Void` (Eiffel's `null`), and
+the compiler refuses to touch such a value until an `attached` test has bound a
+provably non-Void name. `query` returns `detachable CONVEX_RESULT` -- Void only
+on a transport failure -- so reading the count forces both checks:
+
+```eiffel
+state := client.query ("demo:state", args)
+	-- TypeScript: const state = await client.query("demo:state", { room })
+check attached state as l_state and then l_state.is_success then
+	print (l_state.value.field ("count").number_item)
 end
 ```
 
-React's generated `api.demo.state` reference gives TypeScript the function's
-argument and return types. This small Eiffel client instead validates the common
-call shape with `require` clauses, then represents the result as an explicit JSON
-value. Also, `useQuery` stays reactive; `client.query` is one HTTP request.
+And `value` carries its own precondition, `require is_success`, so a failed
+result refuses to even answer -- the success/failure split is enforced twice.
 
-### A Live subscription has an explicit owner
+### Objects are born through named creation procedures
 
-**TypeScript with React**
-
-```tsx
-import { api } from "../convex/_generated/api";
-import { useQuery } from "convex/react";
-
-export function LiveRoomCount() {
-  const state = useQuery(api.demo.state, { room: "readme-live-room" });
-  return <p>{state?.count ?? "Loading..."}</p>;
-}
-```
-
-**Eiffel**
+There is no `new ClassName(...)` in Eiffel. A class publishes named creation
+procedures -- `CONVEX_JSON_VALUE` lists six, from `make_null` to `make_object`
+-- and `create x.make_object` or the inline `create {TYPE}.make_string (...)`
+form picks one by name. Building a mutation's arguments reads like a little
+bill of materials:
 
 ```eiffel
-local
-	args: CONVEX_JSON_VALUE
-	client: CONVEX_CLIENT
-	poll: CONVEX_POLL
-	environment: EXECUTION_ENVIRONMENT
-	configured_url: detachable STRING_32
-	deployment_url: STRING
-do
-	create environment
-	configured_url := environment.item ("CONVEX_URL")
-	-- Reject missing or empty configuration before creating the client.
-	check attached configured_url as url_32 and then not url_32.is_empty then
-		deployment_url := url_32.to_string_8
-		create client.make (deployment_url)
-		create args.make_object
-		args.put_field ("room", create {CONVEX_JSON_VALUE}.make_string ("readme-live-room"))
+create args.make_object
+args.put_field ("room", create {CONVEX_JSON_VALUE}.make_string (room))
+args.put_field ("runId", create {CONVEX_JSON_VALUE}.make_string (room + "-once"))
+	-- TypeScript: await client.mutation("demo:increment", { room, runId })
+mutation_result := client.mutation ("demo:increment", args)
+```
 
-		-- Name the subscription, then open the client's one Live connection.
-		client.live.add_subscription ("room-count", "demo:state", args)
-		client.live.ensure_connected
+`CONVEX_RESULT` goes further: its only creation procedures are `make_success`
+and `make_failure`, so a half-initialized result cannot exist.
 
-		create poll
-		if poll.wait_readable (client.live.descriptor, 200) then
-			client.live.poll (200) -- Decode the next pushed update into pending_events.
-		end
-		client.live.remove_subscription ("room-count") -- The owner tears it down explicitly.
-	end
+### The Live loop: commands act, queries answer
+
+Meyer's command-query separation runs through the Live (WebSocket) side:
+`ensure_connected` and `poll` are commands that return nothing, while
+`pending_events` and `descriptor` are queries -- and since Eiffel will not let
+a function's answer be silently discarded, `add_subscription`'s BOOLEAN must be
+handled:
+
+```eiffel
+if not client.live.add_subscription ("basics", "demo:state", args) then
+	fail ("could not start the Live subscription")
+end
+client.live.ensure_connected
+create poll
+if poll.wait_readable (client.live.descriptor, 200) then
+	client.live.poll (200) -- Appends any pushed update to `pending_events'.
+end
+	-- TypeScript: useQuery(api.demo.state, { room }) re-renders on the same push
+if not client.live.pending_events.is_empty then
+	print (client.live.pending_events.first.value.field ("count").number_item)
 end
 ```
 
-React starts, updates, and disposes the subscription with the component. The
-command-line client deliberately exposes a small polling API, so its application
-owns connection progress and cleanup. That is this client's API choice, not a
-limitation of the Eiffel language.
+The example subscribes before it mutates, so the new count arrives through the
+open socket as a genuine server push -- Convex's reactivity, with no re-query.
 
 ## Status
 

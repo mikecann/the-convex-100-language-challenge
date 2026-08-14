@@ -21,107 +21,69 @@ That command builds and runs the exact example in Docker against a unique room, 
 
 ## Interesting Parts
 
-### JSON is explicit at the C# boundary
+### The `await` you type in TypeScript was born here
 
-In React, Convex's generated API makes the function arguments and result type-safe. This small C# client has no generated model layer, so it constructs and reads JSON nodes directly. The HTTP call is asynchronous, but it is a one-off read rather than a reactive subscription.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../../convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, { room: "readme-csharp" });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // Generated Convex types know this is a number.
-}
-```
-
-**C#**
+C# introduced `async`/`await` with C# 5 in 2012, and JavaScript adopted the keywords almost verbatim a few years later. Combined with top-level statements (no class, no `Main`) and JSON built through indexer initializers, a Convex query is just a few honest lines:
 
 ```csharp
-using System.Text.Json.Nodes;
-using Convex;
-
 var roomArgs = new JsonObject { ["room"] = "readme-csharp" };
-using var client = new ConvexClient(Environment.GetEnvironmentVariable("CONVEX_URL")!);
+using var client = new ConvexClient(url);
 
-var result = await client.Query("demo:state", roomArgs); // One HTTP request, not a subscription.
-var state = result.Value
-    ?? throw new InvalidOperationException("demo:state returned null");
-var count = CountValue.Read(state, "demo:state"); // Validate the JSON number before using it.
-Console.WriteLine(count);
+// TypeScript: const state = useQuery(api.demo.state, { room })
+var result = await client.Query("demo:state", roomArgs);
+Console.WriteLine(CountValue.Read(result.Value!, "demo:state"));
 ```
 
-The example's [`CountValue.Read`](examples/basics/CountValue.cs) also accepts integral JSON values such as `1.0`, while rejecting fractions, strings, non-finite numbers, and values outside `Int32` range. That care is necessary because the wire value is JSON, even though the rest of the C# program is strongly typed.
+The difference hiding in that comment: `useQuery` is a live subscription, while `Query` is one HTTP round-trip.
 
-### A command-line program owns its Live subscription
+### `using var` is the `useEffect` cleanup
 
-React creates and cleans up a subscription as the component and its arguments change. This client exposes that lifecycle directly. It starts Live before the mutation, reads the initial value, performs the mutation over HTTP, and then waits for the reactive update.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../../convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "readme-csharp-live";
-  const state = useQuery(api.demo.state, { room }); // React owns the Live subscription.
-  const increment = useMutation(api.demo.increment);
-
-  async function addOne() {
-    const result = await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.state.count); // The mutation result is type-safe here.
-  }
-
-  if (state === undefined) return <p>Loading...</p>;
-  // A later render receives state.count after Convex pushes the update.
-  return <button onClick={addOne}>Count: {state.count}</button>;
-}
-```
-
-**C#**
+`IDisposable` gives C# deterministic teardown: a `using var` declaration disposes its value when the scope ends, even on an exception. This client wires that into the Live protocol itself — disposing a subscription sends the `Remove` message over the WebSocket, and disposing the `LiveClient` closes the socket.
 
 ```csharp
-using System.Text.Json.Nodes;
-using Convex;
-
-var room = "readme-csharp-live";
-var roomArgs = new JsonObject { ["room"] = room };
-using var http = new ConvexClient(Environment.GetEnvironmentVariable("CONVEX_URL")!);
-using var live = new LiveClient(Environment.GetEnvironmentVariable("CONVEX_URL")!);
+using var live = new LiveClient(url);
 using var subscription = await live.Subscribe("demo:state", roomArgs);
 
-var initial = CountValue.Read(
-    subscription.Next(TimeSpan.FromSeconds(10)), // This client chooses a blocking read.
-    "initial Live value"
-);
-
-var mutation = await http.Mutation(
-    "demo:increment",
-    new JsonObject
-    {
-        ["room"] = room,
-        ["language"] = "csharp",
-        ["runId"] = Guid.NewGuid().ToString(), // The backend uses this as an idempotency key.
-    }
-);
-var returned = CountValue.Read(mutation.Value!["state"]!, "mutation result");
-var updated = CountValue.Read(
-    subscription.Next(TimeSpan.FromSeconds(10)),
-    "Live update"
-);
-Console.WriteLine($"{initial} -> {returned} -> {updated}");
+var initial = CountValue.Read(subscription.Next(TimeSpan.FromSeconds(10)), "initial Live value");
+// ... increment over HTTP; Convex pushes the new count to the socket ...
+var updated = CountValue.Read(subscription.Next(TimeSpan.FromSeconds(10)), "updated Live value");
+// TypeScript: React's useEffect cleanup performs this unsubscribe for you.
 ```
 
-C# supports callbacks and asynchronous streams. The blocking `Next` operation is a deliberate API choice in this compact command-line demonstration, not a limitation of the language. Disposing the subscription sends its removal, while disposing both clients closes their network resources.
+The unsubscribe cannot be forgotten: leaving the scope is what sends it.
+
+### Two `record` lines are the whole wire model
+
+Records (C# 9, 2020) pack a constructor, read-only properties, value equality, and a printable `ToString` into a single line. The client's entire result model is two of them — and the `?` on `JsonNode?` is compiler-enforced nullability doing the same job as TypeScript's `strictNullChecks`.
+
+```csharp
+// ConvexClient.cs — what every query, mutation, and action returns:
+public record Result(JsonNode? Value, IReadOnlyList<string> Logs);
+
+// LiveClient.cs — what every Live push delivers to a subscription:
+public record Update(JsonNode? Value, Exception? Error, IReadOnlyList<string> Logs);
+
+// Since C# 12, even classes take primary constructors:
+public sealed class LiveClient(string deployment) : IDisposable
+```
+
+### Pattern matching reads the sync protocol aloud
+
+Pattern matching has grown steadily since C# 7, and the Live client's message pump uses it to sort Convex's WebSocket frames with code that reads like the sentence it replaces:
+
+```csharp
+var type = message["type"]?.GetValue<string>();
+if (type is "Ping" or "MutationResponse" or "ActionResponse")
+    return;                                     // heartbeats and echoes
+if (type is not "Transition")
+    throw new ConvexClient.ProtocolException("unsupported Live message: " + type);
+
+// The example's decoder tests and binds in a single pattern:
+if (state["count"] is not JsonValue value)
+    throw Invalid(operation);
+```
+
+`is not`, `or` between constants, and declaration patterns turn protocol dispatch into something close to prose.
 
 ## Status
 

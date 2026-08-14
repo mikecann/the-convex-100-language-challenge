@@ -29,137 +29,79 @@ The command needs Docker, but it does not require a Dart SDK on your host.
 
 ## Interesting Parts
 
-### A typed hook meets a JSON boundary
+### A mutation reply is a record, not a class
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function CounterReadout() {
-  const state = useQuery(api.demo.state, { room: "readme-dart-query" });
-  if (state === undefined) return <p>Loading...</p>;
-
-  const count = state.count; // Generated types know this is a number.
-  return <p>Count: {count}</p>;
-}
-```
-
-**Dart**
+Dart 3 (2023) added records: anonymous, immutable tuples with named fields.
+The basics example uses one to hand back both halves of `demo:increment`'s
+reply without declaring a throwaway class. Notice how the `is!` checks also
+*promote* `value` from `Object?` to `Map` — Dart's flow analysis makes the
+casts unnecessary after the guard:
 
 ```dart
-import 'dart:io';
-
-import 'client/convex_client.dart';
-
-Future<void> main() async {
-  final deploymentUrl = Platform.environment['CONVEX_URL'];
-  if (deploymentUrl == null || deploymentUrl.isEmpty) {
-    throw StateError('CONVEX_URL is required');
+({bool applied, int count}) _readMutation(Object? value) {
+  if (value is! Map || value['applied'] is! bool || value['state'] is! Map) {
+    throw FormatException('mutation did not return the expected shape');
   }
-
-  final client = ConvexClient(deploymentUrl);
-  try {
-    final result = await client.query('demo:state', {
-      'room': 'readme-dart-query', // Dart maps become Convex argument objects.
-    });
-    final state = result.value;
-    if (state is! Map || state['count'] is! num) {
-      throw FormatException('demo:state returned an unexpected value');
-    }
-    // Convex numbers decode as num; validate before choosing an int.
-    final count = (state['count'] as num).toInt();
-    stdout.writeln('Count: $count');
-  } finally {
-    await client.close();
-  }
+  return (applied: value['applied'] as bool, count: _count(value['state']));
 }
+
+final result = await client.mutation('demo:increment',
+    {'room': room, 'language': 'dart', 'runId': _runId()});
+// TypeScript: const { applied, state } = await increment({ room, ... });
+final reply = _readMutation(result.value);
+print('applied=${reply.applied} count=${reply.count}');
 ```
 
-The generated React API carries the function's result type into the component.
-This small Dart client deliberately returns decoded JSON as `Object?`, so the
-application validates and maps the shape it needs. The Dart call is also a
-one-off HTTP query, unlike `useQuery`, which stays subscribed while the React
-component is mounted.
+The return type `({bool applied, int count})` is the whole contract, written
+inline where a TypeScript developer would reach for an interface.
 
-### A Live query is an ordinary Dart stream
+### Forget an error case and it won't compile
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "readme-dart-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  return (
-    <button
-      disabled={state === undefined}
-      onClick={() =>
-        increment({
-          room,
-          language: "typescript",
-          runId: crypto.randomUUID(),
-        })
-      }
-    >
-      Count: {state?.count ?? "loading"}
-    </button>
-  ); // React owns the subscription and refreshes this render automatically.
-}
-```
-
-**Dart**
+Everything this client can throw lives under one `sealed class ConvexError`.
+Sealing tells the compiler the subclass list is closed, so a `switch`
+expression over an error is checked for exhaustiveness — miss a case and the
+build fails, which is how the conformance adapter labels failures:
 
 ```dart
-import 'dart:async';
-import 'dart:io';
-
-import 'client/convex_client.dart';
-import 'client/live_client.dart';
-
-Future<void> main() async {
-  final deploymentUrl = Platform.environment['CONVEX_URL'];
-  if (deploymentUrl == null || deploymentUrl.isEmpty) {
-    throw StateError('CONVEX_URL is required');
-  }
-
-  final client = ConvexClient(deploymentUrl);
-  final subscription = await client.subscribe('demo:state', {
-    'room': 'readme-dart-live',
-  });
-  // One iterator stays attached, so no update is lost between reads.
-  final updates = StreamIterator<LiveUpdate>(subscription.updates);
-  try {
-    if (!await updates.moveNext()) throw StateError('Live stream closed');
-    if (updates.current.error != null) throw updates.current.error!;
-    stdout.writeln('Initial: ${updates.current.value}');
-
-    await client.mutation('demo:increment', {
-      'room': 'readme-dart-live',
-      'language': 'dart',
-      'runId': 'dart-readme-${DateTime.now().microsecondsSinceEpoch}',
-    });
-
-    if (!await updates.moveNext()) throw StateError('Live stream closed');
-    if (updates.current.error != null) throw updates.current.error!;
-    stdout.writeln('Updated: ${updates.current.value}'); // Reactive value.
-  } finally {
-    await updates.cancel();
-    await subscription.close(); // The command-line program owns this lifecycle.
-    await client.close();
-  }
-}
+// TypeScript: instanceof chains, and nothing warns about a forgotten case.
+final kind = switch (error) {
+  FunctionError() => 'FunctionError',         // your Convex function threw
+  TransportError() => 'TransportError',       // network, TLS, or timeout
+  ProtocolError() => 'ProtocolError',         // reply broke the pinned contract
+  ClientClosedError() => 'ClientClosedError', // used after close()
+};
 ```
 
-Dart supports asynchronous streams directly. This client chooses to expose
-Live results as a single-listener `Stream<LiveUpdate>` and makes callers close
-the subscription explicitly. React hides those details behind component mount,
-rerender, and unmount behavior.
+Those `FunctionError()` shapes are object patterns; they can also pull fields
+out in the same breath, like `FunctionError(:final data)`.
+
+### A Live query is a stream you pull
+
+Dart shipped `async`/`await` and `Stream` in 2015, before JavaScript had
+either, so Convex's reactive side maps straight onto the standard library:
+`subscribe` returns a `LiveSubscription` whose `updates` getter is a
+`Stream<LiveUpdate>`, and a `StreamIterator` lets a command-line program pull
+each update exactly when it is ready:
+
+```dart
+final subscription = await client.subscribe('demo:state', {'room': room});
+// TypeScript: const state = useQuery(api.demo.state, { room }); auto re-render
+final updates = StreamIterator<LiveUpdate>(subscription.updates);
+
+await updates.moveNext(); // First value: the server's current state.
+print('initial: ${updates.current.value}');
+
+await client.mutation('demo:increment',
+    {'room': room, 'language': 'dart', 'runId': _runId()});
+
+await updates.moveNext(); // Pushed by Convex — no second query.
+print('updated: ${updates.current.value}');
+
+await subscription.close();
+```
+
+The iterator stays attached across both reads, so the update triggered by the
+mutation cannot slip through a gap between polls.
 
 ## Status
 

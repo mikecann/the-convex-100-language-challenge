@@ -26,122 +26,88 @@ From the repository root, Docker builds and runs the exact canonical example:
 
 ## Interesting Parts
 
-### One word can represent anything, but it proves nothing
+### The linker is `GET`: the whole client arrives as source
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function Count() {
-  const room = "bcpl-readme-types";
-  const state = useQuery(api.demo.state, { room });
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**BCPL**
+BCPL predates the module system, the package manager and mostly the linker
+itself, so a large program is assembled by textual inclusion: `GET` splices
+another source file in, and a lone `.` separates independently compiled
+sections. The canonical example pulls in the entire Convex client — HTTP,
+WebSocket, JSON and the sync protocol — with one line.
 
 ```text
-LET start() = VALOF
-{ LET url = 0
-  LET room = 0
-  LET client = 0
-  LET arguments = 0
-  LET path = 0
-  LET result = 0
-  LET count = 0
+SECTION "convexclient"
 
-  UNLESS convexInit() DO stop(1)
-  url := cxGetenv("CONVEX_URL")
-  IF url = 0 DO stop(1)
-  IF url!Bb_len = 0 DO stop(1)
-  room := bbFromStr("bcpl-readme-types") // Matches the React teaching room.
-  client := convexNew(url) // This word now points at the client record.
-  arguments := jsObject()
-  jsObjectPutStr(arguments, "room", jsStringFromBuffer(bbCopy(room)))
-  path := bbFromStr("demo:state")
-  result := convexCall(client, "/api/query", path,
-                       arguments, cxDeadline(Httptimeoutms))
-  // The returned word has no static shape. Check it before using it as a count.
-  UNLESS jsWholeNumber(jsObjectGet(result!Rs_value, "count"), @count) DO stop(1)
-  writef("count: %n*n", count)
+GET "libhdr"      // the standard library arrives the same way
+GET "convexhdr"
+GET "convex.b"    // HTTP, WebSocket, JSON and the Convex sync protocol
 
-  convexResultFree(result)
-  jsFree(arguments)
-  convexClose(client)
-  convexFree(client)
-  bbFree(path)
-  bbFree(room)
-  bbFree(url)
-  RESULTIS 0
-}
+.                 // a dot ends one section; the program itself starts here
+
+SECTION "convexbasics"
 ```
 
-BCPL is typeless: a word may hold an integer, address, or encoded handle. This
-client therefore represents JSON with tagged records of its own and checks the
-`count` node explicitly. The React hook is reactive; this BCPL call is one HTTP
-read. The [complete example](examples/basics/main.b) also handles every failure.
+The dependency graph is the order of the `GET` lines, and nothing else.
 
-### React owns the subscription; this program owns it
+### A record is a word plus arithmetic
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function LiveCount() {
-  const room = "bcpl-readme-live";
-  const state = useQuery(api.demo.state, { room });
-  // React subscribes on mount, rerenders on change, and cleans up on unmount.
-  return <p>{state?.count ?? "Loading..."}</p>;
-}
-```
-
-**BCPL**
+BCPL has exactly one data type — the machine word — and its `!` operator is
+indirection: `result!1` means "the word one past where `result` points". Every
+structure in this client, from JSON nodes to call results, is a vector whose
+field names are `MANIFEST` constants for the offsets.
 
 ```text
-LET watchOnce() BE
-{ LET url = 0
-  LET room = 0
-  LET client = 0
-  LET arguments = 0
-  LET subscription = 0
-  LET initial = 0
-  LET count = 0
+MANIFEST { Rs_value = 0     // from convexhdr.h: a record layout is
+           Rs_logs  = 1 }   // nothing but named word offsets
 
-  UNLESS convexInit() DO stop(1)
-  url := cxGetenv("CONVEX_URL")
-  IF url = 0 DO stop(1)
-  IF url!Bb_len = 0 DO stop(1)
-  room := bbFromStr("bcpl-readme-live") // Matches the React teaching room.
-  client := convexNew(url)
-  arguments := jsObject()
-  jsObjectPutStr(arguments, "room", jsStringFromBuffer(bbCopy(room)))
-  subscription := convexSubscribe(client, bbFromStr("readme-watch"),
-                                  bbFromStr("demo:state"), arguments)
-  // This client API deliberately offers a blocking next-update operation.
-  initial := convexNextUpdate(client, subscription, cxDeadline(15000))
-  UNLESS jsWholeNumber(jsObjectGet(initial!Up_value, "count"), @count) DO stop(1)
-  writef("initial count: %n*n", count)
-  upFree(initial)
+path := bbFromStr("demo:state")
+result := convexCall(client, "/api/query", path, queryargs,
+                     cxDeadline(Httptimeoutms))
+// TypeScript: const state = useQuery(api.demo.state, { room })
+started := countOf(result!Rs_value)
+```
 
-  // A command-line program must end the subscription and release the client.
-  convexUnsubscribe(client, subscription)
-  convexClose(client)
-  convexFree(client)
-  bbFree(room)
-  bbFree(url)
+What TypeScript proves at compile time, this program establishes by naming its
+offsets in one header and trusting the arithmetic.
+
+### `VALOF` put statements inside an expression in 1966
+
+Decades before arrow functions, BCPL let an expression run a block of
+statements until `RESULTIS` supplied its value. Add `@` (address-of) and the
+negative conditional `UNLESS`, and decoding a Convex value reads as a small
+proof rather than a cast.
+
+```text
+AND countOf(state) = VALOF
+{ LET count = 0
+  // TypeScript: state.count is already typed; here the word must be checked
+  UNLESS jsWholeNumber(jsObjectGet(state, "count"), @count) RESULTIS -1
+  RESULTIS count
 }
 ```
 
-The blocking `convexNextUpdate` call is this client's API choice, not a BCPL
-language restriction. The implementation has one single-threaded Live manager
-that owns reads, reconnects, and subscription changes. React hides that
-lifecycle behind `useQuery`; this command-line client makes it explicit.
+`jsWholeNumber` writes through the address `@count` only when the JSON node
+really is a whole number, so `-1` is a genuine mismatch, never a truncation.
+
+### Subscribe first, and the update cannot be missed
+
+BCPL has no threads, so the client keeps one single-threaded Live manager that
+owns the WebSocket, the query set and every reconnect decision. The blocking
+`convexNextUpdate` hands you the next value; subscribing before mutating is
+what guarantees the write's update cannot slip between two calls.
+
+```text
+subscription := convexSubscribe(client, bbFromStr("example"),
+                                bbCopy(path), jsClone(queryargs))
+// ... increment the counter over HTTP ...
+// TypeScript: useQuery(api.demo.state, { room }) rerenders on its own
+update := convexNextUpdate(client, subscription, cxDeadline(15000))
+UNLESS countOf(update!Up_value) = finished DO
+  fail("the updated Live value disagreed with the mutation")
+upFree(update)
+```
+
+The same reactive delivery a React component gets from `useQuery`, expressed
+as one explicit question: what changed next?
 
 ## Status
 

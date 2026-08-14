@@ -37,124 +37,97 @@ on your host.
 
 ## Interesting Parts
 
-### One call can return a value, an error, and logs
+### One `let` binds a value, an error, and the logs
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function CounterRead() {
-  const room = "readme-dylan";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>Count: {state.count}</p>; // state.count is type-safe here.
-}
-```
-
-**Dylan**
+Dylan inherited multiple return values from Common Lisp: a function hands back
+several results directly, and the caller binds them all in a single `let`. The
+client's HTTP entry point uses that instead of wrapping everything in a result
+object.
 
 ```dylan
-let url-text = cx-getenv("CONVEX_URL");
-if (~url-text) error("CONVEX_URL is required") end if;
-let base-url = parse-convex-url(url-text);
-if (~base-url) error("CONVEX_URL is not a valid http(s) URL") end if;
-// The Docker entrypoint maps the verifier's unique room to EXAMPLE_ROOM.
-let room = cx-getenv("EXAMPLE_ROOM");
-if (~room) error("EXAMPLE_ROOM is required") end if;
-// Dylan uses #f for false and, here, for "no authentication token".
-let query-args = make-json-object();
-json-object-set!(query-args, "room", room); // Build { room } explicitly.
-
+// TypeScript: const state = await client.query("demo:state", { room })
 let (state, query-error, _logs) =
   convex-http-call(base-url, "query", "demo:state", query-args, #f,
                    cx-now-ms() + 15000);
 if (query-error)
-  error(query-error.err-message); // The error is separate from the value.
+  error(query-error.err-message); // A structured <convex-error>, not a string.
 end if;
-let count = count-of(state); // Validate the decoded JSON before using it.
 ```
 
-Dylan functions can return several values directly, so the client returns the
-result, a structured error, and Convex log lines without wrapping them in a
-result object. This Dylan call is a one-off HTTP request. Unlike `useQuery`, it
-does not stay subscribed or trigger a render when the data changes.
+The trailing `#f` — Dylan's false — doubles as "no auth token" here, and
+results you do not want, like the Convex log lines, simply get a throwaway
+name.
 
-### The command-line client owns the reactive lifetime
+### `false-or(<integer>)` is an optional type you can spell
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function CounterButton() {
-  const room = "readme-dylan-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  if (state === undefined) return <p>Loading...</p>;
-
-  async function addOne() {
-    const result = await increment({
-      room,
-      language: "TypeScript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.state.count); // The mutation also returns the new state.
-  }
-
-  // useQuery keeps this label reactive after the mutation.
-  return <button onClick={addOne}>Count: {state.count}</button>;
-}
-```
-
-**Dylan**
+Dylan pioneered optional typing back in 1992: annotations are ordinary type
+expressions, so "an integer, or nothing" is just `false-or(<integer>)`. The
+basics example uses it to absorb a real Convex quirk — the `json` HTTP format
+may render a whole count as either `0` or `0.0`.
 
 ```dylan
-let url-text = cx-getenv("CONVEX_URL");
-if (~url-text) error("CONVEX_URL is required") end if;
-let base-url = parse-convex-url(url-text);
-if (~base-url) error("CONVEX_URL is not a valid http(s) URL") end if;
-// The verifier supplies a fresh room through the Docker entrypoint.
-let room = cx-getenv("EXAMPLE_ROOM");
-if (~room) error("EXAMPLE_ROOM is required") end if;
-let query-args = make-json-object();
-json-object-set!(query-args, "room", room);
-
-let manager = sync-manager-new(base-url); // This program owns the connection.
-let query-id =
-  sync-subscribe(manager, "demo:state", query-args, cx-now-ms() + 8000);
-let initial = await-update(manager, query-id, cx-now-ms() + 10000);
-let initial-count = count-of(initial.upd-value); // The first Live value.
-
-let mutation-args = make-json-object();
-json-object-set!(mutation-args, "room", room);
-json-object-set!(mutation-args, "language", "Dylan");
-json-object-set!(mutation-args, "runId", concatenate(room, "-once"));
-let (result, mutation-error, _logs) =
-  convex-http-call(base-url, "mutation", "demo:increment", mutation-args,
-                   #f, cx-now-ms() + 15000); // #f means no auth token.
-if (mutation-error)
-  error(mutation-error.err-message);
-end if;
-let mutation-count = count-of(json-object-ref(result, "state"));
-// The subscription was started first, so the 0 -> 1 update cannot be missed.
-let updated = await-update(manager, query-id, cx-now-ms() + 10000);
-let updated-count = count-of(updated.upd-value); // The reactive value is now 1.
-sync-unsubscribe(manager, query-id, cx-now-ms() + 5000); // Explicit cleanup.
+define function count-of (value :: <object>)
+ => (count :: false-or(<integer>)) // TypeScript: number | undefined
+  let count-value = json-object-ref(value, "count");
+  if (instance?(count-value, <integer>))
+    count-value
+  elseif (instance?(count-value, <float>))
+    let whole = truncate(count-value);
+    if (as(<double-float>, whole) = count-value) whole else #f end if
+  else
+    #f
+  end if
+end function;
 ```
 
-React mounts and cleans up the `useQuery` subscription for the component. The
-Dylan API instead exposes a manager, a subscription ID, a blocking
-`await-update` helper, and explicit unsubscribe. Blocking here is this client's
-small command-line API design, not a limitation of the Dylan language. The
-`concatenate(room, "-once")` run ID is safe in this example because the
-verifier creates a new room for every run. A reusable application should
-generate an operation ID and reuse it only when retrying that same logical
-mutation.
+The signature documents the "maybe", and the compiler can hold callers to it.
+
+### Waiting for a Live update is a `block` with a named exit
+
+The Live client is a one-owner reactor: `sync-subscribe` returns a query ID,
+and nothing moves until someone calls `sync-pump`. To wait for the next
+reactive value, the example wraps a loop in `block (done)` — Dylan's non-local
+exit, another piece of Lisp ancestry wearing infix syntax.
+
+```dylan
+// TypeScript: const state = useQuery(api.demo.state, { room })
+let query-id =
+  sync-subscribe(mgr, "demo:state", query-args, cx-now-ms() + 8000);
+let deadline-ms = cx-now-ms() + 10000;
+block (done)
+  while (#t)
+    let update = sync-poll-update(mgr, query-id);
+    if (update) done(update) end if;          // Exit the block, value in hand.
+    if (cx-now-ms() > deadline-ms) done(#f) end if;
+    sync-pump(mgr, 50); // Live only advances while the reactor is pumped.
+  end while;
+end block
+```
+
+Each update is a `<sync-update>` whose `upd-kind` slot is the symbol
+`#"value"` or `#"error"`, so the counter's `0 -> 1` change arrives as plain
+data rather than a callback.
+
+### The POSIX socket layer is declared in Dylan, not C
+
+Open Dylan's C foreign-function interface is a set of definition macros, so
+binding to C means writing more Dylan. The client's entire native layer —
+sockets, `poll`, OpenSSL — is declared this way in
+[`client/convex-native.dylan`](client/convex-native.dylan), with no separate C
+stub file to compile.
+
+```dylan
+define C-function c-poll
+  parameter fds :: <pollfd*>;
+  parameter nfds :: <C-unsigned-long>;
+  parameter timeout-ms :: <C-int>;
+  result rc :: <C-int>;
+  c-name: "poll";
+end C-function;
+```
+
+This one declaration is what wakes the Live reactor whenever the WebSocket has
+bytes ready.
 
 ## Status
 

@@ -29,143 +29,106 @@ runs that exact example against a unique room:
 
 ## Interesting Parts
 
-### A query becomes a register-level call
+### `{ room }` is built one register at a time
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-function QueryCount() {
-  const room = "readme-room";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**Assembly (x86-64 NASM)**
+Assembly has no object literal — it has a heap and sixteen general-purpose
+registers. This client ships its own hand-written JSON module, so the
+argument object for a Convex query is assembled call by call, each
+parameter loaded into exactly the register the System V AMD64 ABI assigns
+it:
 
 ```nasm
-default rel
-%include "convex.inc"                    ; operation constants and layouts
-extern convex_call
-
-section .rodata
-    path_state: db "demo:state"
-    path_state_len equ $ - path_state
-
-section .text
-; int query_state(client, args, out, err)
-; System V inputs: rdi = convex_client*, rsi = owned { room: "readme-room" },
-; rdx = convex_result*, rcx = convex_error*. The return value is in eax.
-query_state:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 32
-    mov [rbp-8], rdi                     ; client
-    mov [rbp-16], rsi                    ; args, consumed by convex_call
-    mov [rbp-24], rdx                    ; output result
-    mov [rbp-32], rcx                    ; output error
-
+    call json_new_object                 ; rax = a fresh {}
+    mov [rbp-8], rax
+    lea rdi, [room_arg]
+    mov rsi, [room_len]
+    call json_new_string                 ; rax = "readme-room"
+    mov rcx, rax
     mov rdi, [rbp-8]
-    mov esi, CONVEX_OP_QUERY
-    lea rdx, [rel path_state]
+    lea rsi, [rel k_room]                ; the four bytes "room"
+    mov edx, 4                           ; ...and their length, counted by hand
+    call json_object_set                 ; TypeScript: const args = { room }
+```
+
+Strings travel as pointer-and-length pairs, and the assembler can even do
+the counting: `path_state_len equ $ - path_state`, where `$` means "the
+address right here."
+
+### The seventh argument rides the stack
+
+`convex_call` is one function for queries, mutations, and actions, selected
+by a numeric operation constant. It takes seven parameters — but the ABI
+supplies only six integer registers, so the last one, the error out-slot,
+is placed on the stack by hand:
+
+```nasm
+    mov rdi, [client]                    ; 1: client from convex_new
+    mov esi, CONVEX_OP_QUERY             ; 2: which operation
+    lea rdx, [rel path_state]            ; 3+4: "demo:state" and its length
     mov ecx, path_state_len
-    mov r8, [rbp-16]
-    mov r9, [rbp-24]
-    sub rsp, 16                          ; seventh ABI argument uses the stack
-    mov rax, [rbp-32]
-    mov [rsp], rax
-    call convex_call
+    mov r8, [rbp-8]                      ; 5: the { room } args (ownership moves)
+    lea r9, [result1]                    ; 6: where the decoded value lands
+    sub rsp, 16                          ; registers exhausted...
+    lea rax, [err]
+    mov [rsp], rax                       ; 7: ...so the error slot rides the stack
+    call convex_call                     ; TypeScript: await client.query("demo:state", { room })
     add rsp, 16
-    mov rsp, rbp
-    pop rbp
-    ret
 ```
 
-React's `useQuery` is reactive and manages a subscription. The assembly call
-above is deliberately only a one-off HTTP read. Its caller has already built
-the `{ room }` JSON object, and `convex_call` takes ownership of it. The
-canonical example below shows construction, result decoding, checks, and
-cleanup.
+That `sub rsp, 16` also keeps the stack 16-byte aligned at the `call` — an
+ABI rule that here is the programmer's job, not a compiler's.
 
-### Reactivity is an explicit resource
+### A type check is a compare instruction
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-function Counter() {
-  const room = "readme-room";
-  const state = useQuery(api.demo.state, { room });
-
-  // React subscribes on mount, rerenders on updates, and unsubscribes on unmount.
-  return <span>{state?.count ?? "Loading..."}</span>;
-}
-```
-
-**Assembly (x86-64 NASM)**
+Decoded JSON values are 48-byte tagged records laid out with NASM's `struc`
+directive — named offsets over raw memory, the closest thing assembly has
+to a type system. Reading the counter out of the query result means
+fetching a field and comparing its tag number:
 
 ```nasm
-default rel
-%include "convex.inc"                    ; structure layouts
-extern convex_live_subscribe
-extern convex_live_next
-extern convex_live_unsubscribe
+    mov rdi, [result1 + convex_result.value]
+    lea rsi, [rel k_count]
+    mov edx, 5
+    call json_object_get                 ; TypeScript: state.count
+    test rax, rax
+    jz .unexpected                       ; even "field missing" is a manual branch
+    mov rcx, [rax + json_value.tag]
+    cmp rcx, JV_INT                      ; the "type check"
+    jne .unexpected
+    mov rax, [rax + json_value.ival]     ; the count, as an exact 64-bit integer
+```
 
-section .rodata
-    path_state: db "demo:state"
-    path_state_len equ $ - path_state
+A quiet payoff of doing this by hand: integer literals stay exact 64-bit
+values rather than doubles, which matters for Convex's nanosecond Live
+timestamps beyond JavaScript's safe-integer range.
 
-section .text
-; int observe_state_once(live, args, out)
-; System V: rdi = initialized convex_live*, rsi = fresh { room: "readme-room" }
-; args (ownership moves on success), rdx = caller-owned convex_update* output.
-observe_state_once:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 32
-    mov [rbp-8], rdi                     ; Live state remains caller-owned
-    mov [rbp-16], rsi                    ; args move to a successful subscription
-    mov [rbp-24], rdx                    ; delivered update remains caller-owned
+### `useQuery`, unrolled into three calls
 
-    mov rdi, [rbp-8]
+Live is fully verified here (see Status), and everything beneath it — the
+HTTP upgrade, RFC 6455 WebSocket framing, the Convex sync protocol — is
+hand-written assembly. What React folds into a hook and a component
+lifecycle becomes three explicit calls: subscribe, block for the next
+update, unsubscribe:
+
+```nasm
+    lea rdi, [g_live]                    ; the Live sync state machine
     lea rsi, [rel path_state]
     mov edx, path_state_len
-    mov rcx, [rbp-16]
+    mov rcx, [rbp-8]                     ; fresh { room }; the subscription takes it
     call convex_live_subscribe
-    test rax, rax
-    jz .failed                           ; caller still owns args on failure
-    mov [rbp-32], rax                    ; opaque subscription handle
+    mov [g_sub], rax                     ; an opaque subscription handle
 
-    mov rdi, rax
-    mov rsi, [rbp-24]
-    mov edx, 10000
-    call convex_live_next                ; blocking API choice, 10 second limit
-    mov [rbp-16], rax                    ; 1 = update delivered, 0 = timeout
-
-    mov rdi, [rbp-32]
-    call convex_live_unsubscribe         ; frees the subscription and its args
-    mov rax, [rbp-16]
-    jmp .done
-.failed:
-    xor eax, eax
-.done:
-    mov rsp, rbp
-    pop rbp
-    ret
+    mov rdi, [g_sub]
+    lea rsi, [g_update]
+    mov edx, 10000                       ; wait up to ten seconds
+    call convex_live_next                ; TypeScript: useQuery re-rendering with fresh data
+    ; ...read g_update's value, then:
+    mov rdi, [g_sub]
+    call convex_live_unsubscribe
 ```
 
-The command-line client explicitly subscribes, waits, and unsubscribes where
-React does that around component lifetime. This blocking `next` API is a
-client design choice, not a NASM limitation. A delivered update's contents
-belong to the caller; the canonical example shows their cleanup. The internal
-eight-entry queue drops its oldest update when a reader falls behind.
+Subscribe, next, unsubscribe map onto React's mount, render, unmount — the
+component lifecycle, spelled out as explicit resource management.
 
 ## Status
 
