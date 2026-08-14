@@ -31,124 +31,82 @@ Nothing is installed on your host. The command builds and runs the pinned
 
 ## Interesting Parts
 
-### A familiar JSON query, without generated result types
+### A Convex call is one line, thanks to multiple dispatch
 
-TypeScript with React:
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function Counter() {
-  const room = "readme-julia-query";
-  const state = useQuery(api.demo.state, { room });
-  // `api` is generated, so `state.count` is type-safe after loading.
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>Count: {state.count}</p>;
-}
-```
-
-Julia:
+Julia's signature idea is multiple dispatch: functions do not belong to
+classes. A *generic function* is a bundle of methods, and Julia picks one by
+the concrete types of every argument. That makes this client's entry points
+one-line method definitions, and it lets the client extend `Base.showerror`,
+the language's own error printer, with a method for `ConvexError`.
 
 ```julia
-include("client/Convex.jl")
-using .Convex
+query(client::Client, path::AbstractString, args::AbstractDict = Dict{String,Any}()) =
+    call(client, "query", path, args)
+mutation(client::Client, path::AbstractString, args::AbstractDict = Dict{String,Any}()) =
+    call(client, "mutation", path, args)
 
-room = "readme-julia-query"
+# Any method can join any generic function -- even one owned by Base:
+Base.showerror(io::IO, error::ConvexError) = print(io, error.kind, ": ", error.message)
+```
+
+Every Julia error report now knows how to print a Convex failure, and no class
+had to be subclassed to teach it.
+
+### `&&` and `||` are the if statements
+
+Idiomatic Julia writes single-branch conditions as short-circuit operators:
+`condition && consequence` reads as "if", and `assertion || panic` reads as
+"or else". The basics example leans on both when it checks a Live update.
+
+```julia
 url = get(ENV, "CONVEX_URL", "")
 isempty(url) && error("CONVEX_URL is required")
-client = Client(url)
-try
-    # Dict constructs the same `{ room }` argument object explicitly.
-    result = query(client, "demo:state", Dict("room" => room))
-    # This client returns JSON-shaped Dict values, not generated Julia types.
-    count = whole_count(result.value["count"], "state count")
-    println("Count: $(count)")
-finally
-    close!(client)
+
+initial = next_update(subscription; timeout = 10)
+# TypeScript: if (initial.error !== null) throw initial.error;
+initial.error === nothing || throw(initial.error)
+println("count: $(whole_count(initial.value["count"], "initial count"))")
+```
+
+### A `do` block hands `lock` its critical section
+
+`lock(f, l)` is a higher-order function: acquire the lock, run `f`, always
+release. Julia's `do` syntax moves that closure out of the argument list to
+just after the call, and because every block is an expression, the last line
+escapes the critical section as the block's value.
+
+```julia
+token = lock(client.lock) do
+    (client.closed || client.closing) &&
+        throw(ConvexError(:closed, "Convex client is closing or closed", nothing, String[]))
+    client.auth_token  # the block's last expression becomes `token`
 end
 ```
 
-The Julia call is a one-off HTTP query. React's `useQuery` also owns a reactive
-subscription and rerenders the component, so the two snippets deliberately do
-not promise identical lifecycles. Julia can express richer typed models, but
-this small client keeps decoded results as ordinary dictionaries and validates
-important values at runtime.
+This is how the client snapshots its auth token before every HTTP call.
 
-### React rerenders; this client lets you pull the next Live value
+### `next_update` blocks, and the `!` in `unsubscribe!` is a warning label
 
-TypeScript with React:
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "readme-julia-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  async function addOne() {
-    await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-    // useQuery receives the change and React rerenders this component.
-  }
-
-  return <button onClick={addOne}>Count: {state?.count ?? "loading"}</button>;
-}
-```
-
-Julia:
+The Live side speaks Convex's `/api/sync` WebSocket protocol from scratch,
+with one background `Task` owning the socket. Your code pulls values at its
+own pace: `next_update` blocks the calling task, taking `timeout` as a keyword
+argument after the semicolon. The trailing `!` is a convention Julia inherited
+from Scheme: functions that mutate their argument say so in their name.
 
 ```julia
-include("client/Convex.jl")
-using .Convex
-using Random
+subscription = subscribe(client, "demo:state", Dict("room" => room))
 
-room = "readme-julia-live"
-url = get(ENV, "CONVEX_URL", "")
-isempty(url) && error("CONVEX_URL is required")
-client = Client(url)
-subscription = nothing
-try
-    # Subscribe first so the mutation cannot race ahead of Live.
-    subscription = subscribe(client, "demo:state", Dict("room" => room))
-    initial = next_update(subscription; timeout = 10)
-    initial.error === nothing || throw(initial.error)
-    println("Before: $(whole_count(initial.value["count"], "initial count"))")
+mutation(client, "demo:increment",
+    Dict("room" => room, "language" => "julia", "runId" => randstring(16)))
 
-    changed = mutation(
-        client,
-        "demo:increment",
-        Dict(
-            "room" => room,
-            "language" => "julia",
-            "runId" => randstring(16), # Idempotency key for this mutation.
-        ),
-    )
-    println("Applied: $(changed.value["applied"])")
+# Blocks this task until /api/sync delivers the fresh value.
+# TypeScript: useQuery(api.demo.state, { room }) rerenders the component instead.
+updated = next_update(subscription; timeout = 10)
+println("count: $(whole_count(updated.value["count"], "updated count"))")
 
-    # This blocks the calling task until the client delivers the next value.
-    updated = next_update(subscription; timeout = 10)
-    updated.error === nothing || throw(updated.error)
-    println("After: $(whole_count(updated.value["count"], "updated count"))")
-finally
-    try
-        subscription === nothing || unsubscribe!(subscription)
-    finally
-        close!(client)
-    end
-end
+unsubscribe!(subscription)  # the ! promises this call mutates its argument
+close!(client)
 ```
-
-Julia has first-class tasks and channels, but this client's public API chooses
-a blocking `next_update` operation. That is convenient for a command-line
-example, not a limitation of Julia. A GUI or service wrapper could wait in its
-own task and forward updates, while React's hooks manage that work for the
-component automatically.
 
 ## Status
 

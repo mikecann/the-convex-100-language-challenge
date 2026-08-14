@@ -34,173 +34,90 @@ README. Nothing needs to be installed on the host.
 
 ## Interesting Parts
 
-### A typed `Result`, but an explicitly decoded value
+### `use` flattens the error-handling staircase
 
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const [room] = useState(() => `gleam-readme-${crypto.randomUUID()}`);
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // `state` and `count` are generated, typed values.
-}
-```
-
-**Gleam**
+Gleam is famously small — the whole language fits in a weekend — yet it has one
+piece of syntax TypeScript lacks: `use`. Each `use x <- result.try(...)` line
+means "unwrap this `Result` or return the error right here", so a Convex read
+that must survive an HTTP call and two decode steps still reads top to bottom
+instead of nesting into a pyramid.
 
 ```gleam
-import convex
-import convex_error.{type ConvexError}
-import convex_json.{JsonObject, JsonString} as json
-import convex_sys
-import gleam/result
-
-pub fn read_count() -> Result(Int, ConvexError) {
-  // Require real deployment configuration instead of silently using localhost.
-  use deployment_url <- result.try(
-    convex_sys.getenv("CONVEX_URL")
-    |> result.map_error(fn(_) {
-      convex_error.protocol_error("CONVEX_URL must be set")
-    }),
+pub fn read_count(client: convex.Client, room: String) -> Result(Int, ConvexError) {
+  let args = JsonObject([#("room", JsonString(room))])
+  // TypeScript: const state = useQuery(api.demo.state, { room })
+  use response <- result.try(convex.call(client, convex.Query, "demo:state", args))
+  use raw <- result.try(
+    json.field(response.value, "count")
+    |> result.map_error(fn(_) { convex_error.protocol_error("no count field") }),
   )
-  let unique_room_id =
-    "gleam-readme-" <> convex_sys.base64_encode(convex_sys.random_bytes(12))
-  use client <- result.try(convex.new(deployment_url))
-
-  let outcome = {
-    // Object keys are JSON strings here, not generated Convex argument types.
-    let arguments = JsonObject([#("room", JsonString(unique_room_id))])
-    use response <- result.try(convex.call(
-      client,
-      convex.Query,
-      "demo:state",
-      arguments,
-    ))
-    use raw_count <- result.try(
-      json.field(response.value, "count")
-      |> result.map_error(fn(_) {
-        convex_error.protocol_error("Convex value has no count field")
-      }),
-    )
-    // Only after this checked decode is the count a type-safe Gleam Int.
-    json.integral_int(raw_count)
-    |> result.map_error(fn(_) {
-      convex_error.protocol_error("count is not a whole number in range")
-    })
-  }
-
-  let _ = convex.close(client)
-  outcome
+  json.integral_int(raw)
+  |> result.map_error(fn(_) { convex_error.protocol_error("count is not whole") })
 }
 ```
 
-React's generated API makes the argument and returned object type-safe, and
-`useQuery` stays subscribed while the component is mounted. This Gleam call is
-a one-off HTTP read. Its success or failure is visible in the return type as
-`Result(Int, ConvexError)`, but the Convex payload is the client's own `Json`
-type and must be checked at runtime before it becomes an `Int`.
+There is no `try`/`catch` anywhere in this client — the return type
+`Result(Int, ConvexError)` is the entire error story.
 
-### Live updates arrive as typed process messages
+### A Convex subscription is a typed mailbox
 
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  const [room] = useState(() => `gleam-live-${crypto.randomUUID()}`);
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  if (state === undefined) return <p>Loading...</p>;
-  return (
-    <button
-      onClick={() =>
-        void increment({
-          room,
-          language: "TypeScript",
-          runId: crypto.randomUUID(),
-        })
-      }
-    >
-      {state.count} {/* Convex owns the subscription; React rerenders on change. */}
-    </button>
-  );
-}
-```
-
-**Gleam**
+Gleam's home is the BEAM, the Erlang virtual machine built for telephone
+switches in the 1980s, where everything is a featherweight process with a
+mailbox. Gleam types the mailbox: a `Subject(SubscriptionEvent)` can only ever
+receive subscription events. Hand one to `convex.subscribe` and each reactive
+update arrives as a plain message you `receive`.
 
 ```gleam
-import convex
-import convex_error.{type ConvexError}
-import convex_json.{JsonObject, JsonString}
-import convex_live.{LiveFailure, LiveValue, SubscriptionEvent}
-import convex_sys
-import gleam/erlang/process
-import gleam/result
+let updates = process.new_subject()
+let assert Ok(subscription) =
+  convex.subscribe(client, "demo:state", args, updates)
 
-pub fn live_journey() -> Result(Nil, ConvexError) {
-  // A missing deployment URL is a typed error, not an accidental local call.
-  use deployment_url <- result.try(
-    convex_sys.getenv("CONVEX_URL")
-    |> result.map_error(fn(_) {
-      convex_error.protocol_error("CONVEX_URL must be set")
-    }),
-  )
-  let room =
-    "gleam-live-" <> convex_sys.base64_encode(convex_sys.random_bytes(12))
-  let arguments = JsonObject([#("room", JsonString(room))])
-  let assert Ok(client) = convex.new(deployment_url)
+// TypeScript: useQuery re-renders the component; here the update is a message.
+let assert Ok(SubscriptionEvent(_, LiveValue(first, _logs), acknowledged)) =
+  process.receive(updates, 10_000)
+// Tell the client's bounded relay this value has left the mailbox.
+process.send(acknowledged, Nil)
+```
 
-  // This BEAM subject is the typed mailbox for this subscription's events.
-  let updates = process.new_subject()
-  let assert Ok(subscription) =
-    convex.subscribe(client, "demo:state", arguments, updates)
-  let assert Ok(SubscriptionEvent(_, LiveValue(_initial, _), first_ack)) =
-    process.receive(updates, 10_000)
-  // Release the client's bounded event relay before waiting for another value.
-  process.send(first_ack, Nil)
+`let assert` pattern-matches and crashes on anything else — exactly right for a
+verification program that should stop loudly on a surprise.
 
-  let mutation_arguments =
-    JsonObject([
-      #("room", JsonString(room)),
-      #("language", JsonString("Gleam")),
-      #("runId", JsonString(room <> "-once")),
-    ])
-  let assert Ok(_) =
-    convex.call(client, convex.Mutation, "demo:increment", mutation_arguments)
+### Deleting the failure branch is a compile error
 
-  // The next message is the reactive value, not another HTTP query.
-  let assert Ok(SubscriptionEvent(_, event, second_ack)) =
-    process.receive(updates, 10_000)
-  process.send(second_ack, Nil)
-  case event {
-    LiveValue(_updated, _) -> Nil
-    LiveFailure(_error) -> panic as "Live query failed"
+`LiveValue` and `LiveFailure` are two variants of one type, and Gleam's `case`
+must be exhaustive. The canonical example's `next_count` cannot quietly ignore
+a failed query, because the compiler rejects a `case` that forgets a variant.
+
+```gleam
+case event {
+  LiveValue(value, _logs) -> count(value)
+  // Remove this branch and the program no longer compiles.
+  LiveFailure(error) -> {
+    report(error.name <> ": " <> error.message)
+    panic as "Live reported a failure"
   }
-
-  let assert Ok(_) = convex.unsubscribe(client, subscription)
-  let assert Ok(_) = convex.close(client)
-  Ok(Nil)
 }
 ```
 
-React hides subscription setup and cleanup behind the component lifecycle. The
-Gleam command-line client owns both, and a caller explicitly receives and
-acknowledges each value. `LiveValue` and `LiveFailure` are variants the compiler
-can distinguish, although this focused happy-path snippet asserts the value
-case. Waiting with `process.receive` is this client's deliberately simple API,
-not a limitation of Gleam. Callbacks or higher-level actor APIs could be built
-on the same BEAM processes.
+The unhappy path is not a runtime surprise; it is a branch the compiler makes
+you write.
+
+### `set_auth` hands you a whole new client
+
+Every value in Gleam is immutable, including the Convex client. Attaching a
+bearer token does not flip a field — it returns a fresh `Client` that shares
+the same Live connection, built internally with Gleam's `Client(..client, ...)`
+record-update syntax.
+
+```gleam
+// TypeScript: client.setAuth(fetchToken) mutates the client in place.
+let assert Ok(authed) = convex.set_auth(client, token)
+// An empty string hands back an anonymous client again.
+let assert Ok(anonymous) = convex.set_auth(authed, "")
+```
+
+The original `client` is untouched and still anonymous — no shared mutable
+state to reason about.
 
 ## Status
 

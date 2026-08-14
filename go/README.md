@@ -32,159 +32,80 @@ install Go on the host.
 
 ## Interesting Parts
 
-### Generated TypeScript types meet explicit Go decoding
+### `range` over a channel is the render loop
 
-**TypeScript with React**
-
-```tsx
-import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
-
-export function App() {
-  return (
-    <ConvexProvider client={convex}>
-      <RoomCount />
-    </ConvexProvider>
-  );
-}
-
-function RoomCount() {
-  const room = "go-readme";
-  const state = useQuery(api.demo.state, { room });
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // The generated API makes count a number here.
-}
-```
-
-**Go**
+Channels are Go's signature idea, descended from Tony Hoare's 1978
+"Communicating Sequential Processes". In this client one goroutine owns the
+WebSocket, and each Live subscription hands you a receive-only channel of
+updates. Ranging over it blocks until Convex pushes the next value — the
+initial snapshot and every later change arrive the same way.
 
 ```go
-package main
-
-import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"os"
-
-	convex "github.com/mikecann/the-convex-100-language-challenge/go/client"
-)
-
-// roomState names the result fields this program wants to use.
 type roomState struct {
-	Count float64 `json:"count"` // Convex v.number maps to a Go JSON number.
+	Count float64 `json:"count"` // the backtick struct tag names the JSON field
 }
 
-func main() {
-	ctx := context.Background()
-	client, err := convex.New(os.Getenv("CONVEX_URL"))
-	if err != nil {
-		panic(err)
+for update := range subscription.Updates() {
+	if update.Err != nil {
+		break
 	}
-	defer client.Close(ctx)
-
-	room := "go-readme"
-	result, err := client.Query(ctx, "demo:state", map[string]any{"room": room})
-	if err != nil {
-		panic(err)
-	}
-
 	var state roomState
-	if err := json.Unmarshal(result.Value, &state); err != nil {
-		panic(err)
-	}
-	fmt.Println(state.Count) // count is typed only after this explicit decode.
+	json.Unmarshal(update.Value, &state)
+	fmt.Println(state.Count) // TypeScript: every rerender from useQuery(api.demo.state, { room })
 }
 ```
 
-The React hook gets argument and result types from Convex's generated API. This
-handwritten Go client instead accepts a function path and a JSON-shaped argument
-map, then returns `json.RawMessage`. A Go application chooses its own result
-struct and performs the decoding. Also, `Query` is a one-off HTTP request;
-unlike `useQuery`, it does not stay subscribed.
+Where React turns each new value into a render, Go turns it into one more trip
+around the loop.
 
-### A Live query is an owned channel
+### Cleanup is declared next to the thing it cleans up
 
-**TypeScript with React**
-
-```tsx
-import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
-
-export function App() {
-  return (
-    <ConvexProvider client={convex}>
-      <LiveCount room="go-readme" />
-    </ConvexProvider>
-  );
-}
-
-function LiveCount({ room }: { room: string }) {
-  const state = useQuery(api.demo.state, { room });
-  if (state === undefined) return <p>Connecting...</p>;
-  return <p>{state.count}</p>; // React rerenders when the query changes.
-}
-```
-
-**Go**
+Go has no destructors and no `finally`. Instead, `defer` schedules a call to
+run when the surrounding function returns, whichever exit it takes, so a
+resource and its release sit on neighbouring lines.
 
 ```go
-package main
+client, err := convex.New(os.Getenv("CONVEX_URL"))
+// ... check err ...
+defer client.Close(ctx) // shuts the shared WebSocket on every way out of main
 
-import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"os"
+subscription, err := client.Subscribe(ctx, "demo:state", map[string]any{"room": room})
+// ... check err ...
+defer subscription.Close() // TypeScript: the cleanup function returned from useEffect
+```
 
-	convex "github.com/mikecann/the-convex-100-language-challenge/go/client"
-)
+### Errors are values with types worth asking about
 
-type roomState struct {
-	Count float64 `json:"count"` // Convex v.number maps to a Go JSON number.
-}
+Go returns errors instead of throwing them; "errors are values" is a Rob Pike
+essay title and a community proverb. This client gives each failure mode its
+own type — `FunctionError`, `ProtocolError`, `TransportError` — so `errors.As`
+can pick out the one your code can actually respond to.
 
-func main() {
-	ctx := context.Background()
-	client, err := convex.New(os.Getenv("CONVEX_URL"))
-	if err != nil {
-		panic(err)
-	}
-	defer client.Close(ctx) // Shut down the shared WebSocket when the app exits.
+```go
+_, err := client.Mutation(ctx, "demo:increment", args)
 
-	room := "go-readme"
-	subscription, err := client.Subscribe(
-		ctx,
-		"demo:state",
-		map[string]any{"room": room},
-	)
-	if err != nil {
-		panic(err)
-	}
-	defer subscription.Close() // Tell Convex when this query is no longer needed.
-
-	for update := range subscription.Updates() {
-		if update.Err != nil {
-			panic(update.Err)
-		}
-		var state roomState
-		if err := json.Unmarshal(update.Value, &state); err != nil {
-			panic(err)
-		}
-		fmt.Println(state.Count) // The initial value and later changes use one channel.
-	}
+var fnErr *convex.FunctionError
+if errors.As(err, &fnErr) {
+	// The Convex function itself said no; its server log lines came along too.
+	fmt.Println(fnErr.Message, fnErr.LogLines)
+	// TypeScript: catch (e) { if (e instanceof ConvexError) ... }
 }
 ```
 
-React owns the subscription lifecycle and turns each value into a render. The Go
-client deliberately exposes a receive-only channel instead. Channels are a
-normal Go concurrency tool, but the blocking `range` API is this client's design
-choice, not a limitation of Go. The application explicitly closes both the
-subscription and client.
+### Options are plain functions
+
+Go has no keyword arguments or constructor overloads, so its community settled
+on the "functional options" idiom: a constructor accepts variadic values, each
+a function that adjusts the client. Configuration reads aloud, and adding a
+new knob later never breaks an existing caller.
+
+```go
+client, err := convex.New(
+	deploymentURL,
+	convex.WithBearerToken(token), // TypeScript: client.setAuth(fetchToken) — HTTP calls only here
+	convex.WithHTTPClient(&http.Client{Timeout: 5 * time.Second}),
+)
+```
 
 ## Status
 

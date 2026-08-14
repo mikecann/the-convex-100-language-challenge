@@ -17,41 +17,64 @@ Read [`examples/basics/Main.groovy`](examples/basics/Main.groovy) for the comple
 
 ## Interesting Parts
 
-### A live query has an explicit owner
+### A map literal is already a Convex argument
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function Counter() {
-  const room = "groovy-readme";
-  const state = useQuery(api.demo.state, { room });
-  // state.count is type-safe here because api.demo.state is generated.
-  return <p>{state?.count ?? "Loading..."}</p>;
-}
-```
-
-**Groovy**
+Groovy's `[key: value]` map literal is as old as the language (2003), from just before JSON ate the world, and the two turned out to be a perfect match. Arguments travel to Convex as a plain literal, and the decoded reply is a map whose entries read like properties — no DTO classes, no serialization annotations, right on the JVM.
 
 ```groovy
-import convex.LiveClient
-import java.time.Duration
-import java.util.Objects
+Map mutationArgs = [
+  room: room,
+  language: 'groovy',
+  runId: UUID.randomUUID().toString(), // idempotency key: a retry cannot double-count
+]
+// TypeScript: const result = await client.mutation(api.demo.increment, args)
+Map mutation = (Map) client.mutation('demo:increment', mutationArgs).value()
+println mutation.state.count // decoded JSON walks like a property chain
+```
 
-String url = Objects.requireNonNull(System.getenv('CONVEX_URL'), 'CONVEX_URL is required')
-Map args = [room: 'groovy-readme'] // A map becomes the Convex argument object.
+### The language that named the Elvis operator
 
-try (LiveClient live = new LiveClient(url)) {
-  LiveClient.Subscription subscription = live.subscribe('demo:state', args)
-  Map state = (Map) subscription.next(Duration.ofSeconds(10))
-  println state.count // Groovy reads the decoded map entry like a property.
+`?:` picked up its nickname in the Groovy community — tilt your head and the question mark is Elvis's quiff — and Groovy's safe navigation `?.` helped popularize the optional chaining TypeScript developers now use daily. Both do real work here, alongside "Groovy truth", where an empty list or string simply counts as false.
+
+```groovy
+// TypeScript: const url = process.env.CONVEX_URL ?? "https://..."
+String url = System.getenv('CONVEX_URL') ?: 'https://usable-reindeer-44.convex.cloud'
+String room = arguments ? arguments[0] : (System.getenv('EXAMPLE_ROOM') ?: 'groovy-example')
+
+// Inside ConvexClient, the same operators keep error decoding tidy:
+String message = decoded.errorMessage?.toString() ?: 'Convex function failed'
+```
+
+### A live query lives inside `try`
+
+Groovy inherits Java's try-with-resources, so Convex's signature feature — the reactive query — gets an explicit scope. Subscribe, watch the mutation's update arrive as a push over the JDK's own WebSocket, and both clients tear themselves down on the way out of the block.
+
+```groovy
+try (ConvexClient client = new ConvexClient(url); LiveClient live = new LiveClient(url)) {
+  // TypeScript: const state = useQuery(api.demo.state, { room })
+  LiveClient.Subscription subscription = live.subscribe('demo:state', [room: room])
+  Map before = (Map) subscription.next(Duration.ofSeconds(10))
+  client.mutation('demo:increment', mutationArgs)
+  Map after = (Map) subscription.next(Duration.ofSeconds(10)) // pushed, not polled
   subscription.close()
 }
 ```
 
-React starts, updates, and disposes the `useQuery` subscription with the component. This command-line client makes ownership visible. Its blocking `next` method is an API choice for a linear teaching example, not a limitation of Groovy, which also supports callbacks and asynchronous Java APIs.
+Where React ties a subscription's lifetime to a component, this client ties it to a block.
+
+### Closures melt into Java interfaces
+
+The Live client keeps every piece of connection state on a single owner thread, and building that thread shows off a signature Groovy move: a closure handed to a Java API becomes whatever single-method interface is expected — here, a `ThreadFactory` — and its last expression is the return value, no `return` required.
+
+```groovy
+owner = Executors.newSingleThreadScheduledExecutor { Runnable task ->
+  Thread thread = new Thread(task, 'convex-groovy-live-owner')
+  thread.daemon = true
+  thread // last expression is the return value
+}
+```
+
+The same coercion — `{ ... } as Callable<T>` — is how every subscribe and close hops onto that owner thread.
 
 ## Status
 

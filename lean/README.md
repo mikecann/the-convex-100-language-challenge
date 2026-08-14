@@ -30,125 +30,91 @@ install Lean or point the example at your own Convex project.
 
 ## Interesting Parts
 
-### React owns the subscription; this client asks you to own it
+### The whole error channel is one `abbrev` long
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const room = "lean-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <span>Loading...</span>;
-  return <output>{state.count}</output>; // React rerenders when the query changes.
-}
-```
-
-**Lean**
+Lean is best known as a theorem prover, but Lean 4 is also a practical compiled
+language in which monads are ordinary library code, not built-in magic. The
+client's working monad — IO that can also fail with a structured Convex
+error — is a single type alias, and turning a raw runtime failure into a tagged
+transport error is one small function:
 
 ```lean
-def receiveOneState : ConvexM Unit := do
-  -- Use the same deployment setting as the canonical Docker example.
-  let deployment ← match ← IO.getEnv "CONVEX_URL" with
-    | some url =>
-        if url.isEmpty then
-          throw (ConvexError.protocol "CONVEX_URL must not be empty")
-        else
-          pure url
-    | none => throw (ConvexError.protocol "CONVEX_URL is required")
-  let room := "lean-readme"
-  let client ← Client.new deployment
+abbrev ConvexM := ExceptT ConvexError IO
 
-  -- subscribe returns a handle. This command-line program owns its lifetime.
-  let subscription ←
-    client.subscribe "demo:state" (jsonObject [("room", Json.str room)])
+def attempt {α : Type} (context : String) (action : IO α) : ConvexM α := do
+  -- TypeScript: try { await action() } catch (e) { throw new Error(`${context}: ${e}`) }
+  match ← ioAttempt action with
+  | .ok value => pure value
+  | .error problem => throw (ConvexError.transport s!"{context}: {problem}")
+```
 
-  -- nextUpdate drives the Live connection while it waits for one value.
-  match ← client.nextUpdate subscription 10000 with
-  | none => throw (ConvexError.transport "Live update timed out")
+Every `client.query` and `client.mutation` runs in `ConvexM`, so the failure
+path is written into the type of every call.
+
+### `1.0` counts as a whole number — by exact arithmetic, not epsilon
+
+`Lean.Data.Json` stores numbers as exact mantissa-and-exponent pairs, never
+floats. Convex may legitimately send a counter as `1.0`, so the client decides
+"is this integral?" with honest integer division:
+
+```lean
+-- TypeScript: generated bindings already type state.count as number.
+def jsonIntegral? : Json → Option Int
+  | .num number =>
+      if number.exponent == 0 then
+        some number.mantissa
+      else
+        let scale : Int := Int.ofNat (powTen number.exponent)
+        if number.mantissa % scale == 0 then some (number.mantissa / scale) else none
+  | _ => none
+```
+
+A fractional count is rejected outright instead of being silently rounded.
+
+### A Live update is data you pattern-match, not a callback you register
+
+Where React's `useQuery` hides the subscription inside the component lifecycle,
+this command-line client hands you a `Subscription` handle and a blocking
+`nextUpdate` that drives the WebSocket loop while it waits. The reply is plain
+data, and `match` — checked by the same engine that checks mathematical
+proofs — must cover every shape:
+
+```lean
+-- TypeScript: const state = useQuery(api.demo.state, { room })
+let subscription ← client.subscribe "demo:state" (jsonObject [("room", Json.str room)])
+match ← client.nextUpdate subscription 10000 with
+| none => throw (ConvexError.transport "Live update timed out")
+| some update =>
+    match update.error, update.value with
+    | some problem, _ => throw problem
+    | none, some value => IO.println (renderJson value)
+    | none, none => throw (ConvexError.protocol "update had neither value nor error")
+```
+
+Delete the `none, none` arm and the file stops compiling.
+
+### `let mut` and `while` in a pure functional language
+
+Lean 4's `do` notation permits local mutation and loops, which the compiler
+desugars into pure state-passing. The heart of the Live wait loop reads like
+systems code yet remains a functional program:
+
+```lean
+-- Inside Client.nextUpdate: imperative on the surface, pure underneath.
+let mut result : Option Update := none
+let mut waiting := true
+while waiting do
+  Live.pump client.live
+  match ← Live.take client.live subscription.id with
   | some update =>
-      match update.error, update.value with
-      | some problem, _ => throw problem
-      | none, some value => IO.println (renderJson value)
-      | none, none => throw (ConvexError.protocol "Live update had no value")
-
-  -- There is no component unmount here, so cleanup is explicit.
-  client.unsubscribe subscription
-  client.close
+      result := some update
+      waiting := false
+  | none =>
+      if (← Live.nowMs) ≥ deadline then
+        waiting := false
+      -- otherwise poll(2) sleeps on the socket and the loop tries again
+pure result
 ```
-
-`useQuery` hides subscription setup and cleanup behind the React component lifecycle. Lean supports
-higher-order functions and callbacks, but this particular client deliberately exposes a blocking
-`nextUpdate` operation for a command-line program. The [complete example](examples/basics/Main.lean)
-also guarantees cleanup when an earlier operation fails.
-
-### Generated TypeScript types become explicit JSON checks
-
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-  const room = "lean-readme";
-
-  async function handleClick() {
-    const runId = crypto.randomUUID();
-    const result = await increment({ room, language: "typescript", runId });
-    console.log(result.state.count); // The generated API makes state.count a number.
-  }
-
-  return <button onClick={handleClick}>Increment</button>;
-}
-```
-
-**Lean**
-
-```lean
-def freshRunId : ConvexM String := do
-  -- Generate the same 128-bit idempotency key used by the canonical example.
-  let bytes ← ConvexM.attempt "generating a run id" (Ffi.randomBytes 16)
-  pure (Bytes.toHex bytes)
-
-def incrementCounter : ConvexM Unit := do
-  -- Read the deployment supplied by the Docker verifier.
-  let deployment ← match ← IO.getEnv "CONVEX_URL" with
-    | some url =>
-        if url.isEmpty then
-          throw (ConvexError.protocol "CONVEX_URL must not be empty")
-        else
-          pure url
-    | none => throw (ConvexError.protocol "CONVEX_URL is required")
-  let room := "lean-readme"
-  let runId ← freshRunId
-  let client ← Client.new deployment
-
-  -- This client constructs the Convex argument object as Lean.Json.
-  let changed ← client.mutation "demo:increment"
-    (jsonObject
-      [ ("room", Json.str room)
-      , ("language", Json.str "lean")
-      , ("runId", Json.str runId) ])
-
-  -- There is no generated schema binding, so narrow the returned JSON explicitly.
-  let state ← match jsonObjVal? changed.value "state" with
-    | some value => pure value
-    | none => throw (ConvexError.protocol "mutation omitted state")
-  let count ← match jsonObjVal? state "count" >>= jsonIntegral? with
-    | some value => pure value
-    | none => throw (ConvexError.protocol "state.count was not a whole number")
-  IO.println s!"new count: {count}"
-  client.close
-```
-
-Lean can express much stronger types than this snippet uses. The dynamic `Json` boundary is a
-choice in this small handwritten client, not a limitation of Lean. In a normal Convex React app,
-generated bindings connect `api.demo.increment` to its argument and return types automatically.
 
 ## Status
 

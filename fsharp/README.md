@@ -40,75 +40,90 @@ and checks the complete `0 -> 1` output.
 
 ## Interesting Parts
 
-### The JSON boundary is explicit
+### The reply rides the pipeline
 
-A React app gets generated types. This handwritten F# client uses a string path
-and checks the returned JSON itself.
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function CurrentCount({ room }: { room: string }) {
-  const state = useQuery(api.demo.state, { room });
-  return state === undefined ? null : <span>{state.count}</span>; // Typed result.
-}
-```
+The `|>` operator is F#'s signature punctuation: `x |> f` simply means `f x`,
+so a value reads top-to-bottom through its transformations. A query result here
+is a `JsonNode option` — "maybe absent" is a type, not a lurking null — and it
+flows from the wire to a plain `int` in one visible stream:
 
 ```fsharp
-let readCurrentCount (url: string) (room: string) =
-    // Validate configuration before creating the client.
-    if System.String.IsNullOrWhiteSpace url then
-        invalidOp "CONVEX_URL is required"
-
-    let args = System.Text.Json.Nodes.JsonObject()
-    args["room"] <- System.Text.Json.Nodes.JsonValue.Create room
-    use client = new Convex.Client(url)
-    client.Query("demo:state", args).Result.Value
+let before =
+    // TypeScript: const state = useQuery(api.demo.state, { room })
+    client.Query("demo:state", roomArgs).Result.Value
     |> Option.defaultWith (fun () -> invalidOp "query returned null")
-    |> fun value -> ExampleCount.count value "current query" // Decode JsonNode.
+    |> fun value -> count value "current query"
 ```
 
-The [`count` decoder](examples/basics/Count.fs) accepts integral forms such as
-`0.0` without accepting fractions or out-of-range values.
+Because the value is an `option`, the compiler will not let the empty case be
+forgotten; it has to be peeled off deliberately.
 
-### A Live query is an owned resource
+### `use` gives the subscription a visible lifetime
 
-React owns the subscription lifecycle. The F# caller owns its Live resources,
-so the important ordering is visible.
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function CounterButton({ room }: { room: string }) {
-  const state = useQuery(api.demo.state, { room }); // React owns the subscription.
-  const increment = useMutation(api.demo.increment);
-  const addOne = () =>
-    increment({ room, language: "typescript", runId: crypto.randomUUID() });
-  return <button onClick={() => void addOne()}>Count: {state?.count ?? "Loading"}</button>;
-}
-```
+`use` is `let` plus a promise: when the binding leaves scope, `Dispose` runs —
+and disposing a `Subscription` sends the WebSocket unsubscribe. So the
+subscribe-then-mutate ordering at the heart of Convex reactivity reads as a
+plain sequence of lines:
 
 ```fsharp
-let incrementAndObserve url roomArgs mutationArgs =
-    // Validate configuration before opening either client.
-    if System.String.IsNullOrWhiteSpace url then
-        invalidOp "CONVEX_URL is required"
-
-    use client = new Convex.Client(url)
-    use live = new Convex.LiveClient(url)
-    // Start listening before the mutation so its update cannot be missed.
-    use subscription = live.Subscribe("demo:state", roomArgs).Result
-    let initial = subscription.Next(System.TimeSpan.FromSeconds 10.)
-    // mutationArgs includes runId, making this HTTP mutation safe to retry.
-    client.Mutation("demo:increment", mutationArgs).Result |> ignore
-    let updated = subscription.Next(System.TimeSpan.FromSeconds 10.)
-    ExampleCount.count initial "initial", ExampleCount.count updated "updated"
+use live = new LiveClient(url)
+// Start listening before the mutation so its update cannot be missed.
+use subscription = live.Subscribe("demo:state", roomArgs).Result
+let initial = subscription.Next(TimeSpan.FromSeconds 10.)
+client.Mutation("demo:increment", mutationArgs).Result |> ignore
+let updated = subscription.Next(TimeSpan.FromSeconds 10.)
+// TypeScript: React's useQuery owns this whole lifecycle behind the hook.
 ```
 
-`use` disposes the client, Live owner, and subscription when the function exits.
-The canonical example below adds the complete result checks and output sequence.
+When the function returns, subscription, Live client, and HTTP client all clean
+up in reverse order — no `finally` in sight.
+
+### One `match` asks the JSON three questions
+
+An F# pattern can test a value's runtime type (`:? JsonObject`), bind it under
+a new name, and attach a `when` guard, all in a single arm. The example's whole
+decoder — turn `{ "count": 0.0 }` into an `int` or say exactly why not — is one
+expression in [`Count.fs`](examples/basics/Count.fs):
+
+```fsharp
+let count (value: JsonNode) place =
+    match value with
+    | :? JsonObject as objectValue when not (isNull objectValue["count"]) ->
+        match wholeInt32 (objectValue["count"].ToJsonString()) with
+        | Some number -> number
+        | None -> invalidOp (place + " did not return a whole Int32 count")
+    | _ -> invalidOp (place + " did not return a counter value")
+```
+
+The compiler checks the arms cover every case, so "what if it isn't an object?"
+cannot go unanswered.
+
+### An Erlang-flavored mailbox owns the WebSocket
+
+`MailboxProcessor` has shipped with F# since async workflows arrived in 2007 —
+an actor in the standard library, years before `async`/`await` reached C#. This
+client's Live internals use one: each operation becomes a message in a
+discriminated union, and a single async loop is the only code that ever touches
+the socket:
+
+```fsharp
+type private OwnerCommand =
+    | SubscribeOwner of string * JsonObject * int * TaskCompletionSource<Subscription>
+    | UnsubscribeOwner of int * TaskCompletionSource<unit>
+    | ReconnectOwner of int64
+    // ... one case per thing the socket's owner can be asked to do
+
+let owner =
+    MailboxProcessor.Start(fun inbox ->
+        async {
+            // The sole caller of Connect, Receive, Send, and Dispose.
+            let! command = inbox.TryReceive 1
+            // match on the command, drive the socket, reply when done ...
+        })
+```
+
+Callers on any thread just post messages, so races over the socket are
+impossible by construction.
 
 ## Status
 

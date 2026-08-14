@@ -30,146 +30,94 @@ and runs it against a unique room:
 
 ## Interesting Parts
 
-### JSON values have to prove their shape
+### All of JSON is one tagged union
 
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Count() {
-  const [room] = useState(() => `hare-readme-types-${crypto.randomUUID()}`);
-  const state = useQuery(api.demo.state, { room });
-  if (state === undefined) return <p>Loading...</p>;
-
-  return <p>{state.count}</p>; // Generated types know this is a number.
-}
-```
-
-**Hare**
+Hare's tagged unions are plain parenthesized lists of types, and
+`client/json.ha` uses one to model every document Convex can return. `match`
+takes values out: each arm narrows the union to a concrete type, and `yield`
+turns the whole `match` into an expression.
 
 ```hare
-use convex;
-use fmt;
-use os;
-use strings;
-use time;
-
-const url = os::getenv("CONVEX_URL") as str;
-const client = convex::client_init(url) as *convex::client;
-defer convex::client_close(client); // Hare has no garbage collector.
-
-const now = time::now(time::clock::REALTIME);
-const room = fmt::asprintf("hare-readme-types-{}-{}", now.sec, now.nsec);
-defer free(room); // Keep this read separate from any previous run.
-let fields: []convex::entry = alloc([
-	convex::entry {
-		key = strings::dup("room"),
-		value = strings::dup(room),
-	},
-]);
-defer {
-	free(fields[0].key);
-	convex::finish(&fields[0].value);
-	free(fields);
+// client/json.ha:
+// export type value = (void | bool | i64 | f64 | str | []value | []entry);
+const field = convex::lookup(result.value, "count") as *convex::value;
+const count = match (*field) {
+case let i: i64 =>
+	yield i;
+case let f: f64 =>
+	yield f: i64; // Convex's JSON profile may send 1 or 1.0; accept both.
+case =>
+	fmt::fatal("demo count was not numeric");
 };
-const args: convex::value = fields; // This is the { room: ... } object.
+// TypeScript: state.count is already a number, thanks to generated types.
+```
+
+### Cleanup is a `defer`, not a garbage collector
+
+Hare — started by Drew DeVault of SourceHut fame — borrows `defer` from Go but
+pairs it with manual memory management. Every value this client hands out has
+a matching `_close` or `_finish`, scheduled on the line right after the one
+that acquired it.
+
+```hare
+const client = convex::client_init(url) as *convex::client;
+defer convex::client_close(client); // Scheduled now, runs at scope exit.
+
 let result = convex::client_call(client, "query", "demo:state", args)
 	as convex::call_result;
-defer convex::call_result_finish(&result);
-
-const count_value = convex::lookup(result.value, "count") as *convex::value;
-const count = match (*count_value) {
-case let integer: i64 =>
-	yield integer;
-case let decimal: f64 =>
-	yield decimal: i64;
-case =>
-	abort("count was not numeric");
-};
-// count is type-safe as i64 only after the match checks the JSON variants.
+defer convex::call_result_finish(&result); // Frees the decoded response.
 ```
 
-Convex's generated TypeScript API carries the validator's result type into the
-component. This small Hare client instead returns its own tagged union,
-`convex::value`, so application code must inspect the JSON shape. Hare's
-`match` then narrows the selected arm to a concrete type.
+Deferred calls run last-to-first, so teardown mirrors setup no matter how many
+early returns the function grows later.
 
-### Live updates are pulled by the caller
+### An error is a type with `!` in front
 
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const [room] = useState(() => `hare-readme-live-${crypto.randomUUID()}`);
-  const state = useQuery(api.demo.state, { room });
-
-  // React owns the subscription and rerenders after any later mutation.
-  return <p>{state?.count ?? "Loading..."}</p>;
-}
-```
-
-**Hare**
+There are no exceptions. A fallible call returns a union such as
+`(*client | client_error)`, where the error half is an ordinary type flagged
+with `!` — `client_error` is literally `!str`. Each call site chooses to
+`match` on the failure or to assert it away with a postfix `!`.
 
 ```hare
-use convex;
-use fmt;
-use os;
-use strings;
-use time;
-
-const url = os::getenv("CONVEX_URL") as str;
-const client = convex::client_init(url) as *convex::client;
-defer convex::client_close(client);
-
-const now = time::now(time::clock::REALTIME);
-const room = fmt::asprintf("hare-readme-live-{}-{}", now.sec, now.nsec);
-defer free(room); // Each run gets its own counter room.
-let fields: []convex::entry = alloc([
-	convex::entry {
-		key = strings::dup("room"),
-		value = strings::dup(room),
-	},
-]);
-defer {
-	free(fields[0].key);
-	convex::finish(&fields[0].value);
-	free(fields);
+// client/convex.ha: export type client_error = !str;
+const client = match (convex::client_init(url)) {
+case let c: *convex::client =>
+	yield c;
+case let e: convex::client_error =>
+	fmt::fatal("could not create the client: {}", e: str);
 };
-const args: convex::value = fields;
 
-// Register the query explicitly. The client keeps it active across reconnects.
+// When crashing is the right response, one character asserts success:
+convex::client_set_auth(client, token)!;
+```
+
+### One Live step, three possible outcomes
+
+Realtime is Convex's signature, and this client makes the caller drive it: one
+call stack owns the WebSocket, and each `client_live_step` advances it by at
+most one event. Its return type says everything —
+`(sync_event | void | client_error)` — and `match` makes handling all three
+outcomes unavoidable.
+
+```hare
+// TypeScript: useQuery(api.demo.state, { room }) — React runs this loop.
 convex::client_subscribe(client, "counter", "demo:state", args)!;
 defer convex::client_unsubscribe(client, "counter")!;
 
 for (true) {
 	match (convex::client_live_step(client, 100)) {
 	case let event: convex::sync_event =>
-		let event = event;
-		defer convex::sync_event_finish(&event);
-		if (event.subscription_id == "counter") {
-			// event.value is the initial state, then each reactive update.
-			break;
-		};
+		// event.value carries the initial snapshot, then each update.
+		break;
 	case void =>
-		continue; // Nothing arrived during this 100 ms step.
+		continue; // A quiet 100 ms window; step again.
 	case let err: convex::client_error =>
-		abort(err: str);
+		fmt::fatal("Live step failed: {}", err: str);
 	};
 };
 ```
 
-Hare can use callbacks through function pointers, but this client deliberately
-offers a blocking, poll-driven `client_live_step` API. One call stack owns the
-socket, each call yields at most one event, and the command-line caller owns
-unsubscribe and cleanup. That is an API and lifecycle choice, not a claim that
-Hare cannot express callbacks.
+The subscription survives reconnects, and the loop is its own backpressure.
 
 ## Status
 

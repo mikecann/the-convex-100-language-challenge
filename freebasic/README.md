@@ -31,147 +31,80 @@ unique room on an approved test deployment.
 
 ## Interesting Parts
 
-### A typed React result becomes an explicitly checked JSON tree
+### The mutation is QuickBASIC on the surface, C underneath
 
-**TypeScript with React**
-
-```tsx
-import { api } from "../convex/_generated/api";
-import { useQuery } from "convex/react";
-
-export function Count() {
-  const state = useQuery(api.demo.state, {
-    room: "freebasic-readme-query",
-  });
-  if (state === undefined) return <p>Loading...</p>;
-
-  return <p>{state.count}</p>; // `state` and `count` are type-safe here.
-}
-```
-
-**FreeBASIC**
+FreeBASIC began in 2004 as a QuickBASIC-compatible compiler, so a Convex call
+still reads like the BASIC of the early 90s — `dim as`, `end if`, string
+concatenation with `&`. But there is no garbage collector: the argument object
+is a heap-owned JSON tree you build node by node and free yourself, and every
+call reports failure through a `ConvexFault` UDT passed `byref` instead of an
+exception.
 
 ```freebasic
-#include once "convex.bi"
-
-' Configuration is explicit in a command-line program.
-dim as string deploymentUrl = environ("CONVEX_URL")
-dim as ConvexClient client  ' A UDT groups the client's connection state.
-dim as ConvexFault fault
-FaultClear(fault)
-if len(deploymentUrl) = 0 orelse _
-   not ConvexOpen(client, deploymentUrl, fault) then end 1
-
-' Build the same { room: string } argument object by hand.
 dim as JsonValue ptr args = JsonNew(JSON_OBJECT)
-JsonSet(args, "room", JsonNewString("freebasic-readme-query"))
+JsonSet(args, "room", JsonNewString(room))
+JsonSet(args, "language", JsonNewString("FreeBASIC"))
+JsonSet(args, "runId", JsonNewString(room & "-once"))
 
-dim as ConvexResult result  ' Another UDT owns the returned JSON tree.
-ConvexResultInit(result)
-if not ConvexQuery(client, "demo:state", args, result, fault) then end 1
+' TypeScript: const result = await increment({ room, language, runId })
+dim as ConvexResult mutated
+ConvexResultInit(mutated)
+if not ConvexMutation(client, "demo:increment", args, mutated, fault) then
+  Fail(fault.message)
+end if
 
-dim as longint count
-if not JsonWholeNumber(JsonMember(result.value, "count"), count) then end 1
-print count  ' `count` is typed only after the runtime shape check succeeds.
-
-ConvexResultFree(result)  ' Free the result tree owned by the UDT.
+ConvexResultFree(mutated)
 JsonFree(args)
-ConvexClose(client, 3000)
 ```
 
-The React hook validates the generated function shape at compile time and stays
-reactive. `ConvexQuery` is only a one-off HTTP read. FreeBASIC gives the decoded
-number a concrete `longint`, but this client must first validate the dynamic
-JSON value and the caller must explicitly release the owned trees.
+BASIC nostalgia with C-style resource management — both halves are genuine.
 
-### React manages reactivity; this client exposes the lifecycle
+### `orelse` is the short-circuit QuickBASIC never had
 
-**TypeScript with React**
-
-```tsx
-import { api } from "../convex/_generated/api";
-import { useMutation, useQuery } from "convex/react";
-
-export function Counter({ room }: { room: string }) {
-  // The caller supplies a fresh room for this run, just like the CLI argument.
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  if (state === undefined) return <button disabled>Loading...</button>;
-  return (
-    <button
-      onClick={async () => {
-        const result = await increment({
-          room,
-          language: "TypeScript",
-          runId: crypto.randomUUID(),
-        });
-        console.log(result.state.count); // The mutation result is type-safe.
-      }}
-    >
-      Count: {state.count}
-    </button>
-  ); // React re-renders when the subscribed value changes.
-}
-```
-
-**FreeBASIC**
+Classic BASIC's `or` is bitwise and always evaluates both sides. FreeBASIC
+added `andalso` and `orelse`, and this client leans on them to chain a JSON
+shape check with a range check in one guard — decoding Convex's `count` field,
+which may legally arrive spelled `1` or `1.0`.
 
 ```freebasic
-#include once "convex.bi"
-
-dim as string deploymentUrl = environ("CONVEX_URL")
-dim as string room = command(1)  ' Pass a fresh room ID on each run.
-if len(deploymentUrl) = 0 orelse len(room) = 0 then end 1
-
-dim as ConvexClient client
-dim as ConvexFault fault
-FaultClear(fault)
-if not ConvexOpen(client, deploymentUrl, fault) then end 1
-
-dim as JsonValue ptr roomArgs = JsonNew(JSON_OBJECT)
-JsonSet(roomArgs, "room", JsonNewString(room))
-
-' The handle and each delivery are explicit pointers owned by the caller.
-dim as LiveSubscription ptr live = _
-  ConvexSubscribe(client, "demo:state", roomArgs, fault)
-if live = 0 then end 1
-dim as LiveUpdate ptr initial = ConvexNext(client, live, 10000)
-dim as longint initialCount
-if initial = 0 orelse (not initial->hasValue) orelse _
-   not JsonWholeNumber(JsonMember(initial->value, "count"), initialCount) then end 1
-LiveUpdateFree(initial)
-
-' Mutate only after subscribing, using the fresh room as an idempotency key.
-dim as JsonValue ptr mutationArgs = JsonNew(JSON_OBJECT)
-JsonSet(mutationArgs, "room", JsonNewString(room))
-JsonSet(mutationArgs, "language", JsonNewString("FreeBASIC"))
-JsonSet(mutationArgs, "runId", JsonNewString(room & "-once"))
-dim as ConvexResult mutationResult
-ConvexResultInit(mutationResult)
-if not ConvexMutation( _
-    client, "demo:increment", mutationArgs, mutationResult, fault) then end 1
-
-' ConvexNext blocks until this client's mailbox has the reactive update.
-dim as LiveUpdate ptr changed = ConvexNext(client, live, 10000)
-dim as longint changedCount
-if changed = 0 orelse (not changed->hasValue) orelse _
-   not JsonWholeNumber(JsonMember(changed->value, "count"), changedCount) then end 1
-print initialCount; " -> "; changedCount
-
-LiveUpdateFree(changed)
-ConvexResultFree(mutationResult)
-ConvexUnsubscribe(client, live, 2000)
-JsonFree(roomArgs)
-JsonFree(mutationArgs)
-ConvexClose(client, 3000)
+' Accept a whole counter spelled 1 or 1.0; reject fractions and wrong types.
+function CounterFrom(byval state as JsonValue ptr, byref operation as string) as longint
+  dim as longint counted
+  if not JsonWholeNumber(JsonMember(state, "count"), counted) orelse counted < 0 then
+    Fail(operation & " did not return a whole nonnegative count")
+  end if
+  return counted
+end function
 ```
 
-FreeBASIC supports threads and callbacks. The blocking `ConvexNext` API is a
-choice made by this command-line client, not a language restriction. It keeps
-subscription ownership visible: subscribe, consume each owned update, then
-unsubscribe and close. React performs the corresponding subscription cleanup
-for the component.
+`JsonWholeNumber` fills a `byref` out-parameter and returns `false` rather
+than a default, so a missing `count` can never be mistaken for zero — and the
+`orelse` guarantees the range check only runs once the decode has succeeded.
+
+### A Live update is a pointer — in a BASIC
+
+FreeBASIC bolted C-style pointers onto BASIC, `->` dereference and all. This
+client uses them to make Convex's reactive side explicit: `ConvexSubscribe`
+returns a `LiveSubscription ptr`, and each WebSocket delivery is a
+`LiveUpdate ptr` you take with a blocking `ConvexNext`, read through `->`,
+and free.
+
+```freebasic
+' TypeScript: useQuery(api.demo.state, { room }) re-renders on each update.
+dim as LiveSubscription ptr live = ConvexSubscribe(client, "demo:state", roomArgs, fault)
+
+dim as LiveUpdate ptr updated = ConvexNext(client, live, 10000)
+if updated = 0 orelse (not updated->hasValue) then
+  Fail("the Live update did not arrive")
+end if
+print CounterFrom(updated->value, "the Live update")
+
+LiveUpdateFree(updated)
+ConvexUnsubscribe(client, live, 2000)
+```
+
+A worker thread owns the socket and each subscription's bounded mailbox; your
+code just takes one owned update at a time, in program order.
 
 ## Status
 

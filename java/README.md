@@ -31,111 +31,84 @@ not install Java or Maven on your host.
 
 ## Interesting Parts
 
-### A typed language meeting dynamic JSON
+### The closing brace is the unsubscribe
 
-In a normal Convex React app, generated bindings connect a function's argument
-and return types to TypeScript. This demonstration deliberately has no generated
-Java model classes, so it constructs and checks Jackson JSON trees at runtime.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-function Counter({ room }: { room: string }) {
-  const state = useQuery(api.demo.state, { room });
-  if (state === undefined) return <span>Loading...</span>;
-  return <span>{state.count}</span>; // state and count are type-safe here.
-}
-```
-
-**Java**
+Java 7's try-with-resources gives any `AutoCloseable` object a scoped lifetime:
+declare it inside the `try` parentheses and the runtime closes it on every exit
+path. The HTTP client, the Live WebSocket connection, and each subscription are
+all resources here, so the reactive lifecycle React hides inside hooks becomes a
+visible block:
 
 ```java
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
-import convex.ConvexClient;
-
-String room = "readme-java-query";
-ObjectNode args = ConvexClient.JSON.createObjectNode().put("room", room);
-
-try (ConvexClient client = new ConvexClient(System.getenv("CONVEX_URL"))) {
-  // This is one HTTP snapshot, so the application checks the dynamic JSON result itself.
-  JsonNode state = client.query("demo:state", args).value();
-  if (!state.path("count").canConvertToInt()) {
-    throw new IllegalStateException("demo:state returned an invalid count");
-  }
-  int count = state.path("count").intValue(); // count is an ordinary Java int from here.
-  System.out.println(count);
-}
-```
-
-`useQuery` stays subscribed and causes React to render again when the value
-changes. `ConvexClient.query` is a one-off HTTP call, so it is useful for a
-snapshot but is not equivalent to the hook's reactivity.
-
-### Owning a Live subscription explicitly
-
-React owns a hook subscription's lifecycle. This command-line Java API instead
-returns an `AutoCloseable` subscription and exposes a blocking `next` operation,
-which makes the order of the initial value, mutation, and update visible.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-function IncrementButton({ room }: { room: string }) {
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  return (
-    <button
-      onClick={() =>
-        increment({ room, language: "typescript", runId: crypto.randomUUID() })
-      }
-    >
-      Count: {state?.count ?? "loading"}
-    </button>
-  ); // React starts and stops the reactive query with this component.
-}
-```
-
-**Java**
-
-```java
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
-import convex.ConvexClient;
-import convex.LiveClient;
-import java.time.Duration;
-import java.util.UUID;
-
-String room = "readme-java-live";
-ObjectNode roomArgs = ConvexClient.JSON.createObjectNode().put("room", room);
-
-try (ConvexClient http = new ConvexClient(System.getenv("CONVEX_URL"));
-    LiveClient live = new LiveClient(System.getenv("CONVEX_URL"));
+try (ConvexClient http = new ConvexClient(url);
+    LiveClient live = new LiveClient(url);
     LiveClient.Subscription subscription = live.subscribe("demo:state", roomArgs)) {
-  // next waits for the subscription's initial value. Blocking is this client's API choice.
+  // TypeScript: const state = useQuery(api.demo.state, { room }) — React owns the lifecycle.
   JsonNode initial = subscription.next(Duration.ofSeconds(10));
-
-  ObjectNode mutationArgs =
-      roomArgs.deepCopy().put("language", "java").put("runId", UUID.randomUUID().toString());
-  JsonNode mutation = http.mutation("demo:increment", mutationArgs).value();
-  boolean applied = mutation.path("applied").asBoolean(); // The mutation returns this field.
-
-  // The same subscription then supplies the reactive value caused by the mutation.
-  JsonNode updated = subscription.next(Duration.ofSeconds(10));
-  System.out.println(initial.path("count") + " -> " + updated.path("count") + ", " + applied);
-} // try-with-resources unsubscribes and closes both clients, even after a failure.
+  http.mutation("demo:increment", mutationArgs);
+  JsonNode updated = subscription.next(Duration.ofSeconds(10)); // the reactive update arrives
+} // Leaving the block unsubscribes and closes both clients, even after an exception.
 ```
 
-Java itself supports callbacks, futures, streams, and reactive libraries. The
-blocking pull interface is a small-client design decision, not a Java limitation.
-See the complete validation journey in the [canonical example](examples/basics/Main.java).
+Where React unmounts a component to end a `useQuery`, Java simply leaves a block.
+
+### One record line carries the whole reply
+
+Java was famously ceremonious about small classes until records arrived in
+Java 16: one line declares an immutable carrier with a constructor, accessors,
+`equals`, and `hashCode`. This client's HTTP result is exactly that, keeping the
+Convex value and the function's server-side log lines together:
+
+```java
+public record Result(JsonNode value, List<String> logs) {}
+
+ConvexClient.Result result = client.query("demo:state", roomArgs);
+int count = result.value().path("count").intValue();
+result.logs().forEach(System.out::println); // console.log lines from the Convex function
+```
+
+### Checked exceptions put failure in the signature
+
+Checked exceptions are Java's most-debated feature: when a method declares
+`throws FunctionException`, the compiler refuses callers that ignore it. The
+client uses that to split failures into three types, so "your Convex function
+threw" can never be confused with "the network died":
+
+```java
+try {
+  client.mutation("demo:increment", mutationArgs);
+} catch (ConvexClient.FunctionException error) {
+  // The Convex function itself threw: message, structured errorData, and its logs.
+  System.err.println(error.getMessage() + " " + error.data);
+} catch (ConvexClient.TransportException error) {
+  // The network failed before Convex ever answered.
+}
+// TypeScript: one thrown value, and nothing forces you to write the catch.
+```
+
+### An arrow switch sorts the Live wire
+
+When a `Transition` frame arrives on the WebSocket, `LiveClient` routes each
+modification with Java 14's arrow `switch` — no fall-through, no `break`, and a
+`default` arm that makes an unknown protocol message loud instead of silently
+dropped. This is real code from [`LiveClient.java`](client/java/convex/LiveClient.java):
+
+```java
+switch (modification.path("type").asText()) {
+  case "QueryUpdated" ->
+      changed.put(queryId, new Update(modification.get("value"), null, logs));
+  case "QueryFailed" ->
+      changed.put(queryId, new Update(null,
+          new ConvexClient.FunctionException("query",
+              modification.path("errorMessage").asText(),
+              modification.get("errorData"), logs), logs));
+  case "QueryRemoved" -> {}
+  default -> throw new IllegalStateException("unknown Transition modification");
+}
+```
+
+Every reactive update your React app ever received went through a decoder shaped
+like this one.
 
 ## Status
 

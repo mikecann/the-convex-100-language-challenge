@@ -30,34 +30,83 @@ black-box conformance against local, hosted, or both deployment profiles.
 
 ## Interesting Parts
 
-Fennel's keyword call syntax keeps the three HTTP operations close to the
-TypeScript shape:
+### One call, three idioms: `:` methods, keywords, and `{: room}` punning
 
-```ts
-const state = await client.query(api.demo.state, { room });
-```
-
-```fennel
-(local state (checked (: client :query "demo:state" {: room})))
-```
-
-Both versions start Live before the mutation. In TypeScript, a browser client
-returns an unsubscribe callback:
-
-```ts
-const unsubscribe = client.onUpdate(api.demo.state, { room }, handleState);
-```
-
-The Fennel client returns a subscription with a bounded update stream:
+Fennel compiles straight to Lua, so a method call uses the `:` special form —
+`(: client :query ...)` is Lua's `client:query(...)` in S-expression clothing.
+`{: room}` is table punning, where the binding's name becomes the key, exactly
+like TypeScript's `{ room }` shorthand — a trick this Lisp had before it was
+cool.
 
 ```fennel
+;; TypeScript: await client.query(api.demo.state, { room })
+(local current (checked (: client :query "demo:state" {: room})))
+
+(: client :mutation "demo:increment"
+   {: room :language :fennel :runId run-id})
+```
+
+Punned and explicit keys mix freely: `:language :fennel` sits right beside
+`: room` in the same table.
+
+### Failure is a second return value
+
+Lua functions can return several values at once, and its native idiom for
+failure is `result, err` rather than exceptions. The client leans in: one tiny
+`fail` helper produces `(values nil <error>)`, and callers destructure both
+values in a single `let` binding.
+
+```fennel
+(fn fail [name message data logs]
+  (values nil {: name : message : data : logs}))
+
+;; TypeScript: try { JSON.parse(body) } catch (e) { ... }
+(let [(decoded decode-error) (json.decode response)]
+  (if decoded
+      {:value decoded.value :logs (or decoded.logLines {})}
+      (fail :TransportError (tostring decode-error))))
+```
+
+Every transport, protocol, and Convex function error flows through that same
+two-value shape — which is why the canonical example wraps calls in `checked`.
+
+### Metatables tell `{}` apart from `[]`
+
+Lua has exactly one data structure, the table, so an empty table cannot say
+whether it means JSON's `{}` or `[]`. The client settles the question with
+metatables — Lua's mechanism for attaching hidden behaviour to a value:
+
+```fennel
+(fn Json.object [value]
+  (setmetatable value {:__jsontype :object})
+  value)
+
+(fn Json.array [value]
+  (setmetatable value {:__jsontype :array})
+  value)
+```
+
+These are re-exported as `Convex.object`, `Convex.array`, and `Convex.null`,
+so arguments always serialize the way the Convex API expects.
+
+### Live updates are a stream you pull
+
+Subscribing does not register a callback. It returns a subscription whose
+`next-update` blocks — with a timeout in seconds — until the single cqueues
+worker that owns the WebSocket delivers the next value. Coroutines play the
+role of JavaScript's event loop.
+
+```fennel
+;; TypeScript: client.onUpdate(api.demo.state, { room }, handleState)
 (local subscription (checked (: client :subscribe "demo:state" {: room})))
-(local update (checked (: subscription :next-update 10)))
+(local live-initial (checked (: subscription :next-update 10)))
+;; ...mutate, then pull the reactive result of that write...
+(local live-changed (checked (: subscription :next-update 10)))
+(checked (: subscription :close))
 ```
 
-One cqueues worker owns the WebSocket, query-set versions, and reconnects. That
-is the same single-owner idea as an event loop, expressed with Fennel tables and
-coroutines rather than JavaScript promises.
+Each subscription buffers only the newest sixteen updates within a fixed byte
+budget, so a slow reader degrades gracefully instead of leaking memory.
 
 ## Status
 

@@ -33,134 +33,84 @@ against a unique room on the approved local backend:
 
 ## Interesting Parts
 
-### JSON objects are Harbour hashes
+### The argument object is a hash literal, arrows and all
 
-A generated Convex TypeScript API gives React code typed arguments and return
-values. Harbour's `{ "key" => value }` syntax is a hash table, so it maps neatly
-to a JSON object, but this client decodes the result dynamically and must check
-its shape at runtime.
-
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { useMutation } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-  const [room] = useState(() => `harbour-readme-${crypto.randomUUID()}`);
-
-  async function handleClick() {
-    const result = await increment({
-      room,
-      language: "TypeScript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.state.count); // result.state.count is a typed number.
-  }
-
-  return <button onClick={handleClick}>Increment</button>;
-}
-```
-
-**Harbour**
+Harbour's `{ "key" => value }` hash literal maps one-to-one onto a JSON
+object, and `hb_jsonEncode()` ships in the core runtime rather than a
+third-party library. So the arguments you build are already wire-shaped:
 
 ```harbour
-PROCEDURE Main()
-   LOCAL cUrl, cRoom, oClient, hArgs, hResult, hValue
+hArgs := { "room" => cRoom, "language" => "Harbour", "runId" => cRunId }
 
-   cUrl := GetEnv( "CONVEX_URL" )
-   IF Empty( cUrl )
-      OutErr( "CONVEX_URL is required" + hb_eol() )
-      RETURN
-   ENDIF
-   cRoom := "harbour-readme-" + ConvexUuid4()
-   oClient := TConvexClient():New( cUrl, NIL )
-
-   /* A Harbour hash becomes the JSON argument object sent to Convex. */
-   hArgs := { "room" => cRoom, ;
-      "language" => "Harbour", "runId" => ConvexUuid4() }
-   hResult := oClient:Call( "mutation", "demo:increment", hArgs, 10000 )
-
-   /* Unlike generated TypeScript, the decoded hash needs runtime checks. */
-   IF hResult[ "ok" ] .AND. ValType( hResult[ "value" ] ) == "H"
-      hValue := hResult[ "value" ]
-      IF hb_HHasKey( hValue, "state" ) .AND. ;
-         hb_HHasKey( hValue[ "state" ], "count" )
-         ? hValue[ "state" ][ "count" ]
-      ENDIF
-   ENDIF
-
-   oClient:Close()
-   RETURN
+// TypeScript: const result = await increment({ room, language, runId })
+hResult := oClient:Call( "mutation", "demo:increment", hArgs, 10000 )
+IF hResult[ "ok" ]
+   ? hResult[ "value" ][ "state" ][ "count" ]   // hashes all the way down
+ENDIF
 ```
 
-`Call()` is a one-off HTTP mutation. The hashes are pleasantly close to the
-wire-shaped data, but they do not provide the compile-time argument and result
-checks that `api.demo.increment` does.
+Without a generated `api` object, the decoded hash is checked at runtime
+rather than compile time — a fair trade for data this close to the JSON.
 
-### A codeblock receives Live updates
+### Classes are conjured by the preprocessor
 
-React owns a `useQuery` subscription for the component's lifetime. This
-Harbour client instead invokes a callback, called a codeblock, on its Live
-worker thread. The example uses a Harbour mutex as a channel so its main thread
-can wait for the value and then clean up explicitly.
-
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function Counter() {
-  const [room] = useState(() => `harbour-live-${crypto.randomUUID()}`);
-  const state = useQuery(api.demo.state, { room });
-
-  // React starts, updates, and disposes the subscription for this component.
-  if (state === undefined) return <p>Loading</p>;
-  return <p>{state.count}</p>; // state.count is a typed number.
-}
-```
-
-**Harbour**
+Clipper's celebrated preprocessor let library authors define whole new
+*commands*, and Harbour turns that trick on itself: `CREATE CLASS` is not a
+keyword but a set of `#command` rules in `hbclass.ch` that expand into calls
+to the object engine. The entire client rides on one such class:
 
 ```harbour
-PROCEDURE Main()
-   LOCAL cUrl, cRoom, hArgs, cUpdates, bOnEvent, oClient, hUpdate
+#include "hbclass.ch"   // OOP arrives as preprocessor rules, not keywords
 
-   cUrl := GetEnv( "CONVEX_URL" )
-   IF Empty( cUrl )
-      OutErr( "CONVEX_URL is required" + hb_eol() )
-      RETURN
-   ENDIF
-   cRoom := "harbour-live-" + ConvexUuid4()
-   /* This hash is the complete query argument object. */
-   hArgs := { "room" => cRoom }
-   /* This mutex is used here as a one-value channel. */
-   cUpdates := hb_mutexCreate()
+CREATE CLASS TConvexClient
+   VAR oUrl
+   VAR cToken INIT ""
+   METHOD New( cUrl, bOnEvent )
+   METHOD Call( cOpName, cPath, xArgs, nTimeoutMs )
+   METHOD Subscribe( cSubId, cPath, xArgs )
+   // ... SetAuth, Unsubscribe, Close ...
+ENDCLASS
+```
 
-   /* {| ... | ... } is a codeblock. The Live worker calls it per update. */
-   bOnEvent := {| cSubId, xValue, hError, xLogs | ;
-      hb_mutexNotify( cUpdates, { "value" => xValue, "error" => hError } ) }
-   oClient := TConvexClient():New( cUrl, bOnEvent )
+Inside a method, `::oUrl` is shorthand for `Self:oUrl` — Clipper never had
+classes, and Harbour grew them without adding a single reserved word.
 
-   oClient:Subscribe( "counter", "demo:state", hArgs )
-   /* Wait up to ten seconds for the initial state, then read its count. */
-   hb_mutexSubscribe( cUpdates, 10, @hUpdate )
-   /* The returned hash and its count are dynamically decoded. */
+### A 1990 codeblock catches every Live update
+
+The codeblock, `{| args | expression }`, was Clipper 5's first-class closure —
+a remarkable thing to find in the dBase world of 1990, and still the idiomatic
+callback today. This client's Live worker thread `Eval()`s yours once per
+delivered update:
+
+```harbour
+bOnEvent := {| cSubId, xValue, hError, xLogs | ;
+   hb_mutexNotify( cUpdates, { "value" => xValue, "error" => hError } ) }
+
+oClient := TConvexClient():New( cUrl, bOnEvent )
+// TypeScript: const state = useQuery(api.demo.state, { room })
+oClient:Subscribe( "state", "demo:state", { "room" => cRoom } )
+```
+
+Where React owns the subscription's lifetime, here you do: `Unsubscribe()`
+and `Close()` when you are done.
+
+### A mutex that moonlights as a channel
+
+Every Harbour mutex carries a message queue: `hb_mutexNotify()` enqueues a
+value, `hb_mutexSubscribe()` blocks waiting for one. The example uses a bare
+mutex as the channel between the Live worker thread and `Main()`, with `@`
+passing `hUpdate` by reference in classic Clipper style:
+
+```harbour
+cUpdates := hb_mutexCreate()   // no separate queue type needed
+
+// Wait up to ten seconds for the worker to deliver the next Live value.
+IF hb_mutexSubscribe( cUpdates, 10, @hUpdate ) .AND. hUpdate[ "error" ] == NIL
    ? hUpdate[ "value" ][ "count" ]
-
-   /* This command-line API owns the lifecycle that React normally hides. */
-   oClient:Unsubscribe( "counter" )
-   oClient:Close()
-   RETURN
+ENDIF
 ```
 
-Codeblocks and threads are Harbour features. The direct callback and explicit
-`Subscribe()`/`Unsubscribe()` lifecycle are choices made by this small client,
-not limitations of the language.
+Real OS threads from Harbour's `-mt` runtime, coordinated in two calls.
 
 ## Status
 

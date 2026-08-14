@@ -28,108 +28,92 @@ a unique test room. You do not need Lua installed on your host.
 
 ## Interesting Parts
 
-### A Lua table becomes both the arguments and the returned state
+### Errors ride the second return value
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function RoomCount() {
-  const state = useQuery(api.demo.state, { room: "readme-lua" });
-  if (state === undefined) return <p>Loading...</p>;
-
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**Lua**
+Lua functions can return several values at once, and ever since the standard
+`io` library the convention for fallible calls has been `value, err` — no
+exceptions, no wrapper type. Every call in this client speaks that protocol:
 
 ```lua
-package.path = (os.getenv("CONVEX_CLIENT_PATH") or "./client") .. "/?.lua;" .. package.path
-local Convex = require("convex")
-
-local deployment_url = assert(os.getenv("CONVEX_URL"), "CONVEX_URL is required")
-local client = assert(Convex.new(deployment_url)) -- Create the HTTP and Live client.
-
--- Named table fields encode as the Convex function's argument object.
-local result, err = client:query("demo:state", { room = "readme-lua" })
-assert(result, err and err.message or "query failed")
-print(result.value.count) -- Decoded JSON objects are Lua tables too.
-
-client:close()
+-- TypeScript: await client.query("demo:state", { room }) throws on failure.
+local current, err = client:query("demo:state", { room = room })
+assert(current, err and err.message or "query failed")
+print("current count: " .. current.value.count)
 ```
 
-Lua has one general-purpose table type where TypeScript distinguishes object
-shapes and arrays. This client uses JSON metatables when an empty `{}` must be
-distinguished from an empty `[]`. Also, the Lua `query` above is a one-off HTTP
-read. React's `useQuery` stays subscribed and rerenders the component.
+`assert` collapses the pair back into "crash with a message" — right for a
+command-line example, while an embedding app could branch on `err.name`
+(`FunctionError`, `TransportError`, ...) and recover instead.
 
-### Live updates have an explicit lifetime
+### A class is two lines of metatable
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "readme-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  async function handleIncrement() {
-    const result = await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.state.count); // The mutation returns the new state.
-  }
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <button onClick={handleIncrement}>Count: {state.count}</button>;
-}
-```
-
-**Lua**
+Lua ships no `class` keyword. Objects are plain tables, and a metatable's
+`__index` field says where lookups go when a key is missing — that is the
+entire object system this client is built on:
 
 ```lua
-package.path = (os.getenv("CONVEX_CLIENT_PATH") or "./client") .. "/?.lua;" .. package.path
-local Convex = require("convex")
+local Convex = {}
+Convex.__index = Convex -- missing keys fall through to the Convex table
 
-local function checked(result, err)
-	return assert(result, err and err.message or "Convex call failed")
+function Convex.new(deployment_url, options)
+	-- ...validate the URL, then bless an ordinary table as a client...
+	return setmetatable({ deployment_url = deployment_url, closed = false }, Convex)
 end
 
-local deployment_url = assert(os.getenv("CONVEX_URL"), "CONVEX_URL is required")
-local client = assert(Convex.new(deployment_url))
-local room = "readme-live"
-
--- Subscribe before writing so the update cannot be missed.
-local subscription = checked(client:subscribe("demo:state", { room = room }))
-local initial = checked(subscription:next_update(10)) -- Wait for hydration.
-print(initial.value.count)
-
-local run_id = table.concat({ "lua", room, tostring(os.time()), tostring(math.random()) }, ":")
-local mutation = checked(client:mutation("demo:increment", {
-	room = room,
-	language = "lua",
-	runId = run_id,
-}))
-print(mutation.value.state.count) -- Decode the mutation's returned state.
-
-local updated = checked(subscription:next_update(10)) -- Wait for the reactive value.
-print(updated.value.count)
-
-checked(subscription:close()) -- Stop this query explicitly.
-client:close() -- Retire the shared Live worker and its socket.
+-- The colon is sugar: client:query(...) passes client as a hidden `self`.
+function Convex:query(path, args)
+	return self:call("query", path, args)
+end
 ```
 
-React owns the subscription while the component is mounted. The Lua client
-instead exposes a blocking `next_update` call and explicit cleanup, an API
-choice that suits a command-line example rather than a limitation of Lua.
+Lua's designers kept the core tiny on purpose; you assemble exactly as much
+OOP as you need from tables and metatables.
+
+### One table type, so a metatable tells `{}` from `[]`
+
+Lua's single data structure, the table, plays both JSON roles: array and
+object. Delightfully economical — until a table is empty and the wire format
+must pick `[]` or `{}`. The client settles it with metatable identity:
+
+```lua
+-- client/json.lua: dkjson stamps every decoded JSON array with this metatable.
+Json.array_mt = { __jsontype = "array" }
+
+function Json.is_array(value)
+	return type(value) == "table" and getmetatable(value) == Json.array_mt
+end
+
+-- Outbound, hand-written calls pick a side when a table is empty:
+local tags = Convex.array({})   -- encodes as []
+local extra = Convex.object({}) -- encodes as {}
+```
+
+The `{ room = room }` you send and the response you read `.value.count` from
+are the same species of value: one table, tagged at the boundary.
+
+### Live updates arrive when you step the loop
+
+One `cqueues` worker — cqueues being Lua's coroutine-based event loop — owns
+the Live WebSocket. `next_update` adapts to its caller: inside a running
+coroutine it waits on a condition variable; from plain top-level code it steps
+the event loop itself until the update lands.
+
+```lua
+-- Subscribe before writing so the reactive update cannot be missed.
+local subscription = client:subscribe("demo:state", { room = room })
+local initial = subscription:next_update(10) -- hydration delivers today's value
+print(initial.value.count)
+
+client:mutation("demo:increment", { room = room, language = "lua", runId = run_id })
+
+-- TypeScript: useQuery(api.demo.state, { room }) rerenders on this same push.
+local updated = subscription:next_update(10)
+print(updated.value.count) -- the write comes back over the socket, no polling
+subscription:close() -- Stop this query; client:close() retires the shared worker.
+```
+
+React hides subscription lifetime inside the component tree; here it is a
+value you hold, wait on, and close.
 
 ## Status
 

@@ -26,129 +26,101 @@ approved local test deployment entirely through Docker:
 
 ## Interesting Parts
 
-### Generated types become runtime table lookups
+### An expression can fail — and failure is the control flow
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function RoomCount() {
-  const room = "icon-readme";
-  const state = useQuery(api.demo.state, { room });
-  if (state === undefined) return <span>Loading...</span>;
-  return <span>{state.count}</span>; // state and count are type-safe here.
-}
-```
-
-**Icon**
+Icon, designed by SNOBOL4 creator Ralph Griswold, replaces booleans with
+goal-directed evaluation: every expression either succeeds with a value or
+fails, and failure quietly calls off whatever surrounds it. `/x` succeeds only
+when `x` is null, `|` tries alternatives left to right, and `find` produces a
+match position or fails. The example's whole setup is built from that:
 
 ```text
-link "convex"
+convexUrl := getenv("CONVEX_URL")
+if /convexUrl | *convexUrl = 0 then stop("CONVEX_URL is required")
 
-procedure main()
-   local convexUrl, room, result, state
-   convexUrl := getenv("CONVEX_URL")
-   if /convexUrl | *convexUrl = 0 then stop("CONVEX_URL is required")
-   room := "icon-readme"
-
-   # This is one HTTP query. It does not stay subscribed like useQuery does.
-   result := convex_http_call("query", "demo:state",
-      table_of(["room", room]), convexUrl, "")
-   if result.kind ~== "result" then stop(result.errMessage)
-
-   state := result.value
-   write(state["count"]) # JSON objects and fields are checked at runtime.
-end
+# map() lowercases, s[1:6] slices five characters, and `if` is an expression.
+scheme := if map(convexUrl[1:6]) == "https" then "wss" else "ws"
+hostAndMore := convexUrl[find("://", convexUrl) + 3 : 0]
+liveUrl := scheme || "://" || hostAndMore || "/api/sync"
 ```
 
-The generated TypeScript API knows the argument and return types. This Unicon
-client instead accepts an operation name and a table, then decodes the result
-to another table. That keeps the demonstration small, but misspelled paths or
-fields are runtime errors rather than editor feedback.
+No null checks, no ternary operator, no regex — just expressions that succeed
+or step aside.
 
-### The program owns Live, and iteration is goal-directed
+### The JSON decoder is one big string scan
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const room = "icon-readme";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  if (state === undefined) return <button disabled>Loading...</button>;
-  return (
-    <button
-      onClick={() =>
-        void increment({
-          room,
-          language: "Icon",
-          runId: crypto.randomUUID(), // A fresh id makes this logical write idempotent.
-        })
-      }
-    >
-      Count: {state.count}
-    </button>
-  );
-}
-```
-
-**Icon**
+`s ? expr` opens Icon's string-scanning environment: inside it the subject
+string and a cursor (`&subject`, `&pos`) become ambient, dynamically scoped
+state, so nested procedure calls simply continue scanning where their caller
+stopped. This client parses all of Convex's wire JSON that way, and `="true"`
+is a complete pattern match — advance past the literal, or fail:
 
 ```text
-link "convex"
-
-procedure main()
-   local convexUrl, room, scheme, hostAndMore, liveUrl, liveState
-   local initial, mutation, updated, runId
-   convexUrl := getenv("CONVEX_URL")
-   if /convexUrl | *convexUrl = 0 then stop("CONVEX_URL is required")
-   room := "icon-readme"
-
-   scheme := if map(convexUrl[1:6]) == "https" then "wss" else "ws"
-   hostAndMore := convexUrl[find("://", convexUrl) + 3 : 0]
-   liveUrl := scheme || "://" || hostAndMore || "/api/sync"
-
-   # A CLI program explicitly creates, subscribes, polls, and closes Live.
-   liveState := convex_live_new(liveUrl)
-   convex_live_add(liveState, "counter", "demo:state",
-      table_of(["room", room]))
-   initial := next_value(liveState)
-   write("initial: ", initial["count"])
-
-   runId := "icon-readme-" || &now # Fresh for this invocation.
-   mutation := convex_http_call("mutation", "demo:increment",
-      table_of(["room", room, "language", "Icon", "runId", runId]),
-      convexUrl, "")
-   if mutation.kind ~== "result" then stop(mutation.errMessage)
-
-   updated := next_value(liveState)
-   write("updated: ", updated["count"])
-   convex_live_remove(liveState, "counter")
-   convex_live_close(liveState)
-end
-
-procedure next_value(liveState)
-   local event
-   repeat {
-      # ! generates each event; every asks for all generated results.
-      every event := !convex_live_poll(liveState, 500) do
-         if member(event, "value") then return event["value"]
+procedure json_decode(s)
+   s ? {                     # inside here, &subject/&pos are the scan state
+      json_skip_ws()
+      result := json_value()
    }
+   return result
+end
+
+procedure json_match_true()
+   ="true"                   # match the literal at the cursor, or fail
+   return JBool(1)
 end
 ```
 
-React owns the `useQuery` subscription lifecycle and rerenders on updates.
-The Unicon API deliberately exposes a blocking `convex_live_poll` operation,
-so a command-line program owns setup, polling, and cleanup itself. That is a
-choice made by this client, not a limitation of the language. The `!` and
-`every` pair show Icon's goal-directed evaluation in practical use by
-producing and consuming each event in a poll batch.
+A whole number token falls out of one call, `tab(many('-+0123456789.eE'))` —
+no lexer in sight.
+
+### `!` deals each Live update, `every` takes them all
+
+`!events` is a generator that yields a list's elements one at a time, and
+`every` drives a generator until it has nothing left to give. The canonical
+example subscribes before mutating, then its polling helper insists on
+watching the new count arrive through the WebSocket rather than re-querying:
+
+```text
+convex_live_add(liveState, "basics", "demo:state", table_of(["room", room]))
+
+# TypeScript: const state = useQuery(api.demo.state, { room })
+while live_now_ms() < deadline do {
+   events := convex_live_poll(liveState, 500)
+   every evt := !events do {
+      if evt["subscriptionId"] ~== "basics" then next
+      candidate := whole_count(evt["value"], "updated Live value")
+      if candidate ~= 0 then return candidate
+   }
+}
+```
+
+Where React's `useQuery` hides the subscription lifecycle, this CLI client
+owns it — and the same goal-directed machinery that scans strings also drains
+each poll's batch of updates.
+
+### Argument objects are built two list items at a time
+
+Icon has tables (hash maps) but no `{ key: value }` literal, so the client
+grows its own in a three-line helper: `every i := 1 to *pairs by 2` walks a
+flat list in steps of two. `&now` is one of Icon's ambient `&`-keywords, here
+timestamping the idempotency key so a retried mutation can never
+double-increment:
+
+```text
+procedure table_of(pairs)
+   t := table()
+   every i := 1 to *pairs by 2 do t[pairs[i]] := pairs[i + 1]
+   return t
+end
+
+# TypeScript: await client.mutation(api.demo.increment, { room, language, runId })
+mutation := convex_http_call("mutation", "demo:increment",
+   table_of(["room", room, "language", "Icon", "runId", "icon-" || &now]),
+   convexUrl, "")
+if mutation.kind ~== "result" then stop(mutation.errMessage)
+```
+
+One flat list in, one JSON object over the wire.
 
 ## Status
 

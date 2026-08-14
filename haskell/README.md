@@ -16,114 +16,61 @@ The command builds the minimal `linux/amd64` example image and runs that exact s
 
 ## Interesting Parts
 
-### The generated TypeScript client knows the result shape; this client decodes JSON
+### The type signature admits it talks to the network
 
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-
-  async function incrementOnce() {
-    const result = await increment({
-      room: "haskell-readme",
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.state.count); // The generated API makes this a number.
-  }
-
-  return <button onClick={incrementOnce}>Increment</button>;
-}
-```
-
-**Haskell**
+Haskell is *purely* functional: an ordinary function cannot quietly reach the network, so anything effectful wears `IO` in its type. Haskell also lets several names share one signature, which means this client's entire HTTP surface is a single line.
 
 ```haskell
-{-# LANGUAGE OverloadedStrings #-}
+query, mutation, action :: Client -> Text -> Value -> IO Result
 
-import Convex
-import Data.Aeson
-import qualified Data.Aeson.KeyMap as KM
-import Data.Text (Text)
-import qualified Data.Text as T
-import Data.UUID.V4 (nextRandom)
-
-incrementOnce :: Client -> IO Int
-incrementOnce client = do
-    runId <- T.pack . show <$> nextRandom
-    response <-
-        mutation
-            client
-            "demo:increment"
-            ( object
-                [ "room" .= ("haskell-readme" :: Text)
-                , "language" .= ("haskell" :: Text)
-                , "runId" .= runId
-                ]
-            )
-    -- This small client returns generic JSON, so the boundary is checked here.
-    case resultValue response of
-        Object result -> case KM.lookup "state" result of
-            Just state -> wholeCount state
-            _ -> fail "mutation omitted state"
-        _ -> fail "mutation returned a non-object"
-
-wholeCount :: Value -> IO Int
-wholeCount (Object state) = case KM.lookup "count" state of
-    Just (Number count) ->
-        let integer = round count :: Integer
-         in if fromInteger integer == count
-                && integer >= toInteger (minBound :: Int)
-                && integer <= toInteger (maxBound :: Int)
-                then pure (fromInteger integer)
-                else fail "count was not an in-range integer"
-    _ -> fail "state omitted count"
-wholeCount _ = fail "state was not an object"
+-- In a do-block, `<-` runs the effect and binds the pure value it produced.
+current <- query client "demo:state" (object ["room" .= room])
+-- TypeScript: const state = await client.query(api.demo.state, { room });
 ```
 
-Haskell can model the whole response as a record with an Aeson `FromJSON` instance. This client deliberately exposes Aeson's generic `Value` instead, so the canonical example performs the runtime shape and integer checks itself. The `IO Int` signature still makes the successfully decoded result explicit to callers.
+`IO Result` is a promise you can read off the page: this touches the wire, and afterwards you hold the decoded value plus the function's server-side log lines.
 
-### React owns a subscription; this command-line program owns it directly
+### `Just (Bool True)` — one pattern, two layers deep
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, { room: "haskell-readme" });
-  if (state === undefined) return <span>Loading...</span>;
-  return <span>{state.count}</span>; // Generated type-safety, plus reactive re-renders.
-}
-```
-
-**Haskell**
+Aeson, Haskell's ubiquitous JSON library, models any document as one algebraic data type with constructors like `Object`, `Number`, and `Bool`. Checking a mutation's reply is a `case` expression over shapes, not a chain of `typeof` checks.
 
 ```haskell
-{-# LANGUAGE OverloadedStrings #-}
-
-import Control.Exception (bracket)
-import Convex
-import Data.Aeson (object, (.=))
-import Data.Text (Text)
-
-readFirstLiveValue :: String -> IO Update
-readFirstLiveValue deployment =
-    -- closeClient runs even if subscribing or reading throws an exception.
-    bracket (newClient deployment) closeClient $ \client -> do
-        -- The inner bracket also unsubscribes if waiting for an update fails.
-        bracket
-            (subscribe client "demo:state" (object ["room" .= ("haskell-readme" :: Text)]))
-            (unsubscribe client)
-            nextUpdate -- Wait for and return the initial reactive value.
+changed <- mutation client "demo:increment"
+    (object ["room" .= room, "language" .= ("haskell" :: Text), "runId" .= runId])
+applied <- case resultValue changed of
+    Object result -> case KM.lookup "applied" result of
+        Just (Bool True) -> pure True
+        _ -> fail "mutation was not applied"
+    _ -> fail "mutation returned a non-object"
 ```
 
-React mounts, updates, and removes the `useQuery` subscription with the component lifecycle. The Haskell program has no component lifecycle, so it uses `bracket` for the client and explicitly unsubscribes. `nextUpdate` blocking until one value arrives is this educational client's API choice, not a limitation of Haskell's concurrency model.
+The pattern `Just (Bool True)` matches through the lookup's `Maybe` and the JSON boolean in a single stroke.
+
+### `bracket` is try/finally as an ordinary function
+
+Haskell has no try/finally statement — `bracket` is a plain function that takes an acquire action, a release action, and the work in between. The canonical example wraps its whole run in one, so the Live worker and HTTP resources are torn down even when an assertion `fail`s halfway through.
+
+```haskell
+bracket (newClient deployment) closeClient $ \client -> do
+    current <- query client "demo:state" (object ["room" .= room])
+    -- ... subscribe, mutate, and check the reactive update ...
+    unsubscribe client subscription
+```
+
+### A Live update is a blocking read — and `Maybe` makes you check it
+
+React re-renders when Convex pushes new state; a compiled command-line binary has no render loop, so `subscribe` hands you a `Subscription` and `nextUpdate` blocks until the server pushes the next value into its queue. Because Haskell has no `null`, the update's payload is a `Maybe Value` — you cannot touch the value without deciding what happens when it is absent.
+
+```haskell
+subscription <- subscribe client "demo:state" (object ["room" .= room])
+-- ... the mutation runs; nothing polls — the server pushes the new state ...
+updated <- nextUpdate subscription
+-- updateValue :: Maybe Value, so skipping the error case will not compile.
+updatedValue <- maybe (fail "updated Live update was an error") pure (updateValue updated)
+-- TypeScript: useQuery(api.demo.state, { room }) just re-renders with the new count.
+```
+
+The example subscribes *before* mutating, so the reactive journey cannot miss the write.
 
 ## Status
 

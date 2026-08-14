@@ -25,114 +25,84 @@ run the exact example in its Docker image with:
 
 ## Interesting Parts
 
-### Objects become boxed arrays
+### One assignment, three results
 
-TypeScript gets generated types for Convex arguments and return values. J has
-no native record type, so this client sends JSON text and decodes every value
-into a tagged, boxed array. Field access is therefore checked at runtime.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const room = "j-readme-query";
-  const state = useQuery(api.demo.state, { room });
-  if (state === undefined) return <p>Loading...</p>;
-
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**J**
+Iverson designed J's verbs to take one or two arguments, never more, so
+multi-part calls travel as boxed lists glued together with `;` (Link) — and
+replies come back the same way. A string of names on the left of `=.` splits
+a reply in one stroke.
 
 ```text
-load '/project/client/convex.ijs'
+args=. '{"room":',(jw_quote room),'}'
 
-read_count=: 3 : 0
-  url=. tx_getenv 'CONVEX_URL'        NB. Real deployment configuration.
-  if. -. convex_open url;'j-0.1.0' do. convex_error_message '' return. end.
+NB. TypeScript: const state = useQuery(api.demo.state, { room })
+'ok value logs'=. convex_query 'demo:state';args
 
-  room=. 'j-readme-query'
-  args=. '{"room":',(jw_quote room),'}' NB. J builds the argument object as JSON.
-  'ok value logs'=. convex_query 'demo:state';args
-  if. -. ok do. convex_error_message '' return. end.
-
-  'parsed state'=. cx_unpack2 cx_json_parse value
-  if. -. parsed do. 'invalid state JSON' return. end.
-  countNode=. state jfind 'count'      NB. Lookup in the boxed key/value rows.
-  count=. ". jpay > countNode          NB. This conversion is runtime-checked.
-  count
-)
+'pok root'=. cx_unpack2 cx_json_parse value
+node=. root jfind 'count'
+count=. ". jpay > node    NB. Runtime-checked; no generated types to lean on.
 ```
 
-The complete example adds the range and integral-number checks omitted from
-this focused comparison. The boxed representation is a client design choice
-that gives strings, numbers, arrays, and objects one uniform shape.
+### Field access is a table search
 
-### React hides a lifecycle that J drives explicitly
-
-`useQuery` subscribes when the component renders and cleans up when it
-unmounts. This command-line J client instead exposes a blocking pump and queue,
-so its single owner decides when socket work happens and when to close it.
-That is an API choice, not a limitation of reactive Convex queries.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "j-readme-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  return (
-    <button
-      onClick={() =>
-        increment({ room, language: "j", runId: crypto.randomUUID() })
-      }
-    >
-      Count: {state?.count ?? "loading"} {/* This value stays type-safe. */}
-    </button>
-  );
-}
-```
-
-**J**
+J has no record type, and the client does not bolt one on. A decoded JSON
+object is an n-by-2 boxed table of key/value rows, so looking up a field is
+column extraction plus `i.` — index-of, one of the oldest APL-family
+primitives. Trimmed to its heart, the client's `jfind` is:
 
 ```text
-load '/project/client/live.ijs'
-
-watch_once=: 3 : 0
-  url=. tx_getenv 'CONVEX_URL'
-  if. -. convex_open url;'j-0.1.0' do. convex_error_message '' return. end.
-  cx_live_reset ''
-
-  room=. 'j-readme-live'
-  args=. '{"room":',(jw_quote room),'}'
-  cx_live_subscribe (<'counter'),(<'demo:state'),(<args) NB. Own the subscription.
-
-  cx_live_pump 200
-  'hasInitial tag initial logs errName errMsg errData'=. cx_live_next_update ''
-
-  runId=. tx_uuid ''                 NB. Fresh idempotency key for this mutation.
-  mutationArgs=. '{"room":',(jw_quote room),',"language":"j","runId":',(jw_quote runId),'}'
-  'mutationOk result mutationLogs'=. convex_mutation 'demo:increment';mutationArgs
-
-  cx_live_pump 200                   NB. Let the socket owner receive the update.
-  'hasUpdate tag updated logs errName errMsg errData'=. cx_live_next_update ''
-  cx_live_close 2000                 NB. Explicitly release socket and subscription state.
-  initial;result;updated
+jfind=: 4 : 0
+  pairs=. jpay x
+  keys=. 0 {"1 pairs    NB. "1 applies { row by row: the whole key column.
+  hit=. keys i. <y      NB. i. searches that column in one stroke.
+  if. hit = # keys do. _1 return. end.
+  1 { hit { pairs
 )
+
+node=. root jfind 'count'   NB. TypeScript: state.count, checked by tsc instead.
 ```
 
-The canonical example loops with deadlines until each expected value arrives
-and validates every result. The short version above keeps the ownership model
-visible without duplicating that full journey.
+### The WebSocket mask is three array verbs
+
+RFC 6455 makes a client XOR every outgoing payload byte with a fresh 4-byte
+mask. Most clients loop; J explodes both operands into bit planes with `#:`
+(antibase), combines them with `6 b.` — the Boolean function whose truth
+table is XOR — and folds the planes back into bytes with `#.`.
+
+```text
+tx_xor=: 4 : 0
+  bx=. (8#2) #: x        NB. Every byte becomes its 8 bits, all at once.
+  by=. (8#2) #: y
+  (8#2) #. bx (6 b.) by  NB. XOR the bit planes, then fold back to bytes.
+)
+
+mask=. tx_random_bytes 4
+masked=. payload tx_xor (n $ mask)  NB. $ cycles the mask across the payload.
+```
+
+The same pair writes each frame's big-endian length field: `2 tx_be n` is
+`(2#256) #: n`, literally "the digits of n in base 256".
+
+### You pump the reactive loop yourself
+
+This client earned the `live` badge, so these are real Convex sync-protocol
+subscriptions — J just declines to hide the loop. Where `useQuery` subscribes
+during render and re-renders on every update, this single-threaded client
+gives one owner three verbs: subscribe, pump the socket, drain the queue.
+
+```text
+sok=. cx_live_subscribe (<'counter'),(<'demo:state'),(<args)
+
+while. 1 do.
+  cx_live_pump 200        NB. Give the socket 200 ms of attention.
+  'ok utag value logs errname errmsg errdata'=. cx_live_next_update ''
+  if. ok do. break. end.  NB. A mutation from any client lands here, unpolled.
+end.
+NB. TypeScript: useQuery re-renders for you; here every update is one you pumped.
+```
+
+When the counter changes — in this process or anywhere else in the world —
+the next pump delivers it. Realtime, at crank speed.
 
 ## Status
 

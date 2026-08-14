@@ -19,61 +19,62 @@ From the repository root, Docker builds and runs that exact program against the 
 
 ## Interesting Parts
 
-### React owns the subscription; this client makes it visible
+### JSON grows by `//` on self-sizing strings
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  // React subscribes on mount and unsubscribes on unmount.
-  const state = useQuery(api.demo.state, { room: "fortran-readme" });
-  return <p>{state?.count ?? "Loading..."}</p>; // state.count is type-safe here.
-}
-```
-
-**Fortran**
+The original FORTRAN had no string type at all, and FORTRAN 77's `CHARACTER*80` stayed exactly the width you declared, forever. Modern Fortran's deferred-length allocatable character — `character(:), allocatable` — resizes itself on every assignment, so this client builds Convex argument objects with the concatenation operator `//` and never counts a byte. The trailing `&` is Fortran's line continuation.
 
 ```fortran
-program live_counter
-  use convex_fortran
-  implicit none
+character(:), allocatable :: mutation_args, value, error
 
-  type(convex_client) :: client
-  type(convex_live) :: live
-  character(:), allocatable :: url, value, error
-  logical :: ok
-  integer :: count, url_length
-
-  ! Read the deployment selected by the caller, then create the client.
-  call get_environment_variable('CONVEX_URL', length=url_length)
-  if (url_length == 0) error stop 'CONVEX_URL is required'
-  allocate(character(url_length) :: url)
-  call get_environment_variable('CONVEX_URL', url)
-  call convex_new(url, client, ok, error)
-  if (.not. ok) error stop error
-
-  ! The arguments are JSON text because this small client has no value tree.
-  call convex_live_start(client, 'demo:state', &
-    '{"room":"fortran-readme"}', live, ok, error)
-  if (.not. ok) error stop error
-
-  ! next blocks until the subscription produces its initial value.
-  call convex_live_next(live, value, ok, error)
-  if (.not. ok) error stop error
-  count = convex_count(value, ok) ! Decode the returned state object's count.
-  if (.not. ok) error stop 'invalid counter state'
-  write (*, '(I0)') count
-
-  ! There is no component unmount, so cleanup is explicit.
-  call convex_live_close(live)
-  call convex_live_close()
-end program live_counter
+! TypeScript: await client.mutation("demo:increment", { room, runId })
+mutation_args = '{"room":' // quote(room) // ',"language":"Fortran",' // &
+  '"runId":' // quote(room // '-once') // '}'
+call convex_call(client, 'mutation', 'demo:increment', mutation_args, value, ok, error)
 ```
 
-Both snippets subscribe to `api.demo.state` with the same room argument. React rerenders whenever `useQuery` changes. This client instead exposes a blocking `convex_live_next` call so a command-line program can decide when to consume each value. That blocking API is a choice made by this client, not a limitation of Fortran.
+Assignment sizes the string every time; there is no manual allocation in sight.
+
+### Every result rides home in an `intent(out)` argument
+
+Fortran subroutines return nothing. Results, success flags, and error text all travel back through arguments, each stamped with a direction the compiler enforces — writing to an `intent(in)` argument is a compile error, not a code-review comment. This is the actual declaration from [`client/convex.f90`](client/convex.f90):
+
+```fortran
+subroutine convex_call(client, operation, path, args, value, ok, error, logs, error_data)
+  type(convex_client), intent(in) :: client
+  character(*), intent(in) :: operation, path, args
+  character(:), allocatable, intent(out) :: value, error
+  logical, intent(out) :: ok
+  character(:), allocatable, intent(out), optional :: logs, error_data
+```
+
+Callers follow each call with `if (.not. ok) error stop error` — `error stop`, added in Fortran 2008, halts the whole program with that message and a nonzero exit code.
+
+### A Live update is a blocking `next` — with a keyword timeout from 1991
+
+The Status table below shows Live queries verified, and the reactive side reads like classic batch-era Fortran: instead of React re-rendering, the program blocks on `convex_live_next` until the server pushes the next value. Keyword arguments arrived with Fortran 90, so `timeout_ms=` can leapfrog the three optional arguments (`logs`, `error_name`, `error_data`) declared before it.
+
+```fortran
+! TypeScript: const state = useQuery(api.demo.state, { room })
+call convex_live_start(client, 'demo:state', &
+  '{"room":' // quote(room) // '}', live, ok, error)
+
+call convex_live_next(live, value, ok, error)   ! blocks until the initial 0
+! ... demo:increment commits on the server ...
+call convex_live_next(live, value, ok, error, timeout_ms=10000)
+count = convex_count(value, ok)                 ! the pushed update: 1
+```
+
+It is the same subscription protocol `useQuery` speaks, consumed one blocking call at a time.
+
+### One `close`, two jobs — the optional argument decides
+
+`convex_live_close` takes an optional `live` handle. Pass one and it unsubscribes that query; call it bare and it joins the WebSocket worker and releases the socket. What React does invisibly at component unmount is spelled out here as two deliberate calls.
+
+```fortran
+! TypeScript: useQuery unsubscribes on unmount, invisibly
+call convex_live_close(live)   ! with an argument: end this subscription
+call convex_live_close()       ! bare: stop the transport owner, free the socket
+```
 
 ## Status
 

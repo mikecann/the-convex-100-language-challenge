@@ -36,96 +36,76 @@ hosted conformance runs already recorded for this implementation.
 
 ## Interesting Parts
 
-### Familiar object literals, dynamic results
+### Single quotes switch on string interpolation
 
-React's generated types connect a function, its arguments, and its result. The
-handwritten Haxe client accepts an anonymous object but returns `Dynamic` JSON.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-function StateCount({ room }: { room: string }) {
-  const state = useQuery(api.demo.state, { room });
-  return <span>{state?.count ?? "Loading"}</span>;
-}
-```
-
-**Haxe**
+Haxe strings come in two flavors: double quotes are inert, while single quotes
+interpolate `$name` and `${expression}` — a Haxe 3 design that makes formatting
+opt-in per literal instead of per template syntax. It sits right next to the
+anonymous-structure arguments that Convex calls take, so the whole line reads
+like the JavaScript Haxe can compile to.
 
 ```haxe
-class StateCount {
-  public static function openClient():ConvexClient {
-    var url = Sys.getEnv("CONVEX_URL");
-    if (url == null || url.length == 0)
-      throw new haxe.Exception("CONVEX_URL is required");
-    return new ConvexClient(url);
-  }
-  public static function read(client:ConvexClient, room:String):Int {
-    var state:Dynamic = client.query("demo:state", {room: room}).value;
-    return JsonTools.exactInteger(Reflect.field(state, "count"), "state.count");
-  }
-}
+var current = countOf(client.query("demo:state", {room: room}).value, "current query");
+if (current != 0) throw new Exception('current count was $current, expected 0');
+// TypeScript: console.log(`current count: ${current}`)
+Sys.println('current count: $current');
 ```
 
-The helper rejects missing and empty URLs. Its caller owns the client and must
-close it. `read` is one HTTP request and validates its `Dynamic` count.
+### Regex literals start with a tilde
 
-### A blocking stream over a background WebSocket
-
-React manages subscription lifetime and rerenders on change. This Haxe client
-instead exposes a blocking stream backed by a bounded queue and an owner thread.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-function Counter({ room }: { room: string }) {
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  const addOne = () => increment({ room, language: "TypeScript",
-    runId: crypto.randomUUID() });
-  return <button onClick={addOne}>Count: {state?.count ?? 0}</button>;
-}
-```
-
-**Haxe**
+One Haxe codebase can target JavaScript, C++, the JVM, or the Neko VM used
+here, so regular expressions get their own literal syntax, `~/pattern/`, which
+builds a cross-platform `EReg` object. The client uses one to insist that every
+Convex function path looks like `module:function` before a request goes out.
 
 ```haxe
-class LiveCounter {
-  public static function increment(client:ConvexClient, room:String):Array<Int> {
-    var subscription = client.subscribe("counter", "demo:state", {room: room});
-    var failure:Dynamic = null;
-    var counts:Array<Int> = [];
-    try {
-      var initial = subscription.next(10.0);
-      if (initial.error != null) throw initial.error;
-      counts.push(JsonTools.exactInteger(Reflect.field(initial.value, "count"),
-        "initial Live count"));
-      client.mutation("demo:increment", {room: room, language: "Haxe",
-        runId: ConvexClient.randomId()});
-      var updated = subscription.next(10.0);
-      if (updated.error != null) throw updated.error;
-      counts.push(JsonTools.exactInteger(Reflect.field(updated.value, "count"),
-        "updated Live count"));
-    } catch (error:Dynamic) {
-      failure = error;
-    }
-    try subscription.close() catch (closeError:Dynamic) {
-      if (failure == null) failure = closeError;
-    }
-    if (failure != null) throw failure;
-    return counts;
+static function validatePath(value:String):Void {
+  if (value == null || !(~/^[^:\r\n]+:[^:\r\n]+$/).match(value)) {
+    throw ConvexError.protocol("Convex function path must be module:function");
   }
 }
 ```
 
-Blocking `next` is an API choice, not a Haxe limitation. The helper owns its
-subscription and preserves the first failure through cleanup; its caller owns
-the client. Closing or replacing a handle invalidates its old generation.
+### Live updates arrive one blocking next() at a time
+
+Convex's signature move is reactivity, and React gets it by re-rendering
+whenever the server pushes a new value. A terminal program has no render loop,
+so this client parks Live updates in a bounded queue fed by a background
+WebSocket owner thread, and you pull them with `next(timeout)`. Subscribing
+before mutating guarantees the `0 -> 1` story is observed in order.
+
+```haxe
+var subscription = client.subscribe("basic-counter", "demo:state", {room: room});
+var initial = subscription.next(10.0); // blocks up to ten seconds for the snapshot
+client.mutation("demo:increment", {room: room, language: "Haxe",
+  runId: ConvexClient.randomId()});
+// TypeScript: useQuery(api.demo.state, { room }) re-renders here instead
+var updated = subscription.next(10.0);
+Sys.println('live updated count: ${countOf(updated.value, "updated Live value")}');
+```
+
+Same realtime protocol underneath — just pull instead of push.
+
+### There is no finally, because try/catch is an expression
+
+Haxe deliberately ships `try`/`catch` without `finally`. Nearly everything in
+Haxe is an expression, so a complete try/catch fits inside an `if` on a single
+line, and the example does its cleanup by capturing the first failure, closing
+both handles, then rethrowing.
+
+```haxe
+var failure:Dynamic = null;
+try {
+  // ... query, subscribe, mutate, await the Live update ...
+} catch (error:Dynamic) {
+  failure = error;
+}
+if (subscription != null) try subscription.close() catch (_:Dynamic) {}
+client.close();
+if (failure != null) throw failure;
+```
+
+The payoff: cleanup order is explicit, and the original error always wins.
 
 ## Status
 

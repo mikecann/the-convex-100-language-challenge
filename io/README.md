@@ -27,125 +27,80 @@ Nothing from the Io toolchain is installed on your host.
 
 ## Interesting Parts
 
-### A query is a chain of messages
+### Everything after a space is a message
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, { room: "io-readme-query" });
-  if (state === undefined) return <p>Loading...</p>;
-
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**Io**
+Io pares Smalltalk's model down to one rule: `receiver message(arguments)`,
+where a space between two words is a message send. There is no other call
+syntax — `query` below is not a keyword, just a message the client object
+happens to understand.
 
 ```io
-deploymentUrl := System getEnvironmentVariable("CONVEX_URL")
-if(deploymentUrl isNil or deploymentUrl size == 0,
-    Exception raise("CONVEX_URL is required")
-)
-room := "io-readme-query"
+client := Convex clientForUrl(System getEnvironmentVariable("CONVEX_URL"))
+arguments := Convex object(list("room", Convex string("io-demo")))
 
-// list receives messages to build pairs, then object serializes those pairs.
-arguments := Convex object(list("room", Convex string(room)))
-client := Convex clientForUrl(deploymentUrl)
+// TypeScript: const state = useQuery(api.demo.state, { room: "io-demo" })
 response := client query("demo:state", arguments)
-
-// This client preserves Convex values as raw JSON, so this token is not typed.
-countJson := Convex field(response value, "count")
-countJson println
-client close
+Convex field(response value, "count") println
 ```
 
-Io has no classes here. `Convex`, `client`, `response`, and the argument list
-are objects, and each space-separated operation sends a message to the object
-on its left. The React hook owns a live subscription and rerenders the
-component; this particular Io `query` is deliberately a one-off HTTP call. The
-[full example](examples/basics/main.io) adds strict numeric validation before
-using the raw `count` token.
+The last line sends `println` to the extracted value, so the data prints
+itself. The client keeps Convex values as their exact JSON text — Io has a
+single floating-point `Number` type, and raw text never rewrites what Convex
+sent.
 
-### React hides a lifecycle that Io makes explicit
+### State is a cloned Object taught new slots
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function IncrementButton() {
-  const room = "io-readme-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  if (state === undefined) return <button disabled>Loading...</button>;
-  return (
-    <button
-      onClick={async () => {
-        const result = await increment({
-          room,
-          language: "typescript",
-          runId: crypto.randomUUID(), // A fresh id makes the mutation idempotent.
-        });
-        console.log(result.state.count); // The mutation result is type-safe too.
-      }}
-    >
-      Count: {state.count}
-    </button>
-  );
-}
-```
-
-**Io**
+Io inherits prototypes from Self: there are no classes, so the basics example
+conjures its Live bookkeeping by cloning bare `Object` and assigning slots.
+`:=` creates a slot; plain `=` updates one and raises an error if the slot
+does not exist, so a typo cannot silently invent a fresh variable.
 
 ```io
-deploymentUrl := System getEnvironmentVariable("CONVEX_URL")
-if(deploymentUrl isNil or deploymentUrl size == 0,
-    Exception raise("CONVEX_URL is required")
-)
-room := "io-readme-live"
-arguments := Convex object(list("room", Convex string(room)))
-client := Convex clientForUrl(deploymentUrl)
-
-// Clone a plain object and add slots to hold the callback's latest delivery.
 watch := Object clone
 watch latest := nil
 watch deliveries := 0
+watch failure := nil
+
 report := block(kind, payload, logs,
-    if(kind == "value",
+    if(kind == "error") then(
+        watch failure = Convex text(Convex field(payload, "message"))
+    ) else(
         watch latest = payload
         watch deliveries = watch deliveries + 1
     )
 )
+```
 
-// Unlike useQuery, this command-line program owns subscription setup and waits.
+Even the control flow is messages: `if(...)` is a message send, and `then`
+and `else` are messages to its result.
+
+### A Live wait is a block handed to the event pump
+
+The client owns one event loop, and `pumpUntil` drives it until a `block` — a
+real object you pass around like any other value — answers true. Subscribing,
+waiting, mutating, and waiting for the reactive update are four plain message
+sends.
+
+```io
 subscriptionId := client subscribe("demo:state", arguments, report)
 client pumpUntil(block(watch deliveries > 0), client deadlineFor(30000))
 
-runId := room .. "-" .. Convex randomToken(9) // Fresh idempotency key.
-result := client mutation("demo:increment", Convex object(list(
-    "room", Convex string(room),
+// TypeScript: await increment({ room, language, runId }); useQuery re-renders.
+runId := "io-demo-" .. Convex randomToken(9)
+client mutation("demo:increment", Convex object(list(
+    "room", Convex string("io-demo"),
     "language", Convex string("io"),
     "runId", Convex string(runId)
 )))
-result value println // The mutation result is raw JSON, not a typed object.
 
-// Pump again for the reactive update, then release both subscription and client.
+// Wait for Live to deliver the new count instead of polling with a query.
 client pumpUntil(block(watch deliveries > 1), client deadlineFor(30000))
 client unsubscribe(subscriptionId)
-client close
 ```
 
-React mounts, updates, and unmounts `useQuery` for you. This Io client instead
-uses a callback plus an explicit event-loop pump, unsubscribe, and close. That
-blocking API is a design choice made for this small command-line client, not a
-limitation of Io: the language itself also supports coroutines, actors, and
-futures.
+Note `..` on the `runId` line: string concatenation is a message too. React
+hides this whole lifecycle inside `useQuery`; this command-line client makes
+each step a visible send.
 
 ## Status
 

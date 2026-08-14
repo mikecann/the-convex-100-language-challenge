@@ -39,212 +39,93 @@ expected transcript. Nothing needs to be installed on the host.
 
 ## Interesting Parts
 
-### The stack makes every argument explicit
+### A mutation is a sentence of stack words
 
-In React, generated Convex bindings give the mutation typed arguments and a
-typed result. This Forth client builds the same named arguments into JSON, then
-walks the returned JSON document explicitly. The comments in parentheses show
-the stack effect: values before `--` are consumed and values after it are left
-for the next word.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-
-  async function handleClick() {
-    const result = await increment({
-      room: "readme-forth",
-      language: "forth",
-      runId: crypto.randomUUID(), // Fresh per click; retries reuse the call's ID.
-    });
-    console.log(result.state.count); // The generated API makes this type-safe.
-  }
-
-  return <button onClick={handleClick}>Increment</button>;
-}
-```
-
-**Forth**
+Forth has no call syntax and no argument lists. Every named operation — a
+*word* — takes its inputs from a shared data stack, so the arguments come
+first and the verb comes last. Building a Convex mutation's JSON argument
+object is just a run of words, straight out of the canonical example:
 
 ```forth
-require convex.fth
+client s" demo:increment"
+client convex-args
+    \ TypeScript: await increment({ room, language, runId })
+    s" room"     s" readme-forth" convex-arg-string
+    s" language" s" forth"        convex-arg-string
+    s" runId"    fresh-run-id     convex-arg-string
+client convex-args-done
+convex-mutation
+```
 
-\ Fail clearly instead of handing an empty deployment URL to the client.
-: example-give-up ( addr u -- )
-    note-line
-    1 convex-exit ;
+`s"` pushes a string as an address/length pair, so each line hands four cells
+to `convex-arg-string`, which turns them into one JSON property.
 
-: open-example-client ( -- client )
-    s" CONVEX_URL" getenv dup 0= if
-        2drop s" CONVEX_URL is required" example-give-up
-    then
-    convex-open ;
+### `( doc node -- count )` is the type signature
 
-\ Keep the document beside each child node while walking the returned object.
+Forth programmers have documented words with stack-effect comments since the
+1970s: what a word consumes sits left of the `--`, what it leaves sits right.
+Paired with Forth 2012 locals in `{ }`, that comment is the whole interface
+for walking a Convex response:
+
+```forth
+\ json-get returns a child node; keep the document beside it.
 : field ( doc node key-addr key-u -- doc child )
     { doc node key-addr key-count }
     doc  doc node key-addr key-count json-get ;
 
-\ Generate the mutation's idempotency key from unpredictable bytes.
-64 buf-new constant run-id
-
-: fresh-run-id ( -- addr u )
-    run-id buf-reset
-    16 run-id random-hex
-    run-id buf-span ;
-
-open-example-client constant client
-
-client s" demo:increment"
-client convex-args
-    \ Each pair adds one property to the JSON argument object.
-    s" room" s" readme-forth" convex-arg-string
-    s" language" s" forth" convex-arg-string
-    s" runId" fresh-run-id convex-arg-string
-client convex-args-done
-convex-mutation
-
-\ convex-value leaves ( document root-node ); field narrows it to state.count.
-client convex-value s" state" field s" count" field convex-integer . cr
-client convex-free
+\ TypeScript: result.state.count
+client convex-value  s" state" field  s" count" field  convex-integer . cr
 ```
 
-Both snippets create a fresh idempotency key when they invoke the mutation. The
-Forth helper uses the same `random-hex` path as the canonical example. Unlike
-the generated TypeScript API, the Forth client has no compile-time knowledge of
-the backend schema, so a misspelled field becomes a checked runtime error.
+Because `field` leaves `doc child` ready for the next `field`, the chain
+reads left to right like a path expression.
 
-### React owns reactivity; the Forth caller pumps it
+### A Live update is something you wait for, then release
 
-`useQuery` creates a subscription, updates the component, and cleans up when
-the component unmounts. The command-line Forth API exposes those steps. Its
-blocking `convex-live-wait` is a deliberate client design for a single-threaded
-program, not a limitation of the Forth language.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, { room: "readme-forth" });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>Count: {state.count}</p>; // React rerenders on each Live update.
-}
-```
-
-**Forth**
+Convex's signature feature is reactivity, and this client earns its Live
+badge with the WebSocket framing and subscription state written in Forth.
+There is no background thread, so delivery is explicit: waiting pumps the
+single socket owner until your subscription has news.
 
 ```forth
-require convex.fth
-
-\ Fail clearly instead of handing an empty deployment URL to the client.
-: example-give-up ( addr u -- )
-    note-line
-    1 convex-exit ;
-
-: open-example-client ( -- client )
-    s" CONVEX_URL" getenv dup 0= if
-        2drop s" CONVEX_URL is required" example-give-up
-    then
-    convex-open ;
-
-: read-one-update ( client subscription -- )
-    { client subscription }
-    \ Waiting pumps the one socket owner until this subscription has a value.
-    client subscription 10000 convex-live-wait
-    dup convex-live-none = if
-        drop s" no Live value arrived" note-line exit
-    then
-    convex-live-error = if
-        client convex-live-error-message@ note-line
-        client convex-live-release exit
-    then
-    client convex-live-value@ type cr  \ The delivery is JSON text here.
-    client convex-live-release ;       \ Release bounded queue storage promptly.
-
-open-example-client constant client
 client s" demo:state"
-client convex-args
-    s" room" s" readme-forth" convex-arg-string
+client convex-args  s" room" s" readme-forth" convex-arg-string
 client convex-args-done
 convex-subscribe constant subscription
 
-client subscription read-one-update
-client subscription convex-unsubscribe  \ React normally hides this lifecycle.
-client convex-free
+\ TypeScript: const state = useQuery(api.demo.state, { room })
+client subscription 10000 convex-live-wait
+convex-live-value = if
+    client convex-live-value@ type cr  \ the exact bytes Convex sent
+    client convex-live-release         \ hand the bounded queue slot back
+then
+client subscription convex-unsubscribe
 ```
 
-This snippet shows one delivery, not a background component subscription. The
-full [canonical example](examples/basics/main.fth) parses the value, subscribes
-before mutating so there is no update gap, and checks the reactive count.
+The canonical example subscribes *before* mutating, so the increment's
+reactive update cannot fall into a gap — discipline `useQuery` normally hides.
 
-### Decimal JSON numbers are checked without floating point
+### `catch` takes a function pointer, not a block
 
-JavaScript has one ordinary `number` type, so a Convex count written as `0` or
-`0.0` arrives as the same value. This implementation intentionally avoids a
-floating-point detour. `convex-integer` analyses the JSON number's decimal text
-and accepts it only when it is mathematically integral and fits a signed
-64-bit Forth cell.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function CountLogger() {
-  const state = useQuery(api.demo.state, { room: "readme-forth" });
-
-  if (state !== undefined) {
-    console.log(state.count); // Both JSON 0 and 0.0 become the number 0.
-  }
-  return null;
-}
-```
-
-**Forth**
+Forth had structured exception handling long before `try` blocks were
+fashionable, built from two ordinary words: `throw` unwinds the stacks, and
+`catch` runs whatever execution token — Forth's function pointer, fetched
+with `[']` — you hand it, leaving zero on success or the thrown code. The
+example's entire error boundary:
 
 ```forth
-require convex.fth
-
-\ Fail clearly instead of handing an empty deployment URL to the client.
-: example-give-up ( addr u -- )
-    note-line
-    1 convex-exit ;
-
-: open-example-client ( -- client )
-    s" CONVEX_URL" getenv dup 0= if
-        2drop s" CONVEX_URL is required" example-give-up
+\ TypeScript: try { await run() } catch (e) { report(e) }
+: example-main ( -- )
+    ['] example-run catch ?dup if
+        cvx-adopt-fault  \ adopt the code as a structured Convex error
+        report-error
+        1 convex-exit
     then
-    convex-open ;
-
-: state-count ( doc state-node -- count )
-    { doc state }
-    \ Keep the document with the child node, then require an exact integer.
-    doc  doc state s" count" json-get convex-integer ;
-
-open-example-client constant client
-client s" demo:state"
-client convex-args
-    s" room" s" readme-forth" convex-arg-string
-client convex-args-done
-convex-query
-
-client convex-value state-count . cr
-client convex-free
+    0 convex-exit ;
 ```
 
-Fractional, quoted, non-finite, and overflowing values fail instead of being
-silently rounded. The focused regression lives in
-[`client/tests/json-test.fth`](client/tests/json-test.fth).
+Error handling composes like everything else here because it is not special
+syntax — it is one more word taking its values from the stack.
 
 ## Status
 

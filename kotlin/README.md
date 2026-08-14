@@ -34,148 +34,81 @@ suite.
 
 ## Interesting Parts
 
-### Generated types versus explicit JSON
+### The whole session is a trailing lambda
 
-**TypeScript with React**
-
-```tsx
-import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
-
-function Counter() {
-  const state = useQuery(api.demo.state, { room: "readme-kotlin" });
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // Function, arguments, and result are generated types.
-}
-
-export function App() {
-  return (
-    <ConvexProvider client={convex}>
-      <Counter />
-    </ConvexProvider>
-  );
-}
-```
-
-**Kotlin**
+When a Kotlin call's last argument is a lambda, it moves outside the
+parentheses — and `use`, an extension on any `AutoCloseable`, exploits that to
+read like a built-in resource keyword. Both `ConvexClient` and each Live
+`Subscription` are `AutoCloseable`, so the session's lifetime is literally the
+shape of the code.
 
 ```kotlin
-import convex.kotlin.ConvexClient
-import convex.kotlin.integralIntOrNull
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.put
-
-fun main() {
-    val deploymentUrl = System.getenv("CONVEX_URL") ?: error("CONVEX_URL is required")
-    val arguments = buildJsonObject { put("room", "readme-kotlin") }
-
-    ConvexClient(deploymentUrl).use { client ->
-        // This client accepts a function path and JSON, rather than generated types.
-        val state = client.query("demo:state", arguments).value.jsonObject
-        val count = state["count"]?.integralIntOrNull() ?: error("count was not an Int")
-        println(count)
-    } // use closes the client's HTTP and Live resources.
-}
+ConvexClient(deploymentUrl).use { client ->
+    client.subscribe("demo:state", roomArgs).use { subscription ->
+        // ... query, mutate, and watch the room here ...
+    } // Leaving this block unsubscribes from Live.
+} // Leaving this one closes the WebSocket and HTTP resources.
 ```
 
-Kotlin itself is statically typed, but this small client deliberately exposes
-`JsonElement` values instead of generating a Kotlin model for each Convex
-function. The React hook remains subscribed and rerenders its component. The
-Kotlin `query` above is a one-off HTTP read. See
-[`ConvexClient.kt`](client/src/main/kotlin/convex/kotlin/ConvexClient.kt) for the
-actual API.
+React's `useQuery` unsubscribes when your component unmounts; here the same
+cleanup is just a closing brace.
 
-### React-owned reactivity versus an owned subscription
+### Mutation arguments are built, not typed out
 
-**TypeScript with React**
-
-```tsx
-import {
-  ConvexProvider,
-  ConvexReactClient,
-  useMutation,
-  useQuery,
-} from "convex/react";
-import { api } from "./convex/_generated/api";
-
-const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
-
-function Counter() {
-  const state = useQuery(api.demo.state, { room: "readme-live" });
-  const increment = useMutation(api.demo.increment);
-  if (state === undefined) return <p>Loading...</p>;
-
-  async function addOne() {
-    const result = await increment({
-      room: "readme-live",
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.state.count); // The mutation result is type-safe too.
-  }
-
-  // React keeps the query subscribed and rerenders after the mutation.
-  return <button onClick={() => void addOne()}>Count: {state.count}</button>;
-}
-
-export function App() {
-  return (
-    <ConvexProvider client={convex}>
-      <Counter />
-    </ConvexProvider>
-  );
-}
-```
-
-**Kotlin**
+`buildJsonObject` is a *type-safe builder*: a lambda with receiver, where `put`
+is a method on the very object being constructed. This is the same trick behind
+Gradle's Kotlin DSL, and it lets the compiler check a JSON body brace by brace.
 
 ```kotlin
-import convex.kotlin.ConvexClient
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.put
-import java.util.UUID
+val result =
+    client.mutation(
+        "demo:increment",
+        buildJsonObject {
+            put("room", room)
+            put("language", "kotlin")
+            put("runId", UUID.randomUUID().toString()) // Idempotency key.
+        },
+    ).value.jsonObject
+// TypeScript: await increment({ room, language: "typescript", runId })
+```
 
-fun main() {
-    val deploymentUrl = System.getenv("CONVEX_URL") ?: error("CONVEX_URL is required")
-    val roomArguments = buildJsonObject { put("room", "readme-live") }
+### An extension function bolted onto someone else's JSON
 
-    ConvexClient(deploymentUrl).use { client ->
-        // Start Live first so no update can be missed between the read and mutation.
-        client.subscribe("demo:state", roomArguments).use { subscription ->
-            val initialUpdate = subscription.next() ?: error("initial Live value timed out")
-            initialUpdate.error?.let { throw it }
-            val initial = initialUpdate.value ?: error("initial Live value was missing")
-            println(initial.jsonObject["count"]) // The first snapshot is delivered explicitly.
+Convex may serialize an integral counter as `0.0`, which the stock
+kotlinx.serialization `int` accessor rejects. Kotlin's fix is charming: declare
+a new method *on* `JsonElement` — a class this repo does not own — and call it
+as if it had always been there.
 
-            val result =
-                client.mutation(
-                    "demo:increment",
-                    buildJsonObject {
-                        put("room", "readme-live")
-                        put("language", "kotlin")
-                        put("runId", UUID.randomUUID().toString())
-                    },
-                ).value.jsonObject
-            println(result["state"]) // The caller decodes the returned JSON shape.
+```kotlin
+// JsonNumbers.kt adds this to kotlinx.serialization's JsonElement.
+fun JsonElement.integralIntOrNull(): Int? { /* BigDecimal.intValueExact, no rounding */ }
 
-            val updatedEvent = subscription.next() ?: error("Live update timed out")
-            updatedEvent.error?.let { throw it }
-            val updated = updatedEvent.value ?: error("Live update value was missing")
-            println(updated.jsonObject["count"]) // next blocks until a snapshot arrives.
-        } // Closing the subscription removes it from Live.
-    }
+val state = client.query("demo:state", roomArgs).value.jsonObject
+val count = state["count"]?.integralIntOrNull() ?: error("count was not an Int")
+```
+
+That last line chains the safe-call `?.` with `?:` — the Elvis operator, so
+named because, viewed sideways, it is his quiff.
+
+### Question marks decode the Live update
+
+A Live update — the WebSocket push Convex sends when a query's result changes —
+arrives as a small data class whose `value` and `error` are both nullable.
+Nullability lives in Kotlin's type system, so the three outcomes (timeout,
+query failure, fresh snapshot) each take one line, and the compiler will not
+let you skip any of them.
+
+```kotlin
+client.subscribe("demo:state", roomArgs).use { subscription ->
+    // TypeScript: const state = useQuery(api.demo.state, { room })
+    val update = subscription.next() ?: error("Live update timed out") // null = timeout
+    update.error?.let { throw it }                // A structured query failure.
+    println(update.value?.jsonObject?.get("count")) // The fresh snapshot.
 }
 ```
 
-Kotlin supports coroutines, callbacks, and streams. This client's blocking
-`Subscription.next()` is an API choice for a small command-line demonstration,
-not a language limitation. It makes lifecycle and ordering visible, while React
-owns those details for `useQuery`. The complete sequence is in the
-[canonical example](examples/basics/Main.kt).
+`next()` blocks on a bounded queue keeping only the newest 16 snapshots — a
+deliberately visible version of the bookkeeping React hides inside `useQuery`.
 
 ## Status
 

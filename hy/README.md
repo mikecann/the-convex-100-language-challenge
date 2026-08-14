@@ -12,29 +12,75 @@ through the root Docker command: `./run verify-example hy`.
 
 ## Interesting Parts
 
-Hy keeps the Lisp call shape while using the same named Convex arguments a
-React client would pass:
+Hy has been around since 2013, its mascot is a cuttlefish named Cuddles, and
+its trick is compiling s-expressions straight into Python's own abstract
+syntax tree. Every parenthesis below runs as ordinary Python 3 — this repo
+even transpiles ahead of time, so the shipped image contains no Hy at all.
 
-```typescript
-const value = await client.query("demo:state", { room });
-```
+### The method dot walks to the front
 
-```hy
-(setv value (.query client "demo:state" {"room" room}))
-```
-
-Starting Live before the mutation is explicit in both versions. The Hy
-subscription returns structured updates so query failures stay distinct from
-successful values:
-
-```typescript
-const unsubscribe = client.onUpdate("demo:state", { room }, handleUpdate);
-```
+A Python method call becomes a Lisp form whose head starts with a dot:
+`(.query client …)` is `client.query(…)`. Braces build a dict with no colons
+or commas — pairs are simply adjacent — and `(. result value)` is attribute
+access on the `Result` the client hands back.
 
 ```hy
-(setv subscription (.subscribe client "demo:state" {"room" room}))
-(setv update (.next-update subscription 10))
+;; TypeScript: const state = await client.query("demo:state", { room });
+(setv result (.query client "demo:state" {"room" room}))
+(setv current (get (. result value) "count"))
+(print (+ "current count: " (str current)))
 ```
+
+Read aloud, the first call really does say "query the client".
+
+### Kebab-case on the page, snake_case underneath
+
+Hy "mangles" identifiers so Lisp-style names survive as valid Python:
+`deployment-url` compiles to `deployment_url`. The client's API is written
+this way too — `set-auth` in Hy is `set_auth` to any Python caller.
+
+```hy
+;; deployment-url is deployment_url by the time Python runs it.
+(setv deployment-url (.get os.environ "CONVEX_URL")
+      room (if (> (len sys.argv) 1) (get sys.argv 1) "hy-example"))
+(setv client (Client deployment-url))
+```
+
+One `setv` binds several names, and `if` is an expression, so the fallback
+room name needs no extra scaffolding.
+
+### Python's batteries, Lisp's parentheses
+
+Because Hy *is* Python underneath, there is no FFI story: the example calls
+`secrets.token_hex` mid-expression to mint the `runId` that makes the
+increment mutation safe to retry.
+
+```hy
+;; TypeScript: await client.mutation("demo:increment", { room, language, runId })
+(setv mutation (. (.mutation client "demo:increment"
+                             {"room" room "language" "hy"
+                              "runId" (secrets.token_hex 8)})
+                  value))
+(print (get (get mutation "state") "count"))
+```
+
+### A Convex error type in four s-expressions
+
+`defclass` is Python's class machinery in prefix notation. The client uses it
+to keep a failed Convex function distinct from transport trouble:
+`FunctionError` carries the server's structured `data` and `logs`, much like
+`ConvexError` in the official TypeScript SDK. Square-bracket parameters like
+`[data None]` declare defaults, and `#(message)` is Hy's tuple literal.
+
+```hy
+(defclass FunctionError [ConvexError]
+  (defn __init__ [self message [data None] [logs None]]
+    (setv self.args #(message))
+    (setv self.data data self.logs (or logs []))))
+```
+
+Catching it puts the application data your Convex function threw one
+`except` clause away.
 
 ## Status
 

@@ -36,136 +36,90 @@ the shared expected transcript. You do not need Factor installed on your host.
 
 ## Interesting Parts
 
-### A request reads from left to right through the stack
+### The compiler checks the stack, not just the syntax
 
-Factor calls functions "words". Values are placed on a data stack, then words
-consume them and leave results behind. Stack-effect comments such as
-`( client path args -- result )` describe that flow. This client's public words
-compose naturally, although its JSON API returns raw JSON text rather than the
-generated TypeScript types a normal Convex React app enjoys.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const room = "factor-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**Factor**
+Factor calls its functions "words", and every word declares a stack effect
+such as `( client path args -- result )`: what it consumes, what it leaves
+behind. These are not comments — the compiler rejects any word whose body
+does not balance its declared effect. Inside a lexical-locals word (`::`),
+the `:>` word names whatever is on top of the stack, so a Convex query reads
+as a left-to-right pipeline.
 
 ```factor
-USING: accessors arrays environment kernel locals math.parser
-sequences convex convex.json ;
-
-ERROR: example-error message ;
-
-:: read-count ( -- count )
-    "CONVEX_URL" os-env
-    [ "CONVEX_URL is required" example-error ] unless* :> deployment
-    "factor-readme" :> room
+:: read-count ( deployment room -- count )
     deployment <convex-client> :> client
-
-    ! Build the same { room: "factor-readme" } argument as JSON text.
-    room json-escape-string "room" swap 2array 1array json-object
-    :> room-args
-
-    ! Each word consumes the value left by the word before it.
-    client "demo:state" room-args client-query result-value
-    "count" json-field json-whole-number :> count
-
-    client 2 client-close ! Give cleanup a two-second deadline.
-    count ;
-```
-
-The React hook subscribes and rerenders when `demo:state` changes. The Factor
-fragment makes one HTTP query, so it is deliberately not equivalent to the
-hook's reactivity. It shows the same function name, argument, and returned
-`count` at the request level. The explicit JSON construction and decoding are
-choices in this small client, not limitations of Factor itself.
-
-### Live is an owned resource, not a hook
-
-React hides subscription setup, waiting, and teardown behind component
-lifecycle. This command-line API exposes those steps so a caller decides how
-long to wait and when to release the socket.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function IncrementingCounter() {
-  const room = "factor-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  const addOne = () =>
-    increment({ room, language: "TypeScript", runId: crypto.randomUUID() });
-
-  return <button onClick={addOne}>{state?.count ?? "Loading..."}</button>;
-  // React owns the Live subscription and cleans it up on unmount.
-}
-```
-
-**Factor**
-
-```factor
-USING: accessors arrays environment kernel locals make math.parser
-random sequences convex convex.json ;
-
-ERROR: example-error message ;
-
-:: observe-one-change ( -- before after )
-    ! Configure one client from the deployment URL supplied to the container.
-    "CONVEX_URL" os-env
-    [ "CONVEX_URL is required" example-error ] unless* <convex-client>
-    :> client
-    "factor-live" :> room
     room json-escape-string "room" swap 2array 1array json-object :> args
 
-    ! Subscribe first. The client opens Live lazily on this call.
-    client "demo:state" args client-subscribe :> subscription
-    ! The first delivered value hydrates the room's current state.
-    subscription 15 subscription-next update-value
-    "count" json-field json-whole-number :> before
-
-    ! Read 16 random bytes and format them as a fresh idempotency key.
-    [ 16 random-bytes [ >hex 2 CHAR: 0 pad-head % ] each ] "" make :> run-id
-
-    ! Build the same mutation arguments as the React call above.
-    [
-        "room" room json-escape-string 2array ,
-        "language" "\"Factor\"" 2array ,
-        "runId" run-id json-escape-string 2array ,
-    ] { } make json-object :> increment-args
-    client "demo:increment" increment-args client-mutation drop
-
-    ! The next delivery is the reactive update caused by the mutation.
-    ! next blocks only until the client delivers it or 15 seconds pass.
-    subscription 15 subscription-next update-value
-    "count" json-field json-whole-number :> after
-
-    ! Acknowledge unsubscribe, close the client, then return two stack values.
-    client subscription 2 client-unsubscribe
-    client 2 client-close
-    before after ;
+    ! TypeScript: const state = useQuery(api.demo.state, { room })
+    client "demo:state" args client-query result-value
+    "count" json-field "count" json-whole-number ;
 ```
 
-Factor has threads, mailboxes, quotations, and higher-order combinators. The
-blocking `subscription-next` word is this client's API choice for a
-command-line example, not a language restriction. Underneath it, one owner
-thread manages the WebSocket and each subscription has a bounded queue that
-keeps the newest
-updates for a slow consumer.
+Each word consumes what the one before it left: the query result feeds
+`result-value`, the raw JSON feeds `json-field`, and the field feeds the
+whole-number decoder.
+
+### The comma is a word, and it builds the mutation's JSON
+
+`[ ... ] { } make` runs a quotation with an implicit sequence growing behind
+the scenes, and `,` is an ordinary word that appends to it. The client uses
+this beloved Factor idiom to assemble mutation arguments pair by pair — and
+the string variant (`"" make` with `%`) to format a fresh idempotency key
+from 16 random bytes.
+
+```factor
+! TypeScript: await increment({ room, language: "Factor", runId })
+[
+    "room" room json-escape-string 2array ,
+    "language" "\"Factor\"" 2array ,
+    "runId" run-id json-escape-string 2array ,
+] { } make json-object :> increment-args
+client "demo:increment" increment-args client-mutation drop
+```
+
+### A reactive update is a value you wait for, with a deadline
+
+Convex's signature move is the Live subscription: subscribe first, mutate,
+and the new state is pushed to you. Here the push surfaces as
+`subscription-next`, a bounded wait that returns the next delivery or `f`
+once the deadline passes. Underneath, one owner thread owns the WebSocket
+and every other green thread talks to it by posting messages through
+Factor's `concurrency.mailboxes` — a design straight from the actor
+playbook.
+
+```factor
+! Subscribe before mutating, so the update below must arrive reactively.
+client "demo:state" args client-subscribe :> subscription
+subscription 15 subscription-next update-value
+"count" json-field "count" json-whole-number :> before
+
+client "demo:increment" increment-args client-mutation drop
+
+! TypeScript: useQuery(api.demo.state, { room }) would rerender here.
+subscription 15 subscription-next update-value
+"count" json-field "count" json-whole-number :> after
+```
+
+The `15` is seconds: no Live wait in the canonical example can hang forever.
+
+### Try/finally is three quotations and one word
+
+Quotations — the `[ ... ]` blocks — are first-class values, so control flow
+arrives as ordinary words that consume them. `cleanup` takes a body, a
+quotation that always runs, and one reserved for errors; `recover` is
+try/catch. The canonical example leans on both so a failure still releases
+the socket and its owner thread.
+
+```factor
+[
+    ! ... query, subscribe, mutate, observe the 0 -> 1 update ...
+] [
+    subscription [ client subscription 2 client-unsubscribe ] when
+    [ client 2 client-close ] [ drop ] recover
+] [ ] cleanup
+```
+
+No keywords were harmed: `if`, `while`, and `cleanup` are all just words.
 
 ## Status
 

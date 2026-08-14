@@ -17,130 +17,75 @@ The canonical [`examples/basics/Main.idr`](examples/basics/Main.idr) reads a cou
 
 ## Interesting Parts
 
-### JSON shapes stay visible
+### The compiler asks whether your network calls halt
 
-In a typical Convex React app, generated bindings give the query arguments and result their TypeScript types. This small Idris client deliberately exposes a general JSON API, so the argument object and the result decoding are both visible at the call site.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function Counter() {
-  const room = "idris-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // `state` and `count` are type-safe here.
-}
-```
-
-**Idris**
+Idris grew out of a research programme where programs double as proofs, so the compiler classifies every function's totality: a `total` function provably terminates and covers every case, while a `covering` one handles every input but might loop. A client that blocks on a WebSocket cannot honestly promise termination, so this repo's transport functions say so right in their declarations.
 
 ```idris
-import Convex
-import Data.Maybe
-import System
-import System.File
+-- `total` would demand a termination proof the network cannot give,
+-- so every socket-touching function declares itself `covering`.
+export covering
+query : Client -> String -> Json -> IO (Either ConvexError CallResult)
 
-abort : String -> IO a
-abort reason =
-  do ignore $ fPutStrLn stderr ("convex example: " ++ reason)
-     exitFailure
-
-main : IO ()
-main =
-  do let room = "idris-readme"
-     deployment <- getEnv "CONVEX_URL"
-     url <- maybe (abort "CONVEX_URL is required") pure deployment
-     created <- newClient url
-     case created of
-          Left problem => abort problem -- Client creation can fail explicitly.
-          Right client =>
-            do response <- query client "demo:state"
-                             (JObject [("room", JString room)]) -- Build the JSON argument.
-               case response of
-                    Left problem => putStrLn (message problem) -- `Either` needs both cases.
-                    Right result =>
-                      case field "count" (resultValue result) >>= wholeNumber of
-                           Just count => printLn count -- Dynamic JSON is now an Idris `Int`.
-                           Nothing => putStrLn "state had no whole count"
-               closeClient client
+export covering
+nextUpdate : Client -> Subscription -> (budgetMs : Int) -> IO (Maybe LiveUpdate)
 ```
 
-That manual decoding is a choice made by this demonstration client, not a limitation of Idris. The tradeoff is less generated convenience, but the code makes the wire-level JSON boundary hard to miss. See the [`Json` type and accessors](client/Convex/Json.idr).
+And `(budgetMs : Int)` is more than documentation flair: in a dependently typed language, argument names in a signature are real binders that later parts of the type may refer to.
 
-### React owns reactivity; this program owns the subscription
+### Reading `count` is a `>>=` chain the compiler audits
 
-`useQuery` subscribes when the component renders, updates the component when data changes, and cleans up with the component lifecycle. This command-line client instead returns a subscription handle and exposes a blocking `nextUpdate`. Idris supports richer concurrency patterns, but this client intentionally uses a single caller-driven socket owner.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function Counter() {
-  const room = "idris-live-readme";
-  const state = useQuery(api.demo.state, { room }); // React owns this subscription.
-  const increment = useMutation(api.demo.increment);
-
-  async function addOne() {
-    await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-    // `useQuery` rerenders the component with the resulting state.
-  }
-
-  return <button onClick={addOne}>Count: {state?.count ?? 0}</button>;
-}
-```
-
-**Idris**
+This demonstration client has no generated bindings, so a query result arrives as a plain `Json` sum type. Accessors such as `field` and `wholeNumber` each return a `Maybe` — Idris's "might be absent" type — and `>>=` threads the possible failure through the chain, with the compiler insisting the `Nothing` case is handled.
 
 ```idris
-import Convex
-import Data.Maybe
-import System
-import System.File
-
-abort : String -> IO a
-abort reason =
-  do ignore $ fPutStrLn stderr ("convex example: " ++ reason)
-     exitFailure
-
-main : IO ()
-main =
-  do let room = "idris-live-readme"
-     deployment <- getEnv "CONVEX_URL"
-     url <- maybe (abort "CONVEX_URL is required") pure deployment
-     created <- newClient url
-     case created of
-          Left problem => abort problem
-          Right client =>
-            do started <- subscribe client "demo:state" (JObject [("room", JString room)])
-               case started of
-                    Left problem => abort (message problem)
-                    Right watch =>
-                      do initial <- nextUpdate client watch 10000
-                         -- `nextUpdate` drives Live until the initial value arrives.
-                         runId <- newRunId
-                         changed <- mutation client "demo:increment"
-                                      (JObject [ ("room", JString room)
-                                               , ("language", JString "idris")
-                                               , ("runId", JString runId)
-                                               ])
-                         -- This is the reactive result, not a new HTTP query.
-                         updated <- nextUpdate client watch 10000
-                         -- Cleanup is explicit outside a component lifecycle.
-                         ignore $ unsubscribe client watch
-                         closeClient client
+wholeCount : String -> Json -> IO Int
+wholeCount step state =
+  -- TypeScript: const count = state.count  (generated types vouch for it)
+  case field "count" state >>= wholeNumber of
+       Just value => pure value
+       Nothing => abort (step ++ " did not contain a whole count")
 ```
 
-The complete example checks the `Either` and `Maybe` values omitted from this focused sequence. The important semantic difference is lifecycle ownership: React rerenders automatically, while this program decides when to wait, unsubscribe, and close.
+`wholeNumber` also knows Convex numbers travel as Float64: it accepts `1.0` as a count of one but rejects `1.5` outright instead of rounding it.
+
+### The reactive update is the next value, not a rerender
+
+`useQuery` hides Convex's WebSocket sync protocol behind React's lifecycle. Here the same protocol is caller-driven: `subscribe` returns a watch handle, and `nextUpdate` runs the socket loop until an update arrives or the millisecond budget expires. The example subscribes *before* writing, so the reactive update provably cannot be missed.
+
+```idris
+started <- subscribe client "demo:state" (JObject [("room", JString room)])
+watch <- either (abort . message) pure started
+initial <- nextUpdate client watch 10000  -- the first value arrives here
+
+runId <- newRunId
+changed <- mutation client "demo:increment"
+             (JObject [ ("room", JString room)
+                      , ("language", JString "idris")
+                      , ("runId", JString runId) ])
+
+-- TypeScript: useQuery(api.demo.state, { room }) rerenders on its own.
+updated <- nextUpdate client watch 10000  -- pushed by Convex, not re-queried
+```
+
+Each update is a `LiveUpdate` carrying either a value or a typed error, never both, so a failed reactive query stays a subscription event instead of masquerading as state.
+
+### A termination checker reviews the `Eq` instance
+
+Comparing two JSON values sounds routine until Idris's size-change termination analysis reviews the recursion. A recursive `==` written inside the `Eq Json` implementation desugars into a call through the interface dictionary, which the checker cannot follow — so equality lives in plainly named mutually recursive functions, and the interface is a one-line alias.
+
+```idris
+mutual
+  jsonEq : Json -> Json -> Bool
+  jsonEq (JArray left) (JArray right) = jsonArrayEq left right
+  jsonEq (JObject left) (JObject right) =
+    length left == length right && jsonObjectSubset left right
+  -- ...
+
+Eq Json where
+  (==) = jsonEq  -- a non-recursive alias keeps the checker satisfied
+```
+
+The Live client leans on this equality to suppress an unchanged value when the socket reconnects, so the proof-friendly shape is doing real reactive work.
 
 ## Status
 

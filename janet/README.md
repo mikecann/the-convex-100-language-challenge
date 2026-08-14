@@ -21,115 +21,63 @@ You do not need Janet, OpenSSL development headers, or a C compiler installed on
 
 ## Interesting Parts
 
-### JSON objects become Janet tables
+### The `@` sigil separates what you build from what you get back
 
-In a Convex React app, the generated API gives the argument object and returned value TypeScript types:
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function CounterSnapshot() {
-  const room = "janet-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>Count: {state.count}</p>; // state and count are type-safe here.
-}
-```
-
-Janet's `@{...}` literal creates a mutable table, the language's dictionary type. This client uses string keys for JSON objects and keyword keys such as `:value` for its own result wrapper, so the two layers stay visibly distinct:
-
-**Janet**
+Janet gives its data structures immutable and mutable twins, and one character tells them apart: `{...}` is a frozen struct, `@{...}` is a mutable table. The examples build Convex argument objects as tables with string keys, and the client answers with an immutable struct keyed by Janet keywords like `:value` — so decoded JSON and the client's own wrapper stay visibly distinct:
 
 ```janet
-(import ../../client/convex :as convex)
-
-(defn example-failed [message]
-  (flush)
-  (eprint (string "Janet example failed: " message))
-  (eflush)
-  (os/exit 1))
-
-(def deployment (os/getenv "CONVEX_URL"))
-(unless (and deployment (> (length deployment) 0))
-  (example-failed "CONVEX_URL is required"))
-(def client (convex/new-client deployment))
-(defer (convex/close! client)
-  (def room "janet-readme")
-  (def args @{"room" room}) # Build the named Convex argument object.
-  (def result (convex/query client "demo:state" args))
-  (def state (get result :value)) # :value belongs to the client's result wrapper.
-  (print (get state "count")))    # "count" came from the decoded JSON object.
+(def args @{"room" room}) # mutable table, string keys: the JSON argument object
+# TypeScript: const state = useQuery(api.demo.state, { room })
+(def result (convex/query client "demo:state" args))
+(get-in result [:value "count"]) # :value is the client's frozen result wrapper
 ```
 
-The Janet call is a one-off HTTP query, so it does not keep listening or rerun code when the value changes. Unlike the generated TypeScript API, this Janet client is dynamically typed and checks argument and result shapes at runtime.
+One glance at a literal tells you whether anyone can change it.
 
-### The program owns the reactive lifecycle
+### `defer` retires the socket, success or panic
 
-React ties a `useQuery` subscription to the component and rerenders when the value changes. A mutation is another hook, but the component does not pump a socket or explicitly unsubscribe:
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const room = "janet-live-readme";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  if (state === undefined) return <p>Loading...</p>;
-  return (
-    <button
-      onClick={() => increment({ room, language: "TypeScript", runId: crypto.randomUUID() })}
-    >
-      Count: {state.count} {/* React rerenders when the Live value changes. */}
-    </button>
-  );
-}
-```
-
-A Janet command-line program owns that lifecycle. This client returns a subscription handle, offers a blocking `next-update!` operation, and requires explicit cleanup:
-
-**Janet**
+Janet's `defer` will look familiar to Go programmers, but it is scoped to a block: the cleanup form runs when the body exits, including when it exits by raising an error. The basics example wraps its whole session in one, so the subscription and the WebSocket are retired on every path:
 
 ```janet
-(import ../../client/convex :as convex)
-
-(defn example-failed [message]
-  (flush)
-  (eprint (string "Janet example failed: " message))
-  (eflush)
-  (os/exit 1))
-
-(def deployment (os/getenv "CONVEX_URL"))
-(unless (and deployment (> (length deployment) 0))
-  (example-failed "CONVEX_URL is required"))
-(def client (convex/new-client deployment))
-(def room "janet-live-readme")
-(def args @{"room" room})
-(def subscription (convex/subscribe! client "demo:state" args))
-
 (defer (do
-         (convex/unsubscribe! client subscription) # Stop this reactive query.
-         (convex/close! client))                   # Retire the client and socket.
-  (def initial (convex/next-update! client subscription 15000))
-  (print (get-in initial [:value "count"])) # The subscription's initial value.
-
-  (convex/mutation client "demo:increment"
-                   @{"room" room
-                     "language" "Janet"
-                     "runId" (convex/random-hex 16)})
-
-  (def updated (convex/next-update! client subscription 15000))
-  (print (get-in updated [:value "count"]))) # The mutation arrives reactively.
+         (when subscription (convex/unsubscribe! client subscription))
+         (convex/close! client)) # runs even if anything below raises
+  (def current (convex/query client "demo:state" @{"room" room}))
+  # ... subscribe, mutate, verify ...
+  )
 ```
 
-Janet itself has fibers and an event loop. The blocking `next-update!` API is a deliberate choice for this small teaching client, not a limitation of the language. Internally, one cooperative owner advances the WebSocket and reconnect state so callers cannot write conflicting subscription changes.
+### The bang means it changes something
+
+Following Lisp and Scheme tradition, every function that mutates state ends in `!` — and Convex's reactive side is all bangs. `subscribe!` only records intent; `next-update!` cooperatively pumps the client's single socket owner until the next value lands. A mutation made mid-subscription then arrives as ordinary data:
+
+```janet
+(def subscription (convex/subscribe! client "demo:state" @{"room" room}))
+(convex/next-update! client subscription 15000) # the initial Live value
+
+(convex/mutation client "demo:increment"
+                 @{"room" room "language" "Janet" "runId" (convex/random-hex 16)})
+
+# TypeScript: React just rerenders; here the update is a value you wait for.
+(def updated (convex/next-update! client subscription 15000))
+(get-in updated [:value "count"]) # 0 -> 1, delivered over the socket
+```
+
+### Errors are signals; a failed Live query is data
+
+Janet's error handling rides on fibers, its built-in coroutines: `error` raises a signal a parent fiber can trap, and `try`'s catch clause is a binding pattern, `([problem] ...)`. This client raises signals for transport trouble, but a Live query that fails server-side arrives as a normal update carrying `:error` instead of `:value`:
+
+```janet
+(def update (convex/next-update! client subscription 15000))
+(when (has-key? update :error) # a failed reactive query is just data
+  (example-failed (get-in update [:error :message])))
+
+(try
+  (run-example)
+  ([problem] (example-failed (convex/describe-failure problem)))) # trapped signal
+```
+
+Signals for the unexpected, data for the expected — the generated example below leans on both.
 
 ## Status
 

@@ -28,114 +28,87 @@ approved test deployment:
 
 ## Interesting Parts
 
-### Generated references versus a JSON boundary
+### JSON never leaves home
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-function Counter() {
-  const state = useQuery(api.demo.state, { room: "readme-javascript" });
-  if (state === undefined) return <p>Loading...</p>;
-
-  console.log(state.count); // The generated API makes state and count type-safe.
-  return <p>{state.count}</p>;
-}
-```
-
-**JavaScript**
+JSON was not adopted by JavaScript — it was carved *out of* it, when Douglas
+Crockford froze the language's object-literal notation into a wire format. So
+Convex arguments here are never built or marshalled; they are simply written.
+And because Node runs ES modules with top-level `await`, the call needs no
+`main()` wrapper either — this really is the whole program.
 
 ```javascript
-import { Client } from "./client/convex.js";
-
-const deploymentUrl = process.env.CONVEX_URL;
-if (!deploymentUrl) throw new Error("CONVEX_URL is required");
-
 const client = new Client(deploymentUrl);
-const response = await client.query("demo:state", {
-  room: "readme-javascript", // Arguments are an ordinary named JSON object.
-});
 
-const count = response.value.count;
-if (!Number.isSafeInteger(count)) {
-  throw new TypeError("demo:state returned a non-integer count");
-}
-console.log(count); // This check, not JavaScript's type system, protects the boundary.
-await client.close();
+// Top-level await: module scope, no main() in sight.
+const current = await client.query("demo:state", { room });
+// TypeScript: useQuery(api.demo.state, { room }) — generated refs instead of a string path.
+console.log(current.value.count);
 ```
 
-Convex's generated TypeScript API checks the function reference, arguments, and
-returned shape during development. This small client deliberately uses the
-string path `"demo:state"` and plain JSON, so application code must validate any
-shape it depends on at runtime. The client wraps the returned value with its
-Convex log lines as `{ value, logs }`.
+The literal `{ room }` is shorthand for `{ room: room }` — the source code and
+the JSON on the wire are the same notation.
 
-### Owning a reactive subscription
+### A Live query is a `for await` loop
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-function Counter() {
-  const room = "readme-javascript-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-  if (state === undefined) return <p>Loading...</p>;
-
-  return (
-    <button
-      onClick={() =>
-        increment({ room, language: "typescript", runId: crypto.randomUUID() })
-      }
-    >
-      {state.count} {/* React rerenders after the mutation changes this query. */}
-    </button>
-  );
-}
-```
-
-**JavaScript**
+The subscription that `client.subscribe` returns implements
+`[Symbol.asyncIterator]`, one of the language's protocol hooks. That single
+method makes a reactive Convex query consumable by `for await ... of` (ES2018):
+when `client.mutation("demo:increment", ...)` commits, the server reruns the
+query, pushes the new value down the WebSocket, and the loop takes another turn.
 
 ```javascript
-import { Client } from "./client/convex.js";
+const subscription = client.subscribe("demo:state", { room });
+for await (const update of subscription) {
+  if (update.error) throw update.error;
+  console.log(update.value.count); // TypeScript: React rerenders; here the loop body reruns.
+  if (update.value.count >= 1) break; // Saw the increment land.
+}
+await subscription.close(); // break skips iterator cleanup, so close explicitly.
+```
 
-const deploymentUrl = process.env.CONVEX_URL;
-if (!deploymentUrl) throw new Error("CONVEX_URL is required");
+Realtime updates arrive through the same loop syntax you would use to read
+lines from a file.
 
-const client = new Client(deploymentUrl);
-const room = "readme-javascript-live";
-const subscription = client.subscribe("demo:state", { room }); // Start Live first.
+### `#call` is private because the language says so
 
-try {
-  const first = await subscription.next(); // Wait for the initial reactive value.
-  if (first.done) throw new Error("subscription closed before its first value");
-  if (first.value.error) throw first.value.error;
-  console.log(first.value.value.count);
+For most of its life JavaScript faked privacy with `_underscore` naming
+conventions. ES2022 finally gave classes `#`-prefixed members with hard,
+syntax-level privacy — writing `client.#call(...)` outside the class is a
+`SyntaxError`, not a lint warning. This client uses it to keep three thin
+public verbs over one private HTTP engine.
 
-  await client.mutation("demo:increment", {
-    room,
-    language: "javascript",
-    runId: crypto.randomUUID(), // Make a retry of this write idempotent.
-  });
+```javascript
+export class Client {
+  query(path, args = {}) { return this.#call("query", path, args); }
+  mutation(path, args = {}) { return this.#call("mutation", path, args); }
+  action(path, args = {}) { return this.#call("action", path, args); }
 
-  const changed = await subscription.next(); // The mutation reruns the Live query.
-  if (changed.done) throw new Error("subscription closed before its update");
-  if (changed.value.error) throw changed.value.error;
-  console.log(changed.value.value.count);
-} finally {
-  await subscription.close(); // This sends Remove for the Live query.
-  await client.close(); // This closes the underlying WebSocket.
+  async #call(operation, path, args) {
+    // ...one fetch to `${this.deploymentUrl}/api/${operation}`
+  }
 }
 ```
 
-`useQuery` ties the subscription to a component and React owns its cleanup. A
-command-line program has no component lifecycle, so this client exposes an
-async iterator whose `next()` method makes each value and the cleanup visible.
-That is this client's API choice, not a limitation of JavaScript.
+### Two operators keep the WebSocket lazy
+
+Nothing Live exists until the first subscribe. Nullish assignment `??=`
+(ES2021) creates the connection manager only if it is still `null`, and
+optional chaining `?.` lets `close()` shrug when no subscription ever ran.
+
+```javascript
+subscribe(path, args = {}) {
+  this.live ??= new LiveManager(this.deploymentUrl, this.clientVersion);
+  return this.live.subscribe(path, args);
+}
+
+async close() {
+  this.closed = true;
+  await this.live?.close(); // Never subscribed? Then there is no socket to close.
+}
+```
+
+A purely HTTP session never pays for a WebSocket — two operators carry the
+whole lazy lifecycle.
 
 ## Status
 

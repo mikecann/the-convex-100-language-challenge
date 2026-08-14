@@ -32,137 +32,98 @@ file against a unique room:
 
 ## Interesting Parts
 
-### Success and failure are ordinary values
+### Your whole program is a scene tree
 
-A TypeScript Convex mutation returns a typed promise and rejects on failure.
-This GDScript client instead returns a `Dictionary` containing either `value`
-or `error`, so each network step has an explicit branch.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-
-  async function incrementOnce() {
-    const result = await increment({
-      room: "gdscript-readme-mutation",
-      language: "typescript",
-      runId: crypto.randomUUID(), // A fresh ID makes this logical write idempotent.
-    });
-    console.log(result.state.count); // The generated API types state and count.
-  }
-
-  return <button onClick={incrementOnce}>Increment</button>;
-}
-```
-
-**GDScript**
+Godot has no free-standing `main()`. Even in a windowless terminal run, the
+engine starts its main loop and calls you — so this example *is* a
+`SceneTree`, and `_init` runs the whole Convex journey.
 
 ```gdscript
-func increment_once() -> void:
-	# Configuration stays outside the script, just like a web app's deployment URL.
-	var deployment_url := OS.get_environment("CONVEX_URL")
-	if deployment_url.is_empty():
-		printerr("CONVEX_URL is required")
-		return
-	var created := ConvexClient.create(deployment_url)
-	if ConvexResult.is_failure(created):
-		printerr(created["error"]["message"])
-		return
+class_name ConvexExampleMain
+extends SceneTree
+
+func _init() -> void:
+	quit(_run())
+
+func _run() -> int:
+	# := infers the type; the annotation below re-types the decoded Variant.
+	var created := ConvexClient.create(OS.get_environment("CONVEX_URL"))
 	var client: ConvexClient = created["value"]
-
-	var room := "gdscript-readme-mutation"
-	var arguments := {
-		"room": room,
-		"language": "gdscript",
-		# A fresh ID makes this logical write idempotent.
-		"runId": "gdscript:%s:%d:%d" % [room, Time.get_ticks_usec(), randi()],
-	}
-	var mutated := client.mutation("demo:increment", arguments)
-	if ConvexResult.is_failure(mutated):
-		printerr(mutated["error"]["message"])
-		client.close()
-		return
-
-	# The outer variable is typed, but fields decoded from JSON are Variants.
-	var mutation_value: Dictionary = mutated["value"]
-	var state: Dictionary = mutation_value["state"]
-	var counted := ConvexValues.count_from_json(state.get("count"), "mutation count")
-	if not ConvexResult.is_failure(counted):
-		var count: int = counted["value"] # Explicitly an int after validation.
-		print(count)
-	client.close()
+	print(client.query("demo:state", {"room": "gdscript-example"})["value"])
+	return 0
 ```
 
-GDScript supports optional type annotations, but a `Dictionary` cannot declare
-the type of each field. That matters at the JSON boundary, where Godot parses
-numbers as floats. The client validates whole, finite, exactly representable
-counts before converting them to `int`.
+That pair of declarations is GDScript's gradual typing in one screenful.
 
-### React owns the hook; this program owns the subscription
+### No try, no catch: failure is a Dictionary
 
-`useQuery` subscribes when a component renders and cleans up when it unmounts.
-The command-line GDScript client has no component lifecycle, so it creates the
-client, waits for one delivery, then closes both handles itself.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function RoomCount() {
-  const state = useQuery(api.demo.state, {
-    room: "gdscript-readme-live",
-  });
-  if (state === undefined) return <span>Loading...</span>;
-  // Generated types make state.count a number; React rerenders for later values.
-  return <span>{state.count}</span>;
-}
-```
-
-**GDScript**
+GDScript deliberately ships without exceptions — Godot prefers game code that
+keeps running over stack unwinding. So this client cannot throw: every call
+returns a `Dictionary` carrying either `value` or `error`, and `ConvexResult`
+is the small vocabulary for asking which arrived.
 
 ```gdscript
-func read_first_live_value() -> void:
-	var deployment_url := OS.get_environment("CONVEX_URL")
-	if deployment_url.is_empty():
-		printerr("CONVEX_URL is required")
-		return
-	var created := ConvexClient.create(deployment_url)
-	if ConvexResult.is_failure(created):
-		return
-	var client: ConvexClient = created["value"]
-
-	# subscribe returns a handle for this one reactive query.
-	var subscribed := client.subscribe(
-		"demo:state",
-		{"room": "gdscript-readme-live"},
-	)
-	if ConvexResult.is_failure(subscribed):
-		client.close()
-		return
-	var subscription: ConvexSubscription = subscribed["value"]
-
-	# This client API blocks here and drives Godot's WebSocket polling itself.
-	var update := subscription.next_update(15.0)
-	if not ConvexResult.is_failure(update):
-		var state: Dictionary = update["value"]
-		print(state.get("count"))
-
-	# There is no React unmount, so cleanup is our responsibility.
-	subscription.close()
-	client.close()
+var mutated := client.mutation("demo:increment", {
+	"room": room,
+	"language": "gdscript",
+	"runId": run_id, # A fresh ID makes this logical write idempotent.
+})
+# TypeScript: await increment(args) — failure travels as a rejected promise.
+if ConvexResult.is_failure(mutated):
+	printerr(ConvexResult.error_message(mutated))
+	return 1
+var state: Dictionary = mutated["value"]["state"]
 ```
 
-Godot has signals and `await`, but this client does not expose Live that way.
-Its blocking `next_update` is an API choice for a compact headless example,
-not a limitation of GDScript. A game loop can instead call `client.poll()` and
-use the non-blocking `try_next_update()` method.
+### Every number off the wire is a float, so an int must be earned
+
+Godot's `JSON` parser reads numbers with `String.to_float`, so Convex's
+integral counter arrives as `1.0` — and `"1e999"` becomes infinity rather
+than a parse error. Instead of casting and hoping, the client interrogates
+the value:
+
+```gdscript
+static func count_from_json(value: Variant, context: String) -> Dictionary:
+	if typeof(value) != TYPE_FLOAT:
+		return ConvexResult.protocol_failure("%s is not a JSON number" % context)
+	var number: float = value
+	if not is_finite(number):
+		return ConvexResult.protocol_failure("%s is not finite" % context)
+	if number != floor(number):
+		return ConvexResult.protocol_failure("%s is not a whole number" % context)
+	if absf(number) > float(MAX_EXACT_INTEGER):
+		return ConvexResult.protocol_failure("%s is outside the exact integer range" % context)
+	return ConvexResult.ok(int(number))
+```
+
+Only a whole, finite number inside JavaScript's exact-integer range becomes
+an `int`, so the counter never advances on a value Convex did not send.
+
+### Reactivity you pump one frame at a time
+
+Convex's signature move is the server pushing fresh query results to you.
+React hides that machinery inside `useQuery`; in a game engine its natural
+home is the frame loop. A subscription here is a handle you drain however
+your program breathes:
+
+```gdscript
+var subscribed := client.subscribe("demo:state", {"room": room})
+var subscription: ConvexSubscription = subscribed["value"]
+# TypeScript: const state = useQuery(api.demo.state, { room })
+
+# A one-shot script blocks until Convex pushes the next value:
+var update := subscription.next_update(15.0)
+
+# A running game pumps the WebSocket once per frame instead:
+func _process(_delta: float) -> void:
+	client.poll()
+	var latest := subscription.try_next_update()
+	if not latest.is_empty():
+		print(latest["value"].get("count"))
+```
+
+The basic example subscribes *before* mutating, so the update it receives is
+provably a push from the server, not a lucky re-read.
 
 ## Status
 
