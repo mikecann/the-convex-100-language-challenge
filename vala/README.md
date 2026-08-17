@@ -19,162 +19,60 @@ From the repository root, Docker builds the exact canonical example and runs it 
 
 ## Interesting Parts
 
-### JSON values stay explicit
+### One error domain, four codes, zero exception classes
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function StateCount() {
-  const room = "vala-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  console.log(state.count); // state and count are type-safe here.
-  return <p>Count: {state.count}</p>;
-}
-```
-
-**Vala**
+Vala grew up next to GLib, and GLib error handling predates exception hierarchies: an `errordomain` is a closed set of named codes that `valac` compiles straight down to a `GError`, with no base class to subclass or catch by accident. This client raises exactly one domain for everything Convex can throw at it, and the transport layer catches it by name before falling back to GLib's generic `Error`.
 
 ```vala
-var builder = new Json.Builder ();
-builder.begin_object ();
-builder.set_member_name ("room");
-builder.add_string_value ("vala-readme"); // Build the Convex args object explicitly.
-builder.end_object ();
-
-var url = Environment.get_variable ("CONVEX_URL");
-if (url == null || url.length == 0) {
-  throw new Convex.ClientError.PROTOCOL ("CONVEX_URL is required");
+public errordomain ClientError {
+  TRANSPORT, PROTOCOL, FUNCTION, CLOSED
 }
-var client = new Convex.Client (url);
-var value = client.query ("demo:state", builder.get_root ()).value;
 
-// JSON-GLib gives us a runtime JSON tree, so validate before decoding.
-if (value.get_node_type () != Json.NodeType.OBJECT ||
-    !value.get_object ().has_member ("count")) {
-  throw new Convex.ClientError.PROTOCOL ("demo:state omitted count");
-}
-var count_node = value.get_object ().get_member ("count");
-if (count_node.get_node_type () != Json.NodeType.VALUE ||
-    (count_node.get_value_type () != typeof (int64) &&
-     count_node.get_value_type () != typeof (double))) {
-  throw new Convex.ClientError.PROTOCOL ("demo:state returned a non-number");
-}
-double numeric_count = count_node.get_double ();
-int64 count = (int64) numeric_count;
-if ((double) count != numeric_count) {
-  throw new Convex.ClientError.PROTOCOL ("demo:state returned a fractional count");
-}
-stdout.printf ("%" + int64.FORMAT + "\n", count);
-client.close ();
-```
-
-React and generated Convex types make the component result type-safe and keep it current. This Vala method is a blocking, one-off HTTP query, and its result is a `Json.Node` that the program must inspect. That is a choice in this demonstration client, not a limit of Vala, which also supports asynchronous methods.
-
-### Live updates arrive as GLib signals
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "vala-live-readme";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  return (
-    <button
-      onClick={() =>
-        increment({ room, language: "TypeScript", runId: crypto.randomUUID() })
-      }
-    >
-      Count: {state?.count ?? "loading"} {/* React owns the subscription lifecycle. */}
-    </button>
-  );
+try {
+  stream = session.send (message, cancellation);
+} catch (ClientError error) {
+  throw error; // Already carries the right code; just rethrow it.
+} catch (Error error) {
+  throw new ClientError.TRANSPORT (error.message);
+  // TypeScript: try { await client.query(...) } catch (e) { ... } — one Error type, not four.
 }
 ```
 
-**Vala**
+Every failure this client can raise fits in `TRANSPORT`, `PROTOCOL`, `FUNCTION`, or `CLOSED` — no `instanceof` chain required to know what went wrong.
+
+### A GObject property is one line
+
+Vala's real payoff for compiling through C is GObject, the object system underneath GTK and most of the GNOME stack. Declaring a field as `{ get; construct; }` tells the compiler to generate the backing storage, the getter, and a construct-time-only setter, wired into GObject's actual property machinery rather than hand-written accessors. Every Convex response this client returns is one of these.
 
 ```vala
-Json.Node args_for (string room, string? language = null, string? run_id = null) {
-  var builder = new Json.Builder ();
-  builder.begin_object ();
-  builder.set_member_name ("room");
-  builder.add_string_value (room);
-  if (language != null) {
-    builder.set_member_name ("language");
-    builder.add_string_value (language);
+public class Result : GLib.Object {
+  public Json.Node value { get; construct; }
+  public string[] logs { get; construct; }
+  public Result (Json.Node value, string[] logs = {}) {
+    GLib.Object (value: value, logs: logs);
+    // TypeScript: `interface Result { value; logs }` — here it's a live GObject.
   }
-  if (run_id != null) {
-    builder.set_member_name ("runId");
-    builder.add_string_value (run_id);
-  }
-  builder.end_object ();
-  return builder.get_root ().copy ();
 }
+```
 
-var url = Environment.get_variable ("CONVEX_URL");
-if (url == null || url.length == 0) {
-  throw new Convex.ClientError.PROTOCOL ("CONVEX_URL is required");
-}
-var client = new Convex.Client (url);
-var subscription = client.subscribe ("demo:state", args_for ("vala-live-readme"));
-var loop = new MainLoop (); // A command-line app must keep GLib dispatching events.
-bool mutated = false;
+`construct` rather than `set` means `value` and `logs` are readable everywhere but only ever assigned once, at construction — Vala's answer to `readonly`.
 
+### Live fires as a signal, not a promise
+
+React's `useQuery` re-renders a component whenever fresh data lands; this client has no component tree, so it exposes the same reactivity through a GObject signal instead. `updated` is declared once on `Subscription` and emitted every time a value or error arrives over the WebSocket — the same `.connect()` idiom GTK code uses for a button click. Since there's no framework event loop running underneath it, the program has to pump GLib's own.
+
+```vala
+var subscription = client.subscribe ("demo:state", object_node (room));
 subscription.updated.connect ((value, failure) => {
-  try {
-    if (failure != null) throw new Convex.ClientError.PROTOCOL (failure.message);
-    if (value == null) throw new Convex.ClientError.PROTOCOL ("Live omitted its value");
-
-    if (value.get_node_type () != Json.NodeType.OBJECT ||
-        !value.get_object ().has_member ("count")) {
-      throw new Convex.ClientError.PROTOCOL ("Live omitted count");
-    }
-    var count_node = value.get_object ().get_member ("count");
-    if (count_node.get_node_type () != Json.NodeType.VALUE ||
-        (count_node.get_value_type () != typeof (int64) &&
-         count_node.get_value_type () != typeof (double))) {
-      throw new Convex.ClientError.PROTOCOL ("Live returned a non-number");
-    }
-    double numeric_count = count_node.get_double ();
-    if (numeric_count != numeric_count || numeric_count < 0 ||
-        numeric_count >= 9223372036854775808.0) {
-      throw new Convex.ClientError.PROTOCOL ("Live returned an out-of-range count");
-    }
-    int64 count = (int64) numeric_count; // Convex may encode this as 1 or 1.0.
-    if ((double) count != numeric_count) {
-      throw new Convex.ClientError.PROTOCOL ("Live returned a fractional count");
-    }
-    stdout.printf ("count: %" + int64.FORMAT + "\n", count); // A reactive value arrived.
-    if (!mutated) {
-      mutated = true;
-      client.mutation (
-        "demo:increment",
-        args_for ("vala-live-readme", "Vala", Uuid.string_random ())
-      ); // The runId makes a retry idempotent.
-    } else {
-      client.unsubscribe (subscription); // This client owns cleanup explicitly.
-      client.close ();
-      loop.quit ();
-    }
-  } catch (Error error) {
-    stderr.printf ("Live failed: %s\n", error.message);
-    client.close ();
-    loop.quit ();
-  }
+  if (failure != null) throw new ClientError.PROTOCOL (failure.message);
+  var observed = count_from (value, "Live value");
+  stdout.printf ("live count: %" + int64.FORMAT + "\n", observed);
+  // TypeScript: useQuery(api.demo.state, { room }) re-renders — a signal fires here instead.
 });
-loop.run ();
+loop.run (); // Nothing else keeps the process alive between emissions.
 ```
 
-Vala signals are close to C# events: `.connect` registers a callback that runs when the object emits. The client deliberately exposes Live through that native mechanism. Unlike a React component, this command-line program must keep a GLib main loop running and explicitly unsubscribe and close the client.
+The canonical example below relies on this signal firing twice: once for the initial value, once after the mutation lands.
 
 ## Status
 

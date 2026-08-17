@@ -19,145 +19,59 @@ That command builds the pinned `linux/amd64` example image in Docker and runs th
 
 ## Interesting Parts
 
-### Maps are explicit, and returned JSON is checked at runtime
+### A `map!` literal is a mutation's argument object
 
-In TypeScript, generated Convex types check the mutation arguments and result while you write the component.
-
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-  const [room] = useState(() => `react-readme-${crypto.randomUUID()}`);
-
-  async function handleClick() {
-    const result = await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(), // A retry can reuse this ID safely.
-    });
-    console.log(result.state.count); // The result and count are type-safe here.
-  }
-
-  return <button onClick={handleClick}>Increment</button>;
-}
-```
-
-**REBOL**
+REBOL has no `{ }` object syntax; the JSON-friendly `map!` type is built with `make map! []` and filled one key at a time with `put`. There is no dictionary comprehension and no trailing-comma literal — just an empty map and a short run of `put` calls, which is exactly how every Convex call in this client assembles its `args`.
 
 ```rebol
-do %../../client/convex.r3
+mutation-args: make map! []
+put mutation-args "room" room
+put mutation-args "language" "rebol"
+put mutation-args "runId" enbase random-bytes 8 16
+;; TypeScript: await increment({ room, language: "rebol", runId })
+mutation: convex-mutation "demo:increment" mutation-args
+```
 
-convex-url: get-env "CONVEX_URL"
+It reads like assembling a record by hand rather than writing a literal — plainer than the TypeScript object, and just as easy to build in a loop.
+
+### `unless` reads success-first, and failure falls through to `quit/return`
+
+REBOL's `unless` is the mirror of `if`: run the block *unless* the condition is true. Paired with a function returning a plain `true`/`false` and REBOL's `quit/return` (which sets the OS exit code directly), it lets every Convex call read as "assume this worked, and only say what happens if it didn't."
+
+```rebol
 unless convex-open convex-url "rebol-readme-0.1.0" [
     print convex-error-message
     quit/return 1
 ]
 
-room: rejoin ["rebol-readme-" enbase random-bytes 8 16]
-mutation-args: make map! []
-put mutation-args "room" room
-put mutation-args "language" "rebol"
-put mutation-args "runId" enbase random-bytes 8 16
-
 result: convex-mutation "demo:increment" mutation-args
 unless result/ok [
+    ;; TypeScript: try/catch around await increment(args)
     print convex-error-message
     quit/return 1
 ]
-count: convex-field-integer (select result/value "state") "count"
-unless count [
-    print "count was not a safe whole number"
-    quit/return 1
-]
-print count
 ```
 
-`map!` is the REBOL counterpart to the TypeScript argument object. Square-bracket blocks hold ordered REBOL values, so `make map! []` starts from an empty block and the `unless [...]` blocks contain executable code. These are ordinary REBOL blocks, not a custom dialect. Function specifications enforce top-level types at runtime, but decoded JSON fields are dynamic, so this client deliberately validates `count` instead of pretending it has TypeScript-style static field inference.
+No exceptions are thrown or caught here — `result/ok` is just a field on the decoded response map, checked in the open.
 
-### React hides the subscription lifecycle; this client exposes it
+### The Live subscription is polled with a blocking, deadline-bound call
 
-`useQuery` subscribes when the component mounts, updates it when arguments change, and cleans it up when the component unmounts.
-
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const [room] = useState(() => `react-live-${crypto.randomUUID()}`);
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  if (state === undefined) return <p>Loading...</p>;
-
-  return (
-    <button
-      onClick={() =>
-        increment({ room, language: "typescript", runId: crypto.randomUUID() })
-      }
-    >
-      Count: {state.count} {/* This rerenders when the query result changes. */}
-    </button>
-  );
-}
-```
-
-**REBOL**
+`useQuery` in React subscribes on mount and re-renders on every push automatically. This client has no event loop hidden inside a framework, so it exposes the wait explicitly: `convex-subscribe` opens the WebSocket subscription, and `convex-wait-update` blocks up to a millisecond deadline for the next value to arrive over Convex's `/api/sync` protocol.
 
 ```rebol
-do %../../client/convex.r3
-
-convex-url: get-env "CONVEX_URL"
-unless convex-open convex-url "rebol-live-readme-0.1.0" [
-    print convex-error-message
-    quit/return 1
-]
-
-room: rejoin ["rebol-live-" enbase random-bytes 8 16]
-query-args: make map! []
-put query-args "room" room
-
-;; This command-line client owns setup and teardown itself.
 unless convex-subscribe "counter" "demo:state" query-args [
-    print convex-error-message
-    quit/return 1
+    fail "subscribe" convex-error-message
 ]
 initial: convex-wait-update "counter" 15000
-unless initial/ok [
-    print convex-error-message
-    quit/return 1
-]
-print convex-field-integer initial/value "count"
+;; TypeScript: const state = useQuery(api.demo.state, { room })
+check-count "initial Live value" initial/value 0
 
-mutation-args: make map! []
-put mutation-args "room" room
-put mutation-args "language" "rebol"
-put mutation-args "runId" enbase random-bytes 8 16
 mutation: convex-mutation "demo:increment" mutation-args
-unless mutation/ok [
-    print convex-error-message
-    quit/return 1
-]
-
-updated: convex-wait-update "counter" 15000
-unless updated/ok [
-    print convex-error-message
-    quit/return 1
-]
-print convex-field-integer updated/value "count"  ;; The reactive result.
-
-convex-unsubscribe "counter"
-convex-close-live 2000
+updated: convex-wait-update "counter" 15000  ;; the reactive push, not a second query
+check-count "updated Live value" updated/value 1
 ```
 
-The blocking `convex-wait-update` call is a design choice in this small command-line client, not a limitation of REBOL's event system. It keeps the ownership and ordering visible: subscribe, consume the initial value, mutate, consume the update, then clean up. The complete example below adds all value and error checks.
+Subscribe, consume the initial snapshot, mutate, then wait again for the push — the same reactivity React gives you for free, just with the ownership spelled out.
 
 ## Status
 

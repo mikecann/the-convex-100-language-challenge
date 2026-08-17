@@ -16,149 +16,60 @@ From the repository root, Docker builds the Oberon program and runs that exact e
 
 ## Interesting Parts
 
-### JSON is text in a fixed array
+### A JSON value is text you search, not a tree you walk
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function CurrentCount() {
-  const state = useQuery(api.demo.state, { room: "oberon-readme" });
-
-  // state and count are type-safe here.
-  return <span>{state?.count ?? "Loading..."}</span>;
-}
-```
-
-**Oberon-07**
+Convex answers arrive as JSON, but this client never builds an object model for them. Every value stays a fixed, zero-terminated `ARRAY OF CHAR`, and `ConvexJSON.Member` scans that buffer by hand to pull out one field at a time, leaving everything else as untouched text.
 
 ```oberon
-MODULE HttpQuery;
+VAR raw: ARRAY 64 OF CHAR; found, ok: BOOLEAN;
+(* ... *)
+(* TypeScript: const count = state.count *)
+ok := J.Member(value, "count", raw, found) & found;
+IF ok THEN ok := J.IsIntegralNumber(raw) END;
+(* raw is still JSON text -- ordinary digits, parsed by hand from here *)
+```
 
-	IMPORT J := ConvexJSON, S := ConvexSync, Shim := ConvexShim, extEnv, Out;
+There is no parse step to fail up front: a caller only pays for decoding the fields it actually names.
 
-	VAR
-		url: ARRAY 512 OF CHAR;
-		args, value, logs, errorMessage, errorData: ARRAY 8192 OF CHAR;
-		errorName, transportError: ARRAY 256 OF CHAR;
-		countText: ARRAY 64 OF CHAR;
-		haveUrlRes: INTEGER;
-		found, hasErrorData, ok: BOOLEAN;
+### A Live update only shows up when you Pump for it
 
-	PROCEDURE Fail(message: ARRAY OF CHAR);
-	BEGIN
-		Out.String(message); Out.Ln;
-		Shim.Exit(1)
-	END Fail;
+Oberon does have procedure values, so this client could have taken a callback. It doesn't. `Subscribe` hands back a `handle`, and the caller keeps calling `Pump` — a single blocking procedure that owns the WebSocket, reconnects, and the queue of pending updates — until an event carrying that handle appears.
 
-	PROCEDURE SetJSON(text: ARRAY OF CHAR; VAR destination: ARRAY OF CHAR);
-	VAR i: INTEGER;
-	BEGIN
-		i := 0;
-		WHILE text[i] # 0X DO
-			(* Backticks stand in for quote marks that OBNC cannot escape. *)
-			IF text[i] = "`" THEN destination[i] := CHR(34)
-			ELSE destination[i] := text[i]
-			END;
-			INC(i)
-		END;
-		destination[i] := 0X
-	END SetJSON;
+```oberon
+S.Subscribe("demo:state", args, handle, ok, errorText);
+IF ~ok THEN Fail(errorText) END;
 
-BEGIN
-	url[0] := 0X;
-	extEnv.Get("CONVEX_URL", url, haveUrlRes);
-	IF haveUrlRes < 0 THEN Fail("CONVEX_URL is required") END;
-	S.Init(url, "");
+REPEAT
+	(* One caller, one socket: Pump is the only place a Live event arrives. *)
+	S.Pump(200, eventKind, eventHandle, value, logs, errorName,
+		errorMessage, errorData, hasErrorData)
+UNTIL (eventKind # 0) & (eventHandle = handle);
+(* TypeScript: const state = useQuery(api.demo.state, { room }) *)
+```
 
-	SetJSON("{`room`:`oberon-readme`}", args);
-	S.Call("query", "demo:state", args, value, logs, errorName,
-		errorMessage, errorData, hasErrorData, ok, transportError);
-	IF ~ok THEN Fail(transportError) END;
-	IF errorName[0] # 0X THEN Fail(errorMessage) END;
+`useQuery` hides exactly this loop inside a hook; here it is a visible `REPEAT` the caller owns outright.
 
-	(* The result is raw JSON, so the caller selects and validates count. *)
-	IF ~(J.Member(value, "count", countText, found) & found) THEN
-		Fail("demo:state omitted count")
+### No `LOOP`, no `EXIT`: a boolean carries you out
+
+Oberon-07 trims even earlier Oberon dialects, dropping `LOOP`/`EXIT` entirely, and a procedure's `RETURN` must be its final statement. With no early break available, a "wait until" loop threads its own exit condition through a plain flag instead.
+
+```oberon
+waited := 0;
+done := FALSE;
+WHILE ~done DO
+	S.Pump(200, eventKind, eventHandle, eventValue, eventLogs,
+		eventErrorName, eventErrorMessage, eventErrorData, eventHasErrorData);
+	IF (eventKind # 0) & (eventHandle = targetHandle) THEN
+		decoded := DecodeCount(eventValue, result);
+		done := TRUE
+	ELSE
+		INC(waited);
+		IF waited > 150 THEN Fail("timed out waiting for a Live update") END
 	END
-END HttpQuery.
+END
 ```
 
-React's generated API types give the TypeScript call a structured argument and result. This client instead represents JSON in bounded, zero-terminated `ARRAY OF CHAR` buffers. `S.Call` is a one-off HTTP query, so unlike `useQuery` it does not subscribe or trigger another render. The full decoding and error checks are in the [canonical example](examples/basics/main.obn).
-
-### React rerenders; this client pumps
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, { room: "oberon-live" });
-
-  // React owns the subscription and rerenders when count changes.
-  return <span>{state?.count ?? "Loading..."}</span>;
-}
-```
-
-**Oberon-07**
-
-```oberon
-MODULE LiveQuery;
-
-	IMPORT S := ConvexSync, Shim := ConvexShim, extEnv, Out;
-
-	VAR
-		url: ARRAY 512 OF CHAR;
-		args, value, logs, errorMessage, errorData: ARRAY 8192 OF CHAR;
-		errorName, errorText: ARRAY 256 OF CHAR;
-		haveUrlRes, handle, eventKind, eventHandle: INTEGER;
-		hasErrorData, ok: BOOLEAN;
-
-	PROCEDURE Fail(message: ARRAY OF CHAR);
-	BEGIN
-		Out.String(message); Out.Ln;
-		Shim.Exit(1)
-	END Fail;
-
-	PROCEDURE SetJSON(text: ARRAY OF CHAR; VAR destination: ARRAY OF CHAR);
-	VAR i: INTEGER;
-	BEGIN
-		i := 0;
-		WHILE text[i] # 0X DO
-			IF text[i] = "`" THEN destination[i] := CHR(34)
-			ELSE destination[i] := text[i]
-			END;
-			INC(i)
-		END;
-		destination[i] := 0X
-	END SetJSON;
-
-BEGIN
-	url[0] := 0X;
-	extEnv.Get("CONVEX_URL", url, haveUrlRes);
-	IF haveUrlRes < 0 THEN Fail("CONVEX_URL is required") END;
-	S.Init(url, "");
-
-	SetJSON("{`room`:`oberon-live`}", args);
-	S.Subscribe("demo:state", args, handle, ok, errorText);
-	IF ~ok THEN Fail(errorText) END;
-
-	REPEAT
-		(* Pump owns the socket and returns one pending Live event. *)
-		S.Pump(200, eventKind, eventHandle, value, logs, errorName,
-			errorMessage, errorData, hasErrorData)
-	UNTIL (eventKind # 0) & (eventHandle = handle);
-	IF eventKind = 2 THEN Fail(errorMessage) END;
-
-	S.Unsubscribe(handle) (* The command-line program owns cleanup too. *)
-END LiveQuery.
-```
-
-Oberon can have procedure values, but this client deliberately exposes a blocking `Pump` operation instead of callbacks or a stream. That keeps one caller in sole control of WebSocket reads, reconnects, and queued updates. React hides that lifecycle inside `useQuery`; a command-line client has to choose when to wait and when to unsubscribe.
+The flag reads almost like documentation: this loop ends when, and only when, `done` says so.
 
 ## Status
 

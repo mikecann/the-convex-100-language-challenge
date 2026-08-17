@@ -19,88 +19,60 @@ The command builds and runs the exact example in Docker against a unique test ro
 
 ## Interesting Parts
 
-### Type information stops at this client's JSON boundary
+### Constructor parameters that write their own fields
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-function CounterSnapshot() {
-  const room = "typescript-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  if (!state) return <span>Loading...</span>;
-  return <span>{state.count}</span>; // Generated types know count is a number.
-}
-```
-
-**TypeScript**
+TypeScript's classes carry a shorthand plain JavaScript doesn't have: prefixing a constructor parameter with `private`, `readonly`, or `public` declares the field and assigns it in the same breath. The client's `Subscription` object — the handle a Live query hands back — leans on this for every field it owns.
 
 ```typescript
-import { Client } from "./client/convex.js";
-
-const deploymentUrl = process.env.CONVEX_URL;
-if (!deploymentUrl) throw new Error("CONVEX_URL is required");
-const room = "typescript-readme";
-const client = new Client(deploymentUrl);
-
-try {
-  const response = await client.query("demo:state", { room });
-  // This educational client returns unknown, so we describe the JSON shape here.
-  const state = response.value as { count: number };
-  console.log(state.count);
-} finally {
-  await client.close();
+export class Subscription implements AsyncIterable<LiveUpdate> {
+  constructor(
+    private manager: LiveManager,
+    readonly id: number,
+    readonly path: string,
+    readonly args: JsonObject,
+  ) {}
+  // No `this.id = id;` anywhere: TypeScript expands this into plain
+  // field assignments once it compiles down to ordinary JavaScript.
 }
 ```
 
-The official Convex React workflow generates types from the backend, including the function reference, arguments, and returned value. This client's HTTP query is a one-off request, not the reactive equivalent of `useQuery`. It intentionally accepts a string path and returns `unknown`, so the cast helps the compiler but does not validate the server response at runtime. The [complete example](examples/basics/main.ts) adds explicit value checks after decoding.
+Four fields, zero assignment lines, and the compiler still checks every call site that constructs one.
 
-### The command-line program owns its Live subscription
+### A hand-rolled `Symbol.asyncIterator` turns Live updates into a `for await` loop
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-function Counter() {
-  const room = "typescript-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  // React and the Convex hook own subscription setup, updates, and cleanup.
-  return <span>{state?.count ?? "Loading..."}</span>;
-}
-```
-
-**TypeScript**
+`Subscription` doesn't wrap a library's reactive primitive — it implements the same well-known symbol JavaScript itself uses for `for await...of`, so any caller can iterate Live updates as they arrive over the WebSocket.
 
 ```typescript
-import { Client } from "./client/convex.js";
-
-const deploymentUrl = process.env.CONVEX_URL;
-if (!deploymentUrl) throw new Error("CONVEX_URL is required");
-const room = "typescript-readme";
-const client = new Client(deploymentUrl);
-const subscription = client.subscribe("demo:state", { room });
-
-try {
-  // next() waits for the initial state, then waits again for each later update.
-  const initial = await subscription.next();
-  if (!initial.done && !initial.value.error) {
-    const state = initial.value.value as { count: number };
-    console.log(state.count);
+export class Subscription implements AsyncIterable<LiveUpdate> {
+  [Symbol.asyncIterator](): AsyncIterator<LiveUpdate> {
+    return { next: () => this.next() };
   }
-} finally {
-  // A command-line program has no React unmount, so cleanup is explicit.
-  await subscription.close();
-  await client.close();
+  // ...
+}
+
+// Any object carrying that symbol just works with `for await`:
+for await (const update of client.subscribe("demo:state", { room })) {
+  if (update.error) throw update.error;
+  console.log((update.value as { count: number }).count);
 }
 ```
 
-`Subscription` is an `AsyncIterable`, but this client exposes `next()` directly because the verifier needs precise control over the initial and updated values. That is a client API choice, not a TypeScript limitation. In React, `useQuery` manages the reactive lifecycle and causes the component to render again when the value changes.
+The [example program](examples/basics/main.ts) actually calls `.next()` by hand instead, since the verifier needs exactly one initial value and one post-mutation value — but this protocol is what makes the `for await` form available to everyone else.
+
+### The JSON boundary is typed as exactly one thing: `unknown`
+
+The official `convex` npm package runs codegen against your schema, so `useQuery(api.demo.state, args)` comes back already typed. This from-scratch client skips code generation entirely and commits to the honest opposite: every HTTP result is `{ value: unknown; logs: string[] }`, and the caller narrows it.
+
+```typescript
+export type CallResult = { value: unknown; logs: string[] };
+
+const response = await client.query("demo:state", { room });
+// unknown forces this cast to be explicit — TypeScript won't infer it for you.
+const state = response.value as { count: number };
+console.log(state.count);
+```
+
+`unknown` is stricter than `any`: the compiler refuses to let you read `.count` off it until you assert a shape, which is TypeScript's way of admitting this client can't promise the server sent what you expect.
 
 ## Status
 

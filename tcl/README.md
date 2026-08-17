@@ -31,145 +31,62 @@ that exact example against an approved test deployment:
 
 ## Interesting Parts
 
-### Convex objects become Tcl dictionaries
+### A reply becomes a dict, not a type
 
-In a normal Convex React app, generated TypeScript types connect the function
-reference, its arguments, and its return value. This Tcl client instead builds
-JSON explicitly, then decodes the returned object to a Tcl `dict`.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-const room = `tcl-dict-${crypto.randomUUID()}`;
-
-export function Count() {
-  const state = useQuery(api.demo.state, { room });
-  if (state === undefined) return <p>Loading...</p>;
-
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**Tcl**
+Convex sends JSON back over the wire. A TypeScript client leans on generated
+types to know that `state.count` exists; Tcl has no compiler to ask, so this
+client decodes the reply into a plain [`dict`](https://www.tcl-lang.org/man/tcl8.6/TclCmd/dict.htm)
+and every field is looked up by name at runtime.
 
 ```tcl
-source tcl/client/convex.tcl
-
-if {![info exists ::env(CONVEX_URL)] || $::env(CONVEX_URL) eq ""} {
-    error "CONVEX_URL is required"
-}
-set deployment $::env(CONVEX_URL) ;# The real Convex deployment URL.
-set room "tcl-dict-[clock microseconds]" ;# A fresh room for this run.
-set client [::convex::new $deployment]
-
-# This client wants raw JSON arguments, so strings must be quoted explicitly.
 set args [::convex::object [list room [::convex::quote $room]]]
 set response [::convex::query $client demo:state $args]
 set state [::convex::decode [dict get $response value]]
 
-puts [dict get $state count] ;# Checked by key at runtime, not by a type checker.
-::convex::close $client
+puts [dict get $state count] ;# TypeScript: state.count, caught by the compiler instead
 ```
 
-[Tcl dictionaries](https://www.tcl-lang.org/man/tcl8.6/TclCmd/dict.htm) are
-efficient key-value mappings, but Tcl does not statically tie `demo:state` to a
-result shape. The client's `object`, `quote`, and `decode` helpers keep the JSON
-boundary explicit. Also, the Tcl call above is a one-off HTTP query. Unlike
-`useQuery`, it does not subscribe or update a UI.
+Get the key wrong and Tcl fails when the line runs, not before.
 
-### Live is an explicit event-loop relationship
+### Square brackets splice a command straight into a string
 
-React owns the `useQuery` subscription lifecycle and rerenders the component
-when the value changes. Tcl has callbacks and an event loop, but this client
-deliberately exposes subscription ownership directly. The command-line caller
-waits for callback state, then unsubscribes and closes the client itself.
-
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const [room] = useState(() => `tcl-live-${crypto.randomUUID()}`);
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  return (
-    <button
-      disabled={state === undefined}
-      onClick={() =>
-        increment({ room, language: "typescript", runId: crypto.randomUUID() })
-      }
-    >
-      {state?.count ?? "Loading..."} {/* React rerenders on each Live value. */}
-    </button>
-  );
-}
-```
-
-**Tcl**
+Ousterhout built Tcl around one substitution rule: anything inside `[...]`
+runs as a command and its result is pasted into place, even mid-string. There
+are no template literals or string-builder calls — every value, including the
+JSON this client sends Convex, gets assembled the same way.
 
 ```tcl
-source tcl/client/convex.tcl
-
-proc receive_state {kind payload logs} {
-    if {$kind eq "error"} {
-        set ::liveError [::convex::decode [::convex::field $payload message]]
-        set ::liveReady 1 ;# Wake vwait, then report the error outside callback.
-        return
-    }
-    set ::liveState [::convex::decode $payload] ;# Decode the callback's value.
-    set ::liveReady 1 ;# Writing this variable releases vwait below.
-}
-
-if {![info exists ::env(CONVEX_URL)] || $::env(CONVEX_URL) eq ""} {
-    error "CONVEX_URL is required"
-}
-set deployment $::env(CONVEX_URL)
-set room "tcl-live-[clock microseconds]"
-set client [::convex::new $deployment]
-set stateArgs [::convex::object [list room [::convex::quote $room]]]
-
-try {
-    set ::liveError ""
-    set ::liveReady 0
-    set subscription [::convex::subscribe \
-        $client demo:state $stateArgs [list receive_state]]
-    vwait ::liveReady ;# Tcl processes socket events until the callback writes it.
-    if {$::liveError ne ""} { error "Live query failed: $::liveError" }
-    puts "initial: [dict get $::liveState count]"
-
-    # Arm the wait before mutating so a fast update cannot arrive in a gap.
-    set ::liveReady 0
-    set runId "tcl-run-[clock microseconds]"
-    set mutationArgs [::convex::object [list \
-        room [::convex::quote $room] \
-        language [::convex::quote tcl] \
-        runId [::convex::quote $runId]]]
-    set result [::convex::mutation $client demo:increment $mutationArgs]
-    set returned [::convex::decode [dict get $result value]]
-    puts "mutation applied: [dict get $returned applied]" ;# Runtime lookup.
-
-    vwait ::liveReady
-    if {$::liveError ne ""} { error "Live query failed: $::liveError" }
-    puts "updated: [dict get $::liveState count]" ;# The reactive value is now 1.
-} finally {
-    if {[info exists subscription]} {
-        ::convex::unsubscribe $client $subscription
-    }
-    ::convex::close $client
-}
+set room "tcl-live-[clock microseconds]" ;# the bracketed command runs first
+set mutationArgs [::convex::object [list \
+    room [::convex::quote $room] \
+    language [::convex::quote tcl] \
+    runId [::convex::quote [format %x [clock microseconds]]]]]
+set result [::convex::mutation $client demo:increment $mutationArgs]
+puts [dict get [::convex::decode [dict get $result value]] applied]
 ```
 
-[`vwait`](https://www.tcl-lang.org/man/tcl8.6/TclCmd/vwait.htm) processes Tcl
-events until a variable is written. The blocking-looking flow is this client's
-API choice for a readable CLI example, not a limitation of Tcl's callback or
-coroutine support.
+### `vwait` turns Convex's push into a wait
+
+There's no `useQuery` here to own a subscription's lifecycle. Instead the
+client hands Live updates to a plain callback, and the caller blocks on
+[`vwait`](https://www.tcl-lang.org/man/tcl8.6/TclCmd/vwait.htm) — Tcl's event
+loop keeps servicing the WebSocket until that callback writes the variable
+being watched.
+
+```tcl
+proc receive_state {kind payload logs} {
+    set ::liveState [::convex::decode $payload]
+    set ::liveReady 1 ;# writing this releases the vwait below
+}
+
+set subscription [::convex::subscribe $client demo:state $args [list receive_state]]
+vwait ::liveReady ;# TypeScript: this is what useQuery's rerender hides from you
+puts [dict get $::liveState count]
+::convex::unsubscribe $client $subscription
+```
+
+The blocking look is this example's choice, not a limit of Tcl — the same
+event loop is what let the socket keep running underneath `vwait` at all.
 
 ## Status
 

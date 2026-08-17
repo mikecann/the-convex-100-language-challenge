@@ -32,141 +32,67 @@ idempotent increment, and confirms that Live delivers the new value.
 
 ## Interesting Parts
 
-### A familiar query, with an explicit JSON boundary
+### Failure is a return type, not an exception
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, { room: "docs-v" });
-  if (state === undefined) return <p>Loading...</p>;
-
-  return <p>{state.count}</p>; // Generated types make state.count a number.
-}
-```
-
-**V**
+V has no exceptions. A function that can fail says so in its own signature
+with a leading `!`, and every call site either unwraps the failure with
+`or { }` or re-raises it with a trailing `!` — which only compiles if the
+caller's function is itself declared `!`. It is Go's "check every error"
+discipline, except the compiler refuses to build code that skips it.
 
 ```v
-import os
-import x.json2
-import convex
-
 fn run() ! {
-	url := os.getenv('CONVEX_URL')
-	if url.len == 0 {
-		return error('CONVEX_URL is required')
-	}
 	mut client := convex.new_client(url)!
 	defer {
-		client.close() // The command-line program owns the client's lifetime.
+		client.close()
 	}
 
-	// V maps construct the same { room: "docs-v" } argument object.
-	result := client.query('demo:state', {
-		'room': json2.Any('docs-v')
-	})! // A trailing ! returns any client error from run().
-
-	// This demonstration has no generated schema types, so it checks JSON at runtime.
-	state := result.value as map[string]json2.Any
-	count := convex.integral_number(state['count'] or { json2.Any(json2.null) }) or {
-		return error('demo:state did not return an integral count')
-	}
-	println(count)
+	// The trailing `!` re-raises query's failure into run()'s own `!` return.
+	current := client.query('demo:state', {
+		'room': json2.Any(room)
+	})! // TypeScript: const state = await client.query("demo:state", { room })
+	println(current.value)
 }
 ```
 
-The function name and arguments match, but the behavior does not: React's
-`useQuery` stays subscribed and rerenders the component, while `client.query`
-is one HTTP read. The V client deliberately returns `json2.Any` because this
-repository does not generate V types from the Convex schema, so narrowing and
-number validation happen at the boundary. The [complete
-example](examples/basics/main.v) checks the object shape before casting too.
+### Multi-line literals skip the commas
 
-### Live data is an owned resource
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function CounterButton() {
-  const room = "docs-v";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  return (
-    <button
-      disabled={state === undefined}
-      onClick={() =>
-        increment({ room, language: "TypeScript", runId: crypto.randomUUID() })
-      }
-    >
-      {state?.count ?? "Loading..."}
-    </button>
-  ); // React owns subscription setup and cleanup; a new value rerenders this.
-}
-```
-
-**V**
+Convex arguments are ordinary V maps of `json2.Any`, but V's literal syntax
+drops a habit carried over from C: once each entry gets its own line, the
+commas between them disappear. Whitespace does the separating, so a call's
+argument list ends up reading like a small aligned table.
 
 ```v
-import os
-import time
-import x.json2
-import convex
-
-fn run() ! {
-	url := os.getenv('CONVEX_URL')
-	if url.len == 0 {
-		return error('CONVEX_URL is required')
-	}
-	mut client := convex.new_client(url)!
-	defer {
-		client.close() // Also retires the Live worker and socket.
-	}
-
-	// The subscription key lets this program replace or unsubscribe this query.
-	mut updates := client.subscribe('counter', 'demo:state', {
-		'room': json2.Any('docs-v')
-	})!
-	defer {
-		client.unsubscribe('counter') or {}
-	}
-
-	// The first delivery is the query's current value.
-	initial := updates.next(20 * time.second)!
-	if initial.is_error() {
-		return error(initial.error_message)
-	}
-	println(initial.value)
-
-	// Mutate only after subscribing, using the same arguments as the React call.
-	mutation := client.mutation('demo:increment', {
-		'room':     json2.Any('docs-v')
-		'language': json2.Any('V')
-		'runId':    json2.Any('v-${time.sys_mono_now()}')
-	})!
-	println(mutation.value) // The returned JSON contains { applied, state }.
-
-	// The relay blocks until Convex pushes the recomputed query value.
-	updated := updates.next(20 * time.second)!
-	if updated.is_error() {
-		return error(updated.error_message)
-	}
-	println(updated.value)
-}
+mutation := client.mutation('demo:increment', {
+	'room':     json2.Any(room)
+	'language': json2.Any('V')
+	'runId':    json2.Any('v-${os.getpid()}-${time.sys_mono_now()}')
+})! // TypeScript: await mutation({ room, language: "V", runId })
 ```
 
-V supports threads and channels, but this client intentionally exposes a
-blocking, deadline-bounded `next` operation. That keeps ownership obvious for a
-small command-line client: one internal worker owns the WebSocket, and the
-caller owns the subscription relay. Unlike a React hook, nothing automatically
-unsubscribes when a component disappears.
+### A subscription is a queue you poll, not a hook that reruns
+
+Convex's Live protocol pushes a fresh value whenever a subscribed query's
+result changes; React's `useQuery` hides that push behind a hook that reruns
+your component for you. V's client hands back a `Relay` instead — a bounded,
+deadline-aware queue the caller reads from by hand, with nothing unsubscribing
+on your behalf once you stop caring.
+
+```v
+mut updates := client.subscribe('counter', 'demo:state', {
+	'room': json2.Any(room)
+})!
+defer {
+	client.unsubscribe('counter') or {} // Nothing does this automatically.
+}
+
+// next blocks until Convex pushes a value, or the deadline passes.
+initial := updates.next(20 * time.second)!
+if initial.is_error() {
+	return error(initial.error_message)
+}
+println(initial.value) // TypeScript: useQuery reruns the component instead.
+```
 
 ## Status
 

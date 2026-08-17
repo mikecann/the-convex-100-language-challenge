@@ -33,110 +33,85 @@ client capabilities shown below.
 
 ## Interesting Parts
 
-### A Convex response arrives as an actor message
+### Convex answers arrive as a behaviour, not a return value
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function Counter({ room }: { room: string }) {
-  // useQuery owns a reactive subscription for this component.
-  const state = useQuery(api.demo.state, { room });
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // The generated API makes count type-safe.
-}
-```
-
-**Pony**
+Pony has no blocking calls and no promises. An actor's public entry points —
+called **behaviours** — run asynchronously and return immediately, so
+`ConvexClient.query` can't hand back a value the way a function would.
+Instead the call takes a caller-chosen `step` label and a callback, and the
+eventual answer surfaces later as a separate call to `convex_ok` or
+`convex_failed` carrying that same label back.
 
 ```pony
-actor CounterReader is ConvexCallback
-  let _env: Env
-  let _client: ConvexClient
+_client.query(
+  "initial-query", "demo:state", JsonOf.obj1("room", room), this)
 
-  new create(env: Env, deployment_url: String, room: String) ? =>
-    _env = env
-    let config = ConvexConfig(ConvexEndpoint(deployment_url)?)
-    _client = ConvexClient(config, TlsStreamOpener(env.root), RealTicker)
-
-    // The step label lets one actor match this later reply to this request.
-    _client.query(
-      "load-counter", "demo:state", JsonOf.obj1("room", room), this)
-
-  be convex_ok(step: String, result: ConvexResult) =>
-    if step == "load-counter" then
-      match result.value
-      | let fields: JsonObject =>
-        match try fields("count")? else None end
-        | let number: JsonNumber =>
-          try _env.out.print(number.integral()?.string()) end
-        end
-      end
+be convex_ok(step: String, result: ConvexResult) =>
+  if step == "initial-query" then
+    // TypeScript: const state = useQuery(api.demo.state, { room });
+    try
+      _env.out.print("count: " + CounterValue.count(result.value)?.string())
+    else
+      _env.err.print("bad response")
     end
+  end
 
-  be convex_failed(step: String, error': ConvexError) =>
-    _env.err.print(step + " failed: " + error'.describe())
+be convex_failed(step: String, error': ConvexError) =>
+  _env.err.print(step + " failed: " + error'.describe())
 ```
 
-The React hook is reactive and its lifecycle follows the component. Pony has
-asynchronous actor behaviours instead of a returned promise here, so this
-client sends a one-off HTTP query and later calls `convex_ok` or
-`convex_failed`. The explicit step label is this client's API choice, not a
-limitation of Pony's actor model. The full example also closes the client after
-its state machine finishes.
+One actor can drive a whole multi-step conversation with Convex this way,
+just by switching on which step just replied.
 
-### Live updates use explicit demand
+### Every Live update has to be asked for by name
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function LiveCount({ room }: { room: string }) {
-  // React subscribes while this component is mounted and cleans up for us.
-  const state = useQuery(api.demo.state, { room });
-  return <p>{state?.count ?? "Loading..."}</p>;
-}
-```
-
-**Pony**
+Convex's Live protocol pushes fresh state the moment a subscribed query's
+result changes, but this client refuses to let a slow watcher turn that into
+an unbounded backlog. Delivery is demand-driven: `LiveHandle.request_next()`
+is the only thing that releases the next queued update, and nothing more
+arrives until it's called.
 
 ```pony
-actor LiveCount is (ConvexCallback & LiveWatcher)
-  let _client: ConvexClient
+be live_value(handle: LiveHandle, result: ConvexResult) =>
+  // TypeScript: useQuery re-renders on its own; here we must ask.
+  try
+    _env.out.print("live count: " + CounterValue.count(result.value)?.string())
+  end
+  // Grant credit for exactly one more update.
+  handle.request_next()
 
-  new create(client: ConvexClient, room: String) =>
-    _client = client
-    // This actor owns the watcher lifecycle that React normally hides.
-    _client.subscribe(
-      "counter", "demo:state", JsonOf.obj1("room", room), this,
-      "subscribe", this)
-
-  be live_value(handle: LiveHandle, result: ConvexResult) =>
-    // Read result.value here, then grant credit for exactly one more update.
-    handle.request_next()
-
-  be live_failed(handle: LiveHandle, error': ConvexError) =>
-    // A later valid value can recover this same subscription.
-    handle.request_next()
-
-  be stop() =>
-    // This actor, rather than React, explicitly ends the subscription.
-    _client.unsubscribe("counter", "unsubscribe", this)
-
-  be convex_ok(step: String, result: ConvexResult) => None
-  be convex_failed(step: String, error': ConvexError) => None
+be live_failed(handle: LiveHandle, error': ConvexError) =>
+  handle.request_next()
 ```
 
-`request_next()` is a deliberate client API decision, not a Pony language
-restriction. It keeps at most one update in flight and lets the client cap each
-subscription at 32 queued updates or a conservatively charged 2 MiB. When a
-watcher falls behind, older states are discarded so the newest reactive state
-survives. Unlike `useQuery`, the command-line actor must explicitly unsubscribe
-or close its client.
+Fall behind and the oldest queued states are dropped rather than piling up —
+the newest value always wins, which is the right trade when what you want is
+"now," not a log of every change.
+
+### A generated key has to be handed away, not shared
+
+Pony's signature feature is reference capabilities: annotations like `iso`,
+`val`, and `ref` that let the compiler prove, at compile time, whether a
+piece of data can be safely shared, mutated, or must have exactly one owner.
+This client builds the idempotency key for each mutation as an `iso` array,
+and passing it to the hex encoder means literally giving that ownership up.
+
+```pony
+primitive ExampleRunId
+  fun next(): String =>
+    let random = Rand(Time.nanos(), Time.millis())
+    var raw: Array[U8] iso = Array[U8](8)
+    var index: USize = 0
+    while index < 8 do
+      raw.push(random.u8())
+      index = index + 1
+    end
+    // "iso" gives raw exactly one owner; "consume" hands that away.
+    Hex.encode(consume raw)
+```
+
+No lock, no convention, and no code-review rule makes that safe — the
+compiler simply won't allow `raw` to be touched from two places at once.
 
 ## Status
 

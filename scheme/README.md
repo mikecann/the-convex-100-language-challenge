@@ -23,133 +23,59 @@ The command builds the minimal example image and runs the exact source shown lat
 
 ### Parentheses make the request structure visible
 
-In React, a generated hook knows the function reference and gives the returned object a static TypeScript type. This Scheme client instead takes the function path as a string and represents a JSON object as alternating key/value arguments to `json-object`.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function QueryCount() {
-  const room = "scheme-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  console.log(state.count); // The generated API makes both fields type-safe.
-  return <p>{state.count}</p>;
-}
-```
-
-**Scheme**
+There's no codegen here: no `api.demo.state` reference, no generated hook, no compile-time argument type. A Convex function path is just a string, and its arguments are alternating key/value pairs handed to `json-object`. The request *is* the s-expression.
 
 ```scheme
-(import scheme (chicken base) (chicken process-context) convex)
-
-(let ((deployment (get-environment-variable "CONVEX_URL")))
-  (unless (and deployment (> (string-length deployment) 0))
-    (error 'query-example "CONVEX_URL is required"))
-  (let ((client (make-client deployment client-version: "scheme-0.1.0")))
-    (dynamic-wind
-      (lambda () #t)
-      (lambda ()
-        (let* ((room "scheme-readme")
-               ;; This is a one-off HTTP query, not a reactive subscription.
-               (result (client-query client "demo:state"
-                                     (json-object "room" room)))
-               ;; JSON is dynamic, so read the returned field by its string key.
-               (state (result-value result))
-               (count (json-get state "count" #f)))
-          (print count)))
-      ;; The command-line client must release its own resources.
-      (lambda () (client-close! client 2.0)))))
+(let* ((client (make-client deployment client-version: "scheme-0.1.0"))
+       ;; TypeScript: const state = useQuery(api.demo.state, { room });
+       (result (client-query client "demo:state" (json-object "room" room)))
+       (state (result-value result)))
+  (print (json-get state "count" #f)))
 ```
 
-The nested calls look unusual at first, but each pair of parentheses is just a procedure call. The tradeoff is important: Scheme checks the decoded value at runtime, while the generated TypeScript API catches many shape mistakes before the app runs.
+Every nested pair of parens is one procedure call. Scheme trades the generated API's compile-time shape checking for a request you can read as data.
 
-### React owns reactivity, this client hands it to you
+### Live hands you the subscription, not a hook
 
-`useQuery` subscribes when a component renders and cleans up when it unmounts. The command-line Scheme API exposes that lifecycle directly: create a subscription, block for each update, then close it yourself.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const room = "scheme-live-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  // React rerenders this component whenever the subscribed value changes.
-  return <p>{state === undefined ? "Loading..." : state.count}</p>;
-}
-```
-
-**Scheme**
+`useQuery` in React opens a subscription when a component mounts and tears it down when it unmounts, invisibly. This client's Live API is the same lifecycle turned inside out: you open the subscription, block on `subscription-next` for each delivered update, and close it yourself.
 
 ```scheme
-(import scheme (chicken base) (chicken process-context) convex)
-
-(let ((deployment (get-environment-variable "CONVEX_URL")))
-  (unless (and deployment (> (string-length deployment) 0))
-    (error 'live-example "CONVEX_URL is required"))
-  (let ((client (make-client deployment client-version: "scheme-0.1.0"))
-        (subscription #f))
-    (dynamic-wind
-      (lambda () #t)
-      (lambda ()
-        ;; The returned handle owns this Live query until it is closed.
-        (set! subscription
-              (client-subscribe client "demo:state"
-                                (json-object "room" "scheme-live-readme")))
-        ;; Blocking next is this client's API choice, not a Scheme limitation.
-        (let ((update (subscription-next subscription 10.0)))
-          (when (and update (not (update-error update)))
-            (print (json-get (update-value update) "count" #f)))))
-      (lambda ()
-        ;; Cleanup runs even if reading or decoding the update raises an error.
-        (when subscription (subscription-close! subscription 2.0))
-        (client-close! client 2.0)))))
+;; TypeScript: useQuery keeps this open for as long as the component is mounted.
+(let ((subscription (client-subscribe client "demo:state" (json-object "room" room))))
+  (let ((update (subscription-next subscription 10.0)))
+    (when (and update (not (update-error update)))
+      (print (json-get (update-value update) "count" #f))))
+  (subscription-close! subscription 2.0))
 ```
 
-CHICKEN supports threads, and Scheme supports higher-order procedures. This client deliberately offers a small blocking `subscription-next` interface so ownership and timeouts stay explicit for a command-line demonstration.
+No component tree to hang the lifecycle off, so ownership and timeouts have to stay explicit.
 
 ### `0.0` can still be an integer
 
-Convex JSON numbers may decode as an inexact Scheme value such as `1.0`. Scheme's numerical model can still recognise that value as mathematically integral, so the example validates it before converting it to an exact integer.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function SafeCount() {
-  const room = "scheme-number-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  if (!Number.isSafeInteger(state.count)) throw new Error("Invalid count");
-  return <p>{state.count}</p>; // Convex numbers are JavaScript numbers here.
-}
-```
-
-**Scheme**
+Convex may decode an integral JSON number as an inexact Scheme value like `1.0`. Scheme's numeric tower treats "is this exact?" and "is this an integer?" as independent questions, so the example checks integrality before ever trusting the count.
 
 ```scheme
-(import scheme (chicken base) convex)
-
-(define (count-as-exact-integer state)
-  (let ((count (json-get state "count" #f)))
-    ;; (integer? 1.0) is true, but 1.5, NaN, and infinity are rejected.
-    (unless (and (number? count) (real? count) (integer? count)
-                 (<= 0 count 9223372036854775807))
-      (error 'count-as-exact-integer "invalid Convex count"))
-    (inexact->exact count)))
+(let ((count (json-get state "count" #f)))
+  ;; (integer? 1.0) is #t here, but 1.5, NaN, and infinity are all rejected.
+  (unless (and (number? count) (real? count) (integer? count)
+               (<= 0 count 9223372036854775807))
+    (error 'count "invalid Convex count"))
+  (inexact->exact count))
 ```
 
-That extra narrowing is not ceremony. It keeps a JSON decoding detail from leaking into later counter arithmetic while still rejecting fractional or out-of-range results.
+### A denied mutation raises a condition, not an exception
+
+Scheme's condition system predates `try`/`catch`. `handle-exceptions` installs a handler around an expression, and a rejected Convex function surfaces through it as an ordinary `<convex-error>` record — its name, message, and structured `data` are just accessors, not a type you `instanceof`-check.
+
+```scheme
+(handle-exceptions error
+  ;; TypeScript: catch (error) { if (error instanceof ConvexError) ... }
+  (if (convex-error? error)
+      (print "rejected: " (convex-error-name error) " "
+             (json-get (convex-error-data error) "code" #f))
+      (raise error))
+  (client-mutation client "demo:increment" (json-object "room" room)))
+```
 
 ## Status
 

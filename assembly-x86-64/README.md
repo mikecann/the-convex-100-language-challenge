@@ -31,11 +31,9 @@ runs that exact example against a unique room:
 
 ### `{ room }` is built one register at a time
 
-Assembly has no object literal — it has a heap and sixteen general-purpose
-registers. This client ships its own hand-written JSON module, so the
-argument object for a Convex query is assembled call by call, each
-parameter loaded into exactly the register the System V AMD64 ABI assigns
-it:
+Assembly has no object literal — just a heap and general-purpose registers.
+This hand-written JSON module builds a query's argument object call by call,
+each parameter landing in the register the System V ABI assigns it:
 
 ```nasm
     call json_new_object                 ; rax = a fresh {}
@@ -50,16 +48,12 @@ it:
     call json_object_set                 ; TypeScript: const args = { room }
 ```
 
-Strings travel as pointer-and-length pairs, and the assembler can even do
-the counting: `path_state_len equ $ - path_state`, where `$` means "the
-address right here."
+Strings travel as pointer-and-length pairs; even the assembler counts them, via `path_state_len equ $ - path_state`.
 
 ### The seventh argument rides the stack
 
-`convex_call` is one function for queries, mutations, and actions, selected
-by a numeric operation constant. It takes seven parameters — but the ABI
-supplies only six integer registers, so the last one, the error out-slot,
-is placed on the stack by hand:
+`convex_call` handles queries, mutations, and actions through one numeric
+operation constant — but it takes seven parameters, one more than the ABI's six integer registers, so the error out-slot rides the stack by hand:
 
 ```nasm
     mov rdi, [client]                    ; 1: client from convex_new
@@ -75,15 +69,12 @@ is placed on the stack by hand:
     add rsp, 16
 ```
 
-That `sub rsp, 16` also keeps the stack 16-byte aligned at the `call` — an
-ABI rule that here is the programmer's job, not a compiler's.
+That `sub rsp, 16` also keeps the stack 16-byte aligned at the call — an ABI rule that's the programmer's job here, not a compiler's.
 
 ### A type check is a compare instruction
 
 Decoded JSON values are 48-byte tagged records laid out with NASM's `struc`
-directive — named offsets over raw memory, the closest thing assembly has
-to a type system. Reading the counter out of the query result means
-fetching a field and comparing its tag number:
+directive. Reading the counter means comparing its tag number:
 
 ```nasm
     mov rdi, [result1 + convex_result.value]
@@ -98,16 +89,13 @@ fetching a field and comparing its tag number:
     mov rax, [rax + json_value.ival]     ; the count, as an exact 64-bit integer
 ```
 
-A quiet payoff of doing this by hand: integer literals stay exact 64-bit
-values rather than doubles, which matters for Convex's nanosecond Live
-timestamps beyond JavaScript's safe-integer range.
+The payoff: integer literals stay exact 64-bit values rather than doubles, which matters for Convex's nanosecond Live timestamps.
 
 ### `useQuery`, unrolled into three calls
 
-Live is fully verified here (see Status), and everything beneath it — the
-HTTP upgrade, RFC 6455 WebSocket framing, the Convex sync protocol — is
-hand-written assembly. What React folds into a hook and a component
-lifecycle becomes three explicit calls: subscribe, block for the next
+Live is fully verified here (see Status): the HTTP upgrade, WebSocket
+framing, and sync protocol are all hand-written assembly. What React folds
+into a hook becomes three explicit calls — subscribe, block for the next
 update, unsubscribe:
 
 ```nasm
@@ -117,7 +105,6 @@ update, unsubscribe:
     mov rcx, [rbp-8]                     ; fresh { room }; the subscription takes it
     call convex_live_subscribe
     mov [g_sub], rax                     ; an opaque subscription handle
-
     mov rdi, [g_sub]
     lea rsi, [g_update]
     mov edx, 10000                       ; wait up to ten seconds
@@ -127,8 +114,7 @@ update, unsubscribe:
     call convex_live_unsubscribe
 ```
 
-Subscribe, next, unsubscribe map onto React's mount, render, unmount — the
-component lifecycle, spelled out as explicit resource management.
+Subscribe, next, unsubscribe map onto React's mount, render, unmount — resource management spelled out explicitly.
 
 ## Status
 

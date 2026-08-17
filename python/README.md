@@ -34,116 +34,70 @@ the host.
 
 ## Interesting Parts
 
-### Plain dictionaries cross the Convex boundary
+### A dict literal doubles as your request arguments
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function Count() {
-  const room = "python-readme-query";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <span>Loading...</span>;
-  return <span>{state.count}</span>; // state and count are type-safe here.
-}
-```
-
-**Python**
+There is no codegen step between this script and Convex. Named arguments are
+just an ordinary `dict` literal, and the response comes back as a small
+`Result` dataclass that keeps the decoded value and Convex's log lines
+together rather than discarding one of them.
 
 ```python
-import os
-
-from convex import Client
-
 room = "python-readme-query"
 client = Client(os.environ["CONVEX_URL"])
 try:
-    # Named Convex arguments are an ordinary Python dictionary.
+    # No generated types here: the arguments are a plain dict.
     result = client.query("demo:state", {"room": room})
-    print(result.value["count"])  # JSON becomes a dictionary checked at runtime.
+    # TypeScript: const state = useQuery(api.demo.state, { room })
+    print(result.value["count"])  # result.logs carries any console output too.
 finally:
-    client.close()  # Release the client even when the request fails.
-```
-
-The React hook keeps a reactive query alive and has generated TypeScript types.
-This Python call is a one-off HTTP query: `Result` is a small `dataclass` that
-keeps the decoded value and Convex log lines together, while keys and value
-types are checked only when the program uses them.
-
-### The command-line client owns its Live subscription
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function Counter() {
-  const room = "python-readme-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  if (state === undefined) return <span>Loading...</span>;
-
-  async function addOne() {
-    const result = await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.state.count); // The mutation returns the new state.
-  }
-
-  // useQuery keeps this count reactive after the mutation.
-  return <button onClick={addOne}>{state.count}</button>;
-}
-```
-
-**Python**
-
-```python
-import os
-import secrets
-
-from convex import Client
-
-room = "python-readme-live"
-client = Client(os.environ["CONVEX_URL"])
-subscription = client.subscribe("demo:state", {"room": room})
-try:
-    # This client exposes a blocking read so a script controls the sequence.
-    initial = subscription.next_update(10)
-    if initial.error:
-        raise initial.error  # Query failures arrive through the subscription.
-    print(initial.value["count"])
-
-    result = client.mutation(
-        "demo:increment",
-        {
-            "room": room,
-            "language": "python",
-            "runId": secrets.token_hex(8),  # Make retries idempotent.
-        },
-    )
-    print(result.value["state"]["count"])  # The mutation returns the new state.
-
-    changed = subscription.next_update(10)
-    if changed.error:
-        raise changed.error
-    print(changed.value["count"])  # Read the reactive update explicitly.
-finally:
-    subscription.close()  # Stop this query before shutting down the worker.
     client.close()
 ```
 
-React manages the hook's subscription lifecycle and rerenders the component.
-This client instead gives a script a `Subscription` with blocking
-`next_update` calls. That blocking API is a deliberate client design, not a
-limitation of Python, which also supports callbacks, generators, and async
-code.
+### Live updates arrive through a blocking call, not a hook
+
+Convex's Live protocol runs on a daemon thread inside the client, but the
+script never touches that thread directly. It just asks its `Subscription`
+for the next update and blocks until one lands on an internal queue.
+
+```python
+subscription = client.subscribe("demo:state", {"room": room})
+try:
+    initial = subscription.next_update(10)  # Blocks up to 10s on a queue.Queue.
+    if initial.error:
+        raise initial.error
+    client.mutation(
+        "demo:increment", {"room": room, "runId": secrets.token_hex(8)}
+    )
+    changed = subscription.next_update(10)  # No hook, no rerender, just a call.
+    print(changed.value["count"])
+finally:
+    subscription.close()
+```
+
+React's `useQuery` rerenders a component automatically; here the script
+decides exactly when it wants to see the next value.
+
+### `bool` sneaks in as an `int`, so the example checks for it first
+
+Python's `bool` has been a subclass of `int` since Python 2.3, so
+`isinstance(True, int)` is `True` and `True == 1`. The example's `whole()`
+helper, which normalizes a Convex count before printing it, has to reject
+booleans explicitly before it accepts integers.
+
+```python
+def whole(value, operation):
+    # isinstance(True, int) is True, so booleans are excluded first.
+    if isinstance(value, bool):
+        raise RuntimeError(f"{operation} was {value!r}, not a whole number")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)  # Convex may encode a whole number as 1.0.
+    raise RuntimeError(f"{operation} was {value!r}, not a whole number")
+```
+
+A decoded `true` and a decoded `1` would never collide like this in
+TypeScript, so this ordering is Python's quirk, not Convex's.
 
 ## Status
 

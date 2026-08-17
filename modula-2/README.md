@@ -18,125 +18,68 @@ From the repository root, Docker builds the exact canonical example and runs it 
 
 ## Interesting Parts
 
-### A Convex result arrives as JSON in a fixed buffer
+### The interface is a separate file from the implementation
 
-In React, Convex generates TypeScript types from the backend function. This Modula-2 client instead accepts JSON text in caller-owned character arrays, then lets the program decode only the fields it needs.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function StateCount() {
-  const state = useQuery(api.demo.state, { room: "readme-modula-2" });
-
-  if (state === undefined) return <p>Loading</p>;
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**Modula-2**
+Modula-2 was Wirth's fix for a problem C headers only paper over: a module's public contract and its private body are two different files, compiled and checked separately. `ConvexJSON.def` is the entire public face of this client's JSON reader — its scanning logic lives only in `ConvexJSON.mod`, a file the interface never mentions.
 
 ```modula2
-MODULE QueryExample;
+DEFINITION MODULE ConvexJSON;
 
-FROM ConvexJSON IMPORT Member, IsIntegralNumber;
-FROM Environment IMPORT GetEnvironment;
-FROM STextIO IMPORT WriteString, WriteLn;
-FROM CShim IMPORT ShimExit;
-IMPORT ConvexSync;
+(* Callers only ever see this; the byte-scanning implementation lives
+   in ConvexJSON.mod, a file this interface never exposes. *)
+PROCEDURE Member (VAR doc: ARRAY OF CHAR; key: ARRAY OF CHAR;
+                   VAR value: ARRAY OF CHAR; VAR found: BOOLEAN) : BOOLEAN;
+(* ...six more procedures, then nothing else... *)
 
-VAR
-  url: ARRAY [0..511] OF CHAR;
-  args, value, logs: ARRAY [0..65535] OF CHAR;
-  countText: ARRAY [0..63] OF CHAR;
-  errorName, errorMessage, errorData: ARRAY [0..65535] OF CHAR;
-  transportError: ARRAY [0..255] OF CHAR;
-  found, hasErrorData, ok: BOOLEAN;
-
-BEGIN
-  IF NOT GetEnvironment("CONVEX_URL", url) THEN
-    WriteString("CONVEX_URL is required"); WriteLn;
-    ShimExit(1);
-  END;
-  ConvexSync.Init(url, "");
-  args := '{"room":"readme-modula-2"}'; (* Build the argument object as JSON text. *)
-
-  ConvexSync.Call("query", "demo:state", args, value, logs,
-                  errorName, errorMessage, errorData, hasErrorData,
-                  ok, transportError);
-
-  IF ok AND (errorName[0] = 0C)
-     AND Member(value, "count", countText, found) AND found
-     AND IsIntegralNumber(countText) THEN
-    (* countText is still JSON text, for example "0" or "0.0". *)
-  END;
-END QueryExample.
+END ConvexJSON.
 ```
 
-The React hook is reactive, while `Call` is one HTTP request. The fixed arrays and explicit decoding are choices made by this compact client, not requirements of the Modula-2 language. See [`ConvexJSON.def`](client/ConvexJSON.def) for the small scanning API.
+Nothing outside this file can reach `ConvexJSON.mod`'s internals, even by accident — the compiler enforces the boundary, not a convention.
 
-### Live updates happen when the program pumps the connection
+### There's no + for strings
 
-React starts and stops a `useQuery` subscription with the component. The command-line client returns a numeric handle immediately, then the program calls `Pump` to advance network work and receive one queued event at a time.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-function Counter() {
-  const room = "readme-modula-2";
-  const state = useQuery(api.demo.state, { room });
-
-  // React and Convex own the subscription lifecycle and rerender on updates.
-  return <p>{state === undefined ? "Loading" : state.count}</p>;
-}
-```
-
-**Modula-2**
+Modula-2 has no string type and no concatenation operator: `ARRAY OF CHAR` is just a fixed, NUL-terminated block of memory, so a JSON argument object gets built one appended fragment at a time. It reads a little like Forth pushing pieces onto a buffer instead of a stack.
 
 ```modula2
-MODULE LiveExample;
-
-FROM Environment IMPORT GetEnvironment;
-FROM STextIO IMPORT WriteString, WriteLn;
-FROM CShim IMPORT ShimExit;
-IMPORT ConvexSync;
-
-VAR
-  url: ARRAY [0..511] OF CHAR;
-  args: ARRAY [0..255] OF CHAR;
-  value, logs, errorMessage, errorData: ARRAY [0..8191] OF CHAR;
-  errorName, transportError: ARRAY [0..255] OF CHAR;
-  handle, eventKind, eventHandle: INTEGER;
-  hasErrorData, ok: BOOLEAN;
-
-BEGIN
-  IF NOT GetEnvironment("CONVEX_URL", url) THEN
-    WriteString("CONVEX_URL is required"); WriteLn;
-    ShimExit(1);
-  END;
-  ConvexSync.Init(url, "");
-  args := '{"room":"readme-modula-2"}'; (* Same demo:state argument object. *)
-  ConvexSync.Subscribe("demo:state", args, handle, ok, transportError);
-
-  IF ok THEN
-    REPEAT
-      (* Pump owns the socket and returns at most one Live event per call. *)
-      ConvexSync.Pump(200, eventKind, eventHandle, value, logs,
-                      errorName, errorMessage, errorData, hasErrorData);
-    UNTIL (eventKind <> 0) AND (eventHandle = handle);
-
-    (* value now contains the initial or updated demo:state JSON object. *)
-    ConvexSync.Unsubscribe(handle); (* The CLI owns cleanup explicitly. *)
-  END;
-END LiveExample.
+args[0] := 0C;
+AppendLit('{"room":', args);
+IF NOT AppendQuoted(room, args) THEN Fail("room id was too long") END;
+AppendLit('}', args);
+(* TypeScript: `{"room":${JSON.stringify(room)}}` *)
 ```
 
-Modula-2 supports coroutines and procedure values. The blocking, bounded `Pump` API is this client's deliberate single-owner design, not a language limitation. It keeps all WebSocket reads, writes, reconnects, and subscription changes in one place.
+By the time `Call` sees `args`, it is already plain JSON text — there was never a string builder hiding the work.
+
+### Success and failure are separate out-parameters
+
+Modula-2 has no exceptions. Every way a Convex call can end — a clean result, a structured `FunctionError`, or a transport failure — comes back through its own `VAR` parameter, all present in the signature at once rather than caught later.
+
+```modula2
+PROCEDURE Call (operation: ARRAY OF CHAR; path: ARRAY OF CHAR; VAR args: ARRAY OF CHAR;
+                 VAR value: ARRAY OF CHAR; VAR logs: ARRAY OF CHAR;
+                 VAR errorName: ARRAY OF CHAR; VAR errorMessage: ARRAY OF CHAR;
+                 VAR errorData: ARRAY OF CHAR; VAR hasErrorData: BOOLEAN;
+                 VAR ok: BOOLEAN; VAR transportError: ARRAY OF CHAR);
+(* TypeScript: one try/catch around `await client.query(...)` covers all three *)
+```
+
+Reading a result means checking `ok`, then `errorName`, in that fixed order — nothing is hidden, but nothing is optional either.
+
+### Live delivers one event per Pump call
+
+React's `useQuery` starts and stops a subscription with the component and rerenders you automatically. This client hands that job to the caller instead: `Subscribe` only registers intent, and `Pump` is the single place that ever touches the WebSocket, handing back at most one queued update per call.
+
+```modula2
+ConvexSync.Subscribe("demo:state", args, handle, ok, transportError);
+REPEAT
+  (* Pump owns the socket; it returns at most one Live event per call. *)
+  ConvexSync.Pump(200, eventKind, eventHandle, value, logs,
+                  errorName, errorMessage, errorData, hasErrorData);
+UNTIL (eventKind <> 0) AND (eventHandle = handle);
+(* TypeScript: useQuery(api.demo.state, { room }) owns this loop for you *)
+```
+
+Reconnects, backoff, and duplicate-value suppression all happen inside that same one function — proved against a loopback fixture in the test suite.
 
 ## Status
 

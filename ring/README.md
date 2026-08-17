@@ -40,112 +40,87 @@ You do not need Ring installed on your host.
 
 ## Interesting Parts
 
-### Convex values stay as exact JSON until Ring asks for a field
+### A list index can be a bare word
 
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-
-  return (
-    <button
-      onClick={async () => {
-        const result = await increment({
-          room: "readme-ring",
-          language: "TypeScript",
-          runId: crypto.randomUUID(), // Fresh idempotency key for this button action.
-        });
-        console.log(result.state.count); // The generated API makes count a number.
-      }}
-    >
-      Increment
-    </button>
-  );
-}
-```
-
-**Ring**
+Ring lists are plain ordered arrays, but tag an entry's first slot with a
+string and Ring lets you read it back with a colon and a bare word. Every
+Convex result here is exactly such a list, so a caller reaches into the
+payload as `aResult[:value]` — no map, struct, or generated type required.
 
 ```text
-load "convex.ring"
-
-cDeployment = cvxEnv("CONVEX_URL")
-oConvex = new ConvexClient(cDeployment) # Reuses one TLS-verified HTTP handle.
-
-# Ring builds the argument object as JSON text, including a unique idempotency key.
-cArgs = cvxJsonObject([
-	["room", cvxJsonQuote("readme-ring")],
-	["language", cvxJsonQuote("Ring")],
-	["runId", cvxJsonQuote(lower(hex(floor(uv_hrtime() / 1000))))]])
-
-aResult = oConvex.mutation("demo:increment", cArgs) # A blocking HTTP call.
-cState = cvxJsonField(aResult[:value], "state", true)
-nCount = cvxWholeNumber(cvxJsonField(cState, "count", true), "mutation count")
-? nCount # The helper rejects fractions, strings, and overflowing values.
-
-oConvex.close() # Releases the reusable HTTP handle.
+aCurrent = oConvex.query("demo:state", cRoomArgs)
+aMutation = oConvex.mutation("demo:increment", cRoomArgs)
+# TypeScript: const state = useQuery(api.demo.state, { room })
+if cvxJsonField(aMutation[:value], "applied", true) != "true"
+	raise("the mutation was not applied")
+ok
 ```
 
-The React client returns a generated, type-safe object. This Ring client instead
-retains Convex values as byte-exact JSON text, then validates only the fields the
-program uses. That is a client design suited to Ring's dynamic type system, not
-a requirement of the language.
+`:value` is Ring searching for the pair whose first element is `"value"` —
+syntax sugar over a plain array, not a second data type.
 
-### A Live subscription is an event loop you can see
+### A reply stays exact JSON text until something asks for a field
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-function Counter() {
-  const room = "readme-ring";
-  const state = useQuery(api.demo.state, { room });
-
-  // Convex owns the subscription and React rerenders when state changes.
-  return <output>{state === undefined ? "Loading" : state.count}</output>;
-}
-```
-
-**Ring**
+Convex spells a whole number as `0` or `0.0` on the wire, and Ring's only
+number type is a double. `cvxWholeNumber` walks the digits itself and raises
+before a fraction, a quoted number, or an overflow can pass as a count.
 
 ```text
-load "convex.ring"
+func cvxWholeNumber cRaw, cField
+	cToken = trim(cRaw)
+	...
+	if len(cDigits) = 0 or len(cDigits) > 15
+		cvxRaiseProtocol(cField + " was not a finite whole number")
+	ok
+	...
+```
 
-cDeployment = cvxEnv("CONVEX_URL")
-oConvex = new ConvexClient(cDeployment)
-cArgs = cvxJsonObject([["room", cvxJsonQuote("readme-ring")]])
-nSubscription = oConvex.subscribe("demo:state", cArgs) # Opens Live on demand.
+A generated TypeScript type would just promise `count: number`; Ring earns
+that promise one digit at a time.
 
-nDeadline = cvxNowMs() + 20000
-while cvxNowMs() < nDeadline
-	oConvex.pump(200)        # Give the client time to receive or reconnect.
-	aEvent = oConvex.nextEvent() # Take the oldest buffered delivery.
-	if len(aEvent) = 0 or aEvent[1] != nSubscription
+### An `if` ends with `ok`, and `but` means "or, if instead"
+
+Ring's block syntax has no braces: every block closes with a plain word.
+`but` is Ring's elseif, and it does real work in the client's own error
+classifier as it sorts a dropped connection into protocol or transport.
+
+```text
+if left(cReason, 15) = "ProtocolError: "
+	cName = "ProtocolError"
+	cMessage = substr(cReason, 16)
+but left(cReason, 16) = "TransportError: "
+	cMessage = substr(cReason, 17)
+ok
+# TypeScript: err instanceof ProtocolError ? ... : err instanceof TransportError ? ...
+```
+
+`ok` always means "end if", so Ring code reads like a spoken decision.
+
+### Live updates are yours to pump, not React's
+
+`useQuery` hides its subscription's event loop inside React. Ring's client
+hands that loop to you: `subscribe()` returns a query id, and nothing happens
+until the program calls `pump()` and drains `nextEvent()` itself.
+
+```text
+nSubscription = oConvex.subscribe("demo:state", cRoomArgs)
+# TypeScript: useQuery(api.demo.state, { room }) reruns your component for you
+nStarted = cvxNowMs()
+while cvxNowMs() - nStarted < nDeadlineMs
+	oConvex.pump(200)
+	aEvent = oConvex.nextEvent()
+	if len(aEvent) = 0
 		loop
 	ok
-	if aEvent[2] = "error"
-		raise(aEvent[6]) # A reactive function or transport failure is explicit.
+	if aEvent[1] != nSubscription
+		loop
 	ok
-	nCount = cvxWholeNumber(cvxJsonField(aEvent[3], "count", true), "live count")
-	? nCount
-	exit
+	return aEvent[3]
 end
-
-oConvex.unsubscribe(nSubscription) # Stop this reactive query first.
-oConvex.close()                     # Then release HTTP and WebSocket handles.
 ```
 
-`useQuery` hides subscription setup, cleanup, and rerender scheduling inside
-React. The Ring client deliberately exposes `pump()` and an explicit
-`nextEvent()` queue so a command-line program decides when network work runs.
-Ring supports other programming styles; this explicit lifecycle is this
-client's API choice.
+Nothing updates until your own loop calls `pump()` — this client hands you
+the live wire directly instead of a value that quietly rerenders itself.
 
 ## Status
 

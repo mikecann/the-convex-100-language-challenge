@@ -26,100 +26,37 @@ that exact example against a unique room:
 
 ## Interesting Parts
 
-### JSON becomes a value you must narrow
+### Wire JSON is narrowed by pattern match, not cast
 
-Generated Convex bindings make the query result statically known in React. This
-Standard ML client deliberately exposes the wire-neutral `Json.value` algebraic
-data type instead, so pattern matching makes every accepted shape explicit.
-
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const [room] = useState(() => `readme-${crypto.randomUUID()}`);
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**Standard ML**
+This client has no generated bindings, so every Convex reply arrives as
+`Json.value`, a seven-constructor algebraic data type — the kind of thing ML
+has offered since Robin Milner's original language, decades before pattern
+matching reached the mainstream. Pulling an `int` out of a reply means matching
+`SOME`/`NONE`, never trusting an annotation.
 
 ```sml
-val deployment =
-  case OS.Process.getEnv "CONVEX_URL" of
-      SOME url => if url = "" then raise Fail "CONVEX_URL is required" else url
-    | NONE => raise Fail "CONVEX_URL is required"
-val room = "readme-" ^ Rand.hex 16
-val client = Convex.client deployment
-
-(* The HTTP call returns generic JSON, so the program checks the object field
-   and accepts only a mathematically integral Convex number. *)
+(* Convex has no generated bindings here, so replies arrive as generic JSON. *)
 val {value = state, ...} =
-  Convex.query
-    (client, "demo:state", Json.Object [("room", Json.String room)])
+  Convex.query (client, "demo:state", Json.Object [("room", Json.String room)])
 val count =
   case Json.asInt (Json.getOr (state, "count", Json.Null)) of
-      SOME value => value
+      SOME n => n (* TypeScript: state.count would already be typed *)
     | NONE => raise Fail "demo:state returned a non-integral count"
-val _ = Convex.close client
 ```
 
-The React hook is reactive and owns a subscription. `Convex.query` above is a
-one-off HTTP request, so the comparison is about result typing, not lifecycle.
-Standard ML knows that `count` is an `IntInf.int` after the match, but the JSON
-field name and shape are checked at runtime because this demo has no generated
-bindings.
+Poly/ML warns at compile time if a `case` like this one isn't exhaustive, so a
+forgotten `NONE` arm surfaces before the program ships, not in production.
 
-### Live has an explicit lifetime
+### Live subscriptions are pulled, not pushed
 
-React ties a query subscription to a component. This command-line API makes the
-same resource visible: subscribe before mutating, wait for updates, then always
-unsubscribe and close the client.
-
-**TypeScript with React**
-
-```tsx
-import { useState } from "react";
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function IncrementButton() {
-  const [room] = useState(() => `readme-${crypto.randomUUID()}`);
-  const state = useQuery(api.demo.state, { room }); // React owns Live cleanup.
-  const increment = useMutation(api.demo.increment);
-
-  async function addOne() {
-    const result = await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(), // A fresh id makes this attempt idempotent.
-    });
-    console.log(result.state.count); // The mutation result is type-safe.
-  }
-
-  return <button onClick={addOne}>Count: {state?.count ?? 0}</button>;
-}
-```
-
-**Standard ML**
+Where React's `useQuery` re-renders your component the instant Convex pushes a
+value, this client makes you ask for it. One Poly/ML thread owns the WebSocket
+and feeds a bounded queue; `Convex.next` blocks the caller until an update
+lands or a deadline passes.
 
 ```sml
-val deployment =
-  case OS.Process.getEnv "CONVEX_URL" of
-      SOME url => if url = "" then raise Fail "CONVEX_URL is required" else url
-    | NONE => raise Fail "CONVEX_URL is required"
-val room = "readme-" ^ Rand.hex 16
-val client = Convex.client deployment
 val live =
-  Convex.subscribe
-    (client, "demo:state", Json.Object [("room", Json.String room)])
-
+  Convex.subscribe (client, "demo:state", Json.Object [("room", Json.String room)])
 fun nextValue () =
   case Convex.next (live, 10.0) of
       NONE => raise Fail "Live update timed out"
@@ -127,36 +64,33 @@ fun nextValue () =
         (case Convex.updateError update of
              SOME failure => raise ConvexError.Error failure
            | NONE => Convex.updateValue update)
+val initial = nextValue () (* TypeScript: React re-renders you; here you call next *)
+```
 
-fun run () =
-  let
-    val initial = nextValue () (* The subscription hydrates before mutation. *)
-    val {value = result, ...} =
-      Convex.mutation
-        (client, "demo:increment",
-         Json.Object
-           [("room", Json.String room),
-            ("language", Json.String "standard-ml"),
-            ("runId", Json.String (Rand.hex 16))])
-    val updated = nextValue () (* This is the reactive result, not a new query. *)
-  in
-    (initial, result, updated)
-  end
+Subscribing before mutating, then pulling twice, is how this client proves the
+reactive update is the same change the mutation just made.
 
-(* Both resources are explicit, so every exit path releases both. *)
+### `handle` catches an exception the way `case` catches a value
+
+Standard ML's 1990 Definition treats exceptions as their own extensible
+datatype: `raise` builds one, and `handle pat => expr` is a `case` expression
+over whatever got raised. There is no `finally`, so cleanup leans on that
+symmetry instead.
+
+```sml
+(* handle pattern-matches the raised exception, the same way case matches data. *)
 fun cleanup () =
   ((Convex.unsubscribe live handle _ => ());
    Convex.close client handle _ => ())
 val result =
   run ()
-  handle error => (cleanup (); raise error)
+  handle error => (cleanup (); raise error) (* TypeScript: stands in for try/finally *)
 val _ = cleanup ()
 ```
 
-Blocking `Convex.next` is this client's small command-line API choice, not a
-limitation of Standard ML. Poly/ML provides threads, and the implementation has
-one owner thread handling WebSocket I/O and reconnects while callers consume a
-bounded update queue.
+The `handle _ => ()` swallows on unsubscribe and close are a legitimate arm of
+that expression, not a hack — the exception is just another value being
+matched.
 
 ## Status
 

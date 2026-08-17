@@ -31,117 +31,81 @@ install Perl or CPAN packages on your host.
 
 ## Interesting Parts
 
-### JSON objects become hash references
+### `//=` builds the Live worker only once
 
-**TypeScript with React**
+Perl 5.10 (2007) added the defined-or operator to fix a long-standing footgun
+in `||`: a count of `0` or an empty string is a perfectly good value, but
+`||` would treat it as false and clobber it anyway. Its assignment form,
+`//=`, only ever acts on `undef`, which makes it a natural fit for
+lazily creating a singleton — `subscribe` builds the shared WebSocket worker
+the first time anyone asks for Live updates, and every call after that reuses
+it.
 
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function RoomCount() {
-  const room = "perl-readme-query";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>Count: {state.count}</p>; // The generated API types state.count.
+```perl
+sub subscribe {
+    my ( $self, $path, $args ) = @_;
+    ...
+    # Create the shared Live worker only the first time it's needed.
+    $self->{live} //= Convex::Live->new( $self->{deployment_url}, $self->{version} );
+    # TypeScript: this.live ??= new LiveWorker(url, version);
+    return $self->{live}->subscribe( $path, $args );
 }
 ```
 
-**Perl**
+### Arrows between neighbouring braces are optional
+
+Every call returns a `{ value, logs }` envelope decoded straight out of JSON,
+and `value` is itself hashes nested inside hashes. Perl dereferences each
+level with `->`, but between two adjacent subscripts the arrow can simply be
+dropped, so a deeply nested lookup reads almost like a property chain — minus
+any compile-time guarantee that the shape is actually there.
 
 ```perl
-use strict;
-use warnings;
-use Convex;
-
-my $deployment_url = $ENV{CONVEX_URL} // die "CONVEX_URL is required";
-my $room           = 'perl-readme-query';
-
-# Create the client for the deployment selected by the verifier.
-my $client = Convex->new($deployment_url);
-
-# A hash reference is Perl's counterpart to the JavaScript argument object.
 my $response = $client->query( 'demo:state', { room => $room } );
 
-# The client returns a { value, logs } envelope. Arrow access follows nested
-# hash references, but Perl does not statically check the shape or count type.
-my $count = $response->{value}{count};
+# Perl elides the arrow between adjacent {..}{..} pairs.
+my $count = $response->{value}{count};   # TypeScript: response.value.count, type-checked
 print "Count: $count\n";
-$client->close;    # Release client resources explicitly.
 ```
 
-The React hook keeps a reactive query alive and rerenders the component. Perl's
-`query` here is a one-off HTTP call, so the comparable part is constructing the
-argument object and reading the result, not the subscription lifecycle.
+### A Live subscription is a blocking pull, not a rerender
 
-### Live updates are pulled explicitly
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function CounterButton() {
-  const room = "perl-readme-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  async function addOne() {
-    const runId = crypto.randomUUID();
-    const result = await increment({ room, language: "typescript", runId });
-    console.log(result.state.count); // The mutation returns the new state.
-  }
-
-  return (
-    <button onClick={addOne} disabled={state === undefined}>
-      {state === undefined ? "Loading..." : `Count: ${state.count}`}
-    </button>
-  );
-}
-```
-
-**Perl**
+React's `useQuery` subscribes once and quietly rerenders your component on
+every server push. A script has no render loop to hook into, so this client
+makes that relationship explicit: `subscribe` opens a mailbox on the shared
+Live worker, and `next_update` blocks until a message lands or the timeout
+elapses.
 
 ```perl
-use strict;
-use warnings;
-use Convex;
-
-my $deployment_url = $ENV{CONVEX_URL} // die "CONVEX_URL is required";
-my $room = 'perl-readme-live';
-my $run_id = join '-', 'perl-readme', time, int( rand(1_000_000) );
-
-# One client owns the HTTP calls and the shared Live worker.
-my $client = Convex->new($deployment_url);
-
-# Subscribe before mutating, then wait for the initial server value.
 my $subscription = $client->subscribe( 'demo:state', { room => $room } );
-my $initial      = $subscription->next_update(10);
+my $initial = $subscription->next_update(10);   # blocks up to 10s for the first push
 die $initial->{error} if $initial->{error};
-print "Initial count: ", $initial->{value}{count}, "\n";
+print "count: $initial->{value}{count}\n";
 
-# Send an idempotency key and read the updated state from the HTTP result.
-my $mutation = $client->mutation(
-    'demo:increment',
-    { room => $room, language => 'perl', runId => $run_id }
-);
-print "Mutation count: ", $mutation->{value}{state}{count}, "\n";
-
-# next_update blocks for this subscription's next value or the timeout.
+# ...mutate elsewhere, then pull whatever the Live worker pushed next...
 my $updated = $subscription->next_update(10);
-die $updated->{error} if $updated->{error};
-print "Updated count: ", $updated->{value}{count}, "\n";
-
-$subscription->close;    # Remove this query from the Live connection.
-$client->close;          # Stop the shared worker and release its socket.
+$subscription->close;   # TypeScript: the cleanup effect unsubscribes for you
 ```
 
-React owns the `useQuery` subscription and rerender lifecycle. This command-line
-API instead makes ownership visible through `subscribe`, blocking
-`next_update`, and `close`. Blocking is a deliberate client API choice, not a
-limitation of the Perl language.
+### `eval` is Perl's `try`, `$@` is the `catch`
+
+Perl's real `try`/`catch` keywords only arrived as an experiment in 5.34
+(2022) — for the three decades before that, `eval { }` was the exception
+handler. A block ending in a true value signals success; anything that dies
+inside it lands in the global `$@` for the code right after to inspect.
+
+```perl
+eval {
+    my $mutation = $client->mutation( 'demo:increment',
+        { room => $room, runId => $run_id } );
+    die 'mutation was not applied' unless $mutation->{value}{applied};
+    1;
+} or do {
+    my $error = $@ || 'unknown example failure';   # TypeScript: catch (error) { ... }
+    $client->close;
+    die $error;
+};
+```
 
 ## Status
 

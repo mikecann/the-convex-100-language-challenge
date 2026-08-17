@@ -33,10 +33,9 @@ install Lean or point the example at your own Convex project.
 ### The whole error channel is one `abbrev` long
 
 Lean is best known as a theorem prover, but Lean 4 is also a practical compiled
-language in which monads are ordinary library code, not built-in magic. The
-client's working monad — IO that can also fail with a structured Convex
-error — is a single type alias, and turning a raw runtime failure into a tagged
-transport error is one small function:
+language where monads are ordinary library code, not built-in magic. The client's
+working monad — IO that can also fail with a structured Convex error — is one type
+alias, and turning a raw failure into a tagged transport error is one small function:
 
 ```lean
 abbrev ConvexM := ExceptT ConvexError IO
@@ -48,14 +47,14 @@ def attempt {α : Type} (context : String) (action : IO α) : ConvexM α := do
   | .error problem => throw (ConvexError.transport s!"{context}: {problem}")
 ```
 
-Every `client.query` and `client.mutation` runs in `ConvexM`, so the failure
-path is written into the type of every call.
+Every `client.query` and `client.mutation` runs in `ConvexM`, so the failure path is
+part of each call's type, not an afterthought.
 
 ### `1.0` counts as a whole number — by exact arithmetic, not epsilon
 
-`Lean.Data.Json` stores numbers as exact mantissa-and-exponent pairs, never
-floats. Convex may legitimately send a counter as `1.0`, so the client decides
-"is this integral?" with honest integer division:
+`Lean.Data.Json` stores numbers as exact mantissa-and-exponent pairs, never floats.
+Convex may legitimately send a counter as `1.0`, so the client decides "is this
+integral?" with honest integer division rather than a tolerance check:
 
 ```lean
 -- TypeScript: generated bindings already type state.count as number.
@@ -69,15 +68,12 @@ def jsonIntegral? : Json → Option Int
   | _ => none
 ```
 
-A fractional count is rejected outright instead of being silently rounded.
-
 ### A Live update is data you pattern-match, not a callback you register
 
-Where React's `useQuery` hides the subscription inside the component lifecycle,
-this command-line client hands you a `Subscription` handle and a blocking
-`nextUpdate` that drives the WebSocket loop while it waits. The reply is plain
-data, and `match` — checked by the same engine that checks mathematical
-proofs — must cover every shape:
+Where React's `useQuery` hides the subscription inside the component lifecycle, this
+command-line client hands you a `Subscription` handle and a blocking `nextUpdate` that
+drives the WebSocket loop while it waits. The reply is plain data, and `match` —
+checked by the same engine that checks mathematical proofs — must cover every shape:
 
 ```lean
 -- TypeScript: const state = useQuery(api.demo.state, { room })
@@ -95,9 +91,9 @@ Delete the `none, none` arm and the file stops compiling.
 
 ### `let mut` and `while` in a pure functional language
 
-Lean 4's `do` notation permits local mutation and loops, which the compiler
-desugars into pure state-passing. The heart of the Live wait loop reads like
-systems code yet remains a functional program:
+Lean 4's `do` notation permits local mutation and loops, which the compiler desugars
+into pure state-passing. The heart of the Live wait loop reads like systems code yet
+remains a functional program underneath:
 
 ```lean
 -- Inside Client.nextUpdate: imperative on the surface, pure underneath.

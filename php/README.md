@@ -30,164 +30,88 @@ source against the project's approved test deployment:
 
 ## Interesting Parts
 
-### One PHP array does the jobs of object and dictionary
+### One array shape is list, map, and JSON payload at once
 
-React gets a generated TypeScript type for both the arguments and returned
-state. This PHP client decodes JSON objects into PHP associative arrays, which
-are ordered maps indexed with string keys.
-
-**TypeScript with React**
-
-```tsx
-import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
-
-export function Counter() {
-  return (
-    <ConvexProvider client={convex}>
-      <CounterValue />
-    </ConvexProvider>
-  );
-}
-
-function CounterValue() {
-  const room = "php-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <span>Loading...</span>;
-  return <output>{state.count}</output>; // state and count are type-safe here.
-}
-```
-
-**PHP**
+PHP ships with exactly one native collection type. The `array` is an ordered
+map that happily plays list, dictionary, and struct depending on how you index
+it — there's no separate object-literal syntax the way JavaScript has one.
+Convex arguments go out through this same associative array, and decoded JSON
+comes back through it too.
 
 ```php
-<?php
-declare(strict_types=1);
-
-require __DIR__ . "/client/convex.php";
-
-use Convex\Client;
-
-$convexUrl = getenv("CONVEX_URL");
-if ($convexUrl === false || $convexUrl === "") {
-    throw new RuntimeException("CONVEX_URL is required");
-}
-
-$client = new Client($convexUrl);
 $room = "php-readme";
+$state = $client->query("demo:state", ["room" => $room])->value;
+echo $state["count"];                        // TypeScript: state.count — a generated, typed field
 
-try {
-    // `room` and the decoded state are associative arrays at runtime.
-    $state = $client->query("demo:state", ["room" => $room])->value;
-    echo $state["count"];
-} finally {
-    $client->close();
-}
+$result = $client->mutation("demo:increment", [
+    "room" => $room,
+    "language" => "php",
+    "runId" => bin2hex(random_bytes(8)),
+])->value;
+echo $result["state"]["count"];
 ```
 
-The PHP call is a one-off HTTP query, not a reactive equivalent of `useQuery`.
-Also, `Result::$value` is `mixed`, so this client leaves result-shape checking
-to application code rather than generating PHP types from the Convex API.
+### A class body that fits inside its own constructor
 
-### React owns reactivity; this CLI owns the subscription
-
-In React, `useQuery` subscribes during the component's lifetime and rerenders
-when the value changes. The PHP language supports callbacks, generators, and
-Fibers, but this small client deliberately exposes `nextUpdate()` as a blocking
-operation. That choice keeps ownership visible in a command-line program.
-
-**TypeScript with React**
-
-```tsx
-import {
-  ConvexProvider,
-  ConvexReactClient,
-  useMutation,
-  useQuery,
-} from "convex/react";
-import { api } from "../convex/_generated/api";
-
-const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
-
-export function IncrementButton() {
-  return (
-    <ConvexProvider client={convex}>
-      <IncrementButtonBody />
-    </ConvexProvider>
-  );
-}
-
-function IncrementButtonBody() {
-  const room = "php-readme";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  async function handleIncrement() {
-    const result = await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.state.count); // The mutation result is typed too.
-  }
-
-  return (
-    <button onClick={handleIncrement} disabled={state === undefined}>
-      Count: {state?.count ?? "..."}
-    </button>
-  );
-}
-```
-
-**PHP**
+PHP 8.0 (2020) added constructor property promotion: a parameter list can
+double as a typed property list. No repeated `private $value;` declarations,
+no `$this->value = $value;` assignments — the client's small value types
+collapse to one short block each.
 
 ```php
-<?php
-declare(strict_types=1);
-
-require __DIR__ . "/client/convex.php";
-
-use Convex\Client;
-
-$convexUrl = getenv("CONVEX_URL");
-if ($convexUrl === false || $convexUrl === "") {
-    throw new RuntimeException("CONVEX_URL is required");
-}
-
-$client = new Client($convexUrl);
-$room = "php-readme";
-
-try {
-    // Subscribe before mutating so this command-line process cannot miss the update.
-    $live = $client->subscribe("demo:state", ["room" => $room]);
-    $initial = $live->nextUpdate(10); // Blocks until the initial state arrives.
-    if ($initial->error !== null) {
-        throw $initial->error;
-    }
-
-    $result = $client->mutation("demo:increment", [
-        "room" => $room,
-        "language" => "php",
-        "runId" => bin2hex(random_bytes(8)),
-    ])->value;
-    echo $result["state"]["count"], PHP_EOL; // Decode the returned array directly.
-
-    $changed = $live->nextUpdate(10); // Explicitly wait for the reactive value.
-    if ($changed->error !== null) {
-        throw $changed->error;
-    }
-    echo $changed->value["count"], PHP_EOL;
-    $live->close();
-} finally {
-    $client->close();
+final class Update
+{
+    // TypeScript: this fuses an `interface Update {...}` with its constructor.
+    public function __construct(
+        public mixed $value = null,
+        public ?Error $error = null,
+        public array $logs = [],
+    ) {}
 }
 ```
 
-The explicit `close()` calls matter because this process, rather than a React
-component lifecycle, owns the socket and subscription.
+### `?->` and `??=` keep an unopened socket honest
+
+The Live connection is optional and lazy — nothing opens a WebSocket until the
+first `subscribe()` call. PHP's null-coalescing assignment `??=` and nullsafe
+operator `?->` let the code say "build it once, then call through it if it
+exists" without an `if ($this->live === null)` at every touchpoint.
+
+```php
+public function subscribe(string $path, array $args = []): Subscription
+{
+    $this->validate($path, $args);
+    $this->guard();
+    // ??= builds the LiveManager, and opens the socket, only on first use.
+    return ($this->live ??= new LiveManager($this->url, $this->version))
+        ->subscribe($path, $args);
+}
+
+public function pump(float $timeout = 0.0): void
+{
+    $this->live?->pump($timeout); // TypeScript: the same shrug as `this.live?.pump(t)`
+}
+```
+
+### `nextUpdate()` turns reactivity into a single blocking call
+
+PHP has no event loop the way a browser tab does, so this client doesn't fake
+`useQuery`'s automatic rerenders. Instead `Subscription::nextUpdate()` blocks
+the calling script, pumping the raw WebSocket until a Live update, an error,
+or a timeout arrives.
+
+```php
+$live = $client->subscribe("demo:state", ["room" => $room]);
+$initial = $live->nextUpdate(10); // TypeScript: useQuery just rerenders — no polling call
+if ($initial->error !== null) {
+    throw $initial->error;
+}
+echo $initial->value["count"];
+$live->close();
+```
+
+Reactivity becomes a question the script asks on its own schedule, not a
+stream it's swept along by.
 
 ## Status
 

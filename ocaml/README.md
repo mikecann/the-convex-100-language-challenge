@@ -19,114 +19,53 @@ The command builds and runs the exact example shown below in Docker against a un
 
 ## Interesting Parts
 
-### Pattern matching makes success and failure explicit
+### Ok or Error, never both
 
-Convex's generated TypeScript API gives React code the query's return type. This OCaml client instead returns `('a, Convex.error) result`, so callers must handle `Ok` and `Error` explicitly. The outer result is type-safe, but this client deliberately represents function values as `Yojson.Safe.t`; a field such as `count` becomes trustworthy only after the program validates and converts it.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function RoomCount() {
-  const state = useQuery(api.demo.state, { room: "readme-room" });
-  if (state === undefined) return <p>Loading...</p>;
-
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**OCaml**
+OCaml's `result` is an ordinary two-constructor variant — `Ok of 'a | Error of 'b` — with no special-cased language support. Every Convex call in this client returns one, so the compiler refuses to let you reach for a query's value without first matching the branch where it might not exist. There's no `undefined` to forget, and no exception quietly skipping past a failed HTTP call.
 
 ```ocaml
-let room = "readme-room"
-
-let deployment =
-  match Sys.getenv_opt "CONVEX_URL" with
-  | Some url -> url
-  | None -> failwith "CONVEX_URL is required"
-
-let client =
-  match Convex.create deployment with
-  | Ok client -> client (* The result proves this is a usable client. *)
-  | Error error -> failwith (Convex.error_message error)
-
-let () =
-  Fun.protect
-    ~finally:(fun () -> Convex.close client)
-    (fun () ->
-      let response =
-        match Convex.query client "demo:state" (`Assoc [ ("room", `String room) ]) with
-        | Ok response -> response (* The HTTP call succeeded, type-safely. *)
-        | Error error -> failwith (Convex.error_message error)
-      in
-      match
-        Convex.parse_integral_int64
-          (Yojson.Safe.Util.member "count" response.value)
-      with
-      | Ok count -> Printf.printf "%Ld\n" count (* count is an int64 here. *)
-      | Error message -> failwith message)
+match Convex.query client "demo:state" (`Assoc [ ("room", `String room) ]) with
+| Ok response ->
+    (match Convex.parse_integral_int64 (Yojson.Safe.Util.member "count" response.value) with
+     | Ok count -> Printf.printf "%Ld\n" count (* count is a checked int64 here *)
+     | Error message -> failwith message)
+| Error error -> failwith (Convex.error_message error)
+(* TypeScript: const state = useQuery(api.demo.state, { room }) *)
 ```
 
-The TypeScript hook is reactive and its generated types describe `demo:state`. The OCaml call above is a one-off HTTP query, not an equivalent subscription, and its JSON boundary is a design choice in this client rather than an OCaml limitation.
+Two boundaries, two results: the HTTP round trip can fail, and separately the untyped JSON it returns can fail to decode.
 
-### Live is an explicit resource in this command-line API
+### One error type, five honest shapes
 
-React owns a `useQuery` subscription while the component is mounted and rerenders when its value changes. The OCaml API used here exposes the subscription directly: the caller pulls the next update with a timeout and must unsubscribe. OCaml supports callbacks, streams, and lightweight concurrency; the blocking `subscription_next` shape is this small client's API choice.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveRoomCount() {
-  const state = useQuery(api.demo.state, { room: "readme-live-room" });
-  if (state === undefined) return <p>Connecting...</p>;
-
-  return <p>{state.count}</p>; // React rerenders with a type-safe count.
-}
-```
-
-**OCaml**
+Rather than one `Error` class distinguished by a runtime string, this client's `error` type is a variant with a different payload per failure kind — an `Http_error` carries a status code, a `Function_error` carries the server's own data and logs, `Closed` carries nothing at all. Pattern matching over it, taken straight from the client, is exhaustive: add a sixth constructor and every match in the codebase stops compiling until it's handled.
 
 ```ocaml
-let deployment =
-  match Sys.getenv_opt "CONVEX_URL" with
-  | Some url -> url
-  | None -> failwith "CONVEX_URL is required"
-
-let client =
-  match Convex.create deployment with
-  | Ok client -> client
-  | Error error -> failwith (Convex.error_message error)
-
-let subscription =
-  match
-    Convex.subscribe client "demo:state"
-      (`Assoc [ ("room", `String "readme-live-room") ])
-  with
-  | Ok subscription -> subscription (* An abstract, type-safe handle. *)
-  | Error error -> failwith (Convex.error_message error)
-
-let () =
-  Fun.protect
-    ~finally:(fun () ->
-      ignore (Convex.unsubscribe subscription);
-      Convex.close client)
-    (fun () ->
-      match Convex.subscription_next subscription 10.0 with
-      | Ok (Some { value = Some json; error = None; _ }) ->
-          print_endline (Yojson.Safe.to_string json) (* JSON still needs decoding. *)
-      | Ok (Some { error = Some error; _ }) ->
-          failwith (Convex.error_message error)
-      | Ok (Some { value = None; _ }) -> failwith "Live update omitted value"
-      | Ok None -> failwith "Live subscription closed or timed out"
-      | Error error -> failwith (Convex.error_message error))
+let error_message = function
+  | Function_error { message; _ } -> message
+  | Protocol_error message -> message
+  | Http_error { operation; status_code; message } ->
+      "HTTP " ^ operation ^ " returned " ^ string_of_int status_code ^ ": " ^ message
+  | Transport_error { operation; message } -> operation ^ ": " ^ message
+  | Closed -> "client is closed"
 ```
 
-The full example starts Live before the mutation so it cannot miss the change, then disposes both resources even when validation fails.
+### Live is a value you pull, not a callback you get
+
+React's `useQuery` hands you a subscription and reruns your component whenever it changes; this client hands you a `subscription` handle and leaves fetching the next update up to you. `subscription_next` blocks with a timeout and returns an `update option`, and `Fun.protect` guarantees the unsubscribe runs even if decoding the payload throws.
+
+```ocaml
+Fun.protect
+  ~finally:(fun () -> ignore (Convex.unsubscribe subscription))
+  (fun () ->
+    match Convex.subscription_next subscription 10.0 with
+    | Ok (Some { value = Some json; error = None; _ }) ->
+        Yojson.Safe.to_string json (* TypeScript: this arrives as a rerender, not a poll *)
+    | Ok (Some { error = Some error; _ }) -> failwith (Convex.error_message error)
+    | Ok None -> failwith "Live subscription closed or timed out"
+    | Error error -> failwith (Convex.error_message error))
+```
+
+The canonical example starts this subscription before its mutation runs, so the update it waits for can't already have happened.
 
 ## Status
 

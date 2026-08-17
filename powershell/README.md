@@ -19,109 +19,54 @@ You do not need PowerShell installed on the host.
 
 ## Interesting Parts
 
-### Convex arguments look like ordinary PowerShell hashtables
+### Everything on the pipeline is an object, never text
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function CounterSnapshot() {
-  const room = "powershell-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>Count: {state.count}</p>; // The hook keeps this value reactive.
-}
-```
-
-**PowerShell**
+PowerShell's founding bet — going back to the "Monad" design that became PowerShell 1.0 — was that shell commands should hand each other structured .NET objects instead of piping text a downstream command has to re-parse. This client leans on that directly: a Convex response comes back as a `PSCustomObject`, so reading a field is a property access, not a `grep`.
 
 ```powershell
-. (Join-Path $PWD 'powershell/client/Convex.ps1') # Dot-source the client functions.
+$client = New-ConvexClient $env:CONVEX_URL
+# A hashtable literal becomes the Convex function's { room } argument object.
+$state = (Get-ConvexQuery $client 'demo:state' @{ room = $room }).Value
+Write-Output "Count: $($state.count)"
+# TypeScript: const state = useQuery(api.demo.state, { room })
+```
 
-$deploymentUrl = $env:CONVEX_URL
-if (-not $deploymentUrl) { throw 'CONVEX_URL is required' }
-$room = 'powershell-readme'
-$client = New-ConvexClient $deploymentUrl
+No `JSON.parse`, no string splitting — `.Value.count` is already a live property on a .NET object.
+
+### Dot-sourcing stands in for `import`
+
+PowerShell has no import statement for a loose script file. Instead, the dot operator runs another script *in the caller's own scope*, so every function it defines simply appears, as if you'd typed it yourself. That is the entire mechanism this repo uses to load the client — no module manifest, no build step.
+
+```powershell
+# The leading dot runs Convex.ps1 in *this* scope; call it without the dot and
+# every function it defines vanishes the moment the script returns.
+. (Join-Path $PSScriptRoot '../../client/Convex.ps1')
+
+$client = New-ConvexClient $env:CONVEX_URL
 try {
-    # A hashtable becomes the Convex function's { room } argument object.
-    $state = (Get-ConvexQuery $client 'demo:state' @{ room = $room }).Value
-    Write-Output "Count: $($state.count)"
+    $current = (Get-ConvexQuery $client 'demo:state' @{ room = $room }).Value
 }
 finally {
     Close-ConvexClient $client
 }
 ```
 
-PowerShell's `@{ room = $room }` is a key/value object much like the TypeScript argument object. The important semantic difference is lifecycle: React's `useQuery` stays subscribed and rerenders the component, while `Get-ConvexQuery` makes one HTTP request and returns one snapshot.
+### `Receive-ConvexSubscription` turns Live into a blocking call
 
-### A command-line subscription has an explicit lifetime
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function ReactiveCounter() {
-  const room = "powershell-live-readme";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  async function incrementOnce() {
-    await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(), // One logical mutation gets one retry-safe key.
-    });
-  }
-
-  return (
-    <button onClick={incrementOnce} disabled={state === undefined}>
-      Count: {state?.count ?? "loading"}
-    </button>
-  ); // React owns subscription setup and cleanup for useQuery.
-}
-```
-
-**PowerShell**
+A script runs line by line, so instead of hiding a WebSocket behind a callback or an event handler, the Live half of this client queues updates and hands them over through one blocking function. Subscribing, receiving, and unsubscribing are three separate statements you can see, rather than mechanics a component's mount and unmount hide from you.
 
 ```powershell
-. (Join-Path $PWD 'powershell/client/Convex.ps1')
-
-$deploymentUrl = $env:CONVEX_URL
-if (-not $deploymentUrl) { throw 'CONVEX_URL is required' }
-$room = 'powershell-live-readme'
-$client = New-ConvexClient $deploymentUrl
-$live = New-ConvexLiveState $deploymentUrl
-$subscription = $null
+$subscription = Add-ConvexSubscription $live 'counter' 'demo:state' @{ room = $room }
 try {
-    # Subscribe first, then block until the initial reactive value arrives.
-    $subscription = Add-ConvexSubscription $live 'counter' 'demo:state' @{ room = $room }
+    # Blocks the script until Convex pushes a value or the timeout elapses.
     $initial = Receive-ConvexSubscription $live $subscription 10000
-    Write-Output "Initial: $($initial.value.count)"
-
-    $result = (Invoke-ConvexMutation $client 'demo:increment' @{
-            room     = $room
-            language = 'powershell'
-            runId    = [guid]::NewGuid().ToString('N')
-        }).Value
-    Write-Output "Mutation returned: $($result.state.count)"
-
-    # Receive the next value emitted for the same subscription.
-    $updated = Receive-ConvexSubscription $live $subscription 10000
-    Write-Output "Live update: $($updated.value.count)"
+    Write-Output "Live count: $($initial.value.count)"
+    # TypeScript: useQuery keeps this value reactive for you automatically.
 }
 finally {
-    if ($subscription) { Remove-ConvexSubscription $live 'counter' }
-    Close-ConvexLive $live
-    Close-ConvexClient $client
+    Remove-ConvexSubscription $live 'counter'
 }
 ```
-
-PowerShell supports callbacks and asynchronous .NET APIs, but this client deliberately exposes a blocking `Receive-ConvexSubscription` operation. That choice makes ownership visible in a script: subscribe, receive values, unsubscribe, and close. React hides those mechanics behind the component lifecycle.
 
 ## Status
 

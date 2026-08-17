@@ -34,112 +34,79 @@ Nothing from the MoonBit toolchain needs to be installed on your host.
 
 ## Interesting Parts
 
-### A query returns honest JSON, not generated application types
+### `guard` flattens validation into one straight path
 
-**TypeScript with React**
-
-```tsx
-import { api } from "../convex/_generated/api";
-import { useQuery } from "convex/react";
-
-export function QueryCounter() {
-  const state = useQuery(api.demo.state, { room: "moonbit-readme" });
-  if (state === undefined) return <p>Loading...</p>;
-
-  return <p>{state.count}</p>; // `state` and `count` are type-safe here.
-}
-```
-
-**MoonBit**
+MoonBit's `guard` pattern-matches an expression and, the moment it fails to
+match, drops you straight into a diverging `else` block — the same idea as
+Swift's `guard let` or Rust's `let`-`else`, but built on full pattern matching
+rather than just `Option`. Every precondition in this client reads as one of
+these instead of a pyramid of nested `if`s, so a fresh environment variable and
+a freshly decoded count get checked in a straight line, not a staircase.
 
 ```moonbit
-async fn query_counter() -> Unit {
-  guard @env.get_env_var("CONVEX_URL") is Some(deployment_url) else {
-    fail("CONVEX_URL is required")
-  }
-  guard deployment_url.length() > 0 else { fail("CONVEX_URL must not be empty") }
-
-  let arguments : Map[String, Json] = Map::new()
-  arguments["room"] = Json::string("moonbit-readme") // Build the Convex args object.
-
-  @convex.with_client(deployment_url, client => {
-    // This is one HTTP request, so it does not stay subscribed.
-    let result = client.query("demo:state", Json::object(arguments))
-    let count = @convex.integer_value(
-      @convex.required_field(result.value, "count", "demo:state"),
-      "demo:state count",
-    )
-    println(count) // The checked decoder has proved this is a whole Int64.
-  })
+guard @env.get_env_var("CONVEX_URL") is Some(url) else {
+  fail("CONVEX_URL is required")
 }
+let current = count_of(
+  client.query("demo:state", room_args(room)).value,
+  "current",
+)
+guard current == 0L else {
+  fail("expected a fresh room, but it already had a count")
+}
+// TypeScript: const state = useQuery(api.demo.state, { room }) - no guard needed
+println("current count: " + current.to_string())
 ```
 
-Convex's React hooks use generated TypeScript types from the backend function.
-This small client deliberately supports the JSON-safe value subset instead, so
-MoonBit receives `Json` and validates fields at the application boundary. The
-helper accepts `0` and `0.0` as the same integer, but rejects fractions, strings,
-non-finite values, and overflow instead of silently coercing them.
+One `else` per `guard`, and the compiler will not let you fall through it.
 
-### React owns reactivity; this client gives you the subscription
+### Numbers are honest: `0` and `0.0` both mean zero, and nothing else does
 
-**TypeScript with React**
-
-```tsx
-import { api } from "../convex/_generated/api";
-import { useQuery } from "convex/react";
-
-export function LiveCounter() {
-  const state = useQuery(api.demo.state, { room: "moonbit-live-readme" });
-  if (state === undefined) return <p>Loading...</p>;
-
-  // React keeps the subscription alive and rerenders when `count` changes.
-  return <p>{state.count}</p>;
-}
-```
-
-**MoonBit**
+Convex's `format=json` encoding is free to spell a whole count as `0` or as
+`0.0`, and MoonBit's own `Json` type keeps both spellings distinct so a
+document can round-trip losslessly. `integer_value` is where those two facts
+meet: it treats `0` and `0.0` as the same integer while still raising on a
+fraction, a string, `NaN`, or anything too big for an `Int64` — the exact job
+a generated TypeScript type would otherwise let you assume was already done.
 
 ```moonbit
-async fn watch_counter() -> Unit {
-  guard @env.get_env_var("CONVEX_URL") is Some(deployment_url) else {
-    fail("CONVEX_URL is required")
+pub fn integer_value(value : Json, what : String) -> Int64 raise ConvexError {
+  guard value is Number(number, ..) else {
+    raise protocol_error(what + " was not a JSON number")
   }
-  guard deployment_url.length() > 0 else { fail("CONVEX_URL must not be empty") }
-
-  let arguments : Map[String, Json] = Map::new()
-  arguments["room"] = Json::string("moonbit-live-readme")
-
-  @convex.with_client(deployment_url, client => {
-    // The caller owns this subscription and decides when to read each update.
-    let subscription = client.subscribe("demo:state", Json::object(arguments))
-
-    guard subscription.next(timeout_ms=20000) is Some(initial) else {
-      fail("initial Live value timed out")
-    }
-    guard initial.value is Some(initial_value) else {
-      fail("initial Live query failed")
-    }
-    println(initial_value.stringify()) // The value current at subscription time.
-
-    guard subscription.next(timeout_ms=20000) is Some(changed) else {
-      fail("next Live value timed out")
-    }
-    guard changed.value is Some(changed_value) else {
-      fail("updated Live query failed")
-    }
-    println(changed_value.stringify()) // A later change, pushed without polling.
-
-    client.unsubscribe(subscription) // Retire it explicitly when finished.
-  })
+  guard !number.is_nan() && !number.is_inf() else {
+    raise protocol_error(what + " was not a finite number")
+  }
+  // (a sibling guard also rejects anything outside Int64's range)
+  let integral = number.to_int64()
+  guard integral.to_double() == number else {
+    raise protocol_error(what + " was not a whole number")
+  }
+  integral
 }
 ```
 
-MoonBit supports asynchronous functions and callbacks. The blocking
-`Subscription::next` shape is a choice made by this command-line client, not a
-language limitation. It makes ownership and backpressure visible: React hides
-the subscription lifecycle behind component mounting and rerenders, while this
-caller waits for and disposes each stream itself. See the complete sequencing
-and failure checks in the [canonical example](examples/basics/main.mbt).
+### The Live socket's lifetime is exactly your callback's
+
+`with_client` is itself `async` and takes an `async` closure, running the Live
+WebSocket's single owner task only for as long as that closure runs — MoonBit's
+flavor of structured concurrency, in the spirit of Kotlin's `coroutineScope` or
+Swift's task groups. Subscribe, block for the next reactive frame, and
+unsubscribe, all inside the callback that owns the socket; when the callback
+returns, by any path, the worker is already gone.
+
+```moonbit
+@convex.with_client(url, client => {
+  let subscription = client.subscribe("demo:state", room_args(room))
+  guard subscription.next(timeout_ms=20000) is Some(update) else {
+    fail("Live update did not arrive before the deadline")
+  }
+  client.unsubscribe(subscription)
+}) // TypeScript: a component owns that lifetime; here, this closure does
+```
+
+No manual disconnect on the error path, because there is no path that skips
+the closure's own cleanup.
 
 ## Status
 

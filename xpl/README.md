@@ -31,110 +31,71 @@ XPL compiler installed on your machine.
 
 ## Interesting Parts
 
-### Function arguments and results are JSON text
+### A mutation's arguments are spliced-together JSON text
 
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-
-  return (
-    <button
-      onClick={async () => {
-        const result = await increment({
-          room: "readme-xpl",
-          language: "XPL",
-          runId: crypto.randomUUID(), // One idempotency key for this click.
-        });
-        console.log(result.state.count); // The generated API types describe this result.
-      }}
-    >
-      Increment
-    </button>
-  );
-}
-```
-
-**XPL**
+XPL has no record or struct type, so the client can't hand `convex_call` a
+typed argument object the way a generated Convex API would. The caller
+concatenates JSON text by hand instead, leaning on `json_encode_string` only
+for escaping:
 
 ```text
-declare room character, run_id character, args character, count fixed;
-
-/* Read CONVEX_URL and optional authentication before making a client call. */
-if convex_init = 0 then call die(g_error_message);
-if argc > 1 then room = argv(1);
-else room = 'xpl-basic-example';
-
-/* The verifier supplies a unique room, so room-plus-once is stable for this run. */
-run_id = room || '-once';
-/* Build the same argument object as JSON because XPL has no record type. */
 args = '{"room":' || json_encode_string('', room) ||
     ',"language":' || json_encode_string('', 'XPL') ||
     ',"runId":' || json_encode_string('', run_id) || '}';
 
 if convex_call('mutation', 'demo:increment', args) = 0 then
-    call die(g_error_message); /* The client puts structured failure details in globals. */
-
-/* Locate the returned state object, then decode its count as a whole number. */
-if json_find_member(g_value_json, 1, 'state') = 0 then
-    call die('mutation result has no state');
-count = count_of(substr(g_value_json, g_span_start, g_span_end - g_span_start));
-/* convex_call closes its one-off HTTP connection before returning. */
+    call die(g_error_message);
+/* TypeScript: await increment({ room, language: "XPL", runId }) */
 ```
 
-React's generated API gives the mutation typed arguments and a typed return
-value. This XPL client instead accepts an encoded JSON object and exposes the
-returned JSON through `g_value_json`. That is a client design shaped by XPL's
-small type system, not a different Convex function. The full executable gets a
-verifier-unique room, so `room || '-once'` remains stable for one process and
-one logical mutation. It is not a globally safe fixed idempotency key. React
-can create a fresh key for each click with `crypto.randomUUID()`.
+`||` is XPL's string operator, inherited from PL/I. There's no object literal
+to reach for, so the request over the wire is exactly the text you build.
 
-### A reactive query has an explicit lifetime
+### A live query is a blocking call, not a subscribed callback
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, { room: "readme-xpl" });
-  if (state === undefined) return <span>Loading...</span>;
-  return <span>{state.count}</span>; // React rerenders when Convex sends an update.
-}
-```
-
-**XPL**
+React's `useQuery` subscribes once and quietly re-renders on every push from
+Convex. This client exposes the same WebSocket stream as an ordinary function
+that blocks until Convex has something to say, and the caller dequeues
+updates on its own schedule:
 
 ```text
-declare room character, args character, count fixed;
-
-/* Configure the client before opening the Live connection. */
-if convex_init = 0 then call die(g_error_message);
-if argc > 1 then room = argv(1);
-else room = 'xpl-basic-example';
-args = '{"room":' || json_encode_string('', room) || '}';
-
-/* The command-line program owns the subscription that React normally owns. */
 if convex_subscribe('demo:state', args) = 0 then call die(g_error_message);
 if convex_subscription_next = 0 then call die(g_error_message);
-
-/* Each call waits for the next value; the complete example calls it again after mutation. */
 count = count_of(g_sub_pending_value);
-output = 'live initial count: ' || count;
-call convex_unsubscribe; /* Cleanup is explicit rather than tied to component unmounting. */
+
+/* TypeScript: const state = useQuery(api.demo.state, { room }) */
+call convex_unsubscribe;
 ```
 
-`useQuery` subscribes and unsubscribes with the React component lifecycle. The
-XPL example owns the connection directly, and this client deliberately exposes
-a blocking `convex_subscription_next` operation because that keeps a small
-command-line program straightforward. A one-off `convex_call('query', ...)`
-would fetch the same shape once, but it would not be reactive.
+There's no component unmount to trigger cleanup, so `convex_unsubscribe` has
+to be called by hand once the program is done watching.
+
+### No struct type, so a WebSocket frame is poked into memory
+
+XPL compiles down to C but never picked up a struct of its own, so the client
+can't declare an RFC 6455 frame header as a record. Sending a Live message
+means writing the header, mask, and masked payload straight into a raw byte
+buffer, one `corebyte` poke at a time:
+
+```text
+mbase = addr(mask(0));
+call RAND_bytes(mbase, 4);                 /* 4 random mask bytes, from OpenSSL */
+fbase = addr(framebuf(0));
+
+corebyte(fbase) = 128 | opcode;            /* fin bit + opcode */
+corebyte(fbase + 1) = 128 | n;             /* masked bit + payload length */
+corebyte(fbase + hlen) = mask(0);
+corebyte(fbase + hlen + 1) = mask(1);
+corebyte(fbase + hlen + 2) = mask(2);
+corebyte(fbase + hlen + 3) = mask(3);
+hlen = hlen + 4;
+do i = 0 to n - 1;
+    corebyte(fbase + hlen + i) = byte(payload, i) xor mask(i mod 4);
+end;
+```
+
+Nothing in the runtime knows what a WebSocket frame is; the client builds one
+from scratch, byte by byte, every time it talks to Convex.
 
 ## Status
 

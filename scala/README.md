@@ -26,98 +26,72 @@ and runs that exact program in Docker against a unique test room:
 
 ## Interesting Parts
 
-### A reactive value has an explicit owner
+### Three Convex verbs, three one-line methods
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, { room: "scala-readme-live" });
-  if (state === undefined) return <p>Loading...</p>;
-
-  return <p>{state.count}</p>; // The generated API makes count type-safe here.
-}
-```
-
-**Scala**
+Scala descends from Java, but Odersky built it around expressions rather than
+statements: a method body is just the value it evaluates to, so a simple call
+needs neither `return` nor braces. The client's three HTTP call kinds collapse
+to one line apiece:
 
 ```scala
-import convex.{ConvexClient, LiveClient}
-import java.time.Duration
-
-@main def observeCounter(): Unit =
-  val deploymentUrl = Option(System.getenv("CONVEX_URL"))
-    .getOrElse(throw new IllegalStateException("CONVEX_URL is required"))
-  // Convex arguments are Jackson JSON nodes in this small client.
-  val arguments = ConvexClient.json.createObjectNode().put("room", "scala-readme-live")
-  val live = new LiveClient(deploymentUrl)
-  try
-    val subscription = live.subscribe("demo:state", arguments)
-    try
-      // next blocks until the initial reactive value arrives or the timeout expires.
-      val state = subscription.next(Duration.ofSeconds(10))
-      println(state.path("count").intValue()) // count is decoded dynamically here.
-    finally subscription.close()
-  finally live.close()
+def query(path: String, args: JsonNode): Result = call("query", path, args)
+def mutation(path: String, args: JsonNode): Result = call("mutation", path, args)
+def action(path: String, args: JsonNode): Result = call("action", path, args)
+// TypeScript: each of those would still want its own async function body
 ```
 
-React owns the `useQuery` subscription and rerenders the component whenever its
-value changes. This command-line client exposes a blocking `next` operation, so
-the caller owns both the wait and cleanup. That is a deliberate client API
-choice, not a limitation of Scala's concurrency features.
+Convex's three verbs and Scala's terse `def`s were made for each other.
 
-### Mutations trade generated types for direct JSON construction
+### `Option` turns "might be missing" into a value
 
-**TypeScript with React**
+Scala keeps `null` around for Java interop, but idiomatic code routes anything
+that might be absent through `Option` instead, so the compiler forces you to
+handle the empty case. The example reads its configuration that way twice in a
+row — once wrapping a nullable Java call, once unwrapping a Scala collection:
 
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
+```scala
+val url = Option(System.getenv("CONVEX_URL"))
+  .getOrElse(throw new IllegalStateException("CONVEX_URL is required"))
+val room = args.headOption.getOrElse("scala-example")
+// TypeScript: process.env.CONVEX_URL ?? (() => { throw new Error("...") })()
+```
 
-export function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
+Same `getOrElse` shape, whether the "maybe nothing" came from Java or Scala.
 
-  async function handleClick() {
-    const result = await increment({
-      room: "scala-readme-mutation",
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.state.count); // The generated API checks args and result.
+### Reactivity is a blocking call, not a callback
+
+Convex's Live sync protocol streams updates over a websocket; rather than
+firing a callback, this client turns each push into a value a plain script can
+wait for, the same way it would wait for anything else:
+
+```scala
+val subscription = live.subscribe("demo:state", roomArgs)
+try
+  // next blocks this thread until Convex pushes a value or the timeout fires.
+  val initial = subscription.next(Duration.ofSeconds(10))
+  println(initial.path("count").intValue())
+finally subscription.close()
+// TypeScript: useQuery(api.demo.state, { room }) reruns your component instead
+```
+
+React owns the rerender in a browser; here, the caller owns the wait.
+
+### `extends AutoCloseable, WebSocket.Listener` — no `with` needed
+
+Scala 2 chained extra mixed-in traits with `extends A with B with C`. Scala 3
+lets a comma do that job, so a class can pick up a Java interface and a Scala
+trait in the same breath:
+
+```scala
+final class LiveClient(rawUrl: String) extends AutoCloseable, WebSocket.Listener:
+  // ...
+  override def onOpen(webSocket: WebSocket): Unit = submit {
+    webSocket.request(1)
   }
-
-  return <button onClick={handleClick}>Increment</button>;
-}
 ```
 
-**Scala**
-
-```scala
-import convex.ConvexClient
-import java.util.UUID
-
-@main def incrementCounter(): Unit =
-  val deploymentUrl = Option(System.getenv("CONVEX_URL"))
-    .getOrElse(throw new IllegalStateException("CONVEX_URL is required"))
-  val arguments = ConvexClient.json
-    .createObjectNode()
-    .put("room", "scala-readme-mutation")
-    .put("language", "scala")
-    .put("runId", UUID.randomUUID().toString) // Makes a retry idempotent.
-  val client = new ConvexClient(deploymentUrl)
-  try
-    val result = client.mutation("demo:increment", arguments).value
-    println(result.path("state").path("count").intValue())
-  finally client.close()
-```
-
-The Scala call is synchronous and uses a string function path plus Jackson's
-dynamic JSON tree. The React client instead gets argument and result types from
-Convex's generated API. Scala itself has a rich static type system; dynamic
-decoding is simply the scope chosen for this demonstration.
+`WebSocket.Listener` is the JDK's own callback interface — Scala mixes it in
+like any other trait, no adapter required.
 
 ## Status
 

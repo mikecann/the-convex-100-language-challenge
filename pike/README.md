@@ -33,123 +33,87 @@ Pike or any build dependency on your host.
 
 ## Interesting Parts
 
-### Named arguments are mappings, but returned data needs runtime checks
+### Mapping literals cover JSON objects, but zero doesn't lie about absence
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function RoomCount() {
-  const room = "readme-pike-room";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // The generated API makes state.count type-safe.
-}
-```
-
-**Pike**
+Pike's `([ ... ])` syntax is its one collection-literal for anything
+key-value shaped, so it doubles as both the JSON object Convex expects on the
+wire and the argument bag the client builds locally. The catch is Pike's `->`
+member access: it returns `0` for a key that is genuinely `0` and for a key
+that was never there, so a real count of zero and a missing field look
+identical until something checks.
 
 ```pike
-string deployment_url = getenv("CONVEX_URL");
-if (!deployment_url || !sizeof(deployment_url))
-  error("CONVEX_URL is required\n");
-
-// Compile this educational client, then connect to the checked deployment.
-object convex = compile_file("client/convex.pike")();
-object client = convex->Client(deployment_url);
-string room = "readme-pike-room";
-
-// ([ ... ]) is Pike's mapping literal, much like a JavaScript object.
+// TypeScript: const state = useQuery(api.demo.state, { room });
 object result = client->query("demo:state", ([ "room": room ]));
 mapping state = convex->require_object(result->value, "demo:state result");
 
-// Mapping lookup returns 0 for both a missing key and a real zero value.
+// A mapping lookup can't tell 0 from "not present" -- absence has to be
+// ruled out with zero_type() before a genuine 0 can be trusted.
 if (zero_type(state->count))
   error("demo:state omitted count\n");
 int count = convex->require_whole_number(state->count, "state count");
-write("%d\n", count);
-client->close(); // This command-line program owns its client lifecycle.
 ```
 
-Both calls send `{ room: "readme-pike-room" }` to `api.demo.state`, but the
-semantics differ. React's `useQuery` owns a reactive subscription and rerenders
-the component. Pike's `query` is one HTTP snapshot, and the native client
-returns dynamically decoded JSON, so the example checks the object shape and
-number explicitly. Pike's `->` member syntax works for both objects and mapping
-keys, which is convenient until zero is a valid answer.
+### A Live subscription is a handle you poll and close yourself
 
-### A command-line program owns the Live subscription itself
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function IncrementButton() {
-  const room = "readme-pike-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  async function onIncrement() {
-    const result = await increment({
-      room,
-      language: "TypeScript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.state.count); // The mutation returns the updated state.
-  }
-
-  return <button onClick={onIncrement}>Count: {state?.count ?? 0}</button>;
-}
-```
-
-**Pike**
+Live is verified here, locally and hosted, so this is the client's real
+reactive path rather than a stand-in. `subscribe` hands back a plain
+`Subscription` object instead of hooking into a component tree: nothing
+streams until the program calls `next_update`, and nothing stops until it
+calls `close`. In a command-line example that means the reactive wait is
+just another blocking call sitting between two ordinary lines of code.
 
 ```pike
-string deployment_url = getenv("CONVEX_URL");
-if (!deployment_url || !sizeof(deployment_url))
-  error("CONVEX_URL is required\n");
-
-// Compile this educational client, then connect to the checked deployment.
-object convex = compile_file("client/convex.pike")();
-object client = convex->Client(deployment_url);
-string room = "readme-pike-live";
-
-// Subscribe before mutating so this handle can observe the pushed update.
+// Subscribing opens a handle -- nothing streams until it's asked for.
 object updates = client->subscribe("demo:state", ([ "room": room ]));
-object initial = updates->next_update(20000); // Wait for initial hydration.
-if (initial->failure)
-  error("initial Live query failed: %s\n", initial->failure->describe());
-write("initial count: %d\n",
-      convex->require_whole_number(initial->value->count, "initial count"));
+object initial = updates->next_update(20000); // blocks up to 20s
 
-// Reuse this stable id for retries of this one logical mutation call.
-string run_id = sprintf("pike-%s-%d-%d", room, time(), random(1000000000));
-object result = client->mutation("demo:increment", ([
-  "room": room,
-  "language": "Pike",
-  "runId": run_id,
-]));
-mapping outcome = convex->require_object(result->value, "mutation result");
-write("mutation count: %d\n",
-      convex->require_whole_number(outcome->state->count, "mutation count"));
+client->mutation("demo:increment", ([ "room": room, "runId": run_id ]));
 
-object changed = updates->next_update(20000); // The existing Live query moved.
-write("live count: %d\n",
-      convex->require_whole_number(changed->value->count, "live count"));
-updates->close();
-client->close(); // Explicit cleanup replaces React's automatic unmount cleanup.
+// TypeScript: a rerender happens on its own; here the next value is requested.
+object changed = updates->next_update(20000);
+write("live count: %d\n", changed->value->count);
+updates->close(); // there is no unmount event to do this automatically
 ```
 
-React owns setup, cleanup, and rerendering around `useQuery`. This Pike program
-owns an explicit subscription and closes it itself. The blocking `next_update`
-call is a deliberate API choice for a linear command-line example, not a Pike
-limitation. The same client also supports callbacks, which the conformance
-adapter uses when it needs pushed events instead of a blocking read.
+The same `LiveOwner` also supports a callback style for programs that would
+rather be handed updates than ask for them.
+
+### No build step: `compile_file` turns source text into a running program
+
+Pike has no separate compile-then-run pipeline for this client and no
+package manager standing in front of it: `compile_file` reads the six-file
+client straight into a `Program` value at process startup, and calling that
+value like a function instantiates it. That "compile whatever you find,
+right now" habit predates npm by a couple of decades -- Pike's predecessor,
+µLPC, was already loading game code this way in 1994.
+
+```pike
+// compile_file compiles source into a Program; the trailing () instantiates it.
+// TypeScript: import { ConvexClient } from "convex/browser";
+object convex = compile_file(client_source())();
+object client = convex->Client(deployment_url);
+```
+
+### `catch` is an expression, and every failure arrives pre-classified
+
+Pike's `catch { ... }` isn't a statement bolted onto a `try`; it's an
+expression that evaluates to `0` on success or to whatever was thrown on
+failure, so a caller can capture the outcome inline with no separate
+handler block. This client leans on that to fold transport faults, protocol
+violations, closed-client misuse, and genuine Convex function errors into
+one `ConvexError` shape before any of them reach the example.
+
+```pike
+mixed failed = catch { status = demonstrate(convex, client, room); };
+client->close();
+if (failed) {
+  // TypeScript: catch (err) { console.error(err.message); }
+  werror("pike example failed: %s\n",
+         convex->as_convex_error(failed)->describe());
+  return 1;
+}
+```
 
 ## Status
 

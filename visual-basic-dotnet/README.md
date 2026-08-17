@@ -27,155 +27,78 @@ example against an isolated test room:
 
 ## Interesting Parts
 
-### JSON objects use collection initializers
+### JSON objects are collection literals, not builder chains
 
-In React, a plain object becomes the mutation arguments. This VB client accepts
-`JsonObject`, so its `From` collection initializer plays the same role.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-  const room = "vb-readme-room";
-
-  return (
-    <button
-      onClick={() =>
-        increment({
-          room,
-          language: "typescript",
-          runId: crypto.randomUUID(), // Makes a retry safe.
-        })
-      }
-    >
-      Increment
-    </button>
-  );
-}
-```
-
-**Visual Basic .NET**
+Visual Basic's `From` collection initializer clause lets a `New JsonObject` be
+written like a dictionary literal, no chain of `.Add` calls required. Since this
+client accepts a raw `JsonObject` for every query and mutation, sending a
+request is just writing the JSON by hand.
 
 ```vbnet
-Imports System
-Imports System.Text.Json.Nodes
-Imports System.Threading.Tasks
-Imports ConvexVisualBasic
-
-Module IncrementExample
-    Public Async Function IncrementAsync() As Task
-        Dim url = Environment.GetEnvironmentVariable("CONVEX_URL")
-        If String.IsNullOrWhiteSpace(url) Then Throw New InvalidOperationException("CONVEX_URL is required")
-
-        Dim room = "vb-readme-room"
-        Dim mutationArgs As New JsonObject From {
-            {"room", room},
-            {"language", "visual-basic-dotnet"},
-            {"runId", Guid.NewGuid().ToString()} ' Makes a retry safe.
-        }
-
-        Using client As New ConvexClient(url)
-            Dim result = Await client.Mutation("demo:increment", mutationArgs)
-            Dim mutation = result.Value.AsObject() ' The returned JSON remains explicit.
-            Dim state = mutation("state").AsObject()
-            Console.WriteLine(state("count"))
-        End Using
-    End Function
-End Module
-```
-
-The VB initializer is concise, but it is not a generated, type-safe function
-reference. Function paths and returned JSON fields are checked at runtime. The
-[full example](examples/basics/Program.vb) adds strict numeric decoding and
-checks the mutation result before trusting it.
-
-### The command-line client owns the Live subscription
-
-React starts, updates, and disposes the `useQuery` subscription with the
-component. This VB API deliberately exposes a blocking `Next` operation so a
-small console program can control exactly when it observes each value. That is
-a choice made by this client, not a limitation of Visual Basic or .NET.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const room = "vb-readme-room";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  if (state === undefined) return <p>Loading...</p>;
-  return (
-    <>
-      <p>Count: {state.count}</p> {/* React re-renders after updates. */}
-      <button
-        onClick={() =>
-          void increment({
-            room,
-            language: "typescript",
-            runId: crypto.randomUUID(),
-          })
-        }
-      >
-        Increment
-      </button>
-    </>
-  );
+Dim mutationArgs As New JsonObject From {
+    {"room", room},
+    {"language", "visual-basic-dotnet"},
+    {"runId", Guid.NewGuid().ToString()} ' TypeScript: increment({ room, language, runId })
 }
+
+Dim result = Await client.Mutation("demo:increment", mutationArgs)
 ```
 
-**Visual Basic .NET**
+There's no generated `api.demo.increment` reference here — the function path is
+just the string `"demo:increment"`, checked by the server at call time.
+
+### Booleans spelled out in full words
+
+Visual Basic's name traces back to Dartmouth BASIC (1964), a language designed
+so beginners could read code almost like English, and VB.NET still keeps that
+habit in its keywords: `AndAlso`, `OrElse`, `Not`, and `Is Nothing` stand in for
+`&&`, `||`, `!`, and `== null`. The client's constructor reads almost like a
+sentence when it rejects a bad deployment URL.
 
 ```vbnet
-Imports System
-Imports System.Text.Json.Nodes
-Imports System.Threading.Tasks
-Imports ConvexVisualBasic
-
-Module LiveExample
-    Public Async Function ObserveAsync() As Task
-        Dim url = Environment.GetEnvironmentVariable("CONVEX_URL")
-        If String.IsNullOrWhiteSpace(url) Then Throw New InvalidOperationException("CONVEX_URL is required")
-
-        Dim room = "vb-readme-room"
-        Dim queryArgs As New JsonObject From {{"room", room}}
-
-        Using client As New ConvexClient(url)
-            Using live As New LiveClient(url)
-                ' Subscribe owns the server query until this object is disposed.
-                Using subscription = Await live.Subscribe("demo:state", queryArgs)
-                    Dim initial = subscription.Next(TimeSpan.FromSeconds(10)).AsObject()
-                    Console.WriteLine(initial("count")) ' The first available value.
-
-                    Dim mutationArgs As New JsonObject From {
-                        {"room", room},
-                        {"language", "visual-basic-dotnet"},
-                        {"runId", Guid.NewGuid().ToString()}
-                    }
-                    Dim result = Await client.Mutation("demo:increment", mutationArgs)
-                    Dim mutation = result.Value.AsObject()
-                    Console.WriteLine(mutation("applied")) ' The mutation's returned value.
-
-                    Dim updated = subscription.Next(TimeSpan.FromSeconds(10)).AsObject()
-                    Console.WriteLine(updated("count")) ' The resulting reactive value.
-                End Using
-            End Using
-        End Using
-    End Function
-End Module
+If Not Uri.TryCreate(deployment.TrimEnd("/"c), UriKind.Absolute, candidate) OrElse
+    (candidate.Scheme <> Uri.UriSchemeHttp AndAlso candidate.Scheme <> Uri.UriSchemeHttps) OrElse
+    Not String.IsNullOrEmpty(candidate.UserInfo) Then
+    Throw New ArgumentException("Convex deployment URL must be http(s), have a host, and omit user info")
+End If
 ```
 
-The React component leaves subscription cleanup and rerendering to the hook.
-The VB fragment explicitly owns both clients and pulls each value in order. The
-canonical example adds checks that the initial query, mutation result, and Live
-update all agree.
+### TryCast asks politely; DirectCast does not
+
+Where C# has one `as` operator, VB keeps two verbs for casting. `TryCast`
+returns `Nothing` on a bad cast; `DirectCast` throws. Decoding a Live transition
+message leans on both within the same function — untrusted server JSON gets the
+polite cast, and data this method already validated gets the demanding one.
+
+```vbnet
+Dim modification = TryCast(raw, JsonObject) ' Nothing if the server sent something odd.
+If modification Is Nothing Then Throw New ConvexClient.ProtocolException("...")
+...
+version = DirectCast(endVersion.DeepClone(), JsonObject) ' Trusted: already validated above.
+```
+
+### A Live subscription is a resource you check out and return
+
+React's `useQuery` opens and tears down a subscription as the component mounts
+and unmounts. This client hands you that lifetime directly: `Subscribe` returns
+an `IDisposable` `Subscription`, so nesting it inside a `Using` block guarantees
+the socket unsubscribes the moment you're done watching, even if an exception
+throws through the middle.
+
+```vbnet
+Using client As New ConvexClient(url)
+    Using live As New LiveClient(url)
+        Using subscription = Await live.Subscribe("demo:state", roomArgs)
+            Dim initial = subscription.NextUpdate(TimeSpan.FromSeconds(10)) ' TypeScript: useQuery(api.demo.state, { room })
+            Await client.Mutation("demo:increment", mutationArgs)
+            Dim updated = subscription.NextUpdate(TimeSpan.FromSeconds(10))
+        End Using
+    End Using
+End Using
+```
+
+Three nested `Using` blocks close in reverse order the instant control leaves
+them — there's no cleanup effect to remember.
 
 ## Status
 

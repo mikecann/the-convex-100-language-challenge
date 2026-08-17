@@ -34,143 +34,80 @@ installed on your host.
 
 ## Interesting Parts
 
-### JSON is a real data type, not an untyped object
+### JSON is a sum type, not an object literal
 
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function IncrementButton() {
-  const room = "readme-purescript";
-  const increment = useMutation(api.demo.increment);
-
-  return (
-    <button
-      onClick={async () => {
-        const result = await increment({
-          room,
-          language: "TypeScript",
-          runId: crypto.randomUUID(), // A fresh click gets a fresh idempotency key.
-        });
-        console.log(result.state.count); // Generated types know this is a number.
-      }}
-    >
-      Increment
-    </button>
-  );
-}
-```
-
-**PureScript**
+PureScript inherits Haskell's algebraic data types, so this client models a
+Convex value as a real `Json` sum type rather than leaning on JavaScript's
+grab-bag `object`. Building a request means reaching for constructors —
+`JsonObject`, `JsonString`, `Tuple` — instead of writing object-literal syntax.
 
 ```purescript
--- The verifier supplies a unique room as the first command-line argument.
-arguments <- Sys.plainArguments
-room <- case listHead arguments of
-  Nothing -> Sys.fatal "pass a unique room as the first argument"
-  Just value -> pure value
+data Json
+  = JsonNull
+  | JsonBool Boolean
+  | JsonInt Int
+  | JsonNumber Number
+  | JsonString String
+  | JsonArray (List Json)
+  | JsonObject (List (Tuple String Json)) -- keeps key order, unlike a JS object
 
-deployment <- Sys.env "CONVEX_URL" ""
-if deployment == "" then Sys.fatal "set CONVEX_URL to a Convex deployment"
-else do
-  clientResult <- Convex.new deployment
-  case clientResult of
-    Left problem -> Sys.fatal problem.message
-    Right client -> do
-      -- The room is verifier-unique, so this is one unique logical action.
-      let runId = room <> "-once"
-      -- `JsonObject` and `Tuple` make the wire shape explicit.
-      let mutationArgs = JsonObject
-            ( Cons (Tuple "room" (JsonString room))
-                ( Cons (Tuple "language" (JsonString "PureScript"))
-                    (listSingleton (Tuple "runId" (JsonString runId)))
-                )
-            )
-      outcome <- Convex.call client Convex.Mutation "demo:increment" mutationArgs
-      case outcome of
-        Left problem -> Sys.fatal problem.message
-        Right result -> case Json.field result.value "state" of
-          Nothing -> Sys.fatal "the mutation returned no state"
-          Just state -> case Json.field state "count" of
-            Nothing -> Sys.fatal "the state returned no count"
-            Just raw -> case Json.integralInt raw of
-              Nothing -> Sys.fatal "count was not a whole number"
-              Just count ->
-                Sys.println ("mutation count: " <> intToString count)
-      -- This command-line program owns the client, so it releases it itself.
-      _ <- Convex.close client
-      pure unit
+let mutationArgs = JsonObject
+      ( Cons (Tuple "room" (JsonString room))
+          (listSingleton (Tuple "language" (JsonString "PureScript")))
+      )
+-- TypeScript: await increment({ room, language: "PureScript" })
 ```
 
-The React call gets argument and result types from Convex's generated API. This
-PureScript client instead accepts a function path and its own `Json` algebraic
-data type, so the backend schema is checked at runtime. Pattern matching makes
-every missing field and failed call visible, but it is not generated end-to-end
-type safety.
+Convex re-encodes and compares these values elsewhere in the client, so making
+key order part of the type — rather than trusting whatever a hash map hands
+back — is a deliberate design choice, not an oversight.
 
-### Reactive updates arrive through a process mailbox
+### A missing field is `Nothing`, never an exception
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function Counter() {
-  const room = "readme-purescript";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <span>Loading...</span>;
-  return <span>{state.count}</span>; // React rerenders after each Live update.
-}
-```
-
-**PureScript**
+Convex results arrive as untyped JSON, so instead of trusting a generated type
+and throwing on a bad shape, this client leans on PureScript's `Maybe`.
+Decoding a mutation's result means matching down through every layer by hand.
 
 ```purescript
-let room = "readme-purescript"
-let args = JsonObject (listSingleton (Tuple "room" (JsonString room)))
-
-deployment <- Sys.env "CONVEX_URL" ""
-if deployment == "" then Sys.fatal "set CONVEX_URL to a Convex deployment"
-else do
-  clientResult <- Convex.new deployment
-  case clientResult of
-    Left problem -> Sys.fatal problem.message
-    Right client -> do
-      -- The BEAM process running this code receives subscription events.
-      self <- Sys.selfPid
-      subscribed <- Convex.subscribe client "demo:state" args self
-      case subscribed of
-        Left problem -> Sys.fatal problem.message
-        Right subscriptionId -> do
-          delivery <- Sys.receiveEvent 10000
-          case delivery of
-            Nothing -> Sys.fatal "Live timed out"
-            Just received -> do
-              -- Acknowledge before the bounded relay sends another value.
-              Live.acknowledge received
-              case received.event of
-                LiveFailure problem -> Sys.fatal problem.message
-                LiveValue value _logs -> case Json.field value "count" of
-                  Nothing -> Sys.fatal "the Live value returned no count"
-                  Just raw -> case Json.integralInt raw of
-                    Nothing -> Sys.fatal "count was not a whole number"
-                    Just count ->
-                      Sys.println ("live count: " <> intToString count)
-          -- Unsubscribe is an explicit lifecycle boundary in this API.
-          _ <- Convex.unsubscribe client subscriptionId
-          _ <- Convex.close client
-          pure unit
+case Json.field result.value "state" of
+  Nothing -> Sys.fatal "the mutation returned no state"
+  Just state -> case Json.field state "count" of
+    Nothing -> Sys.fatal "the state returned no count"
+    Just raw -> case Json.integralInt raw of
+      Nothing -> Sys.fatal "count was not a whole number"
+      Just count ->
+        Sys.println ("mutation count: " <> intToString count)
+        -- TypeScript: result.state.count, trusted from generated types
 ```
 
-`useQuery` owns the subscription lifecycle and rerenders the component when the
-value changes. PureScript supports many asynchronous abstractions, but this
-client deliberately exposes a mailbox plus a blocking receive because it maps
-cleanly onto BEAM processes. The full example starts Live before its mutation,
-then receives both the initial value and the resulting update.
+The chain doesn't get shorter as the response gets deeper, but it also never
+gets to lie: every field that might be missing has to be opened before it can
+be used.
+
+### A Live update lands in your mailbox, not a callback
+
+This client's PureScript compiles through [purerl](https://github.com/purerl/purerl)
+to Erlang, so it runs as an honest-to-goodness BEAM process — and Live is built
+on that fact rather than emulated on top of it. Subscribing hands Convex a
+process id, and updates arrive as ordinary messages in that process's mailbox.
+
+```purescript
+self <- Sys.selfPid
+subscription <- Convex.subscribe client "demo:state" args self
+delivery <- Sys.receiveEvent liveTimeout
+case delivery of
+  Nothing -> Sys.fatal "Live timed out"
+  Just received -> do
+    Live.acknowledge received -- backpressure: this value has left the mailbox
+    case received.event of
+      LiveValue value _logs -> count value
+      LiveFailure problem -> Sys.fatal problem.message
+-- TypeScript: useQuery(api.demo.state, { room }) triggers a rerender instead
+```
+
+Each subscription holds at most 16 undelivered events, so `acknowledge` is not
+optional bookkeeping — it's the signal that keeps a slow reader's mailbox from
+growing without bound.
 
 ## Status
 

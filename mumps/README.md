@@ -29,106 +29,61 @@ provides the pinned compiler and runtime.
 
 ## Interesting Parts
 
-### A typed object in React becomes an inspected local tree in M
+### A JSON reply becomes numbered nodes in a bounded array, not an object
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const room = "readme-mumps";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**MUMPS**
+MUMPS's name comes from its 1960s origin — the Massachusetts General Hospital
+Utility Multi-Programming System — and its whole storage model has always been
+the sparse, subscripted array. This client's JSON parser leans on that
+heritage: a Convex response doesn't become an object, it becomes a tree of
+numbered nodes in a local array, walked one lookup at a time.
 
 ```mumps
- do setup^convex
- new url set url=$ztrnlnm("CONVEX_URL") ; Read configuration from the environment.
- if '$$open^convex(url,"mumps-readme") zhalt 1 ; ' means logical NOT.
- new q set q=$char(34) ; A quote character, used to construct valid JSON.
- new room set room="readme-mumps"
- new args set args="{"_q_"room"_q_":"_q_room_q_"}" ; _ concatenates strings.
-
- new response
- if '$$query^convex("demo:state",args,.response) zhalt 1 ; . passes the result by reference.
- new mark set mark=$$jMark^convex()
- new root set root=$$jParse^convex(response("value")) ; Parse JSON into local array nodes.
- if root<0 zhalt 1
- new countNode set countNode=$$jFind^convex(root,"count")
- if countNode<0!($$jType^convex(countNode)'="number") zhalt 1
- write $$jText^convex(countNode),! ; Checked at runtime, not type-safe at compile time.
- do jRelease^convex(mark) ; Release this parse tree's bounded node allocation.
+ new mark set mark=$$jMark^convex() ; Bound this parse's node allocation.
+ new root set root=$$jParse^convex(response("value"))
+ new node set node=$$jFind^convex(root,"count") ; Object lookup by exact key.
+ if node<0!($$jType^convex(node)'="number") zhalt 1
+ write $$jText^convex(node),! ; TypeScript: state.count, already type-checked.
+ do jRelease^convex(mark) ; Free every node parsed since mark.
 ```
 
-The React hook owns a reactive subscription and rerenders the component. The M
-call above is deliberately a one-off HTTP query. M has no static object type to
-match Convex's generated TypeScript type, so this client parses the response
-into a subscripted local array and checks each node before using it. YottaDB's
-[language guide](https://docs.yottadb.com/ProgrammersGuide/langfeat.html#variables)
-explains these sparse, expression-subscripted arrays.
+Nothing here knows Convex's generated TypeScript types exist; each field is
+checked the moment it's read, and `mark`/`jRelease` cap how many nodes one
+parse is allowed to allocate.
 
-### React manages Live; this command-line client waits explicitly
+### Success is the return value; the payload comes back by reference
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function IncrementButton() {
-  const room = "readme-mumps";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  async function addOne() {
-    const result = await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.state.count); // The mutation result is type-safe here.
-  }
-
-  return <button onClick={addOne}>Count: {state?.count ?? 0}</button>;
-}
-```
-
-**MUMPS**
+An M function returns exactly one value from `$$name(...)`, so this client
+spends that slot on a plain success flag and hands back everything else
+through arguments written with a leading dot — call by reference, resolved by
+variable name rather than copied in.
 
 ```mumps
- do setup^convex ; Initialize the client's bounded tables.
- new url set url=$ztrnlnm("CONVEX_URL") ; Read the deployment URL from the environment.
- if '$$open^convex(url,"mumps-readme") zhalt 1 ; Create this program's client session.
- new q set q=$char(34)
- new room set room="readme-mumps"
- new args set args="{"_q_"room"_q_":"_q_room_q_"}"
- if '$$subscribe^convex("counter","demo:state",args) zhalt 1 ; Register Live before mutation.
+ new args set args="{"_q_"room"_q_":"_q_room_q_"}" ; q holds a quote char; _ concatenates.
+ new response ; Declared empty; the callee fills it in as a side effect.
+ if '$$query^convex("demo:state",args,.response) zhalt 1
+ write response("value"),! ; TypeScript: const { value } = await client.query(...)
+```
 
+`response` is just local scratch space until the call returns — there's no
+result object to destructure, only a variable the callee was trusted to set.
+
+### Reactivity here is a blocking wait, not a re-render
+
+React's `useQuery` subscribes once and lets a re-render carry every future
+value. This command-line client has no event loop to hand that off to, so
+`waitUpdate` parks the single M process until Convex's Live protocol delivers
+the next transition or the deadline passes.
+
+```mumps
+ if '$$subscribe^convex("counter","demo:state",args) zhalt 1 ; Register Live before mutating.
  new hasError,errName,errMsg,value
  if '$$waitUpdate^convex("counter",15000,.hasError,.errName,.errMsg,.value) zhalt 1
- if hasError zhalt 1 ; The first blocking wait receives the initial Live value.
-
- new mutation,response
- set mutation="{"_q_"room"_q_":"_q_room_q_","_q_"language"_q_":"_q_"mumps"_q_","_q_"runId"_q_":"_q_$$randomHex^convex(16)_q_"}"
- if '$$mutation^convex("demo:increment",mutation,.response) zhalt 1
- ; response("value") is JSON text, so callers must validate it at runtime.
-
- if '$$waitUpdate^convex("counter",15000,.hasError,.errName,.errMsg,.value) zhalt 1
- if hasError zhalt 1 ; This blocking wait receives the reactive update.
- do closeLive^convex(2000) ; The command-line program owns subscription cleanup.
+ if hasError zhalt 1 ; A reactive query failure is an out parameter, not an exception.
+ write value,! ; TypeScript: useQuery just re-renders the component.
 ```
 
-M supports ordinary subroutines and returned values, but this client's blocking
-`waitUpdate` is an API choice suited to its single-threaded command-line loop.
-React instead manages subscription setup and cleanup around the component
-lifecycle. The complete example performs the runtime JSON checks omitted here.
+Run a mutation and call `waitUpdate` again: the same line receives the pushed
+update, proof the change arrived over the wire rather than from asking again.
 
 ## Status
 

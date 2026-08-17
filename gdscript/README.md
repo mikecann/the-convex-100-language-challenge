@@ -53,8 +53,6 @@ func _run() -> int:
 	return 0
 ```
 
-That pair of declarations is GDScript's gradual typing in one screenful.
-
 ### No try, no catch: failure is a Dictionary
 
 GDScript deliberately ships without exceptions — Godot prefers game code that
@@ -78,9 +76,8 @@ var state: Dictionary = mutated["value"]["state"]
 ### Every number off the wire is a float, so an int must be earned
 
 Godot's `JSON` parser reads numbers with `String.to_float`, so Convex's
-integral counter arrives as `1.0` — and `"1e999"` becomes infinity rather
-than a parse error. Instead of casting and hoping, the client interrogates
-the value:
+integral counter arrives as `1.0` — and `"1e999"` becomes infinity, not a
+parse error. The client interrogates the value instead of casting and hoping:
 
 ```gdscript
 static func count_from_json(value: Variant, context: String) -> Dictionary:
@@ -96,15 +93,14 @@ static func count_from_json(value: Variant, context: String) -> Dictionary:
 	return ConvexResult.ok(int(number))
 ```
 
-Only a whole, finite number inside JavaScript's exact-integer range becomes
-an `int`, so the counter never advances on a value Convex did not send.
+Only a whole, finite number in range becomes an `int`, so the counter never
+advances on a value Convex did not send.
 
 ### Reactivity you pump one frame at a time
 
 Convex's signature move is the server pushing fresh query results to you.
-React hides that machinery inside `useQuery`; in a game engine its natural
-home is the frame loop. A subscription here is a handle you drain however
-your program breathes:
+React hides that machinery inside `useQuery`; in a game engine, the natural
+home is the frame loop — a handle you drain however your program breathes:
 
 ```gdscript
 var subscribed := client.subscribe("demo:state", {"room": room})

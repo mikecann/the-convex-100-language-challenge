@@ -21,109 +21,55 @@ The command builds and runs the exact example below in Docker against a unique t
 
 ## Interesting Parts
 
-### A generated React API becomes a string path and JSON dictionary
+### Guard clauses decode JSON or bail, in one breath
 
-**TypeScript with React**
-
-```tsx
-import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
-
-export function App() {
-  return (
-    <ConvexProvider client={convex}>
-      <Counter />
-    </ConvexProvider>
-  );
-}
-
-function Counter() {
-  const state = useQuery(api.demo.state, { room: "swift-readme-http" });
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // The generated API types state and count.
-}
-```
-
-**Swift**
+`guard` has no real TypeScript counterpart: it is a control-flow keyword, added in Swift 2 specifically so validation code reads as a straight line instead of a pyramid of nested `if`s. Because this client treats a Convex reply as untyped `Any` rather than a generated type, every decode leans on it — bind the shape you expect, or exit right there.
 
 ```swift
-import Convex
-import Foundation
-
-func printCounter() async throws {
-  guard let deployment = ProcessInfo.processInfo.environment["CONVEX_URL"] else {
-    throw URLError(.badURL)
-  }
-  let client = try ConvexClient(deployment)
-  defer { client.close() }
-
-  // This client uses the deployed function's string path and a JSON dictionary.
-  let result = try await client.query("demo:state", ["room": "swift-readme-http"])
-  guard
-    let state = result.value as? [String: Any],
-    let count = state["count"] as? NSNumber
-  else { throw URLError(.cannotDecodeContentData) }
-  print(count.intValue) // The JSON boundary is dynamic, so decoding is explicit.
-}
+let result = try await client.query("demo:state", ["room": room])
+// TypeScript: const state = useQuery(api.demo.state, { room })
+guard
+  let state = result.value as? [String: Any],
+  let count = state["count"] as? NSNumber
+else { throw URLError(.cannotDecodeContentData) }
+print(count.intValue)
 ```
 
-React's `useQuery` stays subscribed and rerenders the component when the value changes. The Swift `query` call above is deliberately one-shot. Swift itself has a rich type system, but this small client exposes JSON as `Any` and does not generate types from the Convex API, so function names and result shapes are checked at runtime. See [`client/Convex.swift`](client/Convex.swift).
+Nothing past the `guard` runs without a valid `count`, and there's no separate `else` block sitting far away from the check it belongs to.
 
-### Live updates are an `AsyncStream` that you own
+### An actor is the only thing allowed to touch the socket
 
-**TypeScript with React**
-
-```tsx
-import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
-
-export function App() {
-  return (
-    <ConvexProvider client={convex}>
-      <LiveCounter />
-    </ConvexProvider>
-  );
-}
-
-function LiveCounter() {
-  const state = useQuery(api.demo.state, { room: "swift-readme-live" });
-  return <p>{state?.count ?? "Loading..."}</p>; // React owns subscription cleanup.
-}
-```
-
-**Swift**
+Swift's `actor`, introduced with the Swift 5.5 concurrency overhaul, is a reference type the compiler forces you to call asynchronously: only one task may be running inside it at a time, so its stored properties can never be torn by a race. `LiveClient` is a single actor guarding the WebSocket, the subscription table, and all reconnect bookkeeping — no separate mutex to reason about.
 
 ```swift
-import Convex
-import Foundation
+public actor LiveClient {
+  private var socket: (any LiveSocket)?
+  private var subscriptions: [Int: Entry] = [:]
 
-func printFirstLiveValue() async throws {
-  guard let deployment = ProcessInfo.processInfo.environment["CONVEX_URL"] else {
-    throw URLError(.badURL)
+  public nonisolated func subscribe(
+    _ path: String, _ args: [String: JSON]
+  ) async throws -> Subscription {
+    // TypeScript's client leans on a single-threaded event loop instead.
+    try await subscribeIsolated(path, JSONArguments(args))
   }
-  let live = try LiveClient(deployment)
-
-  // The command-line client owns both the subscription and its lifetime.
-  let subscription = try await live.subscribe(
-    "demo:state", ["room": "swift-readme-live"])
-  var updates = subscription.stream.makeAsyncIterator()
-  if let update = await updates.next(),
-    let state = update.value as? [String: Any],
-    let count = state["count"] as? NSNumber
-  {
-    print(count.intValue) // `next()` waits for the initial reactive value.
-  }
-
-  await live.unsubscribe(subscription)
-  await live.close() // Shutdown is explicit outside a React component lifecycle.
 }
 ```
 
-Swift supports callbacks and other asynchronous designs. Returning an `AsyncStream` is this client's API choice: it fits `async`/`await`, lets `for await` consume later values, and makes ownership clear in a command-line program. Internally, a Swift `actor` serializes the socket, subscription set, and reconnect state. Actors are a language feature for protecting shared mutable state, described in Swift's [official concurrency guide](https://docs.swift.org/swift-book/documentation/the-swift-programming-language/concurrency/).
+### A subscription is an `AsyncStream` you pull with `await`
+
+Rather than a callback or a third-party reactive type, `subscribe` hands back a Swift `AsyncStream`, so a plain command-line program can `await` each live update the same way it awaits an HTTP call — no framework required to keep it alive.
+
+```swift
+let sub = try await liveClient.subscribe("demo:state", ["room": room])
+var updates = sub.stream.makeAsyncIterator()
+guard let initial = await updates.next() else {
+  throw ExampleError("Live closed before initial value")
+}
+// TypeScript: useQuery(api.demo.state, { room }) subscribes and rerenders for you.
+print("live initial count: \(count(initial.value!))")
+```
+
+`updates.next()` suspends until the deployment's first snapshot arrives, and later mutations surface through the same iterator with no extra wiring.
 
 ## Status
 

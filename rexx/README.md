@@ -30,98 +30,64 @@ local backend.
 
 ## Interesting Parts
 
-### A query can be reactive and typed, or one-shot and textual
+### PARSE takes a URL apart without split() or regex
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const room = "readme-rexx-query";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // state.count is a type-safe number here.
-}
-```
-
-**Rexx**
+`PARSE` has been in Rexx since Cowlishaw's original 1979 design, and it is
+still one of the language's signature moves: match a string against a
+template of literals and variable names in a single statement, and Rexx
+fills in the pieces. The client leans on it to read a Convex deployment URL
+apart before opening the connection:
 
 ```rexx
-convexUrl = value('CONVEX_URL',, 'ENVIRONMENT')
-if convexUrl == '' then do
-  call lineout 'stderr', 'CONVEX_URL is required'
-  exit 1
-end
-roomArgs = '{"room":"readme-rexx-query"}'
-
-/* One CALL opens the HTTP connection, sends demo:state, and closes it. */
-call '/opt/convex/client/convex.rexx' 'http_call', 'query', 'demo:state', ,
-  roomArgs, convexUrl, ''
-stateEnvelope = result
-
-say stateEnvelope /* Plain character data, not a statically typed object. */
+parse var baseUrl scheme '://' hostport '/'
+useTls = 0
+if translate(scheme) == 'HTTPS' then useTls = 1
+if pos(':', hostport) > 0 then parse var hostport host ':' port
+else host = hostport
+/* TypeScript: const { protocol, host } = new URL(baseUrl) */
 ```
 
-The function and arguments match, but the lifecycle does not. React keeps
-`useQuery` subscribed and rerenders when the value changes. Rexx's `http_call`
-is deliberately a single request, and this small client returns a JSON envelope
-as text for the caller to validate and decode.
+No index arithmetic, no regex engine — just the shape the string is expected to fit.
 
-### Live makes ownership visible
+### There is no boolean type, so `"true"` really is just text
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "readme-rexx-live";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Connecting...</p>;
-  return <p>{state.count}</p>; // React owns subscribe, update, and cleanup.
-}
-```
-
-**Rexx**
+Classic Rexx has exactly one data type: a character string, read as a number
+only when the surrounding operation calls for one. So decoding a JSON
+boolean from a Convex mutation reply is an ordinary string comparison, not a
+cast to some other type:
 
 ```rexx
-convexUrl = value('CONVEX_URL',, 'ENVIRONMENT')
-if convexUrl == '' then do
-  call lineout 'stderr', 'CONVEX_URL is required'
+applied = field_json(mutationValue, 'applied')
+if applied <> 'true' then do
+  call lineout 'stderr', 'mutation was not applied'
   exit 1
 end
-roomArgs = '{"room":"readme-rexx-live"}'
-subscriptionId = 'readme-rexx-subscription'
+say 'mutation applied: true'
+/* TypeScript: if (!result.applied) throw new Error(...) */
+```
 
-scheme = 'ws'
-if translate(left(convexUrl, 8)) == 'HTTPS://' then scheme = 'wss'
-parse var convexUrl '//' hostAndMore
-liveUrl = scheme || '://' || hostAndMore || '/api/sync'
+### A live subscription is a string you carry, not a callback you register
 
+Classic Rexx has no closures and no event loop, so Live is built as a
+reducer instead: every operation hands back an updated state string plus
+whatever new events arrived, and the caller keeps that string and feeds it
+into the next call.
+
+```rexx
 liveState = ''
 call '/opt/convex/client/convex.rexx' 'live_add', liveState, liveUrl, ,
-  subscriptionId, 'demo:state', roomArgs
-parse var result liveState '0b'x events
+  'basics', 'demo:state', roomArgs
+parse var result liveState '0b'x .
 
-/* Poll again later for the initial value or a reactive update. */
 call '/opt/convex/client/convex.rexx' 'live_poll', liveState, 500
 parse var result liveState '0b'x events
-say events /* Form-feed-separated JSON event text, not a typed value. */
-
-/* A command-line caller must explicitly unsubscribe and close. */
-call '/opt/convex/client/convex.rexx' 'live_remove', liveState, subscriptionId
-parse var result liveState '0b'x .
-call '/opt/convex/client/convex.rexx' 'live_close', liveState
+say events
+/* TypeScript: useQuery reruns your component; here you poll and reparse. */
 ```
 
-This explicit polling API is a choice made by this client, not a limitation of
-Rexx. Each operation returns a new serialized `liveState`, so the caller owns
-the subscription and connection lifetime that React normally hides.
+Where React's `useQuery` hides subscribe, update, and cleanup inside a hook,
+this client makes every step of that lifecycle a value passing through your
+hands.
 
 ## Status
 

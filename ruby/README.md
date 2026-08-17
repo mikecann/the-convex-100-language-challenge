@@ -31,121 +31,63 @@ you do not need to install Ruby or this client on the host.
 
 ## Interesting Parts
 
-### JSON objects become ordinary Ruby hashes
+### A `Result` is just a frozen `Data.define` record
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function CurrentCount() {
-  const room = "readme-current-count";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>Count: {state.count}</p>; // Generated types know `count` is a number.
-}
-```
-
-**Ruby**
+Ruby 3.2 added `Data.define`, a lighter cousin of `Struct` for plain
+immutable value objects: one call gives you a class with keyword-or-positional
+construction, `==`, and no setters. This client reaches for it the moment an
+HTTP response is decoded, so a Convex value and its server logs travel
+together as one small, un-mutatable object instead of a loose two-element
+array or an ad-hoc hash.
 
 ```ruby
-# Load this repository's client, which is not published as a gem.
-$LOAD_PATH.unshift(ENV.fetch("CONVEX_CLIENT_PATH", File.expand_path("client", __dir__)))
-require "convex"
+# Keeps the decoded value and server log lines together, immutably.
+Result = Data.define(:value, :logs)
 
-deployment_url = ENV.fetch("CONVEX_URL")
-client = Convex::Client.new(deployment_url)
-room = "readme-current-count"
-
-begin
-  result = client.query("demo:state", "room" => room)
-  state = result.value # Decoded JSON is a string-keyed Ruby Hash.
-  puts "Count: #{state.fetch("count")}" # Ruby checks this shape at runtime.
-ensure
-  client.close
-end
+# Later, once the HTTP response body has been parsed as JSON:
+Result.new(decoded["value"], Array(decoded["logLines"]))
+# TypeScript: no equivalent record type - useQuery just returns state | undefined
 ```
 
-The generated TypeScript API catches a wrong function name, argument, or result
-field before the app runs. This small Ruby client deliberately has no generated
-types, so `query` accepts a function-path string and named hash, and returns
-decoded JSON plus separate log lines. Also, React's `useQuery` remains reactive;
-Ruby's `query` above is one HTTP request.
+### Guard clauses read right to left, like sentences
 
-### The command-line client pulls Live values explicitly
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "readme-live-counter";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  if (state === undefined) return <button disabled>Loading...</button>;
-  return (
-    <button
-      onClick={() =>
-        void increment({
-          room,
-          language: "typescript",
-          runId: crypto.randomUUID(),
-        })
-      }
-    >
-      Count: {state.count}
-    </button>
-  );
-}
-```
-
-**Ruby**
+Ruby lets almost any statement carry a trailing `if` or `unless`, and a method
+body can `rescue` without an explicit `begin`. The client's argument validator
+leans on both, so the failure conditions read as plain-English preconditions
+stacked above the happy path rather than a nested pyramid of `if` blocks.
 
 ```ruby
-require "securerandom"
+def validate_function(path, args)
+  raise ArgumentError, "Convex function path is required" if path.to_s.empty?
+  raise ArgumentError, "Convex arguments must be a named JSON object" unless args.is_a?(Hash)
 
-# Load this repository's client, which is not published as a gem.
-$LOAD_PATH.unshift(ENV.fetch("CONVEX_CLIENT_PATH", File.expand_path("client", __dir__)))
-require "convex"
-
-client = Convex::Client.new(ENV.fetch("CONVEX_URL"))
-room = "readme-live-counter"
-subscription = nil
-
-begin
-  # Subscribe before mutating so the command-line program cannot miss the change.
-  subscription = client.subscribe("demo:state", "room" => room)
-  initial = subscription.next_update(timeout: 10)
-  raise initial.error if initial.error
-  puts "Initial count: #{initial.value.fetch("count")}" # First current value.
-
-  mutation = client.mutation(
-    "demo:increment",
-    "room" => room,
-    "language" => "ruby",
-    "runId" => SecureRandom.hex(8)
-  )
-  puts "Applied: #{mutation.value.fetch("applied")}" # HTTP result.
-
-  changed = subscription.next_update(timeout: 10)
-  raise changed.error if changed.error
-  puts "Changed count: #{changed.value.fetch("count")}" # Reactive update.
-ensure
-  subscription&.close # Unsubscribe from the query.
-  client.close        # Stop the shared Live worker.
+  JSON.generate(args)
+rescue JSON::GeneratorError => error
+  raise ArgumentError, "encode Convex arguments: #{error.message}"
 end
+# TypeScript: the generated api.demo.state type rules this out before it runs
 ```
 
-React owns the subscription as the component mounts, rerenders, and unmounts.
-Ruby supports callbacks and blocks, but this client chooses a blocking
-`next_update` API with an optional timeout because it makes command-line control
-flow and cleanup explicit. That is this client's API design, not a Ruby
-limitation.
+### Live subscriptions are pulled, one `next_update` at a time
+
+React's `useQuery` re-renders a component whenever a subscription changes;
+there is no component tree here to do that for you. So `Subscription` instead
+hands back a blocking `next_update`, backed by a `Mutex` and
+`ConditionVariable`, that a script calls whenever it is ready for the next
+reactive value - turning push-based Live updates into an ordinary,
+step-by-step Ruby control flow.
+
+```ruby
+subscription = client.subscribe("demo:state", "room" => room)
+begin
+  update = subscription.next_update(timeout: 10)
+  raise update.error if update.error
+  puts "count: #{update.value.fetch("count")}"
+  # TypeScript: useQuery(api.demo.state, { room }) would re-render instead
+ensure
+  subscription.close
+end
+```
 
 ## Status
 

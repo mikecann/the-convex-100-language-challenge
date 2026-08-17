@@ -32,147 +32,70 @@ You do not need a Rust toolchain installed on the host.
 
 ## Interesting Parts
 
-### The type system stops at the JSON boundary
+### A Live update arrives in a mailbox, not a hook
 
-Convex's generated TypeScript API carries the result type into a React
-component. This Rust client deliberately returns `serde_json::Value`, so Rust
-can check a decoded struct but cannot infer its shape from the Convex function.
-
-**TypeScript with React**
-
-```tsx
-import { ConvexProvider, ConvexReactClient, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
-
-function RoomCount() {
-  const state = useQuery(api.demo.state, { room: "readme-rust" });
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // `state` and `count` are type-safe here.
-}
-
-export function App() {
-  return (
-    <ConvexProvider client={convex}>
-      <RoomCount />
-    </ConvexProvider>
-  );
-}
-```
-
-**Rust**
+React's `useQuery` opens a subscription when a component mounts and tears it
+down when it unmounts, all invisibly. This client has no component tree to
+hook into, so a Live query becomes an explicit resource instead: call
+`subscribe`, then block on a bounded mailbox whenever you want the next value.
 
 ```rust
-use convex_rust_demo::Client;
-use serde::Deserialize;
-use serde_json::json;
+let live = client.subscribe("demo:state", json!({"room": room}))?;
 
+// TypeScript: `useQuery(api.demo.state, { room })` does this invisibly.
+let initial = live.updates().recv_timeout(Duration::from_secs(10))?;
+if let Some(error) = initial.error {
+    panic!("initial Live error: {error}");
+}
+println!("live initial count: {}", initial.value.unwrap()["count"]);
+
+live.close()?; // nothing unsubscribes until you say so
+```
+
+The mailbox only keeps the newest 16 updates, so a command-line consumer that
+falls behind stays bounded instead of piling up an unread backlog forever.
+
+### A rejected call is a value, not a thrown exception
+
+Rust has no exceptions. Every fallible call in this client returns
+`Result<T, Error>`, and `Error` is a plain enum, so the ways a Convex call can
+fail are written down as a type instead of left implicit.
+
+```rust
+pub enum Error {
+    Function(FunctionError), // the Convex function itself rejected the call
+    Protocol(String),        // a server response this client can't parse
+    Transport(String),       // reqwest/tungstenite couldn't reach the deployment
+    Closed,                  // client.close() already ran
+}
+
+// TypeScript: an uncaught throw crashes the app; `?` here just returns early.
+let mutation = client.mutation("demo:increment", json!({"room": room}))?;
+```
+
+Match on `Error::Function` to read Convex's own `message` and `data` back out;
+every other variant is this client admitting the network or protocol misbehaved.
+
+### Types don't exist until serde decodes them
+
+Convex's generated TypeScript API carries a query's result type all the way
+into the component. This client isn't typed against your schema at all — it
+passes `serde_json::Value` around until the moment you ask `serde` to turn it
+into a struct.
+
+```rust
 #[derive(Deserialize)]
 struct State {
-    count: f64, // Decoding is where this JSON field becomes type-checked.
+    count: f64, // Convex may send 1 or 1.0 -- this is where the field becomes typed.
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let deployment = std::env::var("CONVEX_URL")?;
-    let client = Client::new(&deployment)?;
-    let result = client.query("demo:state", json!({ "room": "readme-rust" }))?;
-    let state: State = serde_json::from_value(result.value)?;
-    println!("{}", state.count);
-    client.close()?;
-    Ok(())
-}
+let result = client.query("demo:state", json!({"room": room}))?;
+let state: State = serde_json::from_value(result.value)?;
+println!("{}", state.count);
 ```
 
-The Rust call is a one-off HTTP query, not the equivalent of React's reactive
-`useQuery` hook. The [full example](examples/basics/main.rs) also handles the
-fact that a whole Convex number may be encoded as either `1` or `1.0`.
-
-### A Live subscription is a resource you own
-
-React starts and stops a query subscription with the component lifecycle. The
-Rust API instead exposes a subscription and a blocking `recv_timeout` mailbox.
-That blocking shape is a choice made by this small client, not a limitation of
-Rust, which also supports callbacks, channels, and async streams.
-
-**TypeScript with React**
-
-```tsx
-import {
-  ConvexProvider,
-  ConvexReactClient,
-  useMutation,
-  useQuery,
-} from "convex/react";
-import { api } from "../convex/_generated/api";
-
-const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
-
-function Counter() {
-  const room = "readme-live-rust";
-  const state = useQuery(api.demo.state, { room }); // React owns the subscription.
-  const increment = useMutation(api.demo.increment);
-  const addOne = () =>
-    increment({ room, language: "typescript", runId: crypto.randomUUID() });
-
-  return <button onClick={() => void addOne()}>{state?.count ?? "Loading..."}</button>;
-}
-
-export function App() {
-  return (
-    <ConvexProvider client={convex}>
-      <Counter />
-    </ConvexProvider>
-  );
-}
-```
-
-**Rust**
-
-```rust
-use convex_rust_demo::Client;
-use serde_json::json;
-use std::time::Duration;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let deployment = std::env::var("CONVEX_URL")?;
-    let room = "readme-live-rust";
-    let client = Client::new(&deployment)?;
-    let live = client.subscribe("demo:state", json!({ "room": room }))?;
-
-    // This client exposes the next reactive value through a blocking mailbox.
-    let initial = live.updates().recv_timeout(Duration::from_secs(10))?;
-    if let Some(error) = initial.error {
-        return Err(Box::new(error));
-    }
-    println!("initial: {}", initial.value.expect("initial value")["count"]);
-
-    let mutation = client.mutation(
-        "demo:increment",
-        json!({
-            "room": room,
-            "language": "rust",
-            "runId": uuid::Uuid::new_v4().to_string()
-        }),
-    )?;
-    println!("mutation: {}", mutation.value["state"]["count"]);
-
-    // The next mailbox item is the reactive result of that mutation.
-    let updated = live.updates().recv_timeout(Duration::from_secs(10))?;
-    if let Some(error) = updated.error {
-        return Err(Box::new(error));
-    }
-    println!("updated: {}", updated.value.expect("updated value")["count"]);
-
-    live.close()?; // Explicitly remove the query before stopping its owner loop.
-    client.close()?;
-    Ok(())
-}
-```
-
-The owned subscription makes cleanup and timeout policy visible. Its mailbox
-keeps the newest 16 updates, so a slow command-line consumer stays bounded but
-may not observe every intermediate value.
+Everything before that last `from_value` call is just JSON; decoding is the
+one place `State` becomes real.
 
 ## Status
 

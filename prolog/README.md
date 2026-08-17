@@ -21,117 +21,63 @@ Docker builds the pinned `linux/amd64` SWI-Prolog image and runs that exact exam
 
 ## Interesting Parts
 
-### A query becomes a relationship between terms
+### Unification Decodes the Reply
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function RoomCount() {
-  const state = useQuery(api.demo.state, { room: "prolog-readme" });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // `api` makes this result type-safe.
-}
-```
-
-**Prolog**
+Prolog has no `return` statement and no assignment operator, only unification: a variable and a term become equal to each other wherever a goal succeeds. Ask this client for a room's counter and the JSON Convex hands back becomes an ordinary SWI-Prolog dict, so pulling `count` out of it is that same unification the whole language runs on, not a special accessor call.
 
 ```prolog
-:- use_module('../../client/convex').
-
 show_room_count :-
-    % Construct a client term from configuration supplied by the environment.
-    getenv('CONVEX_URL', DeploymentURL),
     new_client(DeploymentURL, Client),
-    % _{room:...} is an SWI-Prolog dict and mirrors the Convex argument object.
-    query(
-        Client,
-        "demo:state",
-        _{room:"prolog-readme"},
-        result(State, _Logs)
-    ),
-    % Unification binds Count to the returned dict field.
+    % TypeScript: useQuery(api.demo.state, { room: "prolog-readme" })
+    query(Client, "demo:state", _{room:"prolog-readme"}, result(State, _Logs)),
+    % Unification binds Count to the field inside the returned dict.
     get_dict(count, State, Count),
     format('~w~n', [Count]).
 ```
 
-React's `useQuery` remains subscribed and rerenders the component. The Prolog `query/4` call above is deliberately a one-off HTTP request. Prolog has no generated Convex types here, so the result is a runtime dict and `get_dict/3` checks its shape while binding `Count`.
+There is no generated `api` object standing guard here — if the shape is wrong, `get_dict/3` simply fails.
 
-### Live is an owned resource, not a hook
+### A Live Update Is a Term You Wait For
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "prolog-live-readme";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  async function addOne() {
-    await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    }); // Arguments and result are checked from generated Convex types.
-  }
-
-  // React starts, updates, and disposes the subscription for this component.
-  return <button onClick={addOne}>{state?.count ?? "Loading..."}</button>;
-}
-```
-
-**Prolog**
+SWI-Prolog has shipped native threads and message queues since the late 1990s, and this client's Live layer leans on both: one background thread owns the WebSocket, and `subscription_next/3` blocks the calling thread until the next update — or a timeout — arrives as a term. Blocking is this client's own design choice for a linear command-line demo, not something the language forces on it.
 
 ```prolog
-:- use_module('../../client/convex').
-:- use_module(library(random)).
-
-observe_one_increment :-
-    getenv('CONVEX_URL', DeploymentURL),
-    Room = "prolog-live-readme",
-    new_client(DeploymentURL, Client),
-    live_start(Client, Live),
-    setup_call_cleanup(
-        % Subscribe before writing so no reactive update can be missed.
-        live_subscribe(Live, "demo:state", _{room:Room}, Subscription),
-        ( subscription_next(
-              Subscription,
-              10,
-              update(value(InitialState), _InitialLogs)
-          ),
-          get_dict(count, InitialState, InitialCount),
-          random_between(100000000, 999999999, RunNumber),
-          format(string(RunId), 'prolog-readme-~d', [RunNumber]),
-          mutation(
-              Client,
-              "demo:increment",
-              _{room:Room, language:"prolog", runId:RunId},
-              result(MutationResult, _MutationLogs)
-          ),
-          get_dict(applied, MutationResult, Applied),
-          % Blocking next/3 is this client's API choice, not a Prolog limit.
-          subscription_next(
-              Subscription,
-              10,
-              update(value(UpdatedState), _UpdatedLogs)
-          ),
-          get_dict(count, UpdatedState, UpdatedCount),
-          format('~w: ~d -> ~d~n', [Applied, InitialCount, UpdatedCount])
-        ),
-        % The command-line program owns both resources and closes them itself.
-        ( subscription_close(Subscription),
-          live_close(Live)
-        )
-    ).
+new_client(DeploymentURL, Client),
+live_start(Client, Live),
+setup_call_cleanup(
+    % Subscribe before writing so no reactive update can be missed.
+    live_subscribe(Live, "demo:state", _{room:Room}, Subscription),
+    ( subscription_next(Subscription, 10, update(value(InitialState), _)),
+      % TypeScript: useMutation(api.demo.increment)(args) — here it just blocks.
+      mutation(Client, "demo:increment",
+               _{room:Room, language:"prolog", runId:RunId}, _),
+      subscription_next(Subscription, 10, update(value(UpdatedState), _))
+    ),
+    ( subscription_close(Subscription), live_close(Live) )
+).
 ```
 
-The Prolog API exposes each update as a term returned by `subscription_next/3`. That blocking interface keeps a command-line example linear and readable; it is a design choice in this client, while SWI-Prolog itself also supports threads and message queues.
+`setup_call_cleanup/3` guarantees the subscription and the Live client both close, whether the goal in between succeeds or throws.
+
+### Success and Failure Are Different Clauses
+
+Prolog has no `try`/`catch` idiom for picking a value apart and no boolean flag to branch on — it has clauses, tried top to bottom, each committing only once its head and body match. `decode_http_response/4` leans on exactly that to turn Convex's `"status": "success"` or `"status": "error"` JSON into either a `result/2` term or a thrown Prolog error, letting the dict itself choose the clause.
+
+```prolog
+decode_http_response(_, _, Response, result(Value, Logs)) :-
+    get_dict(status, Response, "success"),
+    get_dict(value, Response, Value),
+    strict_logs(Response, Logs),
+    !.
+decode_http_response(Operation, _, Response, _) :-
+    get_dict(status, Response, "error"),
+    get_dict(errorMessage, Response, Message),
+    throw(error(function_error(Operation, Message, _, _), _)).
+decode_http_response(_, Status, Response, _) :-
+    throw(error(protocol_error(http_response(Status, Response)), _)).
+```
+
+The cut (`!`) after the first clause is the only place the branching is explicit; the other two clauses simply never get tried once it fires.
 
 ## Status
 

@@ -19,108 +19,55 @@ The command supplies a fresh room, runs `/usr/local/bin/convex-example` from the
 
 ## Interesting Parts
 
-### JSON looks like an object literal, but the result stays dynamic
+### A macro writes the JSON tree, before your program even runs
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function RoomCount() {
-  const state = useQuery(api.demo.state, { room: "readme-json-room" });
-  if (state === undefined) return <p>Loading...</p>;
-
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**Nim**
+Nim's standard `json` module ships `%*`, a macro that takes what looks like an ordinary curly-brace literal and rewrites it, at compile time, into the calls that build a `JsonNode`. There is no dictionary type hiding underneath — the compiler has already turned the syntax into tree-building code by the time it runs.
 
 ```nim
-import std/[json, os]
-import ../../client/convex
-
-proc main() =
-  let deployment = getEnv("CONVEX_URL")
-  if deployment.len == 0:
-    quit("CONVEX_URL is required", 2)
-  let client = newClient(deployment)
-  defer: client.close() # `defer` closes the client when this scope exits.
-
-  # `%*` is Nim's macro for turning this object-like syntax into a JsonNode.
-  let state = client.query("demo:state", %*{"room": "readme-json-room"})
-
-  # The response is dynamic JSON, so this client validates the numeric value.
-  let count = integralCount(state.value["count"])
-  echo count
-
-main()
+# TypeScript: await client.mutation("demo:increment", { room, language, runId })
+let mutation = client.mutation("demo:increment", %*{
+  "room": room,
+  "language": "nim",
+  "runId": fmt"nim-{getTime().toUnix}-{epochTime()}"
+})
 ```
 
-The shapes look pleasantly similar, but the semantics differ. Convex's generated TypeScript API checks the function name, arguments, and returned fields at compile time. This Nim client accepts a function path string and returns `JsonNode`, so decoding and field validation happen at runtime. The Nim call is also a one-off HTTP snapshot, not a reactive subscription like `useQuery`.
+The literal reads like a typed object, but everything past the macro is dynamic JSON again — Nim's compile-time checking stops exactly at the boundary the macro draws.
 
-### A Live subscription is a resource you own
+### A Live update is something you pull, not something that calls you
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const room = "readme-live-room";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  async function addOne() {
-    const result = await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.state.count); // The mutation returns the updated state.
-  }
-
-  // React starts and stops the query subscription with the component.
-  return <button onClick={addOne}>{state?.count ?? "Loading..."}</button>;
-}
-```
-
-**Nim**
+There's no callback here, and no component to rerender. `subscribe` hands back a subscription, and `nextUpdate()` blocks the calling thread until the single worker that owns the WebSocket delivers the next value — the very first call simply returns whatever is current right now.
 
 ```nim
-import std/[json, os, strformat, times]
-import ../../client/convex
+let subscription = client.subscribe("demo:state", %*{"room": room})
+defer: subscription.close() # this program owns the subscription's lifecycle
 
-proc main() =
-  let room = "readme-live-room"
-  let deployment = getEnv("CONVEX_URL")
-  if deployment.len == 0:
-    quit("CONVEX_URL is required", 2)
-  let client = newClient(deployment)
-  defer: client.close() # Closing the client also stops its socket owner.
+let initial = subscription.nextUpdate() # first delivery is the current value
+echo parseJson(initial.value)["count"]
 
-  let subscription = client.subscribe("demo:state", %*{"room": room})
-  defer: subscription.close() # The command-line program owns this lifecycle.
-
-  let initial = subscription.nextUpdate()
-  echo parseJson(initial.value)["count"] # First delivery is the current value.
-
-  let result = client.mutation("demo:increment", %*{
-    "room": room,
-    "language": "nim",
-    "runId": fmt"nim-{getTime().toUnix}-{epochTime()}"
-  })
-  echo result.value["state"]["count"] # The mutation returns updated state.
-
-  let updated = subscription.nextUpdate()
-  echo parseJson(updated.value)["count"] # This blocks for the Live update.
-
-main()
+# TypeScript: useQuery reruns your component; here the call just blocks
+let updated = subscription.nextUpdate()
+echo parseJson(updated.value)["count"]
 ```
 
-React manages the subscription and rerenders the component. Nim itself supports several concurrency styles, but this client deliberately exposes blocking `nextUpdate()` calls because they make ownership and sequencing clear in a small command-line example. The real example also checks `isError` before decoding an update and uses a unique idempotency key.
+Reactivity is a loop you write yourself here, not a hook React writes for you.
+
+### One `!=` catches a NaN before it reaches your counter
+
+JSON has exactly one numeric type, so every count Convex sends back arrives as a 64-bit float. Rather than cast it straight to an integer, the client's `integralCount` leans on one of floating point's oldest tricks — a NaN is the only float that is never equal to itself — alongside a `floor` check and JavaScript's own safe-integer ceiling.
+
+```nim
+proc integralCount*(node: JsonNode): float =
+  if node.kind notin {JInt, JFloat}:
+    raise newException(ValueError, "count must be a JSON number")
+  let value = node.getFloat
+  if value != value or value != floor(value) or
+      abs(value) > 9_007_199_254_740_991.0:
+    raise newException(ValueError, "count must be finite and integral")
+  return value
+```
+
+Counting up from `count` to `count + 1` only makes sense once you know `count` was never a fraction to begin with.
 
 ## Status
 

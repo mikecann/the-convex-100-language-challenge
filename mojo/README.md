@@ -33,147 +33,75 @@ approved test backend. It does not require a Mojo toolchain on your host.
 
 ## Interesting Parts
 
-### A familiar query shape, with explicit JSON at the boundary
+### A caret that means "take it, don't copy it"
 
-In a React app, generated Convex types carry the query arguments and result into
-the component. This Mojo client deliberately exposes the HTTP result as JSON
-text, so the application has to construct and decode that boundary itself.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function CounterState() {
-  const room = "mojo-readme-query";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // `state` and `count` are type-safe here.
-}
-```
-
-**Mojo**
+Mojo's ownership model shows up right in a function's parameter list: an
+argument is a read-only borrow by default, `mut self` asks for a mutable one,
+and a `var` parameter is *owned* — the caller must hand it over. The `^`
+sigil on `update^` marks that handoff explicitly, telling the compiler to move
+the value into the queue rather than copy it.
 
 ```mojo
-from std.os import getenv
-
-from convex import Client, default_ca_file
-from json import parse, quote
-
-
-fn main() raises:
-    var deployment_url = getenv("CONVEX_URL")
-    if not deployment_url:
-        raise Error("CONVEX_URL is required")
-
-    var client = Client(deployment_url, default_ca_file())
-    var room = String("mojo-readme-query")
-    # This client accepts serialized JSON rather than a generated argument type.
-    var args_json = String('{"room":') + quote(room) + "}"
-    var response = client.call(String("query"), String("demo:state"), args_json)
-    if not response.ok:
-        raise Error(response.error_name + ": " + response.error_message)
-
-    var document = parse(response.value_json)
-    # The field name is checked at runtime; `count` is an Int after `as_int`.
-    var count = document.as_int(document.member(document.root, "count"))
-    print(count)
-    client.close(2000)
+fn enqueue(mut self, var update: Update):
+    """Append one delivery, dropping the oldest to stay inside both bounds."""
+    var incoming = update.size()
+    self.queue.append(update^)
+    # TypeScript: queue.push(update) is always a reference, never a transfer.
+    self.queue_bytes += incoming
+    while len(self.queue) > QUEUE_CAPACITY or (
+        self.queue_bytes > QUEUE_BYTE_BUDGET and len(self.queue) > 1
+    ):
+        var oldest = self.queue.pop(0)
+        self.queue_bytes -= oldest.size()
+        self.dropped += 1
 ```
 
-The Mojo syntax looks Python-like, but `String`, `Client`, and `Int` are static
-types. Unlike the generated TypeScript API, this small client cannot catch a
-misspelled function name or JSON field at compile time.
+Nothing here is garbage-collector bookkeeping — the compiler tracks who owns
+`update` at every line, and `enqueue` is the only place it is ever named again.
 
-### React owns reactivity; this command-line client owns it directly
+### A `raises` you can't leave off, guarding a hand-pumped subscription
 
-`useQuery` subscribes during rendering and React cleans it up when the component
-unmounts. The Mojo program starts the subscription itself, blocks until each
-value arrives, and must unsubscribe and close the client.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function CounterButton() {
-  const room = "mojo-readme-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  async function incrementOnce() {
-    const result = await increment({
-      room,
-      language: "TypeScript",
-      runId: crypto.randomUUID(), // Fresh on every click, so each write can apply.
-    });
-    console.log(result.state.count); // The mutation result is generated and typed.
-  }
-
-  return (
-    <button onClick={() => void incrementOnce()}>
-      {state === undefined ? "Loading..." : `Count: ${state.count}`}
-    </button>
-  ); // A successful mutation causes `useQuery` to render the new count.
-}
-```
-
-**Mojo**
+Where `useQuery` subscribes on render and lets React manage delivery, this
+client's Live loop is one the caller drives by hand: `wait_update` pumps the
+WebSocket until a delivery is queued or a deadline passes, and the chance of
+failure is written straight into the return type via `raises`.
 
 ```mojo
-from std.base64 import b64encode
-from std.os import getenv
-
-from convex import Client, default_ca_file
-from json import parse, quote
-from net import random_bytes
-
-
-fn main() raises:
-    var deployment_url = getenv("CONVEX_URL")
-    if not deployment_url:
-        raise Error("CONVEX_URL is required")
-
-    var client = Client(deployment_url, default_ca_file())
-    var room = String("mojo-readme-live")
-    var query_args = String('{"room":') + quote(room) + "}"
-
-    # This program owns the subscription and asks for each delivery explicitly.
-    client.subscribe(String("counter"), String("demo:state"), query_args)
-    var initial = client.wait_update(String("counter"), 20000)
-    var initial_json = parse(initial.value_json)
-    print(initial_json.as_int(initial_json.member(initial_json.root, "count")))
-
-    # Kernel randomness gives this write a new idempotency key on every run.
-    var run_id = String("mojo-readme-") + b64encode(Span(random_bytes(16)))
-    var mutation_args = String('{"room":') + quote(room)
-    mutation_args += ',"language":"Mojo"'
-    mutation_args += ',"runId":' + quote(run_id) + "}"
-    var result = client.call(
-        String("mutation"), String("demo:increment"), mutation_args
-    )
-    if not result.ok:
-        raise Error(result.error_name + ": " + result.error_message)
-    var result_json = parse(result.value_json)
-    var state = result_json.member(result_json.root, "state")
-    print(result_json.as_int(result_json.member(state, "count")))
-
-    # The same subscription now yields the reactive consequence of the write.
-    var updated = client.wait_update(String("counter"), 20000)
-    var updated_json = parse(updated.value_json)
-    print(updated_json.as_int(updated_json.member(updated_json.root, "count")))
-
-    client.unsubscribe(String("counter"))
-    client.close(2000)  # Cleanup is the caller's responsibility here.
+fn wait_update(mut self, id: String, timeout_ms: Int) raises -> Update:
+    """Pump the connection until this subscription has a delivery."""
+    var deadline = now_ms() + timeout_ms
+    while True:
+        if self.has_update(id):
+            return self.take_update(id)
+        if now_ms() >= deadline:
+            # TypeScript: this is the wait `useQuery`'s loading state hides.
+            raise Error(
+                "TransportError|timed out waiting for a Live update"
+            )
+        self.pump(25)
 ```
 
-The blocking `wait_update` interface is a choice made by this compact client
-for a command-line demonstration, not a limitation of the Mojo language. It
-also makes ownership obvious: one `Client` owns the connection and its queued
-updates, while React normally hides that lifecycle behind hooks.
+Every caller of `wait_update` either handles that failure or is itself marked
+`raises` — Mojo won't let a possible error cross a plain function boundary
+unannounced, the same way it won't let an owned value cross one unmoved.
+
+### Python's slice syntax, pinned to a byte offset
+
+Mojo reads like Python until a string gets sliced. A `String` here is a UTF-8
+byte buffer rather than Python's abstract sequence of characters, so carving
+out a substring means saying, in the slice itself, which unit is being counted.
+
+```mojo
+fn error_name_of(message: String) -> String:
+    """Split the `Name|text` convention the transport layers raise with."""
+    var bar = message.find("|")
+    if bar > 0:
+        return String(message[byte=0:bar])
+    return String("Error")
+```
+
+It is the same square-bracket slice a Python programmer already reaches for,
+with one extra keyword pinning down exactly what it is counting.
 
 ## Status
 

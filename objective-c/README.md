@@ -18,121 +18,53 @@ That command builds and runs the exact example below in Docker against a unique 
 
 ## Interesting Parts
 
-### A familiar query becomes a message to an object
+### A method call is a sentence with the arguments woven in
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, { room: "readme-objective-c" });
-  return <p>{state === undefined ? "Loading..." : state.count}</p>;
-}
-```
-
-**Objective-C**
+Objective-C inherited its message syntax from Smalltalk rather than from C. A call isn't `name(a, b, c)`; it's a bracketed message whose keyword parts interleave with the arguments they take, so the whole invocation reads as one labeled sentence instead of a comma list. This client leans on that: every RPC keeps `args:` and `error:` right next to the values they belong to.
 
 ```objective-c
-#import "ConvexClient.h"
-#import <Foundation/Foundation.h>
-#include <stdio.h>
-#include <stdlib.h>
-
-int main(void) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  const char *deployment = getenv("CONVEX_URL");
-  if (!deployment) {
-    fprintf(stderr, "CONVEX_URL is required\n");
-    [pool drain];
-    return 1;
-  }
-  // Convert the deployment setting into a Foundation URL, then create a client.
-  NSURL *url = [NSURL URLWithString:[NSString stringWithUTF8String:deployment]];
-  NSError *error = nil;
-  CVXClient *client = [[CVXClient alloc] initWithDeploymentURL:url
-                                                clientVersion:@"readme-example"
-                                                        error:&error];
-
-  // NSDictionary is the Objective-C argument object for { room: ... }.
-  NSDictionary *arguments = @{ @"room" : @"readme-objective-c" };
-  CVXResult *result = [client query:@"demo:state" args:arguments error:&error];
-  NSNumber *count = [result.value objectForKey:@"count"];
-  printf("%lld\n", [count longLongValue]); // The value is decoded at runtime.
-
-  [client release]; // This build uses manual reference counting.
-  [pool drain];
-  return 0;
-}
+NSDictionary *arguments = @{ @"room" : @"readme-objective-c" };
+NSError *error = nil;
+// TypeScript: const state = useQuery(api.demo.state, { room })
+CVXResult *result = [client query:@"demo:state" args:arguments error:&error];
+NSNumber *count = [result.value objectForKey:@"count"];
 ```
 
-The brackets send the `query:args:error:` message to `client`; named pieces such as `args:` are part of the method selector. Unlike `useQuery`, this call is a one-off HTTP query. It returns ordinary Foundation objects rather than a generated TypeScript type, so the complete example validates the dictionary and number before trusting them.
+Once you can hear `query:args:error:` as a single selector, the brackets stop looking like noise and start reading like a sentence.
 
-### The caller owns the Live subscription
+### Failure comes back through a pointer to a pointer
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "readme-objective-c-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  return (
-    <button
-      onClick={() =>
-        increment({ room, language: "TypeScript", runId: crypto.randomUUID() })
-      }
-    >
-      Count: {state?.count ?? "Loading..."}
-    </button>
-  );
-}
-```
-
-**Objective-C**
+There are no exceptions or `Result` enums here: every fallible call takes an `NSError **` — the address of your local `error` variable — and writes into it only if something went wrong. A `nil` return is the actual failure signal; the error object is supplementary detail the callee hands back through that extra layer of indirection.
 
 ```objective-c
-#import "ConvexClient.h"
-#import <Foundation/Foundation.h>
-
-static void incrementAndReadUpdate(CVXClient *client) {
-  NSString *room = @"readme-objective-c-live";
-  NSError *error = nil;
-  NSDictionary *queryArguments = @{ @"room" : room };
-
-  // Subscribe first so the mutation's reactive update cannot be missed.
-  CVXSubscription *subscription = [client subscribe:@"demo:state"
-                                                args:queryArguments
-                                               error:&error];
-  CVXLiveUpdate *initial =
-      [subscription nextUpdateWithTimeoutMilliseconds:10000 error:&error];
-
-  NSDictionary *mutationArguments = @{
-    @"room" : room,
-    @"language" : @"Objective-C",
-    @"runId" : [[NSUUID UUID] UUIDString],
-  };
-  // A fresh UUID gives this call its own mutation identity.
-  CVXResult *mutation = [client mutation:@"demo:increment"
-                                    args:mutationArguments
-                                   error:&error];
-  // Block until Live delivers the state produced by that mutation.
-  CVXLiveUpdate *updated =
-      [subscription nextUpdateWithTimeoutMilliseconds:10000 error:&error];
-  // Decode initial.value, mutation.value, and updated.value as Foundation objects.
-  (void)initial;
-  (void)mutation;
-  (void)updated;
-  [subscription unsubscribe:&error]; // The command-line caller cleans up.
+NSError *error = nil;
+CVXResult *mutation = [client mutation:@"demo:increment"
+                                   args:mutationArguments
+                                  error:&error];
+if (!mutation) {
+  // TypeScript: try { await client.mutation(...) } catch (e) { ... }
+  fprintf(stderr, "%s\n", [[error localizedDescription] UTF8String]);
 }
 ```
 
-React starts, updates, and disposes the `useQuery` subscription with the component lifecycle. Here the caller creates and removes `CVXSubscription` explicitly. Objective-C can use callbacks and asynchronous APIs, but this client deliberately offers blocking `nextUpdateWithTimeoutMilliseconds:error:` so command-line sequencing stays easy to see. The full example checks every returned value and error.
+The pattern predates `Swift`-style throwing entirely, and it's still how Foundation reports errors today.
+
+### The Live subscription is a queue you pull from by hand
+
+React's `useQuery` subscribes and re-renders on its own timeline. This client hands you a `CVXSubscription` object instead and leaves the pulling to you: `nextUpdateWithTimeoutMilliseconds:error:` blocks the calling thread until Live delivers the next value, so a command-line program can sequence "mutate, then wait for the update" without any callback at all.
+
+```objective-c
+CVXSubscription *subscription = [client subscribe:@"demo:state"
+                                               args:queryArguments
+                                              error:&error];
+[subscription nextUpdateWithTimeoutMilliseconds:10000 error:&error]; // initial
+[client mutation:@"demo:increment" args:mutationArguments error:&error];
+CVXLiveUpdate *updated =
+    [subscription nextUpdateWithTimeoutMilliseconds:10000 error:&error];
+[subscription unsubscribe:&error];
+```
+
+Subscribing before mutating is deliberate: it guarantees the reactive update that follows can't slip past an empty queue before anyone is listening.
 
 ## Status
 

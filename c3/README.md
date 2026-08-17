@@ -40,9 +40,6 @@ fn int? parse_counter(String encoded)
 }
 ```
 
-At the call site one suffix picks the policy: `!` re-raises to the caller,
-`!!` asserts success.
-
 ### `??` turns a missing key into a raised fault
 
 Most languages give `??` a default value. In C3 the right-hand side can itself
@@ -62,9 +59,6 @@ fn DecodedResponse? decode(String body)
 }
 ```
 
-No `if err != nil` staircase — malformed JSON, a missing key, and a wrong type
-all funnel into the same typed fault channel.
-
 ### Backtick JSON on the temp allocator
 
 C3's backtick strings are raw, so a JSON template keeps its quotes unescaped.
@@ -80,9 +74,6 @@ fn String mutation_envelope(String path, String args, String idempotency_key)
                            path.tescape(), args, idempotency_key.tescape());
 }
 ```
-
-The reply then lands in a stack buffer sliced as `response[..]` — a full Convex
-round trip with no heap allocation for the payload at all.
 
 ### Live is a loop you tick
 

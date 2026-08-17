@@ -35,117 +35,80 @@ you do not need to install Racket or configure Convex on the host.
 
 ### Convex objects become immutable symbol-keyed hashes
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function RoomCount() {
-  const state = useQuery(api.demo.state, { room: "comparison-room" });
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // Generated types know the result shape.
-}
-```
-
-**Racket**
+The quote in `'room` isn't punctuation — it makes a *symbol*, Racket's interned
+atom for naming things. `hasheq` builds an immutable hash keyed by symbols like
+it, and the JSON library maps each one straight onto a JSON object key. So this
+client asks Convex for data with a plain hash literal instead of a generated
+wrapper type:
 
 ```racket
-#lang racket/base
-
-(require "client/client.rkt")
-
-(define deployment-url
-  (or (getenv "CONVEX_URL") (error 'readme "CONVEX_URL is required")))
-(define client (make-convex-client deployment-url))
-
-;; `hasheq` creates an immutable object whose keys are symbols such as 'room.
+;; The quote in 'room makes a symbol; hasheq builds an immutable
+;; hash keyed by symbols — Racket's answer to a JS object literal.
 (define arguments (hasheq 'room "comparison-room"))
 
-;; This is one HTTP request, not a reactive subscription like useQuery.
 (define result (convex-client-query client "demo:state" arguments))
 (define state (convex-result-value result))
-(displayln (hash-ref state 'count)) ; The returned hash is dynamically typed.
 
-(convex-client-close! client)
+;; TypeScript: const state = useQuery(api.demo.state, { room })
+(displayln (hash-ref state 'count))
 ```
 
-Racket's quote in `'room` creates a symbol, which its JSON library maps to the
-object key `room`. Unlike the generated TypeScript API, this demonstration uses
-the string path `"demo:state"` and checks returned shapes at runtime. See the
-[HTTP client](client/http.rkt) for the JSON request and result handling.
+`hash-ref` looks up `'count` at run time. There is no generated type to lean
+on, so a typo in the key becomes a runtime error rather than a compile one.
 
-### A command-line program owns its Live subscription
+### A blocking call stands in for `useQuery`'s rerender
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "live-comparison-room";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  return (
-    <button
-      onClick={() =>
-        increment({ room, language: "typescript", runId: crypto.randomUUID() })
-      }
-    >
-      Count: {state?.count ?? "loading"} {/* React rerenders on each update. */}
-    </button>
-  );
-}
-```
-
-**Racket**
+React's `useQuery` subscribes on your behalf and reruns the component whenever
+Convex pushes a change. A command-line script has no component to rerun, so
+here the subscription is just a value: `subscription-next-update` parks the
+calling thread until Live delivers the next snapshot, wrapped in
+`dynamic-wind` — Racket's "run this no matter how we leave" form, which closes
+the subscription even if the mutation below raises.
 
 ```racket
-#lang racket/base
-
-(require "client/client.rkt")
-
-(define deployment-url
-  (or (getenv "CONVEX_URL") (error 'readme "CONVEX_URL is required")))
-(define client (make-convex-client deployment-url))
-(define room "live-comparison-room")
-(define run-id (format "readme-~a" (current-inexact-milliseconds)))
 (define subscription
   (convex-client-subscribe client "demo:state" (hasheq 'room room)))
 
 (dynamic-wind
   void
   (lambda ()
-    ;; The client publishes the initial query value through the subscription.
-    (define initial (subscription-next-update subscription #:timeout 10))
-    (when (convex-update-error initial) (raise (convex-update-error initial)))
-
-    ;; Starting Live first means this mutation cannot slip between query setup
-    ;; and the subscription becoming active.
-    (convex-client-mutation
-     client
-     "demo:increment"
-     ;; runId makes retrying this logical write idempotent.
-     (hasheq 'room room 'language "racket" 'runId run-id))
-
-    ;; `next-update` blocks until Live supplies the changed value.
+    ;; The first update is the query's current value, as if the
+    ;; subscription had been open all along.
+    (subscription-next-update subscription #:timeout 10)
+    (convex-client-mutation client "demo:increment"
+                             (hasheq 'room room 'runId run-id))
+    ;; `next-update` blocks this thread until Live pushes again.
     (define changed (subscription-next-update subscription #:timeout 10))
-    (when (convex-update-error changed) (raise (convex-update-error changed)))
     (displayln (hash-ref (convex-update-value changed) 'count)))
-  (lambda ()
-    ;; `dynamic-wind` runs cleanup even when the body raises an exception.
-    (subscription-close! subscription)
-    (convex-client-close! client)))
+  (lambda () (subscription-close! subscription)))
 ```
 
-React owns the `useQuery` subscription and component rerenders. This client
-instead exposes a blocking `subscription-next-update`, so a script owns the
-subscription, reads each value, and closes it. That is a deliberate API choice,
-not a limitation of Racket's threads, events, or callbacks. The complete
-[canonical example](examples/basics/main.rkt) also validates every returned
-counter value.
+Racket has ordinary threads, events, and callbacks — blocking here is a
+deliberate choice for a script that reads one value and exits, not a fallback
+for something the language lacks.
+
+### Errors are a struct hierarchy, matched by predicate
+
+Racket exceptions are just structs, and struct definitions can extend one
+another into a real subtype tree. This client grows the built-in `exn:fail`
+into `exn:fail:convex`, then branches into `-function`, `-protocol`,
+`-transport`, and `-closed` — so a handler can catch by *shape* instead of
+parsing an error string:
+
+```racket
+(with-handlers
+  ([exn:fail:convex:function?
+    ;; Convex ran the mutation and rejected it.
+    (lambda (error)
+      (printf "~a failed: ~a\n"
+              (exn:fail:convex:function-operation error) (exn-message error)))]
+   ;; TypeScript: catch (error) { if (error instanceof ConvexError) ... }
+   [exn:fail:convex:transport? (lambda (error) (printf "network trouble\n"))])
+  (convex-client-mutation client "demo:increment" (hasheq 'room room)))
+```
+
+Each struct is declared `#:transparent`, so even an uncaught error prints its
+fields instead of hiding behind an opaque message.
 
 ## Status
 

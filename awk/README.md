@@ -95,9 +95,6 @@ function convex_wait_update(tag, timeout_ms, update,    deadline) {
 }
 ```
 
-These fifteen lines are also the reactive heart: one single-threaded process
-owns the WebSocket, draining delivered updates and pumping the socket in turn.
-
 ### Subscribe first, and the socket proves the increment
 
 Live is verified for this client, and the canonical example leans on it:

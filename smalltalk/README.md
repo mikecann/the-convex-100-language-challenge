@@ -33,114 +33,68 @@ example, not the wider conformance suite.
 
 ## Interesting Parts
 
-### Keyword messages make calls read differently
+### Keyword messages read like a sentence
 
-React's generated API gives the query result a static TypeScript type. This
-Smalltalk client instead builds an ordered JSON object and returns the decoded
-result as a dictionary. The colons in `query:args:` mark the two parts of one
-keyword message, not named arguments to a conventional function.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, { room: "readme-room" });
-  if (state === undefined) return <p>Loading...</p>;
-
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**Smalltalk**
+Smalltalk methods that take more than one argument aren't called with a fixed
+parameter list — they're a single message whose selector is spelled out in
+pieces, each piece ending in a colon right before the value it takes.
+`query:args:` is one selector, not two arguments bolted onto a function name,
+and there is no other order to write it in. Reading a call aloud is close to
+reading English, which was rather the point when Alan Kay's group settled on
+this syntax in the 1970s.
 
 ```smalltalk
-| deployment client arguments state |
-"Read the deployment URL supplied to this process by the verifier or operator."
-deployment := OSEnvironment current at: 'CONVEX_URL' ifAbsent: [ nil ].
-(deployment isNil or: [ deployment isEmpty ]) ifTrue: [
-	(ConvexTransportError message: 'CONVEX_URL is required') signal ].
+"query:args: is one two-part message; the colons belong to the selector."
+current := client query: 'demo:state' args: (self roomArguments).
 
-"Create an ordered dictionary that will become the query's JSON args object."
-arguments := ConvexJson objectWith: { 'room' -> 'readme-room' }.
-client := ConvexClient deployment: deployment.
-
-[
-	"Send the keyword message query:args: and decode the one-off HTTP result."
-	state := client query: 'demo:state' args: arguments.
-	Transcript show: (state at: 'count') printString
-] ensure: [ client close ]. "Release any client-owned resources even on error."
+"Same shape for a mutation: one message, two keyword parts, no positional args."
+mutation := client mutation: 'demo:increment' args: (ConvexJson objectWith: {
+	'room' -> room.
+	'language' -> 'smalltalk'.
+	'runId' -> ConvexRandom hexIdentifier }).
+"TypeScript: await client.mutation('demo:increment', { room, language, runId })"
 ```
 
-`useQuery` keeps a React component subscribed and rerenders it. The Smalltalk
-call above is deliberately a one-off HTTP read, so another call is needed to see
-later data. That is a client API difference, not a limitation of Smalltalk.
+### A Live subscription is an object you pull from
 
-### A Live subscription is an object you own
-
-React owns the query subscription for as long as the component needs it. The
-command-line Smalltalk API exposes that lifecycle directly: subscribe, pull the
-next delivery with a deadline, inspect either its error or value, then close it.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "readme-live-room";
-  const state = useQuery(api.demo.state, { room }); // React owns the subscription.
-  const increment = useMutation(api.demo.increment);
-
-  const addOne = () =>
-    increment({ room, language: "typescript", runId: crypto.randomUUID() });
-
-  return <button onClick={addOne}>Count: {state?.count ?? "loading"}</button>;
-  // A Live update rerenders this component with the mutation's new count.
-}
-```
-
-**Smalltalk**
+React's `useQuery` keeps its subscription behind the scenes and rerenders your
+component whenever fresh data lands; you never touch the subscription itself.
+This client's `subscribe:args:` hands it to you instead — you hold onto it,
+ask for the next delivery with a deadline, and decide yourself whether what
+comes back is an error or a value.
 
 ```smalltalk
-| deployment client room arguments subscription initial mutation update |
-"Use the same required deployment setting as the canonical example."
-deployment := OSEnvironment current at: 'CONVEX_URL' ifAbsent: [ nil ].
-(deployment isNil or: [ deployment isEmpty ]) ifTrue: [
-	(ConvexTransportError message: 'CONVEX_URL is required') signal ].
+"Subscribe before mutating, so the reactive update that follows can't be missed."
+subscription := client subscribe: 'demo:state' args: (self roomArguments).
 
-room := 'readme-live-room'.
-arguments := ConvexJson objectWith: { 'room' -> room }.
-client := ConvexClient deployment: deployment.
-
-[
-	"Subscribe before mutating so the resulting update cannot be missed."
-	subscription := client subscribe: 'demo:state' args: arguments.
-	initial := subscription nextWithinMilliseconds: 10000.
-	initial error ifNotNil: [ :error | error signal ].
-
-	"The runId makes this increment idempotent if the operation is retried."
-	mutation := client mutation: 'demo:increment' args: (ConvexJson objectWith: {
-		'room' -> room.
-		'language' -> 'smalltalk'.
-		'runId' -> ConvexRandom hexIdentifier }).
-	Transcript show: ((mutation at: 'state') at: 'count') printString.
-
-	"Pull the reactive delivery and decode its dictionary value."
-	update := subscription nextWithinMilliseconds: 10000.
-	update error ifNotNil: [ :error | error signal ].
-	Transcript show: (update value at: 'count') printString
-] ensure: [
-	subscription ifNotNil: [ subscription close ].
-	client close ].
+"Pulling a Live delivery, rather than being handed one by a rerender."
+update := subscription nextWithinMilliseconds: 10000.
+update ifNil: [ ^ (ConvexTransportError message: 'Live value timed out') signal ].
+update error ifNotNil: [ :error | ^ error signal ].
+^ update value
+"TypeScript: const state = useQuery(api.demo.state, { room }); // pushed to you"
 ```
 
-Pharo supports blocks, callbacks and concurrent processes. Returning a
-`ConvexUpdate` from blocking `nextWithinMilliseconds:` is this client's API
-choice for a small command-line example, not the language's only reactive style.
+Closing it is explicit too: `subscription close` retires the delivery queue
+before `client close` shuts the underlying WebSocket down.
+
+### A cascade fires several messages at one receiver
+
+The semicolon is Smalltalk's cascade operator: every message after the first
+`;` in a cascade is sent to that same original receiver, not to whatever the
+previous message happened to return. The client leans on this to write the
+raw HTTP text that upgrades a Live connection into a WebSocket, one header
+per cascaded send.
+
+```smalltalk
+"Five sends to 'out': the receiver is named once, then reused after each ';'."
+request := String streamContents: [ :out |
+	out nextPutAll: 'GET '; nextPutAll: self requestTarget; nextPutAll: ' HTTP/1.1'; nextPutAll: String crlf.
+	out nextPutAll: 'Upgrade: websocket'; nextPutAll: String crlf.
+	out nextPutAll: 'Sec-WebSocket-Key: '; nextPutAll: aKey; nextPutAll: String crlf.
+	out nextPutAll: String crlf ].
+"TypeScript: new WebSocket(url) does this whole handshake for you"
+```
 
 ## Status
 

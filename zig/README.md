@@ -29,156 +29,68 @@ update move the count from `0` to `1`.
 
 ## Interesting Parts
 
-### Generated TypeScript types versus runtime JSON
+### A Rejected Mutation Is Data, a Dead Socket Is an Error
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function CounterValue() {
-  const room = "zig-readme";
-  const state = useQuery(api.demo.state, { room });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // Generated API types make state.count a number.
-}
-```
-
-**Zig**
+Zig has no exceptions. Every fallible function returns an error union spelled
+`!T`, and `try` forwards a failure to the caller instead of unwinding a hidden
+stack. Convex gives that split a nice, concrete use: a legitimate Convex
+function rejection is not a Zig error at all, it comes back as ordinary data
+in `CallResult.function_error`, while only a broken connection or a malformed
+reply reaches for the error union.
 
 ```zig
-const std = @import("std");
-const convex = @import("convex");
-
-fn printCount(allocator: std.mem.Allocator, client: *convex.Client) !void {
-    const room = "zig-readme";
-    var args_object = std.json.ObjectMap.init(allocator);
-    defer args_object.deinit();
-    try args_object.put("room", .{ .string = room }); // Build { room } explicitly.
-    const args = convex.JsonValue{ .object = args_object };
-
-    const result = try client.call(allocator, "query", "demo:state", args);
-    const value = result.value orelse return error.InvalidResponse;
-    const state = switch (value) {
-        .object => |object| object,
-        else => return error.InvalidResponse,
-    };
-    const count = switch (state.get("count") orelse return error.InvalidResponse) {
-        .integer => |integer| integer,
-        .float => |float| if (@trunc(float) == float)
-            @as(i64, @intFromFloat(float))
-        else
-            return error.InvalidResponse,
-        else => return error.InvalidResponse,
-    };
-    // count is type-safe only after the runtime decoder accepts the JSON shape.
-    std.debug.print("count: {d}\n", .{count});
+const result = try client.call(allocator, "mutation", "demo:increment", args);
+if (result.function_error) |failure| {
+    // TypeScript: catch (e) { if (e instanceof ConvexError) ... }
+    std.debug.print("rejected: {s}\n", .{failure.message});
+    return;
 }
+const applied = result.value.?.object.get("applied").?.bool;
 ```
 
-Convex generates the TypeScript type for `api.demo.state`, including its
-arguments and return value. This client has no Zig code-generation step. It
-accepts `std.json.Value`, so the compiler checks the Zig decoder but cannot
-prove that the server returned a `count` field. The full example's
-[`countOf`](examples/basics/main.zig) helper adds stricter finite, integral, and
-range checks than the shortened comparison above.
+`try` only fires here for a transport or protocol failure; a round trip that
+Convex completed but chose to reject still lands on the next line.
 
-The React hook is also reactive, while `client.call` is deliberately a one-off
-HTTP request. Zig can run long-lived threaded code; choosing a synchronous HTTP
-method here is this client's small API design, not a Zig language limitation.
+### Building `{ room }` Takes Four Explicit Lines
 
-### React-managed reactivity versus explicit ownership
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-function Counter() {
-  const room = "zig-readme";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  if (state === undefined) return <button disabled>Loading...</button>;
-  return (
-    <button
-      onClick={() =>
-        increment({ room, language: "TypeScript", runId: crypto.randomUUID() })
-      }
-    >
-      Count: {state.count} {/* React rerenders when the subscription updates. */}
-    </button>
-  );
-}
-```
-
-**Zig**
+Zig has no garbage collector and no implicit heap access anywhere in its
+standard library, so every allocating call takes an `Allocator` argument you
+supply. The JSON object TypeScript would write inline as `{ room }` means
+asking `std.json.ObjectMap` for storage, filling it in, and owning its
+lifetime with `defer` yourself.
 
 ```zig
-const std = @import("std");
-const convex = @import("convex");
-
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    const deployment_url = try std.process.getEnvVarOwned(allocator, "CONVEX_URL");
-    defer allocator.free(deployment_url); // Real deployment configuration.
-    var client = try convex.Client.init(allocator, deployment_url);
-    var capture = convex.Capture.init(allocator); // Bounded mailbox for Live values.
-    var output = convex.Output.init(
-        allocator,
-        std.io.getStdErr().writer().any(),
-        std.io.getStdErr().handle,
-        .none,
-    );
-    output.capture = &capture;
-    defer {
-        client.deinit(); // Stop Live before freeing its delivery targets.
-        output.deinit();
-        capture.deinit();
-    }
-
-    var query_object = std.json.ObjectMap.init(allocator);
-    try query_object.put("room", .{ .string = "zig-readme" });
-    const query_args = convex.JsonValue{ .object = query_object };
-    try client.subscribe("counter", "demo:state", query_args, &output);
-    const initial = try capture.next(allocator, 10 * std.time.ns_per_s);
-    _ = initial; // The real example decodes and checks the initial count here.
-
-    var mutation_object = std.json.ObjectMap.init(allocator);
-    try mutation_object.put("room", .{ .string = "zig-readme" });
-    try mutation_object.put("language", .{ .string = "Zig" });
-    var run_id_bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&run_id_bytes);
-    var run_id_buffer: [24]u8 = undefined;
-    const run_id = std.base64.standard.Encoder.encode(&run_id_buffer, &run_id_bytes);
-    // A fresh idempotency key lets this fixed-room snippet apply on every run.
-    try mutation_object.put("runId", .{ .string = run_id });
-    const mutation = try client.call(
-        allocator,
-        "mutation",
-        "demo:increment",
-        .{ .object = mutation_object },
-    );
-    _ = mutation; // The real example checks applied and the returned state.
-
-    const updated = try capture.next(allocator, 10 * std.time.ns_per_s);
-    _ = updated; // This is the reactive value after the mutation.
-    try client.unsubscribe("counter");
-}
+var args_object = std.json.ObjectMap.init(allocator);
+defer args_object.deinit(); // TypeScript: const args = { room };
+try args_object.put("room", .{ .string = room });
+const args = convex.JsonValue{ .object = args_object };
+const result = try client.call(allocator, "query", "demo:state", args);
 ```
 
-React owns subscription setup, rerenders, and cleanup for `useQuery`. This
-command-line client exposes that lifecycle directly: subscribe before the
-mutation, read the initial and updated values with blocking `Capture.next`,
-then unsubscribe and tear resources down in dependency order. Blocking `next`
-is a deliberate fit for this teaching program, not the only concurrency model
-Zig can express. Zig's `try` returns an error to the caller immediately, while
-`defer` still runs on that early return.
+The `defer` is not ceremony: it is the only thing that frees `args_object`,
+and it still runs if an earlier `try` above it had bailed out first.
+
+### A Live Update Waits in a Mailbox Until You Ask
+
+Live queries are verified here against both a local and a hosted Convex
+deployment, but this client is a command-line program with no component tree
+to rerender, so `subscribe` cannot hand values to a hook the way `useQuery`
+does. Instead it deposits each one in a small bounded mailbox, and the caller
+blocks on `Capture.next` whenever it is ready for the next value.
+
+```zig
+var capture = convex.Capture.init(allocator);
+output.capture = &capture;
+try client.subscribe("counter", "demo:state", query_args, &output);
+const initial = try capture.next(allocator, 10 * std.time.ns_per_s);
+// ...call demo:increment here...
+// TypeScript: useQuery(api.demo.state, { room }) reruns the component for you
+const updated = try capture.next(allocator, 10 * std.time.ns_per_s);
+try client.unsubscribe("counter");
+```
+
+One owner thread drives every reconnect and delivery in the background;
+`capture.next` just waits its turn at the mailbox door.
 
 ## Status
 

@@ -54,9 +54,7 @@ if (query-error)
 end if;
 ```
 
-The trailing `#f` — Dylan's false — doubles as "no auth token" here, and
-results you do not want, like the Convex log lines, simply get a throwaway
-name.
+The trailing `#f` — Dylan's false — doubles as "no auth token" here.
 
 ### `false-or(<integer>)` is an optional type you can spell
 
@@ -104,9 +102,8 @@ block (done)
 end block
 ```
 
-Each update is a `<sync-update>` whose `upd-kind` slot is the symbol
-`#"value"` or `#"error"`, so the counter's `0 -> 1` change arrives as plain
-data rather than a callback.
+Each update is a `<sync-update>` whose `upd-kind` slot is `#"value"` or
+`#"error"`, so the counter's `0 -> 1` change arrives as plain data.
 
 ### The POSIX socket layer is declared in Dylan, not C
 

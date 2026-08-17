@@ -32,163 +32,67 @@ the source reproduced in the Example section below.
 
 ## Interesting Parts
 
-### Typed objects become bounded JSON buffers
+### A Convex call is a clocked bus transaction
 
-With the generated TypeScript API, Convex checks the argument shape and knows
-the query's return type. This client has no generated Convex types or general
-JSON value tree, so its caller writes the object into a fixed-capacity byte
-array, then explicitly parses and validates the returned `count`.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-function Counter({ room }: { room: string }) {
-  const state = useQuery(api.demo.state, { room });
-  if (state === undefined) return <p>Loading...</p>;
-
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**VHDL**
+VHDL describes hardware, so this client models the network as one: a shared
+`xport_req`/`xport_ack` signal pair, driven by two concurrent processes that
+never touch each other's fields directly. Issuing an HTTP request means
+toggling `req` and blocking on a genuine signal event — `wait until`, not a
+polled timeout — until the transport process's clock edge answers.
 
 ```vhdl
-procedure query_count(
-  signal rq : inout xport_req_t;
-  ep        : in http_endpoint_t;
-  room      : in string;
-  count     : out integer
-) is
-  variable args_buf : byte_array(0 to 255);
-  variable args_len : natural := 0;
-  variable no_token : byte_array(0 to 0);
-  variable is_function_error : boolean;
-  variable value_json, logs_json : byte_array(0 to 4095);
-  variable value_len, logs_len : natural;
-  variable error_message : byte_array(0 to 511);
-  variable error_message_len : natural;
-  variable error_data : byte_array(0 to 1023);
-  variable error_data_len : natural;
-  variable call_ok, parse_ok, found, count_ok : boolean;
-  variable toks : json_tok_array(0 to 63);
-  variable ntoks : natural;
-  variable count_tok : integer;
-begin
-  -- Build the same { room } argument object byte by byte.
-  buf_put_byte(args_buf, args_len, character'pos('{'));
-  json_put_string(args_buf, args_len, "room");
-  buf_put_byte(args_buf, args_len, character'pos(':'));
-  json_put_string(args_buf, args_len, room);
-  buf_put_byte(args_buf, args_len, character'pos('}'));
-
-  -- Call the real demo:state query through this client's HTTP facade.
-  client_call(rq, ep, no_token, 0, "query", "demo:state",
-              args_buf, args_len, is_function_error, value_json,
-              value_len, logs_json, logs_len, error_message,
-              error_message_len, error_data, error_data_len, call_ok);
-  assert call_ok and not is_function_error
-    report "query failed" severity failure;
-
-  -- VHDL types the buffer, not its JSON shape, so decode and check count.
-  json_parse(value_json, value_len, toks, ntoks, parse_ok);
-  assert parse_ok report "query returned invalid JSON" severity failure;
-  json_object_get(value_json, toks, ntoks, toks'low,
-                  "count", count_tok, found);
-  assert found report "demo state was missing count" severity failure;
-  json_tok_as_int(value_json, toks, count_tok, count, count_ok);
-  assert count_ok
-    report "demo count was not an integral number in range"
-    severity failure;
-end procedure query_count;
+rq.cmd <= cmd;
+rq.a0  <= a0;
+posted := not rq.req;
+rq.req <= posted;
+wait until xport_ack.ack = posted;  -- TypeScript: await fetch(url, opts)
+result := xport_ack.result;
 ```
 
-The full example accepts Convex's integral `0.0` representation while rejecting
-fractional, quoted, non-finite, and overflowing values. That is runtime client
-checking, not compile-time knowledge of the Convex schema.
+Every `client_call` and `sync_step` in this repo ultimately blocks on that one
+line: a socket write looks, to the simulator, exactly like a peripheral
+waiting for its ready signal.
 
-### React owns reactivity; this process advances it
+### Typed objects become bounded byte buffers
 
-React's `useQuery` subscribes during rendering and cleans up with the component.
-The command-line VHDL client instead owns a `sync_manager_t`: it subscribes,
-calls `sync_step` until an event arrives, and unsubscribes explicitly.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-function LiveCounter({ room }: { room: string }) {
-  const state = useQuery(api.demo.state, { room });
-  if (state === undefined) return <p>Loading...</p>;
-
-  // The generated API makes state.count a number, and React owns the update.
-  return <p>{state.count}</p>;
-}
-```
-
-**VHDL**
+There is no generated Convex API here and no general JSON value type, so a
+query argument is assembled a byte at a time into a fixed-capacity array, and
+the reply is walked back out through explicit token lookups.
 
 ```vhdl
-procedure observe_once(
-  signal rq : inout xport_req_t;
-  ep        : in http_endpoint_t;
-  room      : in string
-) is
-  variable args_buf : byte_array(0 to 255);
-  variable args_len : natural := 0;
-  variable sm : sync_manager_t;
-  variable sub_ok, has_event, step_ok : boolean;
-  variable event_kind : sync_event_kind_t;
-  variable sub_id : byte_array(0 to 15);
-  variable sub_id_len : natural;
-  variable value_json, logs_json : byte_array(0 to 4095);
-  variable value_len, logs_len : natural;
-  variable error_name : byte_array(0 to 15);
-  variable error_name_len : natural;
-  variable error_message : byte_array(0 to 255);
-  variable error_message_len : natural;
-  variable error_data : byte_array(0 to 511);
-  variable error_data_len : natural;
-  variable attempts : natural := 0;
-begin
-  -- The caller passes the endpoint parsed from CONVEX_URL and a real room.
-  buf_put_byte(args_buf, args_len, character'pos('{'));
-  json_put_string(args_buf, args_len, "room");
-  buf_put_byte(args_buf, args_len, character'pos(':'));
-  json_put_string(args_buf, args_len, room);
-  buf_put_byte(args_buf, args_len, character'pos('}'));
-  sync_init(sm, ep);
-  sync_subscribe(rq, sm, "counter", "demo:state",
-                 args_buf, args_len, sub_ok);
-  assert sub_ok report "subscribe failed" severity failure;
-
-  -- Unlike useQuery, this client must be stepped until an update arrives.
-  loop
-    sync_step(rq, sm, 100, has_event, event_kind, sub_id,
-              sub_id_len, value_json, value_len, logs_json, logs_len,
-              error_name, error_name_len, error_message,
-              error_message_len, error_data, error_data_len, step_ok);
-    assert step_ok report "Live step failed" severity failure;
-    exit when has_event;
-    attempts := attempts + 1;
-    assert attempts < 100 report "Live query timed out" severity failure;
-  end loop;
-  assert event_kind = SYNC_UPDATED
-    report "Live query failed" severity failure;
-
-  -- value_json now contains the reactive state; the full example decodes it.
-  sync_unsubscribe(rq, sm, "counter", sub_ok);
-  assert sub_ok report "unsubscribe failed" severity failure;
-end procedure observe_once;
+buf_put_byte(args_buf, args_len, character'pos('{'));
+json_put_string(args_buf, args_len, "room");
+buf_put_byte(args_buf, args_len, character'pos(':'));
+json_put_string(args_buf, args_len, room);
+buf_put_byte(args_buf, args_len, character'pos('}'));
+-- TypeScript: useQuery(api.demo.state, { room })
+json_object_get(value_json, toks, ntoks, toks'low, "count", count_tok, found);
+json_tok_as_int(value_json, toks, count_tok, count, count_ok);
 ```
 
-`sync_step` is this client's blocking, demand-driven API, so no background
-callback or React lifecycle hides ownership. The [canonical example](examples/basics/main.vhdl) shows
-`CONVEX_URL` parsing, full event decoding, mutation, and cleanup.
+`json_tok_as_int` accepts Convex's integral `0.0` representation and rejects
+fractional, quoted, or overflowing values — a runtime check standing in for
+the compile-time type the generated client would have given for free.
+
+### This process advances Live; React never gets the chance
+
+`useQuery` subscribes during render and React schedules the re-render itself.
+Here a `sync_manager_t` is owned explicitly, and nothing updates until the
+driver process calls `sync_step` again — the polling loop *is* the client.
+
+```vhdl
+sync_subscribe(rq, sm, "example", "demo:state", args_buf, args_len, sub_ok);
+loop
+  sync_step(rq, sm, 100, has_event, ev_kind, ev_sub_id, ev_sub_id_len,
+            ev_value, ev_value_len, ev_logs, ev_logs_len, ev_err_name,
+            ev_err_name_len, ev_err_message, ev_err_message_len,
+            ev_err_data, ev_err_data_len, step_ok);
+  exit when has_event;  -- nothing arrives until this process asks again.
+end loop;
+```
+
+The [canonical example](examples/basics/main.vhdl) subscribes before mutating
+so the initial snapshot can never race the update that follows it.
 
 ## Status
 

@@ -28,114 +28,68 @@ room. You do not need R installed on your computer.
 
 ## Interesting Parts
 
-### Named lists become Convex argument objects
+### `%||%` invents a null-coalescing operator on the spot
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function CounterValue() {
-  const state = useQuery(api.demo.state, { room: "readme-r-query" });
-  if (state === undefined) return <span>Loading...</span>;
-  return <span>{state.count}</span>; // state and count are type-safe here.
-}
-```
-
-**R**
+R lets any name wrapped in percent signs become a new binary operator — the
+same trick the `%>%` pipe used for years before base R grew its own. This
+client mints `%||%` once and leans on it everywhere a Convex response field
+might be absent.
 
 ```r
-source("client/convex.R")
-
-read_counter <- function() {
-  # CONVEX_URL selects the deployment; the named list becomes { room: ... }.
-  client <- convex_client(Sys.getenv("CONVEX_URL"))
-  on.exit(client$close()) # Dispose of HTTP and Live resources on every exit.
-
-  args <- list(room = "readme-r-query")
-  state <- client$query("demo:state", args)$value
-  print(state$count) # JSON objects decode to named lists, accessed with `$`.
+`%||%` <- function(x, y) {
+  if (is.null(x)) y else x
 }
 
-read_counter()
+# TypeScript: decoded.errorMessage ?? "Convex function failed"
+message <- decoded$errorMessage %||% "Convex function failed"
+logs <- unlist(decoded$logLines %||% list(), use.names = FALSE)
 ```
 
-R's named lists are a natural fit for JSON objects, so the call stays compact.
-Unlike the generated TypeScript API, field names and result shapes are checked
-at runtime. This R call is also a one-off HTTP query, not a reactive hook.
+### The client is a closure, not a class
 
-### This client makes the Live lifecycle explicit
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "readme-r-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  async function addOne() {
-    const result = await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(), // Retries with this key apply only once.
-    });
-    console.log(result.applied);
-    // useQuery owns the subscription and rerenders when the count changes.
-  }
-
-  return (
-    <button disabled={state === undefined} onClick={addOne}>
-      Count: {state?.count ?? "loading"}
-    </button>
-  );
-}
-```
-
-**R**
+R has no `class` keyword for a small stateful object. The idiom instead
+closes over an environment — R's one type that is passed by reference
+instead of copied — and hands back a list of functions that share it.
+`convex_client()` is just a function that happens to behave like one.
 
 ```r
-source("client/convex.R")
-source("client/live.R")
+convex_client <- function(url, bearer_token = "") {
+  # State lives in an environment so every returned closure sees the same copy.
+  state <- new.env(parent = emptyenv())
+  state$closed <- FALSE
+  state$live <- NULL
 
-watch_one_change <- function() {
-  client <- convex_client(Sys.getenv("CONVEX_URL"))
-  on.exit(client$close(), add = TRUE) # Always dispose of the client.
-  room <- "readme-r-live"
-
-  # Subscribe before mutating, then read the initial server value explicitly.
-  subscription <- client$subscribe("demo:state", list(room = room))
-  on.exit(subscription$close(), add = TRUE) # Stop Live when this function ends.
-  initial <- subscription$next_update()$value
-  print(initial$count)
-
-  # Convex treats runId as an idempotency key. Time and PID distinguish this run.
-  run_id <- paste0("readme-r-", as.integer(Sys.time()), "-", Sys.getpid())
-  result <- client$mutation(
-    "demo:increment",
-    list(
-      room = room,
-      language = "r",
-      runId = run_id
-    )
-  )$value
-  print(result$applied) # The mutation result is another decoded named list.
-
-  updated <- subscription$next_update()$value
-  print(updated$count) # This value arrived through Live, not another query.
+  list( # TypeScript: a closure returning { query, mutation, close }
+    query = function(path, args = list()) request("query", path, args),
+    mutation = function(path, args = list()) request("mutation", path, args),
+    close = function() {
+      state$closed <- TRUE
+      if (!is.null(state$live)) state$live$close()
+    }
+  )
 }
-
-watch_one_change()
 ```
 
-React creates, updates, and disposes the subscription with the component. This
-command-line client instead returns a subscription that the caller reads and
-closes directly. The blocking `next_update()` API is a deliberate client design
-for a small executable, not a limitation of R itself.
+### `next_update()` turns Live into a queue you pull from
+
+Rather than firing a callback, this client's Live subscription buffers
+updates and makes the caller ask for the next one. `next_update()` blocks
+(up to a timeout) until Convex's server pushes a change, so a plain,
+top-to-bottom R script can read a subscription the same way it reads a
+one-off query.
+
+```r
+subscription <- client$subscribe("demo:state", list(room = room))
+on.exit(subscription$close(), add = TRUE) # stacks after the client's on.exit
+
+initial <- subscription$next_update()$value # blocks until Live delivers
+print(initial$count)
+
+client$mutation("demo:increment", list(room = room, language = "r", runId = run_id))
+
+updated <- subscription$next_update()$value
+print(updated$count) # TypeScript: useQuery(api.demo.state, { room }) would rerender here
+```
 
 ## Status
 

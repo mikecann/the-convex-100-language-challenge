@@ -34,129 +34,84 @@ transcript. It does not install GNU Cim or any build dependency on your host.
 
 ## Interesting Parts
 
-### React hides the subscription; this client makes it visible
+### A subscription you personally keep pumping
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-function Counter() {
-  const room = "readme-comparison";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  if (state === undefined) return <p>Loading...</p>;
-
-  return (
-    <button
-      onClick={() =>
-        increment({
-          room,
-          language: "typescript",
-          runId: crypto.randomUUID(),
-        })
-      }
-    >
-      Count: {state.count} {/* React rerenders when the query changes. */}
-    </button>
-  );
-}
-```
-
-**Simula 67**
+`useQuery` in React hides an entire lifecycle: subscribe, wait, rerender,
+unsubscribe. Simula 67 predates event loops and hooks by decades, so this
+client puts every one of those steps in your hands as an explicit,
+blocking call — you decide exactly when the program is allowed to wait for
+the server's next word.
 
 ```simula
-procedure watchstate(host, hostlen, port, portlen, tls);
-   integer array host, port;
-   integer hostlen, portlen, tls;
-begin
-   integer array pathbuf(0:31), argsbuf(0:127), errbuf(0:255);
-   integer pathlen, argslen, errbuflen, errkind, sub, initialkind, discard;
+comment TypeScript: const state = useQuery(api.demo.state, { room });
+livesubscribe(examplehost, examplehostlen, exampleport, exampleportlen,
+   exampletls, pathbuf, pathlen, argsbuf, 0, argslen, cxnowms + 10000,
+   sub, errbuf, errbuflen, errkind);
 
-   pathlen := 0;
-   discard := bufputstr(pathbuf, 32, pathlen, "demo:state");
-   argslen := 0;
-   discard := bufputstr(argsbuf, 128, argslen,
-      "{""room"":""readme-comparison""}");
-
-   errbuflen := 0; errkind := 0;
-   livesubscribe(host, hostlen, port, portlen, tls,
-      pathbuf, pathlen, argsbuf, 0, argslen,
-      cxnowms + 10000, sub, errbuf, errbuflen, errkind);
-   if errkind <> 0 then cxexit(1);
-
-   comment This blocking next call pumps the socket and returns the first
-      query value. The caller, rather than a UI framework, owns progress;
-   initialkind := livenext(sub, 10000);
-   if initialkind = 0 then cxexit(1);
-   livereleasetaken;
-
-   comment Cleanup is explicit too. The full example mutates between the
-      initial delivery and the updated delivery;
-   liveunsubscribe(sub, cxnowms + 5000);
-   liveclose(cxnowms + 5000)
-end watchstate;
+initialkind := livenext(sub, 10000);
+if initialkind = 2 then givingup("the initial Live value was an error");
+livetakencopyvalue(valuecopy, 2048, valuelen);
+livereleasetaken;
+initial := examplecount(valuecopy, 0, valuelen, initialok);
 ```
 
-`useQuery` owns the subscription lifecycle and causes React to rerender. The
-Simula language has coroutines, but this particular client deliberately offers
-a blocking `livenext` API with explicit unsubscribe and close operations. That
-is a client design choice, not a limitation of the language. See the
-[complete sequence](examples/basics/main.sim).
+No callback ever fires on its own; `livenext` only returns once the
+Convex sync protocol actually has something to say.
 
-### An object-oriented failure path from 1967
+### Failure earns its own class, not an error code
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-class ExampleFailure extends Error {}
-
-function CheckedCounter() {
-  const state = useQuery(api.demo.state, { room: "readme-comparison" });
-
-  if (state === undefined) return <p>Loading...</p>;
-  if (!Number.isSafeInteger(state.count)) {
-    throw new ExampleFailure("demo:state did not return a safe whole count");
-  }
-
-  return <p>Count: {state.count}</p>;
-}
-```
-
-**Simula 67**
+Ole-Johan Dahl and Kristen Nygaard gave the world `class` and subclassing
+right here, in 1967 — an idea that later reached Smalltalk, C++, and
+practically every object-oriented language since. This client puts its own
+invention to work on error handling: rather than one struct with a
+discriminant field, every way the demo can fail is a distinct class.
 
 ```simula
 class ConvexOutcome(reasontext); text reasontext;
 begin
-   comment Common state inherited by every example outcome;
+   comment base class shared by every structured failure;
 end ConvexOutcome;
 
 ConvexOutcome class ExampleFailure;
 begin
    procedure report;
    begin
-      comment The real example writes reasontext to stderr, then exits;
+      comment TypeScript: throw new Error(reasontext);
       cxexit(1)
    end report;
 end ExampleFailure;
-
-begin
-   ref(ExampleFailure) outcome;
-   outcome :- new ExampleFailure("demo:state did not return a count");
-   outcome.report
-end;
 ```
 
-The syntax looks old, but the ideas are familiar: subclassing, object
-construction, a typed reference, and an instance method. GNU Cim 5.1 cannot
-compile the parameterless virtual declaration this example would need for
-polymorphic dispatch through `ConvexOutcome`, so the checked-in code calls
-`report` through the concrete `ExampleFailure` reference.
+`new ExampleFailure(...)` hands back a typed reference with its own
+constructor argument and its own instance method — inheritance doing real
+work, not decoration.
+
+### `name` lets a parameter answer back
+
+Simula inherited ALGOL 60's call-by-name parameters, the mechanism famous
+for Jensen's Device: a `name` parameter isn't a value, it's a re-evaluated
+reference to the caller's variable, so a procedure can hand a result back
+through an argument instead of only through its return value. Decoding a
+Convex reply's `count` field leans on exactly that.
+
+```simula
+comment TypeScript: no equivalent - the answer walks back through "ok";
+integer procedure examplecount(buf, off, limit, ok);
+   name ok;
+   integer array buf;
+   integer off, limit, ok;
+begin
+   integer voff, vlen, found;
+   comment ... locate "count" via jsonfindfield ...;
+   if errkind <> 0 or found = 0 then
+      ok := 0
+   else
+      examplecount := jsonparseint(buf, voff, vlen, ok)
+end examplecount;
+```
+
+The function result carries the parsed count; the `ok` out-parameter,
+passed by name, carries whether Convex's JSON actually held one.
 
 ## Status
 

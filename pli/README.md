@@ -31,161 +31,74 @@ test room. You do not need a PL/I compiler installed on your machine.
 
 ## Interesting Parts
 
-### Arguments are objects in React and bytes here
+### Fixed-length strings, so JSON lives in a byte buffer
 
-In React, generated Convex types make the mutation arguments and return value
-ordinary TypeScript objects:
-
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-function IncrementOnce() {
-  const increment = useMutation(api.demo.increment);
-
-  return (
-    <button
-      onClick={async () => {
-        const result = await increment({
-          room: "readme-pli",
-          language: "TypeScript",
-          // One fresh key per click, reused if that call is retried.
-          runId: crypto.randomUUID(),
-        });
-        console.log(result.state.count); // The result is type-safe here.
-      }}
-    >
-      Increment
-    </button>
-  );
-}
-```
-
-Iron Spring's fixed `CHAR` values are blank padded and limited to roughly
-32,000 characters. This client therefore assembles the same argument object in
-a growable byte buffer before making the HTTP mutation:
-
-**PL/I**
+PL/I's `CHAR` data is fixed length and blank padded on assignment — a
+`CHAR(32)` value cannot simply hold something shorter without trailing spaces
+creeping into your output, and Iron Spring caps a single `CHAR` around 32,000
+bytes besides. So this client never treats Convex arguments as PL/I strings at
+all. It appends literal text and escaped bytes into a growable buffer and
+posts that buffer's raw bytes as the request body:
 
 ```pli
-%include convex; /* The client API, buffers, and result fields. */
-
 dcl mutationpath char(14) init('demo:increment');
-dcl mutationcount fixed bin(31);
+
+call bclear( B_TMP );
+call bputt( B_TMP, '{"room":"' );
+call bputesc( B_TMP, bdata(B_PATH), blen(B_PATH) );
+call bputt( B_TMP, '","language":"PL/I","runId":"' );
+call bputesc( B_TMP, bdata(B_PATH), blen(B_PATH) );
+call bputt( B_TMP, '-once"}' );
+/* TypeScript: await increment({ room, language, runId }) */
+call cvxcall( 'mutation', addr(mutationpath), 14, bdata(B_TMP), blen(B_TMP) );
+```
+
+The argument object never exists as a PL/I record — it leaves the process as
+exactly the bytes queued into `B_TMP`.
+
+### A JSON value is an index, not an object
+
+Rather than decode a Convex response into a PL/I structure, the parser walks
+the response text once and hands back node indices — offsets into the
+original bytes. Reading a field is a further call: `jmember` walks to a named
+member, `jinteger` reads it as a number. Nothing is copied unless a caller
+actually asks for it, which is how large numbers and unfamiliar shapes pass
+through untouched:
+
+```pli
 dcl statenode fixed bin(31);
 dcl countnode fixed bin(31);
 
-/* Build the exact JSON object Convex expects, without CHAR padding. */
-call bclear( B_TMP );
-call bputt( B_TMP, '{"room":"readme-pli",' );
-call bputt( B_TMP, '"language":"PL/I",' );
-/* This focused program makes one logical call, so its key stays fixed. */
-call bputt( B_TMP, '"runId":"readme-pli-once"}' );
-
-/* The real client posts this mutation and parses the JSON response. */
-call cvxcall( 'mutation', addr(mutationpath), 14,
-              bdata(B_TMP), blen(B_TMP) );
-if callok = 0 then call c_exit( 1 );
-
-/* A returned value is a JSON node index, so fields are explicit. */
+/* callvalue is a parsed-JSON node index, not a decoded record. */
 statenode = jmember( D_HTTP, callvalue, 'state' );
 countnode = jmember( D_HTTP, statenode, 'count' );
 mutationcount = jinteger( D_HTTP, countnode );
+/* TypeScript: const count = result.state.count; */
 ```
 
-This is not how every PL/I API must look. It is a client design shaped by this
-compiler's string model and by the need to preserve arbitrary Convex JSON.
-The React handler creates a fresh idempotency key for each click. This PL/I
-fragment represents one process invocation, so its fixed key safely identifies
-that one logical call and any retry of it. The canonical example derives its
-stable `runId` from the verifier's unique room. Its exact builder is in
-[`main.pli`](examples/basics/main.pli).
+Reading a result becomes a short chain of index lookups rather than a struct.
 
-### React hides the subscription loop
+### No component lifecycle, so the subscription loop is explicit
 
-`useQuery` owns a subscription for the lifetime of the component. When the
-mutation changes the room, React renders again with the pushed value:
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-function Counter() {
-  const room = "readme-pli-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  if (state === undefined) return <p>Loading...</p>;
-
-  return (
-    <button
-      onClick={() =>
-        increment({
-          room,
-          language: "TypeScript",
-          // Each click is a new logical increment with its own retry key.
-          runId: crypto.randomUUID(),
-        })
-      }
-    >
-      {state.count} {/* A pushed update causes this component to render again. */}
-    </button>
-  );
-}
-```
-
-A command-line PL/I program has no component lifecycle, so this client exposes
-the subscription and its event loop directly:
-
-**PL/I**
+React's `useQuery` owns a subscription for the life of a component and
+re-renders it when Convex pushes a new value. A PL/I program has no component
+tree to re-render, so this client hands the event loop straight to the
+caller: `livesub` opens a subscription slot, and the caller alternates
+`livepump` (drive the socket) with `livetake` (check for a queued delivery)
+until one arrives:
 
 ```pli
-%include convex; /* The client API, buffers, and subscription state. */
-
-dcl statepath char(10) init('demo:state');
-dcl subname char(5) init('basic');
-dcl slot fixed bin(31);
-dcl envname char(32);
-dcl deployment ptr;
-
-call cvxinit();                 /* Initialise all client-owned state. */
-envname = 'CONVEX_URL' || '00'x;
-deployment = c_getenv( addr(envname) );
-/* Configure the deployment selected by the Docker verifier. */
-if deployment = sysnull() then call c_exit( 1 );
-if cvxseturl( deployment, c_strlen(deployment) ) = 0 then
-  call c_exit( 1 );
-
-call bclear( B_TMP );
-call bputt( B_TMP, '{"room":"readme-pli-live"}' );
-
-/* Subscribe before the mutation so the later value is a pushed update. */
 slot = livesub( addr(subname), 5, addr(statepath), 10,
                 bdata(B_TMP), blen(B_TMP) );
 
-/* livepump advances the socket; livetake removes one queued delivery. */
+/* TypeScript: useQuery re-renders the component on its own. */
 do while( livetake( slot ) = 0 );
   if livepump( -1, 50 ) = 0 then;
   end;
-/* B_MSG now contains the initial demo:state value as JSON text. */
-
-/* The full example performs demo:increment here, then waits again. */
-do while( livetake( slot ) = 0 );
-  if livepump( -1, 50 ) = 0 then;
-  end;
-/* B_MSG now contains the pushed state after the mutation. */
-
-call liveshutdown();            /* Dispose of subscriptions and the socket. */
+/* B_MSG now holds the pushed demo:state value as JSON text. */
 ```
 
-PL/I has broader event and multitasking facilities. The explicit `livepump`
-and blocking `livetake` pairing is this client's small, deterministic API, not
-a language restriction. The complete example adds deadlines, decoding, and
-value checks around this focused lifecycle.
+The pushed update shows up as bytes sitting in `B_MSG`, not as a callback.
 
 ## Status
 

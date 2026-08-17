@@ -29,10 +29,10 @@ Nothing from the Io toolchain is installed on your host.
 
 ### Everything after a space is a message
 
-Io pares Smalltalk's model down to one rule: `receiver message(arguments)`,
-where a space between two words is a message send. There is no other call
-syntax — `query` below is not a keyword, just a message the client object
-happens to understand.
+Io pares Smalltalk's object model down to one rule: `receiver message(arguments)`,
+where a bare space between two words is a message send. There's no separate
+call syntax, so `query` below isn't a keyword — it's just a message the
+client object happens to understand.
 
 ```io
 client := Convex clientForUrl(System getEnvironmentVariable("CONVEX_URL"))
@@ -43,17 +43,16 @@ response := client query("demo:state", arguments)
 Convex field(response value, "count") println
 ```
 
-The last line sends `println` to the extracted value, so the data prints
-itself. The client keeps Convex values as their exact JSON text — Io has a
-single floating-point `Number` type, and raw text never rewrites what Convex
-sent.
+Even `println` here is a message sent to the extracted field, so the data
+prints itself.
 
 ### State is a cloned Object taught new slots
 
-Io inherits prototypes from Self: there are no classes, so the basics example
-conjures its Live bookkeeping by cloning bare `Object` and assigning slots.
-`:=` creates a slot; plain `=` updates one and raises an error if the slot
-does not exist, so a typo cannot silently invent a fresh variable.
+Io inherited Self's prototypes rather than Smalltalk's classes, so there's
+nothing to instantiate — the basics example builds its Live bookkeeping by
+cloning bare `Object` and teaching it slots on the spot. `:=` creates a slot;
+plain `=` updates one and raises if it doesn't already exist, so a typo can't
+quietly invent a new variable.
 
 ```io
 watch := Object clone
@@ -71,15 +70,15 @@ report := block(kind, payload, logs,
 )
 ```
 
-Even the control flow is messages: `if(...)` is a message send, and `then`
-and `else` are messages to its result.
+Notice `if(...)` is itself a message send — `then` and `else` are just
+messages to whatever it returns.
 
 ### A Live wait is a block handed to the event pump
 
-The client owns one event loop, and `pumpUntil` drives it until a `block` — a
-real object you pass around like any other value — answers true. Subscribing,
-waiting, mutating, and waiting for the reactive update are four plain message
-sends.
+The client owns a single event loop, and `pumpUntil` drives it until a
+`block` — an ordinary object you can pass around like any value — answers
+true. Subscribing, waiting, mutating, and waiting again for the reactive
+update are four plain message sends, no callback ceremony required.
 
 ```io
 subscriptionId := client subscribe("demo:state", arguments, report)
@@ -93,14 +92,12 @@ client mutation("demo:increment", Convex object(list(
     "runId", Convex string(runId)
 )))
 
-// Wait for Live to deliver the new count instead of polling with a query.
 client pumpUntil(block(watch deliveries > 1), client deadlineFor(30000))
 client unsubscribe(subscriptionId)
 ```
 
-Note `..` on the `runId` line: string concatenation is a message too. React
-hides this whole lifecycle inside `useQuery`; this command-line client makes
-each step a visible send.
+React hides this whole lifecycle inside `useQuery`; here every step of it is
+a visible send.
 
 ## Status
 

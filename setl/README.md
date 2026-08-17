@@ -25,134 +25,69 @@ deployment. You do not need GNU SETL installed on your machine.
 
 ## Interesting Parts
 
-### Convex objects really are maps
+### An argument object is just a set of pairs
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function CounterRead() {
-  const state = useQuery(api.demo.state, { room: "readme-setl-room" });
-  if (state === undefined) {
-    return <output>loading</output>;
-  }
-  return <output>{state.count}</output>; // state.count is a typed number.
-}
-```
-
-**SETL**
+Jack Schwartz built SETL around the idea that a program's data should look
+like the sets, tuples, and maps in a math paper, with no separate record
+type layered on top. A SETL map is literally a set of `[key, value]` pairs,
+so the object this client sends to `demo:state` is built the same way you'd
+build any other set: start empty, add pairs.
 
 ```setl
-deployment_url := getenv("CONVEX_URL"); -- Real configuration, not a hidden global.
-if deployment_url = om or deployment_url = "" then
-  printa(stderr, "CONVEX_URL is required");
-  stop 1;
-end if;
-query_args := {};                       -- An empty set can become a map.
-query_args("room") := "readme-setl-room"; -- Adds ["room", value] to that map.
+query_args := {};                         -- {} is an empty set, also an empty map
+query_args("room") := room;               -- inserts ["room", room] into that set
 
-response := convex_query(deployment_url, "demo:state", query_args, om, 10000); -- om means no auth token.
+response := convex_query(deployment_url, "demo:state", query_args, om, 10000);
 if response("kind") = "result" then
   state := response("value");
-  print(state("count")); -- SETL checks this shape at runtime, not compile time.
+  print(state("count"));                  -- TypeScript: state.count, checked at compile time
 end if;
 ```
 
-A SETL map is a set of two-element tuples, so the object passed to
-`api.demo.state` is built with ordinary map operations. The React hook owns a
-subscription and rerenders when the result changes. `convex_query` is only one
-HTTP read, so it deliberately does not offer that reactive lifecycle.
+The decoded reply is an equally ordinary map, indexed by string key just like
+the request was assembled.
 
-### A mutation is assembled from the same data primitives
+### A function hands back three things, unpacked on arrival
 
-**TypeScript with React**
-
-```tsx
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function IncrementButton() {
-  const increment = useMutation(api.demo.increment);
-  async function handleClick() {
-    const result = await increment({
-      room: "readme-setl-room",
-      language: "setl",
-      runId: crypto.randomUUID(), // A fresh id makes this attempt idempotent.
-    });
-    console.log(result.state.count); // The generated return type is known here.
-  }
-  return <button onClick={handleClick}>Increment</button>;
-}
-```
-
-**SETL**
+SETL has no `try`/`catch` and no `Result` type. It relies on plain multiple
+assignment instead: a procedure returns a tuple literal, and the caller
+unpacks it against a same-shaped list of names in one statement. The example
+uses this to decode and validate a Convex reply in a single line.
 
 ```setl
-deployment_url := getenv("CONVEX_URL");
-if deployment_url = om or deployment_url = "" then
-  printa(stderr, "CONVEX_URL is required");
+-- convex_state_count returns [true, raw, ""] or [false, om, "message"]
+[decoded, current, message] := convex_state_count(response("value"), "current query");
+if not decoded then
+  printa(stderr, "SETL example failed: " + message); -- TypeScript: try/catch, or a Result<T, E>
   stop 1;
 end if;
-mutation_args := {};
-mutation_args("room") := "readme-setl-room";
-mutation_args("language") := "setl";
-mutation_args("runId") := "readme-" + str(clock) + "-" + str(random(1000000));
--- clock plus a random suffix gives this demonstration run a fresh key.
-
-result := convex_mutation(
-    deployment_url, "demo:increment", mutation_args, om, 10000); -- om means no auth token.
-if result("kind") = "result" then
-  print(result("value")("state")("count")); -- Shape checks happen at runtime.
-end if;
+print("current count: " + str(current));
 ```
 
-Both calls send the same three arguments and receive `{ applied, state }`.
-SETL has no datatype declarations, so this client validates the decoded JSON
-envelope and the complete example performs the stricter count checks.
+No exception machinery, just a tuple wide enough to carry success, value,
+and explanation at once.
 
-### Reactive state is passed back explicitly
+### A Live session comes back new, never changed in place
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  const state = useQuery(api.demo.state, { room: "readme-setl-room" });
-  // React starts, updates, and disposes this component's subscription.
-  return <output>{state?.count ?? "loading"}</output>;
-}
-```
-
-**SETL**
+GNU SETL passes every value by value, maps included, so there is no
+reference to quietly mutate. A long-lived thing like an open Live
+subscription has to be threaded explicitly: each call returns a fresh
+session map that the caller reassigns before asking again.
 
 ```setl
-deployment_url := getenv("CONVEX_URL");
-if deployment_url = om or deployment_url = "" then
-  printa(stderr, "CONVEX_URL is required");
-  stop 1;
-end if;
-args := {};
-args("room") := "readme-setl-room";
-subscription_id := "counter-" + str(clock); -- Caller-owned local identity.
+[connected, sync] := sync_connect(deployment_url, "setl-0.1.0", 10000);
+[subscribed, sync, query_id] := sync_add(sync, "demo:state", query_args);
+-- Subscribing before the mutation runs makes the next wait an observation
+-- of a real change, not a race against one that already happened.
 
-live := live_open(deployment_url, "setl-0.1.0");
-live := live_add(live, subscription_id, "demo:state", args);
-while live("revisions")(subscription_id) = om loop
-  live := live_pump(live, 100); -- Every call returns the next session map.
-end loop;
-print(live("results")(subscription_id)("value")("count"));
-live := live_close(live, "example complete");
+[outcome, sync, result] := sync_wait_next(sync, query_id, 10000);
+if outcome = "ok" and result("kind") = "value" then
+  print(result("value")("count")); -- TypeScript: useQuery(api.demo.state, {room}) rerenders for you
+end if;
 ```
 
-This blocking `live_pump` API is a choice made by this command-line client,
-not a limitation of SETL. SETL passes maps by value, so connection and
-subscription state must be returned and reassigned explicitly. The client uses
-structural map equality to avoid publishing an unchanged value immediately
-after reconnecting.
+Nothing here is a callback firing in the background — the program simply
+blocks until Convex hands `sync` back with a fresher Transition inside it.
 
 ## Status
 

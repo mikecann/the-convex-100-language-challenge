@@ -33,122 +33,73 @@ so nothing needs to be installed on the host.
 
 ## Interesting Parts
 
-### Generated types versus runtime JSON checks
+### A failed call branches to a label, not a catch block
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function RoomCount() {
-  const state = useQuery(api.demo.state, {
-    room: "snobol4-readme-query",
-  });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**SNOBOL4**
+SNOBOL4 predates exceptions by decades. Every statement can succeed or fail,
+and the arrow at the end of a line — `:S(label)` for success, `:F(label)` for
+failure — sends control straight to a label on that outcome. There is no
+`try`/`catch`; failure is just another kind of goto, wired into the grammar
+since the 1966 redesign.
 
 ```snobol4
--include 'convex.sno'
-
-*   Configuration is explicit. :F(label) branches when the call fails.
-    deployment = io.getenv("CONVEX_URL")
+*   TypeScript: try { await client.query(...) } catch (e) { ... }
     cvx.configure(deployment, "")                              :f(configure.failed)
-
-*   Build the real demo:state argument object, then make one HTTP query.
-    room = "snobol4-readme-query"
-    args = json.object1("room", json.qs(room))
-    rawstate = cvx.query("demo:state", args)                    :f(query.failed)
-
-*   The response is raw JSON. These checks provide runtime safety, not
-*   compile-time type safety.
-    rawcount = json.field(rawstate, "count")                    :f(query.badshape)
-    count = json.uint32(rawcount)                               :f(query.badshape)
-    output = count                                               :(done)
-
+    current = cvx.query("demo:state", args)                    :f(query.failed)
+    output = "current count: " current
+                                                                :(done)
 configure.failed
-    output = "invalid deployment configuration"                 :(done)
+    output = "invalid deployment configuration"                :(done)
 query.failed
-    output = cvx.err.name ": " cvx.err.message                  :(done)
-query.badshape
-    output = "demo:state returned an invalid count"
+    output = cvx.err.name ": " cvx.err.message
 done
-end
 ```
 
-The React hook is reactive and its result type comes from Convex's generated
-API. `cvx.query` is a one-off HTTP call. SNOBOL4 values are dynamically typed,
-so this client returns raw JSON and makes callers validate the fields they use.
-Inside [`client/convex-json.sno`](client/convex-json.sno), SNOBOL4 patterns such
-as `SPAN` and `RPOS` do the token validation.
+### A pattern match doubles as a type check
 
-### React owns reactivity, this client exposes it
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveRoomCount() {
-  const state = useQuery(api.demo.state, {
-    room: "snobol4-readme-live",
-  });
-
-  if (state === undefined) return <p>Connecting...</p>;
-  return <p>{state.count}</p>; // React rerenders when the query changes.
-}
-```
-
-**SNOBOL4**
+Pattern matching is SNOBOL4's signature idea: `SPAN` builds a pattern that
+consumes a run of characters from a fixed alphabet, and `RPOS(0)` requires
+that run to reach the end of the string. Chained together, they reject
+anything that isn't a clean run of digits — no separate type system needed.
+This is lifted straight from [`client/convex-json.sno`](client/convex-json.sno),
+where it turns a raw JSON number into a validated Convex `uint32`.
 
 ```snobol4
--include 'convex.sno'
-
-    deployment = io.getenv("CONVEX_URL")
-    cvx.configure(deployment, "")                              :f(configure.failed)
-    cvx.live.init()
-
-*   This command-line program owns the subscription and its cleanup.
-    room = "snobol4-readme-live"
-    args = json.object1("room", json.qs(room))
-    queryid = cvx.live.subscribe("demo:state", args)
-
-*   Pump the connection until the initial Live value enters the queue.
-live.wait
-    gt(cvx.live.event_count, 0)                                :s(live.ready)
-    cvx.live.pump(io.now() + 250)                              :s(live.wait)
-                                                               :(live.failed)
-live.ready
-    kind = cvx.live.next_event()                               :f(live.failed)
-    ident(kind, "value")                                      :f(live.failed)
-    rawcount = json.field(cvx.live.event.payload, "count")     :f(live.failed)
-    count = json.uint32(rawcount)                              :f(live.failed)
-    output = count                                               :(live.cleanup)
-
-live.failed
-    output = "Live query failed"
-live.cleanup
-    cvx.live.unsubscribe(queryid)
-    cvx.live.close()
-                                                               :(done)
-
-configure.failed
-    output = "invalid deployment configuration"
-done
-end
+json.uint32
+        trimmed = json.trim(rawvalue)
+*       ... (split off and reject any fractional part first) ...
+*   TypeScript: typeof value === "number" && Number.isInteger(value)
+        whole span("0123456789") rpos(0)                      :f(freturn)
+        eq(size(whole), 1)                                     :s(json.uint32.value)
+        differ(substr(whole, 1, 1), "0")                       :f(freturn)
+json.uint32.value
+        json.uint32 = whole + 0
+        le(json.uint32, 4294967295)                            :s(return)
 ```
 
-React manages the subscription lifecycle behind `useQuery`. This small
-command-line client instead exposes `pump` and `next_event`, letting its caller
-decide when network progress happens and when queued values are consumed. That
-is a deliberate API design for this experiment, not a claim that one-off HTTP
-queries and reactive hooks are equivalent.
+A malformed number simply fails the match, which fails the function, which
+the caller was already set up to branch on.
+
+### A Live value waits in a queue until you pump for it
+
+This client earns Convex's Live capability, but there's no React runtime
+quietly polling on its behalf. `cvx.live.subscribe` opens the subscription
+and events queue up in silence until the caller explicitly drives the
+connection forward.
+
+```snobol4
+*   TypeScript: useQuery(api.demo.state, { room }) reruns your component.
+    qid = cvx.live.subscribe("demo:state", args)
+wait.loop
+        gt(cvx.live.event_count, 0)                            :s(wait.ready)
+        cvx.live.pump(io.now() + 250)                          :(wait.loop)
+wait.ready
+        kind = cvx.live.next_event()
+        ident(kind, "value")                                   :f(live.failed)
+        count = json.uint32(json.field(cvx.live.event.payload, "count"))
+        output = count
+```
+
+Reactivity here is a queue you own, not a hook that owns you.
 
 ## Status
 

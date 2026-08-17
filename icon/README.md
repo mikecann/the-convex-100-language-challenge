@@ -28,20 +28,18 @@ approved local test deployment entirely through Docker:
 
 ### An expression can fail — and failure is the control flow
 
-Icon, designed by SNOBOL4 creator Ralph Griswold, replaces booleans with
-goal-directed evaluation: every expression either succeeds with a value or
-fails, and failure quietly calls off whatever surrounds it. `/x` succeeds only
-when `x` is null, `|` tries alternatives left to right, and `find` produces a
-match position or fails. The example's whole setup is built from that:
+Icon, designed by SNOBOL4 creator Ralph Griswold, has no boolean type: every
+expression either succeeds with a value or fails, and failure quietly calls
+off whatever surrounds it. `/x` succeeds only when `x` is null, `|` tries
+alternatives in order, and `find` returns a match position or fails — the
+example's setup is built entirely from that:
 
 ```text
 convexUrl := getenv("CONVEX_URL")
 if /convexUrl | *convexUrl = 0 then stop("CONVEX_URL is required")
-
 # map() lowercases, s[1:6] slices five characters, and `if` is an expression.
 scheme := if map(convexUrl[1:6]) == "https" then "wss" else "ws"
 hostAndMore := convexUrl[find("://", convexUrl) + 3 : 0]
-liveUrl := scheme || "://" || hostAndMore || "/api/sync"
 ```
 
 No null checks, no ternary operator, no regex — just expressions that succeed
@@ -49,11 +47,11 @@ or step aside.
 
 ### The JSON decoder is one big string scan
 
-`s ? expr` opens Icon's string-scanning environment: inside it the subject
-string and a cursor (`&subject`, `&pos`) become ambient, dynamically scoped
-state, so nested procedure calls simply continue scanning where their caller
-stopped. This client parses all of Convex's wire JSON that way, and `="true"`
-is a complete pattern match — advance past the literal, or fail:
+`s ? expr` opens Icon's string-scanning environment: the subject string and a
+cursor (`&subject`, `&pos`) become ambient state inside it, so nested calls
+simply keep scanning where their caller stopped. The client parses all of
+Convex's wire JSON this way, and `="true"` is a complete pattern in itself —
+advance past the literal, or fail:
 
 ```text
 procedure json_decode(s)
@@ -70,19 +68,15 @@ procedure json_match_true()
 end
 ```
 
-A whole number token falls out of one call, `tab(many('-+0123456789.eE'))` —
-no lexer in sight.
-
 ### `!` deals each Live update, `every` takes them all
 
 `!events` is a generator that yields a list's elements one at a time, and
 `every` drives a generator until it has nothing left to give. The canonical
-example subscribes before mutating, then its polling helper insists on
-watching the new count arrive through the WebSocket rather than re-querying:
+example subscribes before mutating, then polls Live for the changed value
+instead of re-querying:
 
 ```text
 convex_live_add(liveState, "basics", "demo:state", table_of(["room", room]))
-
 # TypeScript: const state = useQuery(api.demo.state, { room })
 while live_now_ms() < deadline do {
    events := convex_live_poll(liveState, 500)
@@ -94,17 +88,15 @@ while live_now_ms() < deadline do {
 }
 ```
 
-Where React's `useQuery` hides the subscription lifecycle, this CLI client
-owns it — and the same goal-directed machinery that scans strings also drains
-each poll's batch of updates.
+Where React's `useQuery` hides the subscription lifecycle, this client drains
+it by hand, poll by poll.
 
 ### Argument objects are built two list items at a time
 
 Icon has tables (hash maps) but no `{ key: value }` literal, so the client
-grows its own in a three-line helper: `every i := 1 to *pairs by 2` walks a
-flat list in steps of two. `&now` is one of Icon's ambient `&`-keywords, here
-timestamping the idempotency key so a retried mutation can never
-double-increment:
+grows its own: `every i := 1 to *pairs by 2` walks a flat list two at a time.
+`&now`, one of Icon's ambient `&`-keywords, timestamps the idempotency key so
+a retried mutation can never double-increment:
 
 ```text
 procedure table_of(pairs)
@@ -117,7 +109,6 @@ end
 mutation := convex_http_call("mutation", "demo:increment",
    table_of(["room", room, "language", "Icon", "runId", "icon-" || &now]),
    convexUrl, "")
-if mutation.kind ~== "result" then stop(mutation.errMessage)
 ```
 
 One flat list in, one JSON object over the wire.

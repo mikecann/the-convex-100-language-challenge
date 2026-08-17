@@ -21,159 +21,56 @@ That command builds and runs the exact example shown below against a unique room
 
 ## Interesting Parts
 
-### A query returns owned JSON, not a generated application type
+### An error is just the next thing a proc returns
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Count() {
-  const state = useQuery(api.demo.state, { room: "readme-odin" });
-  if (state === undefined) return <p>Loading...</p>;
-
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**Odin**
+Odin has no exceptions, and Ginger Bill built it that way on purpose: a fallible call returns its result and an `Error` side by side, so "handling" it is just an `if` your program can't quietly skip past. Every wrapper in `client/convex.odin` follows the same shape, and `Error_Kind` is a closed enum rather than a string you could typo.
 
 ```odin
-package main
+client, create_err := convex.create(deployment_url)
+if create_err.kind != .None { fmt.eprintln(create_err.message); return }
+defer convex.destroy(client) // The caller owns and releases the client.
 
-import convex "convex:."
-import "core:encoding/json"
-import "core:fmt"
-import "core:os"
-
-main :: proc() {
-	// Read the real deployment at runtime, just like the canonical example.
-	deployment_url := os.get_env_alloc("CONVEX_URL", context.allocator)
-	defer delete(deployment_url)
-	if deployment_url == "" { fmt.eprintln("CONVEX_URL is required"); return }
-
-	client, create_err := convex.create(deployment_url)
-	if create_err.kind != .None { fmt.eprintln(create_err.message); return }
-	defer convex.destroy(client) // The caller owns and releases the client.
-
-	args := `{"room":"readme-odin"}` // This client accepts named arguments as JSON text.
-	result, query_err := convex.query(client, "demo:state", args)
-	if query_err.kind != .None { fmt.eprintln(query_err.message); return }
-	defer convex.destroy_result(&result) // The returned JSON and logs are owned too.
-
-	root, parse_err := convex.parse_json(result.value_json, "demo state")
-	if parse_err.kind != .None { fmt.eprintln(parse_err.message); return }
-	defer json.destroy_value(root)
-
-	object, ok := convex.as_object(root)
-	if !ok { return }
-	count_value, exists := convex.member(object, "count")
-	if !exists { return }
-
-	// Odin's tagged union makes the runtime JSON case explicit.
-	#partial switch count in count_value {
-	case json.Integer: fmt.println(count)
-	case json.Float:   fmt.println(count) // Convex may encode a whole number as 0.0.
-	case:              return
-	}
-}
+result, query_err := convex.query(client, "demo:state", args)
+// TypeScript: try { await client.query(...) } catch (e) { ... }
+if query_err.kind != .None { fmt.eprintln(query_err.message); return }
+defer convex.destroy_result(&result) // The returned JSON and logs are owned too.
 ```
 
-React's `useQuery` is reactive and manages its subscription lifecycle. `convex.query` is deliberately a one-off HTTP snapshot. The Odin language can model richer application types, but this small client intentionally returns bounded JSON text so each application chooses its own decoding layer.
+No hidden `throw` can skip that check, and no empty `catch` can quietly swallow it either.
 
-### Live updates are a resource the program owns
+### JSON lands as one tagged union, not `any`
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const room = "readme-odin-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  return (
-    <button
-      onClick={() => {
-        const runId = crypto.randomUUID(); // Every click is a fresh increment.
-        void increment({ room, language: "TypeScript", runId });
-      }}
-    >
-      Count: {state?.count ?? "loading"} {/* React rerenders after the mutation. */}
-    </button>
-  );
-}
-```
-
-**Odin**
+Odin's `core:encoding/json` package represents every parsed value as a single tagged union, `json.Value`, with a case for each JSON shape. Reading a Convex reply means narrowing that union with a `#partial switch`, so a whole-number count that Convex happens to encode as a float still has to be handled on purpose.
 
 ```odin
-package main
+object, _ := convex.as_object(root)
+count_value, _ := convex.member(object, "count")
 
-import convex "convex:."
-import "core:encoding/json"
-import "core:fmt"
-import "core:os"
-import "core:time"
-
-quote :: proc(text: string) -> string {
-	encoded, err := json.marshal(text, {spec = .JSON})
-	if err != nil { fmt.eprintln("could not encode arguments"); os.exit(1) }
-	return string(encoded)
-}
-
-main :: proc() {
-	deployment_url := os.get_env_alloc("CONVEX_URL", context.allocator)
-	defer delete(deployment_url)
-	if deployment_url == "" { fmt.eprintln("CONVEX_URL is required"); return }
-
-	client, create_err := convex.create(deployment_url)
-	if create_err.kind != .None { fmt.eprintln(create_err.message); return }
-	defer convex.destroy(client) // Also closes Live networking.
-
-	// The verifier supplies a unique room as the first argument.
-	room := "odin-readme"
-	if len(os.args) > 1 { room = os.args[1] }
-	room_json := quote(room)
-	defer delete(room_json)
-	room_args := fmt.aprintf(`{{"room":%s}}`, room_json)
-	defer delete(room_args)
-
-	subscription, subscribe_err := convex.subscribe(client, "demo:state", room_args)
-	if subscribe_err.kind != .None { fmt.eprintln(subscribe_err.message); return }
-	defer convex.subscription_destroy(subscription) // Unsubscribe and release its queue.
-
-	// The client exposes a blocking receive operation for the initial Live value.
-	initial, received := convex.subscription_recv(subscription, 20 * time.Second)
-	defer convex.destroy_update(&initial)
-	if !received || initial.error.kind != .None { return }
-
-	// This key is stable for a retry, while the verifier-unique room makes the run fresh.
-	run_id := fmt.aprintf("%s-odin-once", room)
-	defer delete(run_id)
-	run_id_json := quote(run_id)
-	defer delete(run_id_json)
-	mutation_args := fmt.aprintf(
-		`{{"room":%s,"language":"Odin","runId":%s}}`,
-		room_json,
-		run_id_json,
-	)
-	defer delete(mutation_args)
-	mutation_result, mutation_err := convex.mutation(client, "demo:increment", mutation_args)
-	if mutation_err.kind != .None { fmt.eprintln(mutation_err.message); return }
-	defer convex.destroy_result(&mutation_result)
-
-	// The next receive yields the reactive value published after the mutation.
-	updated, received_update := convex.subscription_recv(subscription, 20 * time.Second)
-	defer convex.destroy_update(&updated)
-	if !received_update || updated.error.kind != .None { return }
+// Odin's json.Value is one tagged union; TypeScript would just call this `any`.
+#partial switch count in count_value {
+case json.Integer: fmt.println(count)
+case json.Float:   fmt.println(count) // Convex may encode a whole number as 0.0.
 }
 ```
 
-The ordering is the same idea as `useQuery` plus `useMutation`: subscribe first, mutate, then observe the committed result. A blocking `subscription_recv` is this client's compact command-line API design, not a limitation of Odin. It makes ownership and timeouts visible where React normally handles them for a component.
+### A live subscription is a resource you block on
+
+There's no component tree to rerender here, so this client makes reactivity explicit instead: `subscribe` hands back an owned subscription, and `subscription_recv` blocks on it with a timeout until the next push arrives. Subscribing before mutating guarantees the initial snapshot and the later update belong to the same reactive query.
+
+```odin
+subscription, _ := convex.subscribe(client, "demo:state", args)
+defer convex.subscription_destroy(subscription) // Unsubscribe, release its queue.
+
+// TypeScript: const state = useQuery(api.demo.state, { room })
+initial, ok := convex.subscription_recv(subscription, 20 * time.Second)
+defer convex.destroy_update(&initial)
+if !ok || initial.error.kind != .None { return }
+
+convex.mutation(client, "demo:increment", mutation_args) // Fire the write...
+updated, ok2 := convex.subscription_recv(subscription, 20 * time.Second) // ...then block for the push.
+```
+
+Where `useQuery` would rerender a component for you, here the wait is a value: you call it, and your own code blocks until the committed count arrives.
 
 ## Status
 

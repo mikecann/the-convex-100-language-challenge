@@ -29,124 +29,97 @@ install Modula-3 on the host.
 
 ## Interesting Parts
 
-### Generated TypeScript results versus explicit JSON decoding
+### Interfaces reveal only what callers need
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function RoomCount() {
-  const state = useQuery(api.demo.state, {
-    room: "readme-modula-3-query",
-  });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // `state.count` is type-safe generated API data.
-}
-```
-
-**Modula-3**
+Modula-3 splits every module into an `INTERFACE` (the public contract) and a
+`MODULE` (the hidden body) — a discipline inherited from Modula-2, sharpened
+here with object types that can be only *partially* revealed. `ConvexJson.T`
+is declared opaque: the interface exposes a `Public` shape with nothing but a
+`kind` tag, and every array/object storage detail stays sealed inside
+`ConvexJson.m3` where no caller, including this client's own `ConvexHttp` and
+`ConvexLive`, can reach in and touch it.
 
 ```modula3
-IMPORT IO, Text, Env, Process, Stdio, ConvexJson, ConvexHttp;
+(* ConvexJson.i3 -- only "kind" is revealed to callers *)
+TYPE
+  Kind = {Null, False, True, Number, Str, Arr, Obj};
+  Public = OBJECT kind: Kind END;
+  T <: Public;                (* the rest of T lives in ConvexJson.m3 *)
 
-VAR
-  deploymentUrl := Env.Get("CONVEX_URL"); (* Real deployment configuration. *)
-  args := ConvexJson.NewObject();
-  result: ConvexHttp.CallResult;
-  countValue: ConvexJson.T;
-  count: LONGREAL;
+PROCEDURE ObjectGet(o: T; key: TEXT): T;
+(* TypeScript: JSON.parse hands back the whole shape at once *)
+```
+
+Every caller in this repo can branch on `value.kind`; none of them can see how
+an object's fields are actually stored.
+
+### A procedure declares its own exceptions
+
+Modula-3 requires a procedure to name every exception that can escape it, via
+a `RAISES` clause on the signature — checked exceptions years before Java
+made them famous. `ConvexJson.NumOf` promises `RAISES {Error}`, so the
+compiler holds every caller to either handling `ConvexJson.Error` or
+re-declaring the same promise onward.
+
+```modula3
+PROCEDURE NumOf(v: T): LONGREAL RAISES {Error};
+
+TRY
+  raw := ConvexJson.NumOf(countField);
+EXCEPT
+| ConvexJson.Error =>
+    Fail(context & ": \"count\" was not a JSON number");
+END;
+(* TypeScript: try/catch compiles fine even if you never write it *)
+```
+
+Decoding an untyped Convex reply into a real `LONGREAL` is exactly where that
+compiler-checked list earns its keep.
+
+### A result can also be a record you interrogate
+
+Modula-3 has no built-in sum types, so where an exception would be the wrong
+shape, this client hand-rolls one instead: `ConvexHttp.Call` never throws for
+a Convex function error or a dropped connection, it returns a `CallResult`
+whose `kind` field says which of four things happened.
+
+```modula3
+TYPE
+  ResultKind = {Result, FunctionError, TransportError, ProtocolError};
+
+queryResult := ConvexHttp.Call("query", "demo:state", queryArgs, deploymentUrl, "");
+IF queryResult.kind # ConvexHttp.ResultKind.Result THEN
+  Fail("query: " & queryResult.errMessage);
+END;
+(* TypeScript: await client.query(...) throws instead of returning a tag *)
+```
+
+Two error-reporting styles, exceptions and tagged records, living side by side
+in one client — the language leaves that choice to the API designer.
+
+### Live doesn't push — you poll for it
+
+The Status table's Live row below is earned: this client really does open the
+`/api/sync` WebSocket and prove a reactive update round-trips through it. But
+there is no callback, promise, or `async` generator. `ConvexLive.Poll` blocks
+the caller for at most a bounded number of milliseconds and hands back
+whatever arrived, even nothing, leaving the loop-and-match entirely up to you.
+
+```modula3
+live := ConvexLive.New(deploymentUrl);
+ConvexLive.Add(live, "counter", "demo:state", queryArgs);
+
+VAR batch := ConvexLive.Poll(live, 200); (* blocks up to 200ms, then returns *)
 BEGIN
-  IF deploymentUrl = NIL OR Text.Equal(deploymentUrl, "") THEN
-    IO.Put("CONVEX_URL is required\n", Stdio.stderr);
-    Process.Exit(1);
-  END;
-
-  (* Modula-3 objects are mutable references, so fields are added explicitly. *)
-  ConvexJson.ObjectSet(args, "room",
-                       ConvexJson.NewString("readme-modula-3-query"));
-  result := ConvexHttp.Call("query", "demo:state", args, deploymentUrl, "");
-
-  IF result.kind = ConvexHttp.ResultKind.Result THEN
-    countValue := ConvexJson.ObjectGet(result.value, "count");
-    count := ConvexJson.NumOf(countValue); (* Checked at runtime, then typed LONGREAL. *)
+  FOR i := 0 TO batch.count - 1 DO
+    IF Text.Equal(batch.events[i].subscriptionId, "counter")
+       AND batch.events[i].kind = ConvexLive.EventKind.Update THEN
+      liveUpdatedCount := DecodeCount(batch.events[i].value, "live");
+      (* TypeScript: useQuery just rerenders you; here you poll a queue *)
+    END;
   END;
 END;
 ```
-
-The React hook owns a continuing subscription and rerenders the component when
-the value changes. `ConvexHttp.Call` is only a one-off HTTP request. Its result
-kind is a typed Modula-3 enum, but this hand-written client has no generated
-function types, so the JSON field name and number shape are checked at runtime.
-The complete example narrows mathematically integral numbers to `INTEGER` too.
-
-### A subscription is an object you close yourself
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "readme-modula-3-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  async function addOne() {
-    const result = await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(), // A fresh id makes retries idempotent.
-    });
-    console.log(result.state.count); // The mutation result is type-safe here.
-  }
-
-  // React disposes the useQuery subscription when this component unmounts.
-  return <button onClick={addOne}>Count: {state?.count ?? 0}</button>;
-}
-```
-
-**Modula-3**
-
-```modula3
-IMPORT IO, Text, Env, Process, Stdio, ConvexJson, ConvexLive;
-
-VAR
-  deploymentUrl := Env.Get("CONVEX_URL");
-  args := ConvexJson.NewObject();
-  live: ConvexLive.T;
-  events: ConvexLive.EventBatch;
-BEGIN
-  IF deploymentUrl = NIL OR Text.Equal(deploymentUrl, "") THEN
-    IO.Put("CONVEX_URL is required\n", Stdio.stderr);
-    Process.Exit(1);
-  END;
-
-  live := ConvexLive.New(deploymentUrl); (* No network work happens yet. *)
-  ConvexJson.ObjectSet(args, "room",
-                       ConvexJson.NewString("readme-modula-3-live"));
-  ConvexLive.Add(live, "readme-counter", "demo:state", args);
-
-  (* Poll blocks for at most 200 ms and returns typed Event records. *)
-  events := ConvexLive.Poll(live, 200);
-  IF events.count > 0 AND
-     events.events[0].kind = ConvexLive.EventKind.Update THEN
-    EVAL ConvexJson.ObjectGet(events.events[0].value, "count");
-    (* The JSON count still needs runtime decoding before application use. *)
-  END;
-
-  ConvexLive.Remove(live, "readme-counter"); (* Stop this subscription. *)
-  ConvexLive.Close(live);                    (* Release the connection. *)
-END;
-```
-
-React hides subscription setup and cleanup behind the component lifecycle.
-This command-line client deliberately exposes `Add`, bounded blocking `Poll`,
-`Remove`, and `Close`. That is this client's small synchronous API design, not
-a limitation of Modula-3, which has threads and procedure values.
 
 ## Status
 

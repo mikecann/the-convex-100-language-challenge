@@ -18,57 +18,69 @@ From the repository root, run:
 
 ## Interesting Parts
 
-### Queries look unusual, but keep the same pieces
+### A function call reads like a tiny sentence
 
-React developers normally pass a function reference and arguments together:
-
-```ts
-const state = await convex.query(api.demo.state, { room });
-```
-
-LOLCODE uses a string path because it has no generated TypeScript API object:
+LOLCODE's grammar comes straight from lolcat captions, so a call isn't
+`f(x, y)` — it's a run-on sentence: `I IZ`, one `YR` per argument joined by
+`AN`, closed off with `MKAY`. The Convex query call in this client is
+literally one long grammatical sentence, and the result comes back as a
+BUKKIT (LOLCODE's one aggregate type) whose fields you read with `'Z`:
 
 ```lolcode
-I HAS A STATE ITZ I IZ CONVEXQUERY YR "demo:state" AN YR ARGS MKAY
+I HAS A FIRST ITZ I IZ CONVEXQUERY YR "demo:state" AN YR ARGS MKAY
+NOT FIRST'Z OK, O RLY?
+  YA RLY
+    I IZ TRANSPORT'Z ABORT YR FIRST'Z ERRORMESSAGE MKAY
+OIC
+BTW TypeScript: const state = await convex.query(api.demo.state, { room });
 ```
 
-Both calls identify a Convex function, encode an argument object, and decode the
-returned value. `CONVEXQUERY` additionally preserves structured function errors
-and log lines.
+### A BUKKIT doubles as this client's hash map
 
-### Live starts before the mutation
+With only one aggregate type available, `live.lol` presses the BUKKIT into a
+second job: the fixed 16-slot table tracking every open Live subscription,
+addressed by a computed string key instead of a numeric index.
 
-The ordering is the same one a React component gets from `useQuery` before a
-button calls a mutation:
-
-```ts
-const state = useQuery(api.demo.state, { room });
-const increment = useMutation(api.demo.increment);
+```lolcode
+I HAS A CONVEXSUBS ITZ A BUKKIT
+IM IN YR MAKESLOTS UPPIN YR SLOT TIL BOTH SAEM SLOT AN 16
+  I HAS A KEY ITZ SMOOSH "S" AN SLOT MKAY
+  CONVEXSUBS HAS A SRS KEY ITZ A BUKKIT
+IM OUTTA YR MAKESLOTS
 ```
 
-The explicit LOLCODE version makes that ordering visible:
+`SRS KEY` means "the slot named by whatever's in KEY" — the same indirection
+a JS `obj[key]` gives you, just spelled out in three words.
+
+### Live starts talking before the mutation does
+
+The reactive path keeps the same ordering a React component gets from calling
+`useQuery` before a button fires `useMutation`: subscribe first, read the
+value the socket delivers, then mutate and watch the next value arrive over
+that same connection.
 
 ```lolcode
 I IZ CONVEXSUBSCRIBE YR "example" AN YR "demo:state" AN YR ARGS MKAY
+...
+I HAS A EVENT ITZ I IZ CONVEXLIVETICK MKAY
+...
 I HAS A MUTATION ITZ I IZ CONVEXMUTATIONWITHKEY YR "demo:increment" AN YR MUTATIONARGS AN YR ROOM MKAY
+...
+I IZ CONVEXCLOSELIVE MKAY
 ```
 
-One LOLCODE owner controls the WebSocket, query-set versions, transitions, and
-reconnects. Subscribers only receive decoded events from its bounded queue.
+One owner in `live.lol` drives the WebSocket, the query-set version, and a
+16-event, 4 MiB bounded queue; `CONVEXLIVETICK` just drains it.
 
-### Integral Convex numbers are checked deliberately
+### A count is only trusted if it's whole
 
-JavaScript uses one number type, so this usually needs no visible conversion:
-
-```ts
-const count: number = state.count;
-```
-
-The LOLCODE helper accepts mathematically integral JSON spellings such as `0.0`
-while rejecting fractions and values outside its safe integer range:
+The LOLCODE helper behind Convex's numbers accepts mathematically integral
+JSON spellings such as `0.0`, while rejecting fractions and anything outside
+the safe integer range, before it becomes a LOLCODE `NUMBR`:
 
 ```lolcode
 FOUND YR I IZ TRANSPORT'Z JSONINTEGER YR I IZ TRANSPORT'Z JSONGET YR VALUE AN YR "count" MKAY MKAY
+BTW TypeScript: const count: number = state.count;
 ```
 
 ## Status

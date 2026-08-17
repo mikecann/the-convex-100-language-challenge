@@ -37,122 +37,66 @@ install Seed7 on your computer.
 
 ## Interesting Parts
 
-### A query can read like a Seed7 statement
+### A library can teach the language a new sentence
 
-TypeScript names a query through the generated `api` object. Seed7 libraries
-can define statically checked statement forms, so this call reads like a
-sentence.
-
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-export function Seed7Comparison() {
-  const room = "seed7-readme-query";
-  const state = useQuery(api.demo.state, { room });
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // Generated types prove count is a number.
-}
-```
-
-**Seed7**
+Seed7's headline idea, mentioned above, is that control structures like `for`
+and even `:=` are ordinary library declarations, not compiler built-ins. This
+client leans on that directly: a two-line `$ syntax` pragma teaches the
+compiler a brand-new statement shape, so calling a Convex query reads like a
+sentence instead of a three-argument function call.
 
 ```text
-const proc: showCount (inout convexClient: client, in string: room) is func
-  local
-    var jsonObject: queryArgs is jsonObject.value;
-    var convexOutcome: outcome is convexOutcome.value;
-  begin
-    # The caller creates client from a validated CONVEX_URL.
-    queryArgs @:= ["room"] jsonValue(room); # Build the { room } argument.
-    outcome := client query "demo:state" withArgs jsonValue(queryArgs);
-    if not outcome.ok then
-      writeln(STD_ERR, outcome.error.message);
-      exit(1);
-    else
-      # Only use the returned JSON after the call succeeds.
-      writeln(jsonEncode(outcome.value));
-    end if;
-  end func;
+$ syntax expr: .().query.().withArgs.() is -><- 9;
+const func convexOutcome: (inout convexClient: client) query (in string: path)
+    withArgs (in jsonValue: args) is
+  return convexCall(client, "query", path, args);
+
+# TypeScript: const state = useQuery(api.demo.state, { room });
+outcome := client query "demo:state" withArgs jsonValue(queryArgs);
 ```
 
-`query` and `withArgs` come from
-[`client/convex.s7i`](client/convex.s7i), not Seed7 itself. This small client
-uses a string path and checked JSON, while generated TypeScript knows the
-arguments and result type. `useQuery` also stays subscribed; Seed7's `query` is
-one HTTP snapshot. The full example below validates the returned count.
+`query ... withArgs ...` isn't a macro or a parser special case — it's exactly
+as "built-in" as Seed7's own `if`, defined by the same mechanism.
 
-### A Live subscription has an explicit lifecycle
+### JSON grows with an operator, not a builder
 
-React manages a query subscription for a component. The Seed7 command-line
-client exposes that lifecycle directly.
-
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "seed7-readme-live";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-  const addOne = () =>
-    increment({ room, language: "TypeScript", runId: crypto.randomUUID() });
-  return (
-    <button onClick={addOne}>
-      Count: {state?.count ?? "Loading..."}
-    </button>
-  );
-}
-```
-
-**Seed7**
+Instead of a `.set()` chain or an object literal, appending a field to a JSON
+object uses `@:=`, an operator the standard library itself defines rather than
+hard-wiring into the compiler. It reads like updating a hash map in place, one
+field at a time.
 
 ```text
-const proc: incrementAndObserve (inout convexClient: client,
-    in string: room) is func
-  local
-    var convexLive: live is convexLive.value;
-    var jsonObject: queryArgs is jsonObject.value;
-    var jsonObject: mutationArgs is jsonObject.value;
-    var convexOutcome: outcome is convexOutcome.value;
-  begin
-    # The caller creates client from a validated CONVEX_URL.
-    queryArgs @:= ["room"] jsonValue(room);
-    mutationArgs @:= ["room"] jsonValue(room);
-    mutationArgs @:= ["language"] jsonValue("Seed7");
-    mutationArgs @:= ["runId"] jsonValue(randomSessionId);
-
-    # Subscribe first, then explicitly wait for the initial value.
-    live := openConvexLive(client);
-    subscribeLive(live, "state", "demo:state", jsonValue(queryArgs));
-    outcome := waitForLiveValue(live, "state", 10 . SECONDS);
-    if outcome.ok then
-      # Mutate over HTTP only after Live is ready.
-      outcome := client mutate "demo:increment"
-          withArgs jsonValue(mutationArgs);
-    end if;
-
-    if outcome.ok then
-      # The same subscription receives the pushed update.
-      outcome := waitForLiveValue(live, "state", 10 . SECONDS);
-    end if;
-
-    # Always clean up, including after any failed operation above.
-    unsubscribeLive(live, "state");
-    closeLive(live);
-    if not outcome.ok then
-      exit(1);
-    end if;
-  end func;
+var jsonObject: mutationArgs is jsonObject.value;
+mutationArgs @:= ["room"] jsonValue(room);
+mutationArgs @:= ["language"] jsonValue("Seed7");
+mutationArgs @:= ["runId"] jsonValue(randomSessionId);
+outcome := client mutate "demo:increment" withArgs jsonValue(mutationArgs);
+# TypeScript: await mutation(api.demo.increment, { room, language, runId })
 ```
 
-React owns the lifecycle and rerenders when `state` changes. This client makes
-`waitForLiveValue` blocking so a command-line caller can consume events in
-sequence. That is an API choice, not a Seed7 limitation. The complete
-[`main.sd7` example](examples/basics/main.sd7) decodes and checks every result.
+### Live has no thread, so you pump it yourself
+
+Seed7 ships no thread library, so this client can't hand the WebSocket to a
+background worker the way a browser's `useQuery` implicitly does. A
+subscription is instead a value you poll: `waitForLiveValue` drives Seed7's
+own single event loop until a pushed update arrives or a deadline passes.
+
+```text
+live := openConvexLive(client);
+subscribeLive(live, "state", "demo:state", jsonValue(queryArgs));
+outcome := waitForLiveValue(live, "state", 10 . SECONDS);
+# TypeScript: useQuery just re-renders; here you ask for the next value.
+if outcome.ok then
+  outcome := client mutate "demo:increment" withArgs jsonValue(mutationArgs);
+end if;
+outcome := waitForLiveValue(live, "state", 10 . SECONDS);
+unsubscribeLive(live, "state");
+closeLive(live);
+```
+
+One socket, one loop, no callbacks — the whole subscription lifecycle fits in
+eight lines. The complete [`main.sd7` example](examples/basics/main.sd7)
+decodes and checks every result along the way.
 
 ## Status
 

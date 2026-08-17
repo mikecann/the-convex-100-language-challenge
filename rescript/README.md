@@ -34,115 +34,71 @@ approved test deployment and checks the program's exact six-line transcript.
 
 ## Interesting Parts
 
-### A generated TypeScript client versus checked JSON
+### A guard clause turns an empty string into a real error
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function RoomCount() {
-  const state = useQuery(api.demo.state, { room: "rescript-tour" });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // The generated API makes state.count a number.
-}
-```
-
-**ReScript**
+ReScript's `switch` can attach a plain boolean condition to a pattern with
+`if` — a "pattern guard" inherited from its OCaml ancestry. That means the
+"missing env var" bug and the "set to an empty string" bug are refused by the
+very same arm, instead of two separate `if` checks stacked in front of the
+logic.
 
 ```rescript
 let deploymentUrl = switch Js.Dict.get(ConvexNode.environment, "CONVEX_URL") {
 | Some(value) if value != "" => value
+// TypeScript: process.env.CONVEX_URL || throwUsage("CONVEX_URL is required")
 | _ => ConvexError.raiseError(ConvexError.usage("CONVEX_URL is required"))
 }
+```
 
-let readCount = async () => {
-  let client = Convex.make(deploymentUrl)
-  // This small client names the function as a string and builds JSON arguments.
-  let args = ConvexJson.object_([("room", Js.Json.string("rescript-tour"))])
-  let result = await Convex.query(client, "demo:state", args)
+Leave the guard off and the branch would happily hand back `""` as a deployment URL; the compiler doesn't care, only the test suite would.
 
-  // Server JSON is checked at the boundary before it becomes a ReScript int.
-  let count = switch ConvexJson.intField(result.value, "count") {
-  | Some(count) => count
-  | None => ConvexError.raiseError(ConvexError.protocol("state had no integral count"))
+### Five failure kinds, one variant, no catch-all
+
+Every Convex call in this client can fail for unrelated reasons — the function
+itself threw, the sync socket dropped, the caller misused a closed client —
+so the client folds all of them into one variant type instead of one
+message-shaped exception. `switch` over a variant must cover every
+constructor, so the compiler — not a code reviewer — notices a missing case.
+
+```rescript
+type kind =
+  | FunctionError // the function threw
+  | ProtocolError // the sync profile was violated
+  | TransportError // the socket failed before an answer existed
+  | ClosedError // the caller used a closed client
+  | UsageError // the caller passed something refused to send
+
+// TypeScript: type Kind = "FunctionError" | "ProtocolError" | ...
+let name = error =>
+  switch error.kind {
+  | FunctionError => "FunctionError"
+  | ProtocolError => "ProtocolError"
+  | TransportError => "TransportError"
+  | ClosedError => "ClosedError"
+  | UsageError => "UsageError"
   }
-  Js.log(count)
-  await Convex.close(client)
-}
 ```
 
-The React hook is reactive and uses Convex's generated TypeScript API. This
-ReScript call is a one-off HTTP request, and this educational client deliberately
-returns `Js.Json.t`, so the application must decode the result. ReScript's
-`option` and exhaustive `switch` make the success and failure paths visible.
+Add a sixth kind later and every `switch` like this one stops compiling until it's handled — there's no default arm quietly swallowing the new case.
 
-### React owns reactivity; this client hands you the subscription
+### A subscription is something you `next`, not something that calls you back
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function LiveCounter() {
-  const room = "rescript-live-demo";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  return (
-    <button
-      onClick={() =>
-        increment({ room, language: "typescript", runId: crypto.randomUUID() })
-      }
-    >
-      Count: {state?.count ?? "loading"}
-    </button>
-  ); // React keeps the query subscribed and rerenders after the mutation.
-}
-```
-
-**ReScript**
+React's `useQuery` hides its subscription entirely: new data just rerenders
+the component. This client is a plain Node program with no component tree,
+so `Convex.subscribe` hands back a subscription value the caller pulls from
+directly, one `next` at a time.
 
 ```rescript
-let deploymentUrl = switch Js.Dict.get(ConvexNode.environment, "CONVEX_URL") {
-| Some(value) if value != "" => value
-| _ => ConvexError.raiseError(ConvexError.usage("CONVEX_URL is required"))
-}
+let subscription = await Convex.subscribe(client, "demo:state", roomArguments())
+let initial = await ConvexLive.next(subscription) // the value already in flight
 
-let watchOneIncrement = async () => {
-  let client = Convex.make(deploymentUrl)
-  let room = "rescript-live-demo"
-  let args = ConvexJson.object_([("room", Js.Json.string(room))])
-
-  // This command-line API exposes subscription ownership directly.
-  let subscription = await Convex.subscribe(client, "demo:state", args)
-  let initial = await ConvexLive.next(subscription) // Wait for the initial state.
-
-  let mutationResult = await Convex.mutation(
-    client,
-    "demo:increment",
-    ConvexJson.object_([
-      ("room", Js.Json.string(room)),
-      ("language", Js.Json.string("rescript")),
-      ("runId", Js.Json.string(ConvexNode.randomUUID())),
-    ]),
-  )
-  let updated = await ConvexLive.next(subscription) // The server pushes the new state.
-
-  await ConvexLive.closeSubscription(subscription)
-  await Convex.close(client)
-  (initial, mutationResult.value, updated)
-}
+// TypeScript: const unsubscribe = client.onUpdate(api.demo.state, args, cb)
+let _ = await Convex.mutation(client, "demo:increment", incrementArguments())
+let updated = await ConvexLive.next(subscription) // pushed down the same open socket
+await ConvexLive.closeSubscription(subscription)
 ```
 
-ReScript supports promises and `async`/`await`. The blocking-looking `next`
-operation is this client's API choice, not a language limitation. Unlike a
-React hook, the command-line program must explicitly consume updates,
-unsubscribe, and close the client. The complete example also validates the
-initial value, the mutation's `{applied, state}` result, and the pushed update.
+Because `next` blocks until the server actually pushes something, the example proves the update arrived on the socket that was already open — not from a fresh poll in disguise.
 
 ## Status
 

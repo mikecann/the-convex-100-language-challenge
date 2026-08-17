@@ -32,140 +32,88 @@ You do not need to install the Mercury compiler on your machine.
 
 ## Interesting Parts
 
-### The compiler checks both data flow and possible outcomes
+### Modes turn "did you handle every outcome" into a compile error
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, { room: "mercury-readme" });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // The generated API makes count a number.
-}
-```
-
-**Mercury**
+Mercury split Prolog's one-size-fits-all relation into predicates with
+declared **modes** — each argument marked `in` (already known when the call
+starts) or `out` (produced by the call) — plus a **determinism** promise such
+as `det`, stating exactly how many solutions to expect. The compiler checks
+both, so a query that only sort-of covers its outcomes won't build.
 
 ```mercury
 % `in` values are already known; `out` values are produced by the call.
 % `det` promises this predicate handles every outcome exactly once.
-:- pred read_count(io::di, io::uo) is det.
+:- pred read_count(client::in, string::in, io::di, io::uo) is det.
 
-read_count(!IO) :-
-    io.get_environment_var("CONVEX_URL", MaybeUrl, !IO),
+read_count(Client, Room, !IO) :-
+    Args = j_object(["room" - j_string(Room)]),
+    query(Client, "demo:state", Args, Result, !IO),
     (
-        MaybeUrl = yes(Url),
-        ( new_client(Url, _, Client) ->
-            Args = j_object(["room" - j_string("mercury-readme")]),
-            query(Client, "demo:state", Args, Result, !IO),
-            (
-                Result = call_ok(call_result(Value, _Logs)),
-                io.write_line(Value, !IO)
-            ;
-                Result = call_error(Error),
-                io.write_line(Error, !IO)
-            )
-        ;
-            io.stderr_stream(Stderr, !IO),
-            io.write_string(Stderr,
-                "CONVEX_URL is not a valid deployment URL\n", !IO),
-            io.set_exit_status(1, !IO)
-        )
+        Result = call_ok(call_result(Value, _Logs)),
+        io.write_line(Value, !IO)        % TypeScript: useQuery(api.demo.state, { room })
     ;
-        MaybeUrl = no,
-        io.stderr_stream(Stderr, !IO),
-        io.write_string(Stderr, "CONVEX_URL is required\n", !IO),
-        io.set_exit_status(1, !IO)
+        Result = call_error(Error),
+        io.write_line(Error, !IO)
     ).
 ```
 
-React's `useQuery` is reactive and rerenders when the value changes. Mercury's
-`query` above is a one-off HTTP request. The unusual part is the declaration:
-the compiler checks which arguments flow in and out, and that both success and
-failure are covered. Mercury calls these [modes](https://mercurylang.org/information/doc-latest/mercury_reference_manual/Modes.html)
-and [determinism](https://mercurylang.org/information/doc-latest/mercury_reference_manual/Determinism.html).
+Delete the `call_error` arm and `read_count` stops compiling — `det` isn't a
+comment, it's a promise the compiler enforces.
 
-### React owns reactivity; this client makes it visible
+### A Live subscription's state is a value you pass forward, not a callback
 
-**TypeScript with React**
-
-```tsx
-import { useMutation, useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-export function CounterButton() {
-  const room = "mercury-readme";
-  const state = useQuery(api.demo.state, { room });
-  const increment = useMutation(api.demo.increment);
-
-  async function addOne() {
-    const result = await increment({
-      room,
-      language: "typescript",
-      runId: crypto.randomUUID(),
-    });
-    console.log(result.state.count); // The mutation returns updated state.
-  }
-
-  // React subscribes and unsubscribes with the component lifecycle.
-  return <button onClick={addOne}>Count: {state?.count ?? "..."}</button>;
-}
-```
-
-**Mercury**
+This repo's Live client is a caller-driven state machine over Convex's
+WebSocket sync protocol rather than a background thread: every step takes the
+connection's current `LiveState` and hands back the next one, so exactly one
+place owns the socket at a time.
 
 ```mercury
-io.get_environment_var("CONVEX_URL", MaybeUrl, !IO),
-(
-    MaybeUrl = yes(Url),
-    ( new_client(Url, _, Client) ->
-        Room = "mercury-readme",
-        Args = j_object(["room" - j_string(Room)]),
+% The caller owns the socket and threads its state explicitly.
+live_connect(Client, live_ok(Conn, LiveState0), !IO),
+live_add(Conn, LiveState0, "demo:state", Args, QueryId,
+    LiveState1, ok, !IO),
 
-        % The command-line program owns the socket and threads state explicitly.
-        live_connect(Client, live_ok(Conn, LiveState0), !IO),
-        live_add(Conn, LiveState0, "demo:state", Args, QueryId,
-            LiveState1, ok, !IO),
+mutation(Client, "demo:increment", MutationArgs, MutationResult, !IO),
 
-        % A fresh key makes this one logical write, even if the call is retried.
-        random_hex(16, RunId, !IO),
-        MutationArgs = j_object([
-            "room" - j_string(Room),
-            "language" - j_string("mercury"),
-            "runId" - j_string(RunId)
-        ]),
-        mutation(Client, "demo:increment", MutationArgs, MutationResult, !IO),
-
-        % Polling advances the state and returns the reactive query update.
-        live_poll(Conn, LiveState1,
-            live_transition(LiveState2, Changes), !IO),
-        io.write_line(MutationResult, !IO), % Contains applied and state.
-        io.write_line(Changes, !IO),        % Contains the reactive value.
-        live_remove(Conn, LiveState2, QueryId, _, _, !IO),
-        live_close(Conn, !IO)
-    ;
-        io.stderr_stream(Stderr, !IO),
-        io.write_string(Stderr,
-            "CONVEX_URL is not a valid deployment URL\n", !IO),
-        io.set_exit_status(1, !IO)
-    )
-;
-    MaybeUrl = no,
-    io.stderr_stream(Stderr, !IO),
-    io.write_string(Stderr, "CONVEX_URL is required\n", !IO),
-    io.set_exit_status(1, !IO)
-).
+% Polling advances the state and returns whatever changed.
+live_poll(Conn, LiveState1,
+    live_transition(LiveState2, Changes), !IO),
+io.write_line(Changes, !IO),         % TypeScript: useQuery re-renders on its own
+live_remove(Conn, LiveState2, QueryId, _, _, !IO).
 ```
 
-Mercury supports higher-order code, but this small client deliberately exposes
-a polling API. Passing `LiveState0`, `LiveState1`, and `LiveState2` makes the
-subscription's state transitions explicit and keeps one owner responsible for
-the WebSocket. The [full example](examples/basics/main.m) adds timeout handling
-and validates that the HTTP, mutation, and Live counts agree.
+`LiveState0`, `LiveState1`, `LiveState2` are the same subscription at three
+different moments — reactivity you can watch travel left to right through the
+code, rather than a rerender happening somewhere off-screen.
+
+### Decoding a reply means naming every shape it's allowed to be
+
+Mercury's standard library ships no JSON support, so this client defines its
+own six-constructor `json` type and decodes it with `semidet` functions that
+fail cleanly on a bad shape instead of throwing. Recovering the counter's
+`count` means unifying against `j_object`/`j_number` and spelling out exactly
+what "a whole number" is allowed to look like.
+
+```mercury
+% Unifying against j_object/j_number picks the shape apart; this rejects a
+% fractional or missing count outright.
+% TypeScript: state.count as number -- trusted, not re-checked at runtime
+whole_count(Operation, Value) = Count :-
+    ( Value = j_object(Fields), assoc_search(Fields, "count", CountJson) ->
+        ( json_integral_int(CountJson, Found) ->
+            Count = Found
+        ;
+            Count = 0,
+            unexpected($module, $pred, Operation ++ " did not contain a whole count")
+        )
+    ;
+        Count = 0,
+        unexpected($module, $pred, Operation ++ " was not an object")
+    ).
+```
+
+A `1.0` from the wire passes; a `1.5` or a missing field is caught right here,
+not three call sites downstream.
 
 ## Status
 

@@ -27,150 +27,74 @@ and the resulting Live update. It does not run the full conformance suite.
 
 ## Interesting Parts
 
-### A query is a simulated circuit transaction
+### The client is a module instance, never `new`ed
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function Counter() {
-  const state = useQuery(api.demo.state, { room: "readme-query" });
-
-  if (state === undefined) return <p>Loading...</p>;
-  return <p>{state.count}</p>; // state and count are type-safe here.
-}
-```
-
-**Verilog**
+Verilog has no classes, so this client's "objects" are literal circuit
+instances: dropping a `convex` module into your design gives you a handle you
+call tasks on through plain dot access, the same way you'd wire up any other
+hardware block.
 
 ```verilog
-module query_demo;
-  convex conv ();                 // A reusable client is a module instance.
-  convex_buffer args ();          // This buffer also knows how to encode JSON.
-  convex_buffer result ();        // Returned JSON is parsed in another buffer.
+convex conv ();                 // an instance, not `new Client(url)`
+bit configured_ok, call_ok, function_error;
 
-  string room = "readme-query";
-  string args_json;
-  bit configured_ok, call_ok, function_error, found, number_ok;
-  integer i, root_token, count_token, count;
-  byte current_byte;
+conv.configure(deployment_url, configured_ok);
+if (!configured_ok) $fatal(1, "CONVEX_URL is not a valid deployment URL");
 
-  // The canonical main module passes the validated CONVEX_URL into this task.
-  task automatic run_query(input string deployment_url);
-  begin
-    conv.configure(deployment_url, configured_ok);
-    if (!configured_ok) $fatal(1, "CONVEX_URL is not a valid deployment URL");
-
-    // Build {"room":"readme-query"} without a JavaScript object or heap.
-    args.reset;
-    args.put_byte("{");
-    args.json_put_string("room");
-    args.put_byte(":");
-    args.json_put_string(room);
-    args.put_byte("}");
-
-    // Icarus cannot pass the buffer array into call(), so copy its bytes.
-    args_json = "";
-    for (i = 0; i < args.length(); i = i + 1) begin
-      current_byte = args.get_byte(i);
-      args_json = {args_json, current_byte};
-    end
-
-    // value_json contains the returned demo state as raw JSON.
-    conv.call("query", "demo:state", args_json, call_ok, function_error);
-
-    // Decode the returned value and read the same count React used above.
-    result.reset;
-    result.put_str(conv.value_json);
-    result.parse_json;
-    root_token = result.json_root();
-    result.json_object_get(root_token, "count", count_token, found);
-    result.tok_as_int(count_token, count, number_ok);
-    $display("%0d", count);
-  end
-  endtask
-endmodule
+conv.call("query", "demo:state", args_json, call_ok, function_error);
+// TypeScript: const state = await client.query(api.demo.state, { room })
+$display("%0d", count);
 ```
 
-React's `useQuery` creates and maintains a reactive subscription. Verilog's
-`call()` is deliberately a one-off HTTP request, so it is closer to calling a
-Convex HTTP client than mounting a hook. The surprising bit is that the client
-is a hierarchy of module instances and the network call crosses a real clocked
-request/acknowledge bus before reaching the host. The
-[canonical example](examples/basics/main.v) supplies `deployment_url` by calling
-its byte-by-byte `getenv` helper for `CONVEX_URL`, rejects a missing or empty
-value, and then rejects any URL that `conv.configure()` cannot parse.
+The whole client — HTTP framing, JSON parsing, even the WebSocket handshake —
+lives inside that one instantiated hierarchy.
 
-### Reactivity is an explicit lifecycle
+### JSON gets welded together one byte at a time
 
-**TypeScript with React**
-
-```tsx
-import { useQuery } from "convex/react";
-import { api } from "./convex/_generated/api";
-
-export function LiveCounter() {
-  const state = useQuery(api.demo.state, { room: "readme-live" });
-
-  // React rerenders this component whenever the subscribed value changes.
-  return <output>{state?.count ?? "Loading..."}</output>;
-}
-```
-
-**Verilog**
+There's no object-literal syntax in Verilog, so call arguments go into a
+`convex_buffer` instance as a stream of individual byte and string writes
+instead of a value you build in one expression.
 
 ```verilog
-convex conv ();
-convex_buffer args ();
-string room = "readme-live";
-string args_json;
-bit configured_ok, subscribe_ok, got_message;
-integer i, subscription_index, previous_version;
-byte current_byte;
+args.reset;
+args.put_byte("{");
+args.json_put_string("room");   // handles quoting/escaping for you
+args.put_byte(":");
+args.json_put_string(room);
+args.put_byte("}");
+// TypeScript: JSON.stringify({ room })
+```
 
-// The canonical main module passes the validated CONVEX_URL into this task.
-task automatic watch_counter(input string deployment_url);
-begin
-  conv.configure(deployment_url, configured_ok);
-  if (!configured_ok) $fatal(1, "CONVEX_URL is not a valid deployment URL");
+### Subscriptions live in a hierarchical array, woken by a blocking pump
 
-  // Build the subscription arguments as {"room":"readme-live"}.
-  args.reset;
-  args.put_byte("{");
-  args.json_put_string("room");
-  args.put_byte(":");
-  args.json_put_string(room);
-  args.put_byte("}");
-  args_json = "";
-  for (i = 0; i < args.length(); i = i + 1) begin
-    current_byte = args.get_byte(i);
-    args_json = {args_json, current_byte};
-  end
+Instead of a hook that reruns your component, a Live subscription here is a
+slot in an array inside the embedded `sync` instance, addressed by index. One
+process advances it by explicitly pumping the WebSocket until that slot's
+version counter moves.
 
-  // The tag is this program's local handle for the subscription.
-  conv.sync.add_subscription("counter", "demo:state", args_json, subscribe_ok);
-  subscription_index = conv.sync.find_sub_by_tag("counter");
-  previous_version = conv.sync.sub_version[subscription_index];
+```verilog
+conv.sync.add_subscription("counter", "demo:state", args_json, subscribe_ok);
+idx = conv.sync.find_sub_by_tag("counter");
+previous_version = conv.sync.sub_version[idx];
 
-  // This API chooses an explicit blocking pump instead of a callback.
-  while (conv.sync.sub_version[subscription_index] == previous_version) begin
-    conv.sync.pump(100, got_message);
-  end
-
-  // The latest returned state is raw JSON in sub_value_json[index].
-  // The canonical example parses it and reads its count field here.
-  conv.sync.remove_subscription("counter", subscribe_ok);
+// TypeScript: useQuery(api.demo.state, { room }) reruns your component for you
+while (conv.sync.sub_version[idx] == previous_version) begin
+  conv.sync.pump(100, got_message);
 end
-endtask
 ```
 
-The language can express event-driven processes, but this client intentionally
-exposes a blocking `pump()` operation so one process owns all WebSocket work.
-Unlike React, it also makes cleanup explicit. Each subscription stores only its
-newest value, so a slow consumer catches up rather than receiving every
-intermediate state.
+### Success is a pair of bits, never a thrown exception
+
+Hardware description has no exception mechanism, so `call()` reports its
+outcome through two separate output bits: one for whether the round trip
+happened at all, another for whether the Convex function itself threw.
+
+```verilog
+conv.call("mutation", "demo:increment", args_str, call_ok, is_fn_err);
+if (!call_ok) $fatal(1, "transport or HTTP failure");
+if (call_ok && is_fn_err) $fatal(1, conv.error_message);
+// TypeScript: try { await client.mutation(...) } catch (e) { ... }
+```
 
 ## Status
 
