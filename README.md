@@ -1,5 +1,7 @@
 # 100 Convex clients
 
+[![I spent way too many tokens on this…](https://thumbs.video-to-markdown.com/31c14058.jpg)](https://youtu.be/l61cLu8e2tg)
+
 An educational experiment demonstrating Convex from 100 programming languages
 and measuring honestly how much useful client behaviour each language can
 support.
