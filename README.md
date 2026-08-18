@@ -1,29 +1,105 @@
-# 100 Convex clients
+# The Convex 100 Language Challenge
 
-[![I spent way too many tokens on this…](https://thumbs.video-to-markdown.com/31c14058.jpg)](https://youtu.be/l61cLu8e2tg)
+[![I made 100 programming languages talk to Convex](https://img.youtube.com/vi/l61cLu8e2tg/maxresdefault.jpg)](https://youtu.be/l61cLu8e2tg)
 
-An educational experiment demonstrating Convex from 100 programming languages
-and measuring honestly how much useful client behaviour each language can
-support.
+Hi, I'm Mike. I work at [Convex](https://www.convex.dev/), and I had a slightly
+ridiculous idea: what would happen if I pointed a large group of coding agents
+at Convex and asked them to make it work in 100 different programming
+languages?
 
-These implementations are made for the project, website, and video. They are
-not officially sanctioned Convex clients and are not intended to become
-published packages or production SDKs.
+So that is what I did.
 
-The roster is complete: all 100 language implementations passed the shared HTTP
-and Live suites against both the pinned local backend and the dedicated hosted
-drift target. Every language manifest on `main` records both capabilities. See
-[STATS.md](STATS.md) for the completion summary and [BUILD-FLEET.md](BUILD-FLEET.md)
-for the now-deleted remote build fleet.
+I had the agents attempt to make Convex, a realtime database and compute
+platform, work everywhere from JavaScript and Python to Fortran, COBOL,
+LOLCODE, x86-64 assembly and even Verilog. Some of those languages existed
+before the internet. One of them is meant for designing hardware. Somehow,
+they are all here talking to the same cloud backend.
+
+This repository is the complete result: the clients, runnable examples,
+Docker builds, shared tests, failed attempts and all the evidence produced
+along the way. If you would rather hear the story first, the video above covers
+the journey and some of the stranger things that happened.
+
+## What does "working with Convex" mean?
+
+[Convex](https://www.convex.dev/) is a backend platform with a realtime
+database and server-side functions. An application can call queries,
+mutations and actions, then subscribe to a query and receive a new result when
+the underlying data changes.
+
+For a language to make the final roster, it had to demonstrate the same useful
+slice of that experience:
+
+- Call Convex queries, mutations and actions over HTTP.
+- Send and receive normal Convex values, errors and authentication tokens.
+- Subscribe to live query updates over a WebSocket.
+- Build and run from a clean Docker container rather than relying on whatever
+  happened to be installed on my machine.
+
+The goal was not to produce 100 folders that merely compiled. I wanted one set
+of rules that could be applied to every language, including the deeply weird
+ones, without quietly lowering the bar when things got difficult.
+
+## A few of my favourite parts
+
+- **Fortran** first appeared in 1957. It now has a Convex client receiving live
+  query updates from a cloud database.
+- **COBOL** predates the Beatles, and its client is nearly ten thousand lines
+  including tests because COBOL likes to make absolutely everything explicit.
+- **LOLCODE** begins with `HAI 1.3` and `CAN HAS TRANSPORT?`. The agents got it
+  over the line by patching the interpreter itself, which feels very on-brand.
+- **Verilog** is normally used to describe circuits that become hardware. It
+  was never meant for this, but it works anyway :P
+
+Not every language made it. Some needed proprietary tools, some could not open
+a network connection, and a few fought the container limits until the bitter
+end. I kept those stories in [INFEASIBLE.md](INFEASIBLE.md) rather than quietly
+deleting them.
+
+## Where should I start?
+
+- [Watch the video](https://youtu.be/l61cLu8e2tg) for the full story.
+- [Browse all 100 languages](https://the-convex-100-language-challenge.mikecann.app/)
+  and open any card to see its example and evidence.
+- Read [STATS.md](STATS.md) for the numbers, [LESSONS.md](LESSONS.md) for the
+  things the agents and I learned, or [BUILD-FLEET.md](BUILD-FLEET.md) for the
+  small army of rented servers behind the final push.
+- Pick a language directory if you just want to see what a Convex client looks
+  like in your favourite language.
+
+If you have Docker, you can run the same basic counter example used throughout
+the project:
+
+```sh
+git clone https://github.com/mikecann/the-convex-100-language-challenge
+cd the-convex-100-language-challenge
+./run verify-example fortran
+```
+
+Swap `fortran` for another language ID to try a different one.
+
+## A quick caveat
+
+These are educational experiments, not official Convex SDKs. They are not
+published packages and I would not quietly slip one into a production app. The
+interesting part is the source, the common challenge and what each language
+needed to make the same small client experience work.
+
+## Project status
+
+The final roster contains 100 language implementations. Each one completed the
+shared HTTP and Live suites against both the pinned local backend and a hosted
+compatibility deployment. Every language manifest on `main` records both
+capabilities. See [STATS.md](STATS.md) for the measured completion summary.
 
 The final trusted-main website index is still outstanding. The language runs
 were completed on the remote build fleet and recorded in their merged pull
 requests, but the repository's GitHub Actions evidence publisher was never
 expanded beyond the Go pilot. Until that index is produced, `./run site` will
-correctly withhold trusted website badges rather than treating manifest claims
-as signed CI evidence.
+withhold trusted website badges rather than treating manifest claims as signed
+CI evidence.
 
-## Capability badges
+## What the badges mean
 
 | Status | Meaning |
 | --- | --- |
@@ -41,7 +117,7 @@ Live includes HTTP. Implementation provenance is a separate label:
 | Transpiled | The implementation is written in the named source language and compiled to a different host language. |
 | Bridge | The code shells out to another Convex client, runtime, CLI, or sidecar. Bridges are shown but do not count as native clients. |
 
-## Ground rules
+## The rules I gave the agents
 
 - One source language, one audited entry in the roster.
 - Every build and test runs in Docker. Language toolchains are never installed on the host.
@@ -78,7 +154,7 @@ Build status and verified platforms are recorded as evidence. They are not
 capability badges. A successful build alone does not mean a client can talk to
 Convex.
 
-## Docker-only commands
+## Run it yourself
 
 The root script is the supported entrypoint. It invokes Docker for every build,
 test, package operation, and generated artifact.
