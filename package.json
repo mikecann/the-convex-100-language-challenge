@@ -1,0 +1,9 @@
+{
+  "name": "the-convex-100-language-challenge",
+  "private": true,
+  "description": "Lets `npx create-convex@latest my-app -t mikecann/the-convex-100-language-challenge` (the convex.dev/examples command) set this repo up. The language clients build and run in Docker, as the README says. This only installs and runs the shared Convex backend every example talks to, in _shared/backend.",
+  "scripts": {
+    "postinstall": "cd _shared/backend && npm install --no-fund --no-audit",
+    "dev": "cd _shared/backend && npx convex dev"
+  }
+}
